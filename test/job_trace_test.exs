@@ -101,6 +101,20 @@ defmodule Tightbeam.JobTraceTest do
 
   test "proofs 3-5: exact trace schema, review join, wake fact, authorization, and commit refs",
        %{db: db} do
+    law = Path.join(System.tmp_dir!(), "job-trace-law-#{System.unique_integer([:positive])}")
+    rules = Path.join(law, "identity/rules")
+    File.mkdir_p!(rules)
+    on_exit(fn -> File.rm_rf!(law) end)
+
+    for name <- ~w(row-reaction-assignment-inactivity.toml row-reaction-handoff.toml) do
+      File.cp!(
+        Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
+        Path.join(rules, name)
+      )
+    end
+
+    Tightbeam.Rules.load!(law, Map.keys(Tightbeam.Gateway.handlers(%{db: db})))
+
     repo = init_repo()
     on_exit(fn -> File.rm_rf!(repo) end)
     commit = git_output!(repo, ["rev-parse", "HEAD"])
@@ -167,16 +181,93 @@ defmodule Tightbeam.JobTraceTest do
     notice_id = "w_terminal_" <> notice_digest
 
     personal = Org.personal_session_key("owner")
-    assert %{state: "pending", session_key: ^personal} = Tightbeam.Wakes.get(db, notice_id)
 
-    assert {:ok, [[0]]} =
+    admission_evidence =
+      DB.query(
+        db,
+        """
+        SELECT e.eventId,e.event,e.facts,a.id,a.plan,a.status,a.result,
+               w.wakeId,c.reasonKind,c.causalSourceKind,c.causalSourceId,
+               l.id,l.detail
+        FROM row_reaction_events e
+        LEFT JOIN row_reaction_actions a ON a.org=e.org AND a.eventId=e.eventId
+          AND a.family='terminal-handoff' AND a.slot='handoff'
+        LEFT JOIN wakes w ON w.wakeId=json_extract(a.result,'$.wake_id')
+        LEFT JOIN wake_cancellations c ON c.wakeId=w.wakeId
+        LEFT JOIN lifecycle_events l ON l.kind='wake_undeliverable' AND l.subject=w.wakeId
+        WHERE json_extract(e.event,'$.terminal.assignment_id')=?1
+          AND json_extract(e.event,'$.source.kind')='attest'
+        ORDER BY e.eventId,a.id,l.id
+        """,
+        ["asg_direct"]
+      )
+
+    IO.inspect(
+      %{
+        admission: admission_evidence,
+        slate: DB.query(db, "SELECT slateWakeId FROM work_items WHERE id='wi_trace'")
+      },
+      label: "Trace terminal admission evidence",
+      limit: :infinity,
+      printable_limit: :infinity
+    )
+
+    assert {:ok, [admission_row]} = admission_evidence
+
+    assert [
+             event_id,
+             event_json,
+             facts_json,
+             action_id,
+             plan_json,
+             "pending",
+             result_json,
+             ^notice_id,
+             "target_unresolvable",
+             "scheduler_delivery",
+             cancellation_wake_id,
+             lifecycle_id,
+             "terminal_notification_recipient_unavailable"
+           ] = admission_row
+
+    event = JSON.decode!(event_json)
+    facts = JSON.decode!(facts_json)
+    plan = JSON.decode!(plan_json)
+    result = JSON.decode!(result_json)
+    assert event["id"] == event_id
+    assert event["terminal"]["assignment_id"] == "asg_direct"
+    assert event["source"]["kind"] == "attest"
+    assert event["source"]["id"] == completion.id
+    assert plan["source_event_id"] == event_id
+    assert plan["identity"] == [event["org"], "terminal-handoff", event_id, "handoff"]
+    assert action_id == Tightbeam.RowReactions.Store.id(plan["identity"])
+    assert plan["rule"] == "assignment-terminal-handoff"
+    assert plan["selected"] == true
+    assert plan["provenance"]["content_sha256"] =~ ~r/\A[0-9a-f]{64}\z/
+    assert plan["value"]["assignment_id"] == "asg_direct"
+    assert plan["value"]["on_unavailable"] == "undelivered"
+    assert facts["personal_session_key"] == personal
+    refute Enum.any?(facts["sessions"], &(&1["sessionKey"] == personal))
+    assert result["delivery"] == "undelivered"
+    assert result["wake_id"] == notice_id
+    assert result["intent_wake_id"] == notice_id
+    assert result["emitted"]["session_key"] == personal
+    assert result["emitted"]["assignment_id"] == "asg_direct"
+    assert cancellation_wake_id == notice_id
+    assert is_integer(lifecycle_id)
+
+    assert %{state: "canceled", fired_at: nil, session_key: ^personal} =
+             Tightbeam.Wakes.get(db, notice_id)
+
+    assert {:ok, [[1]]} =
              DB.query(db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [notice_id])
 
     # Holder attests replace inactivity deadlines; completion also closes its
-    # replacement. These source transitions precede the notice delivery attempt.
+    # replacement. Keep those source transitions separate from the admission-time
+    # undelivered attempt, which is checked in the complete trace below.
     source_cancellations =
       trace(db, {:user, "owner"}, "wi_trace").timeline
-      |> Enum.filter(&(&1.type == "wake_canceled"))
+      |> Enum.filter(&(&1.type == "wake_canceled" and &1.id != notice_id))
 
     assert Enum.map(source_cancellations, &{&1.assignmentId, &1.reasonKind, &1.outcomeKind}) == [
              {"asg_direct", "superseded", "replacement"},
@@ -308,35 +399,38 @@ defmodule Tightbeam.JobTraceTest do
     assert is_integer(canceled_at) and canceled_at >= completion.ts
 
     # Exact equality also excludes private prompt, attest and transcript fields.
+    expected_cancellations =
+      source_cancellations ++
+        [
+          %{
+            assignmentId: "asg_direct",
+            at: canceled_at,
+            id: notice_id,
+            reason: nil,
+            seqTiebreak: wake_rowid,
+            type: "wake_canceled",
+            provenanceStatus: "proven",
+            schedulingOrigin: "process:tightbeam",
+            requesterKind: "process",
+            requesterId: "tightbeam:wake-scheduler",
+            reasonKind: "target_unresolvable",
+            causalSourceKind: "scheduler_delivery",
+            causalSourceId: notice_id,
+            outcomeKind: "no_replacement",
+            replacementWakeId: nil,
+            dispositionKind: nil,
+            dispositionId: nil,
+            primaryWorkKind: nil,
+            primaryWorkId: nil,
+            workImpactKind: "no_linked_work",
+            livenessTriggerKind: nil,
+            livenessTriggerId: nil,
+            actionNeeded: false
+          }
+        ]
+
     assert Enum.filter(trace.timeline, &(&1.type == "wake_canceled")) ==
-             source_cancellations ++
-               [
-                 %{
-                   assignmentId: "asg_direct",
-                   at: canceled_at,
-                   id: notice_id,
-                   reason: nil,
-                   seqTiebreak: wake_rowid,
-                   type: "wake_canceled",
-                   provenanceStatus: "proven",
-                   schedulingOrigin: "process:tightbeam",
-                   requesterKind: "process",
-                   requesterId: "tightbeam:wake-scheduler",
-                   reasonKind: "target_unresolvable",
-                   causalSourceKind: "scheduler_delivery",
-                   causalSourceId: notice_id,
-                   outcomeKind: "no_replacement",
-                   replacementWakeId: nil,
-                   dispositionKind: nil,
-                   dispositionId: nil,
-                   primaryWorkKind: nil,
-                   primaryWorkId: nil,
-                   workImpactKind: "no_linked_work",
-                   livenessTriggerKind: nil,
-                   livenessTriggerId: nil,
-                   actionNeeded: false
-                 }
-               ]
+             Enum.sort_by(expected_cancellations, &{&1.at, &1.id})
 
     refute Enum.any?(trace.timeline, &(&1.type in ["marker", "disposition"]))
 
