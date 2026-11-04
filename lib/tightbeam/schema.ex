@@ -72,6 +72,13 @@ defmodule Tightbeam.Schema do
     Tightbeam.Toplines
   ]
 
+  @neutral_trigger_sources ~w(batch human agent process other)
+  @generic_trigger_sources ~w(batch agent process other)
+  @trigger_source_constraint_regex ~r/triggerSource\s+TEXT\s+CHECK\s*\(\s*triggerSource\s+IS\s+NULL\s+OR\s+triggerSource\s+IN\s*\(([^)]*)\)\s*\)/i
+  @trigger_source_check_marker ~r/\bCHECK\s*\([^)]*\btriggerSource\b/is
+  @turns_table_name_regex ~r/^\s*CREATE TABLE\s+(?:IF NOT EXISTS\s+)?(?:"turns"|`turns`|\[turns\]|turns)(?=\s|\()/i
+  @neutral_trigger_source_constraint "triggerSource TEXT CHECK (triggerSource IS NULL OR triggerSource IN ('batch','human','agent','process','other'))"
+
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
@@ -2030,6 +2037,8 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_assignment_source_replacement_v1(db)
     :ok = ensure_assignment_parent(db)
     :ok = ensure_turn_chat_provenance(db)
+    :ok = ensure_neutral_turn_trigger_source(db)
+    :ok = Tightbeam.Ledger.ensure_schema(db)
     :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
     :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
     :ok = ensure_notice_batch_chat_message_format(db)
@@ -2205,6 +2214,280 @@ defmodule Tightbeam.Schema do
           message: "turn_chat_provenance_migration_failed: #{Exception.message(error)}"
     end
   end
+
+  @doc false
+  def ensure_neutral_turn_trigger_source(db) do
+    case DB.migration_transaction(
+           db,
+           :neutral_turn_trigger_source,
+           ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+           ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+           fn txn ->
+             [[table_sql]] =
+               Txn.q(
+                 txn,
+                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='turns'"
+               )
+
+             case turn_trigger_source_schema!(table_sql) do
+               :current ->
+                 :ok
+
+               {:legacy, legacy_source} ->
+                 validate_legacy_trigger_source!(txn, legacy_source)
+                 rebuild_turns_trigger_source!(txn, table_sql, legacy_source)
+
+               :unconstrained ->
+                 migrate_unconstrained_trigger_source!(txn)
+             end
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "neutral_turn_trigger_source_migration_failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp turn_trigger_source_schema!(table_sql) do
+    case Regex.run(@trigger_source_constraint_regex, table_sql, capture: :all_but_first) do
+      [encoded_values] ->
+        values = parse_trigger_source_values!(encoded_values)
+        legacy_values = values -- @generic_trigger_sources
+        generic_values = Enum.filter(values, &(&1 in @generic_trigger_sources))
+
+        cond do
+          Enum.sort(values) == Enum.sort(@neutral_trigger_sources) and
+              length(values) == length(@neutral_trigger_sources) ->
+            :current
+
+          length(values) == length(@generic_trigger_sources) + 1 and
+            length(Enum.uniq(values)) == length(values) and
+            "human" not in values and
+            Enum.sort(generic_values) == Enum.sort(@generic_trigger_sources) and
+              length(legacy_values) == 1 ->
+            {:legacy, hd(legacy_values)}
+
+          true ->
+            raise ShapeError,
+              message: "neutral_turn_trigger_source_incompatible_constraint"
+        end
+
+      nil ->
+        if Regex.match?(@trigger_source_check_marker, table_sql) do
+          raise ShapeError, message: "neutral_turn_trigger_source_unknown_constraint"
+        else
+          :unconstrained
+        end
+    end
+  end
+
+  defp parse_trigger_source_values!(encoded_values) do
+    values =
+      Regex.scan(~r/'((?:''|[^'])*)'/, encoded_values, capture: :all_but_first)
+      |> Enum.map(&hd/1)
+
+    remainder =
+      Regex.replace(~r/'(?:''|[^'])*'/, encoded_values, "")
+      |> String.replace(",", "")
+      |> String.trim()
+
+    if values == [] or remainder != "" do
+      raise ShapeError, message: "neutral_turn_trigger_source_malformed_constraint"
+    end
+
+    values
+  end
+
+  defp validate_legacy_trigger_source!(txn, legacy_source) do
+    unrecognized =
+      Txn.q(
+        txn,
+        """
+        SELECT DISTINCT triggerSource FROM turns
+        WHERE triggerSource IS NOT NULL
+          AND triggerSource NOT IN ('batch','human','agent','process','other')
+        ORDER BY triggerSource
+        """
+      )
+      |> Enum.map(&hd/1)
+
+    unless unrecognized in [[], [legacy_source]] do
+      raise ShapeError, message: "neutral_turn_trigger_source_unrecognized_rows"
+    end
+
+    ensure_legacy_trigger_source_is_human!(txn, legacy_source)
+  end
+
+  defp migrate_unconstrained_trigger_source!(txn) do
+    unrecognized =
+      Txn.q(
+        txn,
+        """
+        SELECT DISTINCT triggerSource FROM turns
+        WHERE triggerSource IS NOT NULL
+          AND triggerSource NOT IN ('batch','human','agent','process','other')
+        ORDER BY triggerSource
+        """
+      )
+      |> Enum.map(&hd/1)
+
+    case unrecognized do
+      [] ->
+        :ok
+
+      [legacy_source] ->
+        ensure_legacy_trigger_source_is_human!(txn, legacy_source)
+
+        Txn.q(
+          txn,
+          "UPDATE turns SET triggerSource='human' WHERE triggerSource=?1 AND origin LIKE 'user:%'",
+          [legacy_source]
+        )
+
+        :ok
+
+      _ ->
+        raise ShapeError, message: "neutral_turn_trigger_source_unrecognized_rows"
+    end
+  end
+
+  defp ensure_legacy_trigger_source_is_human!(txn, legacy_source) do
+    [[non_human_rows]] =
+      Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM turns WHERE triggerSource=?1 AND origin NOT LIKE 'user:%'",
+        [legacy_source]
+      )
+
+    if non_human_rows != 0 do
+      raise ShapeError, message: "neutral_turn_trigger_source_legacy_origin_mismatch"
+    end
+  end
+
+  defp rebuild_turns_trigger_source!(txn, table_sql, legacy_source) do
+    unless Regex.match?(@turns_table_name_regex, table_sql) do
+      raise ShapeError, message: "neutral_turn_trigger_source_incompatible_table_name"
+    end
+
+    if Txn.q(
+         txn,
+         "SELECT 1 FROM sqlite_master WHERE name='turns_neutral_source_migration'"
+       ) != [] do
+      raise ShapeError, message: "neutral_turn_trigger_source_temporary_table_exists"
+    end
+
+    objects =
+      Txn.q(
+        txn,
+        """
+        SELECT sql FROM sqlite_master
+        WHERE tbl_name='turns' AND sql IS NOT NULL AND type IN ('index','trigger')
+        ORDER BY type,name
+        """
+      )
+      |> Enum.map(&hd/1)
+
+    columns =
+      Txn.q(txn, "PRAGMA table_info(turns)")
+      |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+    unless Enum.all?(~w(seq origin triggerSource), &(&1 in columns)) do
+      raise ShapeError, message: "neutral_turn_trigger_source_incompatible_columns"
+    end
+
+    [[row_count]] = Txn.q(txn, "SELECT COUNT(*) FROM turns")
+
+    high_water =
+      case Txn.q(txn, "SELECT seq FROM sqlite_sequence WHERE name='turns'") do
+        [[seq]] -> seq
+        [] -> 0
+      end
+
+    previous_foreign_key_violations = Txn.q(txn, "PRAGMA foreign_key_check")
+
+    migration_sql =
+      Regex.replace(
+        @turns_table_name_regex,
+        table_sql,
+        "CREATE TABLE turns_neutral_source_migration",
+        global: false
+      )
+      |> then(fn renamed_table_sql ->
+        Regex.replace(
+          @trigger_source_constraint_regex,
+          renamed_table_sql,
+          @neutral_trigger_source_constraint,
+          global: false
+        )
+      end)
+
+    :ok = Txn.exec(txn, migration_sql)
+
+    quoted_columns = Enum.map(columns, &quote_sql_identifier/1)
+    column_list = Enum.join(quoted_columns, ",")
+
+    selected_columns =
+      Enum.map(columns, fn
+        "triggerSource" ->
+          "CASE WHEN triggerSource=?1 AND origin LIKE 'user:%' THEN 'human' ELSE triggerSource END"
+
+        column ->
+          quote_sql_identifier(column)
+      end)
+      |> Enum.join(",")
+
+    Txn.q(
+      txn,
+      "INSERT INTO turns_neutral_source_migration (#{column_list}) SELECT #{selected_columns} FROM turns",
+      [legacy_source]
+    )
+
+    :ok = Txn.exec(txn, "DROP TABLE turns")
+    :ok = Txn.exec(txn, "ALTER TABLE turns_neutral_source_migration RENAME TO turns")
+    Enum.each(objects, &Txn.exec(txn, &1))
+
+    restore_turns_sequence!(txn, high_water)
+
+    [[migrated_count]] = Txn.q(txn, "SELECT COUNT(*) FROM turns")
+
+    [[remaining_legacy_rows]] =
+      Txn.q(txn, "SELECT COUNT(*) FROM turns WHERE triggerSource=?1", [legacy_source])
+
+    current_foreign_key_violations = Txn.q(txn, "PRAGMA foreign_key_check")
+
+    unless migrated_count == row_count and remaining_legacy_rows == 0 and
+             current_foreign_key_violations -- previous_foreign_key_violations == [] do
+      raise ShapeError, message: "neutral_turn_trigger_source_migration_integrity_failed"
+    end
+
+    :ok
+  end
+
+  defp restore_turns_sequence!(txn, high_water) when high_water <= 0, do: :ok
+
+  defp restore_turns_sequence!(txn, high_water) do
+    case Txn.q(txn, "SELECT seq FROM sqlite_sequence WHERE name='turns'") do
+      [[current]] when current >= high_water ->
+        :ok
+
+      [[_current]] ->
+        Txn.q(txn, "UPDATE sqlite_sequence SET seq=?1 WHERE name='turns'", [high_water])
+        :ok
+
+      [] ->
+        Txn.q(txn, "INSERT INTO sqlite_sequence(name,seq) VALUES ('turns',?1)", [high_water])
+        :ok
+    end
+  end
+
+  defp quote_sql_identifier(identifier),
+    do: "\"" <> String.replace(identifier, "\"", "\"\"") <> "\""
 
   defp ensure_notice_batch_chat_message_format(db) do
     case DB.migration_transaction(db, :notice_batch_chat_message_format, [], [], fn txn ->

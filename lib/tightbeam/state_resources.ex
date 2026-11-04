@@ -34,12 +34,14 @@ defmodule Tightbeam.StateResources do
          t.adapterGen, t.requestRef, t.error, t.createdAt, t.startedAt,
          t.endedAt, t.publishedAt,
          CASE
+           WHEN t.triggerSource IN ('batch','human','agent','process','other') THEN t.triggerSource
+           WHEN t.triggerSource IS NOT NULL AND t.origin LIKE 'user:%' THEN 'human'
            WHEN t.triggerSource IS NOT NULL THEN t.triggerSource
            WHEN EXISTS (
              SELECT 1 FROM wakes AS carrier
              WHERE carrier.wakeId=t.wakeId AND carrier.digest=1
            ) THEN NULL
-           WHEN t.origin LIKE 'user:%' THEN 'mike'
+           WHEN t.origin LIKE 'user:%' THEN 'human'
            WHEN t.origin LIKE 'agent:%' THEN 'agent'
            WHEN t.origin LIKE 'process:%' THEN 'process'
            WHEN t.origin IS NULL THEN NULL
