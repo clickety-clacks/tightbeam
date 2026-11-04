@@ -1542,6 +1542,16 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
+  test "inline image capability is limited to Claude and Codex" do
+    for harness <- Tightbeam.Harness.known() do
+      expected = harness in [Tightbeam.Harness.Claude, Tightbeam.Harness.Codex]
+
+      assert Tightbeam.Harness.accepts_inline_images?(harness) == expected
+      assert Tightbeam.Harness.accepts_inline_images?(harness.id()) == expected
+      assert Tightbeam.Harness.accepts_inline_images?(harness.wire_name()) == expected
+    end
+  end
+
   @tag recipient_readiness: true
   test "untyped carriers remain visible beside separate human batch rows", ctx do
     owner = "test-owner"

@@ -3503,7 +3503,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp covered_inline_harness?(harness), do: harness in [:claude, :codex, "claude", "codex"]
+  defp covered_inline_harness?(harness), do: Harness.accepts_inline_images?(harness)
 
   defp turn_runner(config) do
     db = Map.get(config, :db, Tightbeam.DB)
