@@ -102,6 +102,14 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     verification = { trigger = "registration", terminal = "bound-verdict-or-obligation-terminal", fallback = "wake-due-at" }
     """)
 
+    File.cp!(
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      ]),
+      Path.join(base, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
     Rules.load!(base, ~w(wake attest))
 
     on_exit(fn ->

@@ -1,5 +1,5 @@
 defmodule Tightbeam.ClientE2E.RunPackageTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
   import ExUnit.CaptureIO
   alias Tightbeam.ClientE2E.{LegGateway, Provenance, RunPackage, Scorecard}
 
@@ -178,7 +178,13 @@ defmodule Tightbeam.ClientE2E.RunPackageTest do
   end
 
   test "unavailable post-build provenance warns rather than claiming a clean stamp", ctx do
-    File.write!(Path.join(ctx.repo, "packaging/assemble.sh"), ctx.script <> "rm -rf .git\n")
+    # A broken repository marker stops Git from climbing into the enclosing
+    # checkout after the fixture repository is removed.
+    File.write!(
+      Path.join(ctx.repo, "packaging/assemble.sh"),
+      ctx.script <> "rm -rf .git\nprintf 'unavailable' > .git\n"
+    )
+
     package = build(ctx.repo, Provenance.stamp(ctx.repo))
 
     assert Enum.any?(
