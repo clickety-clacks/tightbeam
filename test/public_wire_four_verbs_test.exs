@@ -270,12 +270,16 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
 
     assert other_incident_count(ctx.db) == 1
 
+    assert {:ok, [[observation_count]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM harness_health_observations")
+
     wrong_target =
-      dispatch_cli(ctx, source.cli_token, %{
+      dispatch_cli(ctx, outsider.cli_token, %{
         observe_body
-        | params: %{
+        | as: outsider_role,
+          params: %{
             observe_params
-            | sourceSessionKey: outsider.session_key,
+            | sourceSessionKey: source.session_key,
               idempotencyKey: "wire-health-target"
           }
       })
@@ -283,6 +287,9 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert wrong_target.status == 403
     assert JSON.decode!(wrong_target.resp_body)["error"]["code"] == "not_authorized"
     assert other_incident_count(ctx.db) == 1
+
+    assert {:ok, [[^observation_count]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM harness_health_observations")
 
     recovery_condition = "a normal provider turn completes"
 
