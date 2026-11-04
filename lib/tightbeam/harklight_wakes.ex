@@ -10,6 +10,9 @@ defmodule Tightbeam.HarklightWakes do
   require Logger
   alias Tightbeam.{DB, ErrorDiagnostic, HarklightLifecycle, Org, Placement, Supervision, Wakes}
 
+  @attach_retry_delays [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
+  @attach_retry_window_ms 180_000
+
   @max_diagnostic_lines 3
   @max_diagnostic_line_chars 240
   @max_diagnostic_chars 768
@@ -416,11 +419,16 @@ defmodule Tightbeam.HarklightWakes do
   def init(opts) do
     Process.flag(:trap_exit, true)
     send(self(), :restore)
+    delays = Keyword.get(opts, :attach_retry_delays, @attach_retry_delays)
+    window = Keyword.get(opts, :attach_retry_window_ms, @attach_retry_window_ms)
 
     {:ok,
      %{
        db: Keyword.get(opts, :db, DB),
-       listener: Keyword.get(opts, :listener, &run_listener/3),
+       listener:
+         Keyword.get(opts, :listener, fn manager, handle, vendor_id ->
+           run_listener(manager, handle, vendor_id, delays, window)
+         end),
        send_runner: Keyword.get(opts, :send_runner),
        workers: %{},
        ports: %{},
@@ -820,7 +828,7 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp run_listener(manager, handle, vendor_id) do
+  defp run_listener(manager, handle, vendor_id, delays, window) do
     Process.flag(:trap_exit, true)
 
     case System.find_executable("harklight-agent") do
@@ -851,7 +859,9 @@ defmodule Tightbeam.HarklightWakes do
           "--controller"
         ]
 
-        case attach(executable, args) do
+        deadline = System.monotonic_time(:millisecond) + window
+
+        case attach_with_transport_recovery(executable, args, delays, deadline, manager, handle) do
           :ok ->
             case GenServer.call(manager, {:attached, handle}, :infinity) do
               :ok -> follow(manager, executable, handle)
@@ -869,22 +879,66 @@ defmodule Tightbeam.HarklightWakes do
     _ -> finish(manager, handle, "listener_failed")
   end
 
+  # Keep the original same-operation recovery inside each attempt. Only an
+  # observed transport failure can schedule another attempt; a handle refusal
+  # or an unclassified unknown result retains the existing disposition.
+  defp attach_with_transport_recovery(executable, args, delays, deadline, manager, handle) do
+    case attach(executable, args) do
+      {:transport, reason, diagnostic} ->
+        case delays do
+          [delay | rest] ->
+            if System.monotonic_time(:millisecond) + delay <= deadline do
+              log_listener_failure(handle, failure_status(reason, "attach", diagnostic))
+
+              receive do
+                {:EXIT, ^manager, exit_reason} -> exit(exit_reason)
+              after
+                delay ->
+                  if System.monotonic_time(:millisecond) <= deadline do
+                    attach_with_transport_recovery(
+                      executable,
+                      args,
+                      rest,
+                      deadline,
+                      manager,
+                      handle
+                    )
+                  else
+                    {:error, reason, diagnostic}
+                  end
+              end
+            else
+              {:error, reason, diagnostic}
+            end
+
+          [] ->
+            {:error, reason, diagnostic}
+        end
+
+      result ->
+        result
+    end
+  end
+
   defp attach(executable, args) do
     case attach_once(executable, args, "ATTACH initial attempt") do
-      {:unknown, op_id, initial_diagnostic} ->
+      {:unknown, op_id, initial_diagnostic, _transport} ->
         case retry_existing_operation(executable, op_id) do
           {:ok, retry_diagnostic} ->
             case attach_once(executable, args, "ATTACH after same-operation retry") do
               :ok ->
                 :ok
 
-              {:unknown, _op_id, diagnostic} ->
-                {:error, "attachment_outcome_unknown",
+              {:unknown, _op_id, diagnostic, transport} ->
+                {if(transport, do: :transport, else: :error), "attachment_outcome_unknown",
                  [initial_diagnostic, retry_diagnostic, diagnostic]}
 
-              {:error, reason, diagnostic} ->
-                {:error, reason, [initial_diagnostic, retry_diagnostic, diagnostic]}
+              {kind, reason, diagnostic} when kind in [:error, :transport] ->
+                {kind, reason, [initial_diagnostic, retry_diagnostic, diagnostic]}
             end
+
+          {:transport, retry_diagnostic} ->
+            {:transport, "attachment_outcome_unknown", [initial_diagnostic, retry_diagnostic]}
 
           {:error, retry_diagnostic} ->
             {:error, "attachment_outcome_unknown", [initial_diagnostic, retry_diagnostic]}
@@ -907,7 +961,11 @@ defmodule Tightbeam.HarklightWakes do
         {:ok, attempt_diagnostic("ATTACH existing same-operation retry", 0, output)}
 
       {output, exit_status} ->
-        {:error, attempt_diagnostic("ATTACH existing same-operation retry", exit_status, output)}
+        diagnostic =
+          attempt_diagnostic("ATTACH existing same-operation retry", exit_status, output)
+
+        kind = if retry_transport_failure?(output, op_id), do: :transport, else: :error
+        {kind, diagnostic}
     end
   rescue
     _ ->
@@ -938,11 +996,42 @@ defmodule Tightbeam.HarklightWakes do
         diagnostic = attempt_diagnostic(attempt, exit_status, output)
 
         if unknown,
-          do: {:unknown, unknown, diagnostic},
-          else: {:error, "attachment_refused", diagnostic}
+          do: {:unknown, unknown, diagnostic, attach_transport_failure?(output)},
+          else:
+            {if(attach_transport_failure?(output), do: :transport, else: :error),
+             "attachment_refused", diagnostic}
     end
   rescue
     _ -> {:error, "attachment_cli_failed", attempt_diagnostic(attempt, nil, nil)}
+  end
+
+  defp attach_transport_failure?(output) do
+    Enum.any?(String.split(output, "\n", trim: true), fn line ->
+      case JSON.decode(line) do
+        {:ok, %{"kind" => kind, "reason_source" => "agent", "reason_code" => code}}
+        when kind in ["refused", "connection_error", "outcome_unknown"] and
+               code in ["transport_error", "timeout"] ->
+          true
+
+        _ ->
+          false
+      end
+    end)
+  end
+
+  # Agent 0.1.6's generic retry omits reason_code. Its ApiError::Transport
+  # Display prefix is emitted on stderr beside the same operation's unknown
+  # record. Inspect that source-defined prefix, but never retain the raw URL.
+  defp retry_transport_failure?(output, op_id) do
+    lines = String.split(output, "\n", trim: true)
+
+    Enum.any?(lines, &String.starts_with?(&1, "origin request failed: ")) and
+      Enum.any?(lines, fn line ->
+        case JSON.decode(line) do
+          {:ok, %{"kind" => "outcome_unknown", "op_id" => ^op_id}} -> true
+          _ -> false
+        end
+      end)
   end
 
   defp attach_result({:unknown, _op_id, diagnostic}),
