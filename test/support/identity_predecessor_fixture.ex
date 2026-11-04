@@ -8,7 +8,6 @@ defmodule Tightbeam.IdentityPredecessorFixture do
   # Existing fixture rows must satisfy those historical constraints.
   def restore!(db) do
     {:ok, source} = DB.start_link(path: ":memory:", name: nil)
-    {:ok, boundary} = __MODULE__.Boundary.start_link(source)
 
     try do
       sql = File.read!(Path.expand("../fixtures/o2_admission_v1.sql", __DIR__))
@@ -19,8 +18,15 @@ defmodule Tightbeam.IdentityPredecessorFixture do
       :ok = DB.execute(source, sql)
       :ok = DB.execute(source, "PRAGMA foreign_keys=ON")
 
+      :ok =
+        DB.execute(source, """
+        CREATE TRIGGER fixture_identity_boundary BEFORE UPDATE ON schema_stamp
+        WHEN NEW.shape='session-identity-v1-0114'
+        BEGIN SELECT RAISE(ABORT, 'fixture identity boundary'); END;
+        """)
+
       assert_raise Schema.ShapeError, ~r/session identity migration rolled back/, fn ->
-        Schema.ensure_all(boundary)
+        Schema.ensure_all(source)
       end
 
       assert {:ok, [["launch-preparation-evidence-v1-0112"]]} =
@@ -82,21 +88,7 @@ defmodule Tightbeam.IdentityPredecessorFixture do
       assert {:ok, [["ok"]]} = DB.query(db, "PRAGMA integrity_check")
       :ok
     after
-      GenServer.stop(boundary)
       GenServer.stop(source)
     end
-  end
-
-  defmodule Boundary do
-    use GenServer
-    def start_link(db), do: GenServer.start_link(__MODULE__, db)
-    @impl true
-    def init(db), do: {:ok, db}
-    @impl true
-    def handle_call({:migration_transaction, :session_identity, _, _, _}, _from, db),
-      do: {:reply, {:error, "fixture identity boundary"}, db}
-
-    def handle_call(request, _from, db),
-      do: {:reply, GenServer.call(db, request, :infinity), db}
   end
 end
