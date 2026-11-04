@@ -840,6 +840,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              [List.last(messages).seq]
 
     assert earliest["page"]["hasMoreBefore"] == false
+
     assert Enum.sort(
              Enum.flat_map([latest, middle_page, earliest], fn p ->
                Enum.map(p["railDenials"], & &1["id"])
