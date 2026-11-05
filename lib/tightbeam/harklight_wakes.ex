@@ -636,7 +636,7 @@ defmodule Tightbeam.HarklightWakes do
     {:noreply, state}
   end
 
-  defp answer_completion_candidates(db, session_key \\ nil) do
+  defp answer_completion_candidates(db, session_key) do
     DB.query(
       db,
       """
