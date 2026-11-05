@@ -951,8 +951,11 @@ defmodule Tightbeam.HarklightLifecycle do
             deliveries
           end
 
-        has_primary = Enum.any?(deliveries, fn [_session, wake_id] -> wake_id == entry.wake_id end)
-        has_origin = Enum.any?(deliveries, fn [session_key, _wake_id] -> session_key == origin_session end)
+        has_primary =
+          Enum.any?(deliveries, fn [_session, wake_id] -> wake_id == entry.wake_id end)
+
+        has_origin =
+          Enum.any?(deliveries, fn [session_key, _wake_id] -> session_key == origin_session end)
 
         has_primary and has_origin and
           Enum.all?(deliveries, fn [session_key, wake_id] ->

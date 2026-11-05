@@ -3852,7 +3852,8 @@ defmodule Tightbeam.HarklightWakesTest do
 
     manager =
       start_supervised!(
-        {HarklightWakes, db: db, listener: completion_notifying_listener(parent), send_runner: runner}
+        {HarklightWakes,
+         db: db, listener: completion_notifying_listener(parent), send_runner: runner}
       )
 
     assert_receive {:restored, @handle, nil}
@@ -4256,7 +4257,8 @@ defmodule Tightbeam.HarklightWakesTest do
                  [session_key, Tightbeam.Id.uuid4(), wake_id, System.system_time(:millisecond)]
                )
 
-      assert {:ok, [[turn_seq]]} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id])
+      assert {:ok, [[turn_seq]]} =
+               DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id])
 
       assert {:ok, _} =
                DB.query(
