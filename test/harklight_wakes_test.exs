@@ -4061,6 +4061,86 @@ defmodule Tightbeam.HarklightWakesTest do
     refute_receive {:ack2, _args}
   end
 
+  test "ACK2 follows discussion retry lineage without treating dispatch as custody receipt", %{
+    db: db,
+    session: session
+  } do
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "redeliver"))
+    assert {:ok, [[root]]} = DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries")
+    first = deliver_discussion_turn!(db, root, session.session_key)
+    assert :ok = Ledger.finish(db, first.seq, "failed", nil, owner_lease: first.owner_lease)
+    test_pid = self()
+
+    runner = fn args ->
+      send(test_pid, {:retry_ack2, args})
+      {"", 0}
+    end
+
+    Enum.reduce(1..2, root, fn attempt, source ->
+      assert {:ok, [[retry]]} =
+               DB.query(db, "SELECT retryWakeId FROM wake_retry_attempts WHERE wakeId=?1", [
+                 source
+               ])
+
+      turn = deliver_discussion_turn!(db, retry, session.session_key)
+      assert :ok = Ledger.stamp_adapter(db, turn.seq, 1)
+
+      assert :ok =
+               HarklightWakes.ack2_for_dispatched_turn(
+                 db,
+                 turn.seq,
+                 session.session_key,
+                 session.display_name,
+                 runner: runner
+               )
+
+      refute_receive {:retry_ack2, _}
+      record_prompt_dispatched!(db, turn)
+
+      assert :ok =
+               HarklightWakes.ack2_for_dispatched_turn(db, turn.seq, "agent:unrelated", "Other",
+                 runner: runner
+               )
+
+      refute_receive {:retry_ack2, _}
+
+      assert :ok =
+               HarklightWakes.ack2_for_dispatched_turn(
+                 db,
+                 turn.seq,
+                 session.session_key,
+                 session.display_name,
+                 runner: runner
+               )
+
+      assert_receive {:retry_ack2,
+                      ["ack2", "--session", @handle, "--event", "1", "--agent", "Origin"]}
+
+      refute_receive {:retry_ack2, _}
+
+      terminal = if attempt == 1, do: "failed_unknown", else: "delivered"
+      assert :ok = Ledger.finish(db, turn.seq, terminal, nil, owner_lease: turn.owner_lease)
+
+      if attempt == 1 do
+        assert {:ok, [[next]]} =
+                 DB.query(db, "SELECT retryWakeId FROM wake_retry_attempts WHERE wakeId=?1", [
+                   retry
+                 ])
+
+        assert is_binary(next)
+      else
+        assert {:ok, [["acted", nil]]} =
+                 DB.query(
+                   db,
+                   "SELECT outcome,retryWakeId FROM wake_retry_attempts WHERE wakeId=?1",
+                   [retry]
+                 )
+      end
+
+      retry
+    end)
+  end
+
   test "Harklight wake instructions leave ACK2 to the receiving system", %{db: db} do
     assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "Person prompt"))
 

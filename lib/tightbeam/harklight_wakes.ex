@@ -131,11 +131,13 @@ defmodule Tightbeam.HarklightWakes do
   @doc false
   def ack2_for_dispatched_turn(db, turn_seq, session_key, agent_name, opts \\ []) do
     query = """
-    SELECT e.handle,e.eventId,h.sessionKey
-    FROM harklight_wake_deliveries d
+    SELECT DISTINCT e.handle,e.eventId,h.sessionKey
+    FROM wakes w
+    LEFT JOIN wake_retry_attempts retry ON retry.wakeId=w.wakeId
+    JOIN harklight_wake_deliveries d
+      ON d.wakeId=COALESCE(retry.rootWakeId,w.wakeId) AND d.sessionKey=w.sessionKey
     JOIN harklight_wake_entries e ON e.handle=d.handle AND e.eventId=d.eventId
     JOIN harklight_wake_handles h ON h.handle=e.handle
-    JOIN wakes w ON w.wakeId=d.wakeId AND w.sessionKey=d.sessionKey
     WHERE w.deliveredTurnSeq=?1 AND d.sessionKey=?2
       AND e.entryKind IN ('discussion','terminal') AND e.entryAuthor='person'
       AND EXISTS (
