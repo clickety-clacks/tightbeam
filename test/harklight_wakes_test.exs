@@ -2045,6 +2045,148 @@ defmodule Tightbeam.HarklightWakesTest do
     assert statement =~ "superseded by replacement"
   end
 
+  test "committed sends pass contradiction matches through with camelCase member names", %{
+    db: db,
+    call: call
+  } do
+    warning =
+      "these possibly contradictory messages are still active, please talk to its poster to reconcile them"
+
+    contradictions = %{
+      "status" => "complete",
+      "unchecked" => 0,
+      "warning" => warning,
+      "messages" => [
+        %{
+          "sender_id" => "sender-a",
+          "sender_name" => "Agent A",
+          "message_id" => "open-a",
+          "title" => "First open request"
+        },
+        %{
+          "sender_id" => "sender-b",
+          "sender_name" => "Agent B",
+          "message_id" => "open-b",
+          "title" => "Second open request"
+        }
+      ]
+    }
+
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: @handle,
+          sender_id: "sender",
+          title: "Replacement"
+        }
+    }
+
+    result =
+      HarklightSend.send_request(db, send_call,
+        runner: lifecycle_runner(db, possible_contradictions: contradictions)
+      )
+
+    assert result.outcome == "committed"
+    assert result.wake_effect == "subscribed"
+
+    assert result.possible_contradictions == %{
+             "status" => "complete",
+             "unchecked" => 0,
+             "warning" => warning,
+             "messages" => [
+               %{
+                 "senderId" => "sender-a",
+                 "senderName" => "Agent A",
+                 "messageId" => "open-a",
+                 "title" => "First open request"
+               },
+               %{
+                 "senderId" => "sender-b",
+                 "senderName" => "Agent B",
+                 "messageId" => "open-b",
+                 "title" => "Second open request"
+               }
+             ]
+           }
+  end
+
+  test "committed incomplete result is carried without warning or messages", %{db: db, call: call} do
+    contradictions = %{
+      "status" => "incomplete",
+      "reason" => "unavailable",
+      "unchecked" => 3
+    }
+
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: @handle,
+          sender_id: "sender",
+          title: "Replacement"
+        }
+    }
+
+    result =
+      HarklightSend.send_request(db, send_call,
+        runner: lifecycle_runner(db, possible_contradictions: contradictions)
+      )
+
+    assert result.outcome == "committed"
+    assert result.wake_effect == "subscribed"
+    assert result.possible_contradictions == contradictions
+  end
+
+  test "send without the server field retains the ordinary committed result", %{
+    db: db,
+    call: call
+  } do
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: @handle,
+          sender_id: "sender",
+          title: "Replacement"
+        }
+    }
+
+    result = HarklightSend.send_request(db, send_call, runner: lifecycle_runner(db))
+
+    assert result.outcome == "committed"
+    assert result.wake_effect == "subscribed"
+    refute Map.has_key?(result, :possible_contradictions)
+  end
+
+  test "superseding sends carry the contradiction field without changing supersede results", %{
+    db: db,
+    call: call
+  } do
+    contradictions = %{
+      "status" => "incomplete",
+      "reason" => "unavailable",
+      "unchecked" => 1
+    }
+
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: @handle,
+          sender_id: "sender",
+          title: "Replacement",
+          supersedes: ["request"]
+        }
+    }
+
+    result =
+      HarklightSend.send_request(db, send_call,
+        runner: lifecycle_runner(db, possible_contradictions: contradictions)
+      )
+
+    assert result.outcome == "committed"
+    assert result.wake_effect == "subscribed"
+    assert result.possible_contradictions == contradictions
+    assert [%{message_id: "request", effect: "ended"}] = result.supersedes
+  end
+
   test "failed own terminal acknowledgment stays open and is never retried", %{db: db, call: call} do
     runner =
       lifecycle_runner(db,
@@ -2886,11 +3028,21 @@ defmodule Tightbeam.HarklightWakesTest do
               {JSON.encode!(%{kind: "refused", op_id: op, reason: "not accepted"}), 2}
 
             true ->
+              response = %{
+                session_handle: @handle,
+                supersedes_warnings: opts[:warnings] || []
+              }
+
+              response =
+                if Keyword.has_key?(opts, :possible_contradictions),
+                  do: Map.put(response, :possible_contradictions, opts[:possible_contradictions]),
+                  else: response
+
               frame(%{
                 kind: "committed",
                 operation: "send",
                 op_id: op,
-                response: %{session_handle: @handle, supersedes_warnings: opts[:warnings] || []}
+                response: response
               })
           end
       end

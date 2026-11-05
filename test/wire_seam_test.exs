@@ -471,6 +471,105 @@ defmodule Tightbeam.Wire.SeamTest do
     assert error["reason"] =~ "harklight-settle --message minted-id"
   end
 
+  test "committed Harklight sends expose mapped contradiction matches in the result", ctx do
+    handle = "069c53c7-765f-48d1-bda7-98b58ad94194"
+
+    warning =
+      "these possibly contradictory messages are still active, please talk to its poster to reconcile them"
+
+    contradictions = %{
+      "status" => "complete",
+      "unchecked" => 0,
+      "warning" => warning,
+      "messages" => [
+        %{
+          "sender_id" => "sender-a",
+          "sender_name" => "Agent A",
+          "message_id" => "open-a",
+          "title" => "Open request"
+        }
+      ]
+    }
+
+    runner = fn args ->
+      if Enum.take(args, 2) == ["send", "--prepare"] do
+        op_id = Enum.at(args, 3)
+
+        {JSON.encode!(%{
+           kind: "prepared",
+           op_id: op_id,
+           files: [],
+           request: %{
+             type: "send",
+             op_id: op_id,
+             session_handle: handle,
+             route: "other",
+             message: %{
+               sender_id: "sender",
+               message_id: "minted-id",
+               title: "Question",
+               supersedes: []
+             }
+           }
+         }) <> "\n", 0}
+      else
+        op_id = List.last(args)
+
+        {JSON.encode!(%{
+           kind: "committed",
+           operation: "send",
+           op_id: op_id,
+           response: %{
+             session_handle: handle,
+             possible_contradictions: contradictions
+           }
+         }) <> "\n", 0}
+      end
+    end
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: ctx.opts[:base_dir],
+        harklight_send_runner: runner
+      })
+
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO users(userId,isAdmin,createdAt) VALUES('wire-test-owner',0,1)"
+      )
+
+    session = create_session(ctx.db, "wire-harklight-contradictions", "wire-test-owner")
+    Org.set_host(ctx.db, session.session_key, Tightbeam.Placement.local_host_name())
+
+    response =
+      dispatch_cli(%{ctx | opts: opts}, session.cli_token, %{
+        verb: "harklight-send",
+        params: %{harklightSession: "new", senderId: "sender", title: "Question"}
+      })
+
+    result = JSON.decode!(response.resp_body)["result"]
+
+    assert result["outcome"] == "committed"
+
+    assert result["possibleContradictions"] == %{
+             "status" => "complete",
+             "unchecked" => 0,
+             "warning" => warning,
+             "messages" => [
+               %{
+                 "senderId" => "sender-a",
+                 "senderName" => "Agent A",
+                 "messageId" => "open-a",
+                 "title" => "Open request"
+               }
+             ]
+           }
+  end
+
   test "assignment-stop-turn crosses dispatch and refuses a non-opener", ctx do
     holder = create_session(ctx.db, "stop-holder", "flynn")
 

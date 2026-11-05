@@ -79,6 +79,7 @@ defmodule Tightbeam.HarklightSend do
             registration
             |> Map.merge(identity)
             |> Map.merge(%{command: command, outcome: "committed", result: committed})
+            |> maybe_put_possible_contradictions(command, committed)
             |> HarklightLifecycle.refresh_acknowledgments_result(db)
           else
             error ->
@@ -602,6 +603,37 @@ defmodule Tightbeam.HarklightSend do
   end
 
   defp confirmed_result(_, _, _), do: {:error, "harklight_result_mismatch"}
+
+  defp maybe_put_possible_contradictions(result, "send", %{
+         "response" => %{"possible_contradictions" => contradictions}
+       }) do
+    Map.put(result, :possible_contradictions, possible_contradictions(contradictions))
+  end
+
+  defp maybe_put_possible_contradictions(result, _command, _committed), do: result
+
+  defp possible_contradictions(value) when is_map(value) do
+    Map.new(value, fn
+      {"messages", messages} when is_list(messages) ->
+        {"messages", Enum.map(messages, &possible_contradiction_message/1)}
+
+      pair ->
+        pair
+    end)
+  end
+
+  defp possible_contradictions(value), do: value
+
+  defp possible_contradiction_message(message) when is_map(message) do
+    Map.new(message, fn
+      {"sender_id", value} -> {"senderId", value}
+      {"sender_name", value} -> {"senderName", value}
+      {"message_id", value} -> {"messageId", value}
+      pair -> pair
+    end)
+  end
+
+  defp possible_contradiction_message(message), do: message
 
   defp bind(db, call, op_id, payload, result, request) do
     HarklightWakes.bind_send(
