@@ -1204,6 +1204,72 @@ defmodule Tightbeam.HarklightWakesTest do
     assert File.read!(calls) == "attach\n"
   end
 
+  test "restore caps concurrent attachment attempts and attaches every handle", %{
+    db: db,
+    session: session
+  } do
+    handles = for i <- 1..5, do: "00000000-0000-4000-8000-00000000000#{i}"
+
+    for handle <- handles do
+      {:ok, _} =
+        DB.query(
+          db,
+          "INSERT INTO harklight_wake_handles(handle,sessionKey,host,vendorSessionId,state,createdAt,updatedAt) VALUES(?1,?2,?3,'vendor','active',2,2)",
+          [handle, session.session_key, Placement.local_host_name()]
+        )
+    end
+
+    root = Path.join(System.tmp_dir!(), "attach-cap-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    events = Path.join(root, "events")
+    File.write!(events, "")
+
+    File.write!(Path.join(root, "harklight-agent"), """
+    #!/bin/sh
+    if [ "$1" = listen ]; then exec sleep 300; fi
+    printf 'start\\n' >> '#{events}'
+    sleep 0.2
+    printf 'end\\n' >> '#{events}'
+    printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+    """)
+
+    File.chmod!(Path.join(root, "harklight-agent"), 0o700)
+    old_path = System.fetch_env!("PATH")
+    System.put_env("PATH", root <> ":" <> old_path)
+
+    on_exit(fn ->
+      System.put_env("PATH", old_path)
+      File.rm_rf!(root)
+    end)
+
+    start_supervised!({HarklightWakes, db: db, attach_concurrency: 2})
+    await_listener_ports(6)
+
+    overlap =
+      File.read!(events)
+      |> String.split("\n", trim: true)
+      |> Enum.scan(0, fn
+        "start", n -> n + 1
+        "end", n -> n - 1
+      end)
+
+    assert Enum.max(overlap) == 2
+    assert length(overlap) == 12
+
+    assert {:ok, [["active", 6]]} =
+             DB.query(db, "SELECT state,count(*) FROM harklight_wake_handles GROUP BY state")
+  end
+
+  defp await_listener_ports(count, attempts \\ 300)
+  defp await_listener_ports(_count, 0), do: flunk("listener ports did not start")
+
+  defp await_listener_ports(count, attempts) do
+    if map_size(:sys.get_state(HarklightWakes).ports) < count do
+      Process.sleep(10)
+      await_listener_ports(count, attempts - 1)
+    end
+  end
+
   defp attachment_sequence(responses) do
     root = Path.join(System.tmp_dir!(), "attach-sequence-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
