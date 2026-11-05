@@ -6397,6 +6397,7 @@ mod tests {
                 "operator-rule",
                 "operator-withdraw",
                 "retire",
+                "retire-withdraw",
                 "role-bind",
                 "sentinel",
                 "session-connect",
