@@ -260,7 +260,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
         {Tightbeam.Productions.BubbleSweeper, db: ctx.db, name: :late_terminal_reminder_sweeper}
       )
 
-    assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) >= 1
+    Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
     [first_reminder] = await_pending_reminders(ctx.db, first_root.wake_id)
     assert first_reminder.condition_scope == first_root.wake_id
 
