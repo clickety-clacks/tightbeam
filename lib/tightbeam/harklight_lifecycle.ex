@@ -951,28 +951,47 @@ defmodule Tightbeam.HarklightLifecycle do
             deliveries
           end
 
-        has_primary =
-          Enum.any?(deliveries, fn [_session, wake_id] -> wake_id == entry.wake_id end)
-
-        has_origin =
-          Enum.any?(deliveries, fn [session_key, _wake_id] -> session_key == origin_session end)
-
-        has_primary and has_origin and
+        # The origin must have its own delivery row; another recipient's
+        # receipt never stands in for it.
+        Enum.any?(deliveries, fn [session_key, _wake_id] -> session_key == origin_session end) and
           Enum.all?(deliveries, fn [session_key, wake_id] ->
-            wake =
-              Txn.q(txn, "SELECT sessionKey,state FROM wakes WHERE wakeId=?1", [wake_id])
-
-            source_turns = NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id)
-
-            Enum.any?(wake, fn [wake_session, state] ->
-              wake_session == session_key and state != "canceled"
-            end) and
-              Enum.any?(source_turns, fn [_, delivery_state, _] -> delivery_state != "queued" end) and
-              not NoticeBatcher.pending?(txn, wake_id)
+            delivered_to_recipient?(txn, session_key, wake_id)
           end)
       end)
   rescue
     _ -> false
+  end
+
+  # A failed prompt turn may hand the same text to a retry wake for the same
+  # recipient. Follow that lineage to its latest attempt and credit the entry
+  # only when that attempt's own turn delivered it.
+  defp delivered_to_recipient?(txn, session_key, wake_id, seen \\ MapSet.new()) do
+    if MapSet.member?(seen, wake_id) do
+      false
+    else
+      case Txn.q(txn, "SELECT retryWakeId FROM wake_retry_attempts WHERE wakeId=?1", [wake_id]) do
+        [[retry_wake_id]] when is_binary(retry_wake_id) ->
+          same_recipient? =
+            Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 AND sessionKey=?2", [
+              retry_wake_id,
+              session_key
+            ]) != []
+
+          same_recipient? and
+            delivered_to_recipient?(txn, session_key, retry_wake_id, MapSet.put(seen, wake_id))
+
+        _ ->
+          wake = Txn.q(txn, "SELECT sessionKey,state FROM wakes WHERE wakeId=?1", [wake_id])
+
+          Enum.any?(wake, fn [wake_session, state] ->
+            wake_session == session_key and state != "canceled"
+          end) and
+            Enum.any?(NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id), fn [_, status, _] ->
+              status == "delivered"
+            end) and
+            not NoticeBatcher.pending?(txn, wake_id)
+      end
+    end
   end
 
   def complete_in_txn(txn, handle) do

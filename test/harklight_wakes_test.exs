@@ -4199,6 +4199,67 @@ defmodule Tightbeam.HarklightWakesTest do
              )
   end
 
+  test "completion follows a failed delivery to its same-recipient retry", %{
+    db: db,
+    session: session
+  } do
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+
+    status = %{
+      "session_handle" => @handle,
+      "open_requests" => 0,
+      "pending_undelivered" => 0,
+      "pending_delivered_unacted" => 0
+    }
+
+    runner = fn
+      ["read", "--session", @handle] -> {"", 0}
+      ["status", "--session", @handle] -> {JSON.encode!(status), 0}
+    end
+
+    assert {:ok, [[wake_id, origin_key]]} =
+             DB.query(
+               db,
+               "SELECT wakeId,sessionKey FROM harklight_wake_deliveries WHERE handle=?1 AND eventId='1'",
+               [@handle]
+             )
+
+    assert origin_key == session.session_key
+
+    failed_seq = completion_turn(db, origin_key, wake_id, "failed", "provider rate limit")
+
+    assert {:ok, {:retry, retry_wake_id}} =
+             DB.transaction(db, &Wakes.preserve_failed_intent_for_terminal_in_txn(&1, failed_seq))
+
+    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    completion_turn(db, origin_key, retry_wake_id, "delivered", nil)
+    assert :completed = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+  end
+
+  defp completion_turn(db, session_key, wake_id, status, error) do
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO turns(sessionKey,messageId,wakeId,origin,prompt,status,error,createdAt,endedAt) VALUES(?1,?2,?3,'process:test','completion source wake',?4,?5,?6,?6)",
+               [session_key, Tightbeam.Id.uuid4(), wake_id, status, error, now]
+             )
+
+    assert {:ok, [[turn_seq]]} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id])
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE wakes SET state='fired',firedAt=?3,deliveredTurnSeq=?2 WHERE wakeId=?1",
+               [wake_id, turn_seq, now]
+             )
+
+    turn_seq
+  end
+
   defp completion_event(handle, cursor, message_id, kind, author, channel \\ nil) do
     entry = %{"kind" => kind, "author" => author}
 
