@@ -891,6 +891,16 @@ defmodule Tightbeam.HarklightWakesTest do
       mark_completion_wakes_delivered(db, handle)
     end
 
+    # Previously unavailable answered handles must also skip attachment.
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable' WHERE handle=?1",
+               [
+                 hd(completed_handles)
+               ]
+             )
+
     eligible_status = fn handle ->
       %{
         "session_handle" => handle,
@@ -944,14 +954,16 @@ defmodule Tightbeam.HarklightWakesTest do
     first_manager =
       start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
 
-    restored_before_completion =
-      for _ <- 1..5 do
+    restored_at_startup =
+      for _ <- 1..2 do
         assert_receive {:restored, handle, nil}
         handle
       end
 
-    assert MapSet.new(restored_before_completion) ==
-             MapSet.new(completed_handles ++ [open_request_handle, pending_answer_handle])
+    assert MapSet.new(restored_at_startup) ==
+             MapSet.new([open_request_handle, pending_answer_handle])
+
+    refute_receive {:restored, _, _}
 
     assert eventually(fn ->
              DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'") ==
@@ -992,6 +1004,36 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'")
 
     assert call.session_key == session.session_key
+  end
+
+  for evidence_failure <- [:read_failed, :status_failed, :local_pending] do
+    @evidence_failure evidence_failure
+    test "startup preserves a conversation with #{@evidence_failure}", %{db: db} do
+      answer = completion_event(@handle, 1, "request", "terminal", "person")
+      assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+      if @evidence_failure != :local_pending, do: mark_completion_wakes_delivered(db, @handle)
+
+      eligible_runner = idle_runner()
+
+      runner = fn args ->
+        case {args, @evidence_failure} do
+          {["read" | _], :read_failed} -> {"unavailable", 1}
+          {["status" | _], :status_failed} -> {"unavailable", 1}
+          _ -> eligible_runner.(args)
+        end
+      end
+
+      manager =
+        start_supervised!(
+          {HarklightWakes, db: db, listener: notifying_listener(self()), send_runner: runner}
+        )
+
+      assert_receive {:restored, @handle, nil}
+      assert Map.has_key?(:sys.get_state(manager).workers, @handle)
+
+      assert {:ok, [["active"]]} =
+               DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+    end
   end
 
   test "an agent-authored answer alone does not complete a handle", %{db: db} do

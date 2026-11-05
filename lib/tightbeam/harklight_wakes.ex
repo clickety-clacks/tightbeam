@@ -465,20 +465,18 @@ defmodule Tightbeam.HarklightWakes do
         "SELECT handle FROM harklight_wake_handles WHERE state IN ('active','unavailable') ORDER BY createdAt,handle"
       )
 
-    state = Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle) end)
     manager = self()
 
     Task.start(fn ->
       Tightbeam.HarklightSend.recover_pending(state.db, runner: state.send_runner)
       HarklightLifecycle.process_terminals(state.db, runner: state.send_runner)
 
-      case answer_completion_candidates(state.db) do
-        {:ok, candidates} ->
-          schedule_answered_checks_now(manager, state.db, state.send_runner, candidates)
+      Enum.each(rows, fn [handle] ->
+        evidence =
+          HarklightLifecycle.completion_evidence(state.db, handle, runner: state.send_runner)
 
-        _ ->
-          :ok
-      end
+        GenServer.cast(manager, {:restore_handle, handle, evidence})
+      end)
     end)
 
     {:noreply, state}
@@ -603,6 +601,28 @@ defmodule Tightbeam.HarklightWakes do
 
   def handle_cast({:h8a_acknowledged, handle}, state) do
     schedule_answered_checks(self(), state.db, state.send_runner, [[handle]])
+    {:noreply, state}
+  end
+
+  # Read outside the manager, but validate and complete before starting a listener.
+  # The existing transaction rejects stale evidence and preserves pending work.
+  def handle_cast({:restore_handle, handle, evidence}, state) do
+    result =
+      case evidence do
+        {:ok, evidence} ->
+          DB.transaction(state.db, fn txn ->
+            HarklightLifecycle.complete_answered_in_txn(txn, handle, evidence)
+          end)
+
+        _ ->
+          :active
+      end
+
+    state =
+      if result == {:ok, true},
+        do: stop_worker(state, handle),
+        else: start_worker(state, handle)
+
     {:noreply, state}
   end
 
