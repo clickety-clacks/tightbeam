@@ -1674,7 +1674,7 @@ defmodule Tightbeam.PlacementTest do
       JSON.decode!(json)
     end
 
-    expected_paths = Enum.sort([personal, legacy])
+    expected_paths = Enum.sort(Enum.map([personal, legacy], &realpath!/1))
     actual = read_config.(opts)
     assert actual["bypass_hook_trust"] == true
 
@@ -1687,7 +1687,7 @@ defmodule Tightbeam.PlacementTest do
     refreshed = Placement.adapter_opts!(config, {:codex, "default", "testhost"}) |> read_config.()
 
     assert Enum.sort(Enum.map(refreshed["skills"]["config"], & &1["path"])) ==
-             Enum.sort([personal, legacy, added])
+             Enum.sort(Enum.map([personal, legacy, added], &realpath!/1))
 
     assert File.read!(workspace) == "synthetic skill"
     assert File.read!(retained) == "synthetic skill"
@@ -2154,6 +2154,14 @@ defmodule Tightbeam.PlacementTest do
 
   defp stat_identity(%File.Stat{} = stat) do
     Map.take(stat, [:type, :size, :mode, :links, :major, :minor, :inode, :uid, :gid, :mtime])
+  end
+
+  # Mirrors fs.realpathSync's directory resolution (chdir+getcwd resolves
+  # symlinks in the path, e.g. macOS /var/folders -> /private/var/folders)
+  # so expectations compare against the same canonical path codex.ex emits.
+  defp realpath!(path) do
+    real_dir = File.cd!(Path.dirname(path), fn -> File.cwd!() end)
+    Path.join(real_dir, Path.basename(path))
   end
 
   test "the hosts table is the one registry; register_host records and updates in place", %{
