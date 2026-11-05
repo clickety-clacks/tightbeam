@@ -412,6 +412,18 @@ defmodule Tightbeam.HarklightWakes do
     :ok
   end
 
+  def origin_turn_ended(session_key) do
+    if pid = Process.whereis(__MODULE__),
+      do: GenServer.cast(pid, {:origin_turn_ended, session_key})
+
+    :ok
+  end
+
+  def h8a_acknowledged(handle) do
+    if pid = Process.whereis(__MODULE__), do: GenServer.cast(pid, {:h8a_acknowledged, handle})
+    :ok
+  end
+
   @impl true
   def init(opts) do
     Process.flag(:trap_exit, true)
@@ -438,12 +450,23 @@ defmodule Tightbeam.HarklightWakes do
         "SELECT handle FROM harklight_wake_handles WHERE state IN ('active','unavailable') ORDER BY createdAt,handle"
       )
 
+    state = Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle) end)
+    manager = self()
+
     Task.start(fn ->
       Tightbeam.HarklightSend.recover_pending(state.db, runner: state.send_runner)
       HarklightLifecycle.process_terminals(state.db, runner: state.send_runner)
+
+      case answer_completion_candidates(state.db) do
+        {:ok, candidates} ->
+          schedule_answered_checks_now(manager, state.db, state.send_runner, candidates)
+
+        _ ->
+          :ok
+      end
     end)
 
-    {:noreply, Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle) end)}
+    {:noreply, state}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
@@ -535,6 +558,64 @@ defmodule Tightbeam.HarklightWakes do
       )
 
     {:noreply, Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle) end)}
+  end
+
+  def handle_cast({:origin_turn_ended, session_key}, state) do
+    case answer_completion_candidates(state.db, session_key) do
+      {:ok, candidates} ->
+        schedule_answered_checks(self(), state.db, state.send_runner, candidates)
+
+      _ ->
+        :ok
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_cast({:h8a_acknowledged, handle}, state) do
+    schedule_answered_checks(self(), state.db, state.send_runner, [[handle]])
+    {:noreply, state}
+  end
+
+  def handle_cast({:answer_completion_evidence, handle, evidence}, state) do
+    result =
+      DB.transaction(state.db, fn txn ->
+        HarklightLifecycle.complete_answered_in_txn(txn, handle, evidence)
+      end)
+
+    state = if result == {:ok, true}, do: stop_worker(state, handle), else: state
+    {:noreply, state}
+  end
+
+  defp answer_completion_candidates(db, session_key \\ nil) do
+    DB.query(
+      db,
+      """
+      SELECT DISTINCT h.handle
+      FROM harklight_wake_handles h
+      JOIN harklight_wake_entries e ON e.handle=h.handle
+      WHERE h.state IN ('active','unavailable') AND e.entryKind='terminal' AND e.entryAuthor='person'
+        AND (?1 IS NULL OR h.sessionKey=?1)
+      ORDER BY h.handle
+      """,
+      [session_key]
+    )
+  end
+
+  defp schedule_answered_checks(manager, db, runner, candidates) do
+    Task.start(fn -> schedule_answered_checks_now(manager, db, runner, candidates) end)
+  end
+
+  defp schedule_answered_checks_now(manager, db, runner, candidates) do
+    Enum.each(candidates, fn [handle] ->
+      case HarklightLifecycle.completion_evidence(db, handle, runner: runner) do
+        {:ok, evidence} ->
+          GenServer.cast(manager, {:answer_completion_evidence, handle, evidence})
+
+        _ ->
+          :ok
+      end
+    end)
   end
 
   defp force_worker(state, handle) do

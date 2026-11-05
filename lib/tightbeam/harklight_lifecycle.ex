@@ -425,11 +425,14 @@ defmodule Tightbeam.HarklightLifecycle do
                 {:error, reason} -> {"open", "failed", reason}
               end
 
-            DB.query(
-              db,
-              "UPDATE harklight_subscription_ends SET state=?3,acknowledgment=?4,reason=?5 WHERE senderId=?1 AND messageId=?2",
-              [sender, message, state, status, reason]
-            )
+            case DB.query(
+                   db,
+                   "UPDATE harklight_subscription_ends SET state=?3,acknowledgment=?4,reason=?5 WHERE senderId=?1 AND messageId=?2",
+                   [sender, message, state, status, reason]
+                 ) do
+              {:ok, _} when status == "acknowledged" -> HarklightWakes.h8a_acknowledged(handle)
+              _ -> :ok
+            end
 
           _ ->
             :ok
@@ -470,5 +473,331 @@ defmodule Tightbeam.HarklightLifecycle do
       "UPDATE harklight_subscription_ends SET state='ended',acknowledgment=CASE WHEN acknowledgment='pending' AND ackEventId IS NULL THEN 'not_needed' ELSE acknowledgment END WHERE handle=?1",
       [handle]
     )
+  end
+
+  # The Agent's read and status commands are the existing source for pending
+  # entries and delivery receipts. Any refusal, malformed output, or local
+  # record that changes while those reads run leaves the handle active.
+  def completion_evidence(db, handle, opts \\ []) do
+    :global.trans({{__MODULE__, db, :answer_completion}, self()}, fn ->
+      read_completion_evidence(db, handle, opts)
+    end)
+  rescue
+    _ -> :active
+  end
+
+  def complete_answered(db, handle, opts \\ []) do
+    with {:ok, evidence} <- completion_evidence(db, handle, opts),
+         {:ok, true} <-
+           DB.transaction(db, fn txn -> complete_answered_in_txn(txn, handle, evidence) end) do
+      :completed
+    else
+      _ -> :active
+    end
+  rescue
+    _ -> :active
+  end
+
+  def complete_answered_in_txn(txn, handle, evidence) do
+    snapshot = evidence.snapshot
+    events = evidence.events
+    status = evidence.status
+
+    with {:ok, current} <- completion_snapshot_in_txn(txn, handle),
+         true <- current.session_key == snapshot.session_key,
+         true <- current.requests == snapshot.requests,
+         true <- current.pending_sends == snapshot.pending_sends and current.pending_sends == [],
+         true <- current.entries == snapshot.entries,
+         true <- current.answers != MapSet.new(),
+         true <- status.open_requests == 0,
+         true <- status.pending_undelivered == 0,
+         true <- status.pending_delivered_unacted <= length(events),
+         true <- Enum.all?(events, &delivered_chat_after_answer?(&1, handle, current)),
+         true <- locally_delivered_and_unheld?(txn, handle, current.entries) do
+      Txn.q(
+        txn,
+        "UPDATE harklight_wake_handles SET state='complete',lastError=NULL,updatedAt=?2 WHERE handle=?1 AND state IN ('active','unavailable')",
+        [handle, System.system_time(:millisecond)]
+      )
+
+      if Txn.changes(txn) == 1 do
+        complete_in_txn(txn, handle)
+        true
+      else
+        false
+      end
+    else
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp read_completion_evidence(db, handle, opts) do
+    with {:ok, initial} <- completion_snapshot(db, handle),
+         true <- initial.answers != MapSet.new(),
+         {:ok, runner} <- read_runner(opts),
+         {:ok, read_output} <- run_read(runner, handle),
+         {:ok, events} <- parse_read_events(read_output),
+         {:ok, before_status} <- completion_snapshot(db, handle),
+         true <- before_status.answers != MapSet.new(),
+         true <- before_status.pending_sends == [],
+         {:ok, status_output} <- run_status(runner, handle),
+         {:ok, status} <- parse_status(status_output, handle),
+         true <- status.open_requests == 0,
+         true <- status.pending_undelivered == 0,
+         true <- Enum.all?(events, &delivered_chat_after_answer?(&1, handle, before_status)),
+         true <- status.pending_delivered_unacted <= length(events) do
+      {:ok, %{snapshot: before_status, events: events, status: status}}
+    else
+      _ -> :active
+    end
+  rescue
+    _ -> :active
+  end
+
+  defp completion_snapshot(db, handle) do
+    case DB.transaction(db, fn txn -> completion_snapshot_in_txn(txn, handle) end) do
+      {:ok, {:ok, snapshot}} -> {:ok, snapshot}
+      _ -> :error
+    end
+  end
+
+  defp completion_snapshot_in_txn(txn, handle) do
+    case Txn.q(
+           txn,
+           "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1",
+           [handle]
+         ) do
+      [[session_key, state]] when state in ["active", "unavailable"] ->
+        request_rows =
+          Txn.q(
+            txn,
+            "SELECT senderId,messageId FROM harklight_wake_requests WHERE handle=?1 ORDER BY senderId,messageId",
+            [handle]
+          )
+
+        pending_send_rows =
+          Txn.q(
+            txn,
+            "SELECT opId,payload FROM harklight_send_operations WHERE sessionKey=?1 AND state='pending' ORDER BY opId",
+            [session_key]
+          )
+
+        with {:ok, pending_sends} <- pending_sends_for_handle(pending_send_rows, handle),
+             {:ok, entries} <- completion_entries(txn, handle) do
+          answers =
+            entries
+            |> Enum.filter(fn entry ->
+              entry.entry_kind == "terminal" and entry.entry_author == "person" and
+                get_in(entry.line, ["entry", "terminal_state"]) == "answered"
+            end)
+            |> Enum.map(&{&1.sender_id, &1.message_id})
+            |> MapSet.new()
+
+          {:ok,
+           %{
+             session_key: session_key,
+             requests: request_rows,
+             pending_sends: pending_sends,
+             entries: entries,
+             answers: answers
+           }}
+        else
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp pending_sends_for_handle(rows, handle) do
+    Enum.reduce_while(rows, {:ok, []}, fn [op_id, payload], {:ok, found} ->
+      with {:ok, prepared} when is_map(prepared) <- JSON.decode(payload),
+           request when is_map(request) <- prepared["request"] || prepared,
+           session_handle when is_binary(session_handle) <- request["session_handle"] do
+        if session_handle == handle,
+          do: {:cont, {:ok, [op_id | found]}},
+          else: {:cont, {:ok, found}}
+      else
+        _ -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, ids} -> {:ok, Enum.sort(ids)}
+      _ -> :error
+    end
+  end
+
+  defp completion_entries(txn, handle) do
+    rows =
+      Txn.q(
+        txn,
+        "SELECT eventId,senderId,messageId,entryKind,entryAuthor,rawLine,wakeId FROM harklight_wake_entries WHERE handle=?1 ORDER BY eventId",
+        [handle]
+      )
+
+    Enum.reduce_while(rows, {:ok, []}, fn
+      [event_id, sender_id, message_id, entry_kind, entry_author, raw_line, wake_id],
+      {:ok, entries} ->
+        with {:ok, line} when is_map(line) <- JSON.decode(raw_line),
+             true <- line["session_handle"] == handle,
+             true <- line["event_id"] == event_id,
+             true <- get_in(line, ["request", "sender_id"]) == sender_id,
+             true <- get_in(line, ["request", "message_id"]) == message_id,
+             true <- get_in(line, ["entry", "kind"]) == entry_kind,
+             true <- get_in(line, ["entry", "author"]) == entry_author do
+          entry = %{
+            event_id: event_id,
+            sender_id: sender_id,
+            message_id: message_id,
+            entry_kind: entry_kind,
+            entry_author: entry_author,
+            wake_id: wake_id,
+            line: line
+          }
+
+          {:cont, {:ok, [entry | entries]}}
+        else
+          _ -> {:halt, :error}
+        end
+    end)
+    |> case do
+      {:ok, entries} -> {:ok, Enum.reverse(entries)}
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp read_runner(opts) do
+    case Keyword.get(opts, :runner) do
+      runner when is_function(runner, 1) ->
+        {:ok, runner}
+
+      nil ->
+        case System.find_executable("harklight-agent") do
+          nil -> :error
+          executable -> {:ok, fn args -> System.cmd(executable, args, stderr_to_stdout: true) end}
+        end
+    end
+  end
+
+  defp run_read(runner, handle), do: run_read_command(runner, ["read", "--session", handle])
+
+  defp run_status(runner, handle),
+    do: run_read_command(runner, ["status", "--session", handle])
+
+  defp run_read_command(runner, args) do
+    case runner.(args) do
+      {output, 0} when is_binary(output) -> {:ok, output}
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp parse_read_events(output) do
+    output = String.trim_trailing(output, "\n")
+
+    if output == "" do
+      {:ok, []}
+    else
+      output
+      |> String.split("\n", trim: false)
+      |> Enum.reduce_while({:ok, []}, fn line, {:ok, events} ->
+        case JSON.decode(line) do
+          {:ok, event} when is_map(event) -> {:cont, {:ok, [event | events]}}
+          _ -> {:halt, :error}
+        end
+      end)
+      |> case do
+        {:ok, events} -> {:ok, Enum.reverse(events)}
+        _ -> :error
+      end
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp parse_status(output, handle) do
+    with {:ok, status} when is_map(status) <- JSON.decode(output),
+         true <- status["session_handle"] == handle,
+         open_requests when is_integer(open_requests) and open_requests >= 0 <-
+           status["open_requests"],
+         pending_undelivered when is_integer(pending_undelivered) and pending_undelivered >= 0 <-
+           status["pending_undelivered"],
+         pending_delivered_unacted
+         when is_integer(pending_delivered_unacted) and pending_delivered_unacted >= 0 <-
+           status["pending_delivered_unacted"] do
+      {:ok,
+       %{
+         open_requests: open_requests,
+         pending_undelivered: pending_undelivered,
+         pending_delivered_unacted: pending_delivered_unacted
+       }}
+    else
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp delivered_chat_after_answer?(event, handle, snapshot) do
+    event_id = event["event_id"]
+    sender_id = get_in(event, ["request", "sender_id"])
+    message_id = get_in(event, ["request", "message_id"])
+
+    captured =
+      Enum.find(snapshot.entries, fn entry ->
+        entry.event_id == event_id and entry.sender_id == sender_id and
+          entry.message_id == message_id
+      end)
+
+    event["kind"] == "event" and event["session_handle"] == handle and
+      is_binary(event_id) and event["delivered"] == true and event["channel"] == "chat" and
+      get_in(event, ["entry", "kind"]) == "discussion" and not is_nil(captured) and
+      MapSet.member?(snapshot.answers, {sender_id, message_id})
+  rescue
+    _ -> false
+  end
+
+  defp locally_delivered_and_unheld?(txn, handle, entries) do
+    held =
+      Txn.q(
+        txn,
+        """
+        SELECT 1 FROM harklight_held_terminals t
+        LEFT JOIN harklight_subscription_ends e ON e.senderId=t.senderId AND e.messageId=t.messageId
+        WHERE t.handle=?1
+          AND (e.messageId IS NULL OR e.acknowledgment IN ('pending','failed'))
+        LIMIT 1
+        """,
+        [handle]
+      ) != []
+
+    pending_ack =
+      Txn.q(
+        txn,
+        "SELECT 1 FROM harklight_subscription_ends WHERE handle=?1 AND acknowledgment IN ('pending','failed') AND ackEventId IS NOT NULL LIMIT 1",
+        [handle]
+      ) != []
+
+    not held and not pending_ack and
+      Enum.all?(entries, fn entry ->
+        wake =
+          Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [entry.wake_id])
+
+        deliveries = NoticeBatcher.source_delivery_turns_in_txn(txn, entry.wake_id)
+
+        wake != [] and not match?([["canceled"]], wake) and
+          Enum.any?(deliveries, fn [_, delivery_state, _] -> delivery_state != "queued" end) and
+          not NoticeBatcher.pending?(txn, entry.wake_id)
+      end)
+  rescue
+    _ -> false
   end
 end
