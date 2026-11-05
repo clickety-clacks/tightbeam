@@ -788,16 +788,65 @@ defmodule Tightbeam.HarklightLifecycle do
 
     not held and not pending_ack and
       Enum.all?(entries, fn entry ->
-        wake =
-          Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [entry.wake_id])
-
-        deliveries = NoticeBatcher.source_delivery_turns_in_txn(txn, entry.wake_id)
-
-        wake != [] and not match?([["canceled"]], wake) and
-          Enum.any?(deliveries, fn [_, delivery_state, _] -> delivery_state != "queued" end) and
-          not NoticeBatcher.pending?(txn, entry.wake_id)
+        case Txn.q(txn, "SELECT sessionKey FROM wakes WHERE wakeId=?1", [entry.wake_id]) do
+          [[session_key]] -> delivered_to_recipient?(txn, session_key, entry.wake_id)
+          _ -> false
+        end
       end)
   rescue
     _ -> false
+  end
+
+  # A failed prompt turn may hand the same text to a retry wake for the same
+  # recipient. Follow that lineage to its latest attempt and credit the entry
+  # only when that attempt's turn, or its health redelivery, delivered it.
+  defp delivered_to_recipient?(txn, session_key, wake_id, seen \\ MapSet.new()) do
+    if MapSet.member?(seen, wake_id) do
+      false
+    else
+      case Txn.q(txn, "SELECT retryWakeId FROM wake_retry_attempts WHERE wakeId=?1", [wake_id]) do
+        [[retry_wake_id]] when is_binary(retry_wake_id) ->
+          same_recipient? =
+            Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 AND sessionKey=?2", [
+              retry_wake_id,
+              session_key
+            ]) != []
+
+          same_recipient? and
+            delivered_to_recipient?(txn, session_key, retry_wake_id, MapSet.put(seen, wake_id))
+
+        _ ->
+          wake = Txn.q(txn, "SELECT sessionKey,state FROM wakes WHERE wakeId=?1", [wake_id])
+
+          Enum.any?(wake, fn [wake_session, state] ->
+            wake_session == session_key and state != "canceled"
+          end) and
+            Enum.any?(NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id), fn
+              [_, "delivered", _] ->
+                true
+
+              [seq, status, _] when status in ["failed", "failed_unknown"] ->
+                health_redelivered?(txn, session_key, seq)
+
+              _ ->
+                false
+            end) and
+            not NoticeBatcher.pending?(txn, wake_id)
+      end
+    end
+  end
+
+  # Other failure classes redeliver the same message on a new turn that carries
+  # no wakeId. Credit the failed turn once that redelivery turn delivered.
+  defp health_redelivered?(txn, session_key, source_turn_seq) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM health_redelivery_attempts a
+      JOIN turns t ON t.seq=a.redeliveryTurnSeq
+      WHERE a.sessionKey=?1 AND a.sourceTurnSeq=?2 AND t.status='delivered'
+      """,
+      [session_key, source_turn_seq]
+    ) != []
   end
 end
