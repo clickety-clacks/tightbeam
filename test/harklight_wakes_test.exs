@@ -735,8 +735,8 @@ defmodule Tightbeam.HarklightWakesTest do
       "session_handle" => @handle,
       "open_requests" => 1,
       "open_chats" => 1,
-      "pending_undelivered" => 0,
-      "pending_delivered_unacted" => 1
+      "pending_undelivered" => 1,
+      "pending_delivered_unacted" => 0
     }
 
     {:ok, responses} =
@@ -766,6 +766,14 @@ defmodule Tightbeam.HarklightWakesTest do
     answer_b = completion_event(@handle, 3, "request-b", "terminal", "person")
     assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer_b))
     mark_completion_wakes_delivered(db, @handle)
+
+    assert :active = Tightbeam.HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    Agent.update(responses, fn current ->
+      put_in(current, [:status, "pending_undelivered"], 0)
+      |> put_in([:status, "pending_delivered_unacted"], 1)
+      |> put_in([:events, @handle, Access.at(0), "delivered"], true)
+    end)
 
     HarklightWakes.origin_turn_ended(session.session_key)
 
