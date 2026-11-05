@@ -2076,11 +2076,11 @@ defmodule Tightbeam.HarklightWakesTest do
       assert {:ok, _} =
                DB.query(
                  db,
-                 "INSERT INTO turns(sessionKey,messageId,wakeId,origin,prompt,status,createdAt) VALUES(?1,?2,?3,'process:test','delivered source wake','delivered',?4)",
+                 "INSERT INTO turns(sessionKey,messageId,wakeId,origin,prompt,status,createdAt) VALUES(?1,?2,?3,'process:test','delivered source wake','delivered',?4) ON CONFLICT(wakeId) DO UPDATE SET status='delivered'",
                  [session_key, Tightbeam.Id.uuid4(), wake_id, System.system_time(:millisecond)]
                )
 
-      assert {:ok, [[turn_seq]]} = DB.query(db, "SELECT last_insert_rowid()")
+      assert {:ok, [[turn_seq]]} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id])
 
       assert {:ok, _} =
                DB.query(
