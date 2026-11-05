@@ -21,21 +21,6 @@ Wakes deliver addressed prompts and decisions ask a named principal for judgment
 Use returned typed identifiers exactly; do not invent them. These records preserve
 custody across lost context; recover from them before acting.
 
-## FYI Harklight sends
-
-For an informational update that needs no answer, send an FYI through the native
-Tightbeam command:
-
-```sh
-tightbeam harklight-send --session new --sender-id "$HARKLIGHT_SENDER_ID" \
-  --title "Build finished" --body "The export is ready." --type fyi
-```
-
-An FYI offers only the Seen acknowledgment. Opening it does not mark it Seen; the
-person must choose Seen, and the acknowledgment returns to the originating session.
-The legacy `--informational` flag is an alias for `--type fyi`. Do not use a
-legacy helper or a direct Agent send for this Tightbeam route.
-
 ## Start from the assignment
 
 Run the CLI from the assignment worktree. Let it discover the nearest

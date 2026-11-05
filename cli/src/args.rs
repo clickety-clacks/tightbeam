@@ -859,12 +859,12 @@ COMMANDS:
       --type fyi|request [--kind blocker|success]
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
       [--reply] [--supersedes <id>]...
-      [--body <text>] [--informational] [--choices-json <array>] [--files-json <array>]
+      [--body <text>] [--choices-json <array>] [--files-json <array>]
       [--vendor-session-id <id>]
       FYI is acknowledged with Seen; request needs a choice or --reply. Importance is
       your view; Harklight's ranking decides the priority the recipient sees.
-      --informational is the legacy alias for --type fyi. Correct and resend
-      only after a definite refusal; settle an uncertain send with the same operation.
+      Correct and resend only after a definite refusal;
+      settle an uncertain send with the same operation.
       Use blocker when the recipient must act before work can continue, or success when work finished,
       shipped, or otherwise succeeded.
   artifact-content-fetch <artifactId>
@@ -1317,7 +1317,6 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "dry-run",
     "help",
     "history",
-    "informational",
     "json",
     "manifest",
     "redaction-confirmed",
@@ -2514,7 +2513,6 @@ fn parse_with_optional_catalog(
                             | "by-when"
                             | "reply"
                             | "body"
-                            | "informational"
                             | "choices-json"
                             | "files-json"
                             | "vendor-session-id"
@@ -2522,7 +2520,7 @@ fn parse_with_optional_catalog(
                     )
                 })
             {
-                return Err("usage: tightbeam harklight-send --session new|<handle> --sender-id <id> --title <text> --type fyi|request [--kind blocker|success] [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>] [--reply] [--body <text>] [--informational] [--choices-json <array>] [--files-json <array>] [--vendor-session-id <id>]".to_owned());
+                return Err("usage: tightbeam harklight-send --session new|<handle> --sender-id <id> --title <text> --type fyi|request [--kind blocker|success] [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>] [--reply] [--body <text>] [--choices-json <array>] [--files-json <array>] [--vendor-session-id <id>]".to_owned());
             }
             let list = |name: &str| -> Result<Vec<String>, String> {
                 match flags.get(name) {
@@ -2532,19 +2530,9 @@ fn parse_with_optional_catalog(
                 }
             };
             let sender_identity = identity(flags)?;
-            let informational = flags.contains_key("informational");
-            let message_type = match nonempty(flags, "type") {
-                Some(message_type) if informational && message_type != "fyi" => {
-                    return Err(format!(
-                        "--informational is the legacy alias for --type fyi and cannot be combined with --type {message_type}; remove --informational to keep --type {message_type}, or use --type fyi without it"
-                    ));
-                }
-                Some(message_type) => message_type,
-                None if informational => "fyi".to_owned(),
-                None => {
-                    return Err("--type is required: use --type fyi for a Seen-only message or --type request for choices or a reply".to_owned());
-                }
-            };
+            let message_type = nonempty(flags, "type").ok_or(
+                "--type is required: use --type fyi for a Seen-only message or --type request for choices or a reply",
+            )?;
             Ok(Command::HarklightSend {
                 identity: sender_identity,
                 session: nonempty(flags, "session").ok_or("--session is required")?,
@@ -4604,36 +4592,6 @@ mod tests {
             ])),
             Err("--type is required: use --type fyi for a Seen-only message or --type request for choices or a reply".to_owned())
         );
-
-        assert!(matches!(
-            parse(strings(&[
-                "harklight-send",
-                "--session",
-                "new",
-                "--sender-id",
-                "sender",
-                "--title",
-                "Status update",
-                "--informational",
-            ])),
-            Ok(Command::HarklightSend { message_type, .. }) if message_type == "fyi"
-        ));
-
-        assert_eq!(
-            parse(strings(&[
-                "harklight-send",
-                "--session",
-                "new",
-                "--sender-id",
-                "sender",
-                "--title",
-                "Question",
-                "--type",
-                "request",
-                "--informational",
-            ])),
-            Err("--informational is the legacy alias for --type fyi and cannot be combined with --type request; remove --informational to keep --type request, or use --type fyi without it".to_owned())
-        );
     }
 
     #[test]
@@ -5427,7 +5385,6 @@ mod tests {
             "--type fyi|request",
             "FYI is acknowledged with Seen",
             "request needs a choice or --reply",
-            "--informational is the legacy alias for --type fyi",
             "Importance is",
             "your view;",
             "Harklight's ranking decides the priority the recipient sees",
