@@ -1121,7 +1121,7 @@ defmodule Tightbeam.HarklightWakesTest do
               "\norigin request failed: synthetic connection failure"},
            {0, ~s({"kind":"attached","ready_for_listen":true})}
          ], ["attach", "retry --op-id saved-op", "attach"], true},
-        {"real refusal stays unavailable",
+        {"real refusal gains no transport retry",
          [
            {2,
             ~s({"kind":"refused","reason_source":"server","reason_code":"forbidden","reason":"The server refused this origin's access."})}
@@ -1146,7 +1146,9 @@ defmodule Tightbeam.HarklightWakesTest do
     @retry_recovered recovered
     test "bounded attachment retry: #{label}", %{db: db, session: session} do
       calls = attachment_sequence(@retry_responses)
-      start_supervised!({HarklightWakes, db: db, attach_retry_delays: [20, 40]})
+      # No listener retry, so a failed worker goes straight to gone and only
+      # the attachment window is exercised.
+      start_supervised!({HarklightWakes, db: db, attach_retry_delays: [20, 40], retry_delays: []})
 
       if @retry_recovered do
         await_listener_port()
@@ -1169,11 +1171,30 @@ defmodule Tightbeam.HarklightWakesTest do
         assert prompt =~ "Replies on this thread will not reach"
       end
 
-      assert File.read!(calls) |> String.split("\n", trim: true) == @retry_calls
+      expected = if @retry_recovered, do: @retry_calls, else: @retry_calls ++ ["session"]
+      assert eventually(fn -> File.read!(calls) |> String.split("\n", trim: true) == expected end)
       # Beyond both configured delays, a terminal refusal cannot restart itself.
       Process.sleep(100)
-      assert File.read!(calls) |> String.split("\n", trim: true) == @retry_calls
+      assert File.read!(calls) |> String.split("\n", trim: true) == expected
     end
+  end
+
+  test "an exhausted attachment window is one failure toward the listener budget", %{db: db} do
+    calls =
+      attachment_sequence(
+        List.duplicate(
+          {2, ~s({"kind":"refused","reason_source":"agent","reason_code":"transport_error"})},
+          4
+        )
+      )
+
+    start_supervised!({HarklightWakes, db: db, attach_retry_delays: [1], retry_delays: [1]})
+
+    # Two workers, each spending its own window, then gone. Nothing follows.
+    expected = ["attach", "attach", "attach", "attach", "session"]
+    assert eventually(fn -> File.read!(calls) |> String.split("\n", trim: true) == expected end)
+    Process.sleep(100)
+    assert File.read!(calls) |> String.split("\n", trim: true) == expected
   end
 
   test "retry window does not schedule an attempt beyond its deadline", %{db: db} do
@@ -1183,7 +1204,8 @@ defmodule Tightbeam.HarklightWakesTest do
       ])
 
     start_supervised!(
-      {HarklightWakes, db: db, attach_retry_delays: [100], attach_retry_window_ms: 10}
+      {HarklightWakes,
+       db: db, attach_retry_delays: [100], attach_retry_window_ms: 10, retry_delays: [60_000]}
     )
 
     await_handle_error(db, "attachment_refused")
@@ -1286,6 +1308,7 @@ defmodule Tightbeam.HarklightWakesTest do
     #!/bin/sh
     root='#{root}'
     if [ "$1" = listen ]; then exec sleep 300; fi
+    if [ "$1" = session ]; then printf 'session\n' >> "$root/calls"; exit 0; fi
     if [ "$1" = retry ]; then
       printf '%s\n' "$*" >> "$root/calls"
     else
@@ -2312,7 +2335,9 @@ defmodule Tightbeam.HarklightWakesTest do
       exit 0
       """)
 
-      start_supervised!({HarklightWakes, db: db, retry_delays: [1]})
+      # This measures the listener budget alone; transport codes would also
+      # spend the attachment retry window first.
+      start_supervised!({HarklightWakes, db: db, retry_delays: [1], attach_retry_delays: []})
       assert eventually(fn -> File.read!(path) =~ "session end --session #{@handle} --gone" end)
       calls = File.read!(path) |> String.split("\n", trim: true)
       assert Enum.count(calls, &String.starts_with?(&1, "attach ")) == @refusal_attempts
