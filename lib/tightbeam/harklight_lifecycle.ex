@@ -478,6 +478,37 @@ defmodule Tightbeam.HarklightLifecycle do
   # The Agent's read and status commands are the existing source for pending
   # entries and delivery receipts. Any refusal, malformed output, or local
   # record that changes while those reads run leaves the handle active.
+  # R(H) gates listener starts, independently of answer authorship or results.
+  # Recheck local evidence after status so a registered request or pending send
+  # cannot be skipped using an earlier snapshot.
+  def closed_for_start?(db, handle, opts \\ []) do
+    with {:ok, initial} <- completion_snapshot(db, handle),
+         true <- initial.requests != [] and initial.pending_sends == [],
+         {:ok, runner} <- read_runner(opts),
+         {:ok, output} <- run_status(runner, handle),
+         {:ok, status} when is_map(status) <- JSON.decode(output),
+         true <- status["session_handle"] == handle,
+         0 <- status["open_requests"],
+         0 <- status["pending_undelivered"],
+         {:ok, true} <-
+           DB.transaction(db, fn txn ->
+             with {:ok, current} <- completion_snapshot_in_txn(txn, handle),
+                  true <- current.requests == initial.requests,
+                  true <- current.pending_sends == [],
+                  true <- current.entries == initial.entries do
+               locally_delivered_and_unheld?(txn, handle, current.entries)
+             else
+               _ -> false
+             end
+           end) do
+      true
+    else
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
   def completion_evidence(db, handle, opts \\ []) do
     :global.trans({{__MODULE__, db, :answer_completion}, self()}, fn ->
       read_completion_evidence(db, handle, opts)
@@ -503,7 +534,9 @@ defmodule Tightbeam.HarklightLifecycle do
     events = evidence.events
     status = evidence.status
 
-    with {:ok, current} <- completion_snapshot_in_txn(txn, handle),
+    with [["active"]] <-
+           Txn.q(txn, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]),
+         {:ok, current} <- completion_snapshot_in_txn(txn, handle),
          true <- current.session_key == snapshot.session_key,
          true <- current.requests == snapshot.requests,
          true <- current.pending_sends == snapshot.pending_sends and current.pending_sends == [],
@@ -516,7 +549,7 @@ defmodule Tightbeam.HarklightLifecycle do
          true <- locally_delivered_and_unheld?(txn, handle, current.entries) do
       Txn.q(
         txn,
-        "UPDATE harklight_wake_handles SET state='complete',lastError=NULL,updatedAt=?2 WHERE handle=?1 AND state IN ('active','unavailable')",
+        "UPDATE harklight_wake_handles SET state='complete',lastError=NULL,updatedAt=?2 WHERE handle=?1 AND state='active'",
         [handle, System.system_time(:millisecond)]
       )
 
@@ -534,7 +567,9 @@ defmodule Tightbeam.HarklightLifecycle do
   end
 
   defp read_completion_evidence(db, handle, opts) do
-    with {:ok, initial} <- completion_snapshot(db, handle),
+    with {:ok, [["active"]]} <-
+           DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]),
+         {:ok, initial} <- completion_snapshot(db, handle),
          true <- initial.answers != MapSet.new(),
          {:ok, runner} <- read_runner(opts),
          {:ok, read_output} <- run_read(runner, handle),

@@ -465,26 +465,11 @@ defmodule Tightbeam.HarklightWakes do
         "SELECT handle FROM harklight_wake_handles WHERE state IN ('active','unavailable') ORDER BY createdAt,handle"
       )
 
-    {:ok, candidates} = answer_completion_candidates(state.db, nil)
-    candidates_set = MapSet.new(candidates, fn [handle] -> handle end)
-
-    state =
-      Enum.reduce(rows, state, fn [handle], acc ->
-        if MapSet.member?(candidates_set, handle), do: acc, else: start_worker(acc, handle)
-      end)
-
-    manager = self()
+    state = Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle, :startup) end)
 
     Task.start(fn ->
       Tightbeam.HarklightSend.recover_pending(state.db, runner: state.send_runner)
       HarklightLifecycle.process_terminals(state.db, runner: state.send_runner)
-
-      Enum.each(candidates, fn [handle] ->
-        evidence =
-          HarklightLifecycle.completion_evidence(state.db, handle, runner: state.send_runner)
-
-        GenServer.cast(manager, {:restore_handle, handle, evidence})
-      end)
     end)
 
     {:noreply, state}
@@ -510,8 +495,18 @@ defmodule Tightbeam.HarklightWakes do
             {:noreply, %{state | stopping: MapSet.delete(state.stopping, handle)}}
 
           MapSet.member?(state.restart, handle) ->
-            state = %{state | restart: MapSet.delete(state.restart, handle)}
-            {:noreply, start_worker(state, handle)}
+            mode =
+              if MapSet.member?(state.restart, {handle, :new_request}),
+                do: :new_request,
+                else: :existing
+
+            state = %{
+              state
+              | restart:
+                  state.restart |> MapSet.delete(handle) |> MapSet.delete({handle, :new_request})
+            }
+
+            {:noreply, start_worker(state, handle, mode)}
 
           true ->
             mark_terminated(state.db, handle)
@@ -579,10 +574,11 @@ defmodule Tightbeam.HarklightWakes do
 
   @impl true
   def handle_cast({:activate, handle, true}, state) do
-    {:noreply, force_worker(state, handle)}
+    {:noreply, force_worker(state, handle, :new_request)}
   end
 
-  def handle_cast({:activate, handle, false}, state), do: {:noreply, start_worker(state, handle)}
+  def handle_cast({:activate, handle, false}, state),
+    do: {:noreply, start_worker(state, handle, :new_request)}
 
   def handle_cast({:origin_ready, session_key}, state) do
     {:ok, rows} =
@@ -609,28 +605,6 @@ defmodule Tightbeam.HarklightWakes do
 
   def handle_cast({:h8a_acknowledged, handle}, state) do
     schedule_answered_checks(self(), state.db, state.send_runner, [[handle]])
-    {:noreply, state}
-  end
-
-  # Read outside the manager, but validate and complete before starting a listener.
-  # The existing transaction rejects stale evidence and preserves pending work.
-  def handle_cast({:restore_handle, handle, evidence}, state) do
-    result =
-      case evidence do
-        {:ok, evidence} ->
-          DB.transaction(state.db, fn txn ->
-            HarklightLifecycle.complete_answered_in_txn(txn, handle, evidence)
-          end)
-
-        _ ->
-          :active
-      end
-
-    state =
-      if result == {:ok, true},
-        do: stop_worker(state, handle),
-        else: start_worker(state, handle)
-
     {:noreply, state}
   end
 
@@ -675,15 +649,20 @@ defmodule Tightbeam.HarklightWakes do
     end)
   end
 
-  defp force_worker(state, handle) do
+  defp force_worker(state, handle, mode \\ :existing) do
     case Map.fetch(state.workers, handle) do
       {:ok, worker} ->
         if port = Map.get(state.ports, handle), do: close_listener_port(port)
         Process.exit(worker, :shutdown)
-        %{state | restart: MapSet.put(state.restart, handle)}
+        restart = MapSet.put(state.restart, handle)
+
+        restart =
+          if mode == :new_request, do: MapSet.put(restart, {handle, :new_request}), else: restart
+
+        %{state | restart: restart}
 
       :error ->
-        start_worker(state, handle)
+        start_worker(state, handle, mode)
     end
   end
 
@@ -696,7 +675,8 @@ defmodule Tightbeam.HarklightWakes do
         %{
           state
           | stopping: MapSet.put(state.stopping, handle),
-            restart: MapSet.delete(state.restart, handle)
+            restart:
+              state.restart |> MapSet.delete(handle) |> MapSet.delete({handle, :new_request})
         }
 
       :error ->
@@ -931,7 +911,24 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp start_worker(state, handle) do
+  defp start_worker(state, handle, mode \\ :existing) do
+    cond do
+      Map.has_key?(state.workers, handle) ->
+        state
+
+      mode != :new_request and
+          HarklightLifecycle.closed_for_start?(state.db, handle, runner: state.send_runner) ->
+        if mode == :startup,
+          do: HarklightLifecycle.complete_answered(state.db, handle, runner: state.send_runner)
+
+        state
+
+      true ->
+        start_worker_now(state, handle)
+    end
+  end
+
+  defp start_worker_now(state, handle) do
     if Map.has_key?(state.workers, handle) do
       state
     else

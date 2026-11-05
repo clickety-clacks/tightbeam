@@ -870,143 +870,198 @@ defmodule Tightbeam.HarklightWakesTest do
   end
 
   @tag :restart_count
-  test "restart completes only eligible answered conversations and restores the remainder", %{
+  test "r6 startup skips closed conversations and preserves unfinished work", %{
     db: db,
-    call: call,
     session: session
   } do
-    completed_handles = [@handle, Tightbeam.Id.uuid4(), Tightbeam.Id.uuid4()]
-    open_request_handle = Tightbeam.Id.uuid4()
-    pending_answer_handle = Tightbeam.Id.uuid4()
+    [p1, p2, p3, k1, k2, k3, n1, n2] =
+      handles = [@handle | Enum.map(1..7, fn _ -> Tightbeam.Id.uuid4() end)]
 
-    for {handle, index} <-
-          Enum.with_index(completed_handles ++ [open_request_handle, pending_answer_handle]) do
-      message_id = if handle == @handle, do: "request", else: "request-#{index}"
+    for {handle, index} <- Enum.with_index(handles) do
+      message = if handle == @handle, do: "request", else: "request-#{index}"
+      if handle != @handle, do: seed_completion_handle(db, session.session_key, handle, message)
 
-      if handle != @handle,
-        do: seed_completion_handle(db, session.session_key, handle, message_id)
+      if handle != n1 do
+        author = if handle == k3, do: "agent", else: "person"
+        event = completion_event(handle, 1, message, "terminal", author)
 
-      answer = completion_event(handle, 1, message_id, "terminal", "person")
-      assert :ok = HarklightWakes.capture_line(db, handle, JSON.encode!(answer))
-      mark_completion_wakes_delivered(db, handle)
+        event =
+          if handle == k2,
+            do: put_in(event, ["entry", "terminal_state"], "retracted"),
+            else: event
+
+        assert :ok = HarklightWakes.capture_line(db, handle, JSON.encode!(event))
+        mark_completion_wakes_delivered(db, handle)
+      end
+
+      if handle in [p2, k1, k2, n1] do
+        assert {:ok, _} =
+                 DB.query(
+                   db,
+                   "UPDATE harklight_wake_handles SET state='unavailable',lastError='saved' WHERE handle=?1",
+                   [handle]
+                 )
+      end
     end
 
-    # Previously unavailable answered handles must also skip attachment.
     assert {:ok, _} =
              DB.query(
                db,
-               "UPDATE harklight_wake_handles SET state='unavailable' WHERE handle=?1",
+               "INSERT INTO harklight_send_operations(opId,sessionKey,host,payload,state,createdAt,updatedAt) VALUES('pending-r6',?1,?2,?3,'pending',1,1)",
                [
-                 hd(completed_handles)
+                 session.session_key,
+                 Placement.local_host_name(),
+                 JSON.encode!(%{"request" => %{"session_handle" => p3}})
                ]
              )
 
-    eligible_status = fn handle ->
-      %{
-        "session_handle" => handle,
-        "open_requests" => 0,
-        "open_chats" => 1,
-        "pending_undelivered" => 0,
-        "pending_delivered_unacted" => 0
-      }
-    end
+    status =
+      Map.new(handles, fn handle ->
+        {handle,
+         %{
+           "session_handle" => handle,
+           "open_requests" => if(handle == n1, do: 1, else: 0),
+           "pending_undelivered" => if(handle == n2, do: 1, else: 0),
+           "pending_delivered_unacted" => if(handle == k1, do: 1, else: 0)
+         }}
+      end)
 
-    statuses =
-      Map.new(completed_handles, &{&1, eligible_status.(&1)})
-      |> Map.put(open_request_handle, %{
-        "session_handle" => open_request_handle,
-        "open_requests" => 1,
-        "pending_undelivered" => 0,
-        "pending_delivered_unacted" => 0
-      })
-      |> Map.put(pending_answer_handle, %{
-        "session_handle" => pending_answer_handle,
-        "open_requests" => 0,
-        "pending_undelivered" => 1,
-        "pending_delivered_unacted" => 0
-      })
-
-    pending_answer = completion_event(pending_answer_handle, 1, "request-4", "terminal", "person")
-
-    initial = %{
-      status: statuses,
-      events: %{
-        @handle => [],
-        open_request_handle => [],
-        pending_answer_handle => [pending_answer]
-      },
-      commands: []
-    }
-
-    {:ok, responses} = Agent.start_link(fn -> initial end)
-    Process.unlink(responses)
-    on_exit(fn -> Agent.stop(responses) end)
+    {:ok, responses} = Agent.start_link(fn -> %{status: status, events: [], commands: []} end)
     parent = self()
     runner = completion_runner(responses, parent)
     listener = notifying_listener(parent)
 
-    {:ok, [[5]]} =
-      DB.query(
-        db,
-        "SELECT count(*) FROM harklight_wake_handles WHERE state IN ('active','unavailable')"
-      )
+    unchanged =
+      Map.new([p2, k1, k2, k3], fn h ->
+        {h, DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [h])}
+      end)
 
-    first_manager =
-      start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+    for _startup <- 1..2 do
+      manager =
+        start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
 
-    restored_at_startup =
-      for _ <- 1..2 do
-        assert_receive {:restored, handle, nil}
-        handle
-      end
+      restored =
+        for _ <- 1..3 do
+          assert_receive {:restored, handle, nil}
+          handle
+        end
 
-    assert MapSet.new(restored_at_startup) ==
-             MapSet.new([open_request_handle, pending_answer_handle])
+      assert MapSet.new(restored) == MapSet.new([p3, n1, n2])
+      assert map_size(:sys.get_state(manager).workers) == 3
+      refute_receive {:restored, _, _}
 
-    refute_receive {:restored, _, _}
+      assert {:ok, [["complete"]]} =
+               DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [p1])
 
-    assert eventually(fn ->
-             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'") ==
-               {:ok, [[3]]} and map_size(:sys.get_state(first_manager).workers) == 2
-           end)
+      for {handle, row} <- unchanged,
+          do:
+            assert(
+              DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [handle]) ==
+                row
+            )
 
-    first_state = :sys.get_state(first_manager)
-    assert length(Map.keys(first_state.workers)) == 2
+      for handle <- [p3, n1, n2],
+          do:
+            assert(
+              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]) ==
+                {:ok, [["active"]]}
+            )
 
-    assert {:ok, [[3]]} =
-             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'")
+      :ok = stop_supervised(HarklightWakes)
+    end
 
-    assert {:ok, [[2]]} =
-             DB.query(
-               db,
-               "SELECT count(*) FROM harklight_wake_handles WHERE state IN ('active','unavailable')"
-             )
+    assert :active = Tightbeam.HarklightLifecycle.complete_answered(db, p2, runner: runner)
 
-    :ok = stop_supervised(HarklightWakes)
-
-    second_manager =
-      start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
-
-    restored_after_restart =
-      for _ <- 1..2 do
-        assert_receive {:restored, handle, nil}
-        handle
-      end
-
-    second_state = :sys.get_state(second_manager)
-
-    assert MapSet.new(restored_after_restart) ==
-             MapSet.new([open_request_handle, pending_answer_handle])
-
-    assert length(Map.keys(second_state.workers)) == 2
-
-    assert {:ok, [[3]]} =
-             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'")
-
-    assert call.session_key == session.session_key
+    assert DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [p2]) ==
+             unchanged[p2]
   end
 
-  for evidence_failure <- [:read_failed, :status_failed, :local_pending] do
+  test "closed skips survive ready and origin changes, but a new request starts", %{
+    db: db,
+    call: call,
+    session: session
+  } do
+    parent = self()
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: notifying_listener(parent), send_runner: idle_runner()}
+      )
+
+    assert :sys.get_state(manager).workers == %{}
+    GenServer.cast(manager, {:origin_ready, session.session_key})
+    GenServer.cast(manager, {:pointer_changed, session.session_key})
+    GenServer.cast(manager, {:origin_changed, session.session_key})
+    assert :sys.get_state(manager).workers == %{}
+    refute_receive {:restored, _, _}
+
+    op = Tightbeam.Id.uuid4()
+    payload = String.replace(@payload, "request", "new-request")
+    result = String.replace(@result, "request", "new-request")
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
+
+    assert %{state: "registered"} =
+             HarklightWakes.bind_send(
+               db,
+               call,
+               op,
+               payload,
+               result,
+               @handle,
+               "sender",
+               "new-request"
+             )
+
+    assert_receive {:restored, @handle, nil}
+    # A pointer replacement stops the current process, but skips a closed replacement
+    # without writing a failure or ending the handle.
+    row = DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [@handle])
+    GenServer.cast(manager, {:pointer_changed, session.session_key})
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+    refute_receive {:restored, _, _}
+    assert DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [@handle]) == row
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_notice_recovery_%'"
+             )
+  end
+
+  test "R ignores delivered-unacted counts but preserves absent requests and held terminals", %{
+    db: db
+  } do
+    runner = fn ["status", "--session", @handle] ->
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 0,
+         "pending_undelivered" => 0
+       }), 0}
+    end
+
+    assert Tightbeam.HarklightLifecycle.closed_for_start?(db, @handle, runner: runner)
+    raw = event(91, "terminal", "held")
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_held_terminals(handle,eventId,senderId,messageId,rawLine) VALUES(?1,'held','sender','request',?2)",
+               [@handle, raw]
+             )
+
+    refute Tightbeam.HarklightLifecycle.closed_for_start?(db, @handle, runner: runner)
+    assert {:ok, _} = DB.query(db, "DELETE FROM harklight_held_terminals")
+    assert {:ok, _} = DB.query(db, "DELETE FROM harklight_wake_requests")
+    refute Tightbeam.HarklightLifecycle.closed_for_start?(db, @handle, runner: runner)
+  end
+
+  for evidence_failure <- [
+        :read_failed,
+        :status_failed,
+        :status_malformed,
+        :status_missing,
+        :local_pending
+      ] do
     @evidence_failure evidence_failure
     test "startup preserves a conversation with #{@evidence_failure}", %{db: db} do
       answer = completion_event(@handle, 1, "request", "terminal", "person")
@@ -1017,9 +1072,20 @@ defmodule Tightbeam.HarklightWakesTest do
 
       runner = fn args ->
         case {args, @evidence_failure} do
-          {["read" | _], :read_failed} -> {"unavailable", 1}
-          {["status" | _], :status_failed} -> {"unavailable", 1}
-          _ -> eligible_runner.(args)
+          {["read" | _], :read_failed} ->
+            {"unavailable", 1}
+
+          {["status" | _], :status_failed} ->
+            {"unavailable", 1}
+
+          {["status" | _], :status_malformed} ->
+            {"not json", 0}
+
+          {["status" | _], :status_missing} ->
+            {JSON.encode!(%{"session_handle" => @handle, "open_requests" => 0}), 0}
+
+          _ ->
+            eligible_runner.(args)
         end
       end
 
@@ -1028,8 +1094,13 @@ defmodule Tightbeam.HarklightWakesTest do
           {HarklightWakes, db: db, listener: notifying_listener(self()), send_runner: runner}
         )
 
-      assert_receive {:restored, @handle, nil}
-      assert Map.has_key?(:sys.get_state(manager).workers, @handle)
+      if @evidence_failure == :read_failed do
+        assert :sys.get_state(manager).workers == %{}
+        refute_receive {:restored, _, _}
+      else
+        assert_receive {:restored, @handle, nil}
+        assert Map.has_key?(:sys.get_state(manager).workers, @handle)
+      end
 
       assert {:ok, [["active"]]} =
                DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
@@ -1360,6 +1431,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.write!(Path.join(root, "harklight-agent"), """
     #!/bin/sh
+    if [ "$1" = status ]; then exit 1; fi
     if [ "$1" = listen ]; then exec sleep 300; fi
     printf 'start\\n' >> '#{events}'
     sleep 0.2
@@ -1418,6 +1490,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.write!(Path.join(root, "harklight-agent"), """
     #!/bin/sh
+    if [ "$1" = status ]; then exit 1; fi
     root='#{root}'
     if [ "$1" = listen ]; then exec sleep 300; fi
     if [ "$1" = retry ]; then
@@ -1459,6 +1532,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.write!(script, """
     #!/bin/sh
+    if [ "$1" = status ]; then exit 1; fi
     if [ "$1" = attach ]; then
       printf '%s\n' '{"kind":"attached","ready_for_listen":true}'
     else
