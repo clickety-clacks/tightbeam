@@ -688,7 +688,12 @@ defmodule Tightbeam.HarklightSend do
     end
   rescue
     error ->
-      {:error, "harklight_cli_failed",
-       "Harklight Agent could not complete: #{Exception.message(error)}", "failed"}
+      reason =
+        if expected == "prepared",
+          do:
+            "Harklight Agent could not complete during local preparation: #{Exception.message(error)}; the message was not sent.",
+          else: "Harklight Agent could not complete: #{Exception.message(error)}"
+
+      {:error, "harklight_cli_failed", reason, "failed"}
   end
 end
