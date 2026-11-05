@@ -117,7 +117,15 @@ defmodule Tightbeam.HarnessPiTest do
   end
 
   test "isolated engine launcher inventories workspace inputs without personal discovery" do
-    root = tmp_dir!("pi-isolation")
+    # The launcher reports realpaths; macOS resolves the temp dir's /var through
+    # /private, so expectations are built from the resolved root.
+    {root, 0} =
+      System.cmd("node", [
+        "-e",
+        "process.stdout.write(require('fs').realpathSync(process.argv[1]))",
+        tmp_dir!("pi-isolation")
+      ])
+
     cwd = Path.join(root, "workspace")
     home = Path.join(root, "owned")
     bin = Path.join(root, "bin")
