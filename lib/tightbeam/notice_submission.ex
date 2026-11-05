@@ -330,7 +330,8 @@ defmodule Tightbeam.NoticeSubmission do
     originatingTurnSeq recognitionAt recognitionPath recognitionReason recognitionEvidence
     recognitionDisposition recognitionTransition sourceAttachments sourceVisibilityScope sourceAddress)
 
-  defp copy_source_in_txn(txn, source, successor, due_at) do
+  @doc false
+  def copy_source_in_txn(txn, source, successor, due_at) do
     columns = Enum.join(@source_columns, ",")
 
     Txn.q(

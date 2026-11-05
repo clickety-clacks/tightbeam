@@ -1512,6 +1512,8 @@ defmodule Tightbeam.Ledger do
       owner_lease: Map.get(opts, :owner_lease),
       detail: detail
     })
+
+    Tightbeam.Wakes.preserve_harklight_discussions_in_txn(txn, seq, terminal)
   end
 
   @doc "Conservation audit: non-terminal rows older than max_age_ms. Must be []."
