@@ -413,7 +413,9 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   def origin_turn_ended(session_key) do
-    if pid = Process.whereis(__MODULE__), do: GenServer.cast(pid, {:origin_turn_ended, session_key})
+    if pid = Process.whereis(__MODULE__),
+      do: GenServer.cast(pid, {:origin_turn_ended, session_key})
+
     :ok
   end
 
@@ -459,7 +461,8 @@ defmodule Tightbeam.HarklightWakes do
         {:ok, candidates} ->
           schedule_answered_checks_now(manager, state.db, state.send_runner, candidates)
 
-        _ -> :ok
+        _ ->
+          :ok
       end
     end)
 

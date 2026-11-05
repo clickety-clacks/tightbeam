@@ -426,10 +426,10 @@ defmodule Tightbeam.HarklightLifecycle do
               end
 
             case DB.query(
-              db,
-              "UPDATE harklight_subscription_ends SET state=?3,acknowledgment=?4,reason=?5 WHERE senderId=?1 AND messageId=?2",
-              [sender, message, state, status, reason]
-            ) do
+                   db,
+                   "UPDATE harklight_subscription_ends SET state=?3,acknowledgment=?4,reason=?5 WHERE senderId=?1 AND messageId=?2",
+                   [sender, message, state, status, reason]
+                 ) do
               {:ok, _} when status == "acknowledged" -> HarklightWakes.h8a_acknowledged(handle)
               _ -> :ok
             end
@@ -675,7 +675,9 @@ defmodule Tightbeam.HarklightLifecycle do
 
   defp read_runner(opts) do
     case Keyword.get(opts, :runner) do
-      runner when is_function(runner, 1) -> {:ok, runner}
+      runner when is_function(runner, 1) ->
+        {:ok, runner}
+
       nil ->
         case System.find_executable("harklight-agent") do
           nil -> :error
