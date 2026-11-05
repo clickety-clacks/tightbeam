@@ -9,6 +9,18 @@ defmodule Tightbeam.Harness.Pi do
   alias Tightbeam.PiProvider.OpenCodeGo
 
   @models_json "models.json"
+  @launcher "tightbeam-launch-pi"
+  @external_resource Path.expand("../../../priv/pi-launcher.cjs", __DIR__)
+  @launcher_template File.read!(@external_resource)
+
+  @doc false
+  def launcher_source do
+    String.replace(
+      @launcher_template,
+      "__TIGHTBEAM_OWNED_SKILLS__",
+      JSON.encode!(Tightbeam.Homes.baseline_skill_names())
+    )
+  end
 
   @adapter_version "0.0.33"
   @adapter_package "pi-acp"
@@ -83,6 +95,14 @@ defmodule Tightbeam.Harness.Pi do
   @impl true
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
+    controlled = ["PI_CODING_AGENT_DIR", "PI_ACP_PI_COMMAND"]
+
+    if Enum.any?(Keyword.fetch!(opts, :common_env), fn {name, _} -> name in controlled end) or
+         Enum.any?(Keyword.fetch!(opts, :remote_env), fn entry ->
+           Enum.any?(controlled, &String.starts_with?(entry, &1 <> "="))
+         end) do
+      raise ArgumentError, "Pi isolation environment cannot be overridden"
+    end
 
     ssh =
       if Support.local?(target) do
@@ -130,10 +150,17 @@ defmodule Tightbeam.Harness.Pi do
       if Support.local?(target) do
         [
           cmd: [binary],
-          env: [{"PI_CODING_AGENT_DIR", home} | Keyword.fetch!(opts, :common_env)]
+          env: [
+            {"PI_CODING_AGENT_DIR", home},
+            {"PI_ACP_PI_COMMAND", Path.join(home, @launcher)} | Keyword.fetch!(opts, :common_env)
+          ]
         ]
       else
-        remote_env = ["PI_CODING_AGENT_DIR=#{home}" | Keyword.fetch!(opts, :remote_env)]
+        remote_env = [
+          "PI_CODING_AGENT_DIR=#{Support.shell_quote(home)}",
+          "PI_ACP_PI_COMMAND=#{Support.shell_quote(Path.join(home, @launcher))}"
+          | Keyword.fetch!(opts, :remote_env)
+        ]
 
         [
           cmd:
@@ -240,7 +267,7 @@ defmodule Tightbeam.Harness.Pi do
 
   @impl true
   def owned_home_entries do
-    Support.owned_home_entries("extensions/tightbeam.ts", [@models_json])
+    Support.owned_home_entries("extensions/tightbeam.ts", [@models_json, @launcher])
   end
 
   @impl true
@@ -250,7 +277,7 @@ defmodule Tightbeam.Harness.Pi do
     rails =
       case desired.rails do
         nil ->
-          nil
+          extension_source(%{"hooks" => %{"PreToolUse" => []}})
 
         bytes when is_binary(bytes) ->
           bytes
@@ -268,7 +295,32 @@ defmodule Tightbeam.Harness.Pi do
       )
 
     materialize_models_json!(target, home)
+    materialize_launcher!(target, home)
     result
+  end
+
+  defp materialize_launcher!(target, home) do
+    file = Path.join(home, @launcher)
+
+    if Support.local?(target) do
+      File.write!(file, launcher_source())
+      File.chmod!(file, 0o755)
+    else
+      {:ok, ssh} = absolute_executable(target, "ssh")
+
+      script =
+        "/usr/bin/printf %s " <>
+          Support.shell_quote(Base.encode64(launcher_source())) <>
+          " | /usr/bin/base64 -d > " <>
+          Support.shell_quote(file) <>
+          " && /bin/chmod 755 " <> Support.shell_quote(file)
+
+      Support.run!(
+        target,
+        [ssh | Support.ssh_opts()] ++
+          [target.host_config.ssh, "/bin/sh", "-c", Support.shell_quote(script)]
+      )
+    end
   end
 
   defp materialize_models_json!(target, home) do
@@ -469,7 +521,15 @@ defmodule Tightbeam.Harness.Pi do
       skills_path: Path.join([".pi", "skills"]),
       local_extra_env: %{subscription: [], api_key: []},
       rails_env: nil,
-      remote_prefix: fn _base, home, _kind -> ["PI_CODING_AGENT_DIR=#{home}"] end,
+      local_home_env: fn _base, home ->
+        [{"PI_CODING_AGENT_DIR", home}, {"PI_ACP_PI_COMMAND", Path.join(home, @launcher)}]
+      end,
+      remote_prefix: fn _base, home, _kind ->
+        [
+          "PI_CODING_AGENT_DIR=#{Support.shell_quote(home)}",
+          "PI_ACP_PI_COMMAND=#{Support.shell_quote(Path.join(home, @launcher))}"
+        ]
+      end,
       remote_rails_env: nil,
       railed_probe: true,
       # The permission gate receives a discovered catalog entry and returns
