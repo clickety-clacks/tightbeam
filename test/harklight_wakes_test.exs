@@ -2080,7 +2080,8 @@ defmodule Tightbeam.HarklightWakesTest do
                  [session_key, Tightbeam.Id.uuid4(), wake_id, System.system_time(:millisecond)]
                )
 
-      assert {:ok, [[turn_seq]]} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id])
+      assert {:ok, [[turn_seq]]} =
+               DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id])
 
       assert {:ok, _} =
                DB.query(
