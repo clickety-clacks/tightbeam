@@ -1105,6 +1105,242 @@ defmodule Tightbeam.HarklightWakesTest do
     refute_receive :unexpected_listener
   end
 
+  for {label, responses, expected_calls, recovered} <- [
+        {"transport refusal recovers",
+         [
+           {2,
+            ~s({"kind":"refused","reason_source":"agent","reason_code":"transport_error","reason":"The origin transport request failed."})},
+           {0, ~s({"kind":"attached","ready_for_listen":true})}
+         ], ["attach", "attach"], true},
+        {"unknown transport preserves same-operation recovery first",
+         [
+           {7,
+            ~s({"kind":"outcome_unknown","op_id":"saved-op","reason_source":"agent","reason_code":"transport_error"})},
+           {7,
+            ~s({"kind":"outcome_unknown","op_id":"saved-op"}) <>
+              "\norigin request failed: synthetic connection failure"},
+           {0, ~s({"kind":"attached","ready_for_listen":true})}
+         ], ["attach", "retry --op-id saved-op", "attach"], true},
+        {"real refusal gains no transport retry",
+         [
+           {2,
+            ~s({"kind":"refused","reason_source":"server","reason_code":"forbidden","reason":"The server refused this origin's access."})}
+         ], ["attach"], false},
+        {"unknown nontransport does not gain retries",
+         [
+           {7,
+            ~s({"kind":"outcome_unknown","op_id":"saved-op","reason_source":"agent","reason_code":"invalid_response"})},
+           {7,
+            ~s({"kind":"outcome_unknown","op_id":"saved-op"}) <>
+              "\norigin response was not a valid v1 JSON envelope: synthetic"}
+         ], ["attach", "retry --op-id saved-op"], false},
+        {"transport retry exhausts its finite budget",
+         List.duplicate(
+           {2,
+            ~s({"kind":"connection_error","reason_source":"agent","reason_code":"timeout","reason":"The origin request timed out."})},
+           3
+         ), ["attach", "attach", "attach"], false}
+      ] do
+    @retry_responses responses
+    @retry_calls expected_calls
+    @retry_recovered recovered
+    test "bounded attachment retry: #{label}", %{db: db, session: session} do
+      calls = attachment_sequence(@retry_responses)
+      # No listener retry, so a failed worker goes straight to gone and only
+      # the attachment window is exercised.
+      start_supervised!({HarklightWakes, db: db, attach_retry_delays: [20, 40], retry_delays: []})
+
+      if @retry_recovered do
+        await_listener_port()
+
+        assert {:ok, [["active", nil]]} =
+                 DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+
+        assert {:ok, []} =
+                 DB.query(db, "SELECT wakeId FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'")
+      else
+        await_handle_error(db, "attachment_")
+        origin = session.session_key
+
+        assert {:ok, [[^origin, prompt]]} =
+                 DB.query(
+                   db,
+                   "SELECT sessionKey,prompt FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'"
+                 )
+
+        assert prompt =~ "Replies on this thread will not reach"
+      end
+
+      expected = if @retry_recovered, do: @retry_calls, else: @retry_calls ++ ["session"]
+      assert eventually(fn -> File.read!(calls) |> String.split("\n", trim: true) == expected end)
+      # Beyond both configured delays, a terminal refusal cannot restart itself.
+      Process.sleep(100)
+      assert File.read!(calls) |> String.split("\n", trim: true) == expected
+    end
+  end
+
+  test "an exhausted attachment window is one failure toward the listener budget", %{db: db} do
+    calls =
+      attachment_sequence(
+        List.duplicate(
+          {2, ~s({"kind":"refused","reason_source":"agent","reason_code":"transport_error"})},
+          4
+        )
+      )
+
+    start_supervised!({HarklightWakes, db: db, attach_retry_delays: [1], retry_delays: [1]})
+
+    # Two workers, each spending its own window, then gone. Nothing follows.
+    expected = ["attach", "attach", "attach", "attach", "session"]
+    assert eventually(fn -> File.read!(calls) |> String.split("\n", trim: true) == expected end)
+    Process.sleep(100)
+    assert File.read!(calls) |> String.split("\n", trim: true) == expected
+  end
+
+  test "retry window does not schedule an attempt beyond its deadline", %{db: db} do
+    calls =
+      attachment_sequence([
+        {2, ~s({"kind":"refused","reason_source":"agent","reason_code":"transport_error"})}
+      ])
+
+    start_supervised!(
+      {HarklightWakes,
+       db: db, attach_retry_delays: [100], attach_retry_window_ms: 10, retry_delays: [60_000]}
+    )
+
+    await_handle_error(db, "attachment_refused")
+    Process.sleep(120)
+    assert File.read!(calls) == "attach\n"
+  end
+
+  test "controller shutdown cancels a pending transport retry", %{db: db} do
+    calls =
+      attachment_sequence([
+        {2, ~s({"kind":"refused","reason_source":"agent","reason_code":"transport_error"})}
+      ])
+
+    start_supervised!({HarklightWakes, db: db, attach_retry_delays: [500]})
+    await_attachment_calls(calls)
+    :ok = stop_supervised(HarklightWakes)
+    Process.sleep(550)
+    assert File.read!(calls) == "attach\n"
+  end
+
+  test "restore caps concurrent attachment attempts and attaches every handle", %{
+    db: db,
+    session: session
+  } do
+    handles = for i <- 1..5, do: "00000000-0000-4000-8000-00000000000#{i}"
+
+    for handle <- handles do
+      {:ok, _} =
+        DB.query(
+          db,
+          "INSERT INTO harklight_wake_handles(handle,sessionKey,host,vendorSessionId,state,createdAt,updatedAt) VALUES(?1,?2,?3,'vendor','active',2,2)",
+          [handle, session.session_key, Placement.local_host_name()]
+        )
+    end
+
+    root = Path.join(System.tmp_dir!(), "attach-cap-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    events = Path.join(root, "events")
+    File.write!(events, "")
+
+    File.write!(Path.join(root, "harklight-agent"), """
+    #!/bin/sh
+    if [ "$1" = listen ]; then exec sleep 300; fi
+    printf 'start\\n' >> '#{events}'
+    sleep 0.2
+    printf 'end\\n' >> '#{events}'
+    printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+    """)
+
+    File.chmod!(Path.join(root, "harklight-agent"), 0o700)
+    old_path = System.fetch_env!("PATH")
+    System.put_env("PATH", root <> ":" <> old_path)
+
+    on_exit(fn ->
+      System.put_env("PATH", old_path)
+      File.rm_rf!(root)
+    end)
+
+    start_supervised!({HarklightWakes, db: db, attach_concurrency: 2})
+    await_listener_ports(6)
+
+    overlap =
+      File.read!(events)
+      |> String.split("\n", trim: true)
+      |> Enum.scan(0, fn
+        "start", n -> n + 1
+        "end", n -> n - 1
+      end)
+
+    assert Enum.max(overlap) == 2
+    assert length(overlap) == 12
+
+    assert {:ok, [["active", 6]]} =
+             DB.query(db, "SELECT state,count(*) FROM harklight_wake_handles GROUP BY state")
+  end
+
+  defp await_listener_ports(count, attempts \\ 300)
+  defp await_listener_ports(_count, 0), do: flunk("listener ports did not start")
+
+  defp await_listener_ports(count, attempts) do
+    if map_size(:sys.get_state(HarklightWakes).ports) < count do
+      Process.sleep(10)
+      await_listener_ports(count, attempts - 1)
+    end
+  end
+
+  defp attachment_sequence(responses) do
+    root = Path.join(System.tmp_dir!(), "attach-sequence-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    calls = Path.join(root, "calls")
+    File.write!(calls, "")
+
+    Enum.with_index(responses, 1)
+    |> Enum.each(fn {{status, output}, i} ->
+      File.write!(Path.join(root, "response-#{i}"), output <> "\n")
+      File.write!(Path.join(root, "status-#{i}"), Integer.to_string(status))
+    end)
+
+    File.write!(Path.join(root, "harklight-agent"), """
+    #!/bin/sh
+    root='#{root}'
+    if [ "$1" = listen ]; then exec sleep 300; fi
+    if [ "$1" = session ]; then printf 'session\n' >> "$root/calls"; exit 0; fi
+    if [ "$1" = retry ]; then
+      printf '%s\n' "$*" >> "$root/calls"
+    else
+      printf '%s\n' "$1" >> "$root/calls"
+    fi
+    n=$(wc -l < "$root/calls" | tr -d ' ')
+    cat "$root/response-$n"
+    exit "$(cat "$root/status-$n")"
+    """)
+
+    File.chmod!(Path.join(root, "harklight-agent"), 0o700)
+    old_path = System.fetch_env!("PATH")
+    System.put_env("PATH", root <> ":" <> old_path)
+
+    on_exit(fn ->
+      System.put_env("PATH", old_path)
+      File.rm_rf!(root)
+    end)
+
+    calls
+  end
+
+  defp await_attachment_calls(path, attempts \\ 100)
+  defp await_attachment_calls(_path, 0), do: flunk("attachment did not run")
+
+  defp await_attachment_calls(path, attempts) do
+    if File.read!(path) == "" do
+      Process.sleep(10)
+      await_attachment_calls(path, attempts - 1)
+    end
+  end
+
   test "controller shutdown releases its own idle subprocess before restoring", %{db: db} do
     root = Path.join(System.tmp_dir!(), "harklight-child-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
@@ -2099,7 +2335,9 @@ defmodule Tightbeam.HarklightWakesTest do
       exit 0
       """)
 
-      start_supervised!({HarklightWakes, db: db, retry_delays: [1]})
+      # This measures the listener budget alone; transport codes would also
+      # spend the attachment retry window first.
+      start_supervised!({HarklightWakes, db: db, retry_delays: [1], attach_retry_delays: []})
       assert eventually(fn -> File.read!(path) =~ "session end --session #{@handle} --gone" end)
       calls = File.read!(path) |> String.split("\n", trim: true)
       assert Enum.count(calls, &String.starts_with?(&1, "attach ")) == @refusal_attempts
