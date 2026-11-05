@@ -1069,8 +1069,17 @@ defmodule Tightbeam.Wakes do
       """,
       [assignment_id]
     )
-    |> Enum.map(fn [id, work_item, child, owner, opened_user, opened_session, outcome, closed_at,
-                    token] ->
+    |> Enum.map(fn [
+                     id,
+                     work_item,
+                     child,
+                     owner,
+                     opened_user,
+                     opened_session,
+                     outcome,
+                     closed_at,
+                     token
+                   ] ->
       {opener_kind, opener_id} = terminal_opener_in_txn(txn, id, opened_user, opened_session)
 
       %{

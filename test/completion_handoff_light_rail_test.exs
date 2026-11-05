@@ -233,7 +233,10 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     assert %{state: "open"} = Assignments.__handle__(ctx.db, "reopen-assignment", reopen)
 
-    assert %{assignment: %{state: "closed"}, attest: %{kind: "completion", id: second_source_token}} =
+    assert %{
+             assignment: %{state: "closed"},
+             attest: %{kind: "completion", id: second_source_token}
+           } =
              handle(
                ctx,
                "attest",
