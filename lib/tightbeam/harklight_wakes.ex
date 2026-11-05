@@ -465,13 +465,21 @@ defmodule Tightbeam.HarklightWakes do
         "SELECT handle FROM harklight_wake_handles WHERE state IN ('active','unavailable') ORDER BY createdAt,handle"
       )
 
+    {:ok, candidates} = answer_completion_candidates(state.db, nil)
+    candidates_set = MapSet.new(candidates, fn [handle] -> handle end)
+
+    state =
+      Enum.reduce(rows, state, fn [handle], acc ->
+        if MapSet.member?(candidates_set, handle), do: acc, else: start_worker(acc, handle)
+      end)
+
     manager = self()
 
     Task.start(fn ->
       Tightbeam.HarklightSend.recover_pending(state.db, runner: state.send_runner)
       HarklightLifecycle.process_terminals(state.db, runner: state.send_runner)
 
-      Enum.each(rows, fn [handle] ->
+      Enum.each(candidates, fn [handle] ->
         evidence =
           HarklightLifecycle.completion_evidence(state.db, handle, runner: state.send_runner)
 
