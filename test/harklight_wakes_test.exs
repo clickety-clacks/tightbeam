@@ -3818,6 +3818,502 @@ defmodule Tightbeam.HarklightWakesTest do
     calls
   end
 
+  test "a delivered chat after an answered request may finish after the other request is answered",
+       %{db: db, session: session} do
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    chat = completion_event(@handle, 2, "request", "discussion", "person", "chat")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(chat))
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_wake_requests(senderId,messageId,handle) VALUES('sender','request-b',?1)",
+               [@handle]
+             )
+
+    mark_completion_wakes_delivered(db, @handle)
+
+    status = %{
+      "session_handle" => @handle,
+      "open_requests" => 1,
+      "open_chats" => 1,
+      "pending_undelivered" => 1,
+      "pending_delivered_unacted" => 0
+    }
+
+    {:ok, responses} =
+      Agent.start_link(fn -> %{status: status, events: %{@handle => [chat]}, commands: []} end)
+
+    Process.unlink(responses)
+    on_exit(fn -> Agent.stop(responses) end)
+    parent = self()
+    runner = completion_runner(responses, parent)
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: completion_notifying_listener(parent), send_runner: runner}
+      )
+
+    assert_receive {:restored, @handle, nil}
+    assert_receive {:harklight_command, ["status", "--session", @handle]}
+    assert Map.has_key?(:sys.get_state(manager).workers, @handle)
+
+    assert {:ok, [["active"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+
+    Agent.update(responses, fn current ->
+      put_in(current, [:status, "open_requests"], 0)
+    end)
+
+    answer_b = completion_event(@handle, 3, "request-b", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer_b))
+    mark_completion_wakes_delivered(db, @handle)
+
+    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    Agent.update(responses, fn current ->
+      put_in(current, [:status, "pending_undelivered"], 0)
+      |> put_in([:status, "pending_delivered_unacted"], 1)
+      |> put_in([:events, @handle, Access.at(0), "delivered"], true)
+    end)
+
+    HarklightWakes.origin_turn_ended(session.session_key)
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle]) ==
+               {:ok, [["complete"]]}
+           end)
+
+    assert {:ok, [["complete"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+
+    assert {:ok, [[3]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_entries WHERE handle=?1", [@handle])
+
+    assert_receive {:harklight_command, ["read", "--session", @handle]}
+    assert_receive {:harklight_command, ["status", "--session", @handle]}
+
+    refute Enum.any?(Agent.get(responses, & &1.commands), fn [command | _] ->
+             command in ["ack", "reply", "result"]
+           end)
+  end
+
+  test "the answer stays pending until its ACK and result are both recorded", %{db: db} do
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+    mark_completion_wakes_delivered(db, @handle)
+
+    status = %{
+      "session_handle" => @handle,
+      "open_requests" => 0,
+      "pending_undelivered" => 1,
+      "pending_delivered_unacted" => 1
+    }
+
+    {:ok, responses} =
+      Agent.start_link(fn -> %{status: status, events: %{@handle => [answer]}, commands: []} end)
+
+    Process.unlink(responses)
+    on_exit(fn -> Agent.stop(responses) end)
+    runner = completion_runner(responses, self())
+    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    Agent.update(responses, fn current ->
+      put_in(current, [:status, "pending_undelivered"], 0)
+      |> put_in([:status, "pending_delivered_unacted"], 1)
+      |> put_in([:events, @handle, Access.at(0), "delivered"], true)
+    end)
+
+    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    assert {:ok, [["active"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+
+    Agent.update(responses, fn current ->
+      put_in(current, [:status, "pending_delivered_unacted"], 0)
+      |> put_in([:events, @handle], [])
+    end)
+
+    assert :completed = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    assert {:ok, [["complete"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+  end
+
+  test "missing, refused, or unparsable Agent reads keep an answered handle active", %{db: db} do
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+    mark_completion_wakes_delivered(db, @handle)
+
+    failures = [
+      fn _args -> {"harklight-agent executable not found", 127} end,
+      fn _args -> {"origin refused the request", 2} end,
+      fn _args -> {"not-json", 0} end
+    ]
+
+    for runner <- failures do
+      assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+      assert {:ok, [["active"]]} =
+               DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+    end
+
+    status_failure = fn
+      ["read", "--session", _handle] -> {"", 0}
+      ["status", "--session", _handle] -> {"not-json", 0}
+    end
+
+    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: status_failure)
+
+    assert {:ok, [["active"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+  end
+
+  @tag :restart_count
+  test "restart completes only eligible answered conversations and restores the remainder", %{
+    db: db,
+    call: call,
+    session: session
+  } do
+    completed_handles = [@handle, Tightbeam.Id.uuid4(), Tightbeam.Id.uuid4()]
+    open_request_handle = Tightbeam.Id.uuid4()
+    pending_answer_handle = Tightbeam.Id.uuid4()
+
+    for {handle, index} <-
+          Enum.with_index(completed_handles ++ [open_request_handle, pending_answer_handle]) do
+      message_id = if handle == @handle, do: "request", else: "request-#{index}"
+
+      if handle != @handle,
+        do: seed_completion_handle(db, session.session_key, handle, message_id)
+
+      answer = completion_event(handle, 1, message_id, "terminal", "person")
+      assert :ok = HarklightWakes.capture_line(db, handle, JSON.encode!(answer))
+      mark_completion_wakes_delivered(db, handle)
+    end
+
+    eligible_status = fn handle ->
+      %{
+        "session_handle" => handle,
+        "open_requests" => 0,
+        "open_chats" => 1,
+        "pending_undelivered" => 0,
+        "pending_delivered_unacted" => 0
+      }
+    end
+
+    statuses =
+      Map.new(completed_handles, &{&1, eligible_status.(&1)})
+      |> Map.put(open_request_handle, %{
+        "session_handle" => open_request_handle,
+        "open_requests" => 1,
+        "pending_undelivered" => 0,
+        "pending_delivered_unacted" => 0
+      })
+      |> Map.put(pending_answer_handle, %{
+        "session_handle" => pending_answer_handle,
+        "open_requests" => 0,
+        "pending_undelivered" => 1,
+        "pending_delivered_unacted" => 0
+      })
+
+    pending_answer = completion_event(pending_answer_handle, 1, "request-4", "terminal", "person")
+
+    initial = %{
+      status: statuses,
+      events: %{
+        @handle => [],
+        open_request_handle => [],
+        pending_answer_handle => [pending_answer]
+      },
+      commands: []
+    }
+
+    {:ok, responses} = Agent.start_link(fn -> initial end)
+    Process.unlink(responses)
+    on_exit(fn -> Agent.stop(responses) end)
+    parent = self()
+    runner = completion_runner(responses, parent)
+    listener = completion_notifying_listener(parent)
+
+    assert {:ok, [[5]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_wake_handles WHERE state IN ('active','unavailable')"
+             )
+
+    first_manager =
+      start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+
+    restored_before_completion =
+      for _ <- 1..5 do
+        assert_receive {:restored, handle, nil}
+        handle
+      end
+
+    assert MapSet.new(restored_before_completion) ==
+             MapSet.new(completed_handles ++ [open_request_handle, pending_answer_handle])
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'") ==
+               {:ok, [[3]]} and map_size(:sys.get_state(first_manager).workers) == 2
+           end)
+
+    assert length(Map.keys(:sys.get_state(first_manager).workers)) == 2
+
+    assert {:ok, [[3]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'")
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_wake_handles WHERE state IN ('active','unavailable')"
+             )
+
+    :ok = stop_supervised(HarklightWakes)
+
+    second_manager =
+      start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+
+    restored_after_restart =
+      for _ <- 1..2 do
+        assert_receive {:restored, handle, nil}
+        handle
+      end
+
+    assert MapSet.new(restored_after_restart) ==
+             MapSet.new([open_request_handle, pending_answer_handle])
+
+    assert length(Map.keys(:sys.get_state(second_manager).workers)) == 2
+
+    assert {:ok, [[3]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'")
+
+    assert call.session_key == session.session_key
+  end
+
+  test "an agent-authored answer alone does not complete a handle", %{db: db} do
+    answer = completion_event(@handle, 1, "request", "terminal", "agent")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+    mark_completion_wakes_delivered(db, @handle)
+
+    status = %{
+      "session_handle" => @handle,
+      "open_requests" => 0,
+      "pending_undelivered" => 0,
+      "pending_delivered_unacted" => 0
+    }
+
+    runner = fn
+      ["read", "--session", @handle] -> {"", 0}
+      ["status", "--session", @handle] -> {JSON.encode!(status), 0}
+    end
+
+    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    assert {:ok, [["active"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+  end
+
+  test "Mike's no-comment terminal qualifies as an answer", %{db: db} do
+    no_comment =
+      completion_event(@handle, 1, "request", "terminal", "person")
+      |> put_in(["entry", "terminal_kind"], "no_comment")
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(no_comment))
+    mark_completion_wakes_delivered(db, @handle)
+
+    status = %{
+      "session_handle" => @handle,
+      "open_requests" => 0,
+      "pending_undelivered" => 0,
+      "pending_delivered_unacted" => 0
+    }
+
+    runner = fn
+      ["read", "--session", @handle] -> {"", 0}
+      ["status", "--session", @handle] -> {JSON.encode!(status), 0}
+    end
+
+    assert :completed = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+  end
+
+  test "completion waits for every WI7b follow wake delivery", %{db: db, session: session} do
+    follower_key = "agent:origin:completion-follower"
+
+    _follower =
+      Org.create(db, %{
+        session_key: follower_key,
+        display_name: "Completion follower",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        spawned_by: session.session_key,
+        archetype: "default",
+        host: Placement.local_host_name(),
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("fable")
+      })
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_wake_follows(followId,sessionKey,kind,handle,senderId,messageId,state,createdAt) VALUES(?1,?2,'conversation',?3,NULL,'','open',?4)",
+               [Tightbeam.Id.uuid4(), follower_key, @handle, System.system_time(:millisecond)]
+             )
+
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+
+    status = %{
+      "session_handle" => @handle,
+      "open_requests" => 0,
+      "pending_undelivered" => 0,
+      "pending_delivered_unacted" => 0
+    }
+
+    runner = fn
+      ["read", "--session", @handle] -> {"", 0}
+      ["status", "--session", @handle] -> {JSON.encode!(status), 0}
+    end
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_wake_deliveries WHERE handle=?1 AND eventId='1'",
+               [@handle]
+             )
+
+    mark_completion_wakes_delivered(db, @handle, [follower_key])
+    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    mark_completion_wakes_delivered(db, @handle)
+    assert :completed = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    assert {:ok, [["ended"]]} =
+             DB.query(
+               db,
+               "SELECT state FROM harklight_wake_follows WHERE sessionKey=?1 AND handle=?2",
+               [follower_key, @handle]
+             )
+  end
+
+  defp completion_event(handle, cursor, message_id, kind, author, channel \\ nil) do
+    entry = %{"kind" => kind, "author" => author}
+
+    entry =
+      if kind == "terminal",
+        do: Map.merge(entry, %{"terminal_state" => "answered", "terminal_kind" => "answer"}),
+        else: Map.put(entry, "content", "message")
+
+    event = %{
+      "kind" => "event",
+      "session_handle" => handle,
+      "event_id" => Integer.to_string(cursor),
+      "feed_cursor" => cursor,
+      "request" => %{"sender_id" => "sender", "message_id" => message_id},
+      "request_revision" => 1,
+      "delivered" => false,
+      "acted" => false,
+      "entry" => entry
+    }
+
+    if channel, do: Map.put(event, "channel", channel), else: event
+  end
+
+  defp seed_completion_handle(db, session_key, handle, message_id) do
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_wake_handles(handle,sessionKey,host,state,createdAt,updatedAt) VALUES(?1,?2,?3,'active',?4,?4)",
+               [handle, session_key, Placement.local_host_name(), now]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_wake_requests(senderId,messageId,handle) VALUES('sender',?1,?2)",
+               [message_id, handle]
+             )
+  end
+
+  defp mark_completion_wakes_delivered(db, handle, excluded_sessions \\ []) do
+    assert {:ok, rows} =
+             DB.query(
+               db,
+               "SELECT wakeId,sessionKey FROM harklight_wake_deliveries WHERE handle=?1 ORDER BY eventId,sessionKey",
+               [handle]
+             )
+
+    for [wake_id, session_key] <- Enum.uniq_by(rows, &hd/1),
+        session_key not in excluded_sessions do
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "INSERT INTO turns(sessionKey,messageId,wakeId,origin,prompt,status,createdAt) VALUES(?1,?2,?3,'process:test','delivered source wake','delivered',?4) ON CONFLICT(wakeId) DO UPDATE SET status='delivered'",
+                 [session_key, Tightbeam.Id.uuid4(), wake_id, System.system_time(:millisecond)]
+               )
+
+      assert {:ok, [[turn_seq]]} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id])
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "UPDATE wakes SET state='fired',firedAt=?3,deliveredTurnSeq=?2 WHERE wakeId=?1",
+                 [wake_id, turn_seq, System.system_time(:millisecond)]
+               )
+    end
+  end
+
+  defp completion_runner(responses, parent) do
+    fn
+      ["read", "--session", handle] = args ->
+        Agent.update(responses, fn current -> Map.update!(current, :commands, &[args | &1]) end)
+
+        events =
+          Agent.get(responses, fn current ->
+            case current.events do
+              events when is_map(events) -> Map.get(events, handle, [])
+              events when is_list(events) -> events
+            end
+          end)
+
+        output = Enum.map_join(events, "\n", &JSON.encode!/1)
+        send(parent, {:harklight_command, args})
+        if events == [], do: {"", 0}, else: {output <> "\n", 0}
+
+      ["status", "--session", handle] = args ->
+        Agent.update(responses, fn current -> Map.update!(current, :commands, &[args | &1]) end)
+
+        status =
+          Agent.get(responses, fn current ->
+            case current.status do
+              %{"session_handle" => _} = status -> status
+              statuses when is_map(statuses) -> Map.fetch!(statuses, handle)
+            end
+          end)
+
+        send(parent, {:harklight_command, args})
+        {JSON.encode!(status) <> "\n", 0}
+
+      _args ->
+        {"unexpected Harklight Agent command", 2}
+    end
+  end
+
+  defp completion_notifying_listener(parent) do
+    fn manager, handle, vendor ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      send(parent, {:restored, handle, vendor})
+
+      receive do
+        :never -> :ok
+      end
+    end
+  end
+
   defp eventually(fun, attempts \\ 200)
   defp eventually(fun, 0), do: fun.()
 
