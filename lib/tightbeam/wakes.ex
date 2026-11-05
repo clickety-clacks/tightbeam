@@ -862,18 +862,35 @@ defmodule Tightbeam.Wakes do
 
   defp terminal_action_attest_for_wake_in_txn(txn, wake, attest_id) do
     with {:ok, root, event} <- terminal_action_root_event_in_txn(txn, wake),
-         [[^attest_id, "progress", note, parent]] <-
+         [[^attest_id, "progress", note, parent, assignment_id]] <-
            Txn.q(
              txn,
-             "SELECT id,kind,note,bySession FROM attests WHERE id=?1",
+             "SELECT id,kind,note,bySession,assignmentId FROM attests WHERE id=?1",
              [attest_id]
            ),
-         true <- parent == wake.session_key,
+         true <- terminal_action_filer_authorized?(txn, wake, event, parent, assignment_id),
          true <- terminal_action_note_matches?(txn, note, event) do
       {:ok, %{root: root, event: event}}
     else
       _ -> :error
     end
+  end
+
+  # The reminded session always stops its own reminder. The child's original
+  # opener may also stop it, but only while still accountable for something:
+  # holding the open assignment the stopping note was filed on.
+  defp terminal_action_filer_authorized?(_txn, wake, _event, parent, _assignment_id)
+       when parent == wake.session_key,
+       do: true
+
+  defp terminal_action_filer_authorized?(txn, _wake, event, parent, assignment_id) do
+    event.opened_by_kind == "session" and parent == event.opened_by_id and
+      is_binary(assignment_id) and
+      Txn.q(
+        txn,
+        "SELECT 1 FROM assignments WHERE id=?1 AND holderKey=?2 AND state='open'",
+        [assignment_id, parent]
+      ) == [[1]]
   end
 
   defp terminal_action_root_event_in_txn(

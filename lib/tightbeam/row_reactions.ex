@@ -151,7 +151,8 @@ defmodule Tightbeam.RowReactions do
             SELECT DISTINCT a.org,a.eventId FROM row_reaction_actions a
             JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
             JOIN wakes w ON w.wakeId=json_extract(a.result,'$.wake_id')
-            WHERE a.status='pending' AND w.state='pending' AND w.deliveredTurnSeq IS NULL AND w.sessionKey=?1
+            WHERE a.status='pending' AND w.state='pending' AND w.deliveredTurnSeq IS NULL
+              AND (w.sessionKey=?1 OR json_extract(e.facts,'$.terminal_sources[0].openedById')=?1)
               AND json_extract(e.facts,'$.terminal_sources[0].assignmentId')=?2
               AND json_extract(e.facts,'$.terminal_sources[0].sourceKind')=?3
               AND json_extract(e.facts,'$.terminal_sources[0].sourceToken')=?4

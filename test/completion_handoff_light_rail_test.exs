@@ -699,6 +699,109 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert turn_count(ctx.db, pending.wake_id) == before
   end
 
+  test "the child's opener stops a reminder addressed to the delivery owner; an unrelated session cannot",
+       ctx do
+    session(ctx.db, "deliv-owner", "flynn")
+    session(ctx.db, "third-session", "flynn")
+
+    item = create_work_item(ctx, "completion handoff with a delivery owner")
+
+    assert %{deliveryOwnerSessionKey: "deliv-owner"} =
+             handle(
+               ctx,
+               "work-item-update",
+               call("work-item-update", {:user, "flynn"}, nil, %{
+                 work_item_id: item.id,
+                 delivery_owner_session_key: "deliv-owner"
+               })
+             )
+
+    # The reminder rail only arms toward a recipient holding an open
+    # assignment of its own; give the delivery owner one before the child
+    # finishes.
+    handle(
+      ctx,
+      "assign",
+      assign_call({:session, "deliv-owner"}, "deliv-owner", "delivery owner's own lane", item.id)
+    )
+
+    child_assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "notice-parent"}, "holder", "child task", item.id,
+          effect_kind: "coordination"
+        )
+      )
+
+    assert %{assignment: %{state: "closed"}, attest: %{kind: "completion", id: source_token}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, child_assignment.id, "completion")
+             )
+
+    root =
+      case terminal_notices(ctx.db) do
+        [notice] -> notice
+        other -> flunk("expected one root finish notice, got #{inspect(other)}")
+      end
+
+    assert root.prompt =~ "source_token=\"#{source_token}\""
+
+    # With no open assignment of its own on this work item, the opener isn't
+    # "delegated" responsibility, so election prefers the current delivery
+    # owner over the opener for the root notice (and its reminder rail).
+    assert root.session_key == "deliv-owner"
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    [pending] = pending_reminders(ctx.db, root.wake_id)
+    assert pending.session_key == "deliv-owner"
+
+    unrelated_assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "third-session"}, "third-session", "unrelated work", item.id)
+      )
+
+    unrelated_note = action_note(child_assignment.id, root, "kept", "noted by an unrelated session")
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "third-session"}, unrelated_assignment.id, unrelated_note)
+             )
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "pending"
+
+    opener_assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "notice-parent"}, "notice-parent", "opener's own lane", item.id)
+      )
+
+    opener_note = action_note(child_assignment.id, root, "parked", "parked for its next owner")
+
+    assert %{attest: %{id: attest_id, kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, opener_assignment.id, opener_note)
+             )
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
+
+    assert {:ok, [["superseded", "progress_attest", ^attest_id, "no_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [pending.wake_id]
+             )
+  end
+
   test "an exact retired receipt stops the reminder without asserting physical retirement", ctx do
     {parent, child, root} = completed_child(ctx)
     assert :ok = Wakes.fire_due(ctx.scheduler)
