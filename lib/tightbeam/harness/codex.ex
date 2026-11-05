@@ -120,17 +120,18 @@ defmodule Tightbeam.Harness.Codex do
     )
 
     probe = [probe_cwd: probe_cwd]
+    config_json = personal_skill_config!(target, opts)
 
     launch =
       if Support.local?(target) do
-        config = [{"CODEX_CONFIG", ~s({"bypass_hook_trust":true})}]
+        config = [{"CODEX_CONFIG", config_json}]
 
         [
           cmd: [binary],
           env: [{"CODEX_HOME", home} | Keyword.fetch!(opts, :common_env) ++ config]
         ]
       else
-        config = ["CODEX_CONFIG='#{~s({"bypass_hook_trust":true})}'"]
+        config = ["CODEX_CONFIG=#{Support.shell_quote(config_json)}"]
 
         remote_env =
           ["CODEX_HOME=#{home}" | Keyword.fetch!(opts, :remote_env)] ++ config
@@ -144,6 +145,80 @@ defmodule Tightbeam.Harness.Codex do
       end
 
     Keyword.merge(launch, probe)
+  end
+
+  # Regenerate exact document selectors on the launch host. CODEX_HOME still
+  # owns global instructions and served skills; HOME/.agents/skills is a
+  # separate Codex discovery route. Do not disable skills by name: workspace
+  # copies with the same name must remain available.
+  # This is a launch-time inventory, not a root exclusion. Skills installed
+  # after launch can still be discovered until the next launch.
+  defp personal_skill_config!(target, opts) do
+    script = ~S"""
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const home = require("node:os").homedir();
+    const roots = [".agents", ".codex"].map(dir => path.join(home, dir, "skills"));
+    // Retain these personal copies until their migration is explicitly approved.
+    // Canonical paths also preserve aliases reached through either personal root.
+    const retained = new Set();
+    for (const root of roots) {
+      for (const name of ["lavish", "typesafe-ai"]) {
+        try {
+          retained.add(fs.realpathSync(path.join(root, name, "SKILL.md")));
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      }
+    }
+    const visited = new Set();
+    const skills = new Set();
+    function visit(entry) {
+      let stat;
+      try {
+        stat = fs.statSync(entry);
+      } catch (error) {
+        if (error.code === "ENOENT") return;
+        throw error;
+      }
+      if (stat.isDirectory()) {
+        const canonical = fs.realpathSync(entry);
+        if (visited.has(canonical)) return;
+        visited.add(canonical);
+        for (const name of fs.readdirSync(entry).sort()) {
+          if (!name.startsWith(".")) visit(path.join(entry, name));
+        }
+      } else if (stat.isFile() && path.basename(entry) === "SKILL.md") {
+        const canonical = fs.realpathSync(entry);
+        if (!retained.has(canonical)) skills.add(canonical);
+      }
+    }
+    for (const root of roots) visit(root);
+    process.stdout.write(JSON.stringify({
+      bypass_hook_trust: true,
+      skills: {config: [...skills].sort().map(path => ({path, enabled: false}))}
+    }));
+    """
+
+    command =
+      if Support.local?(target) do
+        env =
+          Enum.map(Keyword.fetch!(opts, :common_env), fn {key, value} -> "#{key}=#{value}" end)
+
+        ["env" | env] ++ ["node", "-e", script]
+      else
+        ["ssh" | Support.ssh_opts()] ++
+          [target.host_config.ssh, "env" | Keyword.fetch!(opts, :remote_env)] ++
+          ["node", "-e", Support.shell_quote(script)]
+      end
+
+    # SSH and Node may emit warnings on stderr even when stdout is valid JSON.
+    sh_out = Keyword.get(opts, :sh_out) || (&Support.system_cmd_out/1)
+
+    case sh_out.(command) do
+      {json, 0} -> JSON.decode!(json) |> JSON.encode!()
+      {_output, exit} -> raise "Codex personal skill inventory failed with exit #{exit}"
+    end
   end
 
   @impl true

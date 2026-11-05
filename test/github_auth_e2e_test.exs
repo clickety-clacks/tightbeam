@@ -412,6 +412,11 @@ defmodule Tightbeam.GithubAuthE2ETest do
       cwd: ctx.root,
       cli_bin: Path.join(ctx.local, "bin"),
       default_model: Model.new("fable"),
+      sh_out: fn command ->
+        if "node" in command and "-e" in command,
+          do: {~s({"bypass_hook_trust":true,"skills":{"config":[]}}), 0},
+          else: {"", 0}
+      end,
       sh: fn command ->
         if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
              Enum.any?(command, &String.contains?(&1, "cat")),

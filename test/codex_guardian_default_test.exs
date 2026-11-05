@@ -69,7 +69,10 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
           common_env: [],
           remote_env: [],
           lineage: "fixture",
-          sh_out: nil,
+          sh_out: fn command ->
+            assert "node" in command and "-e" in command
+            {~s({"bypass_hook_trust":true,"skills":{"config":[]}}), 0}
+          end,
           ensure_workdir: fn _host, _cwd, _owner, _opts -> :ok end
         )
 
