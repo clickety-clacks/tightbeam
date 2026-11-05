@@ -223,9 +223,10 @@ defmodule Tightbeam.Gateway do
     defaults = defaults(config, db)
     # Bubble recognition stays outside the lane transaction; it can enqueue
     # turns and therefore must not run synchronously inside LaneManager.
-    on_terminal = fn _session_key, seq ->
+    on_terminal = fn session_key, seq ->
       Tightbeam.HarnessHealth.reconcile_delivered_turn(db, seq)
       Tightbeam.Productions.BubbleSweeper.recognize(seq)
+      Tightbeam.HarklightWakes.origin_turn_ended(session_key)
     end
 
     handler_table =
