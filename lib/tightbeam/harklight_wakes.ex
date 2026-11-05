@@ -12,6 +12,10 @@ defmodule Tightbeam.HarklightWakes do
 
   @attach_retry_delays [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
   @attach_retry_window_ms 180_000
+  # Released Server serializes every origin attach through one Relay process.
+  # Restore starts all listeners at once, so cap concurrent attach attempts to
+  # keep that queue inside the Relay call timeout (WI2979 fifth fleet run).
+  @attach_concurrency 4
 
   @max_diagnostic_lines 3
   @max_diagnostic_line_chars 240
@@ -434,7 +438,10 @@ defmodule Tightbeam.HarklightWakes do
        ports: %{},
        refs: %{},
        restart: MapSet.new(),
-       stopping: MapSet.new()
+       stopping: MapSet.new(),
+       attach_limit: Keyword.get(opts, :attach_concurrency, @attach_concurrency),
+       attach_slots: MapSet.new(),
+       attach_waiting: :queue.new()
      }}
   end
 
@@ -454,7 +461,9 @@ defmodule Tightbeam.HarklightWakes do
     {:noreply, Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle) end)}
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
+    state = release_attach_slot(state, pid)
+
     case Map.pop(state.refs, ref) do
       {nil, _} ->
         {:noreply, state}
@@ -527,6 +536,18 @@ defmodule Tightbeam.HarklightWakes do
     {:noreply, state}
   end
 
+  def handle_cast({:attach_slot, pid, ref}, state) do
+    if MapSet.size(state.attach_slots) < state.attach_limit do
+      send(pid, {:attach_slot, ref})
+      {:noreply, %{state | attach_slots: MapSet.put(state.attach_slots, pid)}}
+    else
+      {:noreply, %{state | attach_waiting: :queue.in({pid, ref}, state.attach_waiting)}}
+    end
+  end
+
+  def handle_cast({:attach_slot_released, pid}, state),
+    do: {:noreply, release_attach_slot(state, pid)}
+
   @impl true
   def handle_cast({:activate, handle, true}, state) do
     {:noreply, force_worker(state, handle)}
@@ -570,6 +591,32 @@ defmodule Tightbeam.HarklightWakes do
         }
 
       :error ->
+        state
+    end
+  end
+
+  # A worker that exits while holding or awaiting a slot is released by DOWN.
+  defp release_attach_slot(state, pid) do
+    waiting = :queue.filter(fn {waiter, _ref} -> waiter != pid end, state.attach_waiting)
+
+    if MapSet.member?(state.attach_slots, pid) do
+      grant_attach_slot(%{
+        state
+        | attach_slots: MapSet.delete(state.attach_slots, pid),
+          attach_waiting: waiting
+      })
+    else
+      %{state | attach_waiting: waiting}
+    end
+  end
+
+  defp grant_attach_slot(state) do
+    case :queue.out(state.attach_waiting) do
+      {{:value, {pid, ref}}, waiting} ->
+        send(pid, {:attach_slot, ref})
+        %{state | attach_slots: MapSet.put(state.attach_slots, pid), attach_waiting: waiting}
+
+      {:empty, _} ->
         state
     end
   end
@@ -861,7 +908,15 @@ defmodule Tightbeam.HarklightWakes do
 
         deadline = System.monotonic_time(:millisecond) + window
 
-        case attach_with_transport_recovery(executable, args, delays, deadline, manager, handle) do
+        case attach_with_transport_recovery(
+               executable,
+               args,
+               delays,
+               deadline,
+               manager,
+               handle,
+               nil
+             ) do
           :ok ->
             case GenServer.call(manager, {:attached, handle}, :infinity) do
               :ok -> follow(manager, executable, handle)
@@ -882,9 +937,9 @@ defmodule Tightbeam.HarklightWakes do
   # Keep the original same-operation recovery inside each attempt. Only an
   # observed transport failure can schedule another attempt; a handle refusal
   # or an unclassified unknown result retains the existing disposition.
-  defp attach_with_transport_recovery(executable, args, delays, deadline, manager, handle) do
-    case attach(executable, args) do
-      {:transport, reason, diagnostic} ->
+  defp attach_with_transport_recovery(executable, args, delays, deadline, manager, handle, last) do
+    case paced_attach(executable, args, deadline, manager, last) do
+      {:transport, reason, diagnostic} = failure ->
         case delays do
           [delay | rest] ->
             if System.monotonic_time(:millisecond) + delay <= deadline do
@@ -901,7 +956,8 @@ defmodule Tightbeam.HarklightWakes do
                       rest,
                       deadline,
                       manager,
-                      handle
+                      handle,
+                      failure
                     )
                   else
                     {:error, reason, diagnostic}
@@ -917,6 +973,26 @@ defmodule Tightbeam.HarklightWakes do
 
       result ->
         result
+    end
+  end
+
+  # Waiting for a slot spends the same retry window; a retry granted after the
+  # deadline reports the previous transport failure instead of attaching.
+  defp paced_attach(executable, args, deadline, manager, last) do
+    ref = make_ref()
+    GenServer.cast(manager, {:attach_slot, self(), ref})
+
+    receive do
+      {:attach_slot, ^ref} -> :ok
+      {:EXIT, ^manager, exit_reason} -> exit(exit_reason)
+    end
+
+    try do
+      if last && System.monotonic_time(:millisecond) > deadline,
+        do: last,
+        else: attach(executable, args)
+    after
+      GenServer.cast(manager, {:attach_slot_released, self()})
     end
   end
 
