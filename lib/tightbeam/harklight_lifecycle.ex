@@ -964,7 +964,7 @@ defmodule Tightbeam.HarklightLifecycle do
 
   # A failed prompt turn may hand the same text to a retry wake for the same
   # recipient. Follow that lineage to its latest attempt and credit the entry
-  # only when that attempt's own turn delivered it.
+  # only when that attempt's turn, or its health redelivery, delivered it.
   defp delivered_to_recipient?(txn, session_key, wake_id, seen \\ MapSet.new()) do
     if MapSet.member?(seen, wake_id) do
       false
@@ -986,12 +986,33 @@ defmodule Tightbeam.HarklightLifecycle do
           Enum.any?(wake, fn [wake_session, state] ->
             wake_session == session_key and state != "canceled"
           end) and
-            Enum.any?(NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id), fn [_, status, _] ->
-              status == "delivered"
+            Enum.any?(NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id), fn
+              [_, "delivered", _] ->
+                true
+
+              [seq, status, _] when status in ["failed", "failed_unknown"] ->
+                health_redelivered?(txn, session_key, seq)
+
+              _ ->
+                false
             end) and
             not NoticeBatcher.pending?(txn, wake_id)
       end
     end
+  end
+
+  # Other failure classes redeliver the same message on a new turn that carries
+  # no wakeId. Credit the failed turn once that redelivery turn delivered.
+  defp health_redelivered?(txn, session_key, source_turn_seq) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM health_redelivery_attempts a
+      JOIN turns t ON t.seq=a.redeliveryTurnSeq
+      WHERE a.sessionKey=?1 AND a.sourceTurnSeq=?2 AND t.status='delivered'
+      """,
+      [session_key, source_turn_seq]
+    ) != []
   end
 
   def complete_in_txn(txn, handle) do

@@ -4238,6 +4238,76 @@ defmodule Tightbeam.HarklightWakesTest do
     assert :completed = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
   end
 
+  test "completion follows a failed delivery to its health redelivery", %{
+    db: db,
+    session: session
+  } do
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+
+    status = %{
+      "session_handle" => @handle,
+      "open_requests" => 0,
+      "pending_undelivered" => 0,
+      "pending_delivered_unacted" => 0
+    }
+
+    runner = fn
+      ["read", "--session", @handle] -> {"", 0}
+      ["status", "--session", @handle] -> {JSON.encode!(status), 0}
+    end
+
+    assert {:ok, [[wake_id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM harklight_wake_deliveries WHERE handle=?1 AND eventId='1' AND sessionKey=?2",
+               [@handle, session.session_key]
+             )
+
+    failed_seq = completion_turn(db, session.session_key, wake_id, "failed", "unauthorized")
+    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    assert {:ok, :ok} =
+             DB.transaction(
+               db,
+               &Wakes.record_health_redelivery_source_in_txn(&1, failed_seq, "auth-dead")
+             )
+
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO turns(sessionKey,messageId,origin,prompt,status,createdAt,endedAt) VALUES(?1,?2,'process:test','restoration',?3,?4,?4)",
+               [session.session_key, Tightbeam.Id.uuid4(), "delivered", now]
+             )
+
+    assert {:ok, [[restoration_seq]]} = DB.query(db, "SELECT MAX(seq) FROM turns")
+
+    assert {:ok, 1} =
+             DB.transaction(
+               db,
+               &Wakes.redeliver_pending_health_intents_in_txn(&1, session, %{seq: restoration_seq})
+             )
+
+    assert {:ok, [[redelivery_seq, nil, "queued"]]} =
+             DB.query(
+               db,
+               "SELECT t.seq,t.wakeId,t.status FROM health_redelivery_attempts a JOIN turns t ON t.seq=a.redeliveryTurnSeq WHERE a.sourceTurnSeq=?1",
+               [failed_seq]
+             )
+
+    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE turns SET status='delivered',endedAt=?2 WHERE seq=?1", [
+               redelivery_seq,
+               now
+             ])
+
+    assert :completed = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+  end
+
   defp completion_turn(db, session_key, wake_id, status, error) do
     now = System.system_time(:millisecond)
 
