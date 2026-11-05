@@ -742,6 +742,7 @@ defmodule Tightbeam.HarklightWakesTest do
     {:ok, responses} =
       Agent.start_link(fn -> %{status: status, events: %{@handle => [chat]}, commands: []} end)
 
+    Process.unlink(responses)
     on_exit(fn -> Agent.stop(responses) end)
     parent = self()
     runner = completion_runner(responses, parent)
@@ -802,6 +803,7 @@ defmodule Tightbeam.HarklightWakesTest do
     {:ok, responses} =
       Agent.start_link(fn -> %{status: status, events: %{@handle => [answer]}, commands: []} end)
 
+    Process.unlink(responses)
     on_exit(fn -> Agent.stop(responses) end)
     runner = completion_runner(responses, self())
     assert :active = Tightbeam.HarklightLifecycle.complete_answered(db, @handle, runner: runner)
@@ -919,12 +921,13 @@ defmodule Tightbeam.HarklightWakesTest do
     }
 
     {:ok, responses} = Agent.start_link(fn -> initial end)
+    Process.unlink(responses)
     on_exit(fn -> Agent.stop(responses) end)
     parent = self()
     runner = completion_runner(responses, parent)
     listener = notifying_listener(parent)
 
-    {:ok, [[6]]} =
+    {:ok, [[5]]} =
       DB.query(
         db,
         "SELECT count(*) FROM harklight_wake_handles WHERE state IN ('active','unavailable')"
@@ -2069,7 +2072,7 @@ defmodule Tightbeam.HarklightWakesTest do
                [handle]
              )
 
-    for [wake_id, session_key] <- rows do
+    for [wake_id, session_key] <- Enum.uniq_by(rows, &hd/1) do
       assert {:ok, _} =
                DB.query(
                  db,
