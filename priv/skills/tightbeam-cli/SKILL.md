@@ -33,7 +33,8 @@ tightbeam harklight-send --session new --sender-id "$HARKLIGHT_SENDER_ID" \
 
 An FYI offers only the Seen acknowledgment. Opening it does not mark it Seen; the
 person must choose Seen, and the acknowledgment returns to the originating session.
-Do not use a legacy helper or a direct Agent send for this Tightbeam route.
+The legacy `--informational` flag is an alias for `--type fyi`. Do not use a
+legacy helper or a direct Agent send for this Tightbeam route.
 
 ## Start from the assignment
 
