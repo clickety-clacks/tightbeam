@@ -1006,28 +1006,86 @@ defmodule Tightbeam.Wakes do
   end
 
   # Match the deterministic identity against durable source rows, never prompt
-  # text. An earlier revocation keeps its identity after revoke/reopen/revoke.
-  # Attest delivery retains its existing current-close validation.
+  # text. A notice can outlive a reopen, so its close must come from the saved
+  # reopening row rather than borrowing the assignment's newer close.
   defp terminal_event_for_wake_in_txn(txn, wake) do
     case terminal_attest_event_in_txn(txn, wake.assignment_id) do
       {:ok, event} ->
-        case terminal_notification(event) do
-          {:ok, %{wake_id: id}} when id == wake.wake_id ->
-            {:ok, event}
-
-          _ ->
-            case terminal_revocation_for_wake_in_txn(txn, wake) do
-              {:ok, _} = revocation -> revocation
-              {:error, _} -> {:ok, event}
-            end
-        end
+        if terminal_event_matches_wake?(event, wake.wake_id),
+          do: {:ok, event},
+          else: prior_terminal_event_for_wake_in_txn(txn, wake)
 
       {:error, _} = refusal ->
-        case terminal_revocation_for_wake_in_txn(txn, wake) do
-          {:ok, _} = revocation -> revocation
-          {:error, _} -> refusal
+        prior_terminal_event_for_wake_in_txn(txn, wake, refusal)
+    end
+  end
+
+  defp terminal_event_matches_wake?(event, wake_id) do
+    case terminal_notification(event) do
+      {:ok, %{wake_id: ^wake_id}} -> true
+      _ -> false
+    end
+  end
+
+  defp prior_terminal_event_for_wake_in_txn(txn, wake, refusal \\ nil) do
+    case terminal_revocation_for_wake_in_txn(txn, wake) do
+      {:ok, _} = revocation ->
+        revocation
+
+      {:error, _} ->
+        txn
+        |> terminal_prior_attest_events_in_txn(wake.assignment_id)
+        |> Enum.find(&terminal_event_matches_wake?(&1, wake.wake_id))
+        |> case do
+          nil -> if(refusal, do: refusal, else: terminal_event_result(nil))
+          event -> {:ok, event}
         end
     end
+  end
+
+  defp terminal_prior_attest_events_in_txn(txn, assignment_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT a.id,a.workItemId,a.holderKey,owner.userId,a.openedByUser,a.openedBySession,
+             reopening.priorOutcome,reopening.priorClosedAt,reopening.priorClosingAttestId
+      FROM assignment_reopenings reopening
+      JOIN assignments a ON a.id=reopening.assignmentId
+      JOIN sessions h ON h.sessionKey=a.holderKey
+      JOIN attests t ON t.id=reopening.priorClosingAttestId AND t.assignmentId=a.id
+      LEFT JOIN work_items w ON w.id=a.workItemId
+      LEFT JOIN sessions parent ON parent.sessionKey=a.openedBySession
+      LEFT JOIN users owner ON owner.userId=CASE
+        WHEN a.openedBySession IS NOT NULL THEN parent.ownerUserId
+        ELSE COALESCE(a.openedByUser, w.ownerUserId) END
+      WHERE a.id=?1 AND reopening.priorClosedBySession=a.holderKey
+        AND reopening.priorClosedByUser IS NULL AND reopening.priorClosedByProcess IS NULL
+        AND t.bySession=a.holderKey AND t.byUser IS NULL
+        AND t.ts=reopening.priorClosedAt
+        AND ((reopening.priorOutcome='completed' AND t.kind='completion')
+          OR (reopening.priorOutcome='surrendered' AND t.kind='surrender'))
+        AND (a.workItemId IS NULL OR w.ownerUserId=owner.userId)
+      ORDER BY reopening.id DESC
+      """,
+      [assignment_id]
+    )
+    |> Enum.map(fn [id, work_item, child, owner, opened_user, opened_session, outcome, closed_at,
+                    token] ->
+      {opener_kind, opener_id} = terminal_opener_in_txn(txn, id, opened_user, opened_session)
+
+      %{
+        source_kind: "attest",
+        source_token: token,
+        assignment_id: id,
+        work_item_id: work_item,
+        child_session_key: child,
+        owner_user_id: terminal_owner_in_txn(txn, id, owner),
+        opened_by_kind: opener_kind,
+        opened_by_id: opener_id,
+        outcome: outcome,
+        terminal_at: closed_at
+      }
+    end)
   end
 
   defp terminal_revocation_for_wake_in_txn(txn, wake) do
