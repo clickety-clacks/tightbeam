@@ -524,6 +524,12 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert turn_count(ctx.db, pending.wake_id) == 0
     assert pending_reminders(ctx.db, root.wake_id) == []
 
+    parent_root = Enum.find(terminal_notices(ctx.db), &(&1.assignment_id == parent.id))
+    assert_delivered_carrier(ctx.db, parent_root.wake_id)
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "other-parent", "unrelated-notice-test")
+    assert turn.seq == Wakes.get(ctx.db, parent_root.wake_id).delivered_turn_seq
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     # The suppression is local to this root; another terminal still reaches its opener.
     assert %{assignment: %{state: "closed"}} =
              handle(
