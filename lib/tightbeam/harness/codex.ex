@@ -105,12 +105,13 @@ defmodule Tightbeam.Harness.Codex do
   def binary_cli_env_name, do: "CODEX_PATH"
 
   @doc false
+  def binary_cli_bundle_script,
+    do:
+      "function bundle(){const r=createRequire(path.join(root,'package.json'));const entry=r.resolve('@agentclientprotocol/codex-acp');return createRequire(entry).resolve('@openai/codex/bin/codex.js');}"
+
+  @doc false
   def binary_cli_probe_script do
-    "const fs=require('node:fs'),path=require('node:path'),{createRequire}=require('node:module'),{spawnSync}=require('node:child_process');" <>
-      "const [root,mode,pin]=process.argv.slice(1);" <>
-      "function resolve(name){if(name.includes(path.sep)||path.isAbsolute(name))return path.resolve(name);for(const dir of (process.env.PATH||'').split(path.delimiter)){const file=path.join(dir,name);try{fs.accessSync(file,fs.constants.X_OK);return file}catch{}}return null;}" <>
-      "function bundle(){const r=createRequire(path.join(root,'package.json'));const entry=r.resolve('@agentclientprotocol/codex-acp');return createRequire(entry).resolve('@openai/codex/bin/codex.js');}" <>
-      "try{const remotePin=mode==='remote'?(process.env.TIGHTBEAM_DIAGNOSTIC_PIN||''):'';const selectedPin=mode==='pinned'?pin:remotePin;const source=selectedPin?'pinned_override':'bundled_fallback';const bin=selectedPin?resolve(selectedPin):bundle();if(!bin){process.stdout.write(JSON.stringify({status:'missing',source,reason:'selected CLI was not found'}));process.exit(0)}const js=bin.endsWith('.js'),runner=js?process.execPath:bin,args=js?[bin,'--version']:['--version'];const out=spawnSync(runner,args,{encoding:'utf8',timeout:1200,env:{PATH:process.env.PATH||''}});if(out.error||out.status!==0){process.stdout.write(JSON.stringify({status:'unprobeable',source,reason:String(out.error||out.stderr||'version command failed')}));process.exit(0)}process.stdout.write(JSON.stringify({status:'observed',source,path:bin,version:(out.stdout||out.stderr||'').trim()}));}catch(e){const source=mode==='pinned'||(mode==='remote'&&(process.env.TIGHTBEAM_DIAGNOSTIC_PIN||''))?'pinned_override':'bundled_fallback';process.stdout.write(JSON.stringify({status:'missing',source,reason:String(e.message||e)}));}"
+    Tightbeam.Harness.BinarySelection.script(__MODULE__)
   end
 
   @impl true
@@ -126,7 +127,6 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def prepare_launch(target, home, opts) do
-    binary = adapter_binary(target)
     # Two different questions. `rails?` — is a PreToolUse map projected at all —
     # decides the trust seed, and is now always true because the substrate's own
     # observation entry rides in that map; seeding an env var costs nothing and
@@ -135,7 +135,6 @@ defmodule Tightbeam.Harness.Codex do
     # worth refusing to boot over; an observation that silently degrades to a
     # weaker evidence class is not, and gating the probe on the map would have
     # turned a hook-trust regression into a dead adapter for orgs with no law.
-    rails? = Keyword.fetch!(opts, :rails) != nil
     statutes? = Keyword.fetch!(opts, :statutes)
 
     probe =
@@ -172,35 +171,42 @@ defmodule Tightbeam.Harness.Codex do
         []
       end
 
-    launch =
-      if Support.local?(target) do
-        config =
-          if rails?,
-            do: [{"CODEX_CONFIG", ~s({"bypass_hook_trust":true})}],
-            else: []
+    launch_plan(target, home, opts)
+    |> Keyword.merge(probe)
+    |> Tightbeam.Harness.BinarySelection.wrap_launch(__MODULE__, target)
+  end
 
-        [
-          cmd: [binary],
-          env: [{"CODEX_HOME", home} | Keyword.fetch!(opts, :common_env) ++ config]
-        ]
-      else
-        config =
-          if rails?,
-            do: ["CODEX_CONFIG='#{~s({"bypass_hook_trust":true})}'"],
-            else: []
+  @doc false
+  def launch_plan(target, home, opts) do
+    binary = adapter_binary(target)
+    rails? = Keyword.fetch!(opts, :rails) != nil
 
-        remote_env =
-          ["CODEX_HOME=#{home}" | Keyword.fetch!(opts, :remote_env)] ++ config
+    if Support.local?(target) do
+      config =
+        if rails?,
+          do: [{"CODEX_CONFIG", ~s({"bypass_hook_trust":true})}],
+          else: []
 
-        [
-          cmd:
-            ["ssh" | Support.ssh_opts()] ++
-              [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
-          env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
-        ]
-      end
+      [
+        cmd: [binary],
+        env: [{"CODEX_HOME", home} | Keyword.fetch!(opts, :common_env) ++ config]
+      ]
+    else
+      config =
+        if rails?,
+          do: ["CODEX_CONFIG='#{~s({"bypass_hook_trust":true})}'"],
+          else: []
 
-    Keyword.merge(launch, probe)
+      remote_env =
+        ["CODEX_HOME=#{home}" | Keyword.fetch!(opts, :remote_env)] ++ config
+
+      [
+        cmd:
+          ["ssh" | Support.ssh_opts()] ++
+            [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
+        env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
+      ]
+    end
   end
 
   @impl true

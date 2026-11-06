@@ -34,6 +34,17 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
           sh: Keyword.get(opts, :run, &Support.system_cmd_out/1)
         }
 
+        target =
+          if supported_module?(module) do
+            Map.put(
+              target,
+              :launch_plan,
+              fn -> Placement.binary_diagnostic_plan(config, host, module, target) end
+            )
+          else
+            target
+          end
+
         {host, module, target, configured_override(db, host, host_config, module)}
       end
 
@@ -116,6 +127,9 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
         end
 
       case outcome do
+        {:selection, result} ->
+          result
+
         {:ok, path, version, observed_source} ->
           selection(observed_source || source, path, version)
 
@@ -212,8 +226,8 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
   def selection_request({:known, override}) do
     pin = nonempty(override)
 
-    {if(pin, do: "pinned", else: "bundled"), pin,
-     if(pin, do: "pinned_override", else: "bundled_fallback"), nil}
+    {if(pin, do: "pinned", else: "automatic"), pin,
+     if(pin, do: "pinned_override", else: "unknown"), nil}
   end
 
   def selection_request(override) do
@@ -238,7 +252,12 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
     |> Enum.flat_map(fn {harness, harness_rows} ->
       host_versions =
         Enum.flat_map(harness_rows, fn row ->
-          versions = field_versions(row, field) |> Enum.uniq() |> Enum.sort()
+          versions =
+            field_versions(row, field)
+            |> Enum.filter(&(is_binary(&1) and &1 != ""))
+            |> Enum.uniq()
+            |> Enum.sort()
+
           if versions == [], do: [], else: [{row["host"], versions}]
         end)
         |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
@@ -376,8 +395,25 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
       pin || ""
     ]
 
-    command = probe_command(target, args, remote_env_name)
-    runner = Keyword.get(opts, :run, target.sh)
+    {command, default_runner} =
+      case Map.get(target, :launch_plan) do
+        nil ->
+          {probe_command(target, args, remote_env_name), target.sh}
+
+        build_plan ->
+          # Resolve each host's launch inputs inside its bounded observation.
+          # Missing configuration must not erase the other hosts' evidence.
+          plan = build_plan.()
+          # Read the effective pin inside the same environment as adapter exec.
+          args = List.replace_at(args, 4, "prospective")
+          plan = Tightbeam.Harness.BinarySelection.probe_plan(plan, args, target)
+          env = Keyword.fetch!(plan, :env)
+
+          {Keyword.fetch!(plan, :cmd),
+           fn [command | argv] -> System.cmd(command, argv, env: env) end}
+      end
+
+    runner = Keyword.get(opts, :run, default_runner)
     timeout = Keyword.get(opts, :probe_timeout_ms, @probe_timeout_ms)
     timeout_reason = "timed out after #{timeout}ms"
 
@@ -405,7 +441,7 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
 
   @doc false
   def probe_command(%{host_config: %{ssh: nil}, adapter_path: path}, args, _remote_env_name) do
-    ["/usr/bin/env", "-i", "PATH=#{path}" | args]
+    ["/usr/bin/env", "PATH=#{path}" | args]
   end
 
   def probe_command(
@@ -444,7 +480,7 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
         path_assignment <>
         "; export PATH; " <>
         remote_pin_assignment <>
-        "exec /usr/bin/env -i PATH=\"$PATH\"" <>
+        "exec /usr/bin/env PATH=\"$PATH\"" <>
         remote_pin_env <>
         " " <>
         Enum.map_join(args, " ", &Support.shell_quote/1)
@@ -454,15 +490,10 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
 
   defp decode_probe(output) do
     case JSON.decode(String.trim(output)) do
-      {:ok,
-       %{
-         "status" => "observed",
-         "path" => path,
-         "version" => version,
-         "source" => source
-       }}
-      when is_binary(path) and path != "" and is_binary(version) and version != "" ->
-        {:ok, path, version, source}
+      {:ok, %{"status" => "observed", "path" => path, "source" => source} = result}
+      when is_binary(path) and path != "" and
+             source in ["system", "pinned_override", "bundled_fallback"] ->
+        {:selection, result}
 
       {:ok, %{"status" => status, "reason" => reason} = result}
       when status in ["missing", "unprobeable"] ->
@@ -561,10 +592,13 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
     }
   end
 
-  defp selection_warnings(%{"source" => "bundled_fallback", "status" => "observed"}, label) do
-    [
-      "#{label} observed the bundled CLI; no automatic host-first resolver is configured"
-    ]
+  defp selection_warnings(
+         %{"source" => "bundled_fallback", "status" => "observed"} = selection,
+         label
+       ) do
+    reason = selection["fallback_reason"]
+    detail = if is_binary(reason), do: "; " <> reason, else: ""
+    ["#{label} selected the bundled CLI" <> detail]
   end
 
   defp selection_warnings(_selection, _label), do: []
@@ -609,7 +643,10 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
   end
 
   defp render_selection(%{"status" => "observed"} = selection) do
-    "#{selection["source"]} #{selection["path"]} version #{selection["version"]}"
+    detail = if selection["reason"], do: " (#{selection["reason"]})", else: ""
+
+    "#{selection["source"]} #{selection["path"]} version #{selection["version"] || "unknown"}" <>
+      detail
   end
 
   defp render_selection(%{"status" => status, "source" => source, "reason" => reason}),

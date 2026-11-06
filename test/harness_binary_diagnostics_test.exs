@@ -64,8 +64,8 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
     musl_package = Path.join(node_modules, "@anthropic-ai/claude-agent-sdk-linux-x64-musl")
 
     for {package, version} <- [
-          {glibc_package, "claude glibc fixture"},
-          {musl_package, "claude musl fixture"}
+          {glibc_package, "claude 1.2.3 glibc fixture"},
+          {musl_package, "claude 1.2.3 musl fixture"}
         ] do
       cli = Path.join(package, "claude")
       File.mkdir_p!(package)
@@ -78,8 +78,8 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
     script = Tightbeam.Harness.Claude.binary_cli_probe_script()
 
     for {libc, package, version} <- [
-          {:glibc, glibc_package, "claude glibc fixture"},
-          {:musl, musl_package, "claude musl fixture"}
+          {:glibc, glibc_package, "claude 1.2.3 glibc fixture"},
+          {:musl, musl_package, "claude 1.2.3 musl fixture"}
         ] do
       report =
         if libc == :glibc,
@@ -94,7 +94,7 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
           "vm.runInNewContext(#{JSON.encode!(script)},{process:processProxy,require});"
 
       {output, status} =
-        System.cmd(node, ["-e", wrapper, adapters, "bundled", ""], stderr_to_stdout: true)
+        System.cmd(node, ["-e", wrapper, adapters, "automatic", ""], stderr_to_stdout: true)
 
       assert status == 0, output
 
@@ -138,8 +138,9 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
     File.mkdir_p!(Path.dirname(bundled))
     File.write!(Path.join(adapters, "package.json"), "{}")
     File.write!(entry, "module.exports = {};")
-    File.write!(bundled, "console.log('bundled-version');")
-    File.write!(inherited_pin, "console.log('remote-pin-version');")
+    File.write!(bundled, "console.log('codex 9.0.0');")
+    File.write!(inherited_pin, "#!/usr/bin/env node\nconsole.log('codex 2.0.0');")
+    File.chmod!(inherited_pin, 0o755)
 
     node = System.find_executable("node") || flunk("Node is required for the adapter probe test")
     script = Tightbeam.Harness.Codex.binary_cli_probe_script()
@@ -167,7 +168,7 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
              "status" => "observed",
              "source" => "pinned_override",
              "path" => ^inherited_pin,
-             "version" => "remote-pin-version"
+             "version" => "codex 2.0.0"
            } = JSON.decode!(pinned_output)
 
     {bundled_output, 0} =
@@ -180,27 +181,27 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
              "status" => "observed",
              "source" => "bundled_fallback",
              "path" => ^canonical_bundled,
-             "version" => "bundled-version"
+             "version" => "codex 9.0.0"
            } = JSON.decode!(bundled_output)
 
     system_bin_dir = Path.join(root, "system-bin")
     system_bin = Path.join(system_bin_dir, "codex")
     File.mkdir_p!(system_bin_dir)
-    File.write!(system_bin, "#!/bin/sh\necho path-system-version\n")
+    File.write!(system_bin, "#!/bin/sh\necho codex 1.0.0\n")
     File.chmod!(system_bin, 0o755)
     path_with_system_copy = system_bin_dir <> ":" <> System.get_env("PATH", "")
 
     {path_mismatch_output, 0} =
-      System.cmd(node, ["-e", script, adapters, "bundled", ""],
+      System.cmd(node, ["-e", script, adapters, "automatic", ""],
         env: [{"PATH", path_with_system_copy}],
         stderr_to_stdout: true
       )
 
     assert %{
              "status" => "observed",
-             "source" => "bundled_fallback",
-             "path" => ^canonical_bundled,
-             "version" => "bundled-version"
+             "source" => "system",
+             "path" => ^system_bin,
+             "version" => "codex 1.0.0"
            } = JSON.decode!(path_mismatch_output)
 
     remote_target =
@@ -237,7 +238,7 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
              "status" => "observed",
              "source" => "pinned_override",
              "path" => ^inherited_pin,
-             "version" => "remote-pin-version"
+             "version" => "codex 2.0.0"
            } = JSON.decode!(remote_pinned_output)
 
     {remote_bundled_output, 0} =
@@ -248,9 +249,9 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
 
     assert %{
              "status" => "observed",
-             "source" => "bundled_fallback",
-             "path" => ^canonical_bundled,
-             "version" => "bundled-version"
+             "source" => "system",
+             "path" => ^system_bin,
+             "version" => "codex 1.0.0"
            } = JSON.decode!(remote_bundled_output)
 
     capture_fun = BinaryDiagnostics.launch_capture(Tightbeam.Harness.Codex, remote_target, [])
@@ -275,9 +276,11 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
 
   test "unconfigured current adapters report bundled fallback with a warning" do
     probe = fn _module, _target, mode, pin ->
-      assert mode == "bundled"
+      assert mode == "automatic"
       assert is_nil(pin)
-      {:ok, "/srv/tightbeam/adapters/node_modules/vendor/claude", "Claude 2.4"}
+
+      {:ok, "/srv/tightbeam/adapters/node_modules/vendor/claude", "Claude 2.4",
+       "bundled_fallback"}
     end
 
     selection = BinaryDiagnostics.observe(Tightbeam.Harness.Claude, @target, nil, probe: probe)
@@ -285,7 +288,8 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
     assert selection["source"] == "bundled_fallback"
     assert selection["path"] == "/srv/tightbeam/adapters/node_modules/vendor/claude"
     assert [warning] = BinaryDiagnostics.warnings_for(selection)
-    assert warning =~ "no automatic host-first resolver"
+    assert warning =~ "selected the bundled CLI"
+    refute warning =~ "no automatic host-first resolver"
   end
 
   test "same-harness version differences warn and equality stays quiet" do
@@ -413,7 +417,7 @@ defmodule Tightbeam.Harness.BinaryDiagnosticsTest do
         )
 
       assert selection["status"] == expected_status
-      assert selection["source"] == "bundled_fallback"
+      assert selection["source"] == "unknown"
 
       assert selection["reason"] =~
                "version probe did not finish within 10ms; target reachability is not established"

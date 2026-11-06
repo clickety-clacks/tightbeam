@@ -1289,6 +1289,55 @@ defmodule Tightbeam.Placement do
     stderr_path =
       Path.join(config.base_dir, "adapter-#{harness}:#{identity_name}@#{host}.stderr.log")
 
+    {common_env, remote_env, overlay_env} = launch_environment(config, host, module, lineage)
+
+    plan =
+      module.prepare_launch(target, home,
+        common_env: common_env,
+        remote_env: remote_env,
+        lineage: lineage,
+        rails: Rails.hook_settings(),
+        statutes: Rails.statutes?(),
+        credential_kind:
+          credential_kind(config, module.credential_provider(), host, module.wire_name()),
+        ensure_workdir: &ensure_workdir/4,
+        sh_out: Map.get(config, :sh_out)
+      )
+
+    binary_capture =
+      unless Keyword.get(plan, :harness_binary_selection) do
+        Tightbeam.Harness.BinaryDiagnostics.launch_capture(
+          module,
+          Map.put(target, :adapter_path, binary_diagnostic_path(config, host_config)),
+          overlay_env
+        )
+      end
+
+    base = [
+      harness: harness,
+      home: home,
+      cwd: config.cwd,
+      stderr_path: stderr_path,
+      process_ssh: host_config.ssh,
+      process_identity_dir: host_config.base_dir,
+      process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
+      on_auth_event: auth_event_handler(config, host, module),
+      on_subagent_event: subagent_event_handler(config, host, module),
+      env: []
+    ]
+
+    base =
+      if is_function(binary_capture, 0),
+        do: Keyword.put(base, :harness_binary_capture, binary_capture),
+        else: base
+
+    Keyword.merge(base, plan)
+  end
+
+  @doc false
+  def launch_environment(config, host, module, lineage) do
+    host_config = Map.fetch!(hosts_for(config), host)
+
     overlay_env =
       config
       |> Map.get(:db, DB)
@@ -1319,45 +1368,23 @@ defmodule Tightbeam.Placement do
         []
       end
 
-    plan =
-      module.prepare_launch(target, home,
-        common_env: common_env,
-        remote_env: remote_env,
-        lineage: lineage,
-        rails: Rails.hook_settings(),
-        statutes: Rails.statutes?(),
-        credential_kind:
-          credential_kind(config, module.credential_provider(), host, module.wire_name()),
-        ensure_workdir: &ensure_workdir/4,
-        sh_out: Map.get(config, :sh_out)
-      )
+    {common_env, remote_env, overlay_env}
+  end
 
-    binary_capture =
-      Tightbeam.Harness.BinaryDiagnostics.launch_capture(
-        module,
-        Map.put(target, :adapter_path, binary_diagnostic_path(config, host_config)),
-        overlay_env
-      )
+  @doc false
+  def binary_diagnostic_plan(config, host, module, target) do
+    lineage = "tb1-" <> Base.url_encode64("#{module.id()}@#{host}", padding: false)
+    {common_env, remote_env, _overlays} = launch_environment(config, host, module, lineage)
+    home = Homes.home_path(target.host_config.base_dir, host, module.id())
 
-    base = [
-      harness: harness,
-      home: home,
-      cwd: config.cwd,
-      stderr_path: stderr_path,
-      process_ssh: host_config.ssh,
-      process_identity_dir: host_config.base_dir,
-      process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
-      on_auth_event: auth_event_handler(config, host, module),
-      on_subagent_event: subagent_event_handler(config, host, module),
-      env: []
-    ]
-
-    base =
-      if is_function(binary_capture, 0),
-        do: Keyword.put(base, :harness_binary_capture, binary_capture),
-        else: base
-
-    Keyword.merge(base, plan)
+    module.launch_plan(target, home,
+      common_env: common_env,
+      remote_env: remote_env,
+      lineage: lineage,
+      rails: Rails.hook_settings(),
+      credential_kind:
+        credential_kind(config, module.credential_provider(), host, module.wire_name())
+    )
   end
 
   @doc "Preview the PATH an adapter on a configured host receives."

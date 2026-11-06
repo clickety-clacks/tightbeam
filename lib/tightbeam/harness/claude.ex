@@ -151,12 +151,13 @@ defmodule Tightbeam.Harness.Claude do
   def binary_cli_env_name, do: "CLAUDE_CODE_EXECUTABLE"
 
   @doc false
+  def binary_cli_bundle_script,
+    do:
+      "function bundle(){const r=createRequire(path.join(root,'package.json'));const entry=r.resolve('@agentclientprotocol/claude-agent-acp');const sdk=createRequire(entry).resolve('@anthropic-ai/claude-agent-sdk');const s=createRequire(sdk),p=process.platform,a=process.arch,e=p==='win32'?'.exe':'';function isMusl(){return !process.report?.getReport()?.header?.glibcVersionRuntime;}const names=p==='linux'?(isMusl()?[`@anthropic-ai/claude-agent-sdk-linux-${a}-musl`,`@anthropic-ai/claude-agent-sdk-linux-${a}`]:[`@anthropic-ai/claude-agent-sdk-linux-${a}`,`@anthropic-ai/claude-agent-sdk-linux-${a}-musl`]):[`@anthropic-ai/claude-agent-sdk-${p}-${a}`];for(const n of names){try{return s.resolve(`${n}/claude${e}`)}catch{}}throw Error('bundled CLI package is missing');}"
+
+  @doc false
   def binary_cli_probe_script do
-    "const fs=require('node:fs'),path=require('node:path'),{createRequire}=require('node:module'),{spawnSync}=require('node:child_process');" <>
-      "const [root,mode,pin]=process.argv.slice(1);" <>
-      "function resolve(name){if(name.includes(path.sep)||path.isAbsolute(name))return path.resolve(name);for(const dir of (process.env.PATH||'').split(path.delimiter)){const file=path.join(dir,name);try{fs.accessSync(file,fs.constants.X_OK);return file}catch{}}return null;}" <>
-      "function bundle(){const r=createRequire(path.join(root,'package.json'));const entry=r.resolve('@agentclientprotocol/claude-agent-acp');const sdk=createRequire(entry).resolve('@anthropic-ai/claude-agent-sdk');const s=createRequire(sdk),p=process.platform,a=process.arch,e=p==='win32'?'.exe':'';function isMusl(){return !process.report?.getReport()?.header?.glibcVersionRuntime;}const names=p==='linux'?(isMusl()?[`@anthropic-ai/claude-agent-sdk-linux-${a}-musl`,`@anthropic-ai/claude-agent-sdk-linux-${a}`]:[`@anthropic-ai/claude-agent-sdk-linux-${a}`,`@anthropic-ai/claude-agent-sdk-linux-${a}-musl`]):[`@anthropic-ai/claude-agent-sdk-${p}-${a}`];for(const n of names){try{return s.resolve(`${n}/claude${e}`)}catch{}}throw Error('bundled CLI package is missing');}" <>
-      "try{const remotePin=mode==='remote'?(process.env.TIGHTBEAM_DIAGNOSTIC_PIN||''):'';const selectedPin=mode==='pinned'?pin:remotePin;const source=selectedPin?'pinned_override':'bundled_fallback';const bin=selectedPin?resolve(selectedPin):bundle();if(!bin){process.stdout.write(JSON.stringify({status:'missing',source,reason:'selected CLI was not found'}));process.exit(0)}const out=spawnSync(bin,['--version'],{encoding:'utf8',timeout:1200,env:{PATH:process.env.PATH||''}});if(out.error||out.status!==0){process.stdout.write(JSON.stringify({status:'unprobeable',source,reason:String(out.error||out.stderr||'version command failed')}));process.exit(0)}process.stdout.write(JSON.stringify({status:'observed',source,path:bin,version:(out.stdout||out.stderr||'').trim()}));}catch(e){const source=mode==='pinned'||(mode==='remote'&&(process.env.TIGHTBEAM_DIAGNOSTIC_PIN||''))?'pinned_override':'bundled_fallback';process.stdout.write(JSON.stringify({status:'missing',source,reason:String(e.message||e)}));}"
+    Tightbeam.Harness.BinarySelection.script(__MODULE__)
   end
 
   @impl true
@@ -181,6 +182,12 @@ defmodule Tightbeam.Harness.Claude do
   # provider, two shapes, because the credentials genuinely are two different things.
   @impl true
   def prepare_launch(target, home, opts) do
+    launch_plan(target, home, opts)
+    |> Tightbeam.Harness.BinarySelection.wrap_launch(__MODULE__, target)
+  end
+
+  @doc false
+  def launch_plan(target, home, opts) do
     binary = adapter_binary(target)
     common = Keyword.fetch!(opts, :common_env)
     kind = Keyword.fetch!(opts, :credential_kind)

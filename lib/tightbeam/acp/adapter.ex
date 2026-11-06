@@ -403,6 +403,11 @@ defmodule Tightbeam.Acp.Adapter do
            timeout: :infinity
          ) do
       {:ok, %{"protocolVersion" => 1}} ->
+        if callback = Keyword.get(opts, :on_binary_selection) do
+          capture = Tightbeam.Harness.BinarySelection.read_capture(stderr_path, offset, module)
+          callback.(capture)
+        end
+
         gate(opts, state)
 
       other ->

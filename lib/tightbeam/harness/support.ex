@@ -279,7 +279,7 @@ defmodule Tightbeam.Harness.Support do
   # environment variable carries the credential; for codex it decides nothing,
   # because codex reads its own auth.json — and running codex under both kinds
   # PINS that invariance instead of assuming it.
-  defp prepare_launch_vectors(_module, profile) do
+  defp prepare_launch_vectors(module, profile) do
     for locality <- [:local, :remote],
         rails <- [:railed, :lawless],
         kind <- [:subscription, :api_key] do
@@ -287,7 +287,7 @@ defmodule Tightbeam.Harness.Support do
 
       vector(
         case_name,
-        expected_launch(profile, locality, rails, kind),
+        expected_launch(module, profile, locality, rails, kind),
         %{profile: profile, locality: locality, rails: rails, kind: kind}
       )
     end
@@ -330,7 +330,7 @@ defmodule Tightbeam.Harness.Support do
     end)
   end
 
-  defp expected_launch(profile, locality, rails, kind) do
+  defp expected_launch(module, profile, locality, rails, kind) do
     base = "<BASE>"
     home = "<HOME>"
     adapter = adapter_path(base, profile.adapter_bin, locality)
@@ -374,6 +374,35 @@ defmodule Tightbeam.Harness.Support do
         plan
       end
 
+    plan =
+      if function_exported?(module, :binary_cli_probe_script, 0) do
+        # Expected command shape is independent of BinarySelection.wrap_launch/3.
+        # The selector's decisions and exec consumption have executable fixtures.
+        selector = [
+          "node",
+          "-e",
+          module.binary_cli_probe_script(),
+          Path.join(base, "adapters"),
+          "launch",
+          adapter
+        ]
+
+        shell =
+          "choice=$(" <>
+            Enum.map_join(selector, " ", &shell_quote/1) <> ") || exit $?; eval \"$choice\""
+
+        command =
+          if local? do
+            ["/bin/sh", "-c", shell]
+          else
+            Enum.drop(Keyword.fetch!(plan, :cmd), -1) ++ ["/bin/sh", "-c", shell_quote(shell)]
+          end
+
+        plan |> Keyword.put(:cmd, command) |> Keyword.put(:harness_binary_selection, true)
+      else
+        plan
+      end
+
     launch_observation(plan)
   end
 
@@ -382,6 +411,7 @@ defmodule Tightbeam.Harness.Support do
 
     %{
       argv: argv,
+      binary_selection: Keyword.get(plan, :harness_binary_selection, false),
       env: Keyword.fetch!(plan, :env),
       serialized_command: Enum.map_join(argv, " ", &shell_quote/1),
       probe_cwd: Keyword.get(plan, :probe_cwd),
