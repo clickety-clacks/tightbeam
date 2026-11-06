@@ -4957,18 +4957,22 @@ defmodule Tightbeam.HarklightWakesTest do
         do: seed_completion_handle(db, session.session_key, handle, "scale-#{index}")
 
     parent = self()
+    {:ok, phase} = Agent.start_link(fn -> nil end)
+    started_at = System.monotonic_time(:millisecond)
 
     runner = fn ["status", "--session", handle] ->
-      send(parent, {:status_waiting, handle, self()})
+      open = Agent.get(phase, & &1)
 
-      receive do
-        :release ->
-          {JSON.encode!(%{
-             "session_handle" => handle,
-             "open_requests" => 0,
-             "pending_undelivered" => 0
-           }), 0}
+      if is_nil(open) do
+        send(parent, {:status_waiting, handle, self()})
+        receive do: (:release -> :ok)
       end
+
+      {JSON.encode!(%{
+         "session_handle" => handle,
+         "open_requests" => if(open && MapSet.member?(open, handle), do: 1, else: 0),
+         "pending_undelivered" => 0
+       }), 0}
     end
 
     manager =
@@ -4994,11 +4998,17 @@ defmodule Tightbeam.HarklightWakesTest do
         end
       )
 
-    assert map_size(:sys.get_state(manager, 1_000).workers) == 194
+    probe_at = System.monotonic_time(:microsecond)
+    state = :sys.get_state(manager, 1_000)
+    response_us = System.monotonic_time(:microsecond) - probe_at
+    assert map_size(state.workers) == 194
+    assert MapSet.size(state.attach_slots) == 4
+    assert eventually(fn -> :queue.len(:sys.get_state(manager).attach_waiting) == 190 end)
     # An actual new registration interrupts its handle's outstanding decision.
     [target, hung, release_first, _] = Map.keys(readers)
     old_reader = readers[target]
     monitor = Process.monitor(old_reader)
+    request_at = System.monotonic_time(:microsecond)
     op = Tightbeam.Id.uuid4()
     payload = String.replace(@payload, "request", "scale-new-request")
 
@@ -5024,6 +5034,7 @@ defmodule Tightbeam.HarklightWakesTest do
     :sys.get_state(manager)
     send(readers[release_first], :release)
     assert_receive {:restored, ^target, nil}, 1_000
+    request_us = System.monotonic_time(:microsecond) - request_at
     # One read never returns; its deadline must preserve attachment. All other
     # slow closed responses skip, rather than attaching before their decision.
     for {handle, pid} <- readers,
@@ -5046,6 +5057,72 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state!='active'")
+
+    first_ms = System.monotonic_time(:millisecond) - started_at
+    # A timed-out command cannot return later and undo its fallback.
+    refute Process.alive?(readers[hung])
+    send(readers[hung], :release)
+    assert Map.has_key?(:sys.get_state(manager).workers, hung)
+
+    :ok = stop_supervised(HarklightWakes)
+    Agent.update(phase, fn _ -> MapSet.new([target, hung]) end)
+    restore_at = System.monotonic_time(:microsecond)
+
+    second =
+      start_supervised!(
+        {HarklightWakes,
+         db: db, listener: completion_notifying_listener(parent), send_runner: runner}
+      )
+
+    restored =
+      for _ <- 1..2 do
+        assert_receive {:restored, handle, nil}, 1_000
+        handle
+      end
+
+    assert MapSet.new(restored) == MapSet.new([target, hung])
+    assert eventually(fn -> map_size(:sys.get_state(second).workers) == 2 end)
+    restore_us = System.monotonic_time(:microsecond) - restore_at
+    refute_receive {:restored, _, _}
+
+    later = Enum.find(handles, &(&1 not in [target, hung]))
+    later_at = System.monotonic_time(:microsecond)
+    later_op = Tightbeam.Id.uuid4()
+    later_payload = String.replace(@payload, "request", "after-restore-request")
+
+    later_result =
+      @result
+      |> String.replace("request", "after-restore-request")
+      |> String.replace(@handle, later)
+
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, later_op, later_payload)
+
+    assert %{state: "registered"} =
+             HarklightWakes.bind_send(
+               db,
+               call,
+               later_op,
+               later_payload,
+               later_result,
+               later,
+               "sender",
+               "after-restore-request"
+             )
+
+    assert_receive {:restored, ^later, nil}, 1_000
+    later_us = System.monotonic_time(:microsecond) - later_at
+
+    IO.puts(
+      "R6_POPULATION_METRICS " <>
+        JSON.encode!(%{
+          handles: 194,
+          manager_response_us: response_us,
+          new_request_us: request_us,
+          first_restore_ms: first_ms,
+          second_restore_us: restore_us,
+          after_restore_request_us: later_us
+        })
+    )
   end
 
   test "a nonreturning status subprocess is terminated before timeout falls back to attach", %{
@@ -5099,6 +5176,48 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert {:ok, [[2]]} =
              DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='active'")
+  end
+
+  test "known R with a nonreturning A8 read skips without completing or late mutation", %{db: db} do
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+    mark_completion_wakes_delivered(db, @handle)
+    parent = self()
+
+    runner = fn
+      ["status", "--session", @handle] ->
+        {JSON.encode!(%{
+           "session_handle" => @handle,
+           "open_requests" => 0,
+           "pending_undelivered" => 0,
+           "pending_delivered_unacted" => 0
+         }), 0}
+
+      ["read", "--session", @handle] ->
+        send(parent, {:a8_waiting, self()})
+        receive do: (:late_success -> {"", 0})
+    end
+
+    row = DB.query(db, "SELECT * FROM harklight_wake_handles")
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db, listener: completion_notifying_listener(parent), send_runner: runner}
+      )
+
+    assert_receive {:a8_waiting, reader}, 1_000
+    monitor = Process.monitor(reader)
+    started = System.monotonic_time(:millisecond)
+    assert map_size(:sys.get_state(manager, 1_000).workers) == 1
+    assert_receive {:DOWN, ^monitor, :process, ^reader, _}, 6_000
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+    refute_receive {:restored, _, _}
+    assert DB.query(db, "SELECT * FROM harklight_wake_handles") == row
+    send(reader, :late_success)
+    refute Process.alive?(reader)
+    assert DB.query(db, "SELECT * FROM harklight_wake_handles") == row
+    IO.puts("R6_A8_TIMEOUT_MS=#{System.monotonic_time(:millisecond) - started}")
   end
 
   @tag :restart_count
