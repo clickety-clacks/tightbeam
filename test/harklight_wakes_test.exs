@@ -1099,8 +1099,10 @@ defmodule Tightbeam.HarklightWakesTest do
     start_supervised!({HarklightWakes, db: db, listener: listener})
     :sys.get_state(HarklightWakes)
 
-    assert {:ok, [["unavailable", "origin_unavailable"]]} =
-             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles") ==
+               {:ok, [["unavailable", "origin_unavailable"]]}
+           end)
 
     refute_receive :unexpected_listener
   end
@@ -2495,6 +2497,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert_receive :first_failed
     assert_receive {:checked_closed, true}
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
     state = :sys.get_state(manager)
     assert state.workers == %{}
     assert state.retry_timers == %{}
@@ -4943,6 +4946,161 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
   end
 
+  test "194 pending status reads leave the manager responsive and new requests ungated", %{
+    db: db,
+    session: session,
+    call: call
+  } do
+    handles = [@handle | Enum.map(1..193, fn _ -> Tightbeam.Id.uuid4() end)]
+
+    for {handle, index} <- Enum.with_index(tl(handles)),
+        do: seed_completion_handle(db, session.session_key, handle, "scale-#{index}")
+
+    parent = self()
+
+    runner = fn ["status", "--session", handle] ->
+      send(parent, {:status_waiting, handle, self()})
+
+      receive do
+        :release ->
+          {JSON.encode!(%{
+             "session_handle" => handle,
+             "open_requests" => 0,
+             "pending_undelivered" => 0
+           }), 0}
+      end
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         listener: fn manager, handle, vendor ->
+           ref = make_ref()
+           GenServer.cast(manager, {:attach_slot, self(), ref})
+           send(parent, {:attachment_waiting, handle})
+           receive do: ({:attach_slot, ^ref} -> :ok)
+           GenServer.cast(manager, {:attach_slot_released, self()})
+           completion_notifying_listener(parent).(manager, handle, vendor)
+         end,
+         send_runner: runner}
+      )
+
+    readers =
+      Map.new(
+        for _ <- 1..4 do
+          assert_receive {:status_waiting, handle, pid}, 5_000
+          {handle, pid}
+        end
+      )
+
+    assert map_size(:sys.get_state(manager, 1_000).workers) == 194
+    # An actual new registration interrupts its handle's outstanding decision.
+    [target, hung, release_first, _] = Map.keys(readers)
+    old_reader = readers[target]
+    monitor = Process.monitor(old_reader)
+    op = Tightbeam.Id.uuid4()
+    payload = String.replace(@payload, "request", "scale-new-request")
+
+    result =
+      @result |> String.replace("request", "scale-new-request") |> String.replace(@handle, target)
+
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
+
+    assert %{state: "registered"} =
+             HarklightWakes.bind_send(
+               db,
+               call,
+               op,
+               payload,
+               result,
+               target,
+               "sender",
+               "scale-new-request"
+             )
+
+    assert_receive {:DOWN, ^monitor, :process, ^old_reader, _}, 1_000
+    assert_receive {:attachment_waiting, ^target}, 1_000
+    :sys.get_state(manager)
+    send(readers[release_first], :release)
+    assert_receive {:restored, ^target, nil}, 1_000
+    # One read never returns; its deadline must preserve attachment. All other
+    # slow closed responses skip, rather than attaching before their decision.
+    for {handle, pid} <- readers,
+        handle not in [target, hung, release_first],
+        do: send(pid, :release)
+
+    for _ <- 1..190 do
+      assert_receive {:status_waiting, _handle, pid}, 1_000
+      send(pid, :release)
+    end
+
+    assert_receive {:restored, ^hung, nil}, 6_000
+
+    assert eventually(fn ->
+             Map.keys(:sys.get_state(manager).workers) |> MapSet.new() ==
+               MapSet.new([target, hung])
+           end)
+
+    refute_receive {:restored, _, _}
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state!='active'")
+  end
+
+  test "a nonreturning status subprocess is terminated before timeout falls back to attach", %{
+    db: db,
+    session: session
+  } do
+    closed = Tightbeam.Id.uuid4()
+    seed_completion_handle(db, session.session_key, closed, "closed-subprocess")
+    root = Path.join(System.tmp_dir!(), "status-timeout-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    executable = Path.join(root, "harklight-agent")
+    pid_file = Path.join(root, "pid")
+
+    status =
+      JSON.encode!(%{
+        "session_handle" => closed,
+        "open_requests" => 0,
+        "pending_undelivered" => 0
+      })
+
+    File.write!(
+      executable,
+      "#!/bin/sh\nif [ \"$3\" = '#{closed}' ]; then printf '%s\\n' '#{status}'; exit 0; fi\necho $$ > '#{pid_file}'\nexec sleep 300\n"
+    )
+
+    File.chmod!(executable, 0o755)
+    previous = System.get_env("PATH")
+    System.put_env("PATH", root <> ":" <> previous)
+
+    on_exit(fn ->
+      System.put_env("PATH", previous)
+      File.rm_rf!(root)
+    end)
+
+    manager =
+      start_supervised!({HarklightWakes, db: db, listener: completion_notifying_listener(self())})
+
+    assert eventually(fn -> File.exists?(pid_file) end)
+    pid = File.read!(pid_file) |> String.trim()
+    assert eventually(fn -> map_size(:sys.get_state(manager, 1_000).workers) == 1 end)
+    assert_receive {:restored, @handle, nil}, 6_000
+
+    assert eventually(fn ->
+             match?(
+               {_, status} when status != 0,
+               System.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true)
+             )
+           end)
+
+    refute_receive {:restored, ^closed, _}
+
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='active'")
+  end
+
   @tag :restart_count
   test "r6 startup skips closed conversations and preserves unfinished work", %{
     db: db,
@@ -5021,7 +5179,7 @@ defmodule Tightbeam.HarklightWakesTest do
         end
 
       assert MapSet.new(restored) == MapSet.new([p3, n1, n2])
-      assert map_size(:sys.get_state(manager).workers) == 3
+      assert eventually(fn -> map_size(:sys.get_state(manager).workers) == 3 end)
       refute_receive {:restored, _, _}
 
       assert {:ok, [["complete"]]} =
@@ -5065,11 +5223,11 @@ defmodule Tightbeam.HarklightWakesTest do
          send_runner: completion_idle_runner()}
       )
 
-    assert :sys.get_state(manager).workers == %{}
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
     GenServer.cast(manager, {:origin_ready, session.session_key})
     GenServer.cast(manager, {:pointer_changed, session.session_key})
     GenServer.cast(manager, {:origin_changed, session.session_key})
-    assert :sys.get_state(manager).workers == %{}
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
     refute_receive {:restored, _, _}
 
     op = Tightbeam.Id.uuid4()
@@ -5173,7 +5331,7 @@ defmodule Tightbeam.HarklightWakesTest do
         )
 
       if @evidence_failure == :read_failed do
-        assert :sys.get_state(manager).workers == %{}
+        assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
         refute_receive {:restored, _, _}
       else
         assert_receive {:restored, @handle, nil}

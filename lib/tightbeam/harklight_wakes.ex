@@ -721,7 +721,8 @@ defmodule Tightbeam.HarklightWakes do
           state
           | refs: refs,
             workers: Map.delete(state.workers, handle),
-            ports: Map.delete(state.ports, handle)
+            ports: Map.delete(state.ports, handle),
+            restart: MapSet.delete(state.restart, {handle, :deciding})
         }
 
         cond do
@@ -836,12 +837,29 @@ defmodule Tightbeam.HarklightWakes do
     {:noreply, reconcile_retirement(state, handles, MapSet.new(gone_handles))}
   end
 
+  def handle_cast({:decision_slot, pid, ref}, state),
+    do: handle_cast({:attach_slot, pid, {:decision, ref}}, state)
+
   def handle_cast({:attach_slot, pid, ref}, state) do
     if MapSet.size(state.attach_slots) < state.attach_limit do
       send(pid, {:attach_slot, ref})
       {:noreply, %{state | attach_slots: MapSet.put(state.attach_slots, pid)}}
     else
-      {:noreply, %{state | attach_waiting: :queue.in({pid, ref}, state.attach_waiting)}}
+      # Share the existing bounded slot pool. Actual attachments retain FIFO
+      # order ahead of queued decisions, so startup reads cannot monopolize it.
+      waiting =
+        if is_tuple(ref) do
+          :queue.in({pid, ref}, state.attach_waiting)
+        else
+          {attaches, decisions} =
+            state.attach_waiting
+            |> :queue.to_list()
+            |> Enum.split_while(fn {_, queued_ref} -> not is_tuple(queued_ref) end)
+
+          :queue.from_list(attaches ++ [{pid, ref}] ++ decisions)
+        end
+
+      {:noreply, %{state | attach_waiting: waiting}}
     end
   end
 
@@ -853,8 +871,16 @@ defmodule Tightbeam.HarklightWakes do
     {:noreply, force_worker(state, handle, :new_request)}
   end
 
-  def handle_cast({:activate, handle, false}, state),
-    do: {:noreply, start_worker(state, handle, :new_request)}
+  def handle_cast({:activate, handle, false}, state) do
+    # Registration must interrupt an outstanding closure read, while an already
+    # running listener continues normally.
+    state =
+      if MapSet.member?(state.restart, {handle, :deciding}),
+        do: force_worker(state, handle, :new_request),
+        else: start_worker(state, handle, :new_request)
+
+    {:noreply, state}
+  end
 
   def handle_cast({:origin_ready, session_key}, state) do
     {:ok, rows} =
@@ -1061,7 +1087,7 @@ defmodule Tightbeam.HarklightWakes do
         restart =
           if mode == :new_request, do: MapSet.put(restart, {handle, :new_request}), else: restart
 
-        %{state | restart: restart}
+        %{state | restart: restart, stopping: MapSet.delete(state.stopping, handle)}
 
       :error ->
         start_worker(state, handle, mode)
@@ -1144,6 +1170,21 @@ defmodule Tightbeam.HarklightWakes do
       if result == :ok, do: %{state | attempts: Map.delete(state.attempts, handle)}, else: state
 
     {:reply, result, state}
+  end
+
+  def handle_call({:start_decided, handle, skip?}, from, state) do
+    if valid_worker?(state, handle, from) do
+      {reply, state} = if skip?, do: {:skip, state}, else: prepare_listener(state, handle)
+
+      state =
+        if reply == :skip,
+          do: %{state | stopping: MapSet.put(state.stopping, handle)},
+          else: %{state | restart: MapSet.delete(state.restart, {handle, :deciding})}
+
+      {:reply, reply, state}
+    else
+      {:reply, :skip, state}
+    end
   end
 
   def handle_call({:listener_port, handle, port}, from, state) do
@@ -1341,20 +1382,52 @@ defmodule Tightbeam.HarklightWakes do
       deferred = if mode != :existing, do: MapSet.put(deferred, {handle, mode}), else: deferred
       %{state | deferred: deferred}
     else
-      cond do
-        Map.has_key?(state.workers, handle) ->
+      if Map.has_key?(state.workers, handle) do
+        state
+      else
+        manager = self()
+
+        {:ok, pid} =
+          Task.start_link(fn ->
+            skip? = decide_start(state, manager, handle, mode)
+
+            case GenServer.call(manager, {:start_decided, handle, skip?}, :infinity) do
+              {:listen, vendor_id} -> state.listener.(manager, handle, vendor_id)
+              :skip -> :ok
+            end
+          end)
+
+        ref = Process.monitor(pid)
+
+        %{
           state
-
-        mode != :new_request and
-            HarklightLifecycle.closed_for_start?(state.db, handle, runner: state.send_runner) ->
-          if mode == :startup,
-            do: HarklightLifecycle.complete_answered(state.db, handle, runner: state.send_runner)
-
-          state
-
-        true ->
-          start_listener_worker(state, handle)
+          | workers: Map.put(state.workers, handle, pid),
+            refs: Map.put(state.refs, ref, handle),
+            restart: MapSet.put(state.restart, {handle, :deciding})
+        }
       end
+    end
+  end
+
+  defp decide_start(_state, _manager, _handle, :new_request), do: false
+
+  defp decide_start(state, manager, handle, mode) do
+    ref = make_ref()
+    GenServer.cast(manager, {:decision_slot, self(), ref})
+
+    receive do
+      {:attach_slot, {:decision, ^ref}} -> :ok
+    end
+
+    try do
+      skip? = HarklightLifecycle.closed_for_start?(state.db, handle, runner: state.send_runner)
+
+      if skip? and mode == :startup,
+        do: HarklightLifecycle.complete_answered(state.db, handle, runner: state.send_runner)
+
+      skip?
+    after
+      GenServer.cast(manager, {:attach_slot_released, self()})
     end
   end
 
@@ -1369,61 +1442,52 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp start_listener_worker(state, handle) do
-    if Map.has_key?(state.workers, handle) do
-      state
-    else
-      case DB.query(
-             state.db,
-             "SELECT sessionKey,host,vendorSessionId,state FROM harklight_wake_handles WHERE handle=?1",
-             [handle]
-           ) do
-        {:ok, [[session_key, host, saved_vendor_id, state_value]]}
-        when state_value in ["active", "unavailable"] ->
-          if listener_eligible?(state.db, handle, session_key, host) do
-            vendor_id =
-              case Org.get(state.db, session_key) do
-                %{state: "active", host: ^host} ->
-                  case Org.current_pointer(state.db, session_key) do
-                    nil -> saved_vendor_id
-                    pointer -> pointer.harness_session_id
-                  end
+  defp prepare_listener(state, handle) do
+    case DB.query(
+           state.db,
+           "SELECT sessionKey,host,vendorSessionId,state FROM harklight_wake_handles WHERE handle=?1",
+           [handle]
+         ) do
+      {:ok, [[session_key, host, saved_vendor_id, state_value]]}
+      when state_value in ["active", "unavailable"] ->
+        if listener_eligible?(state.db, handle, session_key, host) do
+          vendor_id =
+            case Org.get(state.db, session_key) do
+              %{state: "active", host: ^host} ->
+                case Org.current_pointer(state.db, session_key) do
+                  nil -> saved_vendor_id
+                  pointer -> pointer.harness_session_id
+                end
 
-                _ ->
-                  saved_vendor_id
-              end
-
-            if vendor_id != saved_vendor_id do
-              DB.query(
-                state.db,
-                "UPDATE harklight_wake_handles SET vendorSessionId=?2,updatedAt=?3 WHERE handle=?1",
-                [handle, vendor_id, System.system_time(:millisecond)]
-              )
+              _ ->
+                saved_vendor_id
             end
 
-            manager = self()
-            {:ok, pid} = Task.start_link(fn -> state.listener.(manager, handle, vendor_id) end)
-            ref = Process.monitor(pid)
-
-            %{
-              state
-              | workers: Map.put(state.workers, handle, pid),
-                failures: Map.delete(state.failures, handle),
-                refs: Map.put(state.refs, ref, handle)
-            }
-          else
-            reason =
-              if host == Placement.local_host_name(),
-                do: "origin_unavailable",
-                else: "origin_host_mismatch"
-
-            mark_finished(state.db, handle, reason)
-            if host == Placement.local_host_name(), do: start_gone(state, handle), else: state
+          if vendor_id != saved_vendor_id do
+            DB.query(
+              state.db,
+              "UPDATE harklight_wake_handles SET vendorSessionId=?2,updatedAt=?3 WHERE handle=?1",
+              [handle, vendor_id, System.system_time(:millisecond)]
+            )
           end
 
-        _ ->
-          state
-      end
+          {{:listen, vendor_id}, %{state | failures: Map.delete(state.failures, handle)}}
+        else
+          reason =
+            if host == Placement.local_host_name(),
+              do: "origin_unavailable",
+              else: "origin_host_mismatch"
+
+          mark_finished(state.db, handle, reason)
+
+          state =
+            if host == Placement.local_host_name(), do: start_gone(state, handle), else: state
+
+          {:skip, state}
+        end
+
+      _ ->
+        {:skip, state}
     end
   end
 

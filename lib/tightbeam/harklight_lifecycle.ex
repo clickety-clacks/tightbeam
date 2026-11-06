@@ -860,7 +860,7 @@ defmodule Tightbeam.HarklightLifecycle do
       nil ->
         case System.find_executable("harklight-agent") do
           nil -> :error
-          executable -> {:ok, fn args -> System.cmd(executable, args, stderr_to_stdout: true) end}
+          executable -> {:ok, fn args -> read_command(executable, args) end}
         end
     end
   end
@@ -870,13 +870,65 @@ defmodule Tightbeam.HarklightLifecycle do
   defp run_status(runner, handle),
     do: run_read_command(runner, ["status", "--session", handle])
 
+  # Each read has a deadline; a timeout is unknown evidence, so R admits the
+  # ordinary listener start and E cannot complete the handle. No recheck is armed.
+  @read_timeout_ms 5_000
   defp run_read_command(runner, args) do
-    case runner.(args) do
-      {output, 0} when is_binary(output) -> {:ok, output}
+    task =
+      Task.async(fn ->
+        try do
+          runner.(args)
+        rescue
+          _ -> :error
+        catch
+          _, _ -> :error
+        end
+      end)
+
+    case Task.yield(task, @read_timeout_ms) || Task.shutdown(task, 100) do
+      {:ok, {output, 0}} when is_binary(output) -> {:ok, output}
       _ -> :error
     end
   rescue
     _ -> :error
+  end
+
+  defp read_command(executable, args) do
+    # The read task owns this port. On cancellation kill only its child, as the
+    # listener path does; closing stdin alone need not end a blocked CLI.
+    Process.flag(:trap_exit, true)
+
+    port =
+      Port.open(
+        {:spawn_executable, executable},
+        [:binary, :exit_status, :stderr_to_stdout, :hide, {:args, args}]
+      )
+
+    try do
+      receive_read(port, [])
+    after
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} ->
+          System.cmd("/bin/kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+          if Port.info(port), do: Port.close(port)
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defp receive_read(port, output) do
+    receive do
+      {^port, {:data, bytes}} ->
+        receive_read(port, [bytes | output])
+
+      {^port, {:exit_status, status}} ->
+        {output |> Enum.reverse() |> IO.iodata_to_binary(), status}
+
+      {:EXIT, _, reason} ->
+        exit(reason)
+    end
   end
 
   defp parse_read_events(output) do
