@@ -39,7 +39,7 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
             Map.put(
               target,
               :launch_plan,
-              Placement.binary_diagnostic_plan(config, host, module, target)
+              fn -> Placement.binary_diagnostic_plan(config, host, module, target) end
             )
           else
             target
@@ -400,7 +400,10 @@ defmodule Tightbeam.Harness.BinaryDiagnostics do
         nil ->
           {probe_command(target, args, remote_env_name), target.sh}
 
-        plan ->
+        build_plan ->
+          # Resolve each host's launch inputs inside its bounded observation.
+          # Missing configuration must not erase the other hosts' evidence.
+          plan = build_plan.()
           # Read the effective pin inside the same environment as adapter exec.
           args = List.replace_at(args, 4, "prospective")
           plan = Tightbeam.Harness.BinarySelection.probe_plan(plan, args, target)

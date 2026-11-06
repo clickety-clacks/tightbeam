@@ -87,6 +87,8 @@ defmodule Tightbeam.PlacementTest do
     base_dir: base_dir,
     db: db
   } do
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
+
     register_hosts(db, %{
       "remote" => %{ssh: "remote.example", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"}
     })
@@ -100,7 +102,7 @@ defmodule Tightbeam.PlacementTest do
        }) <> "\n", 0}
     end
 
-    assert {:ok, %{"rows" => rows}} =
+    assert {:ok, %{"status" => "observed", "rows" => rows}} =
              BinaryDiagnostics.report(base_dir, db, :offline_coordinator, run: run)
 
     hosts = rows |> Enum.map(& &1["host"]) |> Enum.uniq()
@@ -110,6 +112,39 @@ defmodule Tightbeam.PlacementTest do
       assert Enum.all?(Tightbeam.Harness.all(), fn module ->
                Enum.any?(rows, &(&1["host"] == host and &1["harness"] == module.wire_name()))
              end)
+    end
+  end
+
+  test "missing remote launch inputs preserve per-host diagnostic rows", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    Application.delete_env(:tightbeam, :advertised_url)
+
+    register_hosts(db, %{
+      "remote" => %{ssh: "remote.example", base_dir: "/srv/tightbeam", cli_bin: "/srv/bin"}
+    })
+
+    run = fn _command ->
+      {JSON.encode!(%{
+         status: "observed",
+         source: "system",
+         path: "/fixture/vendor",
+         version: "vendor 1.0.0"
+       }), 0}
+    end
+
+    assert {:ok, %{"status" => "observed", "rows" => rows}} =
+             BinaryDiagnostics.report(base_dir, db, :offline_coordinator, run: run)
+
+    for harness <- ["claude", "codex"] do
+      remote = Enum.find(rows, &(&1["host"] == "remote" and &1["harness"] == harness))
+      assert remote["next_launch"]["status"] == "unknown"
+      assert remote["next_launch"]["source"] == "unknown"
+      assert remote["next_launch"]["reason"] =~ "advertised_url"
+      local = Enum.find(rows, &(&1["host"] == "testhost" and &1["harness"] == harness))
+      assert local["next_launch"]["status"] == "observed"
+      assert local["next_launch"]["source"] == "system"
     end
   end
 
