@@ -39,9 +39,11 @@ Verify actual assignment custody; a role label, PO association or ordinary
 coordination assignment does not itself set that owner. Pass
 `--work-item <workItemId>` on spawn and assignments. Commission a lane through ordinary
 `assign --effect-kind coordination` or `dispatch` on that item; the recorded
-owner remains accountable. Load `delivery-bootstrap` when the owner link is
-missing, unavailable or must be replaced, and reread the item after a change
-or refusal.
+owner remains accountable. If the owner link is missing, route the item to
+responsible intake for a `work-item-handoff` that names the delivery owner and
+delivers its coordination brief before staffing production. Load
+`delivery-bootstrap` for a missing, unavailable or replaced owner, and reread
+the item after a change or refusal.
 
 Classify the promised effect when assigning, not the holder's role:
 
