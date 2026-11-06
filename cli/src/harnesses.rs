@@ -457,8 +457,16 @@ fn render_selection(value: &Value) -> String {
         .unwrap_or("unknown");
     if status == "observed" {
         let path = value.get("path").and_then(Value::as_str).unwrap_or("?");
-        let version = value.get("version").and_then(Value::as_str).unwrap_or("?");
-        format!("{source} {path} version {version}")
+        let version = value
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let detail = value
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default();
+        format!("{source} {path} version {version}{detail}")
     } else {
         let reason = value
             .get("reason")
@@ -481,6 +489,18 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn known_selection_keeps_path_and_failed_version_evidence() {
+        let selection = serde_json::json!({
+            "status": "observed", "source": "pinned_override", "path": "/missing/pin",
+            "version": null, "reason": "version invocation failed"
+        });
+        assert_eq!(
+            render_selection(&selection),
+            "pinned_override /missing/pin version unknown (version invocation failed)"
+        );
+    }
 
     #[test]
     fn round_trips_every_consumed_field() {

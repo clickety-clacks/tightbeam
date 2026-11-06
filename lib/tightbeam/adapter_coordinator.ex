@@ -744,6 +744,15 @@ defmodule Tightbeam.AdapterCoordinator do
       if is_function(capture, 0),
         do: send(coordinator, {:binary_capture_start, key, self(), capture})
 
+      opts =
+        if Keyword.get(opts, :harness_binary_selection) do
+          Keyword.put(opts, :on_binary_selection, fn capture ->
+            send(coordinator, {:binary_capture_start, key, self(), fn -> capture end})
+          end)
+        else
+          opts
+        end
+
       # The message NAMES THE INSTANCE that booted. `on_ready` runs in the
       # adapter's own process, so self here is that adapter. Without it the
       # coordinator can only credit whichever pid the entry holds when the

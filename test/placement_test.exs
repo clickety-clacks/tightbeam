@@ -721,7 +721,23 @@ defmodule Tightbeam.PlacementTest do
 
     for module <- Tightbeam.Harness.all() do
       opts = Placement.adapter_opts(config, {module.id(), "shared", "testhost"})
-      binary = hd(opts[:cmd])
+
+      binary =
+        if opts[:harness_binary_selection] do
+          expected =
+            Path.join([
+              base_dir,
+              "adapters",
+              "node_modules",
+              ".bin",
+              Path.basename(module.install_package())
+            ])
+
+          assert List.last(opts[:cmd]) =~ expected
+          expected
+        else
+          hd(opts[:cmd])
+        end
 
       assert String.ends_with?(
                binary,
@@ -763,8 +779,19 @@ defmodule Tightbeam.PlacementTest do
     expected_home = Path.join([base_dir, "homes", "testhost", "codex"])
 
     assert opts[:harness] == :codex
-    assert opts[:cmd] == [expected_binary]
-    assert is_function(opts[:harness_binary_capture], 0)
+    assert ["/bin/sh", "-c", script] = opts[:cmd]
+    assert script =~ expected_binary
+    assert opts[:harness_binary_selection] == true
+
+    preview =
+      Placement.binary_diagnostic_plan(config, "testhost", Tightbeam.Harness.Codex, %{
+        base_dir: base_dir,
+        host_config: %{base_dir: base_dir, ssh: nil},
+        host_name: "testhost"
+      })
+
+    assert preview[:cmd] == [expected_binary]
+    assert preview[:env] == opts[:env]
     assert opts[:home] == expected_home
     assert opts[:cwd] == "/work"
     assert is_function(opts[:on_auth_event], 2)
@@ -1037,7 +1064,7 @@ defmodule Tightbeam.PlacementTest do
     opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
     remote_home = "/srv/tb/homes/worker/codex"
 
-    assert opts[:cmd] == [
+    assert Enum.drop(opts[:cmd], -3) == [
              "ssh",
              "-o",
              "BatchMode=yes",
@@ -1052,9 +1079,11 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "PATH=/srv/tb/bin:$PATH",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
-             ~s(CODEX_CONFIG='{"bypass_hook_trust":true}'),
-             "/srv/tb/adapters/node_modules/.bin/codex-acp"
+             ~s(CODEX_CONFIG='{"bypass_hook_trust":true}')
            ]
+
+    assert Enum.take(opts[:cmd], -3) |> Enum.take(2) == ["/bin/sh", "-c"]
+    assert List.last(opts[:cmd]) =~ "/srv/tb/adapters/node_modules/.bin/codex-acp"
 
     assert opts[:home] == remote_home
     assert opts[:stderr_path] == Path.join(base_dir, "adapter-codex:default@worker.stderr.log")
