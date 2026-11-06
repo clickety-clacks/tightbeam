@@ -1111,7 +1111,9 @@ defmodule Tightbeam.Org do
   # Retirement no longer arms a supervision controller, so the interval is
   # validated for callers but otherwise unused.
   @spec retire_in_txn(Txn.t(), String.t(), String.t(), pos_integer() | :off) :: session()
-  def retire_in_txn(%Txn{} = txn, session_key, principal, supervision_interval_ms)
+  def retire_in_txn(txn, session_key, principal, supervision_interval_ms, opts \\ [])
+
+  def retire_in_txn(%Txn{} = txn, session_key, principal, supervision_interval_ms, opts)
       when is_binary(principal) and principal != "" and
              ((is_integer(supervision_interval_ms) and supervision_interval_ms > 0) or
                 supervision_interval_ms == :off) do
@@ -1120,16 +1122,16 @@ defmodule Tightbeam.Org do
         session
 
       %{state: "active"} ->
-        retire_active_in_txn(txn, session_key, principal)
+        retire_active_in_txn(txn, session_key, principal, opts)
     end
   end
 
-  def retire_in_txn(%Txn{}, _session_key, _principal, _supervision_interval_ms) do
+  def retire_in_txn(%Txn{}, _session_key, _principal, _supervision_interval_ms, _opts) do
     raise ArgumentError,
           "retirement requires a non-empty principal and positive supervision interval or off"
   end
 
-  defp retire_active_in_txn(txn, session_key, _principal) do
+  defp retire_active_in_txn(txn, session_key, _principal, opts) do
     retirement_epoch = now()
     Tightbeam.Retirements.retiring_in_txn(txn, [session_key])
 
@@ -1151,11 +1153,13 @@ defmodule Tightbeam.Org do
     if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
     Tightbeam.Retirements.session_retired_in_txn(txn, session_key)
 
-    Txn.handoff(
-      txn,
-      Tightbeam.HarklightWakes,
-      Tightbeam.HarklightWakes.retirement_handoff_in_txn(txn, session_key)
-    )
+    unless Keyword.get(opts, :defer_harklight, false) do
+      Txn.handoff(
+        txn,
+        Tightbeam.HarklightWakes,
+        Tightbeam.HarklightWakes.retirement_handoff_in_txn(txn, session_key)
+      )
+    end
 
     Tightbeam.SentinelSubscriptions.end_session_in_txn(txn, session_key)
 
@@ -1189,6 +1193,11 @@ defmodule Tightbeam.Org do
         )
         AND NOT EXISTS (
           SELECT 1 FROM harklight_wake_deliveries d WHERE d.wakeId=w.wakeId
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM wake_retry_attempts retry
+          JOIN harklight_wake_deliveries d ON d.wakeId=retry.rootWakeId
+          WHERE retry.wakeId=w.wakeId
         )
       ORDER BY w.createdAt,w.wakeId
       """,

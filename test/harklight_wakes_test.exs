@@ -89,6 +89,407 @@ defmodule Tightbeam.HarklightWakesTest do
     %{db: db, call: call, session: session, main: main}
   end
 
+  test "retirement transfers pending and later chats through a conversation follow", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    line = event(1, "discussion", "pending successor")
+    assert :ok = HarklightWakes.capture_line(db, @handle, line)
+    assert %{state: "retired"} = Org.retire(db, session.session_key, "user:owner", 60_000)
+
+    assert {:ok, [["conversation", "open"]]} =
+             DB.query(db, "SELECT kind,state FROM harklight_wake_follows WHERE sessionKey=?1", [
+               main.session_key
+             ])
+
+    assert {:ok, [[wake_id, prompt]]} =
+             DB.query(
+               db,
+               "SELECT w.wakeId,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.sessionKey=?1",
+               [main.session_key]
+             )
+
+    assert String.starts_with?(prompt, line <> "\n\n")
+    assert prompt =~ session.session_key
+    assert prompt =~ "Origin"
+    assert prompt =~ "has retired"
+    refute prompt =~ "from your originating session"
+    assert prompt =~ "harklight-agent ack --session #{@handle} --event 1"
+    turn = deliver_discussion_turn!(db, wake_id, main.session_key)
+    assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    assert :ok =
+             HarklightWakes.capture_line(db, @handle, event(2, "discussion", "later successor"))
+
+    assert {:ok, [[key]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey FROM harklight_wake_deliveries WHERE eventId='2'"
+             )
+
+    assert key == main.session_key
+    assert {:ok, [["active"]]} = DB.query(db, "SELECT state FROM harklight_wake_handles")
+  end
+
+  test "failed discussion retry remains with the successor after retirement", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "failed chat"))
+    assert {:ok, [[root]]} = DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries")
+    turn = deliver_discussion_turn!(db, root, session.session_key)
+    assert :ok = Ledger.finish(db, turn.seq, "failed_unknown", nil, owner_lease: turn.owner_lease)
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               main.session_key
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes w JOIN wake_retry_attempts r ON r.wakeId=w.wakeId WHERE r.rootWakeId=?1 AND w.state='pending'",
+               [root]
+             )
+  end
+
+  test "retiring an ordinary follower of a historical retiree passes custody along its own lineage",
+       %{db: db, session: session, main: main, call: call} do
+    parent = follower_session(db, main, "agent:next")
+    follower = follower_session(db, parent, "agent:prior-follower")
+
+    assert %{outcome: "committed"} =
+             HarklightFollows.follow(
+               db,
+               follow_call(call, follower, %{handle: @handle}),
+               runner: lifecycle_runner(db),
+               activate: false
+             )
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        session.session_key
+      ])
+
+    line = event(1, "discussion", "historical conversation")
+    assert :ok = HarklightWakes.capture_line(db, @handle, line)
+    Org.retire(db, follower.session_key, "user:owner", 60_000)
+
+    assert {:ok, [[key, prompt]]} =
+             DB.query(
+               db,
+               "SELECT d.sessionKey,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.sessionKey<>?1",
+               [follower.session_key]
+             )
+
+    assert key == parent.session_key
+    assert String.starts_with?(prompt, line <> "\n\n")
+    assert prompt =~ session.session_key
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(2, "discussion", "next"))
+
+    assert {:ok, [[^key]]} =
+             DB.query(db, "SELECT sessionKey FROM harklight_wake_deliveries WHERE eventId='2'")
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_follows WHERE sessionKey=?1", [
+               main.session_key
+             ])
+  end
+
+  test "successor deliveries retry with identical authored payload and rerouted ACK2", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    assert :ok =
+             HarklightWakes.capture_line(db, @handle, event(1, "discussion", "retry successor"))
+
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+
+    assert {:ok, [[root, prompt]]} =
+             DB.query(
+               db,
+               "SELECT w.wakeId,w.prompt FROM wakes w JOIN harklight_wake_deliveries d ON d.wakeId=w.wakeId WHERE d.sessionKey=?1",
+               [main.session_key]
+             )
+
+    turn = deliver_discussion_turn!(db, root, main.session_key)
+    Ledger.stamp_adapter(db, turn.seq, 1)
+    record_prompt_dispatched!(db, turn)
+
+    assert :ok =
+             HarklightWakes.ack2_for_dispatched_turn(db, turn.seq, main.session_key, "Successor",
+               runner: fn args ->
+                 send(self(), {:ack2, args})
+                 {"", 0}
+               end
+             )
+
+    assert_received {:ack2,
+                     [
+                       "ack2",
+                       "--session",
+                       @handle,
+                       "--event",
+                       "1",
+                       "--agent",
+                       "Successor",
+                       "--rerouted"
+                     ]}
+
+    assert :ok = Ledger.finish(db, turn.seq, "failed_unknown", nil, owner_lease: turn.owner_lease)
+
+    assert {:ok, [[^prompt]]} =
+             DB.query(
+               db,
+               "SELECT w.prompt FROM wakes w JOIN wake_retry_attempts r ON r.wakeId=w.wakeId WHERE r.rootWakeId=?1 AND w.state='pending'",
+               [root]
+             )
+  end
+
+  test "successor lookup orders office, duty transfers and reporting lineage with cycle termination",
+       %{db: db, session: session, main: main} do
+    other = follower_session(db, main, "agent:duty")
+    office = follower_session(db, main, "agent:office")
+    insert_retirement_fixture(db, "retirement", session.session_key, main.session_key)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO retirement_owner_transfers(id,retirementId,formerOwnerSessionKey,newOwnerSessionKey,successorId,createdAt) VALUES(1,'retirement',?1,?2,'retirement',2)",
+        [session.session_key, other.session_key]
+      )
+
+    assert successor(db, session.session_key).session_key == other.session_key
+    Tightbeam.Roles.create!(db, "m-office", "owner", office.session_key)
+    {:ok, _} = DB.query(db, "UPDATE roles SET createdAt=1 WHERE name='m-office'")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO retirement_blockers(retirementId,kind,reference,sessionKey) VALUES('retirement','role','m-office',?1)",
+        [session.session_key]
+      )
+
+    assert successor(db, session.session_key).session_key == office.session_key
+    # A retired office holder passes on before the original holder's duty source.
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [office.session_key])
+
+    assert successor(db, session.session_key).session_key == main.session_key
+    # A recreated office, including a same-millisecond creation, falls through.
+    {:ok, _} = DB.query(db, "UPDATE roles SET createdAt=10 WHERE name='m-office'")
+    assert successor(db, session.session_key).session_key == other.session_key
+    {:ok, _} = DB.query(db, "UPDATE roles SET createdAt=11 WHERE name='m-office'")
+    assert successor(db, session.session_key).session_key == other.session_key
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO retirement_owner_transfers(id,retirementId,formerOwnerSessionKey,newOwnerSessionKey,successorId,createdAt) VALUES(2,'retirement',?1,?2,'retirement',2)",
+        [other.session_key, session.session_key]
+      )
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1,?2)", [
+        other.session_key,
+        session.session_key
+      ])
+
+    assert successor(db, session.session_key) == nil
+  end
+
+  test "a remote successor is selected without admitting it or falling back locally", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    remote = follower_session(db, main, "agent:remote-successor")
+    Org.set_host(db, remote.session_key, "other-host")
+    insert_retirement_fixture(db, "remote-duty", session.session_key, main.session_key)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO retirement_owner_transfers(retirementId,formerOwnerSessionKey,newOwnerSessionKey,successorId,createdAt) VALUES('remote-duty',?1,?2,'remote-duty',2)",
+        [session.session_key, remote.session_key]
+      )
+
+    assert successor(db, session.session_key).session_key == remote.session_key
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "remote"))
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+    assert {:ok, []} = DB.query(db, "SELECT * FROM harklight_wake_follows")
+    assert {:ok, [[key]]} = DB.query(db, "SELECT sessionKey FROM harklight_wake_deliveries")
+    assert key == session.session_key
+  end
+
+  for {state, error} <- [{"complete", nil}, {"unavailable", "origin_unavailable"}] do
+    test "ended #{state}/#{error} conversation is not revived by follower retirement", %{
+      db: db,
+      session: session,
+      main: main,
+      call: call
+    } do
+      follower = follower_session(db, main, "agent:ended-follower")
+
+      assert %{outcome: "committed"} =
+               HarklightFollows.follow(
+                 db,
+                 follow_call(call, follower, %{handle: @handle}),
+                 runner: lifecycle_runner(db),
+                 activate: false
+               )
+
+      {:ok, _} =
+        DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+          session.session_key
+        ])
+
+      {:ok, _} =
+        DB.query(db, "UPDATE harklight_wake_handles SET state=?1,lastError=?2", [
+          unquote(state),
+          unquote(error)
+        ])
+
+      assert {:error, "harklight_origin_unavailable"} =
+               HarklightWakes.capture_line(db, @handle, event(1, "discussion", "ended"))
+
+      Org.retire(db, follower.session_key, "user:owner", 60_000)
+      assert {:ok, [[key]]} = DB.query(db, "SELECT sessionKey FROM harklight_wake_follows")
+      assert key == follower.session_key
+      assert {:ok, []} = DB.query(db, "SELECT * FROM harklight_wake_deliveries")
+
+      assert {:ok, [[unquote(state), unquote(error)]]} =
+               DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+    end
+  end
+
+  test "recoverable listener failure permits successor follow and pending delivery", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "recoverable"))
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE harklight_wake_handles SET state='unavailable',lastError='listener_exit_1'"
+      )
+
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+    assert {:ok, [[key]]} = DB.query(db, "SELECT sessionKey FROM harklight_wake_follows")
+    assert key == main.session_key
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               key
+             ])
+
+    test_pid = self()
+
+    listener = fn manager, handle, _ ->
+      GenServer.call(manager, {:attached, handle})
+      send(test_pid, :successor_listener_restored)
+
+      receive do
+        :never -> :ok
+      end
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener})
+    assert_receive :successor_listener_restored
+
+    assert {:ok, [["active", nil]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+  end
+
+  test "a whole retiring set resolves directly to its first surviving receiver", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    parent = follower_session(db, main, "agent:retiring-parent")
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+        session.session_key,
+        parent.session_key
+      ])
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "subtree"))
+
+    assert {:ok, _} =
+             DB.transaction(db, fn txn ->
+               for key <- [session.session_key, parent.session_key] do
+                 Org.retire_in_txn(txn, key, "user:owner", 60_000, defer_harklight: true)
+               end
+
+               for key <- [session.session_key, parent.session_key] do
+                 HarklightWakes.retirement_handoff_in_txn(txn, key)
+               end
+             end)
+
+    assert {:ok, [[key]]} = DB.query(db, "SELECT sessionKey FROM harklight_wake_follows")
+    assert key == main.session_key
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               parent.session_key
+             ])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               main.session_key
+             ])
+  end
+
+  test "a terminal queued but not dispatched transfers, while a received discussion does not", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "received"))
+    assert {:ok, [[discussion]]} = DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries")
+    received = deliver_discussion_turn!(db, discussion, session.session_key)
+    Ledger.stamp_adapter(db, received.seq, 1)
+    record_prompt_dispatched!(db, received)
+
+    assert :ok =
+             Ledger.finish(db, received.seq, "delivered", nil, owner_lease: received.owner_lease)
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(2, "terminal", "not dispatched"))
+
+    assert {:ok, [[terminal]]} =
+             DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries WHERE eventId='2'")
+
+    # A carrying turn has been created, but no prompt-dispatched event exists.
+    deliver_discussion_turn!(db, terminal, session.session_key)
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+
+    assert {:ok, [["2"]]} =
+             DB.query(db, "SELECT eventId FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               main.session_key
+             ])
+  end
+
+  defp successor(db, key) do
+    {:ok, result} = DB.transaction(db, &HarklightWakes.successor_in_txn(&1, key))
+    result
+  end
+
+  defp insert_retirement_fixture(db, id, target, owner) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO unfinished_retirements(id,targetSessionKey,ownerSessionKey,principalRef,keepOpenDescendants,blockerKind,wakeId,state,createdAt) VALUES(?1,?2,?3,'user:owner',0,'work','fixture','retired',10)",
+        [id, target, owner]
+      )
+  end
+
   test "a prepared send cannot bind through a different payload or origin", %{db: db, call: call} do
     assert %{code: "harklight_send_mismatch"} =
              HarklightWakes.prepare_send(db, call, @send_op, @payload <> " ")
@@ -829,6 +1230,11 @@ defmodule Tightbeam.HarklightWakesTest do
              Tightbeam.Ledger.finish(db, turn.seq, "failed_unknown", nil,
                owner_lease: turn.owner_lease
              )
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
 
     assert %{state: "retired"} = Org.retire(db, session.session_key, "user:owner", 60_000)
 
@@ -1955,6 +2361,12 @@ defmodule Tightbeam.HarklightWakesTest do
              HarklightWakes.capture_line(db, @handle, event(2, "discussion", "later"))
 
     Org.set_host(db, session.session_key, Placement.local_host_name())
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
+
     Org.retire(db, session.session_key, "user:owner", 60_000)
     session_key = session.session_key
 
@@ -1987,6 +2399,11 @@ defmodule Tightbeam.HarklightWakesTest do
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive {:listener_running, worker}
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
 
     retired = Org.retire(db, session.session_key, "user:owner", 60_000)
     assert retired.state == "retired"
@@ -2039,6 +2456,11 @@ defmodule Tightbeam.HarklightWakesTest do
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive {:listener_running, worker}
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
 
     retired = Org.retire(db, session.session_key, "user:owner", 60_000)
     assert retired.state == "retired"
@@ -2117,6 +2539,11 @@ defmodule Tightbeam.HarklightWakesTest do
     :sys.suspend(HarklightWakes)
 
     try do
+      {:ok, _} =
+        DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+          Org.personal_session_key("owner")
+        ])
+
       assert %{state: "retired"} = Org.retire(db, session.session_key, "user:owner", 60_000)
       assert %{state: "retired"} = Org.retire(db, follower.session_key, "user:owner", 60_000)
     after
@@ -2174,6 +2601,11 @@ defmodule Tightbeam.HarklightWakesTest do
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive {:listener_running, worker}
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
 
     retired_follower = Org.retire(db, follower.session_key, "user:owner", 60_000)
     assert retired_follower.state == "retired"
@@ -2239,6 +2671,11 @@ defmodule Tightbeam.HarklightWakesTest do
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive {:listener_running, worker}
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
 
     retired_origin = Org.retire(db, session.session_key, "user:owner", 60_000)
     assert retired_origin.state == "retired"
@@ -2561,6 +2998,11 @@ defmodule Tightbeam.HarklightWakesTest do
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive {:listener_running, _worker}
 
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
+
     retired = Org.retire(db, session.session_key, "user:owner", 60_000)
     assert retired.state == "retired"
     :sys.get_state(HarklightWakes)
@@ -2630,11 +3072,10 @@ defmodule Tightbeam.HarklightWakesTest do
     refute old_worker == new_worker
   end
 
-  test "completed captured wakes stay with the retired origin and notify its owner", %{
+  test "completed conversations acquire no successor or recovery wake at retirement", %{
     db: db,
     call: call,
-    session: session,
-    main: main
+    session: session
   } do
     assert %{state: "registered"} = HarklightWakes.register(db, call)
     assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "terminal", "final"))
@@ -2651,14 +3092,15 @@ defmodule Tightbeam.HarklightWakesTest do
     Org.retire(db, session.session_key, "user:owner", 60_000)
     :sys.get_state(HarklightWakes)
     session_key = session.session_key
-    main_key = main.session_key
 
     assert {:ok, [[^session_key, "pending"]]} =
              DB.query(db, "SELECT sessionKey,state FROM wakes WHERE wakeId LIKE ?1", [
                "w_harklight_" <> @handle <> "_%"
              ])
 
-    assert {:ok, [[^main_key]]} =
+    assert {:ok, []} = DB.query(db, "SELECT * FROM harklight_wake_follows")
+
+    assert {:ok, []} =
              DB.query(
                db,
                "SELECT sessionKey FROM wakes WHERE wakeId=?1",
