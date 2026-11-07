@@ -122,12 +122,7 @@ defmodule Tightbeam.LateRulingHandoffTest do
 
     start_supervised!(
       {Supervision,
-       db: ctx.db,
-       handlers: %{},
-       prod_limit: 3,
-       name: supervision,
-       recover: false,
-       sweep_ms: nil}
+       db: ctx.db, handlers: %{}, prod_limit: 3, name: supervision, recover: false, sweep_ms: nil}
     )
 
     retire =
