@@ -197,7 +197,9 @@ defmodule Tightbeam.ToplinesRailsTest do
     insert!(
       db,
       "topline_placement_obligations",
-      %{placement_row("tlp_process") | openedActorKind: "process", openedActorRef: "tightbeam"}
+      placement_row("tlp_process")
+      |> Map.merge(%{openedActorKind: "process", openedActorRef: "tightbeam"})
+      |> Map.merge(resolved_placement("linked", %{}))
     )
 
     insert!(
