@@ -1,7 +1,10 @@
 import ExUnit.Assertions
-alias Tightbeam.{DB, Gateway, Org, Model}
+alias Tightbeam.{DB, Gateway, Identity, Org, Model}
 
-Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
+Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config, base: base} ->
+  {:ok, candidate} = Identity.learn!(base, "agentic-engineering", "test")
+  {:ok, _revision} = Identity.publish_live!(base, candidate)
+
   Org.create(db, %{
     session_key: "k1",
     display_name: "Main",
