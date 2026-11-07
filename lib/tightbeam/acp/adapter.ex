@@ -1713,9 +1713,9 @@ defmodule Tightbeam.Acp.Adapter do
 
   def handle_info(_msg, state), do: {:noreply, state}
   # ACP's public `messageId` is the boundary authority when present. If it is
-  # absent, preserve the legacy one-message accumulator and assign that group a
-  # generated public id at its first chunk; do not infer boundaries from content
-  # or tool traffic.
+  # absent, preserve the legacy anonymous-group accumulator and assign each new
+  # group a generated public id at its first chunk; do not infer boundaries from
+  # content or timestamps.
   defp assistant_message_id(%{"messageId" => id}) when is_binary(id) and id != "", do: id
   defp assistant_message_id(_update), do: nil
 
@@ -1735,30 +1735,28 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp logical_assistant_message_id(turn, groups, nil) when is_map(turn) do
-    stored_id = Map.get(Map.get(turn, :message_ids, %{}), :anonymous)
-
-    case stored_id do
-      logical_id when is_binary(logical_id) ->
+    case groups do
+      [%{message_id: nil, logical_message_id: logical_id} | _] when is_binary(logical_id) ->
         logical_id
 
       _ ->
-        case Enum.find(groups, &is_nil(&1.message_id)) do
-          %{logical_message_id: logical_id} when is_binary(logical_id) -> logical_id
-          _ -> "s_" <> Tightbeam.Id.uuid4()
-        end
+        "s_" <> Tightbeam.Id.uuid4()
     end
   end
 
   defp logical_assistant_message_id(_turn, _groups, _message_id), do: nil
 
   defp remember_logical_assistant_message(state, sid, message_id, logical_message_id)
-       when (is_binary(message_id) or is_nil(message_id)) and is_binary(logical_message_id) do
+       when is_binary(message_id) and is_binary(logical_message_id) do
     case state.tool_turns[sid] do
       turn when is_map(turn) ->
-        key = if is_binary(message_id), do: message_id, else: :anonymous
-
         message_ids =
-          Map.update(Map.get(turn, :message_ids, %{}), key, logical_message_id, & &1)
+          Map.update(
+            Map.get(turn, :message_ids, %{}),
+            message_id,
+            logical_message_id,
+            & &1
+          )
 
         put_in(state.tool_turns[sid], Map.put(turn, :message_ids, message_ids))
 
