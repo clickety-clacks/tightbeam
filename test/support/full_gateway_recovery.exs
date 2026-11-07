@@ -387,7 +387,6 @@ if phase == "prepare" do
   true = File.regular?(Path.join(base, "build-owner.json"))
   :ok = GenServer.stop(db)
 
-  :initialized = Tightbeam.Identity.init!(base)
   {:ok, candidate_law} = Tightbeam.Identity.learn!(base, "agentic-engineering", "test")
   {:ok, _revision} = Tightbeam.Identity.publish_live!(base, candidate_law)
 
