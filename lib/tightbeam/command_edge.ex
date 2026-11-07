@@ -191,13 +191,15 @@ defmodule Tightbeam.CommandEdge do
     defstruct provider: @missing,
               machine: @missing,
               adapter_keys: @missing,
-              observed_at: @missing
+              observed_at: @missing,
+              decision_id: nil
 
     @type t :: %__MODULE__{
             provider: atom(),
             machine: String.t(),
             adapter_keys: [Tightbeam.Placement.adapter_key()],
-            observed_at: integer()
+            observed_at: integer(),
+            decision_id: String.t() | nil
           }
 
     @doc false
@@ -207,11 +209,13 @@ defmodule Tightbeam.CommandEdge do
             provider: provider,
             machine: machine,
             adapter_keys: adapter_keys,
-            observed_at: observed_at
+            observed_at: observed_at,
+            decision_id: decision_id
           } = command
         )
         when is_atom(provider) and is_binary(machine) and is_list(adapter_keys) and
-               adapter_keys != [] and is_integer(observed_at) do
+               adapter_keys != [] and is_integer(observed_at) and
+               (is_nil(decision_id) or is_binary(decision_id)) do
       if Enum.all?(adapter_keys, fn
            {harness, preset, host} ->
              is_atom(harness) and is_binary(preset) and host == machine
