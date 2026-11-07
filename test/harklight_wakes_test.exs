@@ -1381,8 +1381,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     manager =
       start_supervised!(
-        {HarklightWakes,
-         db: db, retry_delays: [3_000, 3_000], attach_retry_delays: []}
+        {HarklightWakes, db: db, retry_delays: [3_000, 3_000], attach_retry_delays: []}
       )
 
     failed = [stopped, listen_failure, attach_unknown]
