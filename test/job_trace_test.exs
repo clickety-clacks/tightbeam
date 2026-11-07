@@ -341,10 +341,10 @@ defmodule Tightbeam.JobTraceTest do
     assert is_integer(canceled_at) and canceled_at >= completion.ts
 
     # Exact equality also excludes private prompt, attest and transcript fields.
-    assert Enum.filter(trace.timeline, &(&1.type == "wake_canceled")) ==
-             source_cancellations ++
-               [
-                 %{
+    expected_cancellations =
+      (source_cancellations ++
+         [
+           %{
                    assignmentId: "asg_direct",
                    at: canceled_at,
                    id: notice_id,
@@ -368,8 +368,12 @@ defmodule Tightbeam.JobTraceTest do
                    livenessTriggerKind: nil,
                    livenessTriggerId: nil,
                    actionNeeded: false
-                 }
-               ]
+           }
+         ])
+      |> Enum.sort_by(&{&1.at, &1.seqTiebreak})
+
+    assert Enum.filter(trace.timeline, &(&1.type == "wake_canceled")) ==
+             expected_cancellations
 
     refute Enum.any?(trace.timeline, &(&1.type in ["marker", "disposition"]))
 
