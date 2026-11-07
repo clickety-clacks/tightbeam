@@ -75,12 +75,7 @@ defmodule Tightbeam.Projection do
   CREATE UNIQUE INDEX IF NOT EXISTS messages_client_dedupe
     ON messages (sessionKey, deviceId, clientMessageId)
     WHERE clientMessageId IS NOT NULL AND deviceId IS NOT NULL;
-  CREATE TABLE IF NOT EXISTS read_states (
-    userId            TEXT NOT NULL,
-    sessionKey        TEXT NOT NULL,
-    lastReadMessageId TEXT NOT NULL,
-    PRIMARY KEY (userId, sessionKey)
-  );
+  DROP TABLE IF EXISTS read_states;
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
@@ -293,37 +288,6 @@ defmodule Tightbeam.Projection do
       [[id, role]] -> %{last_message_id: id, last_message_role: role}
       [] -> nil
     end
-  end
-
-  @doc "Upsert a user's last-read pointer for a session (client display state only)."
-  @spec set_read_state(db(), String.t(), String.t(), String.t()) :: :ok
-  def set_read_state(db \\ Tightbeam.DB, user_id, session_key, last_read_message_id) do
-    transaction!(db, fn txn ->
-      Txn.q(
-        txn,
-        """
-          INSERT INTO read_states (userId, sessionKey, lastReadMessageId) VALUES (?1, ?2, ?3)
-          ON CONFLICT (userId, sessionKey) DO UPDATE
-            SET lastReadMessageId = excluded.lastReadMessageId
-        """,
-        [user_id, session_key, last_read_message_id]
-      )
-
-      :ok
-    end)
-  end
-
-  @doc "All of a user's read pointers, as `%{session_key => last_read_message_id}`."
-  @spec read_states(db(), String.t()) :: %{optional(String.t()) => String.t()}
-  def read_states(db \\ Tightbeam.DB, user_id) do
-    {:ok, rows} =
-      DB.query(db, "SELECT sessionKey, lastReadMessageId FROM read_states WHERE userId = ?1", [
-        user_id
-      ])
-
-    Map.new(rows, fn [session_key, last_read_message_id] ->
-      {session_key, last_read_message_id}
-    end)
   end
 
   defp select_by_id(txn, id) do

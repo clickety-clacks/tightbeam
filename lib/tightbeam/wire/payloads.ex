@@ -106,7 +106,6 @@ defmodule Tightbeam.Wire.Payloads do
       "replayTruncated" => Map.fetch!(input, :replay_truncated),
       "historyReset" => Map.fetch!(input, :history_reset),
       "sessionKeys" => Map.fetch!(input, :session_keys),
-      "streamReadStates" => Map.fetch!(input, :stream_read_states),
       "streamTailStates" => Map.fetch!(input, :stream_tail_states),
       "features" => Map.fetch!(input, :features),
       "dmScope" => Map.fetch!(input, :dm_scope)
@@ -218,15 +217,6 @@ defmodule Tightbeam.Wire.Payloads do
 
   @spec stream_deleted(String.t()) :: payload()
   def stream_deleted(session_key), do: %{"type" => "stream_deleted", "sessionKey" => session_key}
-
-  @spec stream_read_state(String.t(), String.t()) :: payload()
-  def stream_read_state(session_key, last_read_message_id) do
-    %{
-      "type" => "stream_read_state",
-      "sessionKey" => session_key,
-      "lastReadMessageId" => last_read_message_id
-    }
-  end
 
   @spec prompt_turn_state_event(%{
           client_message_id: String.t(),

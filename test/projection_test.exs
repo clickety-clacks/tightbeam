@@ -220,21 +220,26 @@ defmodule Tightbeam.ProjectionTest do
     assert Projection.tail(db, "empty") == nil
   end
 
-  test "read state upserts per user and session", %{db: db} do
-    :ok = Projection.set_read_state(db, "sample-user", "k1", "s_a")
-    :ok = Projection.set_read_state(db, "sample-user", "k1", "s_b")
-    :ok = Projection.set_read_state(db, "sample-user", "k2", "s_c")
-
-    assert Projection.read_states(db, "sample-user") == %{"k1" => "s_b", "k2" => "s_c"}
-    assert Projection.read_states(db, "sam") == %{}
-
-    {:ok, rows} =
-      DB.query(
+  test "schema cleanup drops legacy read state without migrating it", %{db: db} do
+    :ok =
+      DB.execute(
         db,
-        "SELECT userId, sessionKey, lastReadMessageId FROM read_states ORDER BY sessionKey"
+        "CREATE TABLE read_states (userId TEXT, sessionKey TEXT, lastReadMessageId TEXT)"
       )
 
-    assert rows == [["sample-user", "k1", "s_b"], ["sample-user", "k2", "s_c"]]
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO read_states (userId, sessionKey, lastReadMessageId) " <>
+          "VALUES ('sample-user', 'k1', 's_b')"
+      )
+
+    :ok = Projection.ensure_schema(db)
+
+    {:ok, rows} =
+      DB.query(db, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'read_states'")
+
+    assert rows == []
   end
 
   test "role and client dedupe invariants live in SQL", %{db: db} do
