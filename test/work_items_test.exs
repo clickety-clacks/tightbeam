@@ -1353,7 +1353,18 @@ defmodule Tightbeam.WorkItemsTest do
              )
 
     assert canceled_at == due_at
-    assert {:ok, [["process", "tightbeam:wake-scheduler", "target_unresolvable", "scheduler_delivery", ^notice_id, "no_replacement"]]} =
+
+    assert {:ok,
+            [
+              [
+                "process",
+                "tightbeam:wake-scheduler",
+                "target_unresolvable",
+                "scheduler_delivery",
+                ^notice_id,
+                "no_replacement"
+              ]
+            ]} =
              DB.query(
                ctx.db,
                "SELECT requesterKind,requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",

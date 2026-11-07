@@ -202,6 +202,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert assignment.id
 
     item = create_work_item(ctx, "Off interval linked item")
+
     assert {:ok, [[routing_id]]} =
              DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
 
@@ -211,7 +212,9 @@ defmodule Tightbeam.AssignmentsTest do
                System.system_time(:millisecond)
              ])
 
-    linked = handlers["assign"].(assign_call({:session, "holder"}, "off interval linked", nil, item.id))
+    linked =
+      handlers["assign"].(assign_call({:session, "holder"}, "off interval linked", nil, item.id))
+
     assert linked.workItemId == item.id
 
     assert {:ok, [[0]]} =

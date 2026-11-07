@@ -184,10 +184,26 @@ defmodule Tightbeam.JobTraceTest do
     notice_id = "w_terminal_" <> notice_digest
 
     personal = Org.personal_session_key("owner")
-    assert %{state: "canceled", session_key: ^personal, fired_at: nil, due_at: due_at,
-             canceled_at: due_at} = Tightbeam.Wakes.get(db, notice_id)
 
-    assert {:ok, [["process", "tightbeam:wake-scheduler", "target_unresolvable", "scheduler_delivery", ^notice_id, "no_replacement"]]} =
+    assert %{
+             state: "canceled",
+             session_key: ^personal,
+             fired_at: nil,
+             due_at: due_at,
+             canceled_at: due_at
+           } = Tightbeam.Wakes.get(db, notice_id)
+
+    assert {:ok,
+            [
+              [
+                "process",
+                "tightbeam:wake-scheduler",
+                "target_unresolvable",
+                "scheduler_delivery",
+                ^notice_id,
+                "no_replacement"
+              ]
+            ]} =
              DB.query(
                db,
                "SELECT requesterKind,requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
@@ -345,29 +361,29 @@ defmodule Tightbeam.JobTraceTest do
       (source_cancellations ++
          [
            %{
-                   assignmentId: "asg_direct",
-                   at: canceled_at,
-                   id: notice_id,
-                   reason: nil,
-                   seqTiebreak: wake_rowid,
-                   type: "wake_canceled",
-                   provenanceStatus: "proven",
-                   schedulingOrigin: "process:tightbeam",
-                   requesterKind: "process",
-                   requesterId: "tightbeam:wake-scheduler",
-                   reasonKind: "target_unresolvable",
-                   causalSourceKind: "scheduler_delivery",
-                   causalSourceId: notice_id,
-                   outcomeKind: "no_replacement",
-                   replacementWakeId: nil,
-                   dispositionKind: nil,
-                   dispositionId: nil,
-                   primaryWorkKind: nil,
-                   primaryWorkId: nil,
-                   workImpactKind: "no_linked_work",
-                   livenessTriggerKind: nil,
-                   livenessTriggerId: nil,
-                   actionNeeded: false
+             assignmentId: "asg_direct",
+             at: canceled_at,
+             id: notice_id,
+             reason: nil,
+             seqTiebreak: wake_rowid,
+             type: "wake_canceled",
+             provenanceStatus: "proven",
+             schedulingOrigin: "process:tightbeam",
+             requesterKind: "process",
+             requesterId: "tightbeam:wake-scheduler",
+             reasonKind: "target_unresolvable",
+             causalSourceKind: "scheduler_delivery",
+             causalSourceId: notice_id,
+             outcomeKind: "no_replacement",
+             replacementWakeId: nil,
+             dispositionKind: nil,
+             dispositionId: nil,
+             primaryWorkKind: nil,
+             primaryWorkId: nil,
+             workImpactKind: "no_linked_work",
+             livenessTriggerKind: nil,
+             livenessTriggerId: nil,
+             actionNeeded: false
            }
          ])
       |> Enum.sort_by(&{&1.at, &1.seqTiebreak})
