@@ -1480,6 +1480,8 @@ defmodule Tightbeam.CoordinationFabricTest do
       preflight_terminal_operator_rows_in_txn: "operator",
       rule_operator_request_in_txn: "operator",
       operator_withdraw_in_txn: "operator",
+      applicable_late_rulings_in_txn: "operator",
+      late_ruling_receipt_context_in_txn: "operator",
       open_counts_by_assignment: "statute,effort",
       open_statute_effort_ids_for_assignments_in_txn: "statute,effort",
       consume: "any",
@@ -1552,6 +1554,8 @@ defmodule Tightbeam.CoordinationFabricTest do
       preflight_terminal_operator_rows_in_txn: 2,
       rule_operator_request_in_txn: 6,
       operator_withdraw_in_txn: 4,
+      applicable_late_rulings_in_txn: 4,
+      late_ruling_receipt_context_in_txn: 4,
       open_counts_by_assignment: 1,
       open_statute_effort_ids_for_assignments_in_txn: 2,
       consume: 2,
@@ -1662,7 +1666,8 @@ defmodule Tightbeam.CoordinationFabricTest do
         {:list, 4},
         {:get, 4},
         {:decision_trace_rows, 2},
-        {:open_statute_effort_ids_for_assignments_in_txn, 2}
+        {:open_statute_effort_ids_for_assignments_in_txn, 2},
+        {:applicable_late_rulings_in_txn, 4}
       ])
 
     found_dynamic_queries = dynamic_query_refs("lib/tightbeam/escalation.ex")
