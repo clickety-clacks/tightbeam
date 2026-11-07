@@ -187,7 +187,7 @@ defmodule Tightbeam.Wire.Socket do
     push(Payloads.wire_error("auth_failed", "not authenticated"), state)
   end
 
-  defp route(%{"type" => "message"} = msg, state) do
+  defp route(%{"type" => type} = msg, state) when type == "message" do
     if MapSet.member?(state.subscriptions, "chat") do
       route_chat(msg, state)
     else
