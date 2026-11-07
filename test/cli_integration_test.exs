@@ -689,7 +689,10 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     File.cp!(
-      Path.expand("../priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml", __DIR__),
+      Path.expand(
+        "../priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml",
+        __DIR__
+      ),
       Path.join(ctx.base_dir, "identity/rules/row-reaction-assignment-inactivity.toml")
     )
 
@@ -1885,6 +1888,7 @@ defmodule Tightbeam.CliIntegrationTest do
   test "session-auth --as-user retains agent attribution for verdicts and revocation",
        ctx do
     Tightbeam.TerminalReactionFixture.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
     {:ok, _} =
       DB.query(
         ctx.db,
