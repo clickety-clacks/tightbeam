@@ -85,12 +85,18 @@ defmodule Tightbeam.ConditionFacts do
     ON condition_facts (kind, scope, id);
   CREATE INDEX IF NOT EXISTS condition_facts_owner_match
     ON condition_facts (ownerUserId, kind, scope, id);
+  """
+
+  @filing_index """
   CREATE UNIQUE INDEX IF NOT EXISTS condition_facts_decision_request_filed
-    ON condition_facts (scope) WHERE kind = 'decision-request-filed';
+    ON condition_facts (scope) WHERE kind = 'decision-request-filed'
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+
+  @doc false
+  def ensure_filing_index(db), do: DB.execute(db, @filing_index)
 
   @doc false
   def wake_hint(kind, scope) when is_binary(kind) do
@@ -449,6 +455,9 @@ defmodule Tightbeam.ConditionFacts do
 
     :ok = SentinelSubscriptions.fulfill_fact_in_txn(txn, fact)
     :ok = Tightbeam.Assignments.release_cannot_proceed_in_txn(txn, fact)
+
+    if kind == "escalation-ruled",
+      do: Tightbeam.Recognition.fulfill_fact_in_txn(txn, kind, scope)
 
     EventLog.lifecycle_in_txn(
       txn,

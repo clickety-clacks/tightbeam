@@ -22,9 +22,22 @@ defmodule Tightbeam.Recognition do
     flagged INTEGER NOT NULL DEFAULT 0 CHECK(flagged IN (0,1))
   )
   """
+  @wait_ddl """
+  CREATE TABLE pending_recognition_waits (
+    recognitionId TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    FOREIGN KEY (recognitionId) REFERENCES pending_recognition(id) ON DELETE CASCADE
+  )
+  """
+  @wait_index "CREATE INDEX pending_recognition_waits_fact ON pending_recognition_waits(kind,scope)"
   @max_attempts 5
 
-  def ensure_sqlite_schema(conn), do: Exqlite.Sqlite3.execute(conn, @ddl)
+  def ensure_sqlite_schema(conn) do
+    :ok = Exqlite.Sqlite3.execute(conn, @ddl)
+    :ok = Exqlite.Sqlite3.execute(conn, @wait_ddl)
+    Exqlite.Sqlite3.execute(conn, @wait_index)
+  end
 
   def ensure_schema(db) do
     owner =
@@ -57,6 +70,29 @@ defmodule Tightbeam.Recognition do
 
                :ok
            end
+
+           wait_id = "0.1.15/pending-recognition-fact-wait-v1"
+
+           case Txn.q(txn, "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1", [
+                  wait_id
+                ]) do
+             [[1]] ->
+               :ok
+
+             [] ->
+               unless in_memory? do
+                 Txn.exec(txn, @wait_ddl)
+                 Txn.exec(txn, @wait_index)
+               end
+
+               Txn.q(
+                 txn,
+                 "INSERT INTO supervision_liveness_migrations(migrationId,appliedAt,affectedRows,cause,principal) VALUES(?1,?2,0,'release_upgrade','process:tightbeam')",
+                 [wait_id, now()]
+               )
+           end
+
+           :ok
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
@@ -74,8 +110,30 @@ defmodule Tightbeam.Recognition do
 
   defp worker(db), do: :persistent_term.get({__MODULE__, GenServer.whereis(db)}, nil)
 
+  @doc false
+  def nudge_in_txn(txn) do
+    if pid = :persistent_term.get({__MODULE__, self()}, nil),
+      do: Txn.handoff(txn, pid, :reschedule)
+
+    :ok
+  end
+
+  @doc false
+  def fulfill_fact_in_txn(txn, kind, scope) when is_binary(kind) and is_binary(scope) do
+    Txn.q(
+      txn,
+      "UPDATE pending_recognition SET nextAt=?3 WHERE id IN (SELECT recognitionId FROM pending_recognition_waits WHERE kind=?1 AND scope=?2)",
+      [kind, scope, now()]
+    )
+
+    changed = Txn.changes(txn)
+    Txn.q(txn, "DELETE FROM pending_recognition_waits WHERE kind=?1 AND scope=?2", [kind, scope])
+    if changed > 0, do: nudge_in_txn(txn)
+    :ok
+  end
+
   def record(txn, callback, result, transitions, opts) do
-    id = Tightbeam.Id.uuid4()
+    id = Keyword.get_lazy(opts, :id, &Tightbeam.Id.uuid4/0)
     module = callback |> :erlang.fun_info(:module) |> elem(1)
 
     payload =
@@ -84,15 +142,23 @@ defmodule Tightbeam.Recognition do
          Keyword.get(opts, :retry_deliveries, false)}
       )
 
-    Txn.q(txn, "INSERT INTO pending_recognition(id,version,payload,nextAt) VALUES(?1,1,?2,?3)", [
-      id,
-      {:blob, payload},
-      now() +
-        case txn.deadline do
-          :infinity -> DB.call_timeout()
-          deadline -> max(0, deadline - System.monotonic_time(:millisecond))
-        end
-    ])
+    Txn.q(
+      txn,
+      "INSERT INTO pending_recognition(id,version,payload,nextAt) VALUES(?1,1,?2,?3) ON CONFLICT(id) DO NOTHING",
+      [
+        id,
+        {:blob, payload},
+        Keyword.get_lazy(opts, :next_at, fn ->
+          now() +
+            case txn.deadline do
+              :infinity -> DB.call_timeout()
+              deadline -> max(0, deadline - System.monotonic_time(:millisecond))
+            end
+        end)
+      ]
+    )
+
+    if Keyword.has_key?(opts, :id), do: nudge_in_txn(txn)
 
     %Pending{id: id, result: result, transitions: transitions}
   end
@@ -100,7 +166,7 @@ defmodule Tightbeam.Recognition do
   def inline(db, pending, callback, opts, deadline) do
     case invoke(db, pending, callback, true, deadline) do
       {:ok, result} ->
-        if is_function(callback, 1), do: finish(db, pending.id)
+        if is_function(callback, 1) or is_function(callback, 3), do: finish(db, pending.id)
         {:ok, result}
 
       {:error, _} ->
@@ -121,7 +187,11 @@ defmodule Tightbeam.Recognition do
         Enum.each(pending.transitions, &DB.record_row_commit(txn, &1))
         result = recognized_result!(call_callback!(callback, txn, pending.result), pending.result)
         # Clear the durable intent atomically with recognition's changes.
-        if clear, do: Txn.q(txn, "DELETE FROM pending_recognition WHERE id=?1", [pending.id])
+        if clear do
+          Txn.q(txn, "DELETE FROM pending_recognition_waits WHERE recognitionId=?1", [pending.id])
+          Txn.q(txn, "DELETE FROM pending_recognition WHERE id=?1", [pending.id])
+        end
+
         result
       end
 
@@ -133,6 +203,12 @@ defmodule Tightbeam.Recognition do
 
   defp invoke(_db, pending, callback, _clear, _deadline) when is_function(callback, 1),
     do: safely(fn -> {:ok, recognized_result!(callback.(pending.result), pending.result)} end)
+
+  defp invoke(db, pending, callback, _clear, _deadline) when is_function(callback, 3),
+    do:
+      safely(fn ->
+        {:ok, recognized_result!(callback.(db, pending.id, pending.result), pending.result)}
+      end)
 
   defp call_callback!(callback, txn, result) do
     callback.(txn, result)
@@ -159,7 +235,10 @@ defmodule Tightbeam.Recognition do
     # process crash between publication and deletion, as any external outbox is.
     delete = fn ->
       safely(fn ->
-        DB.transaction(db, &Txn.q(&1, "DELETE FROM pending_recognition WHERE id=?1", [id]))
+        DB.transaction(db, fn txn ->
+          Txn.q(txn, "DELETE FROM pending_recognition_waits WHERE recognitionId=?1", [id])
+          Txn.q(txn, "DELETE FROM pending_recognition WHERE id=?1", [id])
+        end)
       end)
     end
 
@@ -315,6 +394,25 @@ defmodule Tightbeam.Recognition do
       end)
 
     case outcome do
+      {:ok, {:await_fact, kind, scope}} ->
+        DB.transaction(db, fn txn ->
+          Txn.q(
+            txn,
+            "INSERT INTO pending_recognition_waits(recognitionId,kind,scope) VALUES(?1,?2,?3) ON CONFLICT(recognitionId) DO UPDATE SET kind=excluded.kind,scope=excluded.scope",
+            [id, kind, scope]
+          )
+
+          Txn.q(txn, "UPDATE pending_recognition SET nextAt=?2 WHERE id=?1", [
+            id,
+            now() + 3 * 60 * 60_000
+          ])
+        end)
+
+      {:ok, {:defer_until, when_ms}} when is_integer(when_ms) ->
+        DB.transaction(db, fn txn ->
+          Txn.q(txn, "UPDATE pending_recognition SET nextAt=?2 WHERE id=?1", [id, when_ms])
+        end)
+
       {:ok, _result} ->
         finish(db, id)
 

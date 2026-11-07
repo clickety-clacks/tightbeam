@@ -4518,6 +4518,10 @@ defmodule Tightbeam.Escalation do
 
   defp owner_user_id!(_db, %{principal: {:user, user_id}}), do: user_id
 
+  defp owner_user_id!(_db, %{principal: {:remedy, %{owner: owner}}})
+       when is_binary(owner),
+       do: owner
+
   defp owner_user_id!(db, %{principal: {:process, _process}} = call),
     do: org_owner_user_id!(db, call)
 

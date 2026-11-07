@@ -2858,8 +2858,11 @@ defmodule Tightbeam.Wakes do
               )
           end
 
+        {:remedy, rule, call, _evidence} ->
+          Tightbeam.FilingRemedy.enqueue_in_txn(txn, rule, call)
+
         {:error, rule, message} ->
-          EventLog.lifecycle_in_txn(txn, "rule_notice_failed", rule.name, message)
+          EventLog.lifecycle_in_txn(txn, "rule_effect_failed", rule.name, message)
       end)
 
       recognize_wait_transitions_in_txn(txn, transitions)

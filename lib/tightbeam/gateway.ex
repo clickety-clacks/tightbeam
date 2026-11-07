@@ -235,6 +235,8 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:db, db)
       |> handlers()
 
+    :ok = Tightbeam.FilingRemedy.install_handlers(db, handler_table)
+
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the

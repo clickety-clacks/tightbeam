@@ -1075,7 +1075,8 @@ defmodule Tightbeam.Rules do
 
     :persistent_term.get(@persist_key, [])
     |> Enum.filter(fn rule ->
-      verb in rule.verbs and "row-commit" in rule.edges and rule.effect == "notice" and
+      verb in rule.verbs and "row-commit" in rule.edges and
+        rule.effect in ["notice", "remedy"] and
         row_domain_candidate?(rule, domain)
     end)
     |> Enum.flat_map(fn rule ->
@@ -1095,7 +1096,11 @@ defmodule Tightbeam.Rules do
 
             case evaluate_conditions(rule.conditions, rule, txn, candidate_call, %{}) do
               {:match, cache} ->
-                {:halt, [{:notice, rule, candidate_call, evidence_facts(rule.conditions, cache)}]}
+                {:halt,
+                 [
+                   {String.to_atom(rule.effect), rule, candidate_call,
+                    evidence_facts(rule.conditions, cache)}
+                 ]}
 
               {:no_match, _cache} ->
                 {:cont, []}
@@ -1603,12 +1608,29 @@ defmodule Tightbeam.Rules do
     effect =
       validate_effect!(Map.get(rule, "effect", "deny"), check, Map.has_key?(rule, "effect"), fail)
 
-    if "row-commit" in edges and effect != "notice",
-      do: fail.(~s(edge "row-commit" requires effect = "notice"))
+    filing_remedy? =
+      effect == "remedy" and edges == ["row-commit"] and verb == "condition" and
+        Enum.any?(conditions, fn condition ->
+          condition.fact == "condition_fact.kind" and condition.op == "eq" and
+            condition.value == "decision-request-filed"
+        end)
+
+    if "row-commit" in edges and effect != "notice" and not filing_remedy?,
+      do: fail.(~s(edge "row-commit" requires effect = "notice" or a filing-gated remedy))
 
     effects = if check, do: Map.values(check.effects), else: [effect]
     notice = validate_notice!(Map.get(rule, "notice"), effect, fail)
-    remedy = validate_remedy!(Map.get(rule, "remedy"), conditions, check, effects, fail, raw_name)
+
+    remedy =
+      validate_remedy!(
+        Map.get(rule, "remedy"),
+        conditions,
+        check,
+        effects,
+        fail,
+        raw_name,
+        filing_remedy?
+      )
 
     recurrence_suppression =
       validate_recurrence_suppression!(Map.get(rule, "recurrence_suppression"), fail)
@@ -1880,9 +1902,10 @@ defmodule Tightbeam.Rules do
 
   defp validate_check!(_check, _base_dir, fail), do: fail.("check must be a table")
 
-  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _name), do: nil
+  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _name, _filing?), do: nil
 
-  defp validate_remedy!(remedy, conditions, check, effects, fail, name) when is_map(remedy) do
+  defp validate_remedy!(remedy, conditions, check, effects, fail, name, filing?)
+       when is_map(remedy) do
     unknown = unknown_keys(remedy, @remedy_keys)
     if unknown != [], do: fail.("remedy has unknown keys: #{Enum.join(unknown, ", ")}")
 
@@ -1960,7 +1983,8 @@ defmodule Tightbeam.Rules do
       check && not is_nil(produces) ->
         fail.("script-effect remedy must omit produces")
 
-      is_nil(check) and requirements == [] and artifact_requirements(conditions) == [] ->
+      is_nil(check) and requirements == [] and artifact_requirements(conditions) == [] and
+          not filing? ->
         fail.("predicate remedy requires a verdict-fact or artifact-fact gate")
 
       is_nil(check) and requirements == [] and not is_nil(produces) ->
@@ -2001,7 +2025,7 @@ defmodule Tightbeam.Rules do
     }
   end
 
-  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _name),
+  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _name, _filing?),
     do: fail.("remedy must be a table")
 
   defp validate_interpolation!(field, value, fail) when field in @embedded_fields do

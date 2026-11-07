@@ -106,6 +106,7 @@ defmodule Tightbeam.RailRemedy do
   defp fire_legacy(db, handlers, rule, subject, call) do
     result =
       with {:ok, context} <- binding_context(db, subject, call),
+           :ok <- filing_binding(call, context, subject),
            {:ok, resolved} <- resolve_remedy(rule.remedy, context),
            {:ok, resolved} <- bind_target(db, rule.remedy.action, resolved) do
         route_episode(db, handlers, rule, subject, call, context, resolved)
@@ -124,6 +125,17 @@ defmodule Tightbeam.RailRemedy do
     lifecycle(db, rule, subject, call, result)
     result
   end
+
+  defp filing_binding(%{edge: :row_commit, params: params} = call, context, subject) do
+    cond do
+      params[:decision_request_id] != subject -> {:error, :unbound_decision_request}
+      not is_binary(params[:assignment_id]) -> {:error, :unbound_assignment}
+      context.owner != call.predicate_owner_user_id -> {:error, :foreign_owner_assignment}
+      true -> :ok
+    end
+  end
+
+  defp filing_binding(_call, _context, _subject), do: :ok
 
   @doc "Return the occurrence when one statute/subject episode is live."
   @spec live?(DB.server(), String.t(), String.t()) :: pos_integer() | nil
@@ -390,14 +402,22 @@ defmodule Tightbeam.RailRemedy do
           %{outcome: "claimed-dispatched", producer_id: nil}
         end
       else
+        {:decision_pending, decision_id} ->
+          release_dispatch(db, rule.name, subject, token)
+          %{outcome: "blocked", producer_id: nil, pending_decision_id: decision_id}
+
         {:error, %{code: "rule_denied"} = denial}
         when rule.remedy.on_rule_denied == "surface" ->
           release_dispatch(db, rule.name, subject, token)
           %{outcome: "blocked", producer_id: nil, denial: denial}
 
-        _ ->
+        reason ->
           release_dispatch(db, rule.name, subject, token)
-          %{outcome: "blocked", producer_id: nil}
+          result = %{outcome: "blocked", producer_id: nil}
+
+          if Map.get(call, :edge) == :row_commit,
+            do: Map.put(result, :diagnostic, ErrorDiagnostic.from_reason(reason)),
+            else: result
       end
     else
       %{outcome: "claimed-dispatched", producer_id: nil}
@@ -898,6 +918,7 @@ defmodule Tightbeam.RailRemedy do
            holder_role: holder_role,
            holder_archetype: archetype,
            caller_origin: call.origin,
+           decision_request_id: Map.get(call.params, :decision_request_id),
            owner: owner
          }}
 
@@ -945,7 +966,7 @@ defmodule Tightbeam.RailRemedy do
     bindings =
       Map.take(
         context,
-        ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)a
+        ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin decision_request_id)a
       )
 
     with {:ok, target} <- resolve_map(remedy.target, bindings),
@@ -1063,12 +1084,22 @@ defmodule Tightbeam.RailRemedy do
   defp lifecycle(db, rule, subject, call, result) do
     detail =
       %{
-        edge: if(Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb"),
+        edge:
+          case Map.get(call, :edge, :verb) do
+            :turn_end -> "turn-end"
+            :row_commit -> "row-commit"
+            _ -> "verb"
+          end,
         ref: subject,
         action: rule.remedy.action,
         producer_id: result.producer_id,
         outcome: result.outcome,
-        origin: call.origin
+        origin: call.origin,
+        cause: get_in(call, [:transition, :cause]),
+        creator: get_in(call, [:transition, :principal]),
+        remedy_principal: "remedy:#{rule.name}",
+        decision_request_id: Map.get(call.params, :decision_request_id),
+        pending_decision_id: Map.get(result, :pending_decision_id)
       }
       |> ErrorDiagnostic.put(Map.get(result, :diagnostic))
       |> JSON.encode!()
