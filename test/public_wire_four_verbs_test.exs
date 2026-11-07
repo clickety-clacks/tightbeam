@@ -87,11 +87,15 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     owner = ctx.device.user_id
     caller = wire_session(ctx.db, "wire-commit-owner", owner, "product-owner")
     holder = wire_session(ctx.db, "wire-commit-holder", owner, "coder", caller.session_key)
-    stranger = wire_session(ctx.db, "wire-commit-stranger", owner, "product-owner")
+    stranger_owner = "wire-foreign-owner"
+    assert %{user_id: ^stranger_owner, is_admin: false} =
+             Devices.add_user(ctx.db, stranger_owner, false)
+
+    stranger = wire_session(ctx.db, "wire-commit-stranger", stranger_owner, "product-owner")
     caller_role = "coder:wire-commit-owner"
     stranger_role = "coder:wire-commit-stranger"
     Roles.create!(ctx.db, caller_role, owner, caller.session_key)
-    Roles.create!(ctx.db, stranger_role, owner, stranger.session_key)
+    Roles.create!(ctx.db, stranger_role, stranger_owner, stranger.session_key)
 
     {repo, remote, commit} = canonical_repo_fixture!()
     on_exit(fn -> File.rm_rf!(Path.dirname(repo)) end)
@@ -192,11 +196,15 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
        ctx do
     owner = ctx.device.user_id
     source = wire_session(ctx.db, "wire-health-source", owner, "coder")
-    stranger = wire_session(ctx.db, "wire-health-stranger", owner, "coder")
+    stranger_owner = "wire-foreign-owner"
+    assert %{user_id: ^stranger_owner, is_admin: false} =
+             Devices.add_user(ctx.db, stranger_owner, false)
+
+    stranger = wire_session(ctx.db, "wire-health-stranger", stranger_owner, "coder")
     source_role = "coder:wire-health-source"
     stranger_role = "coder:wire-health-stranger"
     Roles.create!(ctx.db, source_role, owner, source.session_key)
-    Roles.create!(ctx.db, stranger_role, owner, stranger.session_key)
+    Roles.create!(ctx.db, stranger_role, stranger_owner, stranger.session_key)
     ctx = %{ctx | opts: real_opts(ctx)}
 
     at = System.system_time(:millisecond)
@@ -328,13 +336,17 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
        ctx do
     owner = ctx.device.user_id
     source = wire_session(ctx.db, "wire-promotion-source", owner, "coder")
-    stranger = wire_session(ctx.db, "wire-promotion-stranger", owner, "coder")
+    stranger_owner = "wire-foreign-owner"
+    assert %{user_id: ^stranger_owner, is_admin: false} =
+             Devices.add_user(ctx.db, stranger_owner, false)
+
+    stranger = wire_session(ctx.db, "wire-promotion-stranger", stranger_owner, "coder")
     reviewer = wire_session(ctx.db, "wire-promotion-reviewer", owner, "coder")
     candidate_holder = wire_session(ctx.db, "wire-promotion-candidate", owner, "coder")
     source_role = "coder:wire-promotion-source"
     stranger_role = "coder:wire-promotion-stranger"
     Roles.create!(ctx.db, source_role, owner, source.session_key)
-    Roles.create!(ctx.db, stranger_role, owner, stranger.session_key)
+    Roles.create!(ctx.db, stranger_role, stranger_owner, stranger.session_key)
 
     at = System.system_time(:millisecond)
 
