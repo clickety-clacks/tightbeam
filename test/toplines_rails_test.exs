@@ -144,12 +144,6 @@ defmodule Tightbeam.ToplinesRailsTest do
         openedActorKind: "process",
         openedActorRef: "other"
       },
-      %{
-        cause: "reopened",
-        sourceCausalEventSeq: 100,
-        openedActorKind: "process",
-        openedActorRef: "other"
-      },
       %{dueAt: 11},
       %{promptWakeId: " "},
       %{resolutionReason: "done"},
@@ -213,6 +207,24 @@ defmodule Tightbeam.ToplinesRailsTest do
       db,
       "topline_placement_obligations",
       %{placement_row("tlp_process") | openedActorKind: "process", openedActorRef: "tightbeam"}
+    )
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO causal_events (seq, at, jobRef, kind, detail) VALUES (102, 10, 'wi_one', 'disposition_transition', '{}')"
+      )
+
+    insert!(
+      db,
+      "topline_placement_obligations",
+      placement_row("tlp_reopened_process_other")
+      |> Map.merge(%{
+        cause: "reopened",
+        sourceCausalEventSeq: 102,
+        openedActorKind: "process",
+        openedActorRef: "other"
+      })
     )
 
     insert!(

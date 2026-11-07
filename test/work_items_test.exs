@@ -1336,19 +1336,39 @@ defmodule Tightbeam.WorkItemsTest do
     era = assign(ctx, "holder", "era", first.id)
     revoked = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(era.id))
     assert revoked.state == "closed"
-    # Closure stores the terminal report and independently schedules the slate.
-    # Recipient availability is decided when delivery is attempted, not here.
-    assert {:ok, [["pending", nil, nil, item_id, "pending"]]} =
+    # Closure stores the terminal report and slate even when its owner has no
+    # personal recipient for the terminal notice.
+    assert {:ok, [[notice_id, "canceled", nil, due_at, canceled_at, item_id, "pending"]]} =
              DB.query(
                ctx.db,
                """
-               SELECT notice.state,notice.firedAt,c.wakeId,wi.id,slate.state
-               FROM wakes notice LEFT JOIN wake_cancellations c ON c.wakeId=notice.wakeId
+               SELECT notice.wakeId,notice.state,notice.firedAt,notice.dueAt,notice.canceledAt,
+                      wi.id,slate.state
+               FROM wakes notice
                JOIN work_items wi ON wi.id=notice.work_item_id
                JOIN wakes slate ON slate.wakeId=wi.slateWakeId
                WHERE notice.assignmentId=?1 AND notice.obligationRef=?2
                """,
                [era.id, "terminal-child-owner-notification:" <> era.id]
+             )
+
+    assert canceled_at == due_at
+    assert {:ok, [["process", "tightbeam:wake-scheduler", "target_unresolvable", "scheduler_delivery", ^notice_id, "no_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT requesterKind,requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [notice_id]
+             )
+
+    assert Enum.count(Tightbeam.EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "wake_undeliverable" and event.subject == notice_id
+           end) == 1
+
+    assert {:ok, [["pending", "undelivered"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,json_extract(result,'$.delivery') FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [notice_id]
              )
 
     assert item_id == first.id

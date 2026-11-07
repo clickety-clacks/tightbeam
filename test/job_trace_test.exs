@@ -174,10 +174,26 @@ defmodule Tightbeam.JobTraceTest do
     notice_id = "w_terminal_" <> notice_digest
 
     personal = Org.personal_session_key("owner")
-    assert %{state: "pending", session_key: ^personal} = Tightbeam.Wakes.get(db, notice_id)
+    assert %{state: "canceled", session_key: ^personal, fired_at: nil, due_at: due_at,
+             canceled_at: due_at} = Tightbeam.Wakes.get(db, notice_id)
 
-    assert {:ok, [[0]]} =
-             DB.query(db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [notice_id])
+    assert {:ok, [["process", "tightbeam:wake-scheduler", "target_unresolvable", "scheduler_delivery", ^notice_id, "no_replacement"]]} =
+             DB.query(
+               db,
+               "SELECT requesterKind,requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [notice_id]
+             )
+
+    assert Enum.count(Tightbeam.EventLog.lifecycle_events(db), fn event ->
+             event.kind == "wake_undeliverable" and event.subject == notice_id
+           end) == 1
+
+    assert {:ok, [["pending", "undelivered"]]} =
+             DB.query(
+               db,
+               "SELECT status,json_extract(result,'$.delivery') FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [notice_id]
+             )
 
     # Holder attests replace inactivity deadlines; completion also closes its
     # replacement. These source transitions precede the notice delivery attempt.

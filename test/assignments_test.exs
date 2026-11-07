@@ -5134,6 +5134,7 @@ defmodule Tightbeam.AssignmentsTest do
     )
 
     Rules.load!(ctx.law, Map.keys(ctx.handlers))
+    off_handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000, supervision_interval_ms: :off})
     work_item = create_work_item(ctx, "Fired routing bracket")
     caller = "holder"
 
@@ -5154,7 +5155,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, %{rumination_required: true, workItemId: work_item_id}} =
              Dispatch.dispatch(
                ctx.db,
-               ctx.handlers,
+               off_handlers,
                dispatch_call(
                  {:session, caller},
                  "fired routing bracket",
@@ -5166,6 +5167,12 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert work_item_id == work_item.id
     assert assignment_count(ctx.db) == baseline + 1
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId IN (SELECT id FROM assignments WHERE workItemId=?1) AND consumer='assignment_inactivity_deadline'",
+               [work_item.id]
+             )
   end
 
   test "unowned dispatch rejects canceled and mismatched routing brackets", ctx do

@@ -2628,16 +2628,22 @@ defmodule Tightbeam.Assignments do
         # bracket left by a prior last-close. Other assignment transitions route
         # the item and cancel both brackets.
         if work_item_id do
-          bracket_trigger = liveness_trigger!(txn, {:work_item, work_item_id})
+          bracket_trigger = optional_liveness_trigger(txn, {:work_item, work_item_id})
+
+          bracket_outcome = %{
+            kind: "disposition",
+            disposition_kind: "assignment_transition",
+            disposition_id: id
+          }
+
+          bracket_outcome =
+            if bracket_trigger,
+              do: Map.put(bracket_outcome, :liveness_trigger, bracket_trigger),
+              else: bracket_outcome
 
           bracket_transition = %{
             causal_source: %{kind: "assignment_transition", id: id},
-            outcome: %{
-              kind: "disposition",
-              disposition_kind: "assignment_transition",
-              disposition_id: id,
-              liveness_trigger: bracket_trigger
-            }
+            outcome: bracket_outcome
           }
 
           Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, bracket_transition)
@@ -4296,16 +4302,22 @@ defmodule Tightbeam.Assignments do
     )
 
     if reopened.workItemId do
-      bracket_trigger = liveness_trigger!(txn, {:work_item, reopened.workItemId})
+      bracket_trigger = optional_liveness_trigger(txn, {:work_item, reopened.workItemId})
+
+      bracket_outcome = %{
+        kind: "disposition",
+        disposition_kind: "assignment_transition",
+        disposition_id: assignment_id
+      }
+
+      bracket_outcome =
+        if bracket_trigger,
+          do: Map.put(bracket_outcome, :liveness_trigger, bracket_trigger),
+          else: bracket_outcome
 
       Tightbeam.WorkItems.cancel_brackets_in_txn(txn, reopened.workItemId, %{
         causal_source: %{kind: "assignment_transition", id: assignment_id},
-        outcome: %{
-          kind: "disposition",
-          disposition_kind: "assignment_transition",
-          disposition_id: assignment_id,
-          liveness_trigger: bracket_trigger
-        }
+        outcome: bracket_outcome
       })
     end
 
@@ -5305,13 +5317,6 @@ defmodule Tightbeam.Assignments do
     case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> nil
-    end
-  end
-
-  defp liveness_trigger!(txn, primary) do
-    case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
-      {:ok, trigger} when is_map(trigger) -> trigger
-      :none -> raise "#{inspect(primary)} has no liveness trigger"
     end
   end
 

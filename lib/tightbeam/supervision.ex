@@ -175,7 +175,7 @@ defmodule Tightbeam.Supervision do
             effective_at,
             interval_ms,
             nil,
-            :activity
+            :replace
           )
 
         # Stamp the replacement at the activity itself: cancellation also
