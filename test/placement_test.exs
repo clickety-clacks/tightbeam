@@ -1674,7 +1674,17 @@ defmodule Tightbeam.PlacementTest do
       JSON.decode!(json)
     end
 
-    expected_paths = Enum.sort([personal, legacy])
+    # The Codex inventory resolves each skill with fs.realpathSync. On macOS
+    # that canonicalizes the /var temp-directory alias to /private/var.
+    canonical_paths = fn paths ->
+      script =
+        "const fs = require('fs'); for (const path of process.argv.slice(1)) console.log(fs.realpathSync(path))"
+
+      {output, 0} = System.cmd(node, ["-e", script] ++ paths)
+      output |> String.split("\n", trim: true) |> Enum.sort()
+    end
+
+    expected_paths = canonical_paths.([personal, legacy])
     actual = read_config.(opts)
     assert actual["bypass_hook_trust"] == true
 
@@ -1687,7 +1697,7 @@ defmodule Tightbeam.PlacementTest do
     refreshed = Placement.adapter_opts!(config, {:codex, "default", "testhost"}) |> read_config.()
 
     assert Enum.sort(Enum.map(refreshed["skills"]["config"], & &1["path"])) ==
-             Enum.sort([personal, legacy, added])
+             canonical_paths.([personal, legacy, added])
 
     assert File.read!(workspace) == "synthetic skill"
     assert File.read!(retained) == "synthetic skill"
