@@ -805,9 +805,6 @@ defmodule Tightbeam.HarklightWakes do
   defp retryable_failure?({:harklight_failure, "attachment_outcome_unknown", "attach", _}),
     do: false
 
-  defp retryable_failure?({:harklight_failure, "attachment_refused", "attach", _}),
-    do: false
-
   defp retryable_failure?({:harklight_failure, {"listener_stopped", code}, "listen", diagnostic}) do
     code in ["transport_error", "timeout"] or diagnostic_contains?(diagnostic, "exit status: 143")
   end
