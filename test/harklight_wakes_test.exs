@@ -1379,7 +1379,11 @@ defmodule Tightbeam.HarklightWakesTest do
       File.rm_rf!(directory)
     end)
 
-    manager = start_supervised!({HarklightWakes, db: db, retry_delays: [3_000, 3_000]})
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db, retry_delays: [3_000, 3_000], attach_retry_delays: []}
+      )
 
     failed = [stopped, listen_failure, attach_unknown]
     failed_markers = Enum.map(failed, &Path.join(directory, "failed-#{&1}"))
@@ -2735,9 +2739,18 @@ defmodule Tightbeam.HarklightWakesTest do
            end)
 
     assert eventually(fn ->
-             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
-               @handle
-             ]) == {:ok, [["unavailable", "listener_stopped"]]}
+             case DB.query(
+                    db,
+                    "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1",
+                    [@handle]
+                  ) do
+               {:ok, [["unavailable", error]]} when is_binary(error) ->
+                 String.starts_with?(error, "listener_stopped") and
+                   String.contains?(error, "exit status: 143")
+
+               _ ->
+                 false
+             end
            end)
 
     assert {:ok, [[1]]} =
