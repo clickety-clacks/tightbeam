@@ -6,7 +6,7 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
   @fixture Path.expand("fixtures/artifact_durability_reparent_9082cb14.sql", __DIR__)
   @fixture_sha "d8039e7a3584ab26a77aae6214c8927dfc077ab1234ba452ae61ba5731597508"
   @predecessor "session-reparent-v1-019"
-  @successor "closed-assignment-cannot-proceed-reconciliation-v1-015"
+  @successor "artifact-process-attribution-v1-015"
 
   @content_objects [
     "artifact_contents",
@@ -163,7 +163,12 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     seed_artifact(db, "art_legacy_1", "released")
     seed_artifact(db, "art_legacy_2", "released")
 
-    before = rows(db, "SELECT * FROM artifacts ORDER BY artifactId")
+    preserved_columns =
+      "artifactId,kind,title,description,createdBySession,workItemId,producedByAssignmentId," <>
+        "parentSession,originPath,contentSha256,recordedMessageId,recordedTurnEvidence,state,home," <>
+        "createdAt,updatedAt"
+
+    before = rows(db, "SELECT #{preserved_columns} FROM artifacts ORDER BY artifactId")
     floors_before = rows(db, "SELECT * FROM artifact_version_floors ORDER BY artifactId")
 
     assert :ok = Schema.ensure_all(db)
@@ -171,8 +176,12 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     # A released row with no stored content is the external case: bytes that
     # were never taken into custody. The migration claims no custody over it,
     # so the terminal state, the origin and the projection version all stand.
-    assert rows(db, "SELECT * FROM artifacts ORDER BY artifactId") ==
-             Enum.map(before, &(&1 ++ [nil, nil]))
+    assert rows(db, "SELECT #{preserved_columns} FROM artifacts ORDER BY artifactId") == before
+
+    assert rows(
+             db,
+             "SELECT createdByProcess,originHost,originWorkspace FROM artifacts ORDER BY artifactId"
+           ) == [[nil, nil, nil], [nil, nil, nil]]
 
     assert rows(db, "SELECT * FROM artifact_version_floors ORDER BY artifactId") == floors_before
     assert rows(db, "SELECT COUNT(*) FROM artifact_contents") == [[0]]
@@ -180,8 +189,12 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert rows(db, "SELECT * FROM artifacts ORDER BY artifactId") ==
-             Enum.map(before, &(&1 ++ [nil, nil]))
+    assert rows(db, "SELECT #{preserved_columns} FROM artifacts ORDER BY artifactId") == before
+
+    assert rows(
+             db,
+             "SELECT createdByProcess,originHost,originWorkspace FROM artifacts ORDER BY artifactId"
+           ) == [[nil, nil, nil], [nil, nil, nil]]
 
     assert rows(db, "SELECT * FROM artifact_version_floors ORDER BY artifactId") == floors_before
   end
