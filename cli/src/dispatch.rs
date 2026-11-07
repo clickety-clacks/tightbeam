@@ -531,6 +531,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             files,
             vendor_session_id,
             supersedes,
+            decision_request_id,
         } => {
             let mut params = vec![
                 format!(
@@ -568,6 +569,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = by_when {
                 params.push(string_field("byWhen", value));
+            }
+            if let Some(value) = decision_request_id {
+                params.push(string_field("decisionRequestId", value));
             }
             Ok(request(identity, "harklight-send", vec![], params))
         }
@@ -1034,6 +1038,18 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params.push(string_field("status", value));
             }
             Ok(request(identity, "decision-requests", vec![], params))
+        }
+        Command::HarklightBriefingsCatchup { identity, limit } => {
+            let params = limit
+                .map(|value| format!("\"limit\":{value}"))
+                .into_iter()
+                .collect();
+            Ok(request(
+                identity,
+                "harklight-briefings-catchup",
+                vec![],
+                params,
+            ))
         }
         Command::DecisionRequest {
             identity,
@@ -3963,6 +3979,11 @@ fn local_harklight_identity_refusal(
         {
             Some("harklight-send requires the authenticated session or one of its roles")
         }
+        Command::HarklightBriefingsCatchup { identity, .. }
+            if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
+        {
+            Some("harklight-briefings-catchup requires an active admin-owned session")
+        }
         Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
@@ -3991,6 +4012,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
+        | Command::HarklightBriefingsCatchup { identity, .. }
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
@@ -4428,6 +4450,8 @@ mod tests {
             "Question",
             "--type",
             "request",
+            "--decision-request-id",
+            "dr_12345678-1234-4234-8234-123456789abc",
             "--choices-json",
             r#"["Yes"]"#,
         ]))
@@ -4437,6 +4461,10 @@ mod tests {
         assert_eq!(request["params"]["senderId"], "sender");
         assert_eq!(request["params"]["messageType"], "request");
         assert_eq!(request["params"]["reply"], false);
+        assert_eq!(
+            request["params"]["decisionRequestId"],
+            "dr_12345678-1234-4234-8234-123456789abc"
+        );
         assert_eq!(request["params"]["choices"], serde_json::json!(["Yes"]));
         assert!(request.get("sessionKey").is_none());
         assert!(request["params"].get("sessionKey").is_none());
@@ -4464,6 +4492,15 @@ mod tests {
         assert!(request.get("sessionKey").is_none());
         assert!(request["params"].get("sessionKey").is_none());
         assert!(request["params"].get("informational").is_none());
+    }
+
+    #[test]
+    fn catchup_limit_is_sent_as_a_number() {
+        let request: Value =
+            serde_json::from_str(&body(&["harklight-briefings-catchup", "--limit", "3"])).unwrap();
+
+        assert_eq!(request["verb"], "harklight-briefings-catchup");
+        assert_eq!(request["params"]["limit"], 3);
     }
 
     #[test]

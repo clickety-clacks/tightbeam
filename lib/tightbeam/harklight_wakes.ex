@@ -130,7 +130,8 @@ defmodule Tightbeam.HarklightWakes do
 
   def ensure_schema(db \\ DB) do
     with :ok <- DB.execute(db, @ddl),
-         :ok <- HarklightLifecycle.ensure_schema(db) do
+         :ok <- HarklightLifecycle.ensure_schema(db),
+         :ok <- Tightbeam.HarklightBriefings.ensure_schema(db) do
       backfill_pending_supersedes(db)
     end
   end
@@ -336,36 +337,58 @@ defmodule Tightbeam.HarklightWakes do
                     [op_id]
                   ) do
                [[^session_key, ^host, ^payload, nil, nil, nil, nil, "pending"]] ->
-                 Txn.q(
-                   txn,
-                   "UPDATE harklight_send_operations SET result=?2,handle=?3,senderId=?4,messageId=?5,state='bound',updatedAt=?6 WHERE opId=?1",
-                   [op_id, result, handle, sender_id, message_id, now]
-                 )
+                 with :ok <-
+                        Tightbeam.HarklightBriefings.validate_send_binding_in_txn(
+                          txn,
+                          op_id,
+                          session_key,
+                          payload,
+                          handle,
+                          sender_id,
+                          message_id
+                        ) do
+                   Txn.q(
+                     txn,
+                     "UPDATE harklight_send_operations SET result=?2,handle=?3,senderId=?4,messageId=?5,state='bound',updatedAt=?6 WHERE opId=?1",
+                     [op_id, result, handle, sender_id, message_id, now]
+                   )
 
-                 case register_in_txn(
-                        txn,
-                        handle,
-                        session_key,
-                        host,
-                        sender_id,
-                        message_id,
-                        vendor_id,
-                        now
-                      ) do
-                   {:ok, registration} ->
-                     effects =
-                       HarklightLifecycle.send_committed_in_txn(
-                         txn,
-                         session_key,
-                         op_id,
-                         payload,
-                         result
-                       )
+                   case register_in_txn(
+                          txn,
+                          handle,
+                          session_key,
+                          host,
+                          sender_id,
+                          message_id,
+                          vendor_id,
+                          now
+                        ) do
+                     {:ok, registration} ->
+                       with :ok <-
+                              Tightbeam.HarklightBriefings.bind_send_in_txn(
+                                txn,
+                                op_id,
+                                session_key,
+                                payload,
+                                handle,
+                                sender_id,
+                                message_id
+                              ) do
+                         effects =
+                           HarklightLifecycle.send_committed_in_txn(
+                             txn,
+                             session_key,
+                             op_id,
+                             payload,
+                             result
+                           )
 
-                     {:ok, Map.merge(registration, effects)}
+                         {:ok, Map.merge(registration, effects)}
+                       end
 
-                   error ->
-                     error
+                     error ->
+                       error
+                   end
                  end
 
                [
@@ -380,30 +403,52 @@ defmodule Tightbeam.HarklightWakes do
                    "bound"
                  ]
                ] ->
-                 case register_in_txn(
-                        txn,
-                        handle,
-                        session_key,
-                        host,
-                        sender_id,
-                        message_id,
-                        vendor_id,
-                        now
-                      ) do
-                   {:ok, registration} ->
-                     effects =
-                       HarklightLifecycle.send_committed_in_txn(
-                         txn,
-                         session_key,
-                         op_id,
-                         payload,
-                         result
-                       )
+                 with :ok <-
+                        Tightbeam.HarklightBriefings.validate_send_binding_in_txn(
+                          txn,
+                          op_id,
+                          session_key,
+                          payload,
+                          handle,
+                          sender_id,
+                          message_id
+                        ) do
+                   case register_in_txn(
+                          txn,
+                          handle,
+                          session_key,
+                          host,
+                          sender_id,
+                          message_id,
+                          vendor_id,
+                          now
+                        ) do
+                     {:ok, registration} ->
+                       with :ok <-
+                              Tightbeam.HarklightBriefings.bind_send_in_txn(
+                                txn,
+                                op_id,
+                                session_key,
+                                payload,
+                                handle,
+                                sender_id,
+                                message_id
+                              ) do
+                         effects =
+                           HarklightLifecycle.send_committed_in_txn(
+                             txn,
+                             session_key,
+                             op_id,
+                             payload,
+                             result
+                           )
 
-                     {:ok, Map.merge(registration, effects)}
+                         {:ok, Map.merge(registration, effects)}
+                       end
 
-                   error ->
-                     error
+                     error ->
+                       error
+                   end
                  end
 
                _ ->
@@ -2293,7 +2338,18 @@ defmodule Tightbeam.HarklightWakes do
       {:error, "event_order_invalid"}
     else
       wake_id = "w_harklight_" <> handle <> "_" <> String.pad_leading(event_id, 20, "0")
-      prompt = line <> "\n\n" <> handling_instruction(handle, event_id, message_id, kind, author)
+
+      prompt =
+        line <>
+          "\n\n" <>
+          handling_instruction(handle, event_id, message_id, kind, author) <>
+          Tightbeam.HarklightBriefings.chat_prompt_context_in_txn(
+            txn,
+            handle,
+            sender_id,
+            message_id
+          )
+
       now = System.system_time(:millisecond)
 
       recipients =
