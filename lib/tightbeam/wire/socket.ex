@@ -35,8 +35,8 @@ defmodule Tightbeam.Wire.Socket do
   - Keepalive: WebSock ping/pong with a pong deadline (Process.send_after);
     silence past the deadline closes the socket. Defaults: ping every 30s,
     pong timeout 90s.
-  - Rate limits are GLOBAL per deviceId and live in ConnRegistry (a
-    per-process window would reset on reconnect): typing 2/s, pair 5/min.
+  - Pairing is rate-limited GLOBAL per deviceId in ConnRegistry (a
+    per-process window would reset on reconnect): pair 5/min.
 
   Inbound frames (server.ts message handler, same semantics):
   - pair_request: protocolVersion must be 1; pair via Devices; reply
@@ -52,7 +52,6 @@ defmodule Tightbeam.Wire.Socket do
     then verb "post" through Dispatch. dedupe: :duplicate → ack again;
     :conflict → invalid_message and NO ack.
   - stream_read: write read state, echo stream_read_state.
-  - typing: rate-limited, otherwise dropped silently (not fanned out in v1).
   - anything else: invalid_message.
   """
 
@@ -190,7 +189,7 @@ defmodule Tightbeam.Wire.Socket do
   end
 
   defp route(%{"type" => type} = msg, state)
-       when type in ["message", "stream_read", "typing"] do
+       when type in ["message", "stream_read"] do
     if MapSet.member?(state.subscriptions, "chat") do
       route_chat(msg, state)
     else
@@ -212,19 +211,6 @@ defmodule Tightbeam.Wire.Socket do
     last = string(msg["lastReadMessageId"])
     :ok = Projection.set_read_state(db(state), state.user_id, session_key, last)
     push(Payloads.stream_read_state(session_key, last), state)
-  end
-
-  defp route_chat(%{"type" => "typing"}, state) do
-    _ =
-      ConnRegistry.within_rate_limit(
-        conn_registry(state),
-        state.device_id,
-        :typing,
-        typing_limit(state),
-        1_000
-      )
-
-    {:ok, state}
   end
 
   defp pair(msg, state) do
@@ -573,7 +559,6 @@ defmodule Tightbeam.Wire.Socket do
   defp string(value), do: to_string(value)
   defp db(state), do: Map.get(state.deps, :db, Tightbeam.DB)
   defp conn_registry(state), do: Map.get(state.deps, :conn_registry, Tightbeam.ConnRegistry)
-  defp typing_limit(state), do: Map.get(state.deps, :typing_per_sec, 2)
   defp pair_limit(state), do: Map.get(state.deps, :pair_per_min, 5)
   defp cancel_timer(nil), do: :ok
   defp cancel_timer(timer), do: Process.cancel_timer(timer, async: true, info: false)

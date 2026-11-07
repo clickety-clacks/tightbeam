@@ -335,6 +335,33 @@ defmodule Tightbeam.Wire.SocketTest do
              )
   end
 
+  test "chat subscription rejects the retired client typing operation", ctx do
+    {:paired, device} =
+      claim_org(ctx.db, %{
+        device_id: "chat-typing",
+        claimed_name: "Sample User",
+        platform: nil,
+        model: nil
+      })
+
+    {:ok, socket} = Socket.init(ctx.deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    {:push, _auth_frames, replaying} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, socket)
+
+    {:push, _sync_frame, live} = Socket.handle_info(:finish_replay, replaying)
+
+    assert {:push, {:text, error}, ^live} =
+             Socket.handle_in({JSON.encode!(%{"type" => "typing"}), opcode: :text}, live)
+
+    assert JSON.decode!(error) == %{
+             "type" => "error",
+             "code" => "invalid_message",
+             "message" => "unsupported type: typing"
+           }
+  end
+
   test "chat ingress resolves one reply reference transactionally and rejects unsafe replays",
        ctx do
     start_supervised!(%{
@@ -892,8 +919,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
     for frame <- [
           %{"type" => "message", "id" => "c_x", "content" => "no"},
-          %{"type" => "stream_read", "sessionKey" => "missing", "lastReadMessageId" => "s_1"},
-          %{"type" => "typing"}
+          %{"type" => "stream_read", "sessionKey" => "missing", "lastReadMessageId" => "s_1"}
         ] do
       {:push, {:text, error}, kept} =
         Socket.handle_in({JSON.encode!(frame), opcode: :text}, live)
