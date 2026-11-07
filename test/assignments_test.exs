@@ -54,8 +54,8 @@ defmodule Tightbeam.AssignmentsTest do
       Path.join(System.tmp_dir!(), "assignment-rails-#{System.unique_integer([:positive])}")
 
     on_exit(fn -> File.rm_rf!(rule_root) end)
-    Tightbeam.TerminalReactionFixture.load!(rule_root, Map.keys(handlers))
-    %{db: db, holder: holder, other: other, handlers: handlers}
+    law = Tightbeam.TerminalReactionFixture.load!(rule_root, Map.keys(handlers))
+    %{db: db, holder: holder, other: other, handlers: handlers, law: law}
   end
 
   test "upgrading assignments adds no parent links to existing rows", ctx do
@@ -2836,6 +2836,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "a standing cannot-proceed block suppresses reminders and still releases on its fact",
        ctx do
+    load_inactivity_policy!(ctx)
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
     blocked =
@@ -3899,6 +3900,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a pending holder reminder does not block opener revocation after reparenting", ctx do
+    load_inactivity_policy!(ctx)
     main = Org.personal_session_key("flynn")
     session(ctx.db, main, "flynn")
     session(ctx.db, "parent-a", "flynn", %{spawned_by: main})
@@ -7809,5 +7811,12 @@ defmodule Tightbeam.AssignmentsTest do
     Enum.filter(rows, fn [_seq, _session_key, _status, wake_id] ->
       MapSet.member?(wake_ids, wake_id)
     end)
+  end
+
+  defp load_inactivity_policy!(ctx) do
+    name = "row-reaction-assignment-inactivity.toml"
+    source = Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name])
+    File.cp!(source, Path.join(ctx.law, "identity/rules/#{name}"))
+    Rules.load!(ctx.law, Map.keys(ctx.handlers))
   end
 end

@@ -688,6 +688,11 @@ defmodule Tightbeam.CliIntegrationTest do
       Path.join(ctx.base_dir, "identity/rules/verification.toml")
     )
 
+    File.cp!(
+      Path.expand("../priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml", __DIR__),
+      Path.join(ctx.base_dir, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     registry = start_supervised!({Tightbeam.ConnRegistry, name: :d3_cli_registry})
     # Stop at the durable notification boundary; do not start an agent/provider lane.

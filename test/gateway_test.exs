@@ -2490,6 +2490,16 @@ defmodule Tightbeam.GatewayTest do
           |> Map.put(:effort_checkin_horizon_ms, 123)
         )
 
+      File.mkdir_p!(Path.join(base_dir, "identity/rules"))
+      name = "row-reaction-assignment-inactivity.toml"
+
+      File.cp!(
+        Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
+        Path.join(base_dir, "identity/rules/#{name}")
+      )
+
+      Tightbeam.Rules.load!(base_dir, Map.keys(handlers))
+
       common = %{
         origin: "user:flynn",
         principal: {:user, "flynn"},
