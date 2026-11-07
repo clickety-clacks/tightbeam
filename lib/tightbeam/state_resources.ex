@@ -241,7 +241,7 @@ defmodule Tightbeam.StateResources do
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "harness processes" => ~w(id host harness pid state createdAt resolvedAt),
     "artifacts" =>
-      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
+      ~w(artifactId kind title description createdBySession createdByProcess workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
     "transcript messages" =>
       ~w(id seq sessionKey role messageType marker content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq turnIncludesHuman isBatchCarrier assignmentId jobRef harness provider model effort context rowVersion),
@@ -358,10 +358,11 @@ defmodule Tightbeam.StateResources do
     },
     "artifacts" => %{
       strings:
-        ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home),
+        ~w(artifactId kind title description createdBySession createdByProcess workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home),
       integers: ~w(createdAt updatedAt rowVersion),
       booleans: [],
-      nullable: ~w(description parentSession contentSha256 recordedMessageId home)
+      nullable:
+        ~w(description createdBySession createdByProcess parentSession contentSha256 recordedMessageId home)
     },
     "read markers" => %{
       strings: ~w(userId scopeKey),
