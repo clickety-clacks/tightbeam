@@ -103,8 +103,12 @@ defmodule Tightbeam.RowReactions.Snapshot do
         txn,
         "attests INDEXED BY row_reaction_receipt_candidates",
         ~w(id assignmentId kind bySession byUser ts note),
-        "bySession=?1 AND kind='progress' AND note>=?2 AND note<?3",
-        [parent, prefix, upper]
+        """
+        bySession=?1 AND kind='progress' AND note>=?2 AND note<?3
+          AND EXISTS (SELECT 1 FROM assignments a
+            WHERE a.id=attests.assignmentId AND a.workItemId IS ?4)
+        """,
+        [parent, prefix, upper, source["workItemId"]]
       )
     end)
     |> Enum.map(&Map.put(&1, "disposition", disposition(&1["note"])))
