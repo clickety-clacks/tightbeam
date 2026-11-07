@@ -224,6 +224,34 @@ defmodule Tightbeam.AssignmentsTest do
                [linked.id]
              )
 
+    assert %{state: "closed"} =
+             handlers["revoke-assignment"].(revoke_call({:user, "flynn"}, linked.id))
+
+    assert {:ok, [[slate_id]]} =
+             DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert is_binary(slate_id)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [
+               slate_id,
+               System.system_time(:millisecond)
+             ])
+
+    reopened =
+      handlers["reopen-assignment"].(
+        reopen_call({:user, "flynn"}, linked.id, "continue without reminders")
+      )
+
+    assert reopened.state == "open"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'",
+               [linked.id]
+             )
+
     retired =
       handlers["retire"].(%{
         origin: "user:flynn",
