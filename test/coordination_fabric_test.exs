@@ -2596,7 +2596,9 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp decision_request_kind_ref(literal) do
     clause_words =
-      MapSet.new(~w(where join left right inner outer cross full on order group having limit offset))
+      MapSet.new(
+        ~w(where join left right inner outer cross full on order group having limit offset)
+      )
 
     case Regex.run(
            ~r/\b(?:FROM|JOIN)\s+decision_requests(?:\s+(?:AS\s+)?([a-z_][a-z0-9_]*))?/i,
