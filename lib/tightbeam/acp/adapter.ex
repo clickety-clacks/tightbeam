@@ -330,7 +330,13 @@ defmodule Tightbeam.Acp.Adapter do
            %{
              stop_reason: String.t(),
              text: String.t(),
-             messages: [%{message_id: String.t() | nil, text: String.t()}]
+             messages: [
+               %{
+                 message_id: String.t() | nil,
+                 logical_message_id: String.t() | nil,
+                 text: String.t()
+               }
+             ]
            }}
           | {:error, term()}
   def prompt(adapter, session_id, text, opts \\ []) do
@@ -1431,14 +1437,58 @@ defmodule Tightbeam.Acp.Adapter do
       text = get_in(update, ["content", "text"])
       message_id = assistant_message_id(update)
 
-      if is_binary(text) and Map.has_key?(state.chunks, sid) do
-        {:noreply,
-         state
-         |> update_in(
-           [Access.key(:chunks), sid],
-           &accumulate_assistant_chunk(&1, message_id, text)
-         )
-         |> record_notification_fields(sid, [:chunks])}
+      if Map.has_key?(state.chunks, sid) do
+        logical_message_id =
+          logical_assistant_message_id(state.tool_turns[sid], state.chunks[sid], message_id)
+
+        state = remember_logical_assistant_message(state, sid, message_id, logical_message_id)
+
+        state =
+          case {message_id, logical_message_id, state.tool_turns[sid], update["content"]} do
+            {provider_id, logical_id, %{session_key: session_key, turn_seq: turn_seq}, content}
+            when is_binary(provider_id) and is_binary(logical_id) and is_map(content) ->
+              case Tightbeam.TurnEvents.append_assistant_segment(
+                     state.db,
+                     session_key,
+                     turn_seq,
+                     logical_id,
+                     content
+                   ) do
+                {:ok, _event} ->
+                  state
+
+                {:error, reason} ->
+                  Logger.error(
+                    "assistant turn-event persistence failed session=#{session_key} turn=#{turn_seq} reason=#{inspect(reason)}"
+                  )
+
+                  raise "assistant turn-event persistence failed: #{inspect(reason)}"
+              end
+
+            {nil, _logical_id, %{session_key: session_key, turn_seq: turn_seq}, _content} ->
+              Logger.warning(
+                "assistant chunk omitted from ordered history without ACP messageId session=#{session_key} turn=#{turn_seq}"
+              )
+
+              state
+
+            _ ->
+              state
+          end
+
+        state =
+          if is_binary(text) do
+            state
+            |> update_in(
+              [Access.key(:chunks), sid],
+              &accumulate_assistant_chunk(&1, message_id, logical_message_id, text)
+            )
+            |> record_notification_fields(sid, [:chunks])
+          else
+            state
+          end
+
+        {:noreply, state}
       else
         {:noreply, state}
       end
@@ -1676,23 +1726,76 @@ defmodule Tightbeam.Acp.Adapter do
   defp assistant_message_id(%{"messageId" => id}) when is_binary(id) and id != "", do: id
   defp assistant_message_id(_update), do: nil
 
+  defp logical_assistant_message_id(turn, groups, message_id) when is_binary(message_id) do
+    stored_id = if is_map(turn), do: Map.get(Map.get(turn, :message_ids, %{}), message_id)
+
+    case stored_id do
+      logical_id when is_binary(logical_id) ->
+        logical_id
+
+      _ ->
+        case Enum.find(groups, &(&1.message_id == message_id)) do
+          %{logical_message_id: logical_id} when is_binary(logical_id) -> logical_id
+          _ -> "s_" <> Tightbeam.Id.uuid4()
+        end
+    end
+  end
+
+  defp logical_assistant_message_id(_turn, _groups, _message_id), do: nil
+
+  defp remember_logical_assistant_message(state, sid, message_id, logical_message_id)
+       when is_binary(message_id) and is_binary(logical_message_id) do
+    case state.tool_turns[sid] do
+      turn when is_map(turn) ->
+        message_ids =
+          Map.update(Map.get(turn, :message_ids, %{}), message_id, logical_message_id, & &1)
+
+        put_in(state.tool_turns[sid], Map.put(turn, :message_ids, message_ids))
+
+      _ ->
+        state
+    end
+  end
+
+  defp remember_logical_assistant_message(state, _sid, _message_id, _logical_message_id),
+    do: state
+
+  defp accumulate_assistant_chunk(groups, message_id, logical_message_id, text)
+       when is_binary(message_id) do
+    case Enum.find_index(groups, &(&1.message_id == message_id)) do
+      nil ->
+        [
+          %{message_id: message_id, logical_message_id: logical_message_id, chunks: [text]}
+          | groups
+        ]
+
+      index ->
+        List.update_at(groups, index, fn group -> %{group | chunks: [text | group.chunks]} end)
+    end
+  end
+
   defp accumulate_assistant_chunk(
-         [%{message_id: message_id, chunks: chunks} | rest],
-         message_id,
+         [%{message_id: nil, chunks: chunks} = group | rest],
+         nil,
+         _logical_message_id,
          text
        ),
-       do: [%{message_id: message_id, chunks: [text | chunks]} | rest]
+       do: [%{group | chunks: [text | chunks]} | rest]
 
-  defp accumulate_assistant_chunk(groups, message_id, text),
-    do: [%{message_id: message_id, chunks: [text]} | groups]
+  defp accumulate_assistant_chunk(groups, nil, _logical_message_id, text),
+    do: [%{message_id: nil, logical_message_id: nil, chunks: [text]} | groups]
 
-  defp assistant_messages([]), do: [%{message_id: nil, text: ""}]
+  defp assistant_messages([]), do: [%{message_id: nil, logical_message_id: nil, text: ""}]
 
   defp assistant_messages(groups) do
     groups
     |> Enum.reverse()
-    |> Enum.map(fn %{message_id: message_id, chunks: chunks} ->
-      %{message_id: message_id, text: chunks |> Enum.reverse() |> Enum.join()}
+    |> Enum.map(fn %{message_id: message_id, logical_message_id: logical_id, chunks: chunks} ->
+      %{
+        message_id: message_id,
+        logical_message_id: logical_id,
+        text: chunks |> Enum.reverse() |> Enum.join()
+      }
     end)
   end
 
@@ -1876,7 +1979,11 @@ defmodule Tightbeam.Acp.Adapter do
     case {Keyword.get(opts, :session_key), Keyword.get(opts, :turn_seq)} do
       {session_key, turn_seq}
       when is_binary(session_key) and is_integer(turn_seq) and turn_seq > 0 ->
-        put_in(state.tool_turns[sid], %{session_key: session_key, turn_seq: turn_seq})
+        put_in(state.tool_turns[sid], %{
+          session_key: session_key,
+          turn_seq: turn_seq,
+          message_ids: %{}
+        })
 
       _ ->
         state

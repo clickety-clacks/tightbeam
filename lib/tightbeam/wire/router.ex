@@ -117,6 +117,11 @@ defmodule Tightbeam.Wire.Router do
       query: :query_tool_call,
       serializer: :tool_call
     },
+    turn_events: %{
+      resource: "turn events",
+      query: :query_turn_event,
+      serializer: :turn_event
+    },
     roles: %{resource: "roles", query: :query_role, serializer: :role},
     facts: %{
       resource: "condition facts",
@@ -603,6 +608,14 @@ defmodule Tightbeam.Wire.Router do
     )
   end
 
+  get "/api/sessions/:session_key/turn-events/:turn_event_id" do
+    core_detail(
+      conn,
+      Map.fetch!(@core_detail_specs, :turn_events),
+      {session_key, turn_event_id}
+    )
+  end
+
   get "/api/roles/:name" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :roles), name)
   end
@@ -635,6 +648,10 @@ defmodule Tightbeam.Wire.Router do
 
   get "/api/sessions/:session_key/tool-calls" do
     tool_calls_collection(conn, session_key)
+  end
+
+  get "/api/sessions/:session_key/turn-events" do
+    turn_events_collection(conn, session_key)
   end
 
   get "/api/sessions/:session_key/wakes" do
@@ -1590,6 +1607,13 @@ defmodule Tightbeam.Wire.Router do
   defp session_collection_tuple("turns", %{seq: seq}), do: [seq]
   defp session_collection_tuple("tool calls", %{seq: seq, id: id}), do: [seq, id]
 
+  defp session_collection_tuple("turn events", %{
+         turn_seq: turn_seq,
+         turn_event_seq: event_seq,
+         id: id
+       }),
+       do: [turn_seq, event_seq, id]
+
   defp session_collection_tuple("wakes", %{created_at: created_at, wake_id: wake_id}),
     do: [created_at, wake_id]
 
@@ -1599,6 +1623,11 @@ defmodule Tightbeam.Wire.Router do
 
   defp session_collection_tuple?("tool calls", [seq, id]),
     do: is_integer(seq) and seq > 0 and is_binary(id) and id != ""
+
+  defp session_collection_tuple?("turn events", [turn_seq, event_seq, id]),
+    do:
+      is_integer(turn_seq) and turn_seq > 0 and is_integer(event_seq) and event_seq > 0 and
+        is_binary(id) and id != ""
 
   defp session_collection_tuple?(
          "wakes",
@@ -1862,7 +1891,7 @@ defmodule Tightbeam.Wire.Router do
     allowed =
       if resource == "tool calls",
         do: allowed ++ ["afterMessageSeqFromInclusive", "afterMessageSeqToExclusive"],
-        else: allowed
+        else: if(resource == "turn events", do: allowed ++ ["turnSeq"], else: allowed)
 
     valid_keys? = Enum.all?(Map.keys(query), &(&1 in allowed))
 
@@ -1940,6 +1969,72 @@ defmodule Tightbeam.Wire.Router do
   rescue
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, "tool calls", 500, "projection_invalid", nil)
+  end
+
+  defp turn_events_collection(conn, session_key) do
+    resource = "turn events"
+    route = "session.turn_events.collection:#{session_key}"
+
+    with {:ok, auth} <- selected_session_auth(conn),
+         {:ok, request} <- decode_state_query(conn),
+         {:ok, principal, request} <-
+           session_collection_principal(auth, request, conn, session_key, resource),
+         :ok <- session_collection_request(request, session_key, resource),
+         {:ok, turn_seq} <- state_nonnegative_integer_filter(request, "turnSeq"),
+         true <- is_nil(turn_seq) or turn_seq > 0,
+         filters <- %{"turnSeq" => cursor_filter_value(turn_seq)},
+         {:ok, limit, boundary} <-
+           state_page_request(
+             request,
+             route,
+             resource,
+             filters,
+             principal,
+             &session_collection_tuple?(resource, &1),
+             @state_default_limit,
+             :latest,
+             :earliest,
+             :latest
+           ),
+         session when not is_nil(session) <-
+           StateResources.query_session(db(conn), %{key: session_key, principal: principal}),
+         page_result <-
+           StateResources.query_turn_events_for_session_page(
+             db(conn),
+             session_key,
+             boundary,
+             limit,
+             turn_seq
+           ),
+         page <-
+           state_page_metadata(
+             page_result.rows,
+             page_result.flags,
+             &session_collection_tuple(resource, &1),
+             route,
+             resource,
+             filters,
+             principal,
+             :asc
+           ),
+         items <- Enum.map(page_result.rows, &StateResources.turn_event/1),
+         item_bytes <-
+           Enum.map(items, &StateResources.encode_item(resource, &1, state_catalog(conn))) do
+      body =
+        "{" <>
+          ~s("schemaVersion":1,"resource":"turn events","items":[) <>
+          Enum.join(item_bytes, ",") <>
+          "],\"page\":" <> JSON.encode!(page) <> "}"
+
+      state_send(conn, 200, body)
+    else
+      false -> state_error(conn, resource, 400, "invalid_filter", nil)
+      nil -> state_error(conn, resource, 404, "not_found", nil)
+      {:error, status, code, message} -> state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "turn events", 500, "projection_invalid", nil)
   end
 
   defp state_nonnegative_integer_filter(query, key) do
@@ -2124,6 +2219,10 @@ defmodule Tightbeam.Wire.Router do
   defp core_detail_key("tool calls", {session_key, tool_call_id})
        when is_binary(session_key) and is_binary(tool_call_id),
        do: {:ok, {session_key, tool_call_id}}
+
+  defp core_detail_key("turn events", {session_key, turn_event_id})
+       when is_binary(session_key) and is_binary(turn_event_id),
+       do: {:ok, {session_key, turn_event_id}}
 
   defp core_detail_key("host environment", {host, harness, name})
        when is_binary(host) and is_binary(harness) and is_binary(name),
