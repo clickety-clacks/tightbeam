@@ -1556,23 +1556,17 @@ defmodule Tightbeam.ClientE2ETest do
                "DIRTY (diff #{fingerprint})"
     end
 
-    test "UNTRACKED content changes the fingerprint" do
+    test "UNTRACKED content changes the fingerprint", ctx do
       # `git diff HEAD` omits untracked files, so the previous fingerprint gave
       # two different untracked driver sources the same empty-diff hash.
       listing = "?? probe.exs\n"
-
-      dir =
-        Path.join(System.tmp_dir!(), "client-e2e-untracked-#{System.unique_integer([:positive])}")
-
-      File.mkdir_p!(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
-      path = Path.join(dir, "probe.exs")
+      path = Path.join(ctx.repo, "probe.exs")
 
       File.write!(path, "IO.puts(:alpha)")
-      alpha = Provenance.fingerprint(dir, listing)
+      alpha = Provenance.fingerprint(ctx.repo, listing)
 
       File.write!(path, "IO.puts(:beta)")
-      beta = Provenance.fingerprint(dir, listing)
+      beta = Provenance.fingerprint(ctx.repo, listing)
 
       refute alpha == beta, "same filename, different bytes must not share a fingerprint"
     end
