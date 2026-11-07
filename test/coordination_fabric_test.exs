@@ -2126,25 +2126,36 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   defp has_dynamic_query?(node, attrs) do
-    {_, hit?} =
-      Macro.prewalk(node, false, fn
-        {{:., _, [_mod, fun]}, _, args} = n, acc
-        when fun in [:q, :query] and length(args) >= 2 ->
-          query_arg = Enum.at(args, 1)
+    dynamic_query_node?(node, attrs)
+  end
 
-          resolved =
-            case query_arg do
-              bin when is_binary(bin) -> {:ok, bin}
-              other -> literal_value(other, attrs)
-            end
+  defp dynamic_query_node?({:|>, _, [left, {{:., _, [_mod, fun]}, _, args}]}, attrs)
+       when fun in [:q, :query] and args != [] do
+    dynamic_query_arg?(hd(args), attrs) or dynamic_query_node?(left, attrs) or
+      Enum.any?(tl(args), &dynamic_query_node?(&1, attrs))
+  end
 
-          {n, acc or match?(:unknown, resolved)}
+  defp dynamic_query_node?({{:., _, [_mod, fun]}, _, args}, attrs)
+       when fun in [:q, :query] and length(args) >= 2 do
+    dynamic_query_arg?(Enum.at(args, 1), attrs) or Enum.any?(args, &dynamic_query_node?(&1, attrs))
+  end
 
-        n, acc ->
-          {n, acc}
-      end)
+  defp dynamic_query_node?({_, _, args}, attrs) when is_list(args),
+    do: Enum.any?(args, &dynamic_query_node?(&1, attrs))
 
-    hit?
+  defp dynamic_query_node?(items, attrs) when is_list(items),
+    do: Enum.any?(items, &dynamic_query_node?(&1, attrs))
+
+  defp dynamic_query_node?(_, _attrs), do: false
+
+  defp dynamic_query_arg?(query_arg, attrs) do
+    resolved =
+      case query_arg do
+        bin when is_binary(bin) -> {:ok, bin}
+        other -> literal_value(other, attrs)
+      end
+
+    match?(:unknown, resolved)
   end
 
   # This file's own `alias` declarations (plain, `as:`, and the `Mod.{A, B}`
