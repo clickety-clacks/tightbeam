@@ -219,15 +219,6 @@ defmodule Tightbeam.Wire.Payloads do
   @spec stream_deleted(String.t()) :: payload()
   def stream_deleted(session_key), do: %{"type" => "stream_deleted", "sessionKey" => session_key}
 
-  @spec stream_read_state(String.t(), String.t()) :: payload()
-  def stream_read_state(session_key, last_read_message_id) do
-    %{
-      "type" => "stream_read_state",
-      "sessionKey" => session_key,
-      "lastReadMessageId" => last_read_message_id
-    }
-  end
-
   @spec prompt_turn_state_event(%{
           client_message_id: String.t(),
           session_key: String.t(),

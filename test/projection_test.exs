@@ -220,10 +220,20 @@ defmodule Tightbeam.ProjectionTest do
     assert Projection.tail(db, "empty") == nil
   end
 
-  test "read state upserts per user and session", %{db: db} do
-    :ok = Projection.set_read_state(db, "sample-user", "k1", "s_a")
-    :ok = Projection.set_read_state(db, "sample-user", "k1", "s_b")
-    :ok = Projection.set_read_state(db, "sample-user", "k2", "s_c")
+  test "read state query preserves persisted compatibility data", %{db: db} do
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO read_states (userId, sessionKey, lastReadMessageId) VALUES (?1, ?2, ?3)",
+        ["sample-user", "k1", "s_b"]
+      )
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO read_states (userId, sessionKey, lastReadMessageId) VALUES (?1, ?2, ?3)",
+        ["sample-user", "k2", "s_c"]
+      )
 
     assert Projection.read_states(db, "sample-user") == %{"k1" => "s_b", "k2" => "s_c"}
     assert Projection.read_states(db, "sam") == %{}

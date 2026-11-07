@@ -51,7 +51,6 @@ defmodule Tightbeam.Wire.Socket do
     llmVisibleMessageId inside the selected session's append transaction;
     then verb "post" through Dispatch. dedupe: :duplicate → ack again;
     :conflict → invalid_message and NO ack.
-  - stream_read: write read state, echo stream_read_state.
   - anything else: invalid_message.
   """
 
@@ -188,8 +187,7 @@ defmodule Tightbeam.Wire.Socket do
     push(Payloads.wire_error("auth_failed", "not authenticated"), state)
   end
 
-  defp route(%{"type" => type} = msg, state)
-       when type in ["message", "stream_read"] do
+  defp route(%{"type" => "message"} = msg, state) do
     if MapSet.member?(state.subscriptions, "chat") do
       route_chat(msg, state)
     else
@@ -205,13 +203,6 @@ defmodule Tightbeam.Wire.Socket do
   end
 
   defp route_chat(%{"type" => "message"} = msg, state), do: client_message(msg, state)
-
-  defp route_chat(%{"type" => "stream_read"} = msg, state) do
-    session_key = string(msg["sessionKey"])
-    last = string(msg["lastReadMessageId"])
-    :ok = Projection.set_read_state(db(state), state.user_id, session_key, last)
-    push(Payloads.stream_read_state(session_key, last), state)
-  end
 
   defp pair(msg, state) do
     device_id = string(msg["deviceId"])

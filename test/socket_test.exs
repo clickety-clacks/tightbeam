@@ -335,7 +335,7 @@ defmodule Tightbeam.Wire.SocketTest do
              )
   end
 
-  test "chat subscription rejects the retired client typing operation", ctx do
+  test "chat subscription rejects retired client typing and stream_read operations", ctx do
     {:paired, device} =
       claim_org(ctx.db, %{
         device_id: "chat-typing",
@@ -352,14 +352,20 @@ defmodule Tightbeam.Wire.SocketTest do
 
     {:push, _sync_frame, live} = Socket.handle_info(:finish_replay, replaying)
 
-    assert {:push, {:text, error}, ^live} =
-             Socket.handle_in({JSON.encode!(%{"type" => "typing"}), opcode: :text}, live)
+    for frame_type <- ["typing", "stream_read"] do
+      frame = %{"type" => frame_type}
 
-    assert JSON.decode!(error) == %{
-             "type" => "error",
-             "code" => "invalid_message",
-             "message" => "unsupported type: typing"
-           }
+      assert {:push, {:text, error}, ^live} =
+               Socket.handle_in({JSON.encode!(frame), opcode: :text}, live)
+
+      assert JSON.decode!(error) == %{
+               "type" => "error",
+               "code" => "invalid_message",
+               "message" => "unsupported type: #{frame_type}"
+             }
+    end
+
+    assert Projection.read_states(ctx.db, device.user_id) == %{}
   end
 
   test "chat ingress resolves one reply reference transactionally and rejects unsafe replays",
