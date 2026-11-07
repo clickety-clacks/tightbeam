@@ -4,7 +4,7 @@ defmodule Tightbeam.DecisionRowVersionTest do
   alias Tightbeam.{DB, Escalation, Schema, StateResources}
 
   @v21 "coordination-fabric-v1-phase1-v21"
-  @v22 "coordination-fabric-v1-phase1-v22"
+  @v23 "coordination-fabric-v1-phase1-v23"
 
   @canonical_changes [
     {"id", "row-version-canonical-fields-next"},
@@ -62,7 +62,7 @@ defmodule Tightbeam.DecisionRowVersionTest do
     assert {:ok, []} = DB.query(upgraded, "UPDATE schema_stamp SET shape=?1", [@v21])
     :ok = Schema.ensure_all(upgraded)
 
-    assert {:ok, [[@v22]]} = DB.query(upgraded, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[@v23]]} = DB.query(upgraded, "SELECT shape FROM schema_stamp")
     assert row_version(upgraded, "existing-decision") == 1
 
     insert_operator(upgraded, "new-decision")
@@ -215,7 +215,7 @@ defmodule Tightbeam.DecisionRowVersionTest do
     refute "rowVersion" in column_names(db, "decision_requests")
 
     :ok = Schema.ensure_all(db)
-    assert {:ok, [[@v22]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[@v23]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     assert row_version(db, "row-version-v20-upgrade") == 1
   end
 
@@ -294,6 +294,7 @@ defmodule Tightbeam.DecisionRowVersionTest do
   end
 
   defp downgrade_to_v21(db) do
+    :ok = Tightbeam.ArtifactProcessSchemaFixture.rebuild_artifacts_table_to_v22!(db)
     assert :ok = DB.execute(db, "DROP TRIGGER decision_requests_row_version")
     assert :ok = DB.execute(db, "DROP TRIGGER decision_request_operator_terminal_insert")
     assert :ok = DB.execute(db, "DROP TRIGGER decision_request_operator_terminal_update")

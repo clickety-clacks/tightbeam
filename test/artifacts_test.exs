@@ -379,11 +379,24 @@ defmodule Tightbeam.ArtifactsTest do
     assert {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(artifacts)")
 
     assert Enum.map(columns, &Enum.at(&1, 1)) == ~w(
-             artifactId kind title description createdBySession workItemId parentSession
+             artifactId kind title description createdBySession createdByProcess workItemId parentSession
              originPath contentSha256 contentSha256Verified recordedMessageId
              recordedTurnEvidence state home
              createdAt updatedAt
            )
+
+    assert Enum.find(columns, &(Enum.at(&1, 1) == "createdBySession")) |> Enum.at(3) == 0
+    assert Enum.find(columns, &(Enum.at(&1, 1) == "createdByProcess")) |> Enum.at(3) == 0
+
+    assert {:error, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, workItemId, originPath, state, createdAt, updatedAt)
+               VALUES ('art_missing_creator', 'other', 'Bad', 'wi_banana', 'bad', 'in-workspace', 1, 1)
+               """
+             )
 
     # NULLABLE now, and paired with a closed evidence domain.
     assert Enum.find(columns, &(Enum.at(&1, 1) == "recordedMessageId")) |> Enum.at(3) == 0

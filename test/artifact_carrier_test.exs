@@ -159,6 +159,8 @@ defmodule Tightbeam.ArtifactCarrierTest do
       })
 
     refute Map.has_key?(result, "code")
+    assert result["createdBySession"] == ctx.coder.session_key
+    assert result["createdByProcess"] == nil
     assert result["recordedMessageId"] == nil
     assert result["recordedTurnEvidence"] == "none"
     assert result["contentSha256Status"] == "attested-not-verified"
@@ -167,6 +169,96 @@ defmodule Tightbeam.ArtifactCarrierTest do
     assert row.recorded_message_id == nil
     assert row.recorded_turn_evidence == "none"
     assert row.content_sha256_status == "attested-not-verified"
+  end
+
+  test "an organization process caller records an artifact attributed to that process", ctx do
+    result =
+      record_as_process_over_org_wire(ctx, "ci", %{
+        "kind" => "report",
+        "title" => "Automated results"
+      })
+
+    refute Map.has_key?(result, "code")
+    assert result["createdBySession"] == nil
+    assert result["createdByProcess"] == "process:ci"
+    assert result["parentSession"] == nil
+    assert result["recordedMessageId"] == nil
+    assert result["recordedTurnEvidence"] == "none"
+
+    row = Artifacts.get(ctx.db, result["artifactId"])
+    assert row.created_by_session == nil
+    assert row.created_by_process == "process:ci"
+  end
+
+  test "process-attribution rebuild preserves populated artifact rows", ctx do
+    first = record_over_wire(ctx, %{"kind" => "report", "title" => "Migration row one"})
+
+    second =
+      record_over_wire(ctx, %{
+        "kind" => "doc",
+        "title" => "Migration row two",
+        "description" => "Archived predecessor row",
+        "contentSha256" => String.duplicate("a", 64)
+      })
+
+    {:ok, :ok} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.DB.Txn.q(
+          txn,
+          "UPDATE artifacts SET state='archived',home='archive/row-two.md' WHERE artifactId=?1",
+          [second["artifactId"]]
+        )
+
+        :ok
+      end)
+
+    predecessor_columns =
+      "artifactId,kind,title,description,createdBySession,workItemId,parentSession,originPath," <>
+        "contentSha256,contentSha256Verified,recordedMessageId,recordedTurnEvidence,state,home," <>
+        "createdAt,updatedAt"
+
+    before =
+      rows(ctx.db, "SELECT #{predecessor_columns} FROM artifacts ORDER BY artifactId")
+
+    assert length(before) == 2
+    assert Enum.map(before, &Enum.at(&1, 4)) == [ctx.coder.session_key, ctx.coder.session_key]
+    :ok = Tightbeam.ArtifactProcessSchemaFixture.rebuild_artifacts_table_to_v22!(ctx.db)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE schema_stamp SET shape=?1 WHERE shape=?2",
+               ["coordination-fabric-v1-phase1-v22", "coordination-fabric-v1-phase1-v23"]
+             )
+
+    assert :ok = Tightbeam.Schema.upgrade_artifact_process_attribution_v1(ctx.db)
+    assert rows(ctx.db, "SELECT COUNT(*) FROM artifacts") == [[2]]
+
+    assert rows(
+             ctx.db,
+             "SELECT #{predecessor_columns} FROM artifacts ORDER BY artifactId"
+           ) == before
+
+    expected_attribution =
+      [first["artifactId"], second["artifactId"]]
+      |> Enum.sort()
+      |> Enum.map(&[&1, ctx.coder.session_key, nil])
+
+    assert rows(
+             ctx.db,
+             "SELECT artifactId,createdBySession,createdByProcess FROM artifacts ORDER BY artifactId"
+           ) == expected_attribution
+
+    process_result =
+      record_as_process_over_org_wire(ctx, "ci", %{
+        "kind" => "report",
+        "title" => "Recorded after migration"
+      })
+
+    assert process_result["createdBySession"] == nil
+    assert process_result["createdByProcess"] == "process:ci"
+
+    assert rows(ctx.db, "PRAGMA foreign_key_check") == []
   end
 
   ## The three evidence classes, each over the real path
@@ -543,6 +635,30 @@ defmodule Tightbeam.ArtifactCarrierTest do
     JSON.decode!(conn.resp_body)["result"]
   end
 
+  defp record_as_process_over_org_wire(ctx, process, params) do
+    params = Map.merge(%{"originPath" => "results.txt", "workItemId" => ctx.work_item_id}, params)
+
+    body =
+      JSON.encode!(%{
+        "asProcess" => process,
+        "verb" => "artifact-record",
+        "params" => params
+      })
+
+    conn =
+      conn(:post, "/agent/dispatch", body)
+      |> Plug.Conn.put_req_header("authorization", "Bearer tbc_carrier")
+      |> Plug.Conn.put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Router.call(ctx.router_opts)
+
+    assert conn.status == 200
+    JSON.decode!(conn.resp_body)["result"]
+  end
+
   defp observe_over_wire(ctx) do
     conn(:post, "/agent/tool-call-observed", "{}")
     |> Plug.Conn.put_req_header("authorization", "Bearer #{ctx.coder.cli_token}")
@@ -553,6 +669,11 @@ defmodule Tightbeam.ArtifactCarrierTest do
     |> Plug.Conn.put_req_header("content-type", "application/json")
     |> Router.call(ctx.router_opts)
     |> Map.fetch!(:status)
+  end
+
+  defp rows(db, sql) do
+    {:ok, result} = DB.query(db, sql)
+    result
   end
 
   defp enqueue_turn(ctx) do

@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision, WorkItems}
 
-  @shape "coordination-fabric-v1-phase1-v22"
+  @shape "coordination-fabric-v1-phase1-v23"
   @principal_duty_previous_shape "coordination-fabric-v1-phase1-v19"
   @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
   @effort_generator_retirement_previous_shape "coordination-fabric-v1-phase1-v17"
@@ -102,6 +102,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_to_v20(db) do
+    :ok = Tightbeam.ArtifactProcessSchemaFixture.rebuild_artifacts_table_to_v22!(db)
     downgrade_decision_row_version(db)
     :ok = DB.execute(db, "ALTER TABLE artifacts DROP COLUMN contentSha256Verified")
 
@@ -180,6 +181,7 @@ defmodule Tightbeam.SchemaShapeTest do
       })
 
     drop_principal_duty(db)
+    :ok = Tightbeam.ArtifactProcessSchemaFixture.rebuild_artifacts_table_to_v22!(db)
     :ok = DB.execute(db, "ALTER TABLE artifacts DROP COLUMN contentSha256Verified")
     downgrade_decision_row_version(db)
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v19'")
