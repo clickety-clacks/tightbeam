@@ -2495,6 +2495,9 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   defp single_literal_kind_shape(ref, literal, declared, pin) do
+    kind_ref = decision_request_kind_ref(literal)
+    kind_re = Regex.compile!(kind_ref, "i")
+
     cond do
       literal =~ ~r/\bOR\b/i ->
         {:error,
@@ -2502,7 +2505,7 @@ defmodule Tightbeam.CoordinationFabricTest do
            "uses OR today, so any occurrence is unreviewed disjunction and fails closed: " <>
            inspect(literal)}
 
-      not (literal =~ ~r/\bkind\b/i) ->
+      not Regex.match?(kind_re, literal) ->
         case pin do
           {:valid, literals} ->
             if literal in literals do
@@ -2530,16 +2533,25 @@ defmodule Tightbeam.CoordinationFabricTest do
       true ->
         negations =
           Regex.scan(
-            ~r/\bkind\s*(?:!=|<>)\s*'[a-z_]+'|\bkind\s+not\s+in\b|\bkind\s+is\s+not\b/i,
+            Regex.compile!(
+              "#{kind_ref}\\s*(?:!=|<>)\\s*'[a-z_]+'|#{kind_ref}\\s+not\\s+in\\b|#{kind_ref}\\s+is\\s+not\\b",
+              "i"
+            ),
             literal
           )
 
         eq_matches =
-          Regex.scan(~r/\bkind\s*=\s*'([a-z_]+)'/i, literal)
+          Regex.scan(Regex.compile!("#{kind_ref}\\s*=\\s*'([a-z_]+)'", "i"), literal)
           |> Enum.map(fn [_, v] -> String.downcase(v) end)
 
         in_matches =
-          Regex.scan(~r/\bkind\s+in\s*\(\s*((?:'[a-z_]+'\s*,\s*)*'[a-z_]+')\s*\)/i, literal)
+          Regex.scan(
+            Regex.compile!(
+              "#{kind_ref}\\s+in\\s*\\(\\s*((?:'[a-z_]+'\\s*,\\s*)*'[a-z_]+')\\s*\\)",
+              "i"
+            ),
+            literal
+          )
           |> Enum.map(fn [_, list] ->
             Regex.scan(~r/'([a-z_]+)'/i, list) |> Enum.map(fn [_, v] -> String.downcase(v) end)
           end)
@@ -2579,6 +2591,26 @@ defmodule Tightbeam.CoordinationFabricTest do
           true ->
             {:error, "#{ref}: unsupported declared-kind arity #{inspect(declared)}"}
         end
+    end
+  end
+
+  defp decision_request_kind_ref(literal) do
+    clause_words =
+      MapSet.new(~w(where join left right inner outer cross full on order group having limit offset))
+
+    case Regex.run(
+           ~r/\b(?:FROM|JOIN)\s+decision_requests(?:\s+(?:AS\s+)?([a-z_][a-z0-9_]*))?/i,
+           literal
+         ) do
+      [_, alias_name] when is_binary(alias_name) and alias_name != "" ->
+        if MapSet.member?(clause_words, String.downcase(alias_name)) do
+          "(?<![A-Za-z0-9_.])kind"
+        else
+          "\\b#{Regex.escape(alias_name)}\\s*\\.\\s*kind"
+        end
+
+      _ ->
+        "(?<![A-Za-z0-9_.])kind"
     end
   end
 
