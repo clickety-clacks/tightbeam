@@ -1247,7 +1247,7 @@ defmodule Tightbeam.Wire.Router do
            core_detail_operation(conn, "sessions", :principal_resolution, fn ->
              core_detail_route_principal(auth, query, conn, "sessions")
            end),
-         :ok <-
+         {:ok, filters} <-
            core_detail_operation(conn, "sessions", :request_validation, fn ->
              session_index_request(query)
            end),
@@ -1256,7 +1256,7 @@ defmodule Tightbeam.Wire.Router do
              query,
              "sessions.collection",
              "sessions",
-             %{},
+             filters,
              principal,
              &session_tuple?/1,
              @state_history_default_limit,
@@ -1271,7 +1271,8 @@ defmodule Tightbeam.Wire.Router do
                db(conn),
                core_detail_trace_principal(conn, principal),
                boundary,
-               limit
+               limit,
+               Map.get(filters, "archetype")
              )
            end),
          page <-
@@ -1281,7 +1282,7 @@ defmodule Tightbeam.Wire.Router do
              &session_tuple/1,
              "sessions.collection",
              "sessions",
-             %{},
+             filters,
              principal,
              :asc
            ),
@@ -1312,9 +1313,24 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp session_index_request(query) do
-    if Enum.all?(Map.keys(query), &(&1 in ["asUser", "limit", "before", "after", "tail"])),
-      do: :ok,
-      else: {:error, 400, "invalid_filter", nil}
+    archetypes = Map.get(query, "archetype", [])
+
+    cond do
+      not Enum.all?(
+        Map.keys(query),
+        &(&1 in ["asUser", "limit", "before", "after", "tail", "archetype"])
+      ) ->
+        {:error, 400, "invalid_filter", nil}
+
+      not (is_list(archetypes) and Enum.all?(archetypes, &is_binary/1)) ->
+        {:error, 400, "invalid_filter", nil}
+
+      true ->
+        case archetypes |> Enum.uniq() |> Enum.sort() do
+          [] -> {:ok, %{}}
+          values -> {:ok, %{"archetype" => values}}
+        end
+    end
   end
 
   defp stream_collection_request(query) do
