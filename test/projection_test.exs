@@ -224,15 +224,15 @@ defmodule Tightbeam.ProjectionTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO read_states (userId, sessionKey, lastReadMessageId) VALUES (?1, ?2, ?3)",
-        ["sample-user", "k1", "s_b"]
+        "INSERT INTO read_states (userId, sessionKey, lastReadMessageId) " <>
+          "VALUES ('sample-user', 'k1', 's_b')"
       )
 
     :ok =
       DB.execute(
         db,
-        "INSERT INTO read_states (userId, sessionKey, lastReadMessageId) VALUES (?1, ?2, ?3)",
-        ["sample-user", "k2", "s_c"]
+        "INSERT INTO read_states (userId, sessionKey, lastReadMessageId) " <>
+          "VALUES ('sample-user', 'k2', 's_c')"
       )
 
     assert Projection.read_states(db, "sample-user") == %{"k1" => "s_b", "k2" => "s_c"}
