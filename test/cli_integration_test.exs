@@ -3366,7 +3366,18 @@ defmodule Tightbeam.CliIntegrationTest do
 
     commands = [
       {"harklight-send",
-       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"]},
+       [
+         "harklight-send",
+         "--session",
+         "new",
+         "--sender-id",
+         "owner",
+         "--title",
+         "Example",
+         "--type",
+         "request",
+         "--reply"
+       ]},
       {"harklight-revise",
        [
          "harklight-revise",
@@ -3419,8 +3430,18 @@ defmodule Tightbeam.CliIntegrationTest do
        ctx do
     commands = [
       {"harklight-send",
-       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"],
-       "harklight-send requires the authenticated session or one of its roles"},
+       [
+         "harklight-send",
+         "--session",
+         "new",
+         "--sender-id",
+         "owner",
+         "--title",
+         "Example",
+         "--type",
+         "request",
+         "--reply"
+       ], "harklight-send requires the authenticated session or one of its roles"},
       {"harklight-revise",
        [
          "harklight-revise",
