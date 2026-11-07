@@ -3791,6 +3791,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "direct process ownership is data and actor provenance stays in events", ctx do
     load_terminal_reactions!(ctx)
+
     File.cp!(
       Path.join([
         :code.priv_dir(:tightbeam),
