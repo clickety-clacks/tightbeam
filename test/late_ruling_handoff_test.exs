@@ -265,8 +265,8 @@ defmodule Tightbeam.LateRulingHandoffTest do
 
     receipt_call = %{
       verb: "attest",
-      origin: ctx.ancestor.session_key,
-      principal: {:session, ctx.ancestor.session_key},
+      origin: ctx.opener.session_key,
+      principal: {:session, ctx.opener.session_key},
       params: %{
         assignment_id: source.id,
         kind: "verdict",
