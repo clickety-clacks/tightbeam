@@ -364,8 +364,6 @@ defmodule Tightbeam.Wire.SocketTest do
                "message" => "unsupported type: #{frame_type}"
              }
     end
-
-    assert Projection.read_states(ctx.db, device.user_id) == %{}
   end
 
   test "chat ingress resolves one reply reference transactionally and rejects unsafe replays",
@@ -915,7 +913,7 @@ defmodule Tightbeam.Wire.SocketTest do
     decoded = JSON.decode!(auth_frame)
     assert decoded["type"] == "auth_result"
     assert decoded["sessionKeys"] == []
-    assert decoded["streamReadStates"] == %{}
+    refute Map.has_key?(decoded, "streamReadStates")
     assert decoded["streamTailStates"] == %{}
     assert decoded["replayCount"] == 0
     assert [%{kind: "main"}] = Org.list_for_user(ctx.db, device.user_id, false)

@@ -27,7 +27,6 @@ defmodule Tightbeam.Wire.PayloadsTest do
         replay_truncated: false,
         history_reset: false,
         session_keys: ["s1"],
-        stream_read_states: %{"s1" => "m1"},
         stream_tail_states: %{
           "s1" => %{"lastMessageId" => "m2", "lastMessageRole" => "assistant"}
         },
@@ -36,7 +35,7 @@ defmodule Tightbeam.Wire.PayloadsTest do
       })
 
     assert auth["sessionKeys"] == ["s1"]
-    assert auth["streamReadStates"] == %{"s1" => "m1"}
+    refute Map.has_key?(auth, "streamReadStates")
     assert auth["dmScope"] == nil
     assert Payloads.auth_result_failure("auth_failed")["success"] == false
     assert Payloads.ack("client-1") == %{"type" => "ack", "id" => "client-1"}

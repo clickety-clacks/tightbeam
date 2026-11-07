@@ -106,7 +106,6 @@ defmodule Tightbeam.Wire.Payloads do
       "replayTruncated" => Map.fetch!(input, :replay_truncated),
       "historyReset" => Map.fetch!(input, :history_reset),
       "sessionKeys" => Map.fetch!(input, :session_keys),
-      "streamReadStates" => Map.fetch!(input, :stream_read_states),
       "streamTailStates" => Map.fetch!(input, :stream_tail_states),
       "features" => Map.fetch!(input, :features),
       "dmScope" => Map.fetch!(input, :dm_scope)

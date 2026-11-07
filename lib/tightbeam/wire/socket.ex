@@ -336,8 +336,6 @@ defmodule Tightbeam.Wire.Socket do
         {messages ++ selected, truncated or length(rows) == 501, sent}
       end)
 
-    read_states = if chat?, do: Projection.read_states(db(state), device.user_id), else: %{}
-
     tail_states =
       Map.new(keys, fn key -> {key, Projection.tail(db(state), key)} end)
       |> Enum.reject(fn {_key, value} -> is_nil(value) end)
@@ -359,7 +357,6 @@ defmodule Tightbeam.Wire.Socket do
         replay_truncated: truncated?,
         history_reset: false,
         session_keys: keys,
-        stream_read_states: read_states,
         stream_tail_states: tail_states,
         features: ["tightbeam"],
         dm_scope: if(device.is_admin, do: "admin", else: nil)
