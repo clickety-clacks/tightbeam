@@ -2430,14 +2430,15 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   # Every double-quoted or triple-quoted string literal inside a chunk of
-  # already-reconstructed (`Macro.to_string/1`) source, each NORMALIZED (and
-  # quote-stripped) INDIVIDUALLY rather than joined into one blob: a single aggregated blob let one properly-scoped query's
+  # already-reconstructed (`Macro.to_string/1`) source, including multiline
+  # strings, each NORMALIZED (and quote-stripped) INDIVIDUALLY rather than
+  # joined into one blob: a single aggregated blob let one properly-scoped query's
   # `kind = '<declared>'` literal satisfy the whole function's check even
   # when a SECOND query in the same function carried no kind constraint (or
   # a wrong one) of its own — the aggregate text still contained the
   # required substring, so the check never looked past it.
   defp own_sql_texts(text) do
-    Regex.scan(~r/"""(?:(?!""").)*"""|"[^"\n]*"/s, text)
+    Regex.scan(~r/"""(?:(?!""").)*"""|"(?:\\.|[^"\\])*"/s, text)
     |> List.flatten()
     |> Enum.map(&normalize_sql_literal/1)
   end
