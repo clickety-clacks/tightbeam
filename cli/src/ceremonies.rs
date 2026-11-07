@@ -1978,7 +1978,7 @@ fn ship_current_cli(
                 // LITERALLY -- there is no remote shell to remove quotes, so quoting it
                 // makes the quotes part of the filename and the parent directory does not
                 // exist. Measured on OpenSSH_9.6p1:
-                //   dest open "'/home/clu/.tightbeam/bin/.tightbeam.update-...'": No such
+                //   dest open "'/home/test-user/.tightbeam/bin/.tightbeam.update-...'": No such
                 //   file or directory
                 // while the same unquoted destination lands. Spaces survive regardless,
                 // because SFTP never word-splits; the quoting only ever existed to survive

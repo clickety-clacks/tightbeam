@@ -29,7 +29,7 @@ defmodule Tightbeam.RulesTest do
         model: nil
       })
 
-    Enum.each(~w(mike other reviewer), &ensure_main_session(db, &1))
+    Enum.each(~w(sample-user-alt other reviewer), &ensure_main_session(db, &1))
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-rules-#{System.unique_integer([:positive])}")
@@ -345,15 +345,20 @@ defmodule Tightbeam.RulesTest do
   test "caller facts cover origin, admin, multi-role, unbound, retired, and malformed cases",
        ctx do
     {:pending, _} =
-      Devices.pair(ctx.db, %{device_id: "d2", claimed_name: "Mike", platform: nil, model: nil})
+      Devices.pair(ctx.db, %{
+        device_id: "d2",
+        claimed_name: "sample-user-alt",
+        platform: nil,
+        model: nil
+      })
 
     active = session(ctx.db, "active", "sample-user")
-    retired = session(ctx.db, "retired", "mike")
-    Org.retire(ctx.db, retired.session_key, "user:mike", 1_000)
+    retired = session(ctx.db, "retired", "sample-user-alt")
+    Org.retire(ctx.db, retired.session_key, "user:sample-user-alt", 1_000)
     Roles.create!(ctx.db, "alpha", "sample-user", active.session_key)
     Roles.create!(ctx.db, "beta", "sample-user", active.session_key)
-    Roles.create!(ctx.db, "vacant", "mike", nil)
-    Roles.create!(ctx.db, "old", "mike", nil)
+    Roles.create!(ctx.db, "vacant", "sample-user-alt", nil)
+    Roles.create!(ctx.db, "old", "sample-user-alt", nil)
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE roles SET boundSessionKey = ?2 WHERE name = ?1", [
@@ -366,11 +371,11 @@ defmodule Tightbeam.RulesTest do
       {call("agent:alpha"), "caller.origin_class", "eq", "agent", true},
       {call("process:cron"), "caller.origin_class", "eq", "process", true},
       {call("agent:alpha"), "caller.user", "eq", "sample-user", true},
-      {call("agent:vacant"), "caller.user", "eq", "mike", false},
-      {call("agent:old"), "caller.user", "eq", "mike", true},
+      {call("agent:vacant"), "caller.user", "eq", "sample-user-alt", false},
+      {call("agent:old"), "caller.user", "eq", "sample-user-alt", true},
       {call("process:cron"), "caller.user", "eq", "sample-user", false},
       {call("user:sample-user"), "caller.is_admin", "eq", true, true},
-      {call("user:mike"), "caller.is_admin", "eq", false, true},
+      {call("user:sample-user-alt"), "caller.is_admin", "eq", false, true},
       {call("user:unknown"), "caller.is_admin", "eq", false, false},
       {call("agent:alpha"), "caller.roles", "in", ["alpha", "beta"], true},
       {call("agent:vacant"), "caller.roles", "not_in", ["alpha"], true},
@@ -489,8 +494,8 @@ defmodule Tightbeam.RulesTest do
 
   test "target facts cover active retired missing ghost dm and main sessions", ctx do
     active = session(ctx.db, "active", "sample-user", kind: "main")
-    dm = session(ctx.db, "dm", "mike", kind: "dm")
-    custom = session(ctx.db, "custom", "mike")
+    dm = session(ctx.db, "dm", "sample-user-alt", kind: "dm")
+    custom = session(ctx.db, "custom", "sample-user-alt")
     retired = session(ctx.db, "retired", "sample-user")
     Org.retire(ctx.db, retired.session_key, "user:sample-user", 1_000)
 
@@ -523,7 +528,7 @@ defmodule Tightbeam.RulesTest do
           {now - 86_400_000, "verb", "post", "user:sample-user"},
           {now - 2, "denied", "post", "user:sample-user"},
           {now - 2, "verb", "wake", "user:sample-user"},
-          {now - 2, "verb", "post", "user:mike"}
+          {now - 2, "verb", "post", "user:sample-user-alt"}
         ] do
       {:ok, _} =
         DB.query(ctx.db, "INSERT INTO events (ts, kind, verb, origin) VALUES (?1, ?2, ?3, ?4)", [

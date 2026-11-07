@@ -514,7 +514,7 @@ defmodule Tightbeam.PlacementTest do
              Placement.provision_endpoint(
                base_dir,
                Placement.local_host_name(),
-               %{ssh: "clu@#{Placement.local_host_name()}", base_dir: "/remote/tb"},
+               %{ssh: "test-user@#{Placement.local_host_name()}", base_dir: "/remote/tb"},
                sh: fn command -> flunk("unexpected command: #{inspect(command)}") end
              )
 
@@ -528,21 +528,24 @@ defmodule Tightbeam.PlacementTest do
              Placement.provision_endpoint(
                base_dir,
                "worker",
-               %{ssh: "clu@worker", base_dir: "~/.tightbeam"},
+               %{ssh: "test-user@worker", base_dir: "~/.tightbeam"},
                sh: sh
              )
 
     assert_receive {:sh, mkdir}
-    assert mkdir == ["ssh"] ++ ssh_opts() ++ ["clu@worker", "mkdir", "-p", "~/.tightbeam"]
+
+    assert mkdir ==
+             ["ssh"] ++ ssh_opts() ++ ["test-user@worker", "mkdir", "-p", "~/.tightbeam"]
+
     assert_receive {:sh, rsync}
-    assert List.last(rsync) == "clu@worker:~/.tightbeam/"
+    assert List.last(rsync) == "test-user@worker:~/.tightbeam/"
     refute File.exists?(Path.join([base_dir, "staging", "gateway-files", "worker"]))
 
     assert_raise RuntimeError, ~r/command failed/, fn ->
       Placement.provision_endpoint(
         base_dir,
         "worker",
-        %{ssh: "clu@worker", base_dir: "/remote/tb"},
+        %{ssh: "test-user@worker", base_dir: "/remote/tb"},
         sh: fn _ -> {"", 255} end
       )
     end
