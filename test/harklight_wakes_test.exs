@@ -2076,6 +2076,8 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: @handle,
+          message_type: "request",
+          reply: true,
           sender_id: "sender",
           title: "Replacement"
         }
@@ -2121,6 +2123,8 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: @handle,
+          message_type: "request",
+          reply: true,
           sender_id: "sender",
           title: "Replacement"
         }
@@ -2144,6 +2148,8 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: @handle,
+          message_type: "request",
+          reply: true,
           sender_id: "sender",
           title: "Replacement"
         }
@@ -2170,6 +2176,8 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: @handle,
+          message_type: "request",
+          reply: true,
           sender_id: "sender",
           title: "Replacement",
           supersedes: ["request"]

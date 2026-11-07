@@ -508,6 +508,8 @@ defmodule Tightbeam.Wire.SeamTest do
                sender_id: "sender",
                message_id: "minted-id",
                title: "Question",
+               message_type: "request",
+               reply: true,
                supersedes: []
              }
            }
@@ -548,7 +550,13 @@ defmodule Tightbeam.Wire.SeamTest do
     response =
       dispatch_cli(%{ctx | opts: opts}, session.cli_token, %{
         verb: "harklight-send",
-        params: %{harklightSession: "new", senderId: "sender", title: "Question"}
+        params: %{
+          harklightSession: "new",
+          senderId: "sender",
+          title: "Question",
+          messageType: "request",
+          reply: true
+        }
       })
 
     result = JSON.decode!(response.resp_body)["result"]
