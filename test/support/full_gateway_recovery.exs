@@ -387,6 +387,10 @@ if phase == "prepare" do
   true = File.regular?(Path.join(base, "build-owner.json"))
   :ok = GenServer.stop(db)
 
+  :initialized = Tightbeam.Identity.init!(base)
+  {:ok, candidate_law} = Tightbeam.Identity.learn!(base, "agentic-engineering", "test")
+  {:ok, _revision} = Tightbeam.Identity.publish_live!(base, candidate_law)
+
   File.write!(Path.join(base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
   Tightbeam.RecoveryFixture.place_adapter!(base, seed_credential: false)
 else
