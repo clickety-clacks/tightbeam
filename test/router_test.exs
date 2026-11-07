@@ -3791,6 +3791,15 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "direct process ownership is data and actor provenance stays in events", ctx do
     load_terminal_reactions!(ctx)
+    File.cp!(
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      ]),
+      Path.join(ctx.base_dir, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
+    Tightbeam.Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
     holder = create_session(ctx.db, "process-task-holder", "flynn")
     create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
