@@ -515,6 +515,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             session,
             sender_id,
             title,
+            message_type,
+            message_kind,
+            importance,
+            stake,
+            by_when,
+            reply,
             body,
             choices,
             files,
@@ -529,6 +535,8 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("harklightSession", session),
                 string_field("senderId", sender_id),
                 string_field("title", title),
+                string_field("messageType", message_type),
+                format!("\"reply\":{}", reply),
                 format!(
                     "\"choices\":{}",
                     serde_json::to_string(choices).expect("choices are JSON serializable")
@@ -543,6 +551,18 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = vendor_session_id {
                 params.push(string_field("vendorSessionId", value));
+            }
+            if let Some(value) = message_kind {
+                params.push(string_field("messageKind", value));
+            }
+            if let Some(value) = importance {
+                params.push(string_field("importance", value));
+            }
+            if let Some(value) = stake {
+                params.push(string_field("stake", value));
+            }
+            if let Some(value) = by_when {
+                params.push(string_field("byWhen", value));
             }
             Ok(request(identity, "harklight-send", vec![], params))
         }
@@ -4029,6 +4049,17 @@ mod tests {
                     "s",
                     "--title",
                     "t",
+                    "--type",
+                    "request",
+                    "--reply",
+                    "--kind",
+                    "blocker",
+                    "--importance",
+                    "high",
+                    "--stake",
+                    "the demo slips",
+                    "--by-when",
+                    "2026-11-01T17:00:00Z",
                     "--supersedes",
                     "one",
                     "--supersedes",
@@ -4071,6 +4102,12 @@ mod tests {
                     body["params"]["supersedes"],
                     serde_json::json!(["one", "two", "one"])
                 );
+                assert_eq!(body["params"]["messageType"], "request");
+                assert_eq!(body["params"]["messageKind"], "blocker");
+                assert_eq!(body["params"]["importance"], "high");
+                assert_eq!(body["params"]["stake"], "the demo slips");
+                assert_eq!(body["params"]["byWhen"], "2026-11-01T17:00:00Z");
+                assert_eq!(body["params"]["reply"], true);
             } else {
                 assert_eq!(body["params"]["messageId"], "m");
             }
@@ -4205,6 +4242,8 @@ mod tests {
             "sender",
             "--title",
             "Question",
+            "--type",
+            "request",
             "--choices-json",
             r#"["Yes"]"#,
         ]))
@@ -4212,9 +4251,35 @@ mod tests {
         assert_eq!(request["verb"], "harklight-send");
         assert_eq!(request["params"]["harklightSession"], "new");
         assert_eq!(request["params"]["senderId"], "sender");
+        assert_eq!(request["params"]["messageType"], "request");
+        assert_eq!(request["params"]["reply"], false);
         assert_eq!(request["params"]["choices"], serde_json::json!(["Yes"]));
         assert!(request.get("sessionKey").is_none());
         assert!(request["params"].get("sessionKey").is_none());
+    }
+
+    #[test]
+    fn fyi_send_builds_seen_only_request_without_caller_origin() {
+        let request: Value = serde_json::from_str(&body(&[
+            "harklight-send",
+            "--session",
+            "new",
+            "--sender-id",
+            "sender",
+            "--title",
+            "Build finished",
+            "--type",
+            "fyi",
+        ]))
+        .unwrap();
+
+        assert_eq!(request["verb"], "harklight-send");
+        assert_eq!(request["params"]["messageType"], "fyi");
+        assert_eq!(request["params"]["reply"], false);
+        assert_eq!(request["params"]["choices"], serde_json::json!([]));
+        assert!(request.get("sessionKey").is_none());
+        assert!(request["params"].get("sessionKey").is_none());
+        assert!(request["params"].get("informational").is_none());
     }
 
     #[test]

@@ -133,8 +133,15 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: "new",
+          message_type: "request",
+          message_kind: "blocker",
+          importance: "high",
+          stake: "A one-week delay",
+          by_when: "2026-11-02T17:00:00Z",
+          reply: true,
           sender_id: "sender",
           title: "Question",
+          choices: ["Approve", "Defer"],
           files: ["/tmp/request.txt"]
         }
     }
@@ -145,6 +152,20 @@ defmodule Tightbeam.HarklightWakesTest do
       cond do
         Enum.take(args, 2) == ["send", "--prepare"] ->
           assert "--controller" in args
+          assert "--reply" in args
+
+          for pair <- [
+                ["--type", "request"],
+                ["--kind", "blocker"],
+                ["--importance", "high"],
+                ["--stake", "A one-week delay"],
+                ["--by-when", "2026-11-02T17:00:00Z"],
+                ["--choice", "Approve"],
+                ["--choice", "Defer"]
+              ] do
+            assert pair in Enum.chunk_every(args, 2, 1, :discard)
+          end
+
           assert Enum.take(args, -2) == ["--file", "/tmp/request.txt"]
 
           assert {:ok, [[0]]} =
@@ -202,7 +223,13 @@ defmodule Tightbeam.HarklightWakesTest do
       end
     end
 
-    assert %{state: "registered", session_key: session, op_id: op_id} =
+    assert %{
+             state: "registered",
+             session_key: session,
+             op_id: op_id,
+             message_type: "request",
+             message_type_label: "Request"
+           } =
              HarklightSend.send_request(db, send_call, runner: runner)
 
     assert session == call.session_key
@@ -215,6 +242,141 @@ defmodule Tightbeam.HarklightWakesTest do
              )
   end
 
+  test "typed send refusals explain a fix before preparing an operation", %{db: db, call: call} do
+    assert {:ok, [[existing_operations]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_send_operations")
+
+    valid = %{
+      harklight_session: "new",
+      sender_id: "sender",
+      title: "Question",
+      message_type: "request",
+      reply: true
+    }
+
+    cases = [
+      {Map.delete(valid, :message_type), "harklight_type_required", "--type is required"},
+      {Map.put(valid, :message_type, "notice"), "harklight_type_invalid", "fyi or request"},
+      {
+        Map.merge(valid, %{message_type: "fyi", reply: false, choices: ["Ship"]}),
+        "harklight_fyi_has_answer_controls",
+        "remove --choices-json and --reply"
+      },
+      {
+        Map.merge(valid, %{message_type: "fyi", reply: true}),
+        "harklight_fyi_has_answer_controls",
+        "remove --choices-json and --reply"
+      },
+      {Map.put(valid, :reply, false), "harklight_request_needs_answer_controls", "--reply"},
+      {Map.put(valid, :message_kind, "update"), "harklight_kind_invalid", "blocker or success"},
+      {
+        Map.put(valid, :importance, "urgent"),
+        "harklight_importance_invalid",
+        "low, normal, high, now"
+      },
+      {Map.put(valid, :stake, "  "), "harklight_stake_invalid", "non-empty text"},
+      {Map.put(valid, :by_when, "tomorrow"), "harklight_by_when_invalid", "RFC 3339"}
+    ]
+
+    for {params, code, fix} <- cases do
+      result =
+        HarklightSend.send_request(db, %{call | params: params},
+          runner: fn _args -> flunk("invalid message reached the Agent CLI") end
+        )
+
+      assert %{outcome: "failed", code: ^code, reason: reason} = result
+      assert reason =~ fix
+    end
+
+    assert {:ok, [[^existing_operations]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_send_operations")
+  end
+
+  test "FYI send forwards Seen-only type through the authenticated origin route", %{
+    db: db,
+    call: call
+  } do
+    handle = "b6a87513-b91d-4314-849a-cb8d80225864"
+    message_id = "seen-notice"
+
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: "new",
+          message_type: "fyi",
+          reply: false,
+          sender_id: "sender",
+          title: "Build finished",
+          body: "The export is ready."
+        }
+    }
+
+    runner = fn args ->
+      op_id = if "--prepare" in args, do: Enum.at(args, 3), else: List.last(args)
+
+      case Enum.take(args, 2) do
+        ["send", "--prepare"] ->
+          assert ["--type", "fyi"] in Enum.chunk_every(args, 2, 1, :discard)
+          refute "--reply" in args
+          refute "--choice" in args
+          assert "--controller" in args
+
+          {JSON.encode!(%{
+             kind: "prepared",
+             op_id: op_id,
+             files: [],
+             request: %{
+               type: "send",
+               op_id: op_id,
+               session_handle: handle,
+               route: "other",
+               message: %{
+                 sender_id: "sender",
+                 message_id: message_id,
+                 title: "Build finished",
+                 body: "The export is ready."
+               }
+             }
+           }) <> "\n", 0}
+
+        ["send", "--execute"] ->
+          assert {:ok, [[session, payload]]} =
+                   DB.query(
+                     db,
+                     "SELECT sessionKey,payload FROM harklight_send_operations WHERE opId=?1",
+                     [op_id]
+                   )
+
+          assert session == call.session_key
+          assert JSON.decode!(payload)["request"]["session_handle"] == handle
+          assert JSON.decode!(payload)["request"]["message"]["message_id"] == message_id
+
+          {JSON.encode!(%{
+             kind: "committed",
+             operation: "send",
+             op_id: op_id,
+             response: %{
+               session_handle: handle,
+               sender_id: "sender",
+               message_id: message_id,
+               revision: 1
+             }
+           }) <> "\n", 0}
+      end
+    end
+
+    assert %{
+             state: "registered",
+             session_key: session,
+             handle: ^handle,
+             message_id: ^message_id,
+             message_type: "fyi",
+             message_type_label: "FYI"
+           } = HarklightSend.send_request(db, send_call, runner: runner)
+
+    assert session == call.session_key
+  end
+
   test "uncertain result stays unregistered and same-operation retry can bind it", %{
     db: db,
     call: call
@@ -223,7 +385,13 @@ defmodule Tightbeam.HarklightWakesTest do
 
     send_call = %{
       call
-      | params: %{harklight_session: "new", sender_id: "sender", title: "Question"}
+      | params: %{
+          harklight_session: "new",
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Question"
+        }
     }
 
     parent = self()
@@ -307,7 +475,13 @@ defmodule Tightbeam.HarklightWakesTest do
 
     send_call = %{
       call
-      | params: %{harklight_session: "new", sender_id: "sender", title: "Question"}
+      | params: %{
+          harklight_session: "new",
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Question"
+        }
     }
 
     parent = self()
@@ -385,7 +559,13 @@ defmodule Tightbeam.HarklightWakesTest do
   } do
     send_call = %{
       call
-      | params: %{harklight_session: "new", sender_id: "sender", title: "Question"}
+      | params: %{
+          harklight_session: "new",
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Question"
+        }
     }
 
     claimed_origin = %{
@@ -1823,6 +2003,8 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: @handle,
+          message_type: "request",
+          reply: true,
           sender_id: "sender",
           title: "Replacement",
           supersedes: ["request", "second", "request", "closed", "unknown"]
@@ -1879,6 +2061,8 @@ defmodule Tightbeam.HarklightWakesTest do
           call
           | params: %{
               harklight_session: @handle,
+              message_type: "request",
+              reply: true,
               sender_id: "sender",
               title: "Replacement",
               supersedes: ["request"]
@@ -1907,6 +2091,8 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: @handle,
+          message_type: "request",
+          reply: true,
           sender_id: "sender",
           title: "Replacement",
           supersedes: ["request"]
@@ -1967,7 +2153,13 @@ defmodule Tightbeam.HarklightWakesTest do
         db,
         %{
           call
-          | params: %{harklight_session: @handle, sender_id: "sender", title: "Replacement"}
+          | params: %{
+              harklight_session: @handle,
+              message_type: "request",
+              reply: true,
+              sender_id: "sender",
+              title: "Replacement"
+            }
         },
         runner: runner
       )
@@ -1975,7 +2167,7 @@ defmodule Tightbeam.HarklightWakesTest do
     assert %{outcome: "refused", message_id: "replacement", wake_effect: "none", reason: reason} =
              result
 
-    assert reason =~ "not sent"
+    assert reason == "not accepted"
 
     assert :ok =
              HarklightSend.recover_pending(db, runner: fn _ -> flunk("refused send retried") end)
@@ -2127,6 +2319,8 @@ defmodule Tightbeam.HarklightWakesTest do
                  call
                  | params: %{
                      harklight_session: @handle,
+                     message_type: "request",
+                     reply: true,
                      sender_id: "sender",
                      title: "Replacement",
                      supersedes: ["request"]
@@ -2249,6 +2443,8 @@ defmodule Tightbeam.HarklightWakesTest do
                  call
                  | params: %{
                      harklight_session: @handle,
+                     message_type: "request",
+                     reply: true,
                      sender_id: "sender",
                      title: "Replacement",
                      supersedes: ["foreign"]
@@ -2277,6 +2473,8 @@ defmodule Tightbeam.HarklightWakesTest do
           call
           | params: %{
               harklight_session: @handle,
+              message_type: "request",
+              reply: true,
               sender_id: "sender",
               title: "Replacement",
               supersedes: ["request", "request"]
@@ -2317,6 +2515,8 @@ defmodule Tightbeam.HarklightWakesTest do
           call
           | params: %{
               harklight_session: @handle,
+              message_type: "request",
+              reply: true,
               sender_id: "sender",
               title: "Replacement",
               supersedes: ["request"]
@@ -2403,6 +2603,8 @@ defmodule Tightbeam.HarklightWakesTest do
                  call
                  | params: %{
                      harklight_session: @handle,
+                     message_type: "request",
+                     reply: true,
                      sender_id: "sender",
                      title: "Replacement",
                      supersedes: ["request"]
