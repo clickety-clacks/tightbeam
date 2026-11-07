@@ -2719,8 +2719,8 @@ defmodule Tightbeam.HarklightWakesTest do
         GenServer.call(
           manager,
           {:finished, handle,
-           {:harklight_failure, "listener_stopped", "listen",
-            "LISTEN attempt; exit status: 143; no safe output captured"}}
+           {:harklight_failure, {"listener_stopped", "stream_io"}, "listen",
+            "LISTEN attempt; reason_code=stream_io; origin reconnecting"}}
         )
     end
 
@@ -2740,7 +2740,7 @@ defmodule Tightbeam.HarklightWakesTest do
                   ) do
                {:ok, [["unavailable", error]]} when is_binary(error) ->
                  String.starts_with?(error, "listener_stopped") and
-                   String.contains?(error, "exit status: 143")
+                   String.contains?(error, "reason_code=stream_io")
 
                _ ->
                  false
