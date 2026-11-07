@@ -821,6 +821,7 @@ defmodule Tightbeam.ArchetypesTest do
         ] do
       model = Tightbeam.Model.new(family, effort: effort)
       assert loaded[role].defaults == %{harness: harness, model: model}
+
       assert loaded[role].model_preferences ==
                Enum.map(preferences, fn {family, effort} ->
                  Tightbeam.Model.new(family, effort: effort)

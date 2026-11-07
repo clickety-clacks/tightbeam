@@ -235,8 +235,16 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
 
     for row <- rows do
       detail = StateResources.query_work_item(db, row.id, principal)
-      assert Map.drop(detail, [:started, :holders, :attest_counts, :verdict_counts,
-                               :effective_commit_refs, :landings]) == row
+
+      assert Map.drop(detail, [
+               :started,
+               :holders,
+               :attest_counts,
+               :verdict_counts,
+               :effective_commit_refs,
+               :landings
+             ]) == row
+
       assert detail.started == false
       assert detail.holders == []
       assert detail.attest_counts == %{}

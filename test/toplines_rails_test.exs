@@ -80,7 +80,9 @@ defmodule Tightbeam.ToplinesRailsTest do
       db,
       "topline_work_memberships",
       membership_row("tlm_process", "tl_one", "wi_one", "flynn")
-      |> Map.merge(ended_membership(%{unlinkedActorKind: "process", unlinkedActorRef: "tightbeam"}))
+      |> Map.merge(
+        ended_membership(%{unlinkedActorKind: "process", unlinkedActorRef: "tightbeam"})
+      )
     )
   end
 

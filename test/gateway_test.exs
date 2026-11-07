@@ -11132,7 +11132,8 @@ defmodule Tightbeam.GatewayTest do
                },
                %{
                  name: "sentinels",
-                 purpose: "Share generic event subscription tools and a read-only Matrix event watcher.",
+                 purpose:
+                   "Share generic event subscription tools and a read-only Matrix event watcher.",
                  phrases: [],
                  root_archetype: "default"
                }
