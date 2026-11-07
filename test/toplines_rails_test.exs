@@ -149,11 +149,6 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{resolutionReason: "done"},
       resolved_placement("left_unlinked", %{resolutionReason: nil}),
       resolved_placement("work_terminal", %{
-        resolutionActorKind: "process",
-        resolutionActorRef: "tightbeam",
-        resolutionReason: "work_item_closed"
-      }),
-      resolved_placement("work_terminal", %{
         resolutionReason: "reupgrade_terminal_reconciliation_closed"
       }),
       resolved_placement("work_terminal", %{
@@ -213,6 +208,20 @@ defmodule Tightbeam.ToplinesRailsTest do
         resolved_placement("linked", %{
           resolutionActorKind: "process",
           resolutionActorRef: "tightbeam"
+        })
+      )
+    )
+
+    # The published schema also admits this exact work-terminal process tuple.
+    insert!(
+      db,
+      "topline_placement_obligations",
+      placement_row("tlp_terminal_process")
+      |> Map.merge(
+        resolved_placement("work_terminal", %{
+          resolutionActorKind: "process",
+          resolutionActorRef: "tightbeam",
+          resolutionReason: "work_item_closed"
         })
       )
     )
