@@ -395,7 +395,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
+    assert {:ok, [["artifact-process-attribution-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1], [1], [1]]} =
@@ -481,7 +481,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
     :ok = DB.execute(db, "DROP TRIGGER reject_decision_revision_stamp")
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
+    assert {:ok, [["artifact-process-attribution-v1-015"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1], [1]]} =
