@@ -2144,6 +2144,9 @@ defmodule Tightbeam.CoordinationFabricTest do
   defp dynamic_query_node?({_, _, args}, attrs) when is_list(args),
     do: Enum.any?(args, &dynamic_query_node?(&1, attrs))
 
+  defp dynamic_query_node?(tuple, attrs) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> Enum.any?(&dynamic_query_node?(&1, attrs))
+
   defp dynamic_query_node?(items, attrs) when is_list(items),
     do: Enum.any?(items, &dynamic_query_node?(&1, attrs))
 
