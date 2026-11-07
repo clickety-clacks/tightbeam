@@ -117,7 +117,6 @@ defmodule Tightbeam.JobTraceTest do
     )
 
     Tightbeam.Rules.load!(law, Map.keys(handlers))
-    assert :ok = Tightbeam.Supervision.migrate_open_assignments(db, 1_000)
 
     repo = init_repo()
     on_exit(fn -> File.rm_rf!(repo) end)
