@@ -797,23 +797,6 @@ defmodule Tightbeam.HarklightWakes do
   # still releasing the lock; bounded attempts let that clear. The Agent takes
   # the exclusive lock before attaching, so a held lock never starts a second
   # stream. Persistent contention ends in gone with its observed reason intact.
-  defp retryable_failure?(
-         {:harklight_failure, {"attachment_outcome_unknown", code}, "attach", _}
-       ),
-       do: code in ["transport_error", "timeout"]
-
-  defp retryable_failure?({:harklight_failure, "attachment_outcome_unknown", "attach", _}),
-    do: false
-
-  defp retryable_failure?({:harklight_failure, {"listener_stopped", code}, "listen", diagnostic}) do
-    code in ["transport_error", "timeout"] or diagnostic_contains?(diagnostic, "exit status: 143")
-  end
-
-  defp retryable_failure?({:harklight_failure, "listener_stopped", "listen", diagnostic}) do
-    origin_transport_failure?(diagnostic) or
-      diagnostic_contains?(diagnostic, "exit status: 143")
-  end
-
   defp retryable_failure?({:harklight_failure, {_error, code}, _, _}) do
     code not in ~w(missing_journal unproven_handle invalid_handle invalid_attachment
       invalid_attachment_receipt support_mismatch configuration_error
