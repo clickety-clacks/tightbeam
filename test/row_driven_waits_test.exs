@@ -283,6 +283,14 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
   test "stored provisional wait recognizes a terminal resolver and gates one delivery",
        ctx do
+    name = "row-reaction-assignment-inactivity.toml"
+
+    File.cp!(
+      Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
+      Path.join(ctx.base, "identity/rules/#{name}")
+    )
+
+    Rules.load!(ctx.base, ~w(wake attest))
     scheduler_pid = suspend_scheduler(ctx)
     turn = running_turn(ctx.db, "holder")
     wake = register_legacy_wait(ctx.db, due_after(), predicate("R"))

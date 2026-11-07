@@ -101,6 +101,11 @@ defmodule Tightbeam.JobTraceTest do
 
   test "proofs 3-5: exact trace schema, review join, wake fact, authorization, and commit refs",
        %{db: db} do
+    law_root = Path.join(System.tmp_dir!(), "job-trace-terminal-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(law_root) end)
+    handlers = Tightbeam.Gateway.handlers(%{db: db})
+    Tightbeam.TerminalReactionFixture.load!(law_root, Map.keys(handlers))
+
     repo = init_repo()
     on_exit(fn -> File.rm_rf!(repo) end)
     commit = git_output!(repo, ["rev-parse", "HEAD"])

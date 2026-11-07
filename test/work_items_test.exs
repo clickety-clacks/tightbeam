@@ -1293,6 +1293,10 @@ defmodule Tightbeam.WorkItemsTest do
   end
 
   test "get and list return deterministic eras, aspects, and ordering", ctx do
+    law_root = Path.join(System.tmp_dir!(), "work-item-terminal-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(law_root) end)
+    Tightbeam.TerminalReactionFixture.load!(law_root, Map.keys(ctx.handlers))
+
     assert %{workItems: []} = list(ctx, {:user, "flynn"})
     assert %{code: "unknown_work_item"} = get(ctx, {:user, "flynn"}, "missing")
 

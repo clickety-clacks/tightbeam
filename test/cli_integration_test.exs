@@ -1884,6 +1884,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "session-auth --as-user retains agent attribution for verdicts and revocation",
        ctx do
+    Tightbeam.TerminalReactionFixture.load!(ctx.base_dir, Map.keys(ctx.handlers))
     {:ok, _} =
       DB.query(
         ctx.db,
