@@ -195,7 +195,9 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
 
   test "observe and resolve other cross the real wire with target and idempotency boundaries",
        ctx do
-    owner = ctx.device.user_id
+    owner = "wire-source-owner"
+    assert %{user_id: ^owner, is_admin: false} = Devices.add_user(ctx.db, owner, false)
+
     source = wire_session(ctx.db, "wire-health-source", owner, "coder")
     stranger_owner = "wire-foreign-owner"
 
