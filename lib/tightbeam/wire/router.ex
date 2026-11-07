@@ -655,6 +655,16 @@ defmodule Tightbeam.Wire.Router do
     )
   end
 
+  get "/api/sessions/:session_key/record-events" do
+    session_collection(
+      conn,
+      session_key,
+      "record events",
+      :query_record_events_for_session_page,
+      :record_event
+    )
+  end
+
   get "/api/sessions/:session_key/tool-calls" do
     tool_calls_collection(conn, session_key)
   end
@@ -1631,6 +1641,7 @@ defmodule Tightbeam.Wire.Router do
   defp session_collection_tuple("transcript messages", %{seq: seq}), do: [seq]
   defp session_collection_tuple("turns", %{seq: seq}), do: [seq]
   defp session_collection_tuple("tool calls", %{seq: seq, id: id}), do: [seq, id]
+  defp session_collection_tuple("record events", %{"at" => at, "eventId" => id}), do: [at, id]
 
   defp session_collection_tuple("turn events", %{
          turn_seq: turn_seq,
@@ -1653,6 +1664,9 @@ defmodule Tightbeam.Wire.Router do
     do:
       is_integer(turn_seq) and turn_seq > 0 and is_integer(event_seq) and event_seq > 0 and
         is_binary(id) and id != ""
+
+  defp session_collection_tuple?("record events", [at, id]),
+    do: is_integer(at) and is_binary(id) and id != ""
 
   defp session_collection_tuple?(
          "wakes",
@@ -1700,7 +1714,10 @@ defmodule Tightbeam.Wire.Router do
              principal,
              &session_collection_tuple?(resource, &1),
              @state_history_default_limit,
-             if(resource == "transcript messages", do: :latest, else: :earliest),
+             if(resource in ["transcript messages", "record events"],
+               do: :latest,
+               else: :earliest
+             ),
              :earliest,
              :latest
            ),
