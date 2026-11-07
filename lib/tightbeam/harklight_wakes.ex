@@ -375,69 +375,77 @@ defmodule Tightbeam.HarklightWakes do
       )
 
     Enum.each(entries, fn [event, line, message, kind, author, root] ->
-      replacement =
-        case Txn.q(
-               txn,
-               "SELECT wakeId FROM harklight_wake_deliveries WHERE handle=?1 AND eventId=?2 AND sessionKey=?3",
-               [handle, event, successor]
-             ) do
-          [[wake_id]] ->
-            wake_id
+      existing =
+        Txn.q(
+          txn,
+          "SELECT wakeId FROM harklight_wake_deliveries WHERE handle=?1 AND eventId=?2 AND sessionKey=?3",
+          [handle, event, successor]
+        )
 
-          [] ->
-            wake =
-              Wakes.schedule_in_txn(txn, %{
-                session_key: successor,
-                origin: "process:tightbeam",
-                prompt: entry_prompt(txn, origin, line, handle, event, message, kind, author),
-                due_at: System.system_time(:millisecond),
-                creator_session_key: origin,
-                class: "blocker"
-              })
+      # Retirement is a new handling context even when this recipient already
+      # saw the event as a follower. Keep that authored payload in history and
+      # make one contextual copy the delivery's new receipt/retry baseline.
+      wake =
+        Wakes.schedule_in_txn(txn, %{
+          session_key: successor,
+          origin: "process:tightbeam",
+          prompt: entry_prompt(txn, origin, line, handle, event, message, kind, author),
+          due_at: System.system_time(:millisecond),
+          creator_session_key: origin,
+          class: "blocker"
+        })
 
-            Txn.q(
-              txn,
-              "INSERT INTO harklight_wake_deliveries(handle,eventId,sessionKey,wakeId) VALUES(?1,?2,?3,?4)",
-              [handle, event, successor, wake.wake_id]
-            )
+      replacement = wake.wake_id
 
-            Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
-            wake.wake_id
-        end
-
-      # A pre-existing follower may already have received this entry. Keep its
-      # delivery and payload; retirement merely withdraws the duplicate custody.
-      outcome =
-        if Wakes.get_in_txn(txn, replacement).state == "pending" do
-          %{kind: "replacement", replacement_wake_id: replacement}
-        else
-          %{kind: "no_replacement"}
-        end
-
-      # Withdraw the old recipient's pending attempts, including a sealed source.
       Txn.q(
         txn,
         """
-        SELECT wakeId FROM wakes WHERE wakeId=?1 AND state='pending'
-        UNION
-        SELECT w.wakeId FROM wake_retry_attempts retry
-        JOIN wakes w ON w.wakeId=retry.wakeId
-        WHERE retry.rootWakeId=?1 AND w.state='pending'
+        INSERT INTO harklight_wake_deliveries(handle,eventId,sessionKey,wakeId)
+        VALUES(?1,?2,?3,?4)
+        ON CONFLICT(handle,eventId,sessionKey) DO UPDATE SET wakeId=excluded.wakeId
         """,
-        [root]
+        [handle, event, successor, replacement]
       )
-      |> Enum.each(fn [wake_id] ->
-        result =
-          Wakes.cancel_in_txn(txn, %{
-            wake_id: wake_id,
-            requester: %{kind: "process", id: "tightbeam:retirement"},
-            reason_kind: "target_retired",
-            causal_source: %{kind: "session_transition", id: retiring},
-            outcome: outcome
-          })
 
-        if result == false, do: raise("Harklight retirement cancellation refused for #{wake_id}")
+      Wakes.publish_change_in_txn(txn, "wake.scheduled", replacement)
+
+      # The retired target is the conversation's former responsible session;
+      # its transition replaces even an active follower's old handling context.
+      Enum.each(existing, fn [prior] ->
+        cancel_handoff_attempts_in_txn(txn, prior, %{
+          requester: %{kind: "process", id: "tightbeam:retirement"},
+          reason_kind: "target_retired",
+          causal_source: %{kind: "session_transition", id: retiring},
+          outcome: %{kind: "replacement", replacement_wake_id: replacement}
+        })
       end)
+
+      cancel_handoff_attempts_in_txn(txn, root, %{
+        requester: %{kind: "process", id: "tightbeam:retirement"},
+        reason_kind: "target_retired",
+        causal_source: %{kind: "session_transition", id: retiring},
+        outcome: %{kind: "replacement", replacement_wake_id: replacement}
+      })
+    end)
+  end
+
+  defp cancel_handoff_attempts_in_txn(txn, root, command) do
+    # Withdraw the old recipient's pending attempts, including a sealed source.
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId FROM wakes WHERE wakeId=?1 AND state='pending'
+      UNION
+      SELECT w.wakeId FROM wake_retry_attempts retry
+      JOIN wakes w ON w.wakeId=retry.wakeId
+      WHERE retry.rootWakeId=?1 AND w.state='pending'
+      """,
+      [root]
+    )
+    |> Enum.each(fn [wake_id] ->
+      result = Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id))
+
+      if result == false, do: raise("Harklight retirement cancellation refused for #{wake_id}")
     end)
   end
 

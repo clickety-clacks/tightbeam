@@ -476,6 +476,116 @@ defmodule Tightbeam.HarklightWakesTest do
              ])
   end
 
+  for earlier_status <- ["pending", "running", "failed_unknown", "delivered"] do
+    test "existing follower gets a contextual handoff after #{earlier_status} prior delivery", %{
+      db: db,
+      session: session,
+      main: main,
+      call: call
+    } do
+      assert %{outcome: "committed"} =
+               HarklightFollows.follow(
+                 db,
+                 follow_call(call, main, %{handle: @handle}),
+                 runner: lifecycle_runner(db),
+                 activate: false
+               )
+
+      line = event(1, "discussion", "same event, new responsibility")
+      assert :ok = HarklightWakes.capture_line(db, @handle, line)
+
+      assert {:ok, [[old, old_prompt]]} =
+               DB.query(
+                 db,
+                 "SELECT w.wakeId,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.sessionKey=?1",
+                 [main.session_key]
+               )
+
+      earlier =
+        if unquote(earlier_status) != "pending" do
+          earlier = deliver_discussion_turn!(db, old, main.session_key)
+          Ledger.stamp_adapter(db, earlier.seq, 1)
+          record_prompt_dispatched!(db, earlier)
+
+          if unquote(earlier_status) != "running" do
+            assert :ok =
+                     Ledger.finish(db, earlier.seq, unquote(earlier_status), nil,
+                       owner_lease: earlier.owner_lease
+                     )
+          end
+
+          earlier
+        end
+
+      Org.retire(db, session.session_key, "user:owner", 60_000)
+
+      if unquote(earlier_status) == "running" do
+        assert :ok =
+                 Ledger.finish(db, earlier.seq, "failed_unknown", nil,
+                   owner_lease: earlier.owner_lease
+                 )
+      end
+
+      assert {:ok, [[handoff, prompt]]} =
+               DB.query(
+                 db,
+                 "SELECT w.wakeId,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.sessionKey=?1",
+                 [main.session_key]
+               )
+
+      refute handoff == old
+      assert String.starts_with?(prompt, line <> "\n\n")
+      assert prompt =~ "Origin (#{session.session_key}), who has retired"
+      refute prompt =~ "from your originating session"
+
+      assert {:ok, [[^old_prompt]]} =
+               DB.query(db, "SELECT prompt FROM wakes WHERE wakeId=?1", [old])
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 db,
+                 "SELECT count(*) FROM wakes w LEFT JOIN wake_retry_attempts r ON r.wakeId=w.wakeId WHERE COALESCE(r.rootWakeId,w.wakeId)=?1 AND w.state='pending'",
+                 [old]
+               )
+
+      carrying = deliver_discussion_turn!(db, handoff, main.session_key)
+      Ledger.stamp_adapter(db, carrying.seq, 1)
+      record_prompt_dispatched!(db, carrying)
+
+      assert :ok =
+               Ledger.finish(db, carrying.seq, "failed_unknown", nil,
+                 owner_lease: carrying.owner_lease
+               )
+
+      assert {:ok, [[retry, ^prompt]]} =
+               DB.query(
+                 db,
+                 "SELECT w.wakeId,w.prompt FROM wakes w JOIN wake_retry_attempts r ON r.wakeId=w.wakeId WHERE r.rootWakeId=?1 AND w.state='pending'",
+                 [handoff]
+               )
+
+      received = deliver_discussion_turn!(db, retry, main.session_key)
+
+      assert :ok =
+               Ledger.finish(db, received.seq, "delivered", nil,
+                 owner_lease: received.owner_lease
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 db,
+                 "SELECT count(*) FROM wakes w JOIN wake_retry_attempts r ON r.wakeId=w.wakeId WHERE r.rootWakeId=?1 AND w.state='pending'",
+                 [handoff]
+               )
+
+      assert {:ok, [[2]]} =
+               DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries WHERE eventId='1'")
+
+      assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
+      assert {:ok, [["active"]]} = DB.query(db, "SELECT state FROM harklight_wake_handles")
+    end
+  end
+
   defp successor(db, key) do
     {:ok, result} = DB.transaction(db, &HarklightWakes.successor_in_txn(&1, key))
     result
