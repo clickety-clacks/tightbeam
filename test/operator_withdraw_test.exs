@@ -94,8 +94,9 @@ defmodule Tightbeam.OperatorWithdrawTest do
     assert terminal_row(ctx.db, request.id) == before
   end
 
-  test "raiser retirement withdraws operator and non-operator requests", ctx do
+  test "raiser retirement preserves operator requests and withdraws non-operator requests", ctx do
     operator = operator_request(ctx, nil)
+    operator_before = terminal_row(ctx.db, operator.id)
 
     {:decision_pending, statute_id} =
       Escalation.escalate(
@@ -112,8 +113,7 @@ defmodule Tightbeam.OperatorWithdrawTest do
 
     assert :ok = Escalation.withdraw_for_retired(ctx.db, ctx.raiser.session_key)
 
-    assert {:ok, [["withdrawn", "process:tightbeam", "raiser-retired", nil, nil, nil, nil]]} =
-             terminal_row(ctx.db, operator.id)
+    assert terminal_row(ctx.db, operator.id) == operator_before
 
     assert {:ok, [["withdrawn", "process:tightbeam", "raiser-retired"]]} =
              DB.query(
@@ -123,19 +123,19 @@ defmodule Tightbeam.OperatorWithdrawTest do
              )
   end
 
-  test "boot recovery withdraws an operator request from an already retired raiser once", ctx do
+  test "boot recovery preserves an operator request from an already retired raiser", ctx do
     request = operator_request(ctx, nil)
+    before_recovery = terminal_row(ctx.db, request.id)
     Org.retire(ctx.db, ctx.raiser.session_key, "user:sample-user", 60_000)
 
     assert :ok = Escalation.recover_retired(ctx.db)
 
     after_first = terminal_row(ctx.db, request.id)
 
-    assert {:ok, [["withdrawn", "process:tightbeam", "raiser-retired", nil, nil, nil, nil]]} =
-             after_first
+    assert after_first == before_recovery
 
     event_count = withdrawn_event_count(ctx.db, request.id)
-    assert event_count == 1
+    assert event_count == 0
 
     assert :ok = Escalation.recover_retired(ctx.db)
     assert terminal_row(ctx.db, request.id) == after_first
