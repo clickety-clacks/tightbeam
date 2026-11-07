@@ -2137,7 +2137,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp dynamic_query_node?({{:., _, [_mod, fun]}, _, args}, attrs)
        when fun in [:q, :query] and length(args) >= 2 do
-    dynamic_query_arg?(Enum.at(args, 1), attrs) or Enum.any?(args, &dynamic_query_node?(&1, attrs))
+    dynamic_query_arg?(Enum.at(args, 1), attrs) or
+      Enum.any?(args, &dynamic_query_node?(&1, attrs))
   end
 
   defp dynamic_query_node?({_, _, args}, attrs) when is_list(args),
