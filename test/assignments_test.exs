@@ -187,10 +187,39 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "gateway opens and retires with supervision reminders off", ctx do
+    File.cp!(
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      ]),
+      Path.join(ctx.law, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
+    Rules.load!(ctx.law, Map.keys(ctx.handlers))
     handlers = Gateway.handlers(%{db: ctx.db, supervision_interval_ms: :off, wake_tick_ms: 101})
 
     assignment = handlers["assign"].(assign_call({:session, "holder"}, "off interval"))
     assert assignment.id
+
+    item = create_work_item(ctx, "Off interval linked item")
+    assert {:ok, [[routing_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [
+               routing_id,
+               System.system_time(:millisecond)
+             ])
+
+    linked = handlers["assign"].(assign_call({:session, "holder"}, "off interval linked", nil, item.id))
+    assert linked.workItemId == item.id
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'",
+               [linked.id]
+             )
 
     retired =
       handlers["retire"].(%{
@@ -5134,7 +5163,6 @@ defmodule Tightbeam.AssignmentsTest do
     )
 
     Rules.load!(ctx.law, Map.keys(ctx.handlers))
-    off_handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000, supervision_interval_ms: :off})
     work_item = create_work_item(ctx, "Fired routing bracket")
     caller = "holder"
 
@@ -5155,7 +5183,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, %{rumination_required: true, workItemId: work_item_id}} =
              Dispatch.dispatch(
                ctx.db,
-               off_handlers,
+               ctx.handlers,
                dispatch_call(
                  {:session, caller},
                  "fired routing bracket",
@@ -5167,12 +5195,6 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert work_item_id == work_item.id
     assert assignment_count(ctx.db) == baseline + 1
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM wakes WHERE assignmentId IN (SELECT id FROM assignments WHERE workItemId=?1) AND consumer='assignment_inactivity_deadline'",
-               [work_item.id]
-             )
   end
 
   test "unowned dispatch rejects canceled and mismatched routing brackets", ctx do

@@ -106,7 +106,18 @@ defmodule Tightbeam.JobTraceTest do
 
     on_exit(fn -> File.rm_rf!(law_root) end)
     handlers = Tightbeam.Gateway.handlers(%{db: db})
-    Tightbeam.TerminalReactionFixture.load!(law_root, Map.keys(handlers))
+    law = Tightbeam.TerminalReactionFixture.load!(law_root, Map.keys(handlers))
+
+    File.cp!(
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      ]),
+      Path.join(law, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
+    Tightbeam.Rules.load!(law, Map.keys(handlers))
+    assert :ok = Tightbeam.Supervision.migrate_open_assignments(db, 1_000)
 
     repo = init_repo()
     on_exit(fn -> File.rm_rf!(repo) end)
@@ -199,7 +210,7 @@ defmodule Tightbeam.JobTraceTest do
     # replacement. These source transitions precede the notice delivery attempt.
     source_cancellations =
       trace(db, {:user, "owner"}, "wi_trace").timeline
-      |> Enum.filter(&(&1.type == "wake_canceled"))
+      |> Enum.filter(&(&1.type == "wake_canceled" and &1.id != notice_id))
 
     assert Enum.map(source_cancellations, &{&1.assignmentId, &1.reasonKind, &1.outcomeKind}) == [
              {"asg_direct", "superseded", "replacement"},
