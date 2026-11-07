@@ -1547,6 +1547,7 @@ defmodule Tightbeam.Gateway do
       {"dispatch",
        [
          "assignment.opened",
+         "work_item.updated",
          "message.created",
          "wake.scheduled",
          "wake.canceled",

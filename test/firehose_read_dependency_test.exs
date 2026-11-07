@@ -243,7 +243,7 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
       assert detail.verdict_counts == %{}
       assert detail.effective_commit_refs == []
       assert detail.landings == []
-      item = StateResources.work_item(row)
+      item = StateResources.work_item(detail)
       assert item["priority"] in [2, 7]
       assert JSON.decode!(StateResources.encode_item("work items", item, %{})) == item
 

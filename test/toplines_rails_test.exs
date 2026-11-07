@@ -496,7 +496,7 @@ defmodule Tightbeam.ToplinesRailsTest do
   end
 
   defp assert_rejected(db, table, row) do
-    assert {:error, %DB.Error{}} = insert(db, table, row),
+    assert match?({:error, %DB.Error{}}, insert(db, table, row)),
            "expected direct SQL rejection for #{table}: #{inspect(row)}"
   end
 

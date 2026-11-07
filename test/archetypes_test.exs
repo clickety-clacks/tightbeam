@@ -206,7 +206,7 @@ defmodule Tightbeam.ArchetypesTest do
         "user's stated goal before any tool call."
 
     section = heading <> "\n\n" <> intro <> "\n\n" <> facts
-    boundary = section <> "\n\n# Served identity\n"
+    boundary = section
 
     validate_facts = fn guidance ->
       assert length(:binary.matches(guidance, heading)) == 1

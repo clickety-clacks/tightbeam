@@ -616,7 +616,7 @@ defmodule Tightbeam.IdentityTest do
        ctx do
     alias Tightbeam.{DB, Gateway, Rails, RailScript, Schema}
 
-    _db = start_supervised!({DB, path: ":memory:", name: DB})
+    db = start_supervised!({DB, path: ":memory:", name: DB})
 
     # Rail containment requires canonical write roots, including macOS /var aliases.
     {root, 0} = System.cmd("/bin/realpath", [ctx.root])
@@ -679,7 +679,6 @@ defmodule Tightbeam.IdentityTest do
     assert File.read!(Path.join(dir, ".git/MERGE_HEAD")) == merge
     assert Identity.live_revision!(ctx.base) == live
 
-    db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = Schema.ensure_all(db)
     File.mkdir_p!(Path.join(ctx.base, "bin"))
     File.cp!(Path.expand("cli/target/release/tightbeam"), Path.join(ctx.base, "bin/tightbeam"))

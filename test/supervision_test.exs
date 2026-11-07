@@ -1706,7 +1706,7 @@ defmodule Tightbeam.SupervisionTest do
 
   test "holder wake registration moves its deadline from registration time, not future due time",
        ctx do
-    opened_at = System.system_time(:millisecond)
+    opened_at = System.system_time(:millisecond) - 5_000
     interval_ms = 60_000
     open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
 
