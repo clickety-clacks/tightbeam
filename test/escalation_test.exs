@@ -178,10 +178,10 @@ defmodule Tightbeam.EscalationTest do
     assert %{owner_user_id: "flynn", raiser_id: "process:maintenance", raiser_session_key: nil} =
              request(ctx, id)
 
-    assert Enum.any?(notification_wakes(ctx), fn wake ->
-             wake.owner_user_id == "flynn" and
-               wake.session_key == Org.personal_session_key("flynn")
-           end)
+    assert notification_wakes(ctx) == []
+
+    assert {:ok, [["decision-request-filed"]]} =
+             DB.query(ctx.db, "SELECT kind FROM condition_facts WHERE scope=?1", [id])
   end
 
   test "statute open, ruling, and consume publish their committed decision snapshots", ctx do
@@ -260,9 +260,7 @@ defmodule Tightbeam.EscalationTest do
              Escalation.escalate(ctx.db, call, statute(), Map.put(escalation_ctx(), :dr_id, id))
   end
 
-  test "owner delivery is one durable source notice armed with the open transaction", ctx do
-    stop_supervised!(Wakes)
-    parent = self()
+  test "statute filing leaves no automatic owner opening notice even when Main exists", ctx do
     call = call(ctx.raiser, %{assignment_id: "a-delivery", kind: "completion"})
     owner_session = Org.personal_session_key("flynn")
 
@@ -283,56 +281,14 @@ defmodule Tightbeam.EscalationTest do
     })
 
     {:decision_pending, id} = Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
-
-    # The notification is committed WITH the request: pending, ungated, carrying
-    # the owner prompt — and nothing has been delivered yet.
-    assert [%{session_key: ^owner_session, target_gate: 0, state: "pending"} = wake] =
-             notification_wakes(ctx)
-
-    assert wake.prompt =~ "Decision #{id} pending on review."
-    assert wake.prompt =~ "Allow this action?"
     assert request(ctx, id).status == "open"
+    assert notification_wakes(ctx) == []
+
+    assert {:ok, [["decision-request-filed"]]} =
+             DB.query(ctx.db, "SELECT kind FROM condition_facts WHERE scope=?1", [id])
+
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
-    # Delivery is the ordinary prompt consumer, strictly after the commit.
-    deliverer = :"escalation_deliverer_#{System.unique_integer([:positive])}"
-
-    start_supervised!(
-      {Wakes,
-       db: ctx.db,
-       name: deliverer,
-       tick_ms: 60_000,
-       deliver: fn fired ->
-         send(parent, {:delivered, fired.session_key, id, request(ctx, id).status})
-       end},
-      id: deliverer
-    )
-
-    :ok = Wakes.fire_due(deliverer)
-    refute_receive {:delivered, _, _, _}
-    assert request(ctx, id).status == "open"
-    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
-
-    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
-             NoticeBatcher.source_refs(ctx.db, wake.wake_id)
-
-    assert Wakes.get(ctx.db, carrier_id).state == "fired"
-    assert carrier_id != wake.wake_id
-
-    assert {:ok, [[^owner_session, "queued", content]]} =
-             DB.query(
-               ctx.db,
-               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
-               [carrier_id]
-             )
-
-    assert content =~ wake.wake_id
-    assert content =~ wake.prompt
-    assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
-    assert turn_count(ctx.db, wake.wake_id) == 0
-    assert turn_count(ctx.db, carrier_id) == 1
-
-    # A decision-pending replay arms nothing and redelivers nothing.
     assert {:decision_pending, ^id} =
              Escalation.escalate(
                ctx.db,
@@ -341,13 +297,13 @@ defmodule Tightbeam.EscalationTest do
                Map.put(escalation_ctx(), :dr_id, id)
              )
 
-    assert Enum.map(notification_wakes(ctx), & &1.wake_id) == [wake.wake_id]
-    assert {:ok, before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
-    assert {:ok, before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY id")
-    :ok = Wakes.fire_due(deliverer)
-    refute_receive {:delivered, _, _, _}
-    assert {:ok, ^before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
-    assert {:ok, ^before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY id")
+    assert notification_wakes(ctx) == []
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE scope=?1", [id])
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
   test "an operator ruling condition notice stays an editable source while its recipient is busy",
@@ -674,7 +630,7 @@ defmodule Tightbeam.EscalationTest do
              ])
   end
 
-  test "terminal requests retract only their pending notice and keep event reports", ctx do
+  test "terminal requests keep event reports without recreating retired opening notices", ctx do
     owner_session = Org.personal_session_key("flynn")
 
     Org.create(ctx.db, %{
@@ -695,13 +651,8 @@ defmodule Tightbeam.EscalationTest do
     {:decision_pending, withdrawn_id} = open(ctx, call, statute())
     withdrawn_ref = Wakes.decision_request_notice_ref(withdrawn_id)
 
-    assert {:ok, [[withdrawn_wake, "pending"]]} =
-             DB.query(ctx.db, "SELECT wakeId,state FROM wakes WHERE obligationRef=?1", [
-               withdrawn_ref
-             ])
-
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert Wakes.get(ctx.db, withdrawn_wake).state == "pending"
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE obligationRef=?1", [withdrawn_ref])
 
     assert %{status: "withdrawn"} =
              Escalation.withdraw(ctx.db, %{
@@ -710,17 +661,15 @@ defmodule Tightbeam.EscalationTest do
                params: %{request_id: withdrawn_id, reason: "changed course"}
              })
 
-    assert {:ok, [["canceled"]]} =
-             DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [withdrawn_wake])
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE obligationRef=?1", [withdrawn_ref])
 
     {:decision_pending, ruled_id} = open(ctx, call, statute())
     ruled_ref = Wakes.decision_request_notice_ref(ruled_id)
 
-    assert {:ok, [[ruled_wake, "pending"]]} =
-             DB.query(ctx.db, "SELECT wakeId,state FROM wakes WHERE obligationRef=?1", [ruled_ref])
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE obligationRef=?1", [ruled_ref])
 
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert Wakes.get(ctx.db, ruled_wake).state == "pending"
     _report = ruling_wake(ctx, ruled_id)
 
     assert %{status: "ruled"} =
@@ -729,8 +678,8 @@ defmodule Tightbeam.EscalationTest do
                scheduler: ctx.scheduler
              )
 
-    assert {:ok, [["canceled"]]} =
-             DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [ruled_wake])
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE obligationRef=?1", [ruled_ref])
 
     assert {:ok, [[event_state, "escalation-ruled"]]} =
              DB.query(
@@ -751,7 +700,8 @@ defmodule Tightbeam.EscalationTest do
                [ruled_id]
              )
 
-    assert Wakes.get(ctx.db, ruled_wake).state == "canceled"
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE obligationRef=?1", [ruled_ref])
   end
 
   test "boot recovery catches a retired session and read surfaces enforce owner or raiser", ctx do
@@ -922,7 +872,7 @@ defmodule Tightbeam.EscalationTest do
            ]
   end
 
-  test "operator ask normalizes, owner-scopes, structurally dedupes, and arms one opportunity",
+  test "operator ask normalizes, owner-scopes, structurally dedupes, and files one fact",
        ctx do
     before_open = System.system_time(:millisecond)
 
@@ -952,12 +902,17 @@ defmodule Tightbeam.EscalationTest do
     assert raiser_key == ctx.raiser.session_key
     assert request.deadline_at >= before_open + 12_345
 
-    assert [%{session_key: main_key, target_gate: 0, state: "pending"} = wake] =
-             notification_wakes(ctx)
+    assert notification_wakes(ctx) == []
 
-    assert main_key == Org.personal_session_key("flynn")
-    assert wake.prompt =~ request.id
-    assert wake.prompt =~ "ship window?"
+    assert {:ok, [["decision-request-filed", encoded]]} =
+             DB.query(ctx.db, "SELECT kind,payload FROM condition_facts WHERE scope=?1", [
+               request.id
+             ])
+
+    assert %{"requestId" => request_id, "addressedPrincipal" => "user:flynn"} =
+             JSON.decode!(encoded)
+
+    assert request_id == request.id
 
     replay =
       operator_call(ctx.raiser, %{
@@ -970,7 +925,10 @@ defmodule Tightbeam.EscalationTest do
     assert %{id: id, deadline_at: deadline_at} = Escalation.operator_ask(ctx.db, replay)
     assert id == request.id
     assert deadline_at == request.deadline_at
-    assert length(notification_wakes(ctx)) == 1
+    assert notification_wakes(ctx) == []
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE scope=?1", [request.id])
 
     defaulted =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "defaults?"}))
@@ -1915,14 +1873,13 @@ defmodule Tightbeam.EscalationTest do
              ])
   end
 
-  test "a failure after wake and fact creation rolls the full ruling back", ctx do
-    # The opening notice has its own delivery transaction, outside the ruling.
+  test "a failure after fact creation rolls the full ruling back", ctx do
     stop_supervised!(Wakes)
 
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "rollback?"}))
 
-    assert [%{wake_id: opening_id, state: "pending"}] = notification_wakes(ctx)
+    assert notification_wakes(ctx) == []
     before_events = EventLog.lifecycle_events(ctx.db)
 
     assert {:ok, [[wake_count, fact_count, event_count]]} =
@@ -1953,14 +1910,10 @@ defmodule Tightbeam.EscalationTest do
                [request.id]
              )
 
-    # Independently delivering the already-committed opening notice explains
-    # the extra event without changing the rolled-back decision.
     scheduler = start_gateway_scheduler(ctx)
     assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(ctx.db, opening_id).state == "canceled"
-
-    assert [%{kind: "wake_undeliverable", subject: ^opening_id}] =
-             EventLog.lifecycle_events(ctx.db) -- before_events
+    assert notification_wakes(ctx) == []
+    assert EventLog.lifecycle_events(ctx.db) == before_events
 
     assert {:ok, [["open", nil]]} =
              DB.query(ctx.db, "SELECT status,ruledAt FROM decision_requests WHERE id=?1", [
@@ -2860,7 +2813,10 @@ defmodule Tightbeam.EscalationTest do
     assert raiser_key == ctx.raiser.session_key
     assert asked_key == asked.session_key
     assert Escalation.raw_by_id(ctx.db, request.id) == request
-    assert table_count(ctx.db, "condition_facts") == before_facts
+    assert table_count(ctx.db, "condition_facts") == before_facts + 1
+
+    assert {:ok, [["decision-request-filed"]]} =
+             DB.query(ctx.db, "SELECT kind FROM condition_facts WHERE scope=?1", [request.id])
 
     assert [wake] = notification_wakes(ctx)
     assert wake.session_key == asked.session_key
@@ -3207,7 +3163,9 @@ defmodule Tightbeam.EscalationTest do
 
     terminal = Escalation.raw_by_id(ctx.db, request.id)
     assert terminal.status in ["answered", "returned"]
-    assert table_count(ctx.db, "condition_facts") == 0
+
+    assert {:ok, [["decision-request-filed"]]} =
+             DB.query(ctx.db, "SELECT kind FROM condition_facts WHERE scope=?1", [request.id])
 
     assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
              event.subject == request.id and

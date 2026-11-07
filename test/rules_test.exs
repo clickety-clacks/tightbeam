@@ -2039,6 +2039,105 @@ defmodule Tightbeam.RulesTest do
     assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.prompt == "post observed"))
   end
 
+  test "a filing fact selects its addressed principal and routes an exact request notice", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+
+    raiser = session(ctx.db, "filing-raiser", "flynn")
+    recipient = session(ctx.db, "briefing-recipient", "flynn")
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "filing-notice"
+    verb = "condition"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "route an addressed decision request"
+    deny_when = [
+      { fact = "condition_fact.kind", op = "eq", value = "decision-request-filed" },
+      { fact = "decision_request.addressed_principal", op = "eq", value = "user:flynn" },
+      { fact = "condition_fact.matches", op = "eq", value = true }
+    ]
+
+    [rule.notice]
+    target_session = "briefing-recipient"
+    prompt = "Investigate decision {decision_request_id}"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(raiser.session_key, %{question: "Choose a route?"})
+      )
+
+    assert [wake] = Wakes.list_pending(ctx.db)
+    assert wake.session_key == recipient.session_key
+    assert wake.prompt == "Investigate decision #{request.id}"
+    assert wake.origin == "remedy:filing-notice"
+
+    assert {:ok, [[fact_id]]} =
+             DB.query(ctx.db, "SELECT id FROM condition_facts WHERE scope=?1", [request.id])
+
+    transition = %{
+      verb: "condition",
+      domain: "condition_fact",
+      row_id: fact_id,
+      owner_user_id: "flynn",
+      principal: "agent:filing-raiser",
+      cause: "operator-ask",
+      bindings: %{
+        conditionKind: "decision-request-filed",
+        conditionScope: request.id,
+        conditionAfterId: fact_id - 1,
+        conditionFactId: fact_id,
+        decisionRequestId: request.id
+      },
+      field: %{name: "id", old: nil, new: fact_id}
+    }
+
+    assert {:ok, :ok} = DB.transaction(ctx.db, &Wakes.row_commit_in_txn(&1, [transition]))
+    assert [same_wake] = Wakes.list_pending(ctx.db)
+    assert same_wake.wake_id == wake.wake_id
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               ready_key = {Wakes, :wait_recognition_ready, txn.conn}
+               previous = Process.get(ready_key)
+               Process.put(ready_key, false)
+
+               try do
+                 assert_raise Wakes.RuleEvaluationUnavailable, fn ->
+                   Wakes.row_commit_in_txn(txn, [transition])
+                 end
+               after
+                 Process.put(ready_key, previous)
+               end
+
+               :ok
+             end)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('other',0,1)")
+
+    other_raiser = session(ctx.db, "other-filing-raiser", "other")
+
+    other_request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(other_raiser.session_key, %{question: "Choose another route?"})
+      )
+
+    assert {:ok, [["decision-request-filed"]]} =
+             DB.query(ctx.db, "SELECT kind FROM condition_facts WHERE scope=?1", [
+               other_request.id
+             ])
+
+    assert [same_wake] = Wakes.list_pending(ctx.db)
+    assert same_wake.wake_id == wake.wake_id
+  end
+
   test "refused operator ask does not publish a fabricated supersession", ctx do
     assert {:ok, _} =
              DB.query(
@@ -3781,7 +3880,7 @@ defmodule Tightbeam.RulesTest do
     assert question =~ "Session: #{no_context.session_key}"
     assert context =~ "stretch=initial:#{no_context.session_key}"
 
-    assert {:ok, [[main_session, notification_prompt]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT sessionKey,prompt FROM wakes WHERE origin='process:tightbeam' " <>
@@ -3789,8 +3888,13 @@ defmodule Tightbeam.RulesTest do
                ["%#{request_id}%"]
              )
 
-    assert main_session == Org.personal_session_key("flynn")
-    assert notification_prompt =~ question
+    assert {:ok, [["decision-request-filed", payload]]} =
+             DB.query(ctx.db, "SELECT kind,payload FROM condition_facts WHERE scope=?1", [
+               request_id
+             ])
+
+    assert %{"requestId" => ^request_id, "addressedPrincipal" => "user:flynn"} =
+             JSON.decode!(payload)
 
     assert {:ok, [["running"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [no_context_seq])
@@ -3818,12 +3922,17 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE origin='process:tightbeam' AND prompt LIKE ?1",
                ["%#{request_id}%"]
              )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE scope=?1", [
+               request_id
+             ])
 
     assert :ok =
              Ledger.finish(ctx.db, replay_seq, "delivered", nil, owner_lease: replay_lease)

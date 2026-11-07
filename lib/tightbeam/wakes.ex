@@ -41,6 +41,11 @@ defmodule Tightbeam.Wakes do
 
   alias Tightbeam.DB.Txn
 
+  defmodule RuleEvaluationUnavailable do
+    @moduledoc false
+    defexception message: "filing rule evaluation is not ready"
+  end
+
   @miss_detector_ms 180_000
   @miss_lateness_ms 60_000
   @decision_request_notice_marker "decision-request-notice:"
@@ -2831,6 +2836,11 @@ defmodule Tightbeam.Wakes do
   def row_commit_in_txn(%Txn{} = txn, transitions) do
     transitions = List.wrap(transitions) ++ DB.take_row_commits(txn)
 
+    if not wait_recognition_ready?(txn) and
+         Enum.any?(transitions, &filing_transition?/1) do
+      raise RuleEvaluationUnavailable
+    end
+
     if wait_recognition_ready?(txn) do
       txn
       |> RuleRuntime.row_commit_effects_in_txn(transitions)
@@ -2858,6 +2868,12 @@ defmodule Tightbeam.Wakes do
     :ok
   end
 
+  defp filing_transition?(%{domain: "condition_fact", bindings: bindings})
+       when is_map(bindings),
+       do: bindings[:conditionKind] == "decision-request-filed"
+
+  defp filing_transition?(_), do: false
+
   @doc "Execute an actor-owned rule notice without changing the governed decision."
   @spec deliver_rule_notice(DB.server(), map(), map(), list()) :: :ok
   def deliver_rule_notice(db, rule, call, evidence) do
@@ -2876,7 +2892,7 @@ defmodule Tightbeam.Wakes do
   defp deliver_rule_notice_in_txn(txn, rule, call, evidence) do
     case RuleRuntime.resolve_notice_in_txn(txn, rule, call) do
       {:ok, resolved} ->
-        wake_id = rule_notice_wake_id(rule, resolved)
+        wake_id = rule_notice_wake_id(rule, resolved, call)
 
         if is_binary(wake_id) and
              Txn.q(
@@ -2972,9 +2988,24 @@ defmodule Tightbeam.Wakes do
   defp request_unowned_agent_stretch_decision_in_txn(_txn, _rule, _call, _evidence),
     do: :not_applicable
 
-  defp rule_notice_wake_id(_rule, %{idempotency_key: nil}), do: nil
+  defp rule_notice_wake_id(rule, resolved, %{transition: transition, params: params})
+       when is_map(transition) do
+    if is_binary(params[:decision_request_id]) and transition[:domain] == "condition_fact" and
+         get_in(params, [:decision_request_id]) == transition[:bindings][:decisionRequestId] and
+         transition[:bindings][:conditionKind] == "decision-request-filed" do
+      digest =
+        :crypto.hash(:sha256, rule.name <> "\0" <> params.decision_request_id)
+        |> Base.encode16(case: :lower)
 
-  defp rule_notice_wake_id(rule, %{bound_session: session_key, idempotency_key: key})
+      "w_rule_" <> digest
+    else
+      rule_notice_wake_id(rule, resolved, nil)
+    end
+  end
+
+  defp rule_notice_wake_id(_rule, %{idempotency_key: nil}, _call), do: nil
+
+  defp rule_notice_wake_id(rule, %{bound_session: session_key, idempotency_key: key}, _call)
        when is_binary(session_key) and is_binary(key) do
     digest =
       :crypto.hash(:sha256, rule.name <> "\0" <> session_key <> "\0" <> key)
@@ -2983,7 +3014,7 @@ defmodule Tightbeam.Wakes do
     "w_rule_" <> digest
   end
 
-  defp rule_notice_wake_id(_rule, _resolved), do: nil
+  defp rule_notice_wake_id(_rule, _resolved, _call), do: nil
 
   defp principal_session({:session, session_key}), do: session_key
   defp principal_session(_principal), do: nil

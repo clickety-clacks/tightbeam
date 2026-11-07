@@ -54,6 +54,8 @@ defmodule Tightbeam.RuleRuntime do
   # row-commit transition. They are intentionally not ad-hoc wait predicates:
   # the event carries the session and caller binding needed to compute them.
   @row_commit_fact_domains %{
+    "condition_fact.kind" => ["condition_fact"],
+    "decision_request.addressed_principal" => ["condition_fact"],
     "turn.queued_count" => ["queued_turn"],
     "turn.oldest_age_ms" => ["queued_turn"],
     "turn.caller_queued_count" => ["queued_turn"],

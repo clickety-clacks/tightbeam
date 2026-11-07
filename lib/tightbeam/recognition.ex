@@ -318,6 +318,16 @@ defmodule Tightbeam.Recognition do
       {:ok, _result} ->
         finish(db, id)
 
+      {:error, %Tightbeam.Wakes.RuleEvaluationUnavailable{}} ->
+        # Gateway law loads after schema activation. Keep the committed filing
+        # intent pending until Rules can evaluate it after a restart.
+        DB.transaction(db, fn txn ->
+          Txn.q(txn, "UPDATE pending_recognition SET nextAt=?2 WHERE id=?1", [
+            id,
+            now() + 60_000
+          ])
+        end)
+
       {:error, %DB.Overloaded{} = error} ->
         raise error
 

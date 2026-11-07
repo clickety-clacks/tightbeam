@@ -9,7 +9,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Publisher}
 
@@ -2682,6 +2682,7 @@ defmodule Tightbeam.Escalation do
       "cause" => cause,
       "creatingPrincipal" => creator,
       "raiserPrincipal" => request.raiser_id,
+      "assignmentId" => request.assignment_id,
       "addressedPrincipal" => addressed,
       "raisedAt" => request.raised_at
     }

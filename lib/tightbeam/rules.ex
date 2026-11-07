@@ -115,6 +115,7 @@ defmodule Tightbeam.Rules do
                ])
   @binding_tokens ~w(
     assignment_id
+    decision_request_id
     work_item_id
     holder_key
     holder_role
@@ -202,10 +203,12 @@ defmodule Tightbeam.Rules do
     "assign.declared_files_overlap_open" => :bool,
     "assign.delegates_delivery" => :bool,
     "decision_request.status" => :string,
+    "decision_request.addressed_principal" => :string,
     "artifact.present" => :bool,
     "artifact.content_sha256" => :string,
     "review.qualifying_verdict_kinds" => {:list, :string},
     "condition_fact.matches" => :bool,
+    "condition_fact.kind" => :string,
     "wait.obligation_matches" => :bool,
     "wait.admitted" => :bool,
     "wait.after_turn_eligible" => :bool,
@@ -1183,6 +1186,7 @@ defmodule Tightbeam.Rules do
 
     %{
       assignment_id: assignment && assignment.id,
+      decision_request_id: Map.get(call.params, :decision_request_id),
       work_item_id: work_item_id,
       holder_key: assignment && assignment.holder_key,
       holder_role: assignment && assignment[:holder_role],
@@ -2923,6 +2927,29 @@ defmodule Tightbeam.Rules do
       end
 
     {value, cache}
+  end
+
+  defp compute_fact("decision_request.addressed_principal", db, call, cache) do
+    decision_id = Map.get(call.params, :decision_request_id)
+    owner = Map.get(call, :predicate_owner_user_id)
+
+    value =
+      case DB.query(
+             db,
+             "SELECT expecterSessionKey,expecterUserId,ownerUserId FROM decision_requests WHERE id=?1 AND ownerUserId=?2",
+             [decision_id, owner]
+           ) do
+        {:ok, [[session, _user, _owner]]} when is_binary(session) -> "session:" <> session
+        {:ok, [[_session, user, _owner]]} when is_binary(user) -> "user:" <> user
+        {:ok, [[_session, _user, owner]]} -> "user:" <> owner
+        {:ok, []} -> nil
+      end
+
+    {value, cache}
+  end
+
+  defp compute_fact("condition_fact.kind", _db, call, cache) do
+    {get_in(call, [:predicate_bindings, "conditionKind"]), cache}
   end
 
   defp compute_fact("artifact.present", _db, call, cache) do
