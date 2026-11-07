@@ -1,0 +1,90 @@
+# Attest and first-start notices are elected by the engineering bundle.
+[[reaction]]
+name = "r01-attest-notice"
+family = "r01-attest-notice"
+events = ["assignment_attest", "assignment_start"]
+when = { op = "and", args = [
+  { op = "gt", args = [{ op = "count", args = [{ ref = "recipient_sessions" }] }, 0] },
+  { op = "not", args = [{ ref = "same_author" }] },
+  { op = "or", args = [
+    { op = "and", args = [
+      { op = "eq", args = [{ ref = "event.kind" }, "assignment_start"] },
+      { op = "not", args = [{ op = "eq", args = [{ ref = "assignment.openedBySession" }, { ref = "event.after.turn.sessionKey" }] }] }
+    ] },
+    { op = "and", args = [
+      { op = "eq", args = [{ ref = "event.kind" }, "assignment_attest"] },
+      { op = "eq", args = [{ ref = "attest.kind" }, "verdict"] },
+      { op = "or", args = [
+        { op = "and", args = [
+          { op = "not", args = [{ op = "is_null", args = [{ ref = "assignment.reviewsAssignmentId" }] }] },
+          { op = "is_null", args = [{ ref = "event.after.lateRequestId" }] }
+        ] },
+        { op = "and", args = [
+          { op = "is_null", args = [{ ref = "assignment.reviewsAssignmentId" }] },
+          { op = "is_null", args = [{ ref = "event.after.lateRequestId" }] },
+          { op = "eq", args = [{ ref = "attest.verdictKind" }, "blocked"] }
+        ] },
+        { op = "and", args = [
+          { op = "not", args = [{ op = "is_null", args = [{ ref = "event.after.lateRequestId" }] }] },
+          { op = "eq", args = [{ op = "count", args = [{ op = "filter", items = { ref = "facts.ruling_result_recipients" }, as = "ruling", where = { op = "and", args = [
+            { op = "eq", args = [{ ref = "ruling.sessionKey" }, { ref = "recipient" }] },
+            { op = "eq", args = [{ ref = "ruling.ownerUserId" }, { ref = "facts.assignment_owner_user_id" }] }
+          ] } }] }, 0] }
+        ] }
+      ] }
+    ] }
+  ] }
+] }
+bind = [
+  { name = "assignment", value = { ref = "event.after.assignment" } },
+  { name = "attest", value = { ref = "event.after.attest" } },
+  { name = "recipient", value = { op = "if", args = [
+    { op = "not", args = [{ op = "is_null", args = [{ ref = "assignment.openedBySession" }] }] },
+    { ref = "assignment.openedBySession" },
+    { op = "if", args = [
+      { op = "not", args = [{ op = "is_null", args = [{ ref = "assignment.openedByUser" }] }] },
+      { ref = "facts.personal_session_key" },
+      { ref = "facts.process_notification_recipient.sessionKey" }
+    ] }
+  ] } },
+  { name = "recipient_sessions", value = { op = "filter", items = { ref = "facts.sessions" }, as = "session", where = { op = "and", args = [
+    { op = "eq", args = [{ ref = "session.sessionKey" }, { ref = "recipient" }] },
+    { op = "eq", args = [{ ref = "session.ownerUserId" }, { ref = "facts.assignment_owner_user_id" }] }
+  ] } } },
+  { name = "same_author", value = { op = "if", args = [
+    { op = "eq", args = [{ ref = "event.kind" }, "assignment_start"] },
+    { op = "eq", args = [{ ref = "assignment.openedBySession" }, { ref = "event.after.turn.sessionKey" }] },
+    { op = "or", args = [
+      { op = "and", args = [
+        { op = "not", args = [{ op = "is_null", args = [{ ref = "assignment.openedBySession" }] }] },
+        { op = "eq", args = [{ ref = "assignment.openedBySession" }, { ref = "attest.bySession" }] }
+      ] },
+      { op = "and", args = [
+        { op = "not", args = [{ op = "is_null", args = [{ ref = "assignment.openedByUser" }] }] },
+        { op = "eq", args = [{ ref = "assignment.openedByUser" }, { ref = "attest.byUser" }] }
+      ] }
+    ] }
+  ] } },
+  { name = "attest_wake_id", value = { op = "concat", args = ["w_r01_", { op = "sha256", args = [{ op = "json", args = [["r01-attest-notice", { ref = "event.id" }, "notice"]] }] }] } },
+  { name = "start_wake_id", value = { op = "concat", args = ["w_r01_", { op = "sha256", args = [{ op = "json", args = [["r01-attest-notice", { ref = "event.id" }, "start"]] }] }] } }
+]
+
+[[reaction.effects]]
+slot = "notice"
+kind = "notice"
+when = { op = "eq", args = [{ ref = "event.kind" }, "assignment_attest"] }
+value = { wake_id = { ref = "attest_wake_id" }, session_key = { ref = "recipient" }, owner_user_id = { ref = "facts.assignment_owner_user_id" }, origin = { op = "if", args = [
+  { op = "eq", args = [{ ref = "event.principal.kind" }, "session"] },
+  { op = "concat", args = ["agent:", { ref = "event.principal.id" }] },
+  { op = "if", args = [
+    { op = "eq", args = [{ ref = "event.principal.kind" }, "user"] },
+    { op = "concat", args = ["user:", { ref = "event.principal.id" }] },
+    { op = "concat", args = ["process:", { ref = "event.principal.id" }] }
+  ] }
+] }, creator_session_key = { ref = "attest.bySession" }, assignment_id = { ref = "assignment.id" }, work_item_id = { ref = "assignment.workItemId" }, prompt = { op = "concat", args = ["Attest ", { ref = "attest.id" }, " (", { ref = "attest.kind" }, ") was filed on assignment ", { ref = "assignment.id" }, "."] }, due_at = { ref = "event.at" }, on_unavailable = "schedule" }
+
+[[reaction.effects]]
+slot = "start"
+kind = "notice"
+when = { op = "eq", args = [{ ref = "event.kind" }, "assignment_start"] }
+value = { wake_id = { ref = "start_wake_id" }, session_key = { ref = "recipient" }, owner_user_id = { ref = "facts.assignment_owner_user_id" }, origin = "process:tightbeam", creator_session_key = { ref = "event.after.turn.sessionKey" }, assignment_id = { ref = "assignment.id" }, work_item_id = { ref = "assignment.workItemId" }, prompt = { op = "concat", args = ["The first holder turn for assignment ", { ref = "assignment.id" }, " has started."] }, due_at = { ref = "event.at" }, on_unavailable = "schedule" }
