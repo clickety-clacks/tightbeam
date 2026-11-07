@@ -1141,10 +1141,11 @@ defmodule Tightbeam.HarklightWakesTest do
     assert_receive :listener_failed
     origin_key = session.session_key
 
-    assert {:ok, [["unavailable", "listener_stopped"]]} =
+    assert eventually(fn ->
              DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
                @handle
-             ])
+             ]) == {:ok, [["unavailable", "listener_stopped"]]}
+           end)
 
     assert {:ok, [[^origin_key, prompt]]} =
              DB.query(
@@ -1269,6 +1270,167 @@ defmodule Tightbeam.HarklightWakesTest do
     assert prompt =~ "Replies on this thread will not reach"
   end
 
+  test "startup re-arms restart-stopped listeners after a brief origin outage", %{
+    db: db,
+    session: session
+  } do
+    stopped = @handle
+    listen_failure = Tightbeam.Id.uuid4()
+    attach_unknown = Tightbeam.Id.uuid4()
+
+    seed_completion_handle(db, session.session_key, listen_failure, "restart-listen-failure")
+    seed_completion_handle(db, session.session_key, attach_unknown, "restart-attach-unknown")
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable',lastError='listener_stopped' WHERE handle IN (?1,?2,?3)",
+               [stopped, listen_failure, attach_unknown]
+             )
+
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        "harklight-restart-rearm-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(directory)
+    executable = Path.join(directory, "harklight-agent")
+    calls = Path.join(directory, "calls")
+
+    File.write!(
+      executable,
+      """
+      #!/bin/sh
+      root='#{directory}'
+      if [ "$1" = status ]; then exit 1; fi
+      printf '%s\\n' "$*" >> "$root/calls"
+
+      session=""
+      previous=""
+      for argument in "$@"; do
+        if [ "$previous" = --session ]; then
+          session="$argument"
+          break
+        fi
+        previous="$argument"
+      done
+
+      case "$1" in
+        attach)
+          if [ -e "$root/origin-ready" ]; then
+            printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+            exit 0
+          fi
+
+          case "$session" in
+            '#{stopped}'|'#{listen_failure}')
+              printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+              exit 0
+              ;;
+            '#{attach_unknown}')
+              printf '%s\\n' '{"kind":"outcome_unknown","op_id":"restart-op"}'
+              exit 7
+              ;;
+          esac
+          exit 99
+          ;;
+        retry)
+          touch "$root/failed-#{attach_unknown}"
+          printf '%s\\n' '{"kind":"outcome_unknown","op_id":"restart-op"}'
+          printf '%s\\n' 'origin request failed: temporary origin outage' >&2
+          exit 7
+          ;;
+        listen)
+          if [ ! -e "$root/origin-ready" ]; then
+            case "$session" in
+              '#{stopped}')
+                touch "$root/failed-#{stopped}"
+                exit 143
+                ;;
+              '#{listen_failure}')
+                touch "$root/failed-#{listen_failure}"
+                printf '%s\\n' 'origin request failed: temporary origin outage' >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          touch "$root/listening-$session"
+          exec sleep 300
+          ;;
+        session)
+          exit 0
+          ;;
+      esac
+      exit 0
+      """
+    )
+
+    File.chmod!(executable, 0o755)
+    previous_path = System.get_env("PATH")
+    System.put_env("PATH", Enum.join([directory, previous_path] |> Enum.reject(&is_nil/1), ":"))
+
+    on_exit(fn ->
+      if is_nil(previous_path),
+        do: System.delete_env("PATH"),
+        else: System.put_env("PATH", previous_path)
+
+      File.rm_rf!(directory)
+    end)
+
+    manager = start_supervised!({HarklightWakes, db: db, retry_delays: [3_000, 3_000]})
+
+    failed = [stopped, listen_failure, attach_unknown]
+    failed_markers = Enum.map(failed, &Path.join(directory, "failed-#{&1}"))
+
+    assert eventually(fn -> Enum.all?(failed_markers, &File.exists?/1) end)
+    assert eventually(fn -> map_size(:sys.get_state(manager).retry_timers) == 3 end)
+
+    File.write!(Path.join(directory, "origin-ready"), "reconnected")
+
+    assert eventually(
+             fn ->
+               Enum.all?(failed, &File.exists?(Path.join(directory, "listening-#{&1}"))) and
+                 map_size(:sys.get_state(manager).ports) == 3
+             end,
+             700
+           )
+
+    assert Process.alive?(manager)
+
+    assert {:ok, [[3]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_wake_handles WHERE state='active' AND lastError IS NULL"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'")
+
+    call_log = File.read!(calls) |> String.split("\n", trim: true)
+
+    for handle <- [stopped, listen_failure, attach_unknown] do
+      assert Enum.count(call_log, &String.starts_with?(&1, "attach --session #{handle} ")) == 2
+    end
+
+    for handle <- [stopped, listen_failure] do
+      assert Enum.count(
+               call_log,
+               &String.starts_with?(&1, "listen --follow --controller --session #{handle} ")
+             ) == 2
+    end
+
+    assert Enum.count(call_log, &(&1 == "retry --op-id restart-op")) == 1
+
+    assert Enum.count(
+             call_log,
+             &String.starts_with?(&1, "listen --follow --controller --session #{attach_unknown} ")
+           ) == 1
+
+    refute Enum.any?(call_log, &String.starts_with?(&1, "session end "))
+  end
+
   test "startup records an ineligible origin without launching a listener", %{
     db: db,
     session: session
@@ -1308,6 +1470,8 @@ defmodule Tightbeam.HarklightWakesTest do
            {2,
             ~s({"kind":"refused","reason_source":"server","reason_code":"forbidden","reason":"The server refused this origin's access."})}
          ], ["attach"], false},
+        {"plain handle refusal stays final", [{7, "The handle has been revoked."}], ["attach"],
+         false},
         {"unknown nontransport does not gain retries",
          [
            {7,
@@ -1326,11 +1490,18 @@ defmodule Tightbeam.HarklightWakesTest do
     @retry_responses responses
     @retry_calls expected_calls
     @retry_recovered recovered
+    @retry_label label
     test "bounded attachment retry: #{label}", %{db: db, session: session} do
       calls = attachment_sequence(@retry_responses)
-      # No listener retry, so a failed worker goes straight to gone and only
-      # the attachment window is exercised.
-      start_supervised!({HarklightWakes, db: db, attach_retry_delays: [20, 40], retry_delays: []})
+
+      retry_delays =
+        if @retry_label == "transport retry exhausts its finite budget",
+          do: [],
+          else: [10, 20]
+
+      start_supervised!(
+        {HarklightWakes, db: db, attach_retry_delays: [20, 40], retry_delays: retry_delays}
+      )
 
       if @retry_recovered do
         await_listener_port()
@@ -2538,46 +2709,42 @@ defmodule Tightbeam.HarklightWakesTest do
     end
   end
 
-  test "successful quiet reattachments reset the consecutive failure budget", %{db: db} do
+  test "listener failures exhaust the budget even when ATTACH succeeds", %{db: db} do
     calls = fake_harklight_session_end_agent!()
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      send(test_pid, {:listener_started, self()})
+      :ok = GenServer.call(manager, {:attached, handle})
+      send(test_pid, :listener_attempt)
 
-      receive do
-        :attach ->
-          :ok = GenServer.call(manager, {:attached, handle})
-          send(test_pid, {:listener_attached, self()})
-          receive do: (:drop -> :ok)
-
-        :fail ->
-          :ok = GenServer.call(manager, {:finished, handle, "listener_terminated"})
-      end
+      :ok =
+        GenServer.call(
+          manager,
+          {:finished, handle,
+           {:harklight_failure, "listener_stopped", "listen",
+            "LISTEN attempt; exit status: 143; no safe output captured"}}
+        )
     end
 
     start_supervised!({HarklightWakes, db: db, listener: listener, retry_delays: [1, 1]})
 
-    for _ <- 1..7 do
-      assert_receive {:listener_started, worker}, 1_000
-      send(worker, :attach)
-      assert_receive {:listener_attached, ^worker}, 1_000
-      refute File.exists?(calls)
-      send(worker, :drop)
-    end
-
-    # No captured event replenished the budget. After the final drop, its
-    # recovery attempt and one further retry can fail before reaching gone.
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
-
-    for _ <- 1..2 do
-      assert_receive {:listener_started, worker}, 1_000
-      send(worker, :fail)
-    end
+    for _ <- 1..3, do: assert_receive(:listener_attempt, 1_000)
 
     assert eventually(fn ->
              File.read(calls) == {:ok, "session end --session #{@handle} --gone\n"}
            end)
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [["unavailable", "listener_stopped"]]}
+           end)
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'")
+
+    Process.sleep(30)
+    refute_received(:listener_attempt)
   end
 
   test "a releasing listener lock retries once then completes without gone", %{db: db} do

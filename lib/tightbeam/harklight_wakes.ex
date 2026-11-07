@@ -842,6 +842,26 @@ defmodule Tightbeam.HarklightWakes do
   # still releasing the lock; bounded attempts let that clear. The Agent takes
   # the exclusive lock before attaching, so a held lock never starts a second
   # stream. Persistent contention ends in gone with its observed reason intact.
+  defp retryable_failure?(
+         {:harklight_failure, {"attachment_outcome_unknown", code}, "attach", _}
+       ),
+       do: code in ["transport_error", "timeout"]
+
+  defp retryable_failure?({:harklight_failure, "attachment_outcome_unknown", "attach", _}),
+    do: false
+
+  defp retryable_failure?({:harklight_failure, "attachment_refused", "attach", _}),
+    do: false
+
+  defp retryable_failure?({:harklight_failure, {"listener_stopped", code}, "listen", diagnostic}) do
+    code in ["transport_error", "timeout"] or diagnostic_contains?(diagnostic, "exit status: 143")
+  end
+
+  defp retryable_failure?({:harklight_failure, "listener_stopped", "listen", diagnostic}) do
+    origin_transport_failure?(diagnostic) or
+      diagnostic_contains?(diagnostic, "exit status: 143")
+  end
+
   defp retryable_failure?({:harklight_failure, {_error, code}, _, _}) do
     code not in ~w(missing_journal unproven_handle invalid_handle invalid_attachment
       invalid_attachment_receipt support_mismatch configuration_error
@@ -1255,11 +1275,9 @@ defmodule Tightbeam.HarklightWakes do
         {:error, "listener_fenced"}
       end
 
-    # Quiet conversations may reconnect without capturing another event. Only
-    # consecutive failed attachments consume the recovery budget.
-    state =
-      if result == :ok, do: %{state | attempts: Map.delete(state.attempts, handle)}, else: state
-
+    # ATTACH alone does not prove that the listener recovered: LISTEN may still
+    # fail while the origin is reconnecting. Keep the retry budget until a line
+    # is captured, which proves the stream carried an event again.
     {:reply, result, state}
   end
 
@@ -1622,15 +1640,15 @@ defmodule Tightbeam.HarklightWakes do
                       failure
                     )
                   else
-                    {:error, reason, diagnostic}
+                    {:error, tag_transport_failure(reason), diagnostic}
                   end
               end
             else
-              {:error, reason, diagnostic}
+              {:error, tag_transport_failure(reason), diagnostic}
             end
 
           [] ->
-            {:error, reason, diagnostic}
+            {:error, tag_transport_failure(reason), diagnostic}
         end
 
       result ->
@@ -1966,8 +1984,29 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
+  defp failure_status("listener_stopped" = error, "listen" = operation, diagnostic) do
+    error = if origin_transport_failure?(diagnostic), do: {error, "transport_error"}, else: error
+    {:harklight_failure, error, operation, diagnostic}
+  end
+
   defp failure_status(error, operation, diagnostic),
     do: {:harklight_failure, error, operation, diagnostic}
+
+  defp tag_transport_failure({_error, _code} = reason), do: reason
+  defp tag_transport_failure(reason), do: {reason, "transport_error"}
+
+  defp origin_transport_failure?(diagnostic) do
+    diagnostic_contains?(diagnostic, "origin request failed:") or
+      diagnostic_contains?(diagnostic, "reason_code=transport_error") or
+      diagnostic_contains?(diagnostic, "reason_code=timeout")
+  end
+
+  defp diagnostic_contains?(diagnostic, text) do
+    diagnostic
+    |> List.wrap()
+    |> Enum.join(" ")
+    |> String.contains?(text)
+  end
 
   defp failure_details({:harklight_failure, {error, code}, operation, diagnostics}),
     do:
