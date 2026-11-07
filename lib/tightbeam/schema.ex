@@ -112,8 +112,10 @@ defmodule Tightbeam.Schema do
   # objects, backfills existing work-item provenance, and stamps v20 in the same
   # transaction.
   # Artifact digest evidence remains the fixed v20-to-v21 destination. Stored
-  # decision versions add the current v21-to-v22 rung.
-  @shape "coordination-fabric-v1-phase1-v22"
+  # decision versions add v21-to-v22. Process artifact attribution rebuilds
+  # the exact v22 artifacts table and advances it to v23.
+  @shape "coordination-fabric-v1-phase1-v23"
+  @artifact_process_previous_shape "coordination-fabric-v1-phase1-v22"
   @artifact_digest_next_shape "coordination-fabric-v1-phase1-v21"
   @artifact_digest_previous_shape "coordination-fabric-v1-phase1-v20"
   @decision_row_version_previous_shape "coordination-fabric-v1-phase1-v21"
@@ -2180,7 +2182,7 @@ defmodule Tightbeam.Schema do
              "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
              [
                @decision_row_version_previous_shape,
-               @shape,
+               @artifact_process_previous_shape,
                System.system_time(:millisecond)
              ]
            )
@@ -2410,6 +2412,165 @@ defmodule Tightbeam.Schema do
     |> String.trim_trailing(";")
   end
 
+  @doc false
+  @spec upgrade_artifact_process_attribution_v1(DB.server()) :: :ok
+  def upgrade_artifact_process_attribution_v1(db) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@artifact_process_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_artifact_process_attribution_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           validate_artifact_process_table!(
+             txn,
+             Tightbeam.Artifacts.previous_table_definitions(),
+             Tightbeam.Artifacts.previous_index_ddl()
+           )
+
+           [[source_count]] = Txn.q(txn, "SELECT COUNT(*) FROM artifacts")
+           :ok = Txn.exec(txn, "PRAGMA legacy_alter_table=ON")
+
+           try do
+             :ok =
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE artifacts RENAME TO artifacts_process_attribution_source"
+               )
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "CREATE TABLE artifacts (#{Tightbeam.Artifacts.current_table_definition()})"
+               )
+
+             Txn.q(txn, """
+             INSERT INTO artifacts
+               (artifactId,kind,title,description,createdBySession,createdByProcess,workItemId,
+                parentSession,originPath,contentSha256,contentSha256Verified,recordedMessageId,
+                recordedTurnEvidence,state,home,createdAt,updatedAt)
+             SELECT artifactId,kind,title,description,createdBySession,NULL,workItemId,
+                parentSession,originPath,contentSha256,contentSha256Verified,recordedMessageId,
+                recordedTurnEvidence,state,home,createdAt,updatedAt
+             FROM artifacts_process_attribution_source
+             """)
+
+             if Txn.changes(txn) != source_count do
+               raise ShapeError,
+                 message:
+                   "incompatible_artifact_process_attribution_v1: copied #{Txn.changes(txn)} of #{source_count} artifact rows"
+             end
+
+             :ok = Txn.exec(txn, "DROP TABLE artifacts_process_attribution_source")
+             :ok = Tightbeam.Artifacts.ensure_indexes_in_txn(txn)
+
+             validate_artifact_process_table!(
+               txn,
+               [Tightbeam.Artifacts.current_table_definition()],
+               Tightbeam.Artifacts.index_ddl()
+             )
+
+             Txn.q(
+               txn,
+               "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3",
+               [@shape, System.system_time(:millisecond), @artifact_process_previous_shape]
+             )
+
+             if Txn.changes(txn) != 1 do
+               raise ShapeError,
+                 message:
+                   "incompatible_artifact_process_attribution_v1: stamp transition was not exact"
+             end
+
+             :ok
+           after
+             :ok = Txn.exec(txn, "PRAGMA legacy_alter_table=OFF")
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_artifact_process_attribution_v1: migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp validate_artifact_process_table!(txn, table_definitions, index_ddl) do
+    expected_tables =
+      MapSet.new(
+        Enum.map(table_definitions, fn definition ->
+          "CREATE TABLE IF NOT EXISTS artifacts (\n" <> definition <> "\n);"
+        end),
+        &normalize_schema_sql/1
+      )
+
+    case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='artifacts'") do
+      [[actual]] when is_binary(actual) ->
+        if normalize_schema_sql(actual) not in expected_tables do
+          raise ShapeError,
+            message: "incompatible_artifact_process_attribution_v1: artifacts table shape differs"
+        end
+
+      rows ->
+        raise ShapeError,
+          message:
+            "incompatible_artifact_process_attribution_v1: artifacts table is #{inspect(rows)}"
+    end
+
+    case Txn.q(
+           txn,
+           "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='artifacts' ORDER BY name"
+         ) do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "incompatible_artifact_process_attribution_v1: unexpected artifacts triggers #{inspect(rows)}"
+    end
+
+    expected_indexes =
+      Map.new(index_ddl, fn sql ->
+        [_match, name] = Regex.run(~r/CREATE INDEX IF NOT EXISTS ([A-Za-z0-9_]+)/i, sql)
+        {name, sql}
+      end)
+
+    actual_indexes =
+      Txn.q(
+        txn,
+        "SELECT name,sql FROM sqlite_master WHERE type='index' AND tbl_name='artifacts' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+      )
+      |> Map.new(fn [name, sql] -> {name, sql} end)
+
+    actual_index_names = actual_indexes |> Map.keys() |> MapSet.new()
+    expected_index_names = expected_indexes |> Map.keys() |> MapSet.new()
+
+    if actual_index_names != expected_index_names do
+      raise ShapeError,
+        message: "incompatible_artifact_process_attribution_v1: artifacts indexes differ"
+    end
+
+    Enum.each(expected_indexes, fn {name, expected_sql} ->
+      if normalize_schema_sql(actual_indexes[name]) != normalize_schema_sql(expected_sql) do
+        raise ShapeError,
+          message:
+            "incompatible_artifact_process_attribution_v1: artifacts index differs: #{name}"
+      end
+    end)
+
+    :ok
+  end
+
   defp maybe_interrupt_activation!(opts, statement_index) do
     if Keyword.get(opts, :fail_after_statement) == statement_index do
       raise "forced activation interruption"
@@ -2450,17 +2611,23 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@artifact_process_previous_shape]]} ->
+        upgrade_artifact_process_attribution_v1(db)
+
       {:ok, [[@decision_row_version_previous_shape]]} ->
-        upgrade_decision_row_version_v1(db)
+        :ok = upgrade_decision_row_version_v1(db)
+        upgrade_artifact_process_attribution_v1(db)
 
       {:ok, [[@principal_duty_previous_shape]]} ->
         :ok = upgrade_principal_duty_v1(db)
         :ok = upgrade_artifact_digest_integrity_v1(db)
-        upgrade_decision_row_version_v1(db)
+        :ok = upgrade_decision_row_version_v1(db)
+        upgrade_artifact_process_attribution_v1(db)
 
       {:ok, [[@artifact_digest_previous_shape]]} ->
         :ok = upgrade_artifact_digest_integrity_v1(db)
-        upgrade_decision_row_version_v1(db)
+        :ok = upgrade_decision_row_version_v1(db)
+        upgrade_artifact_process_attribution_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -2478,7 +2645,7 @@ defmodule Tightbeam.Schema do
 
         There is no migration from #{found}. The supported upgrade sources are
         #{@principal_duty_previous_shape}, #{@artifact_digest_previous_shape}, and
-        #{@decision_row_version_previous_shape}.
+        #{@decision_row_version_previous_shape}, and #{@artifact_process_previous_shape}.
         Move this database aside and let it be recreated.
         """
 

@@ -55,15 +55,43 @@ defmodule Tightbeam.Artifacts do
     CHECK ((state = 'archived') = (home IS NOT NULL))
   """
 
-  @index_ddl [
+  # The stamped v22 shape has two exact SQLite encodings. Fresh v22 databases
+  # create this column beside contentSha256; the v20-to-v21 migration added it
+  # at the end of the column list before SQLite's table-level checks.
+  @previous_table_definition_with_digest_at_end @table_definition
+                                                |> String.replace(
+                                                  ~r/contentSha256Verified INTEGER NOT NULL DEFAULT 0\s+CHECK \(contentSha256Verified IN \(0,1\)\)\s+CHECK \(contentSha256Verified = 0 OR contentSha256 IS NOT NULL\),\n/u,
+                                                  ""
+                                                )
+                                                |> String.replace(
+                                                  "CHECK ((state = 'archived') = (home IS NOT NULL))",
+                                                  "contentSha256Verified INTEGER NOT NULL DEFAULT 0 CHECK (contentSha256Verified IN (0,1)) CHECK (contentSha256Verified = 0 OR contentSha256 IS NOT NULL),\n    CHECK ((state = 'archived') = (home IS NOT NULL))",
+                                                  global: false
+                                                )
+
+  @current_table_definition @table_definition
+                            |> String.replace(
+                              "createdBySession  TEXT NOT NULL REFERENCES sessions(sessionKey),",
+                              "createdBySession  TEXT NULL REFERENCES sessions(sessionKey),\n    createdByProcess  TEXT NULL,",
+                              global: false
+                            )
+                            |> String.replace(
+                              "CHECK ((state = 'archived') = (home IS NOT NULL))",
+                              "CHECK ((state = 'archived') = (home IS NOT NULL)),\n    CHECK (createdBySession IS NOT NULL OR createdByProcess IS NOT NULL)",
+                              global: false
+                            )
+
+  @previous_index_ddl [
     "CREATE INDEX IF NOT EXISTS artifacts_work_item ON artifacts (workItemId)",
     "CREATE INDEX IF NOT EXISTS artifacts_created_by_session ON artifacts (createdBySession)",
     "CREATE INDEX IF NOT EXISTS artifacts_recorded_message ON artifacts (recordedMessageId)"
   ]
 
+  @index_ddl @previous_index_ddl
+
   @ddl """
   CREATE TABLE IF NOT EXISTS artifacts (
-  #{@table_definition}
+  #{@current_table_definition}
   );
   #{Enum.join(@index_ddl, ";\n")};
   """
@@ -72,8 +100,31 @@ defmodule Tightbeam.Artifacts do
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
+  @doc false
+  def current_table_definition, do: @current_table_definition
+
+  @doc false
+  def previous_table_definition, do: @table_definition
+
+  @doc false
+  def previous_table_definitions,
+    do: [@table_definition, @previous_table_definition_with_digest_at_end]
+
+  @doc false
+  def previous_index_ddl, do: @previous_index_ddl
+
+  @doc false
+  def index_ddl, do: @index_ddl
+
+  @doc false
+  def ensure_indexes_in_txn(%Txn{} = txn) do
+    Enum.each(@index_ddl, &Txn.exec(txn, &1))
+    :ok
+  end
+
   @doc """
-  Record a deliberate artifact pointer for the authenticated calling session.
+  Record a deliberate artifact pointer for the authenticated calling session or
+  the named process selected by the authenticated caller.
 
   FAILS OPEN on the turn edge. Whatever the substrate can establish about the
   firing turn, the row lands — it is never refused for want of provenance. The
@@ -89,11 +140,14 @@ defmodule Tightbeam.Artifacts do
   @doc false
   @spec record(DB.server(), map(), map()) :: map()
   def record(db, call, config) do
-    case {call[:principal], call[:session_key], call[:params][:work_item_id]} do
-      {{:session, session_key}, session_key, work_item_id}
-      when is_binary(session_key) and is_binary(work_item_id) ->
+    case {artifact_creator(call), call[:params][:work_item_id]} do
+      {{:ok, session_key, created_by_process}, work_item_id}
+      when is_binary(work_item_id) ->
         artifact_id = "art_" <> (:crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower))
-        {recorded_message_id, evidence} = turn_evidence(db, session_key)
+
+        {recorded_message_id, evidence} =
+          if is_binary(session_key), do: turn_evidence(db, session_key), else: {nil, "none"}
+
         digest_source = digest_source(db, config, session_key, call.params.origin_path)
         digest = content_digest(digest_source, call.params[:content_sha256])
         now = now()
@@ -104,17 +158,19 @@ defmodule Tightbeam.Artifacts do
                    case IdPrefix.resolve_in_txn(txn, :work_item, work_item_id) do
                      {:ok, canonical_id} ->
                        parent_session =
-                         Org.effective_parent_in_txn(txn, session_key).session_key
+                         if is_binary(session_key),
+                           do: Org.effective_parent_in_txn(txn, session_key).session_key
 
                        Txn.q(
                          txn,
                          """
                          INSERT INTO artifacts
-                           (artifactId, kind, title, description, createdBySession, workItemId,
-                            parentSession, originPath, contentSha256, contentSha256Verified,
-                            recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                                 'in-workspace', NULL, ?13, ?13)
+                           (artifactId, kind, title, description, createdBySession, createdByProcess,
+                            workItemId, parentSession, originPath, contentSha256,
+                            contentSha256Verified, recordedMessageId, recordedTurnEvidence,
+                            state, home, createdAt, updatedAt)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                                 'in-workspace', NULL, ?14, ?14)
                          """,
                          [
                            artifact_id,
@@ -122,6 +178,7 @@ defmodule Tightbeam.Artifacts do
                            call.params.title,
                            call.params[:description],
                            session_key,
+                           created_by_process,
                            canonical_id,
                            parent_session,
                            call.params.origin_path,
@@ -163,13 +220,41 @@ defmodule Tightbeam.Artifacts do
             }
         end
 
-      {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->
+      {{:ok, _session_key, _created_by_process}, nil} ->
         %{code: "invalid", message: "artifact-record requires provenance edges"}
 
       _ ->
         %{code: "invalid", message: "artifact-record requires a session caller"}
     end
   end
+
+  defp artifact_creator(%{
+         principal: {:session, session_key},
+         session_key: session_key,
+         origin: "process:" <> process_name
+       })
+       when is_binary(session_key) and process_name != "",
+       do: {:ok, session_key, "process:" <> process_name}
+
+  defp artifact_creator(%{
+         principal: {:session, session_key},
+         session_key: session_key
+       })
+       when is_binary(session_key),
+       do: {:ok, session_key, nil}
+
+  defp artifact_creator(%{
+         principal: {:process, process_name},
+         session_key: nil,
+         origin: origin
+       })
+       when is_binary(process_name) and process_name != "" do
+    if origin == "process:" <> process_name,
+      do: {:ok, nil, origin},
+      else: :error
+  end
+
+  defp artifact_creator(_call), do: :error
 
   # The best edge the substrate OBSERVED, with the observation method named.
   #
@@ -715,7 +800,7 @@ defmodule Tightbeam.Artifacts do
 
   defp columns do
     """
-    artifactId, kind, title, description, createdBySession, workItemId,
+    artifactId, kind, title, description, createdBySession, createdByProcess, workItemId,
     parentSession, originPath, contentSha256, contentSha256Verified, recordedMessageId,
     recordedTurnEvidence, state, home, createdAt, updatedAt
     """
@@ -727,6 +812,7 @@ defmodule Tightbeam.Artifacts do
          title,
          description,
          created_by_session,
+         created_by_process,
          work_item_id,
          parent_session,
          origin_path,
@@ -745,6 +831,7 @@ defmodule Tightbeam.Artifacts do
       title: title,
       description: description,
       created_by_session: created_by_session,
+      created_by_process: created_by_process,
       work_item_id: work_item_id,
       parent_session: parent_session,
       origin_path: origin_path,

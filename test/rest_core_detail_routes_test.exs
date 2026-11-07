@@ -42,7 +42,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
-      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 contentSha256Status recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
+      ~w(artifactId kind title description createdBySession createdByProcess workItemId parentSession originPath contentSha256 contentSha256Status recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion)
   }
 
@@ -60,7 +60,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "sessions" =>
       ~w(ownerUserId spawnedBy handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides),
     "devices" => ~w(claimedName platform model),
-    "artifacts" => ~w(description parentSession contentSha256 recordedMessageId home),
+    "artifacts" =>
+      ~w(description createdBySession createdByProcess parentSession contentSha256 recordedMessageId home),
     "read markers" => []
   }
 
