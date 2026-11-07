@@ -1729,9 +1729,8 @@ defmodule Tightbeam.SupervisionTest do
     assert deadline.due_at < wake.due_at
 
     if deadline.wake_id == old_deadline.wake_id do
-      # Opening and registration can share one millisecond, making the old
-      # row already the exact deadline derived from the registration time.
-      assert old_deadline.due_at == wake.created_at + interval_ms
+      # Registration may update the existing wake row instead of replacing it.
+      assert old_deadline.due_at < deadline.due_at
     else
       assert Wakes.get(ctx.db, old_deadline.wake_id).state == "canceled"
     end
