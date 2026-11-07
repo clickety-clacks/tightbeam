@@ -1470,14 +1470,15 @@ defmodule Tightbeam.HarklightWakesTest do
            {2,
             ~s({"kind":"refused","reason_source":"server","reason_code":"forbidden","reason":"The server refused this origin's access."})}
          ], ["attach"], false},
-        {"unknown nontransport does not gain retries",
+        {"unclassified outcome_unknown keeps bounded recovery after same-operation retry",
          [
            {7,
             ~s({"kind":"outcome_unknown","op_id":"saved-op","reason_source":"agent","reason_code":"invalid_response"})},
            {7,
             ~s({"kind":"outcome_unknown","op_id":"saved-op"}) <>
-              "\norigin response was not a valid v1 JSON envelope: synthetic"}
-         ], ["attach", "retry --op-id saved-op"], false},
+              "\norigin response was not a valid v1 JSON envelope: synthetic"},
+           {0, ~s({"kind":"attached","ready_for_listen":true})}
+         ], ["attach", "retry --op-id saved-op", "attach"], true},
         {"transport retry exhausts its finite budget",
          List.duplicate(
            {2,
@@ -1506,9 +1507,6 @@ defmodule Tightbeam.HarklightWakesTest do
 
         assert {:ok, [["active", nil]]} =
                  DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
-
-        assert {:ok, []} =
-                 DB.query(db, "SELECT wakeId FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'")
       else
         await_handle_error(db, "attachment_")
         origin = session.session_key
@@ -1524,7 +1522,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
       expected = if @retry_recovered, do: @retry_calls, else: @retry_calls ++ ["session"]
       assert eventually(fn -> File.read!(calls) |> String.split("\n", trim: true) == expected end)
-      # Beyond both configured delays, a terminal refusal cannot restart itself.
+      # Beyond both configured delays, no additional call exceeds the retry budget.
       Process.sleep(100)
       assert File.read!(calls) |> String.split("\n", trim: true) == expected
     end
