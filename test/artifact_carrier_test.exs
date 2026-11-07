@@ -135,12 +135,32 @@ defmodule Tightbeam.ArtifactCarrierTest do
     result = record_over_wire(ctx, %{"kind" => "report", "title" => "Results"})
 
     refute Map.has_key?(result, "code")
+    assert result["createdBySession"] == ctx.coder.session_key
+    assert result["createdByProcess"] == nil
     assert result["recordedMessageId"] == nil
     assert result["recordedTurnEvidence"] == "none"
 
     assert [row] = Artifacts.list(ctx.db, %{session_key: ctx.coder.session_key})
     assert row.recorded_message_id == nil
     assert row.recorded_turn_evidence == "none"
+  end
+
+  test "an organization process caller records an artifact attributed to that process", ctx do
+    result =
+      record_as_process_over_org_wire(ctx, "ci", %{
+        "kind" => "report",
+        "title" => "Automated results"
+      })
+
+    refute Map.has_key?(result, "code")
+    assert result["createdBySession"] == nil
+    assert result["createdByProcess"] == "process:ci"
+    assert result["recordedMessageId"] == nil
+    assert result["recordedTurnEvidence"] == "none"
+
+    assert [row] = Artifacts.list(ctx.db, %{work_item_id: ctx.work_item_id})
+    assert row.created_by_session == nil
+    assert row.created_by_process == "process:ci"
   end
 
   ## The three evidence classes, each over the real path
@@ -518,6 +538,30 @@ defmodule Tightbeam.ArtifactCarrierTest do
     conn =
       conn(:post, "/agent/dispatch", body)
       |> Plug.Conn.put_req_header("authorization", "Bearer #{ctx.coder.cli_token}")
+      |> Plug.Conn.put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Router.call(ctx.router_opts)
+
+    assert conn.status == 200
+    JSON.decode!(conn.resp_body)["result"]
+  end
+
+  defp record_as_process_over_org_wire(ctx, process, params) do
+    params = Map.merge(%{"originPath" => "results.txt", "workItemId" => ctx.work_item_id}, params)
+
+    body =
+      JSON.encode!(%{
+        "asProcess" => process,
+        "verb" => "artifact-record",
+        "params" => params
+      })
+
+    conn =
+      conn(:post, "/agent/dispatch", body)
+      |> Plug.Conn.put_req_header("authorization", "Bearer tbc_carrier")
       |> Plug.Conn.put_req_header(
         "x-tightbeam-cli-version",
         Tightbeam.CliCompatibility.required_version()

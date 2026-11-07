@@ -46,7 +46,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
-      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
+      ~w(artifactId kind title description createdBySession createdByProcess workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion)
   }
 
@@ -64,7 +64,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "sessions" =>
       ~w(ownerUserId spawnedBy topologyParent handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides),
     "devices" => ~w(claimedName platform model),
-    "artifacts" => ~w(description parentSession contentSha256 recordedMessageId home),
+    "artifacts" =>
+      ~w(description createdBySession createdByProcess parentSession contentSha256 recordedMessageId home),
     "read markers" => ~w(marker)
   }
 
