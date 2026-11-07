@@ -1036,6 +1036,9 @@ defmodule Tightbeam.Gateway do
           runner: Map.get(config, :harklight_send_runner)
         )
       end,
+      {"harklight-briefings-catchup", []} => fn call ->
+        Tightbeam.HarklightBriefings.catchup(db, call, authorized: admin_caller?(db, call))
+      end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,
