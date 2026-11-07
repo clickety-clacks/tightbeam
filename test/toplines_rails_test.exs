@@ -64,7 +64,6 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{linkedActorRef: nil},
       %{linkReason: " "},
       %{unlinkedAt: 20},
-      ended_membership(%{unlinkedActorKind: "process"}),
       ended_membership(%{unlinkedAt: "later"}),
       ended_membership(%{unlinkedAt: 9})
     ]
@@ -76,6 +75,13 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(membership_row("tlm_invalid", "tl_one", "wi_one", "flynn"), overrides)
       )
     end)
+
+    insert!(
+      db,
+      "topline_work_memberships",
+      membership_row("tlm_process", "tl_one", "wi_one", "flynn")
+      |> Map.merge(ended_membership(%{unlinkedActorKind: "process", unlinkedActorRef: "tightbeam"}))
+    )
   end
 
   test "AC67 rejects invalid Concern actors, time, and titles", %{db: db} do
@@ -130,7 +136,6 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{cause: "other"},
       %{state: "other"},
       %{openedActorRef: nil},
-      %{openedActorKind: "process", openedActorRef: "tightbeam"},
       %{
         cause: "migration",
         causeRef: "migration",
@@ -205,6 +210,12 @@ defmodule Tightbeam.ToplinesRailsTest do
     insert!(
       db,
       "topline_placement_obligations",
+      %{placement_row("tlp_process") | openedActorKind: "process", openedActorRef: "tightbeam"}
+    )
+
+    insert!(
+      db,
+      "topline_placement_obligations",
       placement_row("tlp_source")
       |> Map.merge(%{
         cause: "reopened",
@@ -268,7 +279,6 @@ defmodule Tightbeam.ToplinesRailsTest do
     invalid = [
       %{kind: "other"},
       %{actorRef: nil},
-      %{actorKind: "process"},
       %{seq: "one"},
       %{seq: 0},
       %{eventAt: "now"},
@@ -286,6 +296,8 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(event_row("tl_one"), overrides)
       )
     end)
+
+    insert!(db, "topline_events", %{event_row("tl_one") | actorKind: "process"})
   end
 
   test "AC71 rejects both possible owner values for a cross-owner membership", %{db: db} do

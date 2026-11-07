@@ -100,6 +100,12 @@ defmodule Tightbeam.IdentityTest do
                  "I want to know a change was actually tested, not just claimed."
                ],
                root_archetype: "orchestrator"
+             },
+             %{
+               name: "sentinels",
+               purpose: "Share generic event subscription tools and a read-only Matrix event watcher.",
+               phrases: [],
+               root_archetype: "default"
              }
            ]
   end
@@ -183,7 +189,8 @@ defmodule Tightbeam.IdentityTest do
     purpose = "Help a team ship dependable work."
     """)
 
-    assert [%{phrases: []}] = Identity.available_bundles()
+    assert %{phrases: []} =
+             Enum.find(Identity.available_bundles(), &(&1.name == "agentic-engineering"))
   end
 
   test "a manifest with invalid phrases is refused before identity mutation", ctx do
@@ -609,6 +616,8 @@ defmodule Tightbeam.IdentityTest do
        ctx do
     alias Tightbeam.{DB, Gateway, Rails, RailScript, Schema}
 
+    _db = start_supervised!({DB, path: ":memory:", name: DB})
+
     # Rail containment requires canonical write roots, including macOS /var aliases.
     {root, 0} = System.cmd("/bin/realpath", [ctx.root])
     ctx = %{ctx | base: Path.join(String.trim(root), "runtime")}
@@ -689,7 +698,8 @@ defmodule Tightbeam.IdentityTest do
 
   test "recovery keeps invalid published law closed and preserves the merge",
        ctx do
-    alias Tightbeam.Gateway
+    alias Tightbeam.{DB, Gateway}
+    _db = start_supervised!({DB, path: ":memory:", name: DB})
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
     File.mkdir_p!(Path.join(dir, "rules"))

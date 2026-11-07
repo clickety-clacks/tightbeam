@@ -349,7 +349,7 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
         |> Base.url_decode64!(padding: false)
         |> JSON.decode!()
 
-      assert identity["principalKind"] == "user"
+      assert identity["principalKind"] == "user-admin"
       assert identity["principalId"] == "owner"
     end
 
