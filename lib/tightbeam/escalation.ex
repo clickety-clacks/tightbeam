@@ -811,8 +811,14 @@ defmodule Tightbeam.Escalation do
           if fact_id, do: nudge(opts, [fact_id])
 
           case result do
-            %{kind: "operator", status: "ruled"} -> terminal_operator_legacy_projection(result)
-            other -> other
+            %{kind: "operator", status: "ruled"} ->
+              warning = Map.get(result, :warning)
+              projection = terminal_operator_legacy_projection(Map.delete(result, :warning))
+
+              if warning, do: Map.put(projection, :warning, warning), else: projection
+
+            other ->
+              other
           end
 
         {:error, error} ->
@@ -821,6 +827,233 @@ defmodule Tightbeam.Escalation do
     else
       {:error, reason} -> reason
     end
+  end
+
+  @doc false
+  @spec late_ruling_receipt_context_in_txn(Txn.t(), String.t(), String.t(), term()) ::
+          :ok | :not_found
+  def late_ruling_receipt_context_in_txn(txn, request_id, assignment_id, principal) do
+    with %{kind: "operator", status: "ruled", assignment_id: ^assignment_id} = request <-
+           request_in_txn_optional(txn, request_id),
+         {:ok, accountable_owner} <- late_source_owner_in_txn(txn, request),
+         true <- late_route_marker_count_in_txn(txn, request_id) == 1,
+         true <-
+           late_ruling_receipt_notification_valid_in_txn(
+             txn,
+             request,
+             accountable_owner,
+             principal
+           ) do
+      :ok
+    else
+      _ -> :not_found
+    end
+  end
+
+  @doc false
+  @spec applicable_late_rulings_in_txn(Txn.t(), [String.t()], [String.t()], [String.t()]) ::
+          [String.t()]
+  def applicable_late_rulings_in_txn(txn, assignment_ids, work_item_ids, carried_ids) do
+    {assignment_sql, params} = in_predicate("dr.assignmentId", assignment_ids, [])
+    {work_item_sql, params} = in_predicate("source.workItemId", work_item_ids, params)
+    {carried_sql, params} = in_predicate("dr.id", carried_ids, params)
+
+    where =
+      [assignment_sql, work_item_sql, carried_sql]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" OR ")
+
+    if where == "" do
+      []
+    else
+      txn
+      |> Txn.q(
+        """
+        SELECT dr.id
+        FROM decision_requests dr
+        JOIN assignments source ON source.id = dr.assignmentId
+        WHERE dr.kind = 'operator' AND dr.status = 'ruled'
+          AND 1 = (
+            SELECT COUNT(*) FROM condition_facts marker
+            WHERE marker.kind IN (
+              'operator-ruling-late-routed',
+              'operator-ruling-late-recipient-unavailable'
+            )
+              AND marker.scope = dr.id AND marker.origin = 'process:tightbeam'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM attests receipt
+            WHERE receipt.assignmentId = source.id
+              AND receipt.kind = 'verdict'
+              AND receipt.verdictKind = 'ruling-consumed:' || dr.id
+          )
+          AND (#{where})
+        ORDER BY dr.ruledAt ASC, dr.id ASC
+        """,
+        params
+      )
+      |> Enum.map(fn [id] -> id end)
+      |> Enum.filter(&canonical_request_id?/1)
+    end
+  end
+
+  defp ruling_recipient_in_txn(txn, request) do
+    case late_ruling_route_in_txn(txn, request) do
+      :ordinary ->
+        {:ok, request.raiser_session_key, false, nil}
+
+      {:late, session_key, _accountable_owner} ->
+        {:ok, session_key, true, nil}
+
+      :unavailable ->
+        {:ok, nil, true, late_ruling_recipient_unavailable_warning()}
+    end
+  end
+
+  defp late_ruling_recipient_unavailable_warning do
+    error(
+      "late_ruling_recipient_unavailable",
+      "no live opener or owner recipient was available; the ruling was recorded as ruled and remains unconsumed for late routing"
+    )
+  end
+
+  defp late_ruling_route_in_txn(_txn, %{assignment_id: nil}), do: :ordinary
+
+  defp late_ruling_route_in_txn(txn, request) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.state, a.holderKey, a.openedBySession, a.openedByUser,
+                  COALESCE(w.ownerUserId, ?2)
+           FROM assignments a
+           LEFT JOIN work_items w ON w.id = a.workItemId
+           WHERE a.id = ?1
+           """,
+           [request.assignment_id, request.owner_user_id]
+         ) do
+      [["open", _holder, _opened_session, _opened_user, _accountable_owner]] ->
+        :ordinary
+
+      [["closed", holder, opened_session, opened_user, accountable_owner]] ->
+        recipient =
+          late_ruling_candidate_sessions(txn, opened_session, opened_user, accountable_owner)
+          |> Enum.uniq()
+          |> Enum.reject(&(&1 in [holder, request.raiser_session_key]))
+          |> Enum.find(&active_session_in_txn?(txn, &1))
+
+        if recipient,
+          do: {:late, recipient, accountable_owner},
+          else: :unavailable
+
+      [] ->
+        :ordinary
+    end
+  end
+
+  defp late_ruling_candidate_sessions(txn, opened_session, opened_user, accountable_owner) do
+    opener_lineage_in_txn(txn, opened_session) ++
+      optional_personal_session(opened_user) ++
+      [Org.personal_session_key(accountable_owner)]
+  end
+
+  defp opener_lineage_in_txn(_txn, nil), do: []
+
+  defp opener_lineage_in_txn(txn, session_key),
+    do: opener_lineage_in_txn(txn, session_key, MapSet.new(), [])
+
+  defp opener_lineage_in_txn(txn, session_key, visited, acc) do
+    if MapSet.member?(visited, session_key) do
+      Enum.reverse(acc)
+    else
+      next_acc = [session_key | acc]
+
+      case Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [session_key]) do
+        [[1]] ->
+          next = Org.effective_parent_in_txn(txn, session_key).session_key
+
+          opener_lineage_in_txn(
+            txn,
+            next,
+            MapSet.put(visited, session_key),
+            next_acc
+          )
+
+        [] ->
+          Enum.reverse(next_acc)
+      end
+    end
+  end
+
+  defp optional_personal_session(nil), do: []
+  defp optional_personal_session(user_id), do: [Org.personal_session_key(user_id)]
+
+  defp active_session_in_txn?(txn, session_key) do
+    Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1 AND state = 'active'", [session_key]) ==
+      [[1]]
+  end
+
+  defp late_source_owner_in_txn(txn, request) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COALESCE(w.ownerUserId, ?2)
+           FROM assignments a
+           LEFT JOIN work_items w ON w.id = a.workItemId
+           WHERE a.id = ?1 AND a.state = 'closed'
+           """,
+           [request.assignment_id, request.owner_user_id]
+         ) do
+      [[accountable_owner]] -> {:ok, accountable_owner}
+      _ -> :not_found
+    end
+  end
+
+  defp late_route_marker_count_in_txn(txn, request_id) do
+    [[count]] =
+      Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM condition_facts WHERE kind IN ('operator-ruling-late-routed', 'operator-ruling-late-recipient-unavailable') AND scope = ?1 AND origin = 'process:tightbeam'",
+        [request_id]
+      )
+
+    count
+  end
+
+  defp late_ruling_recipient_unavailable_count_in_txn(txn, request_id) do
+    [[count]] =
+      Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM condition_facts WHERE kind = 'operator-ruling-late-recipient-unavailable' AND scope = ?1 AND origin = 'process:tightbeam'",
+        [request_id]
+      )
+
+    count
+  end
+
+  defp late_ruling_wake_sessions_in_txn(txn, request_id) do
+    txn
+    |> Txn.q(
+      """
+      SELECT sessionKey FROM wakes
+      WHERE conditionKind = 'escalation-ruled' AND conditionScope = ?1
+        AND origin = 'process:tightbeam' AND targetRole IS NULL
+      """,
+      [request_id]
+    )
+    |> Enum.map(fn [session_key] -> session_key end)
+  end
+
+  defp in_predicate(_column, [], params), do: {nil, params}
+
+  defp in_predicate(column, values, params) do
+    offset = length(params)
+
+    placeholders =
+      values
+      |> Enum.with_index(offset + 1)
+      |> Enum.map_join(",", fn {_value, index} -> "?#{index}" end)
+
+    {"#{column} IN (#{placeholders})", params ++ values}
   end
 
   @doc "Withdraw one operator request as its owner, same-owner raiser, or same-owner subject-card opener."
@@ -2823,7 +3056,12 @@ defmodule Tightbeam.Escalation do
         with {:ok, decision} <- operator_decision(request, answer) do
           if request.decision == decision and request.rationale == answer.rationale and
                request.ruled_by == ruled_by do
-            {request, nil}
+            result =
+              if late_ruling_recipient_unavailable_count_in_txn(txn, request.id) == 1,
+                do: Map.put(request, :warning, late_ruling_recipient_unavailable_warning()),
+                else: request
+
+            {result, nil}
           else
             {error("not_open", "decision request is not open"), nil}
           end
@@ -2843,61 +3081,79 @@ defmodule Tightbeam.Escalation do
     via_state = if is_binary(via_session), do: "known", else: "none"
 
     if request.status == "open" do
-      ruled_at = now()
+      with {:ok, notification_session, late?, warning} <- ruling_recipient_in_txn(txn, request) do
+        ruled_at = now()
 
-      Wakes.schedule_in_txn(txn, %{
-        session_key: request.raiser_session_key,
-        origin: "process:tightbeam",
-        prompt: operator_ruling_notification(request.id),
-        due_at: ruled_at + operator_decision_duration(request),
-        condition_kind: "escalation-ruled",
-        condition_scope: request.id,
-        creator_session_key: via_session,
-        target_gate: 0
-      })
+        if notification_session do
+          Wakes.schedule_in_txn(txn, %{
+            session_key: notification_session,
+            origin: "process:tightbeam",
+            prompt: operator_ruling_notification(request.id),
+            due_at: ruled_at + operator_decision_duration(request),
+            condition_kind: "escalation-ruled",
+            condition_scope: request.id,
+            creator_session_key: via_session,
+            target_gate: 0
+          })
+        end
 
-      %{fact_id: fact_id} =
-        ConditionFacts.file_in_txn(txn, %{
-          kind: "escalation-ruled",
-          scope: request.id,
-          origin: "process:tightbeam"
-        })
+        %{fact_id: fact_id} =
+          ConditionFacts.file_in_txn(txn, %{
+            kind: "escalation-ruled",
+            scope: request.id,
+            origin: "process:tightbeam"
+          })
 
-      Txn.q(
-        txn,
-        "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledViaSessionKey = ?5, ruledViaPrincipal = ?6, ruledViaSessionState = ?7, ruledAt = ?8, rulingFactId = ?9 WHERE id = ?1 AND kind = 'operator' AND status = 'open'",
-        [
+        if late? do
+          ConditionFacts.file_in_txn(txn, %{
+            kind:
+              if(warning,
+                do: "operator-ruling-late-recipient-unavailable",
+                else: "operator-ruling-late-routed"
+              ),
+            scope: request.id,
+            origin: "process:tightbeam"
+          })
+        end
+
+        Txn.q(
+          txn,
+          "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledViaSessionKey = ?5, ruledViaPrincipal = ?6, ruledViaSessionState = ?7, ruledAt = ?8, rulingFactId = ?9 WHERE id = ?1 AND kind = 'operator' AND status = 'open'",
+          [
+            request.id,
+            decision,
+            answer.rationale,
+            ruled_by,
+            via_session,
+            performer,
+            via_state,
+            ruled_at,
+            fact_id
+          ]
+        )
+
+        if Txn.changes(txn) != 1,
+          do: raise(DB.Error, message: "operator ruling lost its open-row CAS")
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "decision_request_ruled",
           request.id,
-          decision,
-          answer.rationale,
-          ruled_by,
-          via_session,
-          performer,
-          via_state,
-          ruled_at,
-          fact_id
-        ]
-      )
+          "by=#{ruled_by} decision=#{decision} factId=#{fact_id}"
+        )
 
-      if Txn.changes(txn) != 1,
-        do: raise(DB.Error, message: "operator ruling lost its open-row CAS")
+        ruled = request_in_txn(txn, request.id)
 
-      EventLog.lifecycle_in_txn(
-        txn,
-        "decision_request_ruled",
-        request.id,
-        "by=#{ruled_by} decision=#{decision} factId=#{fact_id}"
-      )
+        case validate_operator_terminal_in_txn(txn, ruled, "detail", performer) do
+          :ok ->
+            Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], ruled)
+            {if(warning, do: Map.put(ruled, :warning, warning), else: ruled), fact_id}
 
-      ruled = request_in_txn(txn, request.id)
-
-      case validate_operator_terminal_in_txn(txn, ruled, "detail", performer) do
-        :ok ->
-          Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], ruled)
-          {ruled, fact_id}
-
-        {:error, refusal} ->
-          raise DB.Error, message: refusal.code
+          {:error, refusal} ->
+            raise DB.Error, message: refusal.code
+        end
+      else
+        {:error, refusal} -> {refusal, nil}
       end
     else
       {error("not_open", "decision request is not open"), nil}
@@ -3030,7 +3286,15 @@ defmodule Tightbeam.Escalation do
     session_valid = performer_session_valid?(request, fact_epoch)
     lifecycle_valid = request.status == "ruled" and is_nil(request.consumed_at)
     event_valid = event_count == 1
-    notification_valid = fact_epoch != :post_activation or notification_count == 1
+
+    no_recipient_notification_valid =
+      late_route_marker_count_in_txn(txn, request.id) == 1 and
+        late_ruling_recipient_unavailable_count_in_txn(txn, request.id) == 1 and
+        late_ruling_wake_sessions_in_txn(txn, request.id) == [] and notification_count == 0
+
+    notification_valid =
+      fact_epoch != :post_activation or notification_count == 1 or
+        no_recipient_notification_valid
 
     checks = %{
       "requestIdentity" =>
@@ -3263,22 +3527,21 @@ defmodule Tightbeam.Escalation do
         do: request.ruled_at + operator_decision_duration(request),
         else: nil
 
-    [[count]] =
+    rows =
       Txn.q(
         txn,
         """
-        SELECT COUNT(*) FROM wakes
-        WHERE sessionKey = ?1 AND targetRole IS NULL AND origin = 'process:tightbeam'
-          AND prompt = ?2 AND consumer = 'prompt'
-          AND conditionKind = 'escalation-ruled' AND conditionScope = ?3
-          AND conditionAfterId < ?4 AND dueAt = ?5 AND targetGate = 0
+        SELECT sessionKey FROM wakes
+        WHERE targetRole IS NULL AND origin = 'process:tightbeam'
+          AND prompt = ?1 AND consumer = 'prompt'
+          AND conditionKind = 'escalation-ruled' AND conditionScope = ?2
+          AND conditionAfterId < ?3 AND dueAt = ?4 AND targetGate = 0
           AND reresolve IS NULL AND reresolveSeed IS NULL AND reresolveRung IS NULL
-          AND ((?6 IS NULL AND creatorSessionKey IS NULL) OR creatorSessionKey = ?6)
+          AND ((?5 IS NULL AND creatorSessionKey IS NULL) OR creatorSessionKey = ?5)
           AND ((state = 'pending' AND firedAt IS NULL AND firedBy IS NULL)
                OR (state = 'fired' AND firedAt IS NOT NULL AND firedBy = 'condition'))
         """,
         [
-          request.raiser_session_key,
           prompt,
           request.id,
           request.ruling_fact_id,
@@ -3287,7 +3550,54 @@ defmodule Tightbeam.Escalation do
         ]
       )
 
-    count
+    wake_sessions = late_ruling_wake_sessions_in_txn(txn, request.id)
+
+    case {
+      late_route_marker_count_in_txn(txn, request.id),
+      late_ruling_recipient_unavailable_count_in_txn(txn, request.id),
+      wake_sessions,
+      rows
+    } do
+      {0, 0, [session_key], [[row_session]]}
+      when session_key == request.raiser_session_key and row_session == session_key ->
+        1
+
+      {1, 0, [_routed_session], [_one]} ->
+        1
+
+      {1, 1, [], []} ->
+        0
+
+      _ ->
+        0
+    end
+  end
+
+  defp late_ruling_receipt_notification_valid_in_txn(
+         txn,
+         request,
+         accountable_owner,
+         principal
+       ) do
+    owner_principals = [
+      {:session, Org.personal_session_key(accountable_owner)},
+      {:user, accountable_owner}
+    ]
+
+    case {
+      late_ruling_recipient_unavailable_count_in_txn(txn, request.id),
+      late_ruling_wake_sessions_in_txn(txn, request.id),
+      operator_notification_count_in_txn(txn, request)
+    } do
+      {0, [routed_session], 1} ->
+        principal in [{:session, routed_session} | owner_principals]
+
+      {1, [], 0} ->
+        principal in owner_principals
+
+      _ ->
+        false
+    end
   end
 
   defp performer_principal_valid?(request, :post_activation),

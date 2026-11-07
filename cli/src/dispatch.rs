@@ -575,6 +575,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Assign {
             identity,
             subject,
+            succeeds,
             target,
             idempotency_key,
             work_item_id,
@@ -590,6 +591,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 Target::User(_) => unreachable!("assign has no user target"),
             };
             let mut params = vec![string_field("subject", subject)];
+            if let Some(value) = succeeds {
+                params.push(string_field("succeedsAssignmentId", value));
+            }
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
             }
@@ -619,6 +623,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Dispatch {
             identity,
             subject,
+            succeeds,
             holder,
             work_item_id,
             effect_kind,
@@ -632,6 +637,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("subject", subject),
                 string_field("brief", brief),
             ];
+            if let Some(value) = succeeds {
+                params.push(string_field("succeedsAssignmentId", value));
+            }
             if let Some(value) = work_item_id {
                 params.push(string_field("workItemId", value));
             }
@@ -3374,6 +3382,36 @@ mod tests {
                 "sample-user",
             ]),
             r#"{"asUser":"sample-user","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem","reportToSessionKey":"agent:report s_1","deliversWorkItem":true}}"#
+        );
+        assert_eq!(
+            body(&[
+                "assign",
+                "--subject",
+                "continue",
+                "--session",
+                "agent:builder",
+                "--succeeds",
+                "asg_12345678-1234-4234-9234-123456789abc",
+                "--as",
+                "builder",
+            ]),
+            r#"{"as":"builder","verb":"assign","sessionKey":"agent:builder","params":{"subject":"continue","succeedsAssignmentId":"asg_12345678-1234-4234-9234-123456789abc"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "dispatch",
+                "--to",
+                "agent:builder",
+                "--subject",
+                "continue",
+                "--brief",
+                "Continue the work.",
+                "--succeeds",
+                "asg_12345678-1234-4234-9234-123456789abc",
+                "--as",
+                "builder",
+            ]),
+            r#"{"as":"builder","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"continue","brief":"Continue the work.","succeedsAssignmentId":"asg_12345678-1234-4234-9234-123456789abc"}}"#
         );
         assert_eq!(
             body(&[
