@@ -7276,7 +7276,6 @@ defmodule Tightbeam.Gateway do
              :condition_kind,
              :predicate,
              :after_turn,
-             :assignment_id,
              :replace_queued
            ],
            &is_nil(p[&1])
@@ -7404,10 +7403,12 @@ defmodule Tightbeam.Gateway do
     p = call.params
     assignment_id = wake_assignment_id_in_txn(txn, call)
 
-    # A no-trigger assignment on a conversational wake is a reference only.
-    # Keep it on the wake, but do not count the notification as holder activity.
+    # Immediate assignment pointers and recurring crons are references, not holder work.
+    # Keep the assignment on each wake without counting its creation as activity.
     activity_assignment_id =
-      if immediate_assignment_pointer_request?(p), do: nil, else: assignment_id
+      if immediate_assignment_pointer_request?(p) or is_binary(p[:cron]),
+        do: nil,
+        else: assignment_id
 
     wake =
       Wakes.schedule_in_txn(txn, %{
@@ -7504,7 +7505,7 @@ defmodule Tightbeam.Gateway do
 
   defp scheduled_wake_assignment_id(params) do
     if is_number(params[:after_ms]) or is_number(params[:at]) or
-         is_binary(params[:condition_kind]),
+         is_binary(params[:condition_kind]) or is_binary(params[:cron]),
        do: params[:assignment_id],
        else: nil
   end

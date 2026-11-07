@@ -826,6 +826,314 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
+  test "a linked pending cron from its current holder suppresses the 30-minute reminder", ctx do
+    interval_ms = 30 * 60 * 1_000
+    opened_at = System.system_time(:millisecond) - interval_ms - 5_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+
+    cron =
+      schedule_cron_wake!(
+        ctx.db,
+        ctx.holder.session_key,
+        ctx.holder.session_key,
+        "asg_inactive"
+      )
+
+    assert {:ok, [["asg_inactive", creator, target, nil, "cron", "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,creatorSessionKey,sessionKey,targetRole,consumer,state " <>
+                 "FROM wakes WHERE wakeId=?1",
+               [cron.wake_id]
+             )
+
+    assert creator == ctx.holder.session_key
+    assert target == ctx.holder.session_key
+
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    checked_at = System.system_time(:millisecond)
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+    assert Wakes.get(ctx.db, cron.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' " <>
+                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%' AND state='pending'"
+             )
+
+    assert pending_deadline!(ctx.db, "asg_inactive").due_at >= checked_at + interval_ms
+  end
+
+  test "an unlinked session cron does not cover the 30-minute reminder", ctx do
+    interval_ms = 30 * 60 * 1_000
+    opened_at = System.system_time(:millisecond) - interval_ms - 5_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+
+    cron = schedule_cron_wake!(ctx.db, ctx.holder.session_key, ctx.holder.session_key, nil)
+
+    assert {:ok, [[nil, creator, target, "cron", "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,creatorSessionKey,sessionKey,consumer,state " <>
+                 "FROM wakes WHERE wakeId=?1",
+               [cron.wake_id]
+             )
+
+    assert creator == ctx.holder.session_key
+    assert target == ctx.holder.session_key
+
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert Wakes.get(ctx.db, cron.wake_id).state == "pending"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' " <>
+                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%' AND state='pending'"
+             )
+  end
+
+  test "a linked cron covers only when directly addressed to its current holder", ctx do
+    interval_ms = 30 * 60 * 1_000
+    opened_at = System.system_time(:millisecond) - interval_ms - 5_000
+
+    cases = [
+      {"asg_cron_other_creator", ctx.parent.session_key, ctx.holder.session_key, false, 0},
+      {"asg_cron_other_target", ctx.holder.session_key, ctx.parent.session_key, false, 1},
+      {"asg_cron_role_target", ctx.holder.session_key, ctx.holder.session_key, true, 1}
+    ]
+
+    for {assignment_id, creator, target, role_target?, expected_reminder_count} <- cases do
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO assignments (id,subject,holderKey,openedBySession,openedAt,state) " <>
+                   "VALUES (?1,'cron coverage boundary',?2,?4,?3,'open')",
+                 [assignment_id, ctx.holder.session_key, opened_at, ctx.holder.session_key]
+               )
+
+      open_deadline!(ctx.db, assignment_id, opened_at, interval_ms)
+      cron = schedule_cron_wake!(ctx.db, creator, target, assignment_id)
+
+      if role_target? do
+        assert {:ok, _} =
+                 DB.query(ctx.db, "UPDATE wakes SET targetRole='assigned-role' WHERE wakeId=?1", [
+                   cron.wake_id
+                 ])
+      end
+
+      deadline = pending_deadline!(ctx.db, assignment_id)
+
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+      assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+      assert Wakes.get(ctx.db, cron.wake_id).state == "pending"
+
+      assert {:ok, [[^expected_reminder_count]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' " <>
+                   "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%' AND state='pending'",
+                 [assignment_id]
+               )
+    end
+  end
+
+  test "canceling a linked cron restores ordinary inactivity reminders", ctx do
+    interval_ms = 30 * 60 * 1_000
+    opened_at = System.system_time(:millisecond) - interval_ms - 5_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+
+    cron =
+      schedule_cron_wake!(
+        ctx.db,
+        ctx.holder.session_key,
+        ctx.holder.session_key,
+        "asg_inactive"
+      )
+
+    result =
+      Gateway.handlers(%{db: ctx.db})["wake"].(%{
+        origin: "session:#{ctx.holder.session_key}",
+        principal: {:session, ctx.holder.session_key},
+        session_key: ctx.holder.session_key,
+        params: %{cancel_wake_id: cron.wake_id}
+      })
+
+    assert result == %{canceled: true} or
+             match?({:accepted_in_txn, _, %{canceled: true}}, result)
+
+    assert Wakes.get(ctx.db, cron.wake_id).state == "canceled"
+
+    assert {:ok, [[canceled_at]]} =
+             DB.query(ctx.db, "SELECT canceledAt FROM wake_cancellations WHERE wakeId=?1", [
+               cron.wake_id
+             ])
+
+    assert is_integer(canceled_at)
+
+    # The cancellation starts a fresh quiet interval; make it old enough to observe
+    # the ordinary reminder without waiting 30 minutes in the test.
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Txn.q(txn, "UPDATE wakes SET canceledAt=?2 WHERE wakeId=?1", [
+                 cron.wake_id,
+                 opened_at
+               ])
+
+               Txn.q(txn, "UPDATE wake_cancellations SET canceledAt=?2 WHERE wakeId=?1", [
+                 cron.wake_id,
+                 opened_at
+               ])
+
+               :ok
+             end)
+
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' " <>
+                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%' AND state='pending'"
+             )
+  end
+
+  test "changing the holder makes its prior holder's linked cron uncovered", ctx do
+    interval_ms = 30 * 60 * 1_000
+    opened_at = System.system_time(:millisecond) - interval_ms - 5_000
+    assignment_id = "asg_cron_holder_change"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments (id,subject,holderKey,openedBySession,openedAt,state) " <>
+                 "VALUES (?1,'cron coverage holder change',?2,?4,?3,'open')",
+               [assignment_id, ctx.holder.session_key, opened_at, ctx.holder.session_key]
+             )
+
+    open_deadline!(ctx.db, assignment_id, opened_at, interval_ms)
+
+    cron =
+      schedule_cron_wake!(
+        ctx.db,
+        ctx.holder.session_key,
+        ctx.holder.session_key,
+        assignment_id
+      )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET holderKey=?2 WHERE id=?1", [
+               assignment_id,
+               ctx.parent.session_key
+             ])
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Supervision.assignment_opened_in_txn(txn, assignment_id, opened_at, interval_ms)
+             end)
+
+    assert {:ok, [[deadline_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey=?2 " <>
+                 "AND consumer='assignment_inactivity_deadline' AND state='pending' " <>
+                 "ORDER BY dueAt,wakeId LIMIT 1",
+               [assignment_id, ctx.parent.session_key]
+             )
+
+    deadline = Wakes.get(ctx.db, deadline_id)
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline_id])
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline_id))
+    assert Wakes.get(ctx.db, cron.wake_id).state == "pending"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' " <>
+                 "AND sessionKey=?2 AND obligationRef LIKE 'assignment-inactivity-episode-v1:%' " <>
+                 "AND state='pending'",
+               [assignment_id, ctx.parent.session_key]
+             )
+  end
+
+  test "the Harklight root assignment is covered once its recurring wake is linked", ctx do
+    interval_ms = 30 * 60 * 1_000
+    opened_at = System.system_time(:millisecond) - interval_ms - 5_000
+    assignment_id = "asg_589f8e3b"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments (id,subject,holderKey,openedBySession,openedAt,state) " <>
+                 "VALUES (?1,'Harklight root',?2,?4,?3,'open')",
+               [assignment_id, ctx.holder.session_key, opened_at, ctx.holder.session_key]
+             )
+
+    open_deadline!(ctx.db, assignment_id, opened_at, interval_ms)
+
+    cron =
+      schedule_cron_wake!(
+        ctx.db,
+        ctx.holder.session_key,
+        ctx.holder.session_key,
+        assignment_id,
+        "0 * * * *"
+      )
+
+    deadline = pending_deadline!(ctx.db, assignment_id)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline.wake_id])
+
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline.wake_id))
+
+    assert Wakes.get(ctx.db, cron.wake_id).assignment_id == assignment_id
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' " <>
+                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%' AND state='pending'",
+               [assignment_id]
+             )
+  end
+
   test "a model-unavailable incident suppresses holder reminders", ctx do
     opened_at = System.system_time(:millisecond) - 5_000
     open_deadline!(ctx.db, "asg_inactive", opened_at, 1_000)
@@ -1996,6 +2304,32 @@ defmodule Tightbeam.SupervisionTest do
                [consumer, assignment_id]
              )
 
+    Wakes.get(db, wake_id)
+  end
+
+  defp schedule_cron_wake!(
+         db,
+         creator_session_key,
+         target_session_key,
+         assignment_id,
+         cron \\ "0 * * * *"
+       ) do
+    params = %{prompt: "continue the linked assignment", cron: cron}
+
+    params =
+      if is_binary(assignment_id),
+        do: Map.put(params, :assignment_id, assignment_id),
+        else: params
+
+    result =
+      Gateway.handlers(%{db: db})["wake"].(%{
+        origin: "session:#{creator_session_key}",
+        principal: {:session, creator_session_key},
+        session_key: target_session_key,
+        params: params
+      })
+
+    assert %{wake_id: wake_id, state: "pending"} = result
     Wakes.get(db, wake_id)
   end
 

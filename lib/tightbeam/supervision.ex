@@ -1810,6 +1810,16 @@ defmodule Tightbeam.Supervision do
           AND w.state='pending'
           AND w.consumer NOT IN (?3,?4,'effort_probe','effort_deadline')
           AND (w.obligationRef IS NULL OR substr(w.obligationRef,1,length(?5))<>?5)
+          AND (
+            w.consumer<>'cron'
+            OR (
+              w.targetRole IS NULL
+              AND EXISTS (
+                SELECT 1 FROM assignments a
+                WHERE a.id=w.assignmentId AND a.state='open' AND a.holderKey=?2
+              )
+            )
+          )
         LIMIT 1
         """,
         [assignment_id, holder, @deadline_consumer, @climb_consumer, @episode_ref]
