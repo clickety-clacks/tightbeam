@@ -1210,9 +1210,11 @@ defmodule Tightbeam.HarklightWakes do
         {:error, "listener_fenced"}
       end
 
-    # ATTACH alone does not prove that the listener recovered: LISTEN may still
-    # fail while the origin is reconnecting. Keep the retry budget until a line
-    # is captured, which proves the stream carried an event again.
+    # Quiet conversations may reconnect without capturing another event. Only
+    # consecutive failed attachments consume the recovery budget.
+    state =
+      if result == :ok, do: %{state | attempts: Map.delete(state.attempts, handle)}, else: state
+
     {:reply, result, state}
   end
 
