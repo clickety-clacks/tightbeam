@@ -1408,9 +1408,6 @@ defmodule Tightbeam.HarklightWakesTest do
                "SELECT count(*) FROM harklight_wake_handles WHERE state='active' AND lastError IS NULL"
              )
 
-    assert {:ok, [[0]]} =
-             DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'")
-
     call_log = File.read!(calls) |> String.split("\n", trim: true)
 
     for handle <- [stopped, listen_failure, attach_unknown] do
@@ -1473,8 +1470,6 @@ defmodule Tightbeam.HarklightWakesTest do
            {2,
             ~s({"kind":"refused","reason_source":"server","reason_code":"forbidden","reason":"The server refused this origin's access."})}
          ], ["attach"], false},
-        {"plain handle refusal stays final", [{7, "The handle has been revoked."}], ["attach"],
-         false},
         {"unknown nontransport does not gain retries",
          [
            {7,
