@@ -22,6 +22,12 @@ case "$OS-$ARCH" in
     exit 1
     ;;
 esac
+TAR_METADATA_FLAGS=
+if [ "$OS" = darwin ]; then
+  # BSD tar records host metadata unless every class is disabled explicitly.
+  TAR_METADATA_FLAGS="--no-mac-metadata --no-xattrs --no-acls --no-fflags"
+fi
+
 case "$ARCH" in aarch64) NPM_CPU=arm64 ;; x86_64) NPM_CPU=x64 ;; esac
 OUT="_build/npm/tightbeam"
 rm -rf _build/npm && mkdir -p "$OUT/bin"
@@ -41,6 +47,6 @@ sed "s/\"name\": \"tightbeam\"/\"name\": \"tightbeam\",\n  \"version\": \"$VERSI
 ARTIFACT="_build/npm/tightbeam-$VERSION-$OS-$ARCH.tgz"
 TEMP_ARTIFACT="$ARTIFACT.tmp.$$"
 trap 'rm -f "$TEMP_ARTIFACT"' EXIT HUP INT TERM
-(cd _build/npm && tar czf "$(basename "$TEMP_ARTIFACT")" tightbeam)
+(cd _build/npm && tar $TAR_METADATA_FLAGS -czf "$(basename "$TEMP_ARTIFACT")" tightbeam)
 sh packaging/finalize-artifact.sh "$TEMP_ARTIFACT" "$ARTIFACT" "$VERSION"
 echo "artifact: $ARTIFACT"
