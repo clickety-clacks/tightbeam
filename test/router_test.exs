@@ -3800,7 +3800,10 @@ defmodule Tightbeam.Wire.RouterTest do
       Path.join(law, "identity/rules/row-reaction-assignment-inactivity.toml")
     )
 
-    Tightbeam.Rules.load!(law, Map.keys(ctx.handlers))
+    Tightbeam.Rules.load!(
+      law,
+      Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir}) |> Map.keys()
+    )
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
     holder = create_session(ctx.db, "process-task-holder", "flynn")
     create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
