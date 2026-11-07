@@ -1888,15 +1888,11 @@ defmodule Tightbeam.Escalation do
     )
   end
 
-  @doc "Withdraw open requests and revoke live waivers for one retired session raiser."
-  # KIND-AGNOSTIC BY DESIGN, not an oversight the tripwire's enumeration should
-  # flag: withdrawal is the one verb every arm
-  # answers to as its own lawful, judgment-free exit (gate Q3 for the agent
-  # arm's own doc above). Retirement withdraws ALL of a session's open rows —
-  # statute, effort, agent alike — on that session's behalf, exactly as if the
-  # session had called `withdraw` on each itself. Typed cannot-proceed requests
-  # remain open because retirement is neither an exact assignment disposition
-  # nor an exact release fact.
+  @doc "Withdraw open non-operator requests and revoke live waivers for one retired session raiser."
+  # Operator requests survive raiser retirement so the operator can still record
+  # a ruling; the existing late-ruling path then routes it to a live owner.
+  # Typed cannot-proceed requests also remain open because retirement is neither
+  # an exact assignment disposition nor an exact release fact.
   @spec withdraw_for_retired(DB.server(), String.t()) :: :ok
   def withdraw_for_retired(db, session_key) do
     raiser_id = "session:" <> session_key
@@ -1907,7 +1903,7 @@ defmodule Tightbeam.Escalation do
         rows =
           Txn.q(
             txn,
-            "SELECT id,context FROM decision_requests WHERE raiserSessionKey = ?1 AND status = 'open'",
+            "SELECT id,context FROM decision_requests WHERE raiserSessionKey = ?1 AND kind != 'operator' AND status = 'open'",
             [session_key]
           )
           |> Enum.reject(fn [_id, context] ->
@@ -2024,8 +2020,8 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc "Boot backstop for retirement casts lost across a crash."
-  # Same kind-agnostic exemption as `withdraw_for_retired/2` immediately above,
-  # which this only locates candidates for and then calls unchanged.
+  # Retired raisers with open operator requests remain candidates: the existing
+  # withdrawal path preserves those requests for late ruling.
   @spec recover_retired(DB.server()) :: :ok
   def recover_retired(db \\ DB) do
     {:ok, rows} =

@@ -6,8 +6,10 @@ defmodule Tightbeam.LateRulingHandoffTest do
     ConnRegistry,
     DB,
     Escalation,
+    Gateway,
     Model,
     Org,
+    Supervision,
     Wakes,
     WorkItems
   }
@@ -80,7 +82,7 @@ defmodule Tightbeam.LateRulingHandoffTest do
     }
   end
 
-  test "late ruling survives revocation, successor handoff, and consumption", ctx do
+  test "dr_07bdef13 survives revocation, late ruling, successor handoff, and consumption", ctx do
     source_item = work_item(ctx.db, ctx.opener.session_key, "source item")
 
     source =
@@ -116,7 +118,42 @@ defmodule Tightbeam.LateRulingHandoffTest do
     assert revoked.state == "closed"
     assert revoked.outcome == "revoked"
 
-    Org.retire(ctx.db, ctx.opener.session_key, "user:flynn", 1_000)
+    supervision = :"late_ruling_supervision_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Supervision,
+       db: ctx.db,
+       handlers: %{},
+       prod_limit: 3,
+       name: supervision,
+       recover: false,
+       sweep_ms: nil}
+    )
+
+    retire =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        wake_tick_ms: 1_000,
+        on_retired: fn session_key -> Supervision.notify_retired(supervision, session_key) end
+      })["retire"]
+
+    assert %{retired_session_keys: [retired_session_key]} =
+             retire.(%{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: ctx.raiser.session_key,
+               params: %{}
+             })
+
+    assert retired_session_key == ctx.raiser.session_key
+    assert Org.get(ctx.db, ctx.raiser.session_key).state == "retired"
+    :sys.get_state(supervision)
+
+    refute Enum.any?(Tightbeam.EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "supervision_evaluate_failed" and
+               event.subject == ctx.raiser.session_key
+           end)
 
     assert {:ok, [["open"]]} =
              DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [
@@ -150,8 +187,8 @@ defmodule Tightbeam.LateRulingHandoffTest do
                [@incident_request_id]
              )
 
-    assert session_key == ctx.ancestor.session_key
-    refute session_key == ctx.opener.session_key
+    assert session_key == ctx.opener.session_key
+    refute session_key == ctx.ancestor.session_key
     refute session_key == ctx.raiser.session_key
 
     assert {:ok, [[1]]} =
