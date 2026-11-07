@@ -17,7 +17,7 @@ defmodule Tightbeam.ConditionFacts do
   alias Tightbeam.DB.Txn
 
   @reserved_kinds ~w(
-    quota-recovered escalation-ruled operator-ruling-late-routed
+    quota-recovered escalation-ruled operator-ruling-late-routed decision-request-filed
     assignment-successor-created assignment-landed assignment-reviewed assignment-blocked
     user-alerted user-alert-cleared credential-present
     harness-auth-dead harness-auth-restored
@@ -85,6 +85,8 @@ defmodule Tightbeam.ConditionFacts do
     ON condition_facts (kind, scope, id);
   CREATE INDEX IF NOT EXISTS condition_facts_owner_match
     ON condition_facts (ownerUserId, kind, scope, id);
+  CREATE UNIQUE INDEX IF NOT EXISTS condition_facts_decision_request_filed
+    ON condition_facts (scope) WHERE kind = 'decision-request-filed';
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
@@ -264,6 +266,43 @@ defmodule Tightbeam.ConditionFacts do
 
       _ ->
         {:error, %{code: "invalid", message: "invalid observed merge payload or scope"}}
+    end
+  end
+
+  defp consequence_admission(txn, %{kind: "decision-request-filed"} = input) do
+    payload = input[:payload]
+
+    case Txn.q(
+           txn,
+           "SELECT kind, raiserId, ownerUserId, raisedAt, expecterSessionKey, expecterUserId FROM decision_requests WHERE id=?1",
+           [input[:scope]]
+         ) do
+      [[kind, raiser, owner, raised_at, asked_session, asked_user]] when is_map(payload) ->
+        addressed =
+          cond do
+            kind == "agent" and is_binary(asked_session) -> "session:" <> asked_session
+            kind == "agent" and is_binary(asked_user) -> "user:" <> asked_user
+            true -> "user:" <> owner
+          end
+
+        if input[:origin] == "process:tightbeam" and input[:owner_user_id] == owner and
+             payload == %{
+               "requestId" => input[:scope],
+               "kind" => kind,
+               "cause" => input[:cause],
+               "creatingPrincipal" => input[:creating_principal],
+               "raiserPrincipal" => raiser,
+               "addressedPrincipal" => addressed,
+               "raisedAt" => raised_at
+             } and is_binary(input[:creating_principal]) and
+             is_binary(input[:cause]) do
+          :ok
+        else
+          {:error, %{code: "invalid", message: "filing fact must match its request"}}
+        end
+
+      _ ->
+        {:error, %{code: "invalid", message: "filing fact requires a committed request"}}
     end
   end
 

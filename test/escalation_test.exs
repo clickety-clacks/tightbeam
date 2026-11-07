@@ -58,6 +58,74 @@ defmodule Tightbeam.EscalationTest do
     %{db: db, scheduler: scheduler, raiser: raiser}
   end
 
+  test "filing records one attributable fact and operator and statute openings do not relay to Main",
+       ctx do
+    operator_call = operator_call(ctx.raiser, %{question: "Choose the next step?"})
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER reject_filing_fact BEFORE INSERT ON condition_facts
+      WHEN NEW.kind='decision-request-filed'
+      BEGIN SELECT RAISE(ABORT, 'filing fact unavailable'); END
+      """)
+
+    assert_raise MatchError, fn -> Escalation.operator_ask(ctx.db, operator_call) end
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM decision_requests")
+    :ok = DB.execute(ctx.db, "DROP TRIGGER reject_filing_fact")
+
+    operator = Escalation.operator_ask(ctx.db, operator_call)
+    assert operator.id == Escalation.operator_ask(ctx.db, operator_call).id
+
+    {:decision_pending, statute_id} =
+      open(ctx, call(ctx.raiser, %{kind: "completion"}), statute())
+
+    {:decision_pending, ^statute_id} =
+      open(ctx, call(ctx.raiser, %{kind: "completion"}), statute())
+
+    for {request_id, cause} <- [{operator.id, "operator-ask"}, {statute_id, "statute-escalation"}] do
+      assert {:ok,
+              [["decision-request-filed", ^request_id, "process:tightbeam", "flynn", encoded]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT kind,scope,origin,ownerUserId,payload FROM condition_facts WHERE kind='decision-request-filed' AND scope=?1",
+                 [request_id]
+               )
+
+      assert %{
+               "requestId" => ^request_id,
+               "cause" => ^cause,
+               "addressedPrincipal" => "user:flynn",
+               "creatingPrincipal" => "agent:raiser"
+             } =
+               JSON.decode!(encoded)
+    end
+
+    assert notification_wakes(ctx) == []
+
+    asked = session(ctx.db, "asked", "flynn")
+
+    agent =
+      Escalation.ask(
+        ctx.db,
+        agent_call(ctx.raiser, %{question: "Can you advise?"}, %{session_key: asked.session_key})
+      )
+
+    assert {:ok, [[encoded]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM condition_facts WHERE kind='decision-request-filed' AND scope=?1",
+               [agent.id]
+             )
+
+    assert %{"requestId" => request_id, "cause" => "ask", "addressedPrincipal" => addressed} =
+             JSON.decode!(encoded)
+
+    assert request_id == agent.id
+    assert addressed == "session:" <> asked.session_key
+    assert [%{session_key: asked_session}] = notification_wakes(ctx)
+    assert asked_session == asked.session_key
+  end
+
   test "resolve exposes all four shapes without mutating, and consume wins once", ctx do
     call = call(ctx.raiser, %{assignment_id: "a1", kind: "completion"})
     statute = statute()

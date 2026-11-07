@@ -788,96 +788,92 @@ defmodule Tightbeam.Escalation do
         deadline_at = now + decision_deadline_ms()
 
         {:ok, request} =
-          DB.transaction(db, fn txn ->
-            Txn.q(
-              txn,
-              """
-              INSERT INTO decision_requests
-                (id, raiserId, raiserSessionKey, ownerUserId, assignmentId, raisedAt,
-                 deadlineAt, statuteName, actionKey, question, options, context, status,
-                 rowSchemaRevision)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open', 2)
-              ON CONFLICT DO NOTHING
-              """,
-              [
-                request_id,
-                raiser_id,
-                raiser_session_key,
-                owner_user_id,
-                assignment_id,
-                now,
-                deadline_at,
-                statute_name,
-                action_key,
-                question,
-                options,
-                context
-              ]
-            )
-
-            inserted? = Txn.changes(txn) == 1
-
-            if inserted? and is_binary(raiser_session_key) do
-              Tightbeam.Supervision.activity_in_txn(
-                txn,
-                assignment_id,
-                raiser_session_key,
-                now
-              )
-            end
-
-            [row] =
+          DB.transaction_then(
+            db,
+            fn txn ->
               Txn.q(
                 txn,
-                "SELECT #{@request_columns} FROM decision_requests WHERE kind = 'statute' AND raiserId = ?1 AND statuteName = ?2 AND actionKey = ?3 AND status = 'open' ORDER BY rowid DESC LIMIT 1",
-                [raiser_id, statute_name, action_key]
+                """
+                INSERT INTO decision_requests
+                  (id, raiserId, raiserSessionKey, ownerUserId, assignmentId, raisedAt,
+                   deadlineAt, statuteName, actionKey, question, options, context, status,
+                   rowSchemaRevision)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open', 2)
+                ON CONFLICT DO NOTHING
+                """,
+                [
+                  request_id,
+                  raiser_id,
+                  raiser_session_key,
+                  owner_user_id,
+                  assignment_id,
+                  now,
+                  deadline_at,
+                  statute_name,
+                  action_key,
+                  question,
+                  options,
+                  context
+                ]
               )
 
-            request = request_from_row(row)
+              inserted? = Txn.changes(txn) == 1
 
-            request =
-              if inserted?,
-                do: publish_decision_transition_in_txn(txn, nil, request),
-                else: request
+              if inserted? and is_binary(raiser_session_key) do
+                Tightbeam.Supervision.activity_in_txn(
+                  txn,
+                  assignment_id,
+                  raiser_session_key,
+                  now
+                )
+              end
 
-            if inserted? do
-              EventLog.lifecycle_in_txn(
-                txn,
-                "decision_request_opened",
-                request.id,
-                "raiser=#{raiser_id} statute=#{statute_name} owner=#{owner_user_id} assignment=#{assignment_id || "nil"}"
-              )
+              [row] =
+                Txn.q(
+                  txn,
+                  "SELECT #{@request_columns} FROM decision_requests WHERE kind = 'statute' AND raiserId = ?1 AND statuteName = ?2 AND actionKey = ?3 AND status = 'open' ORDER BY rowid DESC LIMIT 1",
+                  [raiser_id, statute_name, action_key]
+                )
 
-              # Transactional outbox: the owner notification is a durable wake
-              # armed with the request itself. Only the winning insert arms one;
-              # a conflict or replay arms none.
-              Wakes.schedule_in_txn(txn, %{
-                session_key: Org.personal_session_key(request.owner_user_id),
-                owner_user_id: request.owner_user_id,
-                origin: "process:tightbeam",
-                prompt: owner_notification(request),
-                due_at: now,
-                target_gate: 0,
-                obligation_ref: Wakes.decision_request_notice_ref(request.id)
-              })
+              request = request_from_row(row)
+
+              request =
+                if inserted?,
+                  do: publish_decision_transition_in_txn(txn, nil, request),
+                  else: request
+
+              if inserted? do
+                file_filing_fact_in_txn(txn, request, call.origin, "statute-escalation")
+
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  "decision_request_opened",
+                  request.id,
+                  "raiser=#{raiser_id} statute=#{statute_name} owner=#{owner_user_id} assignment=#{assignment_id || "nil"}"
+                )
+              end
+
+              # Observability only (see @summon_kind). Ordering does not depend on this
+              # row landing, or on its position — the single writer stamped its own
+              # sequence before this transaction was opened. It stays inside the
+              # transaction so the record matches what actually happened, not because
+              # anything reads it back.
+              if is_binary(episode_key) do
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  @summon_kind,
+                  request.id,
+                  "statute=#{statute_name} class=#{episode_key} opened=#{inserted?}"
+                )
+              end
+
+              request
+            end,
+            fn txn, request ->
+              Wakes.row_commit_in_txn(txn, [])
+              request
             end
-
-            # Observability only (see @summon_kind). Ordering does not depend on this
-            # row landing, or on its position — the single writer stamped its own
-            # sequence before this transaction was opened. It stays inside the
-            # transaction so the record matches what actually happened, not because
-            # anything reads it back.
-            if is_binary(episode_key) do
-              EventLog.lifecycle_in_txn(
-                txn,
-                @summon_kind,
-                request.id,
-                "statute=#{statute_name} class=#{episode_key} opened=#{inserted?}"
-              )
-            end
-
-            request
-          end)
+          )
 
         {:decision_pending, request.id}
     end
@@ -1272,19 +1268,24 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  # THE ONLY `decision_requests` INSERT that is not the substrate's own doing.
-  # It arms its owner notification inside the same transaction, exactly as
-  # `escalate/4` and the effort rail do (escalation-delivery-v1 proof 10).
+  # Agent requests retain their addressed notification in the filing transaction.
   defp file_agent_request(db, input) do
-    case DB.transaction(db, fn txn ->
-           case file_agent_request_in_txn(txn, input) do
-             %{request: _request} = filed ->
-               filed
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             case file_agent_request_in_txn(txn, input) do
+               %{request: _request} = filed ->
+                 filed
 
-             error ->
-               error
+               error ->
+                 error
+             end
+           end,
+           fn txn, result ->
+             Wakes.row_commit_in_txn(txn, [])
+             result
            end
-         end) do
+         ) do
       {:ok, %{request: request}} -> request
       {:ok, error} -> error
       {:error, reason} -> raise "agent request transaction failed: #{inspect(reason)}"
@@ -1345,6 +1346,13 @@ defmodule Tightbeam.Escalation do
         request_id,
         "asker=session:#{resolved_input.asker_session_key} askedOf=#{resolved_input.asked.session_key} " <>
           "role=#{resolved_input.asked_of_role || "nil"} assignment=#{resolved_input.assignment_id || "nil"}"
+      )
+
+      file_filing_fact_in_txn(
+        txn,
+        request_in_txn(txn, request_id),
+        "session:" <> resolved_input.asker_session_key,
+        Map.get(input, :verb, "ask")
       )
 
       wake =
@@ -2635,6 +2643,8 @@ defmodule Tightbeam.Escalation do
 
     request = request_in_txn(txn, request_id)
 
+    file_filing_fact_in_txn(txn, request, raiser_id, "operator-ask")
+
     EventLog.lifecycle_in_txn(
       txn,
       "decision_request_opened",
@@ -2651,19 +2661,46 @@ defmodule Tightbeam.Escalation do
       )
     end
 
-    # The opening notice is an ordinary stored wake associated with this open
-    # request. Terminal transitions retract it while preserving any delivered
-    # transport history and the separate ruling event report.
-    Wakes.schedule_in_txn(txn, %{
-      session_key: Org.personal_session_key(owner_user_id),
-      origin: "process:tightbeam",
-      prompt: operator_notification(request),
-      due_at: raised_at,
-      target_gate: 0,
-      obligation_ref: Wakes.decision_request_notice_ref(request.id)
-    })
-
     request
+  end
+
+  defp file_filing_fact_in_txn(txn, request, creator, cause) do
+    addressed =
+      case request.kind do
+        "agent" ->
+          if request.expecter_session_key,
+            do: "session:" <> request.expecter_session_key,
+            else: "user:" <> request.expecter_user_id
+
+        _ ->
+          "user:" <> request.owner_user_id
+      end
+
+    payload = %{
+      "requestId" => request.id,
+      "kind" => request.kind,
+      "cause" => cause,
+      "creatingPrincipal" => creator,
+      "raiserPrincipal" => request.raiser_id,
+      "addressedPrincipal" => addressed,
+      "raisedAt" => request.raised_at
+    }
+
+    case ConditionFacts.file_in_txn(txn, %{
+           kind: "decision-request-filed",
+           origin: "process:tightbeam",
+           scope: request.id,
+           owner_user_id: request.owner_user_id,
+           cause: cause,
+           creating_principal: creator,
+           payload: payload
+         }) do
+      %{fact_id: _} ->
+        :ok
+
+      {:error, reason} ->
+        raise DB.Error, message: "decision request filing fact refused: #{inspect(reason)}"
+    end
   end
 
   defp operator_rule_in_txn(txn, call, request_id, answer, opts) do
@@ -4550,19 +4587,6 @@ defmodule Tightbeam.Escalation do
   defp fetch_string!(map, key) do
     value = Map.get(map, key) || Map.get(map, Atom.to_string(key))
     if is_binary(value), do: value, else: raise(ArgumentError, "#{key} is required")
-  end
-
-  defp owner_notification(request) do
-    options = if request.options, do: "\nOptions: #{JSON.encode!(request.options)}", else: ""
-
-    "Decision #{request.id} pending on #{request.statute_name}.\n" <>
-      request.question <>
-      options <>
-      "\nContext: #{JSON.encode!(request.context)}"
-  end
-
-  defp operator_notification(request) do
-    "Decision #{request.id}: #{request.question}\nOptions: #{JSON.encode!(request.options)}"
   end
 
   defp changed_decision_transition(
