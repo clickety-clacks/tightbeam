@@ -88,6 +88,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     caller = wire_session(ctx.db, "wire-commit-owner", owner, "product-owner")
     holder = wire_session(ctx.db, "wire-commit-holder", owner, "coder", caller.session_key)
     stranger_owner = "wire-foreign-owner"
+
     assert %{user_id: ^stranger_owner, is_admin: false} =
              Devices.add_user(ctx.db, stranger_owner, false)
 
@@ -197,6 +198,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     owner = ctx.device.user_id
     source = wire_session(ctx.db, "wire-health-source", owner, "coder")
     stranger_owner = "wire-foreign-owner"
+
     assert %{user_id: ^stranger_owner, is_admin: false} =
              Devices.add_user(ctx.db, stranger_owner, false)
 
@@ -337,6 +339,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     owner = ctx.device.user_id
     source = wire_session(ctx.db, "wire-promotion-source", owner, "coder")
     stranger_owner = "wire-foreign-owner"
+
     assert %{user_id: ^stranger_owner, is_admin: false} =
              Devices.add_user(ctx.db, stranger_owner, false)
 
