@@ -163,6 +163,73 @@ defmodule Tightbeam.ArtifactCarrierTest do
     assert row.created_by_process == "process:ci"
   end
 
+  test "process-attribution rebuild preserves populated artifact rows", ctx do
+    first = record_over_wire(ctx, %{"kind" => "report", "title" => "Migration row one"})
+
+    second =
+      record_over_wire(ctx, %{
+        "kind" => "doc",
+        "title" => "Migration row two",
+        "description" => "Archived predecessor row",
+        "contentSha256" => String.duplicate("a", 64)
+      })
+
+    {:ok, :ok} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.DB.Txn.q(
+          txn,
+          "UPDATE artifacts SET state='archived',home='archive/row-two.md' WHERE artifactId=?1",
+          [second["artifactId"]]
+        )
+
+        :ok
+      end)
+
+    predecessor_columns =
+      "artifactId,kind,title,description,createdBySession,workItemId,producedByAssignmentId," <>
+        "parentSession,originPath,contentSha256,recordedMessageId,recordedTurnEvidence,state," <>
+        "home,createdAt,updatedAt,originHost,originWorkspace"
+
+    before =
+      rows(
+        ctx.db,
+        "SELECT #{predecessor_columns} FROM artifacts ORDER BY artifactId"
+      )
+
+    assert length(before) == 2
+    assert Enum.map(before, &Enum.at(&1, 4)) == [ctx.coder.session_key, ctx.coder.session_key]
+    rebuild_artifacts_to_process_predecessor!(ctx.db, predecessor_columns)
+
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert rows(ctx.db, "SELECT COUNT(*) FROM artifacts") == [[2]]
+
+    assert rows(
+             ctx.db,
+             "SELECT #{predecessor_columns} FROM artifacts ORDER BY artifactId"
+           ) == before
+
+    expected_attribution =
+      [first["artifactId"], second["artifactId"]]
+      |> Enum.sort()
+      |> Enum.map(&[&1, ctx.coder.session_key, nil])
+
+    assert rows(
+             ctx.db,
+             "SELECT artifactId,createdBySession,createdByProcess FROM artifacts ORDER BY artifactId"
+           ) == expected_attribution
+
+    process_result =
+      record_as_process_over_org_wire(ctx, "ci", %{
+        "kind" => "report",
+        "title" => "Recorded after migration"
+      })
+
+    assert process_result["createdBySession"] == nil
+    assert process_result["createdByProcess"] == "process:ci"
+
+    assert rows(ctx.db, "PRAGMA foreign_key_check") == []
+  end
+
   ## The three evidence classes, each over the real path
 
   test "a hook observation binds the turn it saw, as tool-call-observed", ctx do
@@ -573,6 +640,68 @@ defmodule Tightbeam.ArtifactCarrierTest do
     JSON.decode!(conn.resp_body)["result"]
   end
 
+  defp rebuild_artifacts_to_process_predecessor!(db, columns) do
+    {:ok, :ok} =
+      DB.migration_transaction(
+        db,
+        :test_artifact_process_predecessor,
+        ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+        ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+        fn txn ->
+          triggers =
+            Tightbeam.DB.Txn.q(
+              txn,
+              "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='artifacts' ORDER BY name"
+            )
+
+          Enum.each(triggers, fn [name, _sql] ->
+            :ok = Tightbeam.DB.Txn.exec(txn, "DROP TRIGGER #{name}")
+          end)
+
+          :ok =
+            Tightbeam.DB.Txn.exec(
+              txn,
+              "ALTER TABLE artifacts RENAME TO artifacts_process_attribution_test_source"
+            )
+
+          :ok =
+            Tightbeam.DB.Txn.exec(
+              txn,
+              "CREATE TABLE artifacts (#{Artifacts.legacy_current_table_definition()})"
+            )
+
+          :ok =
+            Tightbeam.DB.Txn.exec(
+              txn,
+              "INSERT INTO artifacts (#{columns}) SELECT #{columns} " <>
+                "FROM artifacts_process_attribution_test_source"
+            )
+
+          :ok = Tightbeam.DB.Txn.exec(txn, "DROP TABLE artifacts_process_attribution_test_source")
+          :ok = Artifacts.ensure_indexes_in_txn(txn)
+
+          Enum.each(triggers, fn [_name, sql] ->
+            :ok = Tightbeam.DB.Txn.exec(txn, sql)
+          end)
+
+          Tightbeam.DB.Txn.q(
+            txn,
+            "UPDATE schema_stamp SET shape=?1 WHERE shape=?2",
+            [
+              "closed-assignment-cannot-proceed-reconciliation-v1-015",
+              "artifact-process-attribution-v1-015"
+            ]
+          )
+
+          if Tightbeam.DB.Txn.changes(txn) != 1 do
+            raise "test fixture could not restore exact artifact-process predecessor stamp"
+          end
+
+          :ok
+        end
+      )
+  end
+
   defp observe_over_wire(ctx) do
     conn(:post, "/agent/tool-call-observed", "{}")
     |> Plug.Conn.put_req_header("authorization", "Bearer #{ctx.coder.cli_token}")
@@ -583,6 +712,11 @@ defmodule Tightbeam.ArtifactCarrierTest do
     |> Plug.Conn.put_req_header("content-type", "application/json")
     |> Router.call(ctx.router_opts)
     |> Map.fetch!(:status)
+  end
+
+  defp rows(db, sql) do
+    {:ok, result} = DB.query(db, sql)
+    result
   end
 
   defp enqueue_turn(ctx) do
