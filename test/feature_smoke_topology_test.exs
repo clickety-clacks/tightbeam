@@ -47,7 +47,9 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
           {"support/fixtures/feature_smoke_topology.toml", "topology.toml"},
           {"support/fixtures/feature_smoke_engineering.toml", "engineering.toml"},
           {"support/fixtures/feature_smoke_verification.toml", "verification.toml"},
-          {"../priv/kungfu/agentic-engineering/rules/delivery.toml", "delivery.toml"}
+          {"../priv/kungfu/agentic-engineering/rules/delivery.toml", "delivery.toml"},
+          {"../priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml",
+           "row-reaction-assignment-inactivity.toml"}
         ] do
       File.cp!(Path.expand(source, __DIR__), Path.join(base, "identity/rules/#{name}"))
     end

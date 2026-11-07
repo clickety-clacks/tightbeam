@@ -132,6 +132,18 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       Path.join(base, "identity/rules/delivery.toml")
     )
 
+    File.cp!(
+      "priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml",
+      Path.join(base, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
+    for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
+      File.cp!(
+        Path.join("priv/kungfu/agentic-engineering/rules", name),
+        Path.join([base, "identity/rules", name])
+      )
+    end
+
     Rules.load!(base, Map.keys(handlers))
     # Real wake scheduling and atomic carrier admission; the local doorbell
     # does not execute a provider or synthesize an assistant turn.

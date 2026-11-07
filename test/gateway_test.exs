@@ -27,11 +27,11 @@ defmodule Tightbeam.GatewayTest do
       expected ++
         ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow)
 
-    expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle)
+    expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 
     expected =
       expected ++
-        ~w(kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe)
+        ~w(kungfu-setup sentinel-demand sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe)
 
     expected = expected ++ ~w(memento-set mementos)
 
@@ -2489,6 +2489,16 @@ defmodule Tightbeam.GatewayTest do
           |> Map.put(:effort_checkins_enabled, true)
           |> Map.put(:effort_checkin_horizon_ms, 123)
         )
+
+      File.mkdir_p!(Path.join(base_dir, "identity/rules"))
+      name = "row-reaction-assignment-inactivity.toml"
+
+      File.cp!(
+        Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
+        Path.join(base_dir, "identity/rules/#{name}")
+      )
+
+      Tightbeam.Rules.load!(base_dir, Map.keys(handlers))
 
       common = %{
         origin: "user:flynn",
@@ -11129,6 +11139,13 @@ defmodule Tightbeam.GatewayTest do
                  purpose: purpose,
                  phrases: phrases,
                  root_archetype: "orchestrator"
+               },
+               %{
+                 name: "sentinels",
+                 purpose:
+                   "Share generic event subscription tools and a read-only Matrix event watcher.",
+                 phrases: [],
+                 root_archetype: "default"
                }
              ]
            } = list.(%{origin: "agent:k1", params: %{}})

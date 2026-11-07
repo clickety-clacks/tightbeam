@@ -78,6 +78,7 @@ defmodule Tightbeam.WorkStateTest do
     linked = assign(ctx, "holder", "linked", item.id)
     unlinked = assign(ctx, "holder", "unlinked")
     attest(ctx, linked.id, "progress")
+    item = WorkState.item_detail(ctx.db, item.id).workItem
 
     assignment_snapshot = WorkState.list(ctx.db, %{state: "all"})
     assignment_detail = WorkState.detail(ctx.db, linked.id)

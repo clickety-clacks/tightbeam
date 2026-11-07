@@ -165,6 +165,7 @@ defmodule Tightbeam.Supervision do
           end
 
         effective_at = max(activity_start, max(last_activity, at))
+        mode = if effective_at > last_activity, do: :replace, else: :activity
 
         deadline =
           schedule_deadline_in_txn(
@@ -175,7 +176,7 @@ defmodule Tightbeam.Supervision do
             effective_at,
             interval_ms,
             nil,
-            :activity
+            mode
           )
 
         # Stamp the replacement at the activity itself: cancellation also

@@ -54,8 +54,8 @@ defmodule Tightbeam.AssignmentsTest do
       Path.join(System.tmp_dir!(), "assignment-rails-#{System.unique_integer([:positive])}")
 
     on_exit(fn -> File.rm_rf!(rule_root) end)
-    Tightbeam.TerminalReactionFixture.load!(rule_root, Map.keys(handlers))
-    %{db: db, holder: holder, other: other, handlers: handlers}
+    law = Tightbeam.TerminalReactionFixture.load!(rule_root, Map.keys(handlers))
+    %{db: db, holder: holder, other: other, handlers: handlers, law: law}
   end
 
   test "upgrading assignments adds no parent links to existing rows", ctx do
@@ -187,10 +187,70 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "gateway opens and retires with supervision reminders off", ctx do
+    File.cp!(
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      ]),
+      Path.join(ctx.law, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
+    Rules.load!(ctx.law, Map.keys(ctx.handlers))
     handlers = Gateway.handlers(%{db: ctx.db, supervision_interval_ms: :off, wake_tick_ms: 101})
 
     assignment = handlers["assign"].(assign_call({:session, "holder"}, "off interval"))
     assert assignment.id
+
+    item = create_work_item(ctx, "Off interval linked item")
+
+    assert {:ok, [[routing_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [
+               routing_id,
+               System.system_time(:millisecond)
+             ])
+
+    linked =
+      handlers["assign"].(assign_call({:session, "holder"}, "off interval linked", nil, item.id))
+
+    assert linked.workItemId == item.id
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'",
+               [linked.id]
+             )
+
+    assert %{state: "closed"} =
+             handlers["revoke-assignment"].(revoke_call({:user, "flynn"}, linked.id))
+
+    assert {:ok, [[slate_id]]} =
+             DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert is_binary(slate_id)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [
+               slate_id,
+               System.system_time(:millisecond)
+             ])
+
+    reopened =
+      handlers["reopen-assignment"].(
+        reopen_call({:user, "flynn"}, linked.id, "continue without reminders")
+      )
+
+    assert reopened.state == "open"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'",
+               [linked.id]
+             )
 
     retired =
       handlers["retire"].(%{
@@ -2836,6 +2896,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "a standing cannot-proceed block suppresses reminders and still releases on its fact",
        ctx do
+    load_inactivity_policy!(ctx)
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
     blocked =
@@ -3899,6 +3960,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a pending holder reminder does not block opener revocation after reparenting", ctx do
+    load_inactivity_policy!(ctx)
     main = Org.personal_session_key("flynn")
     session(ctx.db, main, "flynn")
     session(ctx.db, "parent-a", "flynn", %{spawned_by: main})
@@ -5123,6 +5185,15 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a fired owner routing bracket permits only the first rumination deferral", ctx do
+    File.cp!(
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      ]),
+      Path.join(ctx.law, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
+    Rules.load!(ctx.law, Map.keys(ctx.handlers))
     work_item = create_work_item(ctx, "Fired routing bracket")
     caller = "holder"
 
@@ -7809,5 +7880,12 @@ defmodule Tightbeam.AssignmentsTest do
     Enum.filter(rows, fn [_seq, _session_key, _status, wake_id] ->
       MapSet.member?(wake_ids, wake_id)
     end)
+  end
+
+  defp load_inactivity_policy!(ctx) do
+    name = "row-reaction-assignment-inactivity.toml"
+    source = Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name])
+    File.cp!(source, Path.join(ctx.law, "identity/rules/#{name}"))
+    Rules.load!(ctx.law, Map.keys(ctx.handlers))
   end
 end

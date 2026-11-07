@@ -244,6 +244,15 @@ defmodule Tightbeam.Harness do
     @production_registry ++ @dormant_registry ++ if(@fixture_harness?, do: [Fixture], else: [])
   end
 
+  @doc "Whether the registered harness accepts inline image attachments in turn prompts."
+  @spec inline_attachments?(atom() | binary()) :: boolean()
+  def inline_attachments?(harness) do
+    Enum.any?(known(), fn module ->
+      module in [Tightbeam.Harness.Claude, Tightbeam.Harness.Codex] and
+        harness in [module, module.id(), module.wire_name()]
+    end)
+  end
+
   @doc "The configured default harness module, or the first registry entry."
   @spec default() :: module()
   def default do
