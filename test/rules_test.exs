@@ -1017,6 +1017,80 @@ defmodule Tightbeam.RulesTest do
              )
   end
 
+  test "a new qualifying-review refusal is reconstructable from the denial listener", ctx do
+    holder = session(ctx.db, "trace-producer", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "trace-reviewer", "other", archetype: "reviewer")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+
+    %{attest: review_attest} =
+      verdict(ctx, reviewer.session_key, review.id, "changes-requested")
+
+    submitted_refs = [
+      %{repo: "sirius:/srv/tightbeam", commit: String.duplicate("a", 40)}
+    ]
+
+    put_raw(ctx, review_gate_rule())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: producer.id,
+        kind: "completion",
+        commit_refs: submitted_refs
+      })
+
+    assert {:error, %{rule_trace: trace}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert trace == %{
+             final_decision: "deny",
+             resolver_arity: 3,
+             submitted_commit_refs: submitted_refs,
+             selected_review_assignment_id: review.id,
+             selected_review_attest_id: review_attest.id,
+             selected_review_holder_key: reviewer.session_key,
+             selected_verdict_kind: "changes-requested",
+             resolved_fact: []
+           }
+
+    assert [%{rule_trace: persisted}] = EventLog.rail_denials(ctx.db, 0, 10)
+
+    assert persisted == %{
+             "final_decision" => "deny",
+             "resolver_arity" => 3,
+             "submitted_commit_refs" => [
+               %{"repo" => "sirius:/srv/tightbeam", "commit" => String.duplicate("a", 40)}
+             ],
+             "selected_review_assignment_id" => review.id,
+             "selected_review_attest_id" => review_attest.id,
+             "selected_review_holder_key" => reviewer.session_key,
+             "selected_verdict_kind" => "changes-requested",
+             "resolved_fact" => []
+           }
+
+    injected = "credential-do-not-retain"
+
+    malformed_completion =
+      put_in(completion, [:params, :commit_refs], [
+        %{
+          repo: "sirius:/srv/tightbeam",
+          commit: String.duplicate("b", 40),
+          token: injected
+        }
+      ])
+
+    assert {:error, %{rule_trace: malformed_trace} = refusal} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, malformed_completion)
+
+    assert malformed_trace.submitted_commit_refs == %{status: "invalid"}
+    refute inspect(refusal) =~ injected
+
+    assert [_, %{rule_trace: persisted_malformed}] = EventLog.rail_denials(ctx.db, 0, 10)
+    assert persisted_malformed["submitted_commit_refs"] == %{"status" => "invalid"}
+    refute JSON.encode!(persisted_malformed) =~ injected
+  end
+
   test "artifact kinds fact resolves holder-recorded kinds only (A6)", ctx do
     holder = session(ctx.db, "artifact-holder", "sample-user", archetype: "coder")
     other = session(ctx.db, "artifact-other", "other")
