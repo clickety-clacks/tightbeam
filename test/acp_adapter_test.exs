@@ -4161,7 +4161,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute first_id == second_id
   end
 
-  test "ACP receive order assigns turn ordinals before grouping reply chunks" do
+  test "ACP chunks without messageId receive ordered events and one stable logical id" do
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-turn-events-#{System.unique_integer([:positive])}")
 
@@ -4220,11 +4220,8 @@ defmodule Tightbeam.Acp.AdapterTest do
       )
     end
 
-    reply_message_id = "provider-message-1"
-
     send_update.(%{
       "sessionUpdate" => "agent_message_chunk",
-      "messageId" => reply_message_id,
       "content" => %{"type" => "text", "text" => "A"}
     })
 
@@ -4239,7 +4236,6 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     send_update.(%{
       "sessionUpdate" => "agent_message_chunk",
-      "messageId" => reply_message_id,
       "content" => %{"type" => "text", "text" => "B"}
     })
 
@@ -4252,7 +4248,6 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     send_update.(%{
       "sessionUpdate" => "agent_message_chunk",
-      "messageId" => reply_message_id,
       "content" => %{"type" => "text", "text" => "C"}
     })
 
@@ -4260,7 +4255,6 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     send_update.(%{
       "sessionUpdate" => "agent_message_chunk",
-      "messageId" => reply_message_id,
       "content" => image_content
     })
 
@@ -4268,7 +4262,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert [
              %{
-               message_id: ^reply_message_id,
+               message_id: nil,
                logical_message_id: logical_message_id,
                chunks: ["C", "B", "A"]
              }

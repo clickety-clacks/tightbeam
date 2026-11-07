@@ -1444,9 +1444,9 @@ defmodule Tightbeam.Acp.Adapter do
         state = remember_logical_assistant_message(state, sid, message_id, logical_message_id)
 
         state =
-          case {message_id, logical_message_id, state.tool_turns[sid], update["content"]} do
-            {provider_id, logical_id, %{session_key: session_key, turn_seq: turn_seq}, content}
-            when is_binary(provider_id) and is_binary(logical_id) and is_map(content) ->
+          case {logical_message_id, state.tool_turns[sid], update["content"]} do
+            {logical_id, %{session_key: session_key, turn_seq: turn_seq}, content}
+            when is_binary(logical_id) and is_map(content) ->
               case Tightbeam.TurnEvents.append_assistant_segment(
                      state.db,
                      session_key,
@@ -1465,19 +1465,12 @@ defmodule Tightbeam.Acp.Adapter do
                   raise "assistant turn-event persistence failed: #{inspect(reason)}"
               end
 
-            {nil, _logical_id, %{session_key: session_key, turn_seq: turn_seq}, _content} ->
-              Logger.warning(
-                "assistant chunk omitted from ordered history without ACP messageId session=#{session_key} turn=#{turn_seq}"
-              )
-
-              state
-
             _ ->
               state
           end
 
         state =
-          if is_binary(text) do
+          if is_map(update["content"]) do
             state
             |> update_in(
               [Access.key(:chunks), sid],
@@ -1719,10 +1712,10 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
-  # ACP's public `messageId` is the only boundary authority. Claude and Codex
-  # stamp every chunk from one assistant message with the same stable id. A
-  # changed id starts a new message record; an absent id preserves the legacy
-  # one-message accumulator instead of guessing from content or tool traffic.
+  # ACP's public `messageId` is the boundary authority when present. If it is
+  # absent, preserve the legacy one-message accumulator and assign that group a
+  # generated public id at its first chunk; do not infer boundaries from content
+  # or tool traffic.
   defp assistant_message_id(%{"messageId" => id}) when is_binary(id) and id != "", do: id
   defp assistant_message_id(_update), do: nil
 
@@ -1741,14 +1734,31 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  defp logical_assistant_message_id(turn, groups, nil) when is_map(turn) do
+    stored_id = Map.get(Map.get(turn, :message_ids, %{}), :anonymous)
+
+    case stored_id do
+      logical_id when is_binary(logical_id) ->
+        logical_id
+
+      _ ->
+        case Enum.find(groups, &is_nil(&1.message_id)) do
+          %{logical_message_id: logical_id} when is_binary(logical_id) -> logical_id
+          _ -> "s_" <> Tightbeam.Id.uuid4()
+        end
+    end
+  end
+
   defp logical_assistant_message_id(_turn, _groups, _message_id), do: nil
 
   defp remember_logical_assistant_message(state, sid, message_id, logical_message_id)
-       when is_binary(message_id) and is_binary(logical_message_id) do
+       when (is_binary(message_id) or is_nil(message_id)) and is_binary(logical_message_id) do
     case state.tool_turns[sid] do
       turn when is_map(turn) ->
+        key = if is_binary(message_id), do: message_id, else: :anonymous
+
         message_ids =
-          Map.update(Map.get(turn, :message_ids, %{}), message_id, logical_message_id, & &1)
+          Map.update(Map.get(turn, :message_ids, %{}), key, logical_message_id, & &1)
 
         put_in(state.tool_turns[sid], Map.put(turn, :message_ids, message_ids))
 
@@ -1765,25 +1775,64 @@ defmodule Tightbeam.Acp.Adapter do
     case Enum.find_index(groups, &(&1.message_id == message_id)) do
       nil ->
         [
-          %{message_id: message_id, logical_message_id: logical_message_id, chunks: [text]}
+          %{
+            message_id: message_id,
+            logical_message_id: logical_message_id,
+            chunks: prepend_text_chunk([], text)
+          }
           | groups
         ]
 
       index ->
-        List.update_at(groups, index, fn group -> %{group | chunks: [text | group.chunks]} end)
+        List.update_at(groups, index, fn group ->
+          %{group | chunks: prepend_text_chunk(group.chunks, text)}
+        end)
     end
   end
 
   defp accumulate_assistant_chunk(
          [%{message_id: nil, chunks: chunks} = group | rest],
          nil,
+         logical_message_id,
+         text
+       )
+       when is_binary(logical_message_id),
+       do: [
+         %{
+           group
+           | logical_message_id: logical_message_id,
+             chunks: prepend_text_chunk(chunks, text)
+         }
+         | rest
+       ]
+
+  defp accumulate_assistant_chunk(groups, nil, logical_message_id, text)
+       when is_binary(logical_message_id),
+       do: [
+         %{
+           message_id: nil,
+           logical_message_id: logical_message_id,
+           chunks: prepend_text_chunk([], text)
+         }
+         | groups
+       ]
+
+  defp accumulate_assistant_chunk(
+         [%{message_id: nil, chunks: chunks} = group | rest],
+         nil,
          _logical_message_id,
          text
-       ),
+       )
+       when is_binary(text),
        do: [%{group | chunks: [text | chunks]} | rest]
 
-  defp accumulate_assistant_chunk(groups, nil, _logical_message_id, text),
+  defp accumulate_assistant_chunk(groups, nil, _logical_message_id, text) when is_binary(text),
     do: [%{message_id: nil, logical_message_id: nil, chunks: [text]} | groups]
+
+  defp accumulate_assistant_chunk(groups, nil, _logical_message_id, _text), do: groups
+
+  defp prepend_text_chunk(chunks, text) when is_binary(text), do: [text | chunks]
+  defp prepend_text_chunk(chunks, _text), do: chunks
 
   defp assistant_messages([]), do: [%{message_id: nil, logical_message_id: nil, text: ""}]
 
