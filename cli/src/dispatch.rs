@@ -4801,7 +4801,7 @@ mod tests {
     }
 
     #[test]
-    fn cron_wake_preserves_schedule_and_rejects_other_triggers() {
+    fn cron_wake_preserves_assignment_link_and_rejects_other_triggers() {
         assert_eq!(
             body(&[
                 "wake",
@@ -4816,13 +4816,26 @@ mod tests {
             ]),
             r#"{"verb":"wake","sessionKey":"recipient","params":{"prompt":"check","cron":"*/30 * * * *","class":"status-query"}}"#
         );
+        assert_eq!(
+            body(&[
+                "wake",
+                "--session",
+                "recipient",
+                "--prompt",
+                "check",
+                "--cron",
+                "*/30 * * * *",
+                "--assignment",
+                "asg_recurring"
+            ]),
+            r#"{"verb":"wake","sessionKey":"recipient","params":{"prompt":"check","assignmentId":"asg_recurring","cron":"*/30 * * * *"}}"#
+        );
         for flag in [
             "--after",
             "--at",
             "--when-fact",
             "--predicate",
             "--after-turn",
-            "--assignment",
             "--replace-queued",
             "--fallback-after",
         ] {

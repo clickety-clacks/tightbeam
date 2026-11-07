@@ -95,9 +95,10 @@ defmodule Tightbeam.CronWakeTest do
   end
 
   test "R1.1 wire and public wake handler accept cron and reject mixed triggers", %{db: db} do
-    assert Tightbeam.Wire.Router.atomize_params_for_test("wake", %{"cron" => "0 * * * *"}) == %{
-             cron: "0 * * * *"
-           }
+    assert Tightbeam.Wire.Router.atomize_params_for_test("wake", %{
+             "cron" => "0 * * * *",
+             "assignmentId" => "asg_recurring"
+           }) == %{cron: "0 * * * *", assignment_id: "asg_recurring"}
 
     handler = Gateway.handlers(%{db: db})["wake"]
 
@@ -105,11 +106,20 @@ defmodule Tightbeam.CronWakeTest do
       origin: "process:clock",
       principal: {:process, "clock"},
       session_key: "recipient",
-      params: %{prompt: "check progress", cron: "0 * * * *"}
+      params: %{
+        prompt: "check progress",
+        cron: "0 * * * *",
+        assignment_id: "asg_recurring"
+      }
     }
 
     assert %{wake_id: id, state: "pending", class: "fyi"} = handler.(call)
-    assert Wakes.get(db, id).due_at > System.system_time(:millisecond)
+    wake = Wakes.get(db, id)
+    assert wake.due_at > System.system_time(:millisecond)
+    assert wake.assignment_id == "asg_recurring"
+
+    assert {:ok, [["0 * * * *"]]} =
+             DB.query(db, "SELECT schedule FROM cron_wake_schedules WHERE wakeId=?1", [id])
 
     for params <- [
           %{cron: "bad"},
@@ -117,7 +127,8 @@ defmodule Tightbeam.CronWakeTest do
           %{cron: "0 * * * *", after_ms: 1},
           %{cron: "0 * * * *", condition_kind: "done"},
           %{cron: "0 * * * *", after_turn: true},
-          %{cron: "0 * * * *", predicate: %{}}
+          %{cron: "0 * * * *", predicate: %{}},
+          %{cron: "0 * * * *", assignment_id: "asg_recurring", replace_queued: true}
         ] do
       assert %{code: "invalid"} = handler.(%{call | params: Map.merge(call.params, params)})
     end

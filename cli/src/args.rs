@@ -800,7 +800,7 @@ TARGET (for commands that take one — pass exactly one):
 
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
-       [--after 30s|5m|2h] [--at <epochMs>] [--cron "<schedule>"] [--assignment <id> --replace-queued]
+       [--after 30s|5m|2h] [--at <epochMs>] [--cron "<schedule>"] [--assignment <id>] [--replace-queued]
        [--class fyi|status-query|input-needed|blocker|algedonic]
       Condition wake:
         tightbeam wake (--session <key> | --role <name> | --user <id>)
@@ -816,6 +816,7 @@ COMMANDS:
           --after-turn --prompt "<continuation>"
       --cron uses five numeric fields in gateway local time, such as "*/30 * * * *".
       It repeats until cancel-wake. Lists, ranges and steps are supported.
+      --assignment links a recurring wake to that assignment.
       Send a prompt to the selected target. Immediate = a direct message; with --after or
       --at = a scheduled wake that fires later. A wake ALWAYS carries a prompt —
       there is no content-free ping. This is how you DM or nudge another
@@ -2118,7 +2119,6 @@ fn parse_with_optional_catalog(
                     "when-scope",
                     "predicate",
                     "after-turn",
-                    "assignment",
                     "replace-queued",
                 ]
                 .iter()

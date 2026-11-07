@@ -4494,7 +4494,6 @@ defmodule Tightbeam.Wire.Router do
                :at,
                :condition_kind,
                :condition_scope,
-               :cron,
                :predicate,
                :replace_queued
              ],
