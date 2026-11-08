@@ -16,6 +16,29 @@ defmodule Tightbeam.HarnessProcess.Recovery do
     end
   end
 
+  @doc false
+  def settle_process_snapshot_absence(db, launch_id, adapter_key, requester) do
+    with {:ok, row, fence} <- observe(db, launch_id, adapter_key),
+         {:ok, snapshot} <- HarnessProcess.process_snapshot(row) do
+      case recorded_process_absent?(row, snapshot) do
+        :identity_missing ->
+          {:error, :process_identity_missing}
+
+        false ->
+          {:error, :process_snapshot_present}
+
+        true ->
+          commit(
+            db,
+            row,
+            fence,
+            {:process_snapshot_absent, row.os_pid, row.process_group_id},
+            requester
+          )
+      end
+    end
+  end
+
   defp observe(db, launch_id, adapter_key) do
     case DB.transaction(db, fn txn ->
            with {:ok, row} <- HarnessProcess.fetch_in_txn(txn, launch_id),
@@ -31,6 +54,32 @@ defmodule Tightbeam.HarnessProcess.Recovery do
   end
 
   defp commit(db, observed, fence, proof, requester) do
+    {event_kind, event_detail} =
+      case proof do
+        {:process_snapshot_absent, pid, process_group_id} ->
+          {
+            "harness_launch_process_absent",
+            %{
+              launch_id: observed.launch_id,
+              pid: pid,
+              process_group_id: process_group_id,
+              observation: "complete_process_snapshot_absent",
+              requester: requester
+            }
+          }
+
+        _ ->
+          {
+            "harness_launch_settled",
+            %{
+              launch_id: observed.launch_id,
+              adapter_key: observed.adapter_key,
+              proof: proof,
+              requester: requester
+            }
+          }
+      end
+
     result =
       DB.transaction(db, fn txn ->
         with {:ok, row} <- HarnessProcess.fetch_in_txn(txn, observed.launch_id),
@@ -51,14 +100,9 @@ defmodule Tightbeam.HarnessProcess.Recovery do
           :ok =
             EventLog.lifecycle_in_txn(
               txn,
-              "harness_launch_settled",
+              event_kind,
               row.adapter_key,
-              inspect(%{
-                launch_id: row.launch_id,
-                adapter_key: row.adapter_key,
-                proof: proof,
-                requester: requester
-              })
+              inspect(event_detail)
             )
 
           {:settled, row, proof}
@@ -127,6 +171,16 @@ defmodule Tightbeam.HarnessProcess.Recovery do
       [_ | _] -> {:error, :successor_exists}
     end
   end
+
+  defp recorded_process_absent?(
+         %{os_pid: pid, process_group_id: process_group_id},
+         %{pids: pids, pgids: pgids}
+       )
+       when is_integer(pid) and pid > 0 and is_integer(process_group_id) and process_group_id > 0 do
+    not MapSet.member?(pids, pid) and not MapSet.member?(pgids, process_group_id)
+  end
+
+  defp recorded_process_absent?(_row, _snapshot), do: :identity_missing
 
   # Each fence row carries a generation written once at creation, so a
   # removal and reinsertion is a different instance even when every other
