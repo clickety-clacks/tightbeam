@@ -789,6 +789,8 @@ defmodule Tightbeam.Escalation do
 
         {:ok, request} =
           DB.transaction(db, fn txn ->
+            :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, owner_user_id)
+
             Txn.q(
               txn,
               """
@@ -1287,6 +1289,7 @@ defmodule Tightbeam.Escalation do
          end) do
       {:ok, %{request: request}} -> request
       {:ok, error} -> error
+      {:error, %Tightbeam.UserAdmin.RemovedUserError{} = removed} -> raise removed
       {:error, reason} -> raise "agent request transaction failed: #{inspect(reason)}"
     end
   end
@@ -1307,6 +1310,9 @@ defmodule Tightbeam.Escalation do
     with {:ok, about} <-
            asked_about_in_txn(txn, input.assignment_id, input.asker_session_key) do
       resolved_input = Map.put(input, :assignment_id, about)
+      :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, resolved_input.owner_user_id)
+      # An open ask is an obligation on its expecter (spec section 3).
+      :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, resolved_input.asked.owner_user_id)
 
       Txn.q(
         txn,
@@ -2602,6 +2608,8 @@ defmodule Tightbeam.Escalation do
 
       Wakes.clear_decision_request_notice_in_txn(txn, ask.supersedes)
     end
+
+    :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, owner_user_id)
 
     Txn.q(
       txn,

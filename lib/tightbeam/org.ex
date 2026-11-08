@@ -419,6 +419,7 @@ defmodule Tightbeam.Org do
       Map.get(input, :session_key) || custom_session_key(Map.fetch!(input, :owner_user_id))
 
     validate_topology_creation!(txn, session_key, input)
+    :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, Map.fetch!(input, :owner_user_id))
 
     now = now()
     cli_token = session_token()

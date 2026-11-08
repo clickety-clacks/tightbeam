@@ -61,17 +61,30 @@ defmodule Tightbeam.Assets do
       created_at: System.system_time(:millisecond)
     }
 
-    {:ok, []} =
-      DB.query(
-        db,
-        """
-        INSERT INTO assets (assetId, ownerUserId, mimeType, size, filename, createdAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        """,
-        [asset_id, owner_user_id, mime_type, size, filename, row.created_at]
-      )
+    # The owner check and the row share one transaction (admin user removal R5).
+    # A refused write leaves no row, and the bytes written above are removed.
+    inserted =
+      DB.transaction(db, fn txn ->
+        :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, owner_user_id)
 
-    row
+        DB.Txn.q(
+          txn,
+          """
+          INSERT INTO assets (assetId, ownerUserId, mimeType, size, filename, createdAt)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+          """,
+          [asset_id, owner_user_id, mime_type, size, filename, row.created_at]
+        )
+      end)
+
+    case inserted do
+      {:ok, _} ->
+        row
+
+      {:error, error} ->
+        File.rm(path)
+        raise error
+    end
   end
 
   @doc "Return an asset metadata row by id, or nil when it is unknown."

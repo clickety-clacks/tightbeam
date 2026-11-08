@@ -151,6 +151,7 @@ defmodule Tightbeam.Toplines do
     end
 
     [[history_seq]] = Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) FROM causal_events")
+    :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, Map.fetch!(attrs, :owner_user_id))
 
     Txn.q(
       txn,
@@ -259,6 +260,7 @@ defmodule Tightbeam.Toplines do
             :new ->
               now = mutation_time(call)
               topline_id = id("tl_")
+              :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, caller.user)
 
               Txn.q(
                 txn,
@@ -470,6 +472,7 @@ defmodule Tightbeam.Toplines do
                 true ->
                   now = mutation_time(call)
                   membership_id = id("tlm_")
+                  :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, topline.owner_user_id)
 
                   Txn.q(
                     txn,

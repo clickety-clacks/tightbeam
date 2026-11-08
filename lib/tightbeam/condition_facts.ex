@@ -260,6 +260,7 @@ defmodule Tightbeam.ConditionFacts do
     ts = System.system_time(:millisecond)
     scope = Map.get(input, :scope)
     owner_user_id = Map.get(input, :owner_user_id) || owner_for_origin_in_txn(txn, origin)
+    :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, owner_user_id)
 
     if kind == "user-alerted" and is_binary(scope) do
       :ok =

@@ -52,6 +52,7 @@ defmodule Tightbeam.Roles do
          :ok <- role_absent(txn, name),
          :ok <- active_binding(txn, bound_session_key) do
       now = now()
+      :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, owner_user_id)
 
       Txn.q(
         txn,

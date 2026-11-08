@@ -135,6 +135,7 @@ defmodule Tightbeam.WorkItems do
                 created_in_turn_seq = running_turn_seq(txn, created_by_session)
                 priority = call.params[:priority] || default_priority_in_txn(txn)
                 created_at = now()
+                :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, owner)
 
                 Txn.q(
                   txn,
@@ -400,6 +401,7 @@ defmodule Tightbeam.WorkItems do
       priority = params[:priority] || default_priority_in_txn(txn)
       is_bug = Map.get(params, :is_bug, false)
       created_at = now()
+      :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, item_owner)
 
       Txn.q(
         txn,

@@ -1545,6 +1545,9 @@ defmodule Tightbeam.Wakes do
     owner_user_id =
       Map.get(input, :owner_user_id) || authenticated_wake_owner_in_txn(txn, input.session_key)
 
+    :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, owner_user_id)
+    :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, Map.get(input, :target_user_id))
+
     condition_after_id =
       if is_binary(condition_kind) do
         [[cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")

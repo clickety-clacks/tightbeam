@@ -929,7 +929,7 @@ defmodule Tightbeam.Wire.Router do
          {:ok, upload, conn} <- read_upload(conn) do
       data = File.read!(upload.path)
 
-      row =
+      try do
         Assets.put(
           db(conn),
           deps(conn).base_dir,
@@ -938,8 +938,13 @@ defmodule Tightbeam.Wire.Router do
           upload.filename,
           data
         )
-
-      json(conn, 200, %{asset_id: row.asset_id, mime_type: row.mime_type, size: row.size})
+      rescue
+        removed in UserAdmin.RemovedUserError ->
+          error(conn, 403, "user_removed", Exception.message(removed))
+      else
+        row ->
+          json(conn, 200, %{asset_id: row.asset_id, mime_type: row.mime_type, size: row.size})
+      end
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
@@ -4208,7 +4213,13 @@ defmodule Tightbeam.Wire.Router do
   defp error_status("forbidden"), do: 403
 
   defp error_status(code)
-       when code in ["not_holder", "not_authorized", "process_denied", "principal_required"],
+       when code in [
+              "not_holder",
+              "not_authorized",
+              "process_denied",
+              "principal_required",
+              "user_removed"
+            ],
        do: 403
 
   defp error_status("not_found"), do: 404

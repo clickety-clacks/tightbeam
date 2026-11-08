@@ -3,7 +3,8 @@ defmodule Tightbeam.UserAdminTest do
   import Plug.Test
   import Plug.Conn
 
-  alias Tightbeam.{Assets, DB, Devices, Dispatch, Gateway, Model, Org, Roles, Schema, Toplines}
+  alias Tightbeam.{Assets, DB, Devices, Dispatch, Gateway, Model, Org, Roles, Rules, Schema}
+  alias Tightbeam.Toplines
   alias Tightbeam.UserAdmin
   alias Tightbeam.SchemaShapeRuntimeFixture
   alias Tightbeam.Wire.{OperatorSession, Router}
@@ -220,6 +221,128 @@ defmodule Tightbeam.UserAdminTest do
 
       assert response.status == 200
       assert_received {:call, %{verb: "work-item-list"}}
+    end
+  end
+
+  describe "R5 writes racing a removal" do
+    test "a removal committed after the router's checks refuses the HTTP write, no row", ctx do
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+      on_exit(fn ->
+        Rules.load!(Path.join(System.tmp_dir!(), "missing-user-admin-rules"), [])
+      end)
+
+      for {verb, params, table} <- [
+            {"work-item-create", %{title: "Race"}, "work_items"},
+            {"topline-create", %{title: "Race", idempotencyKey: "race"}, "toplines"}
+          ] do
+        user = "racer-" <> verb
+        assert {:ok, _} = run(ctx, "add-user", "admin", %{user_id: user, is_admin: false})
+
+        # The router admits the active user; the removal then commits before the
+        # real writer's transaction runs.
+        handlers =
+          Map.update!(ctx.handlers, verb, fn writer ->
+            fn call ->
+              assert %{user: %{"state" => "removed"}} =
+                       UserAdmin.remove(ctx.db, %{
+                         principal: {:user, "admin"},
+                         origin: "user:admin",
+                         params: %{user_id: user}
+                       })
+
+              writer.(call)
+            end
+          end)
+
+        opts = Keyword.put(router_opts(ctx), :handlers, handlers)
+        response = dispatch_cli(opts, %{verb: verb, asUser: user, params: params})
+
+        assert response.status == 403
+        assert %{"code" => "user_removed"} = JSON.decode!(response.resp_body)["error"]
+
+        for owned <- [table, "wakes"] do
+          sql = "SELECT COUNT(*) FROM #{owned} WHERE ownerUserId = ?1"
+          assert {:ok, [[0]]} = DB.query(ctx.db, sql, [user])
+        end
+      end
+    end
+
+    test "the shared guard rolls back its whole transaction and maps to user_removed", ctx do
+      assert {:ok, _} = run(ctx, "remove-user", "admin", %{user_id: "guest"})
+
+      assert {:error, %UserAdmin.RemovedUserError{user_id: "guest"} = error} =
+               DB.transaction(ctx.db, fn txn ->
+                 DB.Txn.q(
+                   txn,
+                   "INSERT INTO condition_facts (ts, kind, scope, origin) " <>
+                     "VALUES (1, 'guard-probe', 'guard', 'process:test')"
+                 )
+
+                 UserAdmin.ensure_active_in_txn!(txn, "guest")
+               end)
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE kind = 'guard-probe'")
+
+      # Unknown and absent users keep their existing behavior; active users pass.
+      for user <- ["nobody", nil, "admin"] do
+        assert {:ok, :ok} =
+                 DB.transaction(ctx.db, &UserAdmin.ensure_active_in_txn!(&1, user))
+      end
+
+      assert %{code: "user_removed"} = UserAdmin.refusal_for_exception(error)
+
+      assert %{code: "user_removed"} =
+               UserAdmin.refusal_for_exception(%MatchError{term: {:error, error}})
+
+      assert UserAdmin.refusal_for_exception(%RuntimeError{message: "other"}) == nil
+    end
+
+    test "each direct owner writer refuses a removed owner and leaves no row", ctx do
+      assert {:ok, _} = run(ctx, "remove-user", "admin", %{user_id: "guest"})
+
+      assert_raise UserAdmin.RemovedUserError, fn ->
+        Org.create(ctx.db, %{
+          session_key: "agent:guest-race:app",
+          display_name: "Race",
+          owner_user_id: "guest",
+          origin: "user:guest",
+          archetype: "default",
+          host: "testhost",
+          harness: "claude",
+          provider: "anthropic",
+          model: Model.new("fable")
+        })
+      end
+
+      assert_raise UserAdmin.RemovedUserError, fn ->
+        Roles.create!(ctx.db, "guest-role", "guest", nil)
+      end
+
+      assert_raise UserAdmin.RemovedUserError, fn ->
+        Toplines.create(ctx.db, %{
+          verb: "topline-create",
+          principal: {:user, "guest"},
+          origin: "user:guest",
+          session_key: nil,
+          params: %{title: "Race", idempotency_key: "race"},
+          now: 100
+        })
+      end
+
+      assert_raise UserAdmin.RemovedUserError, fn ->
+        Assets.put(ctx.db, ctx.base_dir, "guest", "image/png", "race.png", "synthetic-bytes")
+      end
+
+      for table <- ~w(sessions roles toplines assets) do
+        assert {:ok, [[0]]} =
+                 DB.query(ctx.db, "SELECT COUNT(*) FROM #{table} WHERE ownerUserId = 'guest'")
+      end
+
+      # The refused upload's bytes are removed with its row.
+      pattern = Path.join([ctx.base_dir, "assets", "**"])
+      assert Enum.filter(Path.wildcard(pattern), &File.regular?/1) == []
     end
   end
 

@@ -110,6 +110,42 @@ defmodule Tightbeam.UserAdmin do
 
   def removed_in_txn?(%Txn{}, _user_id), do: false
 
+  defmodule RemovedUserError do
+    @moduledoc """
+    Raised inside a writer's transaction when the write would name a removed
+    user as owner or target. Raising rolls the transaction back; `Dispatch`
+    turns it into the `user_removed` refusal.
+    """
+    defexception [:user_id, :diagnostic]
+
+    @impl true
+    def message(%{user_id: user_id}), do: Tightbeam.UserAdmin.removed_refusal(user_id).message
+  end
+
+  @doc """
+  R5 write guard. Call it in the same transaction as, and before, any insert
+  that names `user_id` as owner or target. A removal that commits before this
+  check makes the writer refuse; one that commits after finds the new row and
+  refuses removal with `user_owns_rows`. A nil or unknown user passes, leaving
+  existing unknown-user behavior unchanged.
+  """
+  @spec ensure_active_in_txn!(Txn.t(), String.t() | nil) :: :ok
+  def ensure_active_in_txn!(%Txn{} = txn, user_id) do
+    if removed_in_txn?(txn, user_id), do: raise(RemovedUserError, user_id: user_id), else: :ok
+  end
+
+  @doc """
+  The `user_removed` refusal for a raised `RemovedUserError`, including one
+  surfaced by a writer's `{:ok, _} = DB.transaction(...)` match; else nil.
+  """
+  @spec refusal_for_exception(Exception.t()) :: map() | nil
+  def refusal_for_exception(%RemovedUserError{user_id: user_id}), do: removed_refusal(user_id)
+
+  def refusal_for_exception(%MatchError{term: {:error, %RemovedUserError{user_id: user_id}}}),
+    do: removed_refusal(user_id)
+
+  def refusal_for_exception(_exception), do: nil
+
   @doc "The fixed refusal for any admission or write naming a removed user."
   @spec removed_refusal(String.t()) :: %{code: String.t(), message: String.t()}
   def removed_refusal(user_id),
