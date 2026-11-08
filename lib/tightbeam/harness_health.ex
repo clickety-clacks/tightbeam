@@ -1133,7 +1133,7 @@ defmodule Tightbeam.HarnessHealth do
 
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
-        post_commit(result)
+        after_harness_health_commit(result)
     end
   end
 
@@ -1180,7 +1180,7 @@ defmodule Tightbeam.HarnessHealth do
           Wakes.record_health_redelivery_source_in_txn(txn, seq, failure_class)
         end
 
-        post_commit(result)
+        after_harness_health_commit(result)
 
       [] ->
         nil
@@ -1254,6 +1254,7 @@ defmodule Tightbeam.HarnessHealth do
   def observe(db \\ DB, input) do
     input = normalize_failure!(input)
     result = transaction!(db, &observe_in_txn(&1, input))
+    Tightbeam.HarnessHealth.RecoveryScheduler.refresh()
 
     case post_commit(result, Map.get(input, :conn_registry, Tightbeam.ConnRegistry)) do
       nil -> :ok
@@ -1280,14 +1281,21 @@ defmodule Tightbeam.HarnessHealth do
           {:resolved | :duplicate, map()} | :already_healthy
   def resolve(db \\ DB, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
-    transaction!(db, &resolve_in_txn(&1, input))
+    result = transaction!(db, &resolve_in_txn(&1, input))
+    Tightbeam.HarnessHealth.RecoveryScheduler.refresh()
+    result
   end
 
   @doc "The class-specific resolution mutation inside a caller-owned transaction."
   @spec resolve_in_txn(Txn.t(), map()) ::
           {:resolved | :duplicate, map()} | :already_healthy
   def resolve_in_txn(%Txn{} = txn, input) do
-    input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
+    input =
+      input
+      |> Map.put(:evidence_kind, "normal-turn-success")
+      |> Map.put(:cycle_release, false)
+      |> normalize_common!()
+
     validate_session_membership!(txn, input)
 
     # A normal turn may finish while another session opens the shared
@@ -1299,6 +1307,72 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
+  @doc false
+  @spec resolve_recovery_cycle_in_txn(Txn.t(), String.t(), String.t(), integer()) ::
+          {:resolved, map(), String.t()} | :already_healthy
+  def resolve_recovery_cycle_in_txn(%Txn{} = txn, incident_id, cycle_id, observed_at)
+      when is_binary(incident_id) and is_binary(cycle_id) and is_integer(observed_at) do
+    correlation_id = "harness-health-check-cycle:#{incident_id}:#{cycle_id}"
+
+    case Txn.q(
+           txn,
+           "SELECT harness,host,failureClass,state FROM harness_health_incidents WHERE id=?1",
+           [incident_id]
+         ) do
+      [[harness, host, failure_class, "open"]] ->
+        input = %{
+          correlation_id: correlation_id,
+          harness: harness,
+          host: host,
+          failure_class: failure_class,
+          evidence_kind: "normal-turn-success",
+          session_key: nil,
+          assignment_id: nil,
+          observed_at: observed_at,
+          cause: "all constituent routes succeeded in recovery cycle #{cycle_id}",
+          principal: "process:tightbeam/harness-health-recovery",
+          cycle_release: true
+        }
+
+        if recovery_cycle_succeeded_in_txn?(txn, incident_id, cycle_id) do
+          case observation_by_correlation(txn, correlation_id) do
+            nil ->
+              case resolve_open(txn, input) do
+                {:resolved, incident} -> {:resolved, incident, correlation_id}
+                _ -> :already_healthy
+              end
+
+            _ ->
+              :already_healthy
+          end
+        else
+          :already_healthy
+        end
+
+      _ ->
+        :already_healthy
+    end
+  end
+
+  defp recovery_cycle_succeeded_in_txn?(txn, incident_id, cycle_id) do
+    case Tightbeam.RowReactions.Snapshot.harness_health_hold(txn, incident_id) do
+      %{"state" => "open", "routesComplete" => true, "routes" => routes}
+      when is_list(routes) and routes != [] ->
+        Enum.all?(routes, fn route ->
+          route_key = Tightbeam.HarnessHealth.RecoveryCheck.route_key(route)
+
+          Txn.q(
+            txn,
+            "SELECT outcome FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND routeKey=?3",
+            [incident_id, cycle_id, route_key]
+          ) == [["succeeded"]]
+        end)
+
+      _ ->
+        false
+    end
+  end
+
   @doc "Admit an evidence-bearing provider observation for the open-ended other class."
   @spec observe_other(DB.server(), map()) ::
           {:opened | :attached | :duplicate, map()} | {:error, map()}
@@ -1306,6 +1380,7 @@ defmodule Tightbeam.HarnessHealth do
     try do
       input = normalize_other!(input)
       result = transaction!(db, &observe_other_in_txn(&1, input))
+      Tightbeam.HarnessHealth.RecoveryScheduler.refresh()
 
       case post_commit(result, Map.get(input, :conn_registry, Tightbeam.ConnRegistry), db) do
         nil -> :ok
@@ -2298,6 +2373,13 @@ defmodule Tightbeam.HarnessHealth do
       lifecycle_detail(input, opening_observation_id)
     )
 
+    Tightbeam.RowReactions.harness_health_hold_in_txn(
+      txn,
+      incident_id,
+      "opened",
+      input.observed_at
+    )
+
     notice_publication = incident_notice_in_txn(txn, incident_id, input, recipient)
 
     {:opened,
@@ -2345,6 +2427,7 @@ defmodule Tightbeam.HarnessHealth do
         :already_healthy
 
       incident ->
+        reaction_before = Tightbeam.RowReactions.Snapshot.harness_health_hold(txn, incident.id)
         observation_id = insert_observation(txn, input, incident.id, "normal-turn-success")
         attach_observation_references(txn, incident.id, observation_id)
 
@@ -2370,7 +2453,22 @@ defmodule Tightbeam.HarnessHealth do
         if Txn.changes(txn) != 1, do: raise("harness health incident resolution race")
 
         if input.failure_class == "rate-limit-dead" do
-          HarnessProcess.complete_park_in_txn(txn, adapter_key(input.harness, input.host))
+          key = adapter_key(input.harness, input.host)
+
+          if input[:cycle_release] do
+            complete_recovery_park_if_unneeded_in_txn(txn, incident.id, input, key)
+          else
+            HarnessProcess.complete_park_in_txn(txn, key)
+          end
+        end
+
+        if input[:cycle_release] == true do
+          Wakes.mark_cycle_release_health_intents_in_txn(
+            txn,
+            incident.id,
+            input.failure_class,
+            input.correlation_id
+          )
         end
 
         EventLog.lifecycle_in_txn(
@@ -2378,6 +2476,15 @@ defmodule Tightbeam.HarnessHealth do
           "harness_health_incident_resolved",
           incident.id,
           lifecycle_detail(input, observation_id)
+        )
+
+        Tightbeam.RowReactions.harness_health_hold_in_txn(
+          txn,
+          incident.id,
+          "resolved",
+          input.observed_at,
+          reaction_before,
+          input[:cycle_release] == true
         )
 
         {:resolved,
@@ -2388,6 +2495,32 @@ defmodule Tightbeam.HarnessHealth do
            resolutionObservationId: observation_id
          })}
     end
+  end
+
+  defp complete_recovery_park_if_unneeded_in_txn(txn, incident_id, input, key) do
+    adapter_key = Atom.to_string(elem(key, 0)) <> ":shared@" <> elem(key, 2)
+
+    [[standing_reasons]] =
+      Txn.q(
+        txn,
+        """
+        SELECT
+          (SELECT COUNT(*) FROM harness_health_incidents
+            WHERE id != ?1 AND harness=?2 AND host=?3
+              AND failureClass='rate-limit-dead' AND state='open') +
+          (SELECT COUNT(*) FROM harness_processes
+            WHERE adapterKey=?4
+              AND state IN ('launching','running','park_requested','kill_failed')
+              AND resolvedAt IS NULL)
+        """,
+        [incident_id, input.harness, input.host, adapter_key]
+      )
+
+    if standing_reasons == 0 do
+      HarnessProcess.complete_park_in_txn(txn, key)
+    end
+
+    :ok
   end
 
   defp distinct_sessions(txn, input) do
@@ -3286,6 +3419,7 @@ defmodule Tightbeam.HarnessHealth do
 
         input = Map.put(input, :description_digest, opening.description_digest)
         recovery_observation = Map.put(input, :recovery_condition, nil)
+        reaction_before = Tightbeam.RowReactions.Snapshot.harness_health_hold(txn, incident.id)
 
         observation_id =
           insert_observation(txn, recovery_observation, incident.id, "normal-turn-success")
@@ -3321,6 +3455,14 @@ defmodule Tightbeam.HarnessHealth do
           "harness_health_incident_resolved",
           incident.id,
           lifecycle_detail(input, observation_id)
+        )
+
+        Tightbeam.RowReactions.harness_health_hold_in_txn(
+          txn,
+          incident.id,
+          "resolved",
+          input.observed_at,
+          reaction_before
         )
 
         {:resolved,
@@ -4382,6 +4524,18 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   defp post_commit(_result, _registry, _db), do: nil
+
+  defp after_harness_health_commit({status, _detail} = result)
+       when status in [:opened, :attached] do
+    publication = post_commit(result)
+
+    fn ->
+      Tightbeam.HarnessHealth.RecoveryScheduler.refresh()
+      if is_function(publication, 0), do: publication.()
+    end
+  end
+
+  defp after_harness_health_commit(_result), do: nil
 
   defp strip_publication({status, detail}),
     do: {status, Map.delete(detail, :notice_publication)}

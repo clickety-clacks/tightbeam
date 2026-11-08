@@ -83,6 +83,11 @@ defmodule Tightbeam.TestCase do
       ])
 
     File.cp!(rule_source, Path.join(rule_dir, "row-reaction-assignment-inactivity.toml"))
+
+    recovery_rule_source =
+      Path.join(:code.priv_dir(:tightbeam), "seed/rules/harness-health-recovery.toml")
+
+    File.cp!(recovery_rule_source, Path.join(rule_dir, "harness-health-recovery.toml"))
     Tightbeam.Rules.load!(base_dir, [])
     on_exit(fn -> File.rm_rf!(base_dir) end)
 

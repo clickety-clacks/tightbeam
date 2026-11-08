@@ -366,6 +366,11 @@ defmodule Tightbeam.Gateway do
           terminal_publisher: terminal_publisher(db),
           on_terminal: on_terminal,
           name: Tightbeam.LaneManager},
+         {Tightbeam.HarnessHealth.RecoveryScheduler,
+          db: db,
+          base_dir: config.base_dir,
+          task_sup: Tightbeam.TurnTaskSupervisor,
+          name: Tightbeam.HarnessHealth.RecoveryScheduler},
          {Tightbeam.SentinelSupervisor,
           db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
          Tightbeam.ListenerLifecycle.listener_spec(
