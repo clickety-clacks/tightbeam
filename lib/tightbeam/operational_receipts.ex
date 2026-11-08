@@ -32,7 +32,7 @@ defmodule Tightbeam.OperationalReceipts do
   );
   """
 
-  @doc "Install the additive receipt store."
+  @doc "Install the additive receipt store; `Assignments` installs it with `attests`."
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 

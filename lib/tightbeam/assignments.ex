@@ -392,6 +392,7 @@ defmodule Tightbeam.Assignments do
     # SQLite permits the referenced table to arrive in the following DDL.
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
+    :ok = OperationalReceipts.ensure_schema(db)
     :ok = DB.execute(db, @cannot_proceed_ddl)
     :ok = DB.execute(db, @cannot_proceed_release_observations_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
