@@ -6885,15 +6885,26 @@ defmodule Tightbeam.AssignmentsTest do
       stub_eligibility_commit_refs!()
       load_completion_review_rule!(ctx)
       c = eligibility_commits()
-      specimen = eligibility_specimen!(ctx)
-      blocker = eligibility_review_card!(ctx, specimen.work_item.id, nil)
+      work_item = create_work_item(ctx, "dispatch route blocker")
+      producer = eligibility_producer!(ctx, work_item.id)
+      eligibility_verdict!(ctx, "holder", producer.id, "verified", c.verified)
+
+      linked = eligibility_review_card!(ctx, work_item.id, producer.id)
       blocker_refs = eligibility_refs([c.i1], "blocker")
-      eligibility_verdict!(ctx, "other-session", blocker.id, "changes-requested", blocker_refs)
+      eligibility_verdict!(ctx, "other-session", linked.id, "changes-requested", blocker_refs)
+
+      other_producer = eligibility_producer!(ctx, work_item.id)
+      covering_card = eligibility_review_card!(ctx, work_item.id, other_producer.id)
+      eligibility_verdict!(ctx, "other-session", covering_card.id, "reviewed-clean", c.verified)
+
+      # The linked selection holds no clean review, so the rule itself decides,
+      # and the fallback refuses on the intersecting blocker.
+      assert [] == Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder")
 
       assert {:deny, %{rule: "completion-requires-review"}} =
                Rules.evaluate(
                  ctx.db,
-                 attest_call({:session, "holder"}, specimen.producer.id, "completion")
+                 attest_call({:session, "holder"}, producer.id, "completion")
                )
     end
 
