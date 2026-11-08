@@ -6,7 +6,8 @@ defmodule Tightbeam.AssetsTest do
   setup do
     db = :"assets_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Assets.ensure_schema(db)
+    # Assets.put/6 checks its owner against users in the same transaction.
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-assets-#{System.unique_integer([:positive])}")

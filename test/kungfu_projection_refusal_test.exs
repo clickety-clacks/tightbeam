@@ -364,6 +364,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     alias Tightbeam.Devices
     alias Tightbeam.Wire.Router
     :ok = Devices.ensure_schema(db)
+    :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
 
     {:paired, device} =
       Devices.pair(db, %{
@@ -435,6 +436,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     alias Tightbeam.Devices
 
     :ok = Devices.ensure_schema(db)
+    :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
 
     {:paired, device} =
       Devices.pair(db, %{
@@ -473,6 +475,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
   } do
     alias Tightbeam.Devices
     :ok = Devices.ensure_schema(db)
+    :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
 
     pair = fn id ->
       Devices.pair(db, %{device_id: id, claimed_name: id, platform: nil, model: nil})

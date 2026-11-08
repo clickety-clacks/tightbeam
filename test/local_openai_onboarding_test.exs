@@ -24,6 +24,7 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
     db = :"local_openai_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Devices.ensure_schema(db)
+    :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
     :ok = Placement.ensure_schema(db)
     on_exit(fn -> File.rm_rf!(base) end)
     %{base: base, db: db}

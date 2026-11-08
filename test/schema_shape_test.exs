@@ -817,8 +817,13 @@ defmodule Tightbeam.SchemaShapeTest do
       host: "testhost"
     })
 
-    assert %{name: "owner-a-role"} =
-             Tightbeam.Roles.create!(db, "owner-a-role", "owner-a", "owner-a-session")
+    # Seed the predecessor row directly: current writers expect the current schema.
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO roles (name, boundSessionKey, ownerUserId, createdAt, updatedAt) " <>
+                 "VALUES ('owner-a-role', 'owner-a-session', 'owner-a', 1, 1)"
+             )
 
     # A role's current binding cannot prove who owned a historical agent-origin fact.
     assert :ok = Tightbeam.Roles.bind(db, "owner-a-role", "owner-b-session")

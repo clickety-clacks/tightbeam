@@ -89,6 +89,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
     assert [
              @successor,
+             "session-identity-v1-0114",
              "launch-preparation-evidence-v1-0112",
              "launch-preparation-boot-v1-0110",
              "decision-request-row-schema-v2-019",

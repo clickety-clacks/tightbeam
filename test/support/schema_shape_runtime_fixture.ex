@@ -165,6 +165,18 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     :ok
   end
 
+  # Brings a synthetic users table created by Devices.ensure_schema/1 alone to
+  # the current shape: the two nullable columns the user-removal migration adds.
+  def add_user_removal_columns!(db) do
+    assert :ok =
+             DB.execute(db, """
+             ALTER TABLE users ADD COLUMN removedAt INTEGER;
+             ALTER TABLE users ADD COLUMN removedBy TEXT CHECK ((removedAt IS NULL) = (removedBy IS NULL));
+             """)
+
+    :ok
+  end
+
   # The user-removal successor only adds two users columns, so dropping exactly
   # those columns and restoring the stamp recreates its session-identity predecessor.
   def downgrade_user_removal!(db) do
