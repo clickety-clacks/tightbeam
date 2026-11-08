@@ -6769,6 +6769,7 @@ defmodule Tightbeam.AssignmentsTest do
                eligibility_complete(ctx, specimen.producer)
 
       assert message =~ "latest independent clean review is missing verified producer commits"
+
       assert message =~
                "outstanding changes-requested: #{blocking.id} on #{blocker.id} naming #{c.i1}"
     end
@@ -6835,8 +6836,10 @@ defmodule Tightbeam.AssignmentsTest do
       assert message =~ "latest independent clean review is missing verified producer commits"
       assert message =~ "verified commits #{Enum.join(Enum.sort([c.i1, c.runner]), ", ")}"
       assert message =~ "linked selection #{specimen.stale_clean.id} reviewed-clean"
+
       assert message =~
                "#{specimen.covering_clean.id} reviewed-clean on #{specimen.covering_card.id}"
+
       assert message =~ "commits no clean review covers: #{c.runner}"
       assert message =~ "outstanding changes-requested: none"
     end
@@ -7281,6 +7284,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     stale_card = eligibility_review_card!(ctx, work_item.id, producer.id)
     stale_refs = eligibility_refs([c.older], "stale")
+
     stale_clean =
       eligibility_verdict!(ctx, "other-session", stale_card.id, "reviewed-clean", stale_refs)
 
