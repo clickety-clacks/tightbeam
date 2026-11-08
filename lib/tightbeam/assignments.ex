@@ -1904,6 +1904,7 @@ defmodule Tightbeam.Assignments do
         case preflight do
           {:replay, response} ->
             add_referents(db, call, response, artifact_cursor(db))
+            |> with_operational_verification(db, call)
 
           :miss ->
             with :ok <- completion_filing_allowed(db, call),
@@ -1968,6 +1969,7 @@ defmodule Tightbeam.Assignments do
 
                 {:replayed, response} ->
                   add_referents(db, call, response, artifact_cursor)
+                  |> with_operational_verification(db, call)
 
                 other ->
                   add_referents(db, call, other, artifact_cursor)
@@ -1997,7 +1999,8 @@ defmodule Tightbeam.Assignments do
   defp add_referents(_db, _call, result, _artifact_cursor), do: result
 
   # An accepted completion of a receipt-verified operational assignment shows
-  # that verification and any review conclusion beside it.
+  # that verification and any review conclusion beside it. A keyed replay shows
+  # it too: the stored response predates this derived projection.
   defp with_operational_verification(result, db, call) do
     with "completion" <- call.params[:kind],
          %{assignment: %{id: assignment_id}} <- result,

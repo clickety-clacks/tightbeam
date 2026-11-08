@@ -125,6 +125,14 @@ defmodule Tightbeam.OperationalReceiptsTest do
                  idempotency_key: "receipt-completion"
                })
 
+      # Replaying the same key returns the same verification as the first call.
+      assert {:ok, %{operationalVerification: ^shown}} =
+               attest(ctx, ctx.holder, %{
+                 assignment_id: card.id,
+                 kind: "completion",
+                 idempotency_key: "receipt-completion"
+               })
+
       assert shown == %{
                verifiedAttestId: verified.id,
                receipts: [%{artifactId: receipt.id, sha256: receipt.hash}],
