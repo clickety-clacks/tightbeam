@@ -128,9 +128,9 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
                 maybe_after_verify(call, db)
                 commit(db, call, actor, context, verified_refs, verified_at)
 
-              {:error, _verification_error} ->
+              {:error, failed_check} ->
                 commit(db, call, actor, context, requested_refs, nil)
-                |> warn_unverified_correction()
+                |> warn_unverified_correction(failed_check)
             end
         end
       end
@@ -147,13 +147,23 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   defp correction_result(row), do: %{correction: row}
 
   defp warn_unverified_correction(
-         %{correction: %{verifiedAt: nil, assignmentId: assignment_id}} = result
+         %{correction: %{verifiedAt: nil, assignmentId: assignment_id}} = result,
+         failed_check
        ) do
-    Logger.warning("commit_ref_correction_unverified assignmentId=#{assignment_id}")
-    Map.put(result, :warning, unverified_correction_warning())
+    Logger.warning(
+      "commit_ref_correction_unverified assignmentId=#{assignment_id} failedCheck=#{failed_check}"
+    )
+
+    Map.merge(result, %{
+      warning: unverified_correction_warning(failed_check),
+      verificationFailure: failed_check
+    })
   end
 
-  defp warn_unverified_correction(result), do: result
+  defp warn_unverified_correction(result, _failed_check), do: result
+
+  defp unverified_correction_warning(failed_check),
+    do: "commitRefs were recorded unverified; canonical Git check failed: #{failed_check}"
 
   defp unverified_correction_warning,
     do: "commitRefs were recorded without successful canonical Git verification"
@@ -551,24 +561,63 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   defp verify_ref(db, ref) do
     [host, path] = String.split(ref["repo"], ":", parts: 2)
 
-    with {:ok, remote} <- git_output(db, host, path, ["remote", "get-url", "origin"]),
-         true <- remote == ref["remote"],
+    with {:ok, configured_remote} <-
+           checked_output(db, host, path, ["remote", "get-url", "origin"], "origin_url_lookup"),
+         :ok <- declared_remote_check(ref["remote"], configured_remote),
          {:ok, commit} <-
-           git_output(db, host, path, ["rev-parse", "--verify", "#{ref["commit"]}^{commit}"]),
-         true <- commit == ref["commit"],
+           checked_output(
+             db,
+             host,
+             path,
+             ["rev-parse", "--verify", "#{ref["commit"]}^{commit}"],
+             "declared_commit_resolution"
+           ),
+         :ok <- exact_commit_check(commit, ref["commit"]),
          {:ok, ref_commit} <-
-           git_output(db, host, path, ["rev-parse", "--verify", "#{ref["ref"]}^{commit}"]),
-         {:ok, remote_ref_commit} <- remote_ref_commit(db, host, path, ref["remote"], ref["ref"]),
-         true <- remote_ref_commit == ref_commit,
-         :ok <- git_status(db, host, path, ["merge-base", "--is-ancestor", commit, ref_commit]) do
+           checked_output(
+             db,
+             host,
+             path,
+             ["rev-parse", "--verify", "#{ref["ref"]}^{commit}"],
+             "declared_local_ref_resolution"
+           ),
+         {:ok, remote_ref_commit} <-
+           checked_remote_ref_commit(db, host, path, configured_remote, ref["ref"]),
+         :ok <- exact_ref_check(remote_ref_commit, ref_commit),
+         :ok <- ancestor_check(db, host, path, commit, ref_commit) do
       {:ok, Map.put(ref, "verifiedRefCommit", ref_commit)}
     else
-      _ ->
-        {:error,
-         error(
-           "unverifiable_commit_ref",
-           "commitRefs contains a commit without the declared canonical remote/ref proof"
-         )}
+      {:error, failed_check} -> {:error, failed_check}
+    end
+  end
+
+  defp checked_output(db, host, path, args, failed_check) do
+    case git_output(db, host, path, args) do
+      {:ok, output} -> {:ok, output}
+      _ -> {:error, failed_check}
+    end
+  end
+
+  defp declared_remote_check("origin", configured_remote) when configured_remote != "",
+    do: :ok
+
+  defp declared_remote_check(declared_remote, configured_remote)
+       when declared_remote == configured_remote,
+       do: :ok
+
+  defp declared_remote_check(_declared_remote, _configured_remote),
+    do: {:error, "declared_remote_matches_origin"}
+
+  defp exact_commit_check(resolved, declared) when resolved == declared, do: :ok
+  defp exact_commit_check(_resolved, _declared), do: {:error, "declared_commit_resolution"}
+
+  defp exact_ref_check(remote, local) when remote == local, do: :ok
+  defp exact_ref_check(_remote, _local), do: {:error, "remote_ref_matches_declared_local_ref"}
+
+  defp ancestor_check(db, host, path, commit, ref_commit) do
+    case git_status(db, host, path, ["merge-base", "--is-ancestor", commit, ref_commit]) do
+      :ok -> :ok
+      _ -> {:error, "commit_is_ancestor_of_declared_local_ref"}
     end
   end
 
@@ -583,6 +632,13 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
       {:ok, commit}
     else
       _ -> :error
+    end
+  end
+
+  defp checked_remote_ref_commit(db, host, path, remote, ref_name) do
+    case remote_ref_commit(db, host, path, remote, ref_name) do
+      {:ok, commit} -> {:ok, commit}
+      _ -> {:error, "declared_remote_ref_resolution"}
     end
   end
 

@@ -75,6 +75,16 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     assert entry.verifiedAt == correction.verifiedAt
   end
 
+  test "the declared remote may be origin while the configured URL still proves it", ctx do
+    origin_ref = Map.put(ref(ctx), "remote", "origin")
+    call = with_param(ctx, :commit_refs, [origin_ref])
+
+    assert %{correction: correction} = correct(call, {:session, "po-owner"})
+    assert is_integer(correction.verifiedAt)
+    assert [%{"remote" => "origin", "verifiedRefCommit" => verified}] = correction.commitRefs
+    assert verified == ctx.commit
+  end
+
   test "a correction replaces an assignment's attest refs in the work-item summary", ctx do
     original_refs = [
       %{"repo" => "old-host:/old/repository", "commit" => String.duplicate("a", 40)},
@@ -387,14 +397,37 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     refute_received {:git_ran, _, _, _}
   end
 
-  test "unreadable canonical refs are recorded with a warning and no verification time", ctx do
+  test "failed canonical checks are recorded by name with no verification time", ctx do
+    tree = git_output!(ctx.repo, ["rev-parse", "#{ctx.commit}^{tree}"])
+
+    local_ahead =
+      git_output!(ctx.repo, ["commit-tree", tree, "-p", ctx.commit, "-m", "local ahead"])
+
+    unrelated = git_output!(ctx.repo, ["commit-tree", tree, "-m", "unrelated"])
+
+    git!(ctx.repo, ["update-ref", "refs/heads/main", local_ahead])
+    git!(ctx.repo, ["update-ref", "refs/heads/local-only", ctx.commit])
+    git!(ctx.repo, ["update-ref", "refs/heads/unrelated", unrelated])
+    git!(ctx.repo, ["push", "origin", "refs/heads/unrelated"])
+
     bad_refs = [
-      {"asg_bad_remote", Map.put(ref(ctx), "remote", "missing")},
-      {"asg_bad_ref", Map.put(ref(ctx), "ref", "refs/heads/missing")},
-      {"asg_bad_commit", Map.put(ref(ctx), "commit", String.duplicate("f", 40))}
+      {"asg_bad_remote", Map.put(ref(ctx), "remote", "missing"),
+       "declared_remote_matches_origin"},
+      {"asg_bad_ref", Map.put(ref(ctx), "ref", "refs/heads/missing"),
+       "declared_local_ref_resolution"},
+      {"asg_bad_commit", Map.put(ref(ctx), "commit", String.duplicate("f", 40)),
+       "declared_commit_resolution"},
+      {"asg_origin_bad_ref",
+       Map.merge(ref(ctx), %{"remote" => "origin", "ref" => "refs/heads/missing"}),
+       "declared_local_ref_resolution"},
+      {"asg_missing_remote_ref", Map.put(ref(ctx), "ref", "refs/heads/local-only"),
+       "declared_remote_ref_resolution"},
+      {"asg_remote_ref_mismatch", ref(ctx), "remote_ref_matches_declared_local_ref"},
+      {"asg_non_ancestor", Map.put(ref(ctx), "ref", "refs/heads/unrelated"),
+       "commit_is_ancestor_of_declared_local_ref"}
     ]
 
-    for {assignment_id, requested_ref} <- bad_refs do
+    for {assignment_id, requested_ref, failed_check} <- bad_refs do
       insert_closed_assignment!(ctx.db, assignment_id)
 
       correction_call =
@@ -405,16 +438,17 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          assert %{warning: warning, correction: correction} =
+          assert %{warning: warning, verificationFailure: ^failed_check, correction: correction} =
                    correct(correction_call, {:session, "po-owner"})
 
-          assert warning =~ "without successful canonical Git verification"
+          assert warning =~ "canonical Git check failed: #{failed_check}"
           assert correction.assignmentId == assignment_id
           assert is_nil(correction.verifiedAt)
           assert correction.commitRefs == [requested_ref]
         end)
 
-      assert log =~ "commit_ref_correction_unverified assignmentId=#{assignment_id}"
+      assert log =~
+               "commit_ref_correction_unverified assignmentId=#{assignment_id} failedCheck=#{failed_check}"
 
       assert [%{verifiedAt: nil, commitRefs: [^requested_ref]}] =
                AssignmentCommitRefCorrections.list(ctx.db, assignment_id)
