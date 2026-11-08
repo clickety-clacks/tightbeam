@@ -36,6 +36,22 @@ opener must dispose of the obligation through the supported seam. Read the
 assignment's actual state and the requested release evidence before resuming.
 Do not file completion for unfulfilled work or treat a wake as the release.
 
+## Verifying operational work from receipts
+
+An assignment whose opener recorded `--effect-kind live_mutation` or `evidence`
+did its work outside a repository. Its holder verifies it with `attest <id> --kind
+verdict --verdict verified --receipt <artifactId>:<sha256>`, repeatable, citing
+artifacts recorded on the assignment's work item by their recorded hash. Every
+receipt must pass or nothing is written: `operational_receipt_missing` (no row, or
+released), `operational_receipt_unlinked` (another work item, or none),
+`operational_receipt_hash_mismatch` (cite the recorded hash or record a corrected
+artifact; never re-run the operation) and `operational_receipt_malformed`.
+Receipts on code, review cards, progress attests or from a non-holder give
+`operational_receipts_not_applicable`; code keeps its commit evidence. The effect
+kind is the opener's choice and evidence never changes it. Receipts are producer
+verification, not review: completion runs the existing rules unchanged, so where
+a review rule covers the kind, its own refusal names the missing review.
+
 ## Delegated rulings
 
 A presenter's recommendation is its opinion, not the user's ruling. A presenter
