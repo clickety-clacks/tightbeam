@@ -3701,17 +3701,17 @@ defmodule Tightbeam.Gateway do
   defp attachment_resource_uri(turn, message, index),
     do: "urn:tightbeam:attachment:turn-#{turn.seq}:message-#{message.seq}:#{index}"
 
-  defp enforce_codex_text_limit(_config, _turn, _session, entries, harness)
-       when harness != "codex",
-       do: {:ok, entries}
-
   defp enforce_codex_text_limit(config, turn, session, entries, harness) do
-    limit = Harness.submission_text_limit(harness)
+    case Harness.submission_text_limit(harness) do
+      nil ->
+        {:ok, entries}
 
-    if codex_text_item_count(turn.prompt, entries) <= limit do
-      {:ok, entries}
-    else
-      fallback_last_text_resource(config, turn, session, entries, harness)
+      limit ->
+        if codex_text_item_count(turn.prompt, entries) <= limit do
+          {:ok, entries}
+        else
+          fallback_last_text_resource(config, turn, session, entries, harness)
+        end
     end
   end
 
