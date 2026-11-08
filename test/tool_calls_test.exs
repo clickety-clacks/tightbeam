@@ -746,7 +746,7 @@ defmodule Tightbeam.ToolCallsTest do
       DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
 
     assert [
-             ["closed-assignment-cannot-proceed-reconciliation-v1-015", _root_stamped_at_before]
+             ["launch-preparation-evidence-v1-0112", _root_stamped_at_before]
            ] = root_stamp_before
 
     {:ok, memento_stamp_before} =
