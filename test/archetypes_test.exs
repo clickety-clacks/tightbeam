@@ -29,7 +29,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert Archetypes.init_identity!(ctx.base_dir) == :initialized
     identity_dir = Path.join(ctx.base_dir, "identity")
 
-    for ref <- ["tightbeam/upstream", "main", "tightbeam/live"] do
+    for ref <- ["tightbeam/upstream", "main", "tightbeam/live", "tightbeam/product-baseline"] do
       assert {oid, 0} = System.cmd("git", ["rev-parse", ref], cd: identity_dir)
       assert String.trim(oid) != ""
     end
