@@ -54,14 +54,7 @@ defmodule Tightbeam.RowReactions.Cutover do
             adopt_output(txn, Wakes.get_in_txn(txn, id), at) == "held"
           end)
 
-        # Missing historical output is not evidence that a destination existed
-        # at delivery. Mark consumed deliveries without manufacturing reminders.
-        for [id] <- ids,
-            event = RowReactions.delivery_event(txn, id),
-            not is_nil(event),
-            is_nil(Store.event(txn, event["org"], event["id"])) do
-          Store.remember(txn, event, Snapshot.current(txn, event, %{}))
-        end
+        remember_swept_terminal_deliveries(txn, watermark)
 
         Txn.q(
           txn,
@@ -110,6 +103,37 @@ defmodule Tightbeam.RowReactions.Cutover do
         )
 
         :ok
+    end
+  end
+
+  defp remember_swept_terminal_deliveries(txn, watermark) do
+    [[bubble_cursor]] =
+      Txn.q(txn, "SELECT COALESCE(MAX(seq),0) FROM production_cursors WHERE name='bubble'")
+
+    ids =
+      Txn.q(
+        txn,
+        """
+        SELECT w.wakeId FROM wakes AS w INDEXED BY wakes_delivered_turn
+        WHERE w.rowid<=?1 AND w.deliveredTurnSeq>?2
+          AND (w.obligationRef LIKE ?3 OR w.obligationRef LIKE ?4)
+          AND EXISTS (
+            SELECT 1 FROM turns t
+            WHERE t.seq=w.deliveredTurnSeq AND t.sessionKey=w.sessionKey
+          )
+        ORDER BY w.deliveredTurnSeq,w.rowid
+        """,
+        [watermark, bubble_cursor, @root <> "%", @reminder <> "%"]
+      )
+
+    # A restart can revisit ended turns after the durable bubble prefix.
+    # Remember only their delivered legacy root/reminder events so replay
+    # cannot create a second owner for an adopted pending output.
+    for [id] <- ids,
+        event = RowReactions.delivery_event(txn, id),
+        not is_nil(event),
+        is_nil(Store.event(txn, event["org"], event["id"])) do
+      Store.remember(txn, event, Snapshot.current(txn, event, %{}))
     end
   end
 

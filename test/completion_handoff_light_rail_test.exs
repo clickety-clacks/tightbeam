@@ -1592,11 +1592,30 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert [_] = pending_reminders(ctx.db, root.wake_id)
   end
 
-  test "cutover keeps an accepted delivery terminal and adopts only its pending successor", ctx do
+  test "cutover preserves a delivered root through bubble resweep and adopts its pending reminder",
+       ctx do
     {_parent, _child, root} = completed_child(ctx)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     carrier = assert_delivered_carrier(ctx.db, root.wake_id)
     [reminder] = pending_reminders(ctx.db, root.wake_id)
+
+    assert {:ok, [[delivery_seq]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [root.wake_id])
+
+    assert is_integer(delivery_seq)
+
+    assert {:ok, [[^delivery_seq]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [carrier])
+
+    finish_carrier_turn!(ctx.db, carrier)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO production_cursors(name,seq) VALUES('bubble',?1) ON CONFLICT(name) DO UPDATE SET seq=excluded.seq",
+               [delivery_seq - 1]
+             )
+
     stop_supervised!(ctx.scheduler)
     forget_reaction_ledger!(ctx.db)
     assert :ok = Tightbeam.RowReactions.recover(ctx.db)
@@ -1605,6 +1624,28 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert [adopted] = pending_reminders(ctx.db, root.wake_id)
     assert adopted.wake_id == reminder.wake_id
     assert adopted.due_at == reminder.due_at
+
+    delivery_event_id = "wake-delivery:#{root.wake_id}:#{delivery_seq}"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE eventId=?1",
+               [delivery_event_id]
+             )
+
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper,
+         db: ctx.db, interval: 3_600_000, name: :completion_handoff_cutover_sweeper}
+      )
+
+    Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+
+    assert {:ok, [[cursor]]} =
+             DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+
+    assert cursor >= delivery_seq
 
     assert {:ok, [[0]]} =
              DB.query(
@@ -1619,6 +1660,12 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                "SELECT COUNT(*) FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
                [adopted.wake_id]
              )
+
+    start_scheduler(ctx.db)
+    set_due_now(ctx.db, adopted.wake_id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, adopted.wake_id).state == "fired"
+    assert_delivered_carrier(ctx.db, adopted.wake_id)
 
     assert length(terminal_notices(ctx.db)) == 1
   end
