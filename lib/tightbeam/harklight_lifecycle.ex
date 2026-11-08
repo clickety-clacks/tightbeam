@@ -1095,7 +1095,7 @@ defmodule Tightbeam.HarklightLifecycle do
       txn,
       """
       SELECT 1 FROM health_redelivery_attempts a
-      JOIN turns t ON t.seq=a.redeliveryTurnSeq
+      JOIN turns t ON t.seq=COALESCE(a.redeliveryTurnSeq,a.cycleReleaseTurnSeq)
       WHERE a.sessionKey=?1 AND a.sourceTurnSeq=?2 AND t.status='delivered'
       """,
       [session_key, source_turn_seq]
