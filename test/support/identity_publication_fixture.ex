@@ -620,7 +620,7 @@ defmodule Tightbeam.IdentityPublicationFixture do
   defp identity_ref_snapshot(base_dir) do
     identity_dir = Path.join(base_dir, "identity")
 
-    ["main", "tightbeam/live", "tightbeam/upstream"]
+    ["main", "tightbeam/live", "tightbeam/product-baseline", "tightbeam/upstream"]
     |> Enum.map(&git!(identity_dir, ["rev-parse", &1]))
   end
 
