@@ -390,37 +390,35 @@ defmodule Tightbeam.Wire.Socket do
   end
 
   defp auth_success(msg, device, %{conn_ref: nil} = state) do
-    case parse_subscriptions(msg, MapSet.new(["chat"])) do
-      {:ok, subscriptions} ->
-        if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
+    with {:ok, subscriptions} <- parse_subscriptions(msg, MapSet.new(["chat"])),
+         :ok <- seed_chat(subscriptions, device.user_id, state) do
+      registry = GenServer.whereis(conn_registry(state))
+      monitor = Process.monitor(registry)
 
-        registry = GenServer.whereis(conn_registry(state))
-        monitor = Process.monitor(registry)
+      {:ok, conn_ref, _replaced} =
+        ConnRegistry.register(registry, %{
+          pid: self(),
+          user_id: device.user_id,
+          device_id: device.device_id,
+          is_admin: device.is_admin,
+          subscriptions: subscriptions
+        })
 
-        {:ok, conn_ref, _replaced} =
-          ConnRegistry.register(registry, %{
-            pid: self(),
-            user_id: device.user_id,
-            device_id: device.device_id,
-            is_admin: device.is_admin,
-            subscriptions: subscriptions
-          })
-
-        auth_replay(msg, device, conn_ref, subscriptions, %{state | registry_monitor: monitor})
-
-      :error ->
-        stop_with(Payloads.wire_error("invalid_message"), state)
+      auth_replay(msg, device, conn_ref, subscriptions, %{state | registry_monitor: monitor})
+    else
+      :user_removed -> stop_with(Payloads.auth_result_failure("user_removed"), state)
+      :error -> stop_with(Payloads.wire_error("invalid_message"), state)
     end
   end
 
   defp auth_success(msg, device, state) do
-    case parse_subscriptions(msg, state.subscriptions) do
-      {:ok, subscriptions} when subscriptions == state.subscriptions ->
-        if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
-        auth_replay(msg, device, state.conn_ref, subscriptions, state)
-
-      _ ->
-        stop_with(Payloads.wire_error("invalid_message"), state)
+    with {:ok, subscriptions} when subscriptions == state.subscriptions <-
+           parse_subscriptions(msg, state.subscriptions),
+         :ok <- seed_chat(subscriptions, device.user_id, state) do
+      auth_replay(msg, device, state.conn_ref, subscriptions, state)
+    else
+      :user_removed -> stop_with(Payloads.auth_result_failure("user_removed"), state)
+      _ -> stop_with(Payloads.wire_error("invalid_message"), state)
     end
   end
 
@@ -620,22 +618,35 @@ defmodule Tightbeam.Wire.Socket do
     Payloads.wire_error(error[:code] || "server_error", error[:message], id, diagnostic)
   end
 
+  defp seed_chat(subscriptions, user_id, state) do
+    if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(user_id, state), else: :ok
+  end
+
+  # Returns :ok, or :user_removed when the user was removed before the seed
+  # transaction ran. The removal check and the ownership insert share one
+  # transaction, so a removal that commits after the device lookup cannot leave a
+  # session owned by a removed user (admin-user-list-and-removal r3 R5).
   defp seed_main_stream(user_id, state) do
     key = Org.personal_session_key(user_id)
 
-    unless Org.get(db(state), key) do
+    if Org.get(db(state), key) do
+      :ok
+    else
       defaults = Map.fetch!(state.deps, :defaults)
       provider = Map.fetch!(defaults, :provider)
       provider = if is_function(provider, 0), do: provider.(), else: provider
 
       try do
-        {:ok, _session} =
+        {:ok, seeded} =
           DB.transaction(db(state), fn txn ->
-            case DB.Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [key]) do
-              [[1]] ->
+            cond do
+              UserAdmin.removed_in_txn?(txn, user_id) ->
+                :user_removed
+
+              DB.Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [key]) == [[1]] ->
                 :ok
 
-              [] ->
+              true ->
                 archetype =
                   case DB.Txn.q(
                          txn,
@@ -661,6 +672,8 @@ defmodule Tightbeam.Wire.Socket do
                 })
             end
           end)
+
+        if seeded == :user_removed, do: :user_removed, else: :ok
       rescue
         error in Tightbeam.DB.Error ->
           if Org.get(db(state), key), do: :ok, else: reraise(error, __STACKTRACE__)
