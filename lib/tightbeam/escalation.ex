@@ -4505,7 +4505,7 @@ defmodule Tightbeam.Escalation do
   defp org_owner_user_id!(db, call) do
     case DB.query(
            db,
-           "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId LIMIT 1",
+           "SELECT userId FROM users WHERE isAdmin = 1 AND removedAt IS NULL ORDER BY createdAt, userId LIMIT 1",
            []
          ) do
       {:ok, [[owner_user_id]]} ->

@@ -285,6 +285,7 @@ defmodule Tightbeam.Wire.Socket do
             {:paired, device} -> Payloads.pair_result({:ok, device.token, device.user_id})
             {:pending, _device} -> Payloads.pair_result({:error, "pair_pending"})
             :denied -> Payloads.pair_result({:error, "pair_denied"})
+            {:refused, reason} -> Payloads.pair_result({:error, reason})
           end
 
         stop_with(payload, state)
@@ -350,6 +351,7 @@ defmodule Tightbeam.Wire.Socket do
 
         reason =
           case known do
+            %{user_removed: true} -> "user_removed"
             %{status: "pending"} -> "device_not_approved"
             %{status: "allowlisted"} -> "token_revoked"
             _ -> "auth_failed"

@@ -216,7 +216,8 @@ defmodule Tightbeam.TerminalCredentialFailure do
                  "work-item-delivery-owner-v1-019",
                  "launch-preparation-boot-v1-0110",
                  "launch-preparation-evidence-v1-0112",
-                 "session-identity-v1-0114"
+                 "session-identity-v1-0114",
+                 "user-removal-v1-0114"
                ] ->
             readonly_views_from_conn(conn)
 
@@ -744,7 +745,7 @@ defmodule Tightbeam.TerminalCredentialFailure do
   end
 
   defp seed_admin_deliveries_in_txn(txn, incident_id, now) do
-    Txn.q(txn, "SELECT userId FROM users WHERE isAdmin=1 ORDER BY userId")
+    Txn.q(txn, "SELECT userId FROM users WHERE isAdmin=1 AND removedAt IS NULL ORDER BY userId")
     |> List.flatten()
     |> Enum.each(&reconcile_delivery_isolated_in_txn(txn, incident_id, &1, now))
   end
@@ -878,11 +879,13 @@ defmodule Tightbeam.TerminalCredentialFailure do
   defp onboarding_provider(_harness, "cursor"), do: :cursor
   defp onboarding_provider(_harness, "fixture_provider"), do: :fixture_provider
 
+  # An active admin: the stored bit, and not removed.
+  @active_admin_sql "SELECT 1 FROM users WHERE userId=?1 AND isAdmin=1 AND removedAt IS NULL"
+
   defp reconcile_delivery_in_txn(txn, incident_id, user_id, now) do
     incident = get_in_txn(txn, incident_id)
 
-    eligible? =
-      Txn.q(txn, "SELECT 1 FROM users WHERE userId=?1 AND isAdmin=1", [user_id]) == [[1]]
+    eligible? = Txn.q(txn, @active_admin_sql, [user_id]) == [[1]]
 
     cond do
       is_nil(incident) or incident.state != "open" ->

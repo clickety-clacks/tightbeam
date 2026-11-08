@@ -9,9 +9,11 @@ defmodule Tightbeam.Wire.OperatorSession do
     is_binary(token) and token != "" and token == deps[:cli_token]
   end
 
+  # A removed user is never selected as the operation identity.
   def resolve_user(db, user_id) when is_binary(user_id) and user_id != "" do
     case Devices.user(db, user_id) do
       nil -> {:error, "not_found"}
+      %{removed_at: removed_at} when not is_nil(removed_at) -> {:error, "user_removed"}
       user -> {:ok, user}
     end
   end
@@ -22,7 +24,7 @@ defmodule Tightbeam.Wire.OperatorSession do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId LIMIT 1",
+        "SELECT userId FROM users WHERE isAdmin = 1 AND removedAt IS NULL ORDER BY createdAt, userId LIMIT 1",
         []
       )
 
@@ -36,6 +38,7 @@ defmodule Tightbeam.Wire.OperatorSession do
       when is_binary(user_id) and user_id != "" and is_binary(session_key) and
              session_key != "" do
     with user when not is_nil(user) <- Devices.user(db, user_id),
+         nil <- user.removed_at,
          session when not is_nil(session) <- Org.get(db, session_key),
          true <- session.owner_user_id == user_id or user.is_admin do
       {:ok, user, session}

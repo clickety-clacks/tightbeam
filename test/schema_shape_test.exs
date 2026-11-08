@@ -23,7 +23,7 @@ defmodule Tightbeam.SchemaShapeTest do
     Wakes
   }
 
-  @shape "session-identity-v1-0114"
+  @shape "user-removal-v1-0114"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @owner_link_history_ddl """
   CREATE TABLE work_item_delivery_scope_events (

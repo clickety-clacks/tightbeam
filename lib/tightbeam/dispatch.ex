@@ -68,7 +68,11 @@ defmodule Tightbeam.Dispatch do
     decision-request host-env-list sentinel-list identity-status kungfu-list harness-processes
     role-list breathing work-item-get work-item-trace transcript execution-map execution-map-select
     toplines topline topline-placement-list work-item-list attests assignment-get assignments inspect
-    harness-health-evidence-other)
+    harness-health-evidence-other users)
+
+  @doc "Whether a verb only reads (the ephemeral-helper and audit read set)."
+  @spec read_verb?(String.t()) :: boolean()
+  def read_verb?(verb), do: verb in @read_verbs
 
   @db_transaction_diagnostic_fields ~w(
     kind operation origin phase cause reasonCause exception cleanup

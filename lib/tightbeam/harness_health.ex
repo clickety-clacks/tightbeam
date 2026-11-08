@@ -2957,8 +2957,10 @@ defmodule Tightbeam.HarnessHealth do
 
   defp other_source_authorized?(_txn, _principal, _source, _owner), do: false
 
-  defp admin_user?(txn, user),
-    do: Txn.q(txn, "SELECT 1 FROM users WHERE userId=?1 AND isAdmin=1", [user]) == [[1]]
+  # An active admin: the stored bit, and not removed.
+  @active_admin_sql "SELECT 1 FROM users WHERE userId=?1 AND isAdmin=1 AND removedAt IS NULL"
+
+  defp admin_user?(txn, user), do: Txn.q(txn, @active_admin_sql, [user]) == [[1]]
 
   defp create_other_review_in_txn(txn, incident_id, input, _recipient) do
     [[recurrence]] =

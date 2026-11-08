@@ -165,9 +165,27 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     :ok
   end
 
+  # The user-removal successor only adds two users columns, so dropping exactly
+  # those columns and restoring the stamp recreates its session-identity predecessor.
+  def downgrade_user_removal!(db) do
+    if "removedAt" in table_columns(db, "users") do
+      assert :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN removedBy")
+      assert :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN removedAt")
+    end
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE schema_stamp SET shape='session-identity-v1-0114' WHERE shape='user-removal-v1-0114'"
+             )
+
+    :ok
+  end
+
   # Reconstruct all identity predecessor tables through the retained migration chain.
   # The interposer stops before the identity migration; no current DDL is relabeled.
   def downgrade_session_identity!(db) do
+    downgrade_user_removal!(db)
     {:ok, predecessor} = DB.start_link(path: ":memory:", name: nil)
 
     try do

@@ -149,6 +149,8 @@ impl CommandContext {
             IdentityApply { .. } => ("cli.identity_apply", DispatchPath),
             Onboard { .. } => ("cli.onboard", CatalogAndDispatch),
             AddUser { .. } => ("cli.add_user", DispatchPath),
+            Users { .. } => ("cli.users", DispatchPath),
+            RemoveUser { .. } => ("cli.remove_user", DispatchPath),
             ConfigGet { .. } => ("cli.config_get", DispatchPath),
             ConfigSet { .. } => ("cli.config_set", DispatchPath),
             HostEnvSet { .. } => ("cli.host_env_set", DispatchPath),
@@ -338,6 +340,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | SentinelList { .. }
         | SentinelEnvList { .. }
         | ConfigGet { .. }
+        | Users { .. }
         | HostEnvList { .. }
         | HarnessProcesses { .. }
         | UpdateClients { .. } => Read,
@@ -464,6 +467,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | SubtreeGuidanceWithdraw { .. }
         | Onboard { .. }
         | AddUser { .. }
+        | RemoveUser { .. }
         | ConfigSet { .. }
         | HostEnvSet { .. }
         | HostEnvUnset { .. }
