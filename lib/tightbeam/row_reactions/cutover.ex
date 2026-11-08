@@ -7,6 +7,24 @@ defmodule Tightbeam.RowReactions.Cutover do
   @attest_source "assignment-attest-notices/v1"
   @root "terminal-child-owner-notification:"
   @reminder "terminal-child-owner-action-reminder:"
+  # Keep the canceled case aligned with Wakes.undelivered_notice_in_txn?/2:
+  # an unresolved recipient leaves delivery intent pending until it is retried.
+  @pending_legacy_wake """
+  (
+    (w.state='pending' AND w.deliveredTurnSeq IS NULL)
+    OR (
+      w.state='canceled' AND w.deliveredTurnSeq IS NULL
+      AND EXISTS (
+        SELECT 1 FROM wake_cancellations c
+        WHERE c.wakeId=w.wakeId AND c.reasonKind='target_unresolvable'
+      )
+      AND EXISTS (
+        SELECT 1 FROM lifecycle_events e
+        WHERE e.kind='wake_undeliverable' AND e.subject=w.wakeId
+      )
+    )
+  )
+  """
 
   def adopt(txn) do
     case Txn.q(txn, "SELECT 1 FROM row_reaction_cutovers WHERE source=?1", [@source]) do
@@ -21,9 +39,10 @@ defmodule Tightbeam.RowReactions.Cutover do
           Txn.q(
             txn,
             """
-            SELECT wakeId FROM wakes WHERE rowid<=?1 AND
-              (obligationRef LIKE ?2 OR obligationRef LIKE ?3)
-            ORDER BY CASE WHEN obligationRef LIKE ?2 THEN 0 ELSE 1 END,rowid
+            SELECT w.wakeId FROM wakes AS w
+            WHERE w.rowid<=?1 AND #{@pending_legacy_wake}
+              AND (w.obligationRef LIKE ?2 OR w.obligationRef LIKE ?3)
+            ORDER BY CASE WHEN w.obligationRef LIKE ?2 THEN 0 ELSE 1 END,w.rowid
             """,
             [watermark, @root <> "%", @reminder <> "%"]
           )
@@ -68,10 +87,11 @@ defmodule Tightbeam.RowReactions.Cutover do
           Txn.q(
             txn,
             """
-            SELECT wakeId FROM wakes WHERE rowid<=?1 AND consumer='prompt'
-              AND assignmentId IS NOT NULL
-              AND prompt LIKE 'Attest % was filed on assignment %.'
-            ORDER BY rowid
+            SELECT w.wakeId FROM wakes AS w
+            WHERE w.rowid<=?1 AND #{@pending_legacy_wake}
+              AND w.consumer='prompt' AND w.assignmentId IS NOT NULL
+              AND w.prompt LIKE 'Attest % was filed on assignment %.'
+            ORDER BY w.rowid
             """,
             [watermark]
           )

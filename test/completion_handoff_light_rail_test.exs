@@ -1605,6 +1605,21 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert [adopted] = pending_reminders(ctx.db, root.wake_id)
     assert adopted.wake_id == reminder.wake_id
     assert adopted.due_at == reminder.due_at
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [root.wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [adopted.wake_id]
+             )
+
     assert length(terminal_notices(ctx.db)) == 1
   end
 

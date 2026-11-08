@@ -478,6 +478,17 @@ defmodule Tightbeam.AssignmentsTest do
       accepted = legacy_attest_notice!(ctx, assignment, "verified")
       accepted_seq = enqueue_existing_wake!(ctx, assignment, accepted)
       canceled = legacy_attest_notice!(ctx, assignment, "verified")
+      undelivered = legacy_attest_notice!(ctx, assignment, "verified")
+
+      assert {:ok, {:canceled, {_wake_id, _sender_notice}}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Wakes.undeliverable_delivery_in_txn(
+                   txn,
+                   undelivered.wake_id,
+                   "synthetic unresolved recipient",
+                   System.system_time(:millisecond)
+                 )
+               end)
 
       cancellation = %{
         wake_id: canceled.wake_id,
@@ -516,6 +527,7 @@ defmodule Tightbeam.AssignmentsTest do
       assert Wakes.get(ctx.db, blocked.wake_id).state == "pending"
       assert Wakes.get(ctx.db, accepted.wake_id).delivered_turn_seq == accepted_seq
       assert Wakes.get(ctx.db, canceled.wake_id).state == "canceled"
+      assert Wakes.get(ctx.db, undelivered.wake_id).state == "canceled"
       assert Wakes.get(ctx.db, ambiguous.wake_id).state == "pending"
 
       assert {:ok, [["canceled"]]} =
@@ -532,18 +544,20 @@ defmodule Tightbeam.AssignmentsTest do
                  [blocked.wake_id]
                )
 
-      assert {:ok, [["accepted"]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
-                 [accepted.wake_id]
-               )
+      for wake <- [accepted, canceled] do
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                   [wake.wake_id]
+                 )
+      end
 
-      assert {:ok, [["canceled"]]} =
+      assert {:ok, [[1]]} =
                DB.query(
                  ctx.db,
-                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
-                 [canceled.wake_id]
+                 "SELECT COUNT(*) FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [undelivered.wake_id]
                )
 
       assert {:ok, [["held"]]} =
@@ -553,7 +567,7 @@ defmodule Tightbeam.AssignmentsTest do
                  [ambiguous.wake_id]
                )
 
-      assert {:ok, [[5]]} =
+      assert {:ok, [[6]]} =
                DB.query(
                  ctx.db,
                  "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
