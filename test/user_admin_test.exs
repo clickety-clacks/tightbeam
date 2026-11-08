@@ -396,6 +396,7 @@ defmodule Tightbeam.UserAdminTest do
       # The closed topline counts as much as the open one.
       assert message =~ "toplines.ownerUserId: 2 (tl_owner_closed, tl_owner_open)"
       assert users_table(ctx.db) == before
+
       assert {:ok, ^toplines} =
                DB.query(ctx.db, "SELECT id, ownerUserId FROM toplines ORDER BY id")
 
