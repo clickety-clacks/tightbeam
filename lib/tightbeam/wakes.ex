@@ -334,7 +334,9 @@ defmodule Tightbeam.Wakes do
                   "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1",
                   [@health_redelivery_cycle_migration]
                 ) do
-             [[1]] -> :ok
+             [[1]] ->
+               :ok
+
              [] ->
                Txn.q(
                  txn,

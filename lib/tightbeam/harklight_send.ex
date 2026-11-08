@@ -511,8 +511,8 @@ defmodule Tightbeam.HarklightSend do
         {:error, "invalid_harklight_send"}
 
       not (is_nil(decision_request_id) or
-             (is_binary(decision_request_id) and
-                Regex.match?(@decision_request_id, decision_request_id))) ->
+               (is_binary(decision_request_id) and
+                  Regex.match?(@decision_request_id, decision_request_id))) ->
         {:error, "invalid_harklight_send"}
 
       is_nil(message_type) ->
