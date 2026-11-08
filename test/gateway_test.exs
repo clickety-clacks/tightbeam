@@ -167,6 +167,18 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule HarnessProcessCoordinatorStub do
+    use GenServer
+
+    def start_link({parent, rows}), do: GenServer.start_link(__MODULE__, {parent, rows})
+    def init(state), do: {:ok, state}
+
+    def handle_call(:harness_processes, _from, {parent, rows} = state) do
+      send(parent, :harness_processes)
+      {:reply, rows, state}
+    end
+  end
+
   defmodule FenceDeleteRaceDB do
     use GenServer
 
@@ -778,16 +790,44 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, ctx.main_key).state == "active"
   end
 
-  test "admin operator handler lists durable harness launches", ctx do
-    adapter = start_supervised!({AdapterStub, self()})
-    coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
-    handlers = Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})
-    call = %{origin: "user:sample-user", session_key: nil, params: %{}}
+  test "harness process reads expose token presence without the token for every admin caller", ctx do
+    synthetic_token = "synthetic-harness-identity"
 
-    assert %{harness_processes: [%{launch_id: "launch-1", state: "kill_failed"}]} =
-             handlers["harness-processes"].(call)
+    source_rows = [
+      %{launch_id: "launch-with-token", state: "running", identity_token: synthetic_token},
+      %{launch_id: "launch-without-token", state: "launching", identity_token: nil},
+      %{launch_id: "launch-with-empty-token", state: "exited", identity_token: ""}
+    ]
+
+    coordinator = start_supervised!({HarnessProcessCoordinatorStub, {self(), source_rows}})
+    handlers = Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})
+    %{is_admin: true} = Devices.add_user(ctx.db, "second-admin", true)
+
+    calls = [
+      %{origin: "user:sample-user", session_key: nil, params: %{}},
+      %{origin: "user:second-admin", session_key: nil, params: %{}}
+    ]
+
+    expected = %{
+      harness_processes: [
+        %{launch_id: "launch-with-token", state: "running", identity_token_present: true},
+        %{launch_id: "launch-without-token", state: "launching", identity_token_present: false},
+        %{launch_id: "launch-with-empty-token", state: "exited", identity_token_present: false}
+      ]
+    }
+
+    for call <- calls do
+      result = handlers["harness-processes"].(call)
+      assert result == expected
+
+      read_rows = result.harness_processes
+      refute Enum.any?(read_rows, &Map.has_key?(&1, :identity_token))
+      refute synthetic_token in Enum.flat_map(read_rows, &Map.values/1)
+    end
 
     assert_receive :harness_processes
+    assert_receive :harness_processes
+    assert Enum.all?(source_rows, &Map.has_key?(&1, :identity_token))
   end
 
   test "retire atomically cascades parent-last, interrupts assignments, and removes every wire",

@@ -999,6 +999,8 @@ COMMANDS:
       Remove one exact environment overlay.
   harness-process list
       List the durable harness launch ledger, newest launch first.
+      Each item reports identityTokenPresent; identity token values are never
+      returned. Consumers must use the presence field instead of identityToken.
 
   doctor [--json] [--base-dir p]
       Check the local Tightbeam installation and report its health.

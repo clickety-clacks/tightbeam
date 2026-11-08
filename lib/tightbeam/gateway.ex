@@ -1090,7 +1090,13 @@ defmodule Tightbeam.Gateway do
       {"harness-processes", []} =>
         admin_handler(db, fn _params ->
           coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
-          %{harness_processes: AdapterCoordinator.harness_processes(coordinator)}
+
+          harness_processes =
+            coordinator
+            |> AdapterCoordinator.harness_processes()
+            |> Enum.map(&harness_process_read_item/1)
+
+          %{harness_processes: harness_processes}
         end),
       {"role-create", ["role.created"]} => fn call -> role_create_result(db, call) end,
       {"role-bind", ["role.bound"]} => fn call -> role_bind_result(db, call) end,
@@ -4916,6 +4922,14 @@ defmodule Tightbeam.Gateway do
 
   defp parse_default_priority(nil), do: 4
   defp parse_default_priority(value), do: String.to_integer(value)
+
+  defp harness_process_read_item(row) do
+    token_present = row[:identity_token] not in [nil, ""]
+
+    row
+    |> Map.delete(:identity_token)
+    |> Map.put(:identity_token_present, token_present)
+  end
 
   defp put_setting_projected_in_txn(txn, key, value),
     do: Org.put_setting_projected_in_txn(txn, key, value)
