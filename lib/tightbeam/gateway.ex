@@ -4822,6 +4822,7 @@ defmodule Tightbeam.Gateway do
 
   defp identity_relearn_result(config, db, %{params: %{action: "resolve"}} = call) do
     candidate = Identity.resolve_relearn!(config.base_dir, call.origin)
+
     publish_identity_candidate(config, db, call, candidate, %{state: "published"})
     |> with_relearn_setup(config, db)
   end

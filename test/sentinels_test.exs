@@ -260,7 +260,8 @@ defmodule Tightbeam.SentinelsTest do
       assert %{state: "published", setup: [%{bundle: "alpha-bundle", pending: []}]} = configured
     end
 
-    test "successful relearn resolve reports setup and unresolved conflicts remain explicit", ctx do
+    test "successful relearn resolve reports setup and unresolved conflicts remain explicit",
+         ctx do
       Identity.init!(ctx.base)
       handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})
       role_guidance = "guidance/alpha-bundle-role.md"
@@ -283,7 +284,12 @@ defmodule Tightbeam.SentinelsTest do
         )
 
       assert {:ok, _revision} = Identity.publish_live!(ctx.base, candidate)
-      File.write!(Path.join([ctx.bundles, "alpha-bundle", role_guidance]), "Installed guidance.\n")
+
+      File.write!(
+        Path.join([ctx.bundles, "alpha-bundle", role_guidance]),
+        "Installed guidance.\n"
+      )
+
       add_monitor_sentinel!(ctx, "alpha-bundle")
 
       conflicted =
