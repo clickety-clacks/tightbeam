@@ -516,9 +516,16 @@ defmodule Tightbeam.Wire.RouterTest do
            }
 
     for version <- ["1", "2"] do
+      request = conn(:get, "/ws/changes?protocolVersion=#{version}")
+
+      request = %Plug.Conn{
+        request
+        | host: "localhost",
+          req_headers: [{"host", "localhost"} | request.req_headers]
+      }
+
       upgraded =
-        conn(:get, "/ws/changes?protocolVersion=#{version}")
-        |> put_req_header("host", "localhost")
+        request
         |> put_req_header("upgrade", "websocket")
         |> put_req_header("connection", "Upgrade")
         |> put_req_header("sec-websocket-version", "13")
