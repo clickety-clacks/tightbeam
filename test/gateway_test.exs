@@ -886,7 +886,7 @@ defmodule Tightbeam.GatewayTest do
 
       Enum.zip(source_rows, rows)
       |> Enum.each(fn {source, projected} ->
-        assert projected.identity_token_present == (source.identity_token not in [nil, ""])
+        assert projected.identity_token_present == source.identity_token not in [nil, ""]
         assert Map.has_key?(projected, :last_error)
         assert projected.last_error == Map.get(source, :expected_error)
         diagnostic_keys = Map.keys(projected.last_error || %{}) |> Enum.sort()
