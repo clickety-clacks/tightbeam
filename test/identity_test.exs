@@ -856,6 +856,7 @@ defmodule Tightbeam.IdentityTest do
     assert revision == Identity.live_revision!(ctx.base)
     assert File.read!(Path.join(dir, "guidance/coder.md")) == "role-v2"
     assert File.read!(Path.join(dir, "guidance/operator-only.md")) == "organization-owned"
+
     Enum.each(seed_updates, fn {relative, expected} ->
       assert File.read!(Path.join(dir, relative)) == expected
     end)
@@ -945,6 +946,7 @@ defmodule Tightbeam.IdentityTest do
       live_before = Identity.live_revision!(ctx.base)
       upstream_before = git!(dir, ["rev-parse", "tightbeam/upstream"])
       baseline_before = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+
       incoming_manual =
         File.read!(Application.app_dir(:tightbeam, "priv/#{manual_path}"))
 
@@ -954,7 +956,10 @@ defmodule Tightbeam.IdentityTest do
       assert Identity.revision_file_bytes!(ctx.base, "tightbeam/product-incoming", manual_path) ==
                incoming_manual
 
-      assert [%{"path" => ^manual_path, "base_source" => "historical-base-unavailable"} = conflict] =
+      assert [
+               %{"path" => ^manual_path, "base_source" => "historical-base-unavailable"} =
+                 conflict
+             ] =
                Identity.provenance_conflicts(ctx.base)
 
       assert conflict["base"]["present"] == false
@@ -1009,7 +1014,10 @@ defmodule Tightbeam.IdentityTest do
       assert Identity.revision_file_bytes!(ctx.base, "tightbeam/product-incoming", manual_path) ==
                incoming_manual
 
-      assert [%{"path" => ^manual_path, "base_source" => "historical-base-unavailable"} = conflict] =
+      assert [
+               %{"path" => ^manual_path, "base_source" => "historical-base-unavailable"} =
+                 conflict
+             ] =
                Identity.provenance_conflicts(ctx.base)
 
       assert conflict["base"]["present"] == false
@@ -1831,12 +1839,14 @@ defmodule Tightbeam.IdentityTest do
     before = identity_tree(dir)
 
     assert {:ok, _revision} = learn!(ctx.base, "agentic-engineering", "operator")
+
     product_manual =
       Identity.revision_file_bytes!(ctx.base, "tightbeam/product-baseline", manual_path)
 
     assert unlearn!(ctx.base, "agentic-engineering", "operator")
 
     assert File.read!(Path.join(dir, manual_path)) == product_manual
+
     assert identity_tree(dir) ==
              Enum.sort_by(
                before ++ [{manual_path, {:file, product_manual}}],
