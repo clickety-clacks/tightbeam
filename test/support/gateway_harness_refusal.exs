@@ -69,6 +69,7 @@ defmodule GatewayHarnessRefusal do
 
       {:ok, client} =
         SimClient.connect("127.0.0.1", port, device.token, device_id: "context-refusal-device")
+
       session_key = Org.personal_session_key(device.user_id)
       content = String.duplicate("x", 65_537)
       watermark = SimClient.mark(client)
@@ -196,6 +197,7 @@ defmodule GatewayHarnessRefusal do
 
     capture = Path.join(base, "harness-request.json")
     fixture = Path.join(Path.dirname(__ENV__.file), "gateway_refusal_harness.js")
+
     node =
       System.find_executable("node") || raise "node is required for the local harness process"
 
