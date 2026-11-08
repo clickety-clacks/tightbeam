@@ -977,7 +977,11 @@ defmodule Tightbeam.IdentityTest do
              provenance_conflicts: [content_conflict, addition_conflict],
              live_revision: ^live_before
            } =
-             relearn.(%{origin: "relearn operator", params: %{}})
+             relearn.(%{
+               origin: "process:test",
+               principal: {:process, "test"},
+               params: %{}
+             })
 
     status = Identity.status(ctx.base)
     assert status.live_revision == live_before
@@ -1536,7 +1540,7 @@ defmodule Tightbeam.IdentityTest do
     assert traversal.message =~ "available bundles: agentic-engineering"
   end
 
-  test "legacy enriched roots mint one receipt without changing their seed-owned paths", ctx do
+  test "legacy enriched roots preserve seed choices when product provenance is ambiguous", ctx do
     dir = build_legacy_org!(ctx)
     enriched_default = File.read!(Path.join(dir, "archetypes/default.toml"))
 
@@ -1552,14 +1556,36 @@ defmodule Tightbeam.IdentityTest do
            |> Enum.count(&(&1 == "learn-receipt: agentic-engineering")) == 1
 
     live_before = Identity.live_revision!(ctx.base)
-    assert {:conflict, ["archetypes/default.toml"]} = relearn!(ctx.base, "operator")
+
+    conflicts = [
+      "archetypes/default.toml",
+      "guidance/operating-manual.md",
+      "rules/harness-health-recovery.toml",
+      "rules/harness-recovery-main-wake.toml"
+    ]
+
+    assert {:conflict, ^conflicts} = relearn!(ctx.base, "operator")
     assert Identity.live_revision!(ctx.base) == live_before
 
-    assert [%{"base_source" => "legacy-upstream-history", "path" => "archetypes/default.toml"}] =
-             Identity.status(ctx.base).provenance_conflicts
+    provenance_conflicts = Identity.status(ctx.base).provenance_conflicts
+    assert Enum.map(provenance_conflicts, & &1["path"]) == conflicts
+
+    assert Enum.all?(
+             provenance_conflicts,
+             &(&1["base_source"] == "legacy-upstream-history")
+           )
+
+    Enum.each(tl(conflicts), fn path ->
+      refute File.exists?(Path.join(dir, path))
+    end)
 
     File.write!(Path.join(dir, "archetypes/default.toml"), enriched_default)
     git!(dir, ["add", "--", "archetypes/default.toml"])
+
+    Enum.each(tl(conflicts), fn path ->
+      git!(dir, ["add", "-A", "--", path])
+    end)
+
     assert resolve_relearn!(ctx.base, "operator")
     assert Identity.live_revision!(ctx.base) != live_before
 
@@ -1567,6 +1593,10 @@ defmodule Tightbeam.IdentityTest do
              git!(dir, ["rev-parse", "tightbeam/upstream"])
 
     assert File.read!(Path.join(dir, "archetypes/default.toml")) == enriched_default
+
+    Enum.each(tl(conflicts), fn path ->
+      refute File.exists?(Path.join(dir, path))
+    end)
 
     receipt =
       dir

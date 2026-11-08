@@ -1854,7 +1854,11 @@ defmodule Tightbeam.Identity do
       if stages != [],
         do: git_input!(dir, ["update-index", "-z", "--index-info"], IO.iodata_to_binary(stages))
 
-      restore_tree_path!(dir, path, org_entry || incoming_entry)
+      # Keep the conflicted worktree at the organization's side. In
+      # particular, an absent organization path stays absent when the
+      # incoming side adds it, so an unresolved legacy deletion is not
+      # silently replaced before the conflict is settled.
+      restore_tree_path!(dir, path, org_entry)
     end)
   end
 
