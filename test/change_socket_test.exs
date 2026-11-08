@@ -78,6 +78,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert Enum.map(decoded, & &1["subscriptionId"]) |> Enum.sort() == ["all-work", "work"]
     assert Enum.map(decoded, & &1["seq"]) |> Enum.sort() == [1, 2]
+    assert Enum.all?(decoded, &(&1["schemaVersion"] == 1))
   end
 
   test "operator asUser authenticates and protocol v2 subscribes to visible changes", ctx do
@@ -119,7 +120,8 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert_receive {:firehose_notice, frame}
     assert {:push, {:text, bytes}, ^state} =
              ChangeSocket.handle_info({:firehose_notice, frame}, state)
-    assert %{"type" => "change", "subscriptionId" => "all"} = JSON.decode!(bytes)
+    assert %{"type" => "change", "subscriptionId" => "all", "schemaVersion" => 2} =
+             JSON.decode!(bytes)
   end
 
   test "operator auth validates asUser and defaults to the first admin", ctx do

@@ -14,6 +14,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
             device_id: nil,
             is_admin: false,
             subscriptions: %{},
+            subscription_versions: %{},
             heartbeat_timer: nil,
             deps: %{}
 
@@ -39,6 +40,12 @@ defmodule Tightbeam.Wire.ChangeSocket do
   def handle_info({:firehose_notice, notice}, %{phase: :live} = state) do
     await_delivery_release(state, notice)
     Hub.delivered(hub(state), self())
+
+    notice =
+      if state.subscription_versions[notice["subscriptionId"]] == 2,
+        do: Map.put(notice, "schemaVersion", 2),
+        else: notice
+
     push(notice, state)
   end
 
@@ -214,7 +221,13 @@ defmodule Tightbeam.Wire.ChangeSocket do
         case normalize_filters(message["filters"]) do
           {:ok, filters} ->
             :ok = Hub.subscribe(hub(state), self(), id, filters)
-            state = %{state | subscriptions: Map.put(state.subscriptions, id, filters)}
+
+            state = %{
+              state
+              | subscriptions: Map.put(state.subscriptions, id, filters),
+                subscription_versions:
+                  Map.put(state.subscription_versions, id, message["protocolVersion"])
+            }
             push(%{"type" => "subscription_ready", "subscriptionId" => id}, state)
 
           :error ->
@@ -228,7 +241,11 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
     if is_binary(id) and Map.has_key?(state.subscriptions, id) do
       :ok = Hub.unsubscribe(hub(state), self(), id)
-      state = %{state | subscriptions: Map.delete(state.subscriptions, id)}
+      state = %{
+        state
+        | subscriptions: Map.delete(state.subscriptions, id),
+          subscription_versions: Map.delete(state.subscription_versions, id)
+      }
       push(%{"type" => "subscription_removed", "subscriptionId" => id}, state)
     else
       invalid("unknown subscriptionId", state)
