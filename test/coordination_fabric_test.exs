@@ -1480,6 +1480,8 @@ defmodule Tightbeam.CoordinationFabricTest do
       preflight_terminal_operator_rows_in_txn: "operator",
       rule_operator_request_in_txn: "operator",
       operator_withdraw_in_txn: "operator",
+      applicable_late_rulings_in_txn: "operator",
+      late_ruling_receipt_context_in_txn: "operator",
       open_counts_by_assignment: "statute,effort",
       open_statute_effort_ids_for_assignments_in_txn: "statute,effort",
       consume: "any",
@@ -1552,6 +1554,8 @@ defmodule Tightbeam.CoordinationFabricTest do
       preflight_terminal_operator_rows_in_txn: 2,
       rule_operator_request_in_txn: 6,
       operator_withdraw_in_txn: 4,
+      applicable_late_rulings_in_txn: 4,
+      late_ruling_receipt_context_in_txn: 4,
       open_counts_by_assignment: 1,
       open_statute_effort_ids_for_assignments_in_txn: 2,
       consume: 2,
@@ -1662,7 +1666,8 @@ defmodule Tightbeam.CoordinationFabricTest do
         {:list, 4},
         {:get, 4},
         {:decision_trace_rows, 2},
-        {:open_statute_effort_ids_for_assignments_in_txn, 2}
+        {:open_statute_effort_ids_for_assignments_in_txn, 2},
+        {:applicable_late_rulings_in_txn, 4}
       ])
 
     found_dynamic_queries = dynamic_query_refs("lib/tightbeam/escalation.ex")
@@ -2121,25 +2126,40 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   defp has_dynamic_query?(node, attrs) do
-    {_, hit?} =
-      Macro.prewalk(node, false, fn
-        {{:., _, [_mod, fun]}, _, args} = n, acc
-        when fun in [:q, :query] and length(args) >= 2 ->
-          query_arg = Enum.at(args, 1)
+    dynamic_query_node?(node, attrs)
+  end
 
-          resolved =
-            case query_arg do
-              bin when is_binary(bin) -> {:ok, bin}
-              other -> literal_value(other, attrs)
-            end
+  defp dynamic_query_node?({:|>, _, [left, {{:., _, [_mod, fun]}, _, args}]}, attrs)
+       when fun in [:q, :query] and args != [] do
+    dynamic_query_arg?(hd(args), attrs) or dynamic_query_node?(left, attrs) or
+      Enum.any?(tl(args), &dynamic_query_node?(&1, attrs))
+  end
 
-          {n, acc or match?(:unknown, resolved)}
+  defp dynamic_query_node?({{:., _, [_mod, fun]}, _, args}, attrs)
+       when fun in [:q, :query] and length(args) >= 2 do
+    dynamic_query_arg?(Enum.at(args, 1), attrs) or
+      Enum.any?(args, &dynamic_query_node?(&1, attrs))
+  end
 
-        n, acc ->
-          {n, acc}
-      end)
+  defp dynamic_query_node?({_, _, args}, attrs) when is_list(args),
+    do: Enum.any?(args, &dynamic_query_node?(&1, attrs))
 
-    hit?
+  defp dynamic_query_node?(tuple, attrs) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> Enum.any?(&dynamic_query_node?(&1, attrs))
+
+  defp dynamic_query_node?(items, attrs) when is_list(items),
+    do: Enum.any?(items, &dynamic_query_node?(&1, attrs))
+
+  defp dynamic_query_node?(_, _attrs), do: false
+
+  defp dynamic_query_arg?(query_arg, attrs) do
+    resolved =
+      case query_arg do
+        bin when is_binary(bin) -> {:ok, bin}
+        other -> literal_value(other, attrs)
+      end
+
+    match?(:unknown, resolved)
   end
 
   # This file's own `alias` declarations (plain, `as:`, and the `Mod.{A, B}`
@@ -2425,14 +2445,15 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   # Every double-quoted or triple-quoted string literal inside a chunk of
-  # already-reconstructed (`Macro.to_string/1`) source, each NORMALIZED (and
-  # quote-stripped) INDIVIDUALLY rather than joined into one blob: a single aggregated blob let one properly-scoped query's
+  # already-reconstructed (`Macro.to_string/1`) source, including multiline
+  # strings, each NORMALIZED (and quote-stripped) INDIVIDUALLY rather than
+  # joined into one blob: a single aggregated blob let one properly-scoped query's
   # `kind = '<declared>'` literal satisfy the whole function's check even
   # when a SECOND query in the same function carried no kind constraint (or
   # a wrong one) of its own — the aggregate text still contained the
   # required substring, so the check never looked past it.
   defp own_sql_texts(text) do
-    Regex.scan(~r/"""(?:(?!""").)*"""|"[^"\n]*"/s, text)
+    Regex.scan(~r/"""(?:(?!""").)*"""|"(?:\\.|[^"\\])*"/s, text)
     |> List.flatten()
     |> Enum.map(&normalize_sql_literal/1)
   end
@@ -2489,6 +2510,9 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   defp single_literal_kind_shape(ref, literal, declared, pin) do
+    kind_ref = decision_request_kind_ref(literal)
+    kind_re = Regex.compile!(kind_ref, "i")
+
     cond do
       literal =~ ~r/\bOR\b/i ->
         {:error,
@@ -2496,7 +2520,7 @@ defmodule Tightbeam.CoordinationFabricTest do
            "uses OR today, so any occurrence is unreviewed disjunction and fails closed: " <>
            inspect(literal)}
 
-      not (literal =~ ~r/\bkind\b/i) ->
+      not Regex.match?(kind_re, literal) ->
         case pin do
           {:valid, literals} ->
             if literal in literals do
@@ -2524,16 +2548,25 @@ defmodule Tightbeam.CoordinationFabricTest do
       true ->
         negations =
           Regex.scan(
-            ~r/\bkind\s*(?:!=|<>)\s*'[a-z_]+'|\bkind\s+not\s+in\b|\bkind\s+is\s+not\b/i,
+            Regex.compile!(
+              "#{kind_ref}\\s*(?:!=|<>)\\s*'[a-z_]+'|#{kind_ref}\\s+not\\s+in\\b|#{kind_ref}\\s+is\\s+not\\b",
+              "i"
+            ),
             literal
           )
 
         eq_matches =
-          Regex.scan(~r/\bkind\s*=\s*'([a-z_]+)'/i, literal)
+          Regex.scan(Regex.compile!("#{kind_ref}\\s*=\\s*'([a-z_]+)'", "i"), literal)
           |> Enum.map(fn [_, v] -> String.downcase(v) end)
 
         in_matches =
-          Regex.scan(~r/\bkind\s+in\s*\(\s*((?:'[a-z_]+'\s*,\s*)*'[a-z_]+')\s*\)/i, literal)
+          Regex.scan(
+            Regex.compile!(
+              "#{kind_ref}\\s+in\\s*\\(\\s*((?:'[a-z_]+'\\s*,\\s*)*'[a-z_]+')\\s*\\)",
+              "i"
+            ),
+            literal
+          )
           |> Enum.map(fn [_, list] ->
             Regex.scan(~r/'([a-z_]+)'/i, list) |> Enum.map(fn [_, v] -> String.downcase(v) end)
           end)
@@ -2573,6 +2606,28 @@ defmodule Tightbeam.CoordinationFabricTest do
           true ->
             {:error, "#{ref}: unsupported declared-kind arity #{inspect(declared)}"}
         end
+    end
+  end
+
+  defp decision_request_kind_ref(literal) do
+    clause_words =
+      MapSet.new(
+        ~w(where join left right inner outer cross full on order group having limit offset)
+      )
+
+    case Regex.run(
+           ~r/\b(?:FROM|JOIN)\s+decision_requests(?:\s+(?:AS\s+)?([a-z_][a-z0-9_]*))?/i,
+           literal
+         ) do
+      [_, alias_name] when is_binary(alias_name) and alias_name != "" ->
+        if MapSet.member?(clause_words, String.downcase(alias_name)) do
+          "(?<![A-Za-z0-9_.])kind"
+        else
+          "\\b#{Regex.escape(alias_name)}\\s*\\.\\s*kind"
+        end
+
+      _ ->
+        "(?<![A-Za-z0-9_.])kind"
     end
   end
 

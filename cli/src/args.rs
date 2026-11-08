@@ -247,6 +247,7 @@ pub enum Command {
     Assign {
         identity: Identity,
         subject: String,
+        succeeds: Option<String>,
         target: Target,
         idempotency_key: Option<String>,
         work_item_id: Option<String>,
@@ -259,6 +260,7 @@ pub enum Command {
     Dispatch {
         identity: Identity,
         subject: String,
+        succeeds: Option<String>,
         holder: String,
         work_item_id: Option<String>,
         effect_kind: Option<String>,
@@ -853,6 +855,7 @@ COMMANDS:
       Rule an item failed (→ failed); --reason is recorded on the item.
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
+         [--succeeds <assignmentId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
          [--delivers-work-item]
          [--files '["lib/a.ex","test/a_test.exs"]'] [--report-to <sessionKey>]
@@ -860,7 +863,8 @@ COMMANDS:
       across assignments. Use --delivers-work-item only for the whole card.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
-           [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
+           [--succeeds <assignmentId>] [--effect-kind <kind>]
+           [--workdir-root <relativePath>] [--key <key>]
            [--report-to <sessionKey>] [--delivers-work-item]
       Atomically open an assignment and wake its holder with the card id.
   completion-notices --status open|all [--session <childSessionKey>]
@@ -2204,6 +2208,10 @@ fn parse_with_optional_catalog(
             }
             let subject =
                 nonempty(flags, "subject").ok_or_else(|| "--subject is required".to_owned())?;
+            let succeeds = nonempty(flags, "succeeds");
+            if flags.contains_key("succeeds") && succeeds.is_none() {
+                return Err("--succeeds requires a non-empty assignment id".to_owned());
+            }
             let files = nonempty(flags, "files")
                 .map(|encoded| {
                     serde_json::from_str::<Vec<String>>(&encoded)
@@ -2213,6 +2221,7 @@ fn parse_with_optional_catalog(
             Ok(Command::Assign {
                 identity: identity(flags)?,
                 subject,
+                succeeds,
                 target: targets.into_iter().next().expect("exactly one target"),
                 idempotency_key: nonempty(flags, "key"),
                 work_item_id: nonempty(flags, "work-item"),
@@ -2234,9 +2243,14 @@ fn parse_with_optional_catalog(
             let subject =
                 nonempty(flags, "subject").ok_or_else(|| "--subject is required".to_owned())?;
             let brief = nonempty(flags, "brief").ok_or_else(|| "--brief is required".to_owned())?;
+            let succeeds = nonempty(flags, "succeeds");
+            if flags.contains_key("succeeds") && succeeds.is_none() {
+                return Err("--succeeds requires a non-empty assignment id".to_owned());
+            }
             Ok(Command::Dispatch {
                 identity: identity(flags)?,
                 subject,
+                succeeds,
                 holder: holders.into_iter().next().expect("exactly one holder"),
                 work_item_id: nonempty(flags, "work-item"),
                 effect_kind: nonempty(flags, "effect-kind"),
@@ -3374,6 +3388,66 @@ mod tests {
                 "sample-user",
             ])),
             Err("--decision must be retain, park, or retire".to_owned())
+        );
+    }
+
+    #[test]
+    fn successor_assignment_option_parses_on_assign_and_dispatch() {
+        assert!(matches!(
+            parse(strings(&[
+                "assign",
+                "--subject",
+                "continue",
+                "--session",
+                "holder",
+                "--succeeds",
+                "asg_12345678-1234-4234-9234-123456789abc",
+            ])),
+            Ok(Command::Assign { succeeds: Some(value), .. })
+                if value == "asg_12345678-1234-4234-9234-123456789abc"
+        ));
+
+        assert!(matches!(
+            parse(strings(&[
+                "dispatch",
+                "--to",
+                "holder",
+                "--subject",
+                "continue",
+                "--brief",
+                "Continue the work.",
+                "--succeeds",
+                "asg_12345678-1234-4234-9234-123456789abc",
+            ])),
+            Ok(Command::Dispatch { succeeds: Some(value), .. })
+                if value == "asg_12345678-1234-4234-9234-123456789abc"
+        ));
+
+        assert!(
+            parse(strings(&[
+                "assign",
+                "--subject",
+                "continue",
+                "--session",
+                "holder",
+                "--succeeds",
+            ]))
+            .is_err()
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "dispatch",
+                "--to",
+                "holder",
+                "--subject",
+                "continue",
+                "--brief",
+                "Continue the work.",
+                "--succeeds",
+                "",
+            ])),
+            Err("--succeeds requires a non-empty assignment id".to_owned())
         );
     }
 
