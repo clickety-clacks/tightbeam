@@ -3390,7 +3390,8 @@ defmodule Tightbeam.CliIntegrationTest do
        ]},
       {"harklight-retract", ["harklight-retract", "--message", "message-example"]},
       {"harklight-settle", ["harklight-settle", "--message", "message-example"]},
-      {"harklight-follow", ["harklight-follow", "--message", "message-example"]}
+      {"harklight-follow", ["harklight-follow", "--message", "message-example"]},
+      {"harklight-reconnect", ["harklight-reconnect", "--message", "message-example"]}
     ]
 
     for {flag, identity, principal} <- [
@@ -3457,6 +3458,8 @@ defmodule Tightbeam.CliIntegrationTest do
       {"harklight-settle", ["harklight-settle", "--message", "message-example"],
        "invalid Harklight command flags"},
       {"harklight-follow", ["harklight-follow", "--message", "message-example"],
+       "invalid Harklight command flags"},
+      {"harklight-reconnect", ["harklight-reconnect", "--message", "message-example"],
        "invalid Harklight command flags"}
     ]
 

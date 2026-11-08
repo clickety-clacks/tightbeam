@@ -598,6 +598,11 @@ defmodule Tightbeam.HarklightWakes do
     :ok
   end
 
+  @doc false
+  def reconnect_handle(handle, caller_session_key, server \\ __MODULE__) do
+    GenServer.call(server, {:reconnect_handle, handle, caller_session_key}, :infinity)
+  end
+
   def origin_ready(session_key) do
     if pid = Process.whereis(__MODULE__), do: GenServer.cast(pid, {:origin_ready, session_key})
     :ok
@@ -636,6 +641,7 @@ defmodule Tightbeam.HarklightWakes do
        failures: %{},
        attempts: %{},
        retry_timers: %{},
+       reconnect_waiters: %{},
        gone_tasks: %{},
        deferred: MapSet.new(),
        retry_delays: Keyword.get(opts, :retry_delays, [1_000, 2_000, 4_000, 8_000, 16_000]),
@@ -717,6 +723,8 @@ defmodule Tightbeam.HarklightWakes do
         {:noreply, state}
 
       {handle, refs} ->
+        state = reply_reconnect_waiter(state, ref, reconnect_worker_down_result())
+
         state = %{
           state
           | refs: refs,
@@ -1157,6 +1165,132 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   @impl true
+  def handle_call({:reconnect_handle, handle, caller_session_key}, from, state) do
+    case reconnect_admission(state, handle, caller_session_key) do
+      :ok ->
+        state = cancel_retry(state, handle)
+        {:noreply, start_reconnect_worker(state, handle, caller_session_key, from)}
+
+      {:error, {:busy, reason}} ->
+        {:reply, {:error, {:busy, reason}}, state}
+
+      {:error, {:refused, code, reason}} ->
+        {:reply, {:error, {:refused, code, reason}}, state}
+    end
+  end
+
+  def handle_call({:reconnect_result, ref, result}, {pid, _tag}, state) do
+    case Map.fetch(state.refs, ref) do
+      {:ok, handle} ->
+        cond do
+          Map.get(state.workers, handle) != pid ->
+            {:reply, {:error, :listener_fenced}, state}
+
+          origin_managed?(state.db, handle) ->
+            case Map.pop(state.reconnect_waiters, ref) do
+              {nil, _waiters} ->
+                {:reply, :origin_moving, state}
+
+              {waiter, waiters} ->
+                GenServer.reply(
+                  waiter,
+                  {:error,
+                   {:busy, "The original Harklight handle began moving during reconnect."}}
+                )
+
+                {:reply, :origin_moving, %{state | reconnect_waiters: waiters}}
+            end
+
+          not valid_worker?(state, handle, {pid, nil}) ->
+            {:reply, {:error, :listener_fenced}, state}
+
+          true ->
+            case Map.pop(state.reconnect_waiters, ref) do
+              {nil, _waiters} ->
+                {:reply, :ok, state}
+
+              {waiter, waiters} ->
+                case result do
+                  {:ok, %{feed_cursor: cursor}} when is_integer(cursor) and cursor >= 0 ->
+                    case activate_reconnect_handle(state.db, handle) do
+                      :active ->
+                        GenServer.reply(waiter, result)
+
+                        {:reply, :ok,
+                         %{
+                           state
+                           | reconnect_waiters: waiters,
+                             attempts: Map.delete(state.attempts, handle),
+                             failures: Map.delete(state.failures, handle)
+                         }}
+
+                      :closed ->
+                        GenServer.reply(
+                          waiter,
+                          {:error,
+                           {:refused, "harklight_chat_closed",
+                            "The Harklight chat closed while reconnect was starting."}}
+                        )
+
+                        {:reply, :closed, %{state | reconnect_waiters: waiters}}
+
+                      {:error, reason} ->
+                        GenServer.reply(
+                          waiter,
+                          {:error,
+                           {:connection_error, "harklight_reconnect_state_unavailable",
+                            "The Harklight reconnect could not be recorded: #{inspect(reason)}"}}
+                        )
+
+                        {:reply, {:error, reason}, %{state | reconnect_waiters: waiters}}
+                    end
+
+                  _ ->
+                    GenServer.reply(waiter, result)
+                    {:reply, :ok, %{state | reconnect_waiters: waiters}}
+                end
+            end
+        end
+
+      _ ->
+        {:reply, {:error, :listener_fenced}, state}
+    end
+  end
+
+  def handle_call({:capture_reconnect, handle, event_line}, {pid, _tag}, state)
+      when is_binary(event_line) do
+    cond do
+      not valid_worker?(state, handle, {pid, nil}) ->
+        {:reply, {:error, "listener_fenced"}, state}
+
+      not reconnect_events_for_handle?(handle, [event_line]) ->
+        {:reply, {:error, "event_identity_invalid"}, state}
+
+      origin_managed?(state.db, handle) ->
+        result = capture_reconnect_origin_lines(state.db, [event_line])
+
+        case result do
+          :ok ->
+            HarklightLifecycle.acknowledge_pending(state.db, runner: state.send_runner)
+            {:reply, :ok, state}
+
+          :captured ->
+            {:reply, :captured, state}
+
+          :ignored ->
+            {:reply, capture_reconnect_unmanaged(state, handle, [event_line]), state}
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
+        end
+
+      true ->
+        {:reply, capture_reconnect_unmanaged(state, handle, [event_line]), state}
+    end
+  rescue
+    _ -> {:reply, {:error, "reconnect_capture_unavailable"}, state}
+  end
+
   def handle_call({:capture, handle, line}, from, state) do
     result =
       if valid_worker?(state, handle, from),
@@ -1333,6 +1467,24 @@ defmodule Tightbeam.HarklightWakes do
        ) do
     wake_id = "w_harklight_notice_recovery_" <> handle
 
+    message_id =
+      case Txn.q(
+             txn,
+             "SELECT messageId FROM harklight_send_operations WHERE handle=?1 AND state='bound' ORDER BY createdAt,opId LIMIT 1",
+             [handle]
+           ) do
+        [[message_id]] when is_binary(message_id) and message_id != "" -> message_id
+        _ -> "unknown"
+      end
+
+    safe_error =
+      if(is_binary(error), do: error, else: inspect(error))
+      |> sanitize_diagnostic_text()
+      |> case do
+        nil -> "unknown"
+        value -> value
+      end
+
     if Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) == [] do
       recipient =
         case Org.get_in_txn(txn, session_key) do
@@ -1344,7 +1496,7 @@ defmodule Tightbeam.HarklightWakes do
         cli_output =
           case {error, operation, diagnostic} do
             {_, operation, diagnostic}
-            when operation in ["attach", "listen"] and is_binary(diagnostic) ->
+            when operation in ["attach", "listen", "reconnect"] and is_binary(diagnostic) ->
               " #{String.upcase(operation)} failure: #{diagnostic}."
 
             {"origin_unavailable", _, _} ->
@@ -1364,7 +1516,7 @@ defmodule Tightbeam.HarklightWakes do
             origin: "process:tightbeam",
             creator_session_key: session_key,
             prompt:
-              "Harklight listening for session #{session_key} and handle #{handle} stopped (#{error}).#{cli_output} Replies on this thread will not reach the originating session while it is unavailable. Pending entries remain at the origin. The origin may re-ask; do not transfer the conversation.",
+              "DISCONNECT: Harklight message #{message_id} in thread #{handle} for origin session #{session_key} stopped (#{safe_error}).#{cli_output} Replies on this thread will not reach the originating session while it is unavailable. Pending entries remain at the origin. The origin may re-ask; do not transfer the conversation.",
             due_at: now,
             class: "blocker"
           })
@@ -1406,6 +1558,600 @@ defmodule Tightbeam.HarklightWakes do
             restart: MapSet.put(state.restart, {handle, :deciding})
         }
       end
+    end
+  end
+
+  defp reconnect_admission(state, handle, caller_session_key) do
+    case DB.query(
+           state.db,
+           "SELECT sessionKey,host,state FROM harklight_wake_handles WHERE handle=?1",
+           [handle]
+         ) do
+      {:ok, [[session_key, host, handle_state]]} ->
+        cond do
+          not reconnect_authorized?(state.db, caller_session_key, handle, session_key) ->
+            {:error,
+             {:refused, "harklight_reconnect_unauthorized",
+              "Reconnect requires the message owner or an open follow on this thread."}}
+
+          host != Placement.local_host_name() ->
+            {:error,
+             {:refused, "harklight_origin_unavailable",
+              "The original Harklight host is not available here."}}
+
+          handle_state == "complete" ->
+            {:error,
+             {:refused, "harklight_chat_closed", "The Harklight chat is already complete."}}
+
+          handle_state != "unavailable" ->
+            {:error, {:busy, "The Harklight handle is not idle and disconnected."}}
+
+          origin_managed?(state.db, handle) ->
+            {:error, {:busy, "The original Harklight handle is moving or already covered."}}
+
+          Map.has_key?(state.workers, handle) or Map.has_key?(state.ports, handle) or
+            MapSet.member?(state.stopping, handle) or MapSet.member?(state.restart, handle) or
+            MapSet.member?(state.restart, {handle, :deciding}) or
+              handle in Map.values(state.gone_tasks) ->
+            {:error, {:busy, "Another Harklight operation already owns this handle."}}
+
+          true ->
+            :ok
+        end
+
+      {:ok, []} ->
+        {:error,
+         {:refused, "harklight_origin_unavailable",
+          "The original Harklight handle is unavailable."}}
+
+      {:error, _reason} ->
+        {:error,
+         {:refused, "harklight_origin_unavailable",
+          "The original Harklight handle could not be checked."}}
+    end
+  rescue
+    _ ->
+      {:error,
+       {:refused, "harklight_origin_unavailable",
+        "The original Harklight handle could not be checked."}}
+  end
+
+  defp reconnect_authorized?(db, caller_session_key, handle, owner_session_key) do
+    caller_session_key == owner_session_key or
+      match?(
+        {:ok, [[1]]},
+        DB.query(
+          db,
+          "SELECT 1 FROM harklight_wake_follows WHERE sessionKey=?1 AND handle=?2 AND state='open' LIMIT 1",
+          [caller_session_key, handle]
+        )
+      )
+  end
+
+  defp origin_managed?(db, handle) do
+    if Code.ensure_loaded?(Tightbeam.HarklightOrigin) do
+      apply(Tightbeam.HarklightOrigin, :managed?, [db, handle])
+    else
+      false
+    end
+  end
+
+  defp start_reconnect_worker(state, handle, caller_session_key, waiter) do
+    manager = self()
+    captured_state = state
+
+    {:ok, pid} =
+      Task.start_link(fn ->
+        receive do
+          {:reconnect_registered, ref} ->
+            result =
+              try do
+                reconnect_worker(captured_state, manager, handle, ref)
+              rescue
+                error ->
+                  {:result,
+                   reconnect_failure(
+                     manager,
+                     handle,
+                     "harklight_reconnect_failed",
+                     Exception.message(error)
+                   )}
+              catch
+                :exit, :shutdown ->
+                  exit(:shutdown)
+
+                kind, reason ->
+                  {:result,
+                   reconnect_failure(
+                     manager,
+                     handle,
+                     "harklight_reconnect_failed",
+                     "#{kind}: #{inspect(reason)}"
+                   )}
+              end
+
+            case result do
+              {:result, response} ->
+                GenServer.call(manager, {:reconnect_result, ref, response}, :infinity)
+
+              :reported ->
+                :ok
+            end
+        after
+          30_000 -> exit(:reconnect_worker_registration_timeout)
+        end
+      end)
+
+    ref = Process.monitor(pid)
+    send(pid, {:reconnect_registered, ref})
+
+    %{
+      state
+      | workers: Map.put(state.workers, handle, pid),
+        refs: Map.put(state.refs, ref, handle),
+        reconnect_waiters: Map.put(state.reconnect_waiters, ref, waiter),
+        restart: MapSet.put(state.restart, {handle, :deciding})
+    }
+  end
+
+  defp reconnect_worker(state, manager, handle, ref) do
+    skip? = HarklightLifecycle.closed_for_start?(state.db, handle, runner: state.send_runner)
+
+    case GenServer.call(manager, {:start_decided, handle, skip?}, :infinity) do
+      {:listen, _vendor_id} when not skip? ->
+        case System.find_executable("harklight-agent") do
+          nil ->
+            {:result,
+             reconnect_failure(
+               manager,
+               handle,
+               "harklight_cli_missing",
+               "Harklight Agent could not be run."
+             )}
+
+          executable ->
+            run_reconnect_stream(manager, handle, executable, ref)
+        end
+
+      :skip when skip? ->
+        {:result,
+         {:error,
+          {:refused, "harklight_chat_closed",
+           "The original Harklight handle no longer has an unanswered chat."}}}
+
+      :skip ->
+        {:result,
+         {:error,
+          {:connection_error, "harklight_origin_unavailable",
+           "The original Harklight host is no longer available for reconnect."}}}
+    end
+  end
+
+  defp run_reconnect_stream(manager, handle, executable, ref) do
+    try do
+      case GenServer.call(
+             manager,
+             {:launch_child, handle, executable, ["reconnect", "--session", handle]},
+             :infinity
+           ) do
+        {:ok, port, initial} ->
+          try do
+            true = Port.command(port, "continue\n")
+
+            receive_reconnect_output(
+              manager,
+              handle,
+              executable,
+              ref,
+              port,
+              initial,
+              %{connected?: false, feed_cursor: nil, diagnostics: []}
+            )
+          after
+            close_listener_port(port)
+          end
+
+        {:error, reason} ->
+          case reason do
+            :listener_fenced ->
+              {:result,
+               {:error, {:busy, "The original Harklight handle began moving during reconnect."}}}
+
+            _ ->
+              {:result,
+               reconnect_failure(manager, handle, "harklight_reconnect_failed", inspect(reason))}
+          end
+      end
+    rescue
+      error ->
+        reason = Tightbeam.HarklightWakes.sanitize_refusal_output(Exception.message(error))
+        {:result, reconnect_failure(manager, handle, "harklight_reconnect_failed", reason)}
+    catch
+      :exit, :shutdown ->
+        exit(:shutdown)
+
+      kind, reason ->
+        {:result,
+         reconnect_failure(
+           manager,
+           handle,
+           "harklight_reconnect_failed",
+           "#{kind}: #{inspect(reason)}"
+         )}
+    end
+  end
+
+  defp receive_reconnect_output(
+         manager,
+         handle,
+         executable,
+         ref,
+         port,
+         pending,
+         stream_state
+       ) do
+    receive do
+      {:EXIT, ^manager, reason} ->
+        exit(reason)
+
+      {:EXIT, _sender, :shutdown} ->
+        exit(:shutdown)
+
+      {^port, {:data, bytes}} ->
+        case process_reconnect_chunk(
+               manager,
+               handle,
+               ref,
+               pending,
+               bytes,
+               stream_state
+             ) do
+          {:continue, next_pending, next_state} ->
+            receive_reconnect_output(
+              manager,
+              handle,
+              executable,
+              ref,
+              port,
+              next_pending,
+              next_state
+            )
+
+          {:stop, result} ->
+            result
+        end
+
+      {^port, {:exit_status, status}} ->
+        case process_reconnect_final_line(
+               manager,
+               handle,
+               ref,
+               pending,
+               stream_state
+             ) do
+          {:continue, final_state} ->
+            reconnect_stream_exit(manager, handle, status, final_state)
+
+          {:stop, result} ->
+            result
+        end
+    end
+  end
+
+  defp process_reconnect_chunk(manager, handle, ref, pending, bytes, stream_state) do
+    parts = :binary.split(pending <> bytes, "\n", [:global])
+    remainder = List.last(parts)
+    lines = Enum.drop(parts, -1)
+
+    Enum.reduce_while(lines, {:continue, remainder, stream_state}, fn line,
+                                                                      {:continue, _remainder,
+                                                                       current_state} ->
+      case process_reconnect_line(manager, handle, ref, line, current_state) do
+        {:continue, next_state} -> {:cont, {:continue, remainder, next_state}}
+        {:stop, result} -> {:halt, {:stop, result}}
+      end
+    end)
+  end
+
+  defp process_reconnect_final_line(_manager, _handle, _ref, "", stream_state),
+    do: {:continue, stream_state}
+
+  defp process_reconnect_final_line(manager, handle, ref, line, stream_state) do
+    case process_reconnect_line(manager, handle, ref, line, stream_state) do
+      {:continue, next_state} -> {:continue, next_state}
+      {:stop, result} -> {:stop, result}
+    end
+  end
+
+  defp process_reconnect_line(manager, handle, ref, line, stream_state) do
+    case Tightbeam.HarklightReconnect.parse_agent_line(line, handle) do
+      {:connected, cursor} ->
+        if stream_state.connected? do
+          if stream_state.feed_cursor == cursor do
+            {:continue, stream_state}
+          else
+            reconnect_stream_failure(
+              manager,
+              handle,
+              "harklight_reconnect_unconfirmed",
+              "Agent changed the feed cursor during one reconnect stream.",
+              stream_state
+            )
+          end
+        else
+          case GenServer.call(
+                 manager,
+                 {:reconnect_result, ref, {:ok, %{feed_cursor: cursor}}},
+                 :infinity
+               ) do
+            :ok ->
+              {:continue, %{stream_state | connected?: true, feed_cursor: cursor}}
+
+            :origin_moving ->
+              {:stop, :reported}
+
+            :closed ->
+              {:stop, :reported}
+
+            {:error, reason} ->
+              reconnect_stream_failure(
+                manager,
+                handle,
+                "harklight_reconnect_state_unavailable",
+                reason,
+                stream_state
+              )
+          end
+        end
+
+      {:event, event_line} ->
+        case GenServer.call(manager, {:capture_reconnect, handle, event_line}, :infinity) do
+          :ok ->
+            {:continue, stream_state}
+
+          :captured ->
+            {:continue, stream_state}
+
+          {:error, :origin_moving} ->
+            {:stop,
+             if(stream_state.connected?,
+               do: :reported,
+               else:
+                 {:result,
+                  {:error,
+                   {:busy, "The original Harklight handle began moving during reconnect."}}}
+             )}
+
+          {:error, :closed} ->
+            finish(manager, handle, :complete)
+            {:stop, if(stream_state.connected?, do: :reported, else: closed_reconnect_result())}
+
+          {:error, reason} ->
+            reconnect_stream_failure(
+              manager,
+              handle,
+              "harklight_reconnect_capture_failed",
+              reason,
+              stream_state
+            )
+        end
+
+      :idle ->
+        # Reconnect is a standing Agent stream; idle marks a drained cursor,
+        # while later entries can still arrive on this same handle.
+        {:continue, stream_state}
+
+      {:error, outcome, code, reason, op_id} ->
+        reason = reason || "The Agent declined or could not confirm the reconnect."
+
+        finish(
+          manager,
+          handle,
+          failure_status({"harklight_reconnect_failed", code}, "reconnect", reason)
+        )
+
+        result =
+          case outcome do
+            :outcome_unknown -> {:error, {:outcome_unknown, code, reason, op_id}}
+            :refused -> {:error, {:refused, code, reason}}
+            _ -> {:error, {:connection_error, code, reason}}
+          end
+
+        {:stop, if(stream_state.connected?, do: :reported, else: {:result, result})}
+
+      {:diagnostic, diagnostic} ->
+        diagnostics =
+          [String.slice(diagnostic, 0, @max_diagnostic_line_chars) | stream_state.diagnostics]
+          |> Enum.take(@max_diagnostic_lines)
+
+        {:continue, %{stream_state | diagnostics: diagnostics}}
+
+      :ignore ->
+        {:continue, stream_state}
+    end
+  end
+
+  defp reconnect_stream_exit(manager, handle, status, %{connected?: true} = stream_state) do
+    {code, reason} = stream_exit_diagnostic(status, stream_state.diagnostics)
+
+    finish(
+      manager,
+      handle,
+      failure_status({"harklight_reconnect_failed", code}, "reconnect", reason)
+    )
+
+    :reported
+  end
+
+  defp reconnect_stream_exit(manager, handle, status, stream_state) do
+    {code, reason, outcome} = unconfirmed_stream_diagnostic(status, stream_state.diagnostics)
+    _failure = reconnect_failure(manager, handle, code, reason)
+
+    diagnostic =
+      Tightbeam.HarklightWakes.sanitize_refusal_output(reason) ||
+        "The Agent reconnect ended without confirming the connection."
+
+    case outcome do
+      :outcome_unknown ->
+        {:result, {:error, {:outcome_unknown, code, diagnostic, nil}}}
+
+      _ ->
+        {:result, {:error, {:connection_error, code, diagnostic}}}
+    end
+  end
+
+  defp reconnect_stream_failure(manager, handle, code, reason, stream_state) do
+    diagnostic = reason || "The Agent reconnect did not complete."
+    result = reconnect_failure(manager, handle, code, diagnostic)
+    {:stop, if(stream_state.connected?, do: :reported, else: {:result, result})}
+  end
+
+  defp closed_reconnect_result do
+    {:result,
+     {:error,
+      {:refused, "harklight_chat_closed",
+       "The Harklight chat closed while reconnect was in progress."}}}
+  end
+
+  defp stream_exit_diagnostic(status, diagnostics) do
+    detail = diagnostic_summary(diagnostics)
+
+    if status == 0 do
+      {"harklight_reconnect_stream_ended",
+       detail || "The Agent reconnect stream ended unexpectedly."}
+    else
+      {"harklight_reconnect_stream_failed",
+       detail || "The Agent reconnect stream ended with exit status #{status}."}
+    end
+  end
+
+  defp unconfirmed_stream_diagnostic(status, diagnostics) do
+    detail = diagnostic_summary(diagnostics)
+    outcome = if status == 7, do: :outcome_unknown, else: :connection_error
+
+    {"harklight_reconnect_unconfirmed",
+     detail ||
+       "The Agent reconnect ended without confirming the connection (exit status #{status}).",
+     outcome}
+  end
+
+  defp diagnostic_summary([]), do: nil
+
+  defp diagnostic_summary(lines) do
+    lines
+    |> Enum.reverse()
+    |> Enum.join("; ")
+    |> Tightbeam.HarklightWakes.sanitize_refusal_output()
+  end
+
+  defp activate_reconnect_handle(db, handle) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]) do
+             [["complete"]] ->
+               :closed
+
+             [[state]] when state in ["active", "unavailable"] ->
+               Txn.q(
+                 txn,
+                 "UPDATE harklight_wake_handles SET state='active',lastError=NULL,updatedAt=?2 WHERE handle=?1 AND state IN ('active','unavailable')",
+                 [handle, System.system_time(:millisecond)]
+               )
+
+               :active
+
+             _ ->
+               {:error, :handle_unavailable}
+           end
+         end) do
+      {:ok, :active} -> :active
+      {:ok, :closed} -> :closed
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp capture_reconnect_legacy_lines(db, handle, lines) do
+    Enum.reduce_while(lines, :ok, fn line, :ok ->
+      case capture_line(db, handle, line) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp capture_reconnect_unmanaged(state, handle, lines) do
+    case activate_reconnect_handle(state.db, handle) do
+      :active ->
+        result = capture_reconnect_legacy_lines(state.db, handle, lines)
+
+        if result == :ok,
+          do: HarklightLifecycle.acknowledge_pending(state.db, runner: state.send_runner)
+
+        result
+
+      :closed ->
+        {:error, :closed}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp capture_reconnect_origin_lines(db, lines) do
+    Enum.reduce_while(lines, {:ok, false}, fn line, {:ok, staged?} ->
+      case capture_origin_line(db, line) do
+        :ok -> {:cont, {:ok, staged?}}
+        :captured -> {:cont, {:ok, true}}
+        :ignored -> {:cont, {:ignored, staged?}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, false} -> :ok
+      {:ok, true} -> :captured
+      {:ignored, false} -> :ignored
+      {:ignored, true} -> :captured
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp reconnect_events_for_handle?(handle, lines) do
+    Enum.all?(lines, fn line ->
+      case JSON.decode(line) do
+        {:ok, %{"kind" => "event", "session_handle" => ^handle}} -> true
+        _ -> false
+      end
+    end)
+  end
+
+  defp reconnect_failure(manager, handle, code, reason) do
+    reason = if is_binary(reason), do: reason, else: inspect(reason)
+    reason = Tightbeam.HarklightWakes.sanitize_refusal_output(reason)
+    diagnostic = reason || "The Agent reconnect did not complete."
+
+    finish(
+      manager,
+      handle,
+      failure_status({"harklight_reconnect_failed", code}, "reconnect", diagnostic)
+    )
+
+    {:error, {:connection_error, code, diagnostic}}
+  end
+
+  defp reconnect_worker_down_result do
+    {:error,
+     {:connection_error, "harklight_reconnect_worker_failed",
+      "The reconnect worker exited before confirming the connection."}}
+  end
+
+  defp reply_reconnect_waiter(state, ref, result) do
+    case Map.pop(state.reconnect_waiters, ref) do
+      {nil, _waiters} ->
+        state
+
+      {waiter, waiters} ->
+        GenServer.reply(waiter, result)
+        %{state | reconnect_waiters: waiters}
     end
   end
 

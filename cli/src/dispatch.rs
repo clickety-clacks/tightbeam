@@ -624,6 +624,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 vec![selector],
             ))
         }
+        Command::HarklightReconnect { identity, message } => Ok(request(
+            identity,
+            "harklight-reconnect",
+            vec![],
+            vec![string_field("messageId", message)],
+        )),
         // Not a verb and not on /agent/dispatch: it changes no domain state, it
         // tells the gateway to look at this session's running turn NOW, while the
         // command it observed has not run yet.
@@ -3967,6 +3973,7 @@ fn local_harklight_identity_refusal(
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightFollow { identity, .. }
+        | Command::HarklightReconnect { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
         {
             Some("invalid Harklight command flags")
@@ -3995,6 +4002,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightFollow { identity, .. }
+        | Command::HarklightReconnect { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::RoleBind { identity, .. }
@@ -4255,6 +4263,10 @@ mod tests {
             (
                 vec!["harklight-follow", "--handle", "h"],
                 "harklight-follow",
+            ),
+            (
+                vec!["harklight-reconnect", "--message", "m"],
+                "harklight-reconnect",
             ),
         ];
         for (args, verb) in commands {

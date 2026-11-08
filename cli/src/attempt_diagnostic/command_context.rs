@@ -74,6 +74,7 @@ impl CommandContext {
             HarklightRetract { .. } => ("cli.harklight_retract", DispatchPath),
             HarklightSettle { .. } => ("cli.harklight_settle", DispatchPath),
             HarklightFollow { .. } => ("cli.harklight_follow", DispatchPath),
+            HarklightReconnect { .. } => ("cli.harklight_reconnect", DispatchPath),
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
             Artifacts { .. } => ("cli.artifacts", DispatchPath),
             ToolCallObserved => ("cli.tool_call_observed", Requests::ToolCallObserved),
@@ -451,6 +452,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HarklightRetract { .. }
         | HarklightSettle { .. }
         | HarklightFollow { .. }
+        | HarklightReconnect { .. }
         | ToolCallObserved
         | RoleBind { .. }
         | Tune { .. }

@@ -952,6 +952,11 @@ defmodule Tightbeam.Gateway do
           runner: Map.get(config, :harklight_send_runner)
         )
       end,
+      {"harklight-reconnect", []} => fn call ->
+        Tightbeam.HarklightReconnect.reconnect(db, call,
+          agent_runner: Map.get(config, :harklight_agent_runner)
+        )
+      end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,

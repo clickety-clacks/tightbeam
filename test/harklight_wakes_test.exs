@@ -1149,10 +1149,12 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:ok, [[^origin_key, prompt]]} =
              DB.query(
                db,
-               "SELECT sessionKey,prompt FROM wakes WHERE prompt LIKE 'Harklight listening%'"
+               "SELECT sessionKey,prompt FROM wakes WHERE prompt LIKE 'DISCONNECT: Harklight message%'"
              )
 
-    assert String.contains?(prompt, @handle)
+    assert prompt =~ "message request"
+    assert prompt =~ "thread #{@handle}"
+    assert String.starts_with?(prompt, "DISCONNECT: ")
   end
 
   for saved_error <- ["listener_stopped", "attachment_refused"] do
@@ -1265,8 +1267,14 @@ defmodule Tightbeam.HarklightWakesTest do
                "SELECT sessionKey,prompt FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'"
              )
 
+    assert prompt =~ "DISCONNECT:"
     assert prompt =~ "listener lock is held"
     assert prompt =~ "Replies on this thread will not reach"
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
+               "w_harklight_notice_recovery_" <> @handle
+             ])
   end
 
   test "startup records an ineligible origin without launching a listener", %{
@@ -1680,6 +1688,7 @@ defmodule Tightbeam.HarklightWakesTest do
                ["w_harklight_notice_recovery_" <> @handle]
              )
 
+    assert String.starts_with?(prompt, "DISCONNECT: ")
     assert prompt =~ "failure:"
     assert prompt =~ "ATTACH failure:"
     assert prompt =~ "ATTACH initial attempt; exit status: 7"
@@ -1724,6 +1733,9 @@ defmodule Tightbeam.HarklightWakesTest do
                ["w_harklight_notice_recovery_" <> @handle]
              )
 
+    assert String.starts_with?(prompt, "DISCONNECT: ")
+    assert prompt =~ "message request"
+    assert prompt =~ "thread #{@handle}"
     assert prompt =~ "ATTACH initial attempt; exit status: 7"
     assert prompt =~ "ATTACH existing same-operation retry; exit status: 8"
     assert prompt =~ "same operation retry refused"
