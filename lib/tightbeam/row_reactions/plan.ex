@@ -27,8 +27,11 @@ defmodule Tightbeam.RowReactions.Plan do
   end
 
   def compile!(rail, provenance) do
-    fields!(rail, ~w(name family events when effects), ~w(bind))
+    fields!(rail, ~w(name family events when effects), ~w(bind english))
     Enum.each(~w(name family), &text!(rail[&1]))
+
+    english = Map.get(rail, "english")
+    if english, do: text!(english)
 
     unless is_list(rail["events"]) and rail["events"] != [],
       do: raise(ArgumentError, "reaction requires events")
@@ -71,6 +74,7 @@ defmodule Tightbeam.RowReactions.Plan do
       bindings: bindings,
       condition: rail["when"],
       effects: effects,
+      english: english,
       provenance: provenance
     }
   end

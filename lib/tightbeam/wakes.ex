@@ -4387,7 +4387,19 @@ defmodule Tightbeam.Wakes do
         cancellation_reference(command, canceled_at)
       )
 
-      commit_cancellation(txn, wake, cancellation)
+      result = commit_cancellation(txn, wake, cancellation)
+
+      if result != false do
+        Tightbeam.HarnessRecoveryNotice.settle_wake_cancellation_in_txn(
+          txn,
+          wake.wake_id,
+          %{"kind" => cancellation.requester_kind, "id" => cancellation.requester_id},
+          cancellation.reason_kind,
+          canceled_at
+        )
+      end
+
+      result
     else
       _ -> false
     end

@@ -2673,6 +2673,8 @@ defmodule Tightbeam.Gateway do
               source_id,
               seq
             ])
+
+            Tightbeam.HarnessRecoveryNotice.sync_attempt_turn_in_txn(txn, source_id)
           end)
         end
 

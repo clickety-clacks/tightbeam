@@ -83,6 +83,7 @@ defmodule Tightbeam.LaneManager do
     end
 
     HarnessHealth.resume_other_routes(state.db)
+    :ok = Tightbeam.HarnessRecoveryNotice.retry_all(state.db)
     schedule(state.interval)
     {:ok, do_reconcile(state)}
   end

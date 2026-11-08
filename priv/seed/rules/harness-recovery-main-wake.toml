@@ -1,0 +1,35 @@
+[[reaction]]
+name = "harness-recovery-main-wake"
+family = "harness-recovery"
+events = ["harness_health_hold"]
+when = { op = "eq", args = [{ ref = "event.after.state" }, "resolved"] }
+english = """
+Trigger: A harness-health hold resolves.
+Conditions: The hold is now resolved, by any path: the hourly check releasing it, an ordinary turn on that harness and host succeeding, or the "other" resolve command. A hold that expires gets nothing, and an opened hold never qualifies.
+Effect / recipient: For each owner whose sessions were held, one prompt to that owner's Main. A cycle release (`cycleRelease` true) uses the fixed recovery text. The "other" resolve command uses a fixed text saying the hold's recorded recovery condition is met, without claiming a turn succeeded. An ordinary-turn resolution uses the fixed work-resumed text. Neither of those two claims every route is back. No other agent or person receives anything.
+Timing / repetition / stop: Due at once on recovery. If it does not reach a delivered Main turn, it waits and is tried again when that owner's Main becomes active, when that Main completes another turn, or when the gateway starts. Stops when delivered or deliberately canceled. No timer. These are runtime behavior, not reaction settings.
+Owning bundle: Substrate base seed, on by default.
+Intentional change: New behavior. Previously no prompt went to any Main when a held harness recovered.
+"""
+
+[[reaction.bind]]
+name = "recovery_notice"
+value.hold_id = { ref = "event.source.id" }
+value.resolved_at = { ref = "event.at" }
+value.failed_routes = { ref = "event.after.routes" }
+value.prompt_template.op = "if"
+value.prompt_template.args = [
+  { ref = "event.cycleRelease" },
+  "The @@harness@@ harness on @@host@@ recovered from a @@failure_class@@ outage.\nHold @@hold_id@@ opened at @@opened_at@@ and was released at @@released_at@@ after every affected model route (@@routes@@) answered in one check. @@member_count@@ of your sessions were held.\nUse your installed and learned Kung Fu to find live agents whose work stalled on this harness and host, and resume only those agent graphs. Do not wake or resume unrelated agents.",
+  { op = "if", args = [
+    { op = "eq", args = [{ ref = "event.after.failureClass" }, "other"] },
+    "The @@harness@@ harness on @@host@@ was cleared of an unclassified (other) outage.\nHold @@hold_id@@ opened at @@opened_at@@ and was resolved at @@resolved_at@@ on evidence that its recorded recovery condition is now met. This does not mean a turn has succeeded on this harness or that every model route on it is back. @@member_count@@ of your sessions were held.\nUse your installed and learned Kung Fu to find live agents whose work stalled on this harness and host, and resume only those agent graphs. Do not wake or resume unrelated agents.",
+    "Work resumed on the @@harness@@ harness on @@host@@ after a @@failure_class@@ outage. Hold @@hold_id@@ opened at @@opened_at@@ and was resolved at @@resolved_at@@. This does not mean every model route on this harness is back. @@member_count@@ of your sessions were held.\nUse your installed and learned Kung Fu to find live agents whose work stalled on this harness and host, and resume only those agent graphs. Do not wake or resume unrelated agents."
+  ] }
+]
+
+[[reaction.effects]]
+slot = "notice"
+kind = "notice"
+when = true
+value = { ref = "recovery_notice" }
