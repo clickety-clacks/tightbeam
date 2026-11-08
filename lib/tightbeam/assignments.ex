@@ -4713,8 +4713,11 @@ defmodule Tightbeam.Assignments do
             verification && verification.commit_refs
           )
 
-        error(
-          "inapplicable_code_evidence",
+        commit_keyed_review_fallback_in_txn(
+          txn,
+          assignment,
+          review,
+          verification,
           "latest independent clean review is missing verified producer commits: #{Enum.join(uncovered_commits, ", ")}"
         )
 
@@ -4725,6 +4728,17 @@ defmodule Tightbeam.Assignments do
 
         :ok
 
+      # Only review selection failed here: review_pending would have made the
+      # review independent and clean above.
+      verification_qualifies? and not review_pending? ->
+        commit_keyed_review_fallback_in_txn(
+          txn,
+          assignment,
+          review,
+          verification,
+          "code completion requires a holder verification and the latest independent clean review, unless review is pending"
+        )
+
       true ->
         error(
           "inapplicable_code_evidence",
@@ -4733,13 +4747,148 @@ defmodule Tightbeam.Assignments do
     end
   end
 
+  # Amendment A1r3 (AR-2): when the linked selection above refuses for review
+  # selection or coverage, a code completion still qualifies if an independent
+  # review card on the same work item, linked to any producer or unlinked, has a
+  # latest reviewed-clean covering every verified commit, and no such card's
+  # latest conclusion is a changes-requested naming any of those commits. A clean
+  # review elsewhere never overrides an outstanding blocker.
+  defp commit_keyed_review_fallback_in_txn(
+         txn,
+         assignment,
+         linked_review,
+         verification,
+         linked_refusal
+       ) do
+    commits = ref_commits(verification.commit_refs)
+
+    if MapSet.size(commits) == 0 do
+      error("inapplicable_code_evidence", linked_refusal)
+    else
+      conclusions = eligible_review_conclusions_in_txn(txn, assignment)
+
+      covering =
+        Enum.find(conclusions, fn conclusion ->
+          conclusion.kind == "reviewed-clean" and MapSet.subset?(commits, conclusion.commits)
+        end)
+
+      blockers =
+        Enum.filter(conclusions, fn conclusion ->
+          conclusion.kind == "changes-requested" and
+            not MapSet.disjoint?(commits, conclusion.commits)
+        end)
+
+      if covering && blockers == [] do
+        Logger.info(
+          "completion_commit_keyed_review accepted assignmentId=#{assignment.id} " <>
+            "reviewAttestId=#{covering.attest_id}"
+        )
+
+        :ok
+      else
+        error(
+          "inapplicable_code_evidence",
+          commit_keyed_refusal(linked_refusal, commits, linked_review, conclusions, blockers)
+        )
+      end
+    end
+  end
+
+  # Each eligible card's latest conclusion filed by its own holder: review-effect
+  # cards on the producer's work item (a linked card's effect is always review),
+  # linked to any producer or unlinked, held by someone other than the producer's
+  # holder.
+  defp eligible_review_conclusions_in_txn(txn, assignment) do
+    txn
+    |> Txn.q(
+      """
+      SELECT r.id,v.id,v.verdictKind,v.commitRefs
+      FROM assignments producer
+      JOIN assignments r ON r.workItemId=producer.workItemId AND r.id!=producer.id
+      LEFT JOIN assignment_effects review_effect ON review_effect.assignmentId=r.id
+      JOIN attests v ON v.assignmentId=r.id
+      WHERE producer.id=?1
+        AND producer.workItemId IS NOT NULL
+        AND r.holderKey!=?2
+        AND (r.reviewsAssignmentId IS NOT NULL
+          OR COALESCE(review_effect.effectKind,'code')='review')
+        AND v.kind='verdict'
+        AND v.bySession=r.holderKey
+        AND v.verdictKind IN ('reviewed-clean','changes-requested')
+      ORDER BY r.id,v.ts DESC,v.rowid DESC
+      """,
+      [assignment.id, assignment.holderKey]
+    )
+    |> Enum.dedup_by(fn [card_id | _] -> card_id end)
+    |> Enum.map(fn [card_id, attest_id, kind, encoded_refs] ->
+      refs = if is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil
+      %{assignment_id: card_id, attest_id: attest_id, kind: kind, commits: ref_commits(refs)}
+    end)
+  end
+
+  defp ref_commits(refs) when is_list(refs) do
+    refs
+    |> Enum.flat_map(fn
+      %{"commit" => commit} when is_binary(commit) -> [String.downcase(commit)]
+      _ -> []
+    end)
+    |> MapSet.new()
+  end
+
+  defp ref_commits(_refs), do: MapSet.new()
+
+  defp commit_keyed_refusal(linked_refusal, commits, linked_review, conclusions, blockers) do
+    covered =
+      conclusions
+      |> Enum.filter(&(&1.kind == "reviewed-clean"))
+      |> Enum.reduce(MapSet.new(), &MapSet.union(&2, &1.commits))
+
+    uncovered = MapSet.difference(commits, covered)
+
+    considered =
+      Enum.map(conclusions, fn conclusion ->
+        "#{conclusion.attest_id} #{conclusion.kind} on #{conclusion.assignment_id}"
+      end)
+
+    linked =
+      case linked_review do
+        %{attest_id: attest_id, kind: kind} -> "#{attest_id} #{kind}"
+        _ -> "none"
+      end
+
+    uncovered_text =
+      if MapSet.size(uncovered) == 0,
+        do: "none, but no single clean review covers all of them",
+        else: commit_list(uncovered)
+
+    blocker_text =
+      case blockers do
+        [] ->
+          "none"
+
+        _ ->
+          Enum.map_join(blockers, ", ", fn blocker ->
+            "#{blocker.attest_id} on #{blocker.assignment_id} naming " <>
+              commit_list(MapSet.intersection(commits, blocker.commits))
+          end)
+      end
+
+    "#{linked_refusal}. Commit-keyed review fallback also refused: verified commits " <>
+      "#{commit_list(commits)}; linked selection #{linked}; eligible review conclusions " <>
+      "#{if considered == [], do: "none", else: Enum.join(considered, ", ")}; " <>
+      "commits no clean review covers: #{uncovered_text}; outstanding changes-requested: " <>
+      blocker_text
+  end
+
+  defp commit_list(commits), do: commits |> Enum.sort() |> Enum.join(", ")
+
   defp applicable_code_completion_in_txn(_txn, _assignment, _call), do: :ok
 
   defp latest_review_conclusion_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
            """
-           SELECT v.verdictKind,r.holderKey,v.commitRefs,r.reviewsAssignmentId
+           SELECT v.verdictKind,r.holderKey,v.commitRefs,r.reviewsAssignmentId,v.id
            FROM attests v
            JOIN assignments r ON r.id=v.assignmentId
            JOIN assignments producer ON producer.id=?1
@@ -4763,12 +4912,13 @@ defmodule Tightbeam.Assignments do
            """,
            [assignment_id]
          ) do
-      [[kind, holder, encoded_refs, reviews_assignment_id]] ->
+      [[kind, holder, encoded_refs, reviews_assignment_id, attest_id]] ->
         %{
           kind: kind,
           holder: holder,
           commit_refs: if(is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil),
-          linked?: not is_nil(reviews_assignment_id)
+          linked?: not is_nil(reviews_assignment_id),
+          attest_id: attest_id
         }
 
       [] ->
