@@ -790,39 +790,108 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, ctx.main_key).state == "active"
   end
 
-  test "harness process reads expose token presence without the token for every admin caller", ctx do
+  test "harness process reads classify every diagnostic and expose token presence", ctx do
     synthetic_token = "synthetic-harness-identity"
+    diagnostic_marker = "synthetic-private-diagnostic"
 
-    source_rows = [
-      %{launch_id: "launch-with-token", state: "running", identity_token: synthetic_token},
-      %{launch_id: "launch-without-token", state: "launching", identity_token: nil},
-      %{launch_id: "launch-with-empty-token", state: "exited", identity_token: ""}
-    ]
+    summaries = %{
+      "launch_identity_failed" => "launch identity preparation failed",
+      "launcher_failed" => "launcher failed",
+      "no_helper" => "no harness helper available",
+      "boot_identity_unavailable" => "boot identity unavailable",
+      "boot_identity_empty" => "boot identity empty",
+      "identity_unavailable" => "identity unavailable",
+      "identity_file_invalid" => "identity file invalid",
+      "identity_authority_unproved" => "identity authority unproved",
+      "identity_remove_failed" => "identity file removal failed",
+      "signal_refused" => "signal refused",
+      "sigkill_delivery_unconfirmed" => "kill signal delivery unconfirmed",
+      "sigkill_not_delivered" => "kill signal not delivered",
+      "launch_settlement_refused" => "launch settlement refused",
+      "shutdown_preparation_unresolved" => "shutdown preparation unresolved",
+      "shutdown_task_exit" => "shutdown task exited abnormally",
+      "adapter_shutdown_cleanup_failed" => "adapter shutdown cleanup failed"
+    }
+
+    classified_rows =
+      Enum.map(summaries, fn {code, summary} ->
+        %{
+          launch_id: "launch-#{code}",
+          state: "exited",
+          identity_token: nil,
+          last_error: "{:#{code}, \"#{diagnostic_marker}\"}",
+          expected_error: %{code: code, summary: summary}
+        }
+      end)
+
+    source_rows =
+      classified_rows ++
+        [
+          %{
+            launch_id: "launch-with-token",
+            state: "running",
+            identity_token: synthetic_token,
+            last_error: nil
+          },
+          %{
+            launch_id: "launch-empty-token",
+            state: "launching",
+            identity_token: "",
+            last_error: ""
+          },
+          %{
+            launch_id: "launch-timeout",
+            state: "exited",
+            identity_token: nil,
+            last_error: "{:identity_read_timeout, \"#{diagnostic_marker}\"}",
+            expected_error: %{
+              code: "command_timeout",
+              summary: "harness management command timed out"
+            }
+          },
+          %{
+            launch_id: "launch-legacy",
+            state: "exited",
+            identity_token: nil,
+            last_error: diagnostic_marker,
+            expected_error: %{
+              code: "unclassified_error",
+              summary: "unclassified harness error"
+            }
+          },
+          %{
+            launch_id: "launch-malformed",
+            state: "exited",
+            identity_token: nil,
+            last_error: 42,
+            expected_error: %{
+              code: "unclassified_error",
+              summary: "unclassified harness error"
+            }
+          }
+        ]
 
     coordinator = start_supervised!({HarnessProcessCoordinatorStub, {self(), source_rows}})
     handlers = Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})
     %{is_admin: true} = Devices.add_user(ctx.db, "second-admin", true)
 
-    calls = [
-      %{origin: "user:sample-user", session_key: nil, params: %{}},
-      %{origin: "user:second-admin", session_key: nil, params: %{}}
-    ]
+    for origin <- ["user:sample-user", "user:second-admin"] do
+      result = handlers["harness-processes"].(%{origin: origin, session_key: nil, params: %{}})
+      rows = result.harness_processes
 
-    expected = %{
-      harness_processes: [
-        %{launch_id: "launch-with-token", state: "running", identity_token_present: true},
-        %{launch_id: "launch-without-token", state: "launching", identity_token_present: false},
-        %{launch_id: "launch-with-empty-token", state: "exited", identity_token_present: false}
-      ]
-    }
+      assert length(rows) == length(source_rows)
+      refute Enum.any?(rows, &Map.has_key?(&1, :identity_token))
+      refute inspect(result) =~ synthetic_token
+      refute inspect(result) =~ diagnostic_marker
 
-    for call <- calls do
-      result = handlers["harness-processes"].(call)
-      assert result == expected
-
-      read_rows = result.harness_processes
-      refute Enum.any?(read_rows, &Map.has_key?(&1, :identity_token))
-      refute synthetic_token in Enum.flat_map(read_rows, &Map.values/1)
+      Enum.zip(source_rows, rows)
+      |> Enum.each(fn {source, projected} ->
+        assert projected.identity_token_present == (source.identity_token not in [nil, ""])
+        assert Map.has_key?(projected, :last_error)
+        assert projected.last_error == Map.get(source, :expected_error)
+        diagnostic_keys = Map.keys(projected.last_error || %{}) |> Enum.sort()
+        assert diagnostic_keys in [[], [:code, :summary]]
+      end)
     end
 
     assert_receive :harness_processes

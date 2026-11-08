@@ -1001,6 +1001,8 @@ COMMANDS:
       List the durable harness launch ledger, newest launch first.
       Each item reports identityTokenPresent; identity token values are never
       returned. Consumers must use the presence field instead of identityToken.
+      lastError is null or a classified {{code, summary}} object with a fixed
+      summary; raw process diagnostics are never returned.
 
   doctor [--json] [--base-dir p]
       Check the local Tightbeam installation and report its health.
