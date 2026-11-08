@@ -790,6 +790,7 @@ defmodule Tightbeam.Gateway do
 
   defp handler_specs(config) do
     db = Map.get(config, :db, Tightbeam.DB)
+
     harness_process_settler =
       Map.get(config, :harness_process_settler, &Tightbeam.HarnessProcess.settle/4)
 
