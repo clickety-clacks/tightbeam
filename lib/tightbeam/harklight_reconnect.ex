@@ -6,102 +6,113 @@ defmodule Tightbeam.HarklightReconnect do
   @status_timeout_ms 5_000
 
   def reconnect(db, call, opts \\ []) do
-    case target(call) do
-      {:ok, message_id} ->
-        with {:ok, resolved} <- resolve(db, call.session_key, message_id),
-             {:ok, _status} <- status(opts, resolved.handle) do
-          run_reconnect(db, call.session_key, resolved, message_id, opts)
-        else
-          {:error, {:unknown_message, message_id}} ->
-            result(
-              "refused",
-              message_id,
-              nil,
-              nil,
-              "harklight_message_unknown",
-              "The Harklight message is not an existing committed request."
-            )
+    if agent_session_caller?(call) do
+      case target(call) do
+        {:ok, message_id} ->
+          with {:ok, resolved} <- resolve(db, call.session_key, message_id),
+               {:ok, _status} <- status(opts, resolved.handle) do
+            run_reconnect(db, call.session_key, resolved, message_id, opts)
+          else
+            {:error, {:unknown_message, message_id}} ->
+              result(
+                "refused",
+                message_id,
+                nil,
+                nil,
+                "harklight_message_unknown",
+                "The Harklight message is not an existing committed request."
+              )
 
-          {:error, {:unauthorized, resolved}} ->
-            result(
-              "refused",
-              message_id,
-              resolved.handle,
-              Map.get(resolved, :sender_id),
-              "harklight_reconnect_unauthorized",
-              "Reconnect requires the message owner or an open follow on this thread."
-            )
+            {:error, {:unauthorized, resolved}} ->
+              result(
+                "refused",
+                message_id,
+                resolved.handle,
+                Map.get(resolved, :sender_id),
+                "harklight_reconnect_unauthorized",
+                "Reconnect requires the message owner or an open follow on this thread."
+              )
 
-          {:error, {:closed, resolved}} ->
-            result(
-              "refused",
-              message_id,
-              resolved.handle,
-              Map.get(resolved, :sender_id),
-              "harklight_chat_closed",
-              "The Harklight chat is already answered, closed, or ended."
-            )
+            {:error, {:closed, resolved}} ->
+              result(
+                "refused",
+                message_id,
+                resolved.handle,
+                Map.get(resolved, :sender_id),
+                "harklight_chat_closed",
+                "The Harklight chat is already answered, closed, or ended."
+              )
 
-          {:error, {:busy, resolved}} ->
-            result(
-              "refused",
-              message_id,
-              resolved.handle,
-              Map.get(resolved, :sender_id),
-              "harklight_reconnect_busy",
-              "The Harklight handle is not idle and disconnected."
-            )
+            {:error, {:busy, resolved}} ->
+              result(
+                "refused",
+                message_id,
+                resolved.handle,
+                Map.get(resolved, :sender_id),
+                "harklight_reconnect_busy",
+                "The Harklight handle is not idle and disconnected."
+              )
 
-          {:error, {:origin_unavailable, resolved}} ->
-            result(
-              "failed",
-              message_id,
-              resolved.handle,
-              Map.get(resolved, :sender_id),
-              "harklight_origin_unavailable",
-              "The original Harklight host is not available here."
-            )
+            {:error, {:origin_unavailable, resolved}} ->
+              result(
+                "failed",
+                message_id,
+                resolved.handle,
+                Map.get(resolved, :sender_id),
+                "harklight_origin_unavailable",
+                "The original Harklight host is not available here."
+              )
 
-          {:error, {:status_unavailable, resolved, reason}} ->
-            result(
-              "failed",
-              message_id,
-              resolved.handle,
-              Map.get(resolved, :sender_id),
-              "harklight_status_unavailable",
-              reason
-            )
+            {:error, {:status_unavailable, resolved, reason}} ->
+              result(
+                "failed",
+                message_id,
+                resolved.handle,
+                Map.get(resolved, :sender_id),
+                "harklight_status_unavailable",
+                reason
+              )
 
-          {:error, {:status_closed, resolved}} ->
-            result(
-              "refused",
-              message_id,
-              resolved.handle,
-              Map.get(resolved, :sender_id),
-              "harklight_chat_closed",
-              "The Harklight chat has no unanswered chat remaining."
-            )
+            {:error, {:status_closed, resolved}} ->
+              result(
+                "refused",
+                message_id,
+                resolved.handle,
+                Map.get(resolved, :sender_id),
+                "harklight_chat_closed",
+                "The Harklight chat has no unanswered chat remaining."
+              )
 
-          {:error, reason} ->
-            result(
-              "failed",
-              message_id,
-              nil,
-              nil,
-              "harklight_reconnect_failed",
-              safe_reason("The Harklight reconnect could not be prepared.", reason)
-            )
-        end
+            {:error, reason} ->
+              result(
+                "failed",
+                message_id,
+                nil,
+                nil,
+                "harklight_reconnect_failed",
+                safe_reason("The Harklight reconnect could not be prepared.", reason)
+              )
+          end
 
-      {:error, _reason} ->
-        result(
-          "refused",
-          nil,
-          nil,
-          nil,
-          "invalid_harklight_reconnect",
-          "Provide one existing Harklight message with --message."
-        )
+        {:error, _reason} ->
+          result(
+            "refused",
+            nil,
+            nil,
+            nil,
+            "invalid_harklight_reconnect",
+            "Provide one existing Harklight message with --message."
+          )
+      end
+    else
+      result(
+        "failed",
+        message_id_from_call(call),
+        nil,
+        nil,
+        "harklight_origin_unavailable",
+        "Reconnect requires an authenticated Agent session."
+      )
     end
   rescue
     error ->
@@ -131,6 +142,11 @@ defmodule Tightbeam.HarklightReconnect do
 
       {:ok, %{"kind" => "idle", "session_handle" => ^handle, "open_requests" => 0}} ->
         :idle
+
+      {:ok, %{"kind" => "idle", "session_handle" => other}}
+      when is_binary(other) and other != handle ->
+        {:error, :connection_error, "harklight_reconnect_unconfirmed",
+         "Agent returned an idle result for a different Harklight handle.", nil}
 
       {:ok, %{"kind" => "idle"}} ->
         {:error, :connection_error, "harklight_reconnect_unconfirmed",
@@ -173,6 +189,17 @@ defmodule Tightbeam.HarklightReconnect do
 
   def parse_agent_line(_line, _handle),
     do: {:error, :connection_error, "harklight_reconnect_unconfirmed", nil, nil}
+
+  defp agent_session_caller?(%{session_key: session_key, principal: {:session, session_key}})
+       when is_binary(session_key) and session_key != "",
+       do: true
+
+  defp agent_session_caller?(_call), do: false
+
+  defp message_id_from_call(%{params: %{message_id: message_id}}) when is_binary(message_id),
+    do: message_id
+
+  defp message_id_from_call(_call), do: nil
 
   defp target(%{params: %{message_id: message_id}})
        when is_binary(message_id) and message_id != "",

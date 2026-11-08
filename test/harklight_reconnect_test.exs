@@ -395,7 +395,7 @@ defmodule Tightbeam.HarklightReconnectTest do
 
     assert %{outcome: "committed", feed_cursor: 1} = Task.await(result_task, 5_000)
     assert eventually(fn -> :sys.get_state(manager).reconnect_waiters == %{} end)
-    assert File.exists?(connected_marker)
+    assert eventually(fn -> File.exists?(connected_marker) end)
     assert eventually(fn -> File.exists?(idle_marker) end)
     refute File.exists?(events_marker)
 
@@ -647,6 +647,7 @@ defmodule Tightbeam.HarklightReconnectTest do
     assert prompt =~ "message request"
     assert prompt =~ "thread #{@handle}"
     assert prompt =~ "RECONNECT failure: Agent refused the stream"
+    assert prompt =~ "reason_code=transport_error"
     assert prompt =~ "[REDACTED:secret_field]"
     refute prompt =~ "reconnect-stream-secret"
 

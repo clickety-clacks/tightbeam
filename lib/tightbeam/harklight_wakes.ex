@@ -2748,6 +2748,11 @@ defmodule Tightbeam.HarklightWakes do
   defp failure_status(error, operation, diagnostic),
     do: {:harklight_failure, error, operation, diagnostic}
 
+  defp failure_details({:harklight_failure, {error, code}, "reconnect", diagnostics}),
+    do:
+      {error, "reconnect",
+       format_failure_diagnostics(List.wrap(diagnostics) ++ ["reason_code=" <> code])}
+
   defp failure_details({:harklight_failure, {error, code}, operation, diagnostics}),
     do:
       {error, operation,
