@@ -2129,8 +2129,11 @@ defmodule Tightbeam.ExecutionMap do
 
   ## Caller resolution — the same owner-or-admin shape work-item-trace uses
 
+  # Effective admin standing: the stored bit, and not removed.
+  @effective_admin_sql "SELECT isAdmin = 1 AND removedAt IS NULL FROM users WHERE userId = ?1"
+
   defp caller(db, {:user, user}) do
-    case DB.query(db, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do
+    case DB.query(db, @effective_admin_sql, [user]) do
       {:ok, [[admin]]} -> %{owner: user, admin: admin == 1}
       _ -> nil
     end
@@ -2140,7 +2143,7 @@ defmodule Tightbeam.ExecutionMap do
     case DB.query(
            db,
            """
-           SELECT u.userId, u.isAdmin
+           SELECT u.userId, (u.isAdmin = 1 AND u.removedAt IS NULL)
            FROM sessions AS s
            JOIN users AS u ON u.userId = s.ownerUserId
            WHERE s.sessionKey = ?1

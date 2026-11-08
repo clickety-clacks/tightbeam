@@ -135,6 +135,7 @@ defmodule Tightbeam.WorkItems do
                 created_in_turn_seq = running_turn_seq(txn, created_by_session)
                 priority = call.params[:priority] || default_priority_in_txn(txn)
                 created_at = now()
+                :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, owner)
 
                 Txn.q(
                   txn,
@@ -400,6 +401,7 @@ defmodule Tightbeam.WorkItems do
       priority = params[:priority] || default_priority_in_txn(txn)
       is_bug = Map.get(params, :is_bug, false)
       created_at = now()
+      :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, item_owner)
 
       Txn.q(
         txn,
@@ -930,8 +932,10 @@ defmodule Tightbeam.WorkItems do
   defp disposition_allowed?(_txn, {:process, _}, _item), do: true
   defp disposition_allowed?(_txn, _principal, _item), do: false
 
-  defp admin_user?(txn, user),
-    do: Txn.q(txn, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) == [[1]]
+  # Effective admin standing: the stored bit, and not removed.
+  @effective_admin_sql "SELECT isAdmin = 1 AND removedAt IS NULL FROM users WHERE userId = ?1"
+
+  defp admin_user?(txn, user), do: Txn.q(txn, @effective_admin_sql, [user]) == [[1]]
 
   defp open_assignments?(txn, work_item_id) do
     Txn.q(
@@ -1241,7 +1245,7 @@ defmodule Tightbeam.WorkItems do
   defp trace_allowed?(_db, {:user, user}, item) when user == item.ownerUserId, do: true
 
   defp trace_allowed?(db, {:user, user}, _item) do
-    case DB.query(db, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do
+    case DB.query(db, @effective_admin_sql, [user]) do
       {:ok, [[1]]} -> true
       _ -> false
     end
@@ -1251,7 +1255,7 @@ defmodule Tightbeam.WorkItems do
     case DB.query(
            db,
            """
-           SELECT u.userId, u.isAdmin
+           SELECT u.userId, (u.isAdmin = 1 AND u.removedAt IS NULL)
            FROM sessions AS s
            JOIN users AS u ON u.userId = s.ownerUserId
            WHERE s.sessionKey = ?1

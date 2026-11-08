@@ -68,7 +68,11 @@ defmodule Tightbeam.Dispatch do
     decision-request host-env-list sentinel-list identity-status kungfu-list harness-processes
     role-list breathing work-item-get work-item-trace transcript execution-map execution-map-select
     toplines topline topline-placement-list work-item-list attests assignment-get assignments inspect
-    harness-health-evidence-other)
+    harness-health-evidence-other users)
+
+  @doc "Whether a verb only reads (the ephemeral-helper and audit read set)."
+  @spec read_verb?(String.t()) :: boolean()
+  def read_verb?(verb), do: verb in @read_verbs
 
   @db_transaction_diagnostic_fields ~w(
     kind operation origin phase cause reasonCause exception cleanup
@@ -368,7 +372,7 @@ defmodule Tightbeam.Dispatch do
               publisher_call
           end
 
-        case invoke_with_audit(handler, handler_call) do
+        case handler |> invoke_with_audit(handler_call) |> removed_user_refusal() do
           {:returned, %{code: _} = error} ->
             # A denial's diagnostic is caller evidence, like a crash's stack below:
             # the audit row and the firehose keep the denial's existing shape.
@@ -475,6 +479,18 @@ defmodule Tightbeam.Dispatch do
         end
     end
   end
+
+  # A writer that refused a removed owner or target inside its transaction
+  # (Tightbeam.UserAdmin.ensure_active_in_txn!/2) rolled back; report the
+  # refusal as a denial, not a server error.
+  defp removed_user_refusal({:raised, exception, _stacktrace} = outcome) do
+    case Tightbeam.UserAdmin.refusal_for_exception(exception) do
+      nil -> outcome
+      refusal -> {:returned, refusal}
+    end
+  end
+
+  defp removed_user_refusal(outcome), do: outcome
 
   defp audit_payload(verb, call, outcome) do
     if is_integer(Process.get(:tightbeam_dispatch_audited)) or verb in ~w(onboard settle-turn) or

@@ -63,6 +63,7 @@ defmodule Tightbeam.Wire.Router do
     ErrorDiagnostic,
     Org,
     Roles,
+    UserAdmin,
     WorkItems,
     WorkState
   }
@@ -88,7 +89,9 @@ defmodule Tightbeam.Wire.Router do
                    "harness-health-evidence-other",
                    "subtree-guidance-set",
                    "subtree-guidance-withdraw",
-                   "subtree-guidance-show"
+                   "subtree-guidance-show",
+                   "users",
+                   "remove-user"
                  ]
 
   @max_upload_bytes 32 * 1024 * 1024
@@ -332,6 +335,7 @@ defmodule Tightbeam.Wire.Router do
         with {:ok, verb} <- required_string(body["verb"]),
              :ok <- allowed_agent_verb(verb, auth),
              {:ok, origin, principal} <- agent_identity(body, auth, conn),
+             :ok <- removed_user_params(verb, body, conn),
              {:ok, session_key, target_meta} <- typed_target(verb, body, conn),
              :ok <- visible_cancel_target(verb, session_key, principal, conn) do
           call = %{
@@ -925,7 +929,7 @@ defmodule Tightbeam.Wire.Router do
          {:ok, upload, conn} <- read_upload(conn) do
       data = File.read!(upload.path)
 
-      row =
+      try do
         Assets.put(
           db(conn),
           deps(conn).base_dir,
@@ -934,8 +938,13 @@ defmodule Tightbeam.Wire.Router do
           upload.filename,
           data
         )
-
-      json(conn, 200, %{asset_id: row.asset_id, mime_type: row.mime_type, size: row.size})
+      rescue
+        removed in UserAdmin.RemovedUserError ->
+          error(conn, 403, "user_removed", Exception.message(removed))
+      else
+        row ->
+          json(conn, 200, %{asset_id: row.asset_id, mime_type: row.mime_type, size: row.size})
+      end
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
@@ -1216,7 +1225,8 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp observer_user_principal(user_id, conn) do
-    with {:ok, principal} <- resolve_cli_as_user(:org, user_id) do
+    with :ok <- removed_selector(conn, user_id),
+         {:ok, principal} <- resolve_cli_as_user(:org, user_id) do
       {:ok, state_principal_view(principal, conn)}
     end
   end
@@ -1764,17 +1774,8 @@ defmodule Tightbeam.Wire.Router do
         {:ok, principal, Map.delete(query, "asUser")}
 
       [user_id] when user_id != "" ->
-        case Tightbeam.Wire.OperatorSession.resolve(db(conn), %{
-               "asUser" => user_id,
-               "sessionKey" => session_key
-             }) do
-          {:ok, user, _session} ->
-            Tightbeam.RequestContext.resolve_principal("user", user.user_id)
-            principal = %{kind: "user", id: user.user_id, is_admin: user.is_admin}
-            {:ok, principal, Map.delete(query, "asUser")}
-
-          {:error, _} ->
-            {:error, 404, "not_found", nil}
+        with :ok <- removed_selector(conn, user_id) do
+          session_collection_user_principal(conn, user_id, session_key, query)
         end
 
       _ ->
@@ -1846,6 +1847,21 @@ defmodule Tightbeam.Wire.Router do
   defp session_collection_principal(auth, query, conn, _session_key, _resource) do
     with {:ok, principal} <- selected_session_principal(auth, query, conn),
          do: {:ok, principal, query}
+  end
+
+  defp session_collection_user_principal(conn, user_id, session_key, query) do
+    case Tightbeam.Wire.OperatorSession.resolve(db(conn), %{
+           "asUser" => user_id,
+           "sessionKey" => session_key
+         }) do
+      {:ok, user, _session} ->
+        Tightbeam.RequestContext.resolve_principal("user", user.user_id)
+        principal = %{kind: "user", id: user.user_id, is_admin: user.is_admin}
+        {:ok, principal, Map.delete(query, "asUser")}
+
+      {:error, _} ->
+        {:error, 404, "not_found", nil}
+    end
   end
 
   defp session_collection_request(query, session_key) do
@@ -2157,7 +2173,8 @@ defmodule Tightbeam.Wire.Router do
         {:ok, org_read_principal(conn)}
 
       [user_id] when user_id != "" ->
-        with {:ok, principal} <- resolve_cli_as_user(:org, user_id) do
+        with :ok <- removed_selector(conn, user_id),
+             {:ok, principal} <- resolve_cli_as_user(:org, user_id) do
           {:ok, state_principal_view(principal, conn)}
         end
 
@@ -2222,7 +2239,7 @@ defmodule Tightbeam.Wire.Router do
     {:ok, rows} =
       Tightbeam.DB.query(
         db(conn),
-        "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId LIMIT 1",
+        "SELECT userId FROM users WHERE isAdmin = 1 AND removedAt IS NULL ORDER BY createdAt, userId LIMIT 1",
         []
       )
 
@@ -2254,6 +2271,38 @@ defmodule Tightbeam.Wire.Router do
     do: {:ok, {:session, key}}
 
   defp resolve_cli_as_user(_auth, _empty), do: {:error, 400, "invalid_message", nil}
+
+  # A removed user cannot be selected by an organization credential's asUser,
+  # on agent verbs or state reads (admin-user-list-and-removal r3 R5).
+  defp removed_selector(conn, user_id) do
+    if UserAdmin.removed?(db(conn), user_id), do: removed_user_error(user_id), else: :ok
+  end
+
+  defp removed_user_error(user_id),
+    do: {:error, 403, "user_removed", UserAdmin.removed_refusal(user_id).message}
+
+  # A write naming a removed user as owner or target is refused (R5). Reads that
+  # filter by the id stay allowed, and remove-user reports user_already_removed.
+  defp removed_user_params(verb, body, conn) do
+    params = if is_map(body["params"]), do: body["params"], else: %{}
+
+    named =
+      for {key, value} <- params,
+          is_binary(key) and is_binary(value),
+          Macro.underscore(key) in ["user_id", "owner_user_id"],
+          do: value
+
+    if read_verb?(verb) or verb == "remove-user" do
+      :ok
+    else
+      case Enum.find(named, &UserAdmin.removed?(db(conn), &1)) do
+        nil -> :ok
+        user_id -> removed_user_error(user_id)
+      end
+    end
+  end
+
+  defp read_verb?(verb), do: Dispatch.read_verb?(verb)
 
   defp decode_state_query(conn), do: decode_state_query_string(conn.query_string)
 
@@ -3032,7 +3081,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp d1_principal(:org, %{"asUser" => [user_id]}, conn) when user_id != "" do
-    {:ok, d1_user_principal(user_id, conn)}
+    with :ok <- removed_selector(conn, user_id), do: {:ok, d1_user_principal(user_id, conn)}
   end
 
   defp d1_principal(:org, %{"asUser" => [_]}, _conn), do: {:error, 400, "invalid_message", nil}
@@ -3693,7 +3742,7 @@ defmodule Tightbeam.Wire.Router do
         end
 
       is_binary(body["asUser"]) and body["asUser"] != "" ->
-        {:ok, "user:#{body["asUser"]}"}
+        with :ok <- removed_selector(conn, body["asUser"]), do: {:ok, "user:#{body["asUser"]}"}
 
       is_binary(body["asProcess"]) and body["asProcess"] != "" ->
         # Third origin class (closed set: user | agent | process): automation
@@ -3800,11 +3849,17 @@ defmodule Tightbeam.Wire.Router do
         end
 
       given == ["userId"] ->
-        if Devices.user(db(conn), body["userId"]),
-          do:
-            {:ok, Org.personal_session_key(body["userId"]),
-             %{role: nil, fallback: false, user_id: body["userId"]}},
-          else: {:error, 404, "not_found", "unknown userId: #{body["userId"]}"}
+        case Devices.user(db(conn), body["userId"]) do
+          nil ->
+            {:error, 404, "not_found", "unknown userId: #{body["userId"]}"}
+
+          user ->
+            if not is_nil(user.removed_at) and not read_verb?(verb),
+              do: removed_user_error(body["userId"]),
+              else:
+                {:ok, Org.personal_session_key(body["userId"]),
+                 %{role: nil, fallback: false, user_id: body["userId"]}}
+        end
 
       given == ["role"] ->
         case Roles.resolve(db(conn), body["role"]) do
@@ -4158,7 +4213,13 @@ defmodule Tightbeam.Wire.Router do
   defp error_status("forbidden"), do: 403
 
   defp error_status(code)
-       when code in ["not_holder", "not_authorized", "process_denied", "principal_required"],
+       when code in [
+              "not_holder",
+              "not_authorized",
+              "process_denied",
+              "principal_required",
+              "user_removed"
+            ],
        do: 403
 
   defp error_status("not_found"), do: 404
@@ -4314,6 +4375,7 @@ defmodule Tightbeam.Wire.Router do
     "approve-device" => ~w(device_id user_id)a,
     "assignment-get" => ~w(assignment_id fact_id)a,
     "add-user" => ~w(is_admin user_id)a,
+    "remove-user" => ~w(user_id)a,
     "answer" => ~w(answer idempotency_key reason request request_id)a,
     "artifact-content-fetch" => ~w(artifact_id)a,
     "artifact-get" => ~w(artifact_id)a,

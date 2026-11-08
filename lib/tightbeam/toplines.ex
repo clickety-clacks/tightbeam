@@ -151,6 +151,7 @@ defmodule Tightbeam.Toplines do
     end
 
     [[history_seq]] = Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) FROM causal_events")
+    :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, Map.fetch!(attrs, :owner_user_id))
 
     Txn.q(
       txn,
@@ -259,6 +260,7 @@ defmodule Tightbeam.Toplines do
             :new ->
               now = mutation_time(call)
               topline_id = id("tl_")
+              :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, caller.user)
 
               Txn.q(
                 txn,
@@ -470,6 +472,7 @@ defmodule Tightbeam.Toplines do
                 true ->
                   now = mutation_time(call)
                   membership_id = id("tlm_")
+                  :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, topline.owner_user_id)
 
                   Txn.q(
                     txn,
@@ -1648,8 +1651,11 @@ defmodule Tightbeam.Toplines do
 
   defp create_caller(db, call), do: caller(db, call.principal)
 
+  # Effective admin standing: the stored bit, and not removed.
+  @effective_admin_sql "SELECT isAdmin = 1 AND removedAt IS NULL FROM users WHERE userId = ?1"
+
   defp caller(db, {:user, user}) when is_binary(user) do
-    case DB.query(db, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do
+    case DB.query(db, @effective_admin_sql, [user]) do
       {:ok, [[admin]]} ->
         {:ok, %{user: user, admin: admin == 1, actor_kind: "user", actor_ref: user}}
 
@@ -1662,7 +1668,7 @@ defmodule Tightbeam.Toplines do
     case DB.query(
            db,
            """
-           SELECT s.ownerUserId, u.isAdmin
+           SELECT s.ownerUserId, (u.isAdmin = 1 AND u.removedAt IS NULL)
            FROM sessions s
            JOIN users u ON u.userId = s.ownerUserId
            WHERE s.sessionKey = ?1
@@ -1682,7 +1688,7 @@ defmodule Tightbeam.Toplines do
   defp reauthorize(_txn, %{actor_kind: "process"} = caller), do: {:ok, caller}
 
   defp reauthorize(txn, %{actor_kind: "user", actor_ref: user}) do
-    case Txn.q(txn, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do
+    case Txn.q(txn, @effective_admin_sql, [user]) do
       [[admin]] ->
         {:ok, %{user: user, admin: admin == 1, actor_kind: "user", actor_ref: user}}
 
@@ -1695,7 +1701,7 @@ defmodule Tightbeam.Toplines do
     case Txn.q(
            txn,
            """
-           SELECT s.ownerUserId, u.isAdmin
+           SELECT s.ownerUserId, (u.isAdmin = 1 AND u.removedAt IS NULL)
            FROM sessions s
            JOIN users u ON u.userId = s.ownerUserId
            WHERE s.sessionKey = ?1

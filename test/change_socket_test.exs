@@ -661,6 +661,22 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
              ChangeSocket.handle_info(:firehose_heartbeat, state)
   end
 
+  test "heartbeat closes a device connection whose user was removed after auth", ctx do
+    {:push, {:text, _auth}, state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    remove_user!(ctx.db, ctx.device.user_id)
+
+    # Removal keeps the device row and its token; the user's state is what fences it.
+    assert %{status: "allowlisted", user_removed: true} =
+             Devices.by_id(ctx.db, ctx.device.device_id)
+
+    assert Devices.by_id(ctx.db, ctx.device.device_id).token == ctx.device.token
+
+    assert {:stop, :normal, 1008, ^state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
+  end
+
   test "a retirement affecting the authenticated owner closes with policy code", ctx do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
@@ -924,5 +940,17 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       "refs" => %{"workItemId" => id, "ownerUserId" => "flynn"},
       "payload" => payload
     }
+  end
+
+  # A synthetic active admin removes the user through the real removal path.
+  defp remove_user!(db, user_id) do
+    Devices.add_user(db, "remover", true)
+
+    assert %{user: %{"state" => "removed"}} =
+             Tightbeam.UserAdmin.remove(db, %{
+               principal: {:user, "remover"},
+               origin: "user:remover",
+               params: %{user_id: user_id}
+             })
   end
 end

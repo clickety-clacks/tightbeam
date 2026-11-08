@@ -12,30 +12,48 @@ defmodule Tightbeam.Devices do
   gateway-owned; prefix `tbt_`).
   """
 
-  alias Tightbeam.{AdminProjection, DB, StateResources, TerminalCredentialFailure}
+  alias Tightbeam.{AdminProjection, DB, StateResources, TerminalCredentialFailure, UserAdmin}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
   @type db :: GenServer.server()
 
-  @typedoc "A device row; `is_admin` is derived from the owning user via JOIN."
+  @typedoc """
+  A device row; `is_admin` is derived from the owning user via JOIN, and a
+  removed user confers none. `user_removed` says the owning user is removed.
+  """
   @type device :: %{
           device_id: String.t(),
           user_id: String.t(),
           claimed_name: String.t(),
           status: String.t(),
           is_admin: boolean(),
+          user_removed: boolean(),
           token: String.t() | nil,
           platform: String.t() | nil,
           model: String.t() | nil,
           created_at: integer()
         }
 
-  @type user :: %{user_id: String.t(), is_admin: boolean(), created_at: integer()}
+  @typedoc """
+  A user row. `is_admin` is effective admin standing: the stored bit and not
+  removed. `stored_admin` is the stored bit itself.
+  """
+  @type user :: %{
+          user_id: String.t(),
+          is_admin: boolean(),
+          stored_admin: boolean(),
+          created_at: integer(),
+          removed_at: integer() | nil,
+          removed_by: String.t() | nil
+        }
 
-  @typedoc "Pairing outcome — mirrors the TS PairOutcome union."
+  @typedoc """
+  Pairing outcome — mirrors the TS PairOutcome union, plus the refusal for a
+  device whose user was removed.
+  """
   @type pair_outcome ::
-          {:paired, device()} | {:pending, device()} | :denied
+          {:paired, device()} | {:pending, device()} | :denied | {:refused, String.t()}
 
   @ddl """
   CREATE TABLE IF NOT EXISTS users (
@@ -58,6 +76,10 @@ defmodule Tightbeam.Devices do
     rowVersion INTEGER NOT NULL
   );
   """
+
+  # The removal columns are added by the user-removal schema migration
+  # (Tightbeam.Schema); a fresh database gets them the same way.
+  @user_columns "userId, isAdmin, createdAt, removedAt, removedBy"
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
@@ -87,6 +109,10 @@ defmodule Tightbeam.Devices do
       case select_device(txn, "d.deviceId = ?1", [device_id]) do
         [row] ->
           case to_device(row) do
+            # A removed user's device obtains no token, whatever its status.
+            %{user_removed: true} ->
+              {:refused, "user_removed"}
+
             %{status: "denied"} ->
               :denied
 
@@ -109,44 +135,59 @@ defmodule Tightbeam.Devices do
         [] ->
           claimed_name = Map.fetch!(input, :claimed_name)
           user_id = slug_user_id(claimed_name)
-          first_ever? = Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]]
-          ensure_user(txn, user_id)
-          status = if first_ever?, do: "allowlisted", else: "pending"
-          token = if first_ever?, do: mint_token(), else: nil
 
-          Txn.q(
-            txn,
-            """
-              INSERT INTO devices
-                (deviceId, userId, claimedName, status, token, platform, model, createdAt)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            """,
-            [
-              device_id,
-              user_id,
-              claimed_name,
-              status,
-              token,
-              Map.fetch!(input, :platform),
-              Map.fetch!(input, :model),
-              now()
-            ]
-          )
-
-          device = must_get(txn, device_id)
-          stamp_device_in_txn(txn, device_id, device.created_at)
-          if first_ever?, do: {:paired, device}, else: {:pending, device}
+          if UserAdmin.removed_in_txn?(txn, user_id) do
+            {:refused, "user_removed"}
+          else
+            pair_new_device(txn, input, device_id, claimed_name, user_id)
+          end
       end
     end)
   end
 
-  @doc "Device by bearer token — ONLY if allowlisted (revoked/pending tokens never resolve)."
+  defp pair_new_device(txn, input, device_id, claimed_name, user_id) do
+    first_ever? = Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]]
+    ensure_user(txn, user_id)
+    status = if first_ever?, do: "allowlisted", else: "pending"
+    token = if first_ever?, do: mint_token(), else: nil
+
+    Txn.q(
+      txn,
+      """
+        INSERT INTO devices
+          (deviceId, userId, claimedName, status, token, platform, model, createdAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      """,
+      [
+        device_id,
+        user_id,
+        claimed_name,
+        status,
+        token,
+        Map.fetch!(input, :platform),
+        Map.fetch!(input, :model),
+        now()
+      ]
+    )
+
+    device = must_get(txn, device_id)
+    stamp_device_in_txn(txn, device_id, device.created_at)
+    if first_ever?, do: {:paired, device}, else: {:pending, device}
+  end
+
+  @doc """
+  Device by bearer token — ONLY if allowlisted and its user is not removed
+  (revoked/pending tokens and removed users' tokens never resolve).
+  """
   @spec by_token(db(), String.t()) :: device() | nil
   def by_token(db \\ Tightbeam.DB, token) do
     {:ok, rows} =
-      DB.query(db, select_device_sql() <> " WHERE d.token = ?1 AND d.status = 'allowlisted'", [
-        token
-      ])
+      DB.query(
+        db,
+        select_device_sql() <>
+          " WHERE d.token = ?1 AND d.status = 'allowlisted' AND u.removedAt IS NULL",
+        [token]
+      )
 
     one_device_or_nil(rows)
   end
@@ -161,12 +202,17 @@ defmodule Tightbeam.Devices do
   @doc """
   Approve a pending device: status → allowlisted, mint a fresh token, and
   attach to the claimed user (or the explicit override `user_id`, creating it
-  non-admin if new). Raises on unknown device.
+  non-admin if new). Raises on unknown device, and on a removed user.
   """
   @spec approve(db(), String.t(), String.t() | nil) :: device()
   def approve(db \\ Tightbeam.DB, device_id, user_id \\ nil) do
     transaction!(db, fn txn ->
-      must_get(txn, device_id)
+      device = must_get(txn, device_id)
+      target = user_id || device.user_id
+
+      if UserAdmin.removed_in_txn?(txn, target),
+        do: raise(ArgumentError, "user_removed: #{target}")
+
       if user_id, do: ensure_user(txn, user_id)
 
       Txn.q(
@@ -186,21 +232,29 @@ defmodule Tightbeam.Devices do
   end
 
   @doc false
+  # Returns the approved device, or the `user_removed` refusal map when the
+  # device's user (or the override user) was removed; a refusal writes nothing.
   def approve_with_firehose(db, device_id, user_id, call) do
     transaction!(db, fn txn ->
-      must_get(txn, device_id)
-      if user_id, do: ensure_user(txn, user_id)
+      device = must_get(txn, device_id)
+      target = user_id || device.user_id
 
-      Txn.q(
-        txn,
-        "UPDATE devices SET status = 'allowlisted', userId = COALESCE(?2, userId), token = ?3 WHERE deviceId = ?1",
-        [device_id, user_id, mint_token()]
-      )
+      if UserAdmin.removed_in_txn?(txn, target) do
+        UserAdmin.removed_refusal(target)
+      else
+        if user_id, do: ensure_user(txn, user_id)
 
-      stamp_device_in_txn(txn, device_id, now())
-      device = firehose_device_in_txn(txn, device_id)
-      Publisher.maybe_accepted_in_txn(txn, call, %{device: device})
-      device
+        Txn.q(
+          txn,
+          "UPDATE devices SET status = 'allowlisted', userId = COALESCE(?2, userId), token = ?3 WHERE deviceId = ?1",
+          [device_id, user_id, mint_token()]
+        )
+
+        stamp_device_in_txn(txn, device_id, now())
+        device = firehose_device_in_txn(txn, device_id)
+        Publisher.maybe_accepted_in_txn(txn, call, %{device: device})
+        device
+      end
     end)
   end
 
@@ -270,11 +324,10 @@ defmodule Tightbeam.Devices do
     end
   end
 
-  @doc "User row by id, or nil."
+  @doc "User row by id, or nil. `is_admin` is effective: a removed user confers none."
   @spec user(db(), String.t()) :: user() | nil
   def user(db \\ Tightbeam.DB, user_id) do
-    {:ok, rows} =
-      DB.query(db, "SELECT userId, isAdmin, createdAt FROM users WHERE userId = ?1", [user_id])
+    {:ok, rows} = DB.query(db, "SELECT #{@user_columns} FROM users WHERE userId = ?1", [user_id])
 
     case rows do
       [row] -> to_user(row)
@@ -295,13 +348,19 @@ defmodule Tightbeam.Devices do
   end
 
   @doc false
+  # A removed user's id is not reusable: it returns the `user_removed`
+  # refusal map and writes nothing.
   def add_user_with_firehose(db, user_id, is_admin, call) do
     transaction!(db, fn txn ->
-      insert_user(txn, user_id, is_admin)
-      user = StateResources.query_user(txn, user_id)
-      :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
-      Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
-      user
+      if UserAdmin.removed_in_txn?(txn, user_id) do
+        UserAdmin.removed_refusal(user_id)
+      else
+        insert_user(txn, user_id, is_admin)
+        user = StateResources.query_user(txn, user_id)
+        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+        Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
+        user
+      end
     end)
   end
 
@@ -310,30 +369,36 @@ defmodule Tightbeam.Devices do
     do: promote_user_with_firehose(db, user_id, true, call)
 
   @doc false
+  # A removed user cannot be promoted or demoted: it returns the
+  # `user_removed` refusal map and writes nothing.
   def promote_user_with_firehose(db, user_id, is_admin, call) do
     transaction!(db, fn txn ->
       user = must_get_user(txn, user_id)
-
       desired = !!is_admin
 
-      if user.is_admin == desired do
-        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
-        Publisher.maybe_observed_accepted_in_txn(txn, call)
-        %{user: StateResources.query_user(txn, user_id), changed: false}
-      else
-        Txn.q(txn, "UPDATE users SET isAdmin = ?2 WHERE userId = ?1", [
-          user_id,
-          if(desired, do: 1, else: 0)
-        ])
+      cond do
+        not is_nil(user.removed_at) ->
+          UserAdmin.removed_refusal(user_id)
 
-        updated_at = System.system_time(:millisecond)
-        AdminProjection.allocate_in_txn(txn, "users", user_id, updated_at)
-        projection = StateResources.query_user(txn, user_id)
-        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
-        Publisher.maybe_observed_accepted_in_txn(txn, call)
-        class = if desired, do: "user.promoted", else: "user.demoted"
-        Publisher.committed_in_txn(txn, class, projection, %{"userId" => user_id})
-        %{user: projection, changed: true}
+        user.stored_admin == desired ->
+          :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+          Publisher.maybe_observed_accepted_in_txn(txn, call)
+          %{user: StateResources.query_user(txn, user_id), changed: false}
+
+        true ->
+          Txn.q(txn, "UPDATE users SET isAdmin = ?2 WHERE userId = ?1", [
+            user_id,
+            if(desired, do: 1, else: 0)
+          ])
+
+          updated_at = System.system_time(:millisecond)
+          AdminProjection.allocate_in_txn(txn, "users", user_id, updated_at)
+          projection = StateResources.query_user(txn, user_id)
+          :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+          Publisher.maybe_observed_accepted_in_txn(txn, call)
+          class = if desired, do: "user.promoted", else: "user.demoted"
+          Publisher.committed_in_txn(txn, class, projection, %{"userId" => user_id})
+          %{user: projection, changed: true}
       end
     end)
   end
@@ -376,7 +441,7 @@ defmodule Tightbeam.Devices do
   defp select_device_sql do
     """
     SELECT d.deviceId, d.userId, d.claimedName, d.status, d.token, d.platform,
-           d.model, d.createdAt, u.isAdmin
+           d.model, d.createdAt, u.isAdmin, u.removedAt
     FROM devices d JOIN users u ON u.userId = d.userId
     """
   end
@@ -441,14 +506,16 @@ defmodule Tightbeam.Devices do
          platform,
          model,
          created_at,
-         is_admin
+         is_admin,
+         removed_at
        ]) do
     %{
       device_id: device_id,
       user_id: user_id,
       claimed_name: claimed_name,
       status: status,
-      is_admin: is_admin == 1,
+      is_admin: is_admin == 1 and is_nil(removed_at),
+      user_removed: not is_nil(removed_at),
       token: token,
       platform: platform,
       model: model,
@@ -486,14 +553,21 @@ defmodule Tightbeam.Devices do
   end
 
   defp must_get_user(txn, user_id) do
-    case Txn.q(txn, "SELECT userId, isAdmin, createdAt FROM users WHERE userId = ?1", [user_id]) do
+    case Txn.q(txn, "SELECT #{@user_columns} FROM users WHERE userId = ?1", [user_id]) do
       [row] -> to_user(row)
       [] -> raise ArgumentError, "unknown user: #{user_id}"
     end
   end
 
-  defp to_user([user_id, is_admin, created_at]) do
-    %{user_id: user_id, is_admin: is_admin == 1, created_at: created_at}
+  defp to_user([user_id, is_admin, created_at, removed_at, removed_by]) do
+    %{
+      user_id: user_id,
+      is_admin: is_admin == 1 and is_nil(removed_at),
+      stored_admin: is_admin == 1,
+      created_at: created_at,
+      removed_at: removed_at,
+      removed_by: removed_by
+    }
   end
 
   defp slug_user_id(claimed_name) do

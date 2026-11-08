@@ -493,8 +493,10 @@ defmodule Tightbeam.Wire.ChangeSocket do
         end
 
       _ ->
+        # A removed user's device credential is not current, even though removal
+        # keeps the device row and its token as history.
         case Devices.by_id(db(state), state.device_id) do
-          %{status: "allowlisted", token: token} when is_binary(token) ->
+          %{status: "allowlisted", token: token, user_removed: false} when is_binary(token) ->
             Plug.Crypto.secure_compare(credential_digest(token), state.credential_digest)
 
           _other ->

@@ -2159,7 +2159,9 @@ defmodule Tightbeam.StateResources do
   end
 
   def device(row) do
-    row = row |> public() |> Map.delete("isAdmin")
+    # isAdmin and userRemoved are internal: authentication and pairing read
+    # them, but they are not part of the public device item.
+    row = row |> public() |> Map.delete("isAdmin") |> Map.delete("userRemoved")
     device_id = row["deviceId"] || row["id"]
     row |> Map.put("deviceId", device_id) |> Map.delete("id")
   end

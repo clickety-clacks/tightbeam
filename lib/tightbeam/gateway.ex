@@ -106,6 +106,7 @@ defmodule Tightbeam.Gateway do
     Supervision,
     TerminalCredentialFailure,
     Unroutable,
+    UserAdmin,
     Wakes,
     WorkspaceCleanup,
     WorkItems,
@@ -1033,8 +1034,14 @@ defmodule Tightbeam.Gateway do
       {"approve-device", ["device.approved"]} =>
         admin_call_handler(db, fn call ->
           p = call.params
-          d = Devices.approve_with_firehose(db, p.device_id, p[:user_id], call)
-          %{approved: %{device_id: d.device_id, user_id: d.user_id, is_admin: d.is_admin}}
+
+          case Devices.approve_with_firehose(db, p.device_id, p[:user_id], call) do
+            %{code: _code} = refusal ->
+              refusal
+
+            d ->
+              %{approved: %{device_id: d.device_id, user_id: d.user_id, is_admin: d.is_admin}}
+          end
         end),
       {"deny-device", ["device.denied"]} =>
         admin_call_handler(db, fn call ->
@@ -1267,23 +1274,24 @@ defmodule Tightbeam.Gateway do
           result =
             Devices.promote_user_with_firehose(db, p.user_id, Map.get(p, :is_admin, true), call)
 
-          %{user: StateResources.user(result.user), changed: result.changed}
+          case result do
+            %{code: _code} = refusal -> refusal
+            result -> %{user: StateResources.user(result.user), changed: result.changed}
+          end
         end),
       {"add-user", ["user.added"]} =>
         admin_call_handler(db, fn call ->
           p = call.params
 
-          %{
-            user:
-              db
-              |> Devices.add_user_with_firehose(
-                p.user_id,
-                Map.get(p, :is_admin, false),
-                call
-              )
-              |> StateResources.user()
-          }
+          user = Devices.add_user_with_firehose(db, p.user_id, Map.get(p, :is_admin, false), call)
+
+          case user do
+            %{code: _code} = refusal -> refusal
+            user -> %{user: StateResources.user(user)}
+          end
         end),
+      {"users", []} => admin_call_handler(db, fn _call -> %{users: UserAdmin.list(db)} end),
+      {"remove-user", []} => fn call -> UserAdmin.remove(db, call) end,
       {"read-marker-set", ["read_marker.updated"]} => fn call ->
         read_marker_result(db, call, :set)
       end,
@@ -3974,7 +3982,10 @@ defmodule Tightbeam.Gateway do
 
   defp identity_staleness_owner(txn) do
     txn
-    |> Txn.q("SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId", [])
+    |> Txn.q(
+      "SELECT userId FROM users WHERE isAdmin = 1 AND removedAt IS NULL ORDER BY createdAt, userId",
+      []
+    )
     |> Enum.find_value(fn [owner] ->
       target = Org.personal_session_key(owner)
 

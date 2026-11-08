@@ -96,6 +96,7 @@ defmodule Tightbeam.SessionPoAssociations do
         response
 
       current ->
+        :ok = Tightbeam.UserAdmin.ensure_active_in_txn!(txn, owner)
         now = System.system_time(:millisecond)
         revision = if current, do: current["revision"] + 1, else: 1
         wake_id = "w_" <> Tightbeam.Id.uuid4()

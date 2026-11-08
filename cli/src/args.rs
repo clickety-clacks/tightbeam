@@ -622,6 +622,13 @@ pub enum Command {
         user_id: String,
         admin: bool,
     },
+    Users {
+        identity: Identity,
+    },
+    RemoveUser {
+        identity: Identity,
+        user_id: String,
+    },
     ConfigGet {
         identity: Identity,
         setting: String,
@@ -1184,6 +1191,13 @@ COMMANDS:
       Add a user, optionally as an admin. An existing admin may run this over
       the ordinary gateway path. On an empty local org, the first user is
       created directly and becomes admin by the existing cold-start rule.
+  users
+      List every user, active and removed, with admin standing, creation
+      provenance, device and activity counts, and owned-row counts. Admin only.
+  remove-user <userId>
+      Remove one exact user. Removal is deactivation: history is kept, and the
+      user can no longer authenticate, be selected or act. Refuses self, the
+      last admin and any user who owns rows; nothing is reassigned. Admin only.
   config get default-archetype|default-priority  read an organization default
   config set default-archetype <name>            set the default spawn archetype
   config set default-priority <0..8>              set the default card priority
@@ -3738,6 +3752,24 @@ fn parse_with_optional_catalog(
                 admin: flags.contains_key("admin"),
             })
         }
+        "users" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam users".to_owned());
+            }
+            Ok(Command::Users {
+                identity: identity(flags)?,
+            })
+        }
+        "remove-user" => {
+            // Exactly one literal id: there is no bulk or pattern form.
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam remove-user <userId>".to_owned());
+            }
+            Ok(Command::RemoveUser {
+                identity: identity(flags)?,
+                user_id: parsed.positional[1].clone(),
+            })
+        }
         "config" => parse_config(&parsed, flags),
         "host-env-set" => parse_host_env_set(&parsed, flags),
         "host-env-list" => parse_host_env_list(&parsed, flags),
@@ -3783,7 +3815,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, users, remove-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -5917,6 +5949,35 @@ mod tests {
     }
 
     #[test]
+    fn user_admin_commands_take_exact_arguments() {
+        assert_eq!(
+            parse(strings(&["users", "--as-user", "flynn"])),
+            Ok(Command::Users {
+                identity: Identity::User("flynn".to_owned())
+            })
+        );
+        assert_eq!(
+            parse(strings(&["remove-user", "guest"])),
+            Ok(Command::RemoveUser {
+                identity: Identity::Session,
+                user_id: "guest".to_owned()
+            })
+        );
+        let refused: [&[&str]; 3] = [
+            &["users", "extra"],
+            &["remove-user"],
+            &["remove-user", "a", "b"],
+        ];
+        for argv in refused {
+            assert!(
+                parse(strings(argv))
+                    .unwrap_err()
+                    .starts_with("usage: tightbeam ")
+            );
+        }
+    }
+
+    #[test]
     fn settlement_sends_sequence_validity_to_gateway_and_keeps_malformed_values_local() {
         let argv = [
             "settle-turn",
@@ -6092,6 +6153,8 @@ mod tests {
                 "attest",
                 "attests",
                 "add-user",
+                "users",
+                "remove-user",
                 "breathing",
                 "cancel-wake",
                 "condition",
@@ -6189,6 +6252,8 @@ mod tests {
             "onboard local-openai --name NAME --endpoint URL [--api-key]",
             "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
+            "users",
+            "remove-user <userId>",
             "config get default-archetype|default-priority",
             "config set default-archetype <name>",
             "config set default-priority <0..8>",
@@ -7196,7 +7261,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, users, remove-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 

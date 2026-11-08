@@ -407,6 +407,8 @@ defmodule Tightbeam.Schema do
   @launch_preparation_boot_shape "launch-preparation-boot-v1-0110"
   @evidence_release_shape "launch-preparation-evidence-v1-0112"
   @session_identity_shape "session-identity-v1-0114"
+  # Admin user removal: `users` gains removedAt and removedBy.
+  @user_removal_shape "user-removal-v1-0114"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -435,6 +437,7 @@ defmodule Tightbeam.Schema do
     @notice_source_payload_shape,
     @launch_preparation_boot_shape,
     @session_identity_shape,
+    @user_removal_shape,
     @evidence_release_shape,
     @decision_request_row_schema_shape,
     @assignment_source_replacement_shape,
@@ -1736,6 +1739,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @user_removal_shape,
       @session_identity_shape,
       @evidence_release_shape,
       @launch_preparation_boot_shape,
@@ -1882,6 +1886,7 @@ defmodule Tightbeam.Schema do
             @notice_source_payload_shape,
             @launch_preparation_boot_shape,
             @session_identity_shape,
+            @user_removal_shape,
             @evidence_release_shape,
             @decision_request_row_schema_shape,
             @assignment_source_replacement_shape,
@@ -2021,6 +2026,7 @@ defmodule Tightbeam.Schema do
 
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
     :ok = upgrade_session_identity(db)
+    :ok = upgrade_user_removal(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
@@ -2339,6 +2345,7 @@ defmodule Tightbeam.Schema do
                       @decision_request_row_schema_shape,
                       @launch_preparation_boot_shape,
                       @session_identity_shape,
+                      @user_removal_shape,
                       @evidence_release_shape
                     ] ->
                  validate_notice_source_payload_in_txn!(txn)
@@ -3289,7 +3296,7 @@ defmodule Tightbeam.Schema do
         Enum.with_index(@work_item_body_objects, 1)
         |> Enum.each(fn {object, index} ->
           sql =
-            if Txn.q(txn, "SELECT shape FROM schema_stamp") == [[@session_identity_shape]],
+            if process_actor_stamp?(txn),
               do: process_actor_table_sql(object.name, object.sql),
               else: object.sql
 
@@ -3325,9 +3332,18 @@ defmodule Tightbeam.Schema do
     :ok
   end
 
+  # The session identity migration relaxed these tables' attribution clauses;
+  # every later stamp carries the relaxed form too.
+  defp process_actor_stamp?(txn) do
+    Txn.q(txn, "SELECT shape FROM schema_stamp") in [
+      [[@session_identity_shape]],
+      [[@user_removal_shape]]
+    ]
+  end
+
   defp validate_work_item_body_object!(txn, %{type: type, name: name, sql: expected}) do
     expected =
-      if Txn.q(txn, "SELECT shape FROM schema_stamp") == [[@session_identity_shape]],
+      if process_actor_stamp?(txn),
         do: process_actor_table_sql(name, expected),
         else: expected
 
@@ -3374,6 +3390,7 @@ defmodule Tightbeam.Schema do
                  @notice_source_payload_shape,
                  @launch_preparation_boot_shape,
                  @session_identity_shape,
+                 @user_removal_shape,
                  @evidence_release_shape,
                  @decision_request_row_schema_shape
                ],
@@ -3387,6 +3404,7 @@ defmodule Tightbeam.Schema do
           @notice_source_payload_shape,
           @launch_preparation_boot_shape,
           @session_identity_shape,
+          @user_removal_shape,
           @evidence_release_shape,
           @decision_request_row_schema_shape
         ] ->
@@ -3470,6 +3488,7 @@ defmodule Tightbeam.Schema do
            @notice_source_payload_shape,
            @launch_preparation_boot_shape,
            @session_identity_shape,
+           @user_removal_shape,
            @evidence_release_shape,
            @decision_request_row_schema_shape,
            @assignment_source_replacement_shape,
@@ -3490,6 +3509,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] and
@@ -4262,7 +4282,8 @@ defmodule Tightbeam.Schema do
              when shape in [
                     @launch_preparation_boot_shape,
                     @evidence_release_shape,
-                    @session_identity_shape
+                    @session_identity_shape,
+                    @user_removal_shape
                   ] ->
                # A stamped successor missing its required columns is corruption, not a
                # second opportunity to migrate an inferred shape.
@@ -4367,7 +4388,7 @@ defmodule Tightbeam.Schema do
 
                  :ok
 
-               [[@session_identity_shape]] ->
+               [[shape]] when shape in [@session_identity_shape, @user_removal_shape] ->
                  :ok
 
                rows ->
@@ -4382,6 +4403,75 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError, message: "session identity migration rolled back: #{inspect(error)}"
     end
+  end
+
+  # Admin user removal (admin-user-list-and-removal r3) stamps removedAt and
+  # removedBy on the existing users row. The only predecessor is the stamped
+  # session identity shape, whose users table is the three-column table
+  # Tightbeam.Devices has always created. A stamped successor whose users
+  # table lacks the columns is corruption, not a second chance to migrate.
+  # Removal is two additive nullable users columns (admin-user-list-and-removal
+  # r3 R9): existing users stay active with null removal metadata and no row is
+  # rewritten. Re-adding an existing column fails the migration loudly.
+  @users_removal_columns [
+    "removedAt INTEGER",
+    "removedBy TEXT CHECK ((removedAt IS NULL) = (removedBy IS NULL))"
+  ]
+
+  defp upgrade_user_removal(db) do
+    case DB.migration_transaction(
+           db,
+           :user_removal,
+           [],
+           [],
+           fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[@session_identity_shape]] ->
+                 for column <- @users_removal_columns do
+                   :ok = Txn.exec(txn, "ALTER TABLE users ADD COLUMN #{column}")
+                 end
+
+                 validate_user_removal!(txn)
+
+                 Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+                   @user_removal_shape,
+                   System.system_time(:millisecond),
+                   @session_identity_shape
+                 ])
+
+                 if Txn.changes(txn) != 1,
+                   do: raise(ShapeError, message: "user removal stamp race")
+
+                 :ok
+
+               [[@user_removal_shape]] ->
+                 validate_user_removal!(txn)
+
+               rows ->
+                 raise ShapeError,
+                   message: "incompatible user removal predecessor: #{inspect(rows)}"
+             end
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError, message: "user removal migration rolled back: #{inspect(error)}"
+    end
+  end
+
+  defp validate_user_removal!(txn) do
+    columns = Txn.q(txn, "PRAGMA table_info(users)")
+
+    for {name, type} <- [{"removedAt", "INTEGER"}, {"removedBy", "TEXT"}] do
+      case Enum.find(columns, &(Enum.at(&1, 1) == name)) do
+        [_id, ^name, ^type, 0, nil, 0] -> :ok
+        _ -> raise ShapeError, message: "incompatible user removal column: #{name}"
+      end
+    end
+
+    :ok
   end
 
   # These are the existing attribution clauses in the stamped predecessor.
@@ -4487,7 +4577,12 @@ defmodule Tightbeam.Schema do
 
                :ok
 
-             [[shape]] when shape in [@evidence_release_shape, @session_identity_shape] ->
+             [[shape]]
+             when shape in [
+                    @evidence_release_shape,
+                    @session_identity_shape,
+                    @user_removal_shape
+                  ] ->
                Tightbeam.EvidenceSchemaRelease.validate_in_txn!(txn)
 
              rows ->
@@ -4532,6 +4627,7 @@ defmodule Tightbeam.Schema do
                     @decision_request_row_schema_shape,
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
+                    @user_removal_shape,
                     @evidence_release_shape
                   ] ->
                :ok =
@@ -4646,6 +4742,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] do
@@ -4824,6 +4921,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] ->
@@ -4984,6 +5082,7 @@ defmodule Tightbeam.Schema do
              @decision_request_row_schema_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape
            ] ->
         if effort_holder_activity_cancellation_active?(txn) do
@@ -5240,6 +5339,7 @@ defmodule Tightbeam.Schema do
              @decision_request_row_schema_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape
            ] ->
         :ok = check_work_item_owner_link_shape(db)
@@ -5351,7 +5451,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@session_identity_shape}
+          this build: #{@user_removal_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -5379,7 +5479,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@session_identity_shape}
+          this build: #{@user_removal_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
@@ -5468,6 +5568,7 @@ defmodule Tightbeam.Schema do
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
+                    @user_removal_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -5575,6 +5676,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -5606,6 +5708,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -5718,6 +5821,7 @@ defmodule Tightbeam.Schema do
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
+                    @user_removal_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -5902,6 +6006,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7027,6 +7132,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7067,6 +7173,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7185,6 +7292,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7449,6 +7557,7 @@ defmodule Tightbeam.Schema do
              @notice_source_payload_shape,
              @launch_preparation_boot_shape,
              @session_identity_shape,
+             @user_removal_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7477,6 +7586,7 @@ defmodule Tightbeam.Schema do
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
+                    @user_removal_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -7518,6 +7628,7 @@ defmodule Tightbeam.Schema do
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
+                    @user_removal_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -7586,6 +7697,7 @@ defmodule Tightbeam.Schema do
                       @notice_source_payload_shape,
                       @launch_preparation_boot_shape,
                       @session_identity_shape,
+                      @user_removal_shape,
                       @evidence_release_shape,
                       @decision_request_row_schema_shape,
                       @assignment_source_replacement_shape,
@@ -7644,6 +7756,7 @@ defmodule Tightbeam.Schema do
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
+                    @user_removal_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -7710,6 +7823,7 @@ defmodule Tightbeam.Schema do
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
+                    @user_removal_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -7760,6 +7874,7 @@ defmodule Tightbeam.Schema do
                     @notice_source_payload_shape,
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
+                    @user_removal_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape
                   ] ->

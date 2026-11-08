@@ -55,6 +55,31 @@ defmodule Tightbeam.Wire.SocketTest do
       do: {:reply, GenServer.call(state.db, request), state}
   end
 
+  # Answers the device-token lookup from the real database, then commits a user
+  # removal before replying, so authentication continues after removal.
+  defmodule RemoveAfterTokenLookupDB do
+    use GenServer
+
+    def start_link({name, db, remove}),
+      do: GenServer.start_link(__MODULE__, {db, remove}, name: name)
+
+    def init(state), do: {:ok, state}
+
+    def handle_call({:query, sql, _params} = request, _from, {db, remove}) do
+      result = GenServer.call(db, request)
+
+      if is_function(remove, 0) and String.contains?(sql, "d.token = ?1") do
+        remove.()
+        {:reply, result, {db, nil}}
+      else
+        {:reply, result, {db, remove}}
+      end
+    end
+
+    def handle_call(request, _from, {db, _remove} = state),
+      do: {:reply, GenServer.call(db, request), state}
+  end
+
   setup do
     db = :"socket_db_#{System.unique_integer([:positive])}"
     registry = :"socket_registry_#{System.unique_integer([:positive])}"
@@ -107,6 +132,54 @@ defmodule Tightbeam.Wire.SocketTest do
     ref = state.registry_monitor
     assert_receive {:DOWN, ^ref, :process, ^old, :killed} = down
     assert {:stop, :normal, 1012, ^state} = Socket.handle_info(down, state)
+  end
+
+  test "a work-state connection authenticated before its user is removed is fenced", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "removed-state",
+        claimed_name: "Removed",
+        platform: nil,
+        model: nil
+      })
+
+    {:ok, initial} = Socket.init(ctx.deps)
+
+    auth = %{
+      "type" => "auth",
+      "token" => device.token,
+      "deviceId" => device.device_id,
+      "subscriptions" => ["work_state"]
+    }
+
+    {:push, [{:text, _auth}], replaying} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, initial)
+
+    {:push, [{:text, _sync}], live} = Socket.handle_info(:finish_replay, replaying)
+    assert Org.list_for_user(ctx.db, device.user_id, false) == []
+
+    Devices.add_user(ctx.db, "remover", true)
+
+    assert %{user: %{"state" => "removed"}} =
+             Tightbeam.UserAdmin.remove(ctx.db, %{
+               principal: {:user, "remover"},
+               origin: "user:remover",
+               params: %{user_id: device.user_id}
+             })
+
+    # The next inbound frame closes the connection instead of being handled.
+    typing = JSON.encode!(%{"type" => "typing"})
+
+    assert {:stop, :normal, 1000, {:text, error}, _} =
+             Socket.handle_in({typing, opcode: :text}, live)
+
+    assert %{"type" => "error", "code" => "user_removed"} = JSON.decode!(error)
+
+    # An idle connection closes on its next keepalive tick.
+    assert {:stop, :normal, 1000, {:text, error}, _} =
+             Socket.handle_info({:ping, live.deps[:ping_token]}, live)
+
+    assert %{"type" => "error", "code" => "user_removed"} = JSON.decode!(error)
   end
 
   test "chat ingress uses real Gateway handlers for ack, dedupe, conflict, and validation", ctx do
@@ -779,6 +852,44 @@ defmodule Tightbeam.Wire.SocketTest do
 
     assert [%{session_key: key}] = Org.list_for_user(ctx.db, device.user_id, false)
     assert key == Org.personal_session_key(device.user_id)
+  end
+
+  test "a removal committed after the device lookup refuses auth with no seed or registration",
+       ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "removed-race",
+        claimed_name: "Racer",
+        platform: nil,
+        model: nil
+      })
+
+    Devices.add_user(ctx.db, "remover", true)
+    db = ctx.db
+
+    remove = fn ->
+      %{user: %{"state" => "removed"}} =
+        Tightbeam.UserAdmin.remove(db, %{
+          principal: {:user, "remover"},
+          origin: "user:remover",
+          params: %{user_id: device.user_id}
+        })
+    end
+
+    proxy = :"remove_after_lookup_db_#{System.unique_integer([:positive])}"
+    start_supervised!({RemoveAfterTokenLookupDB, {proxy, ctx.db, remove}})
+    {:ok, state} = Socket.init(%{ctx.deps | db: proxy})
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    assert {:stop, :normal, 1000, {:text, frame}, _} =
+             Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
+
+    assert %{"type" => "auth_result", "success" => false, "reason" => "user_removed"} =
+             JSON.decode!(frame)
+
+    assert Devices.user(ctx.db, device.user_id).removed_at
+    assert Org.list_for_user(ctx.db, device.user_id, false) == []
+    assert map_size(:sys.get_state(ctx.registry).conns) == 0
   end
 
   test "drain filters a mid-replay push already covered by the replay window", ctx do
