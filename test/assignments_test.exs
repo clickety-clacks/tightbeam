@@ -6730,6 +6730,213 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  describe "commit-keyed review fallback (amendment A1r3)" do
+    test "a passing linked review never consults the fallback", ctx do
+      stub_eligibility_commit_refs!()
+      c = eligibility_commits()
+      work_item = create_work_item(ctx, "linked path unchanged")
+      producer = eligibility_producer!(ctx, work_item.id)
+      eligibility_verdict!(ctx, "holder", producer.id, "verified", c.verified)
+
+      linked = eligibility_review_card!(ctx, work_item.id, producer.id)
+      eligibility_verdict!(ctx, "other-session", linked.id, "reviewed-clean", c.verified)
+
+      blocker = eligibility_review_card!(ctx, work_item.id, nil)
+      blocker_refs = eligibility_refs([c.i1], "blocker")
+      eligibility_verdict!(ctx, "other-session", blocker.id, "changes-requested", blocker_refs)
+
+      assert %{assignment: %{outcome: "completed"}} = eligibility_complete(ctx, producer)
+    end
+
+    test "the specimen shape completes from a clean review on another producer's card", ctx do
+      stub_eligibility_commit_refs!()
+      specimen = eligibility_specimen!(ctx)
+
+      assert %{assignment: %{outcome: "completed"}} = eligibility_complete(ctx, specimen.producer)
+    end
+
+    test "an eligible changes-requested naming a verified commit refuses", ctx do
+      stub_eligibility_commit_refs!()
+      c = eligibility_commits()
+      specimen = eligibility_specimen!(ctx)
+      blocker = eligibility_review_card!(ctx, specimen.work_item.id, nil)
+      blocker_refs = eligibility_refs([c.i1], "blocker")
+
+      blocking =
+        eligibility_verdict!(ctx, "other-session", blocker.id, "changes-requested", blocker_refs)
+
+      assert %{code: "inapplicable_code_evidence", message: message} =
+               eligibility_complete(ctx, specimen.producer)
+
+      assert message =~ "latest independent clean review is missing verified producer commits"
+
+      assert message =~
+               "outstanding changes-requested: #{blocking.id} on #{blocker.id} naming #{c.i1}"
+    end
+
+    test "changes-requested with absent, empty or disjoint refs does not block", ctx do
+      stub_eligibility_commit_refs!()
+      c = eligibility_commits()
+
+      for refs <- [:absent, [], eligibility_refs([c.other_older], "disjoint")] do
+        work_item = create_work_item(ctx, "non-intersecting adverse conclusion")
+        producer = eligibility_producer!(ctx, work_item.id)
+        eligibility_verdict!(ctx, "holder", producer.id, "verified", c.verified)
+
+        linked = eligibility_review_card!(ctx, work_item.id, producer.id)
+        eligibility_verdict!(ctx, "other-session", linked.id, "changes-requested", refs)
+
+        clean = eligibility_review_card!(ctx, work_item.id, nil)
+        eligibility_verdict!(ctx, "other-session", clean.id, "reviewed-clean", c.verified)
+
+        assert %{assignment: %{outcome: "completed"}} = eligibility_complete(ctx, producer)
+      end
+    end
+
+    test "a blocker cleared on its own card lets the fallback pass", ctx do
+      stub_eligibility_commit_refs!()
+      c = eligibility_commits()
+      specimen = eligibility_specimen!(ctx)
+      blocker_refs = eligibility_refs([c.runner], "linked-blocker")
+
+      eligibility_verdict!(
+        ctx,
+        "other-session",
+        specimen.changes_card.id,
+        "changes-requested",
+        blocker_refs
+      )
+
+      assert %{code: "inapplicable_code_evidence", message: message} =
+               eligibility_complete(ctx, specimen.producer)
+
+      assert message =~ "on #{specimen.changes_card.id} naming #{c.runner}"
+
+      older_refs = eligibility_refs([c.other_older], "cleared")
+
+      eligibility_verdict!(
+        ctx,
+        "other-session",
+        specimen.changes_card.id,
+        "reviewed-clean",
+        older_refs
+      )
+
+      assert %{assignment: %{outcome: "completed"}} = eligibility_complete(ctx, specimen.producer)
+    end
+
+    test "a true commit mismatch refuses and names what is missing", ctx do
+      stub_eligibility_commit_refs!()
+      c = eligibility_commits()
+      specimen = eligibility_specimen!(ctx, covering: [c.i1])
+
+      assert %{code: "inapplicable_code_evidence", message: message} =
+               eligibility_complete(ctx, specimen.producer)
+
+      assert message =~ "latest independent clean review is missing verified producer commits"
+      assert message =~ "verified commits #{Enum.join(Enum.sort([c.i1, c.runner]), ", ")}"
+      assert message =~ "linked selection #{specimen.stale_clean.id} reviewed-clean"
+
+      assert message =~
+               "#{specimen.covering_clean.id} reviewed-clean on #{specimen.covering_card.id}"
+
+      assert message =~ "commits no clean review covers: #{c.runner}"
+      assert message =~ "outstanding changes-requested: none"
+    end
+
+    test "a clean review held by the producer's holder is not eligible", ctx do
+      stub_eligibility_commit_refs!()
+      specimen = eligibility_specimen!(ctx, covering_holder: "holder")
+
+      assert %{code: "inapplicable_code_evidence", message: message} =
+               eligibility_complete(ctx, specimen.producer)
+
+      refute message =~ specimen.covering_clean.id
+    end
+
+    test "the review rule lets the fallback decide on the dispatch route", ctx do
+      stub_eligibility_commit_refs!()
+      load_completion_review_rule!(ctx)
+      c = eligibility_commits()
+
+      for linked_adverse? <- [true, false] do
+        work_item = create_work_item(ctx, "dispatch route fallback")
+        producer = eligibility_producer!(ctx, work_item.id)
+        eligibility_verdict!(ctx, "holder", producer.id, "verified", c.verified)
+
+        if linked_adverse? do
+          linked = eligibility_review_card!(ctx, work_item.id, producer.id)
+          disjoint = eligibility_refs([c.other_older], "disjoint")
+          eligibility_verdict!(ctx, "other-session", linked.id, "changes-requested", disjoint)
+        end
+
+        other_producer = eligibility_producer!(ctx, work_item.id)
+        covering_card = eligibility_review_card!(ctx, work_item.id, other_producer.id)
+        eligibility_verdict!(ctx, "other-session", covering_card.id, "reviewed-clean", c.verified)
+
+        assert [] == Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder")
+
+        completion = attest_call({:session, "holder"}, producer.id, "completion")
+        assert :ok = Rules.evaluate(ctx.db, completion)
+
+        assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+                 Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+      end
+    end
+
+    test "the review rule still denies when an eligible blocker names a verified commit", ctx do
+      stub_eligibility_commit_refs!()
+      load_completion_review_rule!(ctx)
+      c = eligibility_commits()
+      work_item = create_work_item(ctx, "dispatch route blocker")
+      producer = eligibility_producer!(ctx, work_item.id)
+      eligibility_verdict!(ctx, "holder", producer.id, "verified", c.verified)
+
+      linked = eligibility_review_card!(ctx, work_item.id, producer.id)
+      blocker_refs = eligibility_refs([c.i1], "blocker")
+      eligibility_verdict!(ctx, "other-session", linked.id, "changes-requested", blocker_refs)
+
+      other_producer = eligibility_producer!(ctx, work_item.id)
+      covering_card = eligibility_review_card!(ctx, work_item.id, other_producer.id)
+      eligibility_verdict!(ctx, "other-session", covering_card.id, "reviewed-clean", c.verified)
+
+      # The linked selection holds no clean review, so the rule itself decides,
+      # and the fallback refuses on the intersecting blocker.
+      assert [] == Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder")
+
+      assert {:deny, %{rule: "completion-requires-review"}} =
+               Rules.evaluate(
+                 ctx.db,
+                 attest_call({:session, "holder"}, producer.id, "completion")
+               )
+    end
+
+    test "matching uses canonical refs and short refs stay refused at filing", ctx do
+      stub_eligibility_commit_refs!()
+      c = eligibility_commits()
+
+      covering = [
+        %{"repo" => "testhost:/tmp/elsewhere", "commit" => String.upcase(c.runner)},
+        %{"repo" => "otherhost:/srv/review", "commit" => String.upcase(c.i1)}
+      ]
+
+      specimen = eligibility_specimen!(ctx, covering_refs: covering)
+
+      assert %{assignment: %{outcome: "completed"}} = eligibility_complete(ctx, specimen.producer)
+
+      card = eligibility_review_card!(ctx, specimen.work_item.id, nil)
+
+      short =
+        attest_call({:session, "other-session"}, card.id, "verdict")
+        |> put_in([:params, :verdict_kind], "reviewed-clean")
+        |> put_in([:params, :commit_refs], [
+          %{"repo" => "testhost:/tmp/short", "commit" => String.slice(c.i1, 0, 12)}
+        ])
+
+      assert %{code: "invalid_commit_refs"} = handle(ctx, "attest", short)
+    end
+  end
+
   test "attests returns every kind in timestamp and id order", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "all attests"))
 
@@ -6981,6 +7188,127 @@ defmodule Tightbeam.AssignmentsTest do
          )
 
   defp handle(ctx, verb, call), do: WorkItems.__handle__(ctx.db, verb, %{call | verb: verb})
+
+  defp stub_eligibility_commit_refs! do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+  end
+
+  defp load_completion_review_rule!(ctx) do
+    rules_base =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-eligibility-rule-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    completion_rules =
+      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      |> String.split("\n# Posture gate", parts: 2)
+      |> hd()
+
+    File.write!(Path.join(rules_dir, "engineering.toml"), completion_rules)
+    Rules.load!(rules_base, Map.keys(ctx.handlers))
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+  end
+
+  defp eligibility_commits do
+    i1 = String.duplicate("1", 40)
+    runner = String.duplicate("2", 40)
+
+    %{
+      i1: i1,
+      runner: runner,
+      older: String.duplicate("3", 40),
+      other_older: String.duplicate("4", 40),
+      verified: eligibility_refs([i1, runner], "producer")
+    }
+  end
+
+  defp eligibility_refs(commits, checkout) do
+    Enum.map(commits, &%{"repo" => "testhost:/tmp/#{checkout}", "commit" => &1})
+  end
+
+  defp eligibility_producer!(ctx, work_item_id) do
+    assign_call({:user, "flynn"}, "eligibility producer", nil, work_item_id)
+    |> put_in([:params, :effect_kind], "code")
+    |> then(&handle(ctx, "assign", &1))
+  end
+
+  defp eligibility_review_card!(ctx, work_item_id, reviews, holder \\ "other-session") do
+    assign_call({:user, "flynn"}, "eligibility review", nil, work_item_id)
+    |> Map.put(:session_key, holder)
+    |> put_in([:params, :effect_kind], "review")
+    |> put_in([:params, :reviews_assignment_id], reviews)
+    |> then(&handle(ctx, "assign", &1))
+  end
+
+  defp eligibility_verdict!(ctx, session, assignment_id, kind, refs) do
+    call =
+      attest_call({:session, session}, assignment_id, "verdict")
+      |> put_in([:params, :verdict_kind], kind)
+
+    call = if refs == :absent, do: call, else: put_in(call, [:params, :commit_refs], refs)
+    assert %{attest: attest} = handle(ctx, "attest", call)
+    attest
+  end
+
+  defp eligibility_complete(ctx, producer) do
+    handle(ctx, "attest", attest_call({:session, "holder"}, producer.id, "completion"))
+  end
+
+  # The asg_2bf6271d shape: two identical holder verifications of C; a linked
+  # changes-requested and a later linked clean, both on older commits; and a clean
+  # review covering C on a card linked to another producer on the same work item.
+  defp eligibility_specimen!(ctx, opts \\ []) do
+    c = eligibility_commits()
+    work_item = create_work_item(ctx, "eligibility specimen")
+    producer = eligibility_producer!(ctx, work_item.id)
+    eligibility_verdict!(ctx, "holder", producer.id, "verified", c.verified)
+    eligibility_verdict!(ctx, "holder", producer.id, "verified", c.verified)
+
+    changes_card = eligibility_review_card!(ctx, work_item.id, producer.id)
+    changes_refs = eligibility_refs([c.other_older], "changes")
+    eligibility_verdict!(ctx, "other-session", changes_card.id, "changes-requested", changes_refs)
+
+    stale_card = eligibility_review_card!(ctx, work_item.id, producer.id)
+    stale_refs = eligibility_refs([c.older], "stale")
+
+    stale_clean =
+      eligibility_verdict!(ctx, "other-session", stale_card.id, "reviewed-clean", stale_refs)
+
+    other_producer = eligibility_producer!(ctx, work_item.id)
+    holder = Keyword.get(opts, :covering_holder, "other-session")
+    covering_card = eligibility_review_card!(ctx, work_item.id, other_producer.id, holder)
+
+    covering_refs =
+      Keyword.get_lazy(opts, :covering_refs, fn ->
+        eligibility_refs(Keyword.get(opts, :covering, [c.i1, c.runner]), "covering")
+      end)
+
+    covering_clean =
+      eligibility_verdict!(ctx, holder, covering_card.id, "reviewed-clean", covering_refs)
+
+    %{
+      work_item: work_item,
+      producer: producer,
+      changes_card: changes_card,
+      stale_clean: stale_clean,
+      covering_card: covering_card,
+      covering_clean: covering_clean
+    }
+  end
 
   defp create_work_item(ctx, title) do
     handle(
