@@ -13,6 +13,7 @@ defmodule Tightbeam.Assignments do
     Escalation,
     EventLog,
     Mementos,
+    OperationalReceipts,
     Org,
     Placement,
     Projection,
@@ -1153,13 +1154,35 @@ defmodule Tightbeam.Assignments do
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
           [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
+    case qualifying_review_rows(db, assignment_id, assignment_holder_key) do
+      [[_attest_id, _review_id, _review_holder, _linked, "reviewed-clean", encoded_refs]] ->
+        review_refs = if is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil
+
+        if review_covers_commit_refs?(review_refs, commit_refs) do
+          ["reviewed-clean"]
+        else
+          []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  # The one selection both the review rule and the operational display read:
+  # the single winning review-conclusion verdict, kept only when it is
+  # reviewed-clean on a card held by another session.
+  defp qualifying_review_rows(db, assignment_id, assignment_holder_key) do
     {:ok, rows} =
       DB.query(
         db,
         """
         WITH winning_verdict AS (
           SELECT
+            v.id AS attestId,
+            r.id AS reviewAssignmentId,
             r.holderKey AS reviewHolderKey,
+            CASE WHEN r.reviewsAssignmentId = producer.id THEN 1 ELSE 0 END AS linked,
             v.verdictKind AS verdictKind,
             v.commitRefs AS commitRefs
           FROM attests AS v
@@ -1186,7 +1209,7 @@ defmodule Tightbeam.Assignments do
             v.ts DESC, v.rowid DESC
           LIMIT 1
         )
-        SELECT reviewHolderKey, verdictKind, commitRefs
+        SELECT attestId, reviewAssignmentId, reviewHolderKey, linked, verdictKind, commitRefs
         FROM winning_verdict
         WHERE reviewHolderKey != ?2
           AND verdictKind = 'reviewed-clean'
@@ -1194,18 +1217,26 @@ defmodule Tightbeam.Assignments do
         [assignment_id, assignment_holder_key]
       )
 
-    case rows do
-      [[_review_holder, "reviewed-clean", encoded_refs]] ->
-        review_refs = if is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil
+    rows
+  end
 
-        if review_covers_commit_refs?(review_refs, commit_refs) do
-          ["reviewed-clean"]
-        else
-          []
-        end
+  @doc """
+  The review conclusion `qualifying_review_verdict_kinds/3` selects, for
+  display beside an operational verification: its verdict id, card, holder,
+  and whether the card is linked to this assignment. Nil when none qualifies.
+  """
+  def review_conclusion(db, assignment_id, assignment_holder_key) do
+    case qualifying_review_rows(db, assignment_id, assignment_holder_key) do
+      [[attest_id, review_id, review_holder, linked, "reviewed-clean", _refs]] ->
+        %{
+          attestId: attest_id,
+          assignmentId: review_id,
+          holderKey: review_holder,
+          linked: linked == 1
+        }
 
       _ ->
-        []
+        nil
     end
   end
 
@@ -1367,7 +1398,9 @@ defmodule Tightbeam.Assignments do
         [assignment_id]
       )
 
-    Enum.map(rows, fn row -> attest(row) |> then(&Mementos.attach(db, "attest", &1)) end)
+    rows
+    |> Enum.map(fn row -> attest(row) |> then(&Mementos.attach(db, "attest", &1)) end)
+    |> then(&OperationalReceipts.attach(db, &1))
   end
 
   defp attest_collection_where(assignment_id, filters) do
@@ -2040,7 +2073,9 @@ defmodule Tightbeam.Assignments do
       # checked is a fact about the check, not a verdict on the attest.
       case result do
         %{assignment: assignment} ->
-          Map.put(result, :referents, referents(db, call, assignment, artifact_cursor))
+          result
+          |> Map.put(:referents, referents(db, call, assignment, artifact_cursor))
+          |> with_operational_verification(db, call, assignment)
 
         _ ->
           result
@@ -2055,6 +2090,18 @@ defmodule Tightbeam.Assignments do
 
     error in Mementos.Refusal ->
       memento_refusal(error)
+  end
+
+  # An accepted completion of a receipt-verified operational assignment shows
+  # that verification and any review conclusion beside it.
+  defp with_operational_verification(result, db, call, assignment) do
+    with "completion" <- call.params[:kind],
+         false <- Map.get(result, :replayed, false),
+         %{} = verification <- OperationalReceipts.verification(db, assignment.id) do
+      Map.put(result, :operationalVerification, verification)
+    else
+      _ -> result
+    end
   end
 
   defp close_memento_effects(_db, _call, []), do: :ok
@@ -2315,6 +2362,12 @@ defmodule Tightbeam.Assignments do
             if is_map(cannot_proceed),
               do: Map.put(result, :cannotProceed, cannot_proceed),
               else: result
+
+          result =
+            case OperationalReceipts.verification(db, assignment_id) do
+              nil -> result
+              verification -> Map.put(result, :operationalVerification, verification)
+            end
 
           case call.params[:fact_id] do
             nil ->
@@ -2822,37 +2875,38 @@ defmodule Tightbeam.Assignments do
   defp attest_in_txn(txn, call) do
     prepared = AttestEvidence.prepare_in_txn!(txn, Map.put_new(call, :verb, "attest"))
 
-    result =
-      with :ok <- require_producer_commit_refs_after_evidence(txn, prepared),
-           :ok <- validate_revision_binding_in_txn(txn, prepared) do
-        if prepared.params[:kind] == "verdict",
-          do: verdict_in_txn(txn, prepared),
-          else: lifecycle_attest_in_txn(txn, prepared)
-      end
-
-    if prepared.params[:kind] == "verdict" and prepared.params[:verdict_kind] == "verified" and
-         prepared.params[:commit_refs] in [nil, []] and
-         not is_nil(prepared[:validated_operational_evidence]) and
-         is_map(result) and not Map.has_key?(result, :code) do
-      Logger.warning(
-        "verified_artifact_only assignmentId=#{prepared.params[:assignment_id]} " <>
-          "artifactId=#{prepared.params[:artifact_id]}"
-      )
+    with :ok <- require_producer_commit_refs_after_evidence(txn, prepared),
+         :ok <- validate_revision_binding_in_txn(txn, prepared) do
+      if prepared.params[:kind] == "verdict",
+        do: verdict_in_txn(txn, prepared),
+        else: lifecycle_attest_in_txn(txn, prepared)
     end
-
-    result
   end
 
-  # Producer verification requires commit refs unless the selected operational
-  # evidence route has validated the evidence for this call.
+  # Producer verification requires commit refs, or receipts on an operational
+  # assignment. An operational card with declared files keeps its file-effect
+  # outcome when it cites no receipts.
   defp require_producer_commit_refs_after_evidence(txn, call) do
     if call.params[:kind] == "verdict" and call.params[:verdict_kind] == "verified" and
-         call.params[:commit_refs] in [nil, []] and
-         is_nil(call[:validated_operational_evidence]) do
-      case Txn.q(txn, "SELECT holderKey,reviewsAssignmentId FROM assignments WHERE id=?1", [
-             call.params[:assignment_id]
-           ]) do
-        [[holder, nil]] when call.principal == {:session, holder} ->
+         call.params[:commit_refs] in [nil, []] and not Map.has_key?(call, :validated_receipts) do
+      case Txn.q(
+             txn,
+             """
+             SELECT a.holderKey, a.reviewsAssignmentId, COALESCE(e.effectKind,'code'),
+                    EXISTS(SELECT 1 FROM assignment_files f WHERE f.assignmentId = a.id)
+             FROM assignments a
+             LEFT JOIN assignment_effects e ON e.assignmentId = a.id
+             WHERE a.id=?1
+             """,
+             [call.params[:assignment_id]]
+           ) do
+        [[holder, nil, effect_kind, 0]] when call.principal == {:session, holder} ->
+          if OperationalReceipts.operational?(effect_kind),
+            do: operational_receipts_required(call),
+            else:
+              error("invalid_commit_refs", "producer verification requires immutable commitRefs")
+
+        [[holder, nil, _effect_kind, _files]] when call.principal == {:session, holder} ->
           error("invalid_commit_refs", "producer verification requires immutable commitRefs")
 
         _ ->
@@ -2861,6 +2915,23 @@ defmodule Tightbeam.Assignments do
     else
       :ok
     end
+  end
+
+  defp operational_receipts_required(call) do
+    hint =
+      case {call.params[:artifact_id], call.params[:content_sha256]} do
+        {id, digest} when is_binary(id) and is_binary(digest) ->
+          " To verify from that artifact, cite it as a receipt: --receipt #{id}:#{digest}."
+
+        _ ->
+          ""
+      end
+
+    error(
+      "operational_receipts_required",
+      "producer verification of this operational assignment needs evidence: cite recorded " <>
+        "artifacts with --receipt <artifactId>:<sha256>, or commits with --commit-refs." <> hint
+    )
   end
 
   defp validate_revision_binding_in_txn(txn, call) do
@@ -2882,9 +2953,6 @@ defmodule Tightbeam.Assignments do
 
       not (is_binary(artifact_id) and artifact_id != "" and is_binary(hash) and hash != "") ->
         error("invalid_revision_binding", "artifact and sha256 must be nonblank text")
-
-      call[:validated_operational_evidence] != nil ->
-        :ok
 
       true ->
         producer_session =
@@ -4279,24 +4347,34 @@ defmodule Tightbeam.Assignments do
     {by_user, by_session} = opener(call.principal)
     {by_harness, by_provider} = verdict_author_family(txn, call.params.kind, by_session)
 
-    insert_attest_row(txn, %{
-      assignment_id: assignment_id,
-      kind: call.params.kind,
-      verdict_kind: call.params[:verdict_kind],
-      note: call.params[:note],
-      by_session: by_session,
-      by_user: by_user,
-      producer: nil,
-      producer_command: nil,
-      by_harness: by_harness,
-      by_provider: by_provider,
-      commit_refs: call.params[:commit_refs],
-      allow_closed: allow_closed,
-      artifact_id: call.params[:artifact_id],
-      content_sha256: call.params[:content_sha256],
-      wait_id: call.params[:wait_id],
-      supervision_interval_ms: Map.get(call, :supervision_interval_ms)
-    })
+    attest =
+      insert_attest_row(txn, %{
+        assignment_id: assignment_id,
+        kind: call.params.kind,
+        verdict_kind: call.params[:verdict_kind],
+        note: call.params[:note],
+        by_session: by_session,
+        by_user: by_user,
+        producer: nil,
+        producer_command: nil,
+        by_harness: by_harness,
+        by_provider: by_provider,
+        commit_refs: call.params[:commit_refs],
+        allow_closed: allow_closed,
+        artifact_id: call.params[:artifact_id],
+        content_sha256: call.params[:content_sha256],
+        wait_id: call.params[:wait_id],
+        supervision_interval_ms: Map.get(call, :supervision_interval_ms)
+      })
+
+    case Map.get(call, :validated_receipts) do
+      [_ | _] = receipts ->
+        :ok = OperationalReceipts.write_in_txn(txn, attest.id, receipts)
+        Map.put(attest, :receipts, receipts)
+
+      _ ->
+        attest
+    end
   end
 
   defp insert_attest_row(txn, attrs) do
@@ -4542,7 +4620,9 @@ defmodule Tightbeam.Assignments do
   defp commit_ref_filing_allowed_regular(db, call) do
     case {call.params[:kind], call.params[:commit_refs], call.params[:verdict_kind]} do
       {"verdict", nil, "verified"} ->
-        if revision_evidence_supplied?(call) do
+        # Receipts are decided in the attest transaction, against the recorded
+        # effect kind.
+        if revision_evidence_supplied?(call) or not is_nil(call.params[:receipts]) do
           :ok
         else
           case DB.query(

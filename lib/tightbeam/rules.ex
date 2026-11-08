@@ -86,7 +86,11 @@ defmodule Tightbeam.Rules do
   @condition_keys MapSet.new(["fact", "op", "value"])
   @policy_keys MapSet.new(["name", "purpose", "when", "verification", "evidence_memento"])
   @verification_keys MapSet.new(["trigger", "terminal", "fallback"])
-  @policy_purposes ~w(wait-effort-relief wait-verification-admission attest-file-effect-evidence attest-operational-evidence)
+  @policy_purposes ~w(wait-effort-relief wait-verification-admission attest-file-effect-evidence)
+  # Purposes an identity may still declare, loaded with a warning and no effect.
+  # attest-operational-evidence was replaced by receipt verification, which is
+  # keyed on the recorded effect kind and needs no policy.
+  @retired_policy_purposes ~w(wait-effort-relief attest-operational-evidence)
   @recurrence_keys MapSet.new([
                      "scope",
                      "fingerprint",
@@ -1402,7 +1406,7 @@ defmodule Tightbeam.Rules do
               require Logger
 
               Logger.warning(
-                "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose wait-effort-relief is retired"
+                "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose #{Map.get(policy, "purpose")} is retired"
               )
 
               []
@@ -1428,7 +1432,7 @@ defmodule Tightbeam.Rules do
   end
 
   defp retired_policy?(policy),
-    do: is_map(policy) and Map.get(policy, "purpose") == "wait-effort-relief"
+    do: is_map(policy) and Map.get(policy, "purpose") in @retired_policy_purposes
 
   defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
     raw_name = Map.get(policy, "name")
@@ -1449,7 +1453,7 @@ defmodule Tightbeam.Rules do
     verification = validate_policy_verification!(purpose, Map.get(policy, "verification"), fail)
     evidence_memento = Map.get(policy, "evidence_memento")
 
-    if purpose in ~w(attest-file-effect-evidence attest-operational-evidence) do
+    if purpose == "attest-file-effect-evidence" do
       Enum.each(conditions, fn %{fact: fact} ->
         unless fact in ~w(assignment.effect_kind assignment.declared_files_present) or
                  String.starts_with?(fact, "assignment.memento."),
