@@ -1366,6 +1366,7 @@ defmodule Tightbeam.HarklightWakes do
     else
       {:reply, {:error, :handle_not_moving}, state}
     end
+  end
 
   def handle_call({:capture, handle, line}, from, state) do
     result =
