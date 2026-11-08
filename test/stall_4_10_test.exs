@@ -15,14 +15,14 @@ defmodule Tightbeam.Stall410Test do
         "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('mike',0,'admin_add',1),('other',0,'admin_add',1)"
       )
 
-    mike_session = session(db, Org.personal_session_key("mike"), "mike")
+    principal_session = session(db, Org.personal_session_key("mike"), "mike")
     _other_session = session(db, Org.personal_session_key("other"), "other")
-    %{db: db, mike_session: mike_session}
+    %{db: db, principal_session: principal_session}
   end
 
-  test "direct and relayed Mike provenance qualify; another user's item does not", ctx do
+  test "direct and relayed principal provenance qualify; another user's item does not", ctx do
     direct = create(ctx.db, {:user, "mike"}, "direct")
-    relayed = create(ctx.db, {:session, ctx.mike_session.session_key}, "relayed")
+    relayed = create(ctx.db, {:session, ctx.principal_session.session_key}, "relayed")
     other = create(ctx.db, {:user, "other"}, "other")
     behind = create(ctx.db, {:user, "mike"}, "behind")
 
@@ -64,7 +64,7 @@ defmodule Tightbeam.Stall410Test do
              WorkItems.__handle__(
                ctx.db,
                "work-item-deprioritize",
-               call({:session, ctx.mike_session.session_key}, %{
+               call({:session, ctx.principal_session.session_key}, %{
                  work_item_id: item.id,
                  behind_work_item_id: behind.id,
                  mode: :ask,
@@ -79,7 +79,7 @@ defmodule Tightbeam.Stall410Test do
              WorkItems.__handle__(
                ctx.db,
                "work-item-deprioritize",
-               call({:session, ctx.mike_session.session_key}, %{
+               call({:session, ctx.principal_session.session_key}, %{
                  work_item_id: item.id,
                  behind_work_item_id: behind.id,
                  mode: :ask,

@@ -1694,7 +1694,7 @@ defmodule Tightbeam.GatewayTest do
 
     register_hosts(ctx.db, %{
       "already-assimilated" => %{
-        ssh: "clu@already-assimilated",
+        ssh: "test-user@already-assimilated",
         base_dir: "/remote/tb",
         cli_bin: nil
       }
@@ -5275,7 +5275,7 @@ defmodule Tightbeam.GatewayTest do
                session_key: nil,
                params: %{
                  name: local,
-                 ssh: "clu@#{local}",
+                 ssh: "test-user@#{local}",
                  base_dir: "/remote/definitely-elsewhere"
                }
              })
