@@ -444,6 +444,7 @@ pub enum Command {
         verdict: Option<String>,
         note: Option<String>,
         commit_refs: Option<Vec<serde_json::Value>>,
+        receipts: Vec<String>,
         release_fact_kind: Option<String>,
         release_fact_scope: Option<String>,
         release_fact_principal_ref: Option<String>,
@@ -922,6 +923,7 @@ COMMANDS:
       tune also requires --model; rerun requires --outcome not-completed.
   attest <assignmentId> --kind progress|completion|cannot-proceed|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
+      [--receipt <artifactId>:<sha256> ...]
          [--verdict <kind>] [--note "..."]
          [--release-fact-kind <kind> --release-fact-scope <scope>
           --release-fact-principal-ref <principal>] [--key <idempotencyKey>]
@@ -930,6 +932,10 @@ COMMANDS:
       cannot-proceed requires a non-empty --note, keeps the card open, and
       accepts the three release-fact flags only as one complete tuple. A key is
       valid only for completion.
+      --receipt verifies a live_mutation or evidence assignment without commits:
+      its holder files --kind verdict --verdict verified citing artifacts recorded
+      on the assignment's work item by their recorded hash; code keeps its commit
+      evidence, and review rules are unchanged.
   attests <assignmentId> [--after <attestId>] [--limit <n>]
       List every attest filed against an assignment. Without --limit you get
       all of them: an audit list that shortens itself silently is worse than a
@@ -1102,12 +1108,17 @@ struct Flags {
     positional: Vec<String>,
     flags: HashMap<String, String>,
     duplicates: HashSet<String>,
+    /// Every value of a flag that may repeat, in the order given.
+    repeated: HashMap<String, Vec<String>>,
 }
+
+const REPEATABLE_FLAGS: &[&str] = &["receipt"];
 
 fn split_args(args: Vec<String>) -> Flags {
     let mut positional = Vec::new();
     let mut flags = HashMap::new();
     let mut duplicates = HashSet::new();
+    let mut repeated: HashMap<String, Vec<String>> = HashMap::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -1118,6 +1129,12 @@ fn split_args(args: Vec<String>) -> Flags {
                 }
             } else {
                 let value = args.get(index + 1).cloned().unwrap_or_default();
+                if REPEATABLE_FLAGS.contains(&name) {
+                    repeated
+                        .entry(name.to_owned())
+                        .or_default()
+                        .push(value.clone());
+                }
                 if flags.insert(name.to_owned(), value).is_some() {
                     duplicates.insert(name.to_owned());
                 }
@@ -1132,6 +1149,7 @@ fn split_args(args: Vec<String>) -> Flags {
         positional,
         flags,
         duplicates,
+        repeated,
     }
 }
 
@@ -2859,6 +2877,15 @@ fn parse_with_optional_catalog(
             if kind == "cannot-proceed" && note.is_none() {
                 return Err("--note is required when --kind is cannot-proceed".to_owned());
             }
+            let receipts = parsed.repeated.get("receipt").cloned().unwrap_or_default();
+            if receipts.iter().any(String::is_empty) {
+                return Err("--receipt requires <artifactId>:<sha256>".to_owned());
+            }
+            if !receipts.is_empty() && verdict.as_deref() != Some("verified") {
+                return Err(
+                    "--receipt is only valid with --kind verdict --verdict verified".to_owned(),
+                );
+            }
             Ok(Command::Attest {
                 identity: identity(flags)?,
                 assignment_id,
@@ -2866,6 +2893,7 @@ fn parse_with_optional_catalog(
                 verdict,
                 note,
                 commit_refs,
+                receipts,
                 release_fact_kind,
                 release_fact_scope,
                 release_fact_principal_ref,
@@ -3675,6 +3703,24 @@ mod tests {
             flowed.contains("A key is valid only for completion."),
             "{entry}"
         );
+    }
+
+    #[test]
+    fn attest_help_lists_receipts_and_keeps_code_and_review_unchanged() {
+        let entry = render_command_help(None, "attest").unwrap();
+
+        for required in [
+            "[--receipt <artifactId>:<sha256> ...]",
+            "--receipt verifies a live_mutation or evidence assignment without commits",
+            "code keeps its commit",
+            "review rules are unchanged",
+        ] {
+            assert!(
+                entry.contains(required),
+                "missing {required:?} from:\n{entry}"
+            );
+        }
+        assert!(!entry.contains("policy"), "{entry}");
     }
 
     #[test]

@@ -25,6 +25,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.ReadMarkers,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
+    Tightbeam.OperationalReceipts,
     Tightbeam.DeliverableContract,
     Tightbeam.Productions.CompletionEscalation,
     Tightbeam.Activations,
