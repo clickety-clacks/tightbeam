@@ -3772,7 +3772,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp codex_resource_text_count(uri, text) do
-    # codex-acp 1.12.0 turns this resource into `uri\n<context ref="uri">\ntext\n</context>`.
+    # The Codex adapter (v1.12.0) wraps this resource as `uri\n<context ref="uri">\ntext\n</context>`.
     # Count the adapter's final text item, not just resource.text, against Codex's limit.
     unicode_scalar_count(uri) + 1 + unicode_scalar_count("<context ref=\"") +
       unicode_scalar_count(uri) + unicode_scalar_count("\">\n") +
