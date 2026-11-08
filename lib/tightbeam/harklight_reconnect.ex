@@ -113,6 +113,7 @@ defmodule Tightbeam.HarklightReconnect do
         "harklight_origin_unavailable",
         "Reconnect requires an authenticated Agent session."
       )
+      |> Map.put(:code, "harklight_origin_unavailable")
     end
   rescue
     error ->
