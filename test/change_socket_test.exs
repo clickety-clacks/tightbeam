@@ -118,8 +118,10 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     Hub.publish(ctx.hub, reader_notice)
     assert_receive {:firehose_notice, frame}
+
     assert {:push, {:text, bytes}, ^state} =
              ChangeSocket.handle_info({:firehose_notice, frame}, state)
+
     assert %{"type" => "change", "subscriptionId" => "all", "schemaVersion" => 2} =
              JSON.decode!(bytes)
   end

@@ -1911,6 +1911,7 @@ defmodule Tightbeam.Wire.RouterTest do
         |> Router.call(Router.init(ctx.opts))
 
       assert rejected_upload.status == 400
+
       assert JSON.decode!(rejected_upload.resp_body) ==
                %{"error" => %{"code" => "invalid_message"}}
 
@@ -1920,6 +1921,7 @@ defmodule Tightbeam.Wire.RouterTest do
         |> Router.call(Router.init(ctx.opts))
 
       assert rejected_download.status == 400
+
       assert JSON.decode!(rejected_download.resp_body) ==
                %{"error" => %{"code" => "invalid_message"}}
     end
@@ -1930,6 +1932,7 @@ defmodule Tightbeam.Wire.RouterTest do
       |> Router.call(Router.init(ctx.opts))
 
     assert repeated.status == 400
+
     assert JSON.decode!(repeated.resp_body) ==
              %{"error" => %{"code" => "invalid_as_user"}}
 
@@ -1941,6 +1944,7 @@ defmodule Tightbeam.Wire.RouterTest do
       |> Router.call(Router.init(ctx.opts))
 
     assert repeated_upload.status == 400
+
     assert JSON.decode!(repeated_upload.resp_body) ==
              %{"error" => %{"code" => "invalid_as_user"}}
   end

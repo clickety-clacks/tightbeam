@@ -228,6 +228,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
                 subscription_versions:
                   Map.put(state.subscription_versions, id, message["protocolVersion"])
             }
+
             push(%{"type" => "subscription_ready", "subscriptionId" => id}, state)
 
           :error ->
@@ -241,11 +242,13 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
     if is_binary(id) and Map.has_key?(state.subscriptions, id) do
       :ok = Hub.unsubscribe(hub(state), self(), id)
+
       state = %{
         state
         | subscriptions: Map.delete(state.subscriptions, id),
           subscription_versions: Map.delete(state.subscription_versions, id)
       }
+
       push(%{"type" => "subscription_removed", "subscriptionId" => id}, state)
     else
       invalid("unknown subscriptionId", state)
