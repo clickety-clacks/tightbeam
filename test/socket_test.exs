@@ -109,6 +109,54 @@ defmodule Tightbeam.Wire.SocketTest do
     assert {:stop, :normal, 1012, ^state} = Socket.handle_info(down, state)
   end
 
+  test "a work-state connection authenticated before its user is removed is fenced", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "removed-state",
+        claimed_name: "Removed",
+        platform: nil,
+        model: nil
+      })
+
+    {:ok, initial} = Socket.init(ctx.deps)
+
+    auth = %{
+      "type" => "auth",
+      "token" => device.token,
+      "deviceId" => device.device_id,
+      "subscriptions" => ["work_state"]
+    }
+
+    {:push, [{:text, _auth}], replaying} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, initial)
+
+    {:push, [{:text, _sync}], live} = Socket.handle_info(:finish_replay, replaying)
+    assert Org.list_for_user(ctx.db, device.user_id, false) == []
+
+    Devices.add_user(ctx.db, "remover", true)
+
+    assert %{user: %{"state" => "removed"}} =
+             Tightbeam.UserAdmin.remove(ctx.db, %{
+               principal: {:user, "remover"},
+               origin: "user:remover",
+               params: %{user_id: device.user_id}
+             })
+
+    # The next inbound frame closes the connection instead of being handled.
+    typing = JSON.encode!(%{"type" => "typing"})
+
+    assert {:stop, :normal, 1000, {:text, error}, _} =
+             Socket.handle_in({typing, opcode: :text}, live)
+
+    assert %{"type" => "error", "code" => "user_removed"} = JSON.decode!(error)
+
+    # An idle connection closes on its next keepalive tick.
+    assert {:stop, :normal, 1000, {:text, error}, _} =
+             Socket.handle_info({:ping, live.deps[:ping_token]}, live)
+
+    assert %{"type" => "error", "code" => "user_removed"} = JSON.decode!(error)
+  end
+
   test "chat ingress uses real Gateway handlers for ack, dedupe, conflict, and validation", ctx do
     start_supervised!(%{
       id: :socket_e2e_conn_registry,

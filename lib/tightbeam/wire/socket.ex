@@ -57,6 +57,7 @@ defmodule Tightbeam.Wire.Socket do
   @behaviour WebSock
 
   alias Tightbeam.{ConnRegistry, DB, Devices, Dispatch, ErrorDiagnostic, Org, Projection}
+  alias Tightbeam.UserAdmin
   alias Tightbeam.Wire.{OperatorSession, Payloads}
 
   @max_content_bytes 64 * 1024
@@ -95,6 +96,15 @@ defmodule Tightbeam.Wire.Socket do
 
   @impl true
   def handle_in({data, opcode: :text}, state) do
+    if user_removed?(state),
+      do: stop_user_removed(state),
+      else: handle_text(data, state)
+  end
+
+  def handle_in({_data, opcode: :binary}, state),
+    do: push(Payloads.wire_error("invalid_message"), state)
+
+  defp handle_text(data, state) do
     case JSON.decode(data) do
       {:ok, msg} when is_map(msg) ->
         route(msg, state)
@@ -109,8 +119,18 @@ defmodule Tightbeam.Wire.Socket do
     end
   end
 
-  def handle_in({_data, opcode: :binary}, state),
-    do: push(Payloads.wire_error("invalid_message"), state)
+  # Removal keeps the user's devices and tokens as history, so a connection
+  # authenticated before removal is fenced here: before every inbound frame and
+  # on every keepalive tick (admin-user-list-and-removal r3 R3/R5).
+  defp user_removed?(%{user_id: user_id} = state) when is_binary(user_id),
+    do: UserAdmin.removed?(db(state), user_id)
+
+  defp user_removed?(_state), do: false
+
+  defp stop_user_removed(state) do
+    message = UserAdmin.removed_refusal(state.user_id).message
+    stop_with(Payloads.wire_error("user_removed", message), state)
+  end
 
   @impl true
   def handle_info(msg, state) do
@@ -167,11 +187,16 @@ defmodule Tightbeam.Wire.Socket do
         stop_with(Payloads.wire_error("session_replaced"), state)
 
       {:ping, token} ->
-        if token == state.deps[:ping_token] do
-          state = schedule_ping(state)
-          {:push, {:ping, ""}, state}
-        else
-          {:ok, state}
+        cond do
+          token != state.deps[:ping_token] ->
+            {:ok, state}
+
+          user_removed?(state) ->
+            stop_user_removed(state)
+
+          true ->
+            state = schedule_ping(state)
+            {:push, {:ping, ""}, state}
         end
 
       {:pong_deadline, token} ->
