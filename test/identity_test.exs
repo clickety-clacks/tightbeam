@@ -960,8 +960,16 @@ defmodule Tightbeam.IdentityTest do
     new_product_path = "guidance/new-product.md"
     File.write!(Path.join(ctx.source, new_product_path), "new product bytes")
 
-    assert {:conflict, ["guidance/coder.md", ^new_product_path]} =
-             relearn!(ctx.base, "relearn operator")
+    relearn =
+      Tightbeam.Gateway.handlers(%{base_dir: ctx.base, db: nil})["identity-relearn"]
+
+    assert %{
+             state: "relearn-conflicted",
+             conflicting_paths: ["guidance/coder.md", ^new_product_path],
+             provenance_conflicts: [content_conflict, addition_conflict],
+             live_revision: ^live_before
+           } =
+             relearn.(%{origin: "relearn operator", params: %{}})
 
     status = Identity.status(ctx.base)
     assert status.live_revision == live_before
