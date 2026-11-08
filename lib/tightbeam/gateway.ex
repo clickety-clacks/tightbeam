@@ -756,8 +756,42 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  @harness_error_summaries %{
+    "launch_identity_failed" => "launch identity preparation failed",
+    "launcher_failed" => "launcher failed",
+    "no_helper" => "no harness helper available",
+    "boot_identity_unavailable" => "boot identity unavailable",
+    "boot_identity_empty" => "boot identity empty",
+    "identity_unavailable" => "identity unavailable",
+    "identity_file_invalid" => "identity file invalid",
+    "identity_authority_unproved" => "identity authority unproved",
+    "identity_remove_failed" => "identity file removal failed",
+    "signal_refused" => "signal refused",
+    "sigkill_delivery_unconfirmed" => "kill signal delivery unconfirmed",
+    "sigkill_not_delivered" => "kill signal not delivered",
+    "launch_settlement_refused" => "launch settlement refused",
+    "shutdown_preparation_unresolved" => "shutdown preparation unresolved",
+    "shutdown_task_exit" => "shutdown task exited abnormally",
+    "adapter_shutdown_cleanup_failed" => "adapter shutdown cleanup failed",
+    "command_timeout" => "harness management command timed out",
+    "unclassified_error" => "unclassified harness error"
+  }
+  @harness_timeout_classes ~w(
+    adapter_readiness_timeout
+    boot_identity_timeout
+    callback_timeout
+    command_timeout
+    harness_process_command_timeout
+    identity_read_timeout
+    identity_remove_timeout
+    sigkill_delivery_timeout
+    timeout
+  )
+
   defp handler_specs(config) do
     db = Map.get(config, :db, Tightbeam.DB)
+    harness_process_settler =
+      Map.get(config, :harness_process_settler, &Tightbeam.HarnessProcess.settle/4)
 
     assignment_change = fn assignment_id, from ->
       emit_assignment_change(db, assignment_id, from)
@@ -1292,7 +1326,7 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call -> config_result(db, call) end),
       {"harness-process-settle", []} =>
         admin_call_handler(db, fn call ->
-          case Tightbeam.HarnessProcess.settle(
+          case harness_process_settler.(
                  db,
                  call.params.launch_id,
                  call.params.adapter_key,
@@ -1300,7 +1334,7 @@ defmodule Tightbeam.Gateway do
                ) do
             {:ok, result} -> result
             :already_resolved -> %{launch_id: call.params.launch_id, status: "already_settled"}
-            {:error, reason} -> %{code: "launch_settlement_refused", message: inspect(reason)}
+            {:error, reason} -> classified_harness_error(reason)
           end
         end),
       {"harness-processes", []} =>
@@ -6521,10 +6555,53 @@ defmodule Tightbeam.Gateway do
 
   defp harness_process_read_item(row) do
     token_present = row[:identity_token] not in [nil, ""]
+    last_error =
+      if row[:last_error] in [nil, ""],
+        do: nil,
+        else: classified_harness_error(row[:last_error])
 
     row
     |> Map.delete(:identity_token)
     |> Map.put(:identity_token_present, token_present)
+    |> Map.put(:last_error, last_error)
+  end
+
+  defp classified_harness_error(value) do
+    code = classify_harness_error(value) || "unclassified_error"
+    %{code: code, summary: Map.fetch!(@harness_error_summaries, code)}
+  end
+
+  defp classify_harness_error(value) when is_atom(value),
+    do: classify_harness_error(Atom.to_string(value))
+
+  defp classify_harness_error(value) when is_binary(value) do
+    named = Map.keys(@harness_error_summaries) -- ["command_timeout", "unclassified_error"]
+
+    cond do
+      code = Enum.find(named, &diagnostic_class_present?(value, &1)) -> code
+      Enum.any?(@harness_timeout_classes, &diagnostic_class_present?(value, &1)) ->
+        "command_timeout"
+      true -> nil
+    end
+  end
+
+  defp classify_harness_error(value) when is_tuple(value),
+    do: value |> Tuple.to_list() |> classify_harness_error()
+
+  defp classify_harness_error(value) when is_list(value) do
+    Enum.find_value(value, &classify_harness_error/1)
+  end
+
+  defp classify_harness_error(value) when is_map(value) do
+    Enum.find_value(value, fn {key, nested} ->
+      classify_harness_error(key) || classify_harness_error(nested)
+    end)
+  end
+
+  defp classify_harness_error(_value), do: nil
+
+  defp diagnostic_class_present?(text, code) do
+    Regex.match?(~r/(?:^|[^a-z0-9_])#{Regex.escape(code)}(?:[^a-z0-9_]|$)/, text)
   end
 
   defp admin_handler(db, fun) do

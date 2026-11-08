@@ -1194,6 +1194,9 @@ COMMANDS:
       List the durable harness launch ledger, newest launch first.
       Each item reports identityTokenPresent; identity token values are never
       returned. Consumers must use the presence field instead of identityToken.
+      lastError is null or a classified {{code, summary}} object with a fixed
+      summary; raw process diagnostics are never returned. Settlement failures
+      use the same classified {{code, summary}} shape.
 
   session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]
       Read a session's process metadata without querying or changing the database.
