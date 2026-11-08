@@ -795,6 +795,8 @@ defmodule Tightbeam.HarklightReconnectTest do
     end
   end
 
+  defp status(opts), do: status(@handle, opts)
+
   defp status(handle, opts) do
     %{
       "session_handle" => handle,
@@ -803,5 +805,17 @@ defmodule Tightbeam.HarklightReconnectTest do
       "pending_undelivered" => Keyword.get(opts, :pending_undelivered, 0),
       "pending_delivered_unacted" => Keyword.get(opts, :pending_delivered_unacted, 0)
     }
+  end
+
+  defp eventually(fun, attempts \\ 200)
+  defp eventually(_fun, 0), do: false
+
+  defp eventually(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(10)
+      eventually(fun, attempts - 1)
+    end
   end
 end
