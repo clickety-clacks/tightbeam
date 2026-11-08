@@ -247,7 +247,7 @@ defmodule Tightbeam.Wire.Router do
     conn = Plug.Conn.fetch_query_params(conn)
 
     if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] and
-         conn.query_params["protocolVersion"] == "1" do
+         conn.query_params["protocolVersion"] in ["1", "2"] do
       WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn), max_frame_size: 2 * 1024 * 1024)
     else
       error(conn, 426, "unsupported_protocol_version")
@@ -659,7 +659,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   post "/upload" do
-    with {:ok, device} <- device_auth(conn),
+    with {:ok, principal} <- asset_principal(conn),
          {:ok, upload, conn} <- read_upload(conn) do
       data = File.read!(upload.path)
 
@@ -667,7 +667,7 @@ defmodule Tightbeam.Wire.Router do
         Assets.put(
           db(conn),
           deps(conn).base_dir,
-          device.user_id,
+          principal.user_id,
           upload.content_type,
           upload.filename,
           data
@@ -680,8 +680,8 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/download/:asset_id" do
-    with {:ok, device} <- device_auth(conn),
-         {:ok, asset} <- visible_asset(asset_id, device, conn) do
+    with {:ok, principal} <- asset_principal(conn),
+         {:ok, asset} <- visible_asset(asset_id, principal, conn) do
       conn
       |> Plug.Conn.put_resp_header("content-type", asset.mime_type)
       |> Plug.Conn.send_file(
@@ -2078,6 +2078,29 @@ defmodule Tightbeam.Wire.Router do
     case token && Devices.by_token(db(conn), token) do
       nil -> {:error, 401, "auth_failed", nil}
       device -> {:ok, device}
+    end
+  end
+
+  defp asset_principal(conn) do
+    case Plug.Conn.get_req_header(conn, "authorization") do
+      ["Bearer " <> token] when token != "" ->
+        if token == deps(conn).cli_token do
+          with {:ok, query} <- decode_state_query(conn),
+               {:ok, principal} <- state_principal(:org, query, conn) do
+            {:ok, %{user_id: principal.id, is_admin: principal.is_admin}}
+          end
+        else
+          asset_device_principal(conn)
+        end
+
+      _ ->
+        asset_device_principal(conn)
+    end
+  end
+
+  defp asset_device_principal(conn) do
+    with {:ok, device} <- device_auth(conn) do
+      {:ok, %{user_id: device.user_id, is_admin: device.is_admin}}
     end
   end
 

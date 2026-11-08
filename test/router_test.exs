@@ -503,7 +503,7 @@ defmodule Tightbeam.Wire.RouterTest do
                     }}
   end
 
-  test "the change socket requires protocolVersion 1 at upgrade", ctx do
+  test "the change socket requires a supported protocolVersion at upgrade", ctx do
     response =
       conn(:get, "/ws/changes")
       |> put_req_header("upgrade", "websocket")
@@ -514,6 +514,18 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(response.resp_body) == %{
              "error" => %{"code" => "unsupported_protocol_version"}
            }
+
+    for version <- ["1", "2"] do
+      upgraded =
+        conn(:get, "/ws/changes?protocolVersion=#{version}")
+        |> put_req_header("upgrade", "websocket")
+        |> put_req_header("connection", "Upgrade")
+        |> put_req_header("sec-websocket-version", "13")
+        |> put_req_header("sec-websocket-key", Base.encode64(:crypto.strong_rand_bytes(16)))
+        |> Router.call(Router.init(ctx.opts))
+
+      assert upgraded.status == 101
+    end
   end
 
   test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do
@@ -1859,6 +1871,78 @@ defmodule Tightbeam.Wire.RouterTest do
     admin = download(ctx, ctx.device, asset_id)
     assert admin.status == 200
     assert admin.resp_body == "private-bytes"
+  end
+
+  test "organization token uploads and downloads as the named user", ctx do
+    owner = approved_device(ctx.db, "d2", "Other")
+    stranger = approved_device(ctx.db, "d3", "Stranger")
+
+    upload =
+      ctx
+      |> upload_conn(owner, "operator-bytes", "operator.txt", "text/plain")
+      |> Map.put(:query_string, "asUser=#{owner.user_id}")
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert upload.status == 200
+    asset_id = JSON.decode!(upload.resp_body)["assetId"]
+
+    owned =
+      conn(:get, "/download/#{asset_id}?asUser=#{owner.user_id}")
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert owned.status == 200
+    assert owned.resp_body == "operator-bytes"
+
+    denied =
+      conn(:get, "/download/#{asset_id}?asUser=#{stranger.user_id}")
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert denied.status == 404
+
+    for query <- ["", "asUser="] do
+      rejected_upload =
+        ctx
+        |> upload_conn(owner, "x", "x.txt", "text/plain")
+        |> Map.put(:query_string, query)
+        |> put_req_header("authorization", "Bearer tbc_test")
+        |> Router.call(Router.init(ctx.opts))
+
+      assert rejected_upload.status == 400
+      assert JSON.decode!(rejected_upload.resp_body) ==
+               %{"error" => %{"code" => "invalid_message"}}
+
+      rejected_download =
+        conn(:get, "/download/#{asset_id}?#{query}")
+        |> put_req_header("authorization", "Bearer tbc_test")
+        |> Router.call(Router.init(ctx.opts))
+
+      assert rejected_download.status == 400
+      assert JSON.decode!(rejected_download.resp_body) ==
+               %{"error" => %{"code" => "invalid_message"}}
+    end
+
+    repeated =
+      conn(:get, "/download/#{asset_id}?asUser=#{owner.user_id}&asUser=#{stranger.user_id}")
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert repeated.status == 400
+    assert JSON.decode!(repeated.resp_body) ==
+             %{"error" => %{"code" => "invalid_as_user"}}
+
+    repeated_upload =
+      ctx
+      |> upload_conn(owner, "x", "x.txt", "text/plain")
+      |> Map.put(:query_string, "asUser=#{owner.user_id}&asUser=#{stranger.user_id}")
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert repeated_upload.status == 400
+    assert JSON.decode!(repeated_upload.resp_body) ==
+             %{"error" => %{"code" => "invalid_as_user"}}
   end
 
   defp upload_conn(ctx, device, data, filename, content_type) do

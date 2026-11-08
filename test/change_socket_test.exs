@@ -84,7 +84,10 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     user = Tightbeam.Devices.add_user(ctx.db, "reader", false)
 
     {:push, {:text, auth_bytes}, state} =
-      inbound(%{"type" => "auth", "token" => "operator-fixture", "asUser" => user.user_id}, ctx.state)
+      inbound(
+        %{"type" => "auth", "token" => "operator-fixture", "asUser" => user.user_id},
+        ctx.state
+      )
 
     assert JSON.decode!(auth_bytes) == %{
              "type" => "auth_result",
@@ -95,7 +98,12 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     {:push, {:text, ready_bytes}, state} =
       inbound(
-        %{"type" => "subscribe", "protocolVersion" => 2, "subscriptionId" => "all", "filters" => %{}},
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "all",
+          "filters" => %{}
+        },
         state
       )
 
@@ -109,22 +117,35 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     Hub.publish(ctx.hub, reader_notice)
     assert_receive {:firehose_notice, frame}
-    assert {:push, {:text, bytes}, ^state} = ChangeSocket.handle_info({:firehose_notice, frame}, state)
+    assert {:push, {:text, bytes}, ^state} =
+             ChangeSocket.handle_info({:firehose_notice, frame}, state)
     assert %{"type" => "change", "subscriptionId" => "all"} = JSON.decode!(bytes)
   end
 
   test "operator auth validates asUser and defaults to the first admin", ctx do
-    for {as_user, reason} <- [{"missing", "not_found"}, {"", "invalid_message"}, {nil, "invalid_message"}] do
+    for {as_user, reason} <- [
+          {"missing", "not_found"},
+          {"", "invalid_message"},
+          {nil, "invalid_message"}
+        ] do
       assert {:stop, :normal, 1008, {:text, bytes}, _state} =
-               inbound(%{"type" => "auth", "token" => "operator-fixture", "asUser" => as_user}, ctx.state)
+               inbound(
+                 %{"type" => "auth", "token" => "operator-fixture", "asUser" => as_user},
+                 ctx.state
+               )
 
-      assert JSON.decode!(bytes) == %{"type" => "auth_result", "success" => false, "reason" => reason}
+      assert JSON.decode!(bytes) == %{
+               "type" => "auth_result",
+               "success" => false,
+               "reason" => reason
+             }
     end
 
     assert {:push, {:text, bytes}, _state} =
              inbound(%{"type" => "auth", "token" => "operator-fixture"}, ctx.state)
 
-    assert %{"success" => true, "userId" => "sample-user", "isAdmin" => true} = JSON.decode!(bytes)
+    assert %{"success" => true, "userId" => "sample-user", "isAdmin" => true} =
+             JSON.decode!(bytes)
   end
 
   test "the 101st subscription is a typed invalid_request", ctx do
