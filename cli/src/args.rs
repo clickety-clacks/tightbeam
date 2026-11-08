@@ -1192,6 +1192,8 @@ COMMANDS:
   harness-process list
   harness-process settle <launch-id> --adapter-key <key>
       List the durable harness launch ledger, newest launch first.
+      Each item reports identityTokenPresent; identity token values are never
+      returned. Consumers must use the presence field instead of identityToken.
 
   session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]
       Read a session's process metadata without querying or changing the database.
