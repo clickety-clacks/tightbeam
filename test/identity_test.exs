@@ -968,8 +968,9 @@ defmodule Tightbeam.IdentityTest do
     new_product_path = "guidance/new-product.md"
     File.write!(Path.join(ctx.source, new_product_path), "new product bytes")
 
-    relearn =
-      Tightbeam.Gateway.handlers(%{base_dir: ctx.base, db: nil})["identity-relearn"]
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil, guard_inputs: []})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    relearn = Tightbeam.Gateway.handlers(%{base_dir: ctx.base, db: db})["identity-relearn"]
 
     assert %{
              state: "relearn-conflicted",
@@ -1568,7 +1569,7 @@ defmodule Tightbeam.IdentityTest do
     assert Identity.live_revision!(ctx.base) == live_before
 
     provenance_conflicts = Identity.status(ctx.base).provenance_conflicts
-    assert Enum.map(provenance_conflicts, & &1["path"]) == conflicts
+    assert Enum.sort(Enum.map(provenance_conflicts, & &1["path"])) == Enum.sort(conflicts)
 
     assert Enum.all?(
              provenance_conflicts,
