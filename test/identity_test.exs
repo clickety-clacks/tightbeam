@@ -1571,10 +1571,22 @@ defmodule Tightbeam.IdentityTest do
     provenance_conflicts = Identity.status(ctx.base).provenance_conflicts
     assert Enum.sort(Enum.map(provenance_conflicts, & &1["path"])) == Enum.sort(conflicts)
 
-    assert Enum.all?(
-             provenance_conflicts,
-             &(&1["base_source"] == "legacy-upstream-history")
-           )
+    expected_base_sources = %{
+      "archetypes/default.toml" => "legacy-upstream-history",
+      "guidance/operating-manual.md" => "historical-base-unavailable",
+      "rules/harness-health-recovery.toml" => "historical-base-unavailable",
+      "rules/harness-recovery-main-wake.toml" => "historical-base-unavailable"
+    }
+
+    assert Map.new(provenance_conflicts, &{&1["path"], &1["base_source"]}) ==
+             expected_base_sources
+
+    assert Map.new(provenance_conflicts, &{&1["path"], &1["base"]["present"]}) == %{
+             "archetypes/default.toml" => true,
+             "guidance/operating-manual.md" => false,
+             "rules/harness-health-recovery.toml" => false,
+             "rules/harness-recovery-main-wake.toml" => false
+           }
 
     Enum.each(tl(conflicts), fn path ->
       refute File.exists?(Path.join(dir, path))
