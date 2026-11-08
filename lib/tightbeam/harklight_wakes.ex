@@ -1331,6 +1331,7 @@ defmodule Tightbeam.HarklightWakes do
   rescue
     _ -> {:reply, {:error, "reconnect_capture_unavailable"}, state}
   end
+
   def handle_call({:begin_origin_move, handle, session_key}, _from, state) do
     result = Tightbeam.HarklightOrigin.begin_move(state.db, handle, session_key)
     # Preserve the current reader until the first settling cover. Only future
