@@ -92,14 +92,28 @@ defmodule Tightbeam.OperationalReceipts do
     end
   end
 
+  @doc """
+  Refuse receipts on anything but a `verified` verdict, whatever the
+  assignment's state.
+  """
+  def verified_verdict!(call) do
+    unless call.params[:kind] == "verdict" and call.params[:verdict_kind] == "verified" do
+      refuse!(
+        "operational_receipts_not_applicable",
+        "receipts are accepted only on a `--kind verdict --verdict verified` attest"
+      )
+    end
+
+    :ok
+  end
+
   defp not_applicable!(call, assignment) do
+    verified_verdict!(call)
+
     reason =
       cond do
         is_nil(assignment) ->
           "receipts verify only producing assignments, not review cards"
-
-        call.params[:kind] != "verdict" or call.params[:verdict_kind] != "verified" ->
-          "receipts are accepted only on a `--kind verdict --verdict verified` attest"
 
         call.principal != {:session, assignment.holder_key} ->
           "only the assignment's holder #{assignment.holder_key} may verify it from receipts"

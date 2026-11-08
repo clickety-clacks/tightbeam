@@ -52,6 +52,7 @@ defmodule Tightbeam.AttestEvidence do
 
         # Unknown and closed assignments keep their existing refusals.
         _ ->
+          OperationalReceipts.verified_verdict!(call)
           call
       end
     end

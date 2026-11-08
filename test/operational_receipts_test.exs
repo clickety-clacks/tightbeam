@@ -137,6 +137,20 @@ defmodule Tightbeam.OperationalReceiptsTest do
 
       assert filed == expected
       assert [%{receipts: ^expected}] = attests(ctx, card)
+
+      # After close, receipts on anything but a verified verdict are still
+      # refused as not applicable, never silently dropped.
+      assert {:ok, %{assignment: %{state: "closed"}}} = complete(ctx, card)
+
+      assert %{code: "operational_receipts_not_applicable"} =
+               refused(
+                 attest(ctx, ctx.holder, %{
+                   assignment_id: card.id,
+                   kind: "verdict",
+                   verdict_kind: "approved",
+                   receipts: [cite(first)]
+                 })
+               )
     end
 
     test "4: every failing receipt is named and nothing is written", ctx do
