@@ -6555,6 +6555,7 @@ defmodule Tightbeam.Gateway do
 
   defp harness_process_read_item(row) do
     token_present = row[:identity_token] not in [nil, ""]
+
     last_error =
       if row[:last_error] in [nil, ""],
         do: nil,
@@ -6578,10 +6579,14 @@ defmodule Tightbeam.Gateway do
     named = Map.keys(@harness_error_summaries) -- ["command_timeout", "unclassified_error"]
 
     cond do
-      code = Enum.find(named, &diagnostic_class_present?(value, &1)) -> code
+      code = Enum.find(named, &diagnostic_class_present?(value, &1)) ->
+        code
+
       Enum.any?(@harness_timeout_classes, &diagnostic_class_present?(value, &1)) ->
         "command_timeout"
-      true -> nil
+
+      true ->
+        nil
     end
   end
 
