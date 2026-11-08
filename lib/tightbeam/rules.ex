@@ -2706,11 +2706,24 @@ defmodule Tightbeam.Rules do
             # Let the transaction report uncovered producer commits by hash;
             # this rule only distinguishes a clean independent review from no
             # such review or a blocking review verdict.
-            Assignments.qualifying_review_verdict_kinds(
-              db,
-              assignment.id,
-              assignment.holder_key
-            )
+            linked =
+              Assignments.qualifying_review_verdict_kinds(
+                db,
+                assignment.id,
+                assignment.holder_key
+              )
+
+            # Amendment A1r3: when the linked selection yields no clean review,
+            # the commit-keyed fallback the completion transaction applies
+            # decides here too, so the rule never pre-empts it.
+            if linked == [] and
+                 Assignments.commit_keyed_review_qualifies?(
+                   db,
+                   assignment.id,
+                   assignment.holder_key
+                 ),
+               do: ["reviewed-clean"],
+               else: linked
           else
             Assignments.qualifying_review_verdict_kinds(
               db,

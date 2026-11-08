@@ -4760,12 +4760,61 @@ defmodule Tightbeam.Assignments do
          verification,
          linked_refusal
        ) do
-    commits = ref_commits(verification.commit_refs)
+    case commit_keyed_review_evaluation(
+           &Txn.q(txn, &1, &2),
+           assignment.id,
+           assignment.holderKey,
+           verification
+         ) do
+      {:qualifies, covering} ->
+        Logger.info(
+          "completion_commit_keyed_review accepted assignmentId=#{assignment.id} " <>
+            "reviewAttestId=#{covering.attest_id}"
+        )
+
+        :ok
+
+      {:refuses, commits, conclusions, blockers} ->
+        error(
+          "inapplicable_code_evidence",
+          commit_keyed_refusal(linked_refusal, commits, linked_review, conclusions, blockers)
+        )
+
+      :not_applicable ->
+        error("inapplicable_code_evidence", linked_refusal)
+    end
+  end
+
+  @doc """
+  Whether amendment A1r3's commit-keyed fallback qualifies this producer's code
+  completion: the holder's latest verification is `verified` with commits, and
+  the same evaluation the completion transaction applies passes. The
+  completion-requires-review rule consults it only when the linked selection
+  yields no qualifying clean review, so the rule and the transaction agree.
+  """
+  @spec commit_keyed_review_qualifies?(DB.server(), String.t(), String.t()) :: boolean()
+  def commit_keyed_review_qualifies?(db, assignment_id, holder_key) do
+    query = fn sql, params ->
+      {:ok, rows} = DB.query(db, sql, params)
+      rows
+    end
+
+    verification = latest_verification_conclusion(query, assignment_id, holder_key)
+
+    match?(%{kind: "verified"}, verification) and
+      match?(
+        {:qualifies, _covering},
+        commit_keyed_review_evaluation(query, assignment_id, holder_key, verification)
+      )
+  end
+
+  defp commit_keyed_review_evaluation(query, assignment_id, holder_key, verification) do
+    commits = ref_commits(verification && verification.commit_refs)
 
     if MapSet.size(commits) == 0 do
-      error("inapplicable_code_evidence", linked_refusal)
+      :not_applicable
     else
-      conclusions = eligible_review_conclusions_in_txn(txn, assignment)
+      conclusions = eligible_review_conclusions(query, assignment_id, holder_key)
 
       covering =
         Enum.find(conclusions, fn conclusion ->
@@ -4778,19 +4827,9 @@ defmodule Tightbeam.Assignments do
             not MapSet.disjoint?(commits, conclusion.commits)
         end)
 
-      if covering && blockers == [] do
-        Logger.info(
-          "completion_commit_keyed_review accepted assignmentId=#{assignment.id} " <>
-            "reviewAttestId=#{covering.attest_id}"
-        )
-
-        :ok
-      else
-        error(
-          "inapplicable_code_evidence",
-          commit_keyed_refusal(linked_refusal, commits, linked_review, conclusions, blockers)
-        )
-      end
+      if covering && blockers == [],
+        do: {:qualifies, covering},
+        else: {:refuses, commits, conclusions, blockers}
     end
   end
 
@@ -4798,27 +4837,24 @@ defmodule Tightbeam.Assignments do
   # cards on the producer's work item (a linked card's effect is always review),
   # linked to any producer or unlinked, held by someone other than the producer's
   # holder.
-  defp eligible_review_conclusions_in_txn(txn, assignment) do
-    txn
-    |> Txn.q(
-      """
-      SELECT r.id,v.id,v.verdictKind,v.commitRefs
-      FROM assignments producer
-      JOIN assignments r ON r.workItemId=producer.workItemId AND r.id!=producer.id
-      LEFT JOIN assignment_effects review_effect ON review_effect.assignmentId=r.id
-      JOIN attests v ON v.assignmentId=r.id
-      WHERE producer.id=?1
-        AND producer.workItemId IS NOT NULL
-        AND r.holderKey!=?2
-        AND (r.reviewsAssignmentId IS NOT NULL
-          OR COALESCE(review_effect.effectKind,'code')='review')
-        AND v.kind='verdict'
-        AND v.bySession=r.holderKey
-        AND v.verdictKind IN ('reviewed-clean','changes-requested')
-      ORDER BY r.id,v.ts DESC,v.rowid DESC
-      """,
-      [assignment.id, assignment.holderKey]
-    )
+  defp eligible_review_conclusions(query, assignment_id, holder_key) do
+    """
+    SELECT r.id,v.id,v.verdictKind,v.commitRefs
+    FROM assignments producer
+    JOIN assignments r ON r.workItemId=producer.workItemId AND r.id!=producer.id
+    LEFT JOIN assignment_effects review_effect ON review_effect.assignmentId=r.id
+    JOIN attests v ON v.assignmentId=r.id
+    WHERE producer.id=?1
+      AND producer.workItemId IS NOT NULL
+      AND r.holderKey!=?2
+      AND (r.reviewsAssignmentId IS NOT NULL
+        OR COALESCE(review_effect.effectKind,'code')='review')
+      AND v.kind='verdict'
+      AND v.bySession=r.holderKey
+      AND v.verdictKind IN ('reviewed-clean','changes-requested')
+    ORDER BY r.id,v.ts DESC,v.rowid DESC
+    """
+    |> query.([assignment_id, holder_key])
     |> Enum.dedup_by(fn [card_id | _] -> card_id end)
     |> Enum.map(fn [card_id, attest_id, kind, encoded_refs] ->
       refs = if is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil
@@ -4976,9 +5012,11 @@ defmodule Tightbeam.Assignments do
 
   defp uncovered_producer_commits(_review_refs, _producer_refs), do: []
 
-  defp latest_verification_conclusion_in_txn(txn, assignment_id, holder) do
-    case Txn.q(
-           txn,
+  defp latest_verification_conclusion_in_txn(txn, assignment_id, holder),
+    do: latest_verification_conclusion(&Txn.q(txn, &1, &2), assignment_id, holder)
+
+  defp latest_verification_conclusion(query, assignment_id, holder) do
+    case query.(
            """
            SELECT verdictKind,bySession,commitRefs
            FROM attests

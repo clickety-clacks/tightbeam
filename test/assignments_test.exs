@@ -6851,6 +6851,52 @@ defmodule Tightbeam.AssignmentsTest do
       refute message =~ specimen.covering_clean.id
     end
 
+    test "the review rule lets the fallback decide on the dispatch route", ctx do
+      stub_eligibility_commit_refs!()
+      load_completion_review_rule!(ctx)
+      c = eligibility_commits()
+
+      for linked_adverse? <- [true, false] do
+        work_item = create_work_item(ctx, "dispatch route fallback")
+        producer = eligibility_producer!(ctx, work_item.id)
+        eligibility_verdict!(ctx, "holder", producer.id, "verified", c.verified)
+
+        if linked_adverse? do
+          linked = eligibility_review_card!(ctx, work_item.id, producer.id)
+          disjoint = eligibility_refs([c.other_older], "disjoint")
+          eligibility_verdict!(ctx, "other-session", linked.id, "changes-requested", disjoint)
+        end
+
+        other_producer = eligibility_producer!(ctx, work_item.id)
+        covering_card = eligibility_review_card!(ctx, work_item.id, other_producer.id)
+        eligibility_verdict!(ctx, "other-session", covering_card.id, "reviewed-clean", c.verified)
+
+        assert [] == Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder")
+
+        completion = attest_call({:session, "holder"}, producer.id, "completion")
+        assert :ok = Rules.evaluate(ctx.db, completion)
+
+        assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+                 Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+      end
+    end
+
+    test "the review rule still denies when an eligible blocker names a verified commit", ctx do
+      stub_eligibility_commit_refs!()
+      load_completion_review_rule!(ctx)
+      c = eligibility_commits()
+      specimen = eligibility_specimen!(ctx)
+      blocker = eligibility_review_card!(ctx, specimen.work_item.id, nil)
+      blocker_refs = eligibility_refs([c.i1], "blocker")
+      eligibility_verdict!(ctx, "other-session", blocker.id, "changes-requested", blocker_refs)
+
+      assert {:deny, %{rule: "completion-requires-review"}} =
+               Rules.evaluate(
+                 ctx.db,
+                 attest_call({:session, "holder"}, specimen.producer.id, "completion")
+               )
+    end
+
     test "matching uses canonical refs and short refs stay refused at filing", ctx do
       stub_eligibility_commit_refs!()
       c = eligibility_commits()
@@ -7141,6 +7187,26 @@ defmodule Tightbeam.AssignmentsTest do
     Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
       {"", 0}
     end)
+  end
+
+  defp load_completion_review_rule!(ctx) do
+    rules_base =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-eligibility-rule-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    completion_rules =
+      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      |> String.split("\n# Posture gate", parts: 2)
+      |> hd()
+
+    File.write!(Path.join(rules_dir, "engineering.toml"), completion_rules)
+    Rules.load!(rules_base, Map.keys(ctx.handlers))
+    on_exit(fn -> File.rm_rf!(rules_base) end)
   end
 
   defp eligibility_commits do
