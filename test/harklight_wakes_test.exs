@@ -89,6 +89,455 @@ defmodule Tightbeam.HarklightWakesTest do
     %{db: db, call: call, session: session, main: main}
   end
 
+  @tag :origin_consumer
+  test "an unavailable handle does not stop the shared receiver or lose its offer",
+       %{db: db, session: session} do
+    assert {:ok, :started} =
+             Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+
+    assert {:ok, _} = Tightbeam.HarklightOrigin.confirmed(db, @handle, true)
+    assert {:ok, _} = DB.query(db, "UPDATE harklight_wake_handles SET state='complete'")
+    parent = self()
+
+    manager =
+      start_supervised!(
+        {Tightbeam.HarklightOriginListener,
+         db: db,
+         recover_moves: false,
+         runner: fn _ -> {"", 1} end,
+         listener: fn manager ->
+           send(parent, {:origin_started, self()})
+           origin_test_loop(manager, parent)
+         end}
+      )
+
+    assert_receive {:origin_started, worker}
+    send(worker, {:offer, event(1, "discussion", "Retained until available")})
+    assert_receive {:offered, :captured}
+    assert Process.alive?(worker)
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM harklight_origin_offers")
+    assert {:ok, _} = DB.query(db, "UPDATE harklight_wake_handles SET state='active'")
+    Tightbeam.HarklightOriginListener.resume_handle(@handle)
+    :sys.get_state(manager)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM harklight_origin_offers")
+  end
+
+  @tag :origin_consumer
+  test "explicit cover waits for the real legacy child before its final declaration",
+       %{db: db, call: call} do
+    root = Path.join(System.tmp_dir!(), "origin-handover-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    executable = Path.join(root, "harklight-agent")
+    pid_file = Path.join(root, "legacy-pid")
+    count_file = Path.join(root, "covers")
+
+    File.write!(executable, """
+    #!/bin/sh
+    case "$1" in
+      attach) echo '{"kind":"attached","ready_for_listen":true}' ;;
+      listen)
+        if [ "$2" != "--origin" ]; then echo $$ > '#{pid_file}'; fi
+        exec sleep 60 ;;
+      status) echo '{"session_handle":"#{@handle}","open_requests":1,"pending_undelivered":0,"pending_delivered_unacted":0}' ;;
+      cover)
+        if [ -f '#{count_file}' ]; then
+          if kill -0 "$(cat '#{pid_file}')" 2>/dev/null; then exit 19; fi
+          echo 2 > '#{count_file}'
+        else
+          kill -0 "$(cat '#{pid_file}')" || exit 18
+          echo 1 > '#{count_file}'
+        fi
+        echo '{"kind":"covered","session_handle":"#{@handle}","listening_support":{"origin_listener":true}}' ;;
+      *) exit 2 ;;
+    esac
+    """)
+
+    File.chmod!(executable, 0o755)
+    previous = System.fetch_env!("PATH")
+    System.put_env("PATH", root <> ":" <> previous)
+
+    on_exit(fn ->
+      System.put_env("PATH", previous)
+      File.rm_rf!(root)
+    end)
+
+    runner = fn args -> System.cmd(executable, args, stderr_to_stdout: true) end
+    legacy = start_supervised!({HarklightWakes, db: db, send_runner: runner})
+    assert eventually(fn -> File.exists?(pid_file) end)
+    origin = start_supervised!({Tightbeam.HarklightOriginListener, db: db, runner: runner})
+
+    assert %{outcome: "covered", handle: @handle} =
+             Tightbeam.HarklightOriginListener.cover(%{call | params: %{handle: @handle}}, origin)
+
+    assert String.trim(File.read!(count_file)) == "2"
+
+    assert {:ok, [["covered", 1]]} =
+             DB.query(db, "SELECT state,confirmed FROM harklight_origin_moves")
+
+    assert eventually(fn -> map_size(:sys.get_state(legacy).workers) == 0 end)
+    stop_supervised!(Tightbeam.HarklightOriginListener)
+    stop_supervised!(HarklightWakes)
+
+    assert :ok =
+             Tightbeam.HarklightChild.await_stopped(
+               :origin,
+               Application.fetch_env!(:tightbeam, :harklight_child_opts)
+             )
+  end
+
+  @tag :origin_consumer
+  test "moving and covered handles do not restore or reactivate a legacy listener",
+       %{db: db, session: session} do
+    assert {:ok, :started} =
+             Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+
+    parent = self()
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         listener: fn _, _, _ -> send(parent, :legacy_started) end,
+         send_runner: fn _ -> {"", 1} end}
+      )
+
+    assert %{} = :sys.get_state(manager).workers
+
+    for complete? <- [false, true] do
+      if complete?, do: Tightbeam.HarklightOrigin.confirmed(db, @handle, true)
+      GenServer.cast(manager, {:activate, @handle, true})
+      GenServer.cast(manager, {:activate, @handle, false})
+      GenServer.cast(manager, {:pointer_changed, session.session_key})
+      GenServer.cast(manager, {:origin_ready, session.session_key})
+      assert map_size(:sys.get_state(manager).workers) == 0
+      refute_receive :legacy_started
+    end
+  end
+
+  @tag :origin_consumer
+  test "marking a move keeps the current legacy reader alive until the handover stop",
+       %{db: db, session: session} do
+    parent = self()
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         listener: fn manager, handle, _ ->
+           :ok = GenServer.call(manager, {:attached, handle})
+           send(parent, {:legacy_reader, self()})
+
+           receive do
+             {:capture, line} ->
+               send(parent, {:legacy_captured, GenServer.call(manager, {:capture, handle, line})})
+           end
+
+           receive do
+             :finish -> :ok
+           end
+         end,
+         send_runner: fn _ -> {"", 1} end}
+      )
+
+    assert_receive {:legacy_reader, reader}
+
+    assert {:ok, :started} =
+             HarklightWakes.begin_origin_move(@handle, session.session_key, manager)
+
+    GenServer.cast(manager, {:activate, @handle, true})
+    GenServer.cast(manager, {:pointer_changed, session.session_key})
+    assert :sys.get_state(manager).workers[@handle] == reader
+    assert Process.alive?(reader)
+    send(reader, {:capture, event(1, "discussion", "During move")})
+    assert_receive {:legacy_captured, :ok}
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  @tag :origin_consumer
+  test "M2 covers on both sides of the observed legacy exit", %{db: db, session: session} do
+    assert {:ok, :started} =
+             Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+
+    {:ok, sequence} = Agent.start_link(fn -> [] end)
+
+    covered =
+      JSON.encode!(%{
+        "kind" => "covered",
+        "session_handle" => @handle,
+        "listening_support" => %{"origin_listener" => true}
+      })
+
+    runner = fn ["cover", "--session", @handle] ->
+      Agent.update(sequence, &(&1 ++ [:cover]))
+      {covered, 0}
+    end
+
+    stop = fn @handle ->
+      assert {:ok, [["moving", 1]]} =
+               DB.query(db, "SELECT state,confirmed FROM harklight_origin_moves")
+
+      Agent.update(sequence, &(&1 ++ [:exited]))
+      :ok
+    end
+
+    assert :ok = Tightbeam.HarklightOrigin.migrate(db, @handle, runner: runner, stop: stop)
+    assert [:cover, :exited, :cover] = Agent.get(sequence, & &1)
+
+    assert {:ok, [["covered", 1]]} =
+             DB.query(db, "SELECT state,confirmed FROM harklight_origin_moves")
+
+    Agent.stop(sequence)
+  end
+
+  @tag :origin_consumer
+  test "restart requires legacy exit proof before cover, and missing proof leaves the move pending",
+       %{db: db, session: session} do
+    assert {:ok, :started} =
+             Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+
+    assert {:error, :exit_unconfirmed} =
+             Tightbeam.HarklightOrigin.migrate(db, @handle,
+               restore: true,
+               stop: fn _ -> {:error, :exit_unconfirmed} end,
+               runner: fn _ -> flunk("cover must wait for exit proof") end
+             )
+
+    assert {:ok, [["moving", 0]]} =
+             DB.query(db, "SELECT state,confirmed FROM harklight_origin_moves")
+
+    {:ok, sequence} = Agent.start_link(fn -> [] end)
+
+    assert :ok =
+             Tightbeam.HarklightOrigin.migrate(db, @handle,
+               restore: true,
+               stop: fn _ -> Agent.update(sequence, &(&1 ++ [:exited])) end,
+               runner: fn ["cover", "--session", @handle] ->
+                 Agent.update(sequence, &(&1 ++ [:cover]))
+
+                 {JSON.encode!(%{
+                    "kind" => "covered",
+                    "session_handle" => @handle,
+                    "listening_support" => %{"origin_listener" => true}
+                  }), 0}
+               end
+             )
+
+    assert [:exited, :cover] = Agent.get(sequence, & &1)
+    Agent.stop(sequence)
+  end
+
+  @tag :origin_consumer
+  test "one origin receiver ignores foreign offers without triggering pending actions",
+       %{db: db, session: session} do
+    assert {:ok, :started} =
+             Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO harklight_subscription_ends(senderId,messageId,handle,opId,state,acknowledgment,ackEventId)
+               VALUES('pending-sender','pending-message',?1,'pending-op','open','pending','99')
+               """,
+               [@handle]
+             )
+
+    parent = self()
+
+    listener = fn manager ->
+      send(parent, {:origin_started, self()})
+      origin_test_loop(manager, parent)
+    end
+
+    runner = fn args ->
+      send(parent, {:origin_action, args})
+      {JSON.encode!(%{"kind" => "acknowledged", "event_id" => "99", "status" => "delivered"}), 0}
+    end
+
+    manager =
+      start_supervised!(
+        {Tightbeam.HarklightOriginListener,
+         db: db, listener: listener, runner: runner, recover_moves: false}
+      )
+
+    assert_receive {:origin_started, worker}
+    assert :ok = Tightbeam.HarklightOriginListener.ensure_started(manager)
+    assert :ok = Tightbeam.HarklightOriginListener.ensure_started(manager)
+    refute_receive {:origin_started, _}
+
+    send(worker, {:offer, JSON.encode!(%{"kind" => "event", "session_handle" => "foreign"})})
+    assert_receive {:offered, :ignored}
+    refute_receive {:origin_action, _}
+    send(worker, {:offer, event(1, "discussion", "Before receipt")})
+    assert_receive {:offered, :captured}
+    refute_receive {:origin_action, _}
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+
+    assert :ok = Tightbeam.HarklightOriginListener.confirm(@handle, false, manager)
+    assert_receive {:origin_action, ["ack", "--session", @handle, "--event", "99"]}
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+    send(worker, {:offer, event(1, "discussion", "Before receipt")})
+    assert_receive {:offered, :ok}
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  defp origin_test_loop(manager, parent) do
+    receive do
+      {:offer, line} ->
+        send(parent, {:offered, GenServer.call(manager, {:line, line})})
+        origin_test_loop(manager, parent)
+    end
+  end
+
+  @tag :origin_consumer
+  test "settling cover retries the unresolved support key before declaring coverage" do
+    op_id = "df31cb41-662b-4235-a5c1-a6d9c4aec477"
+
+    covered =
+      JSON.encode!(%{
+        "kind" => "covered",
+        "session_handle" => @handle,
+        "listening_support" => %{"origin_listener" => true}
+      })
+
+    for {receipt, status} <- [{"committed", 0}, {"refused", 2}] do
+      {:ok, calls} = Agent.start_link(fn -> [] end)
+
+      runner = fn args ->
+        prior = Agent.get_and_update(calls, fn history -> {history, history ++ [args]} end)
+
+        case {args, length(prior)} do
+          {["cover", "--session", @handle], 0} ->
+            {"support operation #{op_id} is unresolved; retry that exact operation before changing its fields\n",
+             7}
+
+          {["retry", "--op-id", ^op_id], 1} ->
+            {JSON.encode!(%{"kind" => receipt, "op_id" => op_id, "operation" => "support"}),
+             status}
+
+          {["cover", "--session", @handle], 2} ->
+            {covered, 0}
+        end
+      end
+
+      assert :ok = Tightbeam.HarklightOrigin.settle_cover(runner, @handle)
+      assert length(Agent.get(calls, & &1)) == 3
+      Agent.stop(calls)
+    end
+  end
+
+  @tag :origin_consumer
+  test "an unknown retry or missing coverage receipt never completes a move" do
+    op_id = "df31cb41-662b-4235-a5c1-a6d9c4aec477"
+
+    runner = fn
+      ["cover", "--session", @handle] ->
+        {JSON.encode!(%{"kind" => "outcome_unknown", "operation" => "support", "op_id" => op_id}),
+         7}
+
+      ["retry", "--op-id", ^op_id] ->
+        {"still unknown", 7}
+    end
+
+    assert {:pending, ^op_id} = Tightbeam.HarklightOrigin.settle_cover(runner, @handle)
+
+    assert {:error, "coverage_unconfirmed"} =
+             Tightbeam.HarklightOrigin.settle_cover(
+               fn _ ->
+                 {JSON.encode!(%{
+                    "kind" => "covered",
+                    "session_handle" => @handle,
+                    "listening_support" => %{}
+                  }), 0}
+               end,
+               @handle
+             )
+  end
+
+  @tag :origin_consumer
+  test "origin entries for foreign and noncovered handles have no effect", %{db: db} do
+    for handle <- [@handle, "nonmatching-handle"] do
+      line = JSON.encode!(%{"kind" => "event", "session_handle" => handle})
+      assert :ignored = HarklightWakes.capture_origin_line(db, line)
+    end
+
+    for table <- [
+          "harklight_origin_moves",
+          "harklight_origin_offers",
+          "harklight_wake_entries",
+          "harklight_wake_deliveries",
+          "wakes"
+        ] do
+      assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM " <> table)
+    end
+  end
+
+  @tag :origin_consumer
+  test "a moving handle captures early offers and releases them only after a cover receipt",
+       %{db: db, session: session} do
+    assert {:ok, :started} =
+             Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+
+    line = event(1, "discussion", "Early reply")
+
+    for _ <- 1..2, do: assert(:captured == HarklightWakes.capture_origin_line(db, line))
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM harklight_origin_offers")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+
+    # Re-entering after restart retains both the move and the captured offer.
+    assert {:ok, :moving} = Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+    assert {:ok, _} = Tightbeam.HarklightOrigin.confirmed(db, @handle)
+    assert :ok = Tightbeam.HarklightOrigin.drain(db, @handle)
+    assert :ok = Tightbeam.HarklightOrigin.drain(db, @handle)
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM harklight_origin_offers")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM harklight_wake_entries")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+
+    assert {:ok, [["moving", 1]]} =
+             DB.query(db, "SELECT state,confirmed FROM harklight_origin_moves")
+
+    assert {:ok, _} = Tightbeam.HarklightOrigin.confirmed(db, @handle, true)
+
+    assert {:ok, [["covered", 1]]} =
+             DB.query(db, "SELECT state,confirmed FROM harklight_origin_moves")
+  end
+
+  @tag :origin_consumer
+  test "overlapping listeners and replay share one durable wake", %{db: db, session: session} do
+    assert {:ok, :started} =
+             Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+
+    line = event(1, "discussion", "Reply")
+    assert :captured = HarklightWakes.capture_origin_line(db, line)
+    assert :ok = HarklightWakes.capture_line(db, @handle, line)
+    assert {:ok, _} = Tightbeam.HarklightOrigin.confirmed(db, @handle)
+    assert :ok = Tightbeam.HarklightOrigin.drain(db, @handle)
+    assert :ok = HarklightWakes.capture_origin_line(db, line)
+    assert :ok = HarklightWakes.capture_line(db, @handle, line)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM harklight_wake_deliveries")
+  end
+
+  @tag :origin_consumer
+  test "buffered origin offers survive a later legacy capture advancing the cursor",
+       %{db: db, session: session} do
+    assert {:ok, :started} =
+             Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+
+    assert :captured = HarklightWakes.capture_origin_line(db, event(1, "discussion", "Earlier"))
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(2, "discussion", "Later"))
+    assert {:ok, _} = Tightbeam.HarklightOrigin.confirmed(db, @handle)
+    assert :ok = Tightbeam.HarklightOrigin.drain(db, @handle)
+
+    assert {:ok, [["1"], ["2"]]} =
+             DB.query(db, "SELECT eventId FROM harklight_wake_entries ORDER BY feedCursor")
+
+    assert {:ok, [[2]]} = DB.query(db, "SELECT lastCursor FROM harklight_wake_handles")
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+  end
+
   test "a prepared send cannot bind through a different payload or origin", %{db: db, call: call} do
     assert %{code: "harklight_send_mismatch"} =
              HarklightWakes.prepare_send(db, call, @send_op, @payload <> " ")
@@ -1439,7 +1888,7 @@ defmodule Tightbeam.HarklightWakesTest do
     File.write!(Path.join(root, "harklight-agent"), """
     #!/bin/sh
     if [ "$1" = status ]; then exit 1; fi
-    if [ "$1" = listen ]; then exec sleep 300; fi
+    if [ "$1" = listen ]; then printf 'listen\\n' >> '#{events}'; exec sleep 300; fi
     printf 'start\\n' >> '#{events}'
     sleep 0.2
     printf 'end\\n' >> '#{events}'
@@ -1456,11 +1905,12 @@ defmodule Tightbeam.HarklightWakesTest do
     end)
 
     start_supervised!({HarklightWakes, db: db, attach_concurrency: 2})
-    await_listener_ports(6)
+    await_listener_starts(events, 6)
 
     overlap =
       File.read!(events)
       |> String.split("\n", trim: true)
+      |> Enum.reject(&(&1 == "listen"))
       |> Enum.scan(0, fn
         "start", n -> n + 1
         "end", n -> n - 1
@@ -1473,13 +1923,18 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT state,count(*) FROM harklight_wake_handles GROUP BY state")
   end
 
-  defp await_listener_ports(count, attempts \\ 300)
-  defp await_listener_ports(_count, 0), do: flunk("listener ports did not start")
+  # The manager tracks short attach children as well as standing listeners.
+  # Observe the fixture's actual listen start before assessing all attachments.
+  defp await_listener_starts(events, count, attempts \\ 300)
+  defp await_listener_starts(_events, _count, 0), do: flunk("listeners did not start")
 
-  defp await_listener_ports(count, attempts) do
-    if map_size(:sys.get_state(HarklightWakes).ports) < count do
+  defp await_listener_starts(events, count, attempts) do
+    started =
+      File.read!(events) |> String.split("\n", trim: true) |> Enum.count(&(&1 == "listen"))
+
+    if started < count do
       Process.sleep(10)
-      await_listener_ports(count, attempts - 1)
+      await_listener_starts(events, count, attempts - 1)
     end
   end
 

@@ -73,7 +73,7 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-follow harklight-reconnect spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+@agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-follow harklight-reconnect spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle harklight-cover)
   @agent_verbs @agent_verbs ++
                  [
                    "fact-demand",
@@ -3736,7 +3736,7 @@ defmodule Tightbeam.Wire.Router do
   # `--session <key>` is a COHORT FILTER over creator identity, not a target, so
   # resolving it as one would turn a roster filter into a session-existence
   # oracle. Both verbs' selectors travel as ordinary body params.
-  @non_target_verbs ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow harklight-reconnect settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
+@non_target_verbs ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow harklight-reconnect settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harklight-cover)
 
   @non_target_verbs @non_target_verbs ++
                       [
@@ -3840,7 +3840,7 @@ defmodule Tightbeam.Wire.Router do
     do: session_key
 
   defp artifact_caller_session(verb, nil, {:session, session_key})
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow harklight-reconnect),
+when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow harklight-reconnect harklight-cover),
        do: session_key
 
   defp artifact_caller_session(_verb, session_key, _principal), do: session_key
@@ -4304,6 +4304,7 @@ defmodule Tightbeam.Wire.Router do
     "harklight-settle" => ~w(message_id)a,
     "harklight-follow" => ~w(message_id handle)a,
     "harklight-reconnect" => ~w(message_id)a,
+    "harklight-cover" => ~w(handle)a,
     "work-item-list" =>
       ~w(state status owner_user_id created_by_session created_by_user is_bug spec_ref_name holder_key limit after)a,
     "topline-placement-list" => ~w(state)a,
@@ -4529,7 +4530,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp dispatch_error(conn, %{verb: verb}, status, result)
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow harklight-reconnect) do
+when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow harklight-reconnect harklight-cover) do
     json(conn, status, %{"error" => wire_value(result)})
   end
 

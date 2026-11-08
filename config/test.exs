@@ -24,3 +24,8 @@ config :tightbeam, :local_host_name, "testhost"
 config :tightbeam, :fixture_harness, true
 config :tightbeam, :test_suite_tmp, suite_tmp
 config :tightbeam, :port, 0
+
+# The child lifetime wrapper must be the CLI from this same checkout.
+config :tightbeam, :harklight_child_opts,
+  base_dir: Path.join(suite_tmp, "harklight"),
+  cli_path: Path.expand("../cli/target/release/tightbeam", __DIR__)
