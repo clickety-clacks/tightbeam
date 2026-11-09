@@ -857,6 +857,18 @@ defmodule Tightbeam.HarklightWakes do
       event_identity_invalid event_identity_mismatch event_order_invalid invalid_listener_line
       unexpected_listener_line)
 
+  defp transient_origin_failure?({:harklight_failure, {_error, code}, operation, _diagnostic})
+       when operation in ["attach", "listen"] and code in ["transport_error", "timeout"],
+       do: true
+
+  defp transient_origin_failure?({:harklight_failure, error, operation, diagnostic})
+       when operation in ["attach", "listen"] do
+    retryable_failure?({:harklight_failure, error, operation, diagnostic}) and
+      origin_transport_failure?(diagnostic)
+  end
+
+  defp transient_origin_failure?(_status), do: false
+
   @impl true
   def terminate(_reason, state) do
     Enum.each(state.retry_timers, fn {_, {timer, _}} -> Process.cancel_timer(timer) end)
@@ -1319,10 +1331,10 @@ defmodule Tightbeam.HarklightWakes do
 
         if completed, do: HarklightLifecycle.complete_in_txn(txn, handle)
 
-        # Retryable listener failures remain unavailable while the existing
-        # finite recovery budget runs. Notify the owner only if recovery ends
-        # without a retry; permanent failures keep their immediate notice.
-        if not completed and not retryable_failure?(status),
+        # Suppress only an explicitly identified origin transport failure
+        # while its existing finite recovery budget runs. Other failures keep
+        # their immediate owner notice.
+        if not completed and not transient_origin_failure?(status),
           do:
             notify_owner_in_txn(
               txn,
