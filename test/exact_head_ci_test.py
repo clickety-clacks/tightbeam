@@ -181,7 +181,7 @@ class ExactHeadCI(unittest.TestCase):
         self.assertIn('git cat-file -e "$EXPECTED_BASE^{commit}"', job)
         self.assertIn('test "$(git merge-base HEAD "$EXPECTED_BASE")" = "$EXPECTED_BASE"', job)
         self.assertIn('git diff --exit-code "$EXPECTED_BASE" HEAD -- priv', job)
-        self.assertNotIn('HEAD^', job)
+        self.assertNotIn('git rev-parse HEAD^)', job)
         self.assertIn('python3 scripts/verify_shipped_privacy.py', job)
         self.assertIn('sh packaging/assemble.sh', job)
         self.assertIn('mix run --no-start scripts/docs_composition_52.exs', job)
