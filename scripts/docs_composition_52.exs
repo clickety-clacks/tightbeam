@@ -15,6 +15,8 @@ defmodule Tightbeam.DocsComposition52 do
     inventory_path = Path.join(source, "scripts/docs_composition_52.json")
     inventory_bytes = File.read!(inventory_path)
     inventory = JSON.decode!(inventory_bytes)
+    expected_base = System.fetch_env!("EXPECTED_BASE")
+    assert!(inventory["parent"] == expected_base, "inventory base differs from exact workflow base")
     assert!(inventory["count"] == 52, "inventory count")
     assert!(inventory["versions"] == ["parent", "candidate"], "versions")
     assert!(inventory["harnesses"] == ["claude", "codex"], "harnesses")
@@ -23,18 +25,20 @@ defmodule Tightbeam.DocsComposition52 do
     manual_path = "priv/guidance/operating-manual.md"
     after_body = File.read!(Path.join(source, manual_path))
     before_body = git_bytes!(source, ["show", inventory["parent"] <> ":" <> manual_path])
-    reviewed_body = git_bytes!(source, ["show", inventory["reviewed_manual_commit"] <> ":" <> manual_path])
-    assert!(after_body == reviewed_body, "reviewed manual changed")
+    candidate_body = git_bytes!(source, ["show", sha <> ":" <> manual_path])
+    assert!(after_body == candidate_body, "candidate manual differs from exact source")
+    assert!(before_body == after_body, "manual changed between exact base and candidate")
     assert!(digest(after_body) == inventory["manual_sha256"], "candidate manual hash")
     assert!(digest(before_body) == inventory["parent_manual_sha256"], "parent manual hash")
-    before_paragraph = paragraph!(before_body, "Before you end a turn")
+    before_paragraph = paragraph!(before_body, "Advance actionable work immediately")
     after_paragraph = paragraph!(after_body, "Advance actionable work immediately")
+    assert!(before_paragraph == after_paragraph, "base/candidate paragraph changed")
     assert!(String.replace(before_body, before_paragraph, after_paragraph, global: false) == after_body, "non-paragraph change")
 
-    # This task's only shipped input change is the manual paragraph. Every
-    # archetype, skill and other guidance file must still match the parent.
+    # This task changes workflow validation only. No shipped input, archetype,
+    # skill or guidance file may differ from the exact PR base.
     changed = git!(source, ["diff", "--name-only", inventory["parent"], sha, "priv"])
-    assert!(changed == manual_path, "unexpected shipped input change")
+    assert!(changed == "", "unexpected shipped input change")
 
     base = Path.join(output, "composition/identity-base")
     File.mkdir_p!(Path.dirname(base))
