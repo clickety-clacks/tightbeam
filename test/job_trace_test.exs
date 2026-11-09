@@ -83,19 +83,6 @@ defmodule Tightbeam.JobTraceTest do
          'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow');
       """)
 
-    Enum.each([{"asg_direct", 2}, {"asg_bad", 3}, {"asg_review", 4}], fn
-      {assignment_id, opened_at} ->
-        assert {:ok, :ok} =
-                 DB.transaction(db, fn txn ->
-                   Tightbeam.Supervision.assignment_opened_in_txn(
-                     txn,
-                     assignment_id,
-                     opened_at,
-                     1_000
-                   )
-                 end)
-    end)
-
     %{db: db}
   end
 
@@ -107,14 +94,6 @@ defmodule Tightbeam.JobTraceTest do
     on_exit(fn -> File.rm_rf!(law_root) end)
     handlers = Tightbeam.Gateway.handlers(%{db: db})
     law = Tightbeam.TerminalReactionFixture.load!(law_root, Map.keys(handlers))
-
-    File.cp!(
-      Path.join([
-        :code.priv_dir(:tightbeam),
-        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
-      ]),
-      Path.join(law, "identity/rules/row-reaction-assignment-inactivity.toml")
-    )
 
     Tightbeam.Rules.load!(law, Map.keys(handlers))
 
@@ -221,53 +200,11 @@ defmodule Tightbeam.JobTraceTest do
                [notice_id]
              )
 
-    # Holder attests replace inactivity deadlines; completion also closes its
-    # replacement. These source transitions precede the notice delivery attempt.
     source_cancellations =
       trace(db, {:user, "owner"}, "wi_trace").timeline
       |> Enum.filter(&(&1.type == "wake_canceled" and &1.id != notice_id))
 
-    assert Enum.map(source_cancellations, &{&1.assignmentId, &1.reasonKind, &1.outcomeKind}) == [
-             {"asg_direct", "superseded", "replacement"},
-             {"asg_direct", "obligation_disposed", "disposition"},
-             {"asg_review", "superseded", "replacement"},
-             {"asg_review", "superseded", "replacement"}
-           ]
-
-    Enum.each(source_cancellations, fn entry ->
-      assignment_id = entry.assignmentId
-
-      assert %{consumer: "assignment_inactivity_deadline", assignment_id: ^assignment_id} =
-               Tightbeam.Wakes.get(db, entry.id)
-
-      assert entry.provenanceStatus == "proven"
-      assert entry.schedulingOrigin == "process:tightbeam"
-      assert {entry.requesterKind, entry.requesterId} == {"process", "tightbeam:assignments"}
-      assert entry.workImpactKind == "linked_work_open"
-
-      assert {entry.livenessTriggerKind, entry.livenessTriggerId, entry.actionNeeded} ==
-               {nil, nil, false}
-
-      case entry.outcomeKind do
-        "replacement" ->
-          assert {entry.causalSourceKind, entry.causalSourceId} ==
-                   {"wake", entry.replacementWakeId}
-
-          assert {entry.primaryWorkKind, entry.primaryWorkId} == {"assignment", assignment_id}
-
-          assert %{consumer: "assignment_inactivity_deadline", assignment_id: ^assignment_id} =
-                   Tightbeam.Wakes.get(db, entry.replacementWakeId)
-
-        "disposition" ->
-          assert {entry.causalSourceKind, entry.causalSourceId} ==
-                   {"assignment_transition", assignment_id}
-
-          assert {entry.dispositionKind, entry.dispositionId} ==
-                   {"assignment_transition", assignment_id}
-
-          assert {entry.primaryWorkKind, entry.primaryWorkId} == {"work_item", "wi_trace"}
-      end
-    end)
+    assert source_cancellations == []
 
     assert [] =
              Tightbeam.NoticeBatcher.recover(db, System.system_time(:millisecond), [], personal)
@@ -593,7 +530,6 @@ defmodule Tightbeam.JobTraceTest do
         session_key: nil,
         params: Map.merge(%{assignment_id: assignment_id, kind: kind}, extra)
       }
-      |> Map.put_new(:supervision_interval_ms, 1_000)
     )
   end
 

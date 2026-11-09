@@ -140,7 +140,6 @@ defmodule Tightbeam.Gateway do
           default_model: Model.t(),
           max_live_sessions_per_user: pos_integer() | nil,
           wake_tick_ms: pos_integer(),
-          supervision_interval_ms: pos_integer() | :off | nil,
           prod_limit: non_neg_integer(),
           escalation_decision_deadline_ms: pos_integer(),
           critical_lease_hard_cap_ms: pos_integer(),
@@ -248,18 +247,12 @@ defmodule Tightbeam.Gateway do
     # boot (bad law stops the boot). Placement owns every host mechanic.
     load_law!(config, Map.keys(handler_table))
 
-    # The one-time migration creates ordinary deadline wakes before the event
-    # scheduler can consume them. Later changes are written by assignment and
-    # holder-activity transactions.
     :ok = Wakes.activate_wait_recognition(db)
     :ok = Supervision.close_retired_holder_assignments(db)
 
-    case Supervision.migrate_open_assignments(db, supervision_interval_ms(config)) do
-      :ok ->
-        :ok
-
-      {:error, error} ->
-        Logger.error("assignment inactivity recovery deferred: #{Exception.message(error)}")
+    case Supervision.drain_legacy_inactivity_wakes(db) do
+      :ok -> :ok
+      {:error, error} -> raise error
     end
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
@@ -349,9 +342,7 @@ defmodule Tightbeam.Gateway do
             # pre-removal releases. They intentionally neither read generations
             # nor send effort-check-in decisions/notices.
             "effort_probe" => &EffortCheckin.ignore_retired_wake(db, &1),
-            "effort_deadline" => &EffortCheckin.ignore_retired_wake(db, &1),
-            "assignment_inactivity_deadline" => &Supervision.deadline(db, &1),
-            "assignment_inactivity_climb" => &Supervision.climb(db, &1)
+            "effort_deadline" => &EffortCheckin.ignore_retired_wake(db, &1)
           },
           tick_ms: config.wake_tick_ms,
           name: Tightbeam.WakeScheduler},
@@ -1554,7 +1545,6 @@ defmodule Tightbeam.Gateway do
       {"assign", ["assignment.opened"]} => fn call ->
         call =
           call
-          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
 
@@ -1571,7 +1561,6 @@ defmodule Tightbeam.Gateway do
        ]} => fn call ->
         call =
           call
-          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
           |> Map.put(:on_dispatch_delivery, fn delivery, _ ->
@@ -1585,7 +1574,6 @@ defmodule Tightbeam.Gateway do
           db,
           "attest",
           call
-          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:wake_scheduler, Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
         )
@@ -1612,7 +1600,6 @@ defmodule Tightbeam.Gateway do
           db,
           "reopen-assignment",
           call
-          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
         )
       end,
@@ -5053,7 +5040,6 @@ defmodule Tightbeam.Gateway do
 
       {:noop, revision} ->
         load_law!(config)
-        reconcile_assignment_inactivity_after_law_change!(db)
         %{state: "already-learned", kungfu: call.params.name, live_revision: revision}
 
       {:conflict, paths} ->
@@ -5106,7 +5092,6 @@ defmodule Tightbeam.Gateway do
                case Identity.publish_live!(config.base_dir, candidate) do
                  {:ok, revision} ->
                    load_law!(config)
-                   reconcile_assignment_inactivity_after_law_change!(db)
                    {:published, marker, revision}
 
                  {:error, error} ->
@@ -5205,7 +5190,6 @@ defmodule Tightbeam.Gateway do
           case Identity.publish_live!(config.base_dir, candidate) do
             {:ok, revision} ->
               load_law!(config)
-              reconcile_assignment_inactivity_after_law_change!(db)
 
               stamp_served_publication(
                 config,
@@ -5403,13 +5387,6 @@ defmodule Tightbeam.Gateway do
 
     Tightbeam.RowReactions.recover(Map.get(config, :db, Tightbeam.DB))
     rules
-  end
-
-  defp reconcile_assignment_inactivity_after_law_change!(db) do
-    case Supervision.migrate_open_assignments(db) do
-      :ok -> :ok
-      {:error, error} -> raise error
-    end
   end
 
   defp identity_status_result(config, db, call) do
@@ -6940,10 +6917,6 @@ defmodule Tightbeam.Gateway do
         fact = ConditionFacts.latest(db, p.kind, p[:scope])
         %{exists: not is_nil(fact), fact: fact}
     end
-  end
-
-  defp supervision_interval_ms(config) do
-    Map.get(config, :supervision_interval_ms) || Supervision.policy_default_interval_ms()
   end
 
   defp sentinel_post_details(event, values) when is_list(values) do
@@ -10602,7 +10575,6 @@ defmodule Tightbeam.Gateway do
                             plan,
                             owner,
                             principal,
-                            supervision_interval_ms(config),
                             "retired: session retired before execution",
                             retirement_request_id,
                             p[:idempotency_key],
@@ -10979,7 +10951,6 @@ defmodule Tightbeam.Gateway do
          plan,
          owner,
          principal,
-         supervision_interval_ms,
          drain_reason,
          retirement_request_id,
          idempotency_key,
@@ -11037,7 +11008,6 @@ defmodule Tightbeam.Gateway do
               member.session_key,
               owner,
               principal,
-              supervision_interval_ms,
               drain_reason
             )
 
@@ -11145,11 +11115,10 @@ defmodule Tightbeam.Gateway do
          session_key,
          owner,
          principal,
-         supervision_interval_ms,
          drain_reason
        ) do
     assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
-    Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
+    Org.retire_in_txn(txn, session_key, principal)
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
     assignments
   end
