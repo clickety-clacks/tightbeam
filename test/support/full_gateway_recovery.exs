@@ -109,7 +109,6 @@ defmodule Tightbeam.RecoveryScenario do
         origin: "agent:recovery:a",
         principal: {:session, "agent:recovery:a"},
         session_key: "agent:recovery:a",
-        supervision_interval_ms: 1_000,
         params: %{
           assignment_id: "asg_recovery_preserve",
           kind: "progress",
@@ -187,14 +186,8 @@ defmodule Tightbeam.RecoveryScenario do
             "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
           ) == [["fired"], ["fired"]] and
           rows(
-            "SELECT state FROM wakes WHERE assignmentId='asg_recovery_preserve' AND digest=0 AND consumer='prompt'"
-          ) ==
-            [
-              ["fired"]
-            ] and
-          rows("SELECT status FROM turns WHERE assignmentId='asg_recovery_preserve'") == [
-            ["delivered"]
-          ]
+            "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_recovery_preserve' AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')"
+          ) == [[0]]
       end,
       nil,
       &recovery_barrier_state/0
@@ -455,7 +448,6 @@ Application.put_env(
   Tightbeam.Model.new("fixture-model")
 )
 
-Application.put_env(:tightbeam, :supervision_interval_ms, 1_000)
 Application.put_env(:tightbeam, :autostart, true)
 File.mkdir_p!(Path.join(arena, "work"))
 arena_tmp = Path.join(arena, "tmp")

@@ -2,7 +2,7 @@ defmodule Tightbeam.EffortCheckinTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Assignments, DB, Gateway, Org, Placement, Wakes}
+  alias Tightbeam.{Assignments, DB, Gateway, Org, Placement, Wakes, WorkItems}
 
   setup do
     db = :"effort_retirement_#{System.unique_integer([:positive])}"
@@ -236,7 +236,97 @@ defmodule Tightbeam.EffortCheckinTest do
            ) == 0
   end
 
-  defp assign(db) do
+  test "effort wake cancellation uses an open child assignment as work-item liveness", ctx do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:owner",
+        principal: {:user, "owner"},
+        params: %{title: "parent remains live through child"}
+      })
+
+    parent = assign(ctx.db, item.id, "parent assignment", "coordination")
+    child = assign(ctx.db, item.id, "open child assignment", "coordination")
+
+    %{assignment: %{state: "closed", outcome: "completed"}} =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: "holder",
+        params: %{assignment_id: parent.id, kind: "completion", note: "parent work finished"}
+      })
+
+    deadline =
+      old_wake(
+        ctx.db,
+        parent.id,
+        "effort_deadline",
+        System.system_time(:millisecond) + 60_000
+      )
+
+    request_id = "dr_child_live_effort"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
+                  effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,options,context,status)
+               VALUES (?1,'effort','process:tightbeam','owner',?2,'parent',0,1,?3,?4,?5,
+                       'Continue or dismiss?',?6,'{}','open')
+               """,
+               [
+                 request_id,
+                 parent.id,
+                 deadline.wake_id,
+                 now,
+                 now + 86_400_000,
+                 JSON.encode!(["continue", "dismiss"])
+               ]
+             )
+
+    handlers = Gateway.handlers(%{db: ctx.db})
+
+    assert %{status: "ruled", decision: "continue"} =
+             handlers["effort-rule"].(%{
+               verb: "effort-rule",
+               origin: "agent:parent",
+               principal: {:session, "parent"},
+               params: %{request_id: request_id, action: "continue"}
+             })
+
+    assert %{state: "canceled"} = Wakes.get(ctx.db, deadline.wake_id)
+
+    assert [["supervision_entitlement", child_id, 1]] =
+             rows(
+               ctx.db,
+               "SELECT livenessTriggerKind,livenessTriggerId,actionNeeded FROM wake_cancellations WHERE wakeId=?1",
+               [deadline.wake_id]
+             )
+
+    assert child_id == child.id
+
+    assert [["open", "owner"]] =
+             rows(
+               ctx.db,
+               "SELECT state,ownerUserId FROM work_items WHERE id=?1",
+               [item.id]
+             )
+
+    item_id = item.id
+
+    assert [["open", ^item_id]] =
+             rows(
+               ctx.db,
+               "SELECT state,workItemId FROM assignments WHERE id=?1",
+               [child.id]
+             )
+  end
+
+  defp assign(db, work_item_id \\ nil, subject \\ "retired check-in proof", effect_kind \\ nil) do
     result =
       Assignments.__handle__(db, "assign", %{
         verb: "assign",
@@ -245,8 +335,12 @@ defmodule Tightbeam.EffortCheckinTest do
         session_key: "holder",
         target_role: nil,
         role_fallback: false,
-        supervision_interval_ms: 1_000,
-        params: %{subject: "retired check-in proof", brief: "exercise assignment behavior"}
+        params: %{
+          subject: subject,
+          brief: "exercise assignment behavior",
+          work_item_id: work_item_id,
+          effect_kind: effect_kind
+        }
       })
 
     assert %{id: id} = result
