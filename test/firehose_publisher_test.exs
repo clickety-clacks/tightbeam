@@ -628,7 +628,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
 
-    completion_attest_effects = Enum.reject(completion_effects, &(&1 in asynchronous_delivery))
+    completion_attest_effects =
+      completion_effects
+      |> Enum.reject(&(&1 in asynchronous_delivery))
+      |> Enum.uniq()
     declared_attest_effects = Gateway.handler_effects(config)["attest"]
 
     # Without the removed inactivity deadline, this ordinary completion has
