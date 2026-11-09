@@ -3,7 +3,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   @behaviour WebSock
 
-  alias Tightbeam.{Devices, ModelCatalog}
+  alias Tightbeam.{DB, Devices, ModelCatalog}
   alias Tightbeam.Firehose.{Hub, Publisher}
 
   @max_subscriptions 100
@@ -14,6 +14,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
             device_id: nil,
             is_admin: false,
             subscriptions: %{},
+            subscription_versions: %{},
             heartbeat_timer: nil,
             deps: %{}
 
@@ -39,6 +40,12 @@ defmodule Tightbeam.Wire.ChangeSocket do
   def handle_info({:firehose_notice, notice}, %{phase: :live} = state) do
     await_delivery_release(state, notice)
     Hub.delivered(hub(state), self())
+
+    notice =
+      if state.subscription_versions[notice["subscriptionId"]] == 2,
+        do: Map.put(notice, "schemaVersion", 2),
+        else: notice
+
     push(notice, state)
   end
 
@@ -83,7 +90,75 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defp route(_message, state), do: invalid("unsupported request", state)
 
   defp authenticate(message, state) do
-    case Devices.by_token(db(state), string(message["token"])) do
+    token = string(message["token"])
+
+    if token != "" and token == state.deps[:cli_token] do
+      authenticate_operator(message, state)
+    else
+      authenticate_device(message, token, state)
+    end
+  end
+
+  defp authenticate_operator(message, state) do
+    result =
+      case Map.fetch(message, "asUser") do
+        {:ok, user_id} when is_binary(user_id) and user_id != "" ->
+          case Devices.user(db(state), user_id) do
+            nil -> {:error, "not_found"}
+            user -> {:ok, user}
+          end
+
+        {:ok, _invalid} ->
+          {:error, "invalid_message"}
+
+        :error ->
+          {:ok, rows} =
+            DB.query(
+              db(state),
+              "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId LIMIT 1",
+              []
+            )
+
+          case rows do
+            [[user_id]] -> {:ok, Devices.user(db(state), user_id)}
+            [] -> {:ok, %{user_id: "org", is_admin: true}}
+          end
+      end
+
+    case result do
+      {:ok, user} ->
+        :ok =
+          Hub.register(hub(state), self(), %{
+            mode: :filtered,
+            db: db(state),
+            user_id: user.user_id,
+            is_admin: user.is_admin
+          })
+
+        state = %{
+          state
+          | phase: :live,
+            user_id: user.user_id,
+            is_admin: user.is_admin
+        }
+
+        push(
+          %{
+            "type" => "auth_result",
+            "success" => true,
+            "userId" => user.user_id,
+            "isAdmin" => user.is_admin
+          },
+          schedule_heartbeat(state)
+        )
+
+      {:error, reason} ->
+        stop_with(auth_failure(reason), 1008, state)
+    end
+  end
+
+  defp authenticate_device(message, token, state) do
+    case Devices.by_token(db(state), token) do
       nil ->
         known = Devices.by_id(db(state), string(message["deviceId"]))
 
@@ -130,8 +205,8 @@ defmodule Tightbeam.Wire.ChangeSocket do
     id = message["subscriptionId"]
 
     cond do
-      message["protocolVersion"] != 1 ->
-        invalid("protocolVersion must be 1", state)
+      message["protocolVersion"] not in [1, 2] ->
+        invalid("protocolVersion must be 1 or 2", state)
 
       not (is_binary(id) and id != "") ->
         invalid("subscriptionId is required", state)
@@ -146,7 +221,14 @@ defmodule Tightbeam.Wire.ChangeSocket do
         case normalize_filters(message["filters"]) do
           {:ok, filters} ->
             :ok = Hub.subscribe(hub(state), self(), id, filters)
-            state = %{state | subscriptions: Map.put(state.subscriptions, id, filters)}
+
+            state = %{
+              state
+              | subscriptions: Map.put(state.subscriptions, id, filters),
+                subscription_versions:
+                  Map.put(state.subscription_versions, id, message["protocolVersion"])
+            }
+
             push(%{"type" => "subscription_ready", "subscriptionId" => id}, state)
 
           :error ->
@@ -160,7 +242,13 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
     if is_binary(id) and Map.has_key?(state.subscriptions, id) do
       :ok = Hub.unsubscribe(hub(state), self(), id)
-      state = %{state | subscriptions: Map.delete(state.subscriptions, id)}
+
+      state = %{
+        state
+        | subscriptions: Map.delete(state.subscriptions, id),
+          subscription_versions: Map.delete(state.subscription_versions, id)
+      }
+
       push(%{"type" => "subscription_removed", "subscriptionId" => id}, state)
     else
       invalid("unknown subscriptionId", state)
