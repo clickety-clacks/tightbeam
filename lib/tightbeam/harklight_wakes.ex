@@ -821,6 +821,7 @@ defmodule Tightbeam.HarklightWakes do
               retry_timers: Map.put(state.retry_timers, handle, {timer, token})
           }
         else
+          notify_owner_after_recovery_exhaustion(state.db, handle, status)
           start_gone(state, handle)
         end
 
@@ -855,6 +856,18 @@ defmodule Tightbeam.HarklightWakes do
     do: error not in ~w(origin_unavailable origin_host_mismatch listener_unsupported
       event_identity_invalid event_identity_mismatch event_order_invalid invalid_listener_line
       unexpected_listener_line)
+
+  defp transient_origin_failure?({:harklight_failure, {_error, code}, operation, _diagnostic})
+       when operation in ["attach", "listen"] and code in ["transport_error", "timeout"],
+       do: true
+
+  defp transient_origin_failure?({:harklight_failure, error, operation, diagnostic})
+       when operation in ["attach", "listen"] do
+    retryable_failure?({:harklight_failure, error, operation, diagnostic}) and
+      origin_transport_failure?(diagnostic)
+  end
+
+  defp transient_origin_failure?(_status), do: false
 
   @impl true
   def terminate(_reason, state) do
@@ -1318,7 +1331,10 @@ defmodule Tightbeam.HarklightWakes do
 
         if completed, do: HarklightLifecycle.complete_in_txn(txn, handle)
 
-        if not completed,
+        # Suppress only an explicitly identified origin transport failure
+        # while its existing finite recovery budget runs. Other failures keep
+        # their immediate owner notice.
+        if not completed and not transient_origin_failure?(status),
           do:
             notify_owner_in_txn(
               txn,
@@ -1338,6 +1354,45 @@ defmodule Tightbeam.HarklightWakes do
 
       _ ->
         :ok
+    end
+  end
+
+  defp notify_owner_after_recovery_exhaustion(db, handle, status) do
+    {error, operation, diagnostic} = failure_details(status)
+    now = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1",
+                  [
+                    handle
+                  ]
+                ) do
+             [[session_key, state]] when state in ["active", "unavailable"] ->
+               notify_owner_in_txn(
+                 txn,
+                 session_key,
+                 handle,
+                 if(error == "origin_unavailable",
+                   do: "origin_unavailable",
+                   else: "listener_failure"
+                 ),
+                 error,
+                 operation,
+                 diagnostic,
+                 now
+               )
+
+             _ ->
+               :ok
+           end
+         end) do
+      {:ok, _} ->
+        :ok
+
+      {:error, _} ->
+        Logger.error("Harklight recovery notice could not be recorded for handle=#{handle}")
     end
   end
 
@@ -1622,15 +1677,15 @@ defmodule Tightbeam.HarklightWakes do
                       failure
                     )
                   else
-                    {:error, reason, diagnostic}
+                    {:error, tag_transport_failure(reason), diagnostic}
                   end
               end
             else
-              {:error, reason, diagnostic}
+              {:error, tag_transport_failure(reason), diagnostic}
             end
 
           [] ->
-            {:error, reason, diagnostic}
+            {:error, tag_transport_failure(reason), diagnostic}
         end
 
       result ->
@@ -1966,8 +2021,29 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
+  defp failure_status("listener_stopped" = error, "listen" = operation, diagnostic) do
+    error = if origin_transport_failure?(diagnostic), do: {error, "transport_error"}, else: error
+    {:harklight_failure, error, operation, diagnostic}
+  end
+
   defp failure_status(error, operation, diagnostic),
     do: {:harklight_failure, error, operation, diagnostic}
+
+  defp tag_transport_failure({_error, _code} = reason), do: reason
+  defp tag_transport_failure(reason), do: {reason, "transport_error"}
+
+  defp origin_transport_failure?(diagnostic) do
+    diagnostic_contains?(diagnostic, "origin request failed:") or
+      diagnostic_contains?(diagnostic, "reason_code=transport_error") or
+      diagnostic_contains?(diagnostic, "reason_code=timeout")
+  end
+
+  defp diagnostic_contains?(diagnostic, text) do
+    diagnostic
+    |> List.wrap()
+    |> Enum.join(" ")
+    |> String.contains?(text)
+  end
 
   defp failure_details({:harklight_failure, {error, code}, operation, diagnostics}),
     do:
