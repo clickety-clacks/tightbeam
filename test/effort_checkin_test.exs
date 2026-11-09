@@ -245,8 +245,8 @@ defmodule Tightbeam.EffortCheckinTest do
         params: %{title: "parent remains live through child"}
       })
 
-    parent = assign(ctx.db, item.id, "parent assignment")
-    child = assign(ctx.db, item.id, "open child assignment")
+    parent = assign(ctx.db, item.id, "parent assignment", "coordination")
+    child = assign(ctx.db, item.id, "open child assignment", "coordination")
 
     %{assignment: %{state: "closed", outcome: "completed"}} =
       Assignments.__handle__(ctx.db, "attest", %{
@@ -326,7 +326,7 @@ defmodule Tightbeam.EffortCheckinTest do
              )
   end
 
-  defp assign(db, work_item_id \\ nil, subject \\ "retired check-in proof") do
+  defp assign(db, work_item_id \\ nil, subject \\ "retired check-in proof", effect_kind \\ nil) do
     result =
       Assignments.__handle__(db, "assign", %{
         verb: "assign",
@@ -338,7 +338,8 @@ defmodule Tightbeam.EffortCheckinTest do
         params: %{
           subject: subject,
           brief: "exercise assignment behavior",
-          work_item_id: work_item_id
+          work_item_id: work_item_id,
+          effect_kind: effect_kind
         }
       })
 
