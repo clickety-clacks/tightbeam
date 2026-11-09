@@ -1350,9 +1350,13 @@ defmodule Tightbeam.HarklightWakes do
     now = System.system_time(:millisecond)
 
     case DB.transaction(db, fn txn ->
-           case Txn.q(txn, "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1", [
-                  handle
-                ]) do
+           case Txn.q(
+                  txn,
+                  "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1",
+                  [
+                    handle
+                  ]
+                ) do
              [[session_key, state]] when state in ["active", "unavailable"] ->
                notify_owner_in_txn(
                  txn,

@@ -2697,12 +2697,7 @@ defmodule Tightbeam.HarklightWakesTest do
     exit 2
     """)
 
-    start_supervised!(
-      {HarklightWakes,
-       db: db,
-       attach_retry_delays: [],
-       retry_delays: [10, 20]}
-    )
+    start_supervised!({HarklightWakes, db: db, attach_retry_delays: [], retry_delays: [10, 20]})
 
     assert eventually(fn ->
              match?(
@@ -2776,6 +2771,7 @@ defmodule Tightbeam.HarklightWakesTest do
     start_supervised!({HarklightWakes, db: db, listener: listener, retry_delays: [20]})
 
     assert_receive {:retryable_failure, 1, first_worker}, 1_000
+
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
                "w_harklight_notice_recovery_" <> @handle
@@ -2783,6 +2779,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     send(first_worker, :exit_worker)
     assert_receive {:retryable_failure, 2, final_worker}, 1_000
+
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
                "w_harklight_notice_recovery_" <> @handle
