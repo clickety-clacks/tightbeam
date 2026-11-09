@@ -501,59 +501,31 @@ defmodule Tightbeam.Firehose.PublisherTest do
       }
     }
 
-    assert {:ok, [[initial_deadline]]} =
-             DB.query(
-               db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
-               [assignment.id]
-             )
-
     assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
              Dispatch.dispatch(db, handlers, tests_passed)
 
-    # The holder's attest and its holder-authored opener notice each count as
-    # holder activity. Activity in the millisecond of the pending deadline
-    # reuses it, so zero to two replacements follow the initial deadline.
     verdict_notices = drain_notices()
     assert Enum.count(verdict_notices, &(&1["class"] == "verb.accepted")) == 1
 
-    %{"wake.canceled" => cancellations, "message.created" => [opener_notice]} =
-      published =
+    published =
       verdict_notices
       |> Enum.filter(&match?({:ok, _}, Tightbeam.Firehose.Registry.fetch(&1["class"])))
       |> Enum.group_by(& &1["class"])
-      |> Map.put_new("wake.canceled", [])
 
     assert %{"attest.filed" => [_attest_notice]} = published
-    assert map_size(published) == 3
+    assert %{"message.created" => [opener_notice]} = published
+    assert map_size(published) == 2
 
     assert opener_notice["payload"]["content"] ==
              "[verdict filed: tests-passed on #{assignment.id}: effect matrix tests passed]"
 
-    chain =
-      Stream.unfold(initial_deadline, fn wake_id ->
-        case DB.query(
+    assert {:ok, [[0]]} =
+             DB.query(
                db,
-               "SELECT c.replacementWakeId FROM wake_cancellations c JOIN wakes w ON w.wakeId=c.wakeId WHERE c.wakeId=?1 AND w.assignmentId=?2 AND w.consumer='assignment_inactivity_deadline' AND c.reasonKind='superseded' AND c.causalSourceKind='wake' AND c.causalSourceId=c.replacementWakeId AND c.outcomeKind='replacement'",
-               [wake_id, assignment.id]
-             ) do
-          {:ok, [[replacement]]} -> {{wake_id, replacement}, replacement}
-          {:ok, []} -> nil
-        end
-      end)
-      |> Enum.to_list()
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND (consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb') OR (consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'))",
+               [assignment.id]
+             )
 
-    assert length(chain) in 0..2
-
-    assert Enum.sort(Enum.map(cancellations, & &1["refs"]["wakeId"])) ==
-             Enum.sort(Enum.map(chain, &elem(&1, 0)))
-
-    for cancellation <- cancellations do
-      assert cancellation["payload"]["state"] == "canceled"
-    end
-
-    {_, final_deadline} = List.last(chain, {nil, initial_deadline})
-    assert %{state: "pending"} = Wakes.get(db, final_deadline)
     assert observed_state_classes() == []
 
     completion = %{

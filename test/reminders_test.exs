@@ -28,25 +28,19 @@ defmodule Tightbeam.RemindersTest do
     assert {:ok, candidate} = Identity.learn!(ctx.base, "agentic-engineering", "test")
     assert {:ok, _} = Identity.publish_live!(ctx.base, candidate)
 
-    values = %{
-      assignment_id: "task-one",
-      holder: "worker",
-      subject: "fix {holder}",
-      last_activity: "now"
-    }
+    values = %{child_assignment_id: "task-one", child_session_state: "active"}
 
-    before = Reminders.render(ctx.base, "holder-reminder", values)
-    path = Path.join(ctx.dir, "reminders/holder-reminder.md")
-    File.write!(path, "{assignment_id} / {assignment_id} / {subject} / {unknown}")
+    before = Reminders.render(ctx.base, "terminal-action", values)
+    path = Path.join(ctx.dir, "reminders/terminal-action.md")
+    File.write!(path, "{child_assignment_id} / {child_assignment_id} / {child_session_state} / {unknown}")
     commit(ctx.dir)
-    assert Reminders.render(ctx.base, "holder-reminder", values) == before
+    assert Reminders.render(ctx.base, "terminal-action", values) == before
     publish(ctx.base)
 
-    assert Reminders.render(ctx.base, "holder-reminder", values) ==
-             "task-one / task-one / fix {holder} / {unknown}"
+    assert Reminders.render(ctx.base, "terminal-action", values) ==
+             "task-one / task-one / active / {unknown}"
 
     for {kind, values, expected} <- [
-          {"climb-copy", %{holder: "worker"}, "worker"},
           {"terminal-action", %{child_session_state: "active"}, "active"},
           {"work-item-routing", %{title: "ready"}, "ready"},
           {"work-item-slate", %{work_item_id: "item"}, "item"},
@@ -62,9 +56,9 @@ defmodule Tightbeam.RemindersTest do
     end
   end
 
-  test "holder reminders read the published file through the persistent store at each creation",
+  test "parent-action reminders read the published file through the persistent store",
        ctx do
-    alias Tightbeam.{DB, Model, Org, Schema, Supervision, Wakes}
+    alias Tightbeam.{DB, Model, Org, Schema}
 
     prepared =
       Tightbeam.GuardRuntimeFixture.prepare!(ctx.base <> "-database", "schema_shape_runtime.exs")
@@ -100,61 +94,37 @@ defmodule Tightbeam.RemindersTest do
     {:ok, _} = Identity.publish_live!(prepared.base, candidate)
     dir = Path.join(prepared.base, "identity")
 
-    File.write!(
-      Path.join(dir, "reminders/holder-reminder.md"),
-      "Published reminder for {assignment_id}"
-    )
+    File.write!(Path.join(dir, "reminders/terminal-action.md"), "Published handoff {child_assignment_id}")
 
     commit(dir)
 
-    trigger = fn id ->
-      activity = System.system_time(:millisecond) - 3_600_000
+    assert {:ok, "Published handoff child-1"} =
+             DB.transaction(db, fn txn ->
+               Reminders.render(txn, "terminal-action", %{child_assignment_id: "child-1"})
+             end)
 
-      {:ok, _} =
-        DB.query(
-          db,
-          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt) VALUES (?1,'quiet work','worker','owner',?2)",
-          [id, activity]
-        )
-
-      {:ok, :ok} =
-        DB.transaction(db, &Supervision.assignment_opened_in_txn(&1, id, activity, 1_800_000))
-
-      {:ok, [[deadline]]} =
-        DB.query(
-          db,
-          "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
-          [id]
-        )
-
-      assert {:ok, :ok} = Supervision.deadline(db, Wakes.get(db, deadline))
-
-      {:ok, [[prompt]]} =
-        DB.query(db, "SELECT prompt FROM wakes WHERE assignmentId=?1 AND consumer='prompt'", [id])
-
-      prompt
-    end
-
-    assert trigger.("before-publication") =~ "Last recorded activity:"
     publish(prepared.base)
-    assert trigger.("after-publication") == "Published reminder for after-publication"
+    assert {:ok, "Published handoff child-2"} =
+             DB.transaction(db, fn txn ->
+               Reminders.render(txn, "terminal-action", %{child_assignment_id: "child-2"})
+             end)
   end
 
   test "missing, unreadable, blank and unlearned files use exactly the shipped default", ctx do
-    values = %{assignment_id: "task", subject: "work", holder: "worker", last_activity: "now"}
-    expected = Reminders.render(nil, "holder-reminder", values)
-    assert Reminders.render(ctx.base, "holder-reminder", values) == expected
-    assert Reminders.render(Path.join(ctx.base, "absent"), "holder-reminder", values) == expected
+    values = %{child_assignment_id: "task", child_session_state: "active"}
+    expected = Reminders.render(nil, "terminal-action", values)
+    assert Reminders.render(ctx.base, "terminal-action", values) == expected
+    assert Reminders.render(Path.join(ctx.base, "absent"), "terminal-action", values) == expected
     assert {:ok, candidate} = Identity.learn!(ctx.base, "agentic-engineering", "test")
     assert {:ok, _} = Identity.publish_live!(ctx.base, candidate)
-    path = Path.join(ctx.dir, "reminders/holder-reminder.md")
+    path = Path.join(ctx.dir, "reminders/terminal-action.md")
 
     for contents <- [nil, <<255, 254>>, " \n\t"] do
       if contents, do: File.write!(path, contents), else: File.rm!(path)
       commit(ctx.dir)
       publish(ctx.base)
       before = git(ctx.dir, ["rev-parse", "HEAD"])
-      assert Reminders.render(ctx.base, "holder-reminder", values) == expected
+      assert Reminders.render(ctx.base, "terminal-action", values) == expected
       assert git(ctx.dir, ["rev-parse", "HEAD"]) == before
       assert git(ctx.dir, ["status", "--porcelain"]) == ""
     end
@@ -171,12 +141,10 @@ defmodule Tightbeam.RemindersTest do
     commit(ctx.dir)
     publish(ctx.base)
     File.write!(source_terminal, String.replace(original, "line 20\n", "new default\n"))
-    File.write!(Path.join(ctx.source, "reminders/holder-reminder.md"), "new holder wording")
     assert {:ok, candidate} = Identity.relearn!(ctx.base, "test")
     assert {:ok, _} = Identity.publish_live!(ctx.base, candidate)
     assert Reminders.render(ctx.base, "terminal-action", %{}) =~ "org choice"
     assert Reminders.render(ctx.base, "terminal-action", %{}) =~ "new default"
-    assert Reminders.render(ctx.base, "holder-reminder", %{}) == "new holder wording"
 
     File.write!(
       source_terminal,
@@ -189,7 +157,7 @@ defmodule Tightbeam.RemindersTest do
   end
 
   test "all assignment defaults contain the five actions and readable times" do
-    for kind <- ~w(holder-reminder climb-copy terminal-action) do
+    for kind <- ~w(terminal-action) do
       text = Reminders.default(kind)
       assert text =~ "act now"
       assert text =~ "complete the assignment"

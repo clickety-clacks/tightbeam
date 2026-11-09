@@ -309,11 +309,11 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt'")
 
-    # Registering the wait is holder activity on A, so it schedules A's deadline.
-    assert {:ok, [["A", "pending"]]} =
+    # Registering the resolver wait does not create the removed holder timer.
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT assignmentId,state FROM wakes WHERE consumer='assignment_inactivity_deadline'"
+               "SELECT COUNT(*) FROM wakes WHERE consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')"
              )
 
     assert %{outcome: "revoked"} = revoke(ctx.db, "R")

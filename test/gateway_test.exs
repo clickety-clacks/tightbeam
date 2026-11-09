@@ -2462,134 +2462,50 @@ defmodule Tightbeam.GatewayTest do
              DB.query(ctx.db, "SELECT seq FROM turns WHERE sessionKey='k1' AND status='queued'")
   end
 
-  for {cadence, expected_interval} <- [
-        {%{}, 1_800_000},
-        {%{wake_tick_ms: 1_234}, 1_800_000},
-        {%{wake_tick_ms: 10, supervision_interval_ms: 4_321}, 4_321},
-        {%{wake_tick_ms: 900, supervision_interval_ms: 4_321}, 4_321}
-      ] do
-    test "assignment interval wiring #{inspect(cadence)}",
-         ctx do
-      ensure_global_registry()
-      base_dir = role_test_base("gateway-supervision-interval")
+  test "assignment and dispatch do not create inactivity wakes", ctx do
+    handlers = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))
 
-      register_hosts(ctx.db, %{
-        "testhost" => %{ssh: "testhost", base_dir: base_dir, cli_bin: nil}
-      })
+    common = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: "k1",
+      target_role: nil,
+      role_fallback: false
+    }
 
-      cadence = unquote(Macro.escape(cadence))
-      expected_interval = unquote(expected_interval)
+    assert %{id: assign_id} =
+             handlers["assign"].(
+               Map.merge(common, %{verb: "assign", params: %{subject: "quiet assignment"}})
+             )
 
-      handlers =
-        Gateway.handlers(
-          gateway_config(base_dir, ctx.db, 0)
-          |> Map.delete(:wake_tick_ms)
-          |> Map.merge(cadence)
-          # Former settings are intentionally ignored after E's removal.
-          |> Map.put(:effort_checkins_enabled, true)
-          |> Map.put(:effort_checkin_horizon_ms, 123)
-        )
+    assert %{id: dispatch_id} =
+             handlers["dispatch"].(
+               Map.merge(common, %{
+                 verb: "dispatch",
+                 params: %{subject: "quiet dispatch", brief: "continue the assigned work"}
+               })
+             )
 
-      File.mkdir_p!(Path.join(base_dir, "identity/rules"))
-      name = "row-reaction-assignment-inactivity.toml"
+    for assignment_id <- [assign_id, dispatch_id] do
+      assert %{attest: %{id: _}} =
+               handlers["attest"].(%{
+                 origin: "agent:k1",
+                 principal: {:session, "k1"},
+                 session_key: "k1",
+                 params: %{assignment_id: assignment_id, kind: "progress"}
+               })
 
-      File.cp!(
-        Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
-        Path.join(base_dir, "identity/rules/#{name}")
-      )
-
-      Tightbeam.Rules.load!(base_dir, Map.keys(handlers))
-
-      common = %{
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
-        session_key: "k1",
-        target_role: nil,
-        role_fallback: false
-      }
-
-      assert %{id: assign_id} =
-               handlers["assign"].(
-                 Map.merge(common, %{
-                   verb: "assign",
-                   params: %{subject: "gateway interval assign"}
-                 })
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND (consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb') OR (consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'))",
+                 [assignment_id]
                )
-
-      assert %{id: dispatch_id} =
-               handlers["dispatch"].(
-                 Map.merge(common, %{
-                   verb: "dispatch",
-                   params: %{
-                     subject: "gateway interval dispatch",
-                     brief: "prove the configured interval"
-                   }
-                 })
-               )
-
-      for assignment_id <- [assign_id, dispatch_id] do
-        assert {:ok, [[0]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
-                   [assignment_id]
-                 )
-
-        assert {:ok, [[0]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('effort_probe','effort_deadline')",
-                   [assignment_id]
-                 )
-
-        assert {:ok, [[0]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1 AND kind='effort'",
-                   [assignment_id]
-                 )
-      end
-
-      for assignment_id <- [assign_id, dispatch_id] do
-        assert {:ok, [[^expected_interval, ^expected_interval]]} =
-                 DB.query(
-                   ctx.db,
-                   """
-                   SELECT w.dueAt - a.openedAt, json_extract(w.prompt, '$.intervalMs')
-                   FROM assignments a
-                   JOIN wakes w ON w.assignmentId=a.id
-                   WHERE a.id=?1 AND w.consumer='assignment_inactivity_deadline'
-                     AND w.state='pending'
-                   """,
-                   [assignment_id]
-                 )
-
-        assert %{attest: %{id: _}} =
-                 handlers["attest"].(%{
-                   origin: "agent:k1",
-                   principal: {:session, "k1"},
-                   session_key: "k1",
-                   params: %{assignment_id: assignment_id, kind: "progress"}
-                 })
-
-        assert {:ok, [[^expected_interval, ^expected_interval]]} =
-                 DB.query(
-                   ctx.db,
-                   """
-                   SELECT dueAt - json_extract(prompt, '$.activityAt'),
-                          json_extract(prompt, '$.intervalMs')
-                   FROM wakes
-                   WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'
-                     AND state='pending'
-                   """,
-                   [assignment_id]
-                 )
-      end
     end
   end
 
   @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-  test "wake polling cadence ignores the inactivity interval", %{tmp_dir: tmp} do
+  test "wake polling cadence follows only its own setting", %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
       tmp,
       "live_base_gateway_cadence.exs",
@@ -3434,50 +3350,20 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
-  for {override, script} <- [
-        {%{}, "live_base_gateway_liveness_default.exs"},
-        {%{supervision_interval_ms: 4_321}, "live_base_gateway_liveness_override.exs"}
-      ] do
-    @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-    test "children backfills an inactivity deadline with interval #{inspect(override)}", %{
-      tmp_dir: tmp
-    } do
-      Tightbeam.GuardRuntimeFixture.run!(tmp, unquote(script), "guarded-gateway-liveness: ok")
-    end
+  @tag cold_gateway: true, tmp_dir: true
+  test "gateway startup drains pending legacy inactivity wakes", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "legacy_assignment_inactivity_startup.exs",
+      "legacy-assignment-inactivity-startup: ok"
+    )
   end
 
-  test "invalid inactivity settings leave gateway assignment operations available", ctx do
-    rule_base =
-      Path.join(
-        System.tmp_dir!(),
-        "gateway-invalid-assignment-inactivity-#{System.unique_integer([:positive])}"
-      )
-
-    rules_dir = Path.join(rule_base, "identity/rules")
-    File.mkdir_p!(rules_dir)
-
-    source =
-      Path.join(
-        :code.priv_dir(:tightbeam),
-        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
-      )
-
-    invalid =
-      source
-      |> File.read!()
-      |> String.replace("period_ms = 1800000", "period_ms = 0", global: false)
-
-    File.write!(Path.join(rules_dir, "row-reaction-assignment-inactivity.toml"), invalid)
-    on_exit(fn -> File.rm_rf!(rule_base) end)
-
+  test "assignment operations and retirement need no inactivity policy", ctx do
     config = gateway_config(ctx.catalog_base, ctx.db, 0)
     handlers = Gateway.handlers(config)
-    assert [] = Rules.load!(rule_base, Map.keys(handlers))
-    assert %{settings: %{"period_ms" => 0}} = Rules.reaction_policy("assignment-inactivity")
-    assert :off = Tightbeam.Supervision.policy_default_interval_ms()
-
-    # This is the same recovery call Gateway.children makes after law loading.
-    assert :ok = Tightbeam.Supervision.migrate_open_assignments(ctx.db, 1_800_000)
+    assert [] = Rules.load!(ctx.catalog_base, Map.keys(handlers))
+    assert is_nil(Rules.reaction_policy("assignment-inactivity"))
 
     common = %{
       origin: "user:flynn",
@@ -3491,7 +3377,7 @@ defmodule Tightbeam.GatewayTest do
              handlers["assign"].(
                Map.merge(common, %{
                  verb: "assign",
-                 params: %{subject: "invalid rail assignment"}
+                 params: %{subject: "assignment without inactivity policy"}
                })
              )
 
@@ -3499,7 +3385,7 @@ defmodule Tightbeam.GatewayTest do
              handlers["dispatch"].(
                Map.merge(common, %{
                  verb: "dispatch",
-                 params: %{subject: "invalid rail dispatch", brief: "continue without reminders"}
+                 params: %{subject: "dispatch without inactivity policy", brief: "continue work"}
                })
              )
 
@@ -3529,7 +3415,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{assignment_id: assignment_id, reason: "continue work"}
              })
 
-    retiree = create_session(ctx.db, "invalid-rail-retiree", "flynn")
+    retiree = create_session(ctx.db, "no-inactivity-retiree", "flynn")
 
     assert %{id: _} =
              handlers["assign"].(
@@ -3538,6 +3424,13 @@ defmodule Tightbeam.GatewayTest do
                  verb: "assign",
                  params: %{subject: "assignment closed on retirement"}
                })
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId IN (?1,?2) AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
+               [assignment_id, dispatch_id]
              )
 
     assert %{retired_session_keys: [retired_key]} =
@@ -3550,17 +3443,6 @@ defmodule Tightbeam.GatewayTest do
 
     assert retired_key == retiree.session_key
     assert Org.get(ctx.db, retiree.session_key).state == "retired"
-  end
-
-  @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-  test "gateway startup treats invalid inactivity settings as an unavailable reaction", %{
-    tmp_dir: tmp
-  } do
-    Tightbeam.GuardRuntimeFixture.run!(
-      tmp,
-      "invalid_assignment_inactivity_startup.exs",
-      "invalid-assignment-inactivity-startup: ok"
-    )
   end
 
   @tag cold_gateway: true, gateway_retired: true, tmp_dir: true
@@ -11070,57 +10952,10 @@ defmodule Tightbeam.GatewayTest do
     assert setting_message =~ "default-archetype setting: coder"
     :ok = Org.put_setting(ctx.db, "default-archetype", "default")
 
-    opened_at = System.system_time(:millisecond) - 5_000
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state) " <>
-          "VALUES ('asg_runtime_r06_removal','runtime removal','k1','flynn',?1,'open')",
-        [opened_at]
-      )
-
-    assert {:ok, :ok} =
-             DB.transaction(ctx.db, fn txn ->
-               Tightbeam.Supervision.assignment_opened_in_txn(
-                 txn,
-                 "asg_runtime_r06_removal",
-                 opened_at,
-                 1_000
-               )
-             end)
-
-    assert {:ok, [[deadline_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId='asg_runtime_r06_removal' " <>
-                 "AND consumer='assignment_inactivity_deadline' AND state='pending'"
-             )
-
-    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline_id])
-    assert {:ok, :ok} = Tightbeam.Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline_id))
-
-    assert {:ok, [[notice_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId='asg_runtime_r06_removal' " <>
-                 "AND consumer='prompt' AND state='pending' " <>
-                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
-             )
-
-    assert {:ok, [[climb_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId='asg_runtime_r06_removal' " <>
-                 "AND consumer='assignment_inactivity_climb' AND state='pending'"
-             )
-
     assert %{state: "published", kungfu: "agentic-engineering"} =
              unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
 
     assert is_nil(Rules.reaction_policy("assignment-inactivity"))
-    assert Wakes.get(ctx.db, notice_id).state == "canceled"
-    assert Wakes.get(ctx.db, climb_id).state == "canceled"
 
     assert Archetypes.get("coder") == nil
     refute Rails.statutes?()

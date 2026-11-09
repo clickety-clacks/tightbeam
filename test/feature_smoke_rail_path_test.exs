@@ -132,11 +132,6 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       Path.join(base, "identity/rules/delivery.toml")
     )
 
-    File.cp!(
-      "priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml",
-      Path.join(base, "identity/rules/row-reaction-assignment-inactivity.toml")
-    )
-
     for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
       File.cp!(
         Path.join("priv/kungfu/agentic-engineering/rules", name),

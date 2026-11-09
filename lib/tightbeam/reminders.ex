@@ -3,8 +3,6 @@ defmodule Tightbeam.Reminders do
   alias Tightbeam.DB.Txn
 
   @fields %{
-    "holder-reminder" => ~w(assignment_id subject holder last_activity),
-    "climb-copy" => ~w(assignment_id subject holder last_activity),
     "terminal-action" =>
       ~w(child_assignment_id source_kind source_token notice_id child_session child_session_state your_last_activity child_finished),
     "work-item-routing" => ~w(work_item_id title),
