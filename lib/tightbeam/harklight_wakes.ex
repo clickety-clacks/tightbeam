@@ -390,8 +390,7 @@ defmodule Tightbeam.HarklightWakes do
         Wakes.schedule_in_txn(txn, %{
           session_key: successor,
           origin: "process:tightbeam",
-          prompt:
-            entry_prompt(txn, origin, line, handle, event, sender, message, kind, author),
+          prompt: entry_prompt(txn, origin, line, handle, event, sender, message, kind, author),
           due_at: System.system_time(:millisecond),
           creator_session_key: origin,
           class: "blocker"
@@ -2607,6 +2606,7 @@ defmodule Tightbeam.HarklightWakes do
       {:error, "event_order_invalid"}
     else
       wake_id = "w_harklight_" <> handle <> "_" <> String.pad_leading(event_id, 20, "0")
+
       prompt =
         entry_prompt(
           txn,
@@ -2619,6 +2619,7 @@ defmodule Tightbeam.HarklightWakes do
           kind,
           author
         )
+
       now = System.system_time(:millisecond)
 
       recipients =
