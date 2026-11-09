@@ -797,7 +797,7 @@ defmodule Tightbeam.JobForensicsTest do
 
     # Later progress does not rewrite the recorded cancellation provenance.
     after_progress = canceled_entry(db, "wi_open_cancel", wake.wake_id)
-    assert after_progress.livenessTriggerId == trigger_id
+    assert after_progress.livenessTriggerId == "asg_open_cancel"
     assert after_progress.actionNeeded
   end
 
