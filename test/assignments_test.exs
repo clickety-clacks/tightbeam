@@ -5115,14 +5115,6 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a fired owner routing bracket permits only the first rumination deferral", ctx do
-    File.cp!(
-      Path.join([
-        :code.priv_dir(:tightbeam),
-        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
-      ]),
-      Path.join(ctx.law, "identity/rules/row-reaction-assignment-inactivity.toml")
-    )
-
     Rules.load!(ctx.law, Map.keys(ctx.handlers))
     work_item = create_work_item(ctx, "Fired routing bracket")
     caller = "holder"
