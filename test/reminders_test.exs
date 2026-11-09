@@ -106,7 +106,9 @@ defmodule Tightbeam.RemindersTest do
 
     commit(dir)
 
-    assert {:ok, "Published handoff child-1"} =
+    shipped_default = Reminders.default("terminal-action")
+
+    assert {:ok, ^shipped_default} =
              DB.transaction(db, fn txn ->
                Reminders.render(txn, "terminal-action", %{child_assignment_id: "child-1"})
              end)

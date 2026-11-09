@@ -200,7 +200,8 @@ defmodule Tightbeam.AssignmentsTest do
         ctx,
         "work-item-create",
         work_item_call("work-item-create", {:user, "test-owner"}, %{
-          title: "Off interval linked item"
+          title: "Off interval linked item",
+          delivery_owner_session_key: "holder"
         })
       )
 

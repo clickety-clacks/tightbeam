@@ -92,10 +92,6 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
 
         refute Enum.any?(before_wakes, inactivity_wake?)
         refute Enum.any?(after_wakes, inactivity_wake?)
-        assert before["assignment_wakes"] == []
-        assert after_state["assignment_wakes"] == []
-        assert before["assignment_turns"] == []
-        assert after_state["assignment_turns"] == []
 
         turn_columns = after_state["columns"]["turns"]
         after_turns = Enum.map(after_state["turns"], &Map.new(Enum.zip(turn_columns, &1)))

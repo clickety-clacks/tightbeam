@@ -634,6 +634,64 @@ defmodule Tightbeam.Firehose.PublisherTest do
       Enum.reject(completion_effects, &(&1 in asynchronous_delivery))
     )
 
+    blocked_assignment_call = %{
+      verb: "assign",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: "effect-target",
+      target_role: nil,
+      role_fallback: false,
+      params: %{
+        subject: "Close a blocked coordination assignment",
+        effect_kind: "coordination"
+      }
+    }
+
+    assert {:ok, blocked_assignment} = Dispatch.dispatch(db, handlers, blocked_assignment_call)
+    assert "assignment.opened" in observed_state_classes()
+
+    blocked_attest = %{
+      verb: "attest",
+      origin: "agent:effect-target",
+      principal: {:session, "effect-target"},
+      session_key: nil,
+      params: %{
+        assignment_id: blocked_assignment.id,
+        kind: "cannot-proceed",
+        note: "wait for the opener to decide"
+      }
+    }
+
+    assert {:ok, %{cannotProceed: %{state: "standing"}}} =
+             Dispatch.dispatch(db, handlers, blocked_attest)
+
+    assert {:ok, [[blocked_wake_id]]} =
+             DB.query(
+               db,
+               "SELECT decisionWakeId FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing'",
+               [blocked_assignment.id]
+             )
+
+    assert %{state: "pending"} = Wakes.get(db, blocked_wake_id)
+    assert "wake.scheduled" in observed_state_classes()
+
+    blocked_completion = %{
+      blocked_attest
+      | params: %{
+          assignment_id: blocked_assignment.id,
+          kind: "completion",
+          note: "the coordination work is complete"
+        }
+    }
+
+    assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+             Dispatch.dispatch(db, handlers, blocked_completion)
+
+    blocked_close_effects = observed_state_classes()
+    assert "wake.canceled" in blocked_close_effects
+    assert_per_verb_effects!(config, "attest", blocked_close_effects)
+    assert %{state: "canceled"} = Wakes.get(db, blocked_wake_id)
+
     reopen = %{
       verb: "reopen-assignment",
       origin: "agent:effect-target",
