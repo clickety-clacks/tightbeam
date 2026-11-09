@@ -434,31 +434,22 @@ defmodule Tightbeam.HarklightReconnectTest do
 
     File.mkdir_p!(root)
 
-    helper = Path.join(root, "tightbeam-child")
+    # Use the compiled wrapper so port EOF exercises its child kill-and-reap path.
+    helper = Path.expand("../cli/target/release/tightbeam", __DIR__)
     agent = Path.join(root, "harklight-agent")
     started_marker = Path.join(root, "started")
-
-    File.write!(helper, """
-    #!/bin/sh
-    printf 'TIGHTBEAM_CHILD_READY\\n'
-    IFS= read -r command
-    [ "$command" = continue ] || exit 31
-    shift 4
-    exec "$@"
-    """)
 
     File.write!(agent, """
     #!/bin/sh
     case "$1" in
       reconnect)
         touch '#{started_marker}'
-        while :; do sleep 1; done
+        exec sleep 60
         ;;
       *) exit 2 ;;
     esac
     """)
 
-    File.chmod!(helper, 0o755)
     File.chmod!(agent, 0o755)
 
     old_path = System.get_env("PATH") || ""
@@ -528,6 +519,24 @@ defmodule Tightbeam.HarklightReconnectTest do
              not Map.has_key?(settled.reconnect_waiters, ref) and
                not Map.has_key?(settled.refs, ref)
            end)
+
+    stop_task =
+      Task.async(fn ->
+        Tightbeam.HarklightChild.await_stopped(
+          {:handle, @handle},
+          base_dir: root,
+          cli_path: helper
+        )
+      end)
+
+    case Task.yield(stop_task, 5_000) do
+      {:ok, :ok} ->
+        :ok
+
+      result ->
+        Task.shutdown(stop_task, :brutal_kill)
+        flunk("reconnect child did not stop and release its lifetime lock: #{inspect(result)}")
+    end
 
     assert {:error, :listener_fenced} =
              GenServer.call(manager, {:reconnect_result, ref, {:ok, %{feed_cursor: 99}}})
