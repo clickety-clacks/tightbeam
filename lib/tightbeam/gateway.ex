@@ -235,6 +235,8 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:db, db)
       |> handlers()
 
+    :ok = Tightbeam.FilingRemedy.install_handlers(db, handler_table)
+
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the
@@ -956,6 +958,9 @@ defmodule Tightbeam.Gateway do
         Tightbeam.HarklightFollows.follow(db, call,
           runner: Map.get(config, :harklight_send_runner)
         )
+      end,
+      {"harklight-briefings-catchup", []} => fn call ->
+        Tightbeam.HarklightBriefings.catchup(db, call, authorized: admin_caller?(db, call))
       end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->

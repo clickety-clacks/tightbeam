@@ -2054,6 +2054,7 @@ defmodule Tightbeam.Schema do
     # Refused predecessors must retain their exact schema, including indexes.
     # Build these additive access paths only after the existing migrations and
     # qualifications succeed, but before publishing a successful boot marker.
+    :ok = Tightbeam.ConditionFacts.ensure_filing_index(db)
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
     :ok = ensure_rest_collection_indexes(db)

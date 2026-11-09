@@ -1,7 +1,6 @@
 defmodule Tightbeam.EscalationDeliveryFixture do
   @moduledoc """
-  Proofs for spec escalation-delivery-v1 — a decision request and its
-  notification are one durable intent.
+  Delivery proofs for the durable filing fact and retained addressed agent asks.
 
   Every property asserted here lives on OUR side of the ACP seam: SQL
   atomicity, wake durability, dedupe, and the composition root's own delivery
@@ -94,64 +93,60 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     db
   end
 
-  ## Proof 1 — statute atomicity
+  ## Proof 1 — the request and generic filing fact are one transaction
 
   defp scenario(0, ctx) do
-    call = statute_call()
+    block_filing_facts!(ctx.db)
 
-    # FAIL-BEFORE: with the prompt-wake insert aborting, the whole intent dies.
-    block_prompt_wakes!(ctx.db)
-    assert_aborts!(fn -> Escalation.escalate(ctx.db, call, statute(), escalation_ctx()) end)
+    assert_aborts!(fn ->
+      Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
+    end)
 
     assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests") == 0
-    assert notification_wakes(ctx.db) == []
 
-    # PASS-AFTER: the retry commits both.
-    unblock_prompt_wakes!(ctx.db)
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed'"
+           ) == 0
+
+    unblock_filing_facts!(ctx.db)
 
     assert {:decision_pending, id} =
-             Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
+             Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
 
-    assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status='open'") == 1
+    assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE id=?1", [id]) == 1
 
-    owner_session = Org.personal_session_key("flynn")
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed' AND scope=?1",
+             [id]
+           ) == 1
 
-    assert [
-             %{
-               session_key: ^owner_session,
-               consumer: "prompt",
-               state: "pending",
-               target_gate: 0,
-               origin: @origin
-             } = wake
-           ] = notification_wakes(ctx.db)
-
-    assert wake.due_at <= System.system_time(:millisecond)
-    assert wake.prompt =~ "Decision #{id} pending on review."
+    assert notification_wakes(ctx.db) == []
   end
 
   defp scenario(1, ctx) do
-    call = operator_call()
-
-    block_prompt_wakes!(ctx.db)
-    assert_aborts!(fn -> Escalation.operator_ask(ctx.db, call) end)
-
+    block_filing_facts!(ctx.db)
+    assert_aborts!(fn -> Escalation.operator_ask(ctx.db, operator_call()) end)
     assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'") == 0
-    assert notification_wakes(ctx.db) == []
 
-    unblock_prompt_wakes!(ctx.db)
-    request = Escalation.operator_ask(ctx.db, call)
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed'"
+           ) == 0
 
+    unblock_filing_facts!(ctx.db)
+    request = Escalation.operator_ask(ctx.db, operator_call())
     assert request.kind == "operator"
     assert request.status == "open"
-    assert request.deadline_wake_id == nil
 
-    assert [%{session_key: main, consumer: "prompt", target_gate: 0, state: "pending"} = wake] =
-             notification_wakes(ctx.db)
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed' AND scope=?1",
+             [request.id]
+           ) == 1
 
-    assert main == Org.personal_session_key("flynn")
-    assert wake.prompt =~ request.id
-    assert wake.prompt =~ "ship window?"
+    assert notification_wakes(ctx.db) == []
   end
 
   ## Proof 4 — crash before delivery, boot recovery
@@ -161,8 +156,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
     # Commit the request and its due notification with NO scheduler running,
     # then take the DB process down: the crash window the spec names.
-    assert {:decision_pending, id} =
-             Escalation.escalate(db, statute_call(), statute(), escalation_ctx())
+    assert %{id: id, kind: "agent"} = addressed_ask(db)
 
     assert [%{state: "pending"} = wake] = notification_wakes(db)
     assert count(db, "SELECT COUNT(*) FROM turns") == 0
@@ -200,11 +194,10 @@ defmodule Tightbeam.EscalationDeliveryFixture do
   ## Proof 5 — failure before durable acceptance stays observable
 
   defp scenario(5, ctx) do
-    assert {:decision_pending, _id} =
-             Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
+    assert %{kind: "agent"} = addressed_ask(ctx.db)
 
     [wake] = notification_wakes(ctx.db)
-    owner_session = Org.personal_session_key("flynn")
+    owner_session = "mid"
 
     # Fail the NORMAL path at its actual durable turn admission. The legacy
     # callback below is still exercised separately; normal sources never use it.
@@ -334,11 +327,10 @@ defmodule Tightbeam.EscalationDeliveryFixture do
   ## Proof 6 — exactly one initial delivery, and the dedupe backstop
 
   defp scenario(6, ctx) do
-    assert {:decision_pending, _id} =
-             Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
+    assert %{kind: "agent"} = addressed_ask(ctx.db)
 
     assert [wake] = notification_wakes(ctx.db)
-    owner_session = Org.personal_session_key("flynn")
+    owner_session = "mid"
 
     drain!(ctx)
 
@@ -351,13 +343,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
     # A second source lands while the first carrier's recipient turn is still
     # queued. It remains an editable row until that recipient becomes ready.
-    assert {:decision_pending, _} =
-             Escalation.escalate(
-               ctx.db,
-               statute_call(%{assignment_id: "a-backstop"}),
-               statute(),
-               escalation_ctx()
-             )
+    assert %{kind: "agent"} = addressed_ask(ctx.db, "A second addressed question?")
 
     assert [first, synthetic] = notification_wakes(ctx.db)
     assert first.wake_id == wake.wake_id
@@ -428,7 +414,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert content =~ synthetic.prompt
   end
 
-  ## Proof 7 — replay and conflict are silent
+  ## Proof 7 — replay and conflict do not resurrect the retired relay
 
   defp scenario(7, ctx) do
     call = statute_call()
@@ -436,30 +422,30 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert {:decision_pending, id} =
              Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
 
-    [wake] = notification_wakes(ctx.db)
-    drain!(ctx)
+    assert notification_wakes(ctx.db) == []
 
-    before = {message_count(ctx.db), turn_count(ctx.db)}
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed' AND scope=?1",
+             [id]
+           ) == 1
 
-    # The `{:decision_pending, id}` replay path.
     assert {:decision_pending, ^id} =
-             Escalation.escalate(
-               ctx.db,
-               call,
-               statute(),
-               Map.put(escalation_ctx(), :dr_id, id)
-             )
+             Escalation.escalate(ctx.db, call, statute(), Map.put(escalation_ctx(), :dr_id, id))
 
-    assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == [wake.wake_id]
-    assert {message_count(ctx.db), turn_count(ctx.db)} == before
-
-    # The open-request conflict path: same raiser, statute and action key, no
-    # dr_id — the insert loses to `ON CONFLICT DO NOTHING`.
     assert {:decision_pending, ^id} =
              Escalation.escalate(ctx.db, call, statute(), escalation_ctx())
 
-    assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == [wake.wake_id]
-    assert {message_count(ctx.db), turn_count(ctx.db)} == before
+    assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE id=?1", [id]) == 1
+
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed' AND scope=?1",
+             [id]
+           ) == 1
+
+    assert notification_wakes(ctx.db) == []
+    assert {message_count(ctx.db), turn_count(ctx.db)} == {0, 0}
   end
 
   ## Proof 9 — configured delivery dependencies only
@@ -478,8 +464,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
       |> Map.put(:conn_registry, registry)
       |> Map.put(:lane_manager, lanes)
 
-    assert {:decision_pending, _id} =
-             Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
+    assert %{kind: "agent"} = addressed_ask(ctx.db)
 
     assert [statute_wake] = notification_wakes(ctx.db)
 
@@ -613,91 +598,51 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     end
   end
 
-  ## Proof 11 — retirement readdresses before ordinary delivery
+  ## Proof 11 — addressed delivery survives recipient retirement
 
   defp scenario(11, ctx) do
-    assert {:decision_pending, _id} =
-             Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
+    request = addressed_ask(ctx.db)
 
-    system_wake =
-      Wakes.schedule(ctx.db, %{
-        session_key: "mid",
-        origin: @origin,
-        consumer: "prompt",
-        prompt: "System notice",
-        due_at: System.system_time(:millisecond),
-        target_gate: 0
-      })
+    assert [%{session_key: "mid", state: "pending"} = addressed_wake] =
+             notification_wakes(ctx.db)
 
-    assert [statute_wake, system_wake] = notification_wakes(ctx.db)
-    main_key = Org.personal_session_key("flynn")
-    assert statute_wake.session_key == main_key
-
-    # A control prompt wake on the retiring target carries the schema default
-    # targetGate = 1. Retirement must preserve it as an ordinary address too.
     control =
       Wakes.schedule(ctx.db, %{
-        session_key: system_wake.session_key,
+        session_key: "mid",
         origin: @origin,
         prompt: "control gated wake",
         due_at: System.system_time(:millisecond)
       })
 
     assert control.target_gate == 1
+    assert %{state: "retired"} = Org.retire(ctx.db, "mid", "user:flynn", 1_000)
 
-    # Retire the actual active recipient through Org. The gate-zero system
-    # notice moves up the lineage in that transaction; the active Main
-    # decision notice stays gate zero and is delivered through the ordinary path.
-    assert %{state: "retired"} =
-             Org.retire(ctx.db, system_wake.session_key, "user:flynn", 1_000)
+    assert %{session_key: "top", state: "pending"} =
+             Wakes.get(ctx.db, addressed_wake.wake_id)
 
-    readdressed_system_wake = Wakes.get(ctx.db, system_wake.wake_id)
-
-    assert %{
-             state: "pending",
-             session_key: "top",
-             target_gate: 1,
-             target_role: nil,
-             reresolve: nil
-           } =
-             readdressed_system_wake
-
-    assert readdressed_system_wake.wake_id == system_wake.wake_id
-    assert readdressed_system_wake.prompt == system_wake.prompt
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1",
-               [system_wake.wake_id]
-             )
-
-    assert %{state: "pending", session_key: "top", target_gate: 1} =
+    assert %{session_key: "top", state: "pending", target_gate: 1} =
              Wakes.get(ctx.db, control.wake_id)
 
-    assert %{state: "pending", session_key: ^main_key, target_gate: 0} =
-             Wakes.get(ctx.db, statute_wake.wake_id)
+    assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE id=?1", [request.id]) == 1
+
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed' AND scope=?1",
+             [request.id]
+           ) == 1
+
+    drain!(ctx)
+    assert delivery_wake(ctx.db, addressed_wake).state == "fired"
+    assert delivery_wake(ctx.db, control).state == "fired"
+
+    before =
+      {rows(ctx.db, "SELECT * FROM turns ORDER BY seq"),
+       rows(ctx.db, "SELECT * FROM messages ORDER BY id")}
 
     drain!(ctx)
 
-    for {wake, expected_session} <- [
-          {readdressed_system_wake, "top"},
-          {statute_wake, main_key},
-          {Wakes.get(ctx.db, control.wake_id), "top"}
-        ] do
-      carrier = delivery_wake(ctx.db, wake)
-      assert carrier.state == "fired"
-      assert carrier.session_key == expected_session
-
-      assert rows(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId = ?1", [carrier.wake_id]) ==
-               [[expected_session]]
-    end
-
-    before_turns = rows(ctx.db, "SELECT * FROM turns ORDER BY seq")
-    before_messages = rows(ctx.db, "SELECT * FROM messages ORDER BY id")
-    drain!(ctx)
-    assert rows(ctx.db, "SELECT * FROM turns ORDER BY seq") == before_turns
-    assert rows(ctx.db, "SELECT * FROM messages ORDER BY id") == before_messages
+    assert {rows(ctx.db, "SELECT * FROM turns ORDER BY seq"),
+            rows(ctx.db, "SELECT * FROM messages ORDER BY id")} == before
   end
 
   ## Helpers — world
@@ -1062,6 +1007,28 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert match?(%DB.Error{}, error) or
              match?({:badmatch, {:error, %DB.Error{}}}, error),
            "expected the prompt-wake abort to propagate, got #{inspect(error)}"
+  end
+
+  defp block_filing_facts!(db) do
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER block_filing_facts BEFORE INSERT ON condition_facts
+      WHEN NEW.kind='decision-request-filed'
+      BEGIN SELECT RAISE(ABORT, 'filing fact blocked'); END;
+      """)
+  end
+
+  defp unblock_filing_facts!(db),
+    do: :ok = DB.execute(db, "DROP TRIGGER block_filing_facts")
+
+  defp addressed_ask(db, question \\ "Review this request?") do
+    Escalation.ask(db, %{
+      verb: "ask",
+      origin: "agent:raiser",
+      principal: {:session, "raiser"},
+      session_key: "mid",
+      params: %{question: question}
+    })
   end
 
   defp block_prompt_wakes!(db) do

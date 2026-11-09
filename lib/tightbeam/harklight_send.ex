@@ -4,6 +4,7 @@ defmodule Tightbeam.HarklightSend do
   alias Tightbeam.{DB, HarklightLifecycle, HarklightWakes, Id, Org, Placement}
 
   @uuid4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
+  @decision_request_id ~r/\Adr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
 
   def send_request(db, call, opts \\ []) do
     result =
@@ -11,15 +12,7 @@ defmodule Tightbeam.HarklightSend do
            {:ok, input} <- inputs(call.params),
            nil <- HarklightLifecycle.unresolved(db, input.supersedes),
            {:ok, runner} <- runner(opts) do
-        op_id = Id.uuid4()
-
-        case invoke(runner, prepare_args(input, op_id), "prepared", op_id) do
-          {:ok, prepared} ->
-            prepare_and_execute(db, call, input, prepared, op_id, runner, opts)
-
-          {:error, code, reason, outcome} ->
-            failure("send", code, reason, outcome, %{op_id: op_id})
-        end
+        send_with_association(db, call, input, runner, opts)
         |> Map.put(:message_type, input.message_type)
         |> Map.put(:message_type_label, type_label(input.message_type))
       else
@@ -36,12 +29,56 @@ defmodule Tightbeam.HarklightSend do
     unchanged_targets(result, call.params[:supersedes])
   end
 
+  defp send_with_association(db, call, %{decision_request_id: nil} = input, runner, opts) do
+    send_with_operation(db, call, input, Id.uuid4(), runner, opts)
+  end
+
+  defp send_with_association(db, call, input, runner, opts) do
+    case Tightbeam.HarklightBriefings.reserve_send(db, call, input.decision_request_id) do
+      {:ok, %{action: :start, op_id: op_id}} ->
+        send_with_operation(db, call, input, op_id, runner, opts)
+
+      {:ok, %{action: :recover, message_id: message_id}} ->
+        recover_one(db, message_id, opts)
+        |> Map.put(:reconciled, true)
+
+      {:ok, %{action: :existing} = existing} ->
+        %{
+          command: "send",
+          outcome: "committed",
+          state: "registered",
+          reused: true,
+          op_id: existing.op_id,
+          handle: existing.handle,
+          sender_id: existing.sender_id,
+          message_id: existing.message_id,
+          session_key: existing.session_key,
+          wake_effect: "none"
+        }
+
+      {:error, code, reason} ->
+        failure("send", code, "The message was not sent. " <> reason, "refused", %{
+          decision_request_id: input.decision_request_id
+        })
+    end
+  end
+
+  defp send_with_operation(db, call, input, op_id, runner, opts) do
+    case invoke(runner, prepare_args(input, op_id), "prepared", op_id) do
+      {:ok, prepared} ->
+        prepare_and_execute(db, call, input, prepared, op_id, runner, opts)
+
+      {:error, code, reason, outcome} ->
+        failure("send", code, "The message was not sent. " <> reason, outcome, %{op_id: op_id})
+    end
+  end
+
   defp prepare_and_execute(db, call, input, prepared, op_id, runner, opts) do
     identity = prepared_identity(prepared) |> Map.put(:op_id, op_id)
 
     with {:ok, request, files} <- prepared_request(prepared, input, op_id),
          :ok <- handle_available(db, call, input.session, request["session_handle"]),
-         payload = JSON.encode!(%{"request" => request, "files" => files}),
+         payload = send_payload(request, files, input.decision_request_id),
          %{state: "pending"} <- HarklightWakes.prepare_send(db, call, op_id, payload) do
       :global.trans({{__MODULE__, db, op_id}, self()}, fn ->
         with :ok <- HarklightWakes.mark_send_attempt(db, call, op_id, payload) do
@@ -64,6 +101,17 @@ defmodule Tightbeam.HarklightSend do
       {:error, code} -> failure("send", code, early_reason(code), "failed", identity)
     end
   end
+
+  defp send_payload(request, files, nil),
+    do: JSON.encode!(%{"request" => request, "files" => files})
+
+  defp send_payload(request, files, decision_request_id),
+    do:
+      JSON.encode!(%{
+        "request" => request,
+        "files" => files,
+        "decision_request_id" => decision_request_id
+      })
 
   defp finish_send(db, call, op_id, payload, request, response, command, opts) do
     identity = prepared_identity(%{"request" => request}) |> Map.put(:op_id, op_id)
@@ -421,7 +469,7 @@ defmodule Tightbeam.HarklightSend do
     allowed =
       ~w(
         harklight_session sender_id title message_type message_kind importance stake by_when reply
-        body choices files vendor_session_id supersedes
+        body choices files vendor_session_id supersedes decision_request_id
       )a
 
     session = params[:harklight_session]
@@ -438,6 +486,7 @@ defmodule Tightbeam.HarklightSend do
     files = params[:files] || []
     vendor = params[:vendor_session_id]
     supersedes = params[:supersedes] || []
+    decision_request_id = params[:decision_request_id]
 
     cond do
       not Enum.all?(Map.keys(params), &(&1 in allowed)) ->
@@ -459,6 +508,11 @@ defmodule Tightbeam.HarklightSend do
         {:error, "invalid_harklight_send"}
 
       not (is_list(supersedes) and Enum.all?(supersedes, &is_binary/1)) ->
+        {:error, "invalid_harklight_send"}
+
+      not (is_nil(decision_request_id) or
+               (is_binary(decision_request_id) and
+                  Regex.match?(@decision_request_id, decision_request_id))) ->
         {:error, "invalid_harklight_send"}
 
       is_nil(message_type) ->
@@ -509,7 +563,8 @@ defmodule Tightbeam.HarklightSend do
            choices: choices,
            files: files,
            vendor: vendor,
-           supersedes: supersedes
+           supersedes: supersedes,
+           decision_request_id: decision_request_id
          }}
     end
   end

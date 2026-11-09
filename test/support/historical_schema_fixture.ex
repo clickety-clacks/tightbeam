@@ -12,7 +12,8 @@ defmodule Tightbeam.HistoricalSchemaFixture do
       |> :zlib.gunzip()
 
     assert Base.encode16(:crypto.hash(:sha256, sql), case: :lower) == sha256
-    # The DB owner creates this empty retry table before schema activation.
+    # The DB owner creates these empty retry tables before schema activation.
+    assert :ok = DB.execute(db, "DROP TABLE pending_recognition_waits")
     assert :ok = DB.execute(db, "DROP TABLE pending_recognition")
     assert :ok = DB.execute(db, sql)
     assert :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
