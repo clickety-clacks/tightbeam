@@ -645,6 +645,8 @@ defmodule Tightbeam.Gateway do
         if p[:invalid_reply_reference] == true do
           %{code: "invalid_message", message: nil}
         else
+          rest_send? = call[:transport] == :rest
+
           outcome =
             deliver_prompt(call.session_key, call.origin, p.content,
               db: db,
@@ -653,12 +655,32 @@ defmodule Tightbeam.Gateway do
               device_id: p.device_id,
               client_message_id: p.client_message_id,
               attachments: Map.get(p, :attachments, []),
-              reply_to_llm_visible_message_id: Map.get(p, :reply_to_llm_visible_message_id)
+              reply_to_llm_visible_message_id: Map.get(p, :reply_to_llm_visible_message_id),
+              conn_registry: config[:conn_registry] || Tightbeam.ConnRegistry,
+              lane_manager: config[:lane_manager] || Tightbeam.LaneManager,
+              content_only_dedupe: rest_send?,
+              return_receipt: rest_send?
             )
 
           case outcome do
+            {kind, message_id, turn_seq} when kind in [:recorded, :duplicate] ->
+              %{
+                outcome: to_string(kind),
+                sessionKey: call.session_key,
+                deviceId: p.device_id,
+                clientMessageId: p.client_message_id,
+                messageId: message_id,
+                turnSeq: turn_seq
+              }
+
             :appended ->
               %{ack: p.client_message_id}
+
+            :conflict when rest_send? ->
+              %{code: "invalid_message", message: "clientMessageId reused with different content"}
+
+            :skipped when rest_send? ->
+              %{code: "not_deliverable"}
 
             :invalid_reply_reference ->
               %{code: "invalid_message", message: nil}
@@ -1699,6 +1721,7 @@ defmodule Tightbeam.Gateway do
   """
   @spec deliver_prompt(String.t(), String.t(), String.t(), keyword()) ::
           :appended | :duplicate | :conflict | :invalid_reply_reference | :skipped
+          | {:recorded | :duplicate, String.t(), pos_integer()}
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -1709,7 +1732,8 @@ defmodule Tightbeam.Gateway do
 
     case result do
       {:ok, delivery} ->
-        complete_delivery(db, delivery)
+        status = complete_delivery(db, delivery)
+        if opts[:return_receipt], do: delivery_receipt(db, delivery, status), else: status
 
       {:error, %{message: message}} when is_binary(message) ->
         if String.contains?(message, "UNIQUE"),
@@ -1720,6 +1744,22 @@ defmodule Tightbeam.Gateway do
         raise error
     end
   end
+
+  defp delivery_receipt(db, delivery, status) when status in [:appended, :duplicate] do
+    message =
+      case delivery do
+        {:appended, _target, message, _opts} -> message
+        {:duplicate, message} -> message
+      end
+
+    {:ok, [[turn_seq]]} =
+      DB.query(db, "SELECT seq FROM turns WHERE messageId = ?1 ORDER BY seq ASC LIMIT 1", [message.id])
+
+    kind = if status == :appended, do: :recorded, else: :duplicate
+    {kind, message.id, turn_seq}
+  end
+
+  defp delivery_receipt(_db, _delivery, status), do: status
 
   @doc "Delivery's DB-only core for callers already inside the DB owner transaction."
   @spec deliver_prompt_in_txn(DB.Txn.t(), String.t(), String.t(), String.t(), keyword()) ::
@@ -1840,6 +1880,7 @@ defmodule Tightbeam.Gateway do
            content: stamped,
            device_id: opts[:device_id],
            client_message_id: opts[:client_message_id],
+           dedupe_content_only: opts[:content_only_dedupe] == true,
            attachments: opts[:attachments] || [],
            sender: opts[:sender],
            reply_to_message_id: reply_target && reply_target.id,

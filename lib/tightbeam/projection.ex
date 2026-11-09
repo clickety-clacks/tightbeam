@@ -124,8 +124,10 @@ defmodule Tightbeam.Projection do
         message = to_message(row)
 
         if message.content == Map.fetch!(input, :content) and
-             message.reply_to_message_id == Map.get(input, :reply_to_message_id) and
-             message.reply_to_client_message_id == Map.get(input, :reply_to_client_message_id),
+             (Map.get(input, :dedupe_content_only) == true or
+                (message.reply_to_message_id == Map.get(input, :reply_to_message_id) and
+                   message.reply_to_client_message_id ==
+                     Map.get(input, :reply_to_client_message_id))),
            do: {:duplicate, message},
            else: {:conflict, message}
 
