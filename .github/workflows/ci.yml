@@ -461,7 +461,7 @@ jobs:
               manuals = [m for m in archive.getmembers() if m.name.endswith('/priv/guidance/operating-manual.md')]
               assert len(manuals) == 1 and manuals[0].isfile(), 'packaged manual inventory'
               manual = archive.extractfile(manuals[0]).read()
-              assert hashlib.sha256(manual).hexdigest() == '9327561e174d9cd45e0a2f04d93ea71ab040fb30a30e557f3e69e46be64d7dff', 'packaged manual differs'
+              assert hashlib.sha256(manual).hexdigest() == '0618175ebcff194c07efc696789f1ae915f3b0ccf57122935edef19cc0557b39', 'packaged manual differs'
           (root / 'package-hashes.json').write_text(json.dumps({p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}))
           PACKAGES
       - name: Compose 52 supported parent and candidate views without starting the app
