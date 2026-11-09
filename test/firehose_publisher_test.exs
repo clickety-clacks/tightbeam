@@ -691,21 +691,23 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert "message.created" in blocked_attest_effects
     assert "attest.filed" in blocked_attest_effects
 
-    blocked_completion = %{
-      blocked_attest
-      | params: %{
-          assignment_id: blocked_assignment.id,
-          kind: "completion",
-          note: "the coordination work is complete"
-        }
+    # A standing cannot-proceed blocks holder completion; the opener can still
+    # revoke the assignment, which withdraws its pending decision wake.
+    blocked_revoke = %{
+      verb: "revoke-assignment",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{
+        assignment_id: blocked_assignment.id,
+        reason: "the opener ends the blocked work"
+      }
     }
 
-    assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
-             Dispatch.dispatch(db, handlers, blocked_completion)
+    assert {:ok, %{outcome: "revoked"}} = Dispatch.dispatch(db, handlers, blocked_revoke)
 
     blocked_close_effects = observed_state_classes()
-    assert "wake.canceled" in blocked_close_effects
-    assert_per_verb_effects!(config, "attest", blocked_close_effects)
+    assert_per_verb_effects!(config, "revoke-assignment", blocked_close_effects)
     assert %{state: "canceled"} = Wakes.get(db, blocked_wake_id)
 
     reopen = %{
