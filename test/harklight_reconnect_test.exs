@@ -409,7 +409,7 @@ defmodule Tightbeam.HarklightReconnectTest do
              ) == {:ok, [[1]]}
            end)
 
-    assert File.exists?(events_marker)
+    assert eventually(fn -> File.exists?(events_marker) end)
 
     assert {:ok, [[1, 1]]} =
              DB.query(
