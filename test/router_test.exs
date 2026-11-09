@@ -822,7 +822,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "PATCH /api/streams/:key decodes a client '+' path key as a space", ctx do
-    key = "agent:main:clawline:operator:main s_test1234"
+    key = "agent:main:test-host:sample-user:main s_test1234"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
@@ -838,7 +838,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "PATCH /api/streams/:key still accepts an already-decoded space in the key", ctx do
-    key = "agent:main:clawline:operator:main s_test5678"
+    key = "agent:main:test-host:sample-user:main s_test5678"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
@@ -852,7 +852,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "DELETE /api/streams/:key decodes a client '+' path key as a space", ctx do
-    key = "agent:main:clawline:operator:main s_test9012"
+    key = "agent:main:test-host:sample-user:main s_test9012"
     create_session(ctx.db, key, ctx.device.user_id)
 
     opts =
@@ -874,7 +874,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "PATCH /api/streams/:key still accepts a single-encoded %20 space in the key", ctx do
-    key = "agent:main:clawline:operator:main s_test0020"
+    key = "agent:main:test-host:sample-user:main s_test0020"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
@@ -893,15 +893,15 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{verb: "tune", session_key: ^key}}
   end
 
-  test "PATCH /api/streams/:key decodes the captured double-encoded Clawline path", ctx do
-    key = "agent:main:clawline:sample-user:main s_request_path"
+  test "PATCH /api/streams/:key decodes a double-encoded session-key path", ctx do
+    key = "agent:main:test-host:sample-user:main s_request_path"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
     response =
       conn(
         :patch,
-        "/api/streams/agent%253Amain%253Aclawline%253Asample-user%253Amain%2520s_request_path",
+        "/api/streams/agent%253Amain%253Atest-host%253Asample-user%253Amain%2520s_request_path",
         JSON.encode!(%{"displayName" => "Renamed"})
       )
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
@@ -911,8 +911,8 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{verb: "tune", session_key: ^key}}
   end
 
-  test "DELETE /api/streams/:key decodes the captured double-encoded Clawline path", ctx do
-    key = "agent:main:clawline:sample-user:main s_request_path"
+  test "DELETE /api/streams/:key decodes a double-encoded session-key path", ctx do
+    key = "agent:main:test-host:sample-user:main s_request_path"
     create_session(ctx.db, key, ctx.device.user_id)
 
     opts =
@@ -924,7 +924,7 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       conn(
         :delete,
-        "/api/streams/agent%253Amain%253Aclawline%253Asample-user%253Amain%2520s_request_path",
+        "/api/streams/agent%253Amain%253Atest-host%253Asample-user%253Amain%2520s_request_path",
         JSON.encode!(%{})
       )
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
@@ -936,7 +936,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "PATCH /api/streams/:key accepts at most four total percent-decode layers", ctx do
-    key = "agent:main:clawline:operator:main s_test_decode_cap"
+    key = "agent:main:test-host:sample-user:main s_test_decode_cap"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
@@ -970,7 +970,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "stream mutations reject a repeatedly encoded path separator before lookup", ctx do
-    key = "agent:main:clawline:operator:main/child"
+    key = "agent:main:test-host:sample-user:main/child"
     create_session(ctx.db, key, ctx.device.user_id)
 
     opts =
@@ -996,7 +996,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "stream mutations reject malformed percent encoding before lookup", ctx do
-    key = "agent:main:clawline:operator:main%zz"
+    key = "agent:main:test-host:sample-user:main%zz"
     create_session(ctx.db, key, ctx.device.user_id)
 
     opts =
@@ -1023,7 +1023,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "encoded stream keys do not widen PATCH or DELETE ownership", ctx do
     other = approved_device(ctx.db, "other-stream-device", "Other Stream Owner")
-    key = "agent:main:clawline:other:main s_private"
+    key = "agent:main:test-host:other:main s_private"
     create_session(ctx.db, key, other.user_id)
 
     opts =
@@ -1050,7 +1050,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "PATCH /api/streams/:key resolves a double-encoded '%252B' path key as a literal plus",
        ctx do
-    key = "agent:main:clawline:operator:main+plus_test2b"
+    key = "agent:main:test-host:sample-user:main+plus_test2b"
     create_session(ctx.db, key, ctx.device.user_id)
     opts = with_handler(ctx.opts, "tune", &send_call/1)
 
@@ -1075,7 +1075,7 @@ defmodule Tightbeam.Wire.RouterTest do
     response =
       conn(
         :patch,
-        "/api/streams/agent:main:clawline:operator:main%zzmalformed",
+        "/api/streams/agent:main:test-host:sample-user:main%zzmalformed",
         JSON.encode!(%{"displayName" => "Renamed"})
       )
       |> put_req_header("authorization", "Bearer #{ctx.device.token}")
