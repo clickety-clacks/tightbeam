@@ -513,7 +513,7 @@ defmodule Tightbeam.HarnessProcessFixture do
       assert unresolved.os_pid == fixture["recorded_pid"]
       assert unresolved.kill_attempted_at == fixture["kill_attempted_at"]
       assert unresolved.kill_sent_at == fixture["kill_sent_at"]
-      assert unresolved.last_error =~ "identity_unavailable"
+      assert unresolved.last_error == "identity material unavailable"
     end
   end
 
