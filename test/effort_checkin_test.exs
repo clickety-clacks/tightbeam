@@ -316,7 +316,9 @@ defmodule Tightbeam.EffortCheckinTest do
                [item.id]
              )
 
-    assert [["open", ^item.id]] =
+    item_id = item.id
+
+    assert [["open", ^item_id]] =
              rows(
                ctx.db,
                "SELECT state,workItemId FROM assignments WHERE id=?1",
