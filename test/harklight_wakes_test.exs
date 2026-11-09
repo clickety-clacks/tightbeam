@@ -2018,7 +2018,14 @@ defmodule Tightbeam.HarklightWakesTest do
     {:os_pid, pid} = Port.info(port, :os_pid)
 
     listen_call = "listen --follow --controller --session #{@handle} --ack2"
-    assert eventually(fn -> File.read!(script <> ".calls") =~ listen_call end)
+
+    assert eventually(fn ->
+             case File.read(script <> ".calls") do
+               {:ok, calls} -> calls =~ listen_call
+               {:error, :enoent} -> false
+               {:error, reason} -> flunk("could not read attachment calls: #{inspect(reason)}")
+             end
+           end)
 
     calls = File.read!(script <> ".calls")
     assert calls =~ "attach --session #{@handle}"

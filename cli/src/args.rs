@@ -6532,6 +6532,7 @@ mod tests {
                 "harklight-settle",
                 "harklight-follow",
                 "harklight-cover",
+                "harklight-reconnect",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",
