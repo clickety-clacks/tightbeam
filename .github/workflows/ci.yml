@@ -30,6 +30,10 @@ on:
         description: "Exact 40-hex tree required when docs_validation is on"
         required: false
         type: string
+      candidate_base_sha:
+        description: "Exact intended PR base commit required when docs_validation is on"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -380,6 +384,7 @@ jobs:
         shell: bash
     env:
       EXPECTED_TREE: ${{ inputs.candidate_tree }}
+      EXPECTED_BASE: ${{ inputs.candidate_base_sha }}
       DISPATCH_SHA: ${{ github.sha }}
       MIX_ENV: prod
       GIT_AUTHOR_NAME: Offline docs evidence
@@ -391,6 +396,7 @@ jobs:
         run: |
           [[ "$CI_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$EXPECTED_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$EXPECTED_BASE" =~ ^[0-9a-f]{40}$ ]] || exit 1
           test "$DISPATCH_SHA" = "$CI_SOURCE_SHA"
       - uses: actions/checkout@v4
         with:
@@ -402,8 +408,9 @@ jobs:
           test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
           test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
           test -z "$(git status --porcelain)"
-          test "$(git rev-parse HEAD^)" = 28d217988f2db1beb0300a6115b7f7b7e72c7214
-          git diff --exit-code 28d217988f2db1beb0300a6115b7f7b7e72c7214 HEAD -- priv
+          git cat-file -e "$EXPECTED_BASE^{commit}"
+          test "$(git merge-base HEAD "$EXPECTED_BASE")" = "$EXPECTED_BASE"
+          git diff --exit-code "$EXPECTED_BASE" HEAD -- priv
       - name: Create isolated evidence directory
         id: evidence
         run: |
@@ -454,7 +461,7 @@ jobs:
               manuals = [m for m in archive.getmembers() if m.name.endswith('/priv/guidance/operating-manual.md')]
               assert len(manuals) == 1 and manuals[0].isfile(), 'packaged manual inventory'
               manual = archive.extractfile(manuals[0]).read()
-              assert hashlib.sha256(manual).hexdigest() == '9327561e174d9cd45e0a2f04d93ea71ab040fb30a30e557f3e69e46be64d7dff', 'packaged manual differs'
+              assert hashlib.sha256(manual).hexdigest() == '0618175ebcff194c07efc696789f1ae915f3b0ccf57122935edef19cc0557b39', 'packaged manual differs'
           (root / 'package-hashes.json').write_text(json.dumps({p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}))
           PACKAGES
       - name: Compose 52 supported parent and candidate views without starting the app
@@ -473,7 +480,7 @@ jobs:
         run: |
           python3 - <<'RECEIPT'
           import json, os, pathlib
-          keys = ['CI_SOURCE_SHA', 'EXPECTED_TREE', 'DISPATCH_SHA', 'GITHUB_RUN_ID',
+          keys = ['CI_SOURCE_SHA', 'EXPECTED_TREE', 'EXPECTED_BASE', 'DISPATCH_SHA', 'GITHUB_RUN_ID',
                   'GITHUB_RUN_ATTEMPT', 'PRIVACY_OUTCOME', 'PACKAGE_OUTCOME', 'COMPOSITION_OUTCOME']
           receipt = {k: os.environ[k] for k in keys}
           receipt['passed'] = all(receipt[k] == 'success' for k in ['PRIVACY_OUTCOME', 'PACKAGE_OUTCOME', 'COMPOSITION_OUTCOME'])
