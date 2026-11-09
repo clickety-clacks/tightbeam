@@ -1105,21 +1105,23 @@ defmodule Tightbeam.Org do
   Retire a session — soft state flip, never a delete: history, provenance, and
   the pointer chain remain queryable. Returns the updated session.
   """
-  @spec retire(db(), String.t(), String.t(), pos_integer()) :: session()
-  def retire(db \\ Tightbeam.DB, session_key, principal, supervision_interval_ms) do
+  @spec retire(db(), String.t(), String.t()) :: session()
+  def retire(db \\ Tightbeam.DB, session_key, principal) do
     transaction!(db, fn txn ->
-      retire_in_txn(txn, session_key, principal, supervision_interval_ms)
+      retire_in_txn(txn, session_key, principal)
     end)
   end
 
+  # Compatibility for callers on the immediately preceding source line. The
+  # former interval selected only the removed inactivity reminder; retirement
+  # itself no longer depends on it.
+  def retire(db, session_key, principal, _legacy_supervision_interval_ms),
+    do: retire(db, session_key, principal)
+
   @doc false
-  # Retirement no longer arms a supervision controller, so the interval is
-  # validated for callers but otherwise unused.
-  @spec retire_in_txn(Txn.t(), String.t(), String.t(), pos_integer() | :off) :: session()
-  def retire_in_txn(%Txn{} = txn, session_key, principal, supervision_interval_ms)
-      when is_binary(principal) and principal != "" and
-             ((is_integer(supervision_interval_ms) and supervision_interval_ms > 0) or
-                supervision_interval_ms == :off) do
+  @spec retire_in_txn(Txn.t(), String.t(), String.t()) :: session()
+  def retire_in_txn(%Txn{} = txn, session_key, principal)
+      when is_binary(principal) and principal != "" do
     case must_get(txn, session_key) do
       %{state: "retired"} = session ->
         session
@@ -1129,9 +1131,11 @@ defmodule Tightbeam.Org do
     end
   end
 
-  def retire_in_txn(%Txn{}, _session_key, _principal, _supervision_interval_ms) do
-    raise ArgumentError,
-          "retirement requires a non-empty principal and positive supervision interval or off"
+  def retire_in_txn(%Txn{} = txn, session_key, principal, _legacy_supervision_interval_ms),
+    do: retire_in_txn(txn, session_key, principal)
+
+  def retire_in_txn(%Txn{}, _session_key, _principal) do
+    raise ArgumentError, "retirement requires a non-empty principal"
   end
 
   defp retire_active_in_txn(txn, session_key, _principal) do
@@ -1173,8 +1177,6 @@ defmodule Tightbeam.Org do
 
   # SN9: a pending notice to the retiring session is readdressed whatever its
   # targetGate. Effort timers keep the earlier gated selection and handling.
-  # Inactivity deadlines and climbs are the assignment's own pending trigger,
-  # not notices; the ladder resolves their target when they fire.
   defp readdress_retirement_notices_in_txn!(txn, session_key) do
     Txn.q(
       txn,
@@ -1184,7 +1186,6 @@ defmodule Tightbeam.Org do
       FROM wakes w
       LEFT JOIN roles r ON r.name=w.targetRole
       WHERE w.state='pending' AND (w.consumer='prompt' OR w.targetGate=1)
-        AND w.consumer NOT IN ('assignment_inactivity_deadline','assignment_inactivity_climb')
         AND ((w.targetRole IS NULL AND w.sessionKey=?1) OR r.boundSessionKey=?1)
         AND NOT EXISTS (
           SELECT 1 FROM harklight_wake_entries e WHERE e.wakeId=w.wakeId
@@ -1416,7 +1417,7 @@ defmodule Tightbeam.Org do
         nil
 
       primary ->
-        case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
+        case Supervision.liveness_trigger_in_txn(txn, primary) do
           {:ok, trigger} when is_map(trigger) -> trigger
           :none -> nil
         end
