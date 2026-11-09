@@ -636,6 +636,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     # that an attestation that cancels a real pending wake emits wake.canceled.
     assert "wake.canceled" in declared_attest_effects
     refute "wake.canceled" in completion_attest_effects
+
     assert_effects_match!(
       List.delete(declared_attest_effects, "wake.canceled"),
       completion_attest_effects
