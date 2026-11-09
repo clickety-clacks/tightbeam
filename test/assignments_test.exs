@@ -204,7 +204,9 @@ defmodule Tightbeam.AssignmentsTest do
              ])
 
     linked =
-      handlers["assign"].(assign_call({:session, "holder"}, "quiet linked assignment", nil, item.id))
+      handlers["assign"].(
+        assign_call({:session, "holder"}, "quiet linked assignment", nil, item.id)
+      )
 
     assert linked.workItemId == item.id
 
@@ -964,7 +966,8 @@ defmodule Tightbeam.AssignmentsTest do
       assert readdressed.obligation_ref == notice.obligation_ref
     end
 
-    test "assignment completion remains valid without inactivity wakes while sibling work stays live", ctx do
+    test "assignment completion remains valid without inactivity wakes while sibling work stays live",
+         ctx do
       item = create_work_item(ctx, "finish quiet assignment")
 
       assignment =
@@ -7783,5 +7786,4 @@ defmodule Tightbeam.AssignmentsTest do
       MapSet.member?(wake_ids, wake_id)
     end)
   end
-
 end

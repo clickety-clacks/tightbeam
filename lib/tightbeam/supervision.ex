@@ -169,12 +169,16 @@ defmodule Tightbeam.Supervision do
         )
 
         if Txn.changes(txn) != 1,
-          do: raise(DB.Error, message: "legacy assignment inactivity controller changed: #{wake_id}")
+          do:
+            raise(DB.Error,
+              message: "legacy assignment inactivity controller changed: #{wake_id}"
+            )
 
       _ ->
         :ok
     end
   end
+
   @doc """
   Close open assignments whose holder is already retired.
 
@@ -388,5 +392,4 @@ defmodule Tightbeam.Supervision do
       {:error, error} -> raise error
     end
   end
-
 end

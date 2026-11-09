@@ -32,7 +32,12 @@ defmodule Tightbeam.RemindersTest do
 
     before = Reminders.render(ctx.base, "terminal-action", values)
     path = Path.join(ctx.dir, "reminders/terminal-action.md")
-    File.write!(path, "{child_assignment_id} / {child_assignment_id} / {child_session_state} / {unknown}")
+
+    File.write!(
+      path,
+      "{child_assignment_id} / {child_assignment_id} / {child_session_state} / {unknown}"
+    )
+
     commit(ctx.dir)
     assert Reminders.render(ctx.base, "terminal-action", values) == before
     publish(ctx.base)
@@ -94,7 +99,10 @@ defmodule Tightbeam.RemindersTest do
     {:ok, _} = Identity.publish_live!(prepared.base, candidate)
     dir = Path.join(prepared.base, "identity")
 
-    File.write!(Path.join(dir, "reminders/terminal-action.md"), "Published handoff {child_assignment_id}")
+    File.write!(
+      Path.join(dir, "reminders/terminal-action.md"),
+      "Published handoff {child_assignment_id}"
+    )
 
     commit(dir)
 
@@ -104,6 +112,7 @@ defmodule Tightbeam.RemindersTest do
              end)
 
     publish(prepared.base)
+
     assert {:ok, "Published handoff child-2"} =
              DB.transaction(db, fn txn ->
                Reminders.render(txn, "terminal-action", %{child_assignment_id: "child-2"})
