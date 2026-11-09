@@ -713,6 +713,242 @@ defmodule Tightbeam.Placement do
     host_workdir_path(host, session.session_key)
   end
 
+  @doc "Write one byte-exact file into a session's existing workspace."
+  @spec deliver_workdir_file(map(), map(), String.t(), binary()) ::
+          {:ok, String.t()} | {:error, String.t()}
+  def deliver_workdir_file(config, session, relative_path, bytes)
+      when is_map(session) and is_binary(relative_path) and is_binary(bytes) do
+    with :ok <- valid_workdir_relative_path(relative_path) do
+      host = fetch_session_host!(config, session)
+      workspace = attachment_workdir_path(config, session)
+      target = Path.expand(Path.join(workspace, relative_path))
+
+      if inside_workdir?(target, workspace) do
+        write_workdir_file_to_host(config, host, target, bytes)
+      else
+        {:error, "attachment path is outside the session workspace"}
+      end
+    else
+      {:error, _reason} = error -> error
+    end
+  rescue
+    error ->
+      {:error,
+       "could not deliver attachment to the session workspace: #{Exception.message(error)}"}
+  end
+
+  defp attachment_workdir_path(config, session) do
+    if Map.get(config, :db) && Tightbeam.Ephemeral.session?(config.db, session.session_key) do
+      Process.get({__MODULE__, :turn_directory}) ||
+        raise("ephemeral attachment delivery requires its turn directory")
+    else
+      workdir_path(config, session)
+    end
+  end
+
+  defp valid_workdir_relative_path(path) do
+    components = String.split(path, "/", trim: false)
+
+    if Path.type(path) == :relative and components != [] and
+         Enum.all?(components, fn component ->
+           component not in ["", ".", ".."] and not String.contains?(component, <<0>>)
+         end) do
+      :ok
+    else
+      {:error, "attachment path must be a nonempty relative workspace path"}
+    end
+  end
+
+  defp inside_workdir?(target, workspace) do
+    root = Path.expand(workspace)
+    relative = Path.relative_to(target, root)
+
+    relative != ".." and not String.starts_with?(relative, "../") and
+      Path.type(relative) == :relative
+  end
+
+  defp write_workdir_file_to_host(_config, %{ssh: nil}, target, bytes),
+    do: write_local_workdir_file(target, bytes)
+
+  defp write_workdir_file_to_host(config, %{ssh: destination}, target, bytes) do
+    write_remote_workdir_file(config, destination, target, bytes)
+  end
+
+  defp write_local_workdir_file(target, bytes) do
+    with :ok <- File.mkdir_p(Path.dirname(target)),
+         :ok <- write_local_file_if_absent(target, bytes),
+         {:ok, ^bytes} <- File.read(target) do
+      {:ok, target}
+    else
+      {:error, reason} ->
+        {:error, "workspace file write or byte check failed: #{inspect(reason)}"}
+
+      {:ok, _different_bytes} ->
+        {:error, "workspace file byte check failed"}
+    end
+  end
+
+  defp write_local_file_if_absent(target, bytes) do
+    case File.lstat(target) do
+      {:ok, %{type: :regular}} ->
+        case File.read(target) do
+          {:ok, ^bytes} -> :ok
+          {:ok, _other} -> {:error, :workspace_path_already_contains_different_bytes}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:ok, _other_type} ->
+        {:error, :workspace_path_is_not_a_regular_file}
+
+      {:error, :enoent} ->
+        case File.write(target, bytes, [:binary, :exclusive]) do
+          :ok ->
+            case File.chmod(target, 0o600) do
+              :ok ->
+                :ok
+
+              {:error, reason} ->
+                File.rm(target)
+                {:error, reason}
+            end
+
+          {:error, :eexist} ->
+            write_local_file_if_absent(target, bytes)
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp write_remote_workdir_file(config, destination, target, bytes) do
+    sh = Map.get(config, :sh, &system_cmd/1)
+    sh_out = Map.get(config, :sh_out, &system_cmd_out/1)
+    parent = Path.dirname(target)
+
+    with :ok <- remote_shell_ok(sh, destination, "mkdir -p #{shell_quote(parent)}"),
+         {:ok, existing} <- read_remote_workdir_file(sh, sh_out, destination, target) do
+      case existing do
+        {:present, ^bytes} ->
+          {:ok, target}
+
+        {:present, _different_bytes} ->
+          {:error, "workspace path already contains different bytes"}
+
+        :missing ->
+          copy_remote_workdir_file(config, sh, sh_out, destination, target, bytes)
+      end
+    end
+  end
+
+  defp read_remote_workdir_file(sh, sh_out, destination, path) do
+    quoted_path = shell_quote(path)
+
+    script =
+      "if [ -e #{quoted_path} ] && [ ! -f #{quoted_path} ]; then exit 2; " <>
+        "elif [ -L #{quoted_path} ]; then exit 2; " <>
+        "elif [ -f #{quoted_path} ]; then exit 0; else exit 1; fi"
+
+    case sh.(remote_shell_command(destination, script)) do
+      {_output, 0} ->
+        case sh_out.(remote_shell_command(destination, "cat #{shell_quote(path)}")) do
+          {bytes, 0} -> {:ok, {:present, bytes}}
+          {_output, status} -> {:error, "workspace file could not be read back (exit #{status})"}
+        end
+
+      {_output, 1} ->
+        {:ok, :missing}
+
+      {_output, 2} ->
+        {:error, "workspace path is not a regular file"}
+
+      {_output, status} ->
+        {:error, "workspace path could not be checked (exit #{status})"}
+    end
+  end
+
+  defp copy_remote_workdir_file(config, sh, sh_out, destination, target, bytes) do
+    parent = Path.dirname(target)
+    nonce = Integer.to_string(System.unique_integer([:positive, :monotonic]))
+    remote_temp = Path.join(parent, ".tightbeam-attachment-#{nonce}.tmp")
+    stage_dir = Path.join([config.base_dir, "staging", "attachment-delivery", nonce])
+    stage_file = Path.join(stage_dir, "payload")
+    File.mkdir_p!(stage_dir)
+
+    try do
+      File.write!(stage_file, bytes, [:binary, :exclusive])
+      File.chmod!(stage_file, 0o600)
+
+      rsync = [
+        "rsync",
+        "-a",
+        "-e",
+        Enum.join(["ssh" | @ssh_opts], " "),
+        "--",
+        stage_file,
+        "#{destination}:#{shell_quote(remote_temp)}"
+      ]
+
+      case sh.(rsync) do
+        {_output, 0} ->
+          finish_remote_workdir_file(sh, sh_out, destination, remote_temp, target, bytes)
+
+        {_output, status} ->
+          {:error, "workspace file transfer failed (rsync exit #{status})"}
+      end
+    after
+      remote_shell_best_effort(sh, destination, "rm -f #{shell_quote(remote_temp)}")
+      File.rm_rf(stage_dir)
+    end
+  end
+
+  defp finish_remote_workdir_file(sh, sh_out, destination, remote_temp, target, bytes) do
+    commit =
+      "ln #{shell_quote(remote_temp)} #{shell_quote(target)} && rm #{shell_quote(remote_temp)}"
+
+    case sh.(remote_shell_command(destination, commit)) do
+      {_output, 0} ->
+        case sh_out.(remote_shell_command(destination, "cat #{shell_quote(target)}")) do
+          {^bytes, 0} ->
+            {:ok, target}
+
+          {_output, 0} ->
+            remote_shell_best_effort(sh, destination, "rm -f #{shell_quote(target)}")
+            {:error, "workspace file byte check failed"}
+
+          {_output, status} ->
+            remote_shell_best_effort(sh, destination, "rm -f #{shell_quote(target)}")
+            {:error, "workspace file could not be read back (exit #{status})"}
+        end
+
+      {_output, status} ->
+        {:error, "workspace file could not be placed (remote link exit #{status})"}
+    end
+  end
+
+  defp remote_shell_ok(sh, destination, script) do
+    case sh.(remote_shell_command(destination, script)) do
+      {_output, 0} ->
+        :ok
+
+      {_output, status} ->
+        {:error, "session workspace is unavailable (remote command exit #{status})"}
+    end
+  end
+
+  defp remote_shell_best_effort(sh, destination, script) do
+    _ = sh.(remote_shell_command(destination, script))
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp remote_shell_command(destination, script),
+    do: ["ssh" | @ssh_opts] ++ [destination, "sh", "-c", shell_quote(script)]
+
   @doc false
   def host_in_txn(txn, base_dir, name) do
     if name == local_host_name() do

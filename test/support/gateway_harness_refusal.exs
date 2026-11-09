@@ -25,6 +25,7 @@ defmodule GatewayHarnessRefusal do
         )
 
       {:ok, lane_manager} = Tightbeam.LaneManager.start_link(opts)
+
       token =
         base
         |> Path.join("gateway.json")
@@ -67,9 +68,8 @@ defmodule GatewayHarnessRefusal do
         )
 
       {:ok, client} =
-        SimClient.connect("127.0.0.1", port, device.token,
-          device_id: "context-refusal-device"
-        )
+        SimClient.connect("127.0.0.1", port, device.token, device_id: "context-refusal-device")
+
       session_key = Org.personal_session_key(device.user_id)
       content = String.duplicate("x", 65_537)
       watermark = SimClient.mark(client)
@@ -122,6 +122,7 @@ defmodule GatewayHarnessRefusal do
 
       assert prompt == content
       assert byte_size(prompt) == 65_537
+
       assert {:ok, [[^content, 65_537]]} =
                Tightbeam.DB.query(
                  db,
@@ -196,7 +197,9 @@ defmodule GatewayHarnessRefusal do
 
     capture = Path.join(base, "harness-request.json")
     fixture = Path.join(Path.dirname(__ENV__.file), "gateway_refusal_harness.js")
-    node = System.find_executable("node") || raise "node is required for the local harness process"
+
+    node =
+      System.find_executable("node") || raise "node is required for the local harness process"
 
     {:ok, adapter} =
       Adapter.start_link(

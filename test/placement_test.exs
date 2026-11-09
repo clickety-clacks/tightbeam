@@ -535,6 +535,98 @@ defmodule Tightbeam.PlacementTest do
     assert message =~ "source session token removal failed"
   end
 
+  test "deliver_workdir_file stages and verifies remote bytes and refuses transfer failure", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    Application.put_env(:tightbeam, :advertised_url, "https://gateway.example")
+
+    assert {:ok, _} =
+             Placement.register_host(db, "attachment-worker", %{
+               ssh: "worker",
+               base_dir: "/srv/tightbeam"
+             })
+
+    session = %{
+      session_key: "remote-attachment-session",
+      host: "attachment-worker",
+      harness: "claude",
+      cli_token: "tbs_test"
+    }
+
+    workspace_content =
+      JSON.encode!(%{
+        url: "https://gateway.example",
+        token: session.cli_token,
+        sessionKey: session.session_key
+      })
+
+    bytes = <<"%PDF-1.7\nQuarterly total: 7,315 units\n%%EOF\n">>
+    parent = self()
+
+    sh_out = fn command ->
+      result =
+        if String.contains?(List.last(command), ".tightbeam-session"),
+          do: workspace_content,
+          else: bytes
+
+      send(parent, {:attachment_readback_command, command})
+      {result, 0}
+    end
+
+    sh_for_rsync = fn rsync_status ->
+      fn command ->
+        send(parent, {:attachment_delivery_command, command})
+
+        case command do
+          ["rsync" | _rest] ->
+            {"", rsync_status}
+
+          ["ssh" | _rest] ->
+            if String.contains?(List.last(command), "if [ -e"), do: {"", 1}, else: {"", 0}
+        end
+      end
+    end
+
+    config = %{base_dir: base_dir, db: db, sh: sh_for_rsync.(0), sh_out: sh_out}
+
+    assert {:ok, path} =
+             Placement.deliver_workdir_file(
+               config,
+               session,
+               ".tightbeam-attachments/91005/message-9-attachment-1/report.pdf",
+               bytes
+             )
+
+    assert path ==
+             Path.join([
+               Placement.workdir_path(config, session),
+               ".tightbeam-attachments",
+               "91005",
+               "message-9-attachment-1",
+               "report.pdf"
+             ])
+
+    commands = collect_attachment_delivery_commands([])
+    assert Enum.any?(commands, &match?(["rsync" | _rest], &1))
+    assert Enum.any?(commands, &(List.last(&1) =~ "ln "))
+    assert_receive {:attachment_readback_command, _}
+
+    failed_config = %{config | sh: sh_for_rsync.(23)}
+
+    assert {:error, reason} =
+             Placement.deliver_workdir_file(
+               failed_config,
+               session,
+               ".tightbeam-attachments/91006/message-10-attachment-1/report.pdf",
+               bytes
+             )
+
+    assert reason =~ "workspace file transfer failed"
+    assert reason =~ "rsync exit 23"
+    refute Enum.any?(collect_attachment_delivery_commands([]), &(List.last(&1) =~ "ln "))
+  end
+
   test "move_workdir rsyncs local to remote", %{base_dir: base_dir, db: db} do
     old_base = Path.join(base_dir, "old-local")
 
@@ -2142,6 +2234,16 @@ defmodule Tightbeam.PlacementTest do
       {:command, command} -> collect_commands([command | acc])
     after
       0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp collect_attachment_delivery_commands(acc) do
+    receive do
+      {:attachment_delivery_command, command} ->
+        collect_attachment_delivery_commands([command | acc])
+    after
+      0 ->
+        Enum.reverse(acc)
     end
   end
 
