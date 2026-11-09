@@ -2,7 +2,73 @@ defmodule Tightbeam.RowReactions do
   @moduledoc false
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.HarnessHealth.RecoverySchedule
+  alias Tightbeam.HarnessHealth.RecoveryScheduler
   alias Tightbeam.RowReactions.{Cutover, Notice, Snapshot, Store}
+  require Logger
+
+  def harness_health_hold_in_txn(
+        txn,
+        incident_id,
+        transition,
+        at,
+        before \\ nil,
+        cycle_release \\ false
+      )
+      when transition in ["opened", "resolved"] do
+    Cutover.adopt(txn)
+    after_snapshot = Snapshot.harness_health_hold(txn, incident_id)
+
+    event = %{
+      "id" => "harness-health-hold:#{incident_id}:#{transition}",
+      # Harness-health incidents may have no session owner. They are still
+      # global product events; the system namespace keeps them distinct from
+      # any user's assignment and wake reactions.
+      "org" => after_snapshot["ownerUserId"] || "system",
+      "kind" => "harness_health_hold",
+      "at" => at,
+      "generation" => incident_id <> ":" <> transition,
+      "source" => %{"kind" => "harness_health_incident", "id" => incident_id},
+      "transition" => transition,
+      "resolutionCorrelation" => after_snapshot["resolutionCorrelation"],
+      "cycleRelease" => transition == "resolved" and cycle_release == true,
+      "principal" => %{"kind" => "process", "id" => "tightbeam"},
+      "before" => before,
+      "after" => after_snapshot
+    }
+
+    admit(txn, event)
+    RecoverySchedule.reconcile_hold_in_txn(txn, after_snapshot, event["id"], at)
+    :ok
+  end
+
+  @doc false
+  def remember_harness_health_recovery_check_in_txn(txn, check) do
+    Cutover.adopt(txn)
+
+    event = %{
+      "id" => check.event_id,
+      "org" => check.org,
+      "kind" => "harness_health_recovery_check",
+      "at" => check.finished_at,
+      "generation" => check.cycle_id,
+      "source" => %{"kind" => "harness_health_recovery_check", "id" => check.event_id},
+      "holdId" => check.hold_id,
+      "cycleId" => check.cycle_id,
+      "route" => check.route,
+      "startedAt" => check.started_at,
+      "finishedAt" => check.finished_at,
+      "outcome" => check.outcome,
+      "errorExcerpt" => check.error_excerpt,
+      "principal" => %{"kind" => "process", "id" => "tightbeam"},
+      "before" => nil,
+      "after" => nil
+    }
+
+    facts = Snapshot.current(txn, event, %{})
+    Store.remember(txn, event, facts)
+    :ok
+  end
 
   def terminal_in_txn(txn, terminal, before) do
     Cutover.adopt(txn)
@@ -107,7 +173,7 @@ defmodule Tightbeam.RowReactions do
   def admit(txn, event) do
     facts = Snapshot.current(txn, event, %{})
     actions = Store.admit(txn, event, facts)
-    Enum.each(actions, &Notice.execute(txn, &1, event["at"]))
+    Enum.each(actions, &execute_action(txn, event, &1, event["at"]))
     Store.actions(txn, event["org"], event["id"])
   end
 
@@ -116,11 +182,15 @@ defmodule Tightbeam.RowReactions do
            if ready?(txn) do
              Cutover.adopt(txn)
              for {event, _} <- Store.pending_events(txn), do: reconcile_safely(txn, event)
+             RecoverySchedule.reconcile_open_holds_in_txn(txn, System.system_time(:millisecond))
            end
 
            :ok
          end) do
-      {:ok, :ok} -> :ok
+      {:ok, :ok} ->
+        RecoveryScheduler.refresh()
+        :ok
+
       {:error, error} -> raise error
     end
   end
@@ -233,7 +303,7 @@ defmodule Tightbeam.RowReactions do
       )
 
     Store.reconcile(txn, event, original, facts, at)
-    |> Enum.each(&Notice.execute(txn, &1, at))
+    |> Enum.each(&execute_action(txn, event, &1, at))
 
     :ok
   end
@@ -247,27 +317,155 @@ defmodule Tightbeam.RowReactions do
       :ok = Txn.exec(txn, "RELEASE terminal_reaction_reconcile")
     rescue
       error in DB.Error ->
-        # Unknown database shapes and failed writes are defects, not uncertain
-        # historical recipients. Do not hide them as a route hold.
-        reraise error, __STACKTRACE__
+        if retryable_recovery_event?(event) do
+          rollback_reconciliation!(txn, checkpoint)
+          record_recovery_failures(txn, event, Exception.message(error))
+          :ok
+        else
+          # Unknown database shapes and failed writes are defects, not uncertain
+          # historical recipients. Do not hide them as a route hold.
+          reraise error, __STACKTRACE__
+        end
 
       error ->
-        :ok = Txn.exec(txn, "ROLLBACK TO terminal_reaction_reconcile")
-        :ok = Txn.exec(txn, "RELEASE terminal_reaction_reconcile")
-        :ok = Txn.restore_handoffs(txn, checkpoint)
+        rollback_reconciliation!(txn, checkpoint)
 
-        for action <- Store.actions(txn, event["org"], event["id"]),
-            action["status"] == "pending",
-            do:
-              Store.record(
-                txn,
-                action,
-                "held",
-                action["result"],
-                System.system_time(:millisecond),
-                Exception.message(error)
-              )
+        if retryable_recovery_event?(event) do
+          record_recovery_failures(txn, event, Exception.message(error))
+        else
+          for action <- Store.actions(txn, event["org"], event["id"]),
+              action["status"] == "pending",
+              do:
+                Store.record(
+                  txn,
+                  action,
+                  "held",
+                  action["result"],
+                  System.system_time(:millisecond),
+                  Exception.message(error)
+                )
+        end
     end
+  end
+
+  defp execute_action(txn, event, action, at) do
+    if recovery_notice_action?(event, action) do
+      execute_recovery_notice_safely(txn, event, action, at)
+    else
+      Notice.execute(txn, action, at)
+    end
+  end
+
+  defp execute_recovery_notice_safely(txn, event, action, at) do
+    case recovery_notice_checkpoint(txn) do
+      {:ok, checkpoint} ->
+        execute_recovery_notice_effect(txn, action, at, checkpoint)
+
+      {:error, message} ->
+        # No notice effect ran. Action admission predates this attempt, so its
+        # pending row remains the durable retry record.
+        record_recovery_failure(txn, action, at, message)
+        :ok
+    end
+  end
+
+  defp recovery_notice_checkpoint(txn) do
+    try do
+      checkpoint = Txn.handoff_checkpoint(txn)
+      :ok = Txn.exec(txn, "SAVEPOINT harness_recovery_notice_effect")
+      {:ok, checkpoint}
+    rescue
+      error -> {:error, Exception.message(error)}
+    catch
+      kind, reason -> {:error, inspect({kind, reason})}
+    end
+  end
+
+  defp execute_recovery_notice_effect(txn, action, at, checkpoint) do
+    try do
+      Notice.execute(txn, action, at)
+      :ok = Txn.exec(txn, "RELEASE harness_recovery_notice_effect")
+    rescue
+      error ->
+        rollback_recovery_notice_effect!(txn, checkpoint)
+        record_recovery_failure(txn, action, at, Exception.message(error))
+
+        :ok
+    catch
+      kind, reason ->
+        rollback_recovery_notice_effect!(txn, checkpoint)
+        record_recovery_failure(txn, action, at, inspect({kind, reason}))
+
+        :ok
+    end
+  end
+
+  defp recovery_notice_action?(
+         %{"kind" => "harness_health_hold", "transition" => "resolved"} = event,
+         %{"plan" => %{"family" => "harness-recovery"}}
+       ),
+       do: event["cycleRelease"] != true
+
+  defp recovery_notice_action?(_event, _action), do: false
+
+  defp retryable_recovery_event?(
+         %{"kind" => "harness_health_hold", "transition" => "resolved"} = event
+       ),
+       do: event["cycleRelease"] != true
+
+  defp retryable_recovery_event?(_event), do: false
+
+  defp rollback_reconciliation!(txn, checkpoint) do
+    :ok = Txn.exec(txn, "ROLLBACK TO terminal_reaction_reconcile")
+    :ok = Txn.exec(txn, "RELEASE terminal_reaction_reconcile")
+    :ok = Txn.restore_handoffs(txn, checkpoint)
+  end
+
+  defp rollback_recovery_notice_effect!(txn, checkpoint) do
+    :ok = Txn.exec(txn, "ROLLBACK TO harness_recovery_notice_effect")
+    :ok = Txn.exec(txn, "RELEASE harness_recovery_notice_effect")
+    :ok = Txn.restore_handoffs(txn, checkpoint)
+  end
+
+  defp record_recovery_failures(txn, event, message) do
+    at = System.system_time(:millisecond)
+
+    try do
+      for action <- Store.actions(txn, event["org"], event["id"]),
+          action["status"] == "pending",
+          action["plan"]["family"] == "harness-recovery",
+          do: record_recovery_failure(txn, action, at, message)
+    rescue
+      error ->
+        Logger.error(
+          "harness recovery notice remains pending; failure details could not be queried: #{Exception.message(error)}"
+        )
+    catch
+      kind, reason ->
+        Logger.error(
+          "harness recovery notice remains pending; failure details could not be queried: #{inspect({kind, reason})}"
+        )
+    end
+
+    :ok
+  end
+
+  defp record_recovery_failure(txn, action, at, message) do
+    try do
+      Store.record(txn, action, "pending", action["result"], at, message)
+    rescue
+      error ->
+        Logger.error(
+          "harness recovery notice remains pending; failure detail could not be recorded: #{Exception.message(error)}"
+        )
+    catch
+      kind, reason ->
+        Logger.error(
+          "harness recovery notice remains pending; failure detail could not be recorded: #{inspect({kind, reason})}"
+        )
+    end
+
+    :ok
   end
 
   defp principal(row) do

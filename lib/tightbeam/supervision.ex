@@ -165,6 +165,7 @@ defmodule Tightbeam.Supervision do
           end
 
         effective_at = max(activity_start, max(last_activity, at))
+        mode = if effective_at > last_activity, do: :replace, else: :activity
 
         deadline =
           schedule_deadline_in_txn(
@@ -175,7 +176,7 @@ defmodule Tightbeam.Supervision do
             effective_at,
             interval_ms,
             nil,
-            :activity
+            mode
           )
 
         # Stamp the replacement at the activity itself: cancellation also
@@ -1810,6 +1811,16 @@ defmodule Tightbeam.Supervision do
           AND w.state='pending'
           AND w.consumer NOT IN (?3,?4,'effort_probe','effort_deadline')
           AND (w.obligationRef IS NULL OR substr(w.obligationRef,1,length(?5))<>?5)
+          AND (
+            w.consumer<>'cron'
+            OR (
+              w.targetRole IS NULL
+              AND EXISTS (
+                SELECT 1 FROM assignments a
+                WHERE a.id=w.assignmentId AND a.state='open' AND a.holderKey=?2
+              )
+            )
+          )
         LIMIT 1
         """,
         [assignment_id, holder, @deadline_consumer, @climb_consumer, @episode_ref]

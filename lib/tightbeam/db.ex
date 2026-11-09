@@ -699,6 +699,7 @@ defmodule Tightbeam.DB do
     Process.unlink(retry)
     Process.exit(retry, :shutdown)
     :persistent_term.erase({Tightbeam.Recognition, self()})
+    :persistent_term.erase({Tightbeam.FilingRemedy, self()})
     :persistent_term.erase({__MODULE__, self()})
     Enum.each(readers, &GenServer.stop/1)
     :ok = clear_statement_cache(conn)

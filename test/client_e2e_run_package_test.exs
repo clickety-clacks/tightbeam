@@ -1,10 +1,17 @@
 defmodule Tightbeam.ClientE2E.RunPackageTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
   import ExUnit.CaptureIO
   alias Tightbeam.ClientE2E.{LegGateway, Provenance, RunPackage, Scorecard}
 
   setup do
-    root = Path.join(File.cwd!(), "tmp/client-e2e-package-#{System.unique_integer([:positive])}")
+    # The fixture removes its own .git; keep it outside this checkout so a
+    # post-build Git lookup cannot fall through to the source repository.
+    root =
+      Path.join(
+        Path.dirname(File.cwd!()),
+        "client-e2e-package-#{System.unique_integer([:positive])}"
+      )
+
     repo = Path.join(root, "repo")
     fixture = Path.join(root, "fixture")
     app = Path.join(fixture, "release/lib/tightbeam-0.1.15")

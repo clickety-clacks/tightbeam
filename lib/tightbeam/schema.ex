@@ -2043,6 +2043,9 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
     :ok = ensure_notice_batch_chat_message_format(db)
     :ok = Tightbeam.RowReactions.Store.ensure_schema(db)
+    :ok = Tightbeam.HarnessHealth.RecoverySchedule.ensure_schema(db)
+    :ok = Tightbeam.HarnessHealth.RecoveryCheck.ensure_schema(db)
+    :ok = Tightbeam.HarnessRecoveryNotice.ensure_schema(db)
 
     # Preserve exact historical Toplines DDL and its stamp if a preceding
     # migration refuses. Bootstrap already qualified it; now activate V6.
@@ -2051,6 +2054,7 @@ defmodule Tightbeam.Schema do
     # Refused predecessors must retain their exact schema, including indexes.
     # Build these additive access paths only after the existing migrations and
     # qualifications succeed, but before publishing a successful boot marker.
+    :ok = Tightbeam.ConditionFacts.ensure_filing_index(db)
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
     :ok = ensure_rest_collection_indexes(db)

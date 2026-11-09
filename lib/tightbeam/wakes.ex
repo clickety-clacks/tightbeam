@@ -41,6 +41,11 @@ defmodule Tightbeam.Wakes do
 
   alias Tightbeam.DB.Txn
 
+  defmodule RuleEvaluationUnavailable do
+    @moduledoc false
+    defexception message: "filing rule evaluation is not ready"
+  end
+
   @miss_detector_ms 180_000
   @miss_lateness_ms 60_000
   @decision_request_notice_marker "decision-request-notice:"
@@ -243,14 +248,22 @@ defmodule Tightbeam.Wakes do
     restorationTurnSeq INTEGER REFERENCES turns(seq),
     redeliveryTurnSeq INTEGER UNIQUE REFERENCES turns(seq),
     createdAt INTEGER NOT NULL CHECK(createdAt >= 0),
+    cycleReleaseCorrelation TEXT,
+    cycleReleaseTurnSeq INTEGER REFERENCES turns(seq),
     UNIQUE(sessionKey, sourceTurnSeq),
     UNIQUE(sessionKey, sourceMessageId),
     CHECK((restorationTurnSeq IS NULL) = (redeliveryTurnSeq IS NULL))
   );
-  CREATE INDEX IF NOT EXISTS health_redelivery_pending
-    ON health_redelivery_attempts (sourceHarness, sourceHost, sourceTurnSeq)
-    WHERE redeliveryTurnSeq IS NULL;
   """
+
+  @health_redelivery_cycle_migration "harness-health-cycle-redelivery/v1"
+  @health_redelivery_old_columns ~w(
+    idempotencyKey sessionKey sourceHarness sourceHost sourceMessageId sourceTurnSeq
+    sourceWakeId origin prompt roleRef roleFallback assignmentId jobRef requestRef failureClass
+    parentSessionKey restorationTurnSeq redeliveryTurnSeq createdAt
+  )
+  @health_redelivery_cycle_columns @health_redelivery_old_columns ++
+                                     ~w(cycleReleaseCorrelation cycleReleaseTurnSeq)
 
   @retry_base_ms 30_000
   @retry_ceiling_ms 30 * 60_000
@@ -258,9 +271,233 @@ defmodule Tightbeam.Wakes do
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
     with :ok <- ensure_historical_schema(db),
-         :ok <- DB.execute(db, @health_redelivery_ddl) do
+         :ok <- DB.execute(db, @health_redelivery_ddl),
+         :ok <- ensure_health_redelivery_cycle_schema(db) do
       :ok
     end
+  end
+
+  defp ensure_health_redelivery_cycle_schema(db) do
+    case DB.transaction(db, fn txn ->
+           columns =
+             Txn.q(txn, "PRAGMA table_info(health_redelivery_attempts)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           case columns do
+             @health_redelivery_cycle_columns ->
+               ensure_cycle_redelivery_indexes!(txn)
+
+             @health_redelivery_old_columns ->
+               Txn.exec(txn, "DROP INDEX IF EXISTS health_redelivery_pending")
+
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE health_redelivery_attempts ADD COLUMN cycleReleaseCorrelation TEXT"
+               )
+
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE health_redelivery_attempts ADD COLUMN cycleReleaseTurnSeq INTEGER REFERENCES turns(seq)"
+               )
+
+               Txn.exec(
+                 txn,
+                 "CREATE INDEX health_redelivery_cycle_release_pending ON health_redelivery_attempts(cycleReleaseCorrelation,sourceHarness,sourceHost) WHERE cycleReleaseCorrelation IS NOT NULL AND cycleReleaseTurnSeq IS NULL"
+               )
+
+               Txn.exec(
+                 txn,
+                 "CREATE INDEX health_redelivery_pending ON health_redelivery_attempts(sourceHarness,sourceHost,sourceTurnSeq) WHERE redeliveryTurnSeq IS NULL AND cycleReleaseTurnSeq IS NULL"
+               )
+
+               Txn.exec(
+                 txn,
+                 "CREATE UNIQUE INDEX health_redelivery_cycle_release_turn ON health_redelivery_attempts(cycleReleaseTurnSeq) WHERE cycleReleaseTurnSeq IS NOT NULL"
+               )
+
+               columns =
+                 Txn.q(txn, "PRAGMA table_info(health_redelivery_attempts)")
+                 |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+               unless columns == @health_redelivery_cycle_columns do
+                 raise ArgumentError, "incompatible health redelivery cycle schema"
+               end
+
+               ensure_cycle_redelivery_indexes!(txn)
+
+             _ ->
+               raise ArgumentError, "incompatible health redelivery schema"
+           end
+
+           case Txn.q(
+                  txn,
+                  "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1",
+                  [@health_redelivery_cycle_migration]
+                ) do
+             [[1]] ->
+               :ok
+
+             [] ->
+               Txn.q(
+                 txn,
+                 "INSERT INTO supervision_liveness_migrations(migrationId,appliedAt,affectedRows,cause,principal) VALUES(?1,?2,0,'release_upgrade','process:tightbeam')",
+                 [@health_redelivery_cycle_migration, System.system_time(:millisecond)]
+               )
+
+               :ok
+
+             rows ->
+               raise ArgumentError,
+                     "invalid health redelivery migration marker: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp ensure_cycle_redelivery_indexes!(txn) do
+    Txn.exec(
+      txn,
+      "CREATE INDEX IF NOT EXISTS health_redelivery_pending ON health_redelivery_attempts(sourceHarness,sourceHost,sourceTurnSeq) WHERE redeliveryTurnSeq IS NULL AND cycleReleaseTurnSeq IS NULL"
+    )
+
+    Txn.exec(
+      txn,
+      "CREATE UNIQUE INDEX IF NOT EXISTS health_redelivery_cycle_release_turn ON health_redelivery_attempts(cycleReleaseTurnSeq) WHERE cycleReleaseTurnSeq IS NOT NULL"
+    )
+
+    Txn.exec(
+      txn,
+      "CREATE INDEX IF NOT EXISTS health_redelivery_cycle_release_pending ON health_redelivery_attempts(cycleReleaseCorrelation,sourceHarness,sourceHost) WHERE cycleReleaseCorrelation IS NOT NULL AND cycleReleaseTurnSeq IS NULL"
+    )
+
+    expected = %{
+      "health_redelivery_pending" =>
+        "CREATE INDEX health_redelivery_pending ON health_redelivery_attempts(sourceHarness,sourceHost,sourceTurnSeq) WHERE redeliveryTurnSeq IS NULL AND cycleReleaseTurnSeq IS NULL",
+      "health_redelivery_cycle_release_turn" =>
+        "CREATE UNIQUE INDEX health_redelivery_cycle_release_turn ON health_redelivery_attempts(cycleReleaseTurnSeq) WHERE cycleReleaseTurnSeq IS NOT NULL",
+      "health_redelivery_cycle_release_pending" =>
+        "CREATE INDEX health_redelivery_cycle_release_pending ON health_redelivery_attempts(cycleReleaseCorrelation,sourceHarness,sourceHost) WHERE cycleReleaseCorrelation IS NOT NULL AND cycleReleaseTurnSeq IS NULL"
+    }
+
+    Enum.each(expected, fn {name, expected_sql} ->
+      case Txn.q(
+             txn,
+             "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1",
+             [name]
+           ) do
+        [[sql]] when is_binary(sql) ->
+          normalized = sql |> String.downcase() |> String.replace(~r/\s+/, "")
+          expected = expected_sql |> String.downcase() |> String.replace(~r/\s+/, "")
+
+          unless normalized == expected do
+            raise ArgumentError, "incompatible #{name} index definition"
+          end
+
+        _ ->
+          raise ArgumentError, "health redelivery cycle index #{name} is missing"
+      end
+    end)
+
+    :ok
+  end
+
+  @doc false
+  @spec mark_cycle_release_health_intents_in_txn(Txn.t(), String.t(), String.t(), String.t()) ::
+          non_neg_integer()
+  def mark_cycle_release_health_intents_in_txn(
+        %Txn{} = txn,
+        incident_id,
+        failure_class,
+        correlation
+      )
+      when is_binary(incident_id) and is_binary(failure_class) and is_binary(correlation) do
+    health_redelivery_sources_in_txn(txn, incident_id, failure_class)
+    |> Enum.reduce(0, fn [idempotency_key | _rest], count ->
+      Txn.q(
+        txn,
+        "UPDATE health_redelivery_attempts SET cycleReleaseCorrelation=?2 WHERE idempotencyKey=?1 AND restorationTurnSeq IS NULL AND redeliveryTurnSeq IS NULL AND cycleReleaseCorrelation IS NULL AND cycleReleaseTurnSeq IS NULL",
+        [idempotency_key, correlation]
+      )
+
+      count + Txn.changes(txn)
+    end)
+  end
+
+  @doc false
+  @spec redeliver_cycle_release(DB.server(), String.t(), String.t(), String.t()) :: :ok
+  def redeliver_cycle_release(db, correlation, harness, host)
+      when is_binary(correlation) and is_binary(harness) and is_binary(host) do
+    case DB.transaction(db, fn txn ->
+           redeliver_cycle_release_in_txn(txn, correlation, harness, host)
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  @spec resume_cycle_release_redeliveries(DB.server()) :: :ok
+  def resume_cycle_release_redeliveries(db) do
+    case DB.transaction(db, fn txn ->
+           Txn.q(
+             txn,
+             "SELECT DISTINCT cycleReleaseCorrelation,sourceHarness,sourceHost FROM health_redelivery_attempts WHERE cycleReleaseCorrelation IS NOT NULL AND cycleReleaseTurnSeq IS NULL ORDER BY cycleReleaseCorrelation"
+           )
+           |> Enum.each(fn [correlation, harness, host] ->
+             redeliver_cycle_release_in_txn(txn, correlation, harness, host)
+           end)
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp redeliver_cycle_release_in_txn(txn, correlation, harness, host) do
+    case Txn.q(
+           txn,
+           """
+           SELECT i.id FROM harness_health_incidents i
+           JOIN harness_health_observations o ON o.id=i.resolutionObservationId
+           WHERE i.state='resolved'
+             AND i.harness=?2 AND i.host=?3
+             AND o.correlationId=?1 AND o.evidenceKind='normal-turn-success'
+           """,
+           [correlation, harness, host]
+         ) do
+      [[_incident_id]] ->
+        Txn.q(
+          txn,
+          "SELECT idempotencyKey,sessionKey,sourceMessageId,sourceTurnSeq,sourceWakeId,origin,prompt,roleRef,roleFallback,assignmentId,jobRef,requestRef,cycleReleaseCorrelation FROM health_redelivery_attempts WHERE cycleReleaseCorrelation=?1 AND sourceHarness=?2 AND sourceHost=?3 AND redeliveryTurnSeq IS NULL AND cycleReleaseTurnSeq IS NULL AND parentSessionKey IS NULL ORDER BY sourceTurnSeq",
+          [correlation, harness, host]
+        )
+        |> Enum.each(fn source ->
+          redeliver_health_source_in_txn(txn, source, {:cycle_release, correlation})
+        end)
+
+        start_health_redelivery_lanes_in_txn(txn, harness, host)
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
+  defp start_health_redelivery_lanes_in_txn(txn, harness, host) do
+    Txn.q(
+      txn,
+      "SELECT DISTINCT s.sessionKey FROM sessions s JOIN turns t ON t.sessionKey=s.sessionKey WHERE s.harness=?1 AND s.host=?2 AND s.state='active' AND t.status='queued' ORDER BY s.sessionKey",
+      [harness, host]
+    )
+    |> Enum.each(fn [session_key] ->
+      Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
+    end)
+
+    :ok
   end
 
   @doc false
@@ -2601,6 +2838,11 @@ defmodule Tightbeam.Wakes do
   def row_commit_in_txn(%Txn{} = txn, transitions) do
     transitions = List.wrap(transitions) ++ DB.take_row_commits(txn)
 
+    if not wait_recognition_ready?(txn) and
+         Enum.any?(transitions, &filing_transition?/1) do
+      raise RuleEvaluationUnavailable
+    end
+
     if wait_recognition_ready?(txn) do
       txn
       |> RuleRuntime.row_commit_effects_in_txn(transitions)
@@ -2618,8 +2860,11 @@ defmodule Tightbeam.Wakes do
               )
           end
 
+        {:remedy, rule, call, _evidence} ->
+          Tightbeam.FilingRemedy.enqueue_in_txn(txn, rule, call)
+
         {:error, rule, message} ->
-          EventLog.lifecycle_in_txn(txn, "rule_notice_failed", rule.name, message)
+          EventLog.lifecycle_in_txn(txn, "rule_effect_failed", rule.name, message)
       end)
 
       recognize_wait_transitions_in_txn(txn, transitions)
@@ -2627,6 +2872,12 @@ defmodule Tightbeam.Wakes do
 
     :ok
   end
+
+  defp filing_transition?(%{domain: "condition_fact", bindings: bindings})
+       when is_map(bindings),
+       do: bindings[:conditionKind] == "decision-request-filed"
+
+  defp filing_transition?(_), do: false
 
   @doc "Execute an actor-owned rule notice without changing the governed decision."
   @spec deliver_rule_notice(DB.server(), map(), map(), list()) :: :ok
@@ -2646,7 +2897,7 @@ defmodule Tightbeam.Wakes do
   defp deliver_rule_notice_in_txn(txn, rule, call, evidence) do
     case RuleRuntime.resolve_notice_in_txn(txn, rule, call) do
       {:ok, resolved} ->
-        wake_id = rule_notice_wake_id(rule, resolved)
+        wake_id = rule_notice_wake_id(rule, resolved, call)
 
         if is_binary(wake_id) and
              Txn.q(
@@ -2742,9 +2993,24 @@ defmodule Tightbeam.Wakes do
   defp request_unowned_agent_stretch_decision_in_txn(_txn, _rule, _call, _evidence),
     do: :not_applicable
 
-  defp rule_notice_wake_id(_rule, %{idempotency_key: nil}), do: nil
+  defp rule_notice_wake_id(rule, resolved, %{transition: transition, params: params})
+       when is_map(transition) do
+    if is_binary(params[:decision_request_id]) and transition[:domain] == "condition_fact" and
+         get_in(params, [:decision_request_id]) == transition[:bindings][:decisionRequestId] and
+         transition[:bindings][:conditionKind] == "decision-request-filed" do
+      digest =
+        :crypto.hash(:sha256, rule.name <> "\0" <> params.decision_request_id)
+        |> Base.encode16(case: :lower)
 
-  defp rule_notice_wake_id(rule, %{bound_session: session_key, idempotency_key: key})
+      "w_rule_" <> digest
+    else
+      rule_notice_wake_id(rule, resolved, nil)
+    end
+  end
+
+  defp rule_notice_wake_id(_rule, %{idempotency_key: nil}, _call), do: nil
+
+  defp rule_notice_wake_id(rule, %{bound_session: session_key, idempotency_key: key}, _call)
        when is_binary(session_key) and is_binary(key) do
     digest =
       :crypto.hash(:sha256, rule.name <> "\0" <> session_key <> "\0" <> key)
@@ -2753,7 +3019,7 @@ defmodule Tightbeam.Wakes do
     "w_rule_" <> digest
   end
 
-  defp rule_notice_wake_id(_rule, _resolved), do: nil
+  defp rule_notice_wake_id(_rule, _resolved, _call), do: nil
 
   defp principal_session({:session, session_key}), do: session_key
   defp principal_session(_principal), do: nil
@@ -3069,10 +3335,11 @@ defmodule Tightbeam.Wakes do
         """
         SELECT a.idempotencyKey,a.sessionKey,a.sourceMessageId,a.sourceTurnSeq,
                a.sourceWakeId,a.origin,a.prompt,a.roleRef,a.roleFallback,a.assignmentId,
-               a.jobRef,a.requestRef
+               a.jobRef,a.requestRef,a.cycleReleaseCorrelation
         FROM health_redelivery_attempts a
         WHERE ((a.sourceHarness=?1 AND a.sourceHost=?2) OR a.sessionKey=?3)
           AND a.redeliveryTurnSeq IS NULL
+          AND a.cycleReleaseTurnSeq IS NULL
           AND a.parentSessionKey IS NULL
           AND (
             (
@@ -3098,12 +3365,28 @@ defmodule Tightbeam.Wakes do
                 WHERE d.wakeId=retry.rootWakeId AND e.entryKind='discussion'
               ))
           )
+          AND (
+            a.cycleReleaseCorrelation IS NULL OR EXISTS (
+              SELECT 1 FROM harness_health_incidents released
+              JOIN harness_health_observations resolution
+                ON resolution.id=released.resolutionObservationId
+              WHERE released.state='resolved'
+                AND resolution.correlationId=a.cycleReleaseCorrelation
+            )
+          )
         ORDER BY a.sourceTurnSeq
         """,
         [harness, host, session.session_key]
       )
       |> Enum.reduce(0, fn source, count ->
-        count + redeliver_health_source_in_txn(txn, source, restoration_turn_seq)
+        cycle_release_correlation = List.last(source)
+
+        marker =
+          if is_binary(cycle_release_correlation),
+            do: {:cycle_release, cycle_release_correlation},
+            else: restoration_turn_seq
+
+        count + redeliver_health_source_in_txn(txn, source, marker)
       end)
     else
       0
@@ -3160,7 +3443,7 @@ defmodule Tightbeam.Wakes do
       """
       SELECT DISTINCT a.idempotencyKey,a.sessionKey,a.sourceMessageId,a.sourceTurnSeq,
              a.sourceWakeId,a.origin,a.prompt,a.roleRef,a.roleFallback,a.assignmentId,
-             a.jobRef,a.requestRef
+             a.jobRef,a.requestRef,a.cycleReleaseCorrelation
       FROM harness_health_observations observation
       JOIN turns observed
         ON observation.correlationId =
@@ -3174,6 +3457,8 @@ defmodule Tightbeam.Wakes do
         AND observed.messageId IS NOT NULL
         AND a.failureClass=?2
         AND a.redeliveryTurnSeq IS NULL
+        AND a.cycleReleaseCorrelation IS NULL
+        AND a.cycleReleaseTurnSeq IS NULL
         AND a.parentSessionKey IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM wake_retry_attempts retry
@@ -3204,10 +3489,14 @@ defmodule Tightbeam.Wakes do
            role_fallback,
            assignment_id,
            job_ref,
-           request_ref
+           request_ref,
+           cycle_release_correlation
          ],
-         restoration_turn_seq
-       ) do
+         marker
+       )
+       when (is_integer(marker) and is_nil(cycle_release_correlation)) or
+              (is_tuple(marker) and tuple_size(marker) == 2 and elem(marker, 0) == :cycle_release and
+                 is_binary(elem(marker, 1)) and elem(marker, 1) == cycle_release_correlation) do
     if Ledger.enqueueable_in_txn?(txn, session_key) do
       case Ledger.enqueue_in_txn(txn, %{
              session_key: session_key,
@@ -3221,14 +3510,12 @@ defmodule Tightbeam.Wakes do
              request_ref: request_ref
            }) do
         {:ok, redelivery_turn_seq} ->
-          Txn.q(
+          mark_health_redelivery_enqueued_in_txn(
             txn,
-            """
-            UPDATE health_redelivery_attempts
-            SET restorationTurnSeq=?2,redeliveryTurnSeq=?3
-            WHERE idempotencyKey=?1 AND redeliveryTurnSeq IS NULL
-            """,
-            [idempotency_key, restoration_turn_seq, redelivery_turn_seq]
+            idempotency_key,
+            marker,
+            cycle_release_correlation,
+            redelivery_turn_seq
           )
 
           if Txn.changes(txn) != 1,
@@ -3243,6 +3530,47 @@ defmodule Tightbeam.Wakes do
     else
       0
     end
+  end
+
+  defp mark_health_redelivery_enqueued_in_txn(
+         txn,
+         idempotency_key,
+         {:cycle_release, correlation},
+         cycle_release_correlation,
+         redelivery_turn_seq
+       )
+       when is_binary(correlation) and correlation == cycle_release_correlation do
+    Txn.q(
+      txn,
+      """
+      UPDATE health_redelivery_attempts
+      SET cycleReleaseTurnSeq=?2
+      WHERE idempotencyKey=?1 AND cycleReleaseCorrelation=?3
+        AND restorationTurnSeq IS NULL AND redeliveryTurnSeq IS NULL
+        AND cycleReleaseTurnSeq IS NULL
+      """,
+      [idempotency_key, redelivery_turn_seq, correlation]
+    )
+  end
+
+  defp mark_health_redelivery_enqueued_in_txn(
+         txn,
+         idempotency_key,
+         restoration_turn_seq,
+         cycle_release_correlation,
+         redelivery_turn_seq
+       )
+       when is_integer(restoration_turn_seq) and is_nil(cycle_release_correlation) do
+    Txn.q(
+      txn,
+      """
+      UPDATE health_redelivery_attempts
+      SET restorationTurnSeq=?2,redeliveryTurnSeq=?3
+      WHERE idempotencyKey=?1 AND redeliveryTurnSeq IS NULL
+        AND cycleReleaseCorrelation IS NULL AND cycleReleaseTurnSeq IS NULL
+      """,
+      [idempotency_key, restoration_turn_seq, redelivery_turn_seq]
+    )
   end
 
   defp health_redelivery_key(session_key, source_turn_seq) do
@@ -4095,7 +4423,19 @@ defmodule Tightbeam.Wakes do
         cancellation_reference(command, canceled_at)
       )
 
-      commit_cancellation(txn, wake, cancellation)
+      result = commit_cancellation(txn, wake, cancellation)
+
+      if result != false do
+        Tightbeam.HarnessRecoveryNotice.settle_wake_cancellation_in_txn(
+          txn,
+          wake.wake_id,
+          %{"kind" => cancellation.requester_kind, "id" => cancellation.requester_id},
+          cancellation.reason_kind,
+          canceled_at
+        )
+      end
+
+      result
     else
       _ -> false
     end

@@ -627,6 +627,11 @@ defmodule Tightbeam.Org do
     end
 
     publish_session_in_txn(txn, "session.spawned", session)
+
+    if session.kind == "main" do
+      Tightbeam.HarnessRecoveryNotice.retry_owner_in_txn(txn, owner_user_id, now)
+    end
+
     session
   end
 

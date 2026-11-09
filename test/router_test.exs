@@ -3790,6 +3790,21 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "direct process ownership is data and actor provenance stays in events", ctx do
+    law = load_terminal_reactions!(ctx)
+
+    File.cp!(
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
+      ]),
+      Path.join(law, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
+    Tightbeam.Rules.load!(
+      law,
+      Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir}) |> Map.keys()
+    )
+
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
     holder = create_session(ctx.db, "process-task-holder", "flynn")
     create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
@@ -4048,6 +4063,7 @@ defmodule Tightbeam.Wire.RouterTest do
     @personal_session personal_session?
     test "itemless process assignment uses explicit notice owner, personal session=#{@personal_session}",
          ctx do
+      load_terminal_reactions!(ctx)
       ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
       holder = create_session(ctx.db, "itemless-process-holder", "mike")
       personal = Org.personal_session_key("flynn")
@@ -5140,5 +5156,10 @@ defmodule Tightbeam.Wire.RouterTest do
           if(key == Org.personal_session_key(owner), do: "main", else: "custom")
         )
     })
+  end
+
+  defp load_terminal_reactions!(ctx) do
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    Tightbeam.TerminalReactionFixture.load!(ctx.base_dir, Map.keys(handlers))
   end
 end

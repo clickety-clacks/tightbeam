@@ -64,7 +64,6 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{linkedActorRef: nil},
       %{linkReason: " "},
       %{unlinkedAt: 20},
-      ended_membership(%{unlinkedActorKind: "process"}),
       ended_membership(%{unlinkedAt: "later"}),
       ended_membership(%{unlinkedAt: 9})
     ]
@@ -76,6 +75,15 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(membership_row("tlm_invalid", "tl_one", "wi_one", "flynn"), overrides)
       )
     end)
+
+    insert!(
+      db,
+      "topline_work_memberships",
+      membership_row("tlm_process", "tl_one", "wi_one", "flynn")
+      |> Map.merge(
+        ended_membership(%{unlinkedActorKind: "process", unlinkedActorRef: "tightbeam"})
+      )
+    )
   end
 
   test "AC67 rejects invalid Concern actors, time, and titles", %{db: db} do
@@ -130,16 +138,9 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{cause: "other"},
       %{state: "other"},
       %{openedActorRef: nil},
-      %{openedActorKind: "process", openedActorRef: "tightbeam"},
       %{
         cause: "migration",
         causeRef: "migration",
-        openedActorKind: "process",
-        openedActorRef: "other"
-      },
-      %{
-        cause: "reopened",
-        sourceCausalEventSeq: 100,
         openedActorKind: "process",
         openedActorRef: "other"
       },
@@ -147,15 +148,6 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{promptWakeId: " "},
       %{resolutionReason: "done"},
       resolved_placement("left_unlinked", %{resolutionReason: nil}),
-      resolved_placement("linked", %{
-        resolutionActorKind: "process",
-        resolutionActorRef: "tightbeam"
-      }),
-      resolved_placement("work_terminal", %{
-        resolutionActorKind: "process",
-        resolutionActorRef: "tightbeam",
-        resolutionReason: "work_item_closed"
-      }),
       resolved_placement("work_terminal", %{
         resolutionReason: "reupgrade_terminal_reconciliation_closed"
       }),
@@ -201,6 +193,58 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(placement_row("tlp_invalid"), overrides)
       )
     end)
+
+    insert!(
+      db,
+      "topline_placement_obligations",
+      placement_row("tlp_process")
+      |> Map.merge(%{openedActorKind: "process", openedActorRef: "tightbeam"})
+      |> Map.merge(resolved_placement("linked", %{}))
+    )
+
+    insert!(
+      db,
+      "topline_placement_obligations",
+      placement_row("tlp_resolved_process")
+      |> Map.merge(
+        resolved_placement("linked", %{
+          resolutionActorKind: "process",
+          resolutionActorRef: "tightbeam"
+        })
+      )
+    )
+
+    # The published schema also admits this exact work-terminal process tuple.
+    insert!(
+      db,
+      "topline_placement_obligations",
+      placement_row("tlp_terminal_process")
+      |> Map.merge(
+        resolved_placement("work_terminal", %{
+          resolutionActorKind: "process",
+          resolutionActorRef: "tightbeam",
+          resolutionReason: "work_item_closed"
+        })
+      )
+    )
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO causal_events (seq, at, jobRef, kind, detail) VALUES (102, 10, 'wi_one', 'disposition_transition', '{}')"
+      )
+
+    insert!(
+      db,
+      "topline_placement_obligations",
+      placement_row("tlp_reopened_process_other")
+      |> Map.merge(%{
+        cause: "reopened",
+        sourceCausalEventSeq: 102,
+        openedActorKind: "process",
+        openedActorRef: "other"
+      })
+    )
 
     insert!(
       db,
@@ -268,7 +312,6 @@ defmodule Tightbeam.ToplinesRailsTest do
     invalid = [
       %{kind: "other"},
       %{actorRef: nil},
-      %{actorKind: "process"},
       %{seq: "one"},
       %{seq: 0},
       %{eventAt: "now"},
@@ -286,6 +329,8 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(event_row("tl_one"), overrides)
       )
     end)
+
+    insert!(db, "topline_events", %{event_row("tl_one") | actorKind: "process"})
   end
 
   test "AC71 rejects both possible owner values for a cross-owner membership", %{db: db} do
@@ -484,7 +529,7 @@ defmodule Tightbeam.ToplinesRailsTest do
   end
 
   defp assert_rejected(db, table, row) do
-    assert {:error, %DB.Error{}} = insert(db, table, row),
+    assert match?({:error, %DB.Error{}}, insert(db, table, row)),
            "expected direct SQL rejection for #{table}: #{inspect(row)}"
   end
 

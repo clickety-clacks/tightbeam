@@ -65,7 +65,7 @@ defmodule Tightbeam.IdentityTest do
     refute_receive {:firehose_notice, _}
   end
 
-  test "neutral seed creates the exact three refs and only the two seed files", ctx do
+  test "neutral seed creates the exact three refs and all seed files", ctx do
     assert :initialized = Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")
     refs = git!(dir, ["branch", "--format=%(refname:short)"])
@@ -78,7 +78,12 @@ defmodule Tightbeam.IdentityTest do
 
     assert git!(dir, ["ls-tree", "-r", "--name-only", "main"])
            |> String.split("\n", trim: true) ==
-             ["archetypes/default.toml", "guidance/operating-model.md"]
+             [
+               "archetypes/default.toml",
+               "guidance/operating-model.md",
+               "rules/harness-health-recovery.toml",
+               "rules/harness-recovery-main-wake.toml"
+             ]
 
     snapshot = Identity.snapshot!(ctx.base, "default", :codex)
     assert snapshot.skills == %{}
@@ -100,6 +105,20 @@ defmodule Tightbeam.IdentityTest do
                  "I want to know a change was actually tested, not just claimed."
                ],
                root_archetype: "orchestrator"
+             },
+             %{
+               name: "harklight-decision-briefings",
+               purpose:
+                 "Route decision requests through a configurable investigator, preserve its Harklight conversation, and reconcile staged catchup without duplicate briefings.",
+               phrases: [],
+               root_archetype: "orchestrator"
+             },
+             %{
+               name: "sentinels",
+               purpose:
+                 "Share generic event subscription tools and a read-only Matrix event watcher.",
+               phrases: [],
+               root_archetype: "default"
              }
            ]
   end
@@ -183,7 +202,8 @@ defmodule Tightbeam.IdentityTest do
     purpose = "Help a team ship dependable work."
     """)
 
-    assert [%{phrases: []}] = Identity.available_bundles()
+    assert %{phrases: []} =
+             Enum.find(Identity.available_bundles(), &(&1.name == "agentic-engineering"))
   end
 
   test "a manifest with invalid phrases is refused before identity mutation", ctx do
@@ -609,6 +629,8 @@ defmodule Tightbeam.IdentityTest do
        ctx do
     alias Tightbeam.{DB, Gateway, Rails, RailScript, Schema}
 
+    db = start_supervised!({DB, path: ":memory:", name: DB})
+
     # Rail containment requires canonical write roots, including macOS /var aliases.
     {root, 0} = System.cmd("/bin/realpath", [ctx.root])
     ctx = %{ctx | base: Path.join(String.trim(root), "runtime")}
@@ -670,7 +692,6 @@ defmodule Tightbeam.IdentityTest do
     assert File.read!(Path.join(dir, ".git/MERGE_HEAD")) == merge
     assert Identity.live_revision!(ctx.base) == live
 
-    db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = Schema.ensure_all(db)
     File.mkdir_p!(Path.join(ctx.base, "bin"))
     File.cp!(Path.expand("cli/target/release/tightbeam"), Path.join(ctx.base, "bin/tightbeam"))
@@ -689,7 +710,8 @@ defmodule Tightbeam.IdentityTest do
 
   test "recovery keeps invalid published law closed and preserves the merge",
        ctx do
-    alias Tightbeam.Gateway
+    alias Tightbeam.{DB, Gateway}
+    _db = start_supervised!({DB, path: ":memory:", name: DB})
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
     File.mkdir_p!(Path.join(dir, "rules"))

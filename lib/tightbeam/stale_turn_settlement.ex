@@ -321,6 +321,7 @@ defmodule Tightbeam.StaleTurnSettlement do
 
       if Txn.changes(txn) == 1 do
         if transition, do: DB.record_row_commit(txn, transition)
+        Tightbeam.HarnessRecoveryNotice.settle_turn_in_txn(txn, request.turn_seq, status, now)
 
         TurnLifecycle.append_in_txn(txn, request.turn_seq, %{
           event_key: "terminal:committed",

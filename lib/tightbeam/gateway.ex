@@ -235,6 +235,8 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:db, db)
       |> handlers()
 
+    :ok = Tightbeam.FilingRemedy.install_handlers(db, handler_table)
+
     runner = turn_runner(Map.put(config, :db, db))
 
     # Identity is loaded at composition time; a malformed manifest fails the
@@ -366,6 +368,11 @@ defmodule Tightbeam.Gateway do
           terminal_publisher: terminal_publisher(db),
           on_terminal: on_terminal,
           name: Tightbeam.LaneManager},
+         {Tightbeam.HarnessHealth.RecoveryScheduler,
+          db: db,
+          base_dir: config.base_dir,
+          task_sup: Tightbeam.TurnTaskSupervisor,
+          name: Tightbeam.HarnessHealth.RecoveryScheduler},
          {Tightbeam.SentinelSupervisor,
           db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
          Tightbeam.ListenerLifecycle.listener_spec(
@@ -951,6 +958,9 @@ defmodule Tightbeam.Gateway do
         Tightbeam.HarklightFollows.follow(db, call,
           runner: Map.get(config, :harklight_send_runner)
         )
+      end,
+      {"harklight-briefings-catchup", []} => fn call ->
+        Tightbeam.HarklightBriefings.catchup(db, call, authorized: admin_caller?(db, call))
       end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
@@ -1547,6 +1557,7 @@ defmodule Tightbeam.Gateway do
       {"dispatch",
        [
          "assignment.opened",
+         "work_item.updated",
          "message.created",
          "wake.scheduled",
          "wake.canceled",
@@ -2667,6 +2678,8 @@ defmodule Tightbeam.Gateway do
               source_id,
               seq
             ])
+
+            Tightbeam.HarnessRecoveryNotice.sync_attempt_turn_in_txn(txn, source_id)
           end)
         end
 
@@ -3486,7 +3499,7 @@ defmodule Tightbeam.Gateway do
             message,
             attachment,
             index,
-            covered_inline_harness?(harness)
+            Harness.inline_attachments?(harness)
           )
         end)
       end)
@@ -3610,8 +3623,6 @@ defmodule Tightbeam.Gateway do
       Enum.map_join(blocks, "\n\n", & &1.text)
     end
   end
-
-  defp covered_inline_harness?(harness), do: harness in [:claude, :codex, "claude", "codex"]
 
   defp turn_runner(config) do
     db = Map.get(config, :db, Tightbeam.DB)
@@ -7276,7 +7287,6 @@ defmodule Tightbeam.Gateway do
              :condition_kind,
              :predicate,
              :after_turn,
-             :assignment_id,
              :replace_queued
            ],
            &is_nil(p[&1])
@@ -7404,10 +7414,12 @@ defmodule Tightbeam.Gateway do
     p = call.params
     assignment_id = wake_assignment_id_in_txn(txn, call)
 
-    # A no-trigger assignment on a conversational wake is a reference only.
-    # Keep it on the wake, but do not count the notification as holder activity.
+    # Immediate assignment pointers and recurring crons are references, not holder work.
+    # Keep the assignment on each wake without counting its creation as activity.
     activity_assignment_id =
-      if immediate_assignment_pointer_request?(p), do: nil, else: assignment_id
+      if immediate_assignment_pointer_request?(p) or is_binary(p[:cron]),
+        do: nil,
+        else: assignment_id
 
     wake =
       Wakes.schedule_in_txn(txn, %{
@@ -7504,7 +7516,7 @@ defmodule Tightbeam.Gateway do
 
   defp scheduled_wake_assignment_id(params) do
     if is_number(params[:after_ms]) or is_number(params[:at]) or
-         is_binary(params[:condition_kind]),
+         is_binary(params[:condition_kind]) or is_binary(params[:cron]),
        do: params[:assignment_id],
        else: nil
   end

@@ -1,0 +1,12 @@
+[[reaction]]
+name = "harness-health-recovery"
+family = "harness-health-recovery"
+settings = { eligible_failure_classes = ["rate-limit-dead"], interval_ms = 3600000, timeout_ms = 120000, start = "schedule_one_cycle_for_eligible_open_hold", withdraw = "withdraw_resolved_or_ineligible_cycle_at_delivery", reschedule = "move_the_single_pending_cycle_in_place", release = "resolve_only_after_all_constituent_routes_succeed" }
+english = """
+Trigger: a harness-health hold opens or resolves, a scheduled cycle becomes due, or cycle results are recorded.
+Conditions: the hold is open and its failure class is listed above; the seeded list contains rate-limit-dead only.
+Effect and recipient: schedule or withdraw the hold's one check cycle, and release only after every constituent route succeeds in the same cycle; no agent or user is notified.
+Timing, repetition, and stop: the first cycle is due one interval (one hour by default) after opening; later cycles are due one interval after the previous cycle started; resolved or ineligible holds stop, and missed intervals are not caught up.
+Owning bundle: substrate base seed.
+Intentional change: an eligible availability hold can be reassessed without waiting for a human repair resume.
+"""

@@ -657,8 +657,15 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: "new",
+          message_type: "request",
+          message_kind: "blocker",
+          importance: "high",
+          stake: "A one-week delay",
+          by_when: "2026-11-02T17:00:00Z",
+          reply: true,
           sender_id: "sender",
           title: "Question",
+          choices: ["Approve", "Defer"],
           files: ["/tmp/request.txt"]
         }
     }
@@ -669,6 +676,20 @@ defmodule Tightbeam.HarklightWakesTest do
       cond do
         Enum.take(args, 2) == ["send", "--prepare"] ->
           assert "--controller" in args
+          assert "--reply" in args
+
+          for pair <- [
+                ["--type", "request"],
+                ["--kind", "blocker"],
+                ["--importance", "high"],
+                ["--stake", "A one-week delay"],
+                ["--by-when", "2026-11-02T17:00:00Z"],
+                ["--choice", "Approve"],
+                ["--choice", "Defer"]
+              ] do
+            assert pair in Enum.chunk_every(args, 2, 1, :discard)
+          end
+
           assert Enum.take(args, -2) == ["--file", "/tmp/request.txt"]
 
           assert {:ok, [[0]]} =
@@ -726,7 +747,13 @@ defmodule Tightbeam.HarklightWakesTest do
       end
     end
 
-    assert %{state: "registered", session_key: session, op_id: op_id} =
+    assert %{
+             state: "registered",
+             session_key: session,
+             op_id: op_id,
+             message_type: "request",
+             message_type_label: "Request"
+           } =
              HarklightSend.send_request(db, send_call, runner: runner)
 
     assert session == call.session_key
@@ -739,6 +766,141 @@ defmodule Tightbeam.HarklightWakesTest do
              )
   end
 
+  test "typed send refusals explain a fix before preparing an operation", %{db: db, call: call} do
+    assert {:ok, [[existing_operations]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_send_operations")
+
+    valid = %{
+      harklight_session: "new",
+      sender_id: "sender",
+      title: "Question",
+      message_type: "request",
+      reply: true
+    }
+
+    cases = [
+      {Map.delete(valid, :message_type), "harklight_type_required", "--type is required"},
+      {Map.put(valid, :message_type, "notice"), "harklight_type_invalid", "fyi or request"},
+      {
+        Map.merge(valid, %{message_type: "fyi", reply: false, choices: ["Ship"]}),
+        "harklight_fyi_has_answer_controls",
+        "remove --choices-json and --reply"
+      },
+      {
+        Map.merge(valid, %{message_type: "fyi", reply: true}),
+        "harklight_fyi_has_answer_controls",
+        "remove --choices-json and --reply"
+      },
+      {Map.put(valid, :reply, false), "harklight_request_needs_answer_controls", "--reply"},
+      {Map.put(valid, :message_kind, "update"), "harklight_kind_invalid", "blocker or success"},
+      {
+        Map.put(valid, :importance, "urgent"),
+        "harklight_importance_invalid",
+        "low, normal, high, now"
+      },
+      {Map.put(valid, :stake, "  "), "harklight_stake_invalid", "non-empty text"},
+      {Map.put(valid, :by_when, "tomorrow"), "harklight_by_when_invalid", "RFC 3339"}
+    ]
+
+    for {params, code, fix} <- cases do
+      result =
+        HarklightSend.send_request(db, %{call | params: params},
+          runner: fn _args -> flunk("invalid message reached the Agent CLI") end
+        )
+
+      assert %{outcome: "failed", code: ^code, reason: reason} = result
+      assert reason =~ fix
+    end
+
+    assert {:ok, [[^existing_operations]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_send_operations")
+  end
+
+  test "FYI send forwards Seen-only type through the authenticated origin route", %{
+    db: db,
+    call: call
+  } do
+    handle = "b6a87513-b91d-4314-849a-cb8d80225864"
+    message_id = "seen-notice"
+
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: "new",
+          message_type: "fyi",
+          reply: false,
+          sender_id: "sender",
+          title: "Build finished",
+          body: "The export is ready."
+        }
+    }
+
+    runner = fn args ->
+      op_id = if "--prepare" in args, do: Enum.at(args, 3), else: List.last(args)
+
+      case Enum.take(args, 2) do
+        ["send", "--prepare"] ->
+          assert ["--type", "fyi"] in Enum.chunk_every(args, 2, 1, :discard)
+          refute "--reply" in args
+          refute "--choice" in args
+          assert "--controller" in args
+
+          {JSON.encode!(%{
+             kind: "prepared",
+             op_id: op_id,
+             files: [],
+             request: %{
+               type: "send",
+               op_id: op_id,
+               session_handle: handle,
+               route: "other",
+               message: %{
+                 sender_id: "sender",
+                 message_id: message_id,
+                 title: "Build finished",
+                 body: "The export is ready."
+               }
+             }
+           }) <> "\n", 0}
+
+        ["send", "--execute"] ->
+          assert {:ok, [[session, payload]]} =
+                   DB.query(
+                     db,
+                     "SELECT sessionKey,payload FROM harklight_send_operations WHERE opId=?1",
+                     [op_id]
+                   )
+
+          assert session == call.session_key
+          assert JSON.decode!(payload)["request"]["session_handle"] == handle
+          assert JSON.decode!(payload)["request"]["message"]["message_id"] == message_id
+
+          {JSON.encode!(%{
+             kind: "committed",
+             operation: "send",
+             op_id: op_id,
+             response: %{
+               session_handle: handle,
+               sender_id: "sender",
+               message_id: message_id,
+               revision: 1
+             }
+           }) <> "\n", 0}
+      end
+    end
+
+    assert %{
+             state: "registered",
+             session_key: session,
+             handle: ^handle,
+             message_id: ^message_id,
+             message_type: "fyi",
+             message_type_label: "FYI"
+           } = HarklightSend.send_request(db, send_call, runner: runner)
+
+    assert session == call.session_key
+  end
+
   test "uncertain result stays unregistered and same-operation retry can bind it", %{
     db: db,
     call: call
@@ -747,7 +909,13 @@ defmodule Tightbeam.HarklightWakesTest do
 
     send_call = %{
       call
-      | params: %{harklight_session: "new", sender_id: "sender", title: "Question"}
+      | params: %{
+          harklight_session: "new",
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Question"
+        }
     }
 
     parent = self()
@@ -831,7 +999,13 @@ defmodule Tightbeam.HarklightWakesTest do
 
     send_call = %{
       call
-      | params: %{harklight_session: "new", sender_id: "sender", title: "Question"}
+      | params: %{
+          harklight_session: "new",
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Question"
+        }
     }
 
     parent = self()
@@ -909,7 +1083,13 @@ defmodule Tightbeam.HarklightWakesTest do
   } do
     send_call = %{
       call
-      | params: %{harklight_session: "new", sender_id: "sender", title: "Question"}
+      | params: %{
+          harklight_session: "new",
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Question"
+        }
     }
 
     claimed_origin = %{
@@ -1477,10 +1657,11 @@ defmodule Tightbeam.HarklightWakesTest do
     assert_receive :listener_failed
     origin_key = session.session_key
 
-    assert {:ok, [["unavailable", "listener_stopped"]]} =
+    assert eventually(fn ->
              DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
                @handle
-             ])
+             ]) == {:ok, [["unavailable", "listener_stopped"]]}
+           end)
 
     assert {:ok, [[^origin_key, prompt]]} =
              DB.query(
@@ -1605,6 +1786,167 @@ defmodule Tightbeam.HarklightWakesTest do
     assert prompt =~ "Replies on this thread will not reach"
   end
 
+  test "startup re-arms restart-stopped listeners after a brief origin outage", %{
+    db: db,
+    session: session
+  } do
+    stopped = @handle
+    listen_failure = Tightbeam.Id.uuid4()
+    attach_unknown = Tightbeam.Id.uuid4()
+
+    seed_completion_handle(db, session.session_key, listen_failure, "restart-listen-failure")
+    seed_completion_handle(db, session.session_key, attach_unknown, "restart-attach-unknown")
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable',lastError='listener_stopped' WHERE handle IN (?1,?2,?3)",
+               [stopped, listen_failure, attach_unknown]
+             )
+
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        "harklight-restart-rearm-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(directory)
+    executable = Path.join(directory, "harklight-agent")
+    calls = Path.join(directory, "calls")
+
+    File.write!(
+      executable,
+      """
+      #!/bin/sh
+      root='#{directory}'
+      if [ "$1" = status ]; then exit 1; fi
+      printf '%s\\n' "$*" >> "$root/calls"
+
+      session=""
+      previous=""
+      for argument in "$@"; do
+        if [ "$previous" = --session ]; then
+          session="$argument"
+          break
+        fi
+        previous="$argument"
+      done
+
+      case "$1" in
+        attach)
+          if [ -e "$root/origin-ready" ]; then
+            printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+            exit 0
+          fi
+
+          case "$session" in
+            '#{stopped}'|'#{listen_failure}')
+              printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+              exit 0
+              ;;
+            '#{attach_unknown}')
+              printf '%s\\n' '{"kind":"outcome_unknown","op_id":"restart-op"}'
+              exit 7
+              ;;
+          esac
+          exit 99
+          ;;
+        retry)
+          touch "$root/failed-#{attach_unknown}"
+          printf '%s\\n' '{"kind":"outcome_unknown","op_id":"restart-op"}'
+          printf '%s\\n' 'origin request failed: temporary origin outage' >&2
+          exit 7
+          ;;
+        listen)
+          if [ ! -e "$root/origin-ready" ]; then
+            case "$session" in
+              '#{stopped}')
+                touch "$root/failed-#{stopped}"
+                exit 143
+                ;;
+              '#{listen_failure}')
+                touch "$root/failed-#{listen_failure}"
+                printf '%s\\n' 'origin request failed: temporary origin outage' >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          touch "$root/listening-$session"
+          exec sleep 300
+          ;;
+        session)
+          exit 0
+          ;;
+      esac
+      exit 0
+      """
+    )
+
+    File.chmod!(executable, 0o755)
+    previous_path = System.get_env("PATH")
+    System.put_env("PATH", Enum.join([directory, previous_path] |> Enum.reject(&is_nil/1), ":"))
+
+    on_exit(fn ->
+      if is_nil(previous_path),
+        do: System.delete_env("PATH"),
+        else: System.put_env("PATH", previous_path)
+
+      File.rm_rf!(directory)
+    end)
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, retry_delays: [3_000, 3_000], attach_retry_delays: []}
+      )
+
+    failed = [stopped, listen_failure, attach_unknown]
+    failed_markers = Enum.map(failed, &Path.join(directory, "failed-#{&1}"))
+
+    assert eventually(fn -> Enum.all?(failed_markers, &File.exists?/1) end)
+    assert eventually(fn -> map_size(:sys.get_state(manager).retry_timers) == 3 end)
+
+    File.write!(Path.join(directory, "origin-ready"), "reconnected")
+
+    assert eventually(
+             fn ->
+               Enum.all?(failed, &File.exists?(Path.join(directory, "listening-#{&1}"))) and
+                 map_size(:sys.get_state(manager).ports) == 3
+             end,
+             700
+           )
+
+    assert Process.alive?(manager)
+
+    assert {:ok, [[3]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_wake_handles WHERE state='active' AND lastError IS NULL"
+             )
+
+    call_log = File.read!(calls) |> String.split("\n", trim: true)
+
+    for handle <- [stopped, listen_failure, attach_unknown] do
+      assert Enum.count(call_log, &String.starts_with?(&1, "attach --session #{handle} ")) == 2
+    end
+
+    for handle <- [stopped, listen_failure] do
+      assert Enum.count(
+               call_log,
+               &String.starts_with?(&1, "listen --follow --controller --session #{handle} ")
+             ) == 2
+    end
+
+    assert Enum.count(call_log, &(&1 == "retry --op-id restart-op")) == 1
+
+    assert Enum.count(
+             call_log,
+             &String.starts_with?(&1, "listen --follow --controller --session #{attach_unknown} ")
+           ) == 1
+
+    refute Enum.any?(call_log, &String.starts_with?(&1, "session end "))
+  end
+
   test "startup records an ineligible origin without launching a listener", %{
     db: db,
     session: session
@@ -1615,8 +1957,10 @@ defmodule Tightbeam.HarklightWakesTest do
     start_supervised!({HarklightWakes, db: db, listener: listener})
     :sys.get_state(HarklightWakes)
 
-    assert {:ok, [["unavailable", "origin_unavailable"]]} =
-             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+    assert eventually(fn ->
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles") ==
+               {:ok, [["unavailable", "origin_unavailable"]]}
+           end)
 
     refute_receive :unexpected_listener
   end
@@ -1642,14 +1986,15 @@ defmodule Tightbeam.HarklightWakesTest do
            {2,
             ~s({"kind":"refused","reason_source":"server","reason_code":"forbidden","reason":"The server refused this origin's access."})}
          ], ["attach"], false},
-        {"unknown nontransport does not gain retries",
+        {"unclassified outcome_unknown keeps bounded recovery after same-operation retry",
          [
            {7,
             ~s({"kind":"outcome_unknown","op_id":"saved-op","reason_source":"agent","reason_code":"invalid_response"})},
            {7,
             ~s({"kind":"outcome_unknown","op_id":"saved-op"}) <>
-              "\norigin response was not a valid v1 JSON envelope: synthetic"}
-         ], ["attach", "retry --op-id saved-op"], false},
+              "\norigin response was not a valid v1 JSON envelope: synthetic"},
+           {0, ~s({"kind":"attached","ready_for_listen":true})}
+         ], ["attach", "retry --op-id saved-op", "attach"], true},
         {"transport retry exhausts its finite budget",
          List.duplicate(
            {2,
@@ -1660,20 +2005,24 @@ defmodule Tightbeam.HarklightWakesTest do
     @retry_responses responses
     @retry_calls expected_calls
     @retry_recovered recovered
+    @retry_label label
     test "bounded attachment retry: #{label}", %{db: db, session: session} do
       calls = attachment_sequence(@retry_responses)
-      # No listener retry, so a failed worker goes straight to gone and only
-      # the attachment window is exercised.
-      start_supervised!({HarklightWakes, db: db, attach_retry_delays: [20, 40], retry_delays: []})
+
+      retry_delays =
+        if @retry_label == "transport retry exhausts its finite budget",
+          do: [],
+          else: [10, 20]
+
+      start_supervised!(
+        {HarklightWakes, db: db, attach_retry_delays: [20, 40], retry_delays: retry_delays}
+      )
 
       if @retry_recovered do
         await_listener_port()
 
         assert {:ok, [["active", nil]]} =
                  DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
-
-        assert {:ok, []} =
-                 DB.query(db, "SELECT wakeId FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'")
       else
         await_handle_error(db, "attachment_")
         origin = session.session_key
@@ -1689,7 +2038,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
       expected = if @retry_recovered, do: @retry_calls, else: @retry_calls ++ ["session"]
       assert eventually(fn -> File.read!(calls) |> String.split("\n", trim: true) == expected end)
-      # Beyond both configured delays, a terminal refusal cannot restart itself.
+      # Beyond both configured delays, no additional call exceeds the retry budget.
       Process.sleep(100)
       assert File.read!(calls) |> String.split("\n", trim: true) == expected
     end
@@ -1764,6 +2113,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.write!(Path.join(root, "harklight-agent"), """
     #!/bin/sh
+    if [ "$1" = status ]; then exit 1; fi
     if [ "$1" = listen ]; then exec sleep 300; fi
     printf 'start\\n' >> '#{events}'
     sleep 0.2
@@ -1822,6 +2172,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.write!(Path.join(root, "harklight-agent"), """
     #!/bin/sh
+    if [ "$1" = status ]; then exit 1; fi
     root='#{root}'
     if [ "$1" = listen ]; then exec sleep 300; fi
     if [ "$1" = session ]; then printf 'session\n' >> "$root/calls"; exit 0; fi
@@ -1864,6 +2215,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.write!(script, """
     #!/bin/sh
+    if [ "$1" = status ]; then exit 1; fi
     printf '%s\\n' "$*" >> "$0.calls"
     if [ "$1" = attach ]; then
       printf '%s\n' '{"kind":"attached","ready_for_listen":true}'
@@ -2844,6 +3196,176 @@ defmodule Tightbeam.HarklightWakesTest do
     refute output =~ "session end"
   end
 
+  test "a running-origin outage reattaches within its budget without a blocker or replay", %{
+    db: db,
+    session: session
+  } do
+    calls = Path.join(System.tmp_dir!(), "running-outage-#{System.unique_integer([:positive])}")
+    attach_count = calls <> ".attach"
+    listen_count = calls <> ".listen"
+    release = calls <> ".release"
+    File.write!(calls, "")
+
+    on_exit(fn ->
+      Enum.each([calls, attach_count, listen_count, release], &File.rm/1)
+    end)
+
+    handled = event(1, "discussion", "captured before the outage")
+    in_gap = event(2, "discussion", "received during the outage")
+
+    fake_harklight_agent!("""
+    printf '%s\\n' "$*" >> '#{calls}'
+    if [ "$1" = attach ]; then
+      if [ -f '#{attach_count}' ]; then attach_attempt=$(cat '#{attach_count}'); else attach_attempt=0; fi
+      attach_attempt=$((attach_attempt + 1))
+      printf '%s\\n' "$attach_attempt" > '#{attach_count}'
+      if [ "$attach_attempt" = 1 ] || [ "$attach_attempt" = 3 ]; then
+        printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+        exit 0
+      fi
+      printf '%s\\n' '{"kind":"connection_error","reason_code":"transport_error","reason":"origin request failed: simulated outage"}'
+      exit 1
+    fi
+    if [ "$1" = listen ]; then
+      if [ -f '#{listen_count}' ]; then listen_attempt=$(cat '#{listen_count}'); else listen_attempt=0; fi
+      listen_attempt=$((listen_attempt + 1))
+      printf '%s\\n' "$listen_attempt" > '#{listen_count}'
+      if [ "$listen_attempt" = 1 ]; then
+        printf '%s\\n' '#{handled}'
+        printf '%s\\n' '{"kind":"connection_error","reason_code":"transport_error","reason":"origin request failed: simulated outage"}'
+        exit 1
+      fi
+      printf '%s\\n' '#{handled}'
+      printf '%s\\n' '#{in_gap}'
+      printf '%s\\n' '#{in_gap}'
+      while [ ! -e '#{release}' ]; do sleep 0.01; done
+      exit 0
+    fi
+    exit 2
+    """)
+
+    start_supervised!({HarklightWakes, db: db, attach_retry_delays: [], retry_delays: [10, 20]})
+
+    assert eventually(fn ->
+             match?(
+               {:ok, [[_wake_id]]},
+               DB.query(db, "SELECT wakeId FROM harklight_wake_entries WHERE eventId='1'")
+             )
+           end)
+
+    assert {:ok, [[handled_wake]]} =
+             DB.query(db, "SELECT wakeId FROM harklight_wake_entries WHERE eventId='1'")
+
+    turn = deliver_discussion_turn!(db, handled_wake, session.session_key)
+    assert turn.prompt =~ "captured before the outage"
+
+    assert eventually(fn ->
+             match?(
+               {:ok, [[_wake_id]]},
+               DB.query(db, "SELECT wakeId FROM harklight_wake_entries WHERE eventId='2'")
+             ) and
+               match?(
+                 {:ok, [["active", nil]]},
+                 DB.query(
+                   db,
+                   "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1",
+                   [@handle]
+                 )
+               )
+           end)
+
+    assert {:ok, [["1", 1], ["2", 1]]} =
+             DB.query(
+               db,
+               "SELECT eventId,count(*) FROM harklight_wake_entries GROUP BY eventId ORDER BY eventId"
+             )
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE ?1",
+               ["w_harklight_" <> @handle <> "_%"]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
+               "w_harklight_notice_recovery_" <> @handle
+             ])
+
+    commands = File.read!(calls) |> String.split("\n", trim: true)
+    assert Enum.count(commands, &String.starts_with?(&1, "attach --session #{@handle}")) == 3
+    assert Enum.count(commands, &String.starts_with?(&1, "listen --follow --controller")) == 2
+    refute Enum.any?(commands, &String.starts_with?(&1, "session end "))
+  end
+
+  test "a retryable running-gateway failure notifies only after bounded recovery is exhausted",
+       %{db: db} do
+    gone_calls = fake_harklight_session_end_agent!()
+    parent = self()
+    failures = :atomics.new(1, [])
+
+    failure =
+      {:harklight_failure, {"listener_stopped", "transport_error"}, "listen",
+       ["origin request failed: simulated outage"]}
+
+    listener = fn manager, handle, _vendor_id ->
+      attempt = :atomics.add_get(failures, 1, 1)
+      :ok = GenServer.call(manager, {:finished, handle, failure})
+      send(parent, {:retryable_failure, attempt, self()})
+      receive do: (:exit_worker -> :ok)
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener, retry_delays: [20]})
+
+    assert_receive {:retryable_failure, 1, first_worker}, 1_000
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
+               "w_harklight_notice_recovery_" <> @handle
+             ])
+
+    send(first_worker, :exit_worker)
+    assert_receive {:retryable_failure, 2, final_worker}, 1_000
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
+               "w_harklight_notice_recovery_" <> @handle
+             ])
+
+    send(final_worker, :exit_worker)
+
+    assert eventually(fn ->
+             notice_recorded? =
+               match?(
+                 {:ok, [[1]]},
+                 DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
+                   "w_harklight_notice_recovery_" <> @handle
+                 ])
+               )
+
+             gone_sent? =
+               case File.read(gone_calls) do
+                 {:ok, output} ->
+                   String.contains?(output, "session end --session #{@handle} --gone")
+
+                 {:error, _} ->
+                   false
+               end
+
+             notice_recorded? and gone_sent?
+           end)
+
+    assert {:ok, [["unavailable", error]]} =
+             DB.query(
+               db,
+               "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1",
+               [@handle]
+             )
+
+    assert error =~ "listener_stopped"
+    refute_receive {:retryable_failure, 3, _worker}, 50
+  end
+
   # Controller-side classification coverage. These are synthetic responses;
   # released Agent path reproduction and Server behavior require separate evidence.
   for {codes, attempts} <- [
@@ -3007,6 +3529,98 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert {:ok, [["active", nil]]} =
              DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+  end
+
+  test "recovery retry skips a now-closed handle without a gone command", %{db: db} do
+    calls = fake_harklight_session_end_agent!()
+    parent = self()
+    {:ok, closed} = Agent.start_link(fn -> false end)
+
+    runner = fn ["status", "--session", @handle] ->
+      is_closed = Agent.get(closed, & &1)
+      send(parent, {:checked_closed, is_closed})
+
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => if(is_closed, do: 0, else: 1),
+         "pending_undelivered" => 0
+       }), 0}
+    end
+
+    listener = fn manager, handle, _ ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      Agent.update(closed, fn _ -> true end)
+      :ok = GenServer.call(manager, {:finished, handle, "listener_stopped"})
+      send(parent, :first_failed)
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: listener, send_runner: runner, retry_delays: [1]}
+      )
+
+    assert_receive :first_failed
+    assert_receive {:checked_closed, true}
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+    state = :sys.get_state(manager)
+    assert state.workers == %{}
+    assert state.retry_timers == %{}
+    assert state.gone_tasks == %{}
+
+    assert {:ok, [["unavailable", "listener_stopped"]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ])
+
+    refute File.exists?(calls)
+  end
+
+  test "deferred existing starts skip while deferred new-request starts remain ungated", %{
+    db: db,
+    session: session
+  } do
+    calls = fake_harklight_session_end_agent!(0, wait_for_session_end: true)
+    parent = self()
+    {:ok, closed} = Agent.start_link(fn -> false end)
+
+    runner = fn ["status", "--session", @handle] ->
+      is_closed = Agent.get(closed, & &1)
+
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => if(is_closed, do: 0, else: 1),
+         "pending_undelivered" => 0
+       }), 0}
+    end
+
+    listener = fn manager, handle, _ ->
+      send(parent, :started_deferred_test)
+      :ok = GenServer.call(manager, {:finished, handle, "invalid_listener_line"})
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: listener, send_runner: runner, retry_delays: []}
+      )
+
+    assert_receive :started_deferred_test
+    assert eventually(fn -> File.exists?(calls) end)
+    Agent.update(closed, fn _ -> true end)
+    HarklightWakes.origin_ready(session.session_key)
+    assert MapSet.member?(:sys.get_state(manager).deferred, @handle)
+    File.write!(calls <> ".release", "continue")
+    assert eventually(fn -> :sys.get_state(manager).gone_tasks == %{} end)
+    refute_receive :started_deferred_test
+
+    # Trigger a fresh failure/gone cycle, then activate during its outstanding gone.
+    File.rm!(calls <> ".release")
+    HarklightWakes.activate(@handle)
+    assert_receive :started_deferred_test
+    assert eventually(fn -> map_size(:sys.get_state(manager).gone_tasks) == 1 end)
+    HarklightWakes.activate(@handle)
+    assert MapSet.member?(:sys.get_state(manager).deferred, @handle)
+    File.write!(calls <> ".release", "continue")
+    assert_receive :started_deferred_test
   end
 
   test "ordinary worker death restores the same handle after DOWN", %{db: db} do
@@ -3288,6 +3902,8 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: @handle,
+          message_type: "request",
+          reply: true,
           sender_id: "sender",
           title: "Replacement",
           supersedes: ["request", "second", "request", "closed", "unknown"]
@@ -3328,6 +3944,156 @@ defmodule Tightbeam.HarklightWakesTest do
     assert statement =~ "superseded by replacement"
   end
 
+  test "committed sends pass contradiction matches through with camelCase member names", %{
+    db: db,
+    call: call
+  } do
+    warning =
+      "these possibly contradictory messages are still active, please talk to its poster to reconcile them"
+
+    contradictions = %{
+      "status" => "complete",
+      "unchecked" => 0,
+      "warning" => warning,
+      "messages" => [
+        %{
+          "sender_id" => "sender-a",
+          "sender_name" => "Agent A",
+          "message_id" => "open-a",
+          "title" => "First open request"
+        },
+        %{
+          "sender_id" => "sender-b",
+          "sender_name" => "Agent B",
+          "message_id" => "open-b",
+          "title" => "Second open request"
+        }
+      ]
+    }
+
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: @handle,
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Replacement"
+        }
+    }
+
+    result =
+      HarklightSend.send_request(db, send_call,
+        runner: lifecycle_runner(db, possible_contradictions: contradictions)
+      )
+
+    assert result.outcome == "committed"
+    assert result.wake_effect == "subscribed"
+
+    assert result.possible_contradictions == %{
+             "status" => "complete",
+             "unchecked" => 0,
+             "warning" => warning,
+             "messages" => [
+               %{
+                 "senderId" => "sender-a",
+                 "senderName" => "Agent A",
+                 "messageId" => "open-a",
+                 "title" => "First open request"
+               },
+               %{
+                 "senderId" => "sender-b",
+                 "senderName" => "Agent B",
+                 "messageId" => "open-b",
+                 "title" => "Second open request"
+               }
+             ]
+           }
+  end
+
+  test "committed incomplete result is carried without warning or messages", %{db: db, call: call} do
+    contradictions = %{
+      "status" => "incomplete",
+      "reason" => "unavailable",
+      "unchecked" => 3
+    }
+
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: @handle,
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Replacement"
+        }
+    }
+
+    result =
+      HarklightSend.send_request(db, send_call,
+        runner: lifecycle_runner(db, possible_contradictions: contradictions)
+      )
+
+    assert result.outcome == "committed"
+    assert result.wake_effect == "subscribed"
+    assert result.possible_contradictions == contradictions
+  end
+
+  test "send without the server field retains the ordinary committed result", %{
+    db: db,
+    call: call
+  } do
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: @handle,
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Replacement"
+        }
+    }
+
+    result = HarklightSend.send_request(db, send_call, runner: lifecycle_runner(db))
+
+    assert result.outcome == "committed"
+    assert result.wake_effect == "subscribed"
+    refute Map.has_key?(result, :possible_contradictions)
+  end
+
+  test "superseding sends carry the contradiction field without changing supersede results", %{
+    db: db,
+    call: call
+  } do
+    contradictions = %{
+      "status" => "incomplete",
+      "reason" => "unavailable",
+      "unchecked" => 1
+    }
+
+    send_call = %{
+      call
+      | params: %{
+          harklight_session: @handle,
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Replacement",
+          supersedes: ["request"]
+        }
+    }
+
+    result =
+      HarklightSend.send_request(db, send_call,
+        runner: lifecycle_runner(db, possible_contradictions: contradictions)
+      )
+
+    assert result.outcome == "committed"
+    assert result.wake_effect == "subscribed"
+    assert result.possible_contradictions == contradictions
+    assert [%{message_id: "request", effect: "ended"}] = result.supersedes
+  end
+
   test "failed own terminal acknowledgment stays open and is never retried", %{db: db, call: call} do
     runner =
       lifecycle_runner(db,
@@ -3344,6 +4110,8 @@ defmodule Tightbeam.HarklightWakesTest do
           call
           | params: %{
               harklight_session: @handle,
+              message_type: "request",
+              reply: true,
               sender_id: "sender",
               title: "Replacement",
               supersedes: ["request"]
@@ -3372,6 +4140,8 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: @handle,
+          message_type: "request",
+          reply: true,
           sender_id: "sender",
           title: "Replacement",
           supersedes: ["request"]
@@ -3432,7 +4202,13 @@ defmodule Tightbeam.HarklightWakesTest do
         db,
         %{
           call
-          | params: %{harklight_session: @handle, sender_id: "sender", title: "Replacement"}
+          | params: %{
+              harklight_session: @handle,
+              message_type: "request",
+              reply: true,
+              sender_id: "sender",
+              title: "Replacement"
+            }
         },
         runner: runner
       )
@@ -3440,7 +4216,7 @@ defmodule Tightbeam.HarklightWakesTest do
     assert %{outcome: "refused", message_id: "replacement", wake_effect: "none", reason: reason} =
              result
 
-    assert reason =~ "not sent"
+    assert reason == "not accepted"
 
     assert :ok =
              HarklightSend.recover_pending(db, runner: fn _ -> flunk("refused send retried") end)
@@ -3592,6 +4368,8 @@ defmodule Tightbeam.HarklightWakesTest do
                  call
                  | params: %{
                      harklight_session: @handle,
+                     message_type: "request",
+                     reply: true,
                      sender_id: "sender",
                      title: "Replacement",
                      supersedes: ["request"]
@@ -3968,6 +4746,8 @@ defmodule Tightbeam.HarklightWakesTest do
                  call
                  | params: %{
                      harklight_session: @handle,
+                     message_type: "request",
+                     reply: true,
                      sender_id: "sender",
                      title: "Replacement",
                      supersedes: ["foreign"]
@@ -3996,6 +4776,8 @@ defmodule Tightbeam.HarklightWakesTest do
           call
           | params: %{
               harklight_session: @handle,
+              message_type: "request",
+              reply: true,
               sender_id: "sender",
               title: "Replacement",
               supersedes: ["request", "request"]
@@ -4036,6 +4818,8 @@ defmodule Tightbeam.HarklightWakesTest do
           call
           | params: %{
               harklight_session: @handle,
+              message_type: "request",
+              reply: true,
               sender_id: "sender",
               title: "Replacement",
               supersedes: ["request"]
@@ -4122,6 +4906,8 @@ defmodule Tightbeam.HarklightWakesTest do
                  call
                  | params: %{
                      harklight_session: @handle,
+                     message_type: "request",
+                     reply: true,
                      sender_id: "sender",
                      title: "Replacement",
                      supersedes: ["request"]
@@ -4401,6 +5187,8 @@ defmodule Tightbeam.HarklightWakesTest do
       call
       | params: %{
           harklight_session: @handle,
+          message_type: "request",
+          reply: true,
           sender_id: "sender",
           title: "Replacement",
           supersedes: ["request"]
@@ -4516,6 +5304,8 @@ defmodule Tightbeam.HarklightWakesTest do
                  call
                  | params: %{
                      harklight_session: @handle,
+                     message_type: "request",
+                     reply: true,
                      sender_id: "sender",
                      title: "Replacement",
                      supersedes: ["request"]
@@ -5130,11 +5920,21 @@ defmodule Tightbeam.HarklightWakesTest do
               {JSON.encode!(%{kind: "refused", op_id: op, reason: "not accepted"}), 2}
 
             true ->
+              response = %{
+                session_handle: @handle,
+                supersedes_warnings: opts[:warnings] || []
+              }
+
+              response =
+                if Keyword.has_key?(opts, :possible_contradictions),
+                  do: Map.put(response, :possible_contradictions, opts[:possible_contradictions]),
+                  else: response
+
               frame(%{
                 kind: "committed",
                 operation: "send",
                 op_id: op,
-                response: %{session_handle: @handle, supersedes_warnings: opts[:warnings] || []}
+                response: response
               })
           end
       end
@@ -5186,7 +5986,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.mkdir_p!(directory)
     executable = Path.join(directory, "harklight-agent")
-    File.write!(executable, "#!/bin/sh\n" <> body)
+    File.write!(executable, "#!/bin/sh\nif [ \"$1\" = status ]; then exit 1; fi\n" <> body)
     File.chmod!(executable, 0o755)
 
     previous_path = System.get_env("PATH")
@@ -5223,7 +6023,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.write!(
       executable,
-      "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"#{calls}\"\n" <>
+      "#!/bin/sh\nif [ \"$1\" = status ]; then exit 1; fi\nprintf '%s\\n' \"$*\" >> \"#{calls}\"\n" <>
         "if [ \"$1\" = \"attach\" ]; then exit 1; fi\n" <>
         wait_for_session_end <>
         "if [ \"$1\" = \"session\" ]; then printf '%s\\n' '#{exit_status}' > \"#{calls}.exit-status\"; fi\n" <>
@@ -5401,126 +6201,520 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
   end
 
-  @tag :restart_count
-  test "restart completes only eligible answered conversations and restores the remainder", %{
+  test "194 pending status reads leave the manager responsive and new requests ungated", %{
     db: db,
-    call: call,
+    session: session,
+    call: call
+  } do
+    handles = [@handle | Enum.map(1..193, fn _ -> Tightbeam.Id.uuid4() end)]
+
+    for {handle, index} <- Enum.with_index(tl(handles)),
+        do: seed_completion_handle(db, session.session_key, handle, "scale-#{index}")
+
+    parent = self()
+    {:ok, phase} = Agent.start_link(fn -> nil end)
+    started_at = System.monotonic_time(:millisecond)
+
+    runner = fn ["status", "--session", handle] ->
+      open = Agent.get(phase, & &1)
+
+      if is_nil(open) do
+        send(parent, {:status_waiting, handle, self()})
+        receive do: (:release -> :ok)
+      end
+
+      {JSON.encode!(%{
+         "session_handle" => handle,
+         "open_requests" => if(open && MapSet.member?(open, handle), do: 1, else: 0),
+         "pending_undelivered" => 0
+       }), 0}
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         listener: fn manager, handle, vendor ->
+           ref = make_ref()
+           GenServer.cast(manager, {:attach_slot, self(), ref})
+           send(parent, {:attachment_waiting, handle})
+           receive do: ({:attach_slot, ^ref} -> :ok)
+           GenServer.cast(manager, {:attach_slot_released, self()})
+           completion_notifying_listener(parent).(manager, handle, vendor)
+         end,
+         send_runner: runner}
+      )
+
+    readers =
+      Map.new(
+        for _ <- 1..4 do
+          assert_receive {:status_waiting, handle, pid}, 5_000
+          {handle, pid}
+        end
+      )
+
+    probe_at = System.monotonic_time(:microsecond)
+    state = :sys.get_state(manager, 1_000)
+    response_us = System.monotonic_time(:microsecond) - probe_at
+    assert map_size(state.workers) == 194
+    assert MapSet.size(state.attach_slots) == 4
+    assert eventually(fn -> :queue.len(:sys.get_state(manager).attach_waiting) == 190 end)
+    # An actual new registration interrupts its handle's outstanding decision.
+    [target, hung, release_first, _] = Map.keys(readers)
+    old_reader = readers[target]
+    monitor = Process.monitor(old_reader)
+    request_at = System.monotonic_time(:microsecond)
+    op = Tightbeam.Id.uuid4()
+    payload = String.replace(@payload, "request", "scale-new-request")
+
+    result =
+      @result |> String.replace("request", "scale-new-request") |> String.replace(@handle, target)
+
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
+
+    assert %{state: "registered"} =
+             HarklightWakes.bind_send(
+               db,
+               call,
+               op,
+               payload,
+               result,
+               target,
+               "sender",
+               "scale-new-request"
+             )
+
+    assert_receive {:DOWN, ^monitor, :process, ^old_reader, _}, 1_000
+    assert_receive {:attachment_waiting, ^target}, 1_000
+    :sys.get_state(manager)
+    send(readers[release_first], :release)
+    assert_receive {:restored, ^target, nil}, 1_000
+    request_us = System.monotonic_time(:microsecond) - request_at
+    # One read never returns; its deadline must preserve attachment. All other
+    # slow closed responses skip, rather than attaching before their decision.
+    for {handle, pid} <- readers,
+        handle not in [target, hung, release_first],
+        do: send(pid, :release)
+
+    for _ <- 1..190 do
+      assert_receive {:status_waiting, _handle, pid}, 1_000
+      send(pid, :release)
+    end
+
+    assert_receive {:restored, ^hung, nil}, 6_000
+
+    assert eventually(fn ->
+             Map.keys(:sys.get_state(manager).workers) |> MapSet.new() ==
+               MapSet.new([target, hung])
+           end)
+
+    refute_receive {:restored, _, _}
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state!='active'")
+
+    first_ms = System.monotonic_time(:millisecond) - started_at
+    # A timed-out command cannot return later and undo its fallback.
+    refute Process.alive?(readers[hung])
+    send(readers[hung], :release)
+    assert Map.has_key?(:sys.get_state(manager).workers, hung)
+
+    :ok = stop_supervised(HarklightWakes)
+    Agent.update(phase, fn _ -> MapSet.new([target, hung]) end)
+    restore_at = System.monotonic_time(:microsecond)
+
+    second =
+      start_supervised!(
+        {HarklightWakes,
+         db: db, listener: completion_notifying_listener(parent), send_runner: runner}
+      )
+
+    restored =
+      for _ <- 1..2 do
+        assert_receive {:restored, handle, nil}, 1_000
+        handle
+      end
+
+    assert MapSet.new(restored) == MapSet.new([target, hung])
+    assert eventually(fn -> map_size(:sys.get_state(second).workers) == 2 end)
+    restore_us = System.monotonic_time(:microsecond) - restore_at
+    refute_receive {:restored, _, _}
+
+    later = Enum.find(handles, &(&1 not in [target, hung]))
+    later_at = System.monotonic_time(:microsecond)
+    later_op = Tightbeam.Id.uuid4()
+    later_payload = String.replace(@payload, "request", "after-restore-request")
+
+    later_result =
+      @result
+      |> String.replace("request", "after-restore-request")
+      |> String.replace(@handle, later)
+
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, later_op, later_payload)
+
+    assert %{state: "registered"} =
+             HarklightWakes.bind_send(
+               db,
+               call,
+               later_op,
+               later_payload,
+               later_result,
+               later,
+               "sender",
+               "after-restore-request"
+             )
+
+    assert_receive {:restored, ^later, nil}, 1_000
+    later_us = System.monotonic_time(:microsecond) - later_at
+
+    IO.puts(
+      "R6_POPULATION_METRICS " <>
+        JSON.encode!(%{
+          handles: 194,
+          manager_response_us: response_us,
+          new_request_us: request_us,
+          first_restore_ms: first_ms,
+          second_restore_us: restore_us,
+          after_restore_request_us: later_us
+        })
+    )
+  end
+
+  test "a nonreturning status subprocess is terminated before timeout falls back to attach", %{
+    db: db,
     session: session
   } do
-    completed_handles = [@handle, Tightbeam.Id.uuid4(), Tightbeam.Id.uuid4()]
-    open_request_handle = Tightbeam.Id.uuid4()
-    pending_answer_handle = Tightbeam.Id.uuid4()
+    closed = Tightbeam.Id.uuid4()
+    seed_completion_handle(db, session.session_key, closed, "closed-subprocess")
+    root = Path.join(System.tmp_dir!(), "status-timeout-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    executable = Path.join(root, "harklight-agent")
+    pid_file = Path.join(root, "pid")
 
-    for {handle, index} <-
-          Enum.with_index(completed_handles ++ [open_request_handle, pending_answer_handle]) do
-      message_id = if handle == @handle, do: "request", else: "request-#{index}"
-
-      if handle != @handle,
-        do: seed_completion_handle(db, session.session_key, handle, message_id)
-
-      answer = completion_event(handle, 1, message_id, "terminal", "person")
-      assert :ok = HarklightWakes.capture_line(db, handle, JSON.encode!(answer))
-      mark_completion_wakes_delivered(db, handle)
-    end
-
-    eligible_status = fn handle ->
-      %{
-        "session_handle" => handle,
+    status =
+      JSON.encode!(%{
+        "session_handle" => closed,
         "open_requests" => 0,
-        "open_chats" => 1,
-        "pending_undelivered" => 0,
-        "pending_delivered_unacted" => 0
-      }
-    end
-
-    statuses =
-      Map.new(completed_handles, &{&1, eligible_status.(&1)})
-      |> Map.put(open_request_handle, %{
-        "session_handle" => open_request_handle,
-        "open_requests" => 1,
-        "pending_undelivered" => 0,
-        "pending_delivered_unacted" => 0
-      })
-      |> Map.put(pending_answer_handle, %{
-        "session_handle" => pending_answer_handle,
-        "open_requests" => 0,
-        "pending_undelivered" => 1,
-        "pending_delivered_unacted" => 0
+        "pending_undelivered" => 0
       })
 
-    pending_answer = completion_event(pending_answer_handle, 1, "request-4", "terminal", "person")
+    File.write!(
+      executable,
+      "#!/bin/sh\nif [ \"$3\" = '#{closed}' ]; then printf '%s\\n' '#{status}'; exit 0; fi\necho $$ > '#{pid_file}'\nexec sleep 300\n"
+    )
 
-    initial = %{
-      status: statuses,
-      events: %{
-        @handle => [],
-        open_request_handle => [],
-        pending_answer_handle => [pending_answer]
-      },
-      commands: []
-    }
+    File.chmod!(executable, 0o755)
+    previous = System.get_env("PATH")
+    System.put_env("PATH", root <> ":" <> previous)
 
-    {:ok, responses} = Agent.start_link(fn -> initial end)
-    Process.unlink(responses)
-    on_exit(fn -> Agent.stop(responses) end)
+    on_exit(fn ->
+      System.put_env("PATH", previous)
+      File.rm_rf!(root)
+    end)
+
+    manager =
+      start_supervised!({HarklightWakes, db: db, listener: completion_notifying_listener(self())})
+
+    assert eventually(fn -> File.exists?(pid_file) end)
+    pid = File.read!(pid_file) |> String.trim()
+    assert eventually(fn -> map_size(:sys.get_state(manager, 1_000).workers) == 1 end)
+    assert_receive {:restored, @handle, nil}, 6_000
+
+    assert eventually(fn ->
+             match?(
+               {_, status} when status != 0,
+               System.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true)
+             )
+           end)
+
+    refute_receive {:restored, ^closed, _}
+
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='active'")
+  end
+
+  test "known R with a nonreturning A8 read skips without completing or late mutation", %{db: db} do
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+    mark_completion_wakes_delivered(db, @handle)
+    parent = self()
+
+    runner = fn
+      ["status", "--session", @handle] ->
+        {JSON.encode!(%{
+           "session_handle" => @handle,
+           "open_requests" => 0,
+           "pending_undelivered" => 0,
+           "pending_delivered_unacted" => 0
+         }), 0}
+
+      ["read", "--session", @handle] ->
+        send(parent, {:a8_waiting, self()})
+        receive do: (:late_success -> {"", 0})
+    end
+
+    row = DB.query(db, "SELECT * FROM harklight_wake_handles")
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db, listener: completion_notifying_listener(parent), send_runner: runner}
+      )
+
+    assert_receive {:a8_waiting, reader}, 1_000
+    monitor = Process.monitor(reader)
+    started = System.monotonic_time(:millisecond)
+    assert map_size(:sys.get_state(manager, 1_000).workers) == 1
+    assert_receive {:DOWN, ^monitor, :process, ^reader, _}, 6_000
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+    refute_receive {:restored, _, _}
+    assert DB.query(db, "SELECT * FROM harklight_wake_handles") == row
+    send(reader, :late_success)
+    refute Process.alive?(reader)
+    assert DB.query(db, "SELECT * FROM harklight_wake_handles") == row
+    IO.puts("R6_A8_TIMEOUT_MS=#{System.monotonic_time(:millisecond) - started}")
+  end
+
+  @tag :restart_count
+  test "r6 startup skips closed conversations and preserves unfinished work", %{
+    db: db,
+    session: session
+  } do
+    [p1, p2, p3, k1, k2, k3, n1, n2] =
+      handles = [@handle | Enum.map(1..7, fn _ -> Tightbeam.Id.uuid4() end)]
+
+    for {handle, index} <- Enum.with_index(handles) do
+      message = if handle == @handle, do: "request", else: "request-#{index}"
+      if handle != @handle, do: seed_completion_handle(db, session.session_key, handle, message)
+
+      if handle != n1 do
+        author = if handle == k3, do: "agent", else: "person"
+        event = completion_event(handle, 1, message, "terminal", author)
+
+        event =
+          if handle == k2,
+            do: put_in(event, ["entry", "terminal_state"], "retracted"),
+            else: event
+
+        assert :ok = HarklightWakes.capture_line(db, handle, JSON.encode!(event))
+        mark_completion_wakes_delivered(db, handle)
+      end
+
+      if handle in [p2, k1, k2, n1] do
+        assert {:ok, _} =
+                 DB.query(
+                   db,
+                   "UPDATE harklight_wake_handles SET state='unavailable',lastError='saved' WHERE handle=?1",
+                   [handle]
+                 )
+      end
+    end
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_send_operations(opId,sessionKey,host,payload,state,createdAt,updatedAt) VALUES('pending-r6',?1,?2,?3,'pending',1,1)",
+               [
+                 session.session_key,
+                 Placement.local_host_name(),
+                 JSON.encode!(%{"request" => %{"session_handle" => p3}})
+               ]
+             )
+
+    status =
+      Map.new(handles, fn handle ->
+        {handle,
+         %{
+           "session_handle" => handle,
+           "open_requests" => if(handle == n1, do: 1, else: 0),
+           "pending_undelivered" => if(handle == n2, do: 1, else: 0),
+           "pending_delivered_unacted" => if(handle == k1, do: 1, else: 0)
+         }}
+      end)
+
+    {:ok, responses} = Agent.start_link(fn -> %{status: status, events: [], commands: []} end)
     parent = self()
     runner = completion_runner(responses, parent)
     listener = completion_notifying_listener(parent)
 
-    assert {:ok, [[5]]} =
-             DB.query(
+    unchanged =
+      Map.new([p2, k1, k2, k3], fn h ->
+        {h, DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [h])}
+      end)
+
+    for _startup <- 1..2 do
+      manager =
+        start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+
+      restored =
+        for _ <- 1..3 do
+          assert_receive {:restored, handle, nil}
+          handle
+        end
+
+      assert MapSet.new(restored) == MapSet.new([p3, n1, n2])
+      assert eventually(fn -> map_size(:sys.get_state(manager).workers) == 3 end)
+      refute_receive {:restored, _, _}
+
+      assert {:ok, [["complete"]]} =
+               DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [p1])
+
+      for {handle, row} <- unchanged,
+          do:
+            assert(
+              DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [handle]) ==
+                row
+            )
+
+      for handle <- [p3, n1, n2],
+          do:
+            assert(
+              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]) ==
+                {:ok, [["active"]]}
+            )
+
+      :ok = stop_supervised(HarklightWakes)
+    end
+
+    assert :active = Tightbeam.HarklightLifecycle.complete_answered(db, p2, runner: runner)
+
+    assert DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [p2]) ==
+             unchanged[p2]
+  end
+
+  test "closed skips survive ready and origin changes, but a new request starts", %{
+    db: db,
+    call: call,
+    session: session
+  } do
+    parent = self()
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         listener: completion_notifying_listener(parent),
+         send_runner: completion_idle_runner()}
+      )
+
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+    GenServer.cast(manager, {:origin_ready, session.session_key})
+    GenServer.cast(manager, {:pointer_changed, session.session_key})
+    GenServer.cast(manager, {:origin_changed, session.session_key})
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+    refute_receive {:restored, _, _}
+
+    op = Tightbeam.Id.uuid4()
+    payload = String.replace(@payload, "request", "new-request")
+    result = String.replace(@result, "request", "new-request")
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, op, payload)
+
+    assert %{state: "registered"} =
+             HarklightWakes.bind_send(
                db,
-               "SELECT count(*) FROM harklight_wake_handles WHERE state IN ('active','unavailable')"
+               call,
+               op,
+               payload,
+               result,
+               @handle,
+               "sender",
+               "new-request"
              )
 
-    first_manager =
-      start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+    assert_receive {:restored, @handle, nil}
+    # A pointer replacement stops the current process, but skips a closed replacement
+    # without writing a failure or ending the handle.
+    row = DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [@handle])
+    GenServer.cast(manager, {:pointer_changed, session.session_key})
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+    refute_receive {:restored, _, _}
+    assert DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [@handle]) == row
 
-    restored_before_completion =
-      for _ <- 1..5 do
-        assert_receive {:restored, handle, nil}
-        handle
-      end
-
-    assert MapSet.new(restored_before_completion) ==
-             MapSet.new(completed_handles ++ [open_request_handle, pending_answer_handle])
-
-    assert eventually(fn ->
-             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'") ==
-               {:ok, [[3]]} and map_size(:sys.get_state(first_manager).workers) == 2
-           end)
-
-    assert length(Map.keys(:sys.get_state(first_manager).workers)) == 2
-
-    assert {:ok, [[3]]} =
-             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'")
-
-    assert {:ok, [[2]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                db,
-               "SELECT count(*) FROM harklight_wake_handles WHERE state IN ('active','unavailable')"
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_notice_recovery_%'"
+             )
+  end
+
+  test "R ignores delivered-unacted counts but preserves absent requests and held terminals", %{
+    db: db
+  } do
+    runner = fn ["status", "--session", @handle] ->
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 0,
+         "pending_undelivered" => 0
+       }), 0}
+    end
+
+    assert Tightbeam.HarklightLifecycle.closed_for_start?(db, @handle, runner: runner)
+    raw = event(91, "terminal", "held")
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_held_terminals(handle,eventId,senderId,messageId,rawLine) VALUES(?1,'held','sender','request',?2)",
+               [@handle, raw]
              )
 
-    :ok = stop_supervised(HarklightWakes)
+    refute Tightbeam.HarklightLifecycle.closed_for_start?(db, @handle, runner: runner)
+    assert {:ok, _} = DB.query(db, "DELETE FROM harklight_held_terminals")
+    assert {:ok, _} = DB.query(db, "DELETE FROM harklight_wake_requests")
+    refute Tightbeam.HarklightLifecycle.closed_for_start?(db, @handle, runner: runner)
+  end
 
-    second_manager =
-      start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+  for evidence_failure <- [
+        :read_failed,
+        :status_failed,
+        :status_malformed,
+        :status_missing,
+        :local_pending
+      ] do
+    @evidence_failure evidence_failure
+    test "startup preserves a conversation with #{@evidence_failure}", %{db: db} do
+      answer = completion_event(@handle, 1, "request", "terminal", "person")
+      assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+      if @evidence_failure != :local_pending, do: mark_completion_wakes_delivered(db, @handle)
 
-    restored_after_restart =
-      for _ <- 1..2 do
-        assert_receive {:restored, handle, nil}
-        handle
+      eligible_runner = completion_idle_runner()
+
+      runner = fn args ->
+        case {args, @evidence_failure} do
+          {["read" | _], :read_failed} ->
+            {"unavailable", 1}
+
+          {["status" | _], :status_failed} ->
+            {"unavailable", 1}
+
+          {["status" | _], :status_malformed} ->
+            {"not json", 0}
+
+          {["status" | _], :status_missing} ->
+            {JSON.encode!(%{"session_handle" => @handle, "open_requests" => 0}), 0}
+
+          _ ->
+            eligible_runner.(args)
+        end
       end
 
-    assert MapSet.new(restored_after_restart) ==
-             MapSet.new([open_request_handle, pending_answer_handle])
+      manager =
+        start_supervised!(
+          {HarklightWakes,
+           db: db, listener: completion_notifying_listener(self()), send_runner: runner}
+        )
 
-    assert length(Map.keys(:sys.get_state(second_manager).workers)) == 2
+      if @evidence_failure == :read_failed do
+        assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+        refute_receive {:restored, _, _}
+      else
+        assert_receive {:restored, @handle, nil}
+        assert Map.has_key?(:sys.get_state(manager).workers, @handle)
+      end
 
-    assert {:ok, [[3]]} =
-             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'")
-
-    assert call.session_key == session.session_key
+      assert {:ok, [["active"]]} =
+               DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+    end
   end
 
   test "an agent-authored answer alone does not complete a handle", %{db: db} do
@@ -5827,6 +7021,20 @@ defmodule Tightbeam.HarklightWakesTest do
                  "UPDATE wakes SET state='fired',firedAt=?3,deliveredTurnSeq=?2 WHERE wakeId=?1",
                  [wake_id, turn_seq, System.system_time(:millisecond)]
                )
+    end
+  end
+
+  defp completion_idle_runner do
+    status = %{
+      "session_handle" => @handle,
+      "open_requests" => 0,
+      "pending_undelivered" => 0,
+      "pending_delivered_unacted" => 0
+    }
+
+    fn
+      ["read", "--session", @handle] -> {"", 0}
+      ["status", "--session", @handle] -> {JSON.encode!(status), 0}
     end
   end
 

@@ -621,6 +621,37 @@ defmodule Tightbeam.HarklightLifecycle do
   # The Agent's read and status commands are the existing source for pending
   # entries and delivery receipts. Any refusal, malformed output, or local
   # record that changes while those reads run leaves the handle active.
+  # R(H) gates listener starts, independently of answer authorship or results.
+  # Recheck local evidence after status so a registered request or pending send
+  # cannot be skipped using an earlier snapshot.
+  def closed_for_start?(db, handle, opts \\ []) do
+    with {:ok, initial} <- completion_snapshot(db, handle),
+         true <- initial.requests != [] and initial.pending_sends == [],
+         {:ok, runner} <- read_runner(opts),
+         {:ok, output} <- run_status(runner, handle),
+         {:ok, status} when is_map(status) <- JSON.decode(output),
+         true <- status["session_handle"] == handle,
+         0 <- status["open_requests"],
+         0 <- status["pending_undelivered"],
+         {:ok, true} <-
+           DB.transaction(db, fn txn ->
+             with {:ok, current} <- completion_snapshot_in_txn(txn, handle),
+                  true <- current.requests == initial.requests,
+                  true <- current.pending_sends == [],
+                  true <- current.entries == initial.entries do
+               locally_delivered_and_unheld?(txn, handle, current.entries, current.session_key)
+             else
+               _ -> false
+             end
+           end) do
+      true
+    else
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
   def completion_evidence(db, handle, opts \\ []) do
     :global.trans({{__MODULE__, db, :answer_completion}, self()}, fn ->
       read_completion_evidence(db, handle, opts)
@@ -646,7 +677,9 @@ defmodule Tightbeam.HarklightLifecycle do
     events = evidence.events
     status = evidence.status
 
-    with {:ok, current} <- completion_snapshot_in_txn(txn, handle),
+    with [["active"]] <-
+           Txn.q(txn, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]),
+         {:ok, current} <- completion_snapshot_in_txn(txn, handle),
          true <- current.session_key == snapshot.session_key,
          true <- current.requests == snapshot.requests,
          true <- current.pending_sends == snapshot.pending_sends and current.pending_sends == [],
@@ -660,7 +693,7 @@ defmodule Tightbeam.HarklightLifecycle do
            locally_delivered_and_unheld?(txn, handle, current.entries, current.session_key) do
       Txn.q(
         txn,
-        "UPDATE harklight_wake_handles SET state='complete',lastError=NULL,updatedAt=?2 WHERE handle=?1 AND state IN ('active','unavailable')",
+        "UPDATE harklight_wake_handles SET state='complete',lastError=NULL,updatedAt=?2 WHERE handle=?1 AND state='active'",
         [handle, System.system_time(:millisecond)]
       )
 
@@ -678,7 +711,9 @@ defmodule Tightbeam.HarklightLifecycle do
   end
 
   defp read_completion_evidence(db, handle, opts) do
-    with {:ok, initial} <- completion_snapshot(db, handle),
+    with {:ok, [["active"]]} <-
+           DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]),
+         {:ok, initial} <- completion_snapshot(db, handle),
          true <- initial.answers != MapSet.new(),
          {:ok, runner} <- read_runner(opts),
          {:ok, read_output} <- run_read(runner, handle),
@@ -825,7 +860,7 @@ defmodule Tightbeam.HarklightLifecycle do
       nil ->
         case System.find_executable("harklight-agent") do
           nil -> :error
-          executable -> {:ok, fn args -> System.cmd(executable, args, stderr_to_stdout: true) end}
+          executable -> {:ok, fn args -> read_command(executable, args) end}
         end
     end
   end
@@ -835,13 +870,65 @@ defmodule Tightbeam.HarklightLifecycle do
   defp run_status(runner, handle),
     do: run_read_command(runner, ["status", "--session", handle])
 
+  # Each read has a deadline; a timeout is unknown evidence, so R admits the
+  # ordinary listener start and E cannot complete the handle. No recheck is armed.
+  @read_timeout_ms 5_000
   defp run_read_command(runner, args) do
-    case runner.(args) do
-      {output, 0} when is_binary(output) -> {:ok, output}
+    task =
+      Task.async(fn ->
+        try do
+          runner.(args)
+        rescue
+          _ -> :error
+        catch
+          _, _ -> :error
+        end
+      end)
+
+    case Task.yield(task, @read_timeout_ms) || Task.shutdown(task, 100) do
+      {:ok, {output, 0}} when is_binary(output) -> {:ok, output}
       _ -> :error
     end
   rescue
     _ -> :error
+  end
+
+  defp read_command(executable, args) do
+    # The read task owns this port. On cancellation kill only its child, as the
+    # listener path does; closing stdin alone need not end a blocked CLI.
+    Process.flag(:trap_exit, true)
+
+    port =
+      Port.open(
+        {:spawn_executable, executable},
+        [:binary, :exit_status, :stderr_to_stdout, :hide, {:args, args}]
+      )
+
+    try do
+      receive_read(port, [])
+    after
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} ->
+          System.cmd("/bin/kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+          if Port.info(port), do: Port.close(port)
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defp receive_read(port, output) do
+    receive do
+      {^port, {:data, bytes}} ->
+        receive_read(port, [bytes | output])
+
+      {^port, {:exit_status, status}} ->
+        {output |> Enum.reverse() |> IO.iodata_to_binary(), status}
+
+      {:EXIT, _, reason} ->
+        exit(reason)
+    end
   end
 
   defp parse_read_events(output) do
@@ -1008,7 +1095,7 @@ defmodule Tightbeam.HarklightLifecycle do
       txn,
       """
       SELECT 1 FROM health_redelivery_attempts a
-      JOIN turns t ON t.seq=a.redeliveryTurnSeq
+      JOIN turns t ON t.seq=COALESCE(a.redeliveryTurnSeq,a.cycleReleaseTurnSeq)
       WHERE a.sessionKey=?1 AND a.sourceTurnSeq=?2 AND t.status='delivered'
       """,
       [session_key, source_turn_seq]

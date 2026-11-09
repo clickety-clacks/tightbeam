@@ -4,6 +4,7 @@ defmodule Tightbeam.HarklightSend do
   alias Tightbeam.{DB, HarklightLifecycle, HarklightWakes, Id, Org, Placement}
 
   @uuid4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
+  @decision_request_id ~r/\Adr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
 
   def send_request(db, call, opts \\ []) do
     result =
@@ -11,17 +12,12 @@ defmodule Tightbeam.HarklightSend do
            {:ok, input} <- inputs(call.params),
            nil <- HarklightLifecycle.unresolved(db, input.supersedes),
            {:ok, runner} <- runner(opts) do
-        op_id = Id.uuid4()
-
-        case invoke(runner, prepare_args(input, op_id), "prepared", op_id) do
-          {:ok, prepared} ->
-            prepare_and_execute(db, call, input, prepared, op_id, runner, opts)
-
-          {:error, code, reason, outcome} ->
-            failure("send", code, "The message was not sent. " <> reason, outcome, %{op_id: op_id})
-        end
+        send_with_association(db, call, input, runner, opts)
+        |> Map.put(:message_type, input.message_type)
+        |> Map.put(:message_type_label, type_label(input.message_type))
       else
         id when is_binary(id) -> unresolved_result("send", id)
+        {:error, code, reason} -> failure("send", code, reason, "failed")
         {:error, reason} -> failure("send", reason, early_reason(reason), "failed")
       end
 
@@ -33,12 +29,56 @@ defmodule Tightbeam.HarklightSend do
     unchanged_targets(result, call.params[:supersedes])
   end
 
+  defp send_with_association(db, call, %{decision_request_id: nil} = input, runner, opts) do
+    send_with_operation(db, call, input, Id.uuid4(), runner, opts)
+  end
+
+  defp send_with_association(db, call, input, runner, opts) do
+    case Tightbeam.HarklightBriefings.reserve_send(db, call, input.decision_request_id) do
+      {:ok, %{action: :start, op_id: op_id}} ->
+        send_with_operation(db, call, input, op_id, runner, opts)
+
+      {:ok, %{action: :recover, message_id: message_id}} ->
+        recover_one(db, message_id, opts)
+        |> Map.put(:reconciled, true)
+
+      {:ok, %{action: :existing} = existing} ->
+        %{
+          command: "send",
+          outcome: "committed",
+          state: "registered",
+          reused: true,
+          op_id: existing.op_id,
+          handle: existing.handle,
+          sender_id: existing.sender_id,
+          message_id: existing.message_id,
+          session_key: existing.session_key,
+          wake_effect: "none"
+        }
+
+      {:error, code, reason} ->
+        failure("send", code, "The message was not sent. " <> reason, "refused", %{
+          decision_request_id: input.decision_request_id
+        })
+    end
+  end
+
+  defp send_with_operation(db, call, input, op_id, runner, opts) do
+    case invoke(runner, prepare_args(input, op_id), "prepared", op_id) do
+      {:ok, prepared} ->
+        prepare_and_execute(db, call, input, prepared, op_id, runner, opts)
+
+      {:error, code, reason, outcome} ->
+        failure("send", code, "The message was not sent. " <> reason, outcome, %{op_id: op_id})
+    end
+  end
+
   defp prepare_and_execute(db, call, input, prepared, op_id, runner, opts) do
     identity = prepared_identity(prepared) |> Map.put(:op_id, op_id)
 
     with {:ok, request, files} <- prepared_request(prepared, input, op_id),
          :ok <- handle_available(db, call, input.session, request["session_handle"]),
-         payload = JSON.encode!(%{"request" => request, "files" => files}),
+         payload = send_payload(request, files, input.decision_request_id),
          %{state: "pending"} <- HarklightWakes.prepare_send(db, call, op_id, payload) do
       :global.trans({{__MODULE__, db, op_id}, self()}, fn ->
         with :ok <- HarklightWakes.mark_send_attempt(db, call, op_id, payload) do
@@ -62,6 +102,17 @@ defmodule Tightbeam.HarklightSend do
     end
   end
 
+  defp send_payload(request, files, nil),
+    do: JSON.encode!(%{"request" => request, "files" => files})
+
+  defp send_payload(request, files, decision_request_id),
+    do:
+      JSON.encode!(%{
+        "request" => request,
+        "files" => files,
+        "decision_request_id" => decision_request_id
+      })
+
   defp finish_send(db, call, op_id, payload, request, response, command, opts) do
     identity = prepared_identity(%{"request" => request}) |> Map.put(:op_id, op_id)
 
@@ -76,6 +127,7 @@ defmodule Tightbeam.HarklightSend do
             registration
             |> Map.merge(identity)
             |> Map.merge(%{command: command, outcome: "committed", result: committed})
+            |> maybe_put_possible_contradictions(command, committed)
             |> HarklightLifecycle.refresh_acknowledgments_result(db)
           else
             error ->
@@ -92,7 +144,7 @@ defmodule Tightbeam.HarklightSend do
         {:error, code, reason, "refused"} ->
           HarklightLifecycle.record_refused(db, op_id)
           HarklightLifecycle.process_terminals(db, opts)
-          failure(command, code, "The message was not sent. " <> reason, "refused", identity)
+          failure(command, code, reason, "refused", identity)
 
         {:error, code, reason, _outcome} ->
           failure(
@@ -366,6 +418,36 @@ defmodule Tightbeam.HarklightSend do
   defp early_reason("harklight_cli_missing"),
     do: "Harklight Agent could not be run, so nothing was sent."
 
+  defp early_reason("harklight_type_required"),
+    do:
+      "--type is required: use --type fyi for a Seen-only message or --type request for choices or a reply"
+
+  defp early_reason("harklight_type_invalid"),
+    do: "--type must be fyi or request"
+
+  defp early_reason("harklight_fyi_has_answer_controls"),
+    do:
+      "--type fyi carries only the Seen acknowledgment; remove --choices-json and --reply, or send as --type request"
+
+  defp early_reason("harklight_request_needs_answer_controls"),
+    do:
+      "--type request needs at least one choice or a reply: add --choices-json or --reply, or send as --type fyi"
+
+  defp early_reason("harklight_kind_invalid"),
+    do: "--kind must be blocker or success, or left out"
+
+  defp early_reason("harklight_importance_invalid"),
+    do: "--importance must be one of low, normal, high, now"
+
+  defp early_reason("harklight_stake_invalid"),
+    do: "--stake must be non-empty text; remove it or provide non-empty text"
+
+  defp early_reason("harklight_by_when_invalid"),
+    do: "--by-when must be a valid RFC 3339 timestamp"
+
+  defp early_reason("harklight_reply_invalid"),
+    do: "--reply is a flag; omit it or include it without a value"
+
   defp early_reason(code), do: "The command did not run: #{code}."
 
   defp origin!(db, call) do
@@ -385,40 +467,116 @@ defmodule Tightbeam.HarklightSend do
 
   defp inputs(params) do
     allowed =
-      ~w(harklight_session sender_id title body choices files vendor_session_id supersedes)a
+      ~w(
+        harklight_session sender_id title message_type message_kind importance stake by_when reply
+        body choices files vendor_session_id supersedes decision_request_id
+      )a
 
     session = params[:harklight_session]
     sender = params[:sender_id]
     title = params[:title]
+    message_type = params[:message_type]
+    message_kind = params[:message_kind]
+    importance = params[:importance]
+    stake = params[:stake]
+    by_when = params[:by_when]
+    reply = params[:reply]
     body = params[:body]
     choices = params[:choices] || []
     files = params[:files] || []
     vendor = params[:vendor_session_id]
     supersedes = params[:supersedes] || []
+    decision_request_id = params[:decision_request_id]
 
-    if Enum.all?(Map.keys(params), &(&1 in allowed)) and
-         (session == "new" or (is_binary(session) and Regex.match?(@uuid4, session))) and
-         is_binary(sender) and sender != "" and is_binary(title) and title != "" and
-         (is_nil(body) or is_binary(body)) and
-         (is_nil(vendor) or is_binary(vendor)) and
-         is_list(choices) and Enum.all?(choices, &(is_binary(&1) and &1 != "")) and
-         is_list(files) and Enum.all?(files, &(is_binary(&1) and &1 != "")) and
-         is_list(supersedes) and Enum.all?(supersedes, &is_binary/1) do
-      {:ok,
-       %{
-         session: session,
-         sender: sender,
-         title: title,
-         body: body,
-         choices: choices,
-         files: files,
-         vendor: vendor,
-         supersedes: supersedes
-       }}
-    else
-      {:error, "invalid_harklight_send"}
+    cond do
+      not Enum.all?(Map.keys(params), &(&1 in allowed)) ->
+        {:error, "invalid_harklight_send"}
+
+      not (session == "new" or (is_binary(session) and Regex.match?(@uuid4, session))) ->
+        {:error, "invalid_harklight_send"}
+
+      not (is_binary(sender) and sender != "" and is_binary(title) and title != "") ->
+        {:error, "invalid_harklight_send"}
+
+      not (is_nil(body) or is_binary(body)) or not (is_nil(vendor) or is_binary(vendor)) ->
+        {:error, "invalid_harklight_send"}
+
+      not (is_list(choices) and Enum.all?(choices, &(is_binary(&1) and &1 != ""))) ->
+        {:error, "invalid_harklight_send"}
+
+      not (is_list(files) and Enum.all?(files, &(is_binary(&1) and &1 != ""))) ->
+        {:error, "invalid_harklight_send"}
+
+      not (is_list(supersedes) and Enum.all?(supersedes, &is_binary/1)) ->
+        {:error, "invalid_harklight_send"}
+
+      not (is_nil(decision_request_id) or
+               (is_binary(decision_request_id) and
+                  Regex.match?(@decision_request_id, decision_request_id))) ->
+        {:error, "invalid_harklight_send"}
+
+      is_nil(message_type) ->
+        {:error, "harklight_type_required"}
+
+      message_type not in ["fyi", "request"] ->
+        {:error, "harklight_type_invalid",
+         "--type must be fyi or request; got #{inspect(message_type)}"}
+
+      not (is_nil(message_kind) or message_kind in ["blocker", "success"]) ->
+        {:error, "harklight_kind_invalid",
+         "--kind must be blocker or success, or left out; got #{inspect(message_kind)}"}
+
+      not (is_nil(importance) or importance in ["low", "normal", "high", "now"]) ->
+        {:error, "harklight_importance_invalid",
+         "--importance must be one of low, normal, high, now; got #{inspect(importance)}"}
+
+      not (is_nil(stake) or (is_binary(stake) and String.trim(stake) != "")) ->
+        {:error, "harklight_stake_invalid",
+         "--stake must be non-empty text; remove it or provide non-empty text"}
+
+      not (is_nil(by_when) or valid_rfc3339?(by_when)) ->
+        {:error, "harklight_by_when_invalid",
+         "--by-when must be a valid RFC 3339 timestamp; got #{inspect(by_when)}"}
+
+      not (is_nil(reply) or is_boolean(reply)) ->
+        {:error, "harklight_reply_invalid"}
+
+      message_type == "fyi" and (choices != [] or reply == true) ->
+        {:error, "harklight_fyi_has_answer_controls"}
+
+      message_type == "request" and choices == [] and reply != true ->
+        {:error, "harklight_request_needs_answer_controls"}
+
+      true ->
+        {:ok,
+         %{
+           session: session,
+           sender: sender,
+           title: title,
+           message_type: message_type,
+           message_kind: message_kind,
+           importance: importance,
+           stake: stake,
+           by_when: by_when,
+           reply: reply == true,
+           body: body,
+           choices: choices,
+           files: files,
+           vendor: vendor,
+           supersedes: supersedes,
+           decision_request_id: decision_request_id
+         }}
     end
   end
+
+  defp valid_rfc3339?(value) when is_binary(value) do
+    match?({:ok, _datetime, _offset}, DateTime.from_iso8601(value))
+  end
+
+  defp valid_rfc3339?(_value), do: false
+
+  defp type_label("fyi"), do: "FYI"
+  defp type_label("request"), do: "Request"
 
   defp prepare_args(input, op_id) do
     args = [
@@ -435,6 +593,12 @@ defmodule Tightbeam.HarklightSend do
     ]
 
     args = if input.session == "new", do: args ++ ["--route", "other", "--controller"], else: args
+    args = args ++ ["--type", input.message_type]
+    args = if input.message_kind, do: args ++ ["--kind", input.message_kind], else: args
+    args = if input.importance, do: args ++ ["--importance", input.importance], else: args
+    args = if input.stake, do: args ++ ["--stake", input.stake], else: args
+    args = if input.by_when, do: args ++ ["--by-when", input.by_when], else: args
+    args = if input.reply, do: args ++ ["--reply"], else: args
     args = if input.body, do: args ++ ["--body", input.body], else: args
     args = if input.vendor, do: args ++ ["--vendor-session-id", input.vendor], else: args
     args = Enum.reduce(input.choices, args, fn choice, acc -> acc ++ ["--choice", choice] end)
@@ -494,6 +658,37 @@ defmodule Tightbeam.HarklightSend do
   end
 
   defp confirmed_result(_, _, _), do: {:error, "harklight_result_mismatch"}
+
+  defp maybe_put_possible_contradictions(result, "send", %{
+         "response" => %{"possible_contradictions" => contradictions}
+       }) do
+    Map.put(result, :possible_contradictions, possible_contradictions(contradictions))
+  end
+
+  defp maybe_put_possible_contradictions(result, _command, _committed), do: result
+
+  defp possible_contradictions(value) when is_map(value) do
+    Map.new(value, fn
+      {"messages", messages} when is_list(messages) ->
+        {"messages", Enum.map(messages, &possible_contradiction_message/1)}
+
+      pair ->
+        pair
+    end)
+  end
+
+  defp possible_contradictions(value), do: value
+
+  defp possible_contradiction_message(message) when is_map(message) do
+    Map.new(message, fn
+      {"sender_id", value} -> {"senderId", value}
+      {"sender_name", value} -> {"senderName", value}
+      {"message_id", value} -> {"messageId", value}
+      pair -> pair
+    end)
+  end
+
+  defp possible_contradiction_message(message), do: message
 
   defp bind(db, call, op_id, payload, result, request) do
     HarklightWakes.bind_send(
@@ -580,7 +775,12 @@ defmodule Tightbeam.HarklightSend do
     end
   rescue
     error ->
-      {:error, "harklight_cli_failed",
-       "Harklight Agent could not complete: #{Exception.message(error)}", "failed"}
+      reason =
+        if expected == "prepared",
+          do:
+            "Harklight Agent could not complete during local preparation: #{Exception.message(error)}; the message was not sent.",
+          else: "Harklight Agent could not complete: #{Exception.message(error)}"
+
+      {:error, "harklight_cli_failed", reason, "failed"}
   end
 end

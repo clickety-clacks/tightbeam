@@ -25,13 +25,13 @@ defmodule Tightbeam.GatewayTest do
 
     expected =
       expected ++
-        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow)
+        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow harklight-briefings-catchup)
 
-    expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle)
+    expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 
     expected =
       expected ++
-        ~w(kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe)
+        ~w(kungfu-setup sentinel-demand sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe)
 
     expected = expected ++ ~w(memento-set mementos)
 
@@ -2489,6 +2489,16 @@ defmodule Tightbeam.GatewayTest do
           |> Map.put(:effort_checkins_enabled, true)
           |> Map.put(:effort_checkin_horizon_ms, 123)
         )
+
+      File.mkdir_p!(Path.join(base_dir, "identity/rules"))
+      name = "row-reaction-assignment-inactivity.toml"
+
+      File.cp!(
+        Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
+        Path.join(base_dir, "identity/rules/#{name}")
+      )
+
+      Tightbeam.Rules.load!(base_dir, Map.keys(handlers))
 
       common = %{
         origin: "user:flynn",
@@ -11122,19 +11132,30 @@ defmodule Tightbeam.GatewayTest do
     base_dir = role_test_base("kungfu-list")
     list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-list"]
 
+    assert %{bundles: bundles} = list.(%{origin: "agent:k1", params: %{}})
+
     assert %{
-             bundles: [
-               %{
-                 name: "agentic-engineering",
-                 purpose: purpose,
-                 phrases: phrases,
-                 root_archetype: "orchestrator"
-               }
-             ]
-           } = list.(%{origin: "agent:k1", params: %{}})
+             purpose: purpose,
+             phrases: phrases,
+             root_archetype: "orchestrator"
+           } = Enum.find(bundles, &(&1.name == "agentic-engineering"))
+
+    assert %{
+             purpose:
+               "Share generic event subscription tools and a read-only Matrix event watcher.",
+             phrases: [],
+             root_archetype: "default"
+           } = Enum.find(bundles, &(&1.name == "sentinels"))
+
+    assert %{
+             purpose: briefing_purpose,
+             phrases: [],
+             root_archetype: "orchestrator"
+           } = Enum.find(bundles, &(&1.name == "harklight-decision-briefings"))
 
     assert purpose =~ "turn product ideas and bug reports into shipped software"
     assert "I want my code reviewed before it merges." in phrases
+    assert briefing_purpose =~ "configurable investigator"
 
     # The point of phrases is DISCRIMINATION: a phrase another domain's bundle could
     # honestly claim buys nothing. This one could only be a software-engineering bundle.

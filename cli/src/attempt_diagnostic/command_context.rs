@@ -74,6 +74,7 @@ impl CommandContext {
             HarklightRetract { .. } => ("cli.harklight_retract", DispatchPath),
             HarklightSettle { .. } => ("cli.harklight_settle", DispatchPath),
             HarklightFollow { .. } => ("cli.harklight_follow", DispatchPath),
+            HarklightBriefingsCatchup { .. } => ("cli.harklight_briefings_catchup", DispatchPath),
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
             Artifacts { .. } => ("cli.artifacts", DispatchPath),
             ToolCallObserved => ("cli.tool_call_observed", Requests::ToolCallObserved),
@@ -451,6 +452,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HarklightRetract { .. }
         | HarklightSettle { .. }
         | HarklightFollow { .. }
+        | HarklightBriefingsCatchup { .. }
         | ToolCallObserved
         | RoleBind { .. }
         | Tune { .. }
@@ -561,6 +563,27 @@ mod tests {
         assert!(!debug.contains("PRIVATE_USER"));
         assert!(!debug.contains("PRIVATE_ASSIGNMENT"));
         assert!(!debug.contains("PRIVATE_REASON"));
+    }
+
+    #[test]
+    fn harklight_briefing_catchup_is_a_dispatch_write_without_retained_request_data() {
+        let command = Command::HarklightBriefingsCatchup {
+            identity: Identity::Session,
+            limit: Some(7),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.harklight_briefings_catchup"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        assert!(!format!("{context:?}").contains("7"));
     }
 
     #[test]

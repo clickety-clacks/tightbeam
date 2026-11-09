@@ -183,11 +183,22 @@ pub enum Command {
         session: String,
         sender_id: String,
         title: String,
+        message_type: String,
+        message_kind: Option<String>,
+        importance: Option<String>,
+        stake: Option<String>,
+        by_when: Option<String>,
+        reply: bool,
         body: Option<String>,
         choices: Vec<String>,
         files: Vec<String>,
         vendor_session_id: Option<String>,
         supersedes: Vec<String>,
+        decision_request_id: Option<String>,
+    },
+    HarklightBriefingsCatchup {
+        identity: Identity,
+        limit: Option<u32>,
     },
     HarklightRevise {
         identity: Identity,
@@ -800,7 +811,7 @@ TARGET (for commands that take one — pass exactly one):
 
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
-       [--after 30s|5m|2h] [--at <epochMs>] [--cron "<schedule>"] [--assignment <id> --replace-queued]
+       [--after 30s|5m|2h] [--at <epochMs>] [--cron "<schedule>"] [--assignment <id>] [--replace-queued]
        [--class fyi|status-query|input-needed|blocker|algedonic]
       Condition wake:
         tightbeam wake (--session <key> | --role <name> | --user <id>)
@@ -816,6 +827,7 @@ COMMANDS:
           --after-turn --prompt "<continuation>"
       --cron uses five numeric fields in gateway local time, such as "*/30 * * * *".
       It repeats until cancel-wake. Lists, ranges and steps are supported.
+      --assignment links a recurring wake to that assignment.
       Send a prompt to the selected target. Immediate = a direct message; with --after or
       --at = a scheduled wake that fires later. A wake ALWAYS carries a prompt —
       there is no content-free ping. This is how you DM or nudge another
@@ -907,10 +919,21 @@ COMMANDS:
   harklight-follow (--message <id> | --handle <handle>)
       Follow a message or conversation sent through Tightbeam.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
-      [--supersedes <id>]...
+      --type fyi|request [--kind blocker|success]
+      [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
+      [--reply] [--supersedes <id>]...
       [--body <text>] [--choices-json <array>] [--files-json <array>]
-      [--vendor-session-id <id>]
-      Send from the authenticated local session and register its reply wake.
+      [--vendor-session-id <id>] [--decision-request-id <dr_id>]
+      FYI is acknowledged with Seen; request needs a choice or --reply. Importance is
+      your view; Harklight's ranking decides the priority the recipient sees.
+      Correct and resend only after a definite refusal;
+      settle an uncertain send with the same operation.
+      Use blocker when the recipient must act before work can continue, or success when work finished,
+      shipped, or otherwise succeeded.
+      A decision request id durably associates the send with its originating briefing.
+  harklight-briefings-catchup [--limit <count>]
+      Reconcile all of your open decision requests, stage every disposition, and
+      admit at most the requested number of uncovered briefings (default: stage only).
   artifact-content-fetch <artifactId>
       Fetch captured bytes as contentBase64 with contentSha256 and contentSize.
       Reads stored custody only, never the origin path; uncaptured content is reported unavailable.
@@ -1391,6 +1414,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "keep-open-descendants",
     "manifest",
     "redaction-confirmed",
+    "reply",
     "resolve",
     "rm",
     "tree",
@@ -2118,7 +2142,6 @@ fn parse_with_optional_catalog(
                     "when-scope",
                     "predicate",
                     "after-turn",
-                    "assignment",
                     "replace-queued",
                 ]
                 .iter()
@@ -2582,7 +2605,14 @@ fn parse_with_optional_catalog(
                             | "session"
                             | "sender-id"
                             | "title"
+                            | "type"
+                            | "kind"
+                            | "importance"
+                            | "stake"
+                            | "by-when"
+                            | "reply"
                             | "body"
+                            | "decision-request-id"
                             | "choices-json"
                             | "files-json"
                             | "vendor-session-id"
@@ -2590,7 +2620,17 @@ fn parse_with_optional_catalog(
                     )
                 })
             {
-                return Err("usage: tightbeam harklight-send --session new|<handle> --sender-id <id> --title <text> [--body <text>] [--choices-json <array>] [--files-json <array>] [--vendor-session-id <id>]".to_owned());
+                return Err("usage: tightbeam harklight-send --session new|<handle> --sender-id <id> --title <text> --type fyi|request [--kind blocker|success] [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>] [--reply] [--body <text>] [--choices-json <array>] [--files-json <array>] [--vendor-session-id <id>] [--decision-request-id <dr_id>]".to_owned());
+            }
+            let decision_request_id = nonempty(flags, "decision-request-id");
+            if parsed.duplicates.contains("decision-request-id")
+                || decision_request_id
+                    .as_deref()
+                    .is_some_and(|id| !complete_decision_request_id(id))
+            {
+                return Err(
+                    "--decision-request-id must be a complete decision request id".to_owned(),
+                );
             }
             let list = |name: &str| -> Result<Vec<String>, String> {
                 match flags.get(name) {
@@ -2600,11 +2640,20 @@ fn parse_with_optional_catalog(
                 }
             };
             let sender_identity = identity(flags)?;
+            let message_type = nonempty(flags, "type").ok_or(
+                "--type is required: use --type fyi for a Seen-only message or --type request for choices or a reply",
+            )?;
             Ok(Command::HarklightSend {
                 identity: sender_identity,
                 session: nonempty(flags, "session").ok_or("--session is required")?,
                 sender_id: nonempty(flags, "sender-id").ok_or("--sender-id is required")?,
                 title: nonempty(flags, "title").ok_or("--title is required")?,
+                message_type,
+                message_kind: flags.get("kind").cloned(),
+                importance: flags.get("importance").cloned(),
+                stake: flags.get("stake").cloned(),
+                by_when: flags.get("by-when").cloned(),
+                reply: flags.contains_key("reply"),
                 body: flags.get("body").cloned(),
                 choices: list("choices-json")?,
                 files: list("files-json")?,
@@ -2614,6 +2663,7 @@ fn parse_with_optional_catalog(
                     .get("supersedes")
                     .cloned()
                     .unwrap_or_default(),
+                decision_request_id,
             })
         }
         "harklight-revise" | "harklight-retract" | "harklight-settle" => {
@@ -3062,6 +3112,31 @@ fn parse_with_optional_catalog(
             Ok(Command::DecisionRequests {
                 identity: identity(flags)?,
                 status: nonempty(flags, "status"),
+            })
+        }
+        "harklight-briefings-catchup" => {
+            if parsed.positional.len() != 1
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "limit"))
+                || parsed.duplicates.contains("limit")
+            {
+                return Err(
+                    "usage: tightbeam harklight-briefings-catchup [--limit <count>]".to_owned(),
+                );
+            }
+
+            let limit = nonempty(flags, "limit")
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| "--limit must be a nonnegative integer".to_owned())
+                })
+                .transpose()?;
+
+            Ok(Command::HarklightBriefingsCatchup {
+                identity: identity(flags)?,
+                limit,
             })
         }
         "decision-request" => {
@@ -3920,7 +3995,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -4702,6 +4777,17 @@ mod tests {
                 "sender",
                 "--title",
                 "Question",
+                "--type",
+                "request",
+                "--kind",
+                "blocker",
+                "--importance",
+                "high",
+                "--stake",
+                "the demo slips",
+                "--by-when",
+                "2026-11-01T17:00:00Z",
+                "--reply",
                 "--choices-json",
                 r#"["Yes","No"]"#,
                 "--files-json",
@@ -4712,12 +4798,58 @@ mod tests {
                 session: "new".to_owned(),
                 sender_id: "sender".to_owned(),
                 title: "Question".to_owned(),
+                message_type: "request".to_owned(),
+                message_kind: Some("blocker".to_owned()),
+                importance: Some("high".to_owned()),
+                stake: Some("the demo slips".to_owned()),
+                by_when: Some("2026-11-01T17:00:00Z".to_owned()),
+                reply: true,
                 body: None,
                 choices: vec!["Yes".to_owned(), "No".to_owned()],
                 files: vec!["/tmp/request.txt".to_owned()],
                 vendor_session_id: None,
                 supersedes: vec![],
+                decision_request_id: None,
             })
+        );
+
+        assert!(matches!(
+            parse(strings(&[
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "sender",
+                "--title",
+                "Question",
+                "--type",
+                "request",
+                "--reply",
+                "--decision-request-id",
+                "dr_12345678-1234-4234-8234-123456789abc",
+            ])),
+            Ok(Command::HarklightSend {
+                decision_request_id: Some(id),
+                ..
+            }) if id == "dr_12345678-1234-4234-8234-123456789abc"
+        ));
+
+        assert!(
+            parse(strings(&[
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "sender",
+                "--title",
+                "Question",
+                "--type",
+                "request",
+                "--reply",
+                "--decision-request-id",
+                "not-an-id",
+            ]))
+            .is_err()
         );
 
         assert!(matches!(parse(strings(&[
@@ -4728,6 +4860,9 @@ mod tests {
                 "sender",
                 "--title",
                 "Question",
+                "--type",
+                "request",
+                "--reply",
                 "--as-user",
                 "owner",
             ])), Ok(Command::HarklightSend { identity: Identity::User(user), .. }) if user == "owner"));
@@ -4740,6 +4875,9 @@ mod tests {
                 "sender",
                 "--title",
                 "Question",
+                "--type",
+                "request",
+                "--reply",
                 "--as-process",
                 "worker",
             ])),
@@ -4760,6 +4898,42 @@ mod tests {
             ]))
             .is_err()
         );
+
+        assert_eq!(
+            parse(strings(&[
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "sender",
+                "--title",
+                "Question",
+            ])),
+            Err("--type is required: use --type fyi for a Seen-only message or --type request for choices or a reply".to_owned())
+        );
+    }
+
+    #[test]
+    fn harklight_briefings_catchup_defaults_to_staging_and_accepts_bounded_limit() {
+        assert_eq!(
+            parse(strings(&["harklight-briefings-catchup"])),
+            Ok(Command::HarklightBriefingsCatchup {
+                identity: Identity::Session,
+                limit: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&["harklight-briefings-catchup", "--limit", "3"])),
+            Ok(Command::HarklightBriefingsCatchup {
+                identity: Identity::Session,
+                limit: Some(3),
+            })
+        );
+
+        for value in ["-1", "one"] {
+            assert!(parse(strings(&["harklight-briefings-catchup", "--limit", value])).is_err());
+        }
     }
 
     #[test]
@@ -5668,6 +5842,30 @@ mod tests {
     }
 
     #[test]
+    fn harklight_send_help_explains_type_importance_and_safe_correction() {
+        let entry = render_command_help(None, "harklight-send").unwrap();
+
+        for required in [
+            "--type fyi|request",
+            "FYI is acknowledged with Seen",
+            "request needs a choice or --reply",
+            "Importance is",
+            "your view;",
+            "Harklight's ranking decides the priority the recipient sees",
+            "Correct and resend",
+            "only after a definite refusal",
+            "settle an uncertain send with the same operation",
+            "Use blocker when the recipient must act before work can continue",
+            "shipped, or otherwise succeeded",
+        ] {
+            assert!(
+                entry.contains(required),
+                "missing {required:?} from:\n{entry}"
+            );
+        }
+    }
+
+    #[test]
     fn assign_help_calls_files_advisory_not_a_reservation_or_limit() {
         let entry = render_command_help(None, "assign").unwrap();
 
@@ -6372,6 +6570,7 @@ mod tests {
                 "session-diagnose",
                 "effort-rule",
                 "harness-process",
+                "harklight-briefings-catchup",
                 "harklight-send",
                 "harklight-revise",
                 "harklight-retract",
@@ -6397,6 +6596,7 @@ mod tests {
                 "operator-rule",
                 "operator-withdraw",
                 "retire",
+                "retire-withdraw",
                 "role-bind",
                 "sentinel",
                 "session-connect",
@@ -7534,7 +7734,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 

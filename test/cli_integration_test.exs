@@ -688,6 +688,14 @@ defmodule Tightbeam.CliIntegrationTest do
       Path.join(ctx.base_dir, "identity/rules/verification.toml")
     )
 
+    File.cp!(
+      Path.expand(
+        "../priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml",
+        __DIR__
+      ),
+      Path.join(ctx.base_dir, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     registry = start_supervised!({Tightbeam.ConnRegistry, name: :d3_cli_registry})
     # Stop at the durable notification boundary; do not start an agent/provider lane.
@@ -1879,6 +1887,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "session-auth --as-user retains agent attribution for verdicts and revocation",
        ctx do
+    Tightbeam.TerminalReactionFixture.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -3356,7 +3366,18 @@ defmodule Tightbeam.CliIntegrationTest do
 
     commands = [
       {"harklight-send",
-       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"]},
+       [
+         "harklight-send",
+         "--session",
+         "new",
+         "--sender-id",
+         "owner",
+         "--title",
+         "Example",
+         "--type",
+         "request",
+         "--reply"
+       ]},
       {"harklight-revise",
        [
          "harklight-revise",
@@ -3409,8 +3430,18 @@ defmodule Tightbeam.CliIntegrationTest do
        ctx do
     commands = [
       {"harklight-send",
-       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"],
-       "harklight-send requires the authenticated session or one of its roles"},
+       [
+         "harklight-send",
+         "--session",
+         "new",
+         "--sender-id",
+         "owner",
+         "--title",
+         "Example",
+         "--type",
+         "request",
+         "--reply"
+       ], "harklight-send requires the authenticated session or one of its roles"},
       {"harklight-revise",
        [
          "harklight-revise",

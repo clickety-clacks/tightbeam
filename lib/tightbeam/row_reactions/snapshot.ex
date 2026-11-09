@@ -1,10 +1,108 @@
 defmodule Tightbeam.RowReactions.Snapshot do
   @moduledoc false
-  alias Tightbeam.{DeliveryResponsibilities, Org, SessionReparent, Wakes}
+  alias Tightbeam.{
+    DeliveryResponsibilities,
+    Harness,
+    HarnessProcess,
+    Org,
+    SessionReparent,
+    Wakes
+  }
   alias Tightbeam.DB.Txn
 
   @assignment ~w(id holderKey workItemId openedBySession openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
   def assignment(txn, id), do: one(txn, "assignments", @assignment, "id=?1", [id])
+
+  def harness_health_hold(txn, incident_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT i.id,i.harness,i.host,i.failureClass,i.state,i.openedAt,i.resolvedAt,
+                  o.correlationId,
+                  (SELECT s.ownerUserId FROM harness_health_members m
+                   JOIN sessions s ON s.sessionKey=m.sessionKey
+                   WHERE m.incidentId=i.id ORDER BY s.ownerUserId LIMIT 1)
+           FROM harness_health_incidents i
+           LEFT JOIN harness_health_observations o ON o.id=i.resolutionObservationId
+           WHERE i.id=?1
+           """,
+           [incident_id]
+         ) do
+      [[id, harness, host, failure_class, state, opened_at, resolved_at, correlation, owner]] ->
+        route_rows =
+          Txn.q(
+            txn,
+            """
+            WITH terminal_observations AS (
+              SELECT o.correlationId,o.harness,o.host,o.failureClass,o.observedAt,o.id,
+                     CASE
+                       WHEN substr(o.correlationId,1,13)='harness-turn:'
+                         AND instr(substr(o.correlationId,14),':') > 1
+                         AND substr(
+                               o.correlationId,
+                               14,
+                               instr(substr(o.correlationId,14),':') - 1
+                             ) NOT GLOB '*[^0-9]*'
+                       THEN CAST(
+                              substr(
+                                o.correlationId,
+                                14,
+                                instr(substr(o.correlationId,14),':') - 1
+                              ) AS INTEGER
+                            )
+                       ELSE NULL
+                     END AS turnSeq
+              FROM harness_health_observations o
+              WHERE o.incidentId=?1 AND o.evidenceKind='terminal-failure'
+            )
+            SELECT o.correlationId,o.harness,o.host,t.model
+            FROM terminal_observations o
+            LEFT JOIN turns t
+              ON t.seq=o.turnSeq
+             AND o.correlationId='harness-turn:' || t.seq || ':' || o.failureClass
+            ORDER BY o.observedAt,o.id
+            """,
+            [incident_id]
+          )
+
+        routes =
+          route_rows
+          |> Enum.map(fn [_correlation, route_harness, route_host, model] ->
+            %{
+              "harness" => route_harness,
+              "host" => route_host,
+              "sharedAccount" => "shared",
+              "model" => model
+            }
+          end)
+          |> Enum.uniq()
+          |> Enum.sort_by(&{&1["harness"], &1["host"], &1["sharedAccount"], &1["model"] || ""})
+
+        key = {Harness.parse!(harness).id(), "shared", host}
+
+        %{
+          "id" => id,
+          "harness" => harness,
+          "host" => host,
+          "failureClass" => failure_class,
+          "state" => state,
+          "openedAt" => opened_at,
+          "resolvedAt" => resolved_at,
+          "resolutionCorrelation" => correlation,
+          "ownerUserId" => owner,
+          "routes" => routes,
+          "routesComplete" =>
+            route_rows != [] and
+              Enum.all?(routes, fn route ->
+                is_binary(route["model"]) and route["model"] != ""
+              end),
+          "fencePresent" => HarnessProcess.parked_in_txn?(txn, key)
+        }
+
+      [] ->
+        nil
+    end
+  end
 
   def current(txn, %{"kind" => "assignment"} = event, _recorded) do
     terminal = event["terminal"]
@@ -43,6 +141,22 @@ defmodule Tightbeam.RowReactions.Snapshot do
       "sessions" => sessions(txn, keys),
       "assignments" =>
         rows(txn, "assignments", @assignment, "workItemId=?1", [terminal["work_item_id"]])
+    }
+  end
+
+  def current(
+        txn,
+        %{"kind" => "harness_health_hold", "source" => %{"id" => incident_id}},
+        _recorded
+      ) do
+    %{"hold" => harness_health_hold(txn, incident_id)}
+  end
+
+  def current(txn, %{"kind" => "harness_health_recovery_check"} = event, _recorded) do
+    %{
+      "hold" => harness_health_hold(txn, event["holdId"]),
+      "recovery_check" =>
+        Map.take(event, ~w(holdId cycleId route startedAt finishedAt outcome errorExcerpt))
     }
   end
 
@@ -103,8 +217,12 @@ defmodule Tightbeam.RowReactions.Snapshot do
         txn,
         "attests INDEXED BY row_reaction_receipt_candidates",
         ~w(id assignmentId kind bySession byUser ts note),
-        "bySession=?1 AND kind='progress' AND note>=?2 AND note<?3",
-        [parent, prefix, upper]
+        """
+        bySession=?1 AND kind='progress' AND note>=?2 AND note<?3
+          AND EXISTS (SELECT 1 FROM assignments a
+            WHERE a.id=attests.assignmentId AND a.workItemId IS ?4)
+        """,
+        [parent, prefix, upper, source["workItemId"]]
       )
     end)
     |> Enum.map(&Map.put(&1, "disposition", disposition(&1["note"])))
