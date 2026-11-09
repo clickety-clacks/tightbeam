@@ -2465,10 +2465,20 @@ defmodule Tightbeam.GatewayTest do
   test "assignment and dispatch do not create inactivity wakes", ctx do
     handlers = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))
 
+    owner = "test-owner"
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES (?1,0,?2)", [
+               owner,
+               System.system_time(:millisecond)
+             ])
+
+    owner_session = ensure_main_session(ctx.db, owner)
+
     common = %{
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      session_key: "k1",
+      origin: "user:#{owner}",
+      principal: {:user, owner},
+      session_key: owner_session.session_key,
       target_role: nil,
       role_fallback: false
     }
@@ -2489,9 +2499,9 @@ defmodule Tightbeam.GatewayTest do
     for assignment_id <- [assign_id, dispatch_id] do
       assert %{attest: %{id: _}} =
                handlers["attest"].(%{
-                 origin: "agent:k1",
-                 principal: {:session, "k1"},
-                 session_key: "k1",
+                 origin: "agent:#{owner_session.session_key}",
+                 principal: {:session, owner_session.session_key},
+                 session_key: owner_session.session_key,
                  params: %{assignment_id: assignment_id, kind: "progress"}
                })
 
@@ -3365,10 +3375,20 @@ defmodule Tightbeam.GatewayTest do
     assert [] = Rules.load!(ctx.catalog_base, Map.keys(handlers))
     assert is_nil(Rules.reaction_policy("assignment-inactivity"))
 
+    owner = "test-owner"
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES (?1,0,?2)", [
+               owner,
+               System.system_time(:millisecond)
+             ])
+
+    owner_session = ensure_main_session(ctx.db, owner)
+
     common = %{
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      session_key: "k1",
+      origin: "user:#{owner}",
+      principal: {:user, owner},
+      session_key: owner_session.session_key,
       target_role: nil,
       role_fallback: false
     }
@@ -3392,30 +3412,30 @@ defmodule Tightbeam.GatewayTest do
     for assignment_id <- [assignment_id, dispatch_id] do
       assert %{attest: %{id: _}} =
                handlers["attest"].(%{
-                 origin: "agent:k1",
-                 principal: {:session, "k1"},
-                 session_key: "k1",
+                 origin: "agent:#{owner_session.session_key}",
+                 principal: {:session, owner_session.session_key},
+                 session_key: owner_session.session_key,
                  params: %{assignment_id: assignment_id, kind: "progress"}
                })
     end
 
     assert %{state: "closed"} =
              handlers["revoke-assignment"].(%{
-               origin: "agent:k1",
-               principal: {:session, "k1"},
-               session_key: "k1",
+               origin: "agent:#{owner_session.session_key}",
+               principal: {:session, owner_session.session_key},
+               session_key: owner_session.session_key,
                params: %{assignment_id: assignment_id, reason: "reopen after progress"}
              })
 
     assert %{state: "open"} =
              handlers["reopen-assignment"].(%{
-               origin: "agent:k1",
-               principal: {:session, "k1"},
-               session_key: "k1",
+               origin: "agent:#{owner_session.session_key}",
+               principal: {:session, owner_session.session_key},
+               session_key: owner_session.session_key,
                params: %{assignment_id: assignment_id, reason: "continue work"}
              })
 
-    retiree = create_session(ctx.db, "no-inactivity-retiree", "flynn")
+    retiree = create_session(ctx.db, "no-inactivity-retiree", owner)
 
     assert %{id: _} =
              handlers["assign"].(
@@ -3435,8 +3455,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{retired_session_keys: [retired_key]} =
              handlers["retire"].(%{
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
+               origin: "user:#{owner}",
+               principal: {:user, owner},
                session_key: retiree.session_key,
                params: %{}
              })

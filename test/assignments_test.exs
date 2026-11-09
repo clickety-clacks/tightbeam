@@ -45,6 +45,9 @@ defmodule Tightbeam.AssignmentsTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('admin', 1, 1), ('flynn', 0, 1), ('other', 0, 1)"
       )
 
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('test-owner', 0, 1)")
+
     holder = session(db, "holder", "flynn")
     other = session(db, "other-session", "other")
     gateway_config = %{db: db, wake_tick_ms: 1_000}
@@ -192,7 +195,14 @@ defmodule Tightbeam.AssignmentsTest do
     assignment = handlers["assign"].(assign_call({:session, "holder"}, "quiet assignment"))
     assert assignment.id
 
-    item = create_work_item(ctx, "Off interval linked item")
+    item =
+      handle(
+        ctx,
+        "work-item-create",
+        work_item_call("work-item-create", {:user, "test-owner"}, %{
+          title: "Off interval linked item"
+        })
+      )
 
     assert {:ok, [[routing_id]]} =
              DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
@@ -233,7 +243,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     reopened =
       handlers["reopen-assignment"].(
-        reopen_call({:user, "flynn"}, linked.id, "continue quiet work")
+        reopen_call({:user, "test-owner"}, linked.id, "continue quiet work")
       )
 
     assert reopened.state == "open"
@@ -4669,7 +4679,7 @@ defmodule Tightbeam.AssignmentsTest do
   test "raw dispatch precheck and assignment mutation have no inactivity timer dependency", ctx do
     baseline = assignment_count(ctx.db)
 
-    raw_call = assign_call({:user, "flynn"}, "Gateway assignment")
+    raw_call = assign_call({:user, "test-owner"}, "Gateway assignment")
 
     assert :proceed = Assignments.dispatch_precheck(ctx.db, raw_call)
 
