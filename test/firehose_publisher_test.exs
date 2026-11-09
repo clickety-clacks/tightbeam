@@ -628,10 +628,17 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
 
-    assert_per_verb_effects!(
-      config,
-      "attest",
-      Enum.reject(completion_effects, &(&1 in asynchronous_delivery))
+    completion_attest_effects = Enum.reject(completion_effects, &(&1 in asynchronous_delivery))
+    declared_attest_effects = Gateway.handler_effects(config)["attest"]
+
+    # Without the removed inactivity deadline, this ordinary completion has
+    # no pending wake to cancel. The blocked-completion case below still proves
+    # that an attestation that cancels a real pending wake emits wake.canceled.
+    assert "wake.canceled" in declared_attest_effects
+    refute "wake.canceled" in completion_attest_effects
+    assert_effects_match!(
+      List.delete(declared_attest_effects, "wake.canceled"),
+      completion_attest_effects
     )
 
     blocked_assignment_call = %{
