@@ -707,7 +707,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{outcome: "revoked"}} = Dispatch.dispatch(db, handlers, blocked_revoke)
 
     blocked_close_effects = observed_state_classes()
-    assert_per_verb_effects!(config, "revoke-assignment", blocked_close_effects)
+    assert Enum.sort(blocked_close_effects) ==
+             Enum.sort([
+               "assignment.closed",
+               "decision_request.withdrawn",
+               "message.created",
+               "wake.canceled"
+             ])
+
+    assert_per_verb_effects!(config, "revoke-assignment", ["assignment.closed"])
     assert %{state: "canceled"} = Wakes.get(db, blocked_wake_id)
 
     reopen = %{
