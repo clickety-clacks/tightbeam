@@ -821,6 +821,7 @@ defmodule Tightbeam.HarklightWakes do
               retry_timers: Map.put(state.retry_timers, handle, {timer, token})
           }
         else
+          notify_owner_after_recovery_exhaustion(state.db, handle, status)
           start_gone(state, handle)
         end
 
@@ -1318,7 +1319,10 @@ defmodule Tightbeam.HarklightWakes do
 
         if completed, do: HarklightLifecycle.complete_in_txn(txn, handle)
 
-        if not completed,
+        # Retryable listener failures remain unavailable while the existing
+        # finite recovery budget runs. Notify the owner only if recovery ends
+        # without a retry; permanent failures keep their immediate notice.
+        if not completed and not retryable_failure?(status),
           do:
             notify_owner_in_txn(
               txn,
@@ -1338,6 +1342,41 @@ defmodule Tightbeam.HarklightWakes do
 
       _ ->
         :ok
+    end
+  end
+
+  defp notify_owner_after_recovery_exhaustion(db, handle, status) do
+    {error, operation, diagnostic} = failure_details(status)
+    now = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1", [
+                  handle
+                ]) do
+             [[session_key, state]] when state in ["active", "unavailable"] ->
+               notify_owner_in_txn(
+                 txn,
+                 session_key,
+                 handle,
+                 if(error == "origin_unavailable",
+                   do: "origin_unavailable",
+                   else: "listener_failure"
+                 ),
+                 error,
+                 operation,
+                 diagnostic,
+                 now
+               )
+
+             _ ->
+               :ok
+           end
+         end) do
+      {:ok, _} ->
+        :ok
+
+      {:error, _} ->
+        Logger.error("Harklight recovery notice could not be recorded for handle=#{handle}")
     end
   end
 
