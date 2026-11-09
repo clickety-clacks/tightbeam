@@ -180,7 +180,7 @@ defmodule Tightbeam.EffortCheckin do
             decision_disposition_command(
               txn,
               ruled,
-              decision_inactivity_deadline_trigger_in_txn(txn, ruled.assignment_id)
+              decision_liveness_trigger_in_txn(txn, ruled.assignment_id)
             )
           )
 
@@ -235,10 +235,10 @@ defmodule Tightbeam.EffortCheckin do
 
   defp put_liveness_trigger(outcome, nil), do: outcome
 
-  defp decision_inactivity_deadline_trigger_in_txn(txn, assignment_id) do
+  defp decision_liveness_trigger_in_txn(txn, assignment_id) do
     primary = decision_liveness_primary_in_txn(txn, assignment_id)
 
-    case primary && Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
+    case primary && Supervision.liveness_trigger_in_txn(txn, primary) do
       nil -> nil
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> nil
