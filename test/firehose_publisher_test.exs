@@ -707,6 +707,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{outcome: "revoked"}} = Dispatch.dispatch(db, handlers, blocked_revoke)
 
     blocked_close_effects = observed_state_classes()
+
     assert Enum.sort(blocked_close_effects) ==
              Enum.sort([
                "assignment.closed",
