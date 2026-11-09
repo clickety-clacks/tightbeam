@@ -1720,7 +1720,11 @@ defmodule Tightbeam.Gateway do
   then broadcasts the echo and nudges the lane. Returns the dedupe outcome.
   """
   @spec deliver_prompt(String.t(), String.t(), String.t(), keyword()) ::
-          :appended | :duplicate | :conflict | :invalid_reply_reference | :skipped
+          :appended
+          | :duplicate
+          | :conflict
+          | :invalid_reply_reference
+          | :skipped
           | {:recorded | :duplicate, String.t(), pos_integer()}
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
@@ -1753,7 +1757,9 @@ defmodule Tightbeam.Gateway do
       end
 
     {:ok, [[turn_seq]]} =
-      DB.query(db, "SELECT seq FROM turns WHERE messageId = ?1 ORDER BY seq ASC LIMIT 1", [message.id])
+      DB.query(db, "SELECT seq FROM turns WHERE messageId = ?1 ORDER BY seq ASC LIMIT 1", [
+        message.id
+      ])
 
     kind = if status == :appended, do: :recorded, else: :duplicate
     {kind, message.id, turn_seq}

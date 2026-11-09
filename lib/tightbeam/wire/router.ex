@@ -2204,8 +2204,8 @@ defmodule Tightbeam.Wire.Router do
 
     cond do
       not is_binary(id) or not String.starts_with?(id, "c_") or
-          not is_binary(device_id) or device_id == "" or not is_binary(content) or
-          not is_list(attachments) or not Enum.all?(attachments, &post_attachment?/1) ->
+        not is_binary(device_id) or device_id == "" or not is_binary(content) or
+        not is_list(attachments) or not Enum.all?(attachments, &post_attachment?/1) ->
         {:error, 400, "invalid_message", nil}
 
       byte_size(content) > 64 * 1024 ->

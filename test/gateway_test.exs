@@ -7743,6 +7743,7 @@ defmodule Tightbeam.GatewayTest do
     assert message.device_id == "chat_test"
     assert message.client_message_id == "c_rest_1"
     assert message.attachments == [attachment]
+
     assert {:ok, [[^turn_seq, ^message_id]]} =
              DB.query(ctx.db, "SELECT seq, messageId FROM turns WHERE seq = ?1", [turn_seq])
 
@@ -7794,8 +7795,15 @@ defmodule Tightbeam.GatewayTest do
              JSON.decode!(no_user_response.resp_body)
 
     assert rest_post(ctx, "tbc_test", Map.put(body, :role, "other")).status == 400
-    assert rest_post(ctx, "tbc_test", put_in(body, [:params, :clientMessageId], "wrong")).status == 400
-    assert rest_post(ctx, "tbc_test", put_in(body, [:params, :content], String.duplicate("x", 65_537))).status == 400
+
+    assert rest_post(ctx, "tbc_test", put_in(body, [:params, :clientMessageId], "wrong")).status ==
+             400
+
+    assert rest_post(
+             ctx,
+             "tbc_test",
+             put_in(body, [:params, :content], String.duplicate("x", 65_537))
+           ).status == 400
 
     missing = rest_post(ctx, "tbc_test", Map.put(body, :sessionKey, "missing"))
     assert missing.status == 404
@@ -7833,10 +7841,16 @@ defmodule Tightbeam.GatewayTest do
     duplicate = rest_post(ctx, "tbc_test", body)
     assert duplicate.status == 200
 
-    assert %{"result" => %{"outcome" => "duplicate", "messageId" => message_id,
-                            "turnSeq" => turn_seq}} = JSON.decode!(duplicate.resp_body)
+    assert %{
+             "result" => %{
+               "outcome" => "duplicate",
+               "messageId" => message_id,
+               "turnSeq" => turn_seq
+             }
+           } = JSON.decode!(duplicate.resp_body)
 
     assert Projection.get(ctx.db, message_id).content == "hello"
+
     assert {:ok, [[^turn_seq, ^message_id]]} =
              DB.query(ctx.db, "SELECT seq, messageId FROM turns WHERE seq = ?1", [turn_seq])
 
@@ -11666,7 +11680,10 @@ defmodule Tightbeam.GatewayTest do
 
     Plug.Test.conn(:post, "/agent/dispatch", JSON.encode!(body))
     |> Plug.Conn.put_req_header("authorization", "Bearer #{bearer}")
-    |> Plug.Conn.put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+    |> Plug.Conn.put_req_header(
+      "x-tightbeam-cli-version",
+      Tightbeam.CliCompatibility.required_version()
+    )
     |> Tightbeam.Wire.Router.call(Tightbeam.Wire.Router.init(opts))
   end
 
