@@ -24,7 +24,7 @@ defmodule Tightbeam.Wire.Router do
   - GET  /version              — no auth; protocolVersion + health numbers.
   - POST /agent/dispatch       — cliToken auth; body {verb, target?, params,
     as|asUser} → origin resolution; verb must be in the closed AGENT_VERBS
-    set (post excluded on purpose: an agent DM IS a wake-with-prompt).
+    set. Human post requires a user principal and a sessionKey target.
   - POST /agent/tool-call-observed — SESSION token only; no body. The
     substrate-reserved PreToolUse hook reporting that this session is about to
     run `tightbeam artifact-record`. Not a verb: it writes no domain state, only
@@ -71,7 +71,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts activation-declare activation-authority activation-attempt activation-observe activation-reconcile activation-withdraw activation-renotify activation-ack activation-status activations spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user read-marker-set read-marker-clear config register-host host-env-set host-env-list host-env-unset update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment assignments completion-notices completion-disposition work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail work-item-deprioritize work-item-boundary rule effort-rule waive revoke-waiver withdraw ask answer return operator-ask operator-rule operator-withdraw decision-requests decision-request transcript turn-trace attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list coordination-share digest-members breathing harness-processes)
+  @agent_verbs ~w(post wake condition facts-read artifact-record artifact-get artifacts activation-declare activation-authority activation-attempt activation-observe activation-reconcile activation-withdraw activation-renotify activation-ack activation-status activations spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user read-marker-set read-marker-clear config register-host host-env-set host-env-list host-env-unset update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment assignments completion-notices completion-disposition work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail work-item-deprioritize work-item-boundary rule effort-rule waive revoke-waiver withdraw ask answer return operator-ask operator-rule operator-withdraw decision-requests decision-request transcript turn-trace attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list coordination-share digest-members breathing harness-processes)
   @max_upload_bytes 32 * 1024 * 1024
   @state_cursor_version 1
   @state_default_limit 50
@@ -2136,6 +2136,105 @@ defmodule Tightbeam.Wire.Router do
         error(conn, status, code, message)
     end
   end
+
+  defp dispatch_agent_request(conn, auth, "post", body) do
+    with {:ok, user_id} <- post_user(auth, body),
+         {:ok, session_key} <- post_target(body, user_id, conn),
+         {:ok, params} <- post_params(body["params"]) do
+      call = %{
+        verb: "post",
+        origin: "user:#{user_id}",
+        principal: {:user, user_id},
+        session_key: session_key,
+        params: params,
+        transport: :rest,
+        firehose_hub: deps(conn)[:firehose_hub] || Tightbeam.Firehose.Hub
+      }
+
+      dispatch_response(conn, call, 200, &%{"result" => &1})
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  defp post_user(auth, body) do
+    user_id = body["asUser"]
+
+    if is_binary(user_id) and user_id != "" and
+         Enum.all?(~w(as asProcess asSession), &(not Map.has_key?(body, &1))) do
+      case resolve_cli_as_user(auth, user_id) do
+        {:ok, {:user, ^user_id}} -> {:ok, user_id}
+        _ -> {:error, 403, "principal_required", nil}
+      end
+    else
+      {:error, 403, "principal_required", nil}
+    end
+  end
+
+  defp post_target(body, user_id, conn) do
+    key = body["sessionKey"]
+
+    cond do
+      not is_binary(key) or key == "" or
+          Enum.any?(~w(role userId target), &Map.has_key?(body, &1)) ->
+        {:error, 400, "invalid_message", nil}
+
+      true ->
+        session = Org.get(db(conn), key)
+        admin? = match?(%{is_admin: true}, Devices.user(db(conn), user_id))
+
+        cond do
+          is_nil(session) or (session.owner_user_id != user_id and not admin?) ->
+            {:error, 404, "not_found", nil}
+
+          session.state != "active" ->
+            {:error, 400, "not_deliverable", nil}
+
+          true ->
+            {:ok, key}
+        end
+    end
+  end
+
+  defp post_params(params) when is_map(params) do
+    id = params["clientMessageId"]
+    device_id = params["deviceId"]
+    content = params["content"]
+    attachments = Map.get(params, "attachments", [])
+
+    cond do
+      not is_binary(id) or not String.starts_with?(id, "c_") or
+        not is_binary(device_id) or device_id == "" or not is_binary(content) or
+        not is_list(attachments) or not Enum.all?(attachments, &post_attachment?/1) ->
+        {:error, 400, "invalid_message", nil}
+
+      byte_size(content) > 64 * 1024 ->
+        {:error, 400, "payload_too_large", nil}
+
+      true ->
+        {:ok,
+         %{
+           client_message_id: id,
+           device_id: device_id,
+           content: content,
+           attachments: attachments
+         }}
+    end
+  end
+
+  defp post_params(_), do: {:error, 400, "invalid_message", nil}
+
+  defp post_attachment?(%{
+         "assetId" => id,
+         "mimeType" => mime_type,
+         "filename" => filename,
+         "size" => size
+       })
+       when is_binary(id) and id != "" and is_binary(mime_type) and is_binary(filename) and
+              is_integer(size),
+       do: true
+
+  defp post_attachment?(_), do: false
 
   defp dispatch_agent_request(conn, auth, verb, body) do
     with :ok <- allowed_agent_verb(verb),

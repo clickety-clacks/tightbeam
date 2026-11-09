@@ -1135,7 +1135,7 @@ defmodule Tightbeam.Wire.RouterTest do
                     %{verb: "wake", origin: "agent:orchestrator:demo", session_key: "orch"}}
 
     disallowed =
-      conn(:post, "/agent/dispatch", JSON.encode!(%{verb: "post", as_user: "sample-user"}))
+      conn(:post, "/agent/dispatch", JSON.encode!(%{verb: "not-a-verb", as_user: "sample-user"}))
       |> put_req_header("authorization", "Bearer tbc_test")
       |> put_req_header(
         "x-tightbeam-cli-version",
