@@ -685,7 +685,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
              )
 
     assert %{state: "pending"} = Wakes.get(db, blocked_wake_id)
-    assert "wake.scheduled" in observed_state_classes()
+
+    blocked_attest_effects = observed_state_classes()
+    assert "decision_request.opened" in blocked_attest_effects
+    assert "message.created" in blocked_attest_effects
+    assert "attest.filed" in blocked_attest_effects
 
     blocked_completion = %{
       blocked_attest
