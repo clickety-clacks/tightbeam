@@ -72,6 +72,7 @@ defmodule Tightbeam.Harness.Pi do
   @impl true
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
+
     private_home =
       Keyword.get(
         opts,

@@ -2218,7 +2218,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert coordinator_generation(coordinator, key) == 2
   end
 
-  test "closing one Pi session worker reaps only its process group and leaves its sibling ready", ctx do
+  test "closing one Pi session worker reaps only its process group and leaves its sibling ready",
+       ctx do
     script = Path.join(ctx.test_dir, "pi_session_worker.js")
 
     File.write!(script, """
@@ -2744,7 +2745,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     placement_key = {:pi, "shared", "testhost"}
     worker_key = Tightbeam.Placement.pi_session_adapter_key(session_row_key, "testhost")
 
-    assert {:ok, readiness_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, placement_key)
+    assert {:ok, readiness_adapter, 1} =
+             AdapterCoordinator.adapter_for(coordinator, placement_key)
     assert {:ok, session_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, worker_key)
     await_ready!(coordinator, placement_key)
     await_ready!(coordinator, worker_key)
@@ -2811,7 +2813,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
        adapter_context: fn _ -> [] end,
        adapter_opts: fn _, _ ->
          [
-         harness: harness,
+           harness: harness,
            cmd: [System.find_executable("node"), path],
            home: ctx.test_dir,
            cwd: ctx.test_dir
@@ -2843,9 +2845,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   defp process_active?(pid) do
-    case System.cmd("ps", ["-o", "stat=", "-p", Integer.to_string(pid)],
-           stderr_to_stdout: true
-         ) do
+    case System.cmd("ps", ["-o", "stat=", "-p", Integer.to_string(pid)], stderr_to_stdout: true) do
       {state, 0} -> not String.starts_with?(String.trim(state), "Z")
       _ -> false
     end

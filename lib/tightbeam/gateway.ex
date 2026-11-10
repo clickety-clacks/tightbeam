@@ -8523,9 +8523,11 @@ defmodule Tightbeam.Gateway do
         EventLog.lifecycle(db, "adapter_park_failed", session.session_key, inspect(reason))
     end
   rescue
-    exception -> best_effort_failed("reap_old_pi_session_worker", :error, exception, __STACKTRACE__)
+    exception ->
+      best_effort_failed("reap_old_pi_session_worker", :error, exception, __STACKTRACE__)
   catch
-    :exit, reason -> best_effort_failed("reap_old_pi_session_worker", :exit, reason, __STACKTRACE__)
+    :exit, reason ->
+      best_effort_failed("reap_old_pi_session_worker", :exit, reason, __STACKTRACE__)
   end
 
   defp reap_old_pi_session_worker(_config, _db, _session), do: :ok
@@ -9792,7 +9794,13 @@ defmodule Tightbeam.Gateway do
     nil
   end
 
-  defp reject_tuned_session(config, %{harness: "pi"} = session, _adapter, _prior_sid, switched_sid) do
+  defp reject_tuned_session(
+         config,
+         %{harness: "pi"} = session,
+         _adapter,
+         _prior_sid,
+         switched_sid
+       ) do
     coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
 
     case AdapterCoordinator.close_adapter(
@@ -11079,7 +11087,12 @@ defmodule Tightbeam.Gateway do
       |> Enum.filter(&is_binary(&1.sid))
       |> Enum.group_by(& &1.key)
       |> Enum.each(fn {key, sessions} ->
-        reap_adapter_sessions(db, coordinator, key, Enum.map(sessions, &Map.take(&1, [:session_key, :sid])))
+        reap_adapter_sessions(
+          db,
+          coordinator,
+          key,
+          Enum.map(sessions, &Map.take(&1, [:session_key, :sid]))
+        )
       end)
 
       pi_sessions

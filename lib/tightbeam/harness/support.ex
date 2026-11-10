@@ -616,6 +616,7 @@ defmodule Tightbeam.Harness.Support do
     with_tmp("adapter", fn base ->
       adapter = adapter_path(base, profile.adapter_bin, locality)
       bundle = install_fake_adapter!(adapter, profile)
+
       package_json =
         Path.join([
           base,

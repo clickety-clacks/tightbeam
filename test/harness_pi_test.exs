@@ -120,6 +120,7 @@ defmodule Tightbeam.HarnessPiTest do
     )
 
     File.chmod!(fake, 0o755)
+
     env = [
       {"PI_CODING_AGENT_DIR", home},
       {"PI_REAL_HOME", real_home},

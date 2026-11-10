@@ -1936,8 +1936,12 @@ defmodule Tightbeam.PlacementTest do
     private_b = Placement.pi_private_home(host, elem(key_b, 1))
     readiness = Placement.pi_private_home(host, "shared")
 
-    assert private_a == Path.join([Placement.host_workdir_path(host, "session-a"), ".tightbeam", "pi-home"])
-    assert private_b == Path.join([Placement.host_workdir_path(host, "session-b"), ".tightbeam", "pi-home"])
+    assert private_a ==
+             Path.join([Placement.host_workdir_path(host, "session-a"), ".tightbeam", "pi-home"])
+
+    assert private_b ==
+             Path.join([Placement.host_workdir_path(host, "session-b"), ".tightbeam", "pi-home"])
+
     refute private_a == private_b
     refute private_a == readiness
     assert readiness == Path.join([base_dir, "work", "pi-readiness-home"])
@@ -1976,6 +1980,7 @@ defmodule Tightbeam.PlacementTest do
 
     assert env_a["PI_CODING_AGENT_DIR"] == env_b["PI_CODING_AGENT_DIR"]
     assert env_a["PI_CODING_AGENT_DIR"] == opts_a[:home]
+
     assert env_a["HOME"] ==
              Placement.pi_private_home(%{base_dir: base_dir}, "pi-session:session-a")
 
