@@ -8131,6 +8131,9 @@ defmodule Tightbeam.Gateway do
         end)
 
       case session_result do
+        {:error, %Tightbeam.Org.DisplayNameError{} = error} ->
+          %{ok: false, code: error.code, message: error.message}
+
         {:ok, {:cap_exceeded, cap}} ->
           spawn_cap_exceeded(cap, caller.owner_user_id)
 
@@ -8328,11 +8331,26 @@ defmodule Tightbeam.Gateway do
     p = call.params
 
     cond do
-      p[:setting] == "rename" and is_binary(p[:display_name]) ->
-        session = Org.rename(db, call.session_key, p.display_name)
-        stream = Payloads.stream_session(session)
-        broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
-        %{stream: stream}
+      p[:setting] == "rename" ->
+        case runtime_tune_session(db, call) do
+          {:error, denial} ->
+            denial
+
+          {:ok, authorized_session} ->
+            try do
+              session = Org.rename(db, authorized_session.session_key, p.display_name)
+              stream = Payloads.stream_session(session)
+
+              if session.display_name != authorized_session.display_name do
+                broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
+              end
+
+              %{stream: stream}
+            rescue
+              error in Tightbeam.Org.DisplayNameError ->
+                tune_error(error.code, error.message)
+            end
+        end
 
       p[:setting] == "adopt" and is_boolean(p[:adopted]) ->
         session = Org.set_adopted(db, call.session_key, p.adopted)

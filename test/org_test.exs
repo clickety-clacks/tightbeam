@@ -1023,6 +1023,64 @@ defmodule Tightbeam.OrgTest do
     assert rows == [["Renamed", "claude-fable-5", "high", "1m", "anthropic"]]
   end
 
+  test "display names are unique across retained sessions and rename preserves identity", %{
+    db: db
+  } do
+    original =
+      Org.create(db, base(%{session_key: "stable-session-key", display_name: "Original Label"}))
+
+    retired =
+      Org.create(db, base(%{session_key: "retired-label", display_name: "Reserved Label"}))
+
+    assert %{state: "retired"} = Org.retire(db, retired.session_key, "test-principal", 1_000)
+    Org.create(db, base(%{session_key: "unicode-owner", display_name: "Straße"}))
+
+    collision =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.create(db, base(%{session_key: "unicode-collision", display_name: "  STRASSE  "}))
+      end
+
+    assert collision.code == "display_name_taken"
+
+    collision =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.rename(db, original.session_key, "  strasse ")
+      end
+
+    assert collision.code == "display_name_taken"
+
+    collision =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.rename(db, original.session_key, " reserved label ")
+      end
+
+    assert collision.code == "display_name_taken"
+
+    empty =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.rename(db, original.session_key, "  \t ")
+      end
+
+    assert empty.code == "display_name_empty"
+
+    renamed = Org.rename(db, original.session_key, "  ATC PO  ")
+    assert renamed.display_name == "  ATC PO  "
+    assert renamed.session_key == original.session_key
+    assert renamed.origin == original.origin
+    assert renamed.spawned_by == original.spawned_by
+    assert Org.get(db, "stable-session-key").display_name == "  ATC PO  "
+    assert Org.get(db, "Original Label") == nil
+
+    unchanged = Org.rename(db, original.session_key, "  ATC PO  ")
+    assert unchanged.row_version == renamed.row_version
+
+    released_name =
+      Org.create(db, base(%{session_key: "old-label-reused", display_name: "Original Label"}))
+
+    assert released_name.display_name == "Original Label"
+    assert Org.get(db, original.session_key).display_name == "  ATC PO  "
+  end
+
   test "pointer chain is append-only and current is latest", %{db: db} do
     Org.create(db, base(%{session_key: "k1"}))
     Org.append_pointer(db, "k1", "uuid-1", "created")
