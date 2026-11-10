@@ -70,7 +70,16 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     hosts = Keyword.fetch!(inputs, :hosts)
     local_host_name = Keyword.fetch!(inputs, :local_host_name)
     cli_bin = Keyword.get(inputs, :cli_bin, Path.join(base_dir, "bin"))
-    binary_probe = Keyword.get(inputs, :harness_binary_probe, &Placement.harness_binary_probe/2)
+
+    binary_probe =
+      Keyword.get(inputs, :harness_binary_probe, fn harness, cli_bin ->
+        Placement.harness_binary_probe(harness, cli_bin,
+          base_dir: base_dir,
+          db: nil,
+          host: local_host_name
+        )
+      end)
+
     credential_probe = Keyword.get(inputs, :credential_state, fn _provider -> :unknown end)
     terminal_incidents = Keyword.get(inputs, :terminal_incidents, [])
     suppressed = MapSet.new(terminal_incidents, &{&1.host, &1.harness})
