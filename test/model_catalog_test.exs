@@ -2208,7 +2208,7 @@ defmodule Tightbeam.ModelCatalogTest do
       File.write!(codex_path, "#!/bin/sh\nprintf 'codex-cli 0.155.1\\n'\n")
       File.chmod!(codex_path, 0o755)
 
-      fake_bin = Path.join(ctx.base_dir, "catalog-bin")
+      fake_bin = Path.join(ctx.base_dir, "bin")
       body_path = Path.join(ctx.base_dir, "codex-catalog.json")
       curl_path = Path.join(fake_bin, "curl")
       File.mkdir_p!(fake_bin)
