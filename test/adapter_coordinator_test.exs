@@ -2760,36 +2760,27 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert [] = Tightbeam.Projection.list_after(ctx.db, session_row_key, nil, 10)
   end
 
-  test "a running Pi placement readiness launch does not fence session workers", ctx do
+  test "a Pi placement launch does not fence workers, but an explicit park does", ctx do
     path = Path.join(ctx.test_dir, "pi-session-readiness.js")
     File.write!(path, @fake)
 
     placement_key = {:pi, "shared", "testhost"}
     worker_key = Tightbeam.Placement.pi_session_adapter_key("session-a", "testhost")
     blocked_worker_key = Tightbeam.Placement.pi_session_adapter_key("session-b", "testhost")
+    helper = Path.join(ctx.test_dir, "process-helper")
 
     coordinator =
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
          adapter_context: fn _ -> [] end,
-         adapter_opts: fn key, _ ->
-           opts = [
+         adapter_opts: fn _key, _ ->
+           [
              harness: :pi,
              cmd: [System.find_executable("node"), path],
              home: ctx.test_dir,
              cwd: ctx.test_dir
            ]
-
-           if key == placement_key do
-             Keyword.merge(opts,
-               process_identity_dir: Path.join(ctx.test_dir, "placement"),
-               process_helper: @process_helper,
-               stderr_path: Path.join(ctx.test_dir, "placement.stderr")
-             )
-           else
-             opts
-           end
          end,
          db: ctx.db,
          name: :pi_readiness_launch_does_not_fence_workers}
@@ -2801,6 +2792,37 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     await_ready!(coordinator, placement_key)
 
     placement_name = AdapterCoordinator.key_name(placement_key)
+
+    File.write!(
+      helper,
+      "#!/bin/sh\n[ \"$1\" = boot-identity ] || exit 64\nprintf 'fixture-boot-id\\n'\n"
+    )
+
+    File.chmod!(helper, 0o700)
+
+    _launch_opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: [System.find_executable("node"), path],
+          home: ctx.test_dir,
+          process_identity_dir: Path.join(ctx.test_dir, "placement"),
+          process_helper: helper,
+          stderr_path: Path.join(ctx.test_dir, "placement.stderr")
+        ],
+        ctx.db,
+        placement_key
+      )
+
+    assert {:ok, :running} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 "UPDATE harness_processes SET state='running' WHERE adapterKey=?1 AND resolvedAt IS NULL",
+                 [placement_name]
+               )
+
+               :running
+             end)
 
     assert [%{adapter_key: ^placement_name, state: "running", resolved_at: nil}] =
              HarnessProcess.list(ctx.db)
