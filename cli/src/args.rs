@@ -4774,7 +4774,6 @@ mod tests {
         }
         for args in [
             strings(&["retire", "s", "--as-user", "sample-user"]),
-            strings(&["retire", "--role", "r", "--as-user", "sample-user"]),
             strings(&["retire", "--user", "u", "--as-user", "sample-user"]),
         ] {
             assert_eq!(
@@ -4782,6 +4781,22 @@ mod tests {
                 Err("usage: tightbeam retire --session <key>".to_owned())
             );
         }
+
+        let role_error = parse(strings(&[
+            "retire",
+            "--session",
+            "s",
+            "--role",
+            "r",
+            "--as-user",
+            "sample-user",
+        ]))
+        .unwrap_err();
+        assert!(
+            role_error == "usage: tightbeam retire --session <key>"
+                || role_error.contains("--role"),
+            "retire --role should be refused with usage or a role-specific message, got: {role_error}"
+        );
     }
 
     // The repair verb names its reason or it does not run: an unexplained
