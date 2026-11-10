@@ -1653,7 +1653,7 @@ defmodule Tightbeam.Placement do
 
     find =
       Keyword.get(opts, :find_executable) ||
-        fn executable -> System.find_executable(executable, launch_path) end
+        fn executable -> find_launch_path_executable(executable, launch_path) end
 
     run =
       Keyword.get(opts, :run) ||
@@ -1705,6 +1705,17 @@ defmodule Tightbeam.Placement do
 
   defp probe_launch_path(_cli_bin, base_dir, db, host) do
     toolchain_path_preview(%{base_dir: base_dir, db: db}, host)
+  end
+
+  defp find_launch_path_executable(executable, launch_path) do
+    Enum.find_value(String.split(launch_path, ":", trim: false), fn directory ->
+      candidate =
+        if directory == "",
+          do: Path.expand(executable),
+          else: Path.expand(Path.join(directory, executable))
+
+      if File.regular?(candidate) and File.executable?(candidate), do: candidate
+    end)
   end
 
   defp configured_executable_override(module, db, host) do
