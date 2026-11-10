@@ -390,7 +390,7 @@ defmodule Tightbeam.Gateway do
   """
   @spec preflight(config()) :: {:ok, [atom()]} | {:error, {:no_harness_cli, String.t()}}
   def preflight(config) do
-    with {:ok, installed} <- harness_binary_readiness(Path.join(config.base_dir, "bin")) do
+    with {:ok, installed} <- harness_binary_readiness(config) do
       # Readiness only. Identity writes require the persistent DB's admission
       # and occur in Boot or guarded direct Gateway composition, not here.
       {:ok, installed}
@@ -648,10 +648,16 @@ defmodule Tightbeam.Gateway do
 
   defp provision_detail(_name, reason), do: inspect(reason)
 
-  defp harness_binary_readiness(cli_bin) do
+  defp harness_binary_readiness(config) do
+    cli_bin = Path.join(config.base_dir, "bin")
+
     results =
       Enum.map(Harness.all(), fn module ->
-        {module.id(), Placement.harness_binary_probe(module.id(), cli_bin)}
+        {module.id(),
+         Placement.harness_binary_probe(module.id(), cli_bin,
+           base_dir: config.base_dir,
+           db: Map.get(config, :db)
+         )}
       end)
 
     cond do
@@ -691,9 +697,14 @@ defmodule Tightbeam.Gateway do
           Enum.map_join(results, "; ", fn {harness, result} ->
             reason =
               case result do
-                {:error, :not_found} -> "not found"
-                {:error, {:exec_failed, exec_detail}} -> "exec failed: #{exec_detail}"
-                {:error, %{code: code, message: message}} -> "#{code}: #{message}"
+                {:error, :not_found} ->
+                  "not found"
+
+                {:error, {:exec_failed, exec_detail}} ->
+                  "selected executable failed: #{exec_detail}"
+
+                {:error, %{code: code, message: message}} ->
+                  "#{code}: #{message}"
               end
 
             "#{harness}: #{reason}"
@@ -706,7 +717,7 @@ defmodule Tightbeam.Gateway do
   defp describe_probe_failure(:not_found), do: "its CLI is not on PATH"
 
   defp describe_probe_failure({:exec_failed, detail}),
-    do: "its CLI is on PATH but failed to execute (#{String.trim(detail)})"
+    do: "its selected executable failed (#{String.trim(detail)})"
 
   defp describe_probe_failure(other), do: inspect(other)
 
