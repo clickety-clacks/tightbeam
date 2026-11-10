@@ -163,7 +163,10 @@ defmodule Tightbeam.Homes do
     remote_manifest = Path.join(remote_home, @manifest_relative)
 
     {remote_stamp, stamp_exit} =
-      target.sh.(["ssh" | Support.ssh_opts()] ++ [target.host_config.ssh, "cat", remote_manifest])
+      target.sh.(
+        ["ssh" | Support.ssh_opts()] ++
+          [target.host_config.ssh, "cat #{Support.shell_quote(remote_manifest)}"]
+      )
 
     if stamp_exit not in [0, 1] do
       raise "remote stamp check failed with exit #{stamp_exit}: #{remote_stamp}"
