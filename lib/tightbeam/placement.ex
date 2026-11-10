@@ -1714,7 +1714,13 @@ defmodule Tightbeam.Placement do
           do: Path.expand(executable),
           else: Path.expand(Path.join(directory, executable))
 
-      if File.regular?(candidate) and File.executable?(candidate), do: candidate
+      case File.stat(candidate) do
+        {:ok, %File.Stat{type: :regular, mode: mode}} ->
+          if Bitwise.band(mode, 0o111) != 0, do: candidate
+
+        _ ->
+          nil
+      end
     end)
   end
 
