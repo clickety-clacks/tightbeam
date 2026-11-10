@@ -2767,19 +2767,26 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     placement_key = {:pi, "shared", "testhost"}
     worker_key = Tightbeam.Placement.pi_session_adapter_key("session-a", "testhost")
     blocked_worker_key = Tightbeam.Placement.pi_session_adapter_key("session-b", "testhost")
-    helper = Path.join(ctx.test_dir, "process-helper")
 
     coordinator =
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
          adapter_context: fn _ -> [] end,
-         adapter_opts: fn _key, _ ->
+         adapter_opts: fn key, _ ->
+           process_key =
+             key
+             |> AdapterCoordinator.key_name()
+             |> String.replace(~r/[^a-zA-Z0-9._-]/, "_")
+
            [
              harness: :pi,
              cmd: [System.find_executable("node"), path],
              home: ctx.test_dir,
-             cwd: ctx.test_dir
+             cwd: ctx.test_dir,
+             stderr_path: Path.join(ctx.test_dir, process_key <> ".stderr"),
+             process_identity_dir: Path.join(ctx.test_dir, "process-identities"),
+             process_helper: @process_helper
            ]
          end,
          db: ctx.db,
@@ -2792,37 +2799,6 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     await_ready!(coordinator, placement_key)
 
     placement_name = AdapterCoordinator.key_name(placement_key)
-
-    File.write!(
-      helper,
-      "#!/bin/sh\n[ \"$1\" = boot-identity ] || exit 64\nprintf 'fixture-boot-id\\n'\n"
-    )
-
-    File.chmod!(helper, 0o700)
-
-    _launch_opts =
-      HarnessProcess.prepare_launch(
-        [
-          cmd: [System.find_executable("node"), path],
-          home: ctx.test_dir,
-          process_identity_dir: Path.join(ctx.test_dir, "placement"),
-          process_helper: helper,
-          stderr_path: Path.join(ctx.test_dir, "placement.stderr")
-        ],
-        ctx.db,
-        placement_key
-      )
-
-    assert {:ok, :running} =
-             DB.transaction(ctx.db, fn txn ->
-               DB.Txn.q(
-                 txn,
-                 "UPDATE harness_processes SET state='running' WHERE adapterKey=?1 AND resolvedAt IS NULL",
-                 [placement_name]
-               )
-
-               :running
-             end)
 
     assert [%{adapter_key: ^placement_name, state: "running", resolved_at: nil}] =
              HarnessProcess.list(ctx.db)
