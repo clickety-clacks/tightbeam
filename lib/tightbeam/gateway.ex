@@ -2007,7 +2007,7 @@ defmodule Tightbeam.Gateway do
        )
        when action in ["restart", "resume"] do
     coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
-    key = {Harness.parse!(session.harness).id(), "shared", session.host}
+    key = adapter_key(session)
 
     case AdapterCoordinator.close_adapter(coordinator, key) do
       :ok ->
@@ -3954,7 +3954,34 @@ defmodule Tightbeam.Gateway do
   defp turn_failure_context({failed_stage, reason}, fallback),
     do: {failed_stage, reason, fallback}
 
-  defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
+  defp placement_adapter_key(session),
+    do: {Harness.parse!(session.harness).id(), "shared", session.host}
+
+  defp adapter_key(%{harness: harness} = session) do
+    case Harness.parse!(harness).id() do
+      :pi -> Placement.pi_session_adapter_key(session.session_key, session.host)
+      id -> {id, "shared", session.host}
+    end
+  end
+
+  defp adapter_for_session(coordinator, session, turn?) do
+    fetch = fn key ->
+      if turn?,
+        do: AdapterCoordinator.adapter_for_turn(coordinator, key),
+        else: AdapterCoordinator.adapter_for(coordinator, key)
+    end
+
+    key = adapter_key(session)
+
+    if Harness.parse!(session.harness).id() == :pi do
+      with {:ok, _readiness_adapter, _readiness_generation} <-
+             fetch.(placement_adapter_key(session)) do
+        fetch.(key)
+      end
+    else
+      fetch.(key)
+    end
+  end
 
   # Wire publication for terminals that lost their runner closure: turns
   # recovered at boot (failed_unknown), task crashes, republished rows. The
@@ -4281,8 +4308,8 @@ defmodule Tightbeam.Gateway do
   defp harness_cancel(db, session) do
     with {:pointer, %{harness_session_id: sid}} <-
            {:pointer, Org.current_pointer(db, session.session_key)},
-         key = {Harness.parse!(session.harness).id(), "shared", session.host},
-         {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
+         {:ok, adapter, _gen} <-
+           adapter_for_session(Tightbeam.AdapterCoordinator, session, false) do
       Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
         sessionId: sid
       })
@@ -4333,10 +4360,9 @@ defmodule Tightbeam.Gateway do
   defp degraded_detail(_node), do: "(host unreachable or adapter failing; cause unknown)"
 
   defp checkout_adapter(session, config) do
-    key = {Harness.parse!(session.harness).id(), "shared", session.host}
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
-    case AdapterCoordinator.adapter_for_turn(coordinator, key) do
+    case adapter_for_session(coordinator, session, true) do
       {:ok, adapter, generation} ->
         {:ok, adapter, generation}
 
@@ -5300,7 +5326,12 @@ defmodule Tightbeam.Gateway do
     pointer = Org.current_pointer(db, session.session_key)
 
     if pointer do
-      close_resident_main_session(config, session, pointer)
+      if Harness.parse!(session.harness).id() == :pi do
+        coordinator = config[:adapter_coordinator] || AdapterCoordinator
+        AdapterCoordinator.close_adapter(coordinator, adapter_key(session))
+      else
+        close_resident_main_session(config, session, pointer)
+      end
     else
       :ok
     end
@@ -8410,6 +8441,7 @@ defmodule Tightbeam.Gateway do
                       :ok ->
                         case commit_host_update(db, session, host) do
                           :ok ->
+                            reap_old_pi_session_worker(config, db, session)
                             %{ok: true, host: host}
 
                           {:error, reason} ->
@@ -8479,6 +8511,26 @@ defmodule Tightbeam.Gateway do
         %{ok: false, code: "unsupported", message: "tune does not support #{p[:setting]} yet"}
     end
   end
+
+  defp reap_old_pi_session_worker(config, db, %{harness: "pi"} = session) do
+    coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+
+    case AdapterCoordinator.close_adapter(coordinator, adapter_key(session)) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        EventLog.lifecycle(db, "adapter_park_failed", session.session_key, inspect(reason))
+    end
+  rescue
+    exception ->
+      best_effort_failed("reap_old_pi_session_worker", :error, exception, __STACKTRACE__)
+  catch
+    :exit, reason ->
+      best_effort_failed("reap_old_pi_session_worker", :exit, reason, __STACKTRACE__)
+  end
+
+  defp reap_old_pi_session_worker(_config, _db, _session), do: :ok
 
   defp runtime_tune_session(db, call) do
     session = Org.get(db, call.session_key)
@@ -8643,10 +8695,7 @@ defmodule Tightbeam.Gateway do
     coordinator = Process.whereis(Tightbeam.AdapterCoordinator)
 
     if is_pid(coordinator) do
-      AdapterCoordinator.adapter_for(
-        coordinator,
-        {Harness.parse!(session.harness).id(), "shared", session.host}
-      )
+      adapter_for_session(coordinator, session, false)
     else
       {:error, :adapter_unavailable}
     end
@@ -8844,7 +8893,7 @@ defmodule Tightbeam.Gateway do
               {:ok, adapter, sid, handoff.through_seq}
 
             {:error, {:session_prepare_failed, reason, sid, cleanup}} ->
-              {:candidate_prepare_failed, reason, sid, cleanup}
+              {:candidate_prepare_failed, adapter, reason, sid, cleanup}
 
             {:error, reason} ->
               {:error, reason}
@@ -8906,7 +8955,13 @@ defmodule Tightbeam.Gateway do
             publish_stored_message(db, call.session_key, marker)
 
             cleanup =
-              close_source_runtime(db, session, source_pointer, call[:principal] || call.origin)
+              close_source_runtime(
+                config,
+                db,
+                session,
+                source_pointer,
+                call[:principal] || call.origin
+              )
 
             runtime_success(db, call.session_key, "reset", true, cleanup.status)
             |> Map.merge(Map.drop(cleanup, [:status, :diagnostic]))
@@ -8914,7 +8969,9 @@ defmodule Tightbeam.Gateway do
           {:error, error} ->
             cleanup =
               close_runtime(
+                config,
                 db,
+                destination,
                 destination_adapter,
                 destination_sid,
                 error,
@@ -8934,15 +8991,27 @@ defmodule Tightbeam.Gateway do
             |> Map.merge(Map.drop(cleanup, [:status, :diagnostic]))
         end
 
-      {:candidate_prepare_failed, reason, sid, cleanup} ->
+      {:candidate_prepare_failed, _adapter, reason, sid, original_cleanup} ->
         cleanup =
-          report_candidate_cleanup(
-            db,
-            sid,
-            reason,
-            call[:principal] || call.origin,
-            cleanup
-          )
+          if harness_atom == :pi do
+            close_runtime(
+              config,
+              db,
+              destination,
+              nil,
+              sid,
+              reason,
+              call[:principal] || call.origin
+            )
+          else
+            report_candidate_cleanup(
+              db,
+              sid,
+              reason,
+              call[:principal] || call.origin,
+              original_cleanup
+            )
+          end
 
         tune_error(
           "model_apply_failed",
@@ -9117,20 +9186,41 @@ defmodule Tightbeam.Gateway do
     cleanup_unverified(db, sid, cause, close_reason, principal)
   end
 
-  defp close_source_runtime(_db, _session, nil, _principal), do: %{status: "verified"}
+  defp close_source_runtime(_config, _db, _session, nil, _principal),
+    do: %{status: "verified"}
 
-  defp close_source_runtime(db, session, pointer, principal) do
-    case resident_adapter(session) do
-      {:ok, adapter, _generation} ->
-        close_runtime(db, adapter, pointer.harness_session_id, :superseded, principal)
+  defp close_source_runtime(config, db, session, pointer, principal) do
+    if Harness.parse!(session.harness).id() == :pi do
+      close_runtime(config, db, session, nil, pointer.harness_session_id, :superseded, principal)
+    else
+      case resident_adapter(session) do
+        {:ok, adapter, _generation} ->
+          close_runtime(
+            config,
+            db,
+            session,
+            adapter,
+            pointer.harness_session_id,
+            :superseded,
+            principal
+          )
 
-      {:error, reason} ->
-        cleanup_unverified(db, pointer.harness_session_id, nil, reason, principal)
+        {:error, reason} ->
+          cleanup_unverified(db, pointer.harness_session_id, nil, reason, principal)
+      end
     end
   end
 
-  defp close_runtime(db, adapter, sid, cause, principal) do
-    case Adapter.close_session(adapter, sid, diagnostic: true) do
+  defp close_runtime(config, db, session, adapter, sid, cause, principal) do
+    result =
+      if Harness.parse!(session.harness).id() == :pi do
+        coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
+        AdapterCoordinator.close_adapter(coordinator, adapter_key(session))
+      else
+        Adapter.close_session(adapter, sid, diagnostic: true)
+      end
+
+    case result do
       :ok -> %{status: "verified"}
       {:error, reason} -> cleanup_unverified(db, sid, cause, reason, principal)
     end
@@ -9382,10 +9472,7 @@ defmodule Tightbeam.Gateway do
 
         with true <- is_pid(coordinator),
              {:ok, adapter, _generation} <-
-               AdapterCoordinator.adapter_for(
-                 coordinator,
-                 {harness, "shared", session.host}
-               ) do
+               adapter_for_session(coordinator, session, false) do
           case Adapter.knows_session?(adapter, pointer.harness_session_id) do
             # Claude moves the conversation to a fresh fork; harnesses with a
             # live model set update in place. The caller holds the turn
@@ -9411,6 +9498,7 @@ defmodule Tightbeam.Gateway do
                          )
                        end) do
                   project_tuned_model(
+                    config,
                     db,
                     session,
                     adapter,
@@ -9442,6 +9530,7 @@ defmodule Tightbeam.Gateway do
                          )
                        end) do
                   project_tuned_model(
+                    config,
                     db,
                     session,
                     adapter,
@@ -9508,17 +9597,24 @@ defmodule Tightbeam.Gateway do
             :ok
 
           {:error, error} ->
-            cleanup = close_runtime(db, adapter, sid, error, principal)
+            cleanup = close_runtime(config, db, session, adapter, sid, error, principal)
             {:error, commit_failed(error, cleanup, sid)}
         end
 
       {:candidate_prepare_failed, {:runtime_config_mismatch, %Model{} = actual} = reason, sid,
        cleanup} ->
-        _cleanup = report_candidate_cleanup(db, sid, reason, principal, cleanup)
+        _cleanup =
+          if Harness.parse!(session.harness).id() == :pi,
+            do: close_runtime(config, db, session, nil, sid, reason, principal),
+            else: report_candidate_cleanup(db, sid, reason, principal, cleanup)
+
         {:error, {:initial_runtime_config_mismatch, actual}}
 
       {:candidate_prepare_failed, reason, sid, cleanup} ->
-        cleanup = report_candidate_cleanup(db, sid, reason, principal, cleanup)
+        cleanup =
+          if Harness.parse!(session.harness).id() == :pi,
+            do: close_runtime(config, db, session, nil, sid, reason, principal),
+            else: report_candidate_cleanup(db, sid, reason, principal, cleanup)
 
         {:error,
          ErrorDiagnostic.diagnosed(
@@ -9595,6 +9691,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp project_tuned_model(
+         config,
          db,
          session,
          adapter,
@@ -9649,21 +9746,20 @@ defmodule Tightbeam.Gateway do
     case result do
       {:ok, {:changed, marker}} ->
         cleanup =
-          close_superseded_model_session(adapter, session.session_key, prior_sid, switched_sid)
+          close_superseded_model_session(session, adapter, prior_sid, switched_sid)
 
         publish_stored_message(db, session.session_key, marker)
         ErrorDiagnostic.diagnosed(:ok, cleanup)
 
       {:ok, :duplicate} ->
-        adapter
-        |> close_superseded_model_session(session.session_key, prior_sid, switched_sid)
+        close_superseded_model_session(session, adapter, prior_sid, switched_sid)
         |> then(&ErrorDiagnostic.diagnosed(:ok, &1))
 
       {:error, error} ->
         if switched_sid == prior_sid do
           {:runtime_projection_failed, new_ref}
         else
-          cleanup = reject_tuned_session(adapter, prior_sid, switched_sid)
+          cleanup = reject_tuned_session(config, session, adapter, prior_sid, switched_sid)
           {:error, commit_failed(error, cleanup, switched_sid)}
         end
     end
@@ -9671,16 +9767,19 @@ defmodule Tightbeam.Gateway do
 
   # The switch has committed either way; a close that did not confirm rides beside
   # that success as a cleanup node instead of living only in the log.
-  defp close_superseded_model_session(_adapter, _session_key, sid, sid), do: nil
+  defp close_superseded_model_session(_session, _adapter, sid, sid), do: nil
 
-  defp close_superseded_model_session(adapter, session_key, prior_sid, _switched_sid) do
+  defp close_superseded_model_session(%{harness: "pi"}, _adapter, _prior_sid, _switched_sid),
+    do: nil
+
+  defp close_superseded_model_session(session, adapter, prior_sid, _switched_sid) do
     case Adapter.close_session(adapter, prior_sid, diagnostic: true) do
       :ok ->
         nil
 
       {:error, reason} ->
         Logger.warning(
-          "model switch committed for #{session_key}, but superseded session #{prior_sid} " <>
+          "model switch committed for #{session.session_key}, but superseded session #{prior_sid} " <>
             "could not close: #{inspect(ErrorDiagnostic.classified(reason))}"
         )
 
@@ -9693,12 +9792,42 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp reject_tuned_session(adapter, sid, sid) do
+  defp reject_tuned_session(_config, _session, adapter, sid, sid) do
     :ok = Adapter.forget_model_residency(adapter, sid)
     nil
   end
 
-  defp reject_tuned_session(adapter, _prior_sid, switched_sid) do
+  defp reject_tuned_session(
+         config,
+         %{harness: "pi"} = session,
+         _adapter,
+         _prior_sid,
+         switched_sid
+       ) do
+    coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
+
+    case AdapterCoordinator.close_adapter(
+           coordinator,
+           adapter_key(session)
+         ) do
+      :ok ->
+        %{status: "verified"}
+
+      {:error, reason} ->
+        %{
+          status: "unverified",
+          diagnostic:
+            ErrorDiagnostic.new("cleanup",
+              operation: "process_group_close",
+              session_id: switched_sid,
+              status: "unverified",
+              cause: ErrorDiagnostic.with_facts(reason, [])
+            )
+        }
+    end
+  end
+
+  defp reject_tuned_session(_config, _session, adapter, _prior_sid, switched_sid) do
     case Adapter.close_session(adapter, switched_sid, diagnostic: true) do
       :ok ->
         %{status: "verified"}
@@ -10922,42 +11051,93 @@ defmodule Tightbeam.Gateway do
   end
 
   # Retire durability owns the ordering: every DB transition commits before
-  # this seam touches a harness. Adapters are shared by key, so each retired
-  # harness SID is closed independently and the adapter itself is closed only
-  # when no active session still shares that key. Every operation is guarded:
-  # an absent/dead adapter can never turn a committed retire into a failure.
+  # this seam touches a harness. Pi workers are session-keyed and are stopped
+  # as process trees; other harness sessions remain on their shared adapter.
+  # Every operation is guarded so an absent/dead adapter cannot undo a retire.
   defp reap_retired_sessions(_config, _db, []), do: []
 
   defp reap_retired_sessions(config, db, session_keys) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
-    WorkspaceCleanup.kick()
-
     try do
-      session_keys
-      |> Enum.flat_map(fn session_key ->
-        with session when not is_nil(session) <- Org.get(db, session_key),
-             %{harness_session_id: sid} <- Org.current_pointer(db, session_key) do
-          [
-            %{
-              session_key: session_key,
-              sid: sid,
-              key: {Harness.parse!(session.harness).id(), "shared", session.host}
-            }
-          ]
-        else
-          _ -> []
-        end
-      end)
+      retired =
+        session_keys
+        |> Enum.flat_map(fn session_key ->
+          case Org.get(db, session_key) do
+            nil ->
+              []
+
+            session ->
+              pointer = Org.current_pointer(db, session_key)
+              placement_key = placement_adapter_key(session)
+
+              [
+                %{
+                  session: session,
+                  session_key: session_key,
+                  sid: pointer && pointer.harness_session_id,
+                  key: adapter_key(session),
+                  placement_key: placement_key
+                }
+              ]
+          end
+        end)
+
+      {pi_sessions, shared_sessions} =
+        Enum.split_with(retired, &(Harness.parse!(&1.session.harness).id() == :pi))
+
+      shared_sessions
+      |> Enum.filter(&is_binary(&1.sid))
       |> Enum.group_by(& &1.key)
-      |> Enum.each(fn {key, retired} -> reap_adapter_sessions(db, coordinator, key, retired) end)
+      |> Enum.each(fn {key, sessions} ->
+        reap_adapter_sessions(
+          db,
+          coordinator,
+          key,
+          Enum.map(sessions, &Map.take(&1, [:session_key, :sid]))
+        )
+      end)
+
+      pi_sessions
+      |> Enum.group_by(& &1.placement_key)
+      |> Enum.each(fn {placement_key, sessions} ->
+        reap_pi_sessions(db, coordinator, placement_key, sessions)
+      end)
     rescue
       exception -> best_effort_failed("reap_retired_sessions", :error, exception, __STACKTRACE__)
     catch
       :exit, reason -> best_effort_failed("reap_retired_sessions", :exit, reason, __STACKTRACE__)
     end
 
+    WorkspaceCleanup.kick()
+
     :ok
+  end
+
+  defp reap_pi_sessions(db, coordinator, placement_key, retired) do
+    if live_session_on_adapter?(db, placement_key) do
+      Enum.each(retired, fn %{key: key, session_key: session_key} ->
+        case AdapterCoordinator.close_adapter(coordinator, key) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            EventLog.lifecycle(db, "adapter_park_failed", session_key, inspect(reason))
+        end
+      end)
+    else
+      case AdapterCoordinator.close_adapter(coordinator, placement_key) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          EventLog.lifecycle(db, "adapter_park_failed", inspect(placement_key), inspect(reason))
+      end
+    end
+  rescue
+    exception -> best_effort_failed("reap_pi_sessions", :error, exception, __STACKTRACE__)
+  catch
+    :exit, reason -> best_effort_failed("reap_pi_sessions", :exit, reason, __STACKTRACE__)
   end
 
   defp reap_adapter_sessions(db, coordinator, key, retired) do
@@ -11557,9 +11737,8 @@ defmodule Tightbeam.Gateway do
 
   defp assignment_harness_cancel(config, db, session) do
     with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
-         key = {Harness.parse!(session.harness).id(), "shared", session.host},
          coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator),
-         {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(coordinator, key),
+         {:ok, adapter, _gen} <- adapter_for_session(coordinator, session, false),
          :ok <-
            Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
              sessionId: sid
