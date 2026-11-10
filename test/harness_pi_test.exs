@@ -67,9 +67,11 @@ defmodule Tightbeam.HarnessPiTest do
       end
 
     assert Enum.count(commands, &String.contains?(&1, "test -x")) == 2
+
     assert Enum.count(commands, fn command ->
              String.contains?(command, "cat ") and String.contains?(command, expected_package)
            end) == 2
+
     refute Enum.any?(commands, &String.contains?(&1, "node -e"))
     refute Enum.any?(commands, &String.contains?(&1, "npm install"))
   end
