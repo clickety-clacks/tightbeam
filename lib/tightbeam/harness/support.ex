@@ -596,7 +596,7 @@ defmodule Tightbeam.Harness.Support do
 
       vector(
         case_name,
-        expected_adapter(profile, locality, presence),
+        expected_adapter(module, profile, locality, presence),
         %{profile: profile, locality: locality, presence: presence}
       )
     end
@@ -700,11 +700,11 @@ defmodule Tightbeam.Harness.Support do
     end)
   end
 
-  defp expected_adapter(profile, locality, presence) do
-    expected_adapter_npm(profile, locality, presence)
+  defp expected_adapter(module, profile, locality, presence) do
+    expected_adapter_npm(module, profile, locality, presence)
   end
 
-  defp expected_adapter_npm(profile, locality, presence) do
+  defp expected_adapter_npm(module, profile, locality, presence) do
     detail =
       case {locality, presence} do
         {:local, :present} -> "adapters present"
@@ -715,7 +715,7 @@ defmodule Tightbeam.Harness.Support do
 
     %{
       result: {:ok, detail},
-      install_contribution: expected_install_contribution(profile, locality, presence),
+      install_contribution: expected_install_contribution(module, locality, presence),
       bundle: profile.patched,
       mode: 0o751
     }
@@ -725,17 +725,14 @@ defmodule Tightbeam.Harness.Support do
   # the one machine that cannot supply its own. The two contribution strings differ only
   # in how the command reaches the host, which is the point — the script, and with it the
   # pinned package set, is shared.
-  defp expected_install_contribution(_profile, _locality, :present), do: ""
+  defp expected_install_contribution(_module, _locality, :present), do: ""
 
-  defp expected_install_contribution(profile, locality, :absent) do
+  defp expected_install_contribution(module, locality, :absent) do
     packages =
-      Tightbeam.Harness.all()
+      (Tightbeam.Harness.all() ++ [module])
+      |> Enum.uniq()
       |> Enum.reject(&(&1 == Tightbeam.Harness.Cursor))
-      |> Enum.map(&"#{&1.install_package()}@#{&1.adapter_version()}")
-
-    current_package = "#{profile.adapter_package}@#{profile.adapter_version}"
-    packages = if current_package in packages, do: packages, else: packages ++ [current_package]
-    packages = Enum.join(packages, " ")
+      |> Enum.map_join(" ", &"#{&1.install_package()}@#{&1.adapter_version()}")
 
     script = "npm install --prefix '<BASE>/adapters' --no-save " <> packages
 
