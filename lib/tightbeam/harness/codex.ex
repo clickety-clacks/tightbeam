@@ -137,7 +137,13 @@ defmodule Tightbeam.Harness.Codex do
         config = [{"CODEX_CONFIG", config_json}]
 
         [
-          cmd: [binary],
+          cmd:
+            Support.executable_selection_command(
+              binary,
+              "CODEX_PATH",
+              cli_binary(),
+              absolute_executable?: true
+            ),
           env: [{"CODEX_HOME", home} | Keyword.fetch!(opts, :common_env) ++ config]
         ]
       else
@@ -149,7 +155,13 @@ defmodule Tightbeam.Harness.Codex do
         [
           cmd:
             ["ssh" | Support.ssh_opts()] ++
-              [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
+              [target.host_config.ssh, "exec", "env" | remote_env] ++
+              Support.remote_executable_selection_command(
+                binary,
+                "CODEX_PATH",
+                cli_binary(),
+                absolute_executable?: true
+              ),
           env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
         ]
       end
@@ -707,9 +719,36 @@ defmodule Tightbeam.Harness.Codex do
   @impl true
   def probe_cli(target) do
     find = Map.get(target, :find_executable, &System.find_executable/1)
-    shim = Path.join(Map.get(target, :cli_bin, ""), cli_binary())
-    binary = if File.exists?(shim), do: shim, else: find.(cli_binary())
-    Support.bounded_probe(binary, target)
+
+    case Map.fetch(target, :executable_override) do
+      {:ok, executable} ->
+        if Path.type(executable) == :absolute do
+          Support.bounded_probe(executable, target)
+        else
+          {:error, {:exec_failed, "CODEX_PATH must be an absolute executable path"}}
+        end
+
+      :error ->
+        case find.(cli_binary()) do
+          executable when is_binary(executable) ->
+            Support.bounded_probe(executable, target)
+
+          nil ->
+            probe_managed_cli(Map.get(target, :managed_cli), target)
+        end
+    end
+  end
+
+  defp probe_managed_cli(nil, _target), do: {:error, :not_found}
+
+  defp probe_managed_cli(executable, target) do
+    case Support.bounded_probe(executable, target) do
+      {:ok, %{version: version}} ->
+        {:ok, %{bin: "managed #{executable}", version: "#{version} (managed)"}}
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   @impl true
@@ -791,6 +830,8 @@ defmodule Tightbeam.Harness.Codex do
   defp probe(state, kind) do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
     executable = catalog_executable(state, kind)
+    path = catalog_path(state)
+    managed_cli = managed_cli_path(state)
 
     auth =
       Tightbeam.Credentials.credential_path(
@@ -803,7 +844,7 @@ defmodule Tightbeam.Harness.Codex do
     |> Support.catalog_probe(
       Support.catalog_probe_argv(
         Map.get(state, :host_config, %{ssh: nil}).ssh,
-        probe_script(kind, auth, executable)
+        probe_script(kind, auth, executable, path, managed_cli)
       )
     )
     |> classify_extraction(kind, auth, executable)
@@ -822,6 +863,64 @@ defmodule Tightbeam.Harness.Codex do
     else
       _ -> :bare_path
     end
+  end
+
+  defp catalog_path(state) do
+    host = Map.get(state, :host_name, Placement.local_host_name())
+
+    case Map.fetch(state.options, :db) do
+      {:ok, db} ->
+        Placement.toolchain_path_preview(%{base_dir: state.base_dir, db: db}, host)
+
+      :error ->
+        cli_bin = Path.join(state.base_dir, "bin")
+
+        if Map.get(state, :host_config, %{ssh: nil}).ssh do
+          cli_bin <> ":$PATH"
+        else
+          cli_bin <> ":" <> (System.get_env("PATH") || "")
+        end
+    end
+  end
+
+  defp managed_cli_path(state),
+    do: Path.join([state.base_dir, "adapters", "node_modules", ".bin", "codex"])
+
+  defp catalog_path_assignment(path) do
+    if String.ends_with?(path, ":$PATH") do
+      "PATH=#{Support.shell_quote(String.trim_trailing(path, ":$PATH"))}:$PATH"
+    else
+      "PATH=#{Support.shell_quote(path)}"
+    end
+  end
+
+  defp codex_path_resolution(:bare_path, managed_cli) do
+    """
+    if [ "${CODEX_PATH+x}" = x ]; then
+      codex_path="$CODEX_PATH"
+    else
+      codex_path=$(command -v codex 2>/dev/null || :)
+      if [ -z "$codex_path" ]; then
+        codex_path=#{Support.shell_quote(managed_cli)}
+      fi
+    fi
+    case "$codex_path" in
+      /*) ;;
+      *) exit 69 ;;
+    esac
+    if [ ! -f "$codex_path" ] || [ ! -x "$codex_path" ]; then exit 69; fi
+    """
+  end
+
+  defp codex_path_resolution({:bound, path}, _managed_cli) do
+    """
+    codex_path=#{Support.shell_quote(path)}
+    case "$codex_path" in
+      /*) ;;
+      *) exit 69 ;;
+    esac
+    if [ ! -f "$codex_path" ] || [ ! -x "$codex_path" ]; then exit 69; fi
+    """
   end
 
   # Query the same native model/list visibility that stock codex-acp 1.12.0
@@ -895,28 +994,12 @@ defmodule Tightbeam.Harness.Codex do
     executable = catalog_executable(state, :api_key)
     host = Map.get(state, :host_name, Placement.local_host_name())
     home = Tightbeam.Homes.home_path(state.base_dir, host, :codex)
-
-    path =
-      case Map.fetch(state.options, :db) do
-        {:ok, db} ->
-          Placement.toolchain_path_preview(%{base_dir: state.base_dir, db: db}, host)
-
-        :error ->
-          System.get_env("PATH") || ""
-      end
-
-    path_assignment =
-      if String.ends_with?(path, ":$PATH") do
-        "PATH=#{Support.shell_quote(String.trim_trailing(path, ":$PATH"))}:$PATH"
-      else
-        "PATH=#{Support.shell_quote(path)}"
-      end
-
-    binary = if match?({:bound, _}, executable), do: elem(executable, 1), else: "codex"
+    path_setup = catalog_path_assignment(catalog_path(state)) <> "\nexport PATH"
+    codex_path = codex_path_resolution(executable, managed_cli_path(state))
 
     script =
-      "#{path_assignment} exec node -e #{Support.shell_quote(@engine_model_list_js)} " <>
-        "#{Support.shell_quote(binary)} #{Support.shell_quote(home)}"
+      "#{path_setup}\n#{codex_path}\n" <>
+        "exec node -e #{Support.shell_quote(@engine_model_list_js)} \"$codex_path\" #{Support.shell_quote(home)}"
 
     argv = Support.catalog_probe_argv(Map.get(state, :host_config, %{ssh: nil}).ssh, script)
 
@@ -1013,7 +1096,7 @@ defmodule Tightbeam.Harness.Codex do
   # to nothing and blame the account. It rides back on the status line so the
   # refusal can name the version that produced an empty answer. The platform
   # route has no such filter — see the api-key clause below.
-  defp probe_script(:subscription, auth_path, executable) do
+  defp probe_script(:subscription, auth_path, executable, path, managed_cli) do
     # Exit codes are sysexits: 66 EX_NOINPUT (no readable auth.json — a real
     # "this host holds no grant"), 75 EX_TEMPFAIL (present but unparseable — a
     # torn read, transient), 67 EX_NOUSER (parsed, but carries no access token —
@@ -1033,26 +1116,15 @@ defmodule Tightbeam.Harness.Codex do
         " ${raw##* }"
       )
 
-    version =
-      case executable do
-        :bare_path ->
-          "raw=$(codex --version)"
+    path_setup = catalog_path_assignment(path) <> "\nexport PATH"
 
-        {:bound, path} ->
-          """
-          codex_path=#{Support.shell_quote(path)}
-          case "$codex_path" in
-            /*) ;;
-            *) exit 69 ;;
-          esac
-          if [ ! -f "$codex_path" ] || [ ! -x "$codex_path" ]; then exit 69; fi
-          raw=$("$codex_path" --version)
-          """
-      end
+    version =
+      codex_path_resolution(executable, managed_cli) <> "\nraw=$(\"$codex_path\" --version)"
 
     """
     exec 2>&1
     set -eu
+    #{path_setup}
     token=$(node -e '#{node_program}')
     #{version}
     exec #{curl}
@@ -1071,7 +1143,7 @@ defmodule Tightbeam.Harness.Codex do
   # api-key host must not be the one place a torn read reports as a bad
   # credential. As on the other branch the credential is expanded by the REMOTE
   # shell and never appears in a command line on either machine.
-  defp probe_script(:api_key, auth_path, _executable) do
+  defp probe_script(:api_key, auth_path, _executable, _path, _managed_cli) do
     node_program =
       ~s|const fs=require("fs");let raw;| <>
         ~s|try{raw=fs.readFileSync("#{auth_path}","utf8")}catch(e){process.exit(66)}| <>
