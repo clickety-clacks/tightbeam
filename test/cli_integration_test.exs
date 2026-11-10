@@ -391,6 +391,7 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "session rename uses stable keys and preserves history, assignment, and ownership", ctx do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
     owner_id = ctx.session.owner_user_id
 
@@ -427,16 +428,14 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE users SET isAdmin=0 WHERE userId=?1", [owner_id])
 
-    assert {renamed_output, 0} =
-             run.([
-               "session-rename",
-               "--session",
-               "cli-worker",
-               "--display-name",
-               "  New Worker  "
-             ])
-
-    assert JSON.decode!(renamed_output)["stream"]["displayName"] == "  New Worker  "
+    {renamed_output, rename_status} =
+      run.([
+        "session-rename",
+        "--session",
+        "cli-worker",
+        "--display-name",
+        "  New Worker  "
+      ])
 
     assert_receive {:cli_call,
                     %{
@@ -445,6 +444,9 @@ defmodule Tightbeam.CliIntegrationTest do
                       principal: {:session, "cli-holder"},
                       params: %{setting: "rename", display_name: "  New Worker  "}
                     }}
+
+    assert rename_status == 0, renamed_output
+    assert JSON.decode!(renamed_output)["stream"]["displayName"] == "  New Worker  "
 
     assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
     assert Org.get(ctx.db, "  New Worker  ") == nil
@@ -491,6 +493,13 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert status != 0
     assert %{"code" => "display_name_taken", "ok" => false} = JSON.decode!(collision)
+    assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
+
+    {empty_name, status} =
+      run.(["session-rename", "--session", "cli-worker", "--display-name", "  \t "])
+
+    assert status != 0
+    assert %{"code" => "display_name_empty", "ok" => false} = JSON.decode!(empty_name)
     assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
 
     {denied, status} =
