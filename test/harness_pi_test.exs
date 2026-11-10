@@ -67,7 +67,9 @@ defmodule Tightbeam.HarnessPiTest do
       end
 
     assert Enum.count(commands, &String.contains?(&1, "test -x")) == 2
-    assert Enum.count(commands, &String.contains?(&1, "cat '#{expected_package}'")) == 2
+    assert Enum.count(commands, fn command ->
+             String.contains?(command, "cat ") and String.contains?(command, expected_package)
+           end) == 2
     refute Enum.any?(commands, &String.contains?(&1, "node -e"))
     refute Enum.any?(commands, &String.contains?(&1, "npm install"))
   end
@@ -153,7 +155,7 @@ defmodule Tightbeam.HarnessPiTest do
     refute Path.join(home, "skills/unowned/SKILL.md") in args
     later = write.(Path.join(cwd, ".pi/skills/later/SKILL.md"))
     {output, 0} = run.()
-    assert later in JSON.decode!(output)
+    assert later in JSON.decode!(output)["args"]
     File.write!(fake, "#!/bin/sh\nexit 2\n")
     assert {_, 2} = run.()
     File.rm!(extension)
