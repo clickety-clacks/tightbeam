@@ -471,7 +471,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
     cond do
       Tightbeam.Placement.pi_session_adapter?(key) and
-          Tightbeam.HarnessProcess.fenced?(
+          Tightbeam.HarnessProcess.parked?(
             state.db,
             Tightbeam.Placement.placement_adapter_key(key)
           ) ->

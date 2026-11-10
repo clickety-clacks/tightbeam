@@ -2760,6 +2760,69 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert [] = Tightbeam.Projection.list_after(ctx.db, session_row_key, nil, 10)
   end
 
+  test "a running Pi placement readiness launch does not fence session workers", ctx do
+    path = Path.join(ctx.test_dir, "pi-session-readiness.js")
+    File.write!(path, @fake)
+
+    placement_key = {:pi, "shared", "testhost"}
+    worker_key = Tightbeam.Placement.pi_session_adapter_key("session-a", "testhost")
+    blocked_worker_key = Tightbeam.Placement.pi_session_adapter_key("session-b", "testhost")
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn key, _ ->
+           opts = [
+             harness: :pi,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+
+           if key == placement_key do
+             Keyword.merge(opts,
+               process_identity_dir: Path.join(ctx.test_dir, "placement"),
+               process_helper: @process_helper,
+               stderr_path: Path.join(ctx.test_dir, "placement.stderr")
+             )
+           else
+             opts
+           end
+         end,
+         db: ctx.db,
+         name: :pi_readiness_launch_does_not_fence_workers}
+      )
+
+    assert {:ok, _readiness_adapter, 1} =
+             AdapterCoordinator.adapter_for(coordinator, placement_key)
+
+    await_ready!(coordinator, placement_key)
+
+    placement_name = AdapterCoordinator.key_name(placement_key)
+
+    assert [%{adapter_key: ^placement_name, state: "running", resolved_at: nil}] =
+             HarnessProcess.list(ctx.db)
+
+    assert HarnessProcess.fenced?(ctx.db, placement_key)
+    refute HarnessProcess.parked?(ctx.db, placement_key)
+
+    assert {:ok, _session_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, worker_key)
+    await_ready!(coordinator, worker_key)
+
+    assert {:ok, :park_recorded} =
+             DB.transaction(ctx.db, fn txn ->
+               _ = HarnessProcess.begin_park_in_txn(txn, placement_key)
+               :park_recorded
+             end)
+
+    assert HarnessProcess.parked?(ctx.db, placement_key)
+
+    assert {:error, {:park_fenced, ^placement_name}} =
+             AdapterCoordinator.adapter_for(coordinator, blocked_worker_key)
+  end
+
   # `start_supervised!` is not a boot barrier: Acp.Adapter returns from init
   # before `node` is spawned, and only {:adapter_ready, key} marks the entry
   # ready. A death BEFORE that point is a boot failure, which deliberately
