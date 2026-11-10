@@ -345,9 +345,13 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def handle_call({:adapter_for, key}, from, state) do
+    park_error = explicit_pi_park_error(key, state.db)
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
+      park_error ->
+        {:reply, park_error, state}
+
       reusable_entry?(entry) ->
         {:reply, checkout(entry), state}
 
@@ -467,16 +471,12 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp adapter_for_reply(key, context, from, state, authoritative?) do
+    park_error = explicit_pi_park_error(key, state.db)
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
-      Tightbeam.Placement.pi_session_adapter?(key) and
-          Tightbeam.HarnessProcess.parked?(
-            state.db,
-            Tightbeam.Placement.placement_adapter_key(key)
-          ) ->
-        parent = Tightbeam.Placement.placement_adapter_key(key)
-        {:reply, {:error, {:park_fenced, key_name(parent)}}, state}
+      park_error ->
+        {:reply, park_error, state}
 
       authoritative? and readiness_pending?(entry) and
           entry.context != normalize_context(context) ->
@@ -522,6 +522,16 @@ defmodule Tightbeam.AdapterCoordinator do
 
       true ->
         {:noreply, begin_readiness(key, entry, state, context, from)}
+    end
+  end
+
+  defp explicit_pi_park_error(key, db) do
+    if Tightbeam.Placement.pi_session_adapter?(key) do
+      parent = Tightbeam.Placement.placement_adapter_key(key)
+
+      if Tightbeam.HarnessProcess.parked?(db, parent) do
+        {:error, {:park_fenced, key_name(parent)}}
+      end
     end
   end
 
