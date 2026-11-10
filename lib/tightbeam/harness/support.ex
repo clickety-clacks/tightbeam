@@ -589,7 +589,7 @@ defmodule Tightbeam.Harness.Support do
     }
   end
 
-  defp ensure_adapter_vectors(_module, profile) do
+  defp ensure_adapter_vectors(module, profile) do
     for locality <- [:local, :remote],
         presence <- [:present, :absent] do
       case_name = "#{locality}_#{presence}"
