@@ -465,6 +465,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "message.created",
              "session.updated",
              "message.created",
+             "work_item.updated",
              "verb.accepted",
              "assignment.opened"
            ]
@@ -500,59 +501,31 @@ defmodule Tightbeam.Firehose.PublisherTest do
       }
     }
 
-    assert {:ok, [[initial_deadline]]} =
-             DB.query(
-               db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
-               [assignment.id]
-             )
-
     assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
              Dispatch.dispatch(db, handlers, tests_passed)
 
-    # The holder's attest and its holder-authored opener notice each count as
-    # holder activity. Activity in the millisecond of the pending deadline
-    # reuses it, so zero to two replacements follow the initial deadline.
     verdict_notices = drain_notices()
     assert Enum.count(verdict_notices, &(&1["class"] == "verb.accepted")) == 1
 
-    %{"wake.canceled" => cancellations, "message.created" => [opener_notice]} =
-      published =
+    published =
       verdict_notices
       |> Enum.filter(&match?({:ok, _}, Tightbeam.Firehose.Registry.fetch(&1["class"])))
       |> Enum.group_by(& &1["class"])
-      |> Map.put_new("wake.canceled", [])
 
     assert %{"attest.filed" => [_attest_notice]} = published
-    assert map_size(published) == 3
+    assert %{"message.created" => [opener_notice]} = published
+    assert map_size(published) == 2
 
     assert opener_notice["payload"]["content"] ==
              "[verdict filed: tests-passed on #{assignment.id}: effect matrix tests passed]"
 
-    chain =
-      Stream.unfold(initial_deadline, fn wake_id ->
-        case DB.query(
+    assert {:ok, [[0]]} =
+             DB.query(
                db,
-               "SELECT c.replacementWakeId FROM wake_cancellations c JOIN wakes w ON w.wakeId=c.wakeId WHERE c.wakeId=?1 AND w.assignmentId=?2 AND w.consumer='assignment_inactivity_deadline' AND c.reasonKind='superseded' AND c.causalSourceKind='wake' AND c.causalSourceId=c.replacementWakeId AND c.outcomeKind='replacement'",
-               [wake_id, assignment.id]
-             ) do
-          {:ok, [[replacement]]} -> {{wake_id, replacement}, replacement}
-          {:ok, []} -> nil
-        end
-      end)
-      |> Enum.to_list()
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND (consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb') OR (consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'))",
+               [assignment.id]
+             )
 
-    assert length(chain) in 0..2
-
-    assert Enum.sort(Enum.map(cancellations, & &1["refs"]["wakeId"])) ==
-             Enum.sort(Enum.map(chain, &elem(&1, 0)))
-
-    for cancellation <- cancellations do
-      assert cancellation["payload"]["state"] == "canceled"
-    end
-
-    {_, final_deadline} = List.last(chain, {nil, initial_deadline})
-    assert %{state: "pending"} = Wakes.get(db, final_deadline)
     assert observed_state_classes() == []
 
     completion = %{
@@ -655,11 +628,96 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
 
-    assert_per_verb_effects!(
-      config,
-      "attest",
-      Enum.reject(completion_effects, &(&1 in asynchronous_delivery))
+    completion_attest_effects =
+      completion_effects
+      |> Enum.reject(&(&1 in asynchronous_delivery))
+      |> Enum.uniq()
+
+    declared_attest_effects = Gateway.handler_effects(config)["attest"]
+
+    # Without the removed inactivity deadline, this ordinary completion has
+    # no pending wake to cancel. The blocked-completion case below still proves
+    # that an attestation that cancels a real pending wake emits wake.canceled.
+    assert "wake.canceled" in declared_attest_effects
+    refute "wake.canceled" in completion_attest_effects
+
+    assert_effects_match!(
+      List.delete(declared_attest_effects, "wake.canceled"),
+      completion_attest_effects
     )
+
+    blocked_assignment_call = %{
+      verb: "assign",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: "effect-target",
+      target_role: nil,
+      role_fallback: false,
+      params: %{
+        subject: "Close a blocked coordination assignment",
+        effect_kind: "coordination"
+      }
+    }
+
+    assert {:ok, blocked_assignment} = Dispatch.dispatch(db, handlers, blocked_assignment_call)
+    assert "assignment.opened" in observed_state_classes()
+
+    blocked_attest = %{
+      verb: "attest",
+      origin: "agent:effect-target",
+      principal: {:session, "effect-target"},
+      session_key: nil,
+      params: %{
+        assignment_id: blocked_assignment.id,
+        kind: "cannot-proceed",
+        note: "wait for the opener to decide"
+      }
+    }
+
+    assert {:ok, %{cannotProceed: %{state: "standing"}}} =
+             Dispatch.dispatch(db, handlers, blocked_attest)
+
+    assert {:ok, [[blocked_wake_id]]} =
+             DB.query(
+               db,
+               "SELECT decisionWakeId FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing'",
+               [blocked_assignment.id]
+             )
+
+    assert %{state: "pending"} = Wakes.get(db, blocked_wake_id)
+
+    blocked_attest_effects = observed_state_classes()
+    assert "decision_request.opened" in blocked_attest_effects
+    assert "message.created" in blocked_attest_effects
+    assert "attest.filed" in blocked_attest_effects
+
+    # A standing cannot-proceed blocks holder completion; the opener can still
+    # revoke the assignment, which withdraws its pending decision wake.
+    blocked_revoke = %{
+      verb: "revoke-assignment",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{
+        assignment_id: blocked_assignment.id,
+        reason: "the opener ends the blocked work"
+      }
+    }
+
+    assert {:ok, %{outcome: "revoked"}} = Dispatch.dispatch(db, handlers, blocked_revoke)
+
+    blocked_close_effects = observed_state_classes()
+
+    assert Enum.sort(blocked_close_effects) ==
+             Enum.sort([
+               "assignment.closed",
+               "decision_request.withdrawn",
+               "message.created",
+               "wake.canceled"
+             ])
+
+    assert_per_verb_effects!(config, "revoke-assignment", ["assignment.closed"])
+    assert %{state: "canceled"} = Wakes.get(db, blocked_wake_id)
 
     reopen = %{
       verb: "reopen-assignment",

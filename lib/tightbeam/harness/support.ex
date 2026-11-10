@@ -8,7 +8,7 @@ defmodule Tightbeam.Harness.Support do
   # cannot re-inject the poison R3 scrubs (RELEASE_*, instance selectors, ERTS
   # paths). Their prefixes (e.g. RELEASE_*) are enforced in
   # placement.ex `unreserved_env_name/1`, which a flat list cannot express.
-  @reserved_overlay_env_vars ~w(PATH CLAUDE_CONFIG_DIR CODEX_HOME GH_CONFIG_DIR TIGHTBEAM_URL) ++
+  @reserved_overlay_env_vars ~w(PATH CLAUDE_CONFIG_DIR CODEX_HOME GH_CONFIG_DIR TIGHTBEAM_URL PI_CODING_AGENT_DIR PI_ACP_PI_COMMAND) ++
                                Tightbeam.ProductionIdentityEnv.exact()
   @bundle_path Application.app_dir(:tightbeam, "priv/harness_bundle.json")
   @external_resource @bundle_path
@@ -374,6 +374,19 @@ defmodule Tightbeam.Harness.Support do
   # because codex reads its own auth.json — and running codex under both kinds
   # PINS that invariance instead of assuming it.
   defp prepare_launch_vectors(_module, profile) do
+    profile =
+      if profile.wire_name == "codex" do
+        config = codex_inventory_fixture()
+
+        %{
+          profile
+          | rails_env: {"CODEX_CONFIG", config},
+            remote_rails_env: "CODEX_CONFIG=#{shell_quote(config)}"
+        }
+      else
+        profile
+      end
+
     for locality <- [:local, :remote],
         rails <- [:railed, :lawless],
         kind <- [:subscription, :api_key] do
@@ -430,7 +443,7 @@ defmodule Tightbeam.Harness.Support do
         cursor_api_key_loader: fn _ -> {:ok, "vector-token"} end,
         cursor_rails_sha256: String.duplicate("a", 64),
         ensure_workdir: fn _host, _cwd, _content, _opts -> :ok end,
-        sh_out: nil
+        sh_out: launch_probe_shell(profile)
       ]
 
       with {:ok, checked} <- Tightbeam.Harness.preflight_launch(module, target, home, opts),
@@ -448,7 +461,22 @@ defmodule Tightbeam.Harness.Support do
     end
   end
 
+  defp launch_probe_shell(%{wire_name: "codex"}) do
+    fn command ->
+      if "node" in command and "-e" in command,
+        do: {codex_inventory_fixture(), 0},
+        else: {"", 0}
+    end
+  end
+
   defp launch_probe_shell(_profile), do: fn _command -> {"", 0} end
+
+  defp codex_inventory_fixture do
+    JSON.encode!(%{
+      "bypass_hook_trust" => true,
+      "skills" => %{"config" => [%{"path" => "/personal/skill/SKILL.md", "enabled" => false}]}
+    })
+  end
 
   defp expected_launch(profile, locality, rails, kind) do
     if kind in Map.get(profile, :unsupported_launch_kinds, []) do

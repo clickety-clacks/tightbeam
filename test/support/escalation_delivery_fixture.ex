@@ -827,7 +827,6 @@ defmodule Tightbeam.EscalationDeliveryFixture do
         session_key: "holder",
         target_role: nil,
         role_fallback: false,
-        supervision_interval_ms: ctx.config.wake_tick_ms,
         params: %{
           subject: "delivery",
           brief: "exercise the durable notification",

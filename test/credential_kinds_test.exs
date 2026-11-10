@@ -375,18 +375,23 @@ defmodule Tightbeam.CredentialKindsTest do
     test "codex's launch plan does not vary by kind", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-x"}))
 
+      inventory = fn command ->
+        assert "node" in command and "-e" in command
+        {~s({"bypass_hook_trust":true,"skills":{"config":[]}}), 0}
+      end
+
       keyed =
         Codex.prepare_launch(
           target(ctx.base, nil),
           Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :codex),
-          launch_opts(:api_key)
+          Keyword.put(launch_opts(:api_key), :sh_out, inventory)
         )
 
       subbed =
         Codex.prepare_launch(
           target(ctx.base, nil),
           Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :codex),
-          launch_opts(:subscription)
+          Keyword.put(launch_opts(:subscription), :sh_out, inventory)
         )
 
       # Codex reads its credential out of auth.json itself, so the kind cannot
@@ -1087,7 +1092,11 @@ defmodule Tightbeam.CredentialKindsTest do
           onboarding_lease_ms: 1_800_000
         })["onboard"]
 
-      call = %{origin: "user:owner-admin", params: %{provider: "anthropic"}}
+      call = %{
+        origin: "user:owner-admin",
+        principal: {:user, "owner-admin"},
+        params: %{provider: "anthropic"}
+      }
 
       assert %{status: "ready", owner_user_id: "owner-admin"} =
                onboard.(put_in(call.params[:phase], "begin"))

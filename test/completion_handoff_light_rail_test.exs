@@ -188,6 +188,120 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert [^reminder] = pending_reminders(ctx.db, root.wake_id)
   end
 
+  test "a late reminder stays attached to its own close after the assignment reopens", ctx do
+    stop_supervised!(ctx.scheduler)
+    {parent_assignment, child_assignment, first_root} = completed_child(ctx)
+    ["attest", first_source_token] = terminal_source(first_root.prompt)
+
+    # Exercise the durable-source fallback used by a notice created before its
+    # row-reaction output was recorded.
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "DELETE FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+        [first_root.wake_id]
+      )
+
+    set_due_now(ctx.db, first_root.wake_id)
+
+    assert {:ok, {:appended, _recipient, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 first_root.session_key,
+                 first_root.origin,
+                 first_root.prompt,
+                 wake_id: first_root.wake_id,
+                 sender: first_root.origin,
+                 target_gate: first_root,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert Wakes.get(ctx.db, first_root.wake_id).delivered_turn_seq != nil
+    finish_carrier_turn!(ctx.db, first_root.wake_id)
+    assert reminders(ctx.db, first_root.wake_id) == []
+
+    reopen =
+      call(
+        "reopen-assignment",
+        {:session, "notice-parent"},
+        nil,
+        %{assignment_id: child_assignment.id, reason: "continue after the first close"}
+      )
+
+    assert %{state: "open"} = Assignments.__handle__(ctx.db, "reopen-assignment", reopen)
+
+    assert %{
+             assignment: %{state: "closed"},
+             attest: %{kind: "completion", id: second_source_token}
+           } =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, child_assignment.id, "completion")
+             )
+
+    assert [second_root] =
+             Enum.reject(terminal_notices(ctx.db), &(&1.wake_id == first_root.wake_id))
+
+    assert second_root.prompt =~ "source_token=\"#{second_source_token}\""
+
+    assert {:ok, {:ok, first_event}} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.terminal_source_in_txn(txn, first_root.wake_id)
+             end)
+
+    assert first_event.source_token == first_source_token
+
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper, db: ctx.db, name: :late_terminal_reminder_sweeper}
+      )
+
+    Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+    [first_reminder] = await_pending_reminders(ctx.db, first_root.wake_id)
+    assert first_reminder.condition_scope == first_root.wake_id
+
+    scheduler = start_scheduler(ctx.db)
+    assert :ok = Wakes.fire_due(scheduler)
+    second_carrier_id = assert_delivered_carrier(ctx.db, second_root.wake_id)
+    finish_carrier_turn!(ctx.db, second_carrier_id)
+    [second_reminder] = await_pending_reminders(ctx.db, second_root.wake_id)
+
+    first_note = action_note(child_assignment.id, first_root, "kept", "kept the first close")
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, parent_assignment.id, first_note)
+             )
+
+    assert Wakes.get(ctx.db, first_reminder.wake_id).state == "canceled"
+    assert [^second_reminder] = pending_reminders(ctx.db, second_root.wake_id)
+
+    second_note = action_note(child_assignment.id, second_root, "kept", "kept the second close")
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, parent_assignment.id, second_note)
+             )
+
+    assert Wakes.get(ctx.db, second_reminder.wake_id).state == "canceled"
+
+    for reminder <- [first_reminder, second_reminder], do: set_due_now(ctx.db, reminder.wake_id)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    for reminder <- [first_reminder, second_reminder] do
+      assert Wakes.get(ctx.db, reminder.wake_id).state == "canceled"
+      assert Wakes.get(ctx.db, reminder.wake_id).fired_at == nil
+      assert turn_count(ctx.db, reminder.wake_id) == 0
+    end
+  end
+
   test "a parent action reminder waits for the delivered notice turn to end", ctx do
     {_parent_assignment, _child_assignment, root} = completed_child(ctx)
 
@@ -313,12 +427,199 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert reminders(ctx.db, root.wake_id) == []
   end
 
-  test "a pending reminder remains until the recipient closes their last open assignment",
+  test "the accountable opener receives the initial notice and its successors stay with that root",
+       ctx do
+    {parent, child, root} = completed_child(ctx)
+    session(ctx.db, "deliv-owner", "flynn")
+
+    assert %{deliveryOwnerSessionKey: "deliv-owner"} =
+             handle(
+               ctx,
+               "work-item-update",
+               call("work-item-update", {:user, "flynn"}, nil, %{
+                 work_item_id: child.workItemId,
+                 delivery_owner_session_key: "deliv-owner"
+               })
+             )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    root = Wakes.get(ctx.db, root.wake_id)
+    assert root.session_key == "notice-parent"
+    carrier = assert_delivered_carrier(ctx.db, root.wake_id)
+    finish_carrier_turn!(ctx.db, carrier)
+    [first] = await_pending_reminders(ctx.db, root.wake_id)
+    assert first.session_key == root.session_key
+    set_due_now(ctx.db, first.wake_id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    finish_carrier_turn!(ctx.db, assert_delivered_carrier(ctx.db, first.wake_id))
+    [second] = await_pending_reminders(ctx.db, root.wake_id)
+    assert second.session_key == root.session_key
+
+    note = action_note(child.id, root, "kept", "retained by the accountable opener")
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(ctx, "attest", progress_call({:session, "notice-parent"}, parent.id, note))
+
+    assert Wakes.get(ctx.db, second.wake_id).state == "canceled"
+  end
+
+  test "an unrelated open assignment cannot arm a reminder for a finished child", ctx do
+    other_item = create_work_item(ctx, "unrelated parent work")
+
+    handle(
+      ctx,
+      "assign",
+      assign_call({:session, "other-parent"}, "notice-parent", "unrelated lane", other_item.id)
+    )
+
+    {nil, _child, root} = completed_child(ctx, with_parent_destination: false)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    carrier = assert_delivered_carrier(ctx.db, root.wake_id)
+    finish_carrier_turn!(ctx.db, carrier)
+
+    assert :ok =
+             Wakes.reconcile_turn_delivered_sources(
+               ctx.db,
+               Wakes.get(ctx.db, root.wake_id).delivered_turn_seq
+             )
+
+    assert reminders(ctx.db, root.wake_id) == []
+
+    stop_supervised!(ctx.scheduler)
+    restarted = start_scheduler(ctx.db)
+    assert :ok = Wakes.fire_due(restarted)
+    assert reminders(ctx.db, root.wake_id) == []
+  end
+
+  test "closing the last same-item destination cancels the reminder despite unrelated open work",
+       ctx do
+    {parent, _child, root} = completed_child(ctx, parent_opener: "other-parent")
+    other_item = create_work_item(ctx, "unrelated work stays open")
+
+    other =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "other-parent"}, "notice-parent", "other lane", other_item.id,
+          effect_kind: "coordination"
+        )
+      )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    carrier = assert_delivered_carrier(ctx.db, root.wake_id)
+    finish_carrier_turn!(ctx.db, carrier)
+    [pending] = await_pending_reminders(ctx.db, root.wake_id)
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "notice-parent"}, parent.id, "completion")
+             )
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
+    set_due_now(ctx.db, pending.wake_id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, pending.wake_id) == 0
+    assert pending_reminders(ctx.db, root.wake_id) == []
+
+    parent_root = Enum.find(terminal_notices(ctx.db), &(&1.assignment_id == parent.id))
+    assert_delivered_carrier(ctx.db, parent_root.wake_id)
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "other-parent", "unrelated-notice-test")
+    assert turn.seq == Wakes.get(ctx.db, parent_root.wake_id).delivered_turn_seq
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    # The suppression is local to this root; another terminal still reaches its opener.
+    assert %{assignment: %{state: "closed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "notice-parent"}, other.id, "completion")
+             )
+
+    other_root = Enum.find(terminal_notices(ctx.db), &(&1.assignment_id == other.id))
+    assert other_root.session_key == "other-parent"
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert_delivered_carrier(ctx.db, other_root.wake_id)
+  end
+
+  test "same-item receipts stop successors and remain effective after their parent closes", ctx do
+    {parent, child, root} = completed_child(ctx, parent_opener: "other-parent")
+    other_item = create_work_item(ctx, "wrong receipt destination")
+
+    other =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "other-parent"}, "notice-parent", "other lane", other_item.id)
+      )
+
+    another_parent =
+      handle(
+        ctx,
+        "assign",
+        assign_call(
+          {:session, "other-parent"},
+          "notice-parent",
+          "same item lane",
+          child.workItemId
+        )
+      )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    carrier = assert_delivered_carrier(ctx.db, root.wake_id)
+    finish_carrier_turn!(ctx.db, carrier)
+    [first] = await_pending_reminders(ctx.db, root.wake_id)
+    note = action_note(child.id, root, "kept", "kept the completed child")
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(ctx, "attest", progress_call({:session, "notice-parent"}, other.id, note))
+
+    assert Wakes.get(ctx.db, first.wake_id).state == "pending"
+    set_due_now(ctx.db, first.wake_id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    first_carrier = assert_delivered_carrier(ctx.db, first.wake_id)
+    finish_carrier_turn!(ctx.db, first_carrier)
+    [successor] = await_pending_reminders(ctx.db, root.wake_id)
+
+    assert %{attest: %{id: receipt_id}} =
+             handle(ctx, "attest", progress_call({:session, "notice-parent"}, parent.id, note))
+
+    assert Wakes.get(ctx.db, successor.wake_id).state == "canceled"
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "notice-parent"}, parent.id, "completion")
+             )
+
+    assert {:ok, facts} =
+             DB.transaction(ctx.db, fn txn ->
+               event = Tightbeam.RowReactions.delivery_event(txn, first.wake_id)
+               Tightbeam.RowReactions.Snapshot.current(txn, event, %{})
+             end)
+
+    assert Enum.any?(facts["attests"], &(&1["id"] == receipt_id))
+
+    assert Enum.any?(
+             facts["assignments"],
+             &(&1["id"] == another_parent.id and &1["state"] == "open")
+           )
+
+    stop_supervised!(ctx.scheduler)
+    restarted = start_scheduler(ctx.db)
+    assert :ok = Wakes.fire_due(restarted)
+    assert pending_reminders(ctx.db, root.wake_id) == []
+    assert turn_count(ctx.db, successor.wake_id) == 0
+  end
+
+  test "a pending reminder remains until the recipient closes their last same-item assignment",
        ctx do
     {parent_assignment, _child_assignment, root} =
       completed_child(ctx, parent_opener: "other-parent")
 
-    additional_item = create_work_item(ctx, "additional parent work")
+    additional_item = %{id: parent_assignment.workItemId}
 
     additional_assignment =
       handle(
@@ -697,6 +998,110 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     before = turn_count(ctx.db, pending.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, pending.wake_id) == before
+  end
+
+  test "the child's opener stops a reminder addressed to the delivery owner; an unrelated session cannot",
+       ctx do
+    session(ctx.db, "deliv-owner", "flynn")
+    session(ctx.db, "third-session", "flynn")
+
+    item = create_work_item(ctx, "completion handoff with a delivery owner")
+
+    assert %{deliveryOwnerSessionKey: "deliv-owner"} =
+             handle(
+               ctx,
+               "work-item-update",
+               call("work-item-update", {:user, "flynn"}, nil, %{
+                 work_item_id: item.id,
+                 delivery_owner_session_key: "deliv-owner"
+               })
+             )
+
+    # The reminder rail only arms toward a recipient holding an open
+    # assignment of its own; give the delivery owner one before the child
+    # finishes.
+    handle(
+      ctx,
+      "assign",
+      assign_call({:session, "deliv-owner"}, "deliv-owner", "delivery owner's own lane", item.id)
+    )
+
+    child_assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "notice-parent"}, "holder", "child task", item.id,
+          effect_kind: "coordination"
+        )
+      )
+
+    assert %{assignment: %{state: "closed"}, attest: %{kind: "completion", id: source_token}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, child_assignment.id, "completion")
+             )
+
+    root =
+      case terminal_notices(ctx.db) do
+        [notice] -> notice
+        other -> flunk("expected one root finish notice, got #{inspect(other)}")
+      end
+
+    assert root.prompt =~ "source_token=\"#{source_token}\""
+
+    # With no open assignment of its own on this work item, the opener isn't
+    # "delegated" responsibility, so election prefers the current delivery
+    # owner over the opener for the root notice (and its reminder rail).
+    assert root.session_key == "deliv-owner"
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    [pending] = pending_reminders(ctx.db, root.wake_id)
+    assert pending.session_key == "deliv-owner"
+
+    unrelated_assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "third-session"}, "third-session", "unrelated work", item.id)
+      )
+
+    unrelated_note =
+      action_note(child_assignment.id, root, "kept", "noted by an unrelated session")
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "third-session"}, unrelated_assignment.id, unrelated_note)
+             )
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "pending"
+
+    opener_assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "notice-parent"}, "notice-parent", "opener's own lane", item.id)
+      )
+
+    opener_note = action_note(child_assignment.id, root, "parked", "parked for its next owner")
+
+    assert %{attest: %{id: attest_id, kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, opener_assignment.id, opener_note)
+             )
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
+
+    assert {:ok, [["superseded", "progress_attest", ^attest_id, "no_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [pending.wake_id]
+             )
   end
 
   test "an exact retired receipt stops the reminder without asserting physical retirement", ctx do
@@ -1563,9 +1968,6 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
   defp handle(ctx, verb, call) when verb in ["assign", "attest"] do
     routed = %{call | verb: verb}
-
-    routed =
-      if verb == "assign", do: Map.put_new(routed, :supervision_interval_ms, 1_000), else: routed
 
     Assignments.__handle__(ctx.db, verb, routed)
   end

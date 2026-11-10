@@ -681,14 +681,6 @@ defmodule Tightbeam.CliIntegrationTest do
     assert help =~ "--after-turn"
     assert help =~ "--predicate"
     assert help =~ "--fallback-after"
-    File.mkdir_p!(Path.join(ctx.base_dir, "identity/rules"))
-
-    File.cp!(
-      Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__),
-      Path.join(ctx.base_dir, "identity/rules/verification.toml")
-    )
-
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     registry = start_supervised!({Tightbeam.ConnRegistry, name: :d3_cli_registry})
     # Stop at the durable notification boundary; do not start an agent/provider lane.
     lane =
@@ -738,31 +730,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     [assignment, resolver, verifier] = ids
 
-    assert {:ok, :reset} =
-             DB.transaction(ctx.db, fn txn ->
-               Tightbeam.Supervision.activity_in_txn(
-                 txn,
-                 assignment,
-                 "cli-holder",
-                 System.system_time(:millisecond)
-               )
-             end)
-
-    assert {:ok, [[inactivity_wake_id, inactivity_due_at]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
-               [assignment]
-             )
-
-    assert_activity_refresh = fn timing_args, prompt ->
-      assert {:ok, [[prior_wake_id]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
-                 [assignment]
-               )
-
+    schedule_assignment_wake = fn timing_args, prompt ->
       {output, 0} =
         System.cmd(
           ctx.binary,
@@ -775,18 +743,6 @@ defmodule Tightbeam.CliIntegrationTest do
 
       wake = Wakes.get(ctx.db, JSON.decode!(output)["wakeId"])
       assert wake.assignment_id == assignment
-
-      assert {:ok, [["canceled"]]} =
-               DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [prior_wake_id])
-
-      assert {:ok, [[replacement_wake_id]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
-                 [assignment]
-               )
-
-      refute replacement_wake_id == prior_wake_id
       wake
     end
 
@@ -824,13 +780,6 @@ defmodule Tightbeam.CliIntegrationTest do
     assert is_nil(immediate_wake.obligation_ref)
     assert is_nil(immediate_wake.resolver_id)
     assert is_nil(immediate_wake.verification_assignment_id)
-
-    assert {:ok, [[^inactivity_wake_id, ^inactivity_due_at]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
-               [assignment]
-             )
 
     assert {:ok, [[0]]} =
              DB.query(
@@ -883,21 +832,8 @@ defmodule Tightbeam.CliIntegrationTest do
     timed_id = JSON.decode!(timed_output)["wakeId"]
     assert Wakes.get(ctx.db, timed_id).assignment_id == assignment
 
-    assert {:ok, [["canceled"]]} =
-             DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [inactivity_wake_id])
-
-    assert {:ok, [[new_inactivity_wake_id, new_inactivity_due_at]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId,dueAt FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
-               [assignment]
-             )
-
-    refute new_inactivity_wake_id == inactivity_wake_id
-    assert new_inactivity_due_at > inactivity_due_at
-
     fact_wake =
-      assert_activity_refresh.(
+      schedule_assignment_wake.(
         [
           "--when-fact",
           "build-finished",
@@ -924,7 +860,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     after_prompt = "D3 manual: continue the named assignment"
 
-    after_wake = assert_activity_refresh.(["--after-turn"], after_prompt)
+    after_wake = schedule_assignment_wake.(["--after-turn"], after_prompt)
     after_id = after_wake.wake_id
     assert after_wake.assignment_id == assignment
     assert after_wake.obligation_ref == assignment
@@ -947,7 +883,7 @@ defmodule Tightbeam.CliIntegrationTest do
     dependency_prompt = "D3 manual: read the resolver disposition before acting"
 
     dependency =
-      assert_activity_refresh.(
+      schedule_assignment_wake.(
         ["--predicate", JSON.encode!(predicate), "--fallback-after", "1h"],
         dependency_prompt
       )
@@ -1879,6 +1815,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "session-auth --as-user retains agent attribution for verdicts and revocation",
        ctx do
+    Tightbeam.TerminalReactionFixture.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -3356,7 +3294,18 @@ defmodule Tightbeam.CliIntegrationTest do
 
     commands = [
       {"harklight-send",
-       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"]},
+       [
+         "harklight-send",
+         "--session",
+         "new",
+         "--sender-id",
+         "owner",
+         "--title",
+         "Example",
+         "--type",
+         "request",
+         "--reply"
+       ]},
       {"harklight-revise",
        [
          "harklight-revise",
@@ -3409,8 +3358,18 @@ defmodule Tightbeam.CliIntegrationTest do
        ctx do
     commands = [
       {"harklight-send",
-       ["harklight-send", "--session", "new", "--sender-id", "owner", "--title", "Example"],
-       "harklight-send requires the authenticated session or one of its roles"},
+       [
+         "harklight-send",
+         "--session",
+         "new",
+         "--sender-id",
+         "owner",
+         "--title",
+         "Example",
+         "--type",
+         "request",
+         "--reply"
+       ], "harklight-send requires the authenticated session or one of its roles"},
       {"harklight-revise",
        [
          "harklight-revise",

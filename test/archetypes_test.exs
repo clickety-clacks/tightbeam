@@ -194,7 +194,7 @@ defmodule Tightbeam.ArchetypesTest do
       |> Enum.map_join("\n\n", fn path ->
         manifest = path |> File.read!() |> Toml.decode!()
         name = path |> Path.dirname() |> Path.basename()
-        phrases = Enum.map_join(Map.fetch!(manifest, "phrases"), "\n", &"- #{&1}")
+        phrases = Enum.map_join(Map.get(manifest, "phrases", []), "\n", &"- #{&1}")
         "### `#{name}`\nPurpose: #{Map.fetch!(manifest, "purpose")}\nPhrases:\n#{phrases}"
       end)
 
@@ -206,7 +206,7 @@ defmodule Tightbeam.ArchetypesTest do
         "user's stated goal before any tool call."
 
     section = heading <> "\n\n" <> intro <> "\n\n" <> facts
-    boundary = section <> "\n\n# Served identity\n"
+    boundary = section <> "\n# Served identity\n"
 
     validate_facts = fn guidance ->
       assert length(:binary.matches(guidance, heading)) == 1
@@ -809,17 +809,23 @@ defmodule Tightbeam.ArchetypesTest do
     assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
     loaded = Archetypes.load!(ctx.base_dir)
 
-    for {role, harness, family, effort} <- [
-          {"pdo", :codex, "gpt-6-sol", "low"},
-          {"orchestrator", :codex, "gpt-6-luna", "max"},
-          {"coder", :codex, "gpt-6-luna", "max"},
-          {"spec-writer", :claude, "claude-opus-5-5", "high"},
-          {"reviewer-code", :claude, "claude-opus-5-5", "high"},
-          {"reviewer-spec", :codex, "gpt-6-astra", "high"}
+    for {role, harness, family, effort, preferences} <- [
+          {"pdo", :codex, "gpt-6-sol", "low", [{"gpt-6-sol", "low"}]},
+          {"orchestrator", :codex, "gpt-6-luna", "max", [{"gpt-6-luna", "max"}]},
+          {"coder", :codex, "gpt-6-luna", "max", [{"gpt-6-luna", "max"}]},
+          {"spec-writer", :claude, "claude-opus-5-5", "high",
+           [{"claude-opus-5-5", "high"}, {"gpt-6-astra", "high"}]},
+          {"reviewer-code", :claude, "claude-opus-5-5", "high",
+           [{"claude-opus-5-5", "high"}, {"gpt-6-sol", "high"}]},
+          {"reviewer-spec", :codex, "gpt-6-astra", "xhigh", [{"gpt-6-astra", "xhigh"}]}
         ] do
       model = Tightbeam.Model.new(family, effort: effort)
       assert loaded[role].defaults == %{harness: harness, model: model}
-      assert loaded[role].model_preferences == [model]
+
+      assert loaded[role].model_preferences ==
+               Enum.map(preferences, fn {family, effort} ->
+                 Tightbeam.Model.new(family, effort: effort)
+               end)
     end
   end
 

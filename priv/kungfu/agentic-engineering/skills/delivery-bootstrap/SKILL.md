@@ -21,8 +21,12 @@ and actual assignment custody without treating either as a second owner link.
 
 If the owner link is missing or its session is unavailable, route the item to
 responsible intake or its current owner for an authorized remedy. A caller
-permitted by the ordinary work-item update path may set or replace the link
-with `tightbeam work-item-update <workItemId> --delivery-owner <sessionKey>`.
+authorized to hand coordination to a named delivery owner can use
+`tightbeam work-item-handoff --work-item <workItemId> --delivery-owner <sessionKey> --brief "<brief>"`.
+That sets the link and sends the coordination brief in one operation; it does
+not assign a production worker. A caller permitted by the ordinary work-item
+update path may instead repair or replace the link with
+`tightbeam work-item-update <workItemId> --delivery-owner <sessionKey>`.
 Read `tightbeam work-item-get <workItemId>` again before staffing or claiming
 handoff. A refusal is a blocker for its responsible owner, not permission for
 a delegate to self-promote or to infer an owner from a PO association.

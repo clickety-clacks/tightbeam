@@ -890,7 +890,7 @@ defmodule Tightbeam.OrgTest do
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
   end
 
-  test "retirement validates its explicit caller context before state or wake mutation", %{db: db} do
+  test "retirement validates its caller before state or wake mutation", %{db: db} do
     session = Org.create(db, base(%{session_key: "retiring"}))
 
     wake =
@@ -901,14 +901,9 @@ defmodule Tightbeam.OrgTest do
         due_at: 9_000
       })
 
-    for {principal, interval} <- [
-          {"", 1_000},
-          {nil, 1_000},
-          {"user:flynn", 0},
-          {"user:flynn", -1}
-        ] do
-      assert_raise ArgumentError, ~r/non-empty principal and positive supervision interval/, fn ->
-        Org.retire(db, "retiring", principal, interval)
+    for principal <- ["", nil] do
+      assert_raise ArgumentError, ~r/retirement requires a non-empty principal/, fn ->
+        Org.retire(db, "retiring", principal)
       end
 
       assert %{state: "active", updated_at: updated_at} = Org.get(db, "retiring")

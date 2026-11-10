@@ -148,12 +148,45 @@ defmodule Tightbeam.Harness.Claude do
 
     %{
       guidance: guidance,
-      meta: %{systemPrompt: %{type: "preset", preset: "claude_code", append: guidance}},
+      meta: session_meta(session, guidance),
       permission_mode: "bypassPermissions",
       effort_config: "effort",
       resident_model_switch: :fork,
       canonical_model_prefixes: ["claude-"]
     }
+  end
+
+  defp session_meta(session, guidance) do
+    meta = %{systemPrompt: %{type: "preset", preset: "claude_code", append: guidance}}
+
+    case Map.fetch(session, :cwd) do
+      {:ok, cwd} ->
+        Map.put(meta, :claudeCode, %{
+          options: %{settings: %{claudeMdExcludes: ancestor_instruction_paths(cwd)}}
+        })
+
+      :error ->
+        meta
+    end
+  end
+
+  # The ACP cwd is the boundary even when a checkout lives below it. Keep
+  # instruction discovery at that directory and throughout its descendants.
+  defp ancestor_instruction_paths(cwd) do
+    cwd
+    |> Path.expand()
+    |> Stream.unfold(fn directory ->
+      parent = Path.dirname(directory)
+      if parent == directory, do: nil, else: {parent, parent}
+    end)
+    |> Enum.flat_map(fn directory ->
+      for name <- ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"] do
+        # The loader interprets each absolute path as a picomatch pattern.
+        Regex.replace(~r/[\\*?\[\]{}()!+@]/, Path.join(directory, name), fn character ->
+          "\\" <> character
+        end)
+      end
+    end)
   end
 
   @impl true

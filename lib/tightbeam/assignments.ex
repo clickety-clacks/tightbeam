@@ -1799,7 +1799,6 @@ defmodule Tightbeam.Assignments do
     with :ok <- principal_allowed(call.principal, verb),
          :ok <- valid_subject(call.params[:subject]),
          :ok <- process_assignment_owner(db, call),
-         :ok <- valid_supervision_interval(call[:supervision_interval_ms]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          :ok <- valid_effect_kind(call.params[:effect_kind]),
          {:ok, files} <- assignment_files(verb, call.params),
@@ -2616,28 +2615,27 @@ defmodule Tightbeam.Assignments do
           )
         end)
 
-        Supervision.assignment_opened_in_txn(
-          txn,
-          id,
-          now,
-          call.supervision_interval_ms
-        )
-
         # A dispatch that opens work while delivery ownership is still unset does
         # not satisfy the owner's routing bracket. It only satisfies a slate
         # bracket left by a prior last-close. Other assignment transitions route
         # the item and cancel both brackets.
         if work_item_id do
-          bracket_trigger = liveness_trigger!(txn, {:work_item, work_item_id})
+          bracket_trigger = optional_liveness_trigger(txn, {:work_item, work_item_id})
+
+          bracket_outcome = %{
+            kind: "disposition",
+            disposition_kind: "assignment_transition",
+            disposition_id: id
+          }
+
+          bracket_outcome =
+            if bracket_trigger,
+              do: Map.put(bracket_outcome, :liveness_trigger, bracket_trigger),
+              else: bracket_outcome
 
           bracket_transition = %{
             causal_source: %{kind: "assignment_transition", id: id},
-            outcome: %{
-              kind: "disposition",
-              disposition_kind: "assignment_transition",
-              disposition_id: id,
-              liveness_trigger: bracket_trigger
-            }
+            outcome: bracket_outcome
           }
 
           Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, bracket_transition)
@@ -4308,24 +4306,23 @@ defmodule Tightbeam.Assignments do
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     reopened = fetch_assignment!(txn, assignment_id)
 
-    Supervision.assignment_opened_in_txn(
-      txn,
-      assignment_id,
-      reopened_at,
-      call.supervision_interval_ms
-    )
-
     if reopened.workItemId do
-      bracket_trigger = liveness_trigger!(txn, {:work_item, reopened.workItemId})
+      bracket_trigger = optional_liveness_trigger(txn, {:work_item, reopened.workItemId})
+
+      bracket_outcome = %{
+        kind: "disposition",
+        disposition_kind: "assignment_transition",
+        disposition_id: assignment_id
+      }
+
+      bracket_outcome =
+        if bracket_trigger,
+          do: Map.put(bracket_outcome, :liveness_trigger, bracket_trigger),
+          else: bracket_outcome
 
       Tightbeam.WorkItems.cancel_brackets_in_txn(txn, reopened.workItemId, %{
         causal_source: %{kind: "assignment_transition", id: assignment_id},
-        outcome: %{
-          kind: "disposition",
-          disposition_kind: "assignment_transition",
-          disposition_id: assignment_id,
-          liveness_trigger: bracket_trigger
-        }
+        outcome: bracket_outcome
       })
     end
 
@@ -4614,8 +4611,7 @@ defmodule Tightbeam.Assignments do
       allow_closed: allow_closed,
       artifact_id: call.params[:artifact_id],
       content_sha256: call.params[:content_sha256],
-      wait_id: call.params[:wait_id],
-      supervision_interval_ms: Map.get(call, :supervision_interval_ms)
+      wait_id: call.params[:wait_id]
     })
   end
 
@@ -4657,16 +4653,6 @@ defmodule Tightbeam.Assignments do
     )
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
-
-    if is_binary(attrs.by_session) do
-      Supervision.activity_in_txn(
-        txn,
-        attrs.assignment_id,
-        attrs.by_session,
-        ts,
-        Map.get(attrs, :supervision_interval_ms)
-      )
-    end
 
     attest([
       id,
@@ -4778,17 +4764,6 @@ defmodule Tightbeam.Assignments do
 
   def effective_effect_kind(nil, nil), do: "code"
   def effective_effect_kind(nil, requested), do: requested
-
-  defp valid_supervision_interval(interval)
-       when (is_integer(interval) and interval > 0) or interval == :off,
-       do: :ok
-
-  defp valid_supervision_interval(_interval),
-    do:
-      error(
-        "invalid_supervision_interval",
-        "supervisionIntervalMs must be a positive integer or off"
-      )
 
   defp valid_brief(brief) when is_binary(brief) and brief != "", do: :ok
   defp valid_brief(_), do: error("invalid", "a dispatch must carry a brief")
@@ -5322,16 +5297,9 @@ defmodule Tightbeam.Assignments do
     do: optional_liveness_trigger(txn, {:work_item, work_item_id})
 
   defp optional_liveness_trigger(txn, primary) do
-    case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
+    case Supervision.liveness_trigger_in_txn(txn, primary) do
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> nil
-    end
-  end
-
-  defp liveness_trigger!(txn, primary) do
-    case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
-      {:ok, trigger} when is_map(trigger) -> trigger
-      :none -> raise "#{inspect(primary)} has no liveness trigger"
     end
   end
 

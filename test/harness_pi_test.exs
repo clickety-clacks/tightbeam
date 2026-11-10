@@ -116,6 +116,96 @@ defmodule Tightbeam.HarnessPiTest do
     assert result["cancelRejected"] == true
   end
 
+  test "isolated engine launcher inventories workspace inputs without personal discovery" do
+    # The launcher reports realpaths; macOS resolves the temp dir's /var through
+    # /private, so expectations are built from the resolved root.
+    {root, 0} =
+      System.cmd("node", [
+        "-e",
+        "process.stdout.write(require('fs').realpathSync(process.argv[1]))",
+        tmp_dir!("pi-isolation")
+      ])
+
+    cwd = Path.join(root, "workspace")
+    home = Path.join(root, "owned")
+    bin = Path.join(root, "bin")
+    for dir <- [cwd, home, bin], do: File.mkdir_p!(dir)
+
+    write = fn file ->
+      File.mkdir_p!(Path.dirname(file))
+      File.write!(file, "fixture")
+      file
+    end
+
+    write.(Path.join(root, "AGENTS.md"))
+    outside = write.(Path.join(root, "personal/SKILL.md"))
+    extension = write.(Path.join(home, "extensions/tightbeam.ts"))
+    convention = write.(Path.join(cwd, "AGENTS.md"))
+    nested = write.(Path.join(cwd, "nested/CLAUDE.md"))
+    write.(Path.join(cwd, "CLAUDE.md"))
+    skill = write.(Path.join(cwd, ".pi/skills/work/SKILL.md"))
+    other = write.(Path.join(cwd, "nested/.agents/skills/local/SKILL.md"))
+    File.ln_s!(Path.dirname(outside), Path.join(cwd, ".pi/skills/external"))
+    baseline = write.(Path.join(root, "packaged/SKILL.md"))
+    name = hd(Tightbeam.Homes.baseline_skill_names())
+    File.mkdir_p!(Path.join(home, "skills"))
+    File.ln_s!(Path.dirname(baseline), Path.join(home, "skills/" <> name))
+    write.(Path.join(home, "skills/unowned/SKILL.md"))
+    launcher = Path.join(home, "tightbeam-launch-pi")
+    File.write!(launcher, Pi.launcher_source())
+    # This records argv only. No Pi engine or adapter is executed.
+    fake = Path.join(bin, "pi")
+
+    File.write!(
+      fake,
+      "#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify(process.argv.slice(2)));\n"
+    )
+
+    File.chmod!(fake, 0o755)
+    env = [{"PI_CODING_AGENT_DIR", home}, {"PATH", bin <> ":" <> System.fetch_env!("PATH")}]
+
+    run = fn ->
+      System.cmd("node", [launcher, "--mode", "rpc", "--no-themes"],
+        cd: cwd,
+        env: env,
+        stderr_to_stdout: true
+      )
+    end
+
+    {output, 0} = run.()
+    args = JSON.decode!(output)
+    assert Enum.take(args, 5) == ["-nc", "-ns", "-ne", "-e", extension]
+    assert Enum.take(args, -3) == ["--mode", "rpc", "--no-themes"]
+    assert convention in args and nested in args
+    assert skill in args and other in args and baseline in args
+    refute outside in args
+    refute Path.join(root, "AGENTS.md") in args
+    refute Path.join(cwd, "CLAUDE.md") in args
+    refute Path.join(home, "skills/unowned/SKILL.md") in args
+    later = write.(Path.join(cwd, ".pi/skills/later/SKILL.md"))
+    {output, 0} = run.()
+    assert later in JSON.decode!(output)
+    File.write!(fake, "#!/bin/sh\nexit 2\n")
+    assert {_, 2} = run.()
+    File.rm!(extension)
+    assert {error, 1} = run.()
+    assert error =~ "Pi isolated launch refused"
+  end
+
+  test "launch refuses overrides of its isolated engine command and home" do
+    target = %{host_config: %{base_dir: "/fixture", ssh: nil}}
+
+    for name <- ["PI_ACP_PI_COMMAND", "PI_CODING_AGENT_DIR"] do
+      assert_raise ArgumentError, "Pi isolation environment cannot be overridden", fn ->
+        Pi.prepare_launch(target, "/owned", common_env: [{name, "/outside"}], remote_env: [])
+      end
+
+      assert_raise ArgumentError, "Pi isolation environment cannot be overridden", fn ->
+        Pi.prepare_launch(target, "/owned", common_env: [], remote_env: [name <> "=/outside"])
+      end
+    end
+  end
+
   test "projected extension injects served identity and blocks compiled rails before execution" do
     root = tmp_dir!("pi-extension")
     identity = Path.join([root, ".pi", "skills", "tightbeam__served-identity", "SKILL.md"])

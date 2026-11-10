@@ -298,7 +298,6 @@ defmodule Tightbeam.Application do
         ),
       max_live_sessions_per_user: Application.get_env(:tightbeam, :max_live_sessions_per_user),
       wake_tick_ms: wake_tick_ms,
-      supervision_interval_ms: Application.get_env(:tightbeam, :supervision_interval_ms),
       prod_limit: Application.get_env(:tightbeam, :prod_limit, 3),
       escalation_decision_deadline_ms:
         Application.get_env(:tightbeam, :escalation_decision_deadline_ms, 86_400_000),

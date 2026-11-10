@@ -331,7 +331,7 @@ defmodule Tightbeam.RailRemedyTest do
                ctx.db,
                """
                SELECT count(*) FROM wakes
-               WHERE COALESCE(consumer, '') NOT IN ('effort_probe', 'assignment_inactivity_deadline')
+               WHERE COALESCE(consumer, '') != 'effort_probe'
                """
              )
 
@@ -358,7 +358,7 @@ defmodule Tightbeam.RailRemedyTest do
                ctx.db,
                """
                SELECT count(*) FROM wakes
-               WHERE COALESCE(consumer, '') NOT IN ('effort_probe', 'assignment_inactivity_deadline')
+               WHERE COALESCE(consumer, '') != 'effort_probe'
                """
              )
 
@@ -1088,7 +1088,7 @@ defmodule Tightbeam.RailRemedyTest do
 
     expected = %{
       code: "process_denied",
-      message: "process principals cannot use assignment verbs"
+      message: "remedy principal cannot use this assignment verb"
     }
 
     calls = [

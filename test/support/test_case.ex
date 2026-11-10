@@ -75,14 +75,6 @@ defmodule Tightbeam.TestCase do
     rule_dir = Path.join(base_dir, "identity/rules")
     File.mkdir_p!(rule_dir)
 
-    rule_source =
-      Path.join([
-        :code.priv_dir(:tightbeam),
-        "kungfu/agentic-engineering/rules",
-        "row-reaction-assignment-inactivity.toml"
-      ])
-
-    File.cp!(rule_source, Path.join(rule_dir, "row-reaction-assignment-inactivity.toml"))
     Tightbeam.Rules.load!(base_dir, [])
     on_exit(fn -> File.rm_rf!(base_dir) end)
 

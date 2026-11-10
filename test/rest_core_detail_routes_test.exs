@@ -743,13 +743,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert Enum.map(rail_denials, & &1["afterMessageSeq"]) == [
              before_message.seq,
              before_message.seq,
-             nil
+             before_message.seq
            ]
 
     assert Enum.map(rail_denials, & &1["order"]["afterMessageSeq"]) == [
              before_message.seq,
              before_message.seq,
-             nil
+             before_message.seq
            ]
 
     assert Enum.map(rail_denials, & &1["order"]["occurredAt"]) == [
@@ -780,6 +780,199 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     first_denial_at = hd(rail_denials)["occurredAt"]
     assert items[before_message.id]["at"] < first_denial_at
     assert first_denial_at < items[after_message.id]["at"]
+  end
+
+  test "denials belong to one message page and remain reachable by paging back", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "denial-pages-#{System.unique_integer([:positive])}",
+        display_name: "Denial pages",
+        kind: "custom",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    session_key = session.session_key
+    start_at = System.system_time(:millisecond) - 100_000
+
+    messages =
+      for index <- 1..6 do
+        {:appended, message} =
+          Projection.append(ctx.db, %{
+            session_key: session_key,
+            role: "user",
+            content: "page message #{index}",
+            timestamp: start_at + index * 1_000,
+            attachments: []
+          })
+
+        message
+      end
+
+    denial = fn rule, timestamp, after_seq ->
+      payload = %{"rule" => rule, "reason" => "blocked"}
+      payload = if after_seq, do: Map.put(payload, "afterMessageSeq", after_seq), else: payload
+
+      {:ok, id} =
+        DB.transaction(ctx.db, fn txn ->
+          EventLog.append_event_in_txn(
+            txn,
+            "denied",
+            "assign",
+            "session:#{session_key}",
+            session_key,
+            JSON.encode!(payload),
+            {:session, session_key},
+            timestamp
+          )
+        end)
+
+      # The live writer stamps the latest sequence. Recreate historical rows
+      # with their original placement metadata for this paging regression.
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE events SET payload = ?1 WHERE id = ?2", [
+                 JSON.encode!(payload),
+                 id
+               ])
+
+      "rail:#{id}"
+    end
+
+    oldest = denial.("before-first", start_at, nil)
+    middle = denial.("middle", start_at + 3_500, nil)
+    explicit = denial.("explicit", start_at + 5_500, Enum.at(messages, 2).seq)
+    newest = denial.("newest", start_at + 7_000, nil)
+
+    page = fn suffix ->
+      conn =
+        get(
+          ctx,
+          "/api/sessions/#{session_key}/messages?limit=2" <> suffix,
+          ctx.admin_device.token
+        )
+
+      assert conn.status == 200, conn.resp_body
+      JSON.decode!(conn.resp_body)
+    end
+
+    latest = page.("&tail=true")
+    middle_page = page.("&before=" <> latest["page"]["oldestCursor"])
+    earliest = page.("&before=" <> middle_page["page"]["oldestCursor"])
+
+    assert Enum.map(latest["items"], & &1["seq"]) == Enum.map(Enum.take(messages, -2), & &1.seq)
+
+    assert Enum.map(middle_page["items"], & &1["seq"]) ==
+             Enum.map(Enum.slice(messages, 2, 2), & &1.seq)
+
+    assert Enum.map(earliest["items"], & &1["seq"]) == Enum.map(Enum.take(messages, 2), & &1.seq)
+
+    assert Enum.map(latest["railDenials"], &{&1["id"], &1["afterMessageSeq"]}) ==
+             [{newest, List.last(messages).seq}]
+
+    assert Enum.map(middle_page["railDenials"], & &1["id"]) == [middle, explicit]
+    assert Enum.map(earliest["railDenials"], & &1["id"]) == [oldest]
+
+    assert Enum.map(earliest["railDenials"], & &1["afterMessageSeq"]) == [hd(messages).seq]
+
+    assert Enum.map(middle_page["railDenials"], & &1["afterMessageSeq"]) ==
+             [Enum.at(messages, 2).seq, Enum.at(messages, 2).seq]
+
+    assert Enum.map(latest["railDenials"], & &1["afterMessageSeq"]) ==
+             [List.last(messages).seq]
+
+    assert earliest["page"]["hasMoreBefore"] == false
+
+    assert Enum.sort(
+             Enum.flat_map([latest, middle_page, earliest], fn p ->
+               Enum.map(p["railDenials"], & &1["id"])
+             end)
+           ) == Enum.sort([oldest, middle, explicit, newest])
+
+    assert page.("&before=" <> earliest["page"]["oldestCursor"])["railDenials"] == []
+  end
+
+  test "page denial placement remains bounded on a long generated transcript", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "denial-scale-#{System.unique_integer([:positive])}",
+        display_name: "Denial scale",
+        kind: "custom",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    session_key = session.session_key
+    start_at = System.system_time(:millisecond) - 100_000_000
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 75000)
+               INSERT INTO messages (id, sessionKey, role, content, timestamp, llmVisibleMessageId)
+               SELECT 'scale-message-' || x, ?1, 'user', 'scale', ?2 + x * 1000,
+                 'scale-message-' || x FROM n
+               """,
+               [session_key, start_at]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 300)
+               INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload)
+               SELECT ?2 + (x * 250 - 100) * 1000, 'denied', 'assign', ?1,
+                 ?1, NULL, '{"rule":"scale"}' FROM n
+               """,
+               ["session:" <> session_key, start_at]
+             )
+
+    page_messages = fn offset ->
+      {:ok, rows} =
+        DB.query(
+          ctx.db,
+          "SELECT seq, timestamp FROM messages WHERE sessionKey = ?1 ORDER BY seq LIMIT 5 OFFSET ?2",
+          [session_key, offset]
+        )
+
+      Enum.map(rows, fn [seq, timestamp] -> %{seq: seq, timestamp: timestamp} end)
+    end
+
+    latest_messages = page_messages.(74_995)
+    deep_messages = page_messages.(49_897)
+
+    started = System.monotonic_time(:microsecond)
+
+    latest_denials =
+      EventLog.rail_denials_for_session_page(ctx.db, session_key, latest_messages, true)
+
+    latest_us = System.monotonic_time(:microsecond) - started
+
+    started = System.monotonic_time(:microsecond)
+
+    deep_denials =
+      EventLog.rail_denials_for_session_page(ctx.db, session_key, deep_messages, true)
+
+    deep_us = System.monotonic_time(:microsecond) - started
+
+    IO.puts(
+      "denial page scale: 75000 messages, 300 denials, newest=#{latest_us}us deep=#{deep_us}us"
+    )
+
+    assert latest_denials == []
+    assert Enum.map(deep_denials, & &1.rule) == ["scale"]
+    assert hd(deep_denials).after_message_seq == Enum.at(deep_messages, 2).seq
   end
 
   test "actor history includes keyed and NULL-key rule denials routed by principal", ctx do

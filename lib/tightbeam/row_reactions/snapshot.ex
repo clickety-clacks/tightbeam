@@ -64,7 +64,15 @@ defmodule Tightbeam.RowReactions.Snapshot do
         do:
           one(txn, "sessions", ~w(sessionKey state), "sessionKey=?1", [child["childSessionKey"]])
 
-    attests = Enum.flat_map(sources, &receipt_candidates_in_txn(txn, delivery["sessionKey"], &1))
+    attests =
+      Enum.flat_map(sources, fn source ->
+        parents =
+          [delivery["sessionKey"], opener_session(source)]
+          |> Enum.filter(&is_binary/1)
+          |> Enum.uniq()
+
+        receipt_candidates_in_txn(txn, parents, source)
+      end)
 
     %{
       "sessions" => sessions(txn, [delivery["sessionKey"]]),
@@ -79,23 +87,37 @@ defmodule Tightbeam.RowReactions.Snapshot do
     }
   end
 
-  # A binary prefix range uses the receipt index, so unrelated lifetime
-  # progress is neither scanned nor materialized for each pending handoff.
-  def receipt_candidates_in_txn(txn, parent, source) do
+  # A binary prefix range per candidate session uses the receipt index, so
+  # unrelated lifetime progress is neither scanned nor materialized for each
+  # pending handoff. The reminded session is always a candidate; the child's
+  # recorded opener is one too, so its stopping note is found even though the
+  # reminder was addressed to someone else (the work item's delivery owner).
+  def receipt_candidates_in_txn(txn, parents, source) when is_list(parents) do
     prefix =
       "completion-handoff-action #{source["assignmentId"]} #{source["sourceKind"]} #{source["sourceToken"]} "
 
     upper = String.trim_trailing(prefix, " ") <> "!"
 
-    rows(
-      txn,
-      "attests INDEXED BY row_reaction_receipt_candidates",
-      ~w(id assignmentId kind bySession byUser ts note),
-      "bySession=?1 AND kind='progress' AND note>=?2 AND note<?3",
-      [parent, prefix, upper]
-    )
+    Enum.flat_map(parents, fn parent ->
+      rows(
+        txn,
+        "attests INDEXED BY row_reaction_receipt_candidates",
+        ~w(id assignmentId kind bySession byUser ts note),
+        """
+        bySession=?1 AND kind='progress' AND note>=?2 AND note<?3
+          AND EXISTS (SELECT 1 FROM assignments a
+            WHERE a.id=attests.assignmentId AND a.workItemId IS ?4)
+        """,
+        [parent, prefix, upper, source["workItemId"]]
+      )
+    end)
     |> Enum.map(&Map.put(&1, "disposition", disposition(&1["note"])))
   end
+
+  defp opener_session(%{"openedByKind" => "session", "openedById" => id}) when is_binary(id),
+    do: id
+
+  defp opener_session(_source), do: nil
 
   def wake(txn, id) do
     row =
@@ -156,7 +178,9 @@ defmodule Tightbeam.RowReactions.Snapshot do
             "childSessionKey" => source.child_session_key,
             "ownerUserId" => source.owner_user_id,
             "outcome" => source.outcome,
-            "terminalAt" => source.terminal_at
+            "terminalAt" => source.terminal_at,
+            "openedByKind" => source.opened_by_kind,
+            "openedById" => source.opened_by_id
           }
         ]
 

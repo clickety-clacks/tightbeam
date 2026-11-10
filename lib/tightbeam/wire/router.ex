@@ -54,6 +54,7 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{
     Assets,
     CliCompatibility,
+    DB,
     ConditionFacts,
     D1Read,
     Devices,
@@ -72,7 +73,7 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
                    "fact-demand",
@@ -1673,7 +1674,16 @@ defmodule Tightbeam.Wire.Router do
 
       body =
         if resource == "transcript messages" do
-          Map.put(body, "railDenials", session_rail_denials(db(conn), session_key))
+          Map.put(
+            body,
+            "railDenials",
+            session_rail_denials(
+              db(conn),
+              session_key,
+              page_result.rows,
+              page_result.flags.has_more_before
+            )
+          )
         else
           body
         end
@@ -1688,9 +1698,30 @@ defmodule Tightbeam.Wire.Router do
       state_error(conn, resource, 500, "projection_invalid", nil)
   end
 
-  defp session_rail_denials(db, session_key) do
-    db
-    |> EventLog.rail_denials_for_session(session_key)
+  defp session_rail_denials(db, session_key, [], _has_more_before) do
+    # A session with no messages has one empty transcript page; keep its denials
+    # reachable there. An empty page beyond an existing message has none.
+    {:ok, rows} =
+      DB.query(db, "SELECT 1 FROM messages WHERE sessionKey = ?1 LIMIT 1", [session_key])
+
+    if rows == [], do: session_rail_denials_wire(db, session_key, nil), else: []
+  end
+
+  defp session_rail_denials(db, session_key, messages, has_more_before) do
+    session_rail_denials_wire(db, session_key, {messages, has_more_before})
+  end
+
+  defp session_rail_denials_wire(db, session_key, bounds) do
+    denials =
+      case bounds do
+        nil ->
+          EventLog.rail_denials_for_session(db, session_key)
+
+        {messages, has_more_before} ->
+          EventLog.rail_denials_for_session_page(db, session_key, messages, has_more_before)
+      end
+
+    denials
     |> Enum.map(fn denial ->
       %{
         "id" => "rail:#{denial.id}",
@@ -4264,8 +4295,10 @@ defmodule Tightbeam.Wire.Router do
   }
 
   @param_keys %{
-    "harklight-send" =>
-      ~w(harklight_session sender_id title body choices files vendor_session_id supersedes)a,
+    "harklight-send" => ~w(
+        harklight_session sender_id title message_type message_kind importance stake by_when reply
+        body choices files vendor_session_id supersedes
+      )a,
     "harklight-revise" => ~w(message_id base_revision title body choices clear_choices)a,
     "harklight-retract" => ~w(message_id)a,
     "harklight-settle" => ~w(message_id)a,
@@ -4463,7 +4496,6 @@ defmodule Tightbeam.Wire.Router do
                :at,
                :condition_kind,
                :condition_scope,
-               :cron,
                :predicate,
                :replace_queued
              ],

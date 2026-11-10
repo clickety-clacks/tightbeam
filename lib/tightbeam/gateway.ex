@@ -138,7 +138,6 @@ defmodule Tightbeam.Gateway do
           default_model: Model.t(),
           max_live_sessions_per_user: pos_integer() | nil,
           wake_tick_ms: pos_integer(),
-          supervision_interval_ms: pos_integer() | :off | nil,
           prod_limit: non_neg_integer(),
           escalation_decision_deadline_ms: pos_integer(),
           critical_lease_hard_cap_ms: pos_integer(),
@@ -224,9 +223,10 @@ defmodule Tightbeam.Gateway do
     defaults = defaults(config, db)
     # Bubble recognition stays outside the lane transaction; it can enqueue
     # turns and therefore must not run synchronously inside LaneManager.
-    on_terminal = fn _session_key, seq ->
+    on_terminal = fn session_key, seq ->
       Tightbeam.HarnessHealth.reconcile_delivered_turn(db, seq)
       Tightbeam.Productions.BubbleSweeper.recognize(seq)
+      Tightbeam.HarklightWakes.origin_turn_ended(session_key)
     end
 
     handler_table =
@@ -240,18 +240,12 @@ defmodule Tightbeam.Gateway do
     # boot (bad law stops the boot). Placement owns every host mechanic.
     load_law!(config, Map.keys(handler_table))
 
-    # The one-time migration creates ordinary deadline wakes before the event
-    # scheduler can consume them. Later changes are written by assignment and
-    # holder-activity transactions.
     :ok = Wakes.activate_wait_recognition(db)
     :ok = Supervision.close_retired_holder_assignments(db)
 
-    case Supervision.migrate_open_assignments(db, supervision_interval_ms(config)) do
-      :ok ->
-        :ok
-
-      {:error, error} ->
-        Logger.error("assignment inactivity recovery deferred: #{Exception.message(error)}")
+    case Supervision.drain_legacy_inactivity_wakes(db) do
+      :ok -> :ok
+      {:error, error} -> raise error
     end
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
@@ -341,9 +335,7 @@ defmodule Tightbeam.Gateway do
             # pre-removal releases. They intentionally neither read generations
             # nor send effort-check-in decisions/notices.
             "effort_probe" => &EffortCheckin.ignore_retired_wake(db, &1),
-            "effort_deadline" => &EffortCheckin.ignore_retired_wake(db, &1),
-            "assignment_inactivity_deadline" => &Supervision.deadline(db, &1),
-            "assignment_inactivity_climb" => &Supervision.climb(db, &1)
+            "effort_deadline" => &EffortCheckin.ignore_retired_wake(db, &1)
           },
           tick_ms: config.wake_tick_ms,
           name: Tightbeam.WakeScheduler},
@@ -1537,7 +1529,6 @@ defmodule Tightbeam.Gateway do
       {"assign", ["assignment.opened"]} => fn call ->
         call =
           call
-          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
 
@@ -1546,6 +1537,7 @@ defmodule Tightbeam.Gateway do
       {"dispatch",
        [
          "assignment.opened",
+         "work_item.updated",
          "message.created",
          "wake.scheduled",
          "wake.canceled",
@@ -1553,7 +1545,6 @@ defmodule Tightbeam.Gateway do
        ]} => fn call ->
         call =
           call
-          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
           |> Map.put(:on_dispatch_delivery, fn delivery, _ ->
@@ -1567,7 +1558,6 @@ defmodule Tightbeam.Gateway do
           db,
           "attest",
           call
-          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:wake_scheduler, Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
           # Referent verification reaches hosts, so it needs the same placement
@@ -1596,7 +1586,6 @@ defmodule Tightbeam.Gateway do
           db,
           "reopen-assignment",
           call
-          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
         )
       end,
@@ -3485,7 +3474,7 @@ defmodule Tightbeam.Gateway do
             message,
             attachment,
             index,
-            covered_inline_harness?(harness)
+            Harness.inline_attachments?(harness)
           )
         end)
       end)
@@ -3610,8 +3599,6 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp covered_inline_harness?(harness), do: harness in [:claude, :codex, "claude", "codex"]
-
   defp turn_runner(config) do
     db = Map.get(config, :db, Tightbeam.DB)
 
@@ -3692,20 +3679,43 @@ defmodule Tightbeam.Gateway do
                      config.base_dir
                    ),
                    trace_dispatch: fn request_id ->
-                     Tightbeam.TurnLifecycle.append(db, turn.seq, %{
-                       event_key: "prompt:dispatched",
-                       producer_event_id:
-                         "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
-                       kind: "prompt_dispatched",
-                       stage: "prompt",
-                       outcome: "dispatched",
-                       cause: "acp:port-write",
-                       principal: "process:tightbeam",
-                       owner_lease: turn.owner_lease,
-                       adapter_gen: prompt_generation,
-                       acp_request_id: request_id,
-                       detail: %{v: 1}
-                     })
+                     case Tightbeam.TurnLifecycle.append(db, turn.seq, %{
+                            event_key: "prompt:dispatched",
+                            producer_event_id:
+                              "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
+                            kind: "prompt_dispatched",
+                            stage: "prompt",
+                            outcome: "dispatched",
+                            cause: "acp:port-write",
+                            principal: "process:tightbeam",
+                            owner_lease: turn.owner_lease,
+                            adapter_gen: prompt_generation,
+                            acp_request_id: request_id,
+                            detail: %{v: 1}
+                          }) do
+                       result when result in [:ok, :duplicate] ->
+                         case Task.start(fn ->
+                                Tightbeam.HarklightWakes.ack2_for_dispatched_turn(
+                                  db,
+                                  turn.seq,
+                                  turn.session_key,
+                                  active_session.display_name
+                                )
+                              end) do
+                           {:ok, _pid} ->
+                             :ok
+
+                           {:error, reason} ->
+                             Logger.error(
+                               "Harklight ACK2 task could not start for dispatched turn #{turn.seq}: #{inspect(reason)}"
+                             )
+                         end
+
+                         result
+
+                       result ->
+                         result
+                     end
                    end,
                    progress:
                      progress_fun(db, turn.session_key, session.owner_user_id, correlation),
@@ -4991,7 +5001,6 @@ defmodule Tightbeam.Gateway do
 
       {:noop, revision} ->
         load_law!(config)
-        reconcile_assignment_inactivity_after_law_change!(db)
         %{state: "already-learned", kungfu: call.params.name, live_revision: revision}
 
       {:conflict, paths} ->
@@ -5044,7 +5053,6 @@ defmodule Tightbeam.Gateway do
                case Identity.publish_live!(config.base_dir, candidate) do
                  {:ok, revision} ->
                    load_law!(config)
-                   reconcile_assignment_inactivity_after_law_change!(db)
                    {:published, marker, revision}
 
                  {:error, error} ->
@@ -5143,7 +5151,6 @@ defmodule Tightbeam.Gateway do
           case Identity.publish_live!(config.base_dir, candidate) do
             {:ok, revision} ->
               load_law!(config)
-              reconcile_assignment_inactivity_after_law_change!(db)
 
               stamp_served_publication(
                 config,
@@ -5341,13 +5348,6 @@ defmodule Tightbeam.Gateway do
 
     Tightbeam.RowReactions.recover(Map.get(config, :db, Tightbeam.DB))
     rules
-  end
-
-  defp reconcile_assignment_inactivity_after_law_change!(db) do
-    case Supervision.migrate_open_assignments(db) do
-      :ok -> :ok
-      {:error, error} -> raise error
-    end
   end
 
   defp identity_status_result(config, db, call) do
@@ -6880,10 +6880,6 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp supervision_interval_ms(config) do
-    Map.get(config, :supervision_interval_ms) || Supervision.policy_default_interval_ms()
-  end
-
   defp sentinel_post_details(event, values) when is_list(values) do
     declared = MapSet.new(Enum.map(event.details, & &1.name))
 
@@ -7252,7 +7248,6 @@ defmodule Tightbeam.Gateway do
              :condition_kind,
              :predicate,
              :after_turn,
-             :assignment_id,
              :replace_queued
            ],
            &is_nil(p[&1])
@@ -7380,10 +7375,12 @@ defmodule Tightbeam.Gateway do
     p = call.params
     assignment_id = wake_assignment_id_in_txn(txn, call)
 
-    # A no-trigger assignment on a conversational wake is a reference only.
-    # Keep it on the wake, but do not count the notification as holder activity.
+    # Immediate assignment pointers and recurring crons are references, not holder work.
+    # Keep the assignment on each wake without counting its creation as activity.
     activity_assignment_id =
-      if immediate_assignment_pointer_request?(p), do: nil, else: assignment_id
+      if immediate_assignment_pointer_request?(p) or is_binary(p[:cron]),
+        do: nil,
+        else: assignment_id
 
     wake =
       Wakes.schedule_in_txn(txn, %{
@@ -7480,7 +7477,7 @@ defmodule Tightbeam.Gateway do
 
   defp scheduled_wake_assignment_id(params) do
     if is_number(params[:after_ms]) or is_number(params[:at]) or
-         is_binary(params[:condition_kind]),
+         is_binary(params[:condition_kind]) or is_binary(params[:cron]),
        do: params[:assignment_id],
        else: nil
   end
@@ -10376,7 +10373,6 @@ defmodule Tightbeam.Gateway do
                             plan,
                             owner,
                             principal,
-                            supervision_interval_ms(config),
                             "retired: session retired before execution",
                             retirement_request_id,
                             p[:idempotency_key],
@@ -10753,7 +10749,6 @@ defmodule Tightbeam.Gateway do
          plan,
          owner,
          principal,
-         supervision_interval_ms,
          drain_reason,
          retirement_request_id,
          idempotency_key,
@@ -10811,7 +10806,6 @@ defmodule Tightbeam.Gateway do
               member.session_key,
               owner,
               principal,
-              supervision_interval_ms,
               drain_reason
             )
 
@@ -10919,11 +10913,10 @@ defmodule Tightbeam.Gateway do
          session_key,
          owner,
          principal,
-         supervision_interval_ms,
          drain_reason
        ) do
     assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
-    Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
+    Org.retire_in_txn(txn, session_key, principal)
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
     assignments
   end

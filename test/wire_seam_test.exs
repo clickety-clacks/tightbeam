@@ -385,10 +385,16 @@ defmodule Tightbeam.Wire.SeamTest do
     runner = fn args ->
       if Enum.take(args, 2) == ["send", "--prepare"] do
         assert Enum.take(args, 2) == ["send", "--prepare"]
+        assert "--reply" in args
 
         for pair <- [
               ["--sender-id", "sender"],
               ["--title", "Question"],
+              ["--type", "request"],
+              ["--kind", "blocker"],
+              ["--importance", "high"],
+              ["--stake", "the demo slips"],
+              ["--by-when", "2026-11-01T17:00:00Z"],
               ["--body", "Body"],
               ["--vendor-session-id", "vendor"],
               ["--choice", "Yes"],
@@ -443,6 +449,12 @@ defmodule Tightbeam.Wire.SeamTest do
           senderId: "sender",
           title: "Question",
           body: "Body",
+          messageType: "request",
+          messageKind: "blocker",
+          importance: "high",
+          stake: "the demo slips",
+          byWhen: "2026-11-01T17:00:00Z",
+          reply: true,
           vendorSessionId: "vendor",
           choices: ["Yes"],
           files: ["/tmp/file"],
@@ -452,6 +464,8 @@ defmodule Tightbeam.Wire.SeamTest do
 
     error = JSON.decode!(response.resp_body)["error"]
     assert error["messageId"] == "minted-id"
+    assert error["messageType"] == "request"
+    assert error["messageTypeLabel"] == "Request"
     assert error["outcome"] == "outcome_unknown"
     assert error["wakeEffect"] == "none"
     assert error["reason"] =~ "harklight-settle --message minted-id"
