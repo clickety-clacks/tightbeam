@@ -641,6 +641,25 @@ defmodule Tightbeam.Org do
     session
   end
 
+  @doc false
+  @spec initial_display_name_in_txn(Txn.t(), String.t()) :: String.t()
+  def initial_display_name_in_txn(%Txn{} = txn, base_name) when is_binary(base_name) do
+    available_initial_display_name!(txn, base_name, 1)
+  end
+
+  defp available_initial_display_name!(txn, base_name, suffix) do
+    candidate = if suffix == 1, do: base_name, else: "#{base_name} (#{suffix})"
+    validate_display_name!(txn, candidate)
+    candidate
+  rescue
+    error in Tightbeam.Org.DisplayNameError ->
+      if error.code == "display_name_taken" do
+        available_initial_display_name!(txn, base_name, suffix + 1)
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
   # Main may be virtual until its first connection. Only an explicitly supplied
   # parent requires a stored session; the derived fallback never creates one.
   defp validate_topology_creation!(txn, key, input) do

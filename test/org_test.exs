@@ -1106,6 +1106,48 @@ defmodule Tightbeam.OrgTest do
     assert Org.get(db, original.session_key).display_name == "  ATC PO  "
   end
 
+  test "legacy duplicate labels remain unchanged but cannot be newly claimed", %{db: db} do
+    first =
+      Org.create(db, base(%{session_key: "legacy-label-one", display_name: "First label"}))
+
+    second =
+      Org.create(db, base(%{session_key: "legacy-label-two", display_name: "Second label"}))
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET displayName='Legacy label' WHERE sessionKey=?1", [
+        first.session_key
+      ])
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET displayName=' legacy LABEL ' WHERE sessionKey=?1", [
+        second.session_key
+      ])
+
+    first_before = Org.get(db, first.session_key)
+    unchanged = Org.rename(db, first.session_key, first_before.display_name)
+
+    assert unchanged.session_key == first.session_key
+    assert unchanged.display_name == "Legacy label"
+    assert unchanged.updated_at == first_before.updated_at
+
+    collision =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.rename(db, first.session_key, " LEGACY label ")
+      end
+
+    assert collision.code == "display_name_taken"
+
+    collision =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.create(db, base(%{session_key: "legacy-label-three", display_name: "legacy LABEL"}))
+      end
+
+    assert collision.code == "display_name_taken"
+    assert Org.get(db, first.session_key).display_name == "Legacy label"
+    assert Org.get(db, second.session_key).display_name == " legacy LABEL "
+    assert Org.get(db, "legacy-label-three") == nil
+  end
+
   test "pointer chain is append-only and current is latest", %{db: db} do
     Org.create(db, base(%{session_key: "k1"}))
     Org.append_pointer(db, "k1", "uuid-1", "created")
