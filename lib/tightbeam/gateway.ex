@@ -9498,6 +9498,7 @@ defmodule Tightbeam.Gateway do
                          )
                        end) do
                   project_tuned_model(
+                    config,
                     db,
                     session,
                     adapter,
@@ -9529,6 +9530,7 @@ defmodule Tightbeam.Gateway do
                          )
                        end) do
                   project_tuned_model(
+                    config,
                     db,
                     session,
                     adapter,
@@ -9689,6 +9691,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp project_tuned_model(
+         config,
          db,
          session,
          adapter,
