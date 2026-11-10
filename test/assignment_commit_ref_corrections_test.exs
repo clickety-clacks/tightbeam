@@ -455,6 +455,97 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     end
   end
 
+  test "an exact replay verifies an existing correction without changing its contents or history",
+       ctx do
+    assignment_id = "asg_review_reverify_valid"
+    insert_closed_review_assignment!(ctx.db, assignment_id)
+
+    requested_ref = Map.put(ref(ctx), "ref", "refs/heads/reverify-valid")
+
+    call =
+      ctx
+      |> with_param(:assignment_id, assignment_id)
+      |> with_param(:commit_refs, [requested_ref])
+      |> with_param(:idempotency_key, "review-reverify-valid")
+
+    assert %{
+             correction: original,
+             verificationFailure: "declared_local_ref_resolution"
+           } = correct(call, {:session, "po-owner"})
+
+    assert is_nil(original.verifiedAt)
+    assert [original_history] = correction_history(ctx.db, assignment_id)
+    original_lifecycle = lifecycle(ctx.db, assignment_id)
+    assert [original] = AssignmentCommitRefCorrections.list(ctx.db, assignment_id)
+
+    git!(ctx.repo, ["update-ref", "refs/heads/reverify-valid", ctx.commit])
+    git!(ctx.repo, ["push", "origin", "refs/heads/reverify-valid"])
+
+    assert %{correction: verified} = correct(call, {:session, "po-owner"})
+    assert is_integer(verified.verifiedAt)
+    assert Map.delete(verified, :verifiedAt) == Map.delete(original, :verifiedAt)
+    assert verified.commitRefs == original.commitRefs
+    refute Map.has_key?(hd(verified.commitRefs), "verifiedRefCommit")
+
+    assert [verified] = AssignmentCommitRefCorrections.list(ctx.db, assignment_id)
+    assert [verified_history] = correction_history(ctx.db, assignment_id)
+    assert verified_history == Map.put(original_history, :verifiedAt, verified.verifiedAt)
+    assert lifecycle(ctx.db, assignment_id) == original_lifecycle
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1",
+               [assignment_id]
+             )
+  end
+
+  test "an invalid correction replay preserves its named failure and history",
+       ctx do
+    assignment_id = "asg_review_reverify_invalid"
+    insert_closed_review_assignment!(ctx.db, assignment_id)
+
+    requested_ref = Map.put(ref(ctx), "remote", "missing")
+
+    call =
+      ctx
+      |> with_param(:assignment_id, assignment_id)
+      |> with_param(:commit_refs, [requested_ref])
+      |> with_param(:idempotency_key, "review-reverify-invalid")
+
+    assert %{correction: original, verificationFailure: "declared_remote_matches_origin"} =
+             correct(call, {:session, "po-owner"})
+
+    assert is_nil(original.verifiedAt)
+    assert [original_history] = correction_history(ctx.db, assignment_id)
+    original_lifecycle = lifecycle(ctx.db, assignment_id)
+
+    assert %{
+             correction: ^original,
+             warning: warning,
+             verificationFailure: "declared_remote_matches_origin"
+           } = correct(call, {:session, "po-owner"})
+
+    assert warning =~ "canonical Git check failed: declared_remote_matches_origin"
+    assert [^original] = AssignmentCommitRefCorrections.list(ctx.db, assignment_id)
+    assert [^original_history] = correction_history(ctx.db, assignment_id)
+    assert lifecycle(ctx.db, assignment_id) == original_lifecycle
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_commit_ref_corrections WHERE assignmentId=?1",
+               [assignment_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1",
+               [assignment_id]
+             )
+  end
+
   test "same request replays, changed replay conflicts, and a second correction is denied", ctx do
     assert %{correction: first} = correct(ctx, {:session, "po-owner"})
     assert %{correction: ^first} = correct(ctx, {:session, "po-owner"})
@@ -600,6 +691,54 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
         if Tightbeam.DB.Txn.changes(txn) != 1, do: raise("fixture assignment missing")
         :ok
       end)
+  end
+
+  defp insert_closed_review_assignment!(db, assignment_id) do
+    closing_attest_id = "att_review_close_#{assignment_id}"
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO assignments
+            (id, subject, holderKey, openedBySession, openedAt, state, outcome,
+             closedAt, closedBySession, closingAttestId, workItemId)
+          VALUES (?1, 'closed review', 'holder-owner', 'po-owner', 5,
+                  'open', NULL, NULL, NULL, NULL, 'wi_history')
+          """,
+          [assignment_id]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          "INSERT INTO attests (id, assignmentId, kind, bySession, ts) " <>
+            "VALUES (?1, ?2, 'completion', 'holder-owner', 6)",
+          [closing_attest_id, assignment_id]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          "UPDATE assignments SET state='closed', outcome='completed', closedAt=6, " <>
+            "closedBySession='holder-owner', closingAttestId=?1 WHERE id=?2",
+          [closing_attest_id, assignment_id]
+        )
+
+        :ok
+      end)
+  end
+
+  defp correction_history(db, assignment_id) do
+    trace =
+      WorkItems.__handle__(db, "work-item-trace", %{
+        principal: {:user, "owner"},
+        params: %{work_item_id: "wi_history"}
+      })
+
+    Enum.filter(
+      trace.timeline,
+      &(&1.type == "commit_ref_correction" and &1.assignmentId == assignment_id)
+    )
   end
 
   defp recreate_legacy_correction_table!(db) do

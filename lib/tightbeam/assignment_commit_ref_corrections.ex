@@ -118,6 +118,18 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
            {:ok, requested_refs} <- normalize_requested_refs(params[:commit_refs]),
            {:ok, prepared} <- prepare(db, call, actor, requested_refs) do
         case prepared do
+          {:replay, %{verifiedAt: nil} = row} ->
+            case verify_refs(db, row.commitRefs) do
+              {:ok, _verified_refs} ->
+                verified_at = System.system_time(:millisecond)
+                maybe_after_verify(call, db)
+                mark_existing_verified(db, call, actor, row, verified_at)
+
+              {:error, failed_check} ->
+                %{correction: row}
+                |> warn_unverified_correction(failed_check)
+            end
+
           {:replay, row} ->
             correction_result(row)
 
@@ -141,10 +153,53 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     end
   end
 
-  defp correction_result(%{verifiedAt: nil} = row),
-    do: %{correction: row, warning: unverified_correction_warning()}
-
   defp correction_result(row), do: %{correction: row}
+
+  defp mark_existing_verified(db, call, actor, original, verified_at) do
+    transaction(db, fn txn ->
+      with {:ok, context} <-
+             authorize_context(txn, actor, original.assignmentId, original.evidenceArtifactId),
+           :ok <- require_closed(context) do
+        current = fetch!(txn, original.id)
+
+        cond do
+          Map.delete(current, :verifiedAt) != Map.delete(original, :verifiedAt) ->
+            error(
+              "correction_changed",
+              "canonical commitRef correction changed during verification"
+            )
+
+          not is_nil(current.verifiedAt) ->
+            %{correction: current}
+
+          true ->
+            Txn.q(
+              txn,
+              "UPDATE assignment_commit_ref_corrections SET verifiedAt = ?1 " <>
+                "WHERE id = ?2 AND assignmentId = ?3 AND verifiedAt IS NULL",
+              [verified_at, original.id, original.assignmentId]
+            )
+
+            case Txn.changes(txn) do
+              1 ->
+                WorkItemSummary.publish_assignment_change_in_txn(
+                  txn,
+                  original.assignmentId,
+                  call
+                )
+
+                %{correction: fetch!(txn, original.id)}
+
+              _ ->
+                error(
+                  "correction_changed",
+                  "canonical commitRef correction changed during verification"
+                )
+            end
+        end
+      end
+    end)
+  end
 
   defp warn_unverified_correction(
          %{correction: %{verifiedAt: nil, assignmentId: assignment_id}} = result,
@@ -164,9 +219,6 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
 
   defp unverified_correction_warning(failed_check),
     do: "commitRefs were recorded unverified; canonical Git check failed: #{failed_check}"
-
-  defp unverified_correction_warning,
-    do: "commitRefs were recorded without successful canonical Git verification"
 
   defp ensure_nullable_verified_at(txn) do
     columns =
