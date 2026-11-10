@@ -2747,6 +2747,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     assert {:ok, readiness_adapter, 1} =
              AdapterCoordinator.adapter_for(coordinator, placement_key)
+
     assert {:ok, session_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, worker_key)
     await_ready!(coordinator, placement_key)
     await_ready!(coordinator, worker_key)

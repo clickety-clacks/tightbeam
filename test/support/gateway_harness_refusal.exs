@@ -197,6 +197,7 @@ defmodule GatewayHarnessRefusal do
 
     capture = Path.join(base, "harness-request.json")
     fixture = Path.join(Path.dirname(__ENV__.file), "gateway_refusal_harness.js")
+
     node =
       System.find_executable("node") || raise "node is required for the local harness process"
 
