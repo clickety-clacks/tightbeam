@@ -117,7 +117,34 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
     command
     |> Enum.drop(6)
     |> Enum.join(" ")
-    |> then(&System.cmd("sh", ["-c", &1], stderr_to_stdout: true))
+    |> then(&run_remote_fixture_command(:remote, &1))
+  end
+
+  defp run_remote_fixture_command(route, script, options \\ []) do
+    {output, status} =
+      System.cmd("sh", ["-c", script], Keyword.merge([stderr_to_stdout: true], options))
+
+    if status not in [0, 1] do
+      sanitized_script = sanitize_fixture_path(script)
+      sanitized_output = output |> sanitize_fixture_path() |> String.slice(0, 512)
+
+      IO.puts(
+        :stderr,
+        "remote fixture diagnostic route=#{route} " <>
+          "argv=#{inspect(["sh", "-c", sanitized_script])} exit=#{status} " <>
+          "output=#{inspect(sanitized_output)}"
+      )
+    end
+
+    {output, status}
+  end
+
+  defp sanitize_fixture_path(text) do
+    Regex.replace(
+      ~r{/[^\s"']*/tb-codex-guardian-[^/\s"']+},
+      text,
+      "<fixture-root>"
+    )
   end
 
   defp run_remote_fixture(["rsync" | _] = command) do
@@ -138,10 +165,7 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
     script = command |> Enum.drop(6) |> Enum.join(" ")
     path = shim_dir <> ":" <> System.fetch_env!("PATH")
 
-    System.cmd("sh", ["-c", script],
-      stderr_to_stdout: true,
-      env: [{"PATH", path}]
-    )
+    run_remote_fixture_command(:remote_macos, script, env: [{"PATH", path}])
   end
 
   defp run_macos_remote_fixture(["rsync" | _] = command, _shim_dir) do
