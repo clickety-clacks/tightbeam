@@ -103,7 +103,7 @@ defmodule Tightbeam.Spinup do
 
   defp provision_adapter_in_flight(target, module, path, locality, expected_version) do
     install_dir = Path.join(target.host_config.base_dir, "adapters")
-    command = install_command(target, install_dir, locality)
+    command = install_command(target, module, install_dir, locality)
 
     # A start line AND a closing line, deliberately: a cold-cache npm install is
     # minutes of silence, and a gateway that says nothing while it runs reads
@@ -137,7 +137,7 @@ defmodule Tightbeam.Spinup do
   # written against the pinned release, so the install has to land that release — an
   # unpinned tree is reported and skipped rather than patched blindly. Versions stay in
   # the harness modules; this seam only asks each of them for its own.
-  defp install_command(target, install_dir, locality) do
+  defp install_command(target, module, install_dir, locality) do
     packages =
       (Harness.all() ++ [module])
       |> Enum.uniq()
