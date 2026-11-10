@@ -5,9 +5,10 @@ description: Work an assigned Tightbeam card through the tightbeam CLI. Use when
 
 # Work an assigned card through the Tightbeam CLI
 
-Written for Tightbeam 0.1.15. If `tightbeam --version` prints a different version, run
-`tightbeam skill install` to replace this skill with the edition that ships with the
-installed CLI, then start a fresh agent session.
+Written for Tightbeam 0.1.15. Check `tightbeam --version` and command help against this
+edition. If they differ, ask Main which edition applies before using the affected
+operation. `tightbeam skill install` copies the installed CLI's bundled edition; do not
+use it to overwrite a separately supplied reviewed skill without checking that choice.
 
 Use Tightbeam as the record and coordination layer for the assignment. Run only the
 operations that the assignment authorizes. Ask Main to perform broader organization work.
@@ -41,12 +42,13 @@ you need command or flag syntax; `tightbeam help <command>` prints one command's
 The `tightbeam` executable writes JSON results to stdout. A nonzero exit writes the
 failure to stderr.
 
-Use a session credential whose session holds exactly one role. Omit `--as`, `--as-user`,
-and `--as-process`; the CLI and gateway derive the session principal and its one role. If
-the gateway returns `no_role` or `ambiguous_identity`, stop. Use the assignment's
-non-Tightbeam contact channel to ask the owner or Main for a correctly provisioned
-single-role session credential. Do not guess a role, bind a role, change identity, or
-follow a refusal's suggestion to use `--as-user`.
+Omit `--as`, `--as-user`, and `--as-process`; the gateway derives the authenticated
+session principal from the credential whether the session holds zero, one, or several
+roles. A role binding is not a prerequisite, and an attribution flag does not change
+that principal or grant assignment authority. If authentication or identity resolution
+fails, preserve the refusal and ask the owner or Main through the assignment's
+non-Tightbeam contact channel. Do not guess a role, bind one, replace the credential, or
+use `--as-user` to work around a refusal.
 
 Recover the card in this order:
 
@@ -81,17 +83,43 @@ to Main unless the assignment grants that exact operation.
 Discover mechanics from `tightbeam --help`. Do not guess a command, flag, model, role,
 session, target, record shape, or identifier.
 
+## External harness limits
+
+The session credential authenticates CLI calls to the gateway; this skill supplies
+instructions. Neither installs tool hooks or establishes that an externally started
+Codex or Claude session has Tightbeam's managed harness wiring. Gateway rules still
+apply to CLI requests, but do not intercept shell or other tool actions that bypass
+the gateway. Tightbeam's managed harness hooks are a separate mechanism: command
+matching can prevent covered mistakes, but is not a sandbox. Do not infer local tool
+enforcement from a credential, an installed skill, or managed-harness support. If the
+assignment depends on a fence whose wiring has not been established for this session,
+ask Main to resolve that dependency before the affected action.
+
 ## Record the result
 
 Use `tightbeam attest <assignment-id> --kind ... --note "..."` for the assignment result:
 
 - File `progress` only for a new material result, exact refusal, or bounded checkpoint.
-- File `completion` only when the obligation is complete and its required gates allow the
-  assignment to close.
+- File `completion` when the promised output exists, with the required evidence. Under
+  the supported `completion-requires-review` remedy, the report can be recorded while
+  the assignment stays open pending review and the accountable owner is notified. Read
+  the returned assignment state: a recorded completion is not proof of closure. A
+  qualifying clean review can close it later; address requested changes. Other refusals
+  still require their named remedy; do not treat every refusal as pending review.
 - File `cannot-proceed` with the exact reason when the obligation cannot move under current
-  authority. The card stays open and routes one decision to its opener.
+  authority. The card stays open, you retain custody, and one decision routes to its
+  opener. Do not file it merely because an accepted completion is pending review.
 - File a `verdict` only when the assignment authorizes that review judgment. A verdict note
   is capped at 2,000 characters; record a longer judgment as an artifact and cite it.
+
+A standing `cannot-proceed` blocks completion. Its configured release fact must match
+kind, scope and principal, or the block must settle through a supported disposition,
+such as an accepted `answer` on its decision request, opener revocation, or qualifying
+review closure of an already recorded completion. A chat reply, wake, or `cleared`
+verdict alone does not settle it. Read `assignment-get` and its `cannotProceed` state
+before resuming; settlement does not prove the promised work is done. When specifying
+a release fact, supply all three `--release-fact-*` flags from command help together,
+using the existing fact contract; ask Main if that contract is unknown.
 
 Name the operation, observed result, relevant identifiers, and non-secret evidence. Do not
 claim success from process output alone when the durable row should show the effect. Read
