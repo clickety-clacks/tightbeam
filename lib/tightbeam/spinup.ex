@@ -52,23 +52,29 @@ defmodule Tightbeam.Spinup do
   end
 
   @doc false
-  def ensure_adapter(target, module, path) do
+  def ensure_adapter(target, module, path, opts \\ []) do
+    expected_version = Keyword.get(opts, :verify_version)
+
     if Support.local?(target) do
-      if File.exists?(path) do
+      if File.exists?(path) and adapter_version_matches?(target, module, expected_version, :local) do
         maybe_patch_local(target, path)
         {:ok, "adapters present"}
       else
-        provision_adapter(target, module, path, :local)
+        provision_adapter(target, module, path, :local, expected_version)
       end
     else
       check = remote_command(target.host_config.ssh, "test -x #{shell_quote(path)}")
 
       case target.sh.(check) do
         {_output, 0} ->
-          maybe_patch_remote(target, path, "adapters present")
+          if adapter_version_matches?(target, module, expected_version, :remote) do
+            maybe_patch_remote(target, path, "adapters present")
+          else
+            provision_adapter(target, module, path, {:remote, check}, expected_version)
+          end
 
         {_output, _exit} ->
-          provision_adapter(target, module, path, {:remote, check})
+          provision_adapter(target, module, path, {:remote, check}, expected_version)
       end
     end
   end
@@ -84,18 +90,18 @@ defmodule Tightbeam.Spinup do
   # how presence is observed. Everything downstream — the pinned package set, the
   # re-check after installing, the failure remedies — is shared, so a fix to either one
   # cannot drift to only one side.
-  defp provision_adapter(target, module, path, locality) do
+  defp provision_adapter(target, module, path, locality, expected_version) do
     # SINGLE-FLIGHT PER HOST (Tightbeam.Spinup.Flight): the adapters dir is
     # shared across harnesses and npm rewrites node_modules while it works —
     # two concurrent provisions interleave in one directory, and either can
     # momentarily unlink a binary the other harness already installed
     # (SMOKE §11 step 43 caught a launch exec'ing into that window).
     Tightbeam.Spinup.Flight.run(target.host_name, fn ->
-      provision_adapter_in_flight(target, module, path, locality)
+      provision_adapter_in_flight(target, module, path, locality, expected_version)
     end)
   end
 
-  defp provision_adapter_in_flight(target, module, path, locality) do
+  defp provision_adapter_in_flight(target, module, path, locality, expected_version) do
     install_dir = Path.join(target.host_config.base_dir, "adapters")
     command = install_command(target, install_dir, locality)
 
@@ -111,7 +117,7 @@ defmodule Tightbeam.Spinup do
     case target.sh.(command) do
       {_output, 0} ->
         Logger.info("ACP adapter install into #{install_dir} on #{target.host_name} complete")
-        confirm_adapter(target, module, path, locality)
+        confirm_adapter(target, module, path, locality, expected_version)
 
       {output, _exit} ->
         Logger.warning("ACP adapter install into #{install_dir} on #{target.host_name} failed")
@@ -133,7 +139,8 @@ defmodule Tightbeam.Spinup do
   # the harness modules; this seam only asks each of them for its own.
   defp install_command(target, install_dir, locality) do
     packages =
-      Harness.all()
+      (Harness.all() ++ [module])
+      |> Enum.uniq()
       # Cursor is not an npm adapter: its pinned bundle is installed by Cursor's
       # own installer under the dedicated execution account and verified by
       # Cursor.verify_installed_cli/1 (`cursor-agent@<version>` is not published).
@@ -154,8 +161,9 @@ defmodule Tightbeam.Spinup do
     end
   end
 
-  defp confirm_adapter(target, module, path, :local) do
-    if File.exists?(path) do
+  defp confirm_adapter(target, module, path, :local, expected_version) do
+    if File.exists?(path) and
+         adapter_version_matches?(target, module, expected_version, :local) do
       maybe_patch_local(target, path)
       {:ok, "deployed adapters"}
     else
@@ -163,15 +171,59 @@ defmodule Tightbeam.Spinup do
     end
   end
 
-  defp confirm_adapter(target, module, path, {:remote, check}) do
+  defp confirm_adapter(target, module, path, {:remote, check}, expected_version) do
     case target.sh.(check) do
       {_output, 0} ->
-        maybe_patch_remote(target, path, "deployed adapters")
+        if adapter_version_matches?(target, module, expected_version, :remote) do
+          maybe_patch_remote(target, path, "deployed adapters")
+        else
+          {:error,
+           host_unready(
+             "host #{target.host_name} is not ready for #{module.wire_name()}: installed adapter package version does not match #{expected_version}"
+           )}
+        end
 
       {output, _exit} ->
         {:error, host_unready(still_missing(target, module, path, String.trim(output)))}
     end
   end
+
+  defp adapter_version_matches?(_target, _module, nil, _locality), do: true
+
+  defp adapter_version_matches?(target, module, expected, :local) do
+    target
+    |> package_version_path(module)
+    |> File.read()
+    |> package_version_matches?(expected)
+  end
+
+  defp adapter_version_matches?(target, module, expected, :remote) do
+    path = package_version_path(target, module)
+
+    case target.sh.(remote_command(target.host_config.ssh, "cat #{shell_quote(path)}")) do
+      {contents, 0} -> package_version_matches?({:ok, contents}, expected)
+      _ -> false
+    end
+  end
+
+  defp package_version_path(target, module) do
+    Path.join([
+      target.host_config.base_dir,
+      "adapters",
+      "node_modules",
+      module.install_package(),
+      "package.json"
+    ])
+  end
+
+  defp package_version_matches?({:ok, contents}, expected) do
+    case JSON.decode(contents) do
+      {:ok, %{"version" => ^expected}} -> true
+      _ -> false
+    end
+  end
+
+  defp package_version_matches?(_result, _expected), do: false
 
   defp maybe_patch_local(target, path) do
     case Map.get(target, :patch_adapter) do

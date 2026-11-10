@@ -2218,6 +2218,75 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert coordinator_generation(coordinator, key) == 2
   end
 
+  test "closing one Pi session worker reaps only its process group and leaves its sibling ready", ctx do
+    script = Path.join(ctx.test_dir, "pi_session_worker.js")
+
+    File.write!(script, """
+    const fs = require("node:fs");
+    const { spawn } = require("node:child_process");
+    const rl = require("node:readline").createInterface({ input: process.stdin });
+    const child = spawn("/bin/sh", ["-c", "exec sleep 300"], { stdio: "ignore" });
+    fs.writeFileSync(process.env.PI_CHILD_PID_FILE, String(child.pid));
+    const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\\n");
+    rl.on("line", (line) => {
+      const m = JSON.parse(line);
+      if (m.method === "initialize") send({ id: m.id, result: { protocolVersion: 1 } });
+    });
+    """)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn key, _ ->
+           {:ok, session_key} = Tightbeam.Placement.pi_session_key(key)
+           child_pid_file = Path.join(ctx.test_dir, session_key <> ".child-pid")
+
+           [
+             harness: :pi,
+             cmd: [System.find_executable("node"), script],
+             env: [{"PI_CHILD_PID_FILE", child_pid_file}],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             stderr_path: Path.join(ctx.test_dir, session_key <> ".stderr"),
+             process_identity_dir: ctx.test_dir,
+             process_helper: @process_helper
+           ]
+         end,
+         db: ctx.db,
+         name: :pi_session_process_group_coordinator}
+      )
+
+    key_a = Tightbeam.Placement.pi_session_adapter_key("session-a", "testhost")
+    key_b = Tightbeam.Placement.pi_session_adapter_key("session-b", "testhost")
+
+    assert {:ok, adapter_a, 1} = AdapterCoordinator.adapter_for(coordinator, key_a)
+    assert {:ok, adapter_b, 1} = AdapterCoordinator.adapter_for(coordinator, key_b)
+    await_ready!(coordinator, key_a)
+    await_ready!(coordinator, key_b)
+
+    pid_a = read_child_pid!(Path.join(ctx.test_dir, "session-a.child-pid"))
+    pid_b = read_child_pid!(Path.join(ctx.test_dir, "session-b.child-pid"))
+    rows = HarnessProcess.list(ctx.db)
+    row_a = Enum.find(rows, &(&1.adapter_key == AdapterCoordinator.key_name(key_a)))
+    row_b = Enum.find(rows, &(&1.adapter_key == AdapterCoordinator.key_name(key_b)))
+    assert row_a.process_group_id != row_b.process_group_id
+    ref = Process.monitor(adapter_a)
+
+    assert :ok = AdapterCoordinator.close_adapter(coordinator, key_a)
+    assert_receive {:DOWN, ^ref, :process, ^adapter_a, _reason}, 2_000
+    assert eventually(fn -> not process_active?(pid_a) end)
+    assert process_active?(pid_b)
+    assert Process.alive?(adapter_b)
+    assert AdapterCoordinator.ready?(coordinator, key_b)
+    assert {:ok, ^adapter_b, 1} = AdapterCoordinator.adapter_for(coordinator, key_b)
+
+    rows = Map.new(HarnessProcess.list(ctx.db), &{&1.adapter_key, &1})
+    assert Map.fetch!(rows, AdapterCoordinator.key_name(key_a)).resolved_at
+    assert Map.fetch!(rows, AdapterCoordinator.key_name(key_b)).resolved_at == nil
+  end
+
   test "load-slot queue caps concurrency at three and releases on borrower exit", ctx do
     coordinator =
       start_supervised!(
@@ -2661,6 +2730,33 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
   end
 
+  test "a Pi placement readiness death does not notify or stop session workers", ctx do
+    session_row_key =
+      seed_session!(ctx.db,
+        harness: "pi",
+        provider: "opencode_go",
+        model: Tightbeam.Model.new("opencode-go/gpt-5.6-luna")
+      )
+
+    coordinator =
+      start_fake_coordinator(ctx, :pi_readiness_only_coordinator, :pi)
+
+    placement_key = {:pi, "shared", "testhost"}
+    worker_key = Tightbeam.Placement.pi_session_adapter_key(session_row_key, "testhost")
+
+    assert {:ok, readiness_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, placement_key)
+    assert {:ok, session_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, worker_key)
+    await_ready!(coordinator, placement_key)
+    await_ready!(coordinator, worker_key)
+
+    Process.exit(readiness_adapter, :kill)
+
+    assert eventually(fn -> coordinator_generation(coordinator, placement_key) == 2 end)
+    assert Process.alive?(session_adapter)
+    assert AdapterCoordinator.ready?(coordinator, worker_key)
+    assert [] = Tightbeam.Projection.list_after(ctx.db, session_row_key, nil, 10)
+  end
+
   # `start_supervised!` is not a boot barrier: Acp.Adapter returns from init
   # before `node` is spawned, and only {:adapter_ready, key} marks the entry
   # ready. A death BEFORE that point is a boot failure, which deliberately
@@ -2672,7 +2768,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            )
   end
 
-  defp seed_session!(db) do
+  defp seed_session!(db, opts \\ []) do
     :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
     session_key = "agent:main:clawline:flynn:main"
 
@@ -2684,9 +2780,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       origin: "user:flynn",
       archetype: "default",
       host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Tightbeam.Model.new("claude-fable-5")
+      harness: Keyword.get(opts, :harness, "claude"),
+      provider: Keyword.get(opts, :provider, "anthropic"),
+      model: Keyword.get(opts, :model, Tightbeam.Model.new("claude-fable-5"))
     })
 
     session_key
@@ -2705,7 +2801,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     seq
   end
 
-  defp start_fake_coordinator(ctx, name) do
+  defp start_fake_coordinator(ctx, name, harness \\ :claude) do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
 
@@ -2715,7 +2811,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
        adapter_context: fn _ -> [] end,
        adapter_opts: fn _, _ ->
          [
-           harness: :claude,
+         harness: harness,
            cmd: [System.find_executable("node"), path],
            home: ctx.test_dir,
            cwd: ctx.test_dir
@@ -2737,6 +2833,21 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       true ->
         Process.sleep(10)
         eventually(fun, tries - 1)
+    end
+  end
+
+  defp read_child_pid!(path) do
+    assert wait_until(fn -> File.exists?(path) end, 1_000)
+    {pid, ""} = path |> File.read!() |> String.trim() |> Integer.parse()
+    pid
+  end
+
+  defp process_active?(pid) do
+    case System.cmd("ps", ["-o", "stat=", "-p", Integer.to_string(pid)],
+           stderr_to_stdout: true
+         ) do
+      {state, 0} -> not String.starts_with?(String.trim(state), "Z")
+      _ -> false
     end
   end
 end

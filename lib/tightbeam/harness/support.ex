@@ -616,6 +616,15 @@ defmodule Tightbeam.Harness.Support do
     with_tmp("adapter", fn base ->
       adapter = adapter_path(base, profile.adapter_bin, locality)
       bundle = install_fake_adapter!(adapter, profile)
+      package_json =
+        Path.join([
+          base,
+          "adapters",
+          "node_modules",
+          profile.adapter_package,
+          "package.json"
+        ])
+
       File.chmod!(bundle, 0o751)
       if presence == :absent, do: File.rm!(adapter)
 
@@ -631,6 +640,9 @@ defmodule Tightbeam.Harness.Support do
             checks = Process.get({ref, :checks}, 0)
             Process.put({ref, :checks}, checks + 1)
             if presence == :absent and checks == 0, do: {"", 1}, else: {"", 0}
+
+          String.contains?(joined, "cat ") ->
+            {File.read!(package_json), 0}
 
           String.contains?(joined, "npm install") ->
             # npm's whole job here is to leave an executable at the adapter path, and the
@@ -702,7 +714,7 @@ defmodule Tightbeam.Harness.Support do
 
     %{
       result: {:ok, detail},
-      install_contribution: expected_install_contribution(locality, presence),
+      install_contribution: expected_install_contribution(profile, locality, presence),
       bundle: profile.patched,
       mode: 0o751
     }
@@ -712,15 +724,17 @@ defmodule Tightbeam.Harness.Support do
   # the one machine that cannot supply its own. The two contribution strings differ only
   # in how the command reaches the host, which is the point — the script, and with it the
   # pinned package set, is shared.
-  defp expected_install_contribution(_locality, :present), do: ""
+  defp expected_install_contribution(_profile, _locality, :present), do: ""
 
-  defp expected_install_contribution(locality, :absent) do
+  defp expected_install_contribution(profile, locality, :absent) do
     packages =
-      Enum.map_join(
-        Tightbeam.Harness.all(),
-        " ",
-        &"#{&1.install_package()}@#{&1.adapter_version()}"
-      )
+      Tightbeam.Harness.all()
+      |> Enum.reject(&(&1 == Tightbeam.Harness.Cursor))
+      |> Enum.map(&"#{&1.install_package()}@#{&1.adapter_version()}")
+
+    current_package = "#{profile.adapter_package}@#{profile.adapter_version}"
+    packages = if current_package in packages, do: packages, else: packages ++ [current_package]
+    packages = Enum.join(packages, " ")
 
     script = "npm install --prefix '<BASE>/adapters' --no-save " <> packages
 

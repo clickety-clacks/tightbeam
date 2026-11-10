@@ -3,9 +3,10 @@ defmodule Tightbeam.AdapterCoordinator do
   Owner of adapter lifecycle (port spec §Adapter lifecycle — this module IS
   that section; no TS equivalent, the TS gateway restarted nothing).
 
-  One `Tightbeam.Acp.Adapter` per adapter key `{harness, archetype, host}`
+  One `Tightbeam.Acp.Adapter` per adapter key `{harness, identity, host}`
   (§Placement — a host is part of WHERE an adapter is, so it is part of WHICH
-  adapter it is), started
+  adapter it is). Most harnesses use placement-scoped `shared` keys; Pi has a
+  placement readiness key and one worker key per Tightbeam session. Adapters start
   lazily under a DynamicSupervisor with restart: :temporary — the coordinator
   owns ALL restarts, so `normal` exits and crashes take the same path (no
   supervisor auto-restart racing the coordinator's bookkeeping).
@@ -469,6 +470,14 @@ defmodule Tightbeam.AdapterCoordinator do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
+      Tightbeam.Placement.pi_session_adapter?(key) and
+          Tightbeam.HarnessProcess.fenced?(
+            state.db,
+            Tightbeam.Placement.placement_adapter_key(key)
+          ) ->
+        parent = Tightbeam.Placement.placement_adapter_key(key)
+        {:reply, {:error, {:park_fenced, key_name(parent)}}, state}
+
       authoritative? and readiness_pending?(entry) and
           entry.context != normalize_context(context) ->
         {:noreply, replace_pending_readiness(key, entry, state, context, from)}
@@ -529,6 +538,31 @@ defmodule Tightbeam.AdapterCoordinator do
   defp do_close_adapter(key, state), do: do_close_adapter(key, state, :process_tree)
 
   defp do_close_adapter(key, state, cleanup_scope) do
+    keys =
+      case key do
+        {:pi, "shared", host} ->
+          state.adapters
+          |> Map.keys()
+          |> Enum.filter(fn
+            {:pi, _identity, ^host} = child -> Tightbeam.Placement.pi_session_adapter?(child)
+            _ -> false
+          end)
+          |> Enum.sort()
+          |> Kernel.++([key])
+
+        _ ->
+          [key]
+      end
+
+    Enum.reduce(keys, {:ok, state}, fn key, {result, state} ->
+      case do_close_adapter_one(key, state, cleanup_scope) do
+        {:ok, state} -> {result, state}
+        {{:error, _reason} = error, state} -> {if(result == :ok, do: error, else: result), state}
+      end
+    end)
+  end
+
+  defp do_close_adapter_one(key, state, cleanup_scope) do
     {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
     state = cancel_pending_starts(key, state)
 
@@ -991,6 +1025,11 @@ defmodule Tightbeam.AdapterCoordinator do
   # still gets its row; the turn that asked for it gets its own spawn error.
   defp told_sessions(_db, _key, false = _was_ready?), do: []
 
+  # The placement-scoped Pi adapter is only the readiness/cache owner. Pi turns
+  # run on session-keyed workers, so losing this entry does not stop any active
+  # session worker and must not send them an adapter-down notice.
+  defp told_sessions(_db, {:pi, "shared", _host}, true), do: []
+
   defp told_sessions(db, {harness, "shared", host}, true) do
     {:ok, rows} =
       Tightbeam.DB.query(
@@ -1000,6 +1039,20 @@ defmodule Tightbeam.AdapterCoordinator do
       )
 
     Enum.map(rows, fn [session_key] -> session_key end)
+  end
+
+  defp told_sessions(db, {:pi, _identity, host} = key, true) do
+    with {:ok, session_key} <- Tightbeam.Placement.pi_session_key(key),
+         {:ok, [[^session_key]]} <-
+           Tightbeam.DB.query(
+             db,
+             "SELECT sessionKey FROM sessions WHERE state = 'active' AND harness = 'pi' AND host = ?1 AND sessionKey = ?2",
+             [host, session_key]
+           ) do
+      [session_key]
+    else
+      _ -> []
+    end
   end
 
   # Sessions reach a key the way the gateway builds one — harness and host,

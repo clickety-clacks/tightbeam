@@ -28,8 +28,9 @@ defmodule Tightbeam.Placement do
      expects (%{code: ...}), citing what was denied and the allowed set, so
      agents learn the law by hitting it.
 
-  2. `adapter_opts/2` — build the Acp.Adapter start opts for an adapter key
-     {harness, "shared", host}:
+  2. `adapter_opts/2` — build Acp.Adapter start opts for a placement key
+     {harness, "shared", host}; Pi also uses one session-keyed worker key:
+     {pi, "pi-session:" <> sessionKey, host}.
      - local: exactly the previous behavior (local binary path, local home
        from Homes.project, env in the local Port).
      - remote: cmd is SSH-WRAPPED — ["ssh", dest, "exec", "env", "K=V"...,
@@ -103,8 +104,36 @@ defmodule Tightbeam.Placement do
           optional(:toolchain_dirs) => [String.t()]
         }
 
-  @typedoc "Adapter key. The reserved identity `shared` is the one runtime per harness+host."
+  @typedoc "Adapter key. `shared` is placement-scoped; Pi also has private session keys."
   @type adapter_key :: {harness :: atom(), archetype :: String.t(), host :: String.t()}
+
+  @pi_session_identity_prefix "pi-session:"
+
+  @doc false
+  def pi_session_adapter_key(session_key, host) when is_binary(session_key) and is_binary(host),
+    do: {:pi, @pi_session_identity_prefix <> session_key, host}
+
+  @doc false
+  def pi_session_adapter?({:pi, @pi_session_identity_prefix <> _session_key, _host}), do: true
+  def pi_session_adapter?(_key), do: false
+
+  @doc false
+  def pi_session_key({:pi, @pi_session_identity_prefix <> session_key, _host}),
+    do: {:ok, session_key}
+
+  def pi_session_key(_key), do: :error
+
+  @doc false
+  def placement_adapter_key({harness, _identity, host}), do: {harness, "shared", host}
+
+  @doc false
+  def pi_private_home(%{base_dir: base_dir}, "shared") do
+    Path.join([base_dir, "work", "pi-readiness-home"])
+  end
+
+  def pi_private_home(%{base_dir: _base_dir} = host, @pi_session_identity_prefix <> session_key) do
+    Path.join([host_workdir_path(host, session_key), ".tightbeam", "pi-home"])
+  end
 
   @hosts_ddl """
   CREATE TABLE IF NOT EXISTS hosts (
@@ -1518,6 +1547,15 @@ defmodule Tightbeam.Placement do
         end
       end)
       |> Kernel.++(checked_opts)
+
+    launch_opts =
+      if harness == :pi do
+        launch_opts
+        |> Keyword.put(:pi_private_home, pi_private_home(host_config, identity_name))
+        |> Keyword.put(:statutes, identity_name == "shared" and Rails.statutes?())
+      else
+        launch_opts
+      end
 
     process_identity_dir =
       if harness == :cursor and is_nil(host_config.ssh),
