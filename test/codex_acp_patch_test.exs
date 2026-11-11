@@ -1,7 +1,7 @@
 defmodule Tightbeam.HarnessAdapterPatchTest do
   use ExUnit.Case, async: true
 
-  alias Tightbeam.Harness.{Claude, Codex, CodexIdentity}
+  alias Tightbeam.Harness.{Claude, ClaudeFoldedPrompt, Codex, CodexIdentity, Support}
 
   test "Codex projects separate full developer snapshots through the stock SessionStart hook" do
     base = scratch_dir()
@@ -160,71 +160,144 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
     assert reason =~ "exceeds"
   end
 
-  test "Codex and Claude readiness leave present adapter bundles and modes unchanged" do
-    for module <- [Codex, Claude] do
-      base = scratch_dir()
-      package = if module == Codex, do: "codex-acp", else: "claude-agent-acp"
-      bundle_name = if module == Codex, do: "index.js", else: "acp-agent.js"
-      binary = Path.join([base, "adapters", "node_modules", ".bin", package])
+  test "Codex readiness preserves stock bytes and Claude readiness patches once preserving mode" do
+    base = scratch_dir()
+    binary = Path.join([base, "adapters", "node_modules", ".bin", "codex-acp"])
 
-      bundle =
-        Path.join([
-          base,
-          "adapters",
-          "node_modules",
-          "@agentclientprotocol",
-          package,
-          "dist",
-          bundle_name
-        ])
+    bundle =
+      Path.join([
+        base,
+        "adapters",
+        "node_modules",
+        "@agentclientprotocol",
+        "codex-acp",
+        "dist",
+        "index.js"
+      ])
 
-      File.mkdir_p!(Path.dirname(binary))
-      File.mkdir_p!(Path.dirname(bundle))
-      File.write!(bundle, "stock vendor bytes")
-      File.chmod!(bundle, 0o751)
-      File.ln_s!(bundle, binary)
-      before = {File.read!(bundle), File.stat!(bundle).mode, File.stat!(bundle).mtime}
+    File.mkdir_p!(Path.dirname(binary))
+    File.mkdir_p!(Path.dirname(bundle))
+    File.write!(bundle, "stock vendor bytes")
+    File.chmod!(bundle, 0o751)
+    File.ln_s!(bundle, binary)
+    before = {File.read!(bundle), File.stat!(bundle).mode, File.stat!(bundle).mtime}
 
-      target = %{
-        base_dir: base,
-        host_name: "local",
+    target = %{
+      base_dir: base,
+      host_name: "local",
+      host_config: %{base_dir: base, ssh: nil},
+      adapter_binary: binary
+    }
+
+    assert {:ok, "adapters present"} = Codex.ensure_adapter(target)
+    assert {:ok, "adapters present"} = Codex.ensure_adapter(target)
+    assert {File.read!(bundle), File.stat!(bundle).mode, File.stat!(bundle).mtime} == before
+
+    base = scratch_dir()
+    {binary, bundle, source} = claude_adapter_fixture!(base)
+
+    target = %{
+      target
+      | base_dir: base,
         host_config: %{base_dir: base, ssh: nil},
         adapter_binary: binary
-      }
+    }
 
-      assert {:ok, "adapters present"} = module.ensure_adapter(target)
-      assert {:ok, "adapters present"} = module.ensure_adapter(target)
-      assert {File.read!(bundle), File.stat!(bundle).mode, File.stat!(bundle).mtime} == before
-    end
+    local_mode = File.stat!(bundle).mode
+
+    assert {:ok, "adapters present"} = Claude.ensure_adapter(target)
+    assert File.read!(bundle) == ClaudeFoldedPrompt.patch(source)
+    assert File.stat!(bundle).mode == local_mode
+    assert File.read_link!(binary) == bundle
+    before = {File.read!(bundle), File.stat!(bundle).mode, File.stat!(bundle).mtime}
+
+    assert {:ok, "adapters present"} = Claude.ensure_adapter(target)
+    assert {File.read!(bundle), File.stat!(bundle).mode, File.stat!(bundle).mtime} == before
   end
 
-  test "Codex and Claude remote readiness perform only executable checks" do
-    for module <- [Codex, Claude] do
-      base = scratch_dir()
-      package = if module == Codex, do: "codex-acp", else: "claude-agent-acp"
-      parent = self()
+  test "remote readiness checks Codex executables and checks then patches Claude" do
+    base = scratch_dir()
+    parent = self()
 
-      sh = fn argv ->
+    codex_target = %{
+      base_dir: base,
+      host_name: "remote",
+      host_config: %{base_dir: base, ssh: "fixture@remote"},
+      adapter_binary: "/srv/tb/adapters/node_modules/.bin/codex-acp",
+      sh: fn argv ->
         send(parent, {:remote_command, argv})
         {"", 0}
       end
+    }
 
-      target = %{
-        base_dir: base,
-        host_name: "remote",
-        host_config: %{base_dir: base, ssh: "fixture@remote"},
-        adapter_binary: "/srv/tb/adapters/node_modules/.bin/#{package}",
-        sh: sh
-      }
+    assert {:ok, "adapters present"} = Codex.ensure_adapter(codex_target)
+    assert {:ok, "adapters present"} = Codex.ensure_adapter(codex_target)
+    assert_receive {:remote_command, first}
+    assert_receive {:remote_command, second}
+    assert Enum.join(first, " ") =~ "test -x"
+    assert Enum.join(second, " ") =~ "test -x"
+    refute_receive {:remote_command, _}
 
-      assert {:ok, "adapters present"} = module.ensure_adapter(target)
-      assert {:ok, "adapters present"} = module.ensure_adapter(target)
+    {binary, bundle, source} = claude_adapter_fixture!(base)
+
+    claude_target = %{
+      base_dir: base,
+      host_name: "remote",
+      host_config: %{base_dir: base, ssh: "fixture@remote"},
+      adapter_binary: binary,
+      sh: fn argv -> throw(argv) end
+    }
+
+    check =
+      Support.catalog_probe_argv(
+        claude_target.host_config.ssh,
+        "test -x #{Support.shell_quote(binary)}"
+      )
+
+    patch =
+      catch_throw(ClaudeFoldedPrompt.remote(claude_target, binary, "adapters present"))
+
+    claude_target = %{
+      claude_target
+      | sh: fn argv ->
+          assert argv in [check, patch]
+          send(parent, {:remote_command, argv})
+          script = argv |> Enum.drop(6) |> Enum.join(" ")
+          System.cmd("sh", ["-c", script], stderr_to_stdout: true)
+        end
+    }
+
+    mode = File.stat!(bundle).mode
+
+    for _ <- 1..2 do
+      assert {:ok, "adapters present; claude adapter patched"} =
+               Claude.ensure_adapter(claude_target)
+
       assert_receive {:remote_command, first}
+      assert first == check
       assert_receive {:remote_command, second}
-      assert Enum.join(first, " ") =~ "test -x"
-      assert Enum.join(second, " ") =~ "test -x"
+      assert second == patch
       refute_receive {:remote_command, _}
+      assert File.read!(bundle) == ClaudeFoldedPrompt.patch(source)
+      assert File.stat!(bundle).mode == mode
+      assert File.read_link!(binary) == bundle
     end
+  end
+
+  defp claude_adapter_fixture!(base) do
+    package =
+      Path.join([base, "adapters", "node_modules", "@agentclientprotocol", "claude-agent-acp"])
+
+    binary = Path.join([base, "adapters", "node_modules", ".bin", "claude-agent-acp"])
+    bundle = Path.join([package, "dist", "acp-agent.js"])
+    source = ClaudeFoldedPrompt.fixture()
+    File.mkdir_p!(Path.dirname(binary))
+    File.mkdir_p!(Path.dirname(bundle))
+    File.write!(Path.join(package, "package.json"), JSON.encode!(%{"version" => "0.81.0"}))
+    File.write!(bundle, source)
+    File.chmod!(bundle, 0o751)
+    File.ln_s!(bundle, binary)
+    {binary, bundle, source}
   end
 
   defp delivered_row(snapshot) do
