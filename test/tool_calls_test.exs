@@ -439,7 +439,7 @@ defmodule Tightbeam.ToolCallsTest do
 
   test "fresh setup applies the feature-local migration without changing the root stamp", ctx do
     {:ok, [[root_shape]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp", [])
-    assert root_shape == "closed-assignment-cannot-proceed-reconciliation-v1-015"
+    assert root_shape == "holder-role-provenance-v1-016"
 
     {:ok, [[0, "tool-call-transition-v1-011"]]} =
       DB.query(ctx.db, "SELECT id, shape FROM tool_call_transition_migration", [])
@@ -556,7 +556,7 @@ defmodule Tightbeam.ToolCallsTest do
     :ok = Tightbeam.Schema.ensure_all(ctx.db)
     assert :ok = ToolCalls.ensure_schema(ctx.db)
 
-    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015", _]]} =
+    assert {:ok, [["holder-role-provenance-v1-016", _]]} =
              DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
 
     {:ok, [[message_high_water_after]]} =

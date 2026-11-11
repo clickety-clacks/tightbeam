@@ -187,7 +187,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                "SELECT name FROM sqlite_master WHERE name IN ('notice_batch_source_attachments','staged_message_dedupes','notice_delivery_policies','notice_batching_lane_policies')"
              )
 
-    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
+    assert {:ok, [["holder-role-provenance-v1-016"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
@@ -296,7 +296,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
 
       assert Wakes.get(db, ordinary.wake_id).state == "pending"
 
-      assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
+      assert {:ok, [["holder-role-provenance-v1-016"]]} =
                DB.query(db, "SELECT shape FROM schema_stamp")
 
       assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns")
@@ -359,7 +359,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                  [condition.wake_id]
                )
 
-      assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
+      assert {:ok, [["holder-role-provenance-v1-016"]]} =
                DB.query(db, "SELECT shape FROM schema_stamp")
 
       before = current_storage_snapshot(db)
@@ -547,7 +547,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
     assert {:ok, [[nil]]} =
              DB.query(db, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [source.wake_id])
 
-    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
+    assert {:ok, [["holder-role-provenance-v1-016"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert :ok = Schema.ensure_all(db)

@@ -185,7 +185,7 @@ defmodule Tightbeam.ArtifactOriginsTest do
     assert :ok = Schema.ensure_all(db)
     assert Artifacts.get(db, "legacy-origin") == migrated
 
-    assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
+    assert {:ok, [["holder-role-provenance-v1-016"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
