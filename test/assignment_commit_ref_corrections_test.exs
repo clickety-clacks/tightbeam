@@ -455,12 +455,16 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     end
   end
 
-  test "an exact replay verifies an existing correction without changing its contents or history",
+  test "an exact replay verifies an origin-based correction with a full ref without changing history",
        ctx do
     assignment_id = "asg_review_reverify_valid"
     insert_closed_review_assignment!(ctx.db, assignment_id)
 
-    requested_ref = Map.put(ref(ctx), "ref", "refs/heads/reverify-valid")
+    requested_ref =
+      Map.merge(ref(ctx), %{
+        "remote" => "origin",
+        "ref" => "refs/heads/docs/external-agent-skill-016"
+      })
 
     call =
       ctx
@@ -478,8 +482,8 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     original_lifecycle = lifecycle(ctx.db, assignment_id)
     assert [original] = AssignmentCommitRefCorrections.list(ctx.db, assignment_id)
 
-    git!(ctx.repo, ["update-ref", "refs/heads/reverify-valid", ctx.commit])
-    git!(ctx.repo, ["push", "origin", "refs/heads/reverify-valid"])
+    git!(ctx.repo, ["update-ref", requested_ref["ref"], ctx.commit])
+    git!(ctx.repo, ["push", "origin", requested_ref["ref"]])
 
     assert %{correction: verified} = correct(call, {:session, "po-owner"})
     assert is_integer(verified.verifiedAt)
