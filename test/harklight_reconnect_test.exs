@@ -748,6 +748,7 @@ defmodule Tightbeam.HarklightReconnectTest do
     agent = Path.join(root, "harklight-agent")
     connected_marker = Path.join(root, "connected")
     failure_gate = Path.join(root, "failure-gate")
+
     connected_line =
       JSON.encode!(%{"kind" => "reconnected", "session_handle" => @handle, "feed_cursor" => 7})
 
@@ -814,8 +815,7 @@ defmodule Tightbeam.HarklightReconnectTest do
 
     manager =
       start_supervised!(
-        {HarklightWakes,
-         db: db, listener: listener, send_runner: runner, retry_delays: [60_000]}
+        {HarklightWakes, db: db, listener: listener, send_runner: runner, retry_delays: [60_000]}
       )
 
     assert_receive :first_episode_failed
@@ -881,8 +881,10 @@ defmodule Tightbeam.HarklightReconnectTest do
              )
 
     assert length(rows) == 2
+
     assert [second_id, second_prompt] =
              Enum.find(rows, fn [wake_id, _] -> wake_id != first_id end)
+
     assert String.starts_with?(second_id, first_id <> "_")
     assert second_prompt =~ "DISCONNECT: Harklight message request in thread #{@handle}"
     assert second_prompt =~ "RECONNECT failure:"

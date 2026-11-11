@@ -8,6 +8,7 @@ defmodule Tightbeam.HarklightWakes do
 
   use GenServer
   require Logger
+
   alias Tightbeam.{
     DB,
     ErrorDiagnostic,
@@ -18,6 +19,7 @@ defmodule Tightbeam.HarklightWakes do
     Supervision,
     Wakes
   }
+
   alias Tightbeam.DB.Txn
 
   @attach_retry_delays [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
@@ -1663,7 +1665,9 @@ defmodule Tightbeam.HarklightWakes do
       Txn.q(txn, "SELECT recoveryWakeId FROM harklight_wake_handles WHERE handle=?1", [handle])
 
     case marker do
-      [[wake_id]] when is_binary(wake_id) -> wake_id
+      [[wake_id]] when is_binary(wake_id) ->
+        wake_id
+
       [[nil]] ->
         stable_id = "w_harklight_notice_recovery_" <> handle
 
@@ -1685,7 +1689,8 @@ defmodule Tightbeam.HarklightWakes do
 
         wake_id
 
-      _ -> nil
+      _ ->
+        nil
     end
   end
 
