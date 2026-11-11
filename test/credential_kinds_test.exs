@@ -366,10 +366,15 @@ defmodule Tightbeam.CredentialKindsTest do
         )
 
       base_target = target(ctx.base, nil)
+      inventory = fn command ->
+        assert "node" in command and "-e" in command
+        {~s({"bypass_hook_trust":true,"skills":{"config":[]}}), 0}
+      end
 
       native_opts =
         launch_opts(:subscription)
         |> Keyword.put(:common_env, [{"PATH", native_dir}])
+        |> Keyword.put(:sh_out, inventory)
 
       claude_native =
         Claude.prepare_launch(%{base_target | adapter_binary: adapter}, ctx.base, native_opts)
@@ -416,7 +421,7 @@ defmodule Tightbeam.CredentialKindsTest do
         )
 
       explicit_opts =
-        launch_opts(:subscription)
+        native_opts
         |> Keyword.put(:common_env, [
           {"PATH", native_dir},
           {"CLAUDE_CODE_EXECUTABLE", explicit_claude},
@@ -459,7 +464,7 @@ defmodule Tightbeam.CredentialKindsTest do
       }
 
       remote_opts =
-        launch_opts(:subscription)
+        native_opts
         |> Keyword.put(:remote_env, ["PATH='/remote/bin:/usr/bin'"])
 
       remote_codex = Codex.prepare_launch(remote_target, ctx.base, remote_opts)
@@ -471,7 +476,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert remote_command =~ "PATH='/remote/bin:/usr/bin'"
 
       managed_opts =
-        launch_opts(:subscription)
+        native_opts
         |> Keyword.put(:common_env, [{"PATH", managed_only_path}])
 
       claude_managed =
@@ -486,7 +491,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert managed_output =~ "codex=<unset>"
 
       invalid_codex_opts =
-        launch_opts(:subscription)
+        native_opts
         |> Keyword.put(:common_env, [
           {"PATH", native_dir},
           {"CODEX_PATH", Path.join(ctx.base, "missing-codex")}
@@ -505,7 +510,7 @@ defmodule Tightbeam.CredentialKindsTest do
       invalid_claude_path = Path.join(ctx.base, "missing-claude")
 
       invalid_claude_opts =
-        launch_opts(:subscription)
+        native_opts
         |> Keyword.put(:common_env, [
           {"PATH", native_dir},
           {"CLAUDE_CODE_EXECUTABLE", invalid_claude_path}
