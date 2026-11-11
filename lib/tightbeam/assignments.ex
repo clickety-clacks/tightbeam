@@ -14,6 +14,7 @@ defmodule Tightbeam.Assignments do
     Escalation,
     EventLog,
     IdPrefix,
+    OperationalReceipts,
     Org,
     Placement,
     Projection,
@@ -391,6 +392,7 @@ defmodule Tightbeam.Assignments do
     # SQLite permits the referenced table to arrive in the following DDL.
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
+    :ok = OperationalReceipts.ensure_schema(db)
     :ok = DB.execute(db, @cannot_proceed_ddl)
     :ok = DB.execute(db, @cannot_proceed_release_observations_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
@@ -1094,12 +1096,41 @@ defmodule Tightbeam.Assignments do
   """
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
+    case qualifying_review_rows(db, assignment_id, assignment_holder_key) do
+      [[_attest_id, _review_id, _review_holder, verdict_kind]] when is_binary(verdict_kind) ->
+        [verdict_kind]
+
+      _ ->
+        []
+    end
+  end
+
+  @doc """
+  The review conclusion `qualifying_review_verdict_kinds/3` selects, for
+  display beside an operational verification: its verdict id, card, holder,
+  and whether the card is linked to this assignment (always, on this line).
+  Nil when none qualifies.
+  """
+  def review_conclusion(db, assignment_id, assignment_holder_key) do
+    case qualifying_review_rows(db, assignment_id, assignment_holder_key) do
+      [[attest_id, review_id, review_holder, "reviewed-clean"]] ->
+        %{attestId: attest_id, assignmentId: review_id, holderKey: review_holder, linked: true}
+
+      _ ->
+        nil
+    end
+  end
+
+  # The one selection both the review rule and the operational display read.
+  defp qualifying_review_rows(db, assignment_id, assignment_holder_key) do
     {:ok, rows} =
       DB.query(
         db,
         """
         WITH winning_verdict AS (
           SELECT
+            v.id AS attestId,
+            r.id AS reviewAssignmentId,
             r.holderKey AS reviewHolderKey,
             v.verdictKind AS verdictKind
           FROM attests AS v
@@ -1112,7 +1143,7 @@ defmodule Tightbeam.Assignments do
           ORDER BY v.ts DESC, v.rowid DESC
           LIMIT 1
         )
-        SELECT verdictKind
+        SELECT attestId, reviewAssignmentId, reviewHolderKey, verdictKind
         FROM winning_verdict
         WHERE reviewHolderKey != ?2
           AND verdictKind = 'reviewed-clean'
@@ -1120,10 +1151,7 @@ defmodule Tightbeam.Assignments do
         [assignment_id, assignment_holder_key]
       )
 
-    case rows do
-      [[verdict_kind]] when is_binary(verdict_kind) -> [verdict_kind]
-      _ -> []
-    end
+    rows
   end
 
   @doc "Return the declared file paths for an assignment."
@@ -1316,7 +1344,8 @@ defmodule Tightbeam.Assignments do
         [assignment_id | range_params] ++ limit_params
       )
 
-    Enum.map(rows, fn row ->
+    rows
+    |> Enum.map(fn row ->
       filed = attest(row)
 
       Map.put(
@@ -1325,6 +1354,7 @@ defmodule Tightbeam.Assignments do
         Tightbeam.DeliverableContract.attest_claim_projection(db, filed.id)
       )
     end)
+    |> then(&OperationalReceipts.attach(db, &1))
   end
 
   # Row-value comparison written out longhand rather than `(ts, id) > (?, ?)`:
@@ -1748,6 +1778,7 @@ defmodule Tightbeam.Assignments do
 
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
+         :ok <- OperationalReceipts.verified_verdict(call),
          :ok <- valid_attest_idempotency(call.params[:kind], call.params[:idempotency_key]) do
       if call.params[:kind] == "completion" and is_binary(call.params[:idempotency_key]) do
         keyed_completion_result(db, call)
@@ -1823,7 +1854,10 @@ defmodule Tightbeam.Assignments do
       case result do
         %{assignment: assignment} ->
           project_completion_markers(db, result)
-          Map.put(result, :referents, referents(db, call, assignment, artifact_cursor))
+
+          result
+          |> Map.put(:referents, referents(db, call, assignment, artifact_cursor))
+          |> with_operational_verification(db, call)
 
         _ ->
           result
@@ -1870,6 +1904,7 @@ defmodule Tightbeam.Assignments do
         case preflight do
           {:replay, response} ->
             add_referents(db, call, response, artifact_cursor(db))
+            |> with_operational_verification(db, call)
 
           :miss ->
             with :ok <- completion_filing_allowed(db, call),
@@ -1928,10 +1963,13 @@ defmodule Tightbeam.Assignments do
               case result do
                 {:committed, response} ->
                   project_completion_markers(db, response)
+
                   add_referents(db, call, response, artifact_cursor)
+                  |> with_operational_verification(db, call)
 
                 {:replayed, response} ->
                   add_referents(db, call, response, artifact_cursor)
+                  |> with_operational_verification(db, call)
 
                 other ->
                   add_referents(db, call, other, artifact_cursor)
@@ -1959,6 +1997,19 @@ defmodule Tightbeam.Assignments do
   end
 
   defp add_referents(_db, _call, result, _artifact_cursor), do: result
+
+  # An accepted completion of a receipt-verified operational assignment shows
+  # that verification and any review conclusion beside it. A keyed replay shows
+  # it too: the stored response predates this derived projection.
+  defp with_operational_verification(result, db, call) do
+    with "completion" <- call.params[:kind],
+         %{assignment: %{id: assignment_id}} <- result,
+         %{} = verification <- OperationalReceipts.verification(db, assignment_id) do
+      Map.put(result, :operationalVerification, verification)
+    else
+      _ -> result
+    end
+  end
 
   defp project_completion_markers(
          db,
@@ -2520,10 +2571,16 @@ defmodule Tightbeam.Assignments do
           # assignment must be able to answer "why is this open again", not just
           # "database" — this is that answer, in the same list-of-rows shape
           # `attests` already reads via `list_attests/2`.
-          row
-          |> assignment()
-          |> project_assignment(db)
-          |> Map.put(:reopenings, list_reopenings(db, assignment_id))
+          result =
+            row
+            |> assignment()
+            |> project_assignment(db)
+            |> Map.put(:reopenings, list_reopenings(db, assignment_id))
+
+          case OperationalReceipts.verification(db, assignment_id) do
+            nil -> result
+            verification -> Map.put(result, :operationalVerification, verification)
+          end
 
         {:ok, []} ->
           error("not_found", "unknown assignment: #{assignment_id}")
@@ -3088,9 +3145,17 @@ defmodule Tightbeam.Assignments do
   end
 
   defp attest_in_txn(txn, call) do
-    if call.params[:kind] == "verdict",
-      do: verdict_in_txn(txn, call),
-      else: lifecycle_attest_in_txn(txn, call)
+    case OperationalReceipts.prepare(txn, call) do
+      {:ok, receipts} ->
+        call = if receipts, do: Map.put(call, :validated_receipts, receipts), else: call
+
+        if call.params[:kind] == "verdict",
+          do: verdict_in_txn(txn, call),
+          else: lifecycle_attest_in_txn(txn, call)
+
+      refusal ->
+        refusal
+    end
   end
 
   defp lifecycle_attest_in_txn(txn, call) do
@@ -3998,20 +4063,30 @@ defmodule Tightbeam.Assignments do
     {by_user, by_session} = opener(call.principal)
     {by_harness, by_provider} = verdict_author_family(txn, call.params.kind, by_session)
 
-    insert_attest_row(txn, %{
-      assignment_id: assignment_id,
-      kind: call.params.kind,
-      verdict_kind: call.params[:verdict_kind],
-      note: call.params[:note],
-      by_session: by_session,
-      by_user: by_user,
-      producer: nil,
-      producer_command: nil,
-      by_harness: by_harness,
-      by_provider: by_provider,
-      commit_refs: call.params[:commit_refs],
-      allow_closed: allow_closed
-    })
+    attest =
+      insert_attest_row(txn, %{
+        assignment_id: assignment_id,
+        kind: call.params.kind,
+        verdict_kind: call.params[:verdict_kind],
+        note: call.params[:note],
+        by_session: by_session,
+        by_user: by_user,
+        producer: nil,
+        producer_command: nil,
+        by_harness: by_harness,
+        by_provider: by_provider,
+        commit_refs: call.params[:commit_refs],
+        allow_closed: allow_closed
+      })
+
+    case Map.get(call, :validated_receipts) do
+      [_ | _] = receipts ->
+        :ok = OperationalReceipts.write_in_txn(txn, attest.id, receipts)
+        Map.put(attest, :receipts, receipts)
+
+      _ ->
+        attest
+    end
   end
 
   defp insert_attest_row(txn, attrs) do
