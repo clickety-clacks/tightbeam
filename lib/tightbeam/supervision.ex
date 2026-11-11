@@ -3815,6 +3815,42 @@ defmodule Tightbeam.Supervision do
       ) != [] ->
         "pending_wake"
 
+      # The holder already carries an exact, fact-scoped wake for this child: a
+      # PENDING one is a result-triggered continuation already standing in for
+      # the generic prod. A FIRED one only counts when `firedBy='condition'` —
+      # a `fallback` fire is a timeout with no resolved fact, never a terminal
+      # notice (spec: a fallback "detects silence only; it does not select an
+      # action"), and treating it as one would wrongly suppress the owner's
+      # genuine bounded fallback prod. Even a real condition fire is bounded to
+      # one supervision interval past its firedAt: past that window the
+      # suppression lapses and ordinary prodding resumes, so a still-open
+      # assignment is never gated by a single past notice forever across many
+      # evaluations. `escalation-ruled` is excluded throughout: it is this
+      # substrate's own internal park wake for the rail's decision ladder, not
+      # an agent's own exact continuation, and its lifecycle is already
+      # governed by the escalation mechanism, not this gate. The join and the
+      # `wakes_assignment` index below keep this scoped to the one assignment,
+      # not the whole table's conditional-wake history.
+      Txn.q(
+        txn,
+        """
+        SELECT 1 FROM wakes w
+        JOIN supervision_entitlements e ON e.assignmentId = w.assignmentId
+        WHERE w.assignmentId=?1 AND w.sessionKey=?2
+          AND w.conditionKind IS NOT NULL AND w.conditionKind != 'escalation-ruled'
+          AND (
+            w.state = 'pending'
+            OR (
+              w.state = 'fired' AND w.firedBy = 'condition'
+              AND w.firedAt + e.supervisionIntervalMs > ?3
+            )
+          )
+        LIMIT 1
+        """,
+        [assignment_id, holder, now()]
+      ) != [] ->
+        "result_triggered_continuation"
+
       Txn.q(
         txn,
         """
