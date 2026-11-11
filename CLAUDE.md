@@ -10,8 +10,7 @@ review step. Main is never worked in directly, and a red suite is never merged; 
 stop — fix it or surface it to the owner before anything merges. At the
 start of work, branch only from a green main — never start work on a red base, where your own
 breakage and inherited breakage are indistinguishable; if main is red,
-fixing it comes first. Record review evidence in the specs repository before
-merging. If task instructions name a different integration branch, that branch
+fixing it comes first. If task instructions name a different integration branch, that branch
 takes precedence. If your work targets 0.1.x, this is the wrong checkout — do
 not push here. Fixes cross 0.1.x -> main only by maintainer-authorized
 cherry-pick.
@@ -59,10 +58,7 @@ CULTURE = kungfu (domain). See shared specs coordination-fabric-v1.md.
 The spec commons is its own repo: github.com/clickety-clacks/tightbeam-specs.
 For 0.2 work start with:
 - `coordination-fabric-v1.md` — the design authority for the fabric.
-- `0.2-build-ledger.md` — one entry per landing on main; review evidence
-  goes there BEFORE the push.
-- `tightbeam.md` — the spec hub for the wider corpus; `tightbeam-decisions.md`
-  — the decisions ledger.
+- `tightbeam.md` — the spec hub for the wider corpus.
 ## ACP / harness facts (for anyone touching the adapter layer)
 
 - **Zed is the ACP reference implementation.** For ANY protocol capability/semantics
