@@ -179,6 +179,8 @@ Clients read the firehose and send turns. The ones that exist today are open sou
 
 [harklight-app](https://github.com/clickety-clacks/harklight-app) is different: it does not read the firehose. An agent sends you a notice, a question or a decision through its [agent CLI](https://github.com/clickety-clacks/harklight-agent), the [server](https://github.com/clickety-clacks/harklight-server) pushes it to your phone, and your reply goes back to the agent that asked.
 
+The [Harklight for Tightbeam pack](https://github.com/clickety-clacks/harklight-tightbeam-pack) adds versioned Harklight guidance for Tightbeam organizations.
+
 To add a machine so agents can run on it, see [docs/SATELLITE.md](docs/SATELLITE.md). One ssh-reachable host becomes part of the organization with `tightbeam assimilate`.
 
 ## Operating
