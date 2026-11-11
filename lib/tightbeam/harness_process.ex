@@ -491,6 +491,10 @@ defmodule Tightbeam.HarnessProcess do
                   inspect(%{launch_id: row.launch_id})
                 )
 
+              if result == :ok do
+                :ok = complete_reconciled_park_name(db, row.adapter_key)
+              end
+
               if park_fence_exists?(db, row.adapter_key),
                 do: released,
                 else: [row.adapter_key | released]
@@ -510,7 +514,10 @@ defmodule Tightbeam.HarnessProcess do
 
     Enum.each(unresolved(db), fn row ->
       :ok = ensure_fence(db, row.adapter_key)
-      reconcile_boot_row(db, row)
+
+      if reconcile_boot_row(db, row) == :ok do
+        :ok = complete_reconciled_park_name(db, row.adapter_key)
+      end
     end)
 
     :ok
@@ -1676,6 +1683,23 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
+  defp complete_reconciled_park_name(db, adapter_key) do
+    incident_guard = rate_limit_incident_guard(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        DELETE FROM harness_park_fences
+         WHERE adapterKey = ?1
+         #{incident_guard}
+        """,
+        [adapter_key]
+      )
+
+    :ok
+  end
+
   defp park_fence_exists?(db, adapter_key) do
     {:ok, [[count]]} =
       DB.query(db, "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1", [
@@ -1740,8 +1764,6 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp resolve(db, row, state) do
-    incident_guard = rate_limit_incident_guard(db)
-
     {:ok, resolved?} =
       DB.transaction(db, fn txn ->
         DB.Txn.q(
@@ -1754,27 +1776,7 @@ defmodule Tightbeam.HarnessProcess do
           [row.launch_id, state, now()]
         )
 
-        if DB.Txn.changes(txn) == 1 do
-          DB.Txn.q(
-            txn,
-            """
-            DELETE FROM harness_park_fences
-             WHERE adapterKey = ?1
-               AND NOT EXISTS (
-                 SELECT 1 FROM harness_processes
-                  WHERE adapterKey = ?1
-                    AND state IN ('launching','running','park_requested','kill_failed')
-                    AND resolvedAt IS NULL
-               )
-               #{incident_guard}
-            """,
-            [row.adapter_key]
-          )
-
-          true
-        else
-          false
-        end
+        DB.Txn.changes(txn) == 1
       end)
 
     if resolved? do
