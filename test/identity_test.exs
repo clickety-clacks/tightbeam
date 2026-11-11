@@ -107,6 +107,13 @@ defmodule Tightbeam.IdentityTest do
                root_archetype: "orchestrator"
              },
              %{
+               name: "harklight-decision-briefings",
+               purpose:
+                 "Route decision requests through a configurable investigator, preserve its Harklight conversation, and reconcile staged catchup without duplicate briefings.",
+               phrases: [],
+               root_archetype: "orchestrator"
+             },
+             %{
                name: "sentinels",
                purpose:
                  "Share generic event subscription tools and a read-only Matrix event watcher.",
