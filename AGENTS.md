@@ -83,7 +83,7 @@ For 0.2 work start with:
   full command text) and deny actually blocks. That historical probe had two prerequisites: CODEX_PATH pinned
   the binary (codex-acp then bundled 0.144.5), and the boot
   wiring-check prompt asked the probe model to echo the refusal verbatim (codex
-  surfaces a block as a tool result, not agent text). See specs permission-seam-spike.md.
+  surfaces a block as a tool result, not agent text).
 
 ## Change only what the task requires
 

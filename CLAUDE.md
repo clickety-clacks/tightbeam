@@ -80,7 +80,7 @@ For 0.2 work start with:
   the app-server subcommand). Delivery: the `CODEX_CONFIG` env JSON on codex-acp is
   spread into every thread/start config map. PreToolUse fires for shell/unified_exec
   (tool name "Bash", full command text) and deny actually blocks — verified at
-  rust-v0.145.0. See shared specs permission-seam-spike.md.
+  rust-v0.145.0.
 
 ## Report dirt, never accommodate it
 
