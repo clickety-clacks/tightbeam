@@ -323,6 +323,24 @@ defmodule Tightbeam.HarnessHealthTest do
   test "failed-turn evidence and normal-turn recovery share their terminal CAS", ctx do
     [first, second, third] = ctx.sessions
 
+    base = Path.join(System.tmp_dir!(), "tb-health-api-key-#{System.unique_integer([:positive])}")
+    metadata = Path.join([base, "auth", "claude", ".tightbeam", "credential.json"])
+    File.mkdir_p!(Path.dirname(metadata))
+
+    File.write!(
+      metadata,
+      JSON.encode!(%{"onboarded" => true, "terminal" => false, "kind" => "api_key"})
+    )
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    server = Tightbeam.Credentials.server("gibson")
+
+    start_supervised!(%{
+      id: server,
+      start:
+        {Tightbeam.Credentials, :start_link, [[name: server, base_dir: base, machine: "gibson"]]}
+    })
+
     for {ref, message_id} <- [{first, "failed-1"}, {second, "failed-2"}] do
       {:ok, _seq} =
         Ledger.enqueue(ctx.db, %{
@@ -387,6 +405,40 @@ defmodule Tightbeam.HarnessHealthTest do
     assert HarnessHealth.active(ctx.db) == []
     assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
     refute HarnessHealth.unavailable?(ctx.db, "claude", "host-a")
+  end
+
+  test "unreachable Claude credential owner cannot publish local auth-dead evidence", ctx do
+    [first | _] = ctx.sessions
+
+    {:ok, _seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: first.session,
+        message_id: "unowned-auth-failure",
+        origin: "agent:test",
+        prompt: "run",
+        assignment_id: first.assignment
+      })
+
+    {:ok, turn} = Ledger.claim_next(ctx.db, first.session, "test-lane")
+    turn = Map.put(turn, :session_key, first.session)
+
+    session =
+      ctx.db
+      |> Org.get(first.session)
+      |> Map.put(:host, "missing-owner-#{System.unique_integer([:positive])}")
+
+    assert {:ok, nil} =
+             DB.transaction(ctx.db, fn txn ->
+               HarnessHealth.observe_turn_failure_in_txn(
+                 txn,
+                 session,
+                 turn,
+                 :prompt,
+                 %{"data" => %{"details" => "auth expired"}}
+               )
+             end)
+
+    assert HarnessHealth.active(ctx.db) == []
   end
 
   test "one open incident absorbs later evidence and preserves its first evidence", ctx do

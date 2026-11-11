@@ -18,7 +18,7 @@ defmodule Tightbeam.SessionLane do
 
   use GenServer
   require Logger
-  alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Ledger, Placement}
+  alias Tightbeam.{ClaudeAuth, DB, EventLog, Harness, HarnessProcess, Ledger, Placement}
 
   defstruct [
     :session_key,
@@ -231,10 +231,32 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp claim_and_start(state) do
-    if harness_parked?(state) do
-      state
-    else
-      claim_next(state)
+    case admission(state) do
+      {:eligible, instance} -> claim_next(state, instance)
+      :eligible -> claim_next(state, nil)
+      :held -> state
+      :terminal -> state
+    end
+  end
+
+  defp admission(state) do
+    case DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [
+           state.session_key
+         ]) do
+      {:ok, [[harness, host]]} ->
+        cond do
+          harness_parked?(state) ->
+            :terminal
+
+          harness == Atom.to_string(Tightbeam.Harness.Claude.id()) ->
+            ClaudeAuth.admission(state.db, host)
+
+          true ->
+            :eligible
+        end
+
+      _ ->
+        :eligible
     end
   end
 
@@ -250,14 +272,19 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
-  defp claim_next(state) do
+  defp claim_next(state, credential_instance) do
     case Ledger.claim_next(state.db, state.session_key, "lane:#{inspect(self())}") do
       {:ok, turn} ->
         runner = state.runner
 
         task =
           Task.Supervisor.async_nolink(state.task_sup, fn ->
-            {turn.seq, runner.(Map.put(turn, :session_key, state.session_key))}
+            turn =
+              turn
+              |> Map.put(:session_key, state.session_key)
+              |> Map.put(:credential_instance, credential_instance)
+
+            {turn.seq, runner.(turn)}
           end)
 
         state
