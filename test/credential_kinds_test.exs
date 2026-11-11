@@ -366,6 +366,7 @@ defmodule Tightbeam.CredentialKindsTest do
         )
 
       base_target = target(ctx.base, nil)
+
       inventory = fn command ->
         assert "node" in command and "-e" in command
         {~s({"bypass_hook_trust":true,"skills":{"config":[]}}), 0}
