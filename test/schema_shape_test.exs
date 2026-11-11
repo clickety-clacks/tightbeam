@@ -23,7 +23,8 @@ defmodule Tightbeam.SchemaShapeTest do
     Wakes
   }
 
-  @shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
+  @shape "holder-role-provenance-v1-016"
+  @holder_role_previous_shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @owner_link_history_ddl """
   CREATE TABLE work_item_delivery_scope_events (
@@ -392,6 +393,63 @@ defmodule Tightbeam.SchemaShapeTest do
                (kind, principal, subagentRef, sourceEventRef, harness, at)
              VALUES ('subagent_start', 'cursor-session', 'sub', 'event', 'cursor', 1);
              """)
+  end
+
+  test "holder-role migration backfills only one proven role and rolls back on interruption", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, _} =
+             DB.query(db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+
+    for key <- ["unique-holder", "ambiguous-holder", "unbound-holder"] do
+      historical_session!(db, %{
+        session_key: key,
+        display_name: key,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Tightbeam.Model.new("fable"),
+        host: "testhost"
+      })
+    end
+
+    Tightbeam.Roles.create!(db, "unique-role", "flynn", "unique-holder")
+    Tightbeam.Roles.create!(db, "ambiguous-a", "flynn", "ambiguous-holder")
+    Tightbeam.Roles.create!(db, "ambiguous-b", "flynn", "ambiguous-holder")
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO assignments (id,subject,holderKey,holderRole,openedByUser,openedAt)
+             VALUES ('asg_unique','unique','unique-holder',NULL,'flynn',1),
+                    ('asg_ambiguous','ambiguous','ambiguous-holder',NULL,'flynn',2),
+                    ('asg_unbound','unbound','unbound-holder',NULL,'flynn',3),
+                    ('asg_preserved','preserved','unique-holder','historical-role','flynn',4)
+             """)
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [@holder_role_previous_shape])
+
+    assert_raise Schema.ShapeError, fn ->
+      Schema.upgrade_holder_role_v1(db, fail_after_backfill: true)
+    end
+
+    assert {:ok, [[nil]]} =
+             DB.query(db, "SELECT holderRole FROM assignments WHERE id='asg_unique'")
+
+    assert {:ok, [[@holder_role_previous_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["unique-role"], [nil], [nil], ["historical-role"]]} =
+             DB.query(
+               db,
+               "SELECT holderRole FROM assignments WHERE id IN ('asg_unique','asg_ambiguous','asg_unbound','asg_preserved') ORDER BY openedAt"
+             )
   end
 
   test "the exact agent-reparent predecessor backfills current and retired owners", %{db: db} do

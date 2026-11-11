@@ -415,6 +415,7 @@ defmodule Tightbeam.Schema do
   @evidence_release_shape "launch-preparation-evidence-v1-0112"
   @session_identity_shape "session-identity-v1-0114"
   @closed_assignment_reconciliation_shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
+  @holder_role_shape "holder-role-provenance-v1-016"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -444,6 +445,7 @@ defmodule Tightbeam.Schema do
     @launch_preparation_boot_shape,
     @session_identity_shape,
     @closed_assignment_reconciliation_shape,
+    @holder_role_shape,
     @evidence_release_shape,
     @decision_request_row_schema_shape,
     @assignment_source_replacement_shape,
@@ -1811,6 +1813,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @holder_role_shape,
       @closed_assignment_reconciliation_shape,
       @session_identity_shape,
       @evidence_release_shape,
@@ -1959,6 +1962,7 @@ defmodule Tightbeam.Schema do
             @launch_preparation_boot_shape,
             @session_identity_shape,
             @closed_assignment_reconciliation_shape,
+            @holder_role_shape,
             @evidence_release_shape,
             @decision_request_row_schema_shape,
             @assignment_source_replacement_shape,
@@ -2109,6 +2113,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
     :ok = upgrade_session_identity(db)
     :ok = upgrade_closed_assignment_reconciliation(db)
+    :ok = upgrade_holder_role_v1(db)
     :ok = upgrade_retirement_parent_moves(db)
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
@@ -2733,6 +2738,7 @@ defmodule Tightbeam.Schema do
                       @launch_preparation_boot_shape,
                       @session_identity_shape,
                       @closed_assignment_reconciliation_shape,
+                      @holder_role_shape,
                       @evidence_release_shape
                     ] ->
                  validate_notice_source_payload_in_txn!(txn)
@@ -3685,7 +3691,8 @@ defmodule Tightbeam.Schema do
           sql =
             if Txn.q(txn, "SELECT shape FROM schema_stamp") in [
                  [[@session_identity_shape]],
-                 [[@closed_assignment_reconciliation_shape]]
+                 [[@closed_assignment_reconciliation_shape]],
+                 [[@holder_role_shape]]
                ],
                do: process_actor_table_sql(object.name, object.sql),
                else: object.sql
@@ -3726,7 +3733,8 @@ defmodule Tightbeam.Schema do
     expected =
       if Txn.q(txn, "SELECT shape FROM schema_stamp") in [
            [[@session_identity_shape]],
-           [[@closed_assignment_reconciliation_shape]]
+           [[@closed_assignment_reconciliation_shape]],
+           [[@holder_role_shape]]
          ],
          do: process_actor_table_sql(name, expected),
          else: expected
@@ -3775,6 +3783,7 @@ defmodule Tightbeam.Schema do
                  @launch_preparation_boot_shape,
                  @session_identity_shape,
                  @closed_assignment_reconciliation_shape,
+                 @holder_role_shape,
                  @evidence_release_shape,
                  @decision_request_row_schema_shape
                ],
@@ -3789,6 +3798,7 @@ defmodule Tightbeam.Schema do
           @launch_preparation_boot_shape,
           @session_identity_shape,
           @closed_assignment_reconciliation_shape,
+          @holder_role_shape,
           @evidence_release_shape,
           @decision_request_row_schema_shape
         ] ->
@@ -3880,6 +3890,7 @@ defmodule Tightbeam.Schema do
           @launch_preparation_boot_shape,
           @session_identity_shape,
           @closed_assignment_reconciliation_shape,
+          @holder_role_shape,
           @evidence_release_shape,
           @decision_request_row_schema_shape,
           @assignment_source_replacement_shape,
@@ -3904,6 +3915,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] and
@@ -4774,7 +4786,8 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @evidence_release_shape,
                     @session_identity_shape,
-                    @closed_assignment_reconciliation_shape
+                    @closed_assignment_reconciliation_shape,
+                    @holder_role_shape
                   ] ->
                # A stamped successor missing its required columns is corruption, not a
                # second opportunity to migrate an inferred shape.
@@ -4880,7 +4893,11 @@ defmodule Tightbeam.Schema do
                  :ok
 
                [[shape]]
-               when shape in [@session_identity_shape, @closed_assignment_reconciliation_shape] ->
+               when shape in [
+                      @session_identity_shape,
+                      @closed_assignment_reconciliation_shape,
+                      @holder_role_shape
+                    ] ->
                  :ok
 
                rows ->
@@ -4894,6 +4911,50 @@ defmodule Tightbeam.Schema do
 
       {:error, error} ->
         raise ShapeError, message: "session identity migration rolled back: #{inspect(error)}"
+    end
+  end
+
+  @doc false
+  def upgrade_holder_role_v1(db, opts \\ []) when is_list(opts) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@holder_role_shape]] ->
+               :current
+
+             [[@closed_assignment_reconciliation_shape]] ->
+               affected = Tightbeam.Assignments.backfill_holder_roles_in_txn(txn)
+
+               if Keyword.get(opts, :fail_after_backfill),
+                 do: raise("forced holder-role migration interruption")
+
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+                 @holder_role_shape,
+                 System.system_time(:millisecond),
+                 @closed_assignment_reconciliation_shape
+               ])
+
+               if Txn.changes(txn) != 1,
+                 do: raise(ShapeError, message: "incompatible_holder_role_v1: stamp race")
+
+               {:migrated, affected}
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_holder_role_v1: predecessor stamp #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :current} ->
+        :ok
+
+      {:ok, {:migrated, _affected}} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "incompatible_holder_role_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -4923,6 +4984,9 @@ defmodule Tightbeam.Schema do
               {:migrated, report}
 
             [[@closed_assignment_reconciliation_shape]] ->
+              :current
+
+            [[@holder_role_shape]] ->
               :current
 
             rows ->
@@ -5068,7 +5132,8 @@ defmodule Tightbeam.Schema do
              when shape in [
                     @evidence_release_shape,
                     @session_identity_shape,
-                    @closed_assignment_reconciliation_shape
+                    @closed_assignment_reconciliation_shape,
+                    @holder_role_shape
                   ] ->
                Tightbeam.EvidenceSchemaRelease.validate_in_txn!(txn)
 
@@ -5115,6 +5180,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @holder_role_shape,
                     @evidence_release_shape
                   ] ->
                :ok =
@@ -5230,6 +5296,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] do
@@ -5409,6 +5476,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] ->
@@ -5570,6 +5638,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape
            ] ->
         if effort_holder_activity_cancellation_active?(txn) do
@@ -5978,6 +6047,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape
            ] ->
         :ok = check_work_item_owner_link_shape(db)
@@ -6089,7 +6159,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@closed_assignment_reconciliation_shape}
+          this build: #{@holder_role_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -6105,7 +6175,7 @@ defmodule Tightbeam.Schema do
         then #{@work_item_owner_link_shape}, #{@assignment_source_replacement_shape},
         and #{@notice_source_payload_shape}, #{@decision_request_row_schema_shape},
         then #{@launch_preparation_boot_shape}, followed by #{@evidence_release_shape} and
-        #{@closed_assignment_reconciliation_shape}.
+        #{@closed_assignment_reconciliation_shape}, and #{@holder_role_shape}.
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
         """
@@ -6118,7 +6188,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@closed_assignment_reconciliation_shape}
+          this build: #{@holder_role_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
@@ -6208,6 +6278,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @holder_role_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -6316,6 +6387,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6348,6 +6420,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6474,6 +6547,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @holder_role_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -6659,6 +6733,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7785,6 +7860,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7826,6 +7902,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7945,6 +8022,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8210,6 +8288,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @holder_role_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8239,6 +8318,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @holder_role_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8281,6 +8361,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @holder_role_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8350,6 +8431,7 @@ defmodule Tightbeam.Schema do
                       @launch_preparation_boot_shape,
                       @session_identity_shape,
                       @closed_assignment_reconciliation_shape,
+                      @holder_role_shape,
                       @evidence_release_shape,
                       @decision_request_row_schema_shape,
                       @assignment_source_replacement_shape,
@@ -8409,6 +8491,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @holder_role_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8476,6 +8559,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @holder_role_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8527,6 +8611,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @holder_role_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape
                   ] ->
