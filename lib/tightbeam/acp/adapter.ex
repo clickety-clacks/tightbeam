@@ -1181,17 +1181,19 @@ defmodule Tightbeam.Acp.Adapter do
            timeout: request_timeout,
            diagnostic: true
          ) do
-      {:ok, %{"sessionId" => new_sid} = result} when new_sid != sid ->
+      {:ok, %{"sessionId" => new_sid}} when new_sid != sid ->
         with :ok <- project_guidance(state, new_sid, guidance),
+             {:ok, loaded_result} <-
+               load_fork_session(state, new_sid, cwd, mcp_servers, guidance, request_timeout),
              {:ok, applied_model, reported} <-
-               apply_fork_model(state, new_sid, model, result, request_timeout),
+               apply_fork_model(state, new_sid, model, loaded_result, request_timeout),
              :ok <- set_mode(state, new_sid, request_timeout) do
           state =
             state
             |> put_in([Access.key(:known)], MapSet.put(state.known, new_sid))
             |> remember_model(new_sid, applied_model)
-            |> remember_switchable_models(new_sid, result)
-            |> remember_config_options(new_sid, result)
+            |> remember_switchable_models(new_sid, loaded_result)
+            |> remember_config_options(new_sid, loaded_result)
             |> remember_reported_config(new_sid, reported)
             |> put_in([Access.key(:chunks), new_sid], [])
 
@@ -1214,6 +1216,26 @@ defmodule Tightbeam.Acp.Adapter do
 
       {:error, error} ->
         {:reply, {:error, map_fork_error(error)}, state}
+    end
+  end
+
+  defp load_fork_session(state, sid, cwd, mcp_servers, guidance, request_timeout) do
+    # session/fork persists a transcript, but its returned id is not necessarily
+    # a live ACP session. Load that transcript before sending live config calls.
+    case Conn.request(
+           state.conn,
+           "session/load",
+           %{
+             sessionId: sid,
+             cwd: cwd,
+             mcpServers: mcp_servers,
+             _meta: Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
+           },
+           timeout: request_timeout,
+           diagnostic: true
+         ) do
+      {:ok, result} -> {:ok, result}
+      {:error, error} -> {:error, request_failure(error, "session/load")}
     end
   end
 
