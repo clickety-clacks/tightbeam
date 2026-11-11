@@ -731,6 +731,175 @@ defmodule Tightbeam.HarklightReconnectTest do
              )
   end
 
+  @tag :requires_wid247_child_wrapper
+  test "a recovered handle gets one new DISCONNECT for its next persistent failure", %{
+    db: db,
+    call: call
+  } do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "harklight-reconnect-episodes-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(root)
+
+    helper = Path.join(root, "tightbeam-child")
+    agent = Path.join(root, "harklight-agent")
+    connected_marker = Path.join(root, "connected")
+    failure_gate = Path.join(root, "failure-gate")
+    connected_line =
+      JSON.encode!(%{"kind" => "reconnected", "session_handle" => @handle, "feed_cursor" => 7})
+
+    File.write!(helper, """
+    #!/bin/sh
+    printf 'TIGHTBEAM_CHILD_READY\\n'
+    IFS= read -r command
+    [ "$command" = continue ] || exit 31
+    shift 4
+    exec "$@"
+    """)
+
+    File.write!(agent, """
+    #!/bin/sh
+    [ "$1" = reconnect ] || exit 2
+    printf '%s\\n' '#{connected_line}'
+    touch '#{connected_marker}'
+    while [ ! -f '#{failure_gate}' ]; do sleep 0.01; done
+    printf '%s\\n' 'Agent refused the stream: token=second-episode-secret'
+    exit 1
+    """)
+
+    File.chmod!(helper, 0o755)
+    File.chmod!(agent, 0o755)
+
+    old_path = System.get_env("PATH") || ""
+    old_child_opts = Application.get_env(:tightbeam, :harklight_child_opts)
+    System.put_env("PATH", root <> ":" <> old_path)
+
+    Application.put_env(:tightbeam, :harklight_child_opts,
+      base_dir: root,
+      cli_path: helper
+    )
+
+    on_exit(fn ->
+      File.touch!(failure_gate)
+      System.put_env("PATH", old_path)
+
+      if is_nil(old_child_opts),
+        do: Application.delete_env(:tightbeam, :harklight_child_opts),
+        else: Application.put_env(:tightbeam, :harklight_child_opts, old_child_opts)
+
+      File.rm_rf!(root)
+    end)
+
+    parent = self()
+
+    first_failure =
+      {:harklight_failure, {"harklight_attach_failed", "transport_error"}, "attach",
+       "Agent refused the initial stream: token=first-episode-secret"}
+
+    listener = fn manager, handle, _vendor_id ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = GenServer.call(manager, {:finished, handle, first_failure})
+      # A repeated failure before recovery is still the same episode.
+      :ok = GenServer.call(manager, {:finished, handle, first_failure})
+      send(parent, :first_episode_failed)
+    end
+
+    runner = fn
+      ["status", "--session", @handle] -> {JSON.encode!(status(open_chats: 1)), 0}
+      _args -> {"", 0}
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db, listener: listener, send_runner: runner, retry_delays: [60_000]}
+      )
+
+    assert_receive :first_episode_failed
+
+    assert eventually(fn ->
+             DB.query(
+               db,
+               "SELECT state,recoveryWakeId FROM harklight_wake_handles WHERE handle=?1",
+               [@handle]
+             ) == {:ok, [["unavailable", "w_harklight_notice_recovery_" <> @handle]]}
+           end)
+
+    assert eventually(fn -> map_size(:sys.get_state(manager).workers) == 0 end)
+
+    assert {:ok, [[first_id, first_prompt]]} =
+             DB.query(
+               db,
+               "SELECT wakeId,prompt FROM wakes WHERE wakeId LIKE 'w_harklight_notice_recovery_%'",
+               []
+             )
+
+    assert first_id == "w_harklight_notice_recovery_" <> @handle
+    assert first_prompt =~ "DISCONNECT: Harklight message request in thread #{@handle}"
+    assert first_prompt =~ "ATTACH failure:"
+    assert first_prompt =~ "Agent refused the initial stream"
+    assert first_prompt =~ "[REDACTED:secret_field]"
+    refute first_prompt =~ "first-episode-secret"
+
+    assert %{
+             outcome: "committed",
+             feed_cursor: 7,
+             handle: @handle,
+             message_id: "request"
+           } = HarklightReconnect.reconnect(db, call, agent_runner: runner)
+
+    assert eventually(fn -> File.exists?(connected_marker) end)
+
+    assert {:ok, [["active", nil]]} =
+             DB.query(
+               db,
+               "SELECT state,recoveryWakeId FROM harklight_wake_handles WHERE handle=?1",
+               [@handle]
+             )
+
+    File.touch!(failure_gate)
+
+    assert eventually(fn ->
+             case DB.query(
+                    db,
+                    "SELECT wakeId,prompt FROM wakes WHERE wakeId LIKE 'w_harklight_notice_recovery_%' ORDER BY wakeId",
+                    []
+                  ) do
+               {:ok, rows} -> length(rows) == 2
+               _ -> false
+             end
+           end)
+
+    assert {:ok, rows} =
+             DB.query(
+               db,
+               "SELECT wakeId,prompt FROM wakes WHERE wakeId LIKE 'w_harklight_notice_recovery_%'",
+               []
+             )
+
+    assert length(rows) == 2
+    assert [second_id, second_prompt] =
+             Enum.find(rows, fn [wake_id, _] -> wake_id != first_id end)
+    assert String.starts_with?(second_id, first_id <> "_")
+    assert second_prompt =~ "DISCONNECT: Harklight message request in thread #{@handle}"
+    assert second_prompt =~ "RECONNECT failure:"
+    assert second_prompt =~ "Agent refused the stream"
+    assert second_prompt =~ "[REDACTED:secret_field]"
+    refute second_prompt =~ "second-episode-secret"
+
+    assert {:ok, [["unavailable", ^second_id]]} =
+             DB.query(
+               db,
+               "SELECT state,recoveryWakeId FROM harklight_wake_handles WHERE handle=?1",
+               [@handle]
+             )
+
+    assert :ok = stop_supervised(HarklightWakes)
+  end
+
   test "Agent reconnect stream lines confirm the same handle before delivering journal entries",
        %{} do
     connected = ~s({"kind":"reconnected","session_handle":"#{@handle}","feed_cursor":8})

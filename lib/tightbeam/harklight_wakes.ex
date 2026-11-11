@@ -8,7 +8,16 @@ defmodule Tightbeam.HarklightWakes do
 
   use GenServer
   require Logger
-  alias Tightbeam.{DB, ErrorDiagnostic, HarklightLifecycle, Org, Placement, Supervision, Wakes}
+  alias Tightbeam.{
+    DB,
+    ErrorDiagnostic,
+    HarklightLifecycle,
+    Id,
+    Org,
+    Placement,
+    Supervision,
+    Wakes
+  }
   alias Tightbeam.DB.Txn
 
   @attach_retry_delays [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
@@ -57,6 +66,7 @@ defmodule Tightbeam.HarklightWakes do
     state TEXT NOT NULL CHECK(state IN ('active','complete','unavailable')),
     lastCursor INTEGER NOT NULL DEFAULT 0,
     lastError TEXT,
+    recoveryWakeId TEXT,
     createdAt INTEGER NOT NULL,
     updatedAt INTEGER NOT NULL
   );
@@ -130,9 +140,50 @@ defmodule Tightbeam.HarklightWakes do
 
   def ensure_schema(db \\ DB) do
     with :ok <- DB.execute(db, @ddl),
+         :ok <- ensure_recovery_wake_schema(db),
          :ok <- HarklightLifecycle.ensure_schema(db),
          :ok <- Tightbeam.HarklightOrigin.ensure_schema(db) do
       backfill_pending_supersedes(db)
+    end
+  end
+
+  defp ensure_recovery_wake_schema(db) do
+    case DB.transaction(db, fn txn ->
+           columns = Txn.q(txn, "PRAGMA table_info(harklight_wake_handles)")
+
+           case Enum.find(columns, &(Enum.at(&1, 1) == "recoveryWakeId")) do
+             nil ->
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "ALTER TABLE harklight_wake_handles ADD COLUMN recoveryWakeId TEXT"
+                 )
+
+             [_, "recoveryWakeId", "TEXT", 0, nil, 0] ->
+               :ok
+
+             _ ->
+               raise Tightbeam.Schema.ShapeError,
+                 message: "harklight_wake_handles.recoveryWakeId has an unexpected shape"
+           end
+
+           # A legacy unavailable handle with its stable wake already recorded
+           # is still in that same failure episode. Keep deduping it after the
+           # additive migration; active handles will start a new episode ID.
+           Txn.q(txn, """
+           UPDATE harklight_wake_handles
+           SET recoveryWakeId='w_harklight_notice_recovery_' || handle
+           WHERE state='unavailable' AND recoveryWakeId IS NULL
+             AND EXISTS (
+               SELECT 1 FROM wakes
+               WHERE wakeId='w_harklight_notice_recovery_' || harklight_wake_handles.handle
+             )
+           """)
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -1412,7 +1463,7 @@ defmodule Tightbeam.HarklightWakes do
       if valid_worker?(state, handle, from) do
         case DB.query(
                state.db,
-               "UPDATE harklight_wake_handles SET state='active',lastError=NULL,updatedAt=?2 WHERE handle=?1",
+               "UPDATE harklight_wake_handles SET state='active',lastError=NULL,recoveryWakeId=NULL,updatedAt=?2 WHERE handle=?1",
                [handle, System.system_time(:millisecond)]
              ) do
           {:ok, _} -> :ok
@@ -1545,8 +1596,6 @@ defmodule Tightbeam.HarklightWakes do
          diagnostic,
          now
        ) do
-    wake_id = "w_harklight_notice_recovery_" <> handle
-
     message_id =
       case Txn.q(
              txn,
@@ -1565,7 +1614,10 @@ defmodule Tightbeam.HarklightWakes do
         value -> value
       end
 
-    if Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) == [] do
+    wake_id = recovery_wake_id_in_txn(txn, handle)
+
+    if is_binary(wake_id) and
+         Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) == [] do
       recipient =
         case Org.get_in_txn(txn, session_key) do
           %{state: "active"} -> session_key
@@ -1603,6 +1655,37 @@ defmodule Tightbeam.HarklightWakes do
 
         Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
       end
+    end
+  end
+
+  defp recovery_wake_id_in_txn(txn, handle) do
+    marker =
+      Txn.q(txn, "SELECT recoveryWakeId FROM harklight_wake_handles WHERE handle=?1", [handle])
+
+    case marker do
+      [[wake_id]] when is_binary(wake_id) -> wake_id
+      [[nil]] ->
+        stable_id = "w_harklight_notice_recovery_" <> handle
+
+        wake_id =
+          if Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [stable_id]) == [] do
+            stable_id
+          else
+            stable_id <> "_" <> Id.uuid4()
+          end
+
+        Txn.q(
+          txn,
+          """
+          UPDATE harklight_wake_handles SET recoveryWakeId=?2
+          WHERE handle=?1 AND recoveryWakeId IS NULL
+          """,
+          [handle, wake_id]
+        )
+
+        wake_id
+
+      _ -> nil
     end
   end
 
@@ -2133,7 +2216,7 @@ defmodule Tightbeam.HarklightWakes do
              [[state]] when state in ["active", "unavailable"] ->
                Txn.q(
                  txn,
-                 "UPDATE harklight_wake_handles SET state='active',lastError=NULL,updatedAt=?2 WHERE handle=?1 AND state IN ('active','unavailable')",
+                 "UPDATE harklight_wake_handles SET state='active',lastError=NULL,recoveryWakeId=NULL,updatedAt=?2 WHERE handle=?1 AND state IN ('active','unavailable')",
                  [handle, System.system_time(:millisecond)]
                )
 
@@ -3055,7 +3138,7 @@ defmodule Tightbeam.HarklightWakes do
             do:
               Txn.q(
                 txn,
-                "UPDATE harklight_wake_handles SET state='active',lastError=NULL WHERE handle=?1",
+                "UPDATE harklight_wake_handles SET state='active',lastError=NULL,recoveryWakeId=NULL WHERE handle=?1",
                 [handle]
               )
 
