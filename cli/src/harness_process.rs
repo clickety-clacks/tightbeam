@@ -689,10 +689,7 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Option<Sweep>, String> 
     Ok(Some(sweep))
 }
 
-fn freeze_tree_until_stable(
-    target: &HarnessTarget,
-    sweep: &mut Sweep,
-) -> Result<bool, String> {
+fn freeze_tree_until_stable(target: &HarnessTarget, sweep: &mut Sweep) -> Result<bool, String> {
     for _ in 0..FREEZE_ROUNDS {
         if !freeze_tree_round(target, sweep)? {
             return Ok(false);
@@ -725,10 +722,7 @@ enum LeaderFreeze {
     Ready,
 }
 
-fn freeze_sweep_leader(
-    target: &HarnessTarget,
-    sweep: &mut Sweep,
-) -> Result<LeaderFreeze, String> {
+fn freeze_sweep_leader(target: &HarnessTarget, sweep: &mut Sweep) -> Result<LeaderFreeze, String> {
     // Caller exclusion is decided before STOP. There is no group broadcast capable of
     // stopping the caller, even when it is the recorded leader or shares its group.
     if sweep.leader.instance.pid == sweep.caller {
@@ -744,10 +738,7 @@ fn freeze_sweep_leader(
             target.pgid
         )),
         ProcessSignalResult::Delivered => {
-            if matches!(
-                wait_for_leader_freeze(target, sweep)?,
-                LeaderFreeze::Gone
-            ) {
+            if matches!(wait_for_leader_freeze(target, sweep)?, LeaderFreeze::Gone) {
                 return Ok(LeaderFreeze::Gone);
             }
         }
@@ -790,10 +781,7 @@ fn wait_for_leader_freeze(
     Ok(LeaderFreeze::Ready)
 }
 
-fn freeze_tree_round(
-    target: &HarnessTarget,
-    sweep: &mut Sweep,
-) -> Result<bool, String> {
+fn freeze_tree_round(target: &HarnessTarget, sweep: &mut Sweep) -> Result<bool, String> {
     if let Err(reason) = require_sweep_authority(target, &sweep.leader) {
         sweep.failures.push(reason);
         return Ok(false);
