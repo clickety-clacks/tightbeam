@@ -5379,9 +5379,11 @@ defmodule Tightbeam.HarklightWakesTest do
                       "--event",
                       "105",
                       "--agent",
-                      "Follower",
+                      agent_name,
                       "--rerouted"
                     ]}
+
+    assert agent_name == follower.display_name
 
     refute_receive {:ack2, _args}
   end
