@@ -1552,8 +1552,7 @@ defmodule Tightbeam.Assignments do
 
       case replay do
         %{} = assignment ->
-          {:replay,
-           if(verb == "dispatch", do: add_dispatch_condition_hint(assignment), else: assignment)}
+          {:replay, assignment}
 
         nil ->
           case call.params[:work_item_id] do
@@ -1646,17 +1645,6 @@ defmodule Tightbeam.Assignments do
         "tightbeam wake --session <session> --when-fact #{kind} --when-scope #{assignment_id} --fallback-after 2h --prompt \"re-read this card\""
     }
   end
-
-  defp add_dispatch_condition_hint({:accepted_in_txn, event_id, %{assignment: assignment}}) do
-    {:accepted_in_txn, event_id, %{assignment: add_dispatch_condition_hint(assignment)}}
-  end
-
-  defp add_dispatch_condition_hint(%{id: assignment_id, state: "open"} = assignment)
-       when is_binary(assignment_id) do
-    Map.put(assignment, :condition_wake_hint, condition_wait_hint(assignment_id))
-  end
-
-  defp add_dispatch_condition_hint(result), do: result
 
   defp dispatch_result(db, call) do
     case {call.params[:work_item_id], call.principal} do
@@ -1782,7 +1770,7 @@ defmodule Tightbeam.Assignments do
           end
 
         assignment ->
-          add_dispatch_condition_hint(assignment)
+          assignment
       end
     else
       error -> error
@@ -1883,9 +1871,7 @@ defmodule Tightbeam.Assignments do
 
     if delivery, do: best_effort(fn -> notify(call, :on_dispatch_delivery, delivery, nil) end)
 
-    if call.verb == "dispatch",
-      do: add_dispatch_condition_hint(assignment),
-      else: assignment
+    assignment
   end
 
   defp process_assignment_owner(db, %{principal: {:process, _}, params: params}) do

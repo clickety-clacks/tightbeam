@@ -682,12 +682,19 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
   end
 
-  test "dispatch and a bound plain-after recheck teach the exact card fact", ctx do
+  test "dispatch omits a child check hint while a bound plain-after recheck teaches the card fact",
+       ctx do
     dispatch =
       dispatch_call({:user, "flynn"}, "waitable card", "Inspect the card.", "wait-hint")
 
     assignment = dispatch!(ctx, dispatch)
-    hint = assignment.condition_wake_hint
+    refute Map.has_key?(assignment, :condition_wake_hint)
+
+    replay = dispatch!(ctx, dispatch)
+    assert replay.id == assignment.id
+    refute Map.has_key?(replay, :condition_wake_hint)
+
+    hint = Assignments.condition_wait_hint(ctx.db, assignment.id)
     assert hint.kind == "assignment-landed"
     assert hint.scope == assignment.id
     assert hint.fallback_after == "2h"
@@ -700,13 +707,6 @@ defmodule Tightbeam.AssignmentsTest do
     assert hint.record_dependency.message =~ "not a complete --predicate"
     assert hint.record_dependency.message =~ "caller-selected resolverRef"
     assert hint.record_dependency.message =~ "No necessity or verifier assignment is required"
-    assert hint.message =~ "--when-fact assignment-landed"
-    assert hint.message =~ "assignmentId=#{assignment.id}"
-    assert hint.message =~ "assignment.state"
-    assert hint.message =~ "completion attestation only"
-
-    assert %{condition_wake_hint: replay_hint} = dispatch!(ctx, dispatch)
-    assert replay_hint.scope == assignment.id
 
     recheck =
       call("wake", {:user, "flynn"}, "holder", %{
