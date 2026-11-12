@@ -89,7 +89,11 @@ defmodule Tightbeam.OrgTest do
     retired =
       Org.create(
         db,
-        base(%{session_key: "retired-id", identity_name: "default--fedcba9876543210"})
+        base(%{
+          session_key: "retired-id",
+          display_name: "Retired identity",
+          identity_name: "default--fedcba9876543210"
+        })
       )
       |> then(&Org.retire(db, &1.session_key, "user:flynn", 1_000))
 
@@ -118,8 +122,8 @@ defmodule Tightbeam.OrgTest do
   end
 
   test "session CLI tokens are unique, active-only, and indexed", %{db: db} do
-    first = Org.create(db, base(%{session_key: "token-1"}))
-    second = Org.create(db, base(%{session_key: "token-2"}))
+    first = Org.create(db, base(%{session_key: "token-1", display_name: "First token session"}))
+    second = Org.create(db, base(%{session_key: "token-2", display_name: "Second token session"}))
 
     assert first.cli_token =~ ~r/^tbs_[A-Za-z0-9_-]{32}$/
     assert second.cli_token =~ ~r/^tbs_[A-Za-z0-9_-]{32}$/
@@ -140,9 +144,18 @@ defmodule Tightbeam.OrgTest do
   end
 
   test "list scopes active sessions by owner unless admin and preserves ordering", %{db: db} do
-    Org.create(db, base(%{session_key: "k2", order_index: 2}))
-    Org.create(db, base(%{session_key: "k1", order_index: 1}))
-    Org.create(db, base(%{session_key: "sam", owner_user_id: "sam", origin: "user:sam"}))
+    Org.create(db, base(%{session_key: "k2", display_name: "Session two", order_index: 2}))
+    Org.create(db, base(%{session_key: "k1", display_name: "Session one", order_index: 1}))
+
+    Org.create(
+      db,
+      base(%{
+        session_key: "other-owner-session",
+        display_name: "Other owner",
+        owner_user_id: "other-owner",
+        origin: "user:other-owner"
+      })
+    )
 
     assert Enum.map(Org.list_for_user(db, "flynn", false), & &1.session_key) == ["k1", "k2"]
     assert length(Org.list_for_user(db, "flynn", true)) == 3
@@ -158,7 +171,7 @@ defmodule Tightbeam.OrgTest do
        %{db: db} do
     main_key = Org.personal_session_key("flynn")
     Org.create(db, base(%{session_key: main_key, kind: "main", is_built_in: true}))
-    Org.create(db, base(%{session_key: "retiring"}))
+    Org.create(db, base(%{session_key: "retiring", display_name: "Retiring"}))
     Roles.create!(db, "reviewer", "flynn", "retiring")
 
     direct =
@@ -294,7 +307,7 @@ defmodule Tightbeam.OrgTest do
   } do
     main_key = Org.personal_session_key("flynn")
     ensure_legacy_main(db)
-    Org.create(db, base(%{session_key: "retiring"}))
+    Org.create(db, base(%{session_key: "retiring", display_name: "Retiring"}))
     Roles.create!(db, "reviewer", "flynn", "retiring")
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
@@ -395,7 +408,7 @@ defmodule Tightbeam.OrgTest do
   } do
     main_key = Org.personal_session_key("flynn")
     ensure_legacy_main(db)
-    Org.create(db, base(%{session_key: "retiring"}))
+    Org.create(db, base(%{session_key: "retiring", display_name: "Retiring"}))
     Roles.create!(db, "reviewer", "flynn", "retiring")
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
@@ -763,7 +776,7 @@ defmodule Tightbeam.OrgTest do
 
   test "retirement after actual admission preserves the immutable carrier and turn", %{db: db} do
     ensure_legacy_main(db)
-    Org.create(db, base(%{session_key: "retiring"}))
+    Org.create(db, base(%{session_key: "retiring", display_name: "Retiring"}))
     Roles.create!(db, "reviewer", "flynn", "retiring")
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
@@ -825,7 +838,7 @@ defmodule Tightbeam.OrgTest do
 
   test "retirement after terminal carrier preserves the one fired delivery path", %{db: db} do
     ensure_legacy_main(db)
-    Org.create(db, base(%{session_key: "retiring"}))
+    Org.create(db, base(%{session_key: "retiring", display_name: "Retiring"}))
     Roles.create!(db, "reviewer", "flynn", "retiring")
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
@@ -891,7 +904,7 @@ defmodule Tightbeam.OrgTest do
   end
 
   test "retirement validates its explicit caller context before state or wake mutation", %{db: db} do
-    session = Org.create(db, base(%{session_key: "retiring"}))
+    session = Org.create(db, base(%{session_key: "retiring", display_name: "Retiring"}))
 
     wake =
       Wakes.schedule(db, %{
@@ -921,7 +934,7 @@ defmodule Tightbeam.OrgTest do
   test "concurrent retirement commits one state transition and one cancellation carrier", %{
     db: db
   } do
-    Org.create(db, base(%{session_key: "retiring"}))
+    Org.create(db, base(%{session_key: "retiring", display_name: "Retiring"}))
 
     wake =
       Wakes.schedule(db, %{
@@ -954,7 +967,7 @@ defmodule Tightbeam.OrgTest do
   } do
     ensure_legacy_main(db)
     main_key = Org.personal_session_key("flynn")
-    Org.create(db, base(%{session_key: "retiring"}))
+    Org.create(db, base(%{session_key: "retiring", display_name: "Retiring"}))
 
     :ok =
       DB.execute(
@@ -980,13 +993,17 @@ defmodule Tightbeam.OrgTest do
   end
 
   test "spawned-by provenance is retained", %{db: db} do
-    Org.create(db, base(%{session_key: "root", handle: "orchestrator:news"}))
+    Org.create(
+      db,
+      base(%{session_key: "root", display_name: "Root", handle: "orchestrator:news"})
+    )
 
     child =
       Org.create(
         db,
         base(%{
           session_key: "child",
+          display_name: "Child",
           origin: "agent:orchestrator:news",
           spawned_by: "root",
           archetype: "reviewer",
@@ -1023,6 +1040,114 @@ defmodule Tightbeam.OrgTest do
     assert rows == [["Renamed", "claude-fable-5", "high", "1m", "anthropic"]]
   end
 
+  test "display names are unique across retained sessions and rename preserves identity", %{
+    db: db
+  } do
+    original =
+      Org.create(db, base(%{session_key: "stable-session-key", display_name: "Original Label"}))
+
+    retired =
+      Org.create(db, base(%{session_key: "retired-label", display_name: "Reserved Label"}))
+
+    assert %{state: "retired"} = Org.retire(db, retired.session_key, "test-principal", 1_000)
+    Org.create(db, base(%{session_key: "unicode-owner", display_name: "Straße"}))
+
+    collision =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.create(db, base(%{session_key: "unicode-collision", display_name: "  STRASSE  "}))
+      end
+
+    assert collision.code == "display_name_taken"
+
+    empty =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.create(db, base(%{session_key: "empty-label", display_name: "  \t "}))
+      end
+
+    assert empty.code == "display_name_empty"
+
+    collision =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.rename(db, original.session_key, "  strasse ")
+      end
+
+    assert collision.code == "display_name_taken"
+
+    collision =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.rename(db, original.session_key, " reserved label ")
+      end
+
+    assert collision.code == "display_name_taken"
+
+    empty =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.rename(db, original.session_key, "  \t ")
+      end
+
+    assert empty.code == "display_name_empty"
+
+    renamed = Org.rename(db, original.session_key, "  ATC PO  ")
+    assert renamed.display_name == "  ATC PO  "
+    assert renamed.session_key == original.session_key
+    assert renamed.origin == original.origin
+    assert renamed.spawned_by == original.spawned_by
+    assert Org.get(db, "stable-session-key").display_name == "  ATC PO  "
+    assert Org.get(db, "Original Label") == nil
+
+    unchanged = Org.rename(db, original.session_key, "  ATC PO  ")
+    assert unchanged.display_name == renamed.display_name
+    assert unchanged.updated_at == renamed.updated_at
+
+    released_name =
+      Org.create(db, base(%{session_key: "old-label-reused", display_name: "Original Label"}))
+
+    assert released_name.display_name == "Original Label"
+    assert Org.get(db, original.session_key).display_name == "  ATC PO  "
+  end
+
+  test "legacy duplicate labels remain unchanged but cannot be newly claimed", %{db: db} do
+    first =
+      Org.create(db, base(%{session_key: "legacy-label-one", display_name: "First label"}))
+
+    second =
+      Org.create(db, base(%{session_key: "legacy-label-two", display_name: "Second label"}))
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET displayName='Legacy label' WHERE sessionKey=?1", [
+        first.session_key
+      ])
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET displayName=' legacy LABEL ' WHERE sessionKey=?1", [
+        second.session_key
+      ])
+
+    first_before = Org.get(db, first.session_key)
+    unchanged = Org.rename(db, first.session_key, first_before.display_name)
+
+    assert unchanged.session_key == first.session_key
+    assert unchanged.display_name == "Legacy label"
+    assert unchanged.updated_at == first_before.updated_at
+
+    collision =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.rename(db, first.session_key, " LEGACY label ")
+      end
+
+    assert collision.code == "display_name_taken"
+
+    collision =
+      assert_raise Org.DisplayNameError, fn ->
+        Org.create(db, base(%{session_key: "legacy-label-three", display_name: "legacy LABEL"}))
+      end
+
+    assert collision.code == "display_name_taken"
+    assert Org.get(db, first.session_key).display_name == "Legacy label"
+    assert Org.get(db, second.session_key).display_name == " legacy LABEL "
+    assert Org.get(db, "legacy-label-three") == nil
+  end
+
   test "pointer chain is append-only and current is latest", %{db: db} do
     Org.create(db, base(%{session_key: "k1"}))
     Org.append_pointer(db, "k1", "uuid-1", "created")
@@ -1049,7 +1174,7 @@ defmodule Tightbeam.OrgTest do
              Org.source_session_ref("claude", "testhost", "shared-harness-id")
 
     Org.append_pointer(db, "k1", "shared-harness-id", "loaded")
-    Org.create(db, base(%{session_key: "k2"}))
+    Org.create(db, base(%{session_key: "k2", display_name: "Second pointer session"}))
 
     assert_raise Tightbeam.DB.Error, ~r/already belongs to another parent/, fn ->
       Org.append_pointer(db, "k2", "shared-harness-id", "created")
@@ -1061,10 +1186,10 @@ defmodule Tightbeam.OrgTest do
       Org.create(db, base(%{session_key: "bad", harness: "other"}))
     end
 
-    Org.create(db, base(%{session_key: "one", handle: "agent"}))
+    Org.create(db, base(%{session_key: "one", display_name: "First handle", handle: "agent"}))
 
     assert_raise Tightbeam.DB.Error, ~r/UNIQUE constraint/, fn ->
-      Org.create(db, base(%{session_key: "two", handle: "agent"}))
+      Org.create(db, base(%{session_key: "two", display_name: "Second handle", handle: "agent"}))
     end
 
     assert_raise ArgumentError, "unknown session: missing", fn ->
@@ -1113,7 +1238,7 @@ defmodule Tightbeam.OrgTest do
 
   defp selected_retirement_source(db, prompt) do
     ensure_legacy_main(db)
-    Org.create(db, base(%{session_key: "retiring"}))
+    Org.create(db, base(%{session_key: "retiring", display_name: "Retiring"}))
     Roles.create!(db, "reviewer", "flynn", "retiring")
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
