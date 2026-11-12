@@ -1012,64 +1012,64 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     owner = self()
     boot_attempt = :atomics.new(1, signed: false)
 
+    # The timeout event is triggered explicitly below. Keep a generous
+    # readiness deadline for the ordered refusal replacement and recovery.
     coordinator =
-      start_supervised!(
-        {AdapterCoordinator,
-         adapter_sup: ctx.sup,
-         backoff_base_ms: 250,
-         # The timeout event is triggered explicitly below. Keep a generous
-         # readiness deadline for the ordered refusal replacement and recovery.
-         readiness_timeout_ms: 30_000,
-         adapter_context: fn _ -> [] end,
-         adapter_opts: fn _, context ->
-           attempt = :atomics.add_get(boot_attempt, 1, 1)
+      start_supervised!({
+        AdapterCoordinator,
+        adapter_sup: ctx.sup,
+        backoff_base_ms: 250,
+        readiness_timeout_ms: 30_000,
+        adapter_context: fn _ -> [] end,
+        adapter_opts: fn _, context ->
+          attempt = :atomics.add_get(boot_attempt, 1, 1)
 
-           cond do
-             attempt == 1 ->
-               [
-                 harness: :claude,
-                 cmd: [System.find_executable("false")],
-                 home: "/tmp",
-                 cwd: "/tmp"
-               ]
+          cond do
+            attempt == 1 ->
+              [
+                harness: :claude,
+                cmd: [System.find_executable("false")],
+                home: "/tmp",
+                cwd: "/tmp"
+              ]
 
-             attempt == 2 ->
-               send(owner, {:automatic_recovery_timeout_started, self(), context})
-               Process.sleep(:infinity)
+            attempt == 2 ->
+              send(owner, {:automatic_recovery_timeout_started, self(), context})
+              Process.sleep(:infinity)
 
-             attempt == 3 ->
-               send(owner, {:automatic_recovery_preflight_exit_started, self(), context})
+            attempt == 3 ->
+              send(owner, {:automatic_recovery_preflight_exit_started, self(), context})
 
-               receive do
-                 {:exit_automatic_recovery_preflight, pid} when pid == self() ->
-                   exit(:simulated_preflight_exit)
-               end
+              receive do
+                {:exit_automatic_recovery_preflight, pid} when pid == self() ->
+                  exit(:simulated_preflight_exit)
+              end
 
-             attempt == 4 ->
-               send(owner, {:automatic_recovery_refusal_started, self(), context})
-               Process.sleep(:infinity)
+            attempt == 4 ->
+              send(owner, {:automatic_recovery_refusal_started, self(), context})
+              Process.sleep(:infinity)
 
-             attempt == 5 ->
-               {:error,
-                %{code: "temporary_refusal", message: "The launch refusal remains visible"}}
+            attempt == 5 ->
+              {:error,
+               %{code: "temporary_refusal", message: "The launch refusal remains visible"}}
 
-             true ->
-               send(owner, {:automatic_recovery_boot_started, self(), context})
+            true ->
+              send(owner, {:automatic_recovery_boot_started, self(), context})
 
-               receive do
-                 {:release_automatic_recovery_boot, pid} when pid == self() ->
-                   [
-                     harness: :claude,
-                     cmd: [System.find_executable("node"), path],
-                     home: ctx.test_dir,
-                     cwd: ctx.test_dir
-                   ]
-               end
-           end
-         end,
-         db: ctx.db,
-         name: :circuit_latch_recovery_coordinator}
-      )
+              receive do
+                {:release_automatic_recovery_boot, pid} when pid == self() ->
+                  [
+                    harness: :claude,
+                    cmd: [System.find_executable("node"), path],
+                    home: ctx.test_dir,
+                    cwd: ctx.test_dir
+                  ]
+              end
+          end
+        end,
+        db: ctx.db,
+        name: :circuit_latch_recovery_coordinator
+      })
 
     key = {:claude, "default", "testhost"}
     assert {:ok, _first_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
@@ -1090,7 +1090,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # wall-clock wait. The next automatic preflight proves it re-armed restart.
     send(
       coordinator,
-      {:adapter_readiness_timeout, key, timed_out_entry.generation, timed_out_entry.readiness_token}
+      {:adapter_readiness_timeout, key, timed_out_entry.generation,
+       timed_out_entry.readiness_token}
     )
 
     assert_receive {:automatic_recovery_preflight_exit_started, exited_readiness_task, []}, 10_000
