@@ -347,6 +347,8 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
+  defp handoff_refusal(%{code: "unknown_work_item"} = error), do: error
+
   defp handoff_refusal(%{code: "unknown_delivery_owner", message: message} = error),
     do:
       Map.put(
