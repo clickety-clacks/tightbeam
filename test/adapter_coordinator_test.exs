@@ -1035,6 +1035,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
                send(owner, {:automatic_recovery_timeout_started, self(), context})
                Process.sleep(:infinity)
 
+             attempt == 3 ->
+               send(owner, {:automatic_recovery_refusal_started, self(), context})
+               Process.sleep(:infinity)
+
+             attempt == 4 ->
+               {:error,
+                %{code: "temporary_refusal", message: "The launch refusal remains visible"}}
+
              true ->
                send(owner, {:automatic_recovery_boot_started, self(), context})
 
@@ -1071,9 +1079,28 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              entry.circuit == :open and entry.failures == 2 and is_reference(entry.timer)
            end)
 
+    assert_receive {:automatic_recovery_refusal_started, refusal_readiness_task, []}, 1_500
+    assert is_pid(refusal_readiness_task)
+
+    assert {:error,
+            {:launch_refused,
+             %{code: "temporary_refusal", message: "The launch refusal remains visible"}}} =
+             Task.await(
+               Task.async(fn ->
+                 AdapterCoordinator.adapter_for(coordinator, key,
+                   credential_kind: :subscription
+                 )
+               end)
+             )
+
+    assert wait_until(fn ->
+             entry = :sys.get_state(coordinator).adapters[key]
+             entry.circuit == :open and entry.failures == 3 and is_reference(entry.timer)
+           end)
+
     assert_receive {:automatic_recovery_boot_started, readiness_task, []}, 1_500
 
-    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 2}}} =
+    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 3}}} =
              AdapterCoordinator.adapter_for(coordinator, key)
 
     send(readiness_task, {:release_automatic_recovery_boot, readiness_task})
@@ -1085,9 +1112,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
-    assert :atomics.get(boot_attempt, 1) == 3
+    assert :atomics.get(boot_attempt, 1) == 5
     assert AdapterCoordinator.ready?(coordinator, key)
-    assert {:ok, _recovered_adapter, 3} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert {:ok, _recovered_adapter, 4} = AdapterCoordinator.adapter_for(coordinator, key)
   end
 
   # What the coordinator itself says it is doing: {holding a slot, waiting for one}.

@@ -1201,6 +1201,14 @@ defmodule Tightbeam.AdapterCoordinator do
             {:noreply, start_adapter_unfenced(key, entry, state, opts)}
 
           {:error, refusal} ->
+            state =
+              retry_open_circuit_after_failure(
+                state,
+                key,
+                entry,
+                entry.generation
+              )
+
             {:noreply, finish_readiness(state, key, {:error, {:launch_refused, refusal}})}
         end
 
