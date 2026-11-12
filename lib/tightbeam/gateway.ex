@@ -82,6 +82,7 @@ defmodule Tightbeam.Gateway do
     HarnessHealth,
     HarnessProcess,
     HarklightSend,
+    HarklightWakes,
     Identity,
     Idempotency,
     LaneManager,
@@ -953,6 +954,9 @@ defmodule Tightbeam.Gateway do
       end,
       {"harklight-settle", []} => fn call ->
         HarklightSend.settle(db, call, runner: Map.get(config, :harklight_send_runner))
+      end,
+      {"harklight-listener-restore", []} => fn call ->
+        HarklightWakes.restore_listener(db, call, call.params[:handle])
       end,
       {"harklight-follow", []} => fn call ->
         Tightbeam.HarklightFollows.follow(db, call,
