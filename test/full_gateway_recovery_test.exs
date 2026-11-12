@@ -63,10 +63,8 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
           assert before[table] == after_state[table], "unexpected mutation of #{table}"
         end
 
-        # The open obligation's inactivity deadline was stored before the
-        # crash and is overdue at restart. It fires once and raises one plain
-        # notice to the holder, which may finish while A's recovery and B/C
-        # are settling. The assignment row itself is untouched.
+        # An old open assignment remains unchanged across restart but no longer
+        # acquires an inactivity wake or reminder turn.
         assert before["columns"] == after_state["columns"]
         assignment_columns = before["columns"]["assignments"]
         assert [prior_row] = before["assignments"]
@@ -83,58 +81,17 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         before_wakes = Enum.map(before["wakes"], &Map.new(Enum.zip(wake_columns, &1)))
         after_wakes = Enum.map(after_state["wakes"], &Map.new(Enum.zip(wake_columns, &1)))
 
-        deadline? = fn wake ->
+        inactivity_wake? = fn wake ->
           wake["assignmentId"] == prior["id"] and
-            wake["consumer"] == "assignment_inactivity_deadline"
+            (wake["consumer"] in ["assignment_inactivity_deadline", "assignment_inactivity_climb"] or
+               String.starts_with?(
+                 wake["obligationRef"] || "",
+                 "assignment-inactivity-episode-v1:"
+               ))
         end
 
-        assert [%{"state" => "pending", "wakeId" => deadline_id}] =
-                 Enum.filter(before_wakes, deadline?)
-
-        assert [%{"state" => "canceled", "wakeId" => ^deadline_id} | replacements] =
-                 Enum.filter(after_wakes, deadline?)
-
-        assert replacements != []
-
-        for %{"state" => "fired", "wakeId" => replacement_id, "prompt" => replacement_prompt} <-
-              replacements do
-          refute replacement_id == deadline_id
-          assert %{"intervalMs" => 1_000} = JSON.decode!(replacement_prompt)
-        end
-
-        assert Enum.all?(replacements, &(&1["state"] == "fired"))
-
-        assert [notice] =
-                 Enum.filter(after_wakes, fn wake ->
-                   wake["assignmentId"] == prior["id"] and wake["consumer"] == "prompt" and
-                     String.starts_with?(
-                       wake["obligationRef"] || "",
-                       "assignment-inactivity-episode-v1:"
-                     )
-                 end)
-
-        notice_id = notice["wakeId"]
-        refute Enum.any?(before_wakes, &(&1["wakeId"] == notice_id))
-        assert notice["assignmentId"] == prior["id"]
-        assert notice["sessionKey"] == prior["holderKey"]
-        assert notice["ownerUserId"] == prior["openedByUser"]
-        assert notice["origin"] == "process:tightbeam"
-        assert notice["state"] == "fired"
-        assert is_integer(notice["firedAt"])
-
-        carrier_wake_id =
-          case Map.fetch!(after_state["notice_source_refs"], notice_id) do
-            [id] when is_binary(id) ->
-              id
-
-            [] ->
-              notice_id
-
-            other ->
-              flunk(
-                "expected at most one carrier reference for #{notice_id}, got #{inspect(other)}"
-              )
-          end
+        refute Enum.any?(before_wakes, inactivity_wake?)
+        refute Enum.any?(after_wakes, inactivity_wake?)
 
         turn_columns = after_state["columns"]["turns"]
         after_turns = Enum.map(after_state["turns"], &Map.new(Enum.zip(turn_columns, &1)))
@@ -143,22 +100,9 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         assert [successor_carrier_id] =
                  Map.fetch!(after_state["notice_source_refs"], "w_recovery_successor_a")
 
-        # Boot recovery raises the notice while the scheduler releases A's
-        # queued successor. Whichever is recorded first decides the batch: a
-        # notice pending when the successor's batch seals rides the same
-        # carrier; a later one gets its own carrier turn. Both deliver every
-        # source exactly once.
-        shared_carrier? = successor_carrier_id == carrier_wake_id
-        assert length(a_turns) == if(shared_carrier?, do: 3, else: 4)
-
         # The three recovery turns remain exact: the interrupted direct turn,
         # the queued successor's actual carrier, and the direct health replay.
-        recovery_turns =
-          if shared_carrier?,
-            do: a_turns,
-            else: Enum.reject(a_turns, &(&1["wakeId"] == carrier_wake_id))
-
-        assert Enum.map(recovery_turns, &{&1["wakeId"], &1["status"]}) ==
+        assert Enum.map(a_turns, &{&1["wakeId"], &1["status"]}) ==
                  [
                    {nil, "failed_unknown"},
                    {successor_carrier_id, "delivered"},
@@ -166,38 +110,12 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
                  ]
 
         assert Enum.count(a_turns, &is_nil(&1["wakeId"])) == 2
-        [interrupted, successor, replay] = recovery_turns
+        [interrupted, successor, replay] = a_turns
         assert interrupted["messageId"] == replay["messageId"]
         assert interrupted["prompt"] == replay["prompt"]
         assert successor["prompt"] =~ "w_recovery_successor_a"
         assert successor["prompt"] =~ "RECOVERY_SUCCESSOR_A"
         refute Enum.any?(a_turns, &(&1["wakeId"] == "w_recovery_successor_a"))
-        assert [notice_turn] = Enum.filter(a_turns, &(&1["wakeId"] == carrier_wake_id))
-        assert notice_turn["assignmentId"] == prior["id"]
-        assert notice_turn["status"] == "delivered"
-        assert is_integer(notice_turn["endedAt"])
-
-        assert notice["prompt"] =~
-                 "Assignment asg_recovery_preserve (Recovery preservation), held by agent:recovery:a. Last recorded activity:"
-
-        assert notice_turn["origin"] == notice["origin"]
-
-        cond do
-          carrier_wake_id == notice_id ->
-            assert notice_turn["prompt"] ==
-                     "[from #{notice["origin"]}]\n\n#{notice["prompt"]}"
-
-          shared_carrier? ->
-            assert notice_turn["prompt"] =~ "[batched notices: 2]"
-            assert notice_turn["prompt"] =~ "w_recovery_successor_a"
-            assert notice_turn["prompt"] =~ notice_id
-            assert notice_turn["prompt"] =~ notice["prompt"]
-
-          true ->
-            assert notice_turn["prompt"] =~ "[batched notices: 1]"
-            assert notice_turn["prompt"] =~ notice_id
-            assert notice_turn["prompt"] =~ notice["prompt"]
-        end
 
         # Every committed pre-crash message remains byte-identical exactly once.
         assert length(before["artifacts"]) >= 1
