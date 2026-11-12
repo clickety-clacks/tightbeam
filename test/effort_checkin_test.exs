@@ -158,6 +158,26 @@ defmodule Tightbeam.EffortCheckinTest do
            ) == 0
   end
 
+  test "retired effort process cannot issue a new wake cancellation", ctx do
+    assignment = assign(ctx.db)
+    due_at = System.system_time(:millisecond) + 60_000
+    original = old_wake(ctx.db, assignment.id, "effort_probe", due_at)
+    replacement = old_wake(ctx.db, assignment.id, "effort_probe", due_at)
+
+    assert {:ok, false} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.cancel_in_txn(txn, %{
+                 wake_id: original.wake_id,
+                 requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                 reason_kind: "superseded",
+                 causal_source: %{kind: "wake", id: replacement.wake_id},
+                 outcome: %{kind: "replacement", replacement_wake_id: replacement.wake_id}
+               })
+             end)
+
+    assert %{state: "pending"} = Wakes.get(ctx.db, original.wake_id)
+  end
+
   test "an existing effort request remains readable without restoring its retired rule", ctx do
     assignment = assign(ctx.db)
 

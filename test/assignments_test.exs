@@ -7294,9 +7294,9 @@ defmodule Tightbeam.AssignmentsTest do
         INSERT INTO attests
           (id, assignmentId, kind, verdictKind, byUser, artifactId, contentSha256, ts)
         VALUES ('att_with_artifact', ?1, 'verdict', 'user-ruling', 'flynn',
-                'art_attached', 'recorded-hash', 2)
+                'art_attached', ?2, 2)
         """,
-        [assignment.id]
+        [assignment.id, String.duplicate("a", 64)]
       )
 
     assert {:ok, result} =
@@ -7369,6 +7369,7 @@ defmodule Tightbeam.AssignmentsTest do
     item = create_work_item(ctx, "local file")
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
     path = Path.join(Application.fetch_env!(:tightbeam, :base_dir), "checked-file")
+    File.mkdir_p!(Path.dirname(path))
     File.write!(path, "recorded bytes")
 
     seed_file_artifact(

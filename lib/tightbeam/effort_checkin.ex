@@ -9,8 +9,6 @@ defmodule Tightbeam.EffortCheckin do
   alias Tightbeam.{DB, Wakes}
   alias Tightbeam.DB.Txn
 
-  @holder_prod_marker "effort-holder-prod:"
-
   @ddl """
   CREATE TABLE IF NOT EXISTS effort_checkin_generations (
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
@@ -69,7 +67,4 @@ defmodule Tightbeam.EffortCheckin do
       {:error, error} -> raise error
     end
   end
-
-  def holder_prod_ref(assignment_id) when is_binary(assignment_id),
-    do: @holder_prod_marker <> assignment_id
 end
