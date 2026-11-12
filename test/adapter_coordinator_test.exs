@@ -1016,25 +1016,37 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         backoff_base_ms: 1,
+         backoff_base_ms: 250,
+         readiness_timeout_ms: 100,
          adapter_context: fn _ -> [] end,
          adapter_opts: fn _, context ->
            attempt = :atomics.add_get(boot_attempt, 1, 1)
 
-           if attempt == 1 do
-             [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
-           else
-             send(owner, {:automatic_recovery_boot_started, self(), context})
+           cond do
+             attempt == 1 ->
+               [
+                 harness: :claude,
+                 cmd: [System.find_executable("false")],
+                 home: "/tmp",
+                 cwd: "/tmp"
+               ]
 
-             receive do
-               {:release_automatic_recovery_boot, pid} when pid == self() ->
-                 [
-                   harness: :claude,
-                   cmd: [System.find_executable("node"), path],
-                   home: ctx.test_dir,
-                   cwd: ctx.test_dir
-                 ]
-             end
+             attempt == 2 ->
+               send(owner, {:automatic_recovery_timeout_started, self(), context})
+               Process.sleep(:infinity)
+
+             true ->
+               send(owner, {:automatic_recovery_boot_started, self(), context})
+
+               receive do
+                 {:release_automatic_recovery_boot, pid} when pid == self() ->
+                   [
+                     harness: :claude,
+                     cmd: [System.find_executable("node"), path],
+                     home: ctx.test_dir,
+                     cwd: ctx.test_dir
+                   ]
+               end
            end
          end,
          db: ctx.db,
@@ -1051,9 +1063,17 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
+    assert_receive {:automatic_recovery_timeout_started, timed_out_readiness_task, []}, 1_500
+    assert is_pid(timed_out_readiness_task)
+
+    assert wait_until(fn ->
+             entry = :sys.get_state(coordinator).adapters[key]
+             entry.circuit == :open and entry.failures == 2 and is_reference(entry.timer)
+           end)
+
     assert_receive {:automatic_recovery_boot_started, readiness_task, []}, 1_500
 
-    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 1}}} =
+    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 2}}} =
              AdapterCoordinator.adapter_for(coordinator, key)
 
     send(readiness_task, {:release_automatic_recovery_boot, readiness_task})
@@ -1065,9 +1085,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
-    assert :atomics.get(boot_attempt, 1) == 2
+    assert :atomics.get(boot_attempt, 1) == 3
     assert AdapterCoordinator.ready?(coordinator, key)
-    assert {:ok, _recovered_adapter, 2} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert {:ok, _recovered_adapter, 3} = AdapterCoordinator.adapter_for(coordinator, key)
   end
 
   # What the coordinator itself says it is doing: {holding a slot, waiting for one}.

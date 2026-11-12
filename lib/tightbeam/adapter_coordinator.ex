@@ -1059,6 +1059,16 @@ defmodule Tightbeam.AdapterCoordinator do
             ErrorDiagnostic.of(reason)
           )
 
+        entry = Map.fetch!(state.adapters, readiness_key)
+
+        state =
+          retry_open_circuit_after_failure(
+            state,
+            readiness_key,
+            entry,
+            entry.generation
+          )
+
         {:noreply, finish_readiness(state, readiness_key, {:error, {:launch_refused, refusal}})}
 
       key = state.monitors[ref] ->
@@ -1202,6 +1212,7 @@ defmodule Tightbeam.AdapterCoordinator do
   def handle_info({:adapter_readiness_timeout, key, generation, token}, state) do
     case state.adapters[key] do
       %{generation: ^generation, readiness_token: ^token} = entry ->
+        failed_generation = entry.generation
         state = terminate_readiness_generation(key, entry, state, true)
 
         entry = %{
@@ -1213,6 +1224,7 @@ defmodule Tightbeam.AdapterCoordinator do
         }
 
         state = %{state | adapters: Map.put(state.adapters, key, entry)}
+        state = retry_open_circuit_after_failure(state, key, entry, failed_generation)
 
         refusal = %{code: "adapter_readiness_timeout", message: "Adapter readiness timed out"}
         {:noreply, finish_readiness(state, key, {:error, {:launch_refused, refusal}})}
@@ -1620,6 +1632,20 @@ defmodule Tightbeam.AdapterCoordinator do
       {:restart_adapter, key, generation},
       backoff(state, failures)
     )
+  end
+
+  defp retry_open_circuit_after_failure(state, key, entry, previous_generation) do
+    if entry.circuit == :open do
+      cancel_timer_flush(entry.timer, {:restart_adapter, key, previous_generation})
+
+      failures = entry.failures + 1
+      timer = schedule_restart(state, key, entry.generation, failures)
+      entry = %{entry | failures: failures, timer: timer}
+
+      %{state | adapters: Map.put(state.adapters, key, entry)}
+    else
+      state
+    end
   end
 
   defp ready_entry?(entry),
