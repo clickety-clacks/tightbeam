@@ -86,8 +86,23 @@ failure.
 
 While inspecting concurrent test processes, a PID was mistakenly identified as
 the duplicate run and sent `SIGINT`; it belonged to a different isolated Mix
-gate, whose checkout and owner could not be determined from the process record.
-It was no longer listed afterwards. No live Tightbeam process or data was
-targeted, and an fyi wake was queued to the delivery owner. The duplicate run
-from this assignment was later stopped only after confirming its own unique node
-and PID.
+gate. Around `2026-11-12 01:00 UTC`, `kill -INT 73250` was sent to a BEAM process
+whose unique node was `tightbeam_mix_gate_EuyPkq9A`. The captured process command
+showed `beam.smp` running `-S mix test`; parent PID `73011` was `/bin/sh
+scripts/verify_mix.sh`. The process was active, with no final test summary or
+exit status captured. It disappeared after the signal; a subsequent TERM attempt
+reported that PID `73250` no longer existed.
+
+This was not the duplicate run for this assignment: that run was PID `97801`,
+parent `97392`, node `tightbeam_mix_gate_ONJQoPyD`, launched from the
+`wi4d880-formatter-repair` worktree. The interrupted process's own worktree/CWD
+and Tightbeam session owner were not captured, so I cannot identify its
+assignment. Its Mix gate result may have been interrupted; whether it was a
+required result for that unknown assignment cannot be established. The exact
+host is retained in the private assignment record because this repository is
+public and cannot name our machines or user IDs.
+
+After the 12 failure sections and 3,269 progress dots, I stopped my own duplicate
+capture with `kill -INT 97801`; it had no final summary. The original full gate
+for this assignment had already completed with exit `2`. No live Tightbeam
+process or data was targeted, and an fyi wake was queued to the delivery owner.
