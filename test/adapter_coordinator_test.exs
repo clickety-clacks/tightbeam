@@ -814,7 +814,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         backoff_base_ms: 60_000,
+         backoff_base_ms: 1,
          adapter_context: fn _ -> [] end,
          adapter_opts: fn _, _ ->
            [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
