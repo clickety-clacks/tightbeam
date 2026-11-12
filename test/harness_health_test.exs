@@ -3425,12 +3425,28 @@ defmodule Tightbeam.HarnessHealthTest do
   end
 
   test "Codex usage-limit hold releases on its first successful recovery probe", ctx do
+    second_session = "agent:harness-health:codex-recovery-two"
+
+    Org.create(ctx.db, %{
+      session_key: second_session,
+      display_name: "Codex recovery two",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "coder",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("gpt-5")
+    })
+
+    failure_prompt = "Codex rate limit"
+
     failure_turn =
       fail_health_turn!(
         ctx.db,
         ctx.main_session,
         "codex-rate-limit-recovery",
-        "Codex rate limit",
+        failure_prompt,
         @captured_codex_rate_limit
       )
 
@@ -3448,6 +3464,24 @@ defmodule Tightbeam.HarnessHealthTest do
     assert incident.harness == "codex"
     assert incident.failureClass == "rate-limit-dead"
     assert Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+
+    second_failure_prompt = "Codex rate limit on the second session"
+
+    second_failure_turn =
+      fail_health_turn!(
+        ctx.db,
+        second_session,
+        "codex-rate-limit-recovery-two",
+        second_failure_prompt,
+        @captured_codex_rate_limit
+      )
+
+    assert {:ok, [[^incident_id, "authoritative-provider"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT incidentId,evidenceKind FROM harness_health_observations WHERE correlationId=?1",
+               ["harness-turn:#{second_failure_turn.seq}:rate-limit-dead"]
+             )
 
     assert {:ok,
             %{
@@ -3514,35 +3548,49 @@ defmodule Tightbeam.HarnessHealthTest do
     assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
     refute Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
 
-    {:ok, resumed_seq} =
-      Ledger.enqueue(ctx.db, %{
-        session_key: ctx.main_session,
-        message_id: "codex-after-rate-limit-recovery",
-        origin: "user:flynn",
-        prompt: "continue after the provider limit clears"
-      })
+    start_supervised!({RecoveryLane, {ctx.db, self()}})
 
-    assert {:ok, resumed_turn} =
-             Ledger.claim_next(ctx.db, ctx.main_session, "codex-after-rate-limit-recovery")
+    assert :ok =
+             Wakes.redeliver_cycle_release(
+               ctx.db,
+               release.correlation,
+               release.harness,
+               release.host
+             )
 
-    assert resumed_turn.seq == resumed_seq
-    assert resumed_turn.message_id == "codex-after-rate-limit-recovery"
+    assert {:ok, [[first_redelivery_seq, "queued", ^failure_prompt, cycle_correlation]]} =
+             DB.query(
+               ctx.db,
+               "SELECT a.cycleReleaseTurnSeq,t.status,t.prompt,a.cycleReleaseCorrelation " <>
+                 "FROM health_redelivery_attempts a JOIN turns t ON t.seq=a.cycleReleaseTurnSeq " <>
+                 "WHERE a.sourceTurnSeq=?1",
+               [failure_turn.seq]
+             )
 
-    resumed_turn = Map.put(resumed_turn, :session_key, ctx.main_session)
-    resumed_session = Org.get(ctx.db, ctx.main_session)
+    assert cycle_correlation == release.correlation
 
-    assert {:ok, :ok} =
-             DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(
-                        txn,
-                        resumed_turn.seq,
-                        "delivered",
-                        nil,
-                        owner_lease: resumed_turn.owner_lease
-                      )
+    assert {:ok, [[second_redelivery_seq, "queued", ^second_failure_prompt, ^cycle_correlation]]} =
+             DB.query(
+               ctx.db,
+               "SELECT a.cycleReleaseTurnSeq,t.status,t.prompt,a.cycleReleaseCorrelation " <>
+                 "FROM health_redelivery_attempts a JOIN turns t ON t.seq=a.cycleReleaseTurnSeq " <>
+                 "WHERE a.sourceTurnSeq=?1",
+               [second_failure_turn.seq]
+             )
 
-               HarnessHealth.resolve_normal_turn_in_txn(txn, resumed_session, resumed_turn)
-             end)
+    assert {:ok, first_resumed_turn} =
+             Ledger.claim_next(ctx.db, ctx.main_session, "codex-rate-limit-recovery")
+
+    assert first_resumed_turn.seq == first_redelivery_seq
+    assert first_resumed_turn.message_id == "codex-rate-limit-recovery"
+    assert first_resumed_turn.prompt == failure_prompt
+
+    assert {:ok, second_resumed_turn} =
+             Ledger.claim_next(ctx.db, second_session, "codex-rate-limit-recovery-two")
+
+    assert second_resumed_turn.seq == second_redelivery_seq
+    assert second_resumed_turn.message_id == "codex-rate-limit-recovery-two"
+    assert second_resumed_turn.prompt == second_failure_prompt
   end
 
   test "recovery cycle records each route and releases only after all current routes succeed",
