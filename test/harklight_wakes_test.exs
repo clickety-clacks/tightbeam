@@ -5792,7 +5792,7 @@ defmodule Tightbeam.HarklightWakesTest do
   defp follower_session(db, main, key) do
     Org.create(db, %{
       session_key: key,
-      display_name: "Follower",
+      display_name: "Follower #{key}",
       owner_user_id: "owner",
       origin: "user:owner",
       spawned_by: main.session_key,

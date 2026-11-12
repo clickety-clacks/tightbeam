@@ -6977,7 +6977,7 @@ defmodule Tightbeam.GatewayTest do
       spawn.(%{
         origin: "user:flynn",
         session_key: nil,
-        params: %{display_name: "S", host: host, model: model, idempotency_key: key}
+        params: %{display_name: "S #{key}", host: host, model: model, idempotency_key: key}
       })
     end
 
