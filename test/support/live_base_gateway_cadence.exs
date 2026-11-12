@@ -7,7 +7,6 @@ Tightbeam.GuardGatewayFixture.run!(fn %{config: config} ->
       Gateway.children(
         config
         |> Map.put(:wake_tick_ms, wake_tick)
-        |> Map.put(:supervision_interval_ms, 4_321)
       )
 
     {Tightbeam.Wakes, wake_opts} = Enum.find(children, &match?({Tightbeam.Wakes, _}, &1))

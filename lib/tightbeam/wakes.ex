@@ -1793,15 +1793,6 @@ defmodule Tightbeam.Wakes do
       Txn.q(txn, "INSERT INTO wake_activity_exclusions (wakeId) VALUES (?1)", [wake.wake_id])
     end
 
-    if is_binary(activity_assignment_id) and is_binary(wake.creator_session_key) do
-      Tightbeam.Supervision.activity_in_txn(
-        txn,
-        activity_assignment_id,
-        wake.creator_session_key,
-        wake.created_at
-      )
-    end
-
     schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
     wake
   end
@@ -1965,28 +1956,6 @@ defmodule Tightbeam.Wakes do
     )
 
     wake
-  end
-
-  @doc false
-  def dated_continuation_due_in_txn(%Txn{} = txn, assignment_id, at) do
-    [[due_at]] =
-      Txn.q(
-        txn,
-        """
-        SELECT MAX(w.dueAt) FROM wakes w INDEXED BY wakes_assignment
-        JOIN assignments a ON a.id=w.assignmentId AND a.state='open'
-        JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
-          AND s.assignmentId=a.id AND s.controllerOrigin='holder_continuation'
-          AND s.controllerState='pending'
-        WHERE w.assignmentId=?1 AND w.obligationRef=a.id AND w.sessionKey=a.holderKey
-          AND w.creatorSessionKey=a.holderKey AND w.consumer='prompt'
-          AND w.state='pending' AND w.waitMode IS NULL AND w.conditionKind IS NULL
-          AND w.targetRole IS NULL AND w.dueAt>w.createdAt AND w.dueAt>?2
-        """,
-        [assignment_id, at]
-      )
-
-    due_at
   end
 
   defp continuation_facts_in_txn(txn, wake, assignment_id) do
@@ -4369,7 +4338,7 @@ defmodule Tightbeam.Wakes do
   @reason_kinds ~w(requester_withdrew superseded obligation_disposed cannot_proceed_released routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable condition_cleared)
   @source_kinds ~w(retirement_transition verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request routing_bracket session_transition scheduler_delivery sentinel_transition harness_health_transition)
   @disposition_kinds ~w(retirement_transition assignment_transition work_item_transition decision_request_transition)
-  @liveness_kinds ~w(pending_wake routing_bracket)
+  @liveness_kinds ~w(pending_wake routing_bracket supervision_entitlement)
 
   @process_reasons %{
     "tightbeam:wake-scheduler" =>
@@ -4446,7 +4415,7 @@ defmodule Tightbeam.Wakes do
   defp public_cancellation_outcome(txn, %{impact: "linked_work_open"} = primary) do
     kind = if primary.kind == "assignment", do: :assignment, else: :work_item
 
-    case Supervision.inactivity_deadline_trigger_in_txn(txn, {kind, primary.id}) do
+    case Supervision.liveness_trigger_in_txn(txn, {kind, primary.id}) do
       {:ok, trigger} -> %{kind: "no_replacement", liveness_trigger: trigger}
       :none -> %{kind: "no_replacement"}
     end
@@ -5117,8 +5086,7 @@ defmodule Tightbeam.Wakes do
              exact_terminal_effort_request?(txn, command, outcome, wake, primary) or
              cleared_effort_holder_prod_without_liveness?(txn, command, outcome, wake, primary) or
              completed_assignment_without_liveness?(txn, command, outcome, wake, primary) or
-             cleared_decision_notice_without_liveness?(txn, command, outcome, wake, primary) or
-             ladder_ended_source_cancellation?(txn, command, outcome, primary),
+             cleared_decision_notice_without_liveness?(txn, command, outcome, wake, primary),
            do: {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}},
            else: :error
 
@@ -5150,57 +5118,6 @@ defmodule Tightbeam.Wakes do
 
   defp inactivity_policy_action_cancellation?(_command, _outcome, _wake, _primary),
     do: false
-
-  # Past inactivity ladder end (SN12(e)) open work has no pending trigger to
-  # cite. Only the source-owned shapes the stored cancellation CHECK admits
-  # without a trigger may cancel then.
-  defp ladder_ended_source_cancellation?(txn, command, outcome, primary) do
-    ladder_ended_source_shape?(command, outcome) and inactivity_ladder_ended?(txn, primary)
-  end
-
-  defp ladder_ended_source_shape?(
-         %{
-           requester: %{kind: "process", id: "tightbeam:assignments"},
-           reason_kind: "cannot_proceed_released",
-           causal_source: %{kind: "condition_fact"}
-         },
-         %{kind: "no_replacement"}
-       ),
-       do: true
-
-  defp ladder_ended_source_shape?(
-         %{
-           requester: %{kind: "process", id: "tightbeam:retirement"},
-           reason_kind: "obligation_disposed",
-           causal_source: %{kind: "assignment_transition", id: id}
-         },
-         %{kind: "disposition", disposition_kind: "assignment_transition", disposition_id: id}
-       ),
-       do: true
-
-  defp ladder_ended_source_shape?(
-         %{
-           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-           reason_kind: "obligation_disposed",
-           causal_source: %{kind: "decision_request", id: id}
-         },
-         %{
-           kind: "disposition",
-           disposition_kind: "decision_request_transition",
-           disposition_id: id
-         }
-       ),
-       do: true
-
-  defp ladder_ended_source_shape?(_command, _outcome), do: false
-
-  defp inactivity_ladder_ended?(txn, %{kind: "assignment", id: id}) when is_binary(id),
-    do: Supervision.inactivity_ladder_ended_in_txn(txn, {:assignment, id})
-
-  defp inactivity_ladder_ended?(txn, %{kind: "work_item", id: id}) when is_binary(id),
-    do: Supervision.inactivity_ladder_ended_in_txn(txn, {:work_item, id})
-
-  defp inactivity_ladder_ended?(_txn, _primary), do: false
 
   defp retirement_no_replacement_without_liveness?(
          %{
@@ -5445,29 +5362,30 @@ defmodule Tightbeam.Wakes do
     do: row_exists(txn, "SELECT 1 FROM decision_requests WHERE id=?1", id)
 
   # A work item can remain live through an open child assignment after the
-  # assignment whose effort wake is being disposed has closed. In that case
-  # the child's pending inactivity deadline is the canonical liveness proof
-  # selected by Supervision.inactivity_deadline_trigger_in_txn/2; its primary
-  # row is the assignment, while the disposed wake's primary has resolved to
-  # the shared work item.
+  # assignment whose wake is being disposed has closed. The open assignment
+  # row itself is the liveness proof; a pending inactivity wake is not required.
   defp validate_liveness(
          txn,
-         "pending_wake",
+         "supervision_entitlement",
          id,
-         wake,
+         _wake,
+         %{kind: "assignment", id: primary_id}
+       ) do
+    case Supervision.liveness_trigger_in_txn(txn, {:assignment, primary_id}) do
+      {:ok, %{kind: "supervision_entitlement", id: ^id}} -> :ok
+      _ -> :error
+    end
+  end
+
+  defp validate_liveness(
+         txn,
+         "supervision_entitlement",
+         id,
+         _wake,
          %{kind: "work_item", id: work_item_id}
        ) do
-    with true <- id != wake.wake_id,
-         {:ok, %{kind: "pending_wake", id: ^id}} <-
-           Supervision.inactivity_deadline_trigger_in_txn(txn, {:work_item, work_item_id}),
-         [] <-
-           Txn.q(
-             txn,
-             "SELECT 1 FROM work_items WHERE id=?1 AND (routingWakeId=?2 OR slateWakeId=?2)",
-             [work_item_id, id]
-           ) do
-      :ok
-    else
+    case Supervision.liveness_trigger_in_txn(txn, {:work_item, work_item_id}) do
+      {:ok, %{kind: "supervision_entitlement", id: ^id}} -> :ok
       _ -> :error
     end
   end
@@ -5572,19 +5490,6 @@ defmodule Tightbeam.Wakes do
         """,
         [wake.wake_id]
       )
-
-      dated_continuation_canceled? =
-        Txn.changes(txn) == 1 and wake.consumer == "prompt" and
-          is_binary(wake.assignment_id) and wake.obligation_ref == wake.assignment_id and
-          Txn.q(
-            txn,
-            "SELECT 1 FROM wakes WHERE wakeId=?1 AND waitMode IS NULL AND conditionKind IS NULL AND targetRole IS NULL AND dueAt>createdAt",
-            [wake.wake_id]
-          ) == [[1]]
-
-      if dated_continuation_canceled? do
-        Supervision.dated_continuation_canceled_in_txn(txn, wake.assignment_id, canceled_at)
-      end
 
       if is_binary(wake.assignment_id) do
         Tightbeam.ReminderDelivery.canceled_in_txn(txn, wake.assignment_id, wake.wake_id)
