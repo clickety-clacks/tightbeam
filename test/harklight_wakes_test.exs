@@ -1511,6 +1511,16 @@ defmodule Tightbeam.HarklightWakesTest do
         await_handle_error(db, "attachment_")
         origin = session.session_key
 
+        assert eventually(fn ->
+                 case DB.query(
+                        db,
+                        "SELECT sessionKey,prompt FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'"
+                      ) do
+                   {:ok, [[^origin, _prompt]]} -> true
+                   _ -> false
+                 end
+               end)
+
         assert {:ok, [[^origin, prompt]]} =
                  DB.query(
                    db,
