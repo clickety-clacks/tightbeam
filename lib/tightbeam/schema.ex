@@ -45,6 +45,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Idempotency,
     Tightbeam.ConditionFacts,
     Tightbeam.FactProducers,
+    Tightbeam.RuntimeChanges,
     Tightbeam.SubagentMarkers,
     Tightbeam.Escalation,
     Tightbeam.Wakes,
@@ -2107,6 +2108,7 @@ defmodule Tightbeam.Schema do
     end
 
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
+    :ok = Tightbeam.TurnEvents.ensure_schema(db)
     :ok = upgrade_session_identity(db)
     :ok = upgrade_closed_assignment_reconciliation(db)
     :ok = upgrade_retirement_parent_moves(db)

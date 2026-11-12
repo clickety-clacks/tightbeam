@@ -5,6 +5,8 @@ defmodule Tightbeam.Acp.AdapterTest do
   doctest Tightbeam.Acp.Adapter
 
   alias Tightbeam.Acp.Adapter
+  alias Tightbeam.{Archetypes, DB, Devices, Identity, Ledger, Projection, TurnEvents}
+  alias Tightbeam.Firehose.Hub
   alias Tightbeam.Model
   alias Tightbeam.ErrorDiagnostic
 
@@ -673,6 +675,12 @@ defmodule Tightbeam.Acp.AdapterTest do
         cwd: "/tmp",
         name: :"adapter_#{System.unique_integer([:positive])}"
       ]
+      |> then(fn adapter_opts ->
+        case Keyword.fetch(opts, :db) do
+          {:ok, db} -> Keyword.put(adapter_opts, :db, db)
+          :error -> adapter_opts
+        end
+      end)
       |> then(fn adapter_opts ->
         case Keyword.get(opts, :stderr_path, stderr_path) do
           :omit -> adapter_opts
@@ -4140,10 +4148,204 @@ defmodule Tightbeam.Acp.AdapterTest do
               stop_reason: "end_turn",
               text: "first messagesecond message",
               messages: [
-                %{message_id: "msg-1", text: "first message"},
-                %{message_id: "msg-2", text: "second message"}
+                %{message_id: "msg-1", logical_message_id: first_id, text: "first message"},
+                %{message_id: "msg-2", logical_message_id: second_id, text: "second message"}
               ]
             }} = Adapter.prompt(adapter, sid, "preserve boundaries")
+
+    assert first_id =~ ~r/^s_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+    assert second_id =~
+             ~r/^s_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+    refute first_id == second_id
+  end
+
+  test "mixed ACP messageId chunks keep anonymous groups distinct in ordered events" do
+    base_dir =
+      Path.join(System.tmp_dir!(), "tightbeam-turn-events-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(base_dir)
+    :initialized = Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+
+    db = String.to_atom("turn_events_db_#{System.unique_integer([:positive])}")
+    start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!({Hub, name: Hub})
+    :ok = ensure_all_schemas(db)
+
+    {:paired, _device} =
+      Devices.pair(db, %{
+        device_id: "turn-events-device",
+        claimed_name: "Test Device",
+        platform: nil,
+        model: nil
+      })
+
+    session = ensure_main_session(db, "turn-event-owner")
+
+    {:appended, prompt_message} =
+      Projection.append(db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "Start the ordered turn."
+      })
+
+    {:ok, turn_seq} =
+      Ledger.enqueue(db, %{
+        session_key: session.session_key,
+        message_id: prompt_message.id,
+        origin: "user:turn-event-owner",
+        prompt: prompt_message.content
+      })
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    {adapter, _capture_path} = start_adapter(db: db, probe: false)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    :sys.replace_state(adapter, fn state ->
+      %{
+        state
+        | chunks: Map.put(state.chunks, sid, []),
+          tool_turns:
+            Map.put(state.tool_turns, sid, %{session_key: session.session_key, turn_seq: turn_seq})
+      }
+    end)
+
+    send_update = fn update ->
+      send(
+        adapter,
+        {:acp_notification, "session/update", %{"sessionId" => sid, "update" => update}}
+      )
+    end
+
+    send_update.(%{
+      "sessionUpdate" => "agent_message_chunk",
+      "content" => %{"type" => "text", "text" => "A"}
+    })
+
+    send_update.(%{
+      "sessionUpdate" => "tool_call_update",
+      "toolCallId" => "provider-tool-1",
+      "title" => "Run command",
+      "kind" => "execute",
+      "status" => "in_progress",
+      "rawInput" => %{"command" => "printf result"}
+    })
+
+    send_update.(%{
+      "sessionUpdate" => "agent_message_chunk",
+      "content" => %{"type" => "text", "text" => "A2"}
+    })
+
+    send_update.(%{
+      "sessionUpdate" => "agent_message_chunk",
+      "messageId" => "provider-message-1",
+      "content" => %{"type" => "text", "text" => "B"}
+    })
+
+    send_update.(%{
+      "sessionUpdate" => "tool_call_update",
+      "toolCallId" => "provider-tool-1",
+      "status" => "completed",
+      "rawOutput" => %{"stdout" => "result"}
+    })
+
+    send_update.(%{
+      "sessionUpdate" => "agent_message_chunk",
+      "content" => %{"type" => "text", "text" => "C"}
+    })
+
+    image_content = %{"type" => "image", "data" => "YWJj"}
+
+    send_update.(%{
+      "sessionUpdate" => "agent_message_chunk",
+      "content" => image_content
+    })
+
+    state = :sys.get_state(adapter)
+
+    assert [
+             %{
+               message_id: nil,
+               logical_message_id: later_anonymous_id,
+               chunks: ["C"]
+             },
+             %{
+               message_id: "provider-message-1",
+               logical_message_id: identified_id,
+               chunks: ["B"]
+             },
+             %{
+               message_id: nil,
+               logical_message_id: first_anonymous_id,
+               chunks: ["A2", "A"]
+             }
+           ] = state.chunks[sid]
+
+    for logical_message_id <- [first_anonymous_id, identified_id, later_anonymous_id] do
+      assert logical_message_id =~
+               ~r/^s_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    end
+
+    assert length(Enum.uniq([first_anonymous_id, identified_id, later_anonymous_id])) == 3
+
+    %{rows: events} =
+      TurnEvents.page_for_session(db, session.session_key, :latest, 20, turn_seq)
+
+    assert Enum.map(events, &{&1.turn_event_seq, &1.kind}) == [
+             {1, "assistant.segment"},
+             {2, "tool.started"},
+             {3, "assistant.segment"},
+             {4, "assistant.segment"},
+             {5, "tool.ended"},
+             {6, "assistant.segment"},
+             {7, "assistant.segment"}
+           ]
+
+    assert events
+           |> Enum.filter(&(&1.kind == "assistant.segment"))
+           |> Enum.map(& &1.message_id) == [
+             first_anonymous_id,
+             first_anonymous_id,
+             identified_id,
+             later_anonymous_id,
+             later_anonymous_id
+           ]
+
+    assert Enum.at(events, 1).tool_call["rowVersion"] == 1
+    assert Enum.at(events, 4).tool_call["rowVersion"] == 2
+    assert List.last(events).content == image_content
+
+    whole_replies =
+      state.chunks[sid]
+      |> Enum.reverse()
+      |> Enum.map(fn group ->
+        {group.logical_message_id, group.chunks |> Enum.reverse() |> Enum.join()}
+      end)
+
+    assert whole_replies == [
+             {first_anonymous_id, "AA2"},
+             {identified_id, "B"},
+             {later_anonymous_id, "C"}
+           ]
+
+    appended_replies =
+      Enum.map(whole_replies, fn {logical_message_id, text} ->
+        {:appended, message} =
+          Projection.append(db, %{
+            id: logical_message_id,
+            session_key: session.session_key,
+            role: "assistant",
+            content: text
+          })
+
+        message
+      end)
+
+    assert Enum.map(appended_replies, & &1.id) ==
+             [first_anonymous_id, identified_id, later_anonymous_id]
   end
 
   test "consecutive prompts reset the accumulator" do
