@@ -985,7 +985,7 @@ defmodule Tightbeam.HarklightWakes do
       SELECT DISTINCT h.handle
       FROM harklight_wake_handles h
       JOIN harklight_wake_entries e ON e.handle=h.handle
-      WHERE h.state IN ('active','unavailable') AND e.entryKind='terminal' AND e.entryAuthor='person'
+      WHERE h.state IN ('active','unavailable') AND e.entryKind='terminal'
         AND (?1 IS NULL OR h.sessionKey=?1)
       ORDER BY h.handle
       """,
@@ -2593,7 +2593,7 @@ defmodule Tightbeam.HarklightWakes do
   defp handling_instruction(handle, event_id, message_id, _kind, _author) do
     "Handle this Harklight entry from your originating session. First run `harklight-agent ack --session #{handle} --event #{event_id}`. " <>
       "For a person discussion, reply with `harklight-agent reply --session #{handle} --request #{message_id} --in-reply-to #{event_id} --body <reply>`. " <>
-      "For an answered terminal by a person, reconcile any earlier effect before applying once, then report with `harklight-agent result --session #{handle} --request #{message_id} --in-reply-to #{event_id} --status applied|refused`. An agent-authored terminal is not the person's choice. " <>
+      "For an answered terminal, reconcile any earlier effect before applying once, then report with `harklight-agent result --session #{handle} --request #{message_id} --in-reply-to #{event_id} --status applied|refused`. " <>
       "For cleared, expired or superseded, stop work on that request; do not treat it as approval. " <>
       "If delivered is true, check prior effects before acting again. Do not run listen; the controller listens."
   end

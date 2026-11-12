@@ -768,7 +768,7 @@ defmodule Tightbeam.HarklightLifecycle do
           answers =
             entries
             |> Enum.filter(fn entry ->
-              entry.entry_kind == "terminal" and entry.entry_author == "person" and
+              entry.entry_kind == "terminal" and
                 get_in(entry.line, ["entry", "terminal_state"]) == "answered"
             end)
             |> Enum.map(&{&1.sender_id, &1.message_id})
