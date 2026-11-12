@@ -1010,7 +1010,7 @@ defmodule Tightbeam.HarnessHealth do
   defp authoritative_provider_turn_failure?(%{harness: harness}, %{
          "data" => %{"codexErrorInfo" => "usageLimitExceeded"}
        }),
-       do: to_string(harness) == "codex"
+       do: Tightbeam.Harness.parse!(to_string(harness)) == Tightbeam.Harness.Codex
 
   defp authoritative_provider_turn_failure?(_session, _reason), do: false
 
