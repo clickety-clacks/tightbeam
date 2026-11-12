@@ -127,6 +127,11 @@ defmodule Tightbeam.Harness.Claude do
   # the subscription one is ever handed to the harness as a file.
   @impl true
   def ensure_adapter(target) do
+    target =
+      target
+      |> Map.put_new(:patch_adapter, &Tightbeam.Harness.ClaudeFoldedPrompt.local/1)
+      |> Map.put_new(:remote_patch, &Tightbeam.Harness.ClaudeFoldedPrompt.remote(target, &1, &2))
+
     Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
   end
 
@@ -567,7 +572,7 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def conformance_vectors do
-    source = "stock claude adapter fixture"
+    source = Tightbeam.Harness.ClaudeFoldedPrompt.fixture()
 
     valid_entry = %{
       family: "claude-vector",
@@ -619,9 +624,8 @@ defmodule Tightbeam.Harness.Claude do
       adapter_bundle: @adapter_bundle,
       adapter_version: @adapter_version,
       source: source,
-      patched: source,
-      remote_patch_detail: "",
-      stock_adapter: true,
+      patched: Tightbeam.Harness.ClaudeFoldedPrompt.patch(source),
+      remote_patch_detail: "; claude adapter patched",
       session_meta: %{
         systemPrompt: %{
           type: "preset",
