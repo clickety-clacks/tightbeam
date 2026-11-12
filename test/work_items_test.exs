@@ -762,6 +762,23 @@ defmodule Tightbeam.WorkItemsTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
+  test "handoff refuses an unknown work item and identifies its ID", ctx do
+    work_item_id = "wi_missing_handoff"
+
+    request =
+      handoff_call({:user, "flynn"}, %{
+        work_item_id: work_item_id,
+        delivery_owner_session_key: ctx.holder.session_key,
+        brief: "A complete brief."
+      })
+      |> Map.put(:session_key, ctx.holder.session_key)
+
+    assert {:error, %{code: "unknown_work_item", message: message}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, request)
+
+    assert message =~ work_item_id
+  end
+
   test "handoff wake failure rolls back both new and existing item state", ctx do
     existing = create(ctx, {:user, "flynn"}, %{title: "Atomic existing handoff"})
 
