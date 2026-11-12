@@ -1156,6 +1156,91 @@ defmodule Tightbeam.HarklightWakesTest do
     assert String.contains?(prompt, @handle)
   end
 
+  test "Gateway listener restoration preserves the original session delivery route", %{
+    db: db,
+    call: call,
+    session: session,
+    main: main
+  } do
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1",
+               [@handle]
+             )
+
+    parent = self()
+
+    listener = fn manager, handle, vendor_id ->
+      send(parent, {:listener_started, handle, vendor_id})
+      :ok = GenServer.call(manager, {:attached, handle})
+
+      :ok =
+        GenServer.call(
+          manager,
+          {:capture, handle, event(1, "discussion", "same-session reply")}
+        )
+
+      send(parent, :reply_captured)
+
+      receive do
+        :stop -> :ok
+      end
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: listener, send_runner: lifecycle_runner(db)}
+      )
+
+    assert :sys.get_state(manager).workers == %{}
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable',lastError='listener_stopped' WHERE handle=?1",
+               [@handle]
+             )
+
+    other_call = %{
+      call
+      | session_key: main.session_key,
+        principal: {:session, main.session_key},
+        transport_session_key: main.session_key
+    }
+
+    assert %{code: "harklight_origin_mismatch", outcome: "refused"} =
+             HarklightWakes.restore_listener(db, other_call, @handle)
+
+    assert %{
+             command: "listener-restore",
+             outcome: "requested",
+             listener_state: "restoring",
+             handle: @handle,
+             session_key: origin_key
+           } = HarklightWakes.restore_listener(db, call, @handle)
+
+    assert origin_key == session.session_key
+    assert_receive {:listener_started, @handle, _vendor_id}
+    assert_receive :reply_captured
+
+    assert {:ok, [[^origin_key, prompt]]} =
+             DB.query(
+               db,
+               """
+               SELECT w.sessionKey,w.prompt
+               FROM harklight_wake_entries e
+               JOIN wakes w ON w.wakeId=e.wakeId
+               WHERE e.handle=?1
+               """,
+               [@handle]
+             )
+
+    assert prompt =~ "same-session reply"
+  end
+
   for saved_error <- ["listener_stopped", "attachment_refused"] do
     @saved_error saved_error
     test "restart restores an existing #{@saved_error} handle without changing captured state", %{
@@ -3685,7 +3770,7 @@ defmodule Tightbeam.HarklightWakesTest do
     assert reason =~ "already settled as refused"
   end
 
-  test "cross-session retract is allowed and an uncertain command may be reissued", %{
+  test "cross-session retract settles the original uncertain operation", %{
     db: db,
     call: call,
     main: main
@@ -3698,29 +3783,44 @@ defmodule Tightbeam.HarklightWakesTest do
         params: %{message_id: "request"}
     }
 
-    runner = fn ["retract", "--session", @handle, "--request", "request", "--op-id", op] ->
-      send(self(), {:operation, op})
-      {JSON.encode!(%{kind: "outcome_unknown", op_id: op}), 7}
+    parent = self()
+
+    uncertain = fn args ->
+      op = List.last(args)
+      send(parent, {:operation, op, args})
+      frame(%{kind: "outcome_unknown", op_id: op})
     end
 
-    assert %{outcome: "outcome_unknown", wake_effect: "none"} =
-             HarklightSend.change_request(db, caller, "retract", runner: runner)
+    assert %{outcome: "outcome_unknown", wake_effect: "none", op_id: first} =
+             HarklightSend.change_request(db, caller, "retract", runner: uncertain)
 
-    assert_receive {:operation, first}
+    assert_receive {:operation, ^first, saved_request}
 
-    assert %{outcome: "outcome_unknown"} =
-             HarklightSend.change_request(db, caller, "retract", runner: runner)
+    assert %{op_id: ^first, request: ^saved_request, state: "pending"} =
+             HarklightLifecycle.lookup_change(db, "request")
 
-    assert_receive {:operation, second}
-    refute first == second
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_subscription_ends")
+    no_op = fn _ -> flunk("unresolved retract ran a new operation") end
 
-    committed = fn args ->
-      frame(%{kind: "committed", operation: "withdraw", op_id: List.last(args), response: %{}})
-    end
+    assert %{outcome: "refused", code: "harklight_operation_unresolved"} =
+             HarklightSend.change_request(db, caller, "retract", runner: no_op)
 
-    assert %{outcome: "committed", wake_effect: "ended"} =
-             HarklightSend.change_request(db, caller, "retract", runner: committed)
+    settled =
+      HarklightSend.settle(db, caller,
+        runner: fn args ->
+          assert args == saved_request
+          frame(%{kind: "committed", operation: "withdraw", op_id: first, response: %{}})
+        end
+      )
+
+    assert %{
+             command: "settle",
+             settled_command: "retract",
+             outcome: "committed",
+             op_id: ^first,
+             wake_effect: "ended"
+           } = settled
+
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM harklight_subscription_ends")
   end
 
   test "revise passes its base revision and keeps the reply subscription", %{db: db, call: call} do
@@ -3761,6 +3861,99 @@ defmodule Tightbeam.HarklightWakesTest do
     assert %{outcome: "refused", reason: "request is at revision 2"} =
              HarklightSend.change_request(db, revised, "revise",
                runner: fn _ -> {"request is at revision 2", 2} end
+             )
+  end
+
+  test "uncertain revise is settled with its original operation ID and saved request", %{
+    db: db,
+    call: call
+  } do
+    assert_change_recovery(
+      db,
+      call,
+      "revise",
+      %{message_id: "request", base_revision: 1, title: "Updated", body: "Saved text"},
+      "revise",
+      %{revision: 2}
+    )
+  end
+
+  test "uncertain retract is settled with its original operation ID and saved request", %{
+    db: db,
+    call: call
+  } do
+    assert_change_recovery(
+      db,
+      call,
+      "retract",
+      %{message_id: "request"},
+      "withdraw",
+      %{}
+    )
+  end
+
+  test "a thrown revise command preserves its saved operation for settlement", %{
+    db: db,
+    call: call
+  } do
+    change_call = %{
+      call
+      | params: %{
+          message_id: "request",
+          base_revision: 1,
+          title: "Updated",
+          body: "Saved text"
+        }
+    }
+
+    assert %{
+             outcome: "outcome_unknown",
+             code: "harklight_cli_failed",
+             op_id: op_id
+           } =
+             HarklightSend.change_request(db, change_call, "revise",
+               runner: fn _args -> raise "connection lost" end
+             )
+
+    assert %{
+             op_id: ^op_id,
+             request: saved_request,
+             state: "pending"
+           } = HarklightLifecycle.lookup_change(db, "request")
+
+    assert saved_request == [
+             "revise",
+             "--session",
+             @handle,
+             "--request",
+             "request",
+             "--base-revision",
+             "1",
+             "--title",
+             "Updated",
+             "--body",
+             "Saved text",
+             "--op-id",
+             op_id
+           ]
+
+    assert %{
+             command: "settle",
+             settled_command: "revise",
+             outcome: "committed",
+             op_id: ^op_id
+           } =
+             HarklightSend.settle(db, %{call | params: %{message_id: "request"}},
+               runner: fn args ->
+                 assert args == saved_request
+
+                 frame(%{
+                   kind: "committed",
+                   operation: "revise",
+                   op_id: op_id,
+                   response: %{revision: 2}
+                 })
+               end
              )
   end
 
@@ -5267,6 +5460,88 @@ defmodule Tightbeam.HarklightWakesTest do
              )
 
     :ok
+  end
+
+  defp assert_change_recovery(db, call, command, params, committed_operation, response) do
+    request_call = %{call | params: params}
+    settle_call = %{call | params: %{message_id: "request"}}
+    parent = self()
+
+    uncertain_runner = fn args ->
+      op_id = List.last(args)
+
+      assert {:ok, [[payload, nil, "pending"]]} =
+               DB.query(
+                 db,
+                 "SELECT payload,result,state FROM harklight_send_operations WHERE opId=?1",
+                 [op_id]
+               )
+
+      decoded = JSON.decode!(payload)
+      assert decoded["operation_kind"] == "change"
+      assert decoded["command"] == command
+      assert decoded["message_id"] == "request"
+      assert decoded["request"] == args
+      send(parent, {:external_change_request, command, args})
+
+      frame(%{kind: "outcome_unknown", op_id: op_id, reason: "connection lost"})
+    end
+
+    assert %{
+             command: ^command,
+             outcome: "outcome_unknown",
+             op_id: op_id,
+             reason: reason
+           } = HarklightSend.change_request(db, request_call, command, runner: uncertain_runner)
+
+    assert reason =~ "harklight-settle"
+    assert_receive {:external_change_request, ^command, saved_request}
+
+    assert %{op_id: ^op_id, request: ^saved_request, state: "pending"} =
+             HarklightLifecycle.lookup_change(db, "request")
+
+    no_op = fn _ -> flunk("unresolved change operation ran a new request") end
+
+    assert %{outcome: "refused", code: "harklight_operation_unresolved"} =
+             HarklightSend.change_request(db, request_call, command, runner: no_op)
+
+    settled =
+      HarklightSend.settle(db, settle_call,
+        runner: fn args ->
+          assert args == saved_request
+
+          frame(%{
+            kind: "committed",
+            operation: committed_operation,
+            op_id: op_id,
+            response: response
+          })
+        end
+      )
+
+    assert %{
+             command: "settle",
+             settled_command: ^command,
+             outcome: "committed",
+             op_id: ^op_id
+           } = settled
+
+    assert %{op_id: ^op_id, request: ^saved_request, state: "committed"} =
+             HarklightLifecycle.lookup_change(db, "request")
+
+    assert :ok = HarklightSend.recover_pending(db, runner: no_op)
+
+    assert %{outcome: "refused", reason: reason} =
+             HarklightSend.settle(db, settle_call, runner: no_op)
+
+    assert reason =~ "already settled as committed"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_send_operations WHERE json_extract(payload,'$.operation_kind')='change' AND json_extract(payload,'$.message_id')=?1",
+               ["request"]
+             )
   end
 
   defp frame(value), do: {JSON.encode!(value) <> "\n", 0}

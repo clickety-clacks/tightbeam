@@ -73,6 +73,7 @@ impl CommandContext {
             HarklightRevise { .. } => ("cli.harklight_revise", DispatchPath),
             HarklightRetract { .. } => ("cli.harklight_retract", DispatchPath),
             HarklightSettle { .. } => ("cli.harklight_settle", DispatchPath),
+            HarklightListenerRestore { .. } => ("cli.harklight_listener_restore", DispatchPath),
             HarklightFollow { .. } => ("cli.harklight_follow", DispatchPath),
             HarklightBriefingsCatchup { .. } => ("cli.harklight_briefings_catchup", DispatchPath),
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
@@ -451,6 +452,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HarklightRevise { .. }
         | HarklightRetract { .. }
         | HarklightSettle { .. }
+        | HarklightListenerRestore { .. }
         | HarklightFollow { .. }
         | HarklightBriefingsCatchup { .. }
         | ToolCallObserved
@@ -584,6 +586,27 @@ mod tests {
             EffectContract::WriteWithoutIdempotency
         );
         assert!(!format!("{context:?}").contains("7"));
+    }
+
+    #[test]
+    fn harklight_listener_restore_is_an_unkeyed_dispatch_write() {
+        let command = Command::HarklightListenerRestore {
+            identity: Identity::Session,
+            handle: "PRIVATE_HANDLE".into(),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.harklight_listener_restore"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        assert!(!format!("{context:?}").contains("PRIVATE_HANDLE"));
     }
 
     #[test]

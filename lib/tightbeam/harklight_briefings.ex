@@ -931,7 +931,7 @@ defmodule Tightbeam.HarklightBriefings do
   defp send_operations(db) do
     case DB.query(
            db,
-           "SELECT opId,sessionKey,payload,handle,senderId,messageId,state,attemptedAt FROM harklight_send_operations ORDER BY createdAt,opId"
+           "SELECT opId,sessionKey,payload,handle,senderId,messageId,state,attemptedAt FROM harklight_send_operations WHERE COALESCE(json_extract(payload,'$.operation_kind'),'send')<>'change' ORDER BY createdAt,opId"
          ) do
       {:ok, rows} ->
         Enum.reduce_while(rows, {:ok, []}, fn [
