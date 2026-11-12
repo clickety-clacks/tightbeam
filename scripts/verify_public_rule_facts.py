@@ -10,10 +10,12 @@ from pathlib import Path
 SOURCE = Path("lib/tightbeam/rules.ex")
 COMPATIBILITY_BASELINE = "6c13efcbe9e1ae247b8aa7e91a374015c74dc947"
 LAST_SHIPPED_SOURCE = "e28880d6a2980c4ca5a7a983a707f83d504da960"
-# This fact existed only in unshipped 0.1.9 candidates. It encoded engineering
-# role policy in neutral runtime and was withdrawn before the 0.1.9 release.
+# Each entry qualifies an unshipped fact only when every historical source
+# revision containing it is an ancestor of its recorded withdrawal point.
 UNSHIPPED_WITHDRAWN_FACTS = {
-    "assign.admission_context": "27f74c1a2353cdee7ded640b8142ea98bfbae0cd^"
+    "assign.admission_context": "27f74c1a2353cdee7ded640b8142ea98bfbae0cd^",
+    "call.file_effect_manifest.valid": "51dcf59a0b4b3a81d8e7df94962643f126c23281",
+    "work_item.changes_requested_count": "51dcf59a0b4b3a81d8e7df94962643f126c23281",
 }
 FACTS = re.compile(r'@facts %\{\n(.*?)\n  \}', re.DOTALL)
 FACT_NAME = re.compile(r'^\s*"([^"]+)"\s*=>', re.MULTILINE)

@@ -16,6 +16,8 @@ defmodule Tightbeam.Rules do
   ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
+  `assignment.qualifying_review_verdict_kinds`,
+  `assignment.qualifying_verification_verdict_kinds`,
   `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
   holder recorded on its work item, in every artifact state). Assignment
   caller identity comes from the optional dispatch principal rather than the
@@ -134,10 +136,13 @@ defmodule Tightbeam.Rules do
   @verdict_facts ~w(
     assignment.verdicts
     assignment.independent_verdict_kinds
+    assignment.qualifying_review_verdict_kinds
+    assignment.qualifying_verification_verdict_kinds
     work_item.verdict_kinds
   )
   @linked_review_facts ~w(
     assignment.independent_verdict_kinds
+    assignment.qualifying_review_verdict_kinds
   )
   @name_re ~r/^[a-z0-9][a-z0-9-]*$/
   @facts %{
@@ -179,6 +184,8 @@ defmodule Tightbeam.Rules do
     "assignment.outcome" => :string,
     "assignment.holder_noted_verdict_kinds" => {:list, :string},
     "assignment.independent_verdict_kinds" => {:list, :string},
+    "assignment.qualifying_review_verdict_kinds" => {:list, :string},
+    "assignment.qualifying_verification_verdict_kinds" => {:list, :string},
     "assignment.artifact_kinds" => {:list, :string},
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
@@ -3025,6 +3032,38 @@ defmodule Tightbeam.Rules do
     with_dependency("$verdict_authors", db, call, cache, fn
       nil, cache -> {nil, cache}
       authors, cache -> {distinct_verdict_kinds(authors), cache}
+    end)
+  end
+
+  defp compute_fact("assignment.qualifying_review_verdict_kinds", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        kinds =
+          Assignments.qualifying_review_verdict_kinds(
+            db,
+            assignment.id,
+            assignment.holder_key
+          )
+
+        {kinds, cache}
+    end)
+  end
+
+  defp compute_fact("assignment.qualifying_verification_verdict_kinds", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {Assignments.qualifying_verification_verdict_kinds(
+           db,
+           assignment.id,
+           assignment.holder_key,
+           get_in(call, [:params, :commit_refs])
+         ), cache}
     end)
   end
 
