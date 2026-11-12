@@ -2079,6 +2079,7 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     premature_recovery = restore_health_turn!(ctx.db, healthy.session, "premature-recovery")
+    restoration_seq = premature_recovery.seq
     assert HarnessHealth.get(ctx.db, initial_incident.id).state == "resolved"
 
     assert {:ok, [[first_redelivery_seq]]} =
@@ -2112,7 +2113,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     if is_function(post_commit, 0), do: post_commit.()
 
-    assert {:ok, [[nil, nil, nil, nil]]} =
+    assert {:ok, [[^restoration_seq, ^first_redelivery_seq, nil, nil]]} =
              DB.query(
                ctx.db,
                "SELECT restorationTurnSeq,redeliveryTurnSeq,cycleReleaseCorrelation,cycleReleaseTurnSeq FROM health_redelivery_attempts WHERE sessionKey=?1 AND sourceMessageId=?2",
