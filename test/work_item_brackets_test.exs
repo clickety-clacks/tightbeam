@@ -630,6 +630,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
              })
 
     assert get(ctx, iceboxed.id).workItem.failReason == "waiting for a decision"
+
     assert Enum.find(list(ctx).workItems, &(&1.id == iceboxed.id)).failReason ==
              "waiting for a decision"
 
