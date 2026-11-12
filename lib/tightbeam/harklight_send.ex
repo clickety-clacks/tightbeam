@@ -917,7 +917,6 @@ defmodule Tightbeam.HarklightSend do
   end
 
   defp invoke_response(output, status, expected, op_id, operations) do
-
     frames =
       output
       |> String.split("\n", trim: true)

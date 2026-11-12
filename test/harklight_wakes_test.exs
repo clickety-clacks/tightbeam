@@ -3939,6 +3939,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert_receive :retry_missing
     assert_receive :saved_request_replayed
+
     assert %{op_id: ^op_id, request: ^saved_request, state: "committed"} =
              HarklightLifecycle.lookup_change(db, "request")
   end
@@ -3971,13 +3972,16 @@ defmodule Tightbeam.HarklightWakesTest do
         {"operation journal unavailable", 1}
 
       args ->
-        flunk("settlement replayed a request without a missing-operation result: #{inspect(args)}")
+        flunk(
+          "settlement replayed a request without a missing-operation result: #{inspect(args)}"
+        )
     end
 
     assert %{outcome: "outcome_unknown", op_id: ^op_id} =
              HarklightSend.settle(db, settle_call, runner: runner)
 
     assert_receive :retry_failed
+
     assert %{op_id: ^op_id, request: ^saved_request, state: "pending"} =
              HarklightLifecycle.lookup_change(db, "request")
   end
@@ -5599,6 +5603,7 @@ defmodule Tightbeam.HarklightWakesTest do
       HarklightSend.settle(db, settle_call,
         runner: fn args ->
           assert args == ["retry", "--op-id", op_id]
+
           assert %{op_id: ^op_id, request: ^saved_request, state: "pending"} =
                    HarklightLifecycle.lookup_change(db, "request")
 
