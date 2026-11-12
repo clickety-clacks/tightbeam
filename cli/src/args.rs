@@ -1116,8 +1116,7 @@ COMMANDS:
   decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
       List decision requests visible to your principal.
   decision-request --request <decisionRequestId>
-      Read one effort request by complete id. Other request kinds keep their
-      existing visibility rules.
+      Read one decision request by complete id.
   assignment-stop-turn <assignmentId> --reason "<why>"
       Stop the current turn only when you opened that assignment.
   cancel-turn --session <key>
