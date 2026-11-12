@@ -368,6 +368,8 @@ defmodule Tightbeam.GatewayTest do
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
 
+    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
+
     def handle_call({:new_candidate_session, _model, _cwd, _mcp, _guidance}, _from, parent) do
       send(parent, :candidate_prepare_attempted)
       {:reply, {:error, :deliberate_candidate_failure}, parent}
@@ -431,6 +433,15 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:knows_session?, sid}, _from, {parent, opts} = state) do
       send(parent, {:tune_residency_checked, sid})
       {:reply, Keyword.get(opts, :resident, true), state}
+    end
+
+    def handle_call(
+          {:apply_model_strict, sid, model, _prior, _deadline},
+          _from,
+          {parent, opts} = state
+        ) do
+      send(parent, {:tune_config_applied, sid, model})
+      {:reply, Keyword.get(opts, :apply_result, {:ok, model}), state}
     end
 
     def handle_call({:current_model, _sid}, _from, {_parent, opts} = state),
@@ -7644,45 +7655,133 @@ defmodule Tightbeam.GatewayTest do
     assert Org.current_pointer(ctx.db, "k1").harness_session_id == "candidate-reported"
   end
 
-  test "set_model refuses while the lane owns a running turn", ctx do
-    base_dir = role_test_base("resident-set-model-busy")
+  for {harness, provider, family} <- [
+        {"claude", "anthropic", "claude-sonnet-4-6"},
+        {"codex", "openai", "gpt-5.6-sol"}
+      ] do
+    test "#{harness} model and effort requests apply in place during a running turn", ctx do
+      harness = unquote(harness)
+      provider = unquote(provider)
+      family = unquote(family)
+      base_dir = role_test_base("resident-set-model-running-" <> harness)
+      Archetypes.load!(base_dir)
+      config = gateway_config(base_dir, ctx.db, 0)
+      local_host = Placement.local_host_name()
+      origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+      Org.set_host(ctx.db, "k1", local_host)
+
+      Org.set_harness(
+        ctx.db,
+        "k1",
+        harness,
+        provider,
+        Model.new("source-model", effort: "medium")
+      )
+
+      Org.append_pointer(ctx.db, "k1", "running-session", "created")
+      put_host_catalog(local_host, harness, [family])
+      adapter = start_supervised!({TuneAdapterStub, {self(), resident: true}})
+      start_supervised!({CoordinatorStub, {adapter, self()}})
+      {seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "finish once")
+      parent = self()
+
+      start_lane!(ctx.db, "k1", fn _turn ->
+        send(parent, {:set_model_turn_started, self()})
+
+        receive do
+          :finish_set_model_turn -> {:ok, %{}}
+        end
+      end)
+
+      assert_receive {:set_model_turn_started, runner}
+
+      for params <- [
+            %{setting: "set_model", model: family, effort: "high"},
+            %{setting: "set_reasoning", reasoningLevel: "low"}
+          ] do
+        assert %{
+                 ok: true,
+                 accepted: true,
+                 applies: "after_turn",
+                 projection_committed: true,
+                 running_model: nil,
+                 running_status: "current inference not observed"
+               } =
+                 Gateway.handlers(config)["tune"].(%{
+                   origin: origin,
+                   session_key: "k1",
+                   params: params
+                 })
+
+        assert_receive {:tune_config_applied, "running-session", %Model{family: ^family}}
+        assert Org.current_pointer(ctx.db, "k1").harness_session_id == "running-session"
+        assert Ledger.running?(ctx.db, "k1")
+        refute_received {:tune_session_switched, _, _, _, _, _}
+        refute_received {:tune_session_closed, _}
+      end
+
+      assert Org.get(ctx.db, "k1").model == Model.new(family, effort: "low")
+      send(runner, :finish_set_model_turn)
+
+      assert eventually(fn ->
+               DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+                 {:ok, [["delivered"]]}
+             end)
+
+      assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE sessionKey='k1'")
+    end
+  end
+
+  test "running configuration records the provider alias without replacing the session",
+       ctx do
+    base_dir = role_test_base("running-config-alias")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
-    before = Org.get(ctx.db, "k1").model
-    local_host = Placement.local_host_name()
-    Org.set_host(ctx.db, "k1", local_host)
-    put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
+    host = Placement.local_host_name()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    Org.set_host(ctx.db, "k1", host)
+    Org.append_pointer(ctx.db, "k1", "running-session", "created")
+    put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+    actual = Model.new("sonnet", effort: "high")
 
-    assert {:ok, _seq} =
-             Ledger.enqueue(ctx.db, %{
-               session_key: "k1",
-               message_id: "set-model-running",
-               origin: "user:flynn",
-               prompt: "hold the boundary"
-             })
+    adapter =
+      start_supervised!(
+        {TuneAdapterStub,
+         {self(), resident: true, apply_result: {:ok, actual}, current_model: actual}}
+      )
 
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    {_seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "keep running")
     parent = self()
 
-    start_lane!(ctx.db, "k1", fn _turn ->
-      send(parent, {:set_model_turn_started, self()})
+    start_lane!(ctx.db, "k1", fn _ ->
+      send(parent, {:alias_runner, self()})
 
       receive do
-        :finish_set_model_turn -> {:ok, %{}}
+        :finish -> {:ok, %{}}
       end
     end)
 
-    assert_receive {:set_model_turn_started, runner}
+    assert_receive {:alias_runner, worker}
 
-    assert %{ok: false, code: "turn_in_progress", message: message} =
+    assert %{
+             ok: true,
+             applies: "after_turn",
+             model: "sonnet",
+             effort: "high",
+             projection_committed: true
+           } =
              Gateway.handlers(config)["tune"].(%{
-               origin: "user:flynn",
+               origin: origin,
                session_key: "k1",
-               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+               params: %{setting: "set_model", model: "claude-sonnet-4-6", effort: "high"}
              })
 
-    assert message =~ "Try again once the current turn finishes"
-    assert Org.get(ctx.db, "k1").model == before
-    send(runner, :finish_set_model_turn)
+    assert Org.get(ctx.db, "k1").model == actual
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "running-session"
+    assert Ledger.running?(ctx.db, "k1")
+    refute_received {:tune_session_closed, _}
+    send(worker, :finish)
   end
 
   describe "session status reports its host's credential kind" do
@@ -9379,6 +9478,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "set_harness readiness denial leaves Org unchanged", ctx do
     base_dir = role_test_base("harness-unready", false)
+    start_lane!(ctx.db, "k1")
     tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"]
     before = Org.get(ctx.db, "k1")
 
@@ -9660,7 +9760,7 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
-  test "set_harness refuses before writing the new home while a turn runs", ctx do
+  test "set_harness durably accepts without writing the new home while a turn runs", ctx do
     base_dir = role_test_base("harness-running-turn")
     codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
@@ -9707,7 +9807,7 @@ defmodule Tightbeam.GatewayTest do
     assert File.read!(Path.join(home, "auth.json")) == "test-token"
     refute File.exists?(Path.join([home, ".tightbeam", "manifest"]))
 
-    assert %{ok: false, code: "turn_in_progress", message: message} =
+    assert %{ok: true, accepted: true, applies: "after_turn", change_id: change_id} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
@@ -9719,14 +9819,16 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert message =~ "Try again once the current turn finishes"
+    assert [{^change_id, %{"harness" => "codex"}}] =
+             Tightbeam.RuntimeChanges.pending(ctx.db, "k1")
+
     assert Org.get(ctx.db, "k1") == before
     assert File.read!(Path.join(home, "auth.json")) == "test-token"
     refute File.exists?(Path.join([home, ".tightbeam", "manifest"]))
     send(runner, :finish_set_harness_turn)
   end
 
-  test "set_harness refuses a durable running turn after its lane becomes idle", ctx do
+  test "set_harness defers over a durable running turn after its lane becomes idle", ctx do
     candidate = start_supervised!({FailingCandidateAdapterStub, self()})
 
     {config, _local_host} =
@@ -9758,14 +9860,16 @@ defmodule Tightbeam.GatewayTest do
     assert Ledger.running?(ctx.db, "k1")
     assert Ledger.pending_count(ctx.db, "k1") == 2
 
-    assert %{ok: false, code: "turn_in_progress", message: message} =
+    assert %{ok: true, accepted: true, applies: "after_turn", change_id: change_id} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
                params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
              })
 
-    assert message =~ "Try again once the current turn finishes"
+    assert [{^change_id, %{"harness" => "codex"}}] =
+             Tightbeam.RuntimeChanges.pending(ctx.db, "k1")
+
     refute_received :candidate_prepare_attempted
     assert Org.get(ctx.db, "k1") == before
     assert Org.current_pointer(ctx.db, "k1") == before_pointer
@@ -9786,6 +9890,165 @@ defmodule Tightbeam.GatewayTest do
     refute Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn message ->
              message.marker && message.marker.kind == "harness-switch"
            end)
+  end
+
+  test "accepted handoff applies after the real terminal and retains its result", ctx do
+    ensure_global_registry()
+    parent = self()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    candidate = start_supervised!({CandidateAdapterStub, parent})
+    {config, _host} = queued_harness_switch_config!(ctx, "deferred-handoff", candidate)
+    stop_supervised!({:lane, "k1"})
+    {seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "finish once")
+
+    start_lane!(
+      ctx.db,
+      "k1",
+      fn _turn ->
+        send(parent, {:deferred_runner, self()})
+
+        receive do
+          :finish ->
+            {:appended, result} =
+              Projection.append(ctx.db, %{
+                session_key: "k1",
+                role: "assistant",
+                sender: "agent:author",
+                content: "finished once"
+              })
+
+            send(parent, {:kept_result, result.id})
+            {:ok, %{}}
+        end
+      end,
+      before_turn: fn key ->
+        :ok = Gateway.apply_pending_runtime_changes(config, ctx.db, key)
+        send(parent, :changes_processed)
+        :ok
+      end
+    )
+
+    assert_receive {:deferred_runner, worker}
+    assert_receive :changes_processed
+
+    assert %{accepted: true, applies: "after_turn", change_id: id} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: origin,
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    assert %{accepted: true, change_id: second_id} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: origin,
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    refute_received {:candidate_created, _, _}
+    assert Org.get(ctx.db, "k1").harness == "claude"
+    send(worker, :finish)
+    assert_receive {:kept_result, result_id}
+    assert_receive {:candidate_created, "candidate-1", _}, 5_000
+    assert_receive {:candidate_created, "candidate-2", _}, 5_000
+    assert_receive :changes_processed, 5_000
+    assert Org.get(ctx.db, "k1").harness == "codex"
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "candidate-2"
+
+    assert {:ok, [["applied"]]} =
+             DB.query(ctx.db, "SELECT state FROM runtime_changes WHERE id=?1", [id])
+
+    assert {:ok, [["applied"]]} =
+             DB.query(ctx.db, "SELECT state FROM runtime_changes WHERE id=?1", [second_id])
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert {:ok, [["finished once"]]} =
+             DB.query(ctx.db, "SELECT content FROM messages WHERE id=?1", [result_id])
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE sessionKey='k1'")
+    refute_received {:deferred_runner, _}
+  end
+
+  test "accepted handoff failure is readable after terminal and does not replay", ctx do
+    parent = self()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    candidate = start_supervised!({FailingCandidateAdapterStub, parent})
+    {config, _host} = queued_harness_switch_config!(ctx, "deferred-failure", candidate)
+    Org.append_pointer(ctx.db, "k1", "source-session", "created")
+    stop_supervised!({:lane, "k1"})
+    {seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "complete before failure")
+
+    start_lane!(
+      ctx.db,
+      "k1",
+      fn _ ->
+        send(parent, {:failure_runner, self()})
+
+        receive do
+          :finish -> {:ok, %{}}
+        end
+      end,
+      before_turn: fn key ->
+        :ok = Gateway.apply_pending_runtime_changes(config, ctx.db, key)
+        send(parent, :failure_changes_processed)
+        :ok
+      end
+    )
+
+    assert_receive {:failure_runner, worker}
+    assert_receive :failure_changes_processed
+
+    assert %{ok: true, accepted: true, change_id: id, applies: "after_turn"} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: origin,
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    assert %{runtimeChanges: [%{changeId: ^id, state: "pending", result: nil}]} =
+             Gateway.session_status("k1", ctx.db)
+
+    refute_received :candidate_prepare_attempted
+    send(worker, :finish)
+    assert_receive :candidate_prepare_attempted, 5_000
+    assert_receive :failure_changes_processed, 5_000
+
+    assert %{
+             runtimeChanges: [
+               %{
+                 changeId: ^id,
+                 state: "failed",
+                 result: %{"ok" => false, "code" => "model_apply_failed"}
+               }
+             ]
+           } =
+             Gateway.session_status("k1", ctx.db)
+
+    assert Org.get(ctx.db, "k1").harness == "claude"
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "source-session"
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE sessionKey='k1'")
+    assert Tightbeam.RuntimeChanges.pending(ctx.db, "k1") == []
   end
 
   test "queued set_harness handoff preserves plain notices and excludes sender-retracted sources",
@@ -13300,7 +13563,7 @@ defmodule Tightbeam.GatewayTest do
   # A REAL lane for a session, because identity apply now decides its boundary in
   # the lane's mailbox: a session without one cannot be applied to at all. The
   # default runner is inert — these lanes exist to own a boundary, not to work.
-  defp start_lane!(db, session_key, runner \\ fn _turn -> {:ok, %{}} end) do
+  defp start_lane!(db, session_key, runner \\ fn _turn -> {:ok, %{}} end, opts \\ []) do
     task_sup =
       start_supervised!(
         {Task.Supervisor, name: :"lane_tasks_#{System.unique_integer([:positive])}"}
@@ -13310,7 +13573,7 @@ defmodule Tightbeam.GatewayTest do
       id: {:lane, session_key},
       start:
         {SessionLane, :start_link,
-         [[session_key: session_key, db: db, task_sup: task_sup, runner: runner]]}
+         [[session_key: session_key, db: db, task_sup: task_sup, runner: runner] ++ opts]}
     })
   end
 

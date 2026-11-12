@@ -17,6 +17,7 @@ defmodule Tightbeam.LaneManager do
     :interval,
     :terminal_publisher,
     :on_terminal,
+    :before_turn,
     park_recovery: nil,
     lanes: %{},
     reaping: %{}
@@ -71,6 +72,7 @@ defmodule Tightbeam.LaneManager do
       runner: Keyword.fetch!(opts, :runner),
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
       on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
+      before_turn: Keyword.get(opts, :before_turn, fn _ -> :ok end),
       interval: Keyword.get(opts, :interval, 180_000)
     }
 
@@ -193,22 +195,28 @@ defmodule Tightbeam.LaneManager do
     state = recover_failed_parks(state)
     republish_terminals(state, detect)
 
-    Enum.reduce(Ledger.pending_sessions(state.db), state, fn session_key, acc ->
-      active? =
-        Enum.any?(acc.lanes, fn {_pid, {_ref, key, seq}} ->
-          key == session_key and not is_nil(seq) and
-            match?(
-              {:ok, [["running"]]},
-              DB.query(state.db, "SELECT status FROM turns WHERE seq=?1", [seq])
-            )
-        end)
+    Enum.reduce(
+      Enum.uniq(
+        Ledger.pending_sessions(state.db) ++ Tightbeam.RuntimeChanges.pending_sessions(state.db)
+      ),
+      state,
+      fn session_key, acc ->
+        active? =
+          Enum.any?(acc.lanes, fn {_pid, {_ref, key, seq}} ->
+            key == session_key and not is_nil(seq) and
+              match?(
+                {:ok, [["running"]]},
+                DB.query(state.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+              )
+          end)
 
-      if detect and active? do
-        acc
-      else
-        repair_lane(acc, session_key, detect)
+        if detect and active? do
+          acc
+        else
+          repair_lane(acc, session_key, detect)
+        end
       end
-    end)
+    )
   end
 
   defp recover_failed_parks(%{park_recovery: nil} = state) do
@@ -281,7 +289,8 @@ defmodule Tightbeam.LaneManager do
       task_sup: state.task_sup,
       runner: state.runner,
       terminal_publisher: state.terminal_publisher,
-      on_terminal: state.on_terminal
+      on_terminal: state.on_terminal,
+      before_turn: state.before_turn
     ] ++ extra
   end
 
