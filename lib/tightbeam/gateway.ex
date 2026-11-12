@@ -8392,6 +8392,13 @@ defmodule Tightbeam.Gateway do
                          harness,
                          model,
                          from_default?(p)
+                       ),
+                     :ok <-
+                       Spinup.ensure_ready(
+                         config,
+                         harness_atom,
+                         session.host,
+                         spinup_opts(config, db, harness, session.host, model)
                        ) do
                   LaneManager.ensure_lane_quiet(
                     config[:lane_manager] || LaneManager,
