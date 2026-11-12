@@ -1,6 +1,9 @@
 use super::*;
 use std::os::fd::FromRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// An actual session leader and its detached child. Children use only async-signal-safe
 /// libc calls after fork, since the Rust test runner has other threads.
@@ -122,6 +125,47 @@ impl Drop for OwnedTree {
         }
         let _ = fs::remove_file(&self.path);
     }
+}
+
+#[test]
+fn freeze_wait_accepts_a_slow_normally_exiting_multi_process_tree() {
+    let mut leader = Command::new("/bin/sh")
+        .args(["-c", "sleep 2.5 & echo $!; wait"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child_pid = String::new();
+    std::io::BufReader::new(leader.stdout.take().unwrap())
+        .read_line(&mut child_pid)
+        .unwrap();
+    let leader_pid = leader.id() as libc::pid_t;
+    let descendant = read_process(child_pid.trim().parse().unwrap()).unwrap();
+    assert_eq!(descendant.pgid, leader_pid);
+
+    let capture = |process: Process| {
+        BoundProcess::capture(ProcessInstance {
+            pid: process.pid,
+            pgid: process.pgid,
+            start_time: process.start_time,
+        })
+        .unwrap()
+        .unwrap()
+    };
+    let descendant = capture(descendant);
+    let leader_process = capture(read_process(leader_pid).unwrap());
+
+    assert!(
+        !wait_for_stopped(&descendant).unwrap(),
+        "the normally exiting descendant should complete the freeze wait"
+    );
+    assert!(
+        !wait_for_stopped(&leader_process).unwrap(),
+        "the normally exiting leader should complete the freeze wait"
+    );
+    assert!(leader.wait().unwrap().success());
 }
 
 #[test]
