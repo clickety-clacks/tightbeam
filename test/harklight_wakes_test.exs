@@ -3807,8 +3807,8 @@ defmodule Tightbeam.HarklightWakesTest do
     settled =
       HarklightSend.settle(db, caller,
         runner: fn args ->
-          assert args == saved_request
-          frame(%{kind: "committed", operation: "withdraw", op_id: first, response: %{}})
+          assert args == ["retry", "--op-id", first]
+          frame(%{kind: "committed", operation: "retry", op_id: first, response: %{}})
         end
       )
 
@@ -4039,11 +4039,11 @@ defmodule Tightbeam.HarklightWakesTest do
            } =
              HarklightSend.settle(db, %{call | params: %{message_id: "request"}},
                runner: fn args ->
-                 assert args == saved_request
+                 assert args == ["retry", "--op-id", op_id]
 
                  frame(%{
                    kind: "committed",
-                   operation: "revise",
+                   operation: "retry",
                    op_id: op_id,
                    response: %{revision: 2}
                  })
