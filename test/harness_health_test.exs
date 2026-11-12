@@ -3271,24 +3271,6 @@ defmodule Tightbeam.HarnessHealthTest do
   end
 
   test "Codex usage-limit hold releases on its first successful recovery probe", ctx do
-    assert {:opened, incident} =
-             HarnessHealth.observe(ctx.db, %{
-               correlation_id: "codex-rate-limit-provider",
-               harness: "codex",
-               host: "testhost",
-               failure_class: "rate-limit-dead",
-               evidence_kind: "authoritative-provider",
-               session_key: ctx.main_session,
-               assignment_id: nil,
-               observed_at: System.system_time(:millisecond),
-               cause: "provider reported usageLimitExceeded",
-               principal: "process:tightbeam/provider"
-             })
-
-    assert incident.harness == "codex"
-    assert incident.failureClass == "rate-limit-dead"
-    assert Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
-
     failure_turn =
       fail_health_turn!(
         ctx.db,
@@ -3298,14 +3280,20 @@ defmodule Tightbeam.HarnessHealthTest do
         @captured_codex_rate_limit
       )
 
-    incident_id = incident.id
-
-    assert {:ok, [[^incident_id, "terminal-failure"]]} =
+    assert {:ok, [[incident_id, "authoritative-provider"]]} =
              DB.query(
                ctx.db,
                "SELECT incidentId,evidenceKind FROM harness_health_observations WHERE correlationId=?1",
                ["harness-turn:#{failure_turn.seq}:rate-limit-dead"]
              )
+
+    assert is_binary(incident_id)
+    incident = HarnessHealth.get(ctx.db, incident_id)
+    assert incident.state == "open"
+
+    assert incident.harness == "codex"
+    assert incident.failureClass == "rate-limit-dead"
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
 
     assert {:ok,
             %{
@@ -3371,6 +3359,36 @@ defmodule Tightbeam.HarnessHealthTest do
     assert release.host == "testhost"
     assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
     refute Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+
+    {:ok, resumed_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.main_session,
+        message_id: "codex-after-rate-limit-recovery",
+        origin: "user:flynn",
+        prompt: "continue after the provider limit clears"
+      })
+
+    assert {:ok, resumed_turn} =
+             Ledger.claim_next(ctx.db, ctx.main_session, "codex-after-rate-limit-recovery")
+
+    assert resumed_turn.seq == resumed_seq
+    assert resumed_turn.message_id == "codex-after-rate-limit-recovery"
+
+    resumed_turn = Map.put(resumed_turn, :session_key, ctx.main_session)
+    resumed_session = Org.get(ctx.db, ctx.main_session)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(
+                        txn,
+                        resumed_turn.seq,
+                        "delivered",
+                        nil,
+                        owner_lease: resumed_turn.owner_lease
+                      )
+
+               HarnessHealth.resolve_normal_turn_in_txn(txn, resumed_session, resumed_turn)
+             end)
   end
 
   test "recovery cycle records each route and releases only after all current routes succeed",
