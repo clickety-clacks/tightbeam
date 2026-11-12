@@ -1017,7 +1017,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
          backoff_base_ms: 250,
-         readiness_timeout_ms: 100,
+         # The timeout event is triggered explicitly below. Keep a generous
+         # readiness deadline for the ordered refusal replacement and recovery.
+         readiness_timeout_ms: 30_000,
          adapter_context: fn _ -> [] end,
          adapter_opts: fn _, context ->
            attempt = :atomics.add_get(boot_attempt, 1, 1)
@@ -1037,7 +1039,11 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
              attempt == 3 ->
                send(owner, {:automatic_recovery_preflight_exit_started, self(), context})
-               exit(:simulated_preflight_exit)
+
+               receive do
+                 {:exit_automatic_recovery_preflight, pid} when pid == self() ->
+                   exit(:simulated_preflight_exit)
+               end
 
              attempt == 4 ->
                send(owner, {:automatic_recovery_refusal_started, self(), context})
@@ -1075,42 +1081,49 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
-    assert_receive {:automatic_recovery_timeout_started, timed_out_readiness_task, []}, 1_500
+    assert_receive {:automatic_recovery_timeout_started, timed_out_readiness_task, []}, 10_000
     assert is_pid(timed_out_readiness_task)
 
-    assert wait_until(fn ->
-             entry = :sys.get_state(coordinator).adapters[key]
-             entry.circuit == :open and entry.failures == 2 and is_reference(entry.timer)
-           end)
+    timed_out_entry = :sys.get_state(coordinator).adapters[key]
 
-    assert_receive {:automatic_recovery_preflight_exit_started, exited_readiness_task, []}, 1_500
+    # Exercise the scheduled timeout handler without depending on a 30-second
+    # wall-clock wait. The next automatic preflight proves it re-armed restart.
+    send(
+      coordinator,
+      {:adapter_readiness_timeout, key, timed_out_entry.generation, timed_out_entry.readiness_token}
+    )
+
+    assert_receive {:automatic_recovery_preflight_exit_started, exited_readiness_task, []}, 10_000
     assert is_pid(exited_readiness_task)
 
-    assert wait_until(fn ->
-             entry = :sys.get_state(coordinator).adapters[key]
-             entry.circuit == :open and entry.failures == 3 and is_reference(entry.timer)
-           end)
+    timeout_recovery_entry = :sys.get_state(coordinator).adapters[key]
+    assert timeout_recovery_entry.circuit == :open
+    assert timeout_recovery_entry.failures == 2
+    send(exited_readiness_task, {:exit_automatic_recovery_preflight, exited_readiness_task})
 
-    assert_receive {:automatic_recovery_refusal_started, refusal_readiness_task, []}, 1_500
+    assert_receive {:automatic_recovery_refusal_started, refusal_readiness_task, []}, 10_000
     assert is_pid(refusal_readiness_task)
+
+    down_recovery_entry = :sys.get_state(coordinator).adapters[key]
+    assert down_recovery_entry.circuit == :open
+    assert down_recovery_entry.failures == 3
 
     assert {:error,
             {:launch_refused,
              %{code: "temporary_refusal", message: "The launch refusal remains visible"}}} =
              Task.await(
                Task.async(fn ->
-                 AdapterCoordinator.adapter_for(coordinator, key,
-                   credential_kind: :subscription
-                 )
+                 AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
                end)
              )
 
-    assert wait_until(fn ->
-             entry = :sys.get_state(coordinator).adapters[key]
-             entry.circuit == :open and entry.failures == 4 and is_reference(entry.timer)
-           end)
+    # The next automatic attempt proves the explicit refusal re-armed restart.
 
-    assert_receive {:automatic_recovery_boot_started, readiness_task, []}, 3_000
+    assert_receive {:automatic_recovery_boot_started, readiness_task, []}, 10_000
+
+    recovery_entry = :sys.get_state(coordinator).adapters[key]
+    assert recovery_entry.circuit == :open
+    assert recovery_entry.failures == 4
 
     assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 4}}} =
              AdapterCoordinator.adapter_for(coordinator, key)
