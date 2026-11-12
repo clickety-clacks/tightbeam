@@ -198,10 +198,17 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
            db,
            "SELECT MIN(dueAt) FROM harness_health_recovery_schedules WHERE status='pending'"
          ) do
-      {:ok, [[nil]]} -> nil
-      {:ok, [[due_at]]} when is_integer(due_at) -> due_at
-      {:ok, rows} -> raise ArgumentError, "invalid recovery schedule deadline rows: #{inspect(rows)}"
-      {:error, error} -> raise error
+      {:ok, [[nil]]} ->
+        nil
+
+      {:ok, [[due_at]]} when is_integer(due_at) ->
+        due_at
+
+      {:ok, rows} ->
+        raise ArgumentError, "invalid recovery schedule deadline rows: #{inspect(rows)}"
+
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -211,7 +218,17 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
            "SELECT holdId,cycleId,sourceEventId,failureClass,eligibleClasses,intervalMs,timeoutMs,dueAt,startedAt FROM harness_health_recovery_schedules WHERE status='due' ORDER BY startedAt,holdId"
          ) do
       {:ok, rows} ->
-        Enum.map(rows, fn [hold_id, cycle_id, event_id, failure_class, classes, interval, timeout, due, started] ->
+        Enum.map(rows, fn [
+                            hold_id,
+                            cycle_id,
+                            event_id,
+                            failure_class,
+                            classes,
+                            interval,
+                            timeout,
+                            due,
+                            started
+                          ] ->
           %{
             "hold_id" => hold_id,
             "cycle_id" => cycle_id,
@@ -286,8 +303,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
         case {hold, policy()} do
           {%{"state" => "open"} = hold, {:ok, settings, _digest}} ->
             if eligible?(hold, settings) do
-              {:ok,
-               %{cycle_id: cycle_id, started_at: started_at, timeout_ms: timeout_ms}, hold}
+              {:ok, %{cycle_id: cycle_id, started_at: started_at, timeout_ms: timeout_ms}, hold}
             else
               finish_cycle_in_txn(txn, hold_id, cycle_id, now)
               :withdrawn

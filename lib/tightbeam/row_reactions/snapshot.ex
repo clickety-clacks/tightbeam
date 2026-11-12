@@ -8,6 +8,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
     SessionReparent,
     Wakes
   }
+
   alias Tightbeam.DB.Txn
 
   @assignment ~w(id holderKey workItemId openedBySession openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
