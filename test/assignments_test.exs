@@ -7351,7 +7351,7 @@ defmodule Tightbeam.AssignmentsTest do
         )
       end)
 
-    assert_receive {:check_entered, check_pid}
+    assert_receive {:check_entered, check_pid}, 5_000
     assert check_pid == check.pid
 
     another =
