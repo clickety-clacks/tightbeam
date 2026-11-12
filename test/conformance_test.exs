@@ -36,10 +36,16 @@ defmodule Tightbeam.ConformanceSupport do
   }
 
   @fixture_keys MapSet.new(
-                  ~w(class name phase blocking_phase kind source legibility shipped_ref pattern action rule)
+                  ~w(
+                    class name phase blocking_phase kind source legibility shipped_ref shipped_refs
+                    pattern action rule
+                  )
                 )
   @case_keys MapSet.new(
-               ~w(case kind expect reason emits input script_return world call phase2 phase)
+               ~w(
+                 case kind expect reason reason_aliases emits input script_return world call phase2
+                 phase
+               )
              )
   @expects MapSet.new(
              ~w(deny pass refuse run-remedy re-obligate none escalate-halt escalate-open escalate-continue load-unavailable load-clean)
@@ -153,6 +159,14 @@ defmodule Tightbeam.ConformanceSupport do
              "#{path}: #{fixture["kind"]} fixture needs fixture.rule"
     end
 
+    if Map.has_key?(fixture, "shipped_refs") do
+      refs = fixture["shipped_refs"]
+
+      assert fixture["kind"] == "harness-gate" and is_list(refs) and refs != [] and
+               Enum.all?(refs, &(is_binary(&1) and &1 != "")) and Enum.uniq(refs) == refs,
+             "#{path}: shipped_refs must be a nonempty unique list for a harness-gate fixture"
+    end
+
     cases_path = String.replace_suffix(path, ".toml", ".cases.jsonl")
     cases = load_cases!(cases_path, fixture)
     runners = applicable_runners(fixture["kind"], class["runners"])
@@ -252,6 +266,17 @@ defmodule Tightbeam.ConformanceSupport do
 
       if kase["kind"] in ~w(positive legibility),
         do: assert(is_binary(kase["reason"]), "#{path}: positive/legibility case needs reason")
+
+      if Map.has_key?(kase, "reason_aliases") do
+        aliases = kase["reason_aliases"]
+
+        assert fixture["kind"] == "harness-gate" and kase["expect"] == "deny" and
+                 is_list(aliases) and aliases != [] and
+                 Enum.all?(aliases, &(is_binary(&1) and &1 != "")) and
+                 Enum.uniq(aliases) == aliases and kase["reason"] not in aliases,
+               "#{path}: reason_aliases must be a unique nonempty deny-marker list " <>
+                 "for a harness-gate fixture"
+      end
 
       if kase["kind"] == "legibility",
         do: assert(is_binary(kase["emits"]), "#{path}: legibility case needs emits")
@@ -533,10 +558,11 @@ defmodule Tightbeam.ConformanceSupport do
                    "#{kase["case"]}: #{inspect(results, limit: :infinity, printable_limit: :infinity)}"
 
           "deny" ->
-            marker = "[gate: #{kase["reason"]}]"
+            markers = [kase["reason"] | Map.get(kase, "reason_aliases", [])]
+            markers = Enum.map(markers, fn marker -> "[gate: #{marker}]" end)
 
             assert Enum.any?(results, fn {_entry, output, status} ->
-                     status == 2 and output =~ marker
+                     status == 2 and Enum.any?(markers, fn marker -> output =~ marker end)
                    end),
                    "#{kase["case"]}: #{inspect(results, limit: :infinity, printable_limit: :infinity)}"
         end
@@ -547,16 +573,71 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
+  def assert_shipped_hook_input_fails_closed(root) do
+    statutes = shipped_statutes(root)
+    {entries, base} = compiled_shipped_entries(root)
+
+    try do
+      statute_entries = Enum.take(entries, length(entries) - 2)
+      assert statute_entries != []
+      assert Enum.all?(statute_entries, &(&1["matcher"] == "Bash"))
+
+      for input <- ["", "not-json"] do
+        results = Enum.map(statute_entries, &run_hook(&1, input))
+        assert Enum.all?(results, fn {_entry, _output, status} -> status == 2 end)
+        output = Enum.map_join(results, "\n", fn {_entry, output, _status} -> output end)
+
+        Enum.each(statutes, fn statute ->
+          failure =
+            if is_binary(statute["action"]),
+              do: "[gate: #{statute["name"]}] action classifier failed closed (status ",
+              else: "[gate: #{statute["name"]}] hook input check failed closed (status "
+
+          assert output =~ failure, "#{statute["name"]} omitted its failure reason"
+        end)
+      end
+
+      with_hook_tools_without_tightbeam(fn path ->
+        results =
+          Enum.map(statute_entries, fn entry ->
+            run_hook_with_path(entry, ~s({"tool_input":{"command":"true"}}), path)
+          end)
+
+        assert Enum.all?(results, fn {_entry, _output, status} -> status == 2 end)
+        output = Enum.map_join(results, "\n", fn {_entry, output, _status} -> output end)
+
+        Enum.each(statutes, fn statute ->
+          failure =
+            if is_binary(statute["action"]),
+              do: "[gate: #{statute["name"]}] action classifier failed closed (status 127).",
+              else: "[gate: #{statute["name"]}] hook input check failed closed (status 127)."
+
+          assert output =~ failure,
+                 "#{statute["name"]} accepted input without the CLI: #{output}"
+        end)
+      end)
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rails)
+    end
+  end
+
   defp run_hook(entry, input) do
+    cli_dir = Path.expand("../cli/target/release", __DIR__)
+    path = cli_dir <> ":" <> System.get_env("PATH", "")
+    run_hook_with_path(entry, input, path)
+  end
+
+  defp run_hook_with_path(entry, input, path) do
     [%{"command" => command}] = entry["hooks"]
     ensure_real_rail_exec!()
-    cli_dir = Path.expand("../cli/target/release", __DIR__)
+    shell = System.find_executable("sh") || flunk("sh is unavailable")
 
     {output, status} =
-      System.cmd("sh", ["-c", "printf '%s' \"$TB_CONFORMANCE_INPUT\" | " <> command],
+      System.cmd(shell, ["-c", "printf '%s' \"$TB_CONFORMANCE_INPUT\" | " <> command],
         env: [
           {"TB_CONFORMANCE_INPUT", input},
-          {"PATH", cli_dir <> ":" <> System.get_env("PATH", "")}
+          {"PATH", path}
         ],
         stderr_to_stdout: true
       )
@@ -564,19 +645,47 @@ defmodule Tightbeam.ConformanceSupport do
     {entry, output, status}
   end
 
+  defp with_hook_tools_without_tightbeam(fun) do
+    tools_dir = temp_dir!("conformance-hook-tools")
+
+    try do
+      for name <- ~w(cat grep mktemp rm sh) do
+        executable = System.find_executable(name) || flunk("#{name} is unavailable")
+        File.ln_s!(executable, Path.join(tools_dir, name))
+      end
+
+      fun.(tools_dir)
+    after
+      File.rm_rf!(tools_dir)
+    end
+  end
+
   def assert_shipped_parity(fixtures, root) do
     statutes = shipped_statutes(root)
 
     Enum.each(statutes, fn statute ->
       ref = "engineering.toml:#{statute["name"]}"
-      matches = Enum.filter(fixtures, &(&1["shipped_ref"] == ref))
+
+      matches =
+        Enum.filter(fixtures, fn fixture ->
+          refs = [Map.get(fixture, "shipped_ref") | Map.get(fixture, "shipped_refs", [])]
+          ref in refs
+        end)
+
       assert matches != [], "shipped statute #{statute["name"]} has no C1 fixture"
 
-      assert Enum.all?(matches, fn fixture ->
-               fixture["pattern"] == statute["pattern"] and
-                 fixture["action"] == statute["action"]
-             end),
-             "#{ref} classifier drift"
+      if is_binary(statute["action"]) do
+        assert Enum.all?(matches, fn fixture ->
+                 fixture["action"] == statute["action"] and is_nil(fixture["pattern"])
+               end),
+               "#{ref} action classifier drift"
+      else
+        assert Enum.all?(matches, fn fixture ->
+                 is_nil(fixture["action"]) and is_binary(statute["pattern"]) and
+                   String.trim(statute["pattern"]) != ""
+               end),
+               "#{ref} must be a declared pattern statute"
+      end
     end)
   end
 
@@ -2419,9 +2528,10 @@ defmodule Tightbeam.ConformanceTest do
     #
     # Legacy edge-controller fixtures are not part of the active contract set.
     # The active fixture count includes one corpus entry for each of the ten
-    # paired load sets, in addition to the 38 ordinary fixtures.
-    assert length(@fixtures) == 48
-    assert active_fixtures == 38
+    # paired load sets, the 38 existing ordinary fixtures, and five additional
+    # heredoc-focused C1 fixtures for the core Git action statutes.
+    assert length(@fixtures) == 53
+    assert active_fixtures == 43
     assert exact_skips == 10
     assert activated_fixture_tests == 25
     assert activated_class_tests == 3
@@ -2737,6 +2847,10 @@ defmodule Tightbeam.ConformanceTest do
 
   test "c1-wiring-claude compiles and refuses the reserved probe" do
     Corpus.assert_claude_wiring(@root)
+  end
+
+  test "shipped Bash statutes fail closed when hook input cannot be decoded" do
+    Corpus.assert_shipped_hook_input_fails_closed(@root)
   end
 
   test "containment dependencies are named and green" do

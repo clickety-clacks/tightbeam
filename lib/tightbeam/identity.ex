@@ -20,7 +20,11 @@ defmodule Tightbeam.Identity do
   @live "tightbeam/live"
   @required_refs ["main", @upstream, @live]
   @reserved_prefix "tightbeam__"
-  @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
+  @seed_owned_paths [
+    "archetypes/default.toml",
+    "guidance/operating-model.md",
+    "rules/substrate.toml"
+  ]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
   @bundle_setup_path "setup.md"
   @sentinel_keys ~w(name command requires events)
@@ -219,8 +223,10 @@ defmodule Tightbeam.Identity do
     if File.dir?(Path.join(identity_dir, ".git")) do
       verify_required_refs!(identity_dir)
 
-      if required_ref_exists?(identity_dir, "main"),
-        do: maybe_mint_grandfather_receipt!(identity_dir)
+      if required_ref_exists?(identity_dir, "main") do
+        ensure_substrate_rules!(identity_dir)
+        maybe_mint_grandfather_receipt!(identity_dir)
+      end
 
       :noop
     else
@@ -274,6 +280,34 @@ defmodule Tightbeam.Identity do
 
       raise ArgumentError,
             "identity repository is missing required refs: #{Enum.join(missing, ", ")}. Repair with: #{repair}"
+    end
+  end
+
+  defp ensure_substrate_rules!(identity_dir) do
+    relative = "rules/substrate.toml"
+
+    unless path_exists_at?(identity_dir, "main", relative) do
+      if merge_pending?(identity_dir) do
+        raise ArgumentError,
+              "cannot add seeded rules/substrate.toml while an identity merge is pending"
+      end
+
+      path = Path.join(identity_dir, relative)
+
+      unless File.regular?(path) do
+        File.mkdir_p!(Path.dirname(path))
+        File.write!(path, File.read!(Path.join(seed_dir(), relative)))
+      end
+
+      git!(identity_dir, ["add", "--", relative])
+
+      git!(
+        identity_dir,
+        ["commit", "--only", "-m", "seed: substrate rules", "--", relative],
+        "tightbeam"
+      )
+
+      publish_live_unmarked!(identity_dir)
     end
   end
 

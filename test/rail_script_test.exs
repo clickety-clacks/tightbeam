@@ -4,6 +4,7 @@ defmodule Tightbeam.RailScriptTest do
 
   @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
   @cli_dir Path.expand("../cli", __DIR__)
+  @rule_failure_block ~r/^\[\[reaction\]\]\nname = "[^"]+"\nfamily = "rule-failure"\nsettings = [^\n]+\nenglish = [^\n]+\n?/m
 
   # The real-binary integration test invokes @release_binary. `File.exists?` is not
   # enough — a STALE binary (built before rail-exec existed) passes existence yet fails
@@ -56,6 +57,14 @@ defmodule Tightbeam.RailScriptTest do
     bin = Path.join(base_dir, "bin")
     File.mkdir_p!(scripts)
     File.mkdir_p!(bin)
+
+    rules = Path.join([base_dir, "identity", "rules"])
+    File.mkdir_p!(rules)
+
+    File.cp!(
+      Path.expand("../priv/seed/rules/substrate.toml", __DIR__),
+      Path.join(rules, "substrate.toml")
+    )
 
     source_scripts = Path.expand("../identity/rails/scripts", __DIR__)
 
@@ -767,6 +776,80 @@ defmodule Tightbeam.RailScriptTest do
     assert question =~ "script-escalate"
     assert question =~ "denied script_timeout"
     assert question =~ "script_exit_class timeout"
+  end
+
+  test "rule-failure settings control malfunction escalation and recovery", ctx do
+    handlers = %{"post" => fn _call -> %{ok: true} end}
+
+    unavailable = [
+      {"disabled", {false, false}},
+      {"absent", :absent},
+      {"invalid", :invalid},
+      {"ambiguous", :ambiguous}
+    ]
+
+    for {label, setting} <- unavailable do
+      name = "b25-deny-#{label}"
+      put_rule_failure_settings(ctx, setting)
+      put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}, name: name))
+      Rules.load!(ctx.base_dir, ["post"])
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, %{reason: "script_timeout", script_exit_class: "timeout"}} =
+                   Dispatch.dispatch(
+                     ctx.db,
+                     handlers,
+                     call(%{work_item_id: "w-b25-deny-#{label}"})
+                   )
+        end)
+
+      assert_rule_failure_diagnostic(log, label)
+
+      assert [] = Escalation.open_episodes(ctx.db, name)
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE status = 'open'")
+    end
+
+    for {label, setting} <- unavailable do
+      name = "b25-recovery-#{label}"
+      put_rule_failure_settings(ctx, {true, true})
+      put_statute(ctx, statute("rail-timeout", %{"pass" => "allow"}, name: name))
+      Rules.load!(ctx.base_dir, ["post"])
+
+      assert {:error, %{reason: "script_timeout", script_exit_class: "timeout"}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 handlers,
+                 call(%{work_item_id: "w-b25-recovery-#{label}"})
+               )
+
+      assert [episode_id] = Escalation.open_episodes(ctx.db, name)
+
+      put_rule_failure_settings(ctx, setting)
+      put_statute(ctx, statute("rail-pass", %{"pass" => "allow"}, name: name))
+      Rules.load!(ctx.base_dir, ["post"])
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, %{ok: true}} =
+                   Dispatch.dispatch(
+                     ctx.db,
+                     handlers,
+                     call(%{work_item_id: "w-b25-recovery-#{label}"})
+                   )
+        end)
+
+      assert_rule_failure_diagnostic(log, label)
+
+      assert [^episode_id] = Escalation.open_episodes(ctx.db, name)
+      assert {:ok, [["open"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM decision_requests WHERE id = ?1",
+                 [episode_id]
+               )
+    end
   end
 
   # The other producer of `script_timeout`: the wrapper never reports and the BEAM
@@ -1756,6 +1839,7 @@ defmodule Tightbeam.RailScriptTest do
   end
 
   defp statute(script, effects, opts \\ []) do
+    name = Keyword.get(opts, :name, "script-escalate")
     verb = Keyword.get(opts, :verb, "post")
     edges = Keyword.get(opts, :edges)
     predicate = Keyword.get(opts, :predicate)
@@ -1763,7 +1847,7 @@ defmodule Tightbeam.RailScriptTest do
 
     """
     [[rule]]
-    name = "script-escalate"
+    name = "#{name}"
     verb = "#{verb}"
     text = "fixture"
     #{if edges, do: "edges = #{inspect(edges)}", else: ""}
@@ -1782,5 +1866,72 @@ defmodule Tightbeam.RailScriptTest do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, contents)
     path
+  end
+
+  defp put_rule_failure_settings(ctx, settings) do
+    path = Path.join([ctx.base_dir, "identity", "rules", "substrate.toml"])
+    contents = File.read!(path)
+    contents = Regex.replace(@rule_failure_block, contents, "") |> String.trim_trailing()
+
+    declaration =
+      case settings do
+        :absent ->
+          ""
+
+        :invalid ->
+          """
+          [[reaction]]
+          name = "rule-failure-invalid"
+          family = "rule-failure"
+          settings = { escalate_script_failures = "true", recover_on_success = true }
+          english = "Escalate configured script failures and apply the listed recovery treatment."
+          """
+
+        :ambiguous ->
+          """
+          [[reaction]]
+          name = "rule-failure-one"
+          family = "rule-failure"
+          settings = { escalate_script_failures = true, recover_on_success = true }
+          english = "Escalate configured script failures and apply the listed recovery treatment."
+
+          [[reaction]]
+          name = "rule-failure-two"
+          family = "rule-failure"
+          settings = { escalate_script_failures = true, recover_on_success = true }
+          english = "Escalate configured script failures and apply the listed recovery treatment."
+          """
+
+        {escalate_script_failures, recover_on_success}
+        when is_boolean(escalate_script_failures) and is_boolean(recover_on_success) ->
+          """
+          [[reaction]]
+          name = "rule-failure"
+          family = "rule-failure"
+          settings = { escalate_script_failures = #{escalate_script_failures}, recover_on_success = #{recover_on_success} }
+          english = "Escalate configured script failures and apply the listed recovery treatment."
+          """
+      end
+
+    contents =
+      if declaration == "" do
+        contents <> "\n"
+      else
+        contents <> "\n\n" <> declaration <> "\n"
+      end
+
+    File.write!(path, contents)
+  end
+
+  defp assert_rule_failure_diagnostic(log, "invalid") do
+    assert log =~ "settings family rule-failure is invalid; no choice was selected"
+  end
+
+  defp assert_rule_failure_diagnostic(log, "ambiguous") do
+    assert log =~ "settings family rule-failure is ambiguous; no choice was selected"
+  end
+
+  defp assert_rule_failure_diagnostic(log, _label) do
+    refute log =~ "settings family rule-failure"
   end
 end

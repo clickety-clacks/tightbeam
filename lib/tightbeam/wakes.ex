@@ -2388,19 +2388,19 @@ defmodule Tightbeam.Wakes do
   @doc false
   @spec validate_verification_verdict_in_txn(Txn.t(), map()) :: :ok | {:error, map()}
   def validate_verification_verdict_in_txn(%Txn{} = txn, attrs) do
-    verdict_kind = attrs[:verdict_kind]
+    wait_id = attrs[:wait_id]
 
-    cond do
-      verdict_kind in ~w(wait-verified wait-challenged) ->
+    case wait_transition_role(attrs[:verdict_kind]) do
+      role when role in [:verified, :challenged] ->
         verification_verdict_binding_in_txn(txn, attrs)
 
-      is_binary(attrs[:wait_id]) ->
+      nil when is_binary(wait_id) ->
         wait_error(
           "invalid_wait_verdict",
           "--wait is valid only for wait-verified and wait-challenged"
         )
 
-      true ->
+      nil ->
         :ok
     end
   end
@@ -2408,12 +2408,11 @@ defmodule Tightbeam.Wakes do
   @doc false
   @spec verification_verdict_in_txn(Txn.t(), map()) :: :ok
   def verification_verdict_in_txn(%Txn{} = txn, attrs) do
-    case attrs[:verdict_kind] do
-      kind when kind in ~w(wait-verified wait-challenged) ->
-        apply_verification_verdict_in_txn(txn, attrs)
+    case wait_transition_role(attrs[:verdict_kind]) do
+      role when role in [:verified, :challenged] ->
+        apply_verification_verdict_in_txn(txn, attrs, role)
 
-      _ ->
-        :ok
+      nil -> :ok
     end
   end
 
@@ -2421,6 +2420,8 @@ defmodule Tightbeam.Wakes do
     do: wait_error("wait_required", "wait-verified and wait-challenged require --wait")
 
   defp verification_verdict_binding_in_txn(txn, attrs) do
+    role = wait_transition_role(attrs[:verdict_kind])
+
     case Txn.q(
            txn,
            """
@@ -2431,11 +2432,11 @@ defmodule Tightbeam.Wakes do
            [attrs.wait_id, attrs.assignment_id]
          ) do
       [[state, "open", holder_key]] when holder_key == attrs.by_session ->
-        case {attrs.verdict_kind, state} do
-          {"wait-verified", "provisional"} ->
+        case {role, state} do
+          {:verified, "provisional"} ->
             :ok
 
-          {"wait-challenged", state} when state in ~w(provisional confirmed) ->
+          {:challenged, state} when state in ~w(provisional confirmed) ->
             :ok
 
           _ ->
@@ -2450,7 +2451,7 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp apply_verification_verdict_in_txn(txn, %{verdict_kind: "wait-verified"} = attrs) do
+  defp apply_verification_verdict_in_txn(txn, attrs, :verified) do
     Txn.q(
       txn,
       """
@@ -2466,7 +2467,7 @@ defmodule Tightbeam.Wakes do
     :ok
   end
 
-  defp apply_verification_verdict_in_txn(txn, %{verdict_kind: "wait-challenged"} = attrs) do
+  defp apply_verification_verdict_in_txn(txn, attrs, :challenged) do
     Txn.q(
       txn,
       """
@@ -2502,6 +2503,10 @@ defmodule Tightbeam.Wakes do
 
     :ok
   end
+
+  defp wait_transition_role("wait-verified"), do: :verified
+  defp wait_transition_role("wait-challenged"), do: :challenged
+  defp wait_transition_role(_kind), do: nil
 
   defp wait_in_txn(txn, wake_id) do
     case Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [wake_id]) do
@@ -3412,18 +3417,49 @@ defmodule Tightbeam.Wakes do
   end
 
   defp apply_delivery_policy(txn, input, class, created_at, condition_kind) do
+    batching_policy_state =
+      if is_binary(class) and not Map.get(input, :digest, false) and
+           not batcher_inhibited?(input, condition_kind) do
+        NoticeBatcher.batching_policy_state()
+      else
+        :not_applicable
+      end
+
+    batching_enabled? = batching_policy_state == {:available, true}
+
     if is_binary(class) and not Map.get(input, :digest, false) and
-         not batcher_inhibited?(input, condition_kind) do
+         not batcher_inhibited?(input, condition_kind) and batching_enabled? do
       {@digest_rule, Map.fetch!(input, :due_at)}
     else
-      apply_class_delivery_policy(txn, input, class, created_at, condition_kind)
+      apply_class_delivery_policy(
+        txn,
+        input,
+        class,
+        created_at,
+        condition_kind,
+        batching_policy_state
+      )
     end
   end
 
-  defp apply_class_delivery_policy(_txn, input, nil, _created_at, _condition_kind),
+  defp apply_class_delivery_policy(
+         _txn,
+         input,
+         nil,
+         _created_at,
+         _condition_kind,
+         _batching_policy_state
+       ),
     do: {nil, Map.fetch!(input, :due_at)}
 
-  defp apply_class_delivery_policy(txn, input, class, created_at, condition_kind) do
+  defp apply_class_delivery_policy(
+         txn,
+         input,
+         class,
+         created_at,
+         condition_kind,
+         batching_policy_state
+       ) do
     policy = delivery_policy(class)
 
     cond do
@@ -3445,6 +3481,21 @@ defmodule Tightbeam.Wakes do
       # either way — scheduled or not, an alarm is never delayed BY POLICY.
       policy.immediacy == :digest and batcher_inhibited?(input, condition_kind) ->
         {@inhibited_rule, Map.fetch!(input, :due_at)}
+
+      # A condition is part of the source's readiness contract. If batching is
+      # unavailable, keep that source time instead of replacing it with the
+      # class ceiling; terminal condition notices validate their exact event
+      # time in the same transaction that files the condition fact.
+      policy.immediacy == :digest and is_binary(condition_kind) ->
+        {@legacy_digest_rule, Map.fetch!(input, :due_at)}
+
+      # R18's no-choice rule: when notice-delivery is unavailable, retain the
+      # source's readiness time rather than choosing a class-ceiling deadline.
+      policy.immediacy == :digest and batching_policy_state == :unavailable ->
+        {@legacy_digest_rule, Map.fetch!(input, :due_at)}
+
+      policy.immediacy == :digest and batching_policy_state == {:available, false} ->
+        {@legacy_digest_rule, Map.fetch!(input, :due_at)}
 
       policy.immediacy == :digest and not batch_eligible?(input, class, condition_kind) ->
         {@legacy_digest_rule, created_at + policy.ceiling_ms}
@@ -5894,62 +5945,6 @@ defmodule Tightbeam.Wakes do
       share: if(turns > 0, do: coordination / turns),
       by_class: Map.new(by_class, fn [class, count] -> {class, count} end)
     }
-  end
-
-  @doc "Whether a rumination wake is staged for, or has reached, this caller's next turn."
-  @spec rumination_exists?(db(), String.t(), String.t()) :: boolean()
-  def rumination_exists?(db \\ Tightbeam.DB, work_item_id, caller_session) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT 1 FROM wakes
-        WHERE rumination = 1 AND work_item_id = ?1 AND creatorSessionKey = ?2
-          AND (state = 'fired' OR (state = 'pending' AND (
-            firedAt IS NOT NULL OR EXISTS (
-              SELECT 1 FROM notice_batch_members m
-              JOIN notice_batches b ON b.batchId=m.batchId
-              WHERE m.sourceWakeId=wakes.wakeId
-                AND m.state IN ('active','included')
-                AND b.state IN ('open','sealed','delivery_pending')
-            )
-          )))
-        LIMIT 1
-        """,
-        [work_item_id, caller_session]
-      )
-
-    rows != []
-  end
-
-  @doc false
-  @spec rumination_status_in_txn(Txn.t(), String.t(), String.t()) ::
-          :delivered | :staged | :pending | :none
-  def rumination_status_in_txn(%Txn{} = txn, work_item_id, caller_session) do
-    case Txn.q(
-           txn,
-           """
-           SELECT state, firedAt,
-             EXISTS (
-               SELECT 1 FROM notice_batch_members m
-               JOIN notice_batches b ON b.batchId=m.batchId
-               WHERE m.sourceWakeId=wakes.wakeId
-                 AND m.state IN ('active','included')
-                 AND b.state IN ('open','sealed','delivery_pending')
-             )
-           FROM wakes
-           WHERE rumination=1 AND work_item_id=?1 AND creatorSessionKey=?2
-             AND state IN ('pending','fired')
-           ORDER BY CASE state WHEN 'fired' THEN 0 ELSE 1 END, createdAt, wakeId
-           LIMIT 1
-           """,
-           [work_item_id, caller_session]
-         ) do
-      [["fired", _fired_at, _member]] -> :delivered
-      [["pending", fired_at, member]] when not is_nil(fired_at) or member == 1 -> :staged
-      [["pending", nil, 0]] -> :pending
-      [] -> :none
-    end
   end
 
   ## Scheduler process

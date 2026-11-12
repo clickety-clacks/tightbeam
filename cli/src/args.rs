@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::harnesses::HarnessCatalog;
@@ -167,6 +168,7 @@ pub enum Command {
         work_item_id: Option<String>,
         content_sha256: Option<String>,
         content_base64: Option<String>,
+        content_file: Option<PathBuf>,
         produced_by_assignment_id: Option<String>,
     },
     ArtifactContentFetch {
@@ -882,7 +884,8 @@ COMMANDS:
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
-                  [--produced-by-assignment <assignmentId>] [--content-base64 <bytes>]
+                  [--produced-by-assignment <assignmentId>]
+                  [--content-base64 <bytes> | --content-file <local-path>]
       Record a deliberate artifact pointer for the calling session.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
@@ -2507,7 +2510,15 @@ fn parse_with_optional_catalog(
         }
         "artifact-record" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--content-base64 <bytes>] [--produced-by-assignment <assignmentId>]".to_owned());
+                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--content-base64 <bytes> | --content-file <local-path>] [--produced-by-assignment <assignmentId>]".to_owned());
+            }
+            if flags.contains_key("content-base64") && flags.contains_key("content-file") {
+                return Err("choose either --content-base64 or --content-file".to_owned());
+            }
+            if flags.contains_key("content-file")
+                && flags.get("content-file").is_some_and(String::is_empty)
+            {
+                return Err("--content-file requires a non-empty local path".to_owned());
             }
             Ok(Command::ArtifactRecord {
                 identity: identity(flags)?,
@@ -2519,6 +2530,7 @@ fn parse_with_optional_catalog(
                 work_item_id: nonempty(flags, "work-item"),
                 content_sha256: nonempty(flags, "sha256"),
                 content_base64: nonempty(flags, "content-base64"),
+                content_file: nonempty(flags, "content-file").map(PathBuf::from),
                 produced_by_assignment_id: nonempty(flags, "produced-by-assignment"),
             })
         }
@@ -4626,6 +4638,46 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn artifact_record_accepts_one_content_source_and_requires_a_file_path() {
+        let file_path = "/tmp/producer-result.bin";
+        assert!(matches!(
+            parse(strings(&[
+                "artifact-record",
+                "--kind",
+                "report",
+                "--title",
+                "result",
+                "--path",
+                "descriptive-origin.bin",
+                "--content-file",
+                file_path,
+            ])),
+            Ok(Command::ArtifactRecord {
+                content_base64: None,
+                content_file: Some(path),
+                ..
+            }) if path == PathBuf::from(file_path)
+        ));
+
+        for content_flags in [
+            vec!["--content-file", ""],
+            vec!["--content-base64", "YQ==", "--content-file", file_path],
+        ] {
+            let mut argv = vec![
+                "artifact-record",
+                "--kind",
+                "report",
+                "--title",
+                "result",
+                "--path",
+                "descriptive-origin.bin",
+            ];
+            argv.extend(content_flags);
+            assert!(parse(strings(&argv)).is_err());
+        }
     }
 
     #[test]

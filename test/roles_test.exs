@@ -2,7 +2,7 @@ defmodule Tightbeam.RolesTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{DB, Org, Roles}
+  alias Tightbeam.{DB, Gateway, Org, Origin, Roles, Rules}
 
   setup do
     db = :"roles_db_#{System.unique_integer([:positive])}"
@@ -172,6 +172,93 @@ defmodule Tightbeam.RolesTest do
     {:ok, _} = DB.query(db, "DELETE FROM sessions WHERE sessionKey = ?1", [stale.session_key])
     assert {:ok, main, true} == Roles.resolve(db, "stale")
     assert {:error, %{code: "unknown_role"}} = Roles.resolve(db, "missing")
+  end
+
+  test "unavailable role-fallback settings retain personal-session routing", %{
+    db: db
+  } do
+    main = Org.personal_session_key("flynn")
+    session(db, main, "flynn")
+    active = session(db, "agent:role-active", "flynn")
+    retired = session(db, "agent:role-retired", "flynn")
+
+    Roles.create!(db, "active-role", "flynn", active.session_key)
+    Roles.create!(db, "unbound-role", "flynn", nil)
+    Roles.create!(db, "retired-role", "flynn", retired.session_key)
+    Org.retire(db, retired.session_key, "user:flynn", 1_000)
+
+    for mode <- [:absent, :invalid, :ambiguous] do
+      load_role_fallback_rules(db, mode)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, active.session_key, false} == Roles.resolve(db, "active-role")
+
+          for name <- ["unbound-role", "retired-role"] do
+            assert {:ok, ^main, true} = Roles.resolve(db, name)
+          end
+
+          assert {:ok, ^main, true} = Origin.resolve_agent(db, "unbound-role")
+
+          assert {:error, %{code: "unknown_role"}} = Roles.resolve(db, "missing-role")
+        end)
+
+      case mode do
+        :absent ->
+          refute log =~ "substrate settings family role-fallback"
+
+        :invalid ->
+          assert log =~ "substrate settings family role-fallback is invalid"
+
+        :ambiguous ->
+          assert log =~ "substrate settings family role-fallback is ambiguous"
+      end
+    end
+  end
+
+  defp load_role_fallback_rules(db, mode) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "role-fallback-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(root, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    seed =
+      case mode do
+        :absent ->
+          ""
+
+        :invalid ->
+          """
+          [[reaction]]
+          name = "role-fallback"
+          family = "role-fallback"
+          settings = { recipient = "another_recipient" }
+          english = "Select a fallback recipient."
+          """
+
+        :ambiguous ->
+          """
+          [[reaction]]
+          name = "role-fallback-one"
+          family = "role-fallback"
+          settings = { recipient = "owner_personal_session" }
+          english = "Select a fallback recipient."
+
+          [[reaction]]
+          name = "role-fallback-two"
+          family = "role-fallback"
+          settings = { recipient = "owner_personal_session" }
+          english = "Select a fallback recipient."
+          """
+      end
+
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    Rules.load!(root, Map.keys(Gateway.handlers(%{db: db})))
   end
 
   defp session(db, session_key, owner) do

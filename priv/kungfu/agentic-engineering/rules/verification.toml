@@ -1,14 +1,152 @@
-# rules/verification.toml — the engineering school's completion papertrail
+# rules/verification.toml — proof rules for engineering attestations
+[[rule]]
+name = "commits-verification-names-commits"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "Verification of code or a release names the commits it verified. Refile with --commit-refs listing each repo and full commit."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "eq", value = "verified" },
+  { fact = "assignment.effect_kind", op = "in", value = ["code", "release"] },
+  { fact = "assignment.caller_is_holder", op = "eq", value = true },
+  { fact = "call.commit_refs_count", op = "eq", value = 0 },
+]
+
+[[rule]]
+name = "code-review-names-commits"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "A clean review of code names the commits it reviewed. Refile with --commit-refs listing each repo and full commit."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "eq", value = "reviewed-clean" },
+  { fact = "assignment.reviewed_effect_kind", op = "eq", value = "code" },
+  { fact = "call.commit_refs_count", op = "eq", value = 0 },
+]
+
+[[rule]]
+name = "clean-review-covers-verified-commits"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "A clean review covers every commit in the reviewed holder's latest verified verdict. Review the missing commits and name them all in --commit-refs."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "eq", value = "reviewed-clean" },
+  { fact = "review.source_uncovered_commit_count.verified", op = "gt", value = 0 },
+]
+
+[[rule]]
+name = "policy-verification-cites-commits-or-copy"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "Verification of policy names its commits or cites the saved copy. Refile with --commit-refs, or record the document with --content-file <path> and cite it with --artifact and --content-sha256."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "eq", value = "verified" },
+  { fact = "assignment.effect_kind", op = "eq", value = "policy" },
+  { fact = "assignment.caller_is_holder", op = "eq", value = true },
+  { fact = "call.commit_refs_count", op = "eq", value = 0 },
+  { fact = "call.supplied_fields", op = "not_in", value = ["artifact_id"] },
+]
+
+[[rule]]
+name = "document-verification-cites-copy"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "Verification of this deliverable cites its saved copy. Record it with --content-file <path>, then cite it with --artifact and --content-sha256."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "eq", value = "verified" },
+  { fact = "assignment.effect_kind", op = "in", value = ["evidence", "live_mutation", "review", "coordination"] },
+  { fact = "assignment.caller_is_holder", op = "eq", value = true },
+  { fact = "call.supplied_fields", op = "not_in", value = ["artifact_id"] },
+]
+
+[[rule]]
+name = "verified-copy-is-saved"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "The cited artifact has no saved copy. Record it again with --content-file <path> and cite the new artifact."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "in", value = ["verified", "reviewed-clean"] },
+  { fact = "assignment.effect_kind", op = "in", value = ["policy", "evidence", "live_mutation", "review", "coordination"] },
+  { fact = "artifact.cited_content_captured", op = "eq", value = false },
+]
+
+[[rule]]
+name = "linked-review-verification-cites-own-report"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "A review's verified verdict cites the review's own recorded report. Record your report on this assignment with --content-file <path> and cite it."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "assignment.is_producing_card", op = "eq", value = false },
+  { fact = "attest.verdict_kind", op = "eq", value = "verified" },
+  { fact = "call.supplied_fields", op = "in", value = ["artifact_id"] },
+  { fact = "cited_artifact.produced_by_assignment", op = "eq", value = false },
+]
+
+[[rule]]
+name = "linked-review-verification-by-holder"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "Only the review's holder verifies the review's own report."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "assignment.is_producing_card", op = "eq", value = false },
+  { fact = "attest.verdict_kind", op = "eq", value = "verified" },
+  { fact = "call.supplied_fields", op = "in", value = ["artifact_id"] },
+  { fact = "assignment.caller_is_holder", op = "eq", value = false },
+]
+
+[[rule]]
+name = "document-review-cites-commits-or-copy"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "A clean review of this deliverable names the commits or cites the saved copy it reviewed."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "eq", value = "reviewed-clean" },
+  { fact = "assignment.reviewed_effect_kind", op = "in", value = ["policy", "evidence", "live_mutation"] },
+  { fact = "call.commit_refs_count", op = "eq", value = 0 },
+  { fact = "call.supplied_fields", op = "not_in", value = ["artifact_id"] },
+]
+
+[[rule]]
+name = "clean-review-cites-verified-copy"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "A clean review cites the exact copy the reviewed holder's latest verified verdict cited. Cite it with --artifact and --content-sha256 as that verdict did."
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "eq", value = "reviewed-clean" },
+  { fact = "assignment.reviewed_effect_kind", op = "not_in", value = ["code"] },
+  { fact = "review.cites_source_copy.verified", op = "eq", value = false },
+]
+
 [[rule]]
 name = "completion-requires-verification"
 verb = "attest"
 edges = ["verb"]
 effect = "remedy"
-text = "completion requires a verification verdict on the assignment"
+text = "completion of code, policy, release and live-mutation work requires a verification verdict, or a reviewed-clean verdict from a different session holding a --reviews-linked review, on the assignment"
+external_producer = true
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.holder_archetype", op = "in", value = ["coder"] },
+  { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
   { fact = "assignment.verdicts", op = "not_in", value = ["verified"] },
+  { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]
 [rule.remedy]
 action = "wake"
@@ -17,35 +155,6 @@ target_session = "{holder_key}"
 [rule.remedy.params]
 prompt = "Your completion of {assignment_id} is blocked: no verification verdict is filed. Verify the work under the Evidence section of guidance/engineering-core.md, then file `tightbeam attest {assignment_id} --kind verdict --verdict verified` with a note saying what you ran and what you observed."
 
-# Widened 2026-08-18 from coder-only to the other archetypes whose deliverable is
-# a FILE. The shape was right and already proven; only its reach was short, and
-# the loss concentrated exactly where it did not reach. Measured across the fleet that
-# day, closed assignments carrying NO artifact on their work item: review sessions
-# 456/682, spec-writer 35/71, recon 34/148 — against coder's 118/397, the one
-# archetype this rule already covered.
-#
-# REVIEWER BELONGS HERE, and the tempting argument against it is wrong. "A
-# review's deliverable is its verdict, and a verdict is already a durable row"
-# holds only if the verdict can carry the review. It cannot: the note field caps
-# at 2000 characters, and reviewers already route around it in the open — "FULL
-# CLAUSE TABLE + EVIDENCE: art_xxxxxxx, the 2000-char note cap forced the card's
-# clause table". So a review holder that files a verdict and records nothing has kept
-# the DECISION and dropped the REASONING behind it. The review document is the
-# verdict's substance, not an optional companion to it.
-#
-# The product owner ruled the real fix on 2026-08-18: a verdict should POINT AT an artifact
-# rather than carry a capped note, which makes review context durable by
-# construction and retires this clause for reviewers. Until that lands (0.2
-# design), this rail is the interim that keeps the reasoning attached to the
-# decision. A workspace with no artifact rows is
-# REMOVED when it closes (artifacts-and-reconciliation.md, ratified floor), so an
-# unrecorded report is not a filing lapse but a deletion: 7 of 10 workdir paths
-# cited as evidence by attests in a single day no longer existed.
-#
-# The kind list widened with it. `report` alone would have blocked a spec-writer
-# holding a perfectly good spec, because the fact carries the kinds the holder
-# ACTUALLY recorded; this asks whether the work left a record at all, never which
-# sort of record the archetype should have chosen.
 [[rule]]
 name = "completion-requires-results-artifact"
 verb = "attest"
@@ -54,7 +163,7 @@ effect = "remedy"
 text = "completion requires a recorded results artifact from the holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.holder_archetype", op = "in", value = ["coder", "reviewer-code", "reviewer-spec", "spec-writer", "recon"] },
+  { fact = "assignment.effect_kind", op = "not_in", value = ["coordination"] },
   { fact = "assignment.artifact_kinds", op = "not_in", value = ["report", "spec", "doc", "data", "other"] },
 ]
 [rule.remedy]
@@ -85,4 +194,108 @@ when = [
   { fact = "wait.declaration_complete", op = "eq", value = true },
   { fact = "wait.verification_accountable", op = "eq", value = true },
   { fact = "wait.verification_state", op = "in", value = ["provisional", "confirmed"] },
+]
+
+# Attest placement and citation checks
+[[rule]]
+name = "artifact-citation-requires-own-producer"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "holder verification must cite an artifact produced by this assignment"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "call.supplied_fields", op = "in", value = ["artifact_id"] },
+  { fact = "assignment.is_producing_card", op = "eq", value = true },
+  { fact = "cited_artifact.produced_by_assignment", op = "eq", value = false },
+]
+
+[[rule]]
+name = "artifact-citation-requires-holder-verdict"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "an unlinked artifact citation must be filed by the assignment holder"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "call.supplied_fields", op = "in", value = ["artifact_id"] },
+  { fact = "assignment.is_producing_card", op = "eq", value = true },
+  { fact = "assignment.caller_is_holder", op = "eq", value = false },
+]
+
+[[rule]]
+name = "artifact-citation-requires-verification-verdict"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "an unlinked artifact citation requires a verified verdict"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "call.supplied_fields", op = "in", value = ["artifact_id"] },
+  { fact = "assignment.is_producing_card", op = "eq", value = true },
+  { fact = "attest.verdict_kind", op = "ne", value = "verified" },
+]
+
+[[rule]]
+name = "commit-refs-require-result-attest"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "commitRefs are only valid on completion or verdict attests"
+deny_when = [
+  { fact = "call.supplied_fields", op = "in", value = ["commit_refs"] },
+  { fact = "attest.kind", op = "not_in", value = ["completion", "verdict"] },
+]
+
+# Ruling receipt checks
+[[rule]]
+name = "receipt-without-note-requires-one-ref"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "a ruling receipt without a note requires exactly one commit ref"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "matches", value = "^ruling-consumed:(dr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$" },
+  { fact = "call.supplied_fields", op = "not_in", value = ["note"] },
+  { fact = "call.commit_refs_count", op = "ne", value = 1 },
+]
+
+[[rule]]
+name = "receipt-note-excludes-refs"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "a ruling receipt with a note cannot also supply commit refs"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "matches", value = "^ruling-consumed:(dr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$" },
+  { fact = "call.supplied_fields", op = "in", value = ["note"] },
+  { fact = "call.commit_refs_count", op = "ne", value = 0 },
+]
+
+[[rule]]
+name = "receipt-note-requires-operational-action"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "a ruling receipt note requires an operational-action prefix and nonblank action within 2000 characters"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "matches", value = "^ruling-consumed:(dr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$" },
+  { fact = "call.supplied_fields", op = "in", value = ["note"] },
+  { fact = "call.note", op = "matches", value = "(*UTF)\\A(?!operational-action: (?=[\\s\\S]*[^\\x{0009}-\\x{000D}\\x{0020}\\x{0085}\\x{00A0}\\x{1680}\\x{2000}-\\x{200A}\\x{2028}\\x{2029}\\x{202F}\\x{205F}\\x{3000}])[\\s\\S]{0,1980}\\z)" },
+]
+
+[[rule]]
+name = "receipt-requires-full-commit"
+verb = "attest"
+edges = ["verb"]
+effect = "deny"
+text = "a ruling receipt commit must have forty or sixty-four hexadecimal digits"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "matches", value = "^ruling-consumed:(dr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$" },
+  { fact = "call.commit_refs_count", op = "eq", value = 1 },
+  { fact = "call.commit_refs.0.commit", op = "matches", value = "\\A(?![0-9a-fA-F]{40}\\z|[0-9a-fA-F]{64}\\z)" },
 ]

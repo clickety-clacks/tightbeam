@@ -78,7 +78,7 @@ pub fn running_as_launcher() -> bool {
 pub const HELPER_PATH_DIR: &str = "/usr/local/libexec/tightbeam-cursor-path";
 
 /// Read-only rail guards the projected hooks invoke as `tightbeam <guard>`.
-const UNPRIVILEGED_GUARDS: [&str; 2] = ["github-auth-check", "tool-call-observed"];
+const UNPRIVILEGED_GUARDS: [&str; 3] = ["github-auth-check", "tool-call-observed", "hook-command"];
 
 /// What the launcher binary agrees to run. `cursor-exec` always (that is the
 /// sudoers grant). The rail guards only when invoked WITHOUT a privilege change
@@ -924,6 +924,8 @@ mod tests {
             &args("tool-call-observed"),
             true
         ));
+        assert!(launcher_command_allowed_with(&args("hook-command"), true));
+        assert!(!launcher_command_allowed_with(&args("rail-action"), true));
         assert!(!launcher_command_allowed_with(
             &args("github-auth-check"),
             false
@@ -932,5 +934,7 @@ mod tests {
             &args("tool-call-observed"),
             false
         ));
+        assert!(!launcher_command_allowed_with(&args("hook-command"), false));
+        assert!(!launcher_command_allowed_with(&args("rail-action"), false));
     }
 }

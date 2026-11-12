@@ -13,6 +13,7 @@ mod dispatch;
 mod github_auth;
 mod harness_process;
 mod harnesses;
+mod hook_input;
 mod lease;
 mod onboard_emit;
 mod preflight;
@@ -34,6 +35,16 @@ fn main() {
             "Cursor execution launcher refused: only cursor-exec is permitted (rail guards only when invoked unprivileged)"
         );
         std::process::exit(1);
+    }
+
+    if args.first().is_some_and(|arg| arg == "hook-command") {
+        match hook_input::run() {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
     }
 
     if args.first().is_some_and(|arg| arg == "cursor-exec") {

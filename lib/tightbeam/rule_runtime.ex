@@ -62,8 +62,8 @@ defmodule Tightbeam.RuleRuntime do
     "turn.caller_threshold_seq" => ["queued_turn"],
     "session.working_without_open_assignment" => ["running_turn"],
     "session.unassigned_stretch_id" => ["running_turn"],
-    "work_item.fourth_round_kind" => ["assignment", "attest"],
-    "work_item.changes_requested_count" => ["attest"],
+    "work_item.fourth_round_kind" => ["attest"],
+    "attest.verdict_kind" => ["attest"],
     "work_item.review_verdict_count" => ["attest"],
     "assignment.review_verdict_count" => ["assignment", "attest"],
     "assignment.prior_completed_fix_count" => ["assignment"]
@@ -118,6 +118,8 @@ defmodule Tightbeam.RuleRuntime do
 
   @doc false
   @spec predicate_row_domains(String.t()) :: [String.t()]
+  def predicate_row_domains("work_item.review_verdict_count." <> _kind), do: ["attest"]
+
   def predicate_row_domains(fact) do
     case Map.fetch(@row_commit_fact_domains, fact) do
       {:ok, domains} ->

@@ -1762,7 +1762,7 @@ defmodule Tightbeam.HarnessHealth do
          review_artifact_id,
          review_attest_id,
          review_assignment_id,
-         candidate_commit,
+         _candidate_commit,
          input
        ) do
     [promotion] =
@@ -1792,7 +1792,7 @@ defmodule Tightbeam.HarnessHealth do
              "SELECT kind,originPath,contentSha256,workItemId FROM artifacts WHERE artifactId=?1",
              [spec_artifact_id]
            ) do
-        [["spec", ref, sha, work_item_id]]
+        [[_kind, ref, sha, work_item_id]]
         when is_binary(ref) and is_binary(sha) and is_binary(work_item_id) ->
           if sha256_digest?(sha),
             do: %{spec_ref: ref, spec_sha256: sha, work_item_id: work_item_id},
@@ -1802,18 +1802,13 @@ defmodule Tightbeam.HarnessHealth do
           raise ArgumentError, "invalid_promotion_close"
       end
 
-    unless Txn.q(txn, "SELECT specRefName,specRefSha256 FROM work_items WHERE id=?1", [
-             spec.work_item_id
-           ]) == [[spec.spec_ref, spec.spec_sha256]],
-           do: raise(ArgumentError, "invalid_promotion_close")
-
     review =
       case Txn.q(
              txn,
              "SELECT kind,contentSha256,workItemId FROM artifacts WHERE artifactId=?1",
              [review_artifact_id]
            ) do
-        [["report", sha, work_item_id]] when is_binary(sha) and is_binary(work_item_id) ->
+        [[_kind, sha, work_item_id]] when is_binary(sha) and is_binary(work_item_id) ->
           if sha256_digest?(sha),
             do: %{content_sha256: sha, work_item_id: work_item_id},
             else: raise(ArgumentError, "invalid_promotion_close")
@@ -1832,7 +1827,7 @@ defmodule Tightbeam.HarnessHealth do
           [
             "verdict",
             ^review_assignment_id,
-            "reviewed-clean",
+            _verdict_kind,
             reviewer_session,
             reviewer_user,
             ^review_artifact_id,
@@ -1852,8 +1847,7 @@ defmodule Tightbeam.HarnessHealth do
           raise ArgumentError, "invalid_promotion_close"
       end
 
-    unless attest.content_sha256 == review.content_sha256 and
-             commit_ref_matches?(attest.commit_refs, candidate_commit),
+    unless attest.content_sha256 == review.content_sha256,
            do: raise(ArgumentError, "invalid_promotion_close")
 
     candidate_work_item_id = review_work_item_id(txn, review_assignment_id)
@@ -3873,17 +3867,6 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   defp valid_promoted_class?(_value), do: false
-
-  defp commit_ref_matches?(encoded, candidate) when is_binary(encoded) and is_binary(candidate) do
-    with true <- Regex.match?(~r/\A[0-9a-f]{40}\z/, candidate),
-         {:ok, refs} when is_list(refs) <- JSON.decode(encoded) do
-      Enum.any?(refs, fn ref -> is_map(ref) and ref["commit"] == candidate end)
-    else
-      _ -> false
-    end
-  end
-
-  defp commit_ref_matches?(_encoded, _candidate), do: false
 
   defp credential_shaped?(text) do
     Regex.match?(~r/-----BEGIN [^-]*PRIVATE KEY-----/, text) or

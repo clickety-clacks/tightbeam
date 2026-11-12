@@ -21,6 +21,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
     NoticeBatcher,
     Org,
     Roles,
+    Rules,
     Schema,
     Wakes
   }
@@ -53,6 +54,17 @@ defmodule Tightbeam.NoticeBatcherFixture do
     try do
       :ok = ensure_all_schemas(db)
       :ok = DB.assert_base_admitted!(db, base)
+
+      rules_dir = Path.join(base, "identity/rules")
+      File.mkdir_p!(rules_dir)
+
+      File.cp!(
+        Path.expand("../../priv/seed/rules/substrate.toml", __DIR__),
+        Path.join(rules_dir, "substrate.toml")
+      )
+
+      Rules.load!(base, Map.keys(Gateway.handlers(%{db: db})))
+
       seed_session(db, "agent:recipient", "recipient-owner")
       marker = File.read!(Path.join(base, "build-owner.json"))
       scenario(scenario, db)
@@ -188,6 +200,222 @@ defmodule Tightbeam.NoticeBatcherFixture do
     frozen = delivery_snapshot(db)
     assert NoticeBatcher.recover(db, priority.due_at) == []
     assert delivery_snapshot(db) == frozen
+  end
+
+  defp scenario(48, db) do
+    base = Application.fetch_env!(:tightbeam, :base_dir)
+    no_policy = Path.join(base, "no-notice-policy")
+    File.mkdir_p!(Path.join(no_policy, "identity/rules"))
+    Rules.load!(no_policy, Map.keys(Gateway.handlers(%{db: db})))
+
+    wake = ordinary(db, "fyi", "no declared batching choice")
+
+    assert wake.delivery_rule == "turn-boundary-digest r1"
+    assert wake.due_at == 0
+    assert NoticeBatcher.source_refs(db, wake.wake_id) == []
+    assert NoticeBatcher.recover(db, wake.due_at) == []
+
+    condition_due_at = System.system_time(:millisecond)
+
+    condition_wake =
+      Wakes.schedule(db, %{
+        session_key: "agent:recipient",
+        origin: "process:tightbeam",
+        prompt: "condition-triggered source keeps its requested time",
+        class: "fyi",
+        due_at: condition_due_at,
+        condition_kind: "operator-decision-ruled",
+        condition_scope: "dr_absent_notice_settings"
+      })
+
+    assert condition_wake.delivery_rule == "turn-boundary-digest r1"
+    assert condition_wake.due_at == condition_due_at
+    assert NoticeBatcher.source_refs(db, condition_wake.wake_id) == []
+    assert NoticeBatcher.recover(db, condition_due_at) == []
+
+    disabled_policy = Path.join(base, "disabled-notice-policy")
+    disabled_rules = Path.join(disabled_policy, "identity/rules")
+    File.mkdir_p!(disabled_rules)
+
+    disabled_seed =
+      base
+      |> Path.join("identity/rules/substrate.toml")
+      |> File.read!()
+      |> String.replace("batching_enabled = true", "batching_enabled = false")
+
+    File.write!(Path.join(disabled_rules, "substrate.toml"), disabled_seed)
+    Rules.load!(disabled_policy, Map.keys(Gateway.handlers(%{db: db})))
+    refute NoticeBatcher.batching_enabled?()
+
+    disabled_due_at = System.system_time(:millisecond)
+
+    disabled_condition_wake =
+      Wakes.schedule(db, %{
+        session_key: "agent:recipient",
+        origin: "process:tightbeam",
+        prompt: "condition-triggered source keeps its requested time",
+        class: "fyi",
+        due_at: disabled_due_at,
+        condition_kind: "operator-decision-ruled",
+        condition_scope: "dr_disabled_notice_settings"
+      })
+
+    assert disabled_condition_wake.delivery_rule == "turn-boundary-digest r1"
+    assert disabled_condition_wake.due_at == disabled_due_at
+    assert NoticeBatcher.source_refs(db, disabled_condition_wake.wake_id) == []
+    assert NoticeBatcher.recover(db, disabled_due_at) == []
+  end
+
+  defp scenario(50, db), do: deliver_queued_source_without_batching(db, :absent)
+  defp scenario(51, db), do: deliver_queued_source_without_batching(db, :disabled)
+  defp scenario(52, db), do: deliver_queued_source_without_batching(db, :invalid)
+
+  defp scenario(53, db) do
+    base = Application.fetch_env!(:tightbeam, :base_dir)
+    invalid_policy = Path.join(base, "invalid-notice-policy")
+    invalid_rules = Path.join(invalid_policy, "identity/rules")
+    File.mkdir_p!(invalid_rules)
+
+    seed = File.read!(Path.join(base, "identity/rules/substrate.toml"))
+
+    invalid_seed =
+      String.replace(
+        seed,
+        "batching_enabled = true",
+        "batching_enabled = \"true\""
+      )
+
+    assert invalid_seed != seed
+    File.write!(Path.join(invalid_rules, "substrate.toml"), invalid_seed)
+    Rules.load!(invalid_policy, Map.keys(Gateway.handlers(%{db: db})))
+
+    refute NoticeBatcher.batching_enabled?()
+
+    explicit_due_at = System.system_time(:millisecond) + 60_000
+    wake = eligible(db, prompt: "explicit non-lease due time", due_at: explicit_due_at)
+
+    assert wake.delivery_rule == "turn-boundary-digest r1"
+    assert wake.due_at == explicit_due_at
+    refute wake.due_at == wake.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+  end
+
+  defp scenario(54, db) do
+    base = Application.fetch_env!(:tightbeam, :base_dir)
+    disabled_policy = Path.join(base, "disabled-notice-policy")
+    disabled_rules = Path.join(disabled_policy, "identity/rules")
+    File.mkdir_p!(disabled_rules)
+
+    seed = File.read!(Path.join(base, "identity/rules/substrate.toml"))
+
+    disabled_seed =
+      String.replace(
+        seed,
+        "batching_enabled = true",
+        "batching_enabled = false"
+      )
+
+    assert disabled_seed != seed
+    File.write!(Path.join(disabled_rules, "substrate.toml"), disabled_seed)
+    Rules.load!(disabled_policy, Map.keys(Gateway.handlers(%{db: db})))
+
+    assert NoticeBatcher.batching_policy_state() == {:available, false}
+
+    explicit_due_at = System.system_time(:millisecond) + 60_000
+
+    wake =
+      eligible(
+        db,
+        prompt: "explicit deadline with batching disabled",
+        due_at: explicit_due_at
+      )
+
+    assert wake.delivery_rule == "turn-boundary-digest r1"
+    assert wake.due_at == explicit_due_at
+    refute wake.due_at == wake.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+  end
+
+  defp deliver_queued_source_without_batching(db, settings_state) do
+    source = eligible(db, prompt: "queued before batching settings changed")
+    assert source.delivery_rule == NoticeBatcher.rule()
+
+    base = Application.fetch_env!(:tightbeam, :base_dir)
+    handlers = Map.keys(Gateway.handlers(%{db: db}))
+
+    case settings_state do
+      :absent ->
+        no_policy = Path.join(base, "no-notice-policy")
+        File.mkdir_p!(Path.join(no_policy, "identity/rules"))
+        Rules.load!(no_policy, handlers)
+
+      :disabled ->
+        disabled_policy = Path.join(base, "disabled-notice-policy")
+        disabled_rules = Path.join(disabled_policy, "identity/rules")
+        File.mkdir_p!(disabled_rules)
+
+        seed = File.read!(Path.join(base, "identity/rules/substrate.toml"))
+
+        disabled_seed =
+          String.replace(seed, "batching_enabled = true", "batching_enabled = false")
+
+        assert disabled_seed != seed
+        File.write!(Path.join(disabled_rules, "substrate.toml"), disabled_seed)
+        Rules.load!(disabled_policy, handlers)
+
+      :invalid ->
+        invalid_policy = Path.join(base, "invalid-notice-policy")
+        invalid_rules = Path.join(invalid_policy, "identity/rules")
+        File.mkdir_p!(invalid_rules)
+
+        seed = File.read!(Path.join(base, "identity/rules/substrate.toml"))
+
+        invalid_seed =
+          String.replace(seed, "batching_enabled = true", "batching_enabled = \"true\"")
+
+        assert invalid_seed != seed
+        File.write!(Path.join(invalid_rules, "substrate.toml"), invalid_seed)
+        Rules.load!(invalid_policy, handlers)
+    end
+
+    refute NoticeBatcher.batching_enabled?()
+    assert [source.wake_id] == NoticeBatcher.recover(db, source.due_at)
+    assert Wakes.get(db, source.wake_id).state == "fired"
+    assert count(db, "turns", "wakeId=?1", [source.wake_id]) == 1
+
+    assert {:ok, [[prompt]]} =
+             DB.query(db, "SELECT prompt FROM turns WHERE wakeId=?1", [source.wake_id])
+
+    assert prompt == Gateway.decorate_delivery_prompt(source.prompt, source.origin)
+    assert count(db, "notice_batches") == 0
+    assert count(db, "notice_batch_members") == 0
+    assert NoticeBatcher.source_refs(db, source.wake_id) == []
+  end
+
+  defp scenario(49, db) do
+    base = Application.fetch_env!(:tightbeam, :base_dir)
+    settings_path = Path.join(base, "identity/rules/substrate.toml")
+    seed = File.read!(settings_path)
+
+    seed =
+      String.replace(
+        seed,
+        "class_order = [\"algedonic\", \"blocker\", \"input-needed\", \"status-query\", \"fyi\"]",
+        "class_order = [\"fyi\", \"status-query\", \"input-needed\", \"blocker\", \"algedonic\"]"
+      )
+
+    File.write!(settings_path, seed)
+    Rules.load!(base, Map.keys(Gateway.handlers(%{db: db})))
+
+    routine = eligible(db, prompt: "routine")
+
+    for class <- ["input-needed", "blocker", "algedonic"] do
+      ordinary(db, class, "urgent #{class}")
+    end
+
+    ordinary(db, "fyi", "later fyi")
+    assert [_carrier] = Wakes.materialize_digests(db, System.system_time(:millisecond) + 1)
+
+    assert Enum.map(NoticeBatcher.members(db, batch_id(db, routine)), & &1.class) ==
+             ["fyi", "fyi", "input-needed", "blocker", "algedonic"]
   end
 
   defp scenario(40, db) do

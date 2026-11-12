@@ -6440,38 +6440,93 @@ defmodule Tightbeam.Gateway do
          machine
        )
        when provider in [:openai, :anthropic] and is_binary(owner) and owner != "" do
-    creator_session_key =
-      case caller[:caller_session] do
-        %{session_key: session_key} when is_binary(session_key) -> session_key
-        _ -> nil
-      end
+    case refresh_notice_audience() do
+      ["owner"] ->
+        creator_session_key =
+          case caller[:caller_session] do
+            %{session_key: session_key} when is_binary(session_key) -> session_key
+            _ -> nil
+          end
 
-    prompt =
-      "The OAuth token for #{provider} on #{machine} was refreshed. " <>
-        "Read the manifests for every installed or learned Kung Fu. " <>
-        "Read each manifest's declared main archetype. " <>
-        "Find live agents with those archetypes. " <>
-        "Notify each that the OAuth token was refreshed, and require each to inspect and " <>
-        "resume any stalled agent graph."
+        prompt =
+          "The OAuth token for #{provider} on #{machine} was refreshed. " <>
+            "Read the manifests for every installed or learned Kung Fu. " <>
+            "Read each manifest's declared main archetype. " <>
+            "Find live agents with those archetypes. " <>
+            "Notify each that the OAuth token was refreshed, and require each to inspect and " <>
+            "resume any stalled agent graph."
 
-    case DB.transaction(gateway_db(config), fn txn ->
-           Wakes.schedule_in_txn(txn, %{
-             session_key: Org.personal_session_key(owner),
-             origin: "process:tightbeam",
-             creator_session_key: creator_session_key,
-             prompt: prompt,
-             consumer: "prompt",
-             due_at: System.system_time(:millisecond),
-             # Keep this ordinary native traffic immediate. A class would enroll
-             # it in the organization's notice-batching policy.
-             target_gate: 1
-           })
-         end) do
-      {:ok, _wake} ->
+        case DB.transaction(gateway_db(config), fn txn ->
+               Wakes.schedule_in_txn(txn, %{
+                 session_key: Org.personal_session_key(owner),
+                 origin: "process:tightbeam",
+                 creator_session_key: creator_session_key,
+                 prompt: prompt,
+                 consumer: "prompt",
+                 due_at: System.system_time(:millisecond),
+                 # Keep this ordinary native traffic immediate. A class would enroll
+                 # it in the organization's notice-batching policy.
+                 target_gate: 1
+               })
+             end) do
+          {:ok, _wake} ->
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      [] ->
         :ok
 
-      {:error, reason} ->
-        {:error, reason}
+      :unavailable ->
+        :ok
+    end
+  end
+
+  defp refresh_notice_audience do
+    case settings_family("notice-audience") do
+      {:ok, %{"recipients" => recipients} = settings}
+      when is_list(recipients) and length(recipients) <= 1 ->
+        if Map.keys(settings) == ["recipients"] and Enum.all?(recipients, &(&1 == "owner")) do
+          recipients
+        else
+          Logger.warning("substrate settings family notice-audience is invalid")
+          :unavailable
+        end
+
+      {:ok, _settings} ->
+        Logger.warning("substrate settings family notice-audience is invalid")
+        :unavailable
+
+      {:error, :ambiguous} ->
+        Logger.warning("substrate settings family notice-audience is ambiguous")
+        :unavailable
+
+      {:error, :invalid} ->
+        Logger.warning("substrate settings family notice-audience is invalid")
+        :unavailable
+
+      :absent ->
+        :unavailable
+    end
+  end
+
+  defp settings_family(family) do
+    case Rules.reaction_policy(family) do
+      nil ->
+        count =
+          Rules.effective_snapshot()
+          |> Map.get(:reactions, [])
+          |> Enum.count(&(&1.mode == :settings and &1.family == family))
+
+        if count == 0, do: :absent, else: {:error, :ambiguous}
+
+      %{settings: settings} when is_map(settings) ->
+        {:ok, settings}
+
+      _ ->
+        {:error, :invalid}
     end
   end
 
@@ -10730,10 +10785,20 @@ defmodule Tightbeam.Gateway do
         %{target_active?: false}
 
       %{state: "active"} = root ->
+        retirement_policy = session_retirement_policy()
         subtree = session_subtree(sessions_by_key, children, root_key)
         active_subtree = Enum.filter(subtree, &(&1.state == "active"))
         descendants = Enum.reject(active_subtree, &(&1.session_key == root_key))
-        protected = Enum.flat_map(descendants, &protected_descendant_in_txn(txn, &1))
+
+        protected_kinds =
+          case retirement_policy do
+            %{protected_descendant_kinds: kinds} -> kinds
+            :unavailable -> []
+          end
+
+        protected =
+          Enum.flat_map(descendants, &protected_descendant_in_txn(txn, &1, protected_kinds))
+
         protected_keys = MapSet.new(Enum.map(protected, & &1.session_key))
 
         frontiers =
@@ -10746,27 +10811,52 @@ defmodule Tightbeam.Gateway do
             )
           end)
 
-        accountable_parent =
-          if protected == [], do: nil, else: accountable_parent(root, sessions_by_key, owner)
+        kept_frontiers = if keep_open_descendants?, do: frontiers, else: []
 
-        kept_keys =
-          frontiers
-          |> Enum.reduce(MapSet.new(), fn frontier, keys ->
-            children
-            |> subtree_keys(frontier.session_key)
-            |> Enum.reduce(keys, &MapSet.put(&2, &1))
-          end)
+        refuse_by_default? =
+          case retirement_policy do
+            %{refuse_by_default: value} -> value
+            :unavailable -> false
+          end
+
+        refuse_for_protection? =
+          protected != [] and refuse_by_default? and not keep_open_descendants?
+
+        selected_parent =
+          if kept_frontiers == [] and not refuse_for_protection? do
+            nil
+          else
+            retirement_parent(
+              retirement_policy.kept_parent_order,
+              root,
+              sessions_by_key,
+              owner
+            )
+          end
+
+        accountable_parent = if kept_frontiers == [], do: nil, else: selected_parent
+
+        kept_keys = retirement_kept_keys(children, kept_frontiers)
 
         retired = Enum.reject(active_subtree, &MapSet.member?(kept_keys, &1.session_key))
 
-        if protected != [] and not keep_open_descendants? do
+        refusal_retired =
+          if refuse_for_protection? do
+            protected_subtree_keys = retirement_kept_keys(children, frontiers)
+            Enum.reject(active_subtree, &MapSet.member?(protected_subtree_keys, &1.session_key))
+          else
+            retired
+          end
+
+        if refuse_for_protection? do
           %{
             code: "open_descendants",
             message:
               "retire refused because active descendants hold open work or roles; no sessions or descendant work were changed",
             protected_descendants: Enum.map(protected, &protected_descendant_details/1),
-            retired_sessions: Enum.map(retired, &session_details/1),
-            accountable_parent: session_details(accountable_parent)
+            retired_sessions: Enum.map(refusal_retired, &session_details/1),
+            accountable_parent:
+              if(selected_parent, do: session_details(selected_parent), else: nil)
           }
         else
           %{
@@ -10774,7 +10864,7 @@ defmodule Tightbeam.Gateway do
             root_key: root_key,
             owner: owner,
             retired: retired,
-            frontiers: frontiers,
+            frontiers: kept_frontiers,
             accountable_parent: accountable_parent
           }
         end
@@ -10806,6 +10896,14 @@ defmodule Tightbeam.Gateway do
     [root_key | descendants]
   end
 
+  defp retirement_kept_keys(children, frontiers) do
+    Enum.reduce(frontiers, MapSet.new(), fn frontier, keys ->
+      children
+      |> subtree_keys(frontier.session_key)
+      |> Enum.reduce(keys, &MapSet.put(&2, &1))
+    end)
+  end
+
   defp has_protected_ancestor?(nil, _root_key, _protected_keys, _sessions_by_key), do: false
   defp has_protected_ancestor?(root_key, root_key, _protected_keys, _sessions_by_key), do: false
 
@@ -10820,20 +10918,28 @@ defmodule Tightbeam.Gateway do
       end
   end
 
-  defp protected_descendant_in_txn(txn, session) do
+  defp protected_descendant_in_txn(txn, session, kinds) do
     assignments =
-      Txn.q(
-        txn,
-        "SELECT id, subject FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY id",
-        [session.session_key]
-      )
-      |> Enum.map(fn [id, subject] -> %{assignment_id: id, subject: subject} end)
+      if "open_assignments" in kinds do
+        Txn.q(
+          txn,
+          "SELECT id, subject FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY id",
+          [session.session_key]
+        )
+        |> Enum.map(fn [id, subject] -> %{assignment_id: id, subject: subject} end)
+      else
+        []
+      end
 
     roles =
-      Txn.q(txn, "SELECT name FROM roles WHERE boundSessionKey=?1 ORDER BY name", [
-        session.session_key
-      ])
-      |> Enum.map(fn [name] -> name end)
+      if "bound_roles" in kinds do
+        Txn.q(txn, "SELECT name FROM roles WHERE boundSessionKey=?1 ORDER BY name", [
+          session.session_key
+        ])
+        |> Enum.map(fn [name] -> name end)
+      else
+        []
+      end
 
     if assignments == [] and roles == [] do
       []
@@ -10842,9 +10948,74 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp accountable_parent(root, sessions_by_key, owner) do
-    nearest_active_parent(root.parent_session_key, sessions_by_key, MapSet.new()) ||
-      Map.fetch!(sessions_by_key, Org.personal_session_key(owner))
+  defp session_retirement_policy do
+    case settings_family("session-retirement") do
+      {:ok, settings} when is_map(settings) ->
+        protected_kinds = Map.get(settings, "protected_descendant_kinds")
+        refuse_by_default = Map.get(settings, "refuse_by_default")
+        parent_order = Map.get(settings, "kept_parent_order")
+
+        if Enum.sort(Map.keys(settings)) == [
+             "kept_parent_order",
+             "protected_descendant_kinds",
+             "refuse_by_default"
+           ] and valid_retirement_policy?(protected_kinds, refuse_by_default, parent_order) do
+          %{
+            protected_descendant_kinds: protected_kinds,
+            refuse_by_default: refuse_by_default,
+            kept_parent_order: parent_order
+          }
+        else
+          Logger.warning(
+            "substrate settings family session-retirement is invalid; no protection or parent choice was selected"
+          )
+
+          :unavailable
+        end
+
+      {:error, :ambiguous} ->
+        Logger.warning(
+          "substrate settings family session-retirement is ambiguous; no protection or parent choice was selected"
+        )
+
+        :unavailable
+
+      {:error, :invalid} ->
+        Logger.warning(
+          "substrate settings family session-retirement is invalid; no protection or parent choice was selected"
+        )
+
+        :unavailable
+
+      :absent ->
+        :unavailable
+
+      {:ok, _settings} ->
+        Logger.warning(
+          "substrate settings family session-retirement is invalid; no protection or parent choice was selected"
+        )
+
+        :unavailable
+    end
+  end
+
+  defp valid_retirement_policy?(kinds, refuse_by_default, parent_order) do
+    is_list(kinds) and Enum.all?(kinds, &(&1 in ["open_assignments", "bound_roles"])) and
+      length(Enum.uniq(kinds)) == length(kinds) and is_boolean(refuse_by_default) and
+      is_list(parent_order) and parent_order != [] and
+      Enum.all?(parent_order, &(&1 in ["active_ancestor", "owner_personal_session"])) and
+      "owner_personal_session" in parent_order and
+      length(Enum.uniq(parent_order)) == length(parent_order)
+  end
+
+  defp retirement_parent(order, root, sessions_by_key, owner) do
+    Enum.find_value(order, fn
+      "active_ancestor" ->
+        nearest_active_parent(root.parent_session_key, sessions_by_key, MapSet.new())
+
+      "owner_personal_session" ->
+        Map.fetch!(sessions_by_key, Org.personal_session_key(owner))
+    end)
   end
 
   defp nearest_active_parent(nil, _sessions_by_key, _seen), do: nil

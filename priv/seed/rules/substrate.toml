@@ -1,0 +1,53 @@
+[[reaction]]
+name = "notice-audience"
+family = "notice-audience"
+settings = { recipients = ["owner"] }
+english = "Send notices to the listed recipients."
+
+[[reaction]]
+name = "queue-thresholds"
+family = "queue-thresholds"
+settings = { queued_turns = 20, oldest_age_ms = 3600000 }
+english = "Treat a queue as backlogged after either listed threshold."
+
+[[reaction]]
+name = "notice-delivery"
+family = "notice-delivery"
+settings = { batching_enabled = true, class_order = ["algedonic", "blocker", "input-needed", "status-query", "fyi"] }
+english = "Batch prompts by default and order them by the listed classes."
+
+[[reaction]]
+name = "single-turn-session"
+family = "single-turn-session"
+settings = { automatic_retirement = true, result_recipients = ["caller", "parent"] }
+english = "Retire a single-turn session automatically and route its result to the first available recipient."
+
+[[reaction]]
+name = "work-item-context"
+family = "work-item-context"
+settings = { link_current_turn = true }
+english = "Associate new work with its current turn when one is available."
+
+[[reaction]]
+name = "rule-failure"
+family = "rule-failure"
+settings = { escalate_script_failures = true, recover_on_success = true }
+english = "Escalate configured script failures and apply the listed recovery treatment."
+
+[[reaction]]
+name = "session-retirement"
+family = "session-retirement"
+settings = { protected_descendant_kinds = ["open_assignments", "bound_roles"], refuse_by_default = true, kept_parent_order = ["active_ancestor", "owner_personal_session"] }
+english = "Protect the listed descendants by default and use the listed parent order for retained sessions."
+
+[[reaction]]
+name = "late-ruling"
+family = "late-ruling"
+settings = { recipient_order = ["opener_lineage", "opening_user_personal_session", "accountable_owner_personal_session"], default_deadline_ms = 86400000 }
+english = "Choose late-ruling recipients and the default decision deadline."
+
+[[reaction]]
+name = "role-fallback"
+family = "role-fallback"
+settings = { recipient = "owner_personal_session" }
+english = "Choose the recipient for a role without an active bound session."

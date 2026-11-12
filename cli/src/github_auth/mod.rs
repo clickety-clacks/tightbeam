@@ -9,6 +9,10 @@ mod redact;
 use bank::RealGh;
 use redact::Scrubbed;
 
+pub(crate) fn decode_hook_json(raw: &str) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_str(raw)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GithubState {
     Live,

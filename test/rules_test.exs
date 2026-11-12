@@ -12,12 +12,14 @@ defmodule Tightbeam.RulesTest do
     EventLog,
     Gateway,
     Ledger,
+    NoticeBatcher,
     Org,
     RailRemedy,
     Roles,
     Rules,
     Toplines,
-    Wakes
+    Wakes,
+    WorkItems
   }
 
   setup do
@@ -30,6 +32,8 @@ defmodule Tightbeam.RulesTest do
       Path.join(System.tmp_dir!(), "tightbeam-rules-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join(base_dir, "identity/rules"))
+    File.cp!("priv/kungfu/agentic-engineering/rules/assignment-labels.toml",
+      Path.join(base_dir, "identity/rules/assignment-labels.toml"))
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
@@ -37,13 +41,68 @@ defmodule Tightbeam.RulesTest do
     end)
 
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-    Rules.load!(Path.join(base_dir, "missing-rules"), Map.keys(handlers))
+    Rules.load!(base_dir, Map.keys(handlers))
 
     %{
       db: db,
       base_dir: base_dir,
       handlers: handlers
     }
+  end
+
+  test "raw call note patterns preserve whitespace and absent-fact semantics", ctx do
+    put_rule(ctx, rule("note-pattern", "post", "call.note", "matches", "\\A \\z"))
+    assert [_] = Rules.load!(ctx.base_dir, ["post"])
+
+    assert {:deny, %{code: "rule_denied"}} =
+             Rules.evaluate(ctx.db, %{call() | params: %{note: " "}})
+
+    for params <- [%{}, %{note: nil}, %{note: 42}, %{note: ""}, %{note: "  "}] do
+      assert :ok = Rules.evaluate(ctx.db, %{call() | params: params})
+    end
+  end
+
+  test "raw supplied fields include empty text but exclude null", ctx do
+    put_rule(ctx, rule("note-supplied", "post", "call.supplied_fields", "in", ["note"]))
+    assert [_] = Rules.load!(ctx.base_dir, ["post"])
+
+    for note <- ["", " ", 42] do
+      assert {:deny, %{code: "rule_denied"}} =
+               Rules.evaluate(ctx.db, %{call() | params: %{note: note}})
+    end
+
+    assert :ok = Rules.evaluate(ctx.db, %{call() | params: %{note: nil}})
+    assert :ok = Rules.evaluate(ctx.db, call())
+  end
+
+  test "raw commit count preserves duplicates and is absent for non-lists", ctx do
+    put_rule(ctx, rule("two-refs", "post", "call.commit_refs_count", "eq", 2))
+    assert [_] = Rules.load!(ctx.base_dir, ["post"])
+    ref = %{"repo" => "repo", "commit" => String.duplicate("a", 40)}
+    assert {:deny, %{code: "rule_denied"}} =
+             Rules.evaluate(ctx.db, %{call() | params: %{commit_refs: [ref, ref]}})
+
+    put_rule(ctx, rule("nonzero-refs", "post", "call.commit_refs_count", "ne", 0))
+    assert [_] = Rules.load!(ctx.base_dir, ["post"])
+    for params <- [%{}, %{commit_refs: nil}, %{commit_refs: []}, %{commit_refs: "bad"}] do
+      assert :ok = Rules.evaluate(ctx.db, %{call() | params: params})
+    end
+  end
+
+  test "pattern operator rejects invalid patterns and non-string facts at load", ctx do
+    put_rule(ctx, rule("bad-pattern", "post", "call.note", "matches", "["))
+    assert_unavailable(ctx, ~r/invalid pattern/, fn -> Rules.load!(ctx.base_dir, ["post"]) end)
+
+    put_rule(ctx, rule("bad-pattern-type", "post", "call.commit_refs_count", "matches", "0"))
+    assert_unavailable(ctx, ~r/operator matches is invalid/, fn ->
+      Rules.load!(ctx.base_dir, ["post"])
+    end)
+  end
+
+  test "latest named verdict is not an available rule fact", ctx do
+    put_rule(ctx, rule("held-verdict", "attest",
+      "assignment.latest_verdict_kind.blocked,waiting,cleared", "in", ["blocked", "waiting"]))
+    assert_unavailable(ctx, ~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
   end
 
   test "missing and empty directories load zero rules and an empty load clears prior rules",
@@ -187,7 +246,7 @@ defmodule Tightbeam.RulesTest do
       {String.replace(valid, "op = \"eq\", ", ""), "missing op"},
       {String.replace(valid, ", value = \"user\"", ""), "missing value"},
       {String.replace(valid, "caller.origin_class", "caller.unknown"), "unknown fact"},
-      {String.replace(valid, "op = \"eq\"", "op = \"matches\""), "unknown op"},
+      {String.replace(valid, "op = \"eq\"", "op = \"unsupported\""), "unknown op"},
       {String.replace(valid, "op = \"eq\"", "op = \"gt\""), "invalid for string"},
       {String.replace(valid, "value = \"user\"", "value = [\"user\"]"), "does not match string"},
       {rule("float", "post", "caller.verb_count_24h", "gte", "3.0", raw: true),
@@ -666,8 +725,9 @@ defmodule Tightbeam.RulesTest do
     assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
   end
 
-  test "zero rules still require code completion evidence",
+  test "zero rules allow completion without evidence",
        ctx do
+    assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
     holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -678,24 +738,24 @@ defmodule Tightbeam.RulesTest do
         kind: "completion"
       })
 
-    assert {:error, %{code: "inapplicable_code_evidence"}} =
+    assert {:ok, %{assignment: %{state: "closed"}, attest: %{id: closing_id}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert {:ok, [["open", nil]]} =
+    assert {:ok, [["closed", ^closing_id]]} =
              DB.query(
                ctx.db,
                "SELECT state,closingAttestId FROM assignments WHERE id=?1",
                [assignment.id]
              )
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
                [assignment.id]
              )
 
-    assert [%{kind: "denied", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
+    assert [%{kind: "verb", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
   end
 
   test "a declared denial precedes required owner data without changing domain state", ctx do
@@ -726,10 +786,108 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
   end
 
+  test "removed qualification facts and evidence policy purposes refuse to load", ctx do
+    for fact <- [
+          "assignment.qualifying_review_verdict_kinds",
+          "assignment.qualifying_verification_verdict_kinds",
+          "work_item.changes_requested_count",
+          "call.file_effect_manifest.valid"
+        ] do
+      put_rule(ctx, rule("removed-fact", "attest", fact, "in", ["verified"]))
+      assert_unavailable(ctx, ~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+    end
+
+    put_raw(
+      ctx,
+      """
+      [[policy]]
+      name = "removed-evidence-policy"
+      purpose = "attest-file-effect-evidence"
+      when = [{fact = "caller.origin_class", op = "eq", value = "agent"}]
+      """
+    )
+
+    assert_unavailable(ctx, ~r/unsupported purpose/, fn ->
+      Rules.load!(ctx.base_dir, ["attest"])
+    end)
+  end
+
+  test "known retired operational-evidence policy alone is skipped without disabling verbs",
+       ctx do
+    policy = """
+    [[policy]]
+    name = "operational-evidence-for-unfiled-live-effects"
+    purpose = "attest-operational-evidence"
+    when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
+    """
+
+    put_raw(ctx, policy, "engineering.toml")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+        refute Enum.any?(loaded, &(&1.name == "operational-evidence-for-unfiled-live-effects"))
+        assert %{} == :persistent_term.get({Rules, :unavailable_verbs})
+      end)
+
+    assert log =~
+             "policy \"operational-evidence-for-unfiled-live-effects\" skipped: purpose attest-operational-evidence is retired"
+
+    assert :ok = Rules.evaluate(ctx.db, %{call() | verb: "status"})
+  end
+
+  test "known retired operational-evidence policy is skipped without disabling its healthy sibling",
+       ctx do
+    contents =
+      rule("healthy-engineering-sibling", "attest", "caller.origin_class", "eq", "agent") <>
+        """
+
+        [[policy]]
+        name = "operational-evidence-for-unfiled-live-effects"
+        purpose = "attest-operational-evidence"
+        when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
+        """
+
+    put_raw(ctx, contents, "engineering.toml")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        loaded = Rules.load!(ctx.base_dir, ["attest"])
+        assert Enum.any?(loaded, &(&1.name == "healthy-engineering-sibling"))
+        refute Enum.any?(loaded, &(&1.name == "operational-evidence-for-unfiled-live-effects"))
+      end)
+
+    assert log =~
+             "policy \"operational-evidence-for-unfiled-live-effects\" skipped: purpose attest-operational-evidence is retired"
+
+    agent_call = %{call() | verb: "attest", origin: "agent:loader-regression"}
+
+    assert {:deny, %{code: "rule_denied", rule: "healthy-engineering-sibling"}} =
+             Rules.evaluate(ctx.db, agent_call)
+  end
+
+  test "an arbitrary unsupported policy is not discarded beside a healthy rule", ctx do
+    put_raw(
+      ctx,
+      rule("healthy-engineering-sibling", "attest", "caller.origin_class", "eq", "agent") <>
+        """
+
+        [[policy]]
+        name = "future-policy"
+        purpose = "unrecognized-purpose"
+        when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
+        """,
+      "engineering.toml"
+    )
+
+    assert_unavailable(ctx, ~r/unsupported purpose/, fn ->
+      Rules.load!(ctx.base_dir, ["attest"])
+    end)
+  end
+
   test "P3 fact registry has exact names and load-time types", ctx do
     list_facts = [
       "assignment.independent_verdict_kinds",
-      "assignment.qualifying_review_verdict_kinds",
       "assignment.artifact_kinds"
     ]
 
@@ -823,7 +981,7 @@ defmodule Tightbeam.RulesTest do
       rule(
         "bad-list-member",
         "attest",
-        "assignment.qualifying_review_verdict_kinds",
+        "assignment.independent_verdict_kinds",
         "in",
         [1]
       )
@@ -840,7 +998,7 @@ defmodule Tightbeam.RulesTest do
     review = assignment(ctx, holder.session_key, {:user, "flynn"}, reviews: assignment.id)
 
     list_facts = [
-      "assignment.qualifying_review_verdict_kinds",
+      "assignment.independent_verdict_kinds",
       "assignment.artifact_kinds"
     ]
 
@@ -1039,70 +1197,27 @@ defmodule Tightbeam.RulesTest do
     assert {:deny, %{rule: "needs-review"}} = Rules.evaluate(ctx.db, completion)
   end
 
-  test "completion gate loader exception preserves unrelated remedy-link validation",
-       ctx do
-    shipped = File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
-    put_raw(ctx, shipped)
-    loaded_rules = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-
-    assert Enum.map(loaded_rules, & &1.name) == [
-             "completion-requires-review",
-             "implementation-requires-posture",
-             "implementation-dispatch-requires-posture"
-           ]
-
-    # The rest of this test edits the completion rule alone.
-    shipped = shipped |> String.split("\n# Posture gate") |> hd()
-    put_raw(ctx, shipped)
-    assert [loaded] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    assert loaded.name == "completion-requires-review"
-    assert loaded.external_producer
-    assert loaded.remedy.action == "wake"
-    assert loaded.remedy.produces == "reviewed-clean"
-    refute Map.has_key?(loaded.remedy.params, :reviews)
-
-    put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
-
-    assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    end)
-
-    for extra <- [~s(reviews = "{assignment_id}"), ~s(arbitrary = "value")] do
-      put_raw(ctx, shipped <> "\n" <> extra <> "\n")
-
-      assert_unavailable(ctx, ~r/remedy wake has invalid params/, fn ->
+  test "completion rule names do not bypass linked-review remedy validation", ctx do
+    for name <- ["completion-requires-review", "unrelated-review-rule"] do
+      put_raw(ctx, """
+      [[rule]]
+      name = "#{name}"
+      text = "independent review required"
+      verb = "attest"
+      effect = "remedy"
+      external_producer = true
+      deny_when = [{fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"]}]
+      [rule.remedy]
+      action = "wake"
+      produces = "reviewed-clean"
+      target_session = "{holder_key}"
+      [rule.remedy.params]
+      prompt = "Request review"
+      """)
+      assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
         Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
       end)
     end
-
-    put_raw(ctx, String.replace(shipped, "external_producer = true", "external_producer = false"))
-
-    assert_unavailable(ctx, ~r/F1 unsatisfied verdict gate/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    end)
-
-    assigned =
-      shipped
-      |> String.replace(~s(action = "wake"), ~s(action = "assign"))
-      |> String.replace(~s(target_session = "{holder_key}"), ~s(target_role = "reviewer-code"))
-      |> String.replace(~r/^prompt = .*$/m, ~s(subject = "review {assignment_id}"))
-
-    put_raw(ctx, assigned)
-
-    assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    end)
-
-    put_raw(ctx, assigned <> ~s(\nreviews = "{holder_key}"\n))
-
-    assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    end)
-
-    put_raw(ctx, assigned <> ~s(\nreviews = "{assignment_id}"\n))
-    assert [linked] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    assert linked.remedy.params.reviews == "{assignment_id}"
-    assert linked.conditions == loaded.conditions
   end
 
   test "restored independent verdict fact accepts the prior linked-review shape", ctx do
@@ -1136,7 +1251,64 @@ defmodule Tightbeam.RulesTest do
              )
   end
 
-  test "qualifying review ignores harness/provider", ctx do
+  test "legacy assignment facts preserve code and review labels despite settings defaults", ctx do
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('legacy-owner',1,1)"
+      )
+
+    holder = session(ctx.db, "legacy-code-holder", "legacy-owner", archetype: "coder")
+    reviewer = session(ctx.db, "legacy-review-holder", "legacy-owner", archetype: "reviewer-code")
+
+    producer =
+      assignment(ctx, holder.session_key, {:user, "legacy-owner"}, effect_kind: "evidence")
+
+    review = assignment(ctx, reviewer.session_key, {:user, "legacy-owner"}, reviews: producer.id)
+
+    assert %{settings: %{"default" => "evidence", "linked" => "review"}} =
+             Rules.reaction_policy("assignment-effect-labels")
+
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM assignment_effects WHERE assignmentId IN (?1, ?2)", [
+        producer.id,
+        review.id
+      ])
+
+    put_rule(
+      ctx,
+      rule("legacy-code-not-evidence", "attest", "assignment.effect_kind", "eq", "evidence")
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert :ok =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
+             )
+
+    put_rule(
+      ctx,
+      rule("legacy-review-remains-review", "attest", "assignment.effect_kind", "eq", "review")
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert :ok =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
+             )
+
+    assert {:deny, %{rule: "legacy-review-remains-review"}} =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: review.id, kind: "completion"})
+             )
+  end
+
+  test "independent review ignores harness/provider", ctx do
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
@@ -1158,7 +1330,7 @@ defmodule Tightbeam.RulesTest do
       rule(
         "qualified",
         "attest",
-        "assignment.qualifying_review_verdict_kinds",
+        "assignment.independent_verdict_kinds",
         "in",
         ["reviewed-clean"]
       )
@@ -1189,7 +1361,7 @@ defmodule Tightbeam.RulesTest do
              )
   end
 
-  test "uncovered producer commits reach the detailed completion refusal", ctx do
+  test "completion stores refs without comparing review coverage", ctx do
     :ok =
       DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('other',1)")
 
@@ -1203,7 +1375,6 @@ defmodule Tightbeam.RulesTest do
       assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
 
     producer_refs = fixture_commit_refs()
-    missing_commit = hd(producer_refs)["commit"]
 
     review_refs = [
       %{
@@ -1241,11 +1412,9 @@ defmodule Tightbeam.RulesTest do
 
     assert :ok = Rules.evaluate(ctx.db, completion)
 
-    assert {:error, %{code: "inapplicable_code_evidence", message: message}} =
+    assert {:ok, %{assignment: %{state: "closed"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert message =~ "latest independent clean review is missing verified producer commits"
-    assert message =~ missing_commit
   end
 
   test "artifact kinds fact resolves holder-recorded kinds only (A6)", ctx do
@@ -1498,266 +1667,457 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "shipped completion is recorded while a same-source independent review is pending", ctx do
-    holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer-code")
+  test "r4 review facts use the linked effect and the latest holder verified commits", ctx do
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1),('reviewer',0,1),('other',0,1)"
+      )
 
-    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
-
-    {:ok, _} =
-      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
-
-    Roles.create!(ctx.db, "reviewer-code", "flynn", reviewer.session_key)
-    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
-    attach_work_item(ctx, producer.id, "review-notice")
-
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     stub_commit_ref_validation()
-    refs = fixture_commit_refs()
+    create_work_item(ctx, "r4-review-facts")
+    holder = session(ctx.db, "r4-code-holder", "flynn")
+    reviewer = session(ctx.db, "r4-code-reviewer", "reviewer")
+    outsider = session(ctx.db, "r4-other-reviewer", "other")
+    set_work_item_owner(ctx, "r4-review-facts", holder.session_key)
 
-    assert %{attest: %{verdictKind: "verified"}} =
-             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+    producer =
+      assignment(ctx, holder.session_key, {:user, "flynn"},
+        effect_kind: "code",
+        work_item_id: "r4-review-facts"
+      )
 
-    completion =
-      p3_call("attest", {:session, holder.session_key}, %{
-        assignment_id: producer.id,
-        kind: "completion",
-        commit_refs: refs
-      })
+    review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"},
+        reviews: producer.id,
+        work_item_id: "r4-review-facts"
+      )
 
-    assert {:ok,
-            %{
-              assignment: %{id: producer_id, state: "open"},
-              attest: %{kind: "completion"} = completion_attest
-            }} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+    unlinked_code =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"},
+        effect_kind: "code",
+        work_item_id: "r4-review-facts"
+      )
 
-    assert producer_id == producer.id
-    assert completion_attest.bySession == holder.session_key
-    assert completion_attest.commitRefs == refs
-    assert review_count(ctx.db, producer.id) == 0
+    put_raw(
+      ctx,
+      File.read!("priv/kungfu/agentic-engineering/rules/verification.toml"),
+      "verification.toml"
+    )
 
-    # The gate's notice is one ordinary stored notice to the accountable owner; it
-    # starts no review-remedy episode and staffs no reviewer.
-    assert RailRemedy.episode(ctx.db, "completion-requires-review", producer.id) == nil
+    rules = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    assert Enum.any?(rules, &(&1.name == "clean-review-covers-verified-commits"))
+    assert Enum.any?(rules, &(&1.name == "clean-review-cites-verified-copy"))
+    refute Enum.any?(rules, &(&1.name == "completion-requires-review"))
 
-    assert [notice] = review_gate_notices(ctx.db, producer.id)
-    assert notice.session_key == owner.session_key
-    assert notice.owner_user_id == "flynn"
-    assert notice.consumer == "prompt"
-    assert notice.summon == 1
-    assert notice.creator_session_key == nil
-
-    assert notice.prompt ==
-             "Coordinate independent review of assignment #{producer.id}; preserve current evidence and direct staffing through its accountable owner."
-
-    assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
-               "review-notice"
-             ])
-
-    assert {:ok, review} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               p3_call("assign", {:user, "flynn"}, %{
-                 subject: "owner-directed independent review",
-                 reviews_assignment_id: producer.id,
-                 idempotency_key: nil,
-                 files: nil
-               })
-               |> Map.put(:session_key, reviewer.session_key)
-             )
-
-    assert review.holderKey != holder.session_key
-
-    reviewer_refs =
-      Enum.map(refs, fn ref ->
-        Map.put(ref, "repo", "#{Tightbeam.Placement.local_host_name()}:/tmp/reviewer-result")
-      end)
-
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             commit_ref_verdict(
-               ctx,
-               reviewer.session_key,
-               review.id,
-               "reviewed-clean",
-               reviewer_refs,
-               "reviewed exact result"
-             )
-
-    assert {:ok, [["closed", "completed", closing_attest_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
-               [producer.id]
-             )
-
-    assert closing_attest_id == completion_attest.id
-    assert review_count(ctx.db, producer.id) == 1
-  end
-
-  test "shipped completion records pending release and live-mutation work", ctx do
-    holder = session(ctx.db, "non-code-completion-holder", "flynn", archetype: "coder")
-
-    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
-
-    {:ok, _} =
-      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
-
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-
-    for effect_kind <- ["release", "live_mutation"] do
-      producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: effect_kind)
-
-      assert {:ok, %{assignment: %{state: "open"}, attest: %{kind: "completion"}}} =
-               Dispatch.dispatch(
-                 ctx.db,
-                 ctx.handlers,
-                 p3_call("attest", {:session, holder.session_key}, %{
-                   assignment_id: producer.id,
-                   kind: "completion"
-                 })
-               )
-
-      assert review_count(ctx.db, producer.id) == 0
-
-      assert [%{session_key: session_key}] = review_gate_notices(ctx.db, producer.id)
-      assert session_key == owner.session_key
+    clean_call = fn assignment_id, refs ->
+      p3_call(
+        "attest",
+        {:session, reviewer.session_key},
+        %{
+          assignment_id: assignment_id,
+          kind: "verdict",
+          verdict_kind: "reviewed-clean",
+          commit_refs: refs
+        }
+      )
     end
-  end
 
-  test "changes-requested wakes and reopens the author card, then clean review closes it", ctx do
-    holder = session(ctx.db, "review-change-author", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "review-change-judge", "reviewer", archetype: "reviewer-code")
+    assert {:deny, %{rule: "code-review-names-commits"}} =
+             Rules.evaluate(ctx.db, clean_call.(review.id, []))
 
-    _owner =
-      session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+    assert :ok = Rules.evaluate(ctx.db, clean_call.(unlinked_code.id, []))
+
+    repo = "testhost:/tmp/r4-review-subject"
+    commit_a = String.duplicate("a", 40)
+    commit_b = String.duplicate("b", 40)
+    commit_c = String.duplicate("c", 40)
+    commit_x = String.duplicate("x", 40)
+
+    refs_ab = [%{"repo" => repo, "commit" => commit_a}, %{"repo" => repo, "commit" => commit_b}]
+    refs_ac = [%{"repo" => repo, "commit" => commit_a}, %{"repo" => repo, "commit" => commit_c}]
+    refs_x = [%{"repo" => repo, "commit" => commit_x}]
+
+    commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs_ab)
+    commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs_ac)
+
+    now = System.system_time(:millisecond)
 
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1),('reviewer', 0, 1)"
+        """
+        INSERT INTO attests (id,assignmentId,kind,verdictKind,bySession,byUser,commitRefs,ts)
+        VALUES (?1,?2,'verdict','verified',?3,NULL,?4,?5)
+        """,
+        [
+          "r4-outsider-verified",
+          producer.id,
+          outsider.session_key,
+          JSON.encode!(refs_x),
+          now + 1_000
+        ]
       )
 
-    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
-    attach_work_item(ctx, producer.id, "review-change-reopen")
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    stub_commit_ref_validation()
-    refs = fixture_commit_refs()
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO attests (id,assignmentId,kind,verdictKind,bySession,byUser,commitRefs,ts)
+        VALUES (?1,?2,'verdict','verification-failed',?3,NULL,?4,?5)
+        """,
+        ["r4-holder-failed", producer.id, holder.session_key, JSON.encode!(refs_x), now + 2_000]
+      )
 
-    assert %{attest: %{verdictKind: "verified"}} =
-             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+    assert {:deny, %{rule: "clean-review-covers-verified-commits"}} =
+             Rules.evaluate(
+               ctx.db,
+               clean_call.(review.id, [%{"repo" => repo, "commit" => commit_a}])
+             )
 
-    completion_call =
-      p3_call("attest", {:session, holder.session_key}, %{
-        assignment_id: producer.id,
-        kind: "completion",
-        commit_refs: refs
+    assert :ok = Rules.evaluate(ctx.db, clean_call.(review.id, refs_ac))
+
+    mixed_case_refs_ac = [
+      %{"repo" => repo, "commit" => String.upcase(commit_a)},
+      %{"repo" => repo, "commit" => commit_c}
+    ]
+
+    assert :ok = Rules.evaluate(ctx.db, clean_call.(review.id, mixed_case_refs_ac))
+  end
+
+  test "r4 captured-content fact distinguishes missing, uncaptured and captured artifacts", ctx do
+    :ok = DB.execute(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+    create_work_item(ctx, "r4-captured-fact")
+    holder = session(ctx.db, "r4-artifact-holder", "flynn")
+
+    metadata_digest =
+      :crypto.hash(:sha256, "caller-supplied digest only") |> Base.encode16(case: :lower)
+
+    metadata_only =
+      Artifacts.record(ctx.db, %{
+        principal: {:session, holder.session_key},
+        session_key: holder.session_key,
+        params: %{
+          kind: "report",
+          title: "Metadata only",
+          origin_path: "readable-origin.txt",
+          work_item_id: "r4-captured-fact",
+          content_sha256: metadata_digest
+        }
       })
 
-    assert {:ok, %{assignment: %{state: "open"}, attest: completion_attest}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call)
+    captured =
+      record_captured_artifact(
+        ctx,
+        holder.session_key,
+        "r4-captured-fact",
+        nil,
+        "Captured report",
+        <<0, 255, 10>>
+      )
 
-    first_review =
-      assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+    put_rule(
+      ctx,
+      rule("r4-uncaptured-artifact", "attest", "artifact.cited_content_captured", "eq", false)
+    )
 
-    assert %{attest: %{verdictKind: "changes-requested"}} =
-             commit_ref_verdict(
-               ctx,
-               reviewer.session_key,
-               first_review.id,
-               "changes-requested",
-               refs
-             )
+    Rules.load!(ctx.base_dir, ["attest"])
 
-    assert {:ok, [["open"]]} =
-             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [producer.id])
+    call = fn artifact_id ->
+      p3_call("attest", {:session, holder.session_key}, %{artifact_id: artifact_id})
+    end
 
-    assert Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
-             wake.session_key == holder.session_key and wake.assignment_id == producer.id and
-               wake.prompt =~ "requested changes"
-           end)
+    assert :ok = Rules.evaluate(ctx.db, call.("art_missing"))
 
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             commit_ref_verdict(
-               ctx,
-               reviewer.session_key,
-               first_review.id,
-               "reviewed-clean",
-               refs
-             )
+    assert {:deny, %{rule: "r4-uncaptured-artifact"}} =
+             Rules.evaluate(ctx.db, call.(metadata_only.artifact_id))
 
-    assert {:ok, [["closed", "completed", closing_attest_id]]} =
-             DB.query(
+    assert :ok = Rules.evaluate(ctx.db, call.(captured.artifact_id))
+  end
+
+  test "r4 policy verification without file declarations accepts commits or a saved copy", ctx do
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('policy_test_owner',0,1)"
+      )
+
+    work_item_id = "r4-policy-proof-#{System.unique_integer([:positive])}"
+    create_work_item(ctx, work_item_id)
+    holder = session(ctx.db, "r4-policy-holder", "policy_test_owner")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE work_items SET ownerUserId = ?1 WHERE id = ?2", [
+        "policy_test_owner",
+        work_item_id
+      ])
+
+    assert %{deliveryOwnerSessionKey: delivery_owner} =
+             Tightbeam.WorkItems.__handle__(ctx.db, "work-item-update", %{
+               origin: "user:policy_test_owner",
+               principal: {:user, "policy_test_owner"},
+               params: %{
+                 work_item_id: work_item_id,
+                 delivery_owner_session_key: holder.session_key
+               }
+             })
+
+    assert delivery_owner == holder.session_key
+
+    # Omitting :files reproduces a file-producing policy card with no declared
+    # file manifest. K-6 allows commits or a captured copy; K-8 rejects an
+    # artifact whose bytes were not saved.
+    commit_producer =
+      assignment(ctx, holder.session_key, {:user, "policy_test_owner"},
+        effect_kind: "policy",
+        work_item_id: work_item_id
+      )
+
+    saved_copy_producer =
+      assignment(ctx, holder.session_key, {:user, "policy_test_owner"},
+        effect_kind: "policy",
+        work_item_id: work_item_id
+      )
+
+    uncaptured_copy_producer =
+      assignment(ctx, holder.session_key, {:user, "policy_test_owner"},
+        effect_kind: "policy",
+        work_item_id: work_item_id
+      )
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/verification.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    stub_commit_ref_validation()
+
+    refs = [%{"repo" => "testhost:/policy-guidance", "commit" => String.duplicate("a", 40)}]
+
+    verified_call = fn producer, proof_fields ->
+      p3_call(
+        "attest",
+        {:session, holder.session_key},
+        Map.merge(
+          %{
+            assignment_id: producer.id,
+            kind: "verdict",
+            verdict_kind: "verified"
+          },
+          proof_fields
+        )
+      )
+    end
+
+    assert {:ok, %{attest: %{verdictKind: "verified", commitRefs: ^refs}}} =
+             Dispatch.dispatch(
                ctx.db,
-               "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
-               [producer.id]
+               ctx.handlers,
+               verified_call.(commit_producer, %{commit_refs: refs})
              )
 
-    assert closing_attest_id == completion_attest.id
+    bytes = <<0, 255, 10>>
 
-    assert %{assignment: %{state: "closed"}} =
-             Assignments.__handle__(
+    saved =
+      record_captured_artifact(
+        ctx,
+        holder.session_key,
+        work_item_id,
+        saved_copy_producer.id,
+        "Saved policy copy",
+        bytes
+      )
+
+    assert {:ok, %{attest: %{verdictKind: "verified", artifactId: saved_id}}} =
+             Dispatch.dispatch(
                ctx.db,
-               "attest",
-               p3_call("attest", {:session, reviewer.session_key}, %{
-                 assignment_id: first_review.id,
-                 kind: "completion"
+               ctx.handlers,
+               verified_call.(saved_copy_producer, %{
+                 artifact_id: saved.artifact_id,
+                 content_sha256: saved.content_sha256
                })
              )
 
-    second_review =
-      assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+    assert saved_id == saved.artifact_id
 
-    assert %{attest: %{verdictKind: "changes-requested"}} =
-             commit_ref_verdict(
-               ctx,
-               reviewer.session_key,
-               second_review.id,
-               "changes-requested",
-               refs
-             )
+    uncaptured_digest = :crypto.hash(:sha256, "metadata only") |> Base.encode16(case: :lower)
 
-    assert {:ok, [["open", nil, nil]]} =
-             DB.query(
+    uncaptured =
+      Artifacts.record(ctx.db, %{
+        principal: {:session, holder.session_key},
+        session_key: holder.session_key,
+        params: %{
+          kind: "report",
+          title: "Uncaptured policy copy",
+          origin_path: "descriptive/policy-copy",
+          work_item_id: work_item_id,
+          produced_by_assignment_id: uncaptured_copy_producer.id,
+          content_sha256: uncaptured_digest
+        }
+      })
+
+    assert {:error, %{code: "rule_denied", rule: "verified-copy-is-saved"}} =
+             Dispatch.dispatch(
                ctx.db,
-               "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
-               [producer.id]
+               ctx.handlers,
+               verified_call.(uncaptured_copy_producer, %{
+                 artifact_id: uncaptured.artifact_id,
+                 content_sha256: uncaptured_digest
+               })
              )
+  end
 
-    assert {:ok, [[1]]} =
-             DB.query(
+  test "r4 clean review cites only the holder's latest captured verified copy", ctx do
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1),('reviewer',0,1),('other',0,1)"
+      )
+
+    create_work_item(ctx, "r4-copy-facts")
+    holder = session(ctx.db, "r4-copy-holder", "flynn")
+    reviewer = session(ctx.db, "r4-copy-reviewer", "flynn")
+    outsider = session(ctx.db, "r4-copy-outsider", "other")
+    set_work_item_owner(ctx, "r4-copy-facts", holder.session_key)
+
+    producer =
+      assignment(ctx, holder.session_key, {:user, "flynn"},
+        effect_kind: "evidence",
+        work_item_id: "r4-copy-facts"
+      )
+
+    review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"},
+        reviews: producer.id,
+        work_item_id: "r4-copy-facts"
+      )
+
+    unverified_producer =
+      assignment(ctx, holder.session_key, {:user, "flynn"},
+        effect_kind: "evidence",
+        work_item_id: "r4-copy-facts"
+      )
+
+    unverified_review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"},
+        reviews: unverified_producer.id,
+        work_item_id: "r4-copy-facts"
+      )
+
+    copy =
+      record_captured_artifact(
+        ctx,
+        holder.session_key,
+        "r4-copy-facts",
+        producer.id,
+        "Holder's verified copy",
+        "source body"
+      )
+
+    outsider_copy =
+      record_captured_artifact(
+        ctx,
+        holder.session_key,
+        "r4-copy-facts",
+        producer.id,
+        "Other copy",
+        "other body"
+      )
+
+    put_raw(
+      ctx,
+      File.read!("priv/kungfu/agentic-engineering/rules/verification.toml"),
+      "verification.toml"
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             Assignments.__handle__(
                ctx.db,
-               "SELECT count(*) FROM assignment_reopenings WHERE assignmentId=?1",
-               [producer.id]
+               "attest",
+               p3_call(
+                 "attest",
+                 {:session, holder.session_key},
+                 %{
+                   assignment_id: producer.id,
+                   kind: "verdict",
+                   verdict_kind: "verified",
+                   artifact_id: copy.artifact_id,
+                   content_sha256: copy.content_sha256
+                 }
+               )
              )
 
-    assert Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
-             wake.session_key == holder.session_key and wake.assignment_id == producer.id and
-               wake.prompt =~ "requested changes"
-           end)
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO attests
+          (id,assignmentId,kind,verdictKind,bySession,byUser,artifactId,contentSha256,ts)
+        VALUES (?1,?2,'verdict','verified',?3,NULL,?4,?5,?6)
+        """,
+        [
+          "r4-outsider-copy-verified",
+          producer.id,
+          outsider.session_key,
+          outsider_copy.artifact_id,
+          outsider_copy.content_sha256,
+          now + 1_000
+        ]
+      )
+
+    clean_call = fn assignment_id, artifact_id, digest ->
+      p3_call(
+        "attest",
+        {:session, reviewer.session_key},
+        %{
+          assignment_id: assignment_id,
+          kind: "verdict",
+          verdict_kind: "reviewed-clean",
+          artifact_id: artifact_id,
+          content_sha256: digest
+        }
+      )
+    end
 
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             commit_ref_verdict(
-               ctx,
-               reviewer.session_key,
-               second_review.id,
-               "reviewed-clean",
-               refs
-             )
-
-    assert {:ok, [["closed", "completed", closing_attest_id]]} =
-             DB.query(
+             Assignments.__handle__(
                ctx.db,
-               "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
-               [producer.id]
+               "attest",
+               clean_call.(review.id, copy.artifact_id, copy.content_sha256)
              )
 
-    assert closing_attest_id == completion_attest.id
+    assert {:deny, %{rule: "clean-review-cites-verified-copy"}} =
+             Rules.evaluate(
+               ctx.db,
+               clean_call.(review.id, outsider_copy.artifact_id, outsider_copy.content_sha256)
+             )
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               clean_call.(
+                 unverified_review.id,
+                 outsider_copy.artifact_id,
+                 outsider_copy.content_sha256
+               )
+             )
+  end
+
+  test "completion closes every effect without creating a pending review notice", ctx do
+    assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
+    holder = session(ctx.db, "completion-holder", "flynn", archetype: "coder")
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    for effect <- ~w(code policy release live_mutation evidence coordination) do
+      producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: effect)
+      assert {:ok, %{assignment: %{state: "closed"}, attest: %{kind: "completion"}}} =
+        Dispatch.dispatch(ctx.db, ctx.handlers,
+          p3_call("attest", {:session, holder.session_key}, %{assignment_id: producer.id, kind: "completion"}))
+      assert review_count(ctx.db, producer.id) == 0
+      assert review_gate_notices(ctx.db, producer.id) == []
+    end
   end
 
   test "completion accepts a closed linked review of the exact integrated heads", ctx do
@@ -1876,13 +2236,6 @@ defmodule Tightbeam.RulesTest do
                })
              )
 
-    assert Assignments.qualifying_verification_verdict_kinds(
-             ctx.db,
-             producer.id,
-             holder.session_key,
-             reviewer_refs
-           ) == ["verified"]
-
     completion =
       p3_call("attest", {:session, holder.session_key}, %{
         assignment_id: producer.id,
@@ -1893,7 +2246,7 @@ defmodule Tightbeam.RulesTest do
     assert :ok = Rules.evaluate(ctx.db, completion)
   end
 
-  test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
+  test "typed assignments preserve receipt exemptions without a compiled completion gate", ctx do
     :ok =
       DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('reviewer',1)")
 
@@ -1934,8 +2287,7 @@ defmodule Tightbeam.RulesTest do
         kind: "completion"
       })
 
-    assert {:deny, %{rule: "completion-requires-review"}} =
-             Rules.evaluate(ctx.db, coder_completion)
+    assert :ok = Rules.evaluate(ctx.db, coder_completion)
 
     assert orchestration.reviewsAssignmentId == nil
     assert orchestration.effectKind == "evidence"
@@ -2343,6 +2695,190 @@ defmodule Tightbeam.RulesTest do
              "assignment #{opened.id} opened for #{holder.session_key}"
   end
 
+  test "dispatch rumination is an idempotent row-commit notice to the session dispatcher", ctx do
+    assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
+    dispatcher = session(ctx.db, "dispatch-rumination-opener", "flynn")
+    first_holder =
+      session(ctx.db, "dispatch-rumination-holder-one", "flynn", archetype: "coder")
+
+    second_holder =
+      session(ctx.db, "dispatch-rumination-holder-two", "flynn", archetype: "coder")
+
+    user_holder =
+      session(ctx.db, "dispatch-rumination-user-holder", "flynn", archetype: "coder")
+
+    work_item_id = "wi_dispatch_rumination_notice"
+    user_work_item_id = "wi_dispatch_rumination_user"
+    create_work_item(ctx, work_item_id)
+    create_work_item(ctx, user_work_item_id)
+
+    for item_id <- [work_item_id, user_work_item_id] do
+      assert %{deliveryOwnerSessionKey: owner} =
+               WorkItems.__handle__(ctx.db, "work-item-update", %{
+                 principal: {:user, "flynn"},
+                 params: %{work_item_id: item_id, delivery_owner_session_key: dispatcher.session_key}
+               })
+
+      assert owner == dispatcher.session_key
+    end
+
+    put_raw(
+      ctx,
+      File.read!("priv/kungfu/agentic-engineering/rules/dispatch-rumination.toml"),
+      "dispatch-rumination.toml"
+    )
+
+    put_raw(
+      ctx,
+      File.read!("priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"),
+      "row-reaction-assignment-inactivity.toml"
+    )
+
+    [notice_delivery] =
+      Path.expand("../priv/seed/rules/substrate.toml", __DIR__)
+      |> File.read!()
+      |> String.split("[[reaction]]")
+      |> Enum.filter(&String.contains?(&1, ~s(family = "notice-delivery")))
+
+    File.write!(
+      Path.join(ctx.base_dir, "identity/rules/notice-delivery.toml"),
+      "[[reaction]]" <> notice_delivery
+    )
+
+    assert [%{name: "dispatch-rumination"}] =
+             Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    dispatch_call = fn principal, target_session, item_id ->
+      p3_call(
+        "dispatch",
+        principal,
+        %{
+          subject: "Implement the approved change",
+          brief: "Carry out the already approved work.",
+          idempotency_key: nil,
+          work_item_id: item_id
+        }
+      )
+      |> Map.merge(%{
+        session_key: target_session,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000
+      })
+    end
+
+    assert {:ok, first_assignment} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               dispatch_call.(
+                 {:session, dispatcher.session_key},
+                 first_holder.session_key,
+                 work_item_id
+               )
+             )
+
+    [notice] =
+      Wakes.list_pending(ctx.db)
+      |> Enum.filter(&(&1.origin == "remedy:dispatch-rumination"))
+
+    assert notice.session_key == dispatcher.session_key
+    assert notice.assignment_id == first_assignment.id
+    assert notice.work_item_id == work_item_id
+    refute notice.digest
+    refute notice.rumination
+
+    expected_prompt =
+      "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit. " <>
+        "Assignment #{first_assignment.id} has already been dispatched. " <>
+        "When you've thought it through, review the open assignment and adjust it if needed."
+
+    assert notice.prompt == expected_prompt
+
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         name: nil,
+         tick_ms: 60_000,
+         deliver: fn _ -> flunk("normal notice used legacy callback") end}
+      )
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    dispatcher_key = dispatcher.session_key
+
+    assert {:ok, [[source_id, ^expected_prompt, "fired", ^dispatcher_key, assignment_id, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,prompt,state,sessionKey,assignmentId,rumination FROM wakes WHERE origin='remedy:dispatch-rumination' AND work_item_id=?1 AND creatorSessionKey=?2",
+               [work_item_id, dispatcher_key]
+             )
+
+    assert assignment_id == first_assignment.id
+
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, source_id)
+
+    assert {:ok, [[^dispatcher_key, "queued", content]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert content =~ source_id
+    assert content =~ expected_prompt
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source_id])
+
+    assert {:ok, _second_assignment} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               dispatch_call.(
+                 {:session, dispatcher.session_key},
+                 second_holder.session_key,
+                 work_item_id
+               )
+             )
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[1, ^source_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*),MIN(wakeId) FROM wakes WHERE origin='remedy:dispatch-rumination' AND work_item_id=?1 AND creatorSessionKey=?2",
+               [work_item_id, dispatcher_key]
+             )
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, source_id)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source_id])
+
+    assert {:ok, _user_assignment} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               dispatch_call.({:user, "flynn"}, user_holder.session_key, user_work_item_id)
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE origin='remedy:dispatch-rumination'"
+             )
+  end
+
   test "row-commit review-round and completed-fix facts use the subject work item", ctx do
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
@@ -2602,7 +3138,7 @@ defmodule Tightbeam.RulesTest do
              )
 
     rules = load_ac6a_rules(ctx)
-    assert Enum.count(rules, &String.starts_with?(&1.name, "ac6a-")) == 5
+    assert Enum.count(rules, &String.starts_with?(&1.name, "ac6a-")) == 6
 
     assert {:ok, _} =
              Ledger.enqueue(ctx.db, %{
@@ -2715,6 +3251,65 @@ defmodule Tightbeam.RulesTest do
              })
 
     assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+  end
+
+  test "queue thresholds can be changed or removed without replacing episode mechanics", ctx do
+    holder = session(ctx.db, "declared-backlog", "flynn")
+    for index <- 1..2 do
+      assert {:ok, _} = Ledger.enqueue(ctx.db, %{session_key: holder.session_key,
+        origin: "process:fixture", message_id: "declared-backlog-#{index}", prompt: "queued"})
+    end
+    candidate = Map.merge(call(), %{edge: :row_commit, transition: %{domain: "queued_turn"},
+      params: %{session_key: holder.session_key}})
+    conditions = [%{fact: "turn.backlogged", op: "eq", value: true},
+      %{fact: "turn.backlog_episode_id", op: "ne", value: ""}]
+    put_queue_thresholds(ctx, 2, 3_600_000)
+    Rules.load!(ctx.base_dir, ["post"])
+    assert %{matched: true} = Rules.condition_evidence(ctx.db, candidate, conditions)
+    put_queue_thresholds(ctx, 3, 3_600_000)
+    Rules.load!(ctx.base_dir, ["post"])
+    assert %{matched: false} = Rules.condition_evidence(ctx.db, candidate, conditions)
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE turns SET createdAt=?1 WHERE sessionKey=?2",
+      [System.system_time(:millisecond) - 120_000, holder.session_key])
+    put_queue_thresholds(ctx, 3, 60_000)
+    Rules.load!(ctx.base_dir, ["post"])
+    assert %{matched: true} = Rules.condition_evidence(ctx.db, candidate, conditions)
+    File.rm!(Path.join(ctx.base_dir, "identity/rules/queue-settings.toml"))
+    Rules.load!(ctx.base_dir, ["post"])
+    assert %{matched: false} = Rules.condition_evidence(ctx.db, candidate, conditions)
+  end
+
+  test "invalid and ambiguous queue settings log and leave both backlog facts unavailable", ctx do
+    holder = session(ctx.db, "unavailable-backlog", "flynn")
+    assert {:ok, _} = Ledger.enqueue(ctx.db, %{session_key: holder.session_key,
+      origin: "process:fixture", message_id: "unavailable-backlog", prompt: "queued"})
+    candidate = Map.merge(call(), %{edge: :row_commit, transition: %{domain: "queued_turn"},
+      params: %{session_key: holder.session_key}})
+    put_queue_thresholds(ctx, 1, 3_600_000)
+    path = Path.join(ctx.base_dir, "identity/rules/queue-settings.toml")
+    original = File.read!(path)
+
+    entries = [
+      {String.replace(original, "queued_turns = 1", ~s(queued_turns = "one")), "invalid"},
+      {String.replace(original, "oldest_age_ms = 3600000", "oldest_age_ms = -1"), "invalid"},
+      {String.replace(original, ", oldest_age_ms = 3600000", ""), "invalid"},
+      {original <> "\n" <> String.replace(original, ~s(name = "queue-thresholds"),
+        ~s(name = "other-queue-thresholds")), "ambiguous"}
+    ]
+
+    for {contents, reason} <- entries do
+      File.write!(path, contents)
+      Rules.load!(ctx.base_dir, ["post"])
+
+      log = ExUnit.CaptureLog.capture_log(fn ->
+        for condition <- [%{fact: "turn.backlogged", op: "eq", value: true},
+                          %{fact: "turn.backlog_episode_id", op: "ne", value: ""}] do
+          assert %{matched: false} = Rules.condition_evidence(ctx.db, candidate, [condition])
+        end
+      end)
+
+      assert log =~ "queue-thresholds is #{reason}"
+    end
   end
 
   test "AC6a depth backlog survives claims and rearms after an observed recovery", ctx do
@@ -3195,7 +3790,7 @@ defmodule Tightbeam.RulesTest do
       edges = ["row-commit"]
       effect = "notice"
       text = "observe changes-requested review count"
-      deny_when = [{ fact = "work_item.changes_requested_count", op = "eq", value = 2 }]
+      deny_when = [{ fact = "work_item.review_verdict_count.changes-requested", op = "eq", value = 2 }]
 
       [rule.notice]
       target_session = "{assignment_opener_session}"
@@ -3461,8 +4056,9 @@ defmodule Tightbeam.RulesTest do
       )
     end
 
-    churn_origin = "remedy:ac6a-fourth-review-or-fix-round"
-    assert notice_count(ctx.db, churn_origin) == 0
+    review_origin = "remedy:ac6a-fourth-review-round"
+    fix_origin = "remedy:ac6a-fourth-review-or-fix-round"
+    assert notice_count(ctx.db, review_origin) == 0
 
     fourth_subject =
       assignment(ctx, fix_holder.session_key, {:user, "flynn"}, work_item_id: review_item)
@@ -3476,7 +4072,7 @@ defmodule Tightbeam.RulesTest do
              DB.query(
                ctx.db,
                "SELECT sessionKey,assignmentId,work_item_id,prompt FROM wakes WHERE origin=?1",
-               [churn_origin]
+               [review_origin]
              )
 
     assert [review_target, review_notice_assignment, review_work_item] ==
@@ -3510,7 +4106,7 @@ defmodule Tightbeam.RulesTest do
                :ok
              end)
 
-    assert notice_count(ctx.db, churn_origin) == 1
+    assert notice_count(ctx.db, review_origin) == 1
 
     fifth_subject =
       assignment(ctx, fix_holder.session_key, {:user, "flynn"}, work_item_id: review_item)
@@ -3519,7 +4115,7 @@ defmodule Tightbeam.RulesTest do
       assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: fifth_subject.id)
 
     verdict(ctx, reviewer.session_key, fifth_review.id, "changes-requested", "fifth round")
-    assert notice_count(ctx.db, churn_origin) == 1
+    assert notice_count(ctx.db, review_origin) == 1
 
     fix_item = "wi_ac6a_fourth_fix_round"
     create_work_item(ctx, fix_item)
@@ -3546,7 +4142,7 @@ defmodule Tightbeam.RulesTest do
                )
     end
 
-    assert notice_count(ctx.db, churn_origin) == 1
+    assert notice_count(ctx.db, fix_origin) == 0
 
     fourth =
       assignment(ctx, fix_holder.session_key, {:user, "flynn"},
@@ -3559,7 +4155,7 @@ defmodule Tightbeam.RulesTest do
                ctx.db,
                "SELECT sessionKey,assignmentId,work_item_id,prompt FROM wakes " <>
                  "WHERE origin=?1 AND prompt LIKE '%fourth fix round%'",
-               [churn_origin]
+               [fix_origin]
              )
 
     assert [fix_target, fix_assignment, fix_work_item] ==
@@ -3574,7 +4170,7 @@ defmodule Tightbeam.RulesTest do
       )
 
     assert fourth.id != fifth.id
-    assert notice_count(ctx.db, churn_origin) == 2
+    assert notice_count(ctx.db, fix_origin) == 1
   end
 
   test "AC6a routes unassigned agent stretches to the item coordinator once and excludes human starts",
@@ -4051,9 +4647,16 @@ defmodule Tightbeam.RulesTest do
 
     assert ownership_error == "unknown or inaccessible assignment binding"
 
+    assert {:ok, %{matched: true, facts: [{"assignment.state", "open"}]}} =
+             Rules.evaluate_predicate(ctx.db, %{
+               owner_user_id: "flynn",
+               conditions: [%{fact: "assignment.state", op: "matches", value: "^open$"}],
+               bindings: %{assignment_id: own_assignment.id}
+             })
+
     for condition <- [
           %{fact: "assignment.unknown", op: "eq", value: "open"},
-          %{fact: "assignment.state", op: "matches", value: "open"},
+          %{fact: "assignment.state", op: "unsupported", value: "open"},
           %{fact: "assignment.state", op: "eq", value: 1}
         ] do
       assert {:error, %{code: "invalid_predicate"}} =
@@ -4067,6 +4670,8 @@ defmodule Tightbeam.RulesTest do
 
   test "producer verification binds its own artifact revision and reports the expected hash",
        ctx do
+    put_raw(ctx, Tightbeam.TerminalReactionFixture.attest_placement())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     holder = session(ctx.db, "artifact-producer", "flynn", archetype: "coder")
     other = session(ctx.db, "artifact-other", "flynn", archetype: "coder")
     hash = String.duplicate("a", 64)
@@ -4087,8 +4692,12 @@ defmodule Tightbeam.RulesTest do
           commit_refs: fixture_commit_refs()
         })
 
-      assert {:error, %{code: "invalid_commit_refs"}} =
+      assert {:ok, %{attest: without_refs}} =
                Dispatch.dispatch(ctx.db, ctx.handlers, put_in(call.params.commit_refs, nil))
+
+      assert without_refs.artifactId == artifact.artifact_id
+      assert without_refs.contentSha256 == hash
+      assert without_refs.commitRefs == nil
 
       assert {:error, %{code: "invalid_revision_binding", message: message}} =
                Dispatch.dispatch(
@@ -4100,13 +4709,13 @@ defmodule Tightbeam.RulesTest do
       assert message =~ "expected sha256 #{hash}"
       assert message =~ artifact.artifact_id
 
-      assert {:error, %{code: "invalid_revision_binding"}} =
+      assert {:error, %{code: "rule_denied", rule: "artifact-citation-requires-holder-verdict"}} =
                Dispatch.dispatch(ctx.db, ctx.handlers, %{
                  call
                  | principal: {:session, other.session_key}
                })
 
-      assert {:error, %{code: "invalid_revision_binding"}} =
+      assert {:error, %{code: "rule_denied", rule: "artifact-citation-requires-verification-verdict"}} =
                Dispatch.dispatch(
                  ctx.db,
                  ctx.handlers,
@@ -4117,7 +4726,7 @@ defmodule Tightbeam.RulesTest do
 
       unrelated = assignment(ctx, holder.session_key, {:user, "flynn"}, work_item_id: item)
 
-      assert {:error, %{code: "invalid_revision_binding"}} =
+      assert {:error, %{code: "rule_denied", rule: "artifact-citation-requires-own-producer"}} =
                Dispatch.dispatch(
                  ctx.db,
                  ctx.handlers,
@@ -4129,7 +4738,7 @@ defmodule Tightbeam.RulesTest do
       assert verified.contentSha256 == hash
       assert verified.commitRefs == fixture_commit_refs()
 
-      assert {:ok, [[1]]} =
+      assert {:ok, [[2]]} =
                DB.query(ctx.db, "SELECT count(*) FROM attests WHERE assignmentId=?1", [
                  producer.id
                ])
@@ -4466,6 +5075,24 @@ defmodule Tightbeam.RulesTest do
     })
   end
 
+  defp record_captured_artifact(ctx, session_key, work_item_id, producer_id, title, bytes) do
+    digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+    Artifacts.record(ctx.db, %{
+      principal: {:session, session_key},
+      session_key: session_key,
+      params: %{
+        kind: "report",
+        title: title,
+        origin_path: "descriptive/#{title}",
+        work_item_id: work_item_id,
+        produced_by_assignment_id: producer_id,
+        content_base64: Base.encode64(bytes),
+        content_sha256: digest
+      }
+    })
+  end
+
   defp review_gate_notices(db, producer_id) do
     {:ok, rows} =
       DB.query(
@@ -4525,7 +5152,33 @@ defmodule Tightbeam.RulesTest do
       )
   end
 
+  defp put_queue_thresholds(ctx, depth, age) do
+    put_raw(ctx, """
+    [[reaction]]
+    name = "queue-thresholds"
+    family = "queue-thresholds"
+    english = "Treat a queue as backlogged after either listed threshold."
+    settings = { queued_turns = #{depth}, oldest_age_ms = #{age} }
+    """, "queue-settings.toml")
+  end
+
   defp load_ac6a_rules(ctx) do
+    put_queue_thresholds(ctx, 20, 3_600_000)
+
+    # This fixture uses shipped delivery defaults alongside its queue settings.
+    # Copy only this family so the queue-thresholds entry remains unique.
+    [notice_delivery] =
+      "priv/seed/rules/substrate.toml"
+      |> File.read!()
+      |> String.split("[[reaction]]")
+      |> Enum.filter(&String.contains?(&1, ~s(family = "notice-delivery")))
+
+    File.write!(
+      Path.join(ctx.base_dir, "identity/rules/queue-settings.toml"),
+      "\n[[reaction]]" <> notice_delivery,
+      [:append]
+    )
+
     put_raw(
       ctx,
       File.read!("priv/kungfu/agentic-engineering/rules/ac6a.toml"),
@@ -4672,7 +5325,7 @@ defmodule Tightbeam.RulesTest do
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
       { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
-      { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+      { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
     ]
     """
   end
@@ -4711,7 +5364,7 @@ defmodule Tightbeam.RulesTest do
       if op == "not_in" and
            fact in [
              "assignment.verdicts",
-             "assignment.qualifying_review_verdict_kinds"
+             "assignment.independent_verdict_kinds"
            ] do
         "external_producer = true"
       else

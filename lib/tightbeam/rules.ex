@@ -16,8 +16,6 @@ defmodule Tightbeam.Rules do
   ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
-  `assignment.qualifying_review_verdict_kinds`,
-  `assignment.qualifying_verification_verdict_kinds`, and
   `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
   holder recorded on its work item, in every artifact state). Assignment
   caller identity comes from the optional dispatch principal rather than the
@@ -35,8 +33,8 @@ defmodule Tightbeam.Rules do
   `assignment.prior_completed_fix_count` (completed, non-review assignments on
   the same work item, excluding the current assignment), and the row-commit-only
   `work_item.review_verdict_count` (review verdict attest rows on the item
-  through the current row) and `work_item.changes_requested_count` (all
-  changes-requested verdicts across its review assignments). On an
+  through the current row), and named-kind counts across that same review
+  set without a row bound. On an
   implementation `dispatch`, the assignment facts project the latest completed
   fix for the supplied work item so a re-fix gate can inspect its commissioned
   verdicts before the next assignment exists.
@@ -84,9 +82,9 @@ defmodule Tightbeam.Rules do
                "recurrence_suppression"
              ])
   @condition_keys MapSet.new(["fact", "op", "value"])
-  @policy_keys MapSet.new(["name", "purpose", "when", "verification", "evidence_memento"])
+  @policy_keys MapSet.new(["name", "purpose", "when", "verification"])
   @verification_keys MapSet.new(["trigger", "terminal", "fallback"])
-  @policy_purposes ~w(wait-effort-relief wait-verification-admission attest-file-effect-evidence attest-operational-evidence)
+  @policy_purposes ~w(wait-effort-relief wait-verification-admission)
   @recurrence_keys MapSet.new([
                      "scope",
                      "fingerprint",
@@ -136,13 +134,10 @@ defmodule Tightbeam.Rules do
   @verdict_facts ~w(
     assignment.verdicts
     assignment.independent_verdict_kinds
-    assignment.qualifying_review_verdict_kinds
-    assignment.qualifying_verification_verdict_kinds
     work_item.verdict_kinds
   )
   @linked_review_facts ~w(
     assignment.independent_verdict_kinds
-    assignment.qualifying_review_verdict_kinds
   )
   @name_re ~r/^[a-z0-9][a-z0-9-]*$/
   @facts %{
@@ -161,17 +156,29 @@ defmodule Tightbeam.Rules do
     "org.live_sessions_owned_by_caller" => :int,
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
-    "call.file_effect_manifest.valid" => :bool,
+    "attest.verdict_kind" => :string,
+    "call.note" => :string,
+    "call.candidate_commit" => :string,
+    "call.spec_artifact.kind" => :string,
+    "call.review_artifact.kind" => :string,
+    "call.spec_artifact.matches_work_item_spec_binding" => :bool,
+    "call.review_attest.verdict_kind" => :string,
+    "call.review_attest.commit_refs_contains_candidate" => :bool,
+    "cited_artifact.kind" => :string,
+    "cited_artifact.produced_by_assignment" => :bool,
+    "cited_artifact.produced_by_reviewed_assignment" => :bool,
+    "call.commit_refs_count" => :int,
+    "call.supplied_fields" => {:list, :string},
+    "call.commit_refs.0.commit" => :string,
     "assignment.verdicts" => {:list, :string},
     "assignment.is_producing_card" => :bool,
     "assignment.effect_kind" => :string,
+    "assignment.reviewed_effect_kind" => :string,
     "assignment.declared_files_present" => :bool,
     "assignment.state" => :string,
     "assignment.outcome" => :string,
     "assignment.holder_noted_verdict_kinds" => {:list, :string},
     "assignment.independent_verdict_kinds" => {:list, :string},
-    "assignment.qualifying_review_verdict_kinds" => {:list, :string},
-    "assignment.qualifying_verification_verdict_kinds" => {:list, :string},
     "assignment.artifact_kinds" => {:list, :string},
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
@@ -187,7 +194,6 @@ defmodule Tightbeam.Rules do
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
     "work_item.review_verdict_count" => :int,
-    "work_item.changes_requested_count" => :int,
     "work_item.fourth_round_kind" => :string,
     "turn.queued_count" => :int,
     "turn.oldest_age_ms" => :int,
@@ -204,6 +210,7 @@ defmodule Tightbeam.Rules do
     "decision_request.status" => :string,
     "artifact.present" => :bool,
     "artifact.content_sha256" => :string,
+    "artifact.cited_content_captured" => :bool,
     "review.qualifying_verdict_kinds" => {:list, :string},
     "condition_fact.matches" => :bool,
     "wait.obligation_matches" => :bool,
@@ -223,7 +230,7 @@ defmodule Tightbeam.Rules do
     "verifier.open" => :bool,
     "verifier.holder_is_other" => :bool
   }
-  @operators ~w(eq ne gt gte lt lte in not_in)
+  @operators ~w(eq ne gt gte lt lte in not_in matches)
   @predicate_binding_keys ~w(
     workItemId assignmentId decisionRequestId artifact
     conditionKind conditionScope conditionAfterId conditionFactId
@@ -261,7 +268,7 @@ defmodule Tightbeam.Rules do
   )
   """
 
-  @work_item_changes_requested_count_sql """
+  @work_item_named_review_verdict_count_sql """
   SELECT SUM(count) FROM (
     SELECT COUNT(*) AS count
     FROM assignments review
@@ -269,7 +276,7 @@ defmodule Tightbeam.Rules do
     WHERE review.workItemId=?1
       AND review.reviewsAssignmentId IS NOT NULL
       AND verdict.kind='verdict'
-      AND verdict.verdictKind='changes-requested'
+      AND verdict.verdictKind=?2
 
     UNION ALL
 
@@ -281,7 +288,7 @@ defmodule Tightbeam.Rules do
       AND review.reviewsAssignmentId=producer.id
       AND review.workItemId IS NULL
       AND verdict.kind='verdict'
-      AND verdict.verdictKind='changes-requested'
+      AND verdict.verdictKind=?2
   )
   """
 
@@ -320,7 +327,7 @@ defmodule Tightbeam.Rules do
   def work_item_fourth_round_count_sql, do: @work_item_fourth_round_count_sql
 
   @doc false
-  def work_item_changes_requested_count_sql, do: @work_item_changes_requested_count_sql
+  def work_item_named_review_verdict_count_sql, do: @work_item_named_review_verdict_count_sql
 
   @doc false
   def work_item_review_verdict_count_sql, do: @work_item_review_verdict_count_sql
@@ -614,27 +621,6 @@ defmodule Tightbeam.Rules do
     end
   end
 
-  @doc "Select a declared evidence policy in the call's pinned snapshot."
-  def select_policy(db, purpose, call) do
-    with_snapshot(fn ->
-      effective_snapshot().policies
-      |> Enum.filter(&(&1.purpose == purpose))
-      |> Enum.sort_by(& &1.name)
-      |> Enum.find_value(:none, fn policy ->
-        case evaluate_conditions(policy.conditions, policy, db, call, %{}) do
-          {:match, _cache} ->
-            {:ok, policy}
-
-          {:no_match, _cache} ->
-            false
-
-          {:error, fact} ->
-            raise ArgumentError, "#{policy.source}: policy #{policy.name}: failed to read #{fact}"
-        end
-      end)
-    end)
-  end
-
   @doc "Select the bytewise-smallest matching predicate-only policy for one snapshot."
   @spec select_policy_in_txn(DB.Txn.t(), String.t(), map()) :: {:ok, map()} | :none
   def select_policy_in_txn(%DB.Txn{} = txn, purpose, context) do
@@ -671,7 +657,15 @@ defmodule Tightbeam.Rules do
 
   @doc "Return the dry statute decision and the actor-owned close/consume work."
   @spec decide(GenServer.server(), map()) :: {term(), [term()], [String.t()]}
-  def decide(db, call) do
+  def decide(db, call), do: decide(db, call, :short_circuit)
+
+  @doc false
+  @spec decide_with_remedy_closures_after_terminal(GenServer.server(), map()) ::
+          {term(), [term()], [String.t()]}
+  def decide_with_remedy_closures_after_terminal(db, call),
+    do: decide(db, call, :collect_later_remedy_closures)
+
+  defp decide(db, call, terminal_mode) do
     rules = effective_snapshot().rules
     verb = Map.fetch!(call, :verb)
     edge = edge(call)
@@ -680,7 +674,7 @@ defmodule Tightbeam.Rules do
       nil ->
         rules
         |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
-        |> decide_rules(db, call, %{}, [], [])
+        |> decide_rules(db, call, %{}, [], [], terminal_mode)
 
       source ->
         {{:deny,
@@ -1432,16 +1426,18 @@ defmodule Tightbeam.Rules do
           policies
           |> Enum.with_index(1)
           |> Enum.flat_map(fn {policy, ordinal} ->
-            if retired_policy?(policy) do
-              require Logger
+            cond do
+              retired_policy?(policy) ->
+                require Logger
 
-              Logger.warning(
-                "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose #{Map.get(policy, "purpose")} is retired"
-              )
+                Logger.warning(
+                  "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose #{Map.get(policy, "purpose")} is retired"
+                )
 
-              []
-            else
-              [{:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}]
+                []
+
+              true ->
+                [{:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}]
             end
           end)
 
@@ -1473,7 +1469,7 @@ defmodule Tightbeam.Rules do
   defp retired_policy?(policy),
     do:
       is_map(policy) and
-        Map.get(policy, "purpose") in ~w(wait-effort-relief wait-verification-admission)
+        Map.get(policy, "purpose") in ~w(attest-operational-evidence wait-effort-relief wait-verification-admission)
 
   defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
     raw_name = Map.get(policy, "name")
@@ -1492,38 +1488,11 @@ defmodule Tightbeam.Rules do
 
     conditions = validate_policy_conditions!(Map.get(policy, "when"), fail)
     verification = validate_policy_verification!(purpose, Map.get(policy, "verification"), fail)
-    evidence_memento = Map.get(policy, "evidence_memento")
-
-    if purpose in ~w(attest-file-effect-evidence attest-operational-evidence) do
-      Enum.each(conditions, fn %{fact: fact} ->
-        unless fact in ~w(assignment.effect_kind assignment.declared_files_present) or
-                 String.starts_with?(fact, "assignment.memento."),
-               do: fail.("when uses a fact unavailable to attest evidence selection: #{fact}")
-      end)
-    end
-
-    case purpose do
-      "attest-file-effect-evidence" ->
-        case Tightbeam.Mementos.declarations().names[evidence_memento] do
-          %{many: true, records: records} ->
-            unless "attest" in records,
-              do: fail.("evidence_memento must name a declared many attest memento")
-
-          _ ->
-            fail.("evidence_memento must name a declared many attest memento")
-        end
-
-      _ ->
-        unless is_nil(evidence_memento),
-          do: fail.("evidence_memento is valid only for attest-file-effect-evidence")
-    end
-
     %{
       name: raw_name,
       purpose: purpose,
       conditions: conditions,
       verification: verification,
-      evidence_memento: evidence_memento,
       source: path,
       identity_manifest_sha: identity_manifest_sha
     }
@@ -1878,7 +1847,7 @@ defmodule Tightbeam.Rules do
 
   defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _name), do: nil
 
-  defp validate_remedy!(remedy, conditions, check, effects, fail, name) when is_map(remedy) do
+  defp validate_remedy!(remedy, conditions, check, effects, fail, _name) when is_map(remedy) do
     unknown = unknown_keys(remedy, @remedy_keys)
     if unknown != [], do: fail.("remedy has unknown keys: #{Enum.join(unknown, ", ")}")
 
@@ -1973,10 +1942,7 @@ defmodule Tightbeam.Rules do
         :ok
     end
 
-    # This gate records one ordinary holder notice; it does not create a linked
-    # review assignment or require the linked-review remedy binding.
-    if not (name == "completion-requires-review" and action == "wake") and
-         is_nil(check) and
+    if is_nil(check) and
          Enum.any?(requirements, fn {fact, kinds} ->
            fact in @linked_review_facts and produces in kinds
          end) and params["reviews"] != "{assignment_id}" do
@@ -2070,13 +2036,39 @@ defmodule Tightbeam.Rules do
       end
     end
 
-    type = Map.get(@facts, fact) || Tightbeam.MementoFacts.type(fact)
+    type = Map.get(@facts, fact) || parameterized_fact_type(fact) || Tightbeam.MementoFacts.type(fact)
 
     if is_nil(type), do: fail.("condition ##{index} has unknown fact: #{inspect(fact)}")
     unless op in @operators, do: fail.("condition ##{index} has unknown op: #{inspect(op)}")
     validate_value!(type, op, value, index, fail)
     %{fact: fact, op: op, value: value}
   end
+
+  defp parameterized_fact_type("work_item.review_verdict_count." <> kind)
+       when byte_size(kind) > 0,
+       do: :int
+
+  defp parameterized_fact_type("review.source_uncovered_commit_count." <> kind)
+       when byte_size(kind) > 0,
+       do: :int
+
+  defp parameterized_fact_type("review.cites_source_copy." <> kind)
+       when byte_size(kind) > 0,
+       do: :bool
+
+  defp parameterized_fact_type(_), do: nil
+
+  defp validate_value!(:string, "matches", value, index, fail) do
+    unless is_binary(value), do: fail.("condition ##{index} pattern must be text")
+
+    case Regex.compile(value) do
+      {:ok, _} -> :ok
+      {:error, reason} -> fail.("condition ##{index} invalid pattern: #{inspect(reason)}")
+    end
+  end
+
+  defp validate_value!(type, "matches", _value, index, fail),
+    do: fail.("condition ##{index} operator matches is invalid for #{inspect(type)}")
 
   defp validate_value!({:list, :string}, op, value, index, fail) do
     unless op in ~w(in not_in),
@@ -2234,13 +2226,21 @@ defmodule Tightbeam.Rules do
     end)
   end
 
-  defp decide_rules([], _db, _call, _cache, to_close, to_consume),
+  defp decide_rules([], _db, _call, _cache, to_close, to_consume, _terminal_mode),
     do: {:allow, Enum.reverse(to_close), Enum.reverse(to_consume)}
 
-  defp decide_rules([rule | rest], db, call, cache, to_close, to_consume) do
+  defp decide_rules([rule | rest], db, call, cache, to_close, to_consume, terminal_mode) do
     case evaluate_conditions(rule.conditions, rule, db, call, cache) do
       {:no_match, cache} ->
-        decide_rules(rest, db, call, cache, maybe_close(rule, db, call, to_close), to_consume)
+        decide_rules(
+          rest,
+          db,
+          call,
+          cache,
+          maybe_close(rule, db, call, to_close),
+          to_consume,
+          terminal_mode
+        )
 
       {:error, fact} ->
         error =
@@ -2251,17 +2251,37 @@ defmodule Tightbeam.Rules do
             message: "#{rule.name}: failed to compute #{fact}"
           })
 
-        {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+        terminal_result(
+          {:deny, error},
+          rest,
+          db,
+          call,
+          cache,
+          to_close,
+          to_consume,
+          terminal_mode
+        )
 
       {:match, cache} ->
-        evaluate_reached_rule(rule, rest, db, call, cache, to_close, to_consume)
+        evaluate_reached_rule(rule, rest, db, call, cache, to_close, to_consume, terminal_mode)
     end
   end
 
-  defp evaluate_reached_rule(rule, rest, db, call, cache, to_close, to_consume) do
+  defp evaluate_reached_rule(rule, rest, db, call, cache, to_close, to_consume, terminal_mode) do
     case rule.check do
       nil ->
-        fold_effect(rule.effect, rule, rest, db, call, cache, to_close, to_consume, nil)
+        fold_effect(
+          rule.effect,
+          rule,
+          rest,
+          db,
+          call,
+          cache,
+          to_close,
+          to_consume,
+          nil,
+          terminal_mode
+        )
 
       _check ->
         case fetch_fact("$assignment", db, call, cache) do
@@ -2293,7 +2313,8 @@ defmodule Tightbeam.Rules do
                   cache,
                   recovery(rule, position, to_close),
                   to_consume,
-                  exit_class
+                  exit_class,
+                  terminal_mode
                 )
 
               # Everything else is a MALFUNCTION, not a verdict (§A3, Flynn 2026-07-29,
@@ -2306,7 +2327,18 @@ defmodule Tightbeam.Rules do
               # recurring silently on every retry. Only a declared token mapped to `deny`
               # above stays a bare deny; that one is the sensor answering.
               {:error, reason, exit_class} ->
-                malfunction(rule, call, reason, exit_class, to_close, to_consume)
+                malfunction(
+                  rule,
+                  rest,
+                  db,
+                  call,
+                  cache,
+                  reason,
+                  exit_class,
+                  to_close,
+                  to_consume,
+                  terminal_mode
+                )
             end
 
           # The invocation context could not be resolved, so NO script was spawned — the
@@ -2317,23 +2349,57 @@ defmodule Tightbeam.Rules do
           # where the rest of it was cleaned out. The class no observation carried is
           # exactly what `unreported` exists to say.
           :error ->
-            malfunction(rule, call, "script_error", "unreported", to_close, to_consume)
+            malfunction(
+              rule,
+              rest,
+              db,
+              call,
+              cache,
+              "script_error",
+              "unreported",
+              to_close,
+              to_consume,
+              terminal_mode
+            )
         end
     end
   end
 
-  defp fold_effect("allow", rule, rest, db, call, cache, to_close, to_consume, _exit_class),
-    do:
-      decide_rules(
-        rest,
-        db,
-        call,
-        cache,
-        maybe_close(rule, db, call, to_close),
-        to_consume
-      )
+  defp fold_effect(
+         "allow",
+         rule,
+         rest,
+         db,
+         call,
+         cache,
+         to_close,
+         to_consume,
+         _exit_class,
+         terminal_mode
+       ),
+       do:
+         decide_rules(
+           rest,
+           db,
+           call,
+           cache,
+           maybe_close(rule, db, call, to_close),
+           to_consume,
+           terminal_mode
+         )
 
-  defp fold_effect("notice", rule, rest, db, call, cache, to_close, to_consume, _exit_class) do
+  defp fold_effect(
+         "notice",
+         rule,
+         rest,
+         db,
+         call,
+         cache,
+         to_close,
+         to_consume,
+         _exit_class,
+         terminal_mode
+       ) do
     evidence = evidence_facts(rule.conditions, cache)
 
     decide_rules(
@@ -2342,22 +2408,75 @@ defmodule Tightbeam.Rules do
       call,
       cache,
       [{:notice, rule, call, evidence} | maybe_close(rule, db, call, to_close)],
-      to_consume
+      to_consume,
+      terminal_mode
     )
   end
 
-  defp fold_effect("deny", rule, _rest, db, call, _cache, to_close, to_consume, exit_class) do
+  defp fold_effect(
+         "deny",
+         rule,
+         rest,
+         db,
+         call,
+         cache,
+         to_close,
+         to_consume,
+         exit_class,
+         terminal_mode
+       ) do
     error = denial_error(rule, call, "rule_denied", exit_class, notice_bindings(db, call))
-    {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+
+    terminal_result(
+      {:deny, error},
+      rest,
+      db,
+      call,
+      cache,
+      to_close,
+      to_consume,
+      terminal_mode
+    )
   end
 
-  defp fold_effect("remedy", rule, _rest, _db, call, _cache, to_close, to_consume, exit_class) do
+  defp fold_effect(
+         "remedy",
+         rule,
+         rest,
+         db,
+         call,
+         cache,
+         to_close,
+         to_consume,
+         exit_class,
+         terminal_mode
+       ) do
     error = denial_error(rule, call, "remedy_fired", exit_class)
 
-    {{:remedy, rule, gated_ref(call), error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+    terminal_result(
+      {:remedy, rule, gated_ref(call), error},
+      rest,
+      db,
+      call,
+      cache,
+      to_close,
+      to_consume,
+      terminal_mode
+    )
   end
 
-  defp fold_effect("escalate", rule, rest, db, call, cache, to_close, to_consume, exit_class) do
+  defp fold_effect(
+         "escalate",
+         rule,
+         rest,
+         db,
+         call,
+         cache,
+         to_close,
+         to_consume,
+         exit_class,
+         terminal_mode
+       ) do
     ctx = %{
       question: rule.text,
       error: denial_error(rule, call, "escalated", exit_class)
@@ -2365,30 +2484,139 @@ defmodule Tightbeam.Rules do
 
     case Escalation.resolve(db, call, rule) do
       :allow ->
-        decide_rules(rest, db, call, cache, to_close, to_consume)
+        decide_rules(rest, db, call, cache, to_close, to_consume, terminal_mode)
 
       {:allow, ruling_id} ->
-        decide_rules(rest, db, call, cache, to_close, [ruling_id | to_consume])
+        decide_rules(rest, db, call, cache, to_close, [ruling_id | to_consume], terminal_mode)
 
       {:deny, error} ->
         error = enrich_denial(error, rule, call, "rule_denied", exit_class)
-        {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+
+        terminal_result(
+          {:deny, error},
+          rest,
+          db,
+          call,
+          cache,
+          to_close,
+          to_consume,
+          terminal_mode
+        )
 
       {:needs_request, dr_id} ->
-        {{:escalate, rule, ctx, dr_id}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+        terminal_result(
+          {:escalate, rule, ctx, dr_id},
+          rest,
+          db,
+          call,
+          cache,
+          to_close,
+          to_consume,
+          terminal_mode
+        )
     end
   end
 
   # The one shape every malfunction takes, so the two sites that reach one cannot drift:
   # the deny is byte-identical to what it always was, and the summons rides beside it.
-  defp malfunction(rule, call, reason, exit_class, to_close, to_consume) do
+  defp malfunction(
+         rule,
+         rest,
+         db,
+         call,
+         cache,
+         reason,
+         exit_class,
+         to_close,
+         to_consume,
+         terminal_mode
+       ) do
     ctx = %{
       question: malfunction_question(rule, reason, exit_class),
       error: denial_error(rule, call, reason, exit_class),
       episode_key: exit_class
     }
 
-    {{:deny_escalate, rule, ctx}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+    decision =
+      if rule_failure_setting?("escalate_script_failures"),
+        do: {:deny_escalate, rule, ctx},
+        else: {:deny, ctx.error}
+
+    terminal_result(
+      decision,
+      rest,
+      db,
+      call,
+      cache,
+      to_close,
+      to_consume,
+      terminal_mode
+    )
+  end
+
+  defp terminal_result(decision, rest, db, call, cache, to_close, to_consume, terminal_mode) do
+    later_closures =
+      case terminal_mode do
+        :short_circuit -> []
+        :collect_later_remedy_closures -> later_remedy_closures(rest, db, call, cache)
+      end
+
+    {decision, Enum.reverse(to_close) ++ later_closures, Enum.reverse(to_consume)}
+  end
+
+  defp later_remedy_closures(rules, db, call, cache) do
+    {_cache, closures} =
+      Enum.reduce(rules, {cache, []}, fn
+        %{remedy: nil}, state ->
+          state
+
+        rule, {cache, closures} ->
+          case evaluate_conditions(rule.conditions, rule, db, call, cache) do
+            {:no_match, cache} ->
+              {cache, maybe_close(rule, db, call, closures)}
+
+            {:match, cache} ->
+              {cache, closures}
+
+            {:error, _fact} ->
+              {cache, closures}
+          end
+      end)
+
+    Enum.reverse(closures)
+  end
+
+  defp rule_failure_setting?(key) do
+    case reaction_policy("rule-failure") do
+      %{settings: %{"escalate_script_failures" => escalate, "recover_on_success" => recover} = settings}
+      when map_size(settings) == 2 and is_boolean(escalate) and is_boolean(recover) ->
+        Map.fetch!(settings, key)
+
+      nil ->
+        log_ambiguous_settings_family("rule-failure")
+        false
+
+      _ ->
+        log_invalid_settings_family("rule-failure")
+        false
+    end
+  end
+
+  defp log_ambiguous_settings_family(family) do
+    count =
+      effective_snapshot()
+      |> Map.get(:reactions, [])
+      |> Enum.count(&(&1.mode == :settings and &1.family == family))
+
+    if count > 1 do
+      require Logger
+      Logger.warning("settings family #{family} is ambiguous; no choice was selected")
+    end
+  end
+
+  defp log_invalid_settings_family(family) do
+    require Logger
+    Logger.warning("settings family #{family} is invalid; no choice was selected")
   end
 
   # What the summoned mind is asked. It names the statute, the reason code, and the exit
@@ -2448,7 +2676,12 @@ defmodule Tightbeam.Rules do
   # statute had nothing open when the check started, so there is no recovery to schedule
   # and `to_close` stays empty.
   defp recovery(_rule, nil, to_close), do: to_close
-  defp recovery(rule, position, to_close), do: [{:episodes, rule.name, position} | to_close]
+
+  defp recovery(rule, position, to_close) do
+    if rule_failure_setting?("recover_on_success"),
+      do: [{:episodes, rule.name, position} | to_close],
+      else: to_close
+  end
 
   defp maybe_close(rule, db, call, to_close) do
     subject = gated_ref(call)
@@ -2495,6 +2728,23 @@ defmodule Tightbeam.Rules do
       {:ok, value, Map.put(cache, fact, value)}
     catch
       _kind, _reason -> :error
+    end
+  end
+
+  defp queue_thresholds do
+    case reaction_policy("queue-thresholds") do
+      %{settings: %{"queued_turns" => depth, "oldest_age_ms" => age} = settings}
+      when map_size(settings) == 2 and is_integer(depth) and depth >= 0 and
+             is_integer(age) and age >= 0 ->
+        {depth, age}
+
+      nil ->
+        log_ambiguous_settings_family("queue-thresholds")
+        nil
+
+      _ ->
+        log_invalid_settings_family("queue-thresholds")
+        nil
     end
   end
 
@@ -2643,6 +2893,23 @@ defmodule Tightbeam.Rules do
     end
   end
 
+  defp compute_fact("attest.kind", db, %{edge: :row_commit} = call, cache),
+    do: {case row_commit_attest_record(db, call) do
+      %{kind: kind} -> kind
+      _ -> nil
+    end, cache}
+
+  defp compute_fact("attest.verdict_kind", db, %{edge: :row_commit} = call, cache),
+    do: {case row_commit_attest_record(db, call) do
+      %{verdict_kind: kind} -> kind
+      _ -> nil
+    end, cache}
+
+  defp compute_fact("attest.verdict_kind", _db, call, cache) do
+    kind = call.params[:verdict_kind]
+    {if(call.verb == "attest" and is_binary(kind), do: kind), cache}
+  end
+
   defp compute_fact("attest.kind", _db, call, cache) do
     value =
       case {call.verb, Map.get(call.params, :kind)} do
@@ -2671,6 +2938,27 @@ defmodule Tightbeam.Rules do
     with_dependency("$assignment", db, call, cache, fn
       nil, cache -> {nil, cache}
       assignment, cache -> {assignment.effect_kind, cache}
+    end)
+  end
+
+  defp compute_fact("assignment.reviewed_effect_kind", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      %{reviews_assignment_id: reviewed_assignment_id}, cache
+      when is_binary(reviewed_assignment_id) ->
+        {:ok, rows} =
+          query(
+            db,
+            "SELECT effectKind FROM assignment_effects WHERE assignmentId=?1",
+            [reviewed_assignment_id]
+          )
+
+        {case rows do
+           [[effect_kind]] -> effect_kind
+           [] -> nil
+         end, cache}
+
+      _assignment, cache ->
+        {nil, cache}
     end)
   end
 
@@ -2737,49 +3025,6 @@ defmodule Tightbeam.Rules do
     with_dependency("$verdict_authors", db, call, cache, fn
       nil, cache -> {nil, cache}
       authors, cache -> {distinct_verdict_kinds(authors), cache}
-    end)
-  end
-
-  defp compute_fact("assignment.qualifying_review_verdict_kinds", db, call, cache) do
-    with_dependency("$assignment", db, call, cache, fn
-      nil, cache ->
-        {nil, cache}
-
-      assignment, cache ->
-        kinds =
-          if assignment.effect_kind == "code" and get_in(call, [:params, :kind]) == "completion" do
-            # Let the transaction report uncovered producer commits by hash;
-            # this rule only distinguishes a clean independent review from no
-            # such review or a blocking review verdict.
-            Assignments.qualifying_review_verdict_kinds(
-              db,
-              assignment.id,
-              assignment.holder_key
-            )
-          else
-            Assignments.qualifying_review_verdict_kinds(
-              db,
-              assignment.id,
-              assignment.holder_key
-            )
-          end
-
-        {kinds, cache}
-    end)
-  end
-
-  defp compute_fact("assignment.qualifying_verification_verdict_kinds", db, call, cache) do
-    with_dependency("$assignment", db, call, cache, fn
-      nil, cache ->
-        {nil, cache}
-
-      assignment, cache ->
-        {Assignments.qualifying_verification_verdict_kinds(
-           db,
-           assignment.id,
-           assignment.holder_key,
-           get_in(call, [:params, :commit_refs])
-         ), cache}
     end)
   end
 
@@ -2945,6 +3190,27 @@ defmodule Tightbeam.Rules do
       end
 
     {value, cache}
+  end
+
+  defp compute_fact("artifact.cited_content_captured", db, call, cache) do
+    case fact_call_param(call, :artifact_id) do
+      artifact_id when is_binary(artifact_id) ->
+        {:ok, [[artifact_exists, content_exists]]} =
+          query(
+            db,
+            """
+            SELECT EXISTS(SELECT 1 FROM artifacts WHERE artifactId=?1),
+                   EXISTS(SELECT 1 FROM artifact_contents WHERE artifactId=?1)
+            """,
+            [artifact_id]
+          )
+
+        value = if artifact_exists == 1, do: content_exists == 1, else: nil
+        {value, cache}
+
+      _ ->
+        {nil, cache}
+    end
   end
 
   defp compute_fact("review.qualifying_verdict_kinds", db, call, cache) do
@@ -3235,21 +3501,6 @@ defmodule Tightbeam.Rules do
             {nil, cache}
         end
 
-      "assignment" ->
-        case fetch_fact("$assignment", db, call, cache) do
-          {:ok, %{reviews_assignment_id: nil, effect_kind: "code"}, cache} ->
-            case compute_fact("assignment.prior_completed_fix_count", db, call, cache) do
-              {3, cache} -> {"fix", cache}
-              {_count, cache} -> {nil, cache}
-            end
-
-          {:ok, _assignment, cache} ->
-            {nil, cache}
-
-          _ ->
-            {nil, cache}
-        end
-
       _ ->
         {nil, cache}
     end
@@ -3273,28 +3524,63 @@ defmodule Tightbeam.Rules do
     end
   end
 
-  # Count only committed changes-requested verdicts, across every review
-  # assignment whose reviewed producer belongs to this work item. No counter
-  # is persisted, so later review assignments share the same threshold.
-  defp compute_fact("work_item.changes_requested_count", db, call, cache) do
-    case {row_commit_attest_record(db, call), fetch_fact("$assignment", db, call, cache)} do
-      {%{kind: "verdict", verdict_kind: "changes-requested"},
-       {:ok, %{reviews_assignment_id: reviewed_assignment_id} = assignment, cache}}
-      when is_binary(reviewed_assignment_id) ->
+  defp compute_fact("work_item.review_verdict_count." <> kind, db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      assignment, cache ->
         case row_commit_work_item_id(db, call, assignment) do
           work_item_id when is_binary(work_item_id) ->
-            {:ok, [[count]]} =
-              DB.query(db, work_item_changes_requested_count_sql(), [work_item_id])
-
+            {:ok, [[count]]} = query(db, work_item_named_review_verdict_count_sql(), [work_item_id, kind])
             {count, cache}
+          _ -> {nil, cache}
+        end
+    end)
+  end
 
-          _ ->
+  defp compute_fact("review.source_uncovered_commit_count." <> kind, db, call, cache)
+       when byte_size(kind) > 0 do
+    with_dependency("$assignment", db, call, cache, fn
+      %{reviews_assignment_id: reviewed_assignment_id}, cache
+      when is_binary(reviewed_assignment_id) ->
+        case reviewed_assignment_source_verdict(db, reviewed_assignment_id, kind) do
+          nil ->
+            {nil, cache}
+
+          %{commit_refs: source_refs} ->
+            source = stored_commit_ref_set(source_refs)
+            supplied = call_commit_ref_set(fact_call_param(call, :commit_refs))
+            {MapSet.size(MapSet.difference(source, supplied)), cache}
+        end
+
+      _assignment, cache ->
+        {nil, cache}
+    end)
+  end
+
+  defp compute_fact("review.cites_source_copy." <> kind, db, call, cache)
+       when byte_size(kind) > 0 do
+    with_dependency("$assignment", db, call, cache, fn
+      %{reviews_assignment_id: reviewed_assignment_id}, cache
+      when is_binary(reviewed_assignment_id) ->
+        case reviewed_assignment_source_verdict(db, reviewed_assignment_id, kind) do
+          %{artifact_id: artifact_id, content_sha256: content_sha256}
+          when is_binary(artifact_id) and is_binary(content_sha256) ->
+            supplied_artifact = fact_call_param(call, :artifact_id)
+            supplied_digest = fact_call_param(call, :content_sha256)
+
+            {
+              is_binary(supplied_artifact) and is_binary(supplied_digest) and
+                supplied_artifact == artifact_id and supplied_digest == content_sha256,
+              cache
+            }
+
+          _source_without_copy ->
             {nil, cache}
         end
 
-      _ ->
+      _assignment, cache ->
         {nil, cache}
-    end
+    end)
   end
 
   # Keep the historical work-item-wide review count available to existing
@@ -3443,26 +3729,23 @@ defmodule Tightbeam.Rules do
   end
 
   defp compute_fact("turn.backlogged", db, call, cache) do
-    case queued_turn_snapshot(db, call) do
-      %{count: count, age_ms: age_ms} ->
-        {count >= 20 or (is_integer(age_ms) and age_ms >= 60 * 60 * 1_000), cache}
-
+    case {queued_turn_snapshot(db, call), queue_thresholds()} do
+      {%{count: count, age_ms: age_ms}, {depth, age}} ->
+        {count >= depth or (is_integer(age_ms) and age_ms >= age), cache}
       _ ->
         {nil, cache}
     end
   end
 
   defp compute_fact("turn.backlog_episode_id", db, call, cache) do
-    case queued_turn_snapshot(db, call) do
-      %{count: count, age_ms: age_ms, session_key: session_key, now: now}
-      when count >= 20 or (is_integer(age_ms) and age_ms >= 60 * 60 * 1_000) ->
-        case backlog_started_at(db, session_key, now) do
+    case {queued_turn_snapshot(db, call), queue_thresholds()} do
+      {%{count: count, age_ms: age_ms, session_key: session_key, now: now}, {depth, age}}
+      when count >= depth or (is_integer(age_ms) and age_ms >= age) ->
+        case backlog_started_at(db, session_key, now, depth, age) do
           nil -> {nil, cache}
           at -> {"queue:" <> session_key <> ":" <> Integer.to_string(at), cache}
         end
-
-      _ ->
-        {nil, cache}
+      _ -> {nil, cache}
     end
   end
 
@@ -3471,7 +3754,7 @@ defmodule Tightbeam.Rules do
   # Equal-millisecond boundaries are coalesced: durable timestamps cannot order
   # a claim and enqueue within that millisecond, so a zero-duration recovery
   # conservatively stays in the same episode. No classification is persisted.
-  defp backlog_started_at(db, session_key, now) do
+  defp backlog_started_at(db, session_key, now, depth_threshold, age_threshold) do
     {:ok, rows} =
       DB.query(
         db,
@@ -3484,7 +3767,7 @@ defmodule Tightbeam.Rules do
     {_depth, _aged, started_at} =
       rows
       |> Enum.flat_map(fn [created_at, left_at] ->
-        age_at = created_at + 60 * 60 * 1_000
+        age_at = created_at + age_threshold
         left_at = if is_integer(left_at), do: max(left_at, created_at), else: nil
         ages? = is_nil(left_at) or age_at < left_at
         events = [{created_at, 1, 0}]
@@ -3505,7 +3788,7 @@ defmodule Tightbeam.Rules do
             {depth + depth_delta, aged + age_delta}
           end)
 
-        started_at = if depth >= 20 or aged > 0, do: started_at || at, else: nil
+        started_at = if depth >= depth_threshold or aged > 0, do: started_at || at, else: nil
         {depth, aged, started_at}
       end)
 
@@ -3749,17 +4032,164 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("cited_artifact." <> relation, db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      assignment, cache ->
+        case query(db, "SELECT kind,producedByAssignmentId FROM artifacts WHERE artifactId=?1",
+               [call.params[:artifact_id]]) do
+          {:ok, [[kind, producer]]} ->
+            value = case relation do
+              "kind" -> kind
+              "produced_by_assignment" -> producer == assignment.id
+              "produced_by_reviewed_assignment" ->
+                not is_nil(assignment.reviews_assignment_id) and producer == assignment.reviews_assignment_id
+            end
+            {value, cache}
+          {:ok, []} -> {nil, cache}
+        end
+    end)
+  end
+
+  defp compute_fact("call.candidate_commit", _db, call, cache) do
+    value = call.params[:candidate_commit]
+    {if(is_binary(value), do: value), cache}
+  end
+
+  defp compute_fact(fact, db, call, cache)
+       when fact in ["call.spec_artifact.kind", "call.review_artifact.kind"] do
+    key = if fact == "call.spec_artifact.kind", do: :spec_artifact_id, else: :review_artifact_id
+    {:ok, rows} = query(db, "SELECT kind FROM artifacts WHERE artifactId=?1", [call.params[key]])
+    {case rows do
+      [[kind]] -> kind
+      [] -> nil
+    end, cache}
+  end
+
+  defp compute_fact("call.spec_artifact.matches_work_item_spec_binding", db, call, cache) do
+    {:ok, rows} = query(db, """
+    SELECT art.originPath,art.contentSha256,wi.specRefName,wi.specRefSha256
+    FROM artifacts art JOIN work_items wi ON wi.id=art.workItemId WHERE art.artifactId=?1
+    """, [call.params[:spec_artifact_id]])
+    value = case rows do
+      [[path, hash, path, hash]] when not is_nil(path) and not is_nil(hash) -> true
+      _ -> false
+    end
+    {value, cache}
+  end
+
+  defp compute_fact("call.review_attest.verdict_kind", db, call, cache) do
+    {:ok, rows} = query(db, "SELECT verdictKind FROM attests WHERE id=?1", [call.params[:review_attest_id]])
+    {case rows do
+      [[kind]] -> kind
+      [] -> nil
+    end, cache}
+  end
+
+  defp compute_fact("call.review_attest.commit_refs_contains_candidate", db, call, cache) do
+    value = with candidate when is_binary(candidate) <- call.params[:candidate_commit],
+                 {:ok, [[encoded]]} when is_binary(encoded) <-
+                   query(db, "SELECT commitRefs FROM attests WHERE id=?1", [call.params[:review_attest_id]]),
+                 {:ok, refs} when is_list(refs) <- JSON.decode(encoded) do
+      Enum.any?(refs, fn ref -> is_map(ref) and ref["commit"] == candidate end)
+    else
+      _ -> false
+    end
+    {value, cache}
+  end
+
+  defp compute_fact("call.note", _db, call, cache) do
+    note = call.params[:note]
+    {if(is_binary(note), do: note), cache}
+  end
+
+  defp compute_fact("call.commit_refs_count", _db, call, cache) do
+    count = case call.params[:commit_refs] do
+      nil -> 0
+      refs when is_list(refs) -> length(refs)
+      _ -> nil
+    end
+    {count, cache}
+  end
+
+  defp compute_fact("call.supplied_fields", _db, call, cache) do
+    fields = for {key, value} <- call.params, not is_nil(value), do: to_string(key)
+    {Enum.sort(fields), cache}
+  end
+
+  defp compute_fact("call.commit_refs.0.commit", _db, call, cache) do
+    value = case call.params[:commit_refs] do
+      [ref | _] when is_map(ref) -> field(ref, :commit)
+      _ -> nil
+    end
+    {if(is_binary(value), do: value), cache}
+  end
+
   defp compute_fact("call.comparison_value", _db, call, cache),
     do: {Tightbeam.MementoFacts.comparison_value(call), cache}
 
-  defp compute_fact("call.file_effect_manifest.valid", _db, call, cache),
-    do: {get_in(call, [:file_effect_manifest, :valid]) == true, cache}
 
   defp compute_fact("call.has_comparison_value", _db, call, cache),
     do: {Tightbeam.MementoFacts.has_comparison_value?(call), cache}
 
   defp compute_fact("call." <> _ = fact, _db, call, cache),
     do: {Tightbeam.MementoFacts.call_value(fact, Map.get(call, :memento_writes, [])), cache}
+
+  defp reviewed_assignment_source_verdict(db, reviewed_assignment_id, verdict_kind) do
+    case query(
+           db,
+           """
+           SELECT v.commitRefs, v.artifactId, v.contentSha256
+             FROM assignments AS reviewed
+             JOIN attests AS v ON v.assignmentId=reviewed.id
+            WHERE reviewed.id=?1
+              AND v.kind='verdict'
+              AND v.verdictKind=?2
+              AND v.bySession=reviewed.holderKey
+              AND v.byUser IS NULL
+            ORDER BY v.ts DESC, v.rowid DESC
+            LIMIT 1
+           """,
+           [reviewed_assignment_id, verdict_kind]
+         ) do
+      {:ok, [[commit_refs, artifact_id, content_sha256]]} ->
+        %{
+          commit_refs: commit_refs,
+          artifact_id: artifact_id,
+          content_sha256: content_sha256
+        }
+
+      {:ok, []} ->
+        nil
+    end
+  end
+
+  defp fact_call_param(call, key) do
+    Map.get(call.params, key) || Map.get(call.params, Atom.to_string(key))
+  end
+
+  defp call_commit_ref_set(refs) when is_list(refs), do: commit_ref_set(refs)
+  defp call_commit_ref_set(_), do: MapSet.new()
+
+  defp stored_commit_ref_set(nil), do: MapSet.new()
+
+  defp stored_commit_ref_set(encoded) when is_binary(encoded) do
+    case JSON.decode!(encoded) do
+      refs when is_list(refs) -> commit_ref_set(refs)
+      other -> raise ArgumentError, "stored commit refs are not a list: #{inspect(other)}"
+    end
+  end
+
+  defp commit_ref_set(refs) when is_list(refs) do
+    refs
+    |> Enum.flat_map(fn ref ->
+      case field(ref, :commit) do
+        commit when is_binary(commit) -> [String.downcase(commit)]
+        _ -> []
+      end
+    end)
+    |> MapSet.new()
+  end
 
   defp compute_fact(fact, db, call, cache) do
     case String.split(fact, ".", parts: 3) do
@@ -3908,12 +4338,10 @@ defmodule Tightbeam.Rules do
            SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey, a.holderRole,
                   a.state, a.outcome, s.archetype,
                   a.holderHarness, a.holderProvider,
-                  COALESCE(e.effectKind,
-                    CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)
+                  #{Assignments.effect_kind_sql("a")}
            FROM assignments a
            JOIN sessions s ON s.sessionKey = a.holderKey
            LEFT JOIN work_items wi ON wi.id = a.workItemId
-           LEFT JOIN assignment_effects e ON e.assignmentId = a.id
            #{where}
            """,
            params
@@ -4013,6 +4441,9 @@ defmodule Tightbeam.Rules do
   end
 
   defp parse_origin(origin), do: Tightbeam.Origin.parse(origin)
+
+  defp compare(left, "matches", right) when is_binary(left),
+    do: Regex.match?(Regex.compile!(right), left)
 
   defp compare(left, "eq", right), do: left == right
   defp compare(left, "ne", right), do: left != right

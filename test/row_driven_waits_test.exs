@@ -102,6 +102,11 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     verification = { trigger = "registration", terminal = "bound-verdict-or-obligation-terminal", fallback = "wake-due-at" }
     """)
 
+    File.cp!(
+      Path.expand("../priv/seed/rules/substrate.toml", __DIR__),
+      Path.join(base, "identity/rules/substrate.toml")
+    )
+
     Rules.load!(base, ~w(wake attest))
 
     on_exit(fn ->

@@ -1898,6 +1898,183 @@ defmodule Tightbeam.SupervisionTest do
     assert pending_deadline!(ctx.db, "asg_inactive").wake_id == deadline.wake_id
   end
 
+  test "ambiguous inactivity policy retracts actions with no replacement provenance", ctx do
+    base = inactivity_policy_base()
+    write_inactivity_policy!(base, 1_000)
+    assert [] = Tightbeam.Rules.load!(base, [])
+    opened = System.system_time(:millisecond) - 10_000
+    open_deadline!(ctx.db, "asg_inactive", opened, 1_000)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+    path = Path.join(base, "identity/rules/row-reaction-assignment-inactivity.toml")
+    File.write!(Path.join(base, "identity/rules/duplicate.toml"),
+      String.replace(File.read!(path), "assignment-inactivity-reminders", "second-inactivity-policy"))
+    assert [] = Tightbeam.Rules.load!(base, [])
+    assert is_nil(Tightbeam.Rules.reaction_policy("assignment-inactivity"))
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 1_000)
+    assert Wakes.get(ctx.db, deadline.wake_id).state == "canceled"
+    assert {:ok, [["process", "tightbeam:rail-remedy", "superseded", "wake", source,
+                  "no_replacement", nil]]} =
+             DB.query(ctx.db,
+               "SELECT requesterKind,requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,replacementWakeId FROM wake_cancellations WHERE wakeId=?1",
+               [deadline.wake_id])
+    assert source == deadline.wake_id
+    assert deadline_count(ctx.db) == 1
+    assert episode_notices(ctx.db) == []
+  end
+
+  for limit <- [0, 1] do
+    test "inactivity reminder limit #{limit} ends the fresh episode without a climb", ctx do
+      base = inactivity_policy_base()
+      write_inactivity_settings!(base, 1_000, unquote(limit),
+        ["opener", "active_ancestors", "owner_personal_session"])
+      assert [] = Tightbeam.Rules.load!(base, [])
+      opened = System.system_time(:millisecond) - 10_000
+      assert {:ok, _} = DB.query(ctx.db,
+        "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [opened])
+      open_deadline!(ctx.db, "asg_inactive", opened, 1_000)
+      deadline = pending_deadline!(ctx.db, "asg_inactive")
+      assert {:ok, _} = Supervision.deadline(ctx.db, deadline)
+      assert Wakes.get(ctx.db, deadline.wake_id).state == "fired"
+      notices = episode_notices(ctx.db)
+      assert length(notices) == unquote(limit)
+      assert Enum.all?(notices, &(&1.session_key == ctx.holder.session_key))
+      assert {:ok, [[0]]} = DB.query(ctx.db,
+        "SELECT COUNT(*) FROM wakes WHERE consumer='assignment_inactivity_climb' AND state='pending'")
+    end
+  end
+
+  for order <- [[], ["owner_personal_session", "active_ancestors", "opener"]] do
+    test "inactivity honors escalation order #{inspect(order)}", ctx do
+      base = inactivity_policy_base()
+      write_inactivity_settings!(base, 1_000, 2, unquote(order))
+      assert [] = Tightbeam.Rules.load!(base, [])
+      opened = System.system_time(:millisecond) - 10_000
+      assert {:ok, _} = DB.query(ctx.db,
+        "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [opened])
+      open_deadline!(ctx.db, "asg_inactive", opened, 1_000)
+      assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+      [notice] = episode_notices(ctx.db)
+      fire_due_climb!(ctx.db, notice.wake_id, 1_000)
+      first_climb = pending_climb!(ctx.db, "asg_inactive")
+      fire_due_climb!(ctx.db, notice.wake_id, 1_000)
+      assert length(episode_notices(ctx.db)) == 1
+      if unquote(order) == [] do
+        assert Wakes.get(ctx.db, notice.wake_id).session_key == ctx.holder.session_key
+        assert {:ok, [[0]]} = DB.query(ctx.db,
+          "SELECT COUNT(*) FROM wakes WHERE consumer='assignment_inactivity_climb' AND state='pending'")
+      else
+        assert Wakes.get(ctx.db, notice.wake_id).session_key == ctx.main.session_key
+        assert pending_climb!(ctx.db, "asg_inactive").wake_id != first_climb.wake_id
+        fire_due_climb!(ctx.db, notice.wake_id, 1_000)
+        assert Wakes.get(ctx.db, notice.wake_id).session_key == ctx.parent.session_key
+      end
+    end
+  end
+
+  for period <- [1_000, 2_000] do
+    test "startup period #{period} replaces a mismatched episode with a deadline", ctx do
+      base = inactivity_policy_base()
+      write_inactivity_policy!(base, 1_000)
+      assert [] = Tightbeam.Rules.load!(base, [])
+      opened = System.system_time(:millisecond) - 10_000
+      assert {:ok, _} = DB.query(ctx.db,
+        "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [opened])
+      open_deadline!(ctx.db, "asg_inactive", opened, 1_000)
+      assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+      [notice] = episode_notices(ctx.db)
+      old = pending_climb!(ctx.db, "asg_inactive")
+      # Keep the row typed, but make the controller refer to another episode.
+      payload = JSON.decode!(old.prompt)
+      wrong_ref = "assignment-inactivity-episode-v1:other"
+      assert {:ok, _} = DB.query(ctx.db,
+        "UPDATE wakes SET obligationRef=?2,prompt=?3 WHERE wakeId=?1",
+        [old.wake_id, wrong_ref, JSON.encode!(Map.put(payload, "episodeRef", wrong_ref))])
+      write_inactivity_policy!(base, unquote(period))
+      assert [] = Tightbeam.Rules.load!(base, [])
+      assert :ok = Supervision.migrate_open_assignments(ctx.db, unquote(period))
+      assert Wakes.get(ctx.db, notice.wake_id).state == "pending"
+      replacement = pending_deadline!(ctx.db, "asg_inactive")
+      refute replacement.wake_id == old.wake_id
+      assert_replacement!(ctx.db, old.wake_id, replacement.wake_id)
+      assert JSON.decode!(replacement.prompt)["intervalMs"] == unquote(period)
+      assert {:ok, [[0]]} = DB.query(ctx.db,
+        "SELECT COUNT(*) FROM wakes WHERE consumer='assignment_inactivity_climb' AND state='pending'")
+    end
+  end
+
+  test "activity updates its deadline in place and replaces episode controllers with typed provenance", ctx do
+    opened = System.system_time(:millisecond) - 10_000
+    assert {:ok, _} = DB.query(ctx.db,
+      "UPDATE assignments SET openedAt=?1 WHERE id='asg_inactive'", [opened])
+    open_deadline!(ctx.db, "asg_inactive", opened, 1_000)
+    initial = pending_deadline!(ctx.db, "asg_inactive")
+    assert {:ok, :reset} = DB.transaction(ctx.db, fn txn ->
+      Supervision.activity_in_txn(txn, "asg_inactive", ctx.holder.session_key, opened + 1, 1_000)
+    end)
+    assert pending_deadline!(ctx.db, "asg_inactive").wake_id == initial.wake_id
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, pending_deadline!(ctx.db, "asg_inactive"))
+    [notice] = episode_notices(ctx.db)
+    climb = pending_climb!(ctx.db, "asg_inactive")
+    at = System.system_time(:millisecond)
+    assert {:ok, :reset} = DB.transaction(ctx.db, fn txn ->
+      Supervision.activity_in_txn(txn, "asg_inactive", ctx.holder.session_key, at, 2_000)
+    end)
+    replacement = pending_deadline!(ctx.db, "asg_inactive")
+    assert replacement.due_at == at + 2_000
+    refute replacement.wake_id == initial.wake_id
+    assert_replacement!(ctx.db, climb.wake_id, replacement.wake_id)
+    assert_replacement!(ctx.db, notice.wake_id, replacement.wake_id)
+  end
+
+  for failure <- [:refused_cancellation, :malformed_row] do
+    test "unavailable inactivity reconciliation rolls back earlier cancellations on #{failure}", ctx do
+      open_deadline!(ctx.db, "asg_inactive", 1, 1_000)
+      first = pending_deadline!(ctx.db, "asg_inactive")
+      assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET createdAt=0 WHERE wakeId=?1", [first.wake_id])
+      if unquote(failure) == :refused_cancellation do
+        Wakes.schedule(ctx.db, %{
+          session_key: ctx.holder.session_key, origin: "process:test",
+          consumer: "assignment_inactivity_deadline", due_at: 1,
+          assignment_id: "asg_inactive", prompt: "{}", obligation_ref: "wrong-deadline-reference"
+        })
+      else
+        # SQLite permits NULL in this non-integer primary key; exercise the
+        # migration's malformed-row guard without changing the schema.
+        assert {:ok, _} = DB.query(ctx.db,
+          "INSERT INTO wakes(wakeId,sessionKey,origin,consumer,dueAt,createdAt) VALUES(NULL,?1,'process:test','assignment_inactivity_deadline',1,1)",
+          [ctx.holder.session_key])
+      end
+      assert [] = Tightbeam.Rules.load!(inactivity_policy_base(), [])
+      assert {:error, %DB.Error{} = error} = Supervision.migrate_open_assignments(ctx.db, 1_000)
+      if unquote(failure) == :malformed_row do
+        assert Exception.message(error) =~ "malformed unavailable assignment-inactivity wake"
+      else
+        assert Exception.message(error) =~ "could not be canceled"
+      end
+      assert Wakes.get(ctx.db, first.wake_id).state == "pending"
+      assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations")
+      assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE state='pending'")
+    end
+  end
+
+  defp assert_replacement!(db, old_id, replacement_id) do
+    assert Wakes.get(db, old_id).state == "canceled"
+    assert {:ok, [["process", "tightbeam:assignments", "superseded", "wake", causal,
+                  "replacement", replacement]]} = DB.query(db,
+      "SELECT requesterKind,requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,replacementWakeId FROM wake_cancellations WHERE wakeId=?1", [old_id])
+    assert causal == replacement_id
+    assert replacement == replacement_id
+  end
+
+  defp write_inactivity_settings!(base, period, limit, order) do
+    write_inactivity_policy!(base, period)
+    path = Path.join(base, "identity/rules/row-reaction-assignment-inactivity.toml")
+    content = File.read!(path)
+      |> String.replace("holder_reminder_limit = 2", "holder_reminder_limit = #{limit}")
+      |> String.replace(~s(["opener", "active_ancestors", "owner_personal_session"]), JSON.encode!(order))
+    File.write!(path, content)
+  end
+
   defp refuse!(db, condition) do
     assert :ok =
              DB.execute(db, """

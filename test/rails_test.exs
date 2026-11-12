@@ -77,7 +77,8 @@ defmodule Tightbeam.RailsTest do
       {%{"tool" => :omit}, ~r/is missing "tool"/},
       {%{"pattern" => :omit}, ~r/requires exactly one of "pattern" or "action"/},
       {%{"pattern" => :omit, "action" => ~s("unknown")}, ~r/unknown gate action/},
-      {%{"action" => ~s("git-stash")}, ~r/requires exactly one of "pattern" or "action"/},
+      {%{"pattern" => ~s("protected"), "action" => ~s("git-stash")},
+       ~r/requires exactly one of "pattern" or "action"/},
       {%{"text" => :omit}, ~r/is missing "text"/},
       {%{"text" => ~s("  ")}, ~r/is missing "text"/},
       {%{"name" => :omit}, ~r/statute is missing "name"/},
@@ -171,7 +172,9 @@ defmodule Tightbeam.RailsTest do
     assert [%{"type" => "command", "command" => command}] = entry["hooks"]
 
     assert command ==
-             "sh -c 'grep -qE \"git (reset|stash|rebase|checkout \\\\.|restore|clean)\" - || exit 0; " <>
+             "sh -c 'input=$(cat); printf '\\''%s'\\'' \"$input\" | tightbeam hook-command > /dev/null 2>/dev/null; status=$?; " <>
+               "if [ \"$status\" -ne 0 ]; then echo \"[gate: no-history-rewrites] hook input check failed closed (status $status).\" >&2; exit 2; fi; " <>
+               "printf '\\''%s'\\'' \"$input\" | grep -qE \"git (reset|stash|rebase|checkout \\\\.|restore|clean)\" || exit 0; " <>
                "echo \"[gate: no-history-rewrites] History-rewriting git commands are forbidden here: " <>
                "other agents may have uncommitted work in this tree.\" >&2; exit 2'"
   end
@@ -216,7 +219,9 @@ defmodule Tightbeam.RailsTest do
     [%{"command" => command}] = entry["hooks"]
 
     assert command ==
-             "sh -c 'grep -qE \"echo (\\\\\\$HOME|\\\\\\$PATH)\\\\.\" - || exit 0; " <>
+             "sh -c 'input=$(cat); printf '\\''%s'\\'' \"$input\" | tightbeam hook-command > /dev/null 2>/dev/null; status=$?; " <>
+               "if [ \"$status\" -ne 0 ]; then echo \"[gate: no-env-dollars] hook input check failed closed (status $status).\" >&2; exit 2; fi; " <>
+               "printf '\\''%s'\\'' \"$input\" | grep -qE \"echo (\\\\\\$HOME|\\\\\\$PATH)\\\\.\" || exit 0; " <>
                "echo \"[gate: no-env-dollars] Don'\\''t expand env here.\" >&2; exit 2'"
   end
 
@@ -227,7 +232,9 @@ defmodule Tightbeam.RailsTest do
            } = Rails.probe_entry()
 
     assert command ==
-             "sh -c 'grep -qE \"tightbeam-gate-probe\" - || exit 0; " <>
+             "sh -c 'input=$(cat); printf '\\''%s'\\'' \"$input\" | tightbeam hook-command > /dev/null 2>/dev/null; status=$?; " <>
+               "if [ \"$status\" -ne 0 ]; then echo \"[gate: tightbeam-probe] hook input check failed closed (status $status).\" >&2; exit 2; fi; " <>
+               "printf '\\''%s'\\'' \"$input\" | grep -qE \"tightbeam-gate-probe\" || exit 0; " <>
                "echo \"[gate: tightbeam-probe] Spawn wiring-check probe command; " <>
                "always refused by design.\" >&2; exit 2'"
   end
@@ -248,7 +255,7 @@ defmodule Tightbeam.RailsTest do
       ExUnit.CaptureLog.capture_log(fn ->
         result = load.()
         assert is_list(result)
-        assert Enum.all?(result, &(&1.pattern == ".*" and &1.action == nil))
+        assert Enum.all?(result, &(&1.pattern == ".*" and Map.get(&1, :action) == nil))
       end)
       |> String.trim()
 

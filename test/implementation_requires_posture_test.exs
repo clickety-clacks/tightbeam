@@ -365,7 +365,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
   end
 
   defp dispatch_after_rumination(ctx, call) do
-    assert {:ok, %{id: assignment_id, rumination_required: true}} =
+    assert {:ok, %{id: assignment_id}} =
              result = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
     assert {:ok, []} =

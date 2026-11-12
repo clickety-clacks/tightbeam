@@ -1,0 +1,16 @@
+[[reaction]]
+name = "engineering-assignment-effect-labels"
+family = "assignment-effect-labels"
+english = "Assignments use engineering effect labels; omitted labels default to evidence and linked reviews use review."
+[reaction.settings]
+allowed = ["code", "policy", "release", "live_mutation", "evidence", "review", "coordination"]
+default = "evidence"
+linked = "review"
+
+[[reaction]]
+name = "engineering-assignment-verdict-status"
+family = "assignment-verdict-status"
+english = "A completed assignment with a verified verdict presents as verified."
+[reaction.settings]
+verdicts = ["verified"]
+statuses = ["verified"]

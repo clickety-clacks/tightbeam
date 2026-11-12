@@ -105,6 +105,68 @@ defmodule Tightbeam.EphemeralTest do
     assert {:error, :ephemeral_turn_used} = enqueue(db, "helper")
   end
 
+  test "a missing lifecycle family makes no retirement or result-route choice", %{db: db} do
+    rules_base =
+      Path.join(System.tmp_dir!(), "ephemeral-no-policy-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(rules_base, "identity/rules"))
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+    Tightbeam.Rules.load!(rules_base, [])
+
+    assert {:ok, seq} = enqueue(db, "helper")
+    assert {:ok, turn} = Ledger.claim_next(db, "helper", "test")
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    assert Org.get(db, "helper").state == "active"
+    assert Wakes.get(db, "ephemeral-result:helper") == nil
+    assert {:error, :ephemeral_turn_used} = enqueue(db, "helper")
+  end
+
+  test "the lifecycle family controls retirement and result recipient order", %{db: db} do
+    rules_base =
+      Path.join(System.tmp_dir!(), "ephemeral-lifecycle-#{System.unique_integer([:positive])}")
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+
+    seed =
+      seed
+      |> String.replace("automatic_retirement = true", "automatic_retirement = false")
+      |> String.replace(
+        "result_recipients = [\"caller\", \"parent\"]",
+        "result_recipients = [\"parent\", \"caller\"]"
+      )
+
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    Tightbeam.Rules.load!(rules_base, [])
+
+    Org.create(db, %{
+      session_key: "parent",
+      display_name: "parent",
+      owner_user_id: "owner",
+      origin: "user:owner",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    :ok =
+      DB.execute(db, "UPDATE sessions SET spawnedBy='parent' WHERE sessionKey='caller'")
+
+    assert {:ok, seq} = enqueue(db, "helper")
+    assert {:ok, turn} = Ledger.claim_next(db, "helper", "test")
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    assert Org.get(db, "helper").state == "active"
+    assert Wakes.get(db, "ephemeral-result:helper").session_key == "parent"
+    assert {:error, :ephemeral_turn_used} = enqueue(db, "helper")
+  end
+
   test "R2.3 rejects assignment and card ownership at their write paths", %{db: db} do
     call = %{
       verb: "assign",

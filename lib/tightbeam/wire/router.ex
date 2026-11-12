@@ -3780,16 +3780,12 @@ defmodule Tightbeam.Wire.Router do
 
       given == ["role"] ->
         case Roles.resolve(db(conn), body["role"]) do
-          # `Roles.resolve/2` answers "who stands in for this role", falling back to
-          # the owner's personal session when the role is unbound or its binding is
-          # not active. That is a fair answer for a wake and a PHANTOM for an
-          # assignment: assign/dispatch BIND an obligation, and the owner's session
-          # is not the requested role's holder — commonly not even its provider — so
-          # the card lands on a session that cannot do the work while the requester
-          # believes it dispatched, including when a role's bound session was retired.
-          # Refuse HERE, the one place the fallback is still distinguishable: past
-          # this seam only a boolean survives, and the handler sees an active session
-          # it has no reason to doubt. Every other consumer keeps the fallback.
+          # `Roles.resolve/2` may use the declared personal-session fallback when
+          # the role is unbound or its binding is not active. A valid family allows
+          # that fallback for wake and ask, but it cannot stand in for the role on
+          # assign/dispatch: those verbs bind an obligation and the owner's session
+          # is not the requested role's holder. Refuse here, where the fallback is
+          # still distinguishable; past this seam only a boolean survives.
           {:ok, _session_key, true} when verb in ["assign", "dispatch"] ->
             {:error, 400, "no_live_role_holder",
              "role #{body["role"]} has no live bound session; spawn one and bind the role, " <>
@@ -3797,6 +3793,9 @@ defmodule Tightbeam.Wire.Router do
 
           {:ok, session_key, fallback} ->
             {:ok, session_key, %{role: body["role"], fallback: fallback}}
+
+          {:error, %{code: "no_live_role_holder", message: message}} ->
+            {:error, 400, "no_live_role_holder", message}
 
           {:error, %{code: "unknown_role"}} ->
             {:error, 404, "not_found", "unknown role: #{body["role"]}"}

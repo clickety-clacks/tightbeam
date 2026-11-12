@@ -90,126 +90,6 @@ defmodule Tightbeam.RailRemedyTest do
     }
   end
 
-  test "completion review gate stores one ordinary notice for the accountable owner", ctx do
-    main = session(ctx.db, Org.personal_session_key("flynn"), "flynn", "claude", "orchestrator")
-    assignment = assignment(ctx, "review staffing stays outside the core", "policy")
-    load_completion_gate(ctx)
-
-    completion = completion_call(assignment.id)
-
-    # The completion is recorded while review is pending; the card stays open.
-    assert {:ok, %{assignment: %{state: "open"}, attest: %{kind: "completion"}}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
-
-    assert {:ok, [[session_key, prompt, consumer, origin, creator_session_key, summon]]} =
-             DB.query(
-               ctx.db,
-               "SELECT sessionKey,prompt,consumer,origin,creatorSessionKey,summon FROM wakes WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'",
-               [assignment.id]
-             )
-
-    # A user-opened card without a delivery owner reaches the owner's main session.
-    assert session_key == main.session_key
-
-    assert prompt ==
-             "Coordinate independent review of assignment #{assignment.id}; preserve current evidence and direct staffing through its accountable owner."
-
-    assert consumer == "prompt"
-    assert origin == "remedy:completion-requires-review"
-    assert creator_session_key == nil
-    assert summon == 1
-
-    assert {:ok, [[1]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'",
-               [assignment.id]
-             )
-
-    assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id) == nil
-  end
-
-  test "completion review notice reaches the accountable session instead of the holder", ctx do
-    main = session(ctx.db, Org.personal_session_key("flynn"), "flynn", "claude", "orchestrator")
-    orchestrator = session(ctx.db, "lane-orchestrator", "flynn", "claude", "orchestrator")
-    delivery_owner = session(ctx.db, "delivery-owner", "flynn", "claude", "orchestrator")
-    item = work_item(ctx, "accountable review notice")
-
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE work_items SET deliveryOwnerSessionKey=?2 WHERE id=?1", [
-        item.id,
-        delivery_owner.session_key
-      ])
-
-    lane =
-      Assignments.__handle__(ctx.db, "assign", %{
-        verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
-        session_key: orchestrator.session_key,
-        target_role: nil,
-        role_fallback: false,
-        supervision_interval_ms: 1_000,
-        params: %{
-          subject: "orchestrate the lane",
-          work_item_id: item.id,
-          idempotency_key: nil,
-          effect_kind: "coordination"
-        }
-      })
-
-    # Each producer card is held by the coder and opened by the orchestrator.
-    [delegated, current, opener, owner_main, unrouted] =
-      for subject <- ~w(delegated current opener owner-main unrouted) do
-        producer = assignment(ctx, "review notice #{subject}", item.id)
-
-        {:ok, _} =
-          DB.query(
-            ctx.db,
-            "UPDATE assignments SET openedByUser=NULL, openedBySession=?2 WHERE id=?1",
-            [producer.id, orchestrator.session_key]
-          )
-
-        producer
-      end
-
-    load_completion_gate(ctx)
-
-    complete = fn producer ->
-      result = Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(producer.id))
-      {result, review_notice_recipients(ctx, producer.id)}
-    end
-
-    retire = fn session ->
-      {:ok, _} =
-        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
-          session.session_key
-        ])
-    end
-
-    # The opener still holds open work on the item, so it is the delegated owner.
-    assert {{:ok, %{assignment: %{state: "open"}}}, [recipient]} = complete.(delegated)
-    assert recipient == orchestrator.session_key
-
-    assert %{state: "closed", outcome: "revoked"} = revoke(ctx, lane.id)
-    assert {{:ok, %{assignment: %{state: "open"}}}, [recipient]} = complete.(current)
-    assert recipient == delivery_owner.session_key
-
-    retire.(delivery_owner)
-    assert {{:ok, %{assignment: %{state: "open"}}}, [recipient]} = complete.(opener)
-    assert recipient == orchestrator.session_key
-
-    retire.(orchestrator)
-    assert {{:ok, %{assignment: %{state: "open"}}}, [recipient]} = complete.(owner_main)
-    assert recipient == main.session_key
-
-    # With no active accountable session the completion is refused and no
-    # notice falls back to the holder.
-    retire.(main)
-
-    assert {{:error, %{reason: "remedy_fired", producer: nil}}, []} = complete.(unrouted)
-  end
-
   test "absent fact assigns under the remedy principal and actor closes after linked review",
        ctx do
     assignment = assignment(ctx, "original", "policy")
@@ -1262,7 +1142,7 @@ defmodule Tightbeam.RailRemedyTest do
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
       { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
-      { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+      { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
     ]
     [rule.remedy]
     action = "assign"
@@ -1655,23 +1535,6 @@ defmodule Tightbeam.RailRemedyTest do
       session_key: nil,
       params: %{assignment_id: assignment_id, reason: "test disposition"}
     })
-  end
-
-  defp load_completion_gate(ctx) do
-    shipped = File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
-    File.write!(Path.join(ctx.base_dir, "identity/rules/completion.toml"), shipped)
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-  end
-
-  defp review_notice_recipients(ctx, assignment_id) do
-    {:ok, rows} =
-      DB.query(
-        ctx.db,
-        "SELECT sessionKey FROM wakes WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'",
-        [assignment_id]
-      )
-
-    List.flatten(rows)
   end
 
   defp completion_call(assignment_id) do

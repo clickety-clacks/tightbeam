@@ -4,6 +4,7 @@ defmodule Tightbeam.JobTraceTest do
 
   alias Tightbeam.{
     Assignments,
+    Rules,
     DB,
     Org,
     WorkItems
@@ -14,6 +15,16 @@ defmodule Tightbeam.JobTraceTest do
     start_supervised!({DB, path: ":memory:", name: db})
 
     :ok = Tightbeam.Schema.ensure_all(db)
+    root = Path.join(System.tmp_dir!(), "trace-rules-#{System.unique_integer([:positive])}")
+    handlers = Tightbeam.Gateway.handlers(%{db: db})
+    law = Tightbeam.TerminalReactionFixture.load!(root, Map.keys(handlers))
+    File.write!(
+      Path.join(law, "identity/rules/attest-placement.toml"),
+      Tightbeam.TerminalReactionFixture.attest_placement()
+    )
+    Rules.load!(law, Map.keys(handlers))
+    on_exit(fn -> File.rm_rf!(root); :persistent_term.erase(Rules) end)
+
 
     :ok =
       DB.execute(
@@ -120,13 +131,13 @@ defmodule Tightbeam.JobTraceTest do
                commit_refs: commit_refs
              })
 
-    assert %{code: "invalid_commit_refs"} =
+    assert %{code: "rule_denied"} =
              attest(db, {:session, "holder"}, "asg_bad", "verdict", %{
                verdict_kind: "reviewed-clean",
                commit_refs: commit_refs
              })
 
-    assert %{code: "invalid_commit_refs"} =
+    assert %{code: "rule_denied"} =
              attest(db, {:session, "reviewer"}, "asg_review", "completion", %{
                commit_refs: commit_refs
              })
@@ -144,16 +155,16 @@ defmodule Tightbeam.JobTraceTest do
         "UPDATE assignment_effects SET effectKind='code' WHERE assignmentId='asg_bad'"
       )
 
-    unavailable_refs = [
+    malformed_refs = [
       %{
         "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
-        "commit" => String.duplicate("0", 40)
+        "commit" => "not-a-commit"
       }
     ]
 
-    assert %{code: "inapplicable_code_evidence"} =
+    assert %{code: "invalid_commit_refs"} =
              attest(db, {:session, "holder"}, "asg_bad", "completion", %{
-               commit_refs: unavailable_refs
+               commit_refs: malformed_refs
              })
 
     # Completion stores an event report even when its personal recipient is absent.
@@ -530,18 +541,15 @@ defmodule Tightbeam.JobTraceTest do
   end
 
   defp attest(db, principal, assignment_id, kind, extra) do
-    Assignments.__handle__(
-      db,
-      "attest",
-      %{
-        verb: "attest",
-        principal: principal,
-        origin: origin(principal),
-        session_key: nil,
-        params: Map.merge(%{assignment_id: assignment_id, kind: kind}, extra)
-      }
-      |> Map.put_new(:supervision_interval_ms, 1_000)
-    )
+    call = %{
+      verb: "attest", principal: principal, origin: origin(principal), session_key: nil,
+      params: Map.merge(%{assignment_id: assignment_id, kind: kind}, extra),
+      supervision_interval_ms: 1_000
+    }
+    case Rules.evaluate(db, call) do
+      :ok -> Assignments.__handle__(db, "attest", call)
+      {:deny, error} -> error
+    end
   end
 
   defp session(db, key, owner) do

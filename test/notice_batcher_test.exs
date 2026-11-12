@@ -1,6 +1,80 @@
 defmodule Tightbeam.NoticeBatcherTest do
   use Tightbeam.TestCase, async: false
+
+  alias Tightbeam.{NoticeBatcher, Rules}
+
   @moduletag tmp_dir: true
+
+  test "batching and class order follow the declared settings family" do
+    assert NoticeBatcher.batching_enabled?()
+    assert NoticeBatcher.class_order_sql("w") =~ "WHEN 'fyi' THEN 4"
+
+    configured =
+      Path.join(System.tmp_dir!(), "batch-settings-#{System.unique_integer([:positive])}")
+
+    rules_dir = Path.join(configured, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    on_exit(fn -> File.rm_rf!(configured) end)
+
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+
+    seed =
+      String.replace(
+        seed,
+        "class_order = [\"algedonic\", \"blocker\", \"input-needed\", \"status-query\", \"fyi\"]",
+        "class_order = [\"fyi\", \"status-query\", \"input-needed\", \"blocker\", \"algedonic\"]"
+      )
+
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    Rules.load!(configured, [])
+
+    assert NoticeBatcher.batching_enabled?()
+    assert NoticeBatcher.class_order_sql("w") =~ "WHEN 'fyi' THEN 0"
+
+    empty =
+      Path.join(
+        System.tmp_dir!(),
+        "batch-settings-empty-#{System.unique_integer([:positive])}"
+      )
+    File.mkdir_p!(Path.join(empty, "identity/rules"))
+    on_exit(fn -> File.rm_rf!(empty) end)
+    Rules.load!(empty, [])
+
+    refute NoticeBatcher.batching_enabled?()
+    assert NoticeBatcher.class_order_sql("w") == "CASE WHEN 1 = 1 THEN 0 END"
+  end
+
+  test "without the settings family, classed notices are not enrolled in batching", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 48)
+  end
+
+  test "batch members use the configured class order", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 49)
+  end
+
+  test "a queued ordinary prompt is delivered when batching settings are absent", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 50)
+  end
+
+  test "a queued ordinary prompt is delivered when batching is disabled", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 51)
+  end
+
+  test "a queued ordinary prompt is delivered when batching settings are invalid", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 52)
+  end
+
+  test "an explicit non-lease due time survives an invalid notice-delivery family", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 53)
+  end
+
+  test "an explicit non-lease due time survives disabled notice batching", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 54)
+  end
 
   test "acceptance 1: routine envelope preserves two sources and commits one recipient turn", %{
     tmp_dir: tmp

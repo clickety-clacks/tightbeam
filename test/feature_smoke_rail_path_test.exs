@@ -119,6 +119,18 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       })
 
     File.mkdir_p!(Path.join(base, "identity/rules"))
+    File.cp!("priv/kungfu/agentic-engineering/rules/assignment-labels.toml",
+      Path.join(base, "identity/rules/assignment-labels.toml"))
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml",
+      Path.join(base, "identity/rules/row-reaction-assignment-inactivity.toml")
+    )
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/rules/row-reaction-handoff.toml",
+      Path.join(base, "identity/rules/row-reaction-handoff.toml")
+    )
 
     for name <- ~w(topology engineering verification) do
       File.cp!(
@@ -418,29 +430,43 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     end
   end
 
+  test "deployment reviewer selection follows its settings family and disappears with it", ctx do
+    path = Path.join(ctx.base, "identity/rules/deployment-smoke.toml")
+    File.cp!("priv/kungfu/agentic-engineering/rules/deployment-smoke.toml", path)
+    assert Driver.deployment_reviewer_archetype(ctx.state) == "reviewer-code"
+    File.write!(path, String.replace(File.read!(path), "reviewer-code", "default"))
+    assert Driver.deployment_reviewer_archetype(ctx.state) == "default"
+    File.rm!(path)
+    assert Driver.deployment_reviewer_archetype(ctx.state) == nil
+  end
+
+  test "invalid and ambiguous deployment settings log without selecting an archetype", ctx do
+    path = Path.join(ctx.base, "identity/rules/deployment-smoke.toml")
+    original = File.read!("priv/kungfu/agentic-engineering/rules/deployment-smoke.toml")
+    entries = [
+      {String.replace(original, ~s(reviewer_archetype = "reviewer-code"), "reviewer_archetype = 42"), "invalid"},
+      {original <> "\n" <> String.replace(original, ~s(name = "deployment-smoke"),
+        ~s(name = "other-deployment-smoke")), "ambiguous"}
+    ]
+
+    for {contents, reason} <- entries do
+      File.write!(path, contents)
+      log = ExUnit.CaptureLog.capture_log(fn ->
+        assert Driver.deployment_reviewer_archetype(ctx.state) == nil
+      end)
+      assert log =~ "deployment-smoke is #{reason}"
+    end
+  end
+
   for profile <- [:installed, :published] do
     @tag profile: profile
-    test "real gate chain reaches completed with #{profile} review notice and immutable receipts",
+    test "real gate chain reaches completed with #{profile} explicit completion and immutable receipts",
          ctx do
       if ctx.profile == :published do
-        # Current packaged completion is an accountable wake, not automatic staffing.
-        # Keep all additional installed posture/test-receipt rules loaded as well.
-        installed = File.read!(Path.join(ctx.base, "identity/rules/engineering.toml"))
-        [_completion, rest] = String.split(installed, "# Re-entry twin", parts: 2)
-
-        # The fixture's rest already carries the posture gate the shipped file
-        # ends with; take only the shipped completion rule.
-        [shipped_completion | _] =
-          String.split(
-            File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"),
-            "\n# Posture gate",
-            parts: 2
-          )
-
-        File.write!(
-          Path.join(ctx.base, "identity/rules/engineering.toml"),
-          shipped_completion <> "\n# Re-entry twin" <> rest
-        )
+        for name <- ~w(engineering verification) do
+          File.cp!("priv/kungfu/agentic-engineering/rules/#{name}.toml",
+            Path.join(ctx.base, "identity/rules/#{name}.toml"))
+        end
 
         Rules.load!(ctx.base, Map.keys(ctx.handlers))
       end
@@ -456,8 +482,8 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
           "g"
         )
 
-      # Completion must reach the review statute with matching code evidence already
-      # present; otherwise the earlier code-evidence guard masks the rule under test.
+      # Supply an observed producer verification; the driver must preserve it
+      # while showing that a linked review does not itself close the producer.
       verification =
         Driver.post_as(ctx.state, holder.token, "attest", %{
           "assignmentId" => holder.assignment_id,

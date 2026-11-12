@@ -1408,7 +1408,9 @@ defmodule Tightbeam.WakesTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
   end
 
-  test "rumination markers count staged or delivered sources by work-item and caller", %{db: db} do
+  test "scheduled rumination wakes remain durable sources through batch delivery and replay", %{
+    db: db
+  } do
     active_sessions!(db, ["k1", "caller"])
     registry = :"registry_#{System.unique_integer([:positive])}"
     lane = :"lane_#{System.unique_integer([:positive])}"
@@ -1435,9 +1437,6 @@ defmodule Tightbeam.WakesTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
     assert NoticeBatcher.source_refs(db, wake.wake_id) == []
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
-    refute Wakes.rumination_exists?(db, "wi_one", "caller")
-    refute Wakes.rumination_exists?(db, "wi_other", "caller")
-    refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
 
     at = System.system_time(:millisecond) + 1_000
     [carrier_id] = NoticeBatcher.recover(db, at, delivery_opts)
@@ -1459,10 +1458,6 @@ defmodule Tightbeam.WakesTest do
 
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
-
-    assert Wakes.rumination_exists?(db, "wi_one", "caller")
-    refute Wakes.rumination_exists?(db, "wi_other", "caller")
-    refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
 
     carrier = Wakes.get(db, carrier_id)
     assert carrier.state == "fired"
@@ -1490,7 +1485,6 @@ defmodule Tightbeam.WakesTest do
              end)
 
     assert Wakes.get(db, wake.wake_id).state == "fired"
-    assert Wakes.rumination_exists?(db, "wi_one", "caller")
     assert NoticeBatcher.recover(db, at, delivery_opts) == []
     assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
     assert {:ok, ^before_messages} = DB.query(db, "SELECT * FROM messages ORDER BY id")
@@ -1499,8 +1493,6 @@ defmodule Tightbeam.WakesTest do
     assert {:ok, ^before_members} =
              DB.query(db, "SELECT * FROM notice_batch_members ORDER BY memberId")
 
-    refute Wakes.rumination_exists?(db, "wi_other", "caller")
-    refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
   end
 
   defp public_cancel(

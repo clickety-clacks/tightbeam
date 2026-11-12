@@ -10939,6 +10939,89 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[3]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
+  test "inactivity reconciliation failure leaves already reloaded law selected", ctx do
+    base = role_test_base("inactivity-reload-failure")
+    Identity.init!(base)
+    config = gateway_config(base, ctx.db, 0)
+    policy_base = role_test_base("inactivity-reload-policy")
+    policy_dir = Path.join(policy_base, "identity/rules")
+    File.mkdir_p!(policy_dir)
+    File.cp!(
+      Path.join(:code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"),
+      Path.join(policy_dir, "inactivity.toml")
+    )
+    assert [] = Rules.load!(policy_base, [])
+    assert is_map(Rules.reaction_policy("assignment-inactivity"))
+    wake = inactivity_rollback_wake!(ctx.db)
+    refuse_inactivity_cancellation!(ctx.db)
+    revision = Identity.live_revision!(base)
+
+    # Exercise the public reload and reconciliation seams in gateway order.
+    Gateway.load_law!(config)
+    assert is_nil(Rules.reaction_policy("assignment-inactivity"))
+    assert {:error, %DB.Error{} = error} = Tightbeam.Supervision.migrate_open_assignments(ctx.db)
+    assert Exception.message(error) =~ "inactivity cancellation refused"
+    assert Identity.live_revision!(base) == revision
+    assert is_nil(Rules.reaction_policy("assignment-inactivity"))
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+    assert {:ok, [[0]]} = DB.query(ctx.db,
+      "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [wake.wake_id])
+  end
+
+  test "inactivity reconciliation failure after publication retains published law and pending marker", ctx do
+    case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+    base = role_test_base("inactivity-publication-failure")
+    Identity.init!(base)
+    handlers = Gateway.handlers(gateway_config(base, ctx.db, 0))
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    assert %{state: "published", live_revision: before_revision} =
+             handlers["learn"].(%{origin: origin, params: %{name: "agentic-engineering"}})
+    assert is_map(Rules.reaction_policy("assignment-inactivity"))
+    wake = inactivity_rollback_wake!(ctx.db)
+    refuse_inactivity_cancellation!(ctx.db)
+    invocation = "inactivity-unlearn-#{System.unique_integer([:positive])}"
+
+    assert_raise DB.Error, ~r/inactivity cancellation refused/, fn ->
+      handlers["unlearn"].(%{
+        origin: origin, invocation_id: invocation, params: %{name: "agentic-engineering"}
+      })
+    end
+    refute Identity.live_revision!(base) == before_revision
+    assert is_nil(Rules.reaction_policy("assignment-inactivity"))
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+    assert {:ok, [[0]]} = DB.query(ctx.db,
+      "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [wake.wake_id])
+    assert %{state: "pending", candidate_revision: published} =
+             Tightbeam.AdminProjection.identity_publication_marker_by_invocation(ctx.db, invocation)
+    assert published == Identity.live_revision!(base)
+  end
+
+  defp inactivity_rollback_wake!(db) do
+    # This is an ordinary typed internal source; the SQL trigger below models
+    # storage refusal at the existing cancellation transaction boundary.
+    assert {:ok, _} = DB.query(db,
+      "INSERT INTO assignments(id,subject,holderKey,openedAt,state) VALUES('inactivity-rollback-fixture','inactivity rollback','k1',1,'open')")
+    Wakes.schedule(db, %{
+      session_key: "k1", origin: "process:test", consumer: "assignment_inactivity_deadline",
+      assignment_id: "inactivity-rollback-fixture", due_at: 1,
+      prompt: JSON.encode!(%{"version" => 1, "assignmentId" => "inactivity-rollback-fixture",
+        "activityAt" => 1, "intervalMs" => 1_000}),
+      obligation_ref: "assignment-inactivity-deadline-v1:inactivity-rollback-fixture"
+    })
+  end
+
+  defp refuse_inactivity_cancellation!(db) do
+    assert :ok = DB.execute(db, """
+    CREATE TRIGGER refuse_inactivity_cancel BEFORE UPDATE OF state ON wakes
+    WHEN OLD.consumer='assignment_inactivity_deadline' AND NEW.state='canceled'
+    BEGIN SELECT RAISE(ABORT,'inactivity cancellation refused'); END
+    """)
+  end
+
   test "learn and unlearn reload all law and unlearn names durable references", ctx do
     case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
       {:ok, _pid} -> :ok

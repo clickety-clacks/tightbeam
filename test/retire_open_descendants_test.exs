@@ -1,7 +1,7 @@
 defmodule Tightbeam.RetireOpenDescendantsTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway, Ledger, Model, Org, Projection, Roles, Wakes}
+  alias Tightbeam.{DB, Gateway, Ledger, Model, Org, Projection, Roles, Rules, Wakes}
 
   @owner "retire-owner"
   @main Org.personal_session_key(@owner)
@@ -81,6 +81,210 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
                db,
                "SELECT COUNT(*) FROM assignment_revocations WHERE assignmentId='assignment-open-descendant'"
              )
+  end
+
+  test "the kept-session parent follows the declared order", %{db: db} do
+    rules_base =
+      Path.join(System.tmp_dir!(), "retirement-order-#{System.unique_integer([:positive])}")
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+
+    seed =
+      String.replace(
+        seed,
+        "kept_parent_order = [\"active_ancestor\", \"owner_personal_session\"]",
+        "kept_parent_order = [\"owner_personal_session\", \"active_ancestor\"]"
+      )
+
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    Rules.load!(rules_base, Map.keys(Gateway.handlers(%{db: db})))
+
+    tree = protected_tree(db)
+    result = retire(db, tree.target, %{keep_open_descendants: true})
+
+    assert [%{parent_session_key: @main}] = result.kept_descendants
+  end
+
+  test "a kept-parent order without the owner personal session is unavailable", %{db: db} do
+    rules_base =
+      Path.join(
+        System.tmp_dir!(),
+        "retirement-invalid-parent-order-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+
+    seed =
+      String.replace(
+        seed,
+        "kept_parent_order = [\"active_ancestor\", \"owner_personal_session\"]",
+        "kept_parent_order = [\"active_ancestor\"]"
+      )
+
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    Rules.load!(rules_base, Map.keys(Gateway.handlers(%{db: db})))
+
+    tree = protected_tree(db)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        result = retire(db, tree.target, %{keep_open_descendants: true})
+
+        assert Enum.sort(result.retired_session_keys) ==
+                 Enum.sort([
+                   tree.target,
+                   tree.intermediary,
+                   tree.role_holder,
+                   tree.assignment_holder
+                 ])
+
+        refute Map.has_key?(result, :kept_descendants)
+      end)
+
+    assert log =~ "session-retirement is invalid"
+  end
+
+  test "without the settings family, protected descendants do not block retirement", %{db: db} do
+    rules_base =
+      Path.join(System.tmp_dir!(), "retirement-no-policy-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(rules_base, "identity/rules"))
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+    Rules.load!(rules_base, Map.keys(Gateway.handlers(%{db: db})))
+
+    tree = protected_tree(db)
+    result = retire(db, tree.target, %{})
+
+    assert Enum.sort(result.retired_session_keys) ==
+             Enum.sort([
+               tree.target,
+               tree.intermediary,
+               tree.role_holder,
+               tree.assignment_holder
+             ])
+  end
+
+  test "a valid non-refusing policy cascades protected descendants without a keep flag", %{
+    db: db
+  } do
+    rules_base =
+      Path.join(System.tmp_dir!(), "retirement-no-refusal-#{System.unique_integer([:positive])}")
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+    seed = String.replace(seed, "refuse_by_default = true", "refuse_by_default = false")
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    Rules.load!(rules_base, Map.keys(Gateway.handlers(%{db: db})))
+
+    tree = protected_tree(db)
+    parents_before =
+      current_parents(db, tree)
+      |> Map.new(fn {session_key, _state, parent_session_key} ->
+        {session_key, parent_session_key}
+      end)
+
+    result = retire(db, tree.target, %{})
+
+    assert result.deleted_session_key == tree.target
+    assert Enum.sort(result.retired_session_keys) ==
+             Enum.sort([
+               tree.target,
+               tree.intermediary,
+               tree.role_holder,
+               tree.assignment_holder
+             ])
+
+    assert result.deferred == []
+    refute Map.has_key?(result, :kept_descendants)
+
+    assert Enum.all?(result.retired_session_keys, &(Org.get(db, &1).state == "retired"))
+
+    parents_after =
+      current_parents(db, tree)
+      |> Map.new(fn {session_key, _state, parent_session_key} ->
+        {session_key, parent_session_key}
+      end)
+
+    assert parents_after == parents_before
+  end
+
+  test "non-refusing cascade does not resolve a missing owner Main", %{db: db} do
+    owner = "virtual-cascade-owner"
+    insert_user(db, owner)
+    root = create_session(db, "virtual-cascade-root", nil, "Root", owner)
+
+    child =
+      create_session(
+        db,
+        "virtual-cascade-child",
+        root.session_key,
+        "Protected child",
+        owner
+      )
+
+    Roles.create!(db, "virtual-cascade-role", owner, child.session_key)
+
+    rules_base =
+      Path.join(
+        System.tmp_dir!(),
+        "retirement-virtual-cascade-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+    seed = String.replace(seed, "refuse_by_default = true", "refuse_by_default = false")
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    Rules.load!(rules_base, Map.keys(Gateway.handlers(%{db: db})))
+
+    result = retire(db, root.session_key, %{}, owner)
+
+    assert Enum.sort(result.retired_session_keys) ==
+             Enum.sort([root.session_key, child.session_key])
+
+    assert Org.get(db, root.session_key).state == "retired"
+    assert Org.get(db, child.session_key).state == "retired"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM session_retirement_parent_moves WHERE retiredTargetSessionKey=?1",
+               [root.session_key]
+             )
+  end
+
+  test "kept frontier uses an active ancestor when the owner has no Main", %{db: db} do
+    owner = "virtual-parent-owner"
+    insert_user(db, owner)
+    parent = create_session(db, "virtual-active-parent", nil, "Active ancestor", owner)
+
+    root =
+      create_session(db, "virtual-keep-root", parent.session_key, "Retiring session", owner)
+
+    child = create_session(db, "virtual-keep-child", root.session_key, "Protected child", owner)
+    Roles.create!(db, "virtual-keep-role", owner, child.session_key)
+
+    result = retire(db, root.session_key, %{keep_open_descendants: true}, owner)
+
+    assert result.retired_session_keys == [root.session_key]
+    assert [%{session_key: child_key, parent_session_key: parent_key}] = result.kept_descendants
+    assert child_key == child.session_key
+    assert parent_key == parent.session_key
+    assert Org.get(db, child.session_key).state == "active"
+    assert Org.current_parent(db, child.session_key) == parent.session_key
   end
 
   test "the keep disposition atomically retires around protected work and replays its frontier",
@@ -290,13 +494,13 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     }
   end
 
-  defp create_session(db, session_key, parent_key, display_name) do
+  defp create_session(db, session_key, parent_key, display_name, owner \\ @owner) do
     Org.create(db, %{
       session_key: session_key,
       display_name: display_name,
       kind: "custom",
-      owner_user_id: @owner,
-      origin: "user:#{@owner}",
+      owner_user_id: owner,
+      origin: "user:#{owner}",
       spawned_by: parent_key,
       archetype: "default",
       host: "testhost",
@@ -304,6 +508,14 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
       provider: "anthropic",
       model: Model.new("fable")
     })
+  end
+
+  defp insert_user(db, owner) do
+    assert {:ok, []} =
+             DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES(?1,0,?2)", [
+               owner,
+               System.system_time(:millisecond)
+             ])
   end
 
   defp add_pending_work(db, session_key) do
@@ -416,10 +628,10 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     })
   end
 
-  defp retire(db, session_key, params) do
+  defp retire(db, session_key, params, owner \\ @owner) do
     Gateway.handlers(%{db: db})["retire"].(%{
-      origin: "user:#{@owner}",
-      principal: {:user, @owner},
+      origin: "user:#{owner}",
+      principal: {:user, owner},
       session_key: session_key,
       params: params
     })

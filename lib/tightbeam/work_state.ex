@@ -1,6 +1,8 @@
 defmodule Tightbeam.WorkState do
   @moduledoc "Grain-agnostic, query-time work observability."
 
+  require Logger
+
   alias Tightbeam.DB
   alias Tightbeam.Keyset
   alias Tightbeam.DB.Txn
@@ -32,13 +34,11 @@ defmodule Tightbeam.WorkState do
     ON work_item_events (workItemId, id);
   """
 
-  @assignment_status """
+  defp assignment_status do
+    """
   CASE
     WHEN a.state = 'closed' AND a.outcome IN ('surrendered', 'revoked') THEN 'abandoned'
-    WHEN a.state = 'closed' AND a.outcome = 'completed' AND EXISTS (
-      SELECT 1 FROM attests v
-      WHERE v.assignmentId = a.id AND v.kind = 'verdict' AND v.verdictKind = 'verified'
-    ) THEN 'verified'
+    #{verdict_status_cases()}
     WHEN a.state = 'closed' AND a.outcome = 'completed' THEN 'claims-done'
     WHEN a.state = 'open' AND s.state = 'retired' THEN 'stranded'
     WHEN a.state = 'open' AND NOT EXISTS (
@@ -48,7 +48,10 @@ defmodule Tightbeam.WorkState do
   END
   """
 
-  @assignment_columns """
+  end
+
+  defp assignment_columns do
+    """
   a.id, a.subject, a.holderKey, a.holderRole, a.holderFallback,
   a.openedByUser, a.openedBySession, a.openedAt, a.state, a.outcome,
   a.closedAt, a.closedByUser, a.closedBySession, a.closedByProcess, a.closingAttestId,
@@ -58,13 +61,51 @@ defmodule Tightbeam.WorkState do
      (SELECT reopening.id FROM assignment_reopenings reopening
       WHERE reopening.assignmentId = a.id ORDER BY reopening.id DESC LIMIT 1)),
   a.workItemId, s.state,
-  #{@assignment_status},
+  #{assignment_status()},
   COALESCE(
     (SELECT priority FROM assignment_priorities WHERE assignmentId=a.id),
     (SELECT priority FROM work_item_priorities WHERE workItemId=a.workItemId),
     CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
   )
   """
+
+  end
+
+  @doc false
+  def verdict_status_cases do
+    case Tightbeam.Rules.reaction_policy("assignment-verdict-status") do
+      %{settings: %{"verdicts" => verdicts, "statuses" => statuses} = settings}
+      when map_size(settings) == 2 and is_list(verdicts) and is_list(statuses) ->
+        if length(verdicts) == length(statuses) and Enum.all?(verdicts, &is_binary/1) and
+             Enum.all?(statuses, &(&1 in ~w(open active stranded claims-done verified abandoned))) do
+          Enum.zip(verdicts, statuses)
+          |> Enum.map_join("\n", fn {verdict, status} ->
+            quoted = String.replace(verdict, "'", "''")
+            "WHEN a.state='closed' AND a.outcome='completed' AND EXISTS " <>
+              "(SELECT 1 FROM attests v WHERE v.assignmentId=a.id AND v.kind='verdict' " <>
+              "AND v.verdictKind='#{quoted}') THEN '#{status}'"
+          end)
+        else
+          unavailable_verdict_status("invalid")
+        end
+
+      nil ->
+        count =
+          Tightbeam.Rules.effective_snapshot()
+          |> Map.get(:reactions, [])
+          |> Enum.count(&(&1.mode == :settings and &1.family == "assignment-verdict-status"))
+
+        if count > 1, do: unavailable_verdict_status("ambiguous"), else: ""
+
+      _ ->
+        unavailable_verdict_status("invalid")
+    end
+  end
+
+  defp unavailable_verdict_status(reason) do
+    Logger.warning("settings family assignment-verdict-status is #{reason}; no status mapping was selected")
+    ""
+  end
 
   @doc "Create both observability doorbell tables."
   @spec ensure_schema(DB.server()) :: :ok
@@ -91,7 +132,7 @@ defmodule Tightbeam.WorkState do
   @doc "Return one bounded page of assignment observability in its existing order."
   def page(db, filters, boundary, limit) do
     select_from =
-      "SELECT #{@assignment_columns}, s.ownerUserId FROM assignments a " <>
+      "SELECT #{assignment_columns()}, s.ownerUserId FROM assignments a " <>
         "JOIN sessions s ON s.sessionKey = a.holderKey"
 
     probe_from = "assignments a JOIN sessions s ON s.sessionKey = a.holderKey"
@@ -355,7 +396,7 @@ defmodule Tightbeam.WorkState do
   end
 
   defp assignment_query(where) do
-    "SELECT #{@assignment_columns} FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey " <>
+    "SELECT #{assignment_columns()} FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey " <>
       "WHERE #{where} ORDER BY a.openedAt DESC, a.id DESC"
   end
 
@@ -374,7 +415,7 @@ defmodule Tightbeam.WorkState do
     {where, params} =
       case Map.get(filters, :status) do
         nil -> {where, params}
-        statuses -> append_in(where, params, "(#{@assignment_status})", statuses)
+        statuses -> append_in(where, params, "(#{assignment_status()})", statuses)
       end
 
     {where, params} =

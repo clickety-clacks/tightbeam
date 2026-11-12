@@ -9,7 +9,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Rules, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Publisher}
 
@@ -24,6 +24,11 @@ defmodule Tightbeam.Escalation do
   end
 
   @default_decision_deadline_ms 86_400_000
+  @late_ruling_recipient_sources [
+    "opener_lineage",
+    "opening_user_personal_session",
+    "accountable_owner_personal_session"
+  ]
   @terminal_schema_version "terminal-operator-decision-parity-v1"
   @terminal_condition_kind "escalation-ruled"
   @terminal_integrity_code "decision_request_integrity_invalid"
@@ -2894,20 +2899,33 @@ defmodule Tightbeam.Escalation do
         :ordinary
 
       [["closed", holder, opened_session, opened_user, accountable_owner]] ->
-        candidates =
-          opener_lineage_in_txn(txn, opened_session) ++
-            optional_personal_session(opened_user) ++
-            [Org.personal_session_key(accountable_owner)]
+        case late_ruling_policy() do
+          {:ok, policy} ->
+            candidates_by_source = %{
+              "opener_lineage" => opener_lineage_in_txn(txn, opened_session),
+              "opening_user_personal_session" => optional_personal_session(opened_user),
+              "accountable_owner_personal_session" =>
+                [Org.personal_session_key(accountable_owner)]
+            }
 
-        recipient =
-          candidates
-          |> Enum.uniq()
-          |> Enum.reject(&(&1 in [holder, request.raiser_session_key]))
-          |> Enum.find(&active_session_in_txn?(txn, &1))
+            recipient =
+              policy.recipient_order
+              |> Enum.flat_map(&Map.fetch!(candidates_by_source, &1))
+              |> Enum.uniq()
+              |> Enum.reject(&(&1 in [holder, request.raiser_session_key]))
+              |> Enum.find(&active_session_in_txn?(txn, &1))
 
-        if recipient,
-          do: {:late, recipient, accountable_owner},
-          else: :unavailable
+            if recipient,
+              do: {:late, recipient, accountable_owner},
+              else: :unavailable
+
+          :absent ->
+            :unavailable
+
+          {:error, reason} ->
+            log_late_ruling_policy_issue(reason, :recipient)
+            :unavailable
+        end
 
       [] ->
         :ordinary
@@ -4485,12 +4503,16 @@ defmodule Tightbeam.Escalation do
 
   defp owner_user_id!(_db, %{origin: "user:" <> user_id}), do: user_id
 
-  defp owner_user_id!(db, %{origin: "agent:" <> role}) do
-    with {:ok, session_key, _fallback} <- Tightbeam.Origin.resolve_agent(db, role),
-         %{owner_user_id: owner} <- Org.get(db, session_key) do
-      owner
-    else
-      _ -> raise ArgumentError, "unknown raiser origin: agent:#{role}"
+  defp owner_user_id!(db, %{origin: "agent:" <> identifier}) do
+    case Roles.get(db, identifier) do
+      %{owner_user_id: owner} ->
+        owner
+
+      nil ->
+        case Org.get(db, identifier) do
+          %{owner_user_id: owner} -> owner
+          _ -> raise ArgumentError, "unknown raiser origin: agent:#{identifier}"
+        end
     end
   end
 
@@ -4539,13 +4561,92 @@ defmodule Tightbeam.Escalation do
   defp param(call, key),
     do: Map.get(call.params, key) || Map.get(call.params, Atom.to_string(key))
 
-  defp decision_deadline_ms,
-    do:
-      Application.get_env(
-        :tightbeam,
-        :escalation_decision_deadline_ms,
-        @default_decision_deadline_ms
-      )
+  defp decision_deadline_ms do
+    family_default =
+      case late_ruling_policy() do
+        {:ok, policy} ->
+          policy.default_deadline_ms
+
+        :absent ->
+          log_late_ruling_policy_issue(:absent, :deadline)
+          @default_decision_deadline_ms
+
+        {:error, reason} ->
+          log_late_ruling_policy_issue(reason, :deadline)
+          @default_decision_deadline_ms
+      end
+
+    Application.get_env(:tightbeam, :escalation_decision_deadline_ms, family_default)
+  end
+
+  defp late_ruling_policy do
+    case settings_family("late-ruling") do
+      {:ok, settings} ->
+        recipient_order = Map.get(settings, "recipient_order")
+        default_deadline_ms = Map.get(settings, "default_deadline_ms")
+
+        if Enum.sort(Map.keys(settings)) == ["default_deadline_ms", "recipient_order"] and
+             is_list(recipient_order) and
+             Enum.all?(recipient_order, &(&1 in @late_ruling_recipient_sources)) and
+             length(Enum.uniq(recipient_order)) == length(recipient_order) and
+             is_integer(default_deadline_ms) and default_deadline_ms > 0 do
+          {:ok,
+           %{
+             recipient_order: recipient_order,
+             default_deadline_ms: default_deadline_ms
+           }}
+        else
+          {:error, :invalid}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp settings_family(family) do
+    case Rules.reaction_policy(family) do
+      nil ->
+        count =
+          Rules.effective_snapshot()
+          |> Map.get(:reactions, [])
+          |> Enum.count(&(&1.mode == :settings and &1.family == family))
+
+        if count == 0, do: :absent, else: {:error, :ambiguous}
+
+      %{settings: settings} when is_map(settings) ->
+        {:ok, settings}
+
+      _ ->
+        {:error, :invalid}
+    end
+  end
+
+  defp log_late_ruling_policy_issue(:absent, :deadline) do
+    Logger.warning(
+      "substrate settings family late-ruling is absent; using the existing decision deadline"
+    )
+  end
+
+  defp log_late_ruling_policy_issue(:invalid, :recipient) do
+    Logger.warning("substrate settings family late-ruling is invalid; no recipient was selected")
+  end
+
+  defp log_late_ruling_policy_issue(:ambiguous, :recipient) do
+    Logger.warning("substrate settings family late-ruling is ambiguous; no recipient was selected")
+  end
+
+  defp log_late_ruling_policy_issue(:invalid, :deadline) do
+    Logger.warning(
+      "substrate settings family late-ruling is invalid; using the existing decision deadline"
+    )
+  end
+
+  defp log_late_ruling_policy_issue(:ambiguous, :deadline) do
+    Logger.warning(
+      "substrate settings family late-ruling is ambiguous; using the existing decision deadline"
+    )
+  end
 
   defp fetch_string!(map, key) do
     value = Map.get(map, key) || Map.get(map, Atom.to_string(key))

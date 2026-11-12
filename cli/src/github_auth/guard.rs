@@ -71,7 +71,7 @@ pub(super) fn check_tool_call_with(raw: &str, gh: &impl Gh) -> Result<(), String
 // hook shape, or non-JSON stdin), fall back to scanning everything: over-broad
 // gating of an unknown shape beats silently ignoring it.
 fn tool_call_strings(raw: &str) -> Vec<String> {
-    match serde_json::from_str::<serde_json::Value>(raw) {
+    match super::decode_hook_json(raw) {
         Ok(value) => {
             if let Some(command) = value
                 .pointer("/tool_input/command")

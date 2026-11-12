@@ -2041,6 +2041,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_effort_holder_activity_cancellation_v1(db)
     :ok = upgrade_row_reaction_cancellation_v1(db)
     :ok = upgrade_evidence_release(db)
+    :ok = upgrade_assignment_effect_labels(db)
 
     sender_repair_counts = Tightbeam.Projection.repair_missing_human_senders(db)
 
@@ -5306,6 +5307,42 @@ defmodule Tightbeam.Schema do
     validate_owned_object!(txn, new_table)
     Enum.each(triggers, &validate_owned_object!(txn, &1))
     validate_owned_object!(txn, marker)
+  end
+
+  @doc false
+  def upgrade_assignment_effect_labels(db) do
+    migration = "assignment-effect-labels/v1"
+    previous = %{type: "table", name: "assignment_effects", sql: Tightbeam.Assignments.legacy_effects_ddl()}
+    current = %{type: "table", name: "assignment_effects", sql: """
+    CREATE TABLE assignment_effects (
+      assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
+      effectKind TEXT
+    )
+    """}
+
+    case DB.migration_transaction(db, :assignment_effect_labels, [],
+           ["PRAGMA writable_schema = OFF"], fn txn ->
+      if Txn.q(txn, "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1", [migration]) == [[1]] do
+        validate_owned_object!(txn, current)
+      else
+        validate_owned_object!(txn, previous)
+        [[version]] = Txn.q(txn, "PRAGMA schema_version")
+        :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
+        Txn.q(txn, "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='assignment_effects'", [String.trim(current.sql)])
+        1 = Txn.changes(txn)
+        :ok = Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+        :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
+        Txn.q(txn, """
+        INSERT INTO supervision_liveness_migrations(migrationId,appliedAt,affectedRows,cause,principal)
+        VALUES(?1,?2,0,'release_upgrade','process:tightbeam')
+        """, [migration, System.system_time(:millisecond)])
+        validate_owned_object!(txn, current)
+      end
+      :ok
+    end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
   end
 
   defp row_reaction_cancellation_active?(txn) do
