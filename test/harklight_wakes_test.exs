@@ -5986,7 +5986,7 @@ defmodule Tightbeam.HarklightWakesTest do
     listener = completion_notifying_listener(parent)
 
     unchanged =
-      Map.new([p2, k1, k2, k3], fn h ->
+      Map.new([p2, k1, k2], fn h ->
         {h, DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [h])}
       end)
 
@@ -6006,6 +6006,9 @@ defmodule Tightbeam.HarklightWakesTest do
 
       assert {:ok, [["complete"]]} =
                DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [p1])
+
+      assert {:ok, [["complete"]]} =
+               DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [k3])
 
       for {handle, row} <- unchanged,
           do:
