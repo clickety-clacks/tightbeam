@@ -977,9 +977,6 @@ defmodule Tightbeam.Gateway do
           scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
         )
       end,
-      {"effort-rule", ["decision_request.ruled"]} => fn call ->
-        EffortCheckin.rule(db, config, call)
-      end,
       {"waive", []} => fn call ->
         Escalation.waive(db, call,
           authorized: admin_caller?(db, call),

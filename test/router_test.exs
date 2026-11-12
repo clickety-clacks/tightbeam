@@ -67,12 +67,9 @@ defmodule Tightbeam.Wire.RouterTest do
            }) == %{keep_open_descendants: true, idempotency_key: "retry-retire"}
   end
 
-  test "effort and health parameters preserve accepted aliases" do
+  test "onboard and health parameters preserve accepted aliases" do
     assert Router.atomize_params_for_test("onboard", %{"ownerUserId" => "flynn"}) ==
              %{owner_user_id: "flynn"}
-
-    assert Router.atomize_params_for_test("effort-rule", %{"requestId" => "request"}) ==
-             %{request_id: "request"}
 
     assert Router.atomize_params_for_test("harness-health-observe-other", %{
              "acceptedAt" => 123,

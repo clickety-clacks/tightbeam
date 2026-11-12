@@ -89,7 +89,6 @@ impl CommandContext {
             Tune { .. } => ("cli.tune", DispatchPath),
             Assign { .. } => ("cli.assign", DispatchPath),
             Dispatch { .. } => ("cli.dispatch", DispatchPath),
-            EffortRule { .. } => ("cli.effort_rule", DispatchPath),
             Ask { .. } => ("cli.ask", DispatchPath),
             Answer { .. } => ("cli.answer", DispatchPath),
             // Current spelling changed; preserve the existing operation.
@@ -458,7 +457,6 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | ToolCallObserved
         | RoleBind { .. }
         | Tune { .. }
-        | EffortRule { .. }
         | Ask { .. }
         | Answer { .. }
         | Return { .. }

@@ -916,19 +916,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
-        Command::EffortRule {
-            identity,
-            request_id,
-            action,
-        } => Ok(request(
-            identity,
-            "effort-rule",
-            vec![],
-            vec![
-                string_field("request", request_id),
-                string_field("action", action),
-            ],
-        )),
         Command::Ask {
             identity,
             target,
@@ -4036,7 +4023,6 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::SessionConnect { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
-        | Command::EffortRule { identity, .. }
         | Command::Ask { identity, .. }
         | Command::Answer { identity, .. }
         | Command::Return { identity, .. }
@@ -5426,18 +5412,6 @@ mod tests {
             r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem"}}"#
         );
 
-        assert_eq!(
-            body(&[
-                "effort-rule",
-                "--request",
-                "dr_1",
-                "--action",
-                "continue",
-                "--as",
-                "parent",
-            ]),
-            r#"{"as":"parent","verb":"effort-rule","params":{"request":"dr_1","action":"continue"}}"#
-        );
         assert_eq!(
             body(&["decision-requests", "--status", "open", "--as", "parent"]),
             r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#

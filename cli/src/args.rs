@@ -323,11 +323,6 @@ pub enum Command {
         succeeds: Option<String>,
         parent_assignment: Option<String>,
     },
-    EffortRule {
-        identity: Identity,
-        request_id: String,
-        action: String,
-    },
     Ask {
         identity: Identity,
         target: Target,
@@ -1102,9 +1097,6 @@ COMMANDS:
       Atomically open an assignment and wake its holder with the card id.
       For assign/dispatch without a work item, an external process supplies
       --owner <user> for notices. Session callers retain their own attribution.
-  effort-rule --request <decisionRequestId> --action continue|dismiss
-      Rule an effort-without-effect check-in whose complete id you hold. The
-      current expecter is the preferred responder, not an authorization gate.
   ask (--session <key> | --role <name> | --user <id>) --question <text> [--about <assignment>]
   answer --request <dr_id> --answer <text>
   return --request <dr_id> --reason <text>
@@ -3004,25 +2996,6 @@ fn parse_with_optional_catalog(
                 parent_assignment: flags.get("parent-assignment").cloned(),
             })
         }
-        "effort-rule" => {
-            let request_id = nonempty(flags, "request");
-            let action = nonempty(flags, "action");
-            if parsed.positional.get(1).is_some() || request_id.is_none() || action.is_none() {
-                return Err(
-                    "usage: tightbeam effort-rule --request <id> --action continue|dismiss"
-                        .to_owned(),
-                );
-            }
-            let action = action.expect("checked above");
-            if action != "continue" && action != "dismiss" {
-                return Err("--action must be continue or dismiss".to_owned());
-            }
-            Ok(Command::EffortRule {
-                identity: identity(flags)?,
-                request_id: request_id.expect("checked above"),
-                action,
-            })
-        }
         "ask" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -4014,7 +3987,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -6589,7 +6562,6 @@ mod tests {
                 "dispatch",
                 "doctor",
                 "session-diagnose",
-                "effort-rule",
                 "harness-process",
                 "harklight-briefings-catchup",
                 "harklight-send",
@@ -7755,7 +7727,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 

@@ -158,7 +158,7 @@ defmodule Tightbeam.EffortCheckinTest do
            ) == 0
   end
 
-  test "an existing effort request remains answerable and answering it arms nothing", ctx do
+  test "an existing effort request remains readable without restoring its retired rule", ctx do
     assignment = assign(ctx.db)
 
     deadline =
@@ -202,38 +202,10 @@ defmodule Tightbeam.EffortCheckinTest do
                params: %{request_id: request_id}
              })
 
-    result =
-      handlers["effort-rule"].(%{
-        verb: "effort-rule",
-        origin: "agent:parent",
-        principal: {:session, "parent"},
-        params: %{request_id: request_id, action: "continue"}
-      })
-
-    assert %{status: "ruled", decision: "continue"} = result
-    assert %{state: "canceled"} = Wakes.get(ctx.db, deadline.wake_id)
-
-    assert %{decision_request: %{id: ^request_id, status: "ruled", decision: "continue"}} =
-             handlers["decision-request"].(%{
-               verb: "decision-request",
-               origin: "agent:parent",
-               principal: {:session, "parent"},
-               params: %{request_id: request_id}
-             })
-
-    assert count(
-             ctx.db,
-             "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
-             [
-               assignment.id
-             ]
-           ) == 0
-
-    assert count(
-             ctx.db,
-             "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='effort_probe' AND state='pending'",
-             [assignment.id]
-           ) == 0
+    refute Map.has_key?(handlers, "effort-rule")
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
+    assert %{state: "pending"} = Wakes.get(ctx.db, deadline.wake_id)
   end
 
   defp assign(db) do
