@@ -3892,6 +3892,96 @@ defmodule Tightbeam.HarklightWakesTest do
     )
   end
 
+  test "an unrecorded change falls back to its saved request after same-ID retry", %{
+    db: db,
+    call: call
+  } do
+    change_call = %{
+      call
+      | params: %{message_id: "request", base_revision: 1, title: "Updated", body: "Saved text"}
+    }
+
+    assert %{outcome: "outcome_unknown", op_id: op_id} =
+             HarklightSend.change_request(db, change_call, "revise",
+               runner: fn args ->
+                 assert hd(args) == "revise"
+                 frame(%{kind: "outcome_unknown", op_id: List.last(args)})
+               end
+             )
+
+    assert %{request: saved_request, state: "pending"} =
+             HarklightLifecycle.lookup_change(db, "request")
+
+    settle_call = %{call | params: %{message_id: "request"}}
+    parent = self()
+
+    runner = fn
+      ["retry", "--op-id", ^op_id] ->
+        send(parent, :retry_missing)
+        {"no recorded operation with key #{op_id}\n", 1}
+
+      ^saved_request ->
+        send(parent, :saved_request_replayed)
+
+        frame(%{
+          kind: "committed",
+          operation: "revise",
+          op_id: op_id,
+          response: %{revision: 2}
+        })
+
+      args ->
+        flunk("unexpected Harklight command during settlement: #{inspect(args)}")
+    end
+
+    assert %{command: "settle", settled_command: "revise", outcome: "committed", revision: 2} =
+             HarklightSend.settle(db, settle_call, runner: runner)
+
+    assert_receive :retry_missing
+    assert_receive :saved_request_replayed
+    assert %{op_id: ^op_id, request: ^saved_request, state: "committed"} =
+             HarklightLifecycle.lookup_change(db, "request")
+  end
+
+  test "a non-missing retry failure does not replay the saved change request", %{
+    db: db,
+    call: call
+  } do
+    change_call = %{
+      call
+      | params: %{message_id: "request", base_revision: 1, title: "Updated"}
+    }
+
+    assert %{outcome: "outcome_unknown", op_id: op_id} =
+             HarklightSend.change_request(db, change_call, "revise",
+               runner: fn args ->
+                 frame(%{kind: "outcome_unknown", op_id: List.last(args)})
+               end
+             )
+
+    assert %{request: saved_request, state: "pending"} =
+             HarklightLifecycle.lookup_change(db, "request")
+
+    settle_call = %{call | params: %{message_id: "request"}}
+    parent = self()
+
+    runner = fn
+      ["retry", "--op-id", ^op_id] ->
+        send(parent, :retry_failed)
+        {"operation journal unavailable", 1}
+
+      args ->
+        flunk("settlement replayed a request without a missing-operation result: #{inspect(args)}")
+    end
+
+    assert %{outcome: "outcome_unknown", op_id: ^op_id} =
+             HarklightSend.settle(db, settle_call, runner: runner)
+
+    assert_receive :retry_failed
+    assert %{op_id: ^op_id, request: ^saved_request, state: "pending"} =
+             HarklightLifecycle.lookup_change(db, "request")
+  end
+
   test "a thrown revise command preserves its saved operation for settlement", %{
     db: db,
     call: call
@@ -5508,11 +5598,17 @@ defmodule Tightbeam.HarklightWakesTest do
     settled =
       HarklightSend.settle(db, settle_call,
         runner: fn args ->
-          assert args == saved_request
+          assert args == ["retry", "--op-id", op_id]
+          assert %{op_id: ^op_id, request: ^saved_request, state: "pending"} =
+                   HarklightLifecycle.lookup_change(db, "request")
+
+          # Agent 0.1.9 emits "retry" after resubmitting a Prepared/Unknown
+          # operation. A committed operation instead returns its saved kind.
+          operation = if command == "retract", do: committed_operation, else: "retry"
 
           frame(%{
             kind: "committed",
-            operation: committed_operation,
+            operation: operation,
             op_id: op_id,
             response: response
           })

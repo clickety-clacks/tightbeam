@@ -269,7 +269,15 @@ defmodule Tightbeam.HarklightSend do
               send_record,
               op_id,
               change.command,
-              invoke(runner, change.request, "committed", op_id),
+              invoke(
+                runner,
+                ["retry", "--op-id", op_id],
+                "committed",
+                op_id,
+                change: true,
+                operations: change_retry_operations(change.command),
+                fallback_args: change.request
+              ),
               "settle"
             )
           else
@@ -868,15 +876,47 @@ defmodule Tightbeam.HarklightSend do
     end
   end
 
-  defp invoke(runner, args, expected, op_id) do
+  defp invoke(runner, args, expected, op_id, opts \\ []) do
     {output, status} = runner.(args)
 
-    operations =
-      case hd(args) do
-        "retry" -> ["send", "retry"]
-        "retract" -> ["withdraw"]
-        operation -> [operation]
-      end
+    if Keyword.has_key?(opts, :fallback_args) and
+         retry_operation_missing?(args, output, status, op_id) do
+      invoke(
+        runner,
+        Keyword.fetch!(opts, :fallback_args),
+        expected,
+        op_id,
+        opts |> Keyword.delete(:fallback_args) |> Keyword.delete(:operations)
+      )
+    else
+      invoke_response(
+        output,
+        status,
+        expected,
+        op_id,
+        Keyword.get(opts, :operations, operation_names(args))
+      )
+    end
+  rescue
+    error ->
+      change? = Keyword.get(opts, :change, List.first(args) in ["revise", "retract"])
+
+      reason =
+        cond do
+          expected == "prepared" ->
+            "Harklight Agent could not complete during local preparation: #{Exception.message(error)}; the message was not sent."
+
+          change? ->
+            "Harklight Agent could not confirm the change: #{Exception.message(error)}"
+
+          true ->
+            "Harklight Agent could not complete: #{Exception.message(error)}"
+        end
+
+      {:error, "harklight_cli_failed", reason, if(change?, do: "outcome_unknown", else: "failed")}
+  end
+
+  defp invoke_response(output, status, expected, op_id, operations) do
 
     frames =
       output
@@ -925,22 +965,22 @@ defmodule Tightbeam.HarklightSend do
          "Harklight did not return a confirmed result: " <> String.trim(output),
          if(expected == "prepared", do: "failed", else: "outcome_unknown")}
     end
-  rescue
-    error ->
-      change? = List.first(args) in ["revise", "retract"]
-
-      reason =
-        cond do
-          expected == "prepared" ->
-            "Harklight Agent could not complete during local preparation: #{Exception.message(error)}; the message was not sent."
-
-          change? ->
-            "Harklight Agent could not confirm the change: #{Exception.message(error)}"
-
-          true ->
-            "Harklight Agent could not complete: #{Exception.message(error)}"
-        end
-
-      {:error, "harklight_cli_failed", reason, if(change?, do: "outcome_unknown", else: "failed")}
   end
+
+  defp operation_names(args) do
+    case hd(args) do
+      "retry" -> ["send", "retry"]
+      "retract" -> ["withdraw"]
+      operation -> [operation]
+    end
+  end
+
+  defp change_retry_operations("retract"), do: ["retry", "withdraw"]
+  defp change_retry_operations(command), do: ["retry", command]
+
+  defp retry_operation_missing?(["retry", "--op-id", op_id], output, 1, op_id) do
+    String.trim(output) == "no recorded operation with key #{op_id}"
+  end
+
+  defp retry_operation_missing?(_args, _output, _status, _op_id), do: false
 end
