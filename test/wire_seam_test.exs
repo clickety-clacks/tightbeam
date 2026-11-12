@@ -26,7 +26,8 @@ defmodule Tightbeam.Wire.SeamTest do
     Org,
     Roles,
     Rules,
-    Wakes
+    Wakes,
+    WorkItems
   }
 
   alias Tightbeam.Wire.Router
@@ -59,6 +60,35 @@ defmodule Tightbeam.Wire.SeamTest do
         session_status: fn _ -> nil end
       ]
     }
+  end
+
+  test "work-item-icebox reason crosses the camelCase wire into the handler", ctx do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{title: "Wire icebox reason"}
+      })
+
+    result =
+      ok!(
+        dispatch_cli(ctx, "tbc_wire_seam", %{
+          verb: "work-item-icebox",
+          asUser: "flynn",
+          params: %{
+            "workItemId" => item.id,
+            "reason" => "waiting for review"
+          }
+        })
+      )
+
+    assert result["workItem"]["state"] == "iceboxed"
+    assert result["workItem"]["failReason"] == "waiting for review"
+
+    assert {:ok, [["iceboxed", "waiting for review"]]} =
+             DB.query(ctx.db, "SELECT state, failReason FROM work_items WHERE id=?1", [item.id])
   end
 
   test "authenticated wake cancellation crosses the wire with exact envelopes", ctx do
