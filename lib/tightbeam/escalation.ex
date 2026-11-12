@@ -3056,6 +3056,9 @@ defmodule Tightbeam.Escalation do
       %{kind: "effort"} ->
         error("invalid", "effort requests use effort-rule")
 
+      %{kind: "agent"} ->
+        error("invalid", "agent requests use withdraw")
+
       request ->
         with {:ok, by} <- operator_withdrawer_in_txn(txn, call, request) do
           cond do
