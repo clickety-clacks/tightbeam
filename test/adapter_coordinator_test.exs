@@ -814,7 +814,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         backoff_base_ms: 1,
+         backoff_base_ms: 60_000,
          adapter_context: fn _ -> [] end,
          adapter_opts: fn _, _ ->
            [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
@@ -995,7 +995,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            end)
   end
 
-  test "an open circuit suppresses automatic restart but permits authoritative recovery", ctx do
+  test "an open circuit automatically retries and recovers after a successful boot", ctx do
     old_value = Application.get_env(:tightbeam, :adapter_failure_circuit)
 
     on_exit(fn ->
@@ -1024,10 +1024,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            if attempt == 1 do
              [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
            else
-             send(owner, {:recovery_boot_started, self(), context})
+             send(owner, {:automatic_recovery_boot_started, self(), context})
 
              receive do
-               {:release_recovery_boot, pid} when pid == self() ->
+               {:release_automatic_recovery_boot, pid} when pid == self() ->
                  [
                    harness: :claude,
                    cmd: [System.find_executable("node"), path],
@@ -1051,33 +1051,12 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
-    # The threshold opens the latch before any restart can be admitted. The
-    # public checkout must not observe a generation started by an automatic
-    # restart while the latch is open.
-    refute wait_until(fn -> :atomics.get(boot_attempt, 1) > 1 end, 100)
-
-    assert {:error,
-            {:diagnosed, :degraded,
-             %{
-               "kind" => "circuit_open",
-               "consecutiveFailures" => 1,
-               "cause" => %{"generation" => 1}
-             }}} = AdapterCoordinator.adapter_for(coordinator, key)
-
-    # Credential lifecycle recovery is the authoritative boundary: it may
-    # start a replacement while ordinary checkout remains degraded.
-    recovery =
-      Task.async(fn ->
-        AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
-      end)
-
-    assert_receive {:recovery_boot_started, readiness_task, [credential_kind: :subscription]}
+    assert_receive {:automatic_recovery_boot_started, readiness_task, []}, 1_500
 
     assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 1}}} =
              AdapterCoordinator.adapter_for(coordinator, key)
 
-    send(readiness_task, {:release_recovery_boot, readiness_task})
-    assert {:ok, recovery_adapter, 2} = Task.await(recovery)
+    send(readiness_task, {:release_automatic_recovery_boot, readiness_task})
 
     assert wait_until(fn ->
              match?(
@@ -1086,7 +1065,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
-    assert {:ok, ^recovery_adapter, 2} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert :atomics.get(boot_attempt, 1) == 2
+    assert AdapterCoordinator.ready?(coordinator, key)
+    assert {:ok, _recovered_adapter, 2} = AdapterCoordinator.adapter_for(coordinator, key)
   end
 
   # What the coordinator itself says it is doing: {holding a slot, waiting for one}.

@@ -22,7 +22,8 @@ defmodule Tightbeam.AdapterCoordinator do
     `adapter_for/2` returns {:error, :degraded} so affected turns fail fast
     with a clear reason (carried as `{:diagnosed, :degraded, node}` naming the
     consecutive failures and the last cause), /version|/health reflects it, the gateway stays up.
-    A successful restart closes the circuit and resets the count.
+    The existing backoff retries continue while it is open; a successful
+    restart closes the circuit and resets the count.
   - Re-adoption semaphore: at most the configured number of concurrent session/load
     calls per machine (no thundering herd after an adapter bounce, and no machine
     queues behind another machine's recovery). session/load failure → that session
@@ -1114,7 +1115,7 @@ defmodule Tightbeam.AdapterCoordinator do
           # this adapter checked out, and the only one it can ask about.
           died_at = entry.generation
           generation = entry.generation + 1
-          timer = schedule_restart(state, key, generation, failures, circuit)
+          timer = schedule_restart(state, key, generation, failures)
 
           entry = %{
             entry
@@ -1223,7 +1224,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_info({:restart_adapter, key, generation}, state) do
     case state.adapters[key] do
-      %{generation: ^generation, pid: nil, circuit: :closed} = entry ->
+      %{generation: ^generation, pid: nil} = entry ->
         cond do
           readiness_pending?(entry) ->
             {:noreply, state}
@@ -1462,7 +1463,7 @@ defmodule Tightbeam.AdapterCoordinator do
         circuit = if failures >= state.failure_circuit, do: :open, else: :closed
         generation = max(entry.generation, 1)
 
-        timer = schedule_restart(state, key, generation, failures, circuit)
+        timer = schedule_restart(state, key, generation, failures)
 
         entry = %{
           entry
@@ -1612,9 +1613,8 @@ defmodule Tightbeam.AdapterCoordinator do
     do: MapSet.put(ready_refs, monitor)
 
   defp put_ready_ref(ready_refs, _monitor), do: ready_refs
-  defp schedule_restart(_state, _key, _generation, _failures, :open), do: nil
 
-  defp schedule_restart(state, key, generation, failures, :closed) do
+  defp schedule_restart(state, key, generation, failures) do
     Process.send_after(
       self(),
       {:restart_adapter, key, generation},
