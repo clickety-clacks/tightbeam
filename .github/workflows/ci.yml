@@ -53,7 +53,7 @@ jobs:
           - os: macos-latest
             name: macos
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.name == 'macos' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","tb-macos"]') || matrix.os }}
     # Changes land on the fast checks: pull requests, the merge queue and
     # branch pushes run source checks, the gate scripts, and a compile (which
     # builds the Rust NIF, so the Rust toolchain stays). The full mix and cargo
