@@ -6217,6 +6217,7 @@ defmodule Tightbeam.HarklightWakesTest do
       )
 
     assert_receive {:restored, @handle, nil}
+
     assert {:ok, [["active"]]} =
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
 
