@@ -1055,6 +1055,27 @@ defmodule Tightbeam.Assignments do
     Enum.map(rows, &hd/1)
   end
 
+  @doc "Return the current producer verification for a submitted result."
+  @spec qualifying_verification_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
+          [String.t()]
+  def qualifying_verification_verdict_kinds(db, assignment_id, holder_key, _commit_refs) do
+    case DB.query(
+           db,
+           """
+           SELECT verdictKind
+           FROM attests
+           WHERE assignmentId=?1 AND kind='verdict' AND bySession=?2
+             AND verdictKind IN ('verified','verification-failed')
+           ORDER BY ts DESC,rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id, holder_key]
+         ) do
+      {:ok, [["verified"]]} -> ["verified"]
+      _ -> []
+    end
+  end
+
   @doc "Return commissioned independent review verdict authors for an assignment."
   @spec commissioned_review_authors(DB.server(), String.t(), String.t()) :: [map()]
   def commissioned_review_authors(db, assignment_id, a_holder_key) do

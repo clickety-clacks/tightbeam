@@ -789,7 +789,6 @@ defmodule Tightbeam.RulesTest do
   test "removed qualification facts and evidence policy purposes refuse to load", ctx do
     for fact <- [
           "assignment.qualifying_review_verdict_kinds",
-          "assignment.qualifying_verification_verdict_kinds",
           "work_item.changes_requested_count",
           "call.file_effect_manifest.valid"
         ] do
