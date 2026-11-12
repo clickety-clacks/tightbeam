@@ -1073,7 +1073,8 @@ defmodule Tightbeam.WorkItemsTest do
     assert cleared.workItem.specRefSha256 == @sha
   end
 
-  test "body updates leave every work-item lifecycle state and disposition reason unchanged", ctx do
+  test "body updates leave every work-item lifecycle state and disposition reason unchanged",
+       ctx do
     open = create(ctx, {:user, "flynn"}, %{title: "Open body"})
     iceboxed = create(ctx, {:user, "flynn"}, %{title: "Iceboxed body"})
     closed = create(ctx, {:user, "flynn"}, %{title: "Closed body"})

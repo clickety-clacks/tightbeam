@@ -630,8 +630,11 @@ defmodule Tightbeam.WorkItemBracketsTest do
              })
 
     assert get(ctx, iceboxed.id).workItem.failReason == "waiting for a decision"
-    assert Enum.find(list(ctx).workItems, &(&1.id == iceboxed.id)).failReason == "waiting for a decision"
-    assert WorkState.item_detail(ctx.db, iceboxed.id).workItem.failReason == "waiting for a decision"
+    assert Enum.find(list(ctx).workItems, &(&1.id == iceboxed.id)).failReason ==
+             "waiting for a decision"
+
+    assert WorkState.item_detail(ctx.db, iceboxed.id).workItem.failReason ==
+             "waiting for a decision"
 
     item = create(ctx, {:user, "flynn"}, %{title: "Failed with reason"})
 

@@ -449,8 +449,10 @@ defmodule Tightbeam.ExecutionMapTest do
     # Driven through the real disposition writer, so the causal event under test
     # is the one production appends.
     item!(ctx.db, "wi_cycle")
+
     assert %{workItem: %{state: "iceboxed"}} =
              dispose(ctx.db, "work-item-icebox", "wi_cycle", %{reason: "waiting for review"})
+
     assert %{workItem: %{state: "open"}} = dispose(ctx.db, "work-item-reopen", "wi_cycle")
 
     assert node(roster(ctx), "wi_cycle").finished_at == nil,
