@@ -5996,7 +5996,7 @@ defmodule Tightbeam.HarklightWakesTest do
     listener = completion_notifying_listener(parent)
 
     unchanged =
-      Map.new([p2, k1, k2, k3], fn h ->
+      Map.new([p2, k1, k2], fn h ->
         {h, DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [h])}
       end)
 
@@ -6016,6 +6016,9 @@ defmodule Tightbeam.HarklightWakesTest do
 
       assert {:ok, [["complete"]]} =
                DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [p1])
+
+      assert {:ok, [["complete"]]} =
+               DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [k3])
 
       for {handle, row} <- unchanged,
           do:
@@ -6175,7 +6178,7 @@ defmodule Tightbeam.HarklightWakesTest do
     end
   end
 
-  test "an agent-authored answer alone does not complete a handle", %{db: db} do
+  test "an agent-authored answered terminal completes a handle", %{db: db} do
     answer = completion_event(@handle, 1, "request", "terminal", "agent")
     assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
     mark_completion_wakes_delivered(db, @handle)
@@ -6192,9 +6195,57 @@ defmodule Tightbeam.HarklightWakesTest do
       ["status", "--session", @handle] -> {JSON.encode!(status), 0}
     end
 
-    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+    assert :completed = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    assert {:ok, [["complete"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+  end
+
+  test "an agent-authored answered terminal completes when its turn ends", %{
+    db: db,
+    session: session
+  } do
+    answer = completion_event(@handle, 1, "request", "terminal", "agent")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+    mark_completion_wakes_delivered(db, @handle)
+
+    status = %{
+      "session_handle" => @handle,
+      "open_requests" => 1,
+      "pending_undelivered" => 0,
+      "pending_delivered_unacted" => 0
+    }
+
+    {:ok, responses} =
+      Agent.start_link(fn -> %{status: status, events: %{@handle => []}, commands: []} end)
+
+    Process.unlink(responses)
+    on_exit(fn -> Agent.stop(responses) end)
+    parent = self()
+    runner = completion_runner(responses, parent)
+
+    start_supervised!(
+      {HarklightWakes,
+       db: db, listener: completion_notifying_listener(parent), send_runner: runner}
+    )
+
+    assert_receive {:restored, @handle, nil}
 
     assert {:ok, [["active"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+
+    Agent.update(responses, fn current ->
+      put_in(current, [:status, "open_requests"], 0)
+    end)
+
+    HarklightWakes.origin_turn_ended(session.session_key)
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle]) ==
+               {:ok, [["complete"]]}
+           end)
+
+    assert {:ok, [["complete"]]} =
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
   end
 
