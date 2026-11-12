@@ -196,48 +196,112 @@ defmodule Tightbeam.HarklightSend do
   end
 
   defp recover_one(db, message, opts) do
-    case HarklightLifecycle.lookup(db, message) do
-      %{state: "pending", op_id: op_id} ->
-        :global.trans({{__MODULE__, db, op_id}, self()}, fn ->
-          case HarklightLifecycle.lookup(db, message) do
-            %{state: "pending"} = record ->
-              call = %{
-                session_key: record.session_key,
-                principal: {:session, record.session_key},
-                transport_session_key: record.session_key
-              }
+    send_record = HarklightLifecycle.lookup(db, message)
+    change_record = HarklightLifecycle.lookup_change(db, message)
 
-              with :ok <- origin!(db, call), {:ok, runner} <- runner(opts) do
-                finish_send(
-                  db,
-                  call,
-                  op_id,
-                  record.payload,
-                  record.request,
-                  invoke(runner, ["retry", "--op-id", op_id], "committed", op_id),
-                  "settle",
-                  opts
-                )
-              else
-                {:error, code} ->
-                  failure(
-                    "settle",
-                    code,
-                    early_reason(code) <> " " <> unknown_reason(message),
-                    "failed",
-                    identity(record)
-                  )
-                  |> unchanged_targets(record.request["message"]["supersedes"])
-              end
+    cond do
+      match?(%{state: "pending"}, send_record) ->
+        recover_send(db, message, opts, send_record)
 
-            record ->
-              already_settled(record, message)
-          end
-        end)
+      match?(%{state: "pending"}, change_record) ->
+        recover_change(db, message, opts, send_record, change_record)
 
-      record ->
-        already_settled(record, message)
+      not is_nil(change_record) ->
+        already_settled_change(send_record, change_record)
+
+      true ->
+        already_settled(send_record, message)
     end
+  end
+
+  defp recover_send(db, message, opts, %{op_id: op_id}) do
+    :global.trans({{__MODULE__, db, op_id}, self()}, fn ->
+      case HarklightLifecycle.lookup(db, message) do
+        %{state: "pending"} = record ->
+          call = %{
+            session_key: record.session_key,
+            principal: {:session, record.session_key},
+            transport_session_key: record.session_key
+          }
+
+          with :ok <- origin!(db, call), {:ok, runner} <- runner(opts) do
+            finish_send(
+              db,
+              call,
+              op_id,
+              record.payload,
+              record.request,
+              invoke(runner, ["retry", "--op-id", op_id], "committed", op_id),
+              "settle",
+              opts
+            )
+          else
+            {:error, code} ->
+              failure(
+                "settle",
+                code,
+                early_reason(code) <> " " <> unknown_reason(message),
+                "failed",
+                identity(record)
+              )
+              |> unchanged_targets(record.request["message"]["supersedes"])
+          end
+
+        record ->
+          already_settled(record, message)
+      end
+    end)
+  end
+
+  defp recover_change(db, message, opts, send_record, %{op_id: op_id}) do
+    :global.trans({{__MODULE__, db, "change", message}, self()}, fn ->
+      case HarklightLifecycle.lookup_change(db, message) do
+        %{state: "pending"} = change ->
+          call = %{
+            session_key: change.session_key,
+            principal: {:session, change.session_key},
+            transport_session_key: change.session_key
+          }
+
+          with :ok <- origin!(db, call), {:ok, runner} <- runner(opts) do
+            finish_change(
+              db,
+              send_record,
+              op_id,
+              change.command,
+              invoke(runner, change.request, "committed", op_id),
+              "settle"
+            )
+          else
+            {:error, code} ->
+              failure(
+                "settle",
+                code,
+                early_reason(code) <>
+                  " The saved #{change.command} request remains unresolved; retry settlement when the originating session is available.",
+                "failed",
+                identity(send_record) |> Map.put(:op_id, op_id)
+              )
+          end
+
+        change ->
+          already_settled_change(send_record, change)
+      end
+    end)
+  end
+
+  defp already_settled_change(send_record, nil), do: already_settled(send_record, nil)
+
+  defp already_settled_change(send_record, change) do
+    identity = identity(send_record) |> Map.put(:op_id, change.op_id)
+
+    failure(
+      "settle",
+      "harklight_already_settled",
+      "The #{change.command} operation for message #{change.message_id} is already settled as #{change.state}; no operation was run.",
+      "refused",
+      identity
+    )
   end
 
   defp already_settled(nil, message), do: unknown_message("settle", message)
@@ -255,38 +319,46 @@ defmodule Tightbeam.HarklightSend do
   def change_request(db, call, command, opts \\ []) do
     message = call.params[:message_id]
 
-    with :ok <- origin!(db, call),
-         {:ok, record} <- known_message(db, message),
+    with :ok <- origin!(db, call) do
+      :global.trans({{__MODULE__, db, "change", message}, self()}, fn ->
+        case HarklightLifecycle.unresolved_change(db, message) do
+          nil ->
+            change_request_locked(db, call, command, opts)
+
+          change ->
+            record = HarklightLifecycle.lookup(db, message)
+            unresolved_change_result(command, message, record, change)
+        end
+      end)
+    else
+      {:error, code} ->
+        failure(command, code, early_reason(code), "failed", %{message_id: message})
+    end
+  end
+
+  defp change_request_locked(db, call, command, opts) do
+    message = call.params[:message_id]
+
+    with {:ok, record} <- known_message(db, message),
          :ok <- resolved(record),
          {:ok, args} <- change_args(command, call.params, record),
          {:ok, runner} <- runner(opts) do
       op_id = Id.uuid4()
-      identity = identity(record) |> Map.put(:op_id, op_id)
+      request = args ++ ["--op-id", op_id]
 
-      case invoke(runner, args ++ ["--op-id", op_id], "committed", op_id) do
-        {:ok, frame} ->
-          effects =
-            if command == "retract",
-              do: HarklightLifecycle.retract_committed(db, record, op_id),
-              else: %{wake_effect: "kept"}
+      case HarklightWakes.prepare_change(db, call, op_id, message, command, request) do
+        %{state: "pending"} ->
+          finish_change(
+            db,
+            record,
+            op_id,
+            command,
+            invoke(runner, request, "committed", op_id),
+            command
+          )
 
-          Map.merge(identity, effects)
-          |> Map.merge(%{command: command, outcome: "committed"})
-          |> then(fn result ->
-            if command == "revise",
-              do: Map.put(result, :revision, frame["response"]["revision"]),
-              else: result
-          end)
-
-        {:error, code, reason, outcome} ->
-          reason =
-            if outcome == "outcome_unknown",
-              do:
-                "The change may or may not have applied. Tightbeam will not retry it on its own. The subscription is unchanged until a committed retract or supersede, or conversation completion. You may run this command again. " <>
-                  reason,
-              else: reason
-
-          failure(command, code, reason, outcome, identity)
+        %{code: code} ->
+          failure(command, code, early_reason(code), "failed", identity(record))
       end
     else
       {:error, :unknown_message} ->
@@ -297,6 +369,86 @@ defmodule Tightbeam.HarklightSend do
 
       {:error, code} ->
         failure(command, code, early_reason(code), "failed", %{message_id: message})
+    end
+  end
+
+  defp unresolved_change_result(command, message, send_record, change) do
+    failure(
+      command,
+      "harklight_operation_unresolved",
+      "The #{change.command} operation #{change.op_id} is unresolved. Run tightbeam harklight-settle --message #{message} to resend its exact saved request with the same operation ID.",
+      "refused",
+      identity(send_record) |> Map.put(:op_id, change.op_id)
+    )
+  end
+
+  defp finish_change(db, record, op_id, original_command, response, result_command) do
+    identity = identity(record) |> Map.put(:op_id, op_id)
+
+    case response do
+      {:ok, frame} ->
+        case HarklightLifecycle.record_change_result(
+               db,
+               record,
+               op_id,
+               original_command,
+               "committed"
+             ) do
+          {:ok, effects} ->
+            result =
+              Map.merge(identity, effects)
+              |> Map.merge(%{command: result_command, outcome: "committed"})
+
+            result =
+              if result_command == "settle",
+                do: Map.put(result, :settled_command, original_command),
+                else: result
+
+            if original_command == "revise",
+              do: Map.put(result, :revision, get_in(frame, ["response", "revision"])),
+              else: result
+
+          {:error, reason} ->
+            failure(
+              result_command,
+              "harklight_change_unavailable",
+              "The external #{original_command} may have committed, but Tightbeam could not save its result: #{inspect(reason)}. The saved request remains available through harklight-settle.",
+              "outcome_unknown",
+              identity
+            )
+        end
+
+      {:error, code, reason, outcome} ->
+        if outcome == "outcome_unknown" do
+          failure(
+            result_command,
+            code,
+            "The #{original_command} may or may not have applied. Tightbeam saved the exact request and operation ID; run tightbeam harklight-settle --message #{record.message_id} to retry that same operation. " <>
+              reason,
+            "outcome_unknown",
+            identity
+          )
+        else
+          case HarklightLifecycle.record_change_result(
+                 db,
+                 record,
+                 op_id,
+                 original_command,
+                 outcome
+               ) do
+            {:ok, _effects} ->
+              failure(result_command, code, reason, outcome, identity)
+
+            {:error, persist_reason} ->
+              failure(
+                result_command,
+                "harklight_change_unavailable",
+                "The external result was #{outcome}, but Tightbeam could not record it: #{inspect(persist_reason)}. The saved operation remains available through harklight-settle.",
+                "outcome_unknown",
+                identity
+              )
+          end
+        end
     end
   end
 
@@ -775,12 +927,20 @@ defmodule Tightbeam.HarklightSend do
     end
   rescue
     error ->
-      reason =
-        if expected == "prepared",
-          do:
-            "Harklight Agent could not complete during local preparation: #{Exception.message(error)}; the message was not sent.",
-          else: "Harklight Agent could not complete: #{Exception.message(error)}"
+      change? = List.first(args) in ["revise", "retract"]
 
-      {:error, "harklight_cli_failed", reason, "failed"}
+      reason =
+        cond do
+          expected == "prepared" ->
+            "Harklight Agent could not complete during local preparation: #{Exception.message(error)}; the message was not sent."
+
+          change? ->
+            "Harklight Agent could not confirm the change: #{Exception.message(error)}"
+
+          true ->
+            "Harklight Agent could not complete: #{Exception.message(error)}"
+        end
+
+      {:error, "harklight_cli_failed", reason, if(change?, do: "outcome_unknown", else: "failed")}
   end
 end

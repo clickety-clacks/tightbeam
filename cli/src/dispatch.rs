@@ -630,6 +630,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("handle", session)],
         )),
+        Command::HarklightListenerRestore { identity, handle } => Ok(request(
+            identity,
+            "harklight-listener-restore",
+            vec![],
+            vec![string_field("handle", handle)],
+        )),
         Command::HarklightFollow {
             identity,
             message,
@@ -4028,6 +4034,7 @@ fn local_harklight_identity_refusal(
         Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
+        | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
         | Command::HarklightCover { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
@@ -4059,6 +4066,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
+        | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
         | Command::HarklightCover { identity, .. }
         | Command::Spawn { identity, .. }
@@ -4316,6 +4324,10 @@ mod tests {
                 "harklight-settle",
             ),
             (
+                vec!["harklight-listener-restore", "--handle", "h"],
+                "harklight-listener-restore",
+            ),
+            (
                 vec!["harklight-follow", "--message", "m"],
                 "harklight-follow",
             ),
@@ -4345,6 +4357,8 @@ mod tests {
             } else if (verb == "harklight-follow" || verb == "harklight-cover")
                 && body["params"].get("handle").is_some()
             {
+                assert_eq!(body["params"]["handle"], "h");
+            } else if verb == "harklight-listener-restore" {
                 assert_eq!(body["params"]["handle"], "h");
             } else {
                 assert_eq!(body["params"]["messageId"], "m");
