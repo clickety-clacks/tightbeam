@@ -343,6 +343,13 @@ defmodule Tightbeam.ToolCalls do
 
                row = fetch_by_harness_id_in_txn(txn, session_key, harness_tool_call_id)
                terminal? = terminal_status?(row.status)
+
+               Tightbeam.TurnEvents.record_tool_event_in_txn(
+                 txn,
+                 if(terminal?, do: "tool.ended", else: "tool.started"),
+                 row
+               )
+
                publish_tool_call_in_txn(txn, row, terminal?)
 
                if terminal? and row.status == "completed" and is_binary(compaction_from) do
@@ -360,6 +367,7 @@ defmodule Tightbeam.ToolCalls do
                if terminal_status?(Map.get(attributes, :status)) do
                  update_terminal_in_txn(txn, row, attributes)
                  updated = fetch_by_harness_id_in_txn(txn, session_key, harness_tool_call_id)
+                 Tightbeam.TurnEvents.record_tool_event_in_txn(txn, "tool.ended", updated)
                  publish_tool_call_in_txn(txn, updated, true)
 
                  if updated.status == "completed" and is_binary(compaction_from) do

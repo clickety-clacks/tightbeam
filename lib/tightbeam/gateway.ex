@@ -3944,9 +3944,10 @@ defmodule Tightbeam.Gateway do
   # assistant messages. Legacy adapters and test doubles return only `text`;
   # they keep the historical one-row behavior through the fallback below.
   defp append_assistant_messages_in_txn(txn, turn, echo, result, attention_tier) do
-    Enum.map(assistant_message_texts(result), fn text ->
+    Enum.map(assistant_message_rows(result), fn %{text: text, logical_message_id: id} ->
       {:appended, reply} =
         Projection.append_in_txn(txn, %{
+          id: id,
           session_key: turn.session_key,
           role: "assistant",
           content: text,
@@ -3960,6 +3961,18 @@ defmodule Tightbeam.Gateway do
       reply
     end)
   end
+
+  defp assistant_message_rows(%{messages: messages}) when is_list(messages) and messages != [] do
+    Enum.map(messages, fn message ->
+      %{
+        text: Map.fetch!(message, :text),
+        logical_message_id: Map.get(message, :logical_message_id)
+      }
+    end)
+  end
+
+  defp assistant_message_rows(%{text: text}) when is_binary(text),
+    do: [%{text: text, logical_message_id: nil}]
 
   defp assistant_message_texts(%{messages: messages}) when is_list(messages) and messages != [] do
     Enum.map(messages, &Map.fetch!(&1, :text))
