@@ -30,6 +30,7 @@ defmodule Tightbeam.SessionLane do
     :lane_manager,
     terminal_publisher: nil,
     on_terminal: nil,
+    before_turn: nil,
     wake_scheduler: Tightbeam.WakeScheduler,
     task_ref: nil,
     task_pid: nil,
@@ -193,6 +194,14 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  # Both acceptance and execution share the lane mailbox with terminal handling.
+  def change_at_boundary(session_key, apply, defer) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.call(pid, {:change_at_boundary, apply, defer}, :infinity)
+      [] -> :no_lane
+    end
+  end
+
   @doc "Settle one exact stale turn while this lane holds mailbox serialization."
   @spec settle_stale(pid(), reference() | nil, StaleTurnSettlement.request()) ::
           {:ok, map()} | {:error, map()}
@@ -219,6 +228,7 @@ defmodule Tightbeam.SessionLane do
       # indicator stuck forever. No-op default keeps unit tests standalone.
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
       on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
+      before_turn: Keyword.get(opts, :before_turn, fn _ -> :ok end),
       lane_manager: Keyword.get(opts, :lane_manager),
       wake_scheduler: Keyword.get(opts, :wake_scheduler, Tightbeam.WakeScheduler),
       lane_owner: "lane:#{inspect(self())}:#{System.unique_integer([:positive])}"
@@ -481,6 +491,15 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  def handle_call({:change_at_boundary, apply, defer}, _from, state) do
+    result =
+      if not is_nil(state.task_ref) or Ledger.running?(state.db, state.session_key),
+        do: defer.(),
+        else: apply.()
+
+    {:reply, result, state}
+  end
+
   def handle_call({:at_turn_boundary, _fun}, _from, %{task_ref: ref} = state)
       when not is_nil(ref),
       do: {:reply, :busy, state}
@@ -659,6 +678,12 @@ defmodule Tightbeam.SessionLane do
       # (handled above) finishes normally.
       state
     else
+      # Includes boot recovery and explicit cancellation, not just normal results.
+      # A durable running row can outlive its lane; never hand off over it.
+      if not Ledger.running?(state.db, state.session_key) do
+        :ok = state.before_turn.(state.session_key)
+      end
+
       claim_and_start(state)
     end
   end

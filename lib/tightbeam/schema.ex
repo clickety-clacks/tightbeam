@@ -45,6 +45,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Idempotency,
     Tightbeam.ConditionFacts,
     Tightbeam.FactProducers,
+    Tightbeam.RuntimeChanges,
     Tightbeam.SubagentMarkers,
     Tightbeam.Escalation,
     Tightbeam.Wakes,

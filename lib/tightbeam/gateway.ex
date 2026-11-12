@@ -164,6 +164,9 @@ defmodule Tightbeam.Gateway do
   @spec children_after_preflight(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children_after_preflight(config) do
     db = Map.get(config, :db, Tightbeam.DB)
+    # The handler and lane closures need the same DB that this composition
+    # root admitted. `served_snapshot/4` uses it to read session-scoped state.
+    config = Map.put(config, :db, db)
     :ok = DB.assert_base_admitted!(db, config.base_dir)
     Identity.init_after_admission!(config.base_dir, db)
     load_law!(config)
@@ -368,6 +371,7 @@ defmodule Tightbeam.Gateway do
           runner: runner,
           terminal_publisher: terminal_publisher(db),
           on_terminal: on_terminal,
+          before_turn: &apply_pending_runtime_changes(config, db, &1),
           name: Tightbeam.LaneManager},
          {Tightbeam.HarnessHealth.RecoveryScheduler,
           db: db,
@@ -3103,6 +3107,7 @@ defmodule Tightbeam.Gateway do
               )
           },
           runtimeStatus: runtime_projection.status,
+          runtimeChanges: Tightbeam.RuntimeChanges.status(db, session_key),
           lastTurnError: last_turn_error,
           runningStatus:
             if(runtime_projection.status == "known",
@@ -8408,29 +8413,49 @@ defmodule Tightbeam.Gateway do
                          session.host,
                          spinup_opts(config, db, harness, session.host, model)
                        ) do
-                  case at_tune_boundary(
-                         config,
-                         db,
-                         session.session_key,
-                         fn ->
-                           run_session_mutation(session.session_key, fn ->
-                             apply_harness_change(
-                               config,
-                               db,
-                               call,
-                               session,
-                               harness,
-                               harness_atom,
-                               model,
-                               routed.provider
-                             )
-                           end)
-                         end,
-                         allow_queued: true
-                       ) do
-                    {:ok, result} -> result
-                    {:error, :turn_in_progress} -> turn_in_progress_error()
-                  end
+                  LaneManager.ensure_lane_quiet(
+                    config[:lane_manager] || LaneManager,
+                    session.session_key
+                  )
+
+                  Tightbeam.SessionLane.change_at_boundary(
+                    session.session_key,
+                    fn ->
+                      run_session_mutation(session.session_key, fn ->
+                        with :ok <-
+                               Spinup.ensure_ready(
+                                 config,
+                                 harness_atom,
+                                 session.host,
+                                 spinup_opts(config, db, harness, session.host, model)
+                               ) do
+                          apply_harness_change(
+                            config,
+                            db,
+                            call,
+                            session,
+                            harness,
+                            harness_atom,
+                            model,
+                            routed.provider
+                          )
+                          |> applied_runtime_change()
+                        else
+                          {:error, denial} -> normalize_tune_denial(denial)
+                        end
+                      end)
+                    end,
+                    fn ->
+                      Tightbeam.RuntimeChanges.enqueue(db, session.session_key, %{
+                        harness: harness,
+                        model: Map.from_struct(model),
+                        provider: routed.provider,
+                        origin: call.origin,
+                        principal: encode_tune_principal(call[:principal])
+                      })
+                    end
+                  )
+                  |> runtime_change_result()
                 else
                   {:error, denial} -> normalize_tune_denial(denial)
                 end
@@ -8862,6 +8887,89 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp runtime_change_result(:no_lane),
+    do: tune_error("runtime_unavailable", "the session lane stopped; retry the change")
+
+  defp runtime_change_result(result), do: result
+
+  defp applied_runtime_change(%{ok: true} = result), do: Map.put(result, :applies, "now")
+  defp applied_runtime_change(result), do: result
+
+  defp encode_tune_principal(nil), do: nil
+  defp encode_tune_principal({kind, value}), do: %{kind: Atom.to_string(kind), value: value}
+  defp decode_tune_principal(nil), do: nil
+
+  defp decode_tune_principal(%{"kind" => kind, "value" => value}),
+    do: {String.to_existing_atom(kind), value}
+
+  # Called by the lane before it claims another prompt, including after boot.
+  # It must not enter at_turn_boundary again: the lane already owns the boundary.
+  @doc false
+  def apply_pending_runtime_changes(config, db, session_key) do
+    run_session_mutation(session_key, fn ->
+      for {id, request} <- Tightbeam.RuntimeChanges.pending(db, session_key) do
+        session = Org.get(db, session_key)
+
+        model = %Model{
+          family: request["model"]["family"],
+          effort: request["model"]["effort"],
+          context: request["model"]["context"]
+        }
+
+        harness = request["harness"]
+        module = Harness.parse!(harness)
+
+        call = %{
+          session_key: session_key,
+          origin: request["origin"],
+          principal: decode_tune_principal(request["principal"]),
+          on_swap_interlock: fn txn ->
+            Tightbeam.RuntimeChanges.finish_in_txn(txn, id, %{ok: true, applies: "now"})
+          end
+        }
+
+        result =
+          cond do
+            is_nil(session) or session.state != "active" ->
+              tune_error("not_found", "session is no longer active")
+
+            true ->
+              with :ok <-
+                     Spinup.ensure_ready(
+                       config,
+                       module.id(),
+                       session.host,
+                       spinup_opts(config, db, harness, session.host, model)
+                     ) do
+                apply_harness_change(
+                  config,
+                  db,
+                  call,
+                  session,
+                  harness,
+                  module.id(),
+                  model,
+                  request["provider"]
+                )
+              else
+                {:error, denial} -> normalize_tune_denial(denial)
+              end
+          end
+
+        Tightbeam.RuntimeChanges.finish(db, id, result)
+
+        EventLog.lifecycle(
+          db,
+          "runtime_change_finished",
+          session_key,
+          JSON.encode!(%{change_id: id, result: result})
+        )
+      end
+    end)
+
+    :ok
+  end
+
   defp apply_harness_change(
          config,
          db,
@@ -9259,30 +9367,19 @@ defmodule Tightbeam.Gateway do
     |> Map.merge(event)
   end
 
-  # A live model-switch on a RESIDENT session used to hit set_config_option, which
-  # cannot re-read the projected home, so the harness refused any model its offered set
-  # did not already hold (mike's opus-5 picker-pain) and the raw refusal reached the
-  # client as `inspect(reason)` term soup. The fix (apply_tuned_model's resident
-  # branch) forks the conversation, sends the requested canonical model exactly,
-  # and verifies the readback
-  # before projection -- but that move must never land mid-turn, so it runs at
-  # the turn boundary. Ordering is
-  # `at_turn_boundary` OUTER, `run_session_mutation` INNER: the lane IS the
-  # serialization, and this is the only deadlock-safe nesting -- mutation-outer would
-  # wedge a reload that waits on the lane while the lane's bounce waits on the mutation
-  # lock (see repoint_main_session, the same shape). `ensure_lane_quiet` first so
-  # :no_lane can only mean the lane died in the gap, which we treat as busy: retry.
+  # Lane serialization stays outside the session mutation lock. Reversing the
+  # order can deadlock a reload against a lane-owned mutation. Idle Claude
+  # changes retain their existing fork path; active changes use ACP in place.
   defp apply_model_change(config, db, call, session, new_ref) do
     with {:ok, routed} <- validate_catalog_model(session.host, session.harness, new_ref, false) do
       allow_queued = repair_tune_authorized?(db, call, session)
 
-      boundary =
-        at_tune_boundary(
-          config,
-          db,
-          session.session_key,
-          fn ->
-            run_session_mutation(session.session_key, fn ->
+      {boundary, applies} =
+        model_change_boundary(config, db, session, allow_queued, fn running? ->
+          run_session_mutation(session.session_key, fn ->
+            if running? do
+              apply_running_model(db, Org.get(db, session.session_key), new_ref, routed.provider)
+            else
               apply_tuned_model(
                 config,
                 db,
@@ -9291,10 +9388,9 @@ defmodule Tightbeam.Gateway do
                 routed.provider,
                 call[:principal] || call.origin
               )
-            end)
-          end,
-          allow_queued: allow_queued
-        )
+            end
+          end)
+        end)
 
       # Branches read the pre-diagnostic reason so every outcome and message is
       # the one it was; the carried evidence goes only to `diagnostic`.
@@ -9310,6 +9406,16 @@ defmodule Tightbeam.Gateway do
       case ErrorDiagnostic.classified(boundary) do
         {:ok, :ok} ->
           runtime_success(db, session.session_key, "preserved", true, "not_applicable")
+          |> Map.merge(%{
+            accepted: true,
+            applies: applies,
+            message:
+              if(applies == "after_turn",
+                do: "Configuration accepted; applies after this turn.",
+                else: "Configuration applied."
+              )
+          })
+          |> model_change_readback(applies)
           |> ErrorDiagnostic.put(ErrorDiagnostic.of(boundary))
 
         {:ok, {:runtime_projection_failed, %Model{} = actual}} ->
@@ -9378,10 +9484,9 @@ defmodule Tightbeam.Gateway do
           |> ErrorDiagnostic.put(diagnostic)
           |> with_selection_options(boundary)
 
-        # Busy = a turn is in flight; the switch cannot land mid-turn, so the change
-        # was NOT applied. The honest remedy after this fix is to retry at the
-        # boundary -- never "start a new session" (the live switch replaces that old escape),
-        # and never a false intake/validation claim (the intake gate is a different axis).
+        {:error, :no_lane} ->
+          runtime_change_result(:no_lane)
+
         {:error, :turn_in_progress} ->
           turn_in_progress_error()
       end
@@ -9417,6 +9522,69 @@ defmodule Tightbeam.Gateway do
 
   defp model_unsupported_reason?({:adapter_unavailable, _reason}), do: true
   defp model_unsupported_reason?(_reason), do: false
+
+  defp model_change_readback(result, "after_turn") do
+    Map.merge(result, %{
+      running_model: nil,
+      running_label: nil,
+      running_status: "current inference not observed"
+    })
+  end
+
+  defp model_change_readback(result, _applies), do: result
+
+  # Keep turn admission serialized with configuration. A running Claude/Codex
+  # session can accept ACP configuration without replacing its live conversation.
+  # The current provider request retains its inference settings; acceptance is not
+  # a claim that tokens already being generated use the requested configuration.
+  defp model_change_boundary(config, db, session, allow_queued, apply) do
+    if session.harness in ["claude", "codex"] do
+      LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session.session_key)
+
+      Tightbeam.SessionLane.change_at_boundary(
+        session.session_key,
+        fn ->
+          case config[:on_tune_fence] do
+            callback when is_function(callback, 0) -> callback.()
+            _ -> :ok
+          end
+
+          refused? =
+            if allow_queued,
+              do: Ledger.running?(db, session.session_key),
+              else: Ledger.pending_count(db, session.session_key) > 0
+
+          if refused?,
+            do: {{:error, :turn_in_progress}, "now"},
+            else: {{:ok, apply.(false)}, "now"}
+        end,
+        fn -> {{:ok, apply.(true)}, "after_turn"} end
+      )
+      |> case do
+        :no_lane -> {{:error, :no_lane}, "now"}
+        result -> result
+      end
+    else
+      {at_tune_boundary(config, db, session.session_key, fn -> apply.(false) end,
+         allow_queued: allow_queued
+       ), "now"}
+    end
+  end
+
+  defp apply_running_model(db, session, new_ref, provider) do
+    with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
+         {:ok, adapter, _generation} <- resident_adapter(session),
+         true <- Adapter.knows_session?(adapter, sid),
+         {:ok, %Model{} = actual} <-
+           Adapter.apply_model_strict(adapter, sid, new_ref, session.model) do
+      project_tuned_model(db, session, adapter, sid, sid, actual, provider)
+    else
+      nil -> {:error, :running_session_unavailable}
+      false -> {:error, :running_session_unavailable}
+      {:ok, :unknown} -> {:error, {:runtime_config_unknown, :model_readback_unavailable}}
+      {:error, _reason} = error -> error
+    end
+  end
 
   defp project_verified_mismatch(db, session, actual, provider) do
     try do
