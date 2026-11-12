@@ -6627,6 +6627,7 @@ mod tests {
                 "harklight-retract",
                 "harklight-settle",
                 "harklight-follow",
+                "harklight-listener-restore",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",

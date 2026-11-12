@@ -4693,7 +4693,7 @@ mod tests {
                 "--as-user",
                 "rename-owner"
             ]),
-            r#"{"asUser":"rename-owner","verb":"tune","params":{"sessionKey":"session key with spaces","setting":"rename","displayName":"  ATC PO  "}}"#
+            r#"{"asUser":"rename-owner","verb":"tune","sessionKey":"session key with spaces","params":{"setting":"rename","displayName":"  ATC PO  "}}"#
         );
 
         // The CLI preserves an explicit empty value for the server's shared
@@ -4706,7 +4706,7 @@ mod tests {
                 "--display-name",
                 ""
             ]),
-            r#"{"verb":"tune","params":{"sessionKey":"session-key","setting":"rename","displayName":""}}"#
+            r#"{"verb":"tune","sessionKey":"session-key","params":{"setting":"rename","displayName":""}}"#
         );
 
         for missing in ["--session", "--display-name"] {
