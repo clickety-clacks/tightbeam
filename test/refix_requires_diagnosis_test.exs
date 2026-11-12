@@ -124,7 +124,11 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
                  origin: "user:flynn",
                  principal: {:user, "flynn"},
                  session_key: nil,
-                 params: %{work_item_id: item.id}
+                 params:
+                   if(verb == "work-item-icebox",
+                     do: %{work_item_id: item.id, reason: "deferred for review"},
+                     else: %{work_item_id: item.id}
+                   )
                })
 
       assert {:error, %{code: "work_item_not_open"}} =
