@@ -7232,7 +7232,8 @@ defmodule Tightbeam.AssignmentsTest do
                [verified_at, correction_id]
              )
 
-    assert %{attest: %{kind: "completion"}} = result =
+    assert %{attest: %{kind: "completion"}} =
+             result =
              handle(ctx, "attest", completion)
 
     assert result.assignment.state == "closed"
