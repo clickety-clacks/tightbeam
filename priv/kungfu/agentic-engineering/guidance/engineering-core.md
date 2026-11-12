@@ -114,7 +114,10 @@ scenario are the exception.
 
 ## Scope and repositories
 
-Build the authorized outcome and necessary supporting behavior. Route incidental
+Build the authorized outcome and the supporting behavior it needs to work.
+Recommend any limit, threshold, quota or security mechanism the ask did not
+call for to its owner with your reason, rather than implementing it or making
+it a blocker. Route incidental
 findings to their owners. Question unnecessary mechanisms; remove one you added
 when it serves no requirement, but do not remove required behavior, data or
 constraints to make a failure disappear. A diff far larger than its ask deserves
