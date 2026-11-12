@@ -1036,10 +1036,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
                Process.sleep(:infinity)
 
              attempt == 3 ->
+               send(owner, {:automatic_recovery_preflight_exit_started, self(), context})
+               exit(:simulated_preflight_exit)
+
+             attempt == 4 ->
                send(owner, {:automatic_recovery_refusal_started, self(), context})
                Process.sleep(:infinity)
 
-             attempt == 4 ->
+             attempt == 5 ->
                {:error,
                 %{code: "temporary_refusal", message: "The launch refusal remains visible"}}
 
@@ -1079,6 +1083,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              entry.circuit == :open and entry.failures == 2 and is_reference(entry.timer)
            end)
 
+    assert_receive {:automatic_recovery_preflight_exit_started, exited_readiness_task, []}, 1_500
+    assert is_pid(exited_readiness_task)
+
+    assert wait_until(fn ->
+             entry = :sys.get_state(coordinator).adapters[key]
+             entry.circuit == :open and entry.failures == 3 and is_reference(entry.timer)
+           end)
+
     assert_receive {:automatic_recovery_refusal_started, refusal_readiness_task, []}, 1_500
     assert is_pid(refusal_readiness_task)
 
@@ -1095,12 +1107,12 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     assert wait_until(fn ->
              entry = :sys.get_state(coordinator).adapters[key]
-             entry.circuit == :open and entry.failures == 3 and is_reference(entry.timer)
+             entry.circuit == :open and entry.failures == 4 and is_reference(entry.timer)
            end)
 
-    assert_receive {:automatic_recovery_boot_started, readiness_task, []}, 1_500
+    assert_receive {:automatic_recovery_boot_started, readiness_task, []}, 3_000
 
-    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 3}}} =
+    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 4}}} =
              AdapterCoordinator.adapter_for(coordinator, key)
 
     send(readiness_task, {:release_automatic_recovery_boot, readiness_task})
@@ -1112,7 +1124,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
-    assert :atomics.get(boot_attempt, 1) == 5
+    assert :atomics.get(boot_attempt, 1) == 6
     assert AdapterCoordinator.ready?(coordinator, key)
     assert {:ok, _recovered_adapter, 4} = AdapterCoordinator.adapter_for(coordinator, key)
   end
