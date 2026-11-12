@@ -413,11 +413,26 @@ defmodule Tightbeam.Wakes do
         correlation
       )
       when is_binary(incident_id) and is_binary(failure_class) and is_binary(correlation) do
-    health_redelivery_sources_in_txn(txn, incident_id, failure_class)
+    health_redelivery_sources_in_txn(txn, incident_id, failure_class, true)
     |> Enum.reduce(0, fn [idempotency_key | _rest], count ->
       Txn.q(
         txn,
-        "UPDATE health_redelivery_attempts SET cycleReleaseCorrelation=?2 WHERE idempotencyKey=?1 AND restorationTurnSeq IS NULL AND redeliveryTurnSeq IS NULL AND cycleReleaseCorrelation IS NULL AND cycleReleaseTurnSeq IS NULL",
+        """
+        UPDATE health_redelivery_attempts
+        SET cycleReleaseCorrelation=?2
+        WHERE idempotencyKey=?1 AND cycleReleaseCorrelation IS NULL
+          AND cycleReleaseTurnSeq IS NULL
+          AND (
+            (restorationTurnSeq IS NULL AND redeliveryTurnSeq IS NULL)
+            OR EXISTS (
+              SELECT 1 FROM turns failed
+              WHERE failed.seq=health_redelivery_attempts.redeliveryTurnSeq
+                AND failed.sessionKey=health_redelivery_attempts.sessionKey
+                AND failed.messageId=health_redelivery_attempts.sourceMessageId
+                AND failed.status='failed'
+            )
+          )
+        """,
         [idempotency_key, correlation]
       )
 
@@ -471,7 +486,23 @@ defmodule Tightbeam.Wakes do
       [[_incident_id]] ->
         Txn.q(
           txn,
-          "SELECT idempotencyKey,sessionKey,sourceMessageId,sourceTurnSeq,sourceWakeId,origin,prompt,roleRef,roleFallback,assignmentId,jobRef,requestRef,cycleReleaseCorrelation FROM health_redelivery_attempts WHERE cycleReleaseCorrelation=?1 AND sourceHarness=?2 AND sourceHost=?3 AND redeliveryTurnSeq IS NULL AND cycleReleaseTurnSeq IS NULL AND parentSessionKey IS NULL ORDER BY sourceTurnSeq",
+          """
+          SELECT idempotencyKey,sessionKey,sourceMessageId,sourceTurnSeq,sourceWakeId,origin,
+                 prompt,roleRef,roleFallback,assignmentId,jobRef,requestRef,cycleReleaseCorrelation
+          FROM health_redelivery_attempts
+          WHERE cycleReleaseCorrelation=?1 AND sourceHarness=?2 AND sourceHost=?3
+            AND cycleReleaseTurnSeq IS NULL AND parentSessionKey IS NULL
+            AND (
+              redeliveryTurnSeq IS NULL OR EXISTS (
+                SELECT 1 FROM turns failed
+                WHERE failed.seq=health_redelivery_attempts.redeliveryTurnSeq
+                  AND failed.sessionKey=health_redelivery_attempts.sessionKey
+                  AND failed.messageId=health_redelivery_attempts.sourceMessageId
+                  AND failed.status='failed'
+              )
+            )
+          ORDER BY sourceTurnSeq
+          """,
           [correlation, harness, host]
         )
         |> Enum.each(fn source ->
@@ -3220,8 +3251,7 @@ defmodule Tightbeam.Wakes do
           Txn.q(
             txn,
             """
-            UPDATE health_redelivery_attempts
-            SET restorationTurnSeq=NULL,redeliveryTurnSeq=NULL
+            UPDATE health_redelivery_attempts SET restorationTurnSeq=NULL,redeliveryTurnSeq=NULL
             WHERE sessionKey=?1 AND sourceMessageId=?2 AND redeliveryTurnSeq=?3
               AND parentSessionKey IS NULL
             """,
@@ -3437,7 +3467,12 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp health_redelivery_sources_in_txn(txn, incident_id, failure_class) do
+  defp health_redelivery_sources_in_txn(
+         txn,
+         incident_id,
+         failure_class,
+         allow_failed_redelivery \\ false
+       ) do
     Txn.q(
       txn,
       """
@@ -3456,7 +3491,10 @@ defmodule Tightbeam.Wakes do
         AND observed.status='failed'
         AND observed.messageId IS NOT NULL
         AND a.failureClass=?2
-        AND a.redeliveryTurnSeq IS NULL
+        AND (
+          a.redeliveryTurnSeq IS NULL OR
+          (?3=1 AND a.redeliveryTurnSeq=observed.seq)
+        )
         AND a.cycleReleaseCorrelation IS NULL
         AND a.cycleReleaseTurnSeq IS NULL
         AND a.parentSessionKey IS NULL
@@ -3471,7 +3509,7 @@ defmodule Tightbeam.Wakes do
         )
       ORDER BY a.sourceTurnSeq
       """,
-      [incident_id, failure_class]
+      [incident_id, failure_class, if(allow_failed_redelivery, do: 1, else: 0)]
     )
   end
 
@@ -3546,8 +3584,17 @@ defmodule Tightbeam.Wakes do
       UPDATE health_redelivery_attempts
       SET cycleReleaseTurnSeq=?2
       WHERE idempotencyKey=?1 AND cycleReleaseCorrelation=?3
-        AND restorationTurnSeq IS NULL AND redeliveryTurnSeq IS NULL
         AND cycleReleaseTurnSeq IS NULL
+        AND (
+          (restorationTurnSeq IS NULL AND redeliveryTurnSeq IS NULL)
+          OR EXISTS (
+            SELECT 1 FROM turns failed
+            WHERE failed.seq=health_redelivery_attempts.redeliveryTurnSeq
+              AND failed.sessionKey=health_redelivery_attempts.sessionKey
+              AND failed.messageId=health_redelivery_attempts.sourceMessageId
+              AND failed.status='failed'
+          )
+        )
       """,
       [idempotency_key, redelivery_turn_seq, correlation]
     )
