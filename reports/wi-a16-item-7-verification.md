@@ -62,3 +62,5 @@ Result: `git diff --check` exited 0. The wrapper and lockfile hashes are listed 
 ## Limits
 
 The wrapper selected the file-effect test module, the existing code completion test at line 6490, and the new shipped-completion integration test at line 263; 146 tests were excluded. This is targeted regression evidence, not a full-suite or live-gateway result. No live state was read or changed for this run.
+
+The latest work-item readback records that the installed gateway still refuses artifact-bearing verdicts. No separate `verified` verdict was submitted through that runtime because it would evaluate a different revision from the branch under test; a commit-refs-only verdict was not used as a substitute. The successful source-level verification above is recorded, while a formal producer `verified` verdict remains unfiled pending an evaluation path for the target behavior.
