@@ -1013,13 +1013,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     boot_attempt = :atomics.new(1, signed: false)
 
     # The timeout event is triggered explicitly below. Keep a generous
-    # readiness deadline for the ordered refusal replacement and recovery.
+    # readiness deadline, then cancel the held retry's deadline before its
+    # authoritative refusal replacement so that step cannot race the timer.
     coordinator =
       start_supervised!({
         AdapterCoordinator,
         adapter_sup: ctx.sup,
         backoff_base_ms: 250,
-        readiness_timeout_ms: 30_000,
+        readiness_timeout_ms: 300_000,
         adapter_context: fn _ -> [] end,
         adapter_opts: fn _, context ->
           attempt = :atomics.add_get(boot_attempt, 1, 1)
@@ -1046,10 +1047,12 @@ defmodule Tightbeam.AdapterCoordinatorTest do
               end
 
             attempt == 4 ->
-              send(owner, {:automatic_recovery_refusal_started, self(), context})
+              send(owner, {:automatic_recovery_pending_started, self(), context})
               Process.sleep(:infinity)
 
             attempt == 5 ->
+              send(owner, {:automatic_recovery_refusal_started, self(), context})
+
               {:error,
                %{code: "temporary_refusal", message: "The launch refusal remains visible"}}
 
@@ -1086,8 +1089,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     timed_out_entry = :sys.get_state(coordinator).adapters[key]
 
-    # Exercise the scheduled timeout handler without depending on a 30-second
-    # wall-clock wait. The next automatic preflight proves it re-armed restart.
+    # Exercise the scheduled timeout handler without depending on the configured
+    # wall-clock deadline. The next automatic preflight proves it re-armed restart.
     send(
       coordinator,
       {:adapter_readiness_timeout, key, timed_out_entry.generation,
@@ -1102,21 +1105,42 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert timeout_recovery_entry.failures == 2
     send(exited_readiness_task, {:exit_automatic_recovery_preflight, exited_readiness_task})
 
-    assert_receive {:automatic_recovery_refusal_started, refusal_readiness_task, []}, 10_000
-    assert is_pid(refusal_readiness_task)
+    assert_receive {:automatic_recovery_pending_started, pending_readiness_task, []}, 10_000
+    assert is_pid(pending_readiness_task)
 
     down_recovery_entry = :sys.get_state(coordinator).adapters[key]
     assert down_recovery_entry.circuit == :open
     assert down_recovery_entry.failures == 3
 
-    assert {:error,
-            {:launch_refused,
-             %{code: "temporary_refusal", message: "The launch refusal remains visible"}}} =
-             Task.await(
-               Task.async(fn ->
-                 AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
-               end)
-             )
+    # Freeze the coordinator and cancel this intentionally held attempt's
+    # readiness deadline before queuing the credential reset. The reset then
+    # replaces the pending preflight in mailbox order, without racing a timer.
+    :ok = :sys.suspend(coordinator)
+    request =
+      try do
+        refusal_entry = :sys.get_state(coordinator).adapters[key]
+        assert refusal_entry.readiness_task == pending_readiness_task
+        remaining_timeout = Process.cancel_timer(refusal_entry.readiness_timer)
+        assert is_integer(remaining_timeout) and remaining_timeout > 0
+
+        :gen_server.send_request(
+          coordinator,
+          {:adapter_for, key, [credential_kind: :subscription]}
+        )
+      after
+        :sys.resume(coordinator)
+      end
+
+    assert {:reply,
+            {:error,
+             {:launch_refused,
+              %{code: "temporary_refusal", message: "The launch refusal remains visible"}}}} =
+             :gen_server.wait_response(request, 10_000)
+
+    assert_receive {:automatic_recovery_refusal_started, refusal_readiness_task,
+                    [credential_kind: :subscription]}, 10_000
+
+    assert is_pid(refusal_readiness_task)
 
     # The next automatic attempt proves the explicit refusal re-armed restart.
 
