@@ -4816,7 +4816,9 @@ defmodule Tightbeam.Assignments do
         )
 
     review_refs =
-      if review_pending?, do: nil, else: completion_review_commit_refs_in_txn(txn, review)
+      if review_pending?,
+        do: nil,
+        else: completion_review_commit_refs_in_txn(txn, review, assignment.holderKey)
 
     review_covers_producer_commits? =
       review_pending? or
@@ -4907,7 +4909,8 @@ defmodule Tightbeam.Assignments do
            review_state: "closed",
            review_assignment_id: review_id,
            commit_refs: nil
-         }
+         },
+         producer_holder
        ) do
     case Txn.q(
            txn,
@@ -4915,16 +4918,19 @@ defmodule Tightbeam.Assignments do
            SELECT commitRefs
            FROM assignment_commit_ref_corrections
            WHERE assignmentId=?1 AND verifiedAt IS NOT NULL
+             AND NOT (actorKind='session' AND actorRef=?2)
            """,
-           [review_id]
+           [review_id, producer_holder]
          ) do
       [[encoded_refs]] -> JSON.decode!(encoded_refs)
       [] -> nil
     end
   end
 
-  defp completion_review_commit_refs_in_txn(_txn, %{commit_refs: review_refs}), do: review_refs
-  defp completion_review_commit_refs_in_txn(_txn, _review), do: nil
+  defp completion_review_commit_refs_in_txn(_txn, %{commit_refs: review_refs}, _producer_holder),
+    do: review_refs
+
+  defp completion_review_commit_refs_in_txn(_txn, _review, _producer_holder), do: nil
 
   defp review_covers_commit_refs?(_review_refs, nil), do: true
   defp review_covers_commit_refs?(_review_refs, []), do: true
