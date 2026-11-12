@@ -54,6 +54,10 @@ Classify the promised effect when assigning, not the holder's role:
 | `review` | Independent judgment linked with `--reviews` to its producer |
 | `release` / `live_mutation` | The specifically authorized release or live change |
 
+Do not invent a dummy code review to close a consultation. Classify the whole
+assigned output truthfully. Do not relabel historical policy or code work as
+coordination merely to close it; route the actual mismatch to its owner.
+
 Use `dispatch` for ordinary work. Linked review uses `assign --reviews
 <producerAssignment>` and a wake carrying the new assignment. Do not use
 `--reviews` merely to mean successor. Keep PO consultations on the governing item,

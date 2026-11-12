@@ -210,7 +210,42 @@ defmodule Tightbeam.Dispatch do
          session_key,
          helper?
        ) do
-    {decision, to_close, to_consume} = Rules.decide(db, call)
+    case Assignments.attest_f14_precheck(db, call) do
+      {:refuse, error} ->
+        best_effort_denial(db, verb, origin, principal, session_key, error)
+        {:error, error}
+
+      {:proceed, attest_precheck} ->
+        dispatch_after_f14_precheck(
+          db,
+          handlers,
+          call,
+          verb,
+          origin,
+          principal,
+          session_key,
+          helper?,
+          attest_precheck
+        )
+    end
+  end
+
+  defp dispatch_after_f14_precheck(
+         db,
+         handlers,
+         call,
+         verb,
+         origin,
+         principal,
+         session_key,
+         helper?,
+         attest_precheck
+       ) do
+    {decision, to_close, to_consume} =
+      case attest_precheck do
+        {:f14_refusal, _error} -> Rules.decide_with_remedy_closures_after_terminal(db, call)
+        _ -> Rules.decide(db, call)
+      end
 
     decision =
       if helper? do
@@ -225,9 +260,30 @@ defmodule Tightbeam.Dispatch do
         decision
       end
 
+    decision =
+      case attest_precheck do
+        {:f14_refusal, error} -> {:f14_refusal, error}
+        _ -> decision
+      end
+
     Enum.each(to_close, &close(db, &1))
 
     case decision do
+      {:f14_refusal, _error} ->
+        # The rule fold has already run once and its closure effects have been
+        # applied. Carry the cached F14 result through the normal handler path
+        # so the denial notice retains the original call references.
+        dispatch_to_handler(
+          db,
+          handlers,
+          call,
+          verb,
+          origin,
+          principal,
+          session_key,
+          attest_precheck
+        )
+
       {:deny, error} ->
         best_effort_denial(db, verb, origin, principal, session_key, error)
         {:error, error}
@@ -235,25 +291,9 @@ defmodule Tightbeam.Dispatch do
       {:remedy, statute, ref, error} ->
         outcome = RailRemedy.fire(db, handlers, statute, ref, call)
 
-        if statute.name == "completion-requires-review" and verb == "attest" and
-             call.params[:kind] == "completion" and review_notice_routed?(outcome) do
-          # A missing review keeps the assignment open, but it does not erase
-          # the holder's completion report. The remedy's notice is stored
-          # before the handler records it.
-          dispatch_to_handler(
-            db,
-            handlers,
-            Map.put(call, :review_pending, true),
-            verb,
-            origin,
-            principal,
-            session_key
-          )
-        else
-          error = remedy_error(error, outcome)
-          best_effort_denial(db, verb, origin, principal, session_key, error)
-          {:error, error}
-        end
+        error = remedy_error(error, outcome)
+        best_effort_denial(db, verb, origin, principal, session_key, error)
+        {:error, error}
 
       {:escalate, statute, ctx, dr_id} ->
         outcome =
@@ -282,7 +322,16 @@ defmodule Tightbeam.Dispatch do
 
         case Enum.find(consumed, fn {_id, won?} -> not won? end) do
           nil ->
-            dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key)
+            dispatch_to_handler(
+              db,
+              handlers,
+              call,
+              verb,
+              origin,
+              principal,
+              session_key,
+              attest_precheck
+            )
 
           {lost_id, false} ->
             error = %{
@@ -320,7 +369,16 @@ defmodule Tightbeam.Dispatch do
   def close_rule_effects(db, _handlers, effects),
     do: Enum.each(effects, &close(db, &1))
 
-  defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
+  defp dispatch_to_handler(
+         db,
+         handlers,
+         call,
+         verb,
+         origin,
+         principal,
+         session_key,
+         attest_precheck
+       ) do
     call =
       if verb in ["identity-edit", "identity-relearn", "learn", "unlearn", "kungfu-scaffold"] do
         Map.put_new_lazy(call, :invocation_id, fn ->
@@ -360,6 +418,11 @@ defmodule Tightbeam.Dispatch do
           case verb do
             verb when verb in ["assign", "dispatch"] ->
               Map.put(publisher_call, :accepted_event_in_txn, true)
+
+            "attest" when attest_precheck != :not_applicable ->
+              # Carry checked admission data only after Rules.decide so rule facts and
+              # publisher capture see the original call; Assignments consumes the key.
+              Map.put(publisher_call, :attest_f14_precheck, attest_precheck)
 
             "condition" ->
               Map.put(publisher_call, :firehose_effect_requested, true)
@@ -841,17 +904,6 @@ defmodule Tightbeam.Dispatch do
     params[:assignment_id] || params["assignment_id"] || params[:reviews_assignment_id] ||
       params["reviews_assignment_id"] || params[:work_item_id] || params["work_item_id"]
   end
-
-  defp review_notice_routed?(%{outcome: outcome, producer_id: producer_id})
-       when outcome in [
-              "notice-stored",
-              "claimed-dispatched",
-              "recurrence-suppressed",
-              "notification-stopped"
-            ] and is_binary(producer_id),
-       do: true
-
-  defp review_notice_routed?(_outcome), do: false
 
   defp remedy_error(error, %{denial: denial}) do
     error

@@ -1,0 +1,47 @@
+[[rule]]
+name = "promotion-close-requires-spec-artifact"
+verb = "harness-health-close-promotion"
+edges = ["verb"]
+effect = "deny"
+text = "the cited specification artifact must have kind spec"
+deny_when = [{ fact = "call.spec_artifact.kind", op = "ne", value = "spec" }]
+
+[[rule]]
+name = "promotion-close-requires-report-artifact"
+verb = "harness-health-close-promotion"
+edges = ["verb"]
+effect = "deny"
+text = "the cited review artifact must have kind report"
+deny_when = [{ fact = "call.review_artifact.kind", op = "ne", value = "report" }]
+
+[[rule]]
+name = "promotion-close-requires-clean-verdict"
+verb = "harness-health-close-promotion"
+edges = ["verb"]
+effect = "deny"
+text = "the cited review attest must conclude reviewed-clean"
+deny_when = [{ fact = "call.review_attest.verdict_kind", op = "ne", value = "reviewed-clean" }]
+
+[[rule]]
+name = "promotion-close-requires-bound-spec"
+verb = "harness-health-close-promotion"
+edges = ["verb"]
+effect = "deny"
+text = "the cited specification path and digest must equal its work item binding"
+deny_when = [{ fact = "call.spec_artifact.matches_work_item_spec_binding", op = "eq", value = false }]
+
+[[rule]]
+name = "promotion-close-requires-candidate-ref"
+verb = "harness-health-close-promotion"
+edges = ["verb"]
+effect = "deny"
+text = "the cited review attest must contain the candidate commit"
+deny_when = [{ fact = "call.review_attest.commit_refs_contains_candidate", op = "eq", value = false }]
+
+[[rule]]
+name = "promotion-close-requires-full-candidate"
+verb = "harness-health-close-promotion"
+edges = ["verb"]
+effect = "deny"
+text = "the candidate must be a full lowercase forty-digit commit"
+deny_when = [{ fact = "call.candidate_commit", op = "matches", value = "\\A(?![0-9a-f]{40}\\z)" }]

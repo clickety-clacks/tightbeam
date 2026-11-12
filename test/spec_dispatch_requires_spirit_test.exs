@@ -98,7 +98,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     assert assignment.subject == "prepare the bounded implementation"
   end
 
-  test "policy dispatch to an existing spec author opens each assignment with a rumination warning",
+  test "policy dispatch to an existing spec author opens each assignment without compiled rumination",
        ctx do
     item = work_item(ctx)
     spec_author = session(ctx.db, "spec-author", "spec-writer")
@@ -115,8 +115,6 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     assert {:ok,
             %{
               id: first_assignment_id,
-              rumination_required: true,
-              rumination_status: :scheduled,
               workItemId: work_item_id
             }} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
@@ -125,8 +123,6 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     assert {:ok,
             %{
               id: second_assignment_id,
-              rumination_required: true,
-              rumination_status: :pending,
               workItemId: ^work_item_id
             }} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
@@ -146,7 +142,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
                )
     end
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                """
@@ -350,7 +346,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
   end
 
   defp dispatch_after_rumination(ctx, call) do
-    assert {:ok, %{id: assignment_id, rumination_required: true}} =
+    assert {:ok, %{id: assignment_id}} =
              result = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
     assert {:ok, []} =

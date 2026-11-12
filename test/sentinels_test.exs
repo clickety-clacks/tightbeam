@@ -1,7 +1,19 @@
 defmodule Tightbeam.SentinelsTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway, Identity, Ledger, Model, Org, Placement, Projection, Schema}
+  alias Tightbeam.{
+    DB,
+    Gateway,
+    Identity,
+    Ledger,
+    Model,
+    Org,
+    Placement,
+    Projection,
+    Roles,
+    Rules,
+    Schema
+  }
   alias Tightbeam.{SentinelSupervisor, Sentinels}
   alias Tightbeam.Wakes
 
@@ -535,26 +547,26 @@ defmodule Tightbeam.SentinelsTest do
     end
 
     test "repeated fast exits stop the sentinel and wake its enabler once", ctx do
-      Org.create(ctx.db, %{
-        session_key: Org.personal_session_key("flynn"),
-        kind: "main",
-        display_name: "Flynn",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "default",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
+      enabler =
+        Org.create(ctx.db, %{
+          session_key: "sentinel-enabler",
+          kind: "custom",
+          display_name: "Sentinel enabler",
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "default",
+          host: "testhost",
+          harness: "claude",
+          provider: "anthropic",
+          model: Model.new("fable")
+        })
 
-      owner_session = Org.personal_session_key("flynn")
-      busy_turn = start_busy_turn(ctx.db, owner_session)
+      busy_turn = start_busy_turn(ctx.db, enabler.session_key)
 
       File.write!(Path.join(ctx.bundles, "alpha-bundle/sentinels/watch"), "#!/bin/sh\nexit 3\n")
       learn_both!(ctx)
       set_settings!(ctx, "alpha-bundle/watch", %{"WATCH_TARGET" => "a", "WATCH_EXTRA" => "b"})
-      enable!(ctx, "alpha-bundle/watch")
+      enable!(ctx, "alpha-bundle/watch", "agent:#{enabler.session_key}")
 
       supervisor = start_supervisor!(ctx, backoff_unit_ms: 1)
 
@@ -578,7 +590,7 @@ defmodule Tightbeam.SentinelsTest do
         DB.query(ctx.db, "SELECT sessionKey,origin,prompt,obligationRef,state FROM wakes")
 
       assert [[session_key, "process:tightbeam", prompt, obligation_ref, "pending"]] = wakes
-      assert session_key == Org.personal_session_key("flynn")
+      assert session_key == enabler.session_key
       assert prompt =~ "Sentinel alpha-bundle/watch on #{ctx.host} is stopped"
       assert prompt =~ "tightbeam sentinel enable alpha-bundle/watch"
       assert obligation_ref == Wakes.sentinel_stop_notice_ref(ctx.host, "alpha-bundle/watch")
@@ -629,6 +641,176 @@ defmodule Tightbeam.SentinelsTest do
                )
 
       # Children that exit at once never take the supervisor down with them.
+      assert Process.alive?(supervisor)
+    end
+
+    test "the stop is recorded without a notice when its audience family is unavailable", ctx do
+      File.write!(Path.join(ctx.bundles, "alpha-bundle/sentinels/watch"), "#!/bin/sh\nexit 3\n")
+      learn_both!(ctx)
+      set_settings!(ctx, "alpha-bundle/watch", %{"WATCH_TARGET" => "a", "WATCH_EXTRA" => "b"})
+
+      unavailable_families = [
+        {"absent", nil},
+        {"invalid", """
+        [[reaction]]
+        name = "notice-audience"
+        family = "notice-audience"
+        settings = { recipients = ["main"] }
+        english = "Choose a notice recipient."
+        """},
+        {"ambiguous", """
+        [[reaction]]
+        name = "notice-audience-one"
+        family = "notice-audience"
+        settings = { recipients = ["owner"] }
+        english = "Choose a notice recipient."
+
+        [[reaction]]
+        name = "notice-audience-two"
+        family = "notice-audience"
+        settings = { recipients = ["owner"] }
+        english = "Choose a notice recipient."
+        """}
+      ]
+
+      for {label, contents} <- unavailable_families do
+        load_notice_audience!(ctx, contents)
+        enable!(ctx, "alpha-bundle/watch")
+        supervisor = start_temporary_supervisor!(ctx, label)
+
+        assert wait_until(fn ->
+                 state = Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"]
+                 match?(%{state: "stopped"}, state)
+               end),
+               "#{label} audience must not prevent the sentinel stop"
+
+        state = Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"]
+        assert state.reason =~ "exited 5 times in a row"
+
+        assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+        GenServer.stop(supervisor)
+      end
+    end
+
+    test "an agent-role enabler reaches its owner without fallback settings", ctx do
+      File.write!(Path.join(ctx.bundles, "alpha-bundle/sentinels/watch"), "#!/bin/sh\nexit 3\n")
+      learn_both!(ctx)
+      set_settings!(ctx, "alpha-bundle/watch", %{"WATCH_TARGET" => "a", "WATCH_EXTRA" => "b"})
+
+      main =
+        Org.create(ctx.db, %{
+          session_key: Org.personal_session_key("flynn"),
+          kind: "main",
+          display_name: "Flynn",
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "default",
+          host: "testhost",
+          harness: "claude",
+          provider: "anthropic",
+          model: Model.new("fable")
+        })
+
+      Roles.create!(ctx.db, "sentinel-enabler-role", "flynn", nil)
+
+      load_rules_without_role_fallback!(ctx)
+
+      enable!(ctx, "alpha-bundle/watch", "agent:sentinel-enabler-role")
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          supervisor = start_temporary_supervisor!(ctx, "role-fallback-unavailable")
+
+          assert wait_until(fn ->
+                   match?(
+                     %{state: "stopped"},
+                     Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"]
+                   )
+                 end)
+
+          obligation_ref = Wakes.sentinel_stop_notice_ref(ctx.host, "alpha-bundle/watch")
+
+          assert wait_until(fn ->
+                   match?(
+                     {:ok, [[_session_key, "process:tightbeam", _prompt, _ref, "pending"]]},
+                     DB.query(
+                       ctx.db,
+                       "SELECT sessionKey,origin,prompt,obligationRef,state FROM wakes WHERE obligationRef=?1",
+                       [obligation_ref]
+                     )
+                   )
+                 end),
+                 "the stopped sentinel notice should use the role owner's personal session"
+
+          assert {:ok, [[session_key, "process:tightbeam", prompt, ^obligation_ref, "pending"]]} =
+                   DB.query(
+                     ctx.db,
+                     "SELECT sessionKey,origin,prompt,obligationRef,state FROM wakes WHERE obligationRef=?1",
+                     [obligation_ref]
+                   )
+
+          assert session_key == main.session_key
+          assert prompt =~ "Sentinel alpha-bundle/watch on #{ctx.host} is stopped"
+          :sys.get_state(supervisor)
+        end)
+
+      refute log =~ "no principal to wake"
+      assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+    end
+
+    test "an agent-role enabler reaches its owner's personal session with fallback settings", ctx do
+      File.write!(Path.join(ctx.bundles, "alpha-bundle/sentinels/watch"), "#!/bin/sh\nexit 3\n")
+      learn_both!(ctx)
+      set_settings!(ctx, "alpha-bundle/watch", %{"WATCH_TARGET" => "a", "WATCH_EXTRA" => "b"})
+
+      main =
+        Org.create(ctx.db, %{
+          session_key: Org.personal_session_key("flynn"),
+          kind: "main",
+          display_name: "Flynn",
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "default",
+          host: "testhost",
+          harness: "claude",
+          provider: "anthropic",
+          model: Model.new("fable")
+        })
+
+      Roles.create!(ctx.db, "sentinel-enabler-role", "flynn", nil)
+      enable!(ctx, "alpha-bundle/watch", "agent:sentinel-enabler-role")
+      supervisor = start_temporary_supervisor!(ctx, "role-fallback-available")
+
+      assert wait_until(fn ->
+               match?(
+                 %{state: "stopped"},
+                 Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"]
+               )
+             end)
+
+      obligation_ref = Wakes.sentinel_stop_notice_ref(ctx.host, "alpha-bundle/watch")
+
+      assert wait_until(fn ->
+               match?(
+                 {:ok, [[_session_key, "process:tightbeam", _prompt, _obligation_ref, "pending"]]},
+                 DB.query(
+                   ctx.db,
+                   "SELECT sessionKey,origin,prompt,obligationRef,state FROM wakes WHERE obligationRef=?1",
+                   [obligation_ref]
+                 )
+               )
+             end),
+             "the stopped sentinel notice should be scheduled"
+
+      assert {:ok, [[session_key, "process:tightbeam", prompt, ^obligation_ref, "pending"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT sessionKey,origin,prompt,obligationRef,state FROM wakes WHERE obligationRef=?1",
+                 [obligation_ref]
+               )
+
+      assert session_key == main.session_key
+      assert prompt =~ "Sentinel alpha-bundle/watch on #{ctx.host} is stopped"
       assert Process.alive?(supervisor)
     end
   end
@@ -713,9 +895,29 @@ defmodule Tightbeam.SentinelsTest do
     end
   end
 
-  defp enable!(ctx, qualified) do
+  defp enable!(ctx, qualified, principal \\ "user:flynn") do
     {:ok, sentinel} = Sentinels.resolve(ctx.base, qualified)
-    {:ok, %{state: "enabled"}} = Sentinels.enable(ctx.db, ctx.host, sentinel, "user:flynn")
+    {:ok, %{state: "enabled"}} = Sentinels.enable(ctx.db, ctx.host, sentinel, principal)
+  end
+
+  defp load_notice_audience!(ctx, contents) do
+    rules_dir = Path.join(ctx.base, "identity/rules")
+    File.rm_rf!(rules_dir)
+    File.mkdir_p!(rules_dir)
+
+    if contents, do: File.write!(Path.join(rules_dir, "audience.toml"), contents)
+
+    Rules.load!(ctx.base, [])
+  end
+
+  defp load_rules_without_role_fallback!(ctx) do
+    rules_dir = Path.join(ctx.base, "identity/rules")
+    File.rm_rf!(rules_dir)
+    File.mkdir_p!(rules_dir)
+
+    substrate_source = Path.join(__DIR__, "fixtures/role-fallback-unavailable.toml")
+    File.cp!(substrate_source, Path.join(rules_dir, "substrate.toml"))
+    Rules.load!(ctx.base, [])
   end
 
   defp start_busy_turn(db, session_key) do
@@ -741,15 +943,29 @@ defmodule Tightbeam.SentinelsTest do
 
   defp start_supervisor!(ctx, opts \\ []) do
     start_supervised!(
-      {SentinelSupervisor,
-       [
-         db: ctx.db,
-         base_dir: ctx.base,
-         cli_bin: "/synthetic/cli/bin/tightbeam",
-         host: ctx.host,
-         name: :"sentinel_supervisor_#{System.unique_integer([:positive])}"
-       ] ++ opts}
+      sentinel_supervisor_spec(ctx, opts)
     )
+  end
+
+  defp start_temporary_supervisor!(ctx, id) do
+    child_spec =
+      Supervisor.child_spec(sentinel_supervisor_spec(ctx, []),
+        id: {SentinelSupervisor, id},
+        restart: :temporary
+      )
+
+    start_supervised!(child_spec)
+  end
+
+  defp sentinel_supervisor_spec(ctx, opts) do
+    {SentinelSupervisor,
+     [
+       db: ctx.db,
+       base_dir: ctx.base,
+       cli_bin: "/synthetic/cli/bin/tightbeam",
+       host: ctx.host,
+       name: :"sentinel_supervisor_#{System.unique_integer([:positive])}"
+     ] ++ opts}
   end
 
   # Check-side wait: how long to watch for an effect, never a setup budget.

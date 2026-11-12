@@ -92,7 +92,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
   end
 
-  defp reviewed_clean_assignment(ctx) do
+  defp unverified_assignment(ctx) do
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
         principal: {:user, "flynn"},
@@ -106,19 +106,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
         reviews_assignment_id: work.id
       )
 
-    assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               attest_call(ctx.reviewer.session_key, review.id, "verdict", "reviewed-clean")
-             )
-
-    # The review's own document. A verdict row carries the DECISION; the note
-    # field caps at 2000 characters, so the clause table and evidence — the
-    # reasoning that makes the decision reviewable — live in an artifact. The
-    # school requires it of reviewers exactly as it does of coders, so the
-    # papertrail fixture records one rather than modelling a reviewer that
-    # drops its own analysis.
+    # Keep the independent review unfiled so neither verification arm is
+    # satisfied. Its report lets the review itself complete later.
     Artifacts.record(ctx.db, %{
       principal: {:session, ctx.reviewer.session_key},
       session_key: ctx.reviewer.session_key,
@@ -134,9 +123,119 @@ defmodule Tightbeam.VerificationPapertrailTest do
     %{item: item, work: work, review: review}
   end
 
+  test "completion remedies still precede blocked verdict and review-placement refusals", ctx do
+    learn_engineering_rules!(ctx)
+    work = assign(ctx, ctx.holder.session_key, nil, "blocked producer")
+
+    assert {:ok, %{attest: _}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               attest_call(ctx.holder.session_key, work.id, "verdict", "blocked")
+             )
+
+    assert {:error, %{reason: "remedy_fired", rule: @verification_rule}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               attest_call(ctx.holder.session_key, work.id, "completion")
+             )
+
+    assert %{status: "live"} = RailRemedy.episode(ctx.db, @verification_rule, work.id)
+
+    review =
+      assign(ctx, ctx.reviewer.session_key, nil, "review placement",
+        reviews_assignment_id: work.id
+      )
+
+    completion =
+      attest_call(ctx.reviewer.session_key, review.id, "completion")
+      |> put_in([:params, :commit_refs], commit_refs())
+
+    assert {:error, %{reason: "remedy_fired", rule: @artifact_rule}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert %{status: "live"} = RailRemedy.episode(ctx.db, @artifact_rule, review.id)
+  end
+
+  test "refused citation and receipt verdicts retain earlier remedy closures", ctx do
+    learn_engineering_rules!(ctx)
+
+    for rule <- [@verification_rule, @artifact_rule], kind <- [:citation, :receipt] do
+      item =
+        WorkItems.__handle__(ctx.db, "work-item-create", %{
+          principal: {:user, "flynn"},
+          params: %{title: "refused verdict closure #{rule} #{kind}", is_bug: false}
+        })
+
+      work = assign(ctx, ctx.holder.session_key, item.id, "refused verdict closure")
+
+      if rule == @artifact_rule do
+        assert {:ok, %{attest: _}} =
+                 Dispatch.dispatch(
+                   ctx.db,
+                   ctx.handlers,
+                   attest_call(ctx.holder.session_key, work.id, "verdict", "verified")
+                 )
+      end
+
+      assert {:error, %{reason: "remedy_fired", rule: ^rule}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 attest_call(ctx.holder.session_key, work.id, "completion")
+               )
+
+      assert %{status: "live"} = RailRemedy.episode(ctx.db, rule, work.id)
+
+      {candidate, refusal} =
+        case kind do
+          :citation ->
+            record_report_artifact(ctx, item.id, ctx.holder.session_key)
+            digest = String.duplicate("a", 64)
+
+            assert {:ok, [[artifact_id]]} =
+                     DB.query(ctx.db, "SELECT artifactId FROM artifacts WHERE workItemId=?1", [
+                       item.id
+                     ])
+
+            assert {:ok, _} =
+                     DB.query(ctx.db, "UPDATE artifacts SET contentSha256=?1 WHERE artifactId=?2", [
+                       digest,
+                       artifact_id
+                     ])
+
+            call = attest_call(ctx.holder.session_key, work.id, "verdict", "verified")
+
+            call = %{
+              call
+              | params: Map.merge(call.params, %{artifact_id: artifact_id, content_sha256: digest})
+            }
+
+            {call, "artifact-citation-requires-own-producer"}
+
+          :receipt ->
+            # An open assignment cannot be a valid late-receipt target. The fork
+            # still closes its remedy before refusing this simultaneous linkage
+            # and format error; a valid closed target has no live episode left.
+            {attest_call(
+               ctx.holder.session_key,
+               work.id,
+               "verdict",
+               "ruling-consumed:dr_00000000-0000-4000-8000-000000000000"
+             ), "receipt-without-note-requires-one-ref"}
+        end
+
+      assert {:error, %{code: "rule_denied", rule: ^refusal}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, candidate)
+
+      assert %{status: "closed"} = RailRemedy.episode(ctx.db, rule, work.id)
+    end
+  end
+
   test "A1: each remedy wake names its own missing record, in sequence", ctx do
     learn_engineering_rules!(ctx)
-    %{work: work} = reviewed_clean_assignment(ctx)
+    %{work: work} = unverified_assignment(ctx)
     completion = attest_call(ctx.holder.session_key, work.id, "completion")
 
     # First denial: the verification verdict is missing.
@@ -218,7 +317,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
   test "A2: the complete papertrail passes and the episodes close", ctx do
     learn_engineering_rules!(ctx)
-    %{item: item, work: work, review: review} = reviewed_clean_assignment(ctx)
+    %{item: item, work: work, review: review} = unverified_assignment(ctx)
     completion = attest_call(ctx.holder.session_key, work.id, "completion")
 
     assert {:error, %{rule: @verification_rule}} =
@@ -246,8 +345,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
     assert %{status: "closed"} = RailRemedy.episode(ctx.db, @artifact_rule, work.id)
 
     # A review card is non-producing by construction, so its holder can close
-    # it without a review-of-the-review. The implementation-only verification
-    # and artifact statutes also stay out of scope.
+    # it without a review-of-the-review. Its recorded report satisfies the
+    # artifact statute; coder verification does not apply to this holder.
     assert {:ok, %{assignment: %{state: "closed"}}} =
              Dispatch.dispatch(
                ctx.db,
@@ -261,7 +360,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
   test "A3: back-to-back re-attempts rewake the live episode with no new episode", ctx do
     learn_engineering_rules!(ctx)
-    %{work: work} = reviewed_clean_assignment(ctx)
+    %{work: work} = unverified_assignment(ctx)
     completion = attest_call(ctx.holder.session_key, work.id, "completion")
 
     assert {:error, %{rule: @verification_rule}} =
@@ -393,7 +492,6 @@ defmodule Tightbeam.VerificationPapertrailTest do
     refute Enum.any?(loaded, &(&1.name == "wake-obligation-registration-authority"))
 
     expected = [
-      "completion-requires-review",
       @verification_rule,
       @artifact_rule
     ]

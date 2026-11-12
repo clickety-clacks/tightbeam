@@ -55,7 +55,7 @@ defmodule Tightbeam.HotQueryPlansTest do
     assert Enum.any?(count_plan, &String.contains?(&1, "assignments_reviews_assignment"))
 
     work_item_count_plan =
-      plan!(db, Rules.work_item_changes_requested_count_sql(), ["work-item"])
+      plan!(db, Rules.work_item_named_review_verdict_count_sql(), ["work-item", "changes-requested"])
 
     assert Enum.any?(
              work_item_count_plan,

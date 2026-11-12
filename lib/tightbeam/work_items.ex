@@ -132,7 +132,7 @@ defmodule Tightbeam.WorkItems do
                   )
 
                 id = "wi_" <> Tightbeam.Id.uuid4()
-                created_in_turn_seq = running_turn_seq(txn, created_by_session)
+                created_in_turn_seq = linked_turn_seq(txn, created_by_session)
                 priority = call.params[:priority] || default_priority_in_txn(txn)
                 created_at = now()
 
@@ -233,6 +233,61 @@ defmodule Tightbeam.WorkItems do
          ) do
       [[seq]] -> seq
       [] -> nil
+    end
+  end
+
+  defp linked_turn_seq(_txn, nil), do: nil
+
+  defp linked_turn_seq(txn, session_key) do
+    case running_turn_seq(txn, session_key) do
+      nil ->
+        nil
+
+      seq ->
+        case work_item_context_settings() do
+          {:ok, %{"link_current_turn" => true} = settings}
+          when map_size(settings) == 1 ->
+            seq
+
+          {:ok, %{"link_current_turn" => false} = settings}
+          when map_size(settings) == 1 ->
+            nil
+
+          :absent ->
+            nil
+
+          {:error, reason} when reason in [:ambiguous, :invalid] ->
+            Logger.warning(
+              "substrate settings family work-item-context is #{reason}; no turn link was chosen"
+            )
+
+            nil
+
+          {:ok, _settings} ->
+            Logger.warning(
+              "substrate settings family work-item-context is invalid; no turn link was chosen"
+            )
+
+            nil
+        end
+    end
+  end
+
+  defp work_item_context_settings do
+    case Rules.reaction_policy("work-item-context") do
+      nil ->
+        count =
+          Rules.effective_snapshot()
+          |> Map.get(:reactions, [])
+          |> Enum.count(&(&1.mode == :settings and &1.family == "work-item-context"))
+
+        if count == 0, do: :absent, else: {:error, :ambiguous}
+
+      %{settings: settings} when is_map(settings) ->
+        {:ok, settings}
+
+      _ ->
+        {:error, :invalid}
     end
   end
 
@@ -396,7 +451,7 @@ defmodule Tightbeam.WorkItems do
 
     with :ok <- valid_delivery_owner(txn, params) do
       id = "wi_" <> Tightbeam.Id.uuid4()
-      created_in_turn_seq = running_turn_seq(txn, created_by_session)
+      created_in_turn_seq = linked_turn_seq(txn, created_by_session)
       priority = params[:priority] || default_priority_in_txn(txn)
       is_bug = Map.get(params, :is_bug, false)
       created_at = now()

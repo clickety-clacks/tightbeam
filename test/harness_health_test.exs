@@ -1370,8 +1370,17 @@ defmodule Tightbeam.HarnessHealthTest do
                  })
              })
 
-    assert %{code: "invalid_promotion_close", message: "invalid_promotion_close"} =
-             handlers["harness-health-close-promotion"].(%{
+    root = Path.join(System.tmp_dir!(), "promotion-rules-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(Path.join(root, "identity/rules"))
+    File.cp!("priv/kungfu/agentic-engineering/rules/promotion-close.toml",
+      Path.join(root, "identity/rules/promotion.toml"))
+    Tightbeam.Rules.load!(root, ["harness-health-close-promotion"])
+    on_exit(fn -> File.rm_rf!(root); :persistent_term.erase(Tightbeam.Rules) end)
+
+    assert {:deny, %{code: "rule_denied", rule: "promotion-close-requires-bound-spec"}} =
+             Tightbeam.Rules.evaluate(ctx.db, %{
+               verb: "harness-health-close-promotion",
+               origin: "user:flynn",
                principal: {:user, "flynn"},
                params:
                  Map.merge(close_params, %{

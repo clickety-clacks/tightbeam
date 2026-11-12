@@ -22,6 +22,7 @@ defmodule Tightbeam.SentinelSupervisor do
   alias Tightbeam.Identity
   alias Tightbeam.Org
   alias Tightbeam.Placement
+  alias Tightbeam.Rules
   alias Tightbeam.Sentinels
   alias Tightbeam.Wakes
 
@@ -262,7 +263,7 @@ defmodule Tightbeam.SentinelSupervisor do
         "Its output is in #{Path.join([state.base_dir, "sentinels", qualified, "sentinel.log"])}. " <>
         "Run `tightbeam doctor` for its state; `tightbeam sentinel enable #{qualified}` restarts it."
 
-    case principal_session(state.db, enabled_by) do
+    case stop_notice_session(state.db, enabled_by) do
       {:ok, session_key} ->
         {:ok, _wake} =
           DB.transaction(state.db, fn txn ->
@@ -282,6 +283,54 @@ defmodule Tightbeam.SentinelSupervisor do
         Logger.error(
           "sentinel #{qualified} stop has no principal to wake (enabled by #{inspect(enabled_by)})"
         )
+
+      :suppressed ->
+        :ok
+
+      :unavailable ->
+        :ok
+    end
+  end
+
+  defp stop_notice_session(db, enabled_by) do
+    case notice_audience() do
+      ["owner"] -> principal_session(db, enabled_by)
+      [] -> :suppressed
+      :unavailable -> :unavailable
+    end
+  end
+
+  defp notice_audience do
+    case Rules.reaction_policy("notice-audience") do
+      nil ->
+        count =
+          Rules.effective_snapshot()
+          |> Map.get(:reactions, [])
+          |> Enum.count(&(&1.mode == :settings and &1.family == "notice-audience"))
+
+        if count == 0 do
+          :unavailable
+        else
+          Logger.warning("substrate settings family notice-audience is ambiguous")
+          :unavailable
+        end
+
+      %{settings: %{"recipients" => recipients} = settings}
+      when is_list(recipients) and length(recipients) <= 1 ->
+        if Map.keys(settings) == ["recipients"] and Enum.all?(recipients, &(&1 == "owner")) do
+          recipients
+        else
+          Logger.warning("substrate settings family notice-audience is invalid")
+          :unavailable
+        end
+
+      %{settings: _settings} ->
+        Logger.warning("substrate settings family notice-audience is invalid")
+        :unavailable
+
+      _ ->
+        Logger.warning("substrate settings family notice-audience is invalid")
+        :unavailable
     end
   end
 

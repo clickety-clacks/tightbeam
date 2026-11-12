@@ -12,6 +12,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     Org,
     Projection,
     Roles,
+    Rules,
     Wakes
   }
 
@@ -109,6 +110,96 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE sessionKey IN ('agent:product-a','agent:product-b','agent:unrelated')"
              )
+  end
+
+  test "a missing notice audience family schedules no refresh notice", ctx do
+    rules_base =
+      Path.join(System.tmp_dir!(), "oauth-no-audience-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(rules_base, "identity/rules"))
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+    Rules.load!(rules_base, [])
+
+    start_credentials!(ctx)
+    scheduler = start_real_scheduler!(ctx)
+    onboard = onboard_handler(ctx, scheduler)
+    lease_id = begin_and_stage!(onboard, "anthropic", "subscription")
+
+    assert %{provider: :anthropic, credential_kind: "subscription", status: "onboarded"} =
+             finish(onboard, "anthropic", lease_id, "subscription")
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  test "an empty notice audience does not schedule a refresh notice", ctx do
+    rules_base =
+      Path.join(
+        System.tmp_dir!(),
+        "oauth-empty-audience-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(rules_base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    on_exit(fn -> File.rm_rf!(rules_base) end)
+
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+    seed = String.replace(seed, "recipients = [\"owner\"]", "recipients = []")
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    Rules.load!(rules_base, [])
+
+    start_credentials!(ctx)
+    scheduler = start_real_scheduler!(ctx)
+    onboard = onboard_handler(ctx, scheduler)
+    lease_id = begin_and_stage!(onboard, "anthropic", "subscription")
+
+    assert %{provider: :anthropic, credential_kind: "subscription", status: "onboarded"} =
+             finish(onboard, "anthropic", lease_id, "subscription")
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  test "invalid and ambiguous notice audiences suppress refresh notices", ctx do
+    start_credentials!(ctx)
+    scheduler = start_real_scheduler!(ctx)
+    onboard = onboard_handler(ctx, scheduler)
+
+    cases = [
+      {"invalid", """
+       [[reaction]]
+       name = "notice-audience"
+       family = "notice-audience"
+       settings = { recipients = ["main"] }
+       english = "Choose a notice recipient."
+       """, "openai"},
+      {"ambiguous", """
+       [[reaction]]
+       name = "notice-audience-one"
+       family = "notice-audience"
+       settings = { recipients = ["owner"] }
+       english = "Choose a notice recipient."
+
+       [[reaction]]
+       name = "notice-audience-two"
+       family = "notice-audience"
+       settings = { recipients = ["owner"] }
+       english = "Choose a notice recipient."
+       """, "anthropic"}
+    ]
+
+    for {label, contents, provider} <- cases do
+      rules_base =
+        Path.join(System.tmp_dir!(), "oauth-#{label}-audience-#{System.unique_integer([:positive])}")
+
+      rules_dir = Path.join(rules_base, "identity/rules")
+      File.mkdir_p!(rules_dir)
+      File.write!(Path.join(rules_dir, "audience.toml"), contents)
+      on_exit(fn -> File.rm_rf!(rules_base) end)
+      Rules.load!(rules_base, [])
+
+      lease_id = begin_and_stage!(onboard, provider, "subscription")
+      assert %{status: "onboarded"} = finish(onboard, provider, lease_id, "subscription")
+      assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+    end
   end
 
   test "OpenAI subscription finish targets the authenticated session owner's canonical Main",

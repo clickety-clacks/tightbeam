@@ -49,7 +49,8 @@ defmodule Tightbeam.StateResources do
   FROM turns AS t
   """
 
-  @assignment_select """
+  defp assignment_select do
+    """
   SELECT a.id, a.subject, a.holderKey, a.holderRole, a.holderFallback,
          a.openedByUser, a.openedBySession, a.openedAt, a.state, a.outcome,
          a.closedAt, a.closedByUser, a.closedBySession, a.closedByProcess, a.closingAttestId,
@@ -66,17 +67,10 @@ defmodule Tightbeam.StateResources do
            )),
            '[]'
          ),
-         COALESCE(
-           (SELECT effectKind FROM assignment_effects WHERE assignmentId = a.id),
-           CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END
-         ),
+         #{Tightbeam.Assignments.effect_kind_sql("a")},
          CASE
            WHEN a.state = 'closed' AND a.outcome IN ('surrendered','revoked') THEN 'abandoned'
-           WHEN a.state = 'closed' AND a.outcome = 'completed' AND EXISTS (
-             SELECT 1 FROM attests AS verdict
-             WHERE verdict.assignmentId = a.id AND verdict.kind = 'verdict'
-               AND verdict.verdictKind = 'verified'
-           ) THEN 'verified'
+           #{Tightbeam.WorkState.verdict_status_cases()}
            WHEN a.state = 'closed' AND a.outcome = 'completed' THEN 'claims-done'
            WHEN a.state = 'open' AND (
              SELECT state FROM sessions WHERE sessionKey = a.holderKey
@@ -89,6 +83,8 @@ defmodule Tightbeam.StateResources do
   FROM assignments AS a
   LEFT JOIN work_items AS wi ON wi.id = a.workItemId
   """
+
+  end
 
   @assignment_probe_from """
   assignments AS a
@@ -638,7 +634,7 @@ defmodule Tightbeam.StateResources do
     case observed_query(
            db,
            principal,
-           @assignment_select <> " WHERE a.id = ? AND (" <> visibility <> ")",
+           assignment_select() <> " WHERE a.id = ? AND (" <> visibility <> ")",
            [id | visibility_params]
          ) do
       [row] -> assignment_query_row(row)
@@ -656,7 +652,7 @@ defmodule Tightbeam.StateResources do
 
       Keyset.page(
         query,
-        @assignment_select,
+        assignment_select(),
         @assignment_probe_from,
         where,
         params,

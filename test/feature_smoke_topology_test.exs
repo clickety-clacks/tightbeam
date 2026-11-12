@@ -47,10 +47,25 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
           {"support/fixtures/feature_smoke_topology.toml", "topology.toml"},
           {"support/fixtures/feature_smoke_engineering.toml", "engineering.toml"},
           {"support/fixtures/feature_smoke_verification.toml", "verification.toml"},
-          {"../priv/kungfu/agentic-engineering/rules/delivery.toml", "delivery.toml"}
+          {"../priv/kungfu/agentic-engineering/rules/delivery.toml", "delivery.toml"},
+          {"../priv/kungfu/agentic-engineering/rules/dispatch-rumination.toml",
+           "dispatch-rumination.toml"},
+          {"../priv/kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml",
+           "row-reaction-assignment-inactivity.toml"}
         ] do
       File.cp!(Path.expand(source, __DIR__), Path.join(base, "identity/rules/#{name}"))
     end
+
+    [notice_delivery] =
+      Path.expand("../priv/seed/rules/substrate.toml", __DIR__)
+      |> File.read!()
+      |> String.split("[[reaction]]")
+      |> Enum.filter(&String.contains?(&1, ~s(family = "notice-delivery")))
+
+    File.write!(
+      Path.join(base, "identity/rules/notice-delivery.toml"),
+      "[[reaction]]" <> notice_delivery
+    )
 
     rules = Rules.load!(base, Map.keys(handlers))
     assert Enum.any?(rules, &(&1.name == "assign-worker-staffing-needs-topology"))
@@ -71,6 +86,23 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
       call.("work-item-update", %{
         "workItemId" => item,
         "deliveryOwnerSessionKey" => "coordinator"
+      })
+
+      # Satisfy the independent posture prerequisite so this negative control
+      # isolates the missing topology verdict in ordinary sorted rule order.
+      coordination =
+        call.("assign", %{
+          "sessionKey" => "coordinator",
+          "workItemId" => item,
+          "subject" => "fixture posture",
+          "effectKind" => "coordination"
+        })
+
+      call_as.("coordinator", "attest", %{
+        "assignmentId" => coordination["id"],
+        "kind" => "verdict",
+        "verdictKind" => "posture-light",
+        "note" => "Synthetic fixture with bounded assertions"
       })
 
       assert_refused(ctx, item)
@@ -121,7 +153,7 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
     assert_refused(ctx, other)
   end
 
-  test "effort parent keeps its identity, item, and advisory rumination for both dispatches",
+  test "effort parent keeps its identity, item, and one delivered advisory notice across dispatches",
        ctx do
     call = fn verb, params -> ok!(ctx, nil, verb, params) end
     call_as = fn key, verb, params -> ok!(ctx, key, verb, params) end
@@ -136,12 +168,17 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
       "parent"
     )
 
+    dispatched = call_as.("parent", "dispatch", staffing(wi))
+
     assert %{
              "id" => first_id,
              "workItemId" => ^wi,
-             "openedBySession" => "parent",
-             "ruminationRequired" => true
-           } = call_as.("parent", "dispatch", staffing(wi))
+             "openedBySession" => "parent"
+           } = dispatched
+
+    for field <- ~w(ruminationRequired ruminationStatus warning message) do
+      refute Map.has_key?(dispatched, field)
+    end
 
     assert {:ok, [[1, ^first_id]]} =
              DB.query(
@@ -161,18 +198,22 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
          db: ctx.db,
          name: nil,
          tick_ms: 60_000,
-         deliver: fn _ -> flunk("normal rumination used legacy callback") end}
+         deliver: fn _ -> flunk("normal notice used legacy callback") end}
       )
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.rumination_exists?(ctx.db, wi, "parent")
 
-    assert {:ok, [[source_id, prompt, "fired"]]} =
+    assert {:ok, [[source_id, prompt, "fired", "parent", ^first_id, 0]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId,prompt,state FROM wakes WHERE rumination=1 AND work_item_id=?1 AND creatorSessionKey='parent'",
+               "SELECT wakeId,prompt,state,sessionKey,assignmentId,rumination FROM wakes WHERE origin='remedy:dispatch-rumination' AND work_item_id=?1 AND creatorSessionKey='parent'",
                [wi]
              )
+
+    assert prompt ==
+             "digest: Ruminate on work-item #{wi} against the whole spec and its spirit. " <>
+               "Assignment #{first_id} has already been dispatched. " <>
+               "When you've thought it through, review the open assignment and adjust it if needed."
 
     assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
              Tightbeam.NoticeBatcher.source_refs(ctx.db, source_id)
@@ -198,6 +239,24 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
       assert assigned["workItemId"] == wi
       assert assigned["openedBySession"] == "parent"
     end
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[1, ^source_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*),MIN(wakeId) FROM wakes WHERE origin='remedy:dispatch-rumination' AND work_item_id=?1",
+               [wi]
+             )
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             Tightbeam.NoticeBatcher.source_refs(ctx.db, source_id)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source_id])
   end
 
   test "topology alone does not waive the real coder posture gate", ctx do

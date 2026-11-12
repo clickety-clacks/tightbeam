@@ -16,6 +16,7 @@ defmodule Tightbeam.Wire.RouterTest do
     Org,
     Placement,
     Roles,
+    Rules,
     Wakes,
     WorkItems,
     WorkState
@@ -3357,6 +3358,9 @@ defmodule Tightbeam.Wire.RouterTest do
     Roles.create!(ctx.db, "retired-role", "flynn", dead.session_key)
     Roles.create!(ctx.db, "caller-role", "flynn", caller.session_key)
     Org.retire(ctx.db, dead.session_key, "user:flynn", 1_000)
+    load_rules_without_role_fallback(ctx.db)
+    main_key = Org.personal_session_key("flynn")
+    assert {:ok, ^main_key, true} = Roles.resolve(ctx.db, "unbound-role")
 
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
 
@@ -3394,6 +3398,92 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert {:ok, [["live-holder", "live-role", 0]]} =
              DB.query(ctx.db, "SELECT holderKey, holderRole, holderFallback FROM assignments")
+  end
+
+  test "wake and ask retain inactive role targets when fallback settings are unavailable", ctx do
+    main_key = Org.personal_session_key("flynn")
+    create_session(ctx.db, main_key, "flynn")
+    caller = create_session(ctx.db, "role-fallback-caller", "flynn")
+    Roles.create!(ctx.db, "inactive-target", "flynn", nil)
+    load_rules_without_role_fallback(ctx.db)
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
+
+    wake =
+      dispatch_session(ctx, caller, %{
+        verb: "wake",
+        role: "inactive-target",
+        params: %{prompt: "wake inactive role"}
+      })
+
+    assert wake.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "wake",
+                      session_key: ^main_key,
+                      target_role: "inactive-target",
+                      role_fallback: true
+                    }}
+
+    assert {:ok, [[wake_id, ^main_key, "inactive-target", "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,sessionKey,targetRole,state FROM wakes WHERE targetRole=?1",
+               ["inactive-target"]
+             )
+
+    stored_wake = Wakes.get(ctx.db, wake_id)
+    assert stored_wake.session_key == main_key
+    assert stored_wake.target_role == "inactive-target"
+
+    assert {:ok, nil} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.delivery_target(txn, stored_wake.session_key, %{
+                 target_role: stored_wake.target_role
+               })
+             end)
+
+    ask =
+      dispatch_session(ctx, caller, %{
+        verb: "ask",
+        role: "inactive-target",
+        params: %{question: "ask inactive role"}
+      })
+
+    assert ask.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "ask",
+                      session_key: ^main_key,
+                      target_role: "inactive-target",
+                      role_fallback: true
+                    }}
+
+    assert {:ok, [[^main_key, "inactive-target"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT expecterSessionKey,askedOfRole FROM decision_requests WHERE kind='agent'"
+             )
+
+    holder = create_session(ctx.db, "role-fallback-successor", "flynn")
+    holder_session_key = holder.session_key
+    assert :ok = Roles.bind(ctx.db, "inactive-target", holder_session_key)
+
+    assert {:ok, {^holder_session_key, "inactive-target", false}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.delivery_target(txn, stored_wake.session_key, %{
+                 target_role: stored_wake.target_role
+               })
+             end)
+
+    assert {:ok, [[^wake_id, ^main_key, "inactive-target", "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,sessionKey,targetRole,state FROM wakes WHERE wakeId=?1",
+               [wake_id]
+             )
   end
 
   test "acting as a role requires its active binding", ctx do
@@ -4641,6 +4731,32 @@ defmodule Tightbeam.Wire.RouterTest do
   # when it assigns to a role, and the one the phantom specimens came in on.
   defp dispatch_session(ctx, session, body) do
     dispatch_cli(ctx, session.cli_token, body)
+  end
+
+  defp load_rules_without_role_fallback(db) do
+    root =
+      Path.join(System.tmp_dir!(), "role-target-rules-#{System.unique_integer([:positive])}")
+
+    rules_dir = Path.join(root, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    substrate_source = Path.join(__DIR__, "fixtures/role-fallback-unavailable.toml")
+    File.cp!(substrate_source, Path.join(rules_dir, "substrate.toml"))
+
+    inactivity_source =
+      Path.join([
+        :code.priv_dir(:tightbeam),
+        "kungfu/agentic-engineering/rules",
+        "row-reaction-assignment-inactivity.toml"
+      ])
+
+    File.cp!(
+      inactivity_source,
+      Path.join(rules_dir, "row-reaction-assignment-inactivity.toml")
+    )
+
+    Rules.load!(root, Map.keys(Gateway.handlers(%{db: db})))
+    on_exit(fn -> File.rm_rf!(root) end)
   end
 
   # The real handler table, each verb announcing its call before it runs. A mock

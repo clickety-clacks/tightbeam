@@ -18,6 +18,12 @@ defmodule Tightbeam.WorkStateTest do
     start_supervised!({ConnRegistry, name: ConnRegistry})
 
     :ok = Tightbeam.Schema.ensure_all(db)
+    root = Path.join(System.tmp_dir!(), "work-state-labels-#{System.unique_integer([:positive])}")
+    Tightbeam.TerminalReactionFixture.load!(root, Map.keys(Gateway.handlers(%{db: db})))
+    on_exit(fn ->
+      File.rm_rf!(root)
+      :persistent_term.erase(Tightbeam.Rules)
+    end)
 
     {:ok, _} =
       DB.query(

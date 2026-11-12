@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde_json::Value;
 
 use crate::attempt_diagnostic::command_context::CommandContext;
@@ -473,8 +474,25 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             work_item_id,
             content_sha256,
             content_base64,
+            content_file,
             produced_by_assignment_id,
         } => {
+            if content_base64.is_some() && content_file.is_some() {
+                return Err("choose either --content-base64 or --content-file".to_owned());
+            }
+
+            let content_base64 = match (content_base64, content_file) {
+                (Some(_), Some(_)) => unreachable!("conflict checked above"),
+                (Some(content), None) => Some(content.clone()),
+                (None, Some(path)) => {
+                    let bytes = fs::read(path).map_err(|error| {
+                        format!("cannot read --content-file '{}': {error}", path.display())
+                    })?;
+                    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+                }
+                (None, None) => None,
+            };
+
             let mut params = vec![
                 string_field("kind", kind),
                 string_field("title", title),
@@ -484,7 +502,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 ("description", description),
                 ("workItemId", work_item_id),
                 ("contentSha256", content_sha256),
-                ("contentBase64", content_base64),
+                ("contentBase64", &content_base64),
                 ("producedByAssignmentId", produced_by_assignment_id),
             ] {
                 if let Some(value) = value {
@@ -4347,6 +4365,8 @@ mod tests {
     }
     use crate::args;
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn parse(values: &[&str]) -> Command {
@@ -4355,6 +4375,92 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    fn temporary_file(label: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "tightbeam-artifact-content-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn artifact_record_reads_raw_file_bytes_into_the_existing_content_field() {
+        let bytes = [0x00, b'a', b'\n', 0xff, b'\r', b'\n'];
+        let path = temporary_file("binary", &bytes);
+        let path_text = path.to_string_lossy().into_owned();
+        let command = parse(&[
+            "artifact-record",
+            "--kind",
+            "report",
+            "--title",
+            "captured",
+            "--path",
+            "descriptive-origin.bin",
+            "--content-file",
+            &path_text,
+        ]);
+
+        let request = build_request(&command).unwrap();
+        let body: Value = serde_json::from_str(&request.body_json).unwrap();
+        assert_eq!(
+            body["params"]["contentBase64"],
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        assert_eq!(body["params"]["originPath"], "descriptive-origin.bin");
+        assert!(!request.body_json.contains(&path_text));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn artifact_record_reads_empty_file_and_refuses_unreadable_file_before_request_build() {
+        let empty = temporary_file("empty", b"");
+        let empty_text = empty.to_string_lossy().into_owned();
+        let command = parse(&[
+            "artifact-record",
+            "--kind",
+            "report",
+            "--title",
+            "empty",
+            "--path",
+            "empty.bin",
+            "--content-file",
+            &empty_text,
+        ]);
+        let body: Value =
+            serde_json::from_str(&build_request(&command).unwrap().body_json).unwrap();
+        assert_eq!(body["params"]["contentBase64"], "");
+        fs::remove_file(empty).unwrap();
+
+        let missing = std::env::temp_dir().join(format!(
+            "tightbeam-artifact-content-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let missing_text = missing.to_string_lossy().into_owned();
+        let command = parse(&[
+            "artifact-record",
+            "--kind",
+            "report",
+            "--title",
+            "missing",
+            "--path",
+            "missing.bin",
+            "--content-file",
+            &missing_text,
+        ]);
+        let error = build_request(&command).unwrap_err();
+        assert!(error.contains("cannot read --content-file"));
+        assert!(!error.contains("contentBase64"));
     }
 
     #[test]

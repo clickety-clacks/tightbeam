@@ -426,13 +426,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
       origin: "user:flynn",
       principal: {:user, "flynn"},
       session_key: nil,
-      params: %{title: "Exercise the rumination dispatch effect"}
+      params: %{title: "Exercise the linked dispatch effects"}
     }
 
     assert {:ok, work_item} = Dispatch.dispatch(db, handlers, work_item_create)
     _ = observed_classes()
 
-    rumination_dispatch = %{
+    linked_dispatch = %{
       verb: "dispatch",
       origin: "agent:effect-dispatcher",
       principal: {:session, "effect-dispatcher"},
@@ -440,20 +440,19 @@ defmodule Tightbeam.Firehose.PublisherTest do
       target_role: nil,
       role_fallback: false,
       params: %{
-        subject: "Effect rumination dispatch",
-        brief: "Exercise the committed internal wake path.",
+        subject: "Effect linked dispatch",
+        brief: "Exercise assignment opening and routing-wake cancellation.",
         work_item_id: work_item.id
       }
     }
 
-    assert {:ok, %{state: "open", rumination_required: true, work_item_id: work_item_id}} =
-             Dispatch.dispatch(db, handlers, rumination_dispatch)
+    assert {:ok, %{state: "open", workItemId: work_item_id}} =
+             Dispatch.dispatch(db, handlers, linked_dispatch)
 
     assert work_item_id == work_item.id
-    rumination_classes = observed_classes()
+    linked_dispatch_classes = observed_classes()
 
-    assert rumination_classes == [
-             "wake.scheduled",
+    assert linked_dispatch_classes == [
              "wake.canceled",
              "message.created",
              "session.updated",
@@ -462,23 +461,31 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "assignment.opened"
            ]
 
-    assert :ok = Wakes.fire_due(scheduler)
-    dispatch_delivery_effects = observed_state_classes()
+    # A busy recipient stages assignment delivery as an ordinary prompt wake.
+    # This is still a direct dispatch effect after automatic rumination is removed.
+    assert {:ok, busy_turn} = Ledger.claim_next(db, "effect-target", "lane:staged-dispatch")
+    _ = observed_classes()
+
+    assert {:ok, %{id: staged_assignment_id}} =
+             Dispatch.dispatch(db, handlers, %{dispatch | params: %{
+               subject: "Staged assignment delivery", brief: "Deliver when the recipient is ready."
+             }})
+
+    staged_dispatch_classes = observed_state_classes()
+    assert "wake.scheduled" in staged_dispatch_classes
+
+    assert {:ok, [["prompt", 0]]} =
+             DB.query(db,
+               "SELECT consumer,rumination FROM wakes WHERE assignmentId=?1 AND consumer='prompt'",
+               [staged_assignment_id])
 
     dispatch_events =
-      dispatch_observed ++ state_classes(rumination_classes) ++ dispatch_delivery_effects
+      dispatch_observed ++ state_classes(linked_dispatch_classes) ++ staged_dispatch_classes
 
-    # The rumination's asynchronous wake delivery has its own wake.fired event;
-    # the dispatch handler's declared effects describe its direct commit effects.
-    assert "wake.fired" in dispatch_events
-
-    assert_per_verb_effects!(
-      config,
-      "dispatch",
-      Enum.reject(dispatch_events, &(&1 == "wake.fired"))
-    )
-
-    _rumination_turn = finish_next_turn!(db, "effect-dispatcher", "lane:effects")
+    assert_per_verb_effects!(config, "dispatch", dispatch_events)
+    assert :ok = Ledger.finish(db, busy_turn.seq, "delivered", nil,
+      owner_lease: busy_turn.owner_lease)
+    _ = observed_classes()
 
     tests_passed = %{
       verb: "attest",

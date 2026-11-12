@@ -1,6 +1,9 @@
 defmodule Tightbeam.Roles do
+  require Logger
+
   @moduledoc """
-  Durable role names with mutable session bindings and owner-Main fallback.
+  Durable role names with mutable session bindings and a settings-controlled
+  owner-Main fallback.
 
   Roles record assignments; resolution derives a delivery key from those
   recorded facts and never chooses an assignment.
@@ -10,6 +13,7 @@ defmodule Tightbeam.Roles do
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Org
+  alias Tightbeam.Rules
 
   @type db :: GenServer.server()
 
@@ -181,7 +185,7 @@ defmodule Tightbeam.Roles do
     Enum.map(rows, &to_role/1)
   end
 
-  @doc "Resolve a role to its active binding or its owner's Main session."
+  @doc "Resolve a role to its active binding or the declared fallback recipient."
   @spec resolve(db(), String.t()) ::
           {:ok, String.t(), boolean()}
           | {:error, %{code: String.t(), message: String.t()}}
@@ -193,11 +197,67 @@ defmodule Tightbeam.Roles do
       %{bound_session_key: key} = role when is_binary(key) ->
         case Org.get(db, key) do
           %{state: "active"} -> {:ok, key, false}
-          _ -> {:ok, Org.personal_session_key(role.owner_user_id), true}
+          _ -> resolve_fallback(role)
         end
 
       role ->
+        resolve_fallback(role)
+    end
+  end
+
+  defp resolve_fallback(role) do
+    case role_fallback_recipient() do
+      :owner_personal_session ->
         {:ok, Org.personal_session_key(role.owner_user_id), true}
+
+      :unavailable ->
+        # When the settings family is unavailable, keep the established
+        # personal-session fallback for inactive or unbound roles.
+        {:ok, Org.personal_session_key(role.owner_user_id), true}
+    end
+  end
+
+  defp role_fallback_recipient do
+    case settings_family("role-fallback") do
+      {:ok, %{"recipient" => "owner_personal_session"} = settings}
+      when map_size(settings) == 1 ->
+        :owner_personal_session
+
+      {:ok, _settings} ->
+        Logger.warning("substrate settings family role-fallback is invalid")
+
+        :unavailable
+
+      {:error, :ambiguous} ->
+        Logger.warning("substrate settings family role-fallback is ambiguous")
+
+        :unavailable
+
+      {:error, :invalid} ->
+        Logger.warning("substrate settings family role-fallback is invalid")
+
+        :unavailable
+
+      :absent ->
+        :unavailable
+    end
+  end
+
+  defp settings_family(family) do
+    case Rules.reaction_policy(family) do
+      nil ->
+        count =
+          Rules.effective_snapshot()
+          |> Map.get(:reactions, [])
+          |> Enum.count(&(&1.mode == :settings and &1.family == family))
+
+        if count == 0, do: :absent, else: {:error, :ambiguous}
+
+      %{settings: settings} when is_map(settings) ->
+        {:ok, settings}
+
+      _ ->
+        {:error, :invalid}
     end
   end
 

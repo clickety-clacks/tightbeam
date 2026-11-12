@@ -83,6 +83,10 @@ defmodule Tightbeam.TestCase do
       ])
 
     File.cp!(rule_source, Path.join(rule_dir, "row-reaction-assignment-inactivity.toml"))
+
+    substrate_source = Path.expand("../../priv/seed/rules/substrate.toml", __DIR__)
+    File.cp!(substrate_source, Path.join(rule_dir, "substrate.toml"))
+
     Tightbeam.Rules.load!(base_dir, [])
     on_exit(fn -> File.rm_rf!(base_dir) end)
 

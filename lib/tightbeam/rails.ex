@@ -62,7 +62,7 @@ defmodule Tightbeam.Rails do
 
   Hook commands are self-contained (no file paths, no environment
   dependencies — homes live at different paths on gateway, staging, and
-  satellites). Pattern statutes match their POSIX ERE against the RAW
+  satellites). Statute patterns match their POSIX ERE against the raw
   tool-call JSON on stdin, so no jq is required on satellites; patterns
   should not rely on matching bare `"` characters, which arrive
   JSON-escaped. Closed action statutes parse `tool_input.command` and classify
@@ -70,6 +70,9 @@ defmodule Tightbeam.Rails do
   """
 
   @persist_key __MODULE__
+  # Each hook command is passed as one `sh -c` argument. Keep room below the
+  # per-argument exec limit; this bounds packaging, not statute semantics.
+  @bash_hook_command_arg_bytes 90_000
   @statute_keys MapSet.new([
                   "name",
                   "on",
@@ -223,10 +226,20 @@ defmodule Tightbeam.Rails do
   def hook_settings do
     statutes = :persistent_term.get(@persist_key, [])
 
+    statute_entries =
+      statutes
+      |> Enum.chunk_by(&(&1.tool == "Bash" and is_binary(&1.pattern)))
+      |> Enum.flat_map(fn
+        [%{tool: "Bash", pattern: pattern} | _] = bash_statutes when is_binary(pattern) ->
+          bash_pre_tool_use_entries(bash_statutes)
+
+        other_statutes ->
+          Enum.map(other_statutes, &pre_tool_use_entry/1)
+      end)
+
     %{
       "hooks" => %{
-        "PreToolUse" =>
-          Enum.map(statutes, &pre_tool_use_entry/1) ++ [github_auth_entry(), observation_entry()]
+        "PreToolUse" => statute_entries ++ [github_auth_entry(), observation_entry()]
       }
     }
   end
@@ -412,12 +425,21 @@ defmodule Tightbeam.Rails do
           "if [ \"$status\" -ne 0 ]; then " <>
           "echo \"[gate: #{statute.name}] action classifier failed closed (status $status).\" >&2; exit 2; fi"
       else
-        "grep -qE \"#{escape_double_quoted(statute.pattern)}\" - || exit 0"
+        if statute.tool == "Bash" do
+          bash_pre_tool_use_payload(statute)
+        else
+          "grep -qE \"#{escape_double_quoted(statute.pattern)}\" - || exit 0" <>
+            "; echo \"[gate: #{statute.name}] #{escape_double_quoted(one_line(statute.text))}\" >&2; exit 2"
+        end
       end
 
     payload =
-      predicate <>
-        "; echo \"[gate: #{statute.name}] #{escape_double_quoted(one_line(statute.text))}\" >&2; exit 2"
+      if action do
+        predicate <>
+          "; echo \"[gate: #{statute.name}] #{escape_double_quoted(one_line(statute.text))}\" >&2; exit 2"
+      else
+        predicate
+      end
 
     %{
       "matcher" => statute.tool,
@@ -425,6 +447,145 @@ defmodule Tightbeam.Rails do
         %{"type" => "command", "command" => "sh -c '" <> escape_single_quotes(payload) <> "'"}
       ]
     }
+  end
+
+  defp bash_pre_tool_use_entries(statutes) do
+    statutes
+    |> bash_pre_tool_use_reason_groups()
+    |> Enum.reduce([], fn group, groups ->
+      case groups do
+        [current_group | earlier_groups] ->
+          candidate = current_group ++ group
+
+          if byte_size(bash_pre_tool_use_command(candidate)) <= @bash_hook_command_arg_bytes do
+            [candidate | earlier_groups]
+          else
+            [group | groups]
+          end
+
+        [] ->
+          [group]
+      end
+    end)
+    |> Enum.reverse()
+    |> Enum.map(fn
+      [statute] -> pre_tool_use_entry(statute)
+      group -> bash_pre_tool_use_group_entry(group)
+    end)
+  end
+
+  defp bash_pre_tool_use_reason_groups(statutes) do
+    statutes
+    |> Enum.reduce([], fn statute, groups ->
+      reason_key = bash_pre_tool_use_reason_key(statute)
+
+      case Enum.find_index(groups, fn {key, _members} -> key == reason_key end) do
+        nil ->
+          groups ++ [{reason_key, [statute]}]
+
+        index ->
+          List.update_at(groups, index, fn {key, members} ->
+            {key, members ++ [statute]}
+          end)
+      end
+    end)
+    |> Enum.flat_map(fn {_reason_key, members} ->
+      split_bash_pre_tool_use_group(members)
+    end)
+  end
+
+  defp split_bash_pre_tool_use_group(statutes) do
+    statutes
+    |> Enum.reduce([], fn statute, groups ->
+      case groups do
+        [current_group | earlier_groups] ->
+          candidate = current_group ++ [statute]
+
+          if byte_size(bash_pre_tool_use_command(candidate)) <= @bash_hook_command_arg_bytes do
+            [candidate | earlier_groups]
+          else
+            [[statute] | groups]
+          end
+
+        [] ->
+          [[statute]]
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp bash_pre_tool_use_group_entry(statutes) do
+    %{
+      "matcher" => "Bash",
+      "hooks" => [%{"type" => "command", "command" => bash_pre_tool_use_command(statutes)}]
+    }
+  end
+
+  defp bash_pre_tool_use_command(statutes) do
+    "sh -c '" <> escape_single_quotes(grouped_bash_pre_tool_use_payload(statutes)) <> "'"
+  end
+
+  defp grouped_bash_pre_tool_use_payload(statutes) do
+    # Check every statute, but report only the first matching gate for each
+    # exact refusal text to avoid duplicate denial lines.
+    failure_lines =
+      Enum.map_join(statutes, "", fn statute ->
+        "echo \"[gate: #{statute.name}] hook input check failed closed (status $status).\" >&2; "
+      end)
+
+    reason_ids =
+      statutes
+      |> Enum.map(&bash_pre_tool_use_reason_key/1)
+      |> Enum.uniq()
+      |> Enum.with_index()
+      |> Map.new()
+
+    positional_values =
+      Enum.map_join(statutes, " ", fn statute ->
+        reason_id = Map.fetch!(reason_ids, bash_pre_tool_use_reason_key(statute))
+
+        "\"#{escape_double_quoted(statute.pattern)}\" " <>
+          "\"#{escape_double_quoted(statute.name)}\" " <>
+          "\"#{escape_double_quoted(one_line(statute.text))}\" " <>
+          "\"#{reason_id}\""
+      end)
+
+    pattern_arguments =
+      statutes
+      |> Enum.with_index()
+      |> Enum.map_join(" ", fn {_statute, index} -> "-e \"${#{1 + 4 * index}}\"" end)
+
+    "input=$(cat); printf '%s' \"$input\" | tightbeam hook-command > /dev/null 2>/dev/null; status=$?; " <>
+      "if [ \"$status\" -ne 0 ]; then " <>
+      failure_lines <>
+      "exit 2; fi; set -- " <>
+      positional_values <>
+      "; printf '%s' \"$input\" | grep -qE " <>
+      pattern_arguments <>
+      " >/dev/null 2>/dev/null; match_status=$?; " <>
+      "if [ \"$match_status\" -eq 1 ]; then exit 0; fi; " <>
+      "denied=0; reported_reasons=','; while [ \"$#\" -gt 0 ]; do " <>
+      "pattern=$1; gate=$2; reason=$3; reason_id=$4; shift 4; " <>
+      "printf '%s' \"$input\" | grep -qE \"$pattern\"; match_status=$?; " <>
+      "if [ \"$match_status\" -eq 0 ]; then " <>
+      "case \"$reported_reasons\" in *\",$reason_id,\"*) ;; " <>
+      "*) echo \"[gate: $gate] $reason\" >&2; reported_reasons=\"$reported_reasons$reason_id,\";; esac; " <>
+      "denied=1; " <>
+      "elif [ \"$match_status\" -ne 1 ]; then " <>
+      "echo \"[gate: $gate] hook input check failed closed (status $match_status).\" >&2; denied=1; fi; " <>
+      "done; if [ \"$denied\" -eq 1 ]; then exit 2; fi; exit 0"
+  end
+
+  defp bash_pre_tool_use_reason_key(statute), do: one_line(statute.text)
+
+  defp bash_pre_tool_use_payload(statute) do
+    failure = "[gate: #{statute.name}] hook input check failed closed (status "
+    refusal = "[gate: #{statute.name}] #{escape_double_quoted(one_line(statute.text))}"
+
+    "input=$(cat); printf '%s' \"$input\" | tightbeam hook-command > /dev/null 2>/dev/null; status=$?; " <>
+      "if [ \"$status\" -ne 0 ]; then echo \"#{failure}$status).\" >&2; exit 2; fi; " <>
+      "printf '%s' \"$input\" | grep -qE \"#{escape_double_quoted(statute.pattern)}\" || exit 0; " <>
+      "echo \"#{refusal}\" >&2; exit 2"
   end
 
   defp one_line(text), do: text |> String.split() |> Enum.join(" ")

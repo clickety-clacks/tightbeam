@@ -1067,6 +1067,246 @@ defmodule Tightbeam.CliIntegrationTest do
     refute payload =~ Base.encode64(bytes)
   end
 
+  test "real CLI captures ordinary file bytes without putting content in argv", ctx do
+    item =
+      ctx.handlers["work-item-create"].(%{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{title: "File-captured result"}
+      })
+
+    assignment =
+      ctx.handlers["assign"].(%{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: ctx.session.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "Record file-captured result", work_item_id: item.id}
+      })
+
+    size = 2_300_138
+    unit = <<0x00, 0xFF, ?\n, 0xC3>>
+    bytes = :binary.copy(unit, div(size, byte_size(unit))) <> binary_part(unit, 0, rem(size, 4))
+    assert byte_size(bytes) == size
+    refute String.valid?(bytes)
+
+    content_file = Path.join(ctx.workdir, "result-captured.bin")
+    origin_file = Path.join(ctx.workdir, "descriptive-origin.bin")
+    File.write!(content_file, bytes)
+    File.write!(origin_file, "descriptive file whose bytes are not captured")
+    digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+    {recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Captured result file",
+          "--path",
+          origin_file,
+          "--work-item",
+          item.id,
+          "--produced-by-assignment",
+          assignment.id,
+          "--content-file",
+          content_file
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    recorded = JSON.decode!(recorded)
+    assert recorded["contentSha256"] == digest
+    assert recorded["producedByAssignmentId"] == assignment.id
+    assert recorded["originPath"] == origin_file
+
+    empty_file = Path.join(ctx.workdir, "empty-result.bin")
+    File.write!(empty_file, <<>>)
+
+    {empty_recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Empty captured result",
+          "--path",
+          "empty-origin.bin",
+          "--work-item",
+          item.id,
+          "--content-file",
+          empty_file
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    empty_recorded = JSON.decode!(empty_recorded)
+    empty_digest = :crypto.hash(:sha256, <<>>) |> Base.encode16(case: :lower)
+    assert empty_recorded["contentSha256"] == empty_digest
+
+    {empty_fetched, 0} =
+      System.cmd(ctx.binary, ["artifact-content-fetch", empty_recorded["artifactId"]],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(empty_fetched) == %{
+             "artifactId" => empty_recorded["artifactId"],
+             "contentSha256" => empty_digest,
+             "contentSize" => 0,
+             "contentBase64" => ""
+           }
+
+    readable_origin = Path.join(ctx.workdir, "metadata-origin.txt")
+    File.write!(readable_origin, "present on disk but not submitted for capture")
+
+    {metadata_only, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Metadata only",
+          "--path",
+          readable_origin,
+          "--work-item",
+          item.id
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    metadata_only = JSON.decode!(metadata_only)
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM artifact_contents WHERE artifactId=?1", [
+               metadata_only["artifactId"]
+             ])
+
+    artifact_counts = fn ->
+      assert {:ok, [[count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifacts")
+      assert {:ok, [[content_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifact_contents")
+      assert {:ok, [[record_events]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM events WHERE verb='artifact-record'")
+
+      {count, content_count, record_events}
+    end
+
+    before_refusals = artifact_counts.()
+    missing_file = Path.join(ctx.workdir, "does-not-exist.bin")
+
+    {missing_error, missing_status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Missing file",
+          "--path",
+          "missing-origin.bin",
+          "--work-item",
+          item.id,
+          "--content-file",
+          missing_file
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert missing_status != 0
+    assert missing_error =~ "cannot read --content-file"
+    assert artifact_counts.() == before_refusals
+
+    {conflict_error, conflict_status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Conflicting content sources",
+          "--path",
+          "conflicting-origin.bin",
+          "--work-item",
+          item.id,
+          "--content-base64",
+          "YQ==",
+          "--content-file",
+          content_file
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert conflict_status != 0
+    assert conflict_error =~ "choose either --content-base64 or --content-file"
+    assert artifact_counts.() == before_refusals
+
+    wrong_digest = String.duplicate("0", 64)
+
+    {mismatch_error, mismatch_status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Mismatched digest",
+          "--path",
+          "mismatch-origin.bin",
+          "--work-item",
+          item.id,
+          "--sha256",
+          wrong_digest,
+          "--content-file",
+          content_file
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert mismatch_status != 0
+    assert mismatch_error =~ "content_sha256_mismatch"
+
+    {artifacts_after_mismatch, contents_after_mismatch, _record_events_after_mismatch} =
+      artifact_counts.()
+
+    {artifacts_before_refusals, contents_before_refusals, _record_events_before_refusals} =
+      before_refusals
+
+    assert {artifacts_after_mismatch, contents_after_mismatch} ==
+             {artifacts_before_refusals, contents_before_refusals}
+
+    File.write!(content_file, "changed after capture")
+    File.rm!(origin_file)
+
+    {fetched, 0} =
+      System.cmd(ctx.binary, ["artifact-content-fetch", recorded["artifactId"]],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    fetched = JSON.decode!(fetched)
+    assert fetched["artifactId"] == recorded["artifactId"]
+    assert fetched["contentSha256"] == digest
+    assert fetched["contentSize"] == size
+    assert Base.decode64!(fetched["contentBase64"]) == bytes
+  end
+
   test "real CLI writes and reads declared record metadata", ctx do
     manifest = Path.join([ctx.base_dir, "identity", "kungfu", "example", "manifest.toml"])
     File.mkdir_p!(Path.dirname(manifest))
@@ -2158,7 +2398,6 @@ defmodule Tightbeam.CliIntegrationTest do
     Roles.create!(ctx.db, "cli-coder", "flynn", coder.session_key)
     Roles.create!(ctx.db, "cli-reviewer", "flynn", reviewer.session_key)
     coder_dir = session_workdir!(ctx, coder)
-    reviewer_dir = session_workdir!(ctx, reviewer)
 
     {created, 0} =
       System.cmd(
@@ -2386,29 +2625,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
     review_id = JSON.decode!(reviewed)["id"]
 
-    {_verdict, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "attest",
-          review_id,
-          "--kind",
-          "verdict",
-          "--verdict",
-          "reviewed-clean",
-          "--commit-refs",
-          commit_refs
-        ],
-        cd: reviewer_dir,
-        stderr_to_stdout: true
-      )
-
-    assert Assignments.qualifying_review_verdict_kinds(
-             ctx.db,
-             work_id,
-             "cli-coder",
-             JSON.decode!(commit_refs)
-           ) == ["reviewed-clean"]
+    assert {:ok, [[^work_id, "cli-reviewer"]]} =
+      DB.query(ctx.db, "SELECT reviewsAssignmentId,holderKey FROM assignments WHERE id=?1", [review_id])
 
     completion_args = [
       "attest",
@@ -2610,9 +2828,7 @@ defmodule Tightbeam.CliIntegrationTest do
            } = machine_line!(refused)
   end
 
-  # Code-completion evidence remains required even when the org has no learned
-  # statutes; the refusal creates no remedy episode or wake.
-  test "real CLI requires code completion evidence on a rule-free org", ctx do
+  test "real CLI completes without evidence on a rule-free org", ctx do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     coder =
@@ -2661,21 +2877,23 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
-    {denied, denied_status} =
+    {completed, completion_status} =
       System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
         cd: coder_dir,
         stderr_to_stdout: true
       )
 
-    assert denied_status != 0
-    assert denied =~ "inapplicable_code_evidence"
+    assert completion_status == 0
+    assert JSON.decode!(completed)["assignment"]["state"] == "closed"
 
-    assert {:ok, [["open", nil]]} =
+    assert {:ok, [["closed", closing_id]]} =
              DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
                work_id
              ])
 
-    assert {:ok, [[0]]} =
+    assert is_binary(closing_id)
+
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",

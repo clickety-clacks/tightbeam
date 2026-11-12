@@ -1,0 +1,5 @@
+[[reaction]]
+name = "deployment-smoke"
+family = "deployment-smoke"
+english = "Select the archetype for the local deployment smoke check."
+settings = { reviewer_archetype = "reviewer-code" }

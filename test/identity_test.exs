@@ -2,7 +2,7 @@ defmodule Tightbeam.IdentityTest do
   use Tightbeam.TestCase, async: false
   import ExUnit.CaptureLog
 
-  alias Tightbeam.Identity
+  alias Tightbeam.{Identity, NoticeBatcher, Rules}
 
   setup do
     base = Path.join(System.tmp_dir!(), "tb-identity-#{System.unique_integer([:positive])}")
@@ -65,7 +65,7 @@ defmodule Tightbeam.IdentityTest do
     refute_receive {:firehose_notice, _}
   end
 
-  test "neutral seed creates the exact three refs and only the two seed files", ctx do
+  test "neutral seed creates the exact refs and all seed-owned files", ctx do
     assert :initialized = Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")
     refs = git!(dir, ["branch", "--format=%(refname:short)"])
@@ -78,7 +78,11 @@ defmodule Tightbeam.IdentityTest do
 
     assert git!(dir, ["ls-tree", "-r", "--name-only", "main"])
            |> String.split("\n", trim: true) ==
-             ["archetypes/default.toml", "guidance/operating-model.md"]
+             [
+               "archetypes/default.toml",
+               "guidance/operating-model.md",
+               "rules/substrate.toml"
+             ]
 
     snapshot = Identity.snapshot!(ctx.base, "default", :codex)
     assert snapshot.skills == %{}
@@ -102,6 +106,89 @@ defmodule Tightbeam.IdentityTest do
                root_archetype: "orchestrator"
              }
            ]
+  end
+
+  test "starting an existing identity adds substrate rules once and preserves user content",
+       ctx do
+    assert :initialized = Identity.init!(ctx.base)
+    assert {:ok, _revision} = learn!(ctx.base, "agentic-engineering", "test")
+    edit!(ctx.base, "default", :guidance, "operator-added guidance", "operator")
+
+    identity_dir = Path.join(ctx.base, "identity")
+    learned_dir = Path.join(identity_dir, "kungfu/agentic-engineering")
+    learned_before = tree_digest(learned_dir)
+    user_guidance = Path.join(identity_dir, "guidance/default.md")
+    user_guidance_before = File.read!(user_guidance)
+    archetype_before = File.read!(Path.join(identity_dir, "archetypes/default.toml"))
+    operating_model_before = File.read!(Path.join(identity_dir, "guidance/operating-model.md"))
+    substrate_seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+
+    main_before_upgrade = git!(identity_dir, ["rev-parse", "main"])
+    git!(identity_dir, ["rm", "--", "rules/substrate.toml"])
+    git!(identity_dir, ["commit", "-m", "fixture: pre-upgrade identity"], "test")
+    main_before_start = git!(identity_dir, ["rev-parse", "main"])
+    refute File.exists?(Path.join(identity_dir, "rules/substrate.toml"))
+
+    assert :noop = Identity.init!(ctx.base)
+
+    main_after_upgrade = git!(identity_dir, ["rev-parse", "main"])
+    refute main_after_upgrade == main_before_start
+
+    assert git!(identity_dir, ["diff-tree", "--no-commit-id", "--name-only", "-r", "main"]) ==
+             "rules/substrate.toml"
+
+    assert git!(identity_dir, ["rev-parse", "tightbeam/live"]) == main_after_upgrade
+    assert File.read!(Path.join(identity_dir, "rules/substrate.toml")) == substrate_seed
+
+    assert git!(identity_dir, ["show", "main:rules/substrate.toml"]) ==
+             String.trim_trailing(substrate_seed)
+
+    assert File.read!(user_guidance) == user_guidance_before
+    assert File.read!(Path.join(identity_dir, "archetypes/default.toml")) == archetype_before
+
+    assert File.read!(Path.join(identity_dir, "guidance/operating-model.md")) ==
+             operating_model_before
+
+    assert tree_digest(learned_dir) == learned_before
+
+    Rules.load!(ctx.base, [])
+    assert NoticeBatcher.batching_enabled?()
+
+    stable_main = git!(identity_dir, ["rev-parse", "main"])
+    stable_live = git!(identity_dir, ["rev-parse", "tightbeam/live"])
+    assert :noop = Identity.init!(ctx.base)
+    assert git!(identity_dir, ["rev-parse", "main"]) == stable_main
+    assert git!(identity_dir, ["rev-parse", "tightbeam/live"]) == stable_live
+    assert File.read!(user_guidance) == user_guidance_before
+    assert tree_digest(learned_dir) == learned_before
+    assert main_before_upgrade != main_after_upgrade
+  end
+
+  test "starting an identity preserves an existing user-edited substrate file", ctx do
+    assert :initialized = Identity.init!(ctx.base)
+
+    identity_dir = Path.join(ctx.base, "identity")
+    substrate_path = Path.join(identity_dir, "rules/substrate.toml")
+    seeded = File.read!(substrate_path)
+    user_edited = String.replace(seeded, "batching_enabled = true", "batching_enabled = false")
+    assert user_edited != seeded
+    File.write!(substrate_path, user_edited)
+    git!(identity_dir, ["add", "--", "rules/substrate.toml"])
+    git!(identity_dir, ["commit", "-m", "fixture: user-edited substrate"], "operator")
+    git!(identity_dir, ["update-ref", "refs/heads/tightbeam/live", "main"])
+
+    main_before = git!(identity_dir, ["rev-parse", "main"])
+    live_before = git!(identity_dir, ["rev-parse", "tightbeam/live"])
+    assert :noop = Identity.init!(ctx.base)
+
+    assert git!(identity_dir, ["rev-parse", "main"]) == main_before
+    assert git!(identity_dir, ["rev-parse", "tightbeam/live"]) == live_before
+    assert File.read!(substrate_path) == user_edited
+
+    assert git!(identity_dir, ["show", "main:rules/substrate.toml"]) ==
+             String.trim_trailing(user_edited)
+
+    assert git!(identity_dir, ["status", "--short"]) == ""
   end
 
   test "the default snapshot composes every available bundle's offer facts", ctx do
@@ -229,7 +316,7 @@ defmodule Tightbeam.IdentityTest do
     assert {:noop, ^revision} = learn!(ctx.base, "agentic-engineering", "operator")
   end
 
-  test "shipped engineering bundle keeps completion review without receipt admission",
+  test "shipped engineering bundle permits either historical completion check",
        ctx do
     shipped = Path.expand("priv/kungfu/agentic-engineering")
     Application.put_env(:tightbeam, :identity_source_dir, shipped)
@@ -239,9 +326,10 @@ defmodule Tightbeam.IdentityTest do
 
     engineering_rule = File.read!(Path.join(base, "identity/rules/engineering.toml"))
     refute engineering_rule =~ ~s(name = "code-review-requires-passing-tests")
-    assert engineering_rule =~ ~s(name = "completion-requires-review")
-    assert engineering_rule =~ ~s(on_rule_denied = "surface")
-    assert engineering_rule =~ ~s(action = "wake")
+    refute engineering_rule =~ ~s(name = "completion-requires-review")
+    verification_rule = File.read!(Path.join(base, "identity/rules/verification.toml"))
+    assert verification_rule =~ ~s(assignment.independent_verdict_kinds)
+    assert verification_rule =~ ~s(action = "wake")
     refute engineering_rule =~ ~s(action = "assign")
     refute engineering_rule =~ ~s(target_role = "reviewer")
     refute engineering_rule =~ ~s(target_role = "reviewer-code")

@@ -70,6 +70,13 @@ no replacement spec. Use the installed binding route described in the manual.
 
 ## Acceptance is independent and recorded
 
+The delivery owner commissions independent nonauthor review for every code
+assignment alongside the work. Review never holds completion or the next step
+of work. Merge into the authorized target still waits for a clean independent
+review. Before deploy or release, the delivery owner brings open review findings
+to the product owner, who decides whether to hold deployment or file a bug for a
+later fix, and raises only serious findings to the user.
+
 A producer verifies its work; a judge who did not make it assesses acceptance.
 Prefer a qualified, available independent reviewer on the opposite harness from
 actual authorship; this is a preference, never a gate. If that route is unavailable,

@@ -3,7 +3,7 @@ defmodule Tightbeam.Ephemeral do
 
   require Logger
 
-  alias Tightbeam.{DB, Org, Wakes}
+  alias Tightbeam.{DB, Org, Rules, Wakes}
   alias Tightbeam.DB.Txn
 
   # R2.2-R2.5: stamp the election at spawn, independently of later identity edits.
@@ -99,17 +99,28 @@ defmodule Tightbeam.Ephemeral do
 
   def retire_turn_in_txn(txn, seq) do
     if available?(txn) do
-      case Txn.q(
-             txn,
-             "SELECT e.sessionKey,t.status FROM turns t JOIN ephemeral_sessions e ON e.sessionKey=t.sessionKey WHERE t.seq=?1",
-             [seq]
-           ) do
-        [[key, status]] ->
-          return_in_txn(txn, key, terminal_summary(status))
-          retire_in_txn(txn, key)
-
-        [] ->
+      case single_turn_policy() do
+        :unavailable ->
           :ok
+
+        policy ->
+          case Txn.q(
+                 txn,
+                 "SELECT e.sessionKey,t.status FROM turns t JOIN ephemeral_sessions e ON e.sessionKey=t.sessionKey WHERE t.seq=?1",
+                 [seq]
+               ) do
+            [[key, status]] ->
+              return_in_txn(txn, key, terminal_summary(status), policy.result_recipients)
+
+              if policy.automatic_retirement do
+                retire_in_txn(txn, key)
+              else
+                :ok
+              end
+
+            [] ->
+              :ok
+          end
       end
     end
 
@@ -159,47 +170,104 @@ defmodule Tightbeam.Ephemeral do
 
   def final_message_in_txn(_txn, _key, _text), do: :ok
 
-  defp recipient(txn, caller) do
-    case Txn.q(txn, "SELECT state,spawnedBy FROM sessions WHERE sessionKey=?1", [caller]) do
-      [["retired", parent]] ->
+  # R2.5: the existing scheduler delivers the final response to the first
+  # available address in the declared order.
+  def return_in_txn(txn, key, text) do
+    case single_turn_policy() do
+      :unavailable ->
+        :ok
+
+      policy ->
+        return_in_txn(txn, key, text, policy.result_recipients)
+    end
+  end
+
+  defp return_in_txn(txn, key, text, recipients) do
+    if session?(txn, key) and Wakes.get_in_txn(txn, "ephemeral-result:" <> key) == nil do
+      caller = caller(txn, key)
+
+      case recipient(txn, caller, recipients) do
+        target when is_binary(target) ->
+          Wakes.schedule_in_txn(txn, %{
+            wake_id: "ephemeral-result:" <> key,
+            session_key: target,
+            origin: "session:" <> key,
+            prompt: "Ephemeral spawn result from #{key}:\n\n" <> text,
+            due_at: System.system_time(:millisecond)
+          })
+
+        nil ->
+          Logger.warning(
+            "Dropping ephemeral result from #{key}: no available address was selected"
+          )
+      end
+    end
+
+    :ok
+  end
+
+  defp recipient(_txn, nil, _order), do: nil
+
+  defp recipient(txn, caller, order) do
+    Enum.find_value(order, fn
+      "caller" ->
         case Txn.q(
                txn,
                "SELECT sessionKey FROM sessions WHERE sessionKey=?1 AND state!='retired'",
-               [parent]
+               [caller]
              ) do
           [[key]] -> key
           [] -> nil
         end
 
-      [[_, _]] ->
-        caller
+      "parent" ->
+        case Txn.q(
+               txn,
+               "SELECT p.sessionKey FROM sessions c JOIN sessions p ON p.sessionKey=c.spawnedBy " <>
+                 "WHERE c.sessionKey=?1 AND p.state!='retired'",
+               [caller]
+             ) do
+          [[key]] -> key
+          [] -> nil
+        end
+    end)
+  end
 
-      [] ->
-        nil
+  defp single_turn_policy do
+    case Rules.reaction_policy("single-turn-session") do
+      nil ->
+        family_count =
+          Rules.effective_snapshot()
+          |> Map.get(:reactions, [])
+          |> Enum.count(&(&1.mode == :settings and &1.family == "single-turn-session"))
+
+        if family_count > 1, do: unavailable_single_turn_policy("ambiguous"), else: :unavailable
+
+      %{settings: settings} when is_map(settings) ->
+        automatic_retirement = Map.get(settings, "automatic_retirement")
+        recipients = Map.get(settings, "result_recipients")
+        keys = settings |> Map.keys() |> Enum.sort()
+
+        if is_boolean(automatic_retirement) and is_list(recipients) and
+             keys == ["automatic_retirement", "result_recipients"] and
+             Enum.all?(recipients, &(&1 in ["caller", "parent"])) and
+             length(Enum.uniq(recipients)) == length(recipients) do
+          %{automatic_retirement: automatic_retirement, result_recipients: recipients}
+        else
+          unavailable_single_turn_policy("invalid")
+        end
+
+      _ ->
+        unavailable_single_turn_policy("invalid")
     end
   end
 
-  # R2.5: the existing scheduler delivers the final response to the spawning agent.
-  def return_in_txn(txn, key, text) do
-    if session?(txn, key) and Wakes.get_in_txn(txn, "ephemeral-result:" <> key) == nil do
-      caller = caller(txn, key)
+  defp unavailable_single_turn_policy(reason) do
+    Logger.warning(
+      "substrate settings family single-turn-session is #{reason}; no retirement or result route was selected"
+    )
 
-      if target = recipient(txn, caller) do
-        Wakes.schedule_in_txn(txn, %{
-          wake_id: "ephemeral-result:" <> key,
-          session_key: target,
-          origin: "session:" <> key,
-          prompt: "Ephemeral spawn result from #{key}:\n\n" <> text,
-          due_at: System.system_time(:millisecond)
-        })
-      else
-        Logger.warning(
-          "Dropping ephemeral result from #{key}: caller #{caller} and its parent are unavailable"
-        )
-      end
-    end
-
-    :ok
+    :unavailable
   end
 
   defp query(%Txn{} = txn, sql, params), do: Txn.q(txn, sql, params)

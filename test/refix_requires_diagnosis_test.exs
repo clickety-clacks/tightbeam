@@ -77,7 +77,6 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     refute Enum.any?(ctx.rules, &(&1.name == "wake-obligation-registration-authority"))
 
     expected = [
-      "completion-requires-review",
       "completion-requires-verification",
       "completion-requires-results-artifact"
     ]
@@ -263,7 +262,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   end
 
   defp dispatch_after_rumination(ctx, call) do
-    assert {:ok, %{id: assignment_id, rumination_required: true}} =
+    assert {:ok, %{id: assignment_id}} =
              result = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
     assert {:ok, []} =

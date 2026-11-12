@@ -3,13 +3,10 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
   alias Tightbeam.{
     ArtifactContent,
-    AttestEvidence,
     DB,
-    FileEffectEvidence,
     Gateway,
     Mementos,
     Model,
-    OperationalEvidence,
     Org,
     Placement,
     Rules,
@@ -82,371 +79,6 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     }
   end
 
-  test "captured public artifacts validate one exact file pointer", ctx do
-    before = capture(ctx, "old bytes")
-    after_file = capture(ctx, "new bytes")
-    observation = capture(ctx, "observed new bytes")
-    manifest = capture(ctx, manifest(ctx, before, after_file, observation) |> JSON.encode!())
-    pointer = "file-evidence/v1:#{manifest.id}:#{manifest.hash}"
-
-    assert {:ok, result} =
-             DB.transaction(ctx.db, fn txn ->
-               FileEffectEvidence.validate!(
-                 txn,
-                 proof_call(ctx, manifest, pointer),
-                 "example/evidence",
-                 "revision"
-               )
-             end)
-
-    assert result.assignment_id == ctx.assignment_id
-    assert result.comparison_value == pointer
-    assert result.after.sha256 == after_file.hash
-    assert [%{scope: "disk-bytes", author: author}] = result.observation_authors
-    assert author == ctx.holder
-  end
-
-  test "wrong supporting hash and uncaptured bytes refuse with the failed relation", ctx do
-    before = capture(ctx, "old bytes")
-    after_file = capture(ctx, "new bytes")
-    observation = capture(ctx, "observed new bytes")
-
-    changed =
-      manifest(ctx, before, after_file, observation)
-      |> put_in(["after", "sha256"], String.duplicate("0", 64))
-      |> JSON.encode!()
-      |> then(&capture(ctx, &1))
-
-    changed_pointer = "file-evidence/v1:#{changed.id}:#{changed.hash}"
-
-    assert {:error, %Mementos.Refusal{code: "file_effect_evidence_invalid", message: message}} =
-             DB.transaction(ctx.db, fn txn ->
-               FileEffectEvidence.validate!(
-                 txn,
-                 proof_call(ctx, changed, changed_pointer),
-                 "example/evidence",
-                 "revision"
-               )
-             end)
-
-    assert message =~ "after"
-
-    metadata = capture(ctx, nil)
-
-    uncaptured_manifest =
-      manifest(ctx, %{before | id: metadata.id}, after_file, observation)
-      |> JSON.encode!()
-      |> then(&capture(ctx, &1))
-
-    uncaptured_pointer = "file-evidence/v1:#{uncaptured_manifest.id}:#{uncaptured_manifest.hash}"
-
-    assert {:error, %Mementos.Refusal{code: "file_effect_evidence_unavailable", message: message}} =
-             DB.transaction(ctx.db, fn txn ->
-               FileEffectEvidence.validate!(
-                 txn,
-                 proof_call(ctx, uncaptured_manifest, uncaptured_pointer),
-                 "example/evidence",
-                 "revision"
-               )
-             end)
-
-    assert message =~ metadata.id
-  end
-
-  test "operational evidence requires captured bytes from the original holder", ctx do
-    captured = capture(ctx, "operation and observed result")
-
-    call = %{
-      principal: {:session, ctx.holder},
-      params: %{
-        assignment_id: ctx.assignment_id,
-        artifact_id: captured.id,
-        content_sha256: captured.hash
-      }
-    }
-
-    assert {:ok, %{artifact_id: artifact_id, sha256: digest}} =
-             DB.transaction(ctx.db, fn txn -> OperationalEvidence.validate!(txn, call) end)
-
-    assert artifact_id == captured.id
-    assert digest == captured.hash
-
-    wrong = put_in(call, [:params, :content_sha256], String.duplicate("0", 64))
-
-    assert {:error, %Mementos.Refusal{code: "operational_evidence_invalid"}} =
-             DB.transaction(ctx.db, fn txn -> OperationalEvidence.validate!(txn, wrong) end)
-
-    metadata = capture(ctx, nil)
-    uncaptured = put_in(call, [:params, :artifact_id], metadata.id)
-
-    assert {:error, %Mementos.Refusal{code: "content_not_captured"}} =
-             DB.transaction(ctx.db, fn txn -> OperationalEvidence.validate!(txn, uncaptured) end)
-
-    another = put_in(call, [:params, :assignment_id], "another-assignment")
-
-    assert {:error, %Mementos.Refusal{code: "operational_evidence_invalid"}} =
-             DB.transaction(ctx.db, fn txn -> OperationalEvidence.validate!(txn, another) end)
-  end
-
-  test "attest policy selects captured operational evidence from stored assignment scope", ctx do
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO assignment_effects(assignmentId,effectKind) VALUES(?1,'live_mutation')",
-        [ctx.assignment_id]
-      )
-
-    captured = capture(ctx, "operation and observed result")
-
-    call = %{
-      verb: "attest",
-      principal: {:session, ctx.holder},
-      origin: ctx.holder,
-      params: %{
-        assignment_id: ctx.assignment_id,
-        kind: "verdict",
-        verdict_kind: "verified",
-        artifact_id: captured.id,
-        content_sha256: captured.hash
-      }
-    }
-
-    policy = %{
-      name: "operation-evidence",
-      purpose: "attest-operational-evidence",
-      source: "test-policy",
-      conditions: [
-        %{fact: "assignment.effect_kind", op: "eq", value: "live_mutation"},
-        %{fact: "assignment.declared_files_present", op: "eq", value: false}
-      ]
-    }
-
-    snapshot = Rules.effective_snapshot() |> Map.put(:policies, [policy])
-
-    prepare = fn candidate ->
-      DB.transaction(ctx.db, fn txn ->
-        Rules.with_snapshot(snapshot, fn -> AttestEvidence.prepare_in_txn!(txn, candidate) end)
-      end)
-    end
-
-    assert {:ok, %{validated_operational_evidence: %{artifact_id: artifact_id}}} = prepare.(call)
-    assert artifact_id == captured.id
-
-    missing = put_in(call, [:params, :artifact_id], nil)
-    assert {:error, %Mementos.Refusal{code: "operational_evidence_invalid"}} = prepare.(missing)
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO assignment_files(assignmentId,path) VALUES(?1,'notes/result.md')",
-        [ctx.assignment_id]
-      )
-
-    overbroad_policy = %{
-      policy
-      | conditions: [%{fact: "assignment.effect_kind", op: "eq", value: "live_mutation"}]
-    }
-
-    overbroad = Map.put(snapshot, :policies, [overbroad_policy])
-
-    assert {:error, %Mementos.Refusal{code: "non_file_operational_evidence_policy_inactive"}} =
-             DB.transaction(ctx.db, fn txn ->
-               Rules.with_snapshot(overbroad, fn -> AttestEvidence.prepare_in_txn!(txn, call) end)
-             end)
-
-    replacement = Map.put(overbroad, :active_admission_contract, %{"attest" => "replacement"})
-
-    assert {:error, %Mementos.Refusal{code: "non_file_operational_evidence_policy_inactive"}} =
-             DB.transaction(ctx.db, fn txn ->
-               Rules.with_snapshot(replacement, fn ->
-                 AttestEvidence.prepare_in_txn!(txn, call)
-               end)
-             end)
-
-    file_policy = %{
-      name: "file-evidence",
-      purpose: "attest-file-effect-evidence",
-      source: "test-policy",
-      evidence_memento: "example/evidence",
-      conditions: [%{fact: "assignment.declared_files_present", op: "eq", value: true}]
-    }
-
-    legacy_with_file_policy =
-      overbroad
-      |> Map.put(:revision, "revision")
-      |> Map.put(:policies, [overbroad_policy, file_policy])
-      |> Map.put(:declarations, %{
-        revision: "revision",
-        names: %{
-          "example/evidence" => %{
-            name: "evidence",
-            qualified: "example/evidence",
-            records: ["attest"],
-            many: true
-          }
-        }
-      })
-
-    manifest_call =
-      put_in(call, [:params, :mementos], [
-        {"example/evidence", ["file-evidence/v1:#{captured.id}:#{captured.hash}"]}
-      ])
-
-    assert {:error, %Mementos.Refusal{code: "file_effect_evidence_policy_inactive"}} =
-             DB.transaction(ctx.db, fn txn ->
-               Rules.with_snapshot(legacy_with_file_policy, fn ->
-                 AttestEvidence.prepare_in_txn!(txn, manifest_call)
-               end)
-             end)
-  end
-
-  test "replacement file selection derives the comparison from captured manifest bytes", ctx do
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO assignment_files(assignmentId,path) VALUES(?1,'notes/result.md')",
-        [ctx.assignment_id]
-      )
-
-    before = capture(ctx, "old bytes")
-    after_file = capture(ctx, "new bytes")
-    observation = capture(ctx, "observed new bytes")
-    manifest = capture(ctx, manifest(ctx, before, after_file, observation) |> JSON.encode!())
-    pointer = "file-evidence/v1:#{manifest.id}:#{manifest.hash}"
-
-    policy = %{
-      name: "a-file",
-      purpose: "attest-file-effect-evidence",
-      source: "test-policy",
-      evidence_memento: "example/evidence",
-      conditions: [%{fact: "assignment.declared_files_present", op: "eq", value: true}]
-    }
-
-    other_policy = %{policy | name: "b-file", evidence_memento: "example/other"}
-
-    snapshot =
-      Rules.effective_snapshot()
-      |> Map.put(:revision, "revision")
-      |> Map.put(:policies, [other_policy, policy])
-      |> Map.put(:active_admission_contract, %{"attest" => "replacement"})
-      |> Map.put(:declarations, %{
-        revision: "revision",
-        names: %{
-          "example/evidence" => %{
-            name: "evidence",
-            qualified: "example/evidence",
-            records: ["attest"],
-            many: true
-          },
-          "example/other" => %{
-            name: "other",
-            qualified: "example/other",
-            records: ["attest"],
-            many: true
-          }
-        }
-      })
-
-    call = %{
-      verb: "attest",
-      principal: {:session, ctx.holder},
-      origin: ctx.holder,
-      params: %{
-        assignment_id: ctx.assignment_id,
-        kind: "verdict",
-        verdict_kind: "verified",
-        artifact_id: manifest.id,
-        content_sha256: manifest.hash,
-        mementos: [{"example/evidence", [pointer, "observation:disk-only"]}]
-      }
-    }
-
-    prepare = fn candidate, selected ->
-      DB.transaction(ctx.db, fn txn ->
-        Rules.with_snapshot(selected, fn -> AttestEvidence.prepare_in_txn!(txn, candidate) end)
-      end)
-    end
-
-    assert {:ok, prepared} = prepare.(call, snapshot)
-    assert prepared.file_effect_manifest.valid
-    assert prepared.memento_comparison_value == pointer
-    assert prepared.validated_file_effect.after.sha256 == after_file.hash
-
-    wrong_name = put_in(call, [:params, :mementos], [{"example/other", [pointer]}])
-
-    assert {:error, %Mementos.Refusal{code: "file_effect_evidence_invalid"}} =
-             prepare.(wrong_name, snapshot)
-
-    legacy = put_in(snapshot, [:active_admission_contract, "attest"], "legacy")
-
-    assert {:error, %Mementos.Refusal{code: "file_effect_evidence_policy_inactive"}} =
-             prepare.(call, legacy)
-  end
-
-  test "artifact presence alone cannot select operational evidence", ctx do
-    assert Rules.active_admission_contract("attest") == "legacy"
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO assignment_effects(assignmentId,effectKind) VALUES(?1,'live_mutation')",
-        [ctx.assignment_id]
-      )
-
-    captured = capture(ctx, "operation and observed result")
-
-    call = %{
-      verb: "attest",
-      principal: {:session, ctx.holder},
-      origin: ctx.holder,
-      params: %{
-        assignment_id: ctx.assignment_id,
-        kind: "verdict",
-        verdict_kind: "verified",
-        artifact_id: captured.id,
-        content_sha256: captured.hash
-      }
-    }
-
-    assert {:error, %Mementos.Refusal{code: "non_file_operational_evidence_policy_inactive"}} =
-             DB.transaction(ctx.db, fn txn -> AttestEvidence.prepare_in_txn!(txn, call) end)
-  end
-
-  test "legacy code remains outside operational evidence under an overbroad policy", ctx do
-    captured = capture(ctx, "code operation and observed result")
-
-    policy = %{
-      name: "overbroad-operational",
-      purpose: "attest-operational-evidence",
-      source: "test-policy",
-      conditions: [%{fact: "assignment.effect_kind", op: "eq", value: "code"}]
-    }
-
-    snapshot = Rules.effective_snapshot() |> Map.put(:policies, [policy])
-
-    call = %{
-      verb: "attest",
-      principal: {:session, ctx.holder},
-      origin: ctx.holder,
-      params: %{
-        assignment_id: ctx.assignment_id,
-        kind: "verdict",
-        verdict_kind: "verified",
-        artifact_id: captured.id,
-        content_sha256: captured.hash
-      }
-    }
-
-    assert {:ok, prepared} =
-             DB.transaction(ctx.db, fn txn ->
-               Rules.with_snapshot(snapshot, fn -> AttestEvidence.prepare_in_txn!(txn, call) end)
-             end)
-
-    refute Map.has_key?(prepared, :validated_operational_evidence)
-    assert prepared.params.artifact_id == captured.id
-    assert prepared.params.content_sha256 == captured.hash
-  end
-
   test "a lifecycle attest writes declared metadata with its attest row", ctx do
     snapshot =
       Rules.effective_snapshot()
@@ -490,89 +122,23 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     assert Mementos.current(ctx.db, "attest", attest_id, "example/progress") == ["observed"]
   end
 
-  test "verified accepts artifact-only evidence without git refs and still refuses an empty claim",
-       ctx do
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO assignment_effects(assignmentId,effectKind) VALUES(?1,'policy')",
-        [
-          ctx.assignment_id
-        ]
-      )
-
-    policy = %{
-      name: "operation-evidence",
-      purpose: "attest-operational-evidence",
-      source: "test-policy",
-      conditions: [
-        %{fact: "assignment.effect_kind", op: "eq", value: "live_mutation"},
-        %{fact: "assignment.declared_files_present", op: "eq", value: false}
-      ]
-    }
-
-    snapshot = Rules.effective_snapshot() |> Map.put(:policies, [policy])
-
+  test "verified accepts no refs while supplied artifact hashes remain binding", ctx do
     call = %{
-      verb: "attest",
-      principal: {:session, ctx.holder},
-      session_key: ctx.holder,
+      verb: "attest", principal: {:session, ctx.holder}, session_key: ctx.holder,
       origin: ctx.holder,
-      params: %{
-        assignment_id: ctx.assignment_id,
-        kind: "verdict",
-        verdict_kind: "verified"
-      }
+      params: %{assignment_id: ctx.assignment_id, kind: "verdict", verdict_kind: "verified"}
     }
+    assert %{attest: %{commitRefs: nil}} = ctx.handlers["attest"].(call)
+    assert %{attest: %{commitRefs: []}} = ctx.handlers["attest"].(put_in(call, [:params, :commit_refs], []))
 
-    file = fn candidate ->
-      Rules.with_snapshot(snapshot, fn -> ctx.handlers["attest"].(candidate) end)
-    end
-
-    assert %{code: "invalid_commit_refs"} = file.(call)
-    assert %{code: "invalid_commit_refs"} = file.(put_in(call, [:params, :commit_refs], []))
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE assignment_effects SET effectKind='live_mutation' WHERE assignmentId=?1",
-        [
-          ctx.assignment_id
-        ]
-      )
-
-    captured = capture(ctx, "artifact-only operation and result")
-
-    artifact_only =
-      call
-      |> put_in([:params, :artifact_id], captured.id)
+    captured = capture(ctx, "captured result")
+    cited = call |> put_in([:params, :artifact_id], captured.id)
       |> put_in([:params, :content_sha256], captured.hash)
-
-    log =
-      ExUnit.CaptureLog.capture_log(fn ->
-        assert %{attest: %{verdictKind: "verified", commitRefs: nil} = attest} =
-                 file.(artifact_only)
-
-        assert attest.artifactId == captured.id
-        assert attest.contentSha256 == captured.hash
-      end)
-
-    assert log =~ "verified_artifact_only assignmentId=#{ctx.assignment_id}"
-
-    assert %{code: "operational_evidence_invalid"} =
-             file.(put_in(artifact_only, [:params, :content_sha256], String.duplicate("f", 64)))
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO assignment_files(assignmentId,path) VALUES(?1,'notes/result.md')",
-        [
-          ctx.assignment_id
-        ]
-      )
-
-    assert %{code: "invalid_commit_refs"} = file.(call)
-    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
+    assert %{attest: %{artifactId: id, contentSha256: hash}} = ctx.handlers["attest"].(cited)
+    assert {id, hash} == {captured.id, captured.hash}
+    assert %{code: "invalid_revision_binding"} =
+      ctx.handlers["attest"].(put_in(cited, [:params, :content_sha256], String.duplicate("f", 64)))
+    assert {:ok, [[3]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
   end
 
   test "verified filing binds captured evidence and inline metadata in one transaction", ctx do
@@ -585,20 +151,9 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     captured = capture(ctx, "original operation and result")
 
-    policy = %{
-      name: "operation-evidence",
-      purpose: "attest-operational-evidence",
-      source: "test-policy",
-      conditions: [
-        %{fact: "assignment.effect_kind", op: "eq", value: "live_mutation"},
-        %{fact: "assignment.declared_files_present", op: "eq", value: false}
-      ]
-    }
-
     snapshot =
       Rules.effective_snapshot()
       |> Map.put(:revision, "revision")
-      |> Map.put(:policies, [policy])
       |> Map.put(:declarations, %{
         revision: "revision",
         names: %{
@@ -635,7 +190,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     end
 
     invalid = put_in(call, [:params, :content_sha256], String.duplicate("0", 64))
-    assert %{code: "operational_evidence_invalid"} = file.(invalid)
+    assert %{code: "invalid_revision_binding"} = file.(invalid)
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
     assert Mementos.current(ctx.db, "attest", "missing", "example/evidence") == []
 
@@ -701,10 +256,46 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     }
 
     wrong_review = put_in(review_call, [:params, :content_sha256], String.duplicate("0", 64))
-    assert %{code: "operational_evidence_invalid"} = file.(wrong_review)
+    assert %{code: "invalid_revision_binding"} = file.(wrong_review)
     assert Tightbeam.Assignments.list_attests(ctx.db, review_id) == []
     assert %{attest: review} = file.(review_call)
     assert {review.artifactId, review.contentSha256} == {captured.id, captured.hash}
+  end
+
+  test "artifact producer policy can be removed while owner visibility remains", ctx do
+    root = Path.join(System.tmp_dir!(), "artifact-policy-#{System.unique_integer([:positive])}")
+    dir = Path.join(root, "identity/rules")
+    File.mkdir_p!(dir)
+    File.write!(
+      Path.join(dir, "placement.toml"),
+      Tightbeam.TerminalReactionFixture.attest_placement()
+    )
+    Rules.load!(root, Map.keys(ctx.handlers))
+    on_exit(fn -> File.rm_rf!(root); :persistent_term.erase(Rules) end)
+
+    unproduced = capture(%{ctx | assignment_id: nil}, "same-item artifact without producer")
+    call = %{
+      verb: "attest", principal: {:session, ctx.holder}, session_key: ctx.holder, origin: ctx.holder,
+      params: %{assignment_id: ctx.assignment_id, kind: "verdict", verdict_kind: "topology-decided",
+        artifact_id: unproduced.id, content_sha256: unproduced.hash}
+    }
+    assert {:error, %{code: "rule_denied", rule: "artifact-citation-requires-own-producer"}} =
+      Tightbeam.Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    File.rm!(Path.join(dir, "placement.toml"))
+    Rules.load!(root, Map.keys(ctx.handlers))
+    assert {:ok, %{attest: %{verdictKind: "topology-decided"}}} =
+      Tightbeam.Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    other_item = ctx.handlers["work-item-create"].(%{principal: {:user, "owner"}, origin: "user:owner",
+      params: %{title: "Other item"}})
+    foreign = capture(%{ctx | item_id: other_item.id, assignment_id: nil}, "other item artifact")
+    foreign_call =
+      call
+      |> put_in([:params, :artifact_id], foreign.id)
+      |> put_in([:params, :content_sha256], foreign.hash)
+
+    assert {:ok, %{attest: %{verdictKind: "topology-decided"}}} =
+             Tightbeam.Dispatch.dispatch(ctx.db, ctx.handlers, foreign_call)
   end
 
   test "create, assign, and dispatch attach declared metadata only on creation", ctx do
@@ -821,37 +412,4 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     %{id: artifact.artifact_id, hash: artifact.content_sha256}
   end
 
-  defp manifest(ctx, before, after_file, observation) do
-    target = "device:/example/file"
-
-    %{
-      "schema" => "file-effect-evidence/v1",
-      "assignmentId" => ctx.assignment_id,
-      "target" => target,
-      "before" => %{"target" => target, "artifactId" => before.id, "sha256" => before.hash},
-      "after" => %{"target" => target, "artifactId" => after_file.id, "sha256" => after_file.hash},
-      "observations" => [
-        %{
-          "scope" => "disk-bytes",
-          "target" => target,
-          "subject" => target,
-          "resultIdentity" => after_file.hash,
-          "artifactId" => observation.id,
-          "sha256" => observation.hash
-        }
-      ]
-    }
-  end
-
-  defp proof_call(ctx, manifest, pointer) do
-    %{
-      principal: {:session, ctx.holder},
-      params: %{
-        assignment_id: ctx.assignment_id,
-        artifact_id: manifest.id,
-        content_sha256: manifest.hash
-      },
-      memento_writes: [{"example/evidence", [pointer]}]
-    }
-  end
 end

@@ -11,7 +11,7 @@ defmodule Tightbeam.NoticeBatcher do
   wake is never rewritten merely because it became a batch member.
   """
 
-  alias Tightbeam.{DB, EventLog, Gateway, Harness, Org, SubmissionSize, Wakes}
+  alias Tightbeam.{DB, EventLog, Gateway, Harness, Org, Rules, SubmissionSize, Wakes}
   alias Tightbeam.DB.Txn
 
   @doc false
@@ -27,8 +27,97 @@ defmodule Tightbeam.NoticeBatcher do
 
   @rule "notice-batching-v1 r2"
   @policy_revision "notice-batching-v1 r2"
+  @notice_classes ~w(algedonic blocker input-needed status-query fyi)
 
   @states ~w(open sealed delivery_pending delivered delivery_failed canceled)
+
+  @doc false
+  def batching_enabled? do
+    case batching_policy_state() do
+      {:available, enabled} -> enabled
+      :unavailable -> false
+    end
+  end
+
+  @doc false
+  def batching_policy_state do
+    case notice_delivery_policy() do
+      %{batching_enabled: enabled} -> {:available, enabled}
+      :unavailable -> :unavailable
+    end
+  end
+
+  @doc false
+  def class_order_sql(table_alias) when is_binary(table_alias) do
+    case notice_delivery_policy() do
+      %{class_order: order} ->
+        if order == [] do
+          "CASE WHEN 1 = 1 THEN 0 END"
+        else
+          cases =
+            order
+            |> Enum.with_index()
+            |> Enum.map(fn {class, index} -> "WHEN '#{class}' THEN #{index}" end)
+
+          information_case =
+            case Enum.find_index(order, &(&1 == "fyi")) do
+              nil -> []
+              index -> ["WHEN 'information' THEN #{index}"]
+            end
+
+          Enum.join(
+            [
+              "CASE #{table_alias}.class",
+              Enum.join(cases ++ information_case, " "),
+              "ELSE #{length(order)} END"
+            ],
+            " "
+          )
+        end
+
+      :unavailable ->
+        "CASE WHEN 1 = 1 THEN 0 END"
+    end
+  end
+
+  defp notice_delivery_policy do
+    case Rules.reaction_policy("notice-delivery") do
+      nil ->
+        family_count =
+          Rules.effective_snapshot()
+          |> Map.get(:reactions, [])
+          |> Enum.count(&(&1.mode == :settings and &1.family == "notice-delivery"))
+
+        if family_count > 1,
+          do: unavailable_notice_delivery_policy("ambiguous"),
+          else: :unavailable
+
+      %{settings: settings} when is_map(settings) ->
+        enabled = Map.get(settings, "batching_enabled")
+        order = Map.get(settings, "class_order")
+        keys = settings |> Map.keys() |> Enum.sort()
+
+        if is_boolean(enabled) and is_list(order) and
+             keys == ["batching_enabled", "class_order"] and
+             Enum.all?(order, &(&1 in @notice_classes)) and
+             length(Enum.uniq(order)) == length(order) do
+          %{batching_enabled: enabled, class_order: order}
+        else
+          unavailable_notice_delivery_policy("invalid")
+        end
+
+      _ ->
+        unavailable_notice_delivery_policy("invalid")
+    end
+  end
+
+  defp unavailable_notice_delivery_policy(reason) do
+    Logger.warning(
+      "substrate settings family notice-delivery is #{reason}; no batching or class-order choice was selected"
+    )
+
+    :unavailable
+  end
 
   @previous_policy_ddl """
   CREATE TABLE IF NOT EXISTS notice_batching_lane_policies (
@@ -807,9 +896,7 @@ defmodule Tightbeam.NoticeBatcher do
           SELECT 1 FROM wake_retry_attempts r WHERE r.wakeId=w.wakeId))
         AND NOT EXISTS (SELECT 1 FROM notice_batch_members m
           WHERE m.sourceWakeId=w.wakeId AND m.state IN ('active','included'))
-      ORDER BY CASE w.class WHEN 'algedonic' THEN 0 WHEN 'blocker' THEN 1
-        WHEN 'input-needed' THEN 2 WHEN 'status-query' THEN 3
-        WHEN 'fyi' THEN 4 WHEN 'information' THEN 4 ELSE 5 END,
+      ORDER BY #{class_order_sql("w")},
         w.createdAt,COALESCE((SELECT root.rowid FROM wake_retry_attempts r
           JOIN wakes root ON root.wakeId=r.rootWakeId WHERE r.wakeId=w.wakeId),w.rowid)
       """,
@@ -929,15 +1016,44 @@ defmodule Tightbeam.NoticeBatcher do
         admit_waiting_human_post_in_txn(txn, target, source, at, delivery_opts)
       end)
 
-    case batch_sources do
-      [] ->
+    case {batch_sources, batching_enabled?()} do
+      {[], _} ->
         {:deliveries, human_deliveries, []}
 
-      _ ->
+      {sources, false} ->
+        direct_deliveries =
+          Enum.map(sources, fn source ->
+            admit_individual_prompt_in_txn(txn, target, source, at, delivery_opts)
+          end)
+
+        {:deliveries, human_deliveries ++ direct_deliveries, []}
+
+      {sources, true} ->
         {:deliveries, batch_deliveries, notices} =
-          admit_notice_batch_snapshot_in_txn(txn, target, batch_sources, at, delivery_opts)
+          admit_notice_batch_snapshot_in_txn(txn, target, sources, at, delivery_opts)
 
         {:deliveries, human_deliveries ++ batch_deliveries, notices}
+    end
+  end
+
+  defp admit_individual_prompt_in_txn(txn, target, source, _at, delivery_opts) do
+    case Gateway.deliver_prompt_in_txn(
+           txn,
+           target,
+           source.origin,
+           source.delivery_prompt,
+           Keyword.merge(delivery_opts,
+             wake_id: source.wake_id,
+             sender: source.origin,
+             target_gate: if(source.target_gate == 0, do: nil, else: source),
+             fire_wake_in_txn: true
+           )
+         ) do
+      {:appended, ^target, _, _} = delivery ->
+        {:delivered, source.wake_id, delivery}
+
+      other ->
+        raise DB.Error, message: "notice_individual_admission_refused: #{inspect(other)}"
     end
   end
 
@@ -1393,15 +1509,7 @@ defmodule Tightbeam.NoticeBatcher do
         FROM notice_batch_members m
         JOIN wakes w ON w.wakeId=m.sourceWakeId
         WHERE m.batchId=?1
-        ORDER BY CASE w.class
-          WHEN 'algedonic' THEN 0
-          WHEN 'blocker' THEN 1
-          WHEN 'input-needed' THEN 2
-          WHEN 'status-query' THEN 3
-          WHEN 'fyi' THEN 4
-          WHEN 'information' THEN 4
-          ELSE 5
-        END, m.publicationSeq
+        ORDER BY #{class_order_sql("w")}, m.publicationSeq
         """,
         [batch_id]
       )
@@ -1496,15 +1604,7 @@ defmodule Tightbeam.NoticeBatcher do
         JOIN notice_batch_members m ON m.batchId=b.batchId
         JOIN wakes w ON w.wakeId=m.sourceWakeId
         WHERE b.deliveryWakeId=?1 AND m.state='included'
-        ORDER BY CASE w.class
-          WHEN 'algedonic' THEN 0
-          WHEN 'blocker' THEN 1
-          WHEN 'input-needed' THEN 2
-          WHEN 'status-query' THEN 3
-          WHEN 'fyi' THEN 4
-          WHEN 'information' THEN 4
-          ELSE 5
-        END, m.publicationSeq
+        ORDER BY #{class_order_sql("w")}, m.publicationSeq
         """,
         [delivery_wake_id]
       )

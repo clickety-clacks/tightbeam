@@ -392,6 +392,150 @@ defmodule Tightbeam.LateRulingHandoffTest do
     refute second.subject =~ @incident_request_id
   end
 
+  test "late ruling recipient order follows the declared family", ctx do
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+
+    seed =
+      String.replace(
+        seed,
+        "recipient_order = [\"opener_lineage\", \"opening_user_personal_session\", \"accountable_owner_personal_session\"]",
+        "recipient_order = [\"accountable_owner_personal_session\", \"opener_lineage\", \"opening_user_personal_session\"]"
+      )
+
+    load_late_ruling_rules(ctx.db, seed)
+
+    source_item = work_item(ctx.db, ctx.opener.session_key, "configured recipient order")
+
+    source =
+      assign(
+        ctx.db,
+        ctx.opener.session_key,
+        ctx.raiser.session_key,
+        "ordered recipient assignment",
+        source_item.id
+      )
+
+    request =
+      Escalation.operator_ask(ctx.db, %{
+        verb: "operator-ask",
+        origin: ctx.raiser.session_key,
+        principal: {:session, ctx.raiser.session_key},
+        transport_session_key: ctx.raiser.session_key,
+        params: %{question: "route by the declared order", assignment_id: source.id}
+      })
+
+    assert %{state: "closed"} =
+             Assignments.__handle__(ctx.db, "revoke-assignment", %{
+               verb: "revoke-assignment",
+               origin: ctx.opener.session_key,
+               principal: {:session, ctx.opener.session_key},
+               params: %{assignment_id: source.id, reason: "exercise the recipient order"}
+             })
+
+    assert %{status: "ruled"} =
+             Escalation.operator_rule(
+               ctx.db,
+               %{
+                 verb: "operator-rule",
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 transport_session_key: ctx.raiser.session_key,
+                 params: %{request: request.id, decision: "accept"}
+               },
+               scheduler: ctx.scheduler
+             )
+
+    assert {:ok, [[session_key]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert session_key == Org.personal_session_key("flynn")
+  end
+
+  test "unavailable late-ruling families refuse without changing a closed request", ctx do
+    source_item = work_item(ctx.db, ctx.opener.session_key, "unavailable routing")
+
+    source =
+      assign(
+        ctx.db,
+        ctx.opener.session_key,
+        ctx.raiser.session_key,
+        "unavailable recipient assignment",
+        source_item.id
+      )
+
+    request =
+      Escalation.operator_ask(ctx.db, %{
+        verb: "operator-ask",
+        origin: ctx.raiser.session_key,
+        principal: {:session, ctx.raiser.session_key},
+        transport_session_key: ctx.raiser.session_key,
+        params: %{question: "no recipient without a family", assignment_id: source.id}
+      })
+
+    assert %{state: "closed"} =
+             Assignments.__handle__(ctx.db, "revoke-assignment", %{
+               verb: "revoke-assignment",
+               origin: ctx.opener.session_key,
+               principal: {:session, ctx.opener.session_key},
+               params: %{assignment_id: source.id, reason: "exercise unavailable routing"}
+             })
+
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+    absent = remove_late_ruling_family(seed)
+
+    invalid =
+      String.replace(
+        seed,
+        "recipient_order = [\"opener_lineage\", \"opening_user_personal_session\", \"accountable_owner_personal_session\"]",
+        "recipient_order = [\"unknown_source\"]"
+      )
+
+    empty_order =
+      String.replace(
+        seed,
+        "recipient_order = [\"opener_lineage\", \"opening_user_personal_session\", \"accountable_owner_personal_session\"]",
+        "recipient_order = []"
+      )
+
+    ambiguous =
+      seed <>
+        "\n[[reaction]]\nname = \"late-ruling-duplicate\"\nfamily = \"late-ruling\"\n" <>
+        "settings = { recipient_order = [], default_deadline_ms = 86400000 }\n" <>
+        "english = \"Choose late-ruling settings.\"\n"
+
+    for {mode, rules_seed} <- [
+          absent: absent,
+          empty_order: empty_order,
+          invalid: invalid,
+          ambiguous: ambiguous
+        ] do
+      load_late_ruling_rules(ctx.db, rules_seed)
+      before = mutation_counts(ctx.db)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %{code: "late_ruling_recipient_unavailable"} =
+                   Escalation.operator_rule(ctx.db, %{
+                     verb: "operator-rule",
+                     origin: "user:flynn",
+                     principal: {:user, "flynn"},
+                     transport_session_key: ctx.raiser.session_key,
+                     params: %{request: request.id, decision: "accept"}
+                   })
+        end)
+
+      if mode in [:invalid, :ambiguous],
+        do: assert(log =~ "late-ruling is #{mode}")
+
+      assert mutation_counts(ctx.db) == before
+      assert hd(request_row(ctx.db, request.id)) == "open"
+    end
+  end
+
   test "late ruling and successor refusals leave every mutation surface unchanged", ctx do
     source_item = work_item(ctx.db, ctx.opener.session_key, "refusal source")
 
@@ -578,20 +722,18 @@ defmodule Tightbeam.LateRulingHandoffTest do
     assert known_outside == unknown_outside
     assert known_outside.code == "not_found"
 
-    assert %{code: "invalid_ruling_consumption_target"} =
-             Assignments.__handle__(ctx.db, "attest", receipt)
+    assert %{code: "rule_denied"} =
+             declared_receipt(ctx.db, receipt)
 
-    assert %{code: "invalid_ruling_consumption_target"} =
-             Assignments.__handle__(
+    assert %{code: "rule_denied"} =
+             declared_receipt(
                ctx.db,
-               "attest",
                put_in(receipt, [:params, :note], "not-an-operational-action")
              )
 
-    assert %{code: "invalid_ruling_consumption_target"} =
-             Assignments.__handle__(
+    assert %{code: "rule_denied"} =
+             declared_receipt(
                ctx.db,
-               "attest",
                put_in(receipt, [:params, :commit_refs], [
                  %{repo: "fixture:#{File.cwd!()}", commit: "missing"}
                ])
@@ -706,6 +848,28 @@ defmodule Tightbeam.LateRulingHandoffTest do
     })
   end
 
+  defp declared_receipt(db, call) do
+    root = Path.join(System.tmp_dir!(), "receipt-rules-#{System.unique_integer([:positive])}")
+    rules = Path.join(root, "identity/rules")
+    File.mkdir_p!(rules)
+    File.write!(
+      Path.join(rules, "receipts.toml"),
+      Tightbeam.TerminalReactionFixture.ruling_receipts()
+    )
+    previous = :persistent_term.get(Tightbeam.Rules, :missing)
+    try do
+      Tightbeam.Rules.load!(root, ["attest"])
+      case Tightbeam.Rules.evaluate(db, call) do
+        {:deny, error} -> error
+        :ok -> Assignments.__handle__(db, "attest", call)
+      end
+    after
+      File.rm_rf!(root)
+      if previous == :missing, do: :persistent_term.erase(Tightbeam.Rules),
+        else: :persistent_term.put(Tightbeam.Rules, previous)
+    end
+  end
+
   defp assignment_row(db, assignment_id) do
     {:ok, [row]} =
       DB.query(
@@ -726,6 +890,31 @@ defmodule Tightbeam.LateRulingHandoffTest do
       )
 
     row
+  end
+
+  defp load_late_ruling_rules(db, seed) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "late-ruling-rules-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(root, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    on_exit(fn -> File.rm_rf!(root) end)
+    Tightbeam.Rules.load!(root, Map.keys(Tightbeam.Gateway.handlers(%{db: db})))
+  end
+
+  defp remove_late_ruling_family(seed) do
+    pattern =
+      Regex.compile!(
+        "(?m)^\\[\\[reaction\\]\\]\nname = \\\"late-ruling\\\"\n" <>
+          "family = \\\"late-ruling\\\"\nsettings = \\{[^\n]*\\}\n" <>
+          "english = \\\"[^\n]*\\\"\n?"
+      )
+
+    Regex.replace(pattern, seed, "")
   end
 
   defp git_head! do

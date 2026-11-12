@@ -14,6 +14,7 @@ defmodule Tightbeam.EscalationTest do
     NoticeBatcher,
     Org,
     Projection,
+    Roles,
     Wakes
   }
 
@@ -433,6 +434,101 @@ defmodule Tightbeam.EscalationTest do
     deadline_at = request(ctx, id).deadline_at
     assert deadline_at >= before_open + 12_345
     assert deadline_at <= after_open + 12_345
+  end
+
+  test "late-ruling settings choose decision deadlines and unavailable families use the default",
+       ctx do
+    previous = Application.get_env(:tightbeam, :escalation_decision_deadline_ms)
+    assert is_nil(previous), "test needs no explicit gateway deadline override"
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :escalation_decision_deadline_ms),
+        else: Application.put_env(:tightbeam, :escalation_decision_deadline_ms, previous)
+    end)
+
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+
+    seed_with_override =
+      String.replace(seed, "default_deadline_ms = 86400000", "default_deadline_ms = 123456")
+
+    load_escalation_rules(ctx.db, seed_with_override)
+    assert_decision_deadline(ctx, "family-deadline", 123_456, nil)
+
+    absent = remove_settings_family(seed_with_override, "late-ruling")
+    load_escalation_rules(ctx.db, absent)
+    assert_decision_deadline(
+      ctx,
+      "absent-family-deadline",
+      86_400_000,
+      "late-ruling is absent"
+    )
+
+    invalid =
+      String.replace(
+        seed_with_override,
+        "recipient_order = [\"opener_lineage\", \"opening_user_personal_session\", \"accountable_owner_personal_session\"]",
+        "recipient_order = [\"unknown_source\"]"
+      )
+
+    load_escalation_rules(ctx.db, invalid)
+    assert_decision_deadline(
+      ctx,
+      "invalid-family-deadline",
+      86_400_000,
+      "late-ruling is invalid"
+    )
+
+    ambiguous =
+      seed_with_override <>
+        "\n[[reaction]]\nname = \"late-ruling-duplicate\"\nfamily = \"late-ruling\"\n" <>
+        "settings = { recipient_order = [], default_deadline_ms = 123456 }\n" <>
+        "english = \"Choose late-ruling settings.\"\n"
+
+    load_escalation_rules(ctx.db, ambiguous)
+    assert_decision_deadline(
+      ctx,
+      "ambiguous-family-deadline",
+      86_400_000,
+      "late-ruling is ambiguous"
+    )
+
+    Application.put_env(:tightbeam, :escalation_decision_deadline_ms, 12_345)
+    load_escalation_rules(ctx.db, invalid)
+    assert_decision_deadline(
+      ctx,
+      "explicit-deadline-override",
+      12_345,
+      "late-ruling is invalid"
+    )
+  end
+
+  test "agent-origin requests retain the role owner when fallback is unavailable", ctx do
+    Roles.create!(ctx.db, "inactive-raiser", "flynn", nil)
+    load_escalation_rules(ctx.db, "")
+
+    request =
+      Escalation.operator_ask(ctx.db, %{
+        verb: "operator-ask",
+        origin: "agent:inactive-raiser",
+        principal: {:session, ctx.raiser.session_key},
+        transport_session_key: ctx.raiser.session_key,
+        params: %{question: "retain the accountable owner"}
+      })
+
+    assert request.owner_user_id == "flynn"
+    assert request.status == "open"
+
+    direct_session_request =
+      Escalation.operator_ask(ctx.db, %{
+        verb: "operator-ask",
+        origin: "agent:#{ctx.raiser.session_key}",
+        principal: {:session, ctx.raiser.session_key},
+        transport_session_key: ctx.raiser.session_key,
+        params: %{question: "retain the direct session owner"}
+      })
+
+    assert direct_session_request.owner_user_id == "flynn"
   end
 
   test "rule uses admin axis, closed decisions, idempotent re-rule, and wakes on its reserved fact",
@@ -3538,6 +3634,56 @@ defmodule Tightbeam.EscalationTest do
 
   defp open(ctx, call, statute) do
     Escalation.escalate(ctx.db, call, statute, escalation_ctx())
+  end
+
+  defp assert_decision_deadline(ctx, assignment_id, duration_ms, expected_log) do
+    before_open = System.system_time(:millisecond)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:decision_pending, request_id} =
+                 open(
+                   ctx,
+                   call(ctx.raiser, %{assignment_id: assignment_id}),
+                   statute()
+                 )
+
+        after_open = System.system_time(:millisecond)
+        deadline_at = request(ctx, request_id).deadline_at
+        assert deadline_at >= before_open + duration_ms
+        assert deadline_at <= after_open + duration_ms
+      end)
+
+    if expected_log do
+      assert log =~ expected_log
+    else
+      refute log =~ "substrate settings family late-ruling"
+    end
+  end
+
+  defp load_escalation_rules(db, seed) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "escalation-settings-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(root, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    on_exit(fn -> File.rm_rf!(root) end)
+    Tightbeam.Rules.load!(root, Map.keys(Gateway.handlers(%{db: db})))
+  end
+
+  defp remove_settings_family(seed, family) do
+    pattern =
+      Regex.compile!(
+        "(?m)\\n\\[\\[reaction\\]\\]\\nname = \\\"#{Regex.escape(family)}\\\"\\n" <>
+          "family = \\\"#{Regex.escape(family)}\\\"\\nsettings = \\{[^\\n]*\\}\\n" <>
+          "english = \\\"[^\\n]*\\\"\\n?"
+      )
+
+    Regex.replace(pattern, seed, "\n")
   end
 
   defp start_busy_turn(db, session_key) do

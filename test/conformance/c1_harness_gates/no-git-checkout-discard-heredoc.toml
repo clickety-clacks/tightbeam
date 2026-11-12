@@ -1,0 +1,10 @@
+[fixture]
+class = "C1"
+name = "no-git-checkout-discard-heredoc"
+phase = "green"
+blocking_phase = ""
+kind = "harness-gate"
+source = "Shipped engineering.toml"
+legibility = "gate:no-git-checkout-discard"
+shipped_ref = "engineering.toml:no-git-checkout-discard"
+action = "git-checkout-discard"

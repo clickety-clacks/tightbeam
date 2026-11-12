@@ -347,6 +347,48 @@ defmodule FeatureSmoke do
 
   # --- local deployment: live home + cwd projection and durable redelivery ----
   defp check_local_deployment(state) do
+    case deployment_reviewer_archetype(state) do
+      nil ->
+        IO.puts("  SKIP local deployment: deployment-smoke settings unavailable")
+        state
+
+      archetype ->
+        check_local_deployment(state, archetype)
+    end
+  end
+
+  defp deployment_reviewer_archetype(state) do
+    verbs = Tightbeam.Gateway.handlers(%{}) |> Map.keys()
+
+    Tightbeam.Identity.with_recovery_law!(state.base_dir, fn law_base, revision ->
+      Tightbeam.Rules.load!(state.base_dir, verbs, law_base: law_base, revision: revision)
+    end)
+
+    case Tightbeam.Rules.reaction_policy("deployment-smoke") do
+      %{settings: %{"reviewer_archetype" => archetype} = settings}
+      when map_size(settings) == 1 and is_binary(archetype) and archetype != "" ->
+        archetype
+
+      nil ->
+        count =
+          Tightbeam.Rules.effective_snapshot()
+          |> Map.get(:reactions, [])
+          |> Enum.count(&(&1.mode == :settings and &1.family == "deployment-smoke"))
+
+        if count > 1, do: unavailable_deployment_settings("ambiguous"), else: nil
+
+      _ ->
+        unavailable_deployment_settings("invalid")
+    end
+  end
+
+  defp unavailable_deployment_settings(reason) do
+    require Logger
+    Logger.warning("settings family deployment-smoke is #{reason}; no archetype was selected")
+    nil
+  end
+
+  defp check_local_deployment(state, archetype) do
     harness = state.leg.harness.id()
     machine = Tightbeam.Placement.local_host_name()
     wi = ok!(state, "work-item-create", %{"title" => "smoke local deployment #{unique()}"})
@@ -357,7 +399,7 @@ defmodule FeatureSmoke do
 
     session =
       ok!(state, "spawn", %{
-        "archetype" => "reviewer-code",
+        "archetype" => archetype,
         "workItemId" => wi_id,
         "displayName" => "smoke-local-deploy-#{unique()}",
         "idempotencyKey" => "local-deploy-#{unique()}"
@@ -383,12 +425,12 @@ defmodule FeatureSmoke do
         error in RuntimeError -> fail(state, Exception.message(error))
       end
 
-      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer-code", harness)
+      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, archetype, harness)
 
       assert(
         state,
         map_size(snapshot.skills) > 0,
-        "local deployment elected no skills for reviewer-code at #{cwd}"
+        "local deployment elected no skills for #{archetype} at #{cwd}"
       )
 
       wake =
@@ -626,8 +668,7 @@ defmodule FeatureSmoke do
             holder.check.note
       })
 
-      # The code-completion guard needs matching producer verification before the
-      # review statute can keep its pending completion and notify the accountable owner.
+      # Record the operator's observed fixture verification through the holder token.
       matching_verification =
         sqlite(
           state,
@@ -657,55 +698,7 @@ defmodule FeatureSmoke do
         )
       end
 
-      # 1. Review gate. The current statute records an accountable notice rather
-      # than opening an automatic remedy episode or staffing a reviewer. The
-      # completion remains pending until its owner directs a matching review.
-      review_request = complete.()
-
-      assert(
-        state,
-        not (is_map(review_request) and Map.has_key?(review_request, "error")),
-        "gate chain: completion-requires-review did not route the pending completion: " <>
-          "#{inspect(review_request)}"
-      )
-
-      review_notice_count =
-        sqlite(
-          state,
-          "SELECT count(*) FROM wakes WHERE assignmentId = #{sql_quote(asg_id)} " <>
-            "AND origin = 'remedy:completion-requires-review'"
-        )
-
-      assert(
-        state,
-        review_notice_count == "1",
-        "gate chain: completion-requires-review should store one accountable notice, " <>
-          "found #{review_notice_count}"
-      )
-
-      review_episode_count =
-        sqlite(
-          state,
-          "SELECT count(*) FROM rail_remedy_episodes WHERE statute = " <>
-            "'completion-requires-review' AND subject = #{sql_quote(asg_id)}"
-        )
-
-      assert(
-        state,
-        review_episode_count == "0",
-        "gate chain: completion-requires-review notice should not create an automatic " <>
-          "remedy episode, found #{review_episode_count}"
-      )
-
-      pending = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
-
-      assert(
-        state,
-        pending["state"] == "open",
-        "gate chain: review-pending completion should leave #{asg_id} open, got " <>
-          "#{inspect(pending["state"])}"
-      )
-
+      # A linked review records its verdict without completing the producer.
       reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
 
       review =
@@ -723,7 +716,7 @@ defmodule FeatureSmoke do
           })
 
       # Review the actual tiny fixture before filing its scripted conclusion. This
-      # proves the review gate's wire/provenance behavior, not independent inference.
+      # proves verdict wire/provenance behavior, not independent inference.
       # Changed bytes or output refuse; no product source review is manufactured.
       review_note = Tightbeam.FeatureSmokeTopology.review_check!(holder.check)
 
@@ -746,14 +739,13 @@ defmodule FeatureSmoke do
 
       assert(
         state,
-        code_final["state"] == "closed" and code_final["outcome"] == "completed",
-        "gate chain: matching code evidence and review should complete #{asg_id}, got " <>
+        code_final["state"] == "open" and is_nil(code_final["outcome"]),
+        "gate chain: a review verdict must leave #{asg_id} open until completion, got " <>
           "state=#{inspect(code_final["state"])} outcome=#{inspect(code_final["outcome"])}"
       )
 
-      # Verification and artifact statutes are tested on a separate coder-held
-      # evidence assignment so their rule paths remain reachable after the code
-      # completion's review remedy has settled.
+      # Exercise missing-verdict and missing-artifact refusals on a separate
+      # coder-held assignment with no verification or linked review yet.
       gate_assignment =
         ok!(state, "assign", %{
           "sessionKey" => holder.key,
@@ -772,8 +764,7 @@ defmodule FeatureSmoke do
         })
       end
 
-      # 2. Verification gate. This assignment is not a code completion, so the
-      # code-evidence guard cannot mask the statute being exercised here.
+      # Verification gate: neither arm of the declared verdict choice is present.
       denied!(state, "completion-requires-verification", gate_asg_id, complete_gate)
 
       verified_gate =
@@ -851,6 +842,15 @@ defmodule FeatureSmoke do
           "#{inspect(recorded["recordedTurnEvidence"])}. `tool-call-observed` here would mean " <>
           "the strongest evidence class is obtainable WITHOUT a tool call, which would void " <>
           "the carrier proof in the other half of this group. Row: #{inspect(recorded)}"
+      )
+
+      completed = complete.()
+      code_final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
+
+      assert(
+        state,
+        code_final["state"] == "closed" and code_final["outcome"] == "completed",
+        "gate chain: explicit completion should close #{asg_id}: #{inspect(completed)}"
       )
 
       # 5. Release. The verification and artifact gates denied in order; with a
@@ -954,7 +954,7 @@ defmodule FeatureSmoke do
 
       pass(
         state,
-        "gate chain enforced: review(#{reviewer_leg.wire_name}) routed with matching code evidence; " <>
+        "gate chain enforced: review(#{reviewer_leg.wire_name}) leaves producer open until completion; " <>
           "verification → artifact denied on the coder-held evidence task, released by a " <>
           "#{recorded["recordedTurnEvidence"]} row (gate is evidence-blind, classes not spoofable), " <>
           "completes, episode closed — holder: " <>
@@ -1985,11 +1985,10 @@ defmodule FeatureSmoke do
   end
 
   # --- dispatch (happy path: opens the assignment + wakes the holder) --------
-  # NOTE: the rumination REROUTE only fires for a SESSION caller (users don't
-  # ruminate), which needs the caller session's own bearer token — session-token
-  # plumbing this HTTP smoke doesn't do yet. The reroute is covered by unit tests
-  # (assignments_test.exs). Here we drive dispatch as the user and assert it opens
-  # the assignment atomically (the verb's wiring through router→dispatch→handler).
+  # NOTE: the dispatch notice only fires for a SESSION caller, which needs the
+  # caller session's own bearer token — session-token plumbing this HTTP smoke
+  # doesn't do yet. Here we drive dispatch as the user and assert it opens the
+  # assignment atomically (the verb's wiring through router→dispatch→handler).
   defp check_dispatch_opens_assignment(state) do
     wi =
       ok!(state, "work-item-create", %{
@@ -2399,17 +2398,6 @@ defmodule FeatureSmoke do
     )
 
     coordinator
-  end
-
-  defp dispatch_after_rumination!(state, parent_key, params) do
-    result = ok!(state, "dispatch", params)
-
-    if result["ruminationRequired"] || result["rumination_required"] do
-      await_lane_idle!(state, parent_key, "after the staffing work item's rumination")
-      ok!(state, "dispatch", params)
-    else
-      result
-    end
   end
 
   defp ok!(state, verb, params) do

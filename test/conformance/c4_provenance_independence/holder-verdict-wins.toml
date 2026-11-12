@@ -7,9 +7,9 @@ kind = "dispatch-rule"
 source = "coordination-fabric-v1 §13 Phase 0; wi_00000000 wedge class"
 legibility = "event:denied(rule=coder-completion-needs-independent-review)"
 
-# Review judgments come from holder-filed verdict rows, never from bare card
-# lifecycle recency. A verdictless round therefore cannot displace a standing
-# judgment, even when the verdictless card is terminal.
+# Independent review kinds are a set of holder-filed verdicts on linked cards.
+# Card lifecycle and later verdicts do not withdraw an earlier independent clean.
+# Self-held cards and nonholder filings do not contribute to that set.
 [[fixture.rule]]
 name = "coder-completion-needs-independent-review"
 verb = "attest"
@@ -17,5 +17,5 @@ external_producer = true
 text = "completion needs a linked reviewed-clean verdict by the review card's different-session holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+  { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]

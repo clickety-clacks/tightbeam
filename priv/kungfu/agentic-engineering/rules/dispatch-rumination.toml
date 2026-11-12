@@ -1,0 +1,17 @@
+[[rule]]
+name = "dispatch-rumination"
+verb = "dispatch"
+verbs = ["dispatch"]
+edges = ["row-commit"]
+effect = "notice"
+text = "A dispatch opened an assignment on an open work item."
+deny_when = [
+  { fact = "assignment.state", op = "eq", value = "open" },
+  { fact = "caller.origin_class", op = "eq", value = "agent" },
+  { fact = "work_item.state", op = "eq", value = "open" },
+]
+
+[rule.notice]
+target_session = "{assignment_opener_session}"
+prompt = "digest: Ruminate on work-item {work_item_id} against the whole spec and its spirit. Assignment {assignment_id} has already been dispatched. When you've thought it through, review the open assignment and adjust it if needed."
+idempotency_key = "{work_item_id}"

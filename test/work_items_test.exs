@@ -31,7 +31,6 @@ defmodule Tightbeam.WorkItemsTest do
     holder = session(db, "holder", "flynn")
     other = session(db, "other-holder", "other")
     handlers = Gateway.handlers(%{db: db})
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
@@ -792,6 +791,58 @@ defmodule Tightbeam.WorkItemsTest do
     idle = create(ctx, {:session, "holder"}, %{title: "No running turn"})
 
     assert {:ok, [[nil, 1]]} = creation_context(ctx.db, idle.id)
+  end
+
+  test "a missing work-item context family leaves the running-turn link unchosen", ctx do
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "work-item-context-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(Path.join(base, "identity/rules"))
+    on_exit(fn -> File.rm_rf!(base) end)
+    Rules.load!(base, Map.keys(ctx.handlers))
+
+    {_running_seq, _owner_lease} = running_turn!(ctx.db, "holder")
+    item = create(ctx, {:session, "holder"}, %{title: "No selected context"})
+
+    assert {:ok, [[nil, 1]]} = creation_context(ctx.db, item.id)
+
+    assert %{workItem: handoff_item, created: true} =
+             WorkItems.__handle__(
+               ctx.db,
+               "work-item-handoff",
+               handoff_call({:session, "holder"}, %{
+                 title: "Handoff without selected context",
+                 delivery_owner_session_key: ctx.other.session_key,
+                 brief: "Take ownership of this work item."
+               })
+             )
+
+    assert {:ok, [[nil, 1]]} = creation_context(ctx.db, handoff_item.id)
+  end
+
+  test "the work-item context family can disable running-turn links", ctx do
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "work-item-context-off-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    seed = File.read!(Path.expand("../priv/seed/rules/substrate.toml", __DIR__))
+    seed = String.replace(seed, "link_current_turn = true", "link_current_turn = false")
+    File.write!(Path.join(rules_dir, "substrate.toml"), seed)
+    Rules.load!(base, Map.keys(ctx.handlers))
+
+    {_running_seq, _owner_lease} = running_turn!(ctx.db, "holder")
+    item = create(ctx, {:session, "holder"}, %{title: "Disabled context link"})
+
+    assert {:ok, [[nil, 1]]} = creation_context(ctx.db, item.id)
   end
 
   test "Proof 3: a bracket-turn create (jobRef, no assignment) stamps the turn", ctx do
