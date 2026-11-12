@@ -1055,6 +1055,105 @@ defmodule Tightbeam.Assignments do
     Enum.map(rows, &hd/1)
   end
 
+  @doc "Return the current independent clean review for a submitted result."
+  @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
+  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
+    qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, nil)
+  end
+
+  @doc """
+  Return the current independent clean review for a submitted result.
+
+  A linked review conclusion for this producer takes precedence over unlinked
+  review conclusions on the same work item. An unlinked same-item review can
+  qualify only when no linked conclusion exists. When the selected clean review
+  and the producer's latest verification include commit refs, the review must
+  include every verified producer commit; additional reviewed commits do not
+  disqualify it.
+  """
+  @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
+          [String.t()]
+  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        WITH winning_verdict AS (
+          SELECT
+            r.holderKey AS reviewHolderKey,
+            v.verdictKind AS verdictKind,
+            v.commitRefs AS commitRefs
+          FROM attests AS v
+          JOIN assignments AS r
+            ON r.id = v.assignmentId
+          JOIN assignments AS producer
+            ON producer.id = ?1
+          LEFT JOIN assignment_effects AS review_effect
+            ON review_effect.assignmentId = r.id
+          WHERE (
+              r.reviewsAssignmentId = producer.id
+              OR (
+                producer.workItemId IS NOT NULL
+                AND r.id != producer.id
+                AND r.reviewsAssignmentId IS NULL
+                AND r.workItemId = producer.workItemId
+                AND COALESCE(review_effect.effectKind, 'code') = 'review'
+              )
+            )
+            AND v.kind = 'verdict'
+            AND v.bySession = r.holderKey
+            AND v.verdictKind IN ('reviewed-clean', 'changes-requested')
+          ORDER BY CASE WHEN r.reviewsAssignmentId = producer.id THEN 0 ELSE 1 END,
+            v.ts DESC, v.rowid DESC
+          LIMIT 1
+        )
+        SELECT reviewHolderKey, verdictKind, commitRefs
+        FROM winning_verdict
+        WHERE reviewHolderKey != ?2
+          AND verdictKind = 'reviewed-clean'
+        """,
+        [assignment_id, assignment_holder_key]
+      )
+
+    case rows do
+      [[_review_holder, "reviewed-clean", encoded_refs]] ->
+        review_refs = if is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil
+
+        if review_covers_commit_refs?(review_refs, commit_refs) do
+          ["reviewed-clean"]
+        else
+          []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp review_covers_commit_refs?(_review_refs, nil), do: true
+  defp review_covers_commit_refs?(_review_refs, []), do: true
+
+  defp review_covers_commit_refs?(review_refs, producer_refs)
+       when is_list(review_refs) and is_list(producer_refs) do
+    review_commits =
+      review_refs
+      |> Enum.flat_map(fn
+        %{"commit" => commit} when is_binary(commit) -> [String.downcase(commit)]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    Enum.all?(producer_refs, fn
+      %{"commit" => commit} when is_binary(commit) ->
+        MapSet.member?(review_commits, String.downcase(commit))
+
+      _ ->
+        false
+    end)
+  end
+
+  defp review_covers_commit_refs?(_review_refs, _producer_refs), do: false
+
   @doc "Return the current producer verification for a submitted result."
   @spec qualifying_verification_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
           [String.t()]

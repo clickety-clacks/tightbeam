@@ -786,9 +786,8 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
   end
 
-  test "removed qualification facts and evidence policy purposes refuse to load", ctx do
+  test "removed unshipped qualification facts and evidence policy purposes refuse to load", ctx do
     for fact <- [
-          "assignment.qualifying_review_verdict_kinds",
           "work_item.changes_requested_count",
           "call.file_effect_manifest.valid"
         ] do
@@ -887,6 +886,7 @@ defmodule Tightbeam.RulesTest do
   test "P3 fact registry has exact names and load-time types", ctx do
     list_facts = [
       "assignment.independent_verdict_kinds",
+      "assignment.qualifying_review_verdict_kinds",
       "assignment.artifact_kinds"
     ]
 
@@ -998,6 +998,7 @@ defmodule Tightbeam.RulesTest do
 
     list_facts = [
       "assignment.independent_verdict_kinds",
+      "assignment.qualifying_review_verdict_kinds",
       "assignment.artifact_kinds"
     ]
 
