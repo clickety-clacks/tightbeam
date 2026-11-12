@@ -709,7 +709,7 @@ defmodule Tightbeam.GatewayTest do
 
     Org.create(db, %{
       session_key: "k1",
-      display_name: "Main",
+      display_name: "Flynn session",
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
@@ -2611,7 +2611,7 @@ defmodule Tightbeam.GatewayTest do
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
     Org.create(ctx.db, %{
       session_key: Org.personal_session_key("flynn"),
-      display_name: "Main",
+      display_name: "Flynn built-in main",
       kind: "main",
       is_built_in: true,
       owner_user_id: "flynn",
@@ -6988,7 +6988,7 @@ defmodule Tightbeam.GatewayTest do
       spawn.(%{
         origin: "user:flynn",
         session_key: nil,
-        params: %{display_name: "S", host: host, model: model, idempotency_key: key}
+        params: %{display_name: "S #{key}", host: host, model: model, idempotency_key: key}
       })
     end
 
@@ -7980,7 +7980,7 @@ defmodule Tightbeam.GatewayTest do
       Gateway.handlers(config)["spawn"].(%{
         origin: "user:flynn",
         session_key: nil,
-        params: Map.merge(%{display_name: "Partial", idempotency_key: key}, params)
+        params: Map.merge(%{display_name: "Partial #{key}", idempotency_key: key}, params)
       })
     end
 
@@ -8090,7 +8090,7 @@ defmodule Tightbeam.GatewayTest do
                  origin: "user:flynn",
                  session_key: nil,
                  params: %{
-                   display_name: "Nil Family",
+                   display_name: "Nil Family #{inspect(empty)}",
                    idempotency_key: key,
                    model: empty,
                    effort: "high"
@@ -11461,7 +11461,7 @@ defmodule Tightbeam.GatewayTest do
     main =
       Org.create(ctx.db, %{
         session_key: Org.personal_session_key("bundle-owner"),
-        display_name: "Main",
+        display_name: "Bundle owner main",
         kind: "main",
         is_built_in: true,
         owner_user_id: "bundle-owner",
