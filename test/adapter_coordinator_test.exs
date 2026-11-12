@@ -1116,6 +1116,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # readiness deadline before queuing the credential reset. The reset then
     # replaces the pending preflight in mailbox order, without racing a timer.
     :ok = :sys.suspend(coordinator)
+
     request =
       try do
         refusal_entry = :sys.get_state(coordinator).adapters[key]
@@ -1138,7 +1139,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              :gen_server.wait_response(request, 10_000)
 
     assert_receive {:automatic_recovery_refusal_started, refusal_readiness_task,
-                    [credential_kind: :subscription]}, 10_000
+                    [credential_kind: :subscription]},
+                   10_000
 
     assert is_pid(refusal_readiness_task)
 
