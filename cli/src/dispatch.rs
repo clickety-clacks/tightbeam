@@ -1540,6 +1540,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("assignmentId", assignment_id)],
         )),
+        Command::CheckAttest {
+            identity,
+            attest_id,
+        } => Ok(request(
+            identity,
+            "check-attest",
+            vec![],
+            vec![string_field("attestId", attest_id)],
+        )),
         Command::AssignmentGet {
             identity,
             assignment_id,
@@ -4058,6 +4067,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::MementoSet { identity, .. }
         | Command::Mementos { identity, .. }
         | Command::Attests { identity, .. }
+        | Command::CheckAttest { identity, .. }
         | Command::AssignmentGet { identity, .. }
         | Command::Assignments { identity, .. }
         | Command::CancelWake { identity, .. }
@@ -5627,6 +5637,10 @@ mod tests {
         assert_eq!(
             body(&["attests", "asg_1", "--as", "reviewer"]),
             r#"{"as":"reviewer","verb":"attests","params":{"assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&["check-attest", "att_1", "--as", "reviewer"]),
+            r#"{"as":"reviewer","verb":"check-attest","params":{"attestId":"att_1"}}"#
         );
         assert_eq!(
             body(&[

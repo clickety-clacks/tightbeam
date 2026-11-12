@@ -1975,12 +1975,6 @@ defmodule Tightbeam.Assignments do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
 
-      # The referent cursor is read BEFORE the claim is filed: what a claim points
-      # at is what had been recorded when it was made, never an artifact that
-      # appeared while the check was running. Reading it outside the attest's
-      # transaction is deliberate — a registry this cannot read is reported as
-      # such, and a failed CHECK never rejects the claim (§Design 5).
-      artifact_cursor = artifact_cursor(db)
       snapshot = Rules.effective_snapshot()
 
       result =
@@ -2025,16 +2019,7 @@ defmodule Tightbeam.Assignments do
         best_effort(fn -> notify(call, :on_assignment_change, assignment_id, from) end)
       end
 
-      # The claim is filed; now check what it pointed at. Verification runs
-      # AFTER the transaction and never changes it: a referent that cannot be
-      # checked is a fact about the check, not a verdict on the attest.
-      case result do
-        %{assignment: assignment} ->
-          Map.put(result, :referents, referents(db, call, assignment, artifact_cursor))
-
-        _ ->
-          result
-      end
+      result
     end
   rescue
     refusal in TerminalNotificationRefused ->
@@ -2059,149 +2044,6 @@ defmodule Tightbeam.Assignments do
 
   defp memento_refusal(error),
     do: error.admission || error.details || %{code: error.code, message: error.message}
-
-  # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
-  # "Artifacts are the referents" — an attest's referents are the artifacts the
-  # HOLDER recorded, not a separate list it declares, and not a subset chosen
-  # here. Every one of them is verified by write-detection of its originPath on
-  # the host that holds it.
-  #
-  # The one row this cannot check is an ARCHIVED one: archival moved those bytes
-  # into `home` itself, so originPath is knowingly stale and stat-ing it would
-  # manufacture an "absent" the substrate caused. A released row is still checked
-  # — external work lives exactly where it says it does.
-  defp referents(_db, _call, _assignment, {:error, reason}), do: [unreadable_registry(reason)]
-
-  defp referents(db, call, assignment, {:ok, artifact_cursor}) do
-    config = placement_config(db, call)
-    holder = Org.get(db, assignment.holderKey)
-
-    case DB.query(
-           db,
-           """
-           SELECT artifactId, originPath FROM artifacts
-           WHERE createdBySession = ?1 AND rowid <= ?2 AND state <> 'archived'
-           ORDER BY createdAt, artifactId
-           """,
-           [assignment.holderKey, artifact_cursor]
-         ) do
-      {:ok, rows} -> verified_referents(config, holder, rows)
-      {:error, reason} -> [unreadable_registry(reason)]
-    end
-  rescue
-    error -> [unreadable_registry(error)]
-  end
-
-  defp artifact_cursor(db) do
-    case DB.query(db, "SELECT COALESCE(MAX(rowid), 0) FROM artifacts") do
-      {:ok, [[cursor]]} -> {:ok, cursor}
-      {:error, reason} -> {:error, reason}
-    end
-  rescue
-    error -> {:error, error}
-  end
-
-  defp unreadable_registry(reason) do
-    %{
-      artifactId: nil,
-      originPath: nil,
-      host: nil,
-      path: nil,
-      mtime: nil,
-      status: "unverifiable",
-      reason: "the artifact registry could not be read: #{inspect(reason)}"
-    }
-  end
-
-  defp verified_referents(_config, _holder, []), do: []
-
-  # No holder session means no host to resolve a path against. That is reported
-  # per artifact, not swallowed into an empty list that reads like "checked, all
-  # fine".
-  defp verified_referents(_config, nil, rows) do
-    Enum.map(rows, fn [id, origin] ->
-      %{
-        artifactId: id,
-        originPath: origin,
-        host: nil,
-        path: nil,
-        mtime: nil,
-        status: "unverifiable",
-        reason: "the holder session is unavailable, so its host could not be resolved"
-      }
-    end)
-  end
-
-  defp verified_referents(config, holder, rows) do
-    resolved = Enum.map(rows, fn [id, origin] -> resolve_origin(config, holder, id, origin) end)
-
-    checks =
-      resolved
-      |> Enum.filter(& &1.host)
-      |> Enum.group_by(& &1.host, & &1.path)
-      |> Enum.map(fn {host, paths} ->
-        {host, Placement.check_origins(config, host, Enum.uniq(paths))}
-      end)
-      |> Map.new()
-
-    Enum.map(resolved, fn referent ->
-      status =
-        if referent.reason,
-          do: {:error, referent.reason},
-          else: checks[referent.host][referent.path]
-
-      %{
-        artifactId: referent.artifact_id,
-        originPath: referent.origin,
-        host: referent.host,
-        path: referent.path,
-        mtime: referent_mtime(status),
-        status: referent_status(status),
-        reason: referent_reason(status)
-      }
-    end)
-  end
-
-  # `host:/absolute/path` names a machine, exactly as commitRefs' repo does.
-  # Anything else belongs to the holder's own host: absolute as written, relative
-  # to the workdir the holder works in.
-  defp resolve_origin(config, holder, artifact_id, origin) do
-    base = %{artifact_id: artifact_id, origin: origin, host: nil, path: nil, reason: nil}
-
-    case String.split(origin, ":", parts: 2) do
-      [name, path] when path != "" ->
-        cond do
-          Path.type(path) != :absolute ->
-            %{base | host: holder.host, path: local_origin_path(config, holder, origin)}
-
-          Map.has_key?(Placement.hosts(config.base_dir, config.db), name) ->
-            %{base | host: name, path: path}
-
-          true ->
-            %{base | reason: "origin names host #{name}, which is not a registered host"}
-        end
-
-      _ ->
-        %{base | host: holder.host, path: local_origin_path(config, holder, origin)}
-    end
-  end
-
-  defp local_origin_path(config, holder, origin) do
-    if Path.type(origin) == :absolute,
-      do: origin,
-      else: Path.join(Placement.workdir_path(config, holder), origin)
-  end
-
-  defp referent_status({:present, _mtime}), do: "present"
-  defp referent_status(:absent), do: "absent"
-  defp referent_status(_), do: "unverifiable"
-
-  defp referent_mtime({:present, mtime}), do: mtime
-  defp referent_mtime(_), do: nil
-
-  defp referent_reason({:error, reason}), do: reason
-  defp referent_reason(nil), do: "the check returned no answer for this path"
-  defp referent_reason(_), do: nil
 
   defp revoke_result(db, call) do
     with :ok <- principal_allowed(call.principal, "revoke-assignment") do
@@ -4770,16 +4612,6 @@ defmodule Tightbeam.Assignments do
 
   defp valid_brief(brief) when is_binary(brief) and brief != "", do: :ok
   defp valid_brief(_), do: error("invalid", "a dispatch must carry a brief")
-
-  defp placement_config(db, call) do
-    defaults = %{
-      base_dir: Application.get_env(:tightbeam, :base_dir, System.tmp_dir!()),
-      db: db,
-      port: Application.get_env(:tightbeam, :port, 11_373)
-    }
-
-    Map.merge(defaults, Map.get(call, :placement_config, %{}))
-  end
 
   defp valid_note(nil), do: :ok
 

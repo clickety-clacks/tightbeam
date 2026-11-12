@@ -129,6 +129,7 @@ impl CommandContext {
             MementoSet { .. } => ("cli.memento_set", DispatchPath),
             Mementos { .. } => ("cli.mementos", DispatchPath),
             Attests { .. } => ("cli.attests", DispatchPath),
+            CheckAttest { .. } => ("cli.check_attest", DispatchPath),
             AssignmentGet { .. } => ("cli.assignment_get", DispatchPath),
             Assignments { .. } => ("cli.assignments", DispatchPath),
             CancelWake { .. } => ("cli.cancel_wake", DispatchPath),
@@ -339,6 +340,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | DurableTopline { .. }
         | Mementos { .. }
         | Attests { .. }
+        | CheckAttest { .. }
         | AssignmentGet { .. }
         | Assignments { .. }
         | IdentityStatus { .. }
