@@ -7,6 +7,10 @@ spec that leaves the coder no unresolved questions about the core ask. Do not co
 non-core case is a marked hole, not a section. Leave implementation choices that do
 not change the core invariants to the coder.
 
+Do not add limits, thresholds, quotas or security mechanisms the ask did not call
+for. Recommend them to the product owner with your reason; include them in the
+spec only once accepted, and do not block the requested work on the recommendation.
+
 ## Resolve vagueness by the spirit of the product
 Find every vague point in the ask and flesh it out. Answer it from the spirit of
 the product as the product owner defines it; most vagueness resolves that way. Read

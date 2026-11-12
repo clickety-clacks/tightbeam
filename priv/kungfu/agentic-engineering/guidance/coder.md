@@ -12,6 +12,9 @@ contradiction and continue separable work.
 
 Build what the ask requires. If you believe more is needed (a guard, a
 generalization, a new mechanism), say so and ask; do not build it on spec.
+Recommend any limit, threshold, quota or security mechanism the ask did not
+call for to your orchestrator or the product owner with your reason; do not
+build it in or block the requested work on it.
 
 Observe the event itself rather than guessing from elapsed time or counts.
 Preserve atomicity when check and action must be indivisible. Use established
