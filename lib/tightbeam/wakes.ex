@@ -3214,16 +3214,18 @@ defmodule Tightbeam.Wakes do
 
         inserted = Txn.changes(txn) == 1
 
-        if not inserted and failure_class == "adapter_unavailable" do
-          # A refused adapter redelivery has the same message ID as its source.
-          # Re-arm that exact row only when this failed turn was its redelivery.
+        if not inserted and failure_class != "interrupted-outcome-unknown" do
+          # A failed health redelivery did not restore its source prompt. Re-arm
+          # that exact row so the next health recovery event can deliver it;
+          # unknown outcomes remain parent-routed and are never replayed here.
           Txn.q(
             txn,
             """
             UPDATE health_redelivery_attempts
-            SET restorationTurnSeq=NULL,redeliveryTurnSeq=NULL
-            WHERE sessionKey=?1 AND sourceMessageId=?2 AND redeliveryTurnSeq=?3
-              AND parentSessionKey IS NULL
+            SET restorationTurnSeq=NULL,redeliveryTurnSeq=NULL,
+                cycleReleaseCorrelation=NULL,cycleReleaseTurnSeq=NULL
+            WHERE sessionKey=?1 AND sourceMessageId=?2 AND parentSessionKey IS NULL
+              AND (redeliveryTurnSeq=?3 OR cycleReleaseTurnSeq=?3)
             """,
             [session_key, message_id, source_turn_seq]
           )
