@@ -5903,10 +5903,11 @@ defmodule Tightbeam.HarklightWakesTest do
 
     row = DB.query(db, "SELECT * FROM harklight_wake_handles")
 
-    start_supervised!(
-      {HarklightWakes,
-       db: db, listener: completion_notifying_listener(parent), send_runner: runner}
-    )
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db, listener: completion_notifying_listener(parent), send_runner: runner}
+      )
 
     assert_receive {:a8_waiting, reader}, 1_000
     monitor = Process.monitor(reader)
@@ -6210,11 +6211,10 @@ defmodule Tightbeam.HarklightWakesTest do
     parent = self()
     runner = completion_runner(responses, parent)
 
-    manager =
-      start_supervised!(
-        {HarklightWakes,
-         db: db, listener: completion_notifying_listener(parent), send_runner: runner}
-      )
+    start_supervised!(
+      {HarklightWakes,
+       db: db, listener: completion_notifying_listener(parent), send_runner: runner}
+    )
 
     assert_receive {:restored, @handle, nil}
 
