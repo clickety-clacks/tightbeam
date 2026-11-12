@@ -3271,18 +3271,41 @@ defmodule Tightbeam.HarnessHealthTest do
   end
 
   test "Codex usage-limit hold releases on its first successful recovery probe", ctx do
-    fail_health_turn!(
-      ctx.db,
-      ctx.main_session,
-      "codex-rate-limit-recovery",
-      "Codex rate limit",
-      @captured_codex_rate_limit
-    )
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "codex-rate-limit-provider",
+               harness: "codex",
+               host: "testhost",
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: ctx.main_session,
+               assignment_id: nil,
+               observed_at: System.system_time(:millisecond),
+               cause: "provider reported usageLimitExceeded",
+               principal: "process:tightbeam/provider"
+             })
 
-    [incident] = HarnessHealth.active(ctx.db)
     assert incident.harness == "codex"
     assert incident.failureClass == "rate-limit-dead"
     assert Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+
+    failure_turn =
+      fail_health_turn!(
+        ctx.db,
+        ctx.main_session,
+        "codex-rate-limit-recovery",
+        "Codex rate limit",
+        @captured_codex_rate_limit
+      )
+
+    incident_id = incident.id
+
+    assert {:ok, [[^incident_id, "terminal-failure"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT incidentId,evidenceKind FROM harness_health_observations WHERE correlationId=?1",
+               ["harness-turn:#{failure_turn.seq}:rate-limit-dead"]
+             )
 
     assert {:ok,
             %{
