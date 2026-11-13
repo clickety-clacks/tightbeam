@@ -331,7 +331,7 @@ defmodule Tightbeam.RailRemedyTest do
                ctx.db,
                """
                SELECT count(*) FROM wakes
-               WHERE COALESCE(consumer, '') NOT IN ('effort_probe', 'assignment_inactivity_deadline')
+               WHERE COALESCE(consumer, '') != 'effort_probe'
                """
              )
 
@@ -358,7 +358,7 @@ defmodule Tightbeam.RailRemedyTest do
                ctx.db,
                """
                SELECT count(*) FROM wakes
-               WHERE COALESCE(consumer, '') NOT IN ('effort_probe', 'assignment_inactivity_deadline')
+               WHERE COALESCE(consumer, '') != 'effort_probe'
                """
              )
 

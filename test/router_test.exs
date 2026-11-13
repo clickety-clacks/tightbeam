@@ -3789,14 +3789,6 @@ defmodule Tightbeam.Wire.RouterTest do
   test "direct process ownership is data and actor provenance stays in events", ctx do
     law = load_terminal_reactions!(ctx)
 
-    File.cp!(
-      Path.join([
-        :code.priv_dir(:tightbeam),
-        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
-      ]),
-      Path.join(law, "identity/rules/row-reaction-assignment-inactivity.toml")
-    )
-
     Tightbeam.Rules.load!(
       law,
       Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir}) |> Map.keys()
