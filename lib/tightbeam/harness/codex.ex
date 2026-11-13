@@ -50,7 +50,8 @@ defmodule Tightbeam.Harness.Codex do
   @adapter_replacements [
     {
       "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
-      "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId,\n      developerInstructions: request._meta?.developerInstructions\n"
+      "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId,\n      developerInstructions: request._meta?.developerInstructions\n",
+      global: true
     }
   ]
 

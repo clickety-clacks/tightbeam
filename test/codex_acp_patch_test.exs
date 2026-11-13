@@ -174,8 +174,19 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
     patched = Codex.patch_adapter_source(source)
     assert patched =~ "developerInstructions: request._meta?.developerInstructions"
 
-    assert patched =~
-             "threadId: request.sessionId,\n      developerInstructions: request._meta?.developerInstructions"
+    instruction = "developerInstructions: request._meta?.developerInstructions"
+    assert Enum.count(String.split(patched, instruction)) - 1 == 2
+
+    [_, after_resume_session] =
+      String.split(patched, "async resumeSession(request) {", parts: 2)
+
+    [resume_session, _] =
+      String.split(after_resume_session, "async loadSession(request) {", parts: 2)
+
+    [_, load_session] = String.split(patched, "async loadSession(request) {", parts: 2)
+
+    assert resume_session =~ instruction
+    assert load_session =~ instruction
 
     refute patched =~
              "threadStart({\n      modelProvider: this.getModelProvider(),\n      cwd: request.cwd,\n      developerInstructions"
@@ -309,6 +320,13 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
         "    await this.codexClient.threadStart({\n" <>
         "      modelProvider: this.getModelProvider(),\n" <>
         "      cwd: request.cwd\n" <>
+        "    });\n" <>
+        "  }\n" <>
+        "  async resumeSession(request) {\n" <>
+        "    await this.codexClient.threadResume({\n" <>
+        "      excludeTurns: true,\n" <>
+        "      modelProvider: await this.getResumeModelProvider(),\n" <>
+        "      threadId: request.sessionId\n" <>
         "    });\n" <>
         "  }\n" <>
         "  async loadSession(request) {\n" <>
