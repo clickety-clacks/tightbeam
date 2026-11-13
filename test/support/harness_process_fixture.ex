@@ -4,6 +4,7 @@ defmodule Tightbeam.HarnessProcessFixture do
   import Tightbeam.TestCase, only: [ensure_all_schemas: 1]
   alias Tightbeam.{AdapterCoordinator, DB, EventLog, HarnessProcess, HarnessProcessCensus}
   @helper Path.expand("../../cli/target/release/tightbeam", __DIR__)
+  @absent_local_pid 999_999_999
   @fake_adapter ~S"""
   const rl = require("node:readline").createInterface({ input: process.stdin });
   const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\n");
@@ -512,7 +513,7 @@ defmodule Tightbeam.HarnessProcessFixture do
       assert unresolved.os_pid == fixture["recorded_pid"]
       assert unresolved.kill_attempted_at == fixture["kill_attempted_at"]
       assert unresolved.kill_sent_at == fixture["kill_sent_at"]
-      assert unresolved.last_error =~ "identity_unavailable"
+      assert unresolved.last_error == "identity material unavailable"
     end
   end
 
@@ -1457,6 +1458,454 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert is_integer(resolved_at)
     System.cmd("/bin/kill", ["-KILL", detached], stderr_to_stdout: true)
+  end
+
+  defp scenario(35, ctx) do
+    key = {:claude, "shared", "legacy-absent-host"}
+    orphan_fence = {:codex, "shared", "independent-host"}
+    fake_bin = Path.join(ctx.test_dir, "legacy-satellite-bin")
+    fake_ssh = Path.join(fake_bin, "ssh")
+    unsupported_command = Path.join(ctx.test_dir, "unsupported-satellite-command")
+    File.mkdir_p!(fake_bin)
+
+    File.write!(
+      fake_ssh,
+      """
+      #!/bin/sh
+      shift 4
+      destination="$1"
+      shift
+      case "$1" in
+        ps)
+          shift
+          exec /bin/ps "$@"
+          ;;
+        rm)
+          exit 0
+          ;;
+        *tightbeam*)
+          shift
+          if [ "$1" = "harness-group" ]; then touch '#{unsupported_command}'; fi
+          echo 'unknown subcommand: harness-group' >&2
+          exit 2
+          ;;
+        *)
+          echo "unexpected remote command" >&2
+          exit 64
+          ;;
+      esac
+      """
+    )
+
+    File.chmod!(fake_ssh, 0o755)
+    prior_path = System.get_env("PATH")
+    System.put_env("PATH", fake_bin <> ":" <> (prior_path || ""))
+
+    on_exit(fn ->
+      if prior_path, do: System.put_env("PATH", prior_path), else: System.delete_env("PATH")
+    end)
+
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: ["ssh", "legacy-satellite", "claude", "acp"],
+          process_ssh: "legacy-satellite",
+          process_helper: "/satellite/bin/tightbeam",
+          process_identity_dir: "/satellite/tmp"
+        ],
+        ctx.db,
+        key
+      )
+
+    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+    [legacy] = Enum.filter(HarnessProcess.list(ctx.db), &(&1.launch_id == launch_id))
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        UPDATE harness_processes
+           SET osPid = ?2, processGroupId = ?2, state = 'kill_failed',
+               killAttemptedAt = 77, lastError = 'legacy helper refused missing authority'
+         WHERE launchId = ?1
+        """,
+        [launch_id, @absent_local_pid]
+      )
+
+    unrelated_opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: [System.find_executable("false")],
+          process_identity_dir: ctx.test_dir,
+          process_helper: @helper
+        ],
+        ctx.db,
+        {:gemini, "shared", "history-host"}
+      )
+
+    unrelated_id = Keyword.fetch!(unrelated_opts, :harness_process_launch_id)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET state = 'exited', resolvedAt = 42, lastError = 'kept history' WHERE launchId = ?1",
+        [unrelated_id]
+      )
+
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, orphan_fence)
+    assert HarnessProcess.fenced?(ctx.db, orphan_fence)
+    refute File.exists?(legacy.identity_path)
+    refute File.exists?(legacy.identity_path <> ".authority")
+
+    boot_coordinator_once(ctx)
+
+    resolved = Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == launch_id))
+    assert resolved.state == "exited"
+    assert resolved.launch_id == legacy.launch_id
+    assert resolved.adapter_key == legacy.adapter_key
+    assert resolved.launch_sequence == legacy.launch_sequence
+    assert is_integer(resolved.resolved_at)
+    assert resolved.os_pid == @absent_local_pid
+    assert resolved.process_group_id == @absent_local_pid
+    assert resolved.kill_attempted_at == 77
+    assert resolved.kill_sent_at == nil
+    assert resolved.last_error == "legacy helper refused missing authority"
+    refute HarnessProcess.fenced?(ctx.db, key)
+    refute HarnessProcess.fenced?(ctx.db, orphan_fence)
+    refute File.exists?(unsupported_command)
+
+    kept = Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == unrelated_id))
+    assert kept.state == "exited"
+    assert kept.resolved_at == 42
+    assert kept.last_error == "kept history"
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "harness_launch_process_absent" and event.detail =~ launch_id
+           end) == 1
+
+    boot_coordinator_once(ctx)
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "harness_launch_process_absent" and event.detail =~ launch_id
+           end) == 1
+
+    assert Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == launch_id)) == resolved
+    refute HarnessProcess.fenced?(ctx.db, orphan_fence)
+    refute File.exists?(unsupported_command)
+  end
+
+  defp scenario(36, ctx) do
+    key = {:claude, "shared", "legacy-recovered-identity"}
+
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: [System.find_executable("false")],
+          process_identity_dir: ctx.test_dir,
+          process_helper: @helper
+        ],
+        ctx.db,
+        key
+      )
+
+    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+    [legacy] = Enum.filter(HarnessProcess.list(ctx.db), &(&1.launch_id == launch_id))
+    {boot_identity, 0} = System.cmd(@helper, ["boot-identity"])
+
+    File.write!(
+      legacy.identity_path,
+      "#{@absent_local_pid}\t#{@absent_local_pid}\t#{String.trim(boot_identity)}\t#{launch_id}\n"
+    )
+
+    refute File.exists?(legacy.identity_path <> ".authority")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET state = 'kill_failed', killAttemptedAt = 77, lastError = 'old authority refusal' WHERE launchId = ?1",
+        [launch_id]
+      )
+
+    boot_coordinator_once(ctx)
+
+    assert [
+             %{
+               state: "exited",
+               os_pid: @absent_local_pid,
+               process_group_id: @absent_local_pid,
+               kill_attempted_at: 77,
+               kill_sent_at: nil,
+               last_error: "old authority refusal",
+               resolved_at: resolved_at
+             }
+           ] = HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+    refute HarnessProcess.fenced?(ctx.db, key)
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "harness_launch_process_absent" and
+               event.detail =~ launch_id and
+               event.detail =~ "complete_process_snapshot_absent"
+           end)
+  end
+
+  defp scenario(37, ctx) do
+    key = {:claude, "shared", "atomic-reconciliation"}
+    adapter_key = "claude:shared@atomic-reconciliation"
+
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: [System.find_executable("false")],
+          process_identity_dir: ctx.test_dir,
+          process_helper: @helper
+        ],
+        ctx.db,
+        key
+      )
+
+    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET osPid = ?2, processGroupId = ?2, state = 'kill_failed', lastError = 'preserved cleanup history' WHERE launchId = ?1",
+        [launch_id, @absent_local_pid]
+      )
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER fail_reconciled_fence_release
+      BEFORE DELETE ON harness_park_fences
+      WHEN OLD.adapterKey = '#{adapter_key}'
+      BEGIN
+        SELECT RAISE(ABORT, 'simulated interrupted fence release');
+      END;
+      """)
+
+    boot_coordinator_once(ctx)
+
+    assert [%{state: "kill_failed", resolved_at: nil, last_error: "preserved cleanup history"}] =
+             HarnessProcess.list(ctx.db)
+
+    assert HarnessProcess.fenced?(ctx.db, key)
+
+    refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "harness_launch_process_absent" and event.detail =~ launch_id
+           end)
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER fail_reconciled_fence_release")
+    boot_coordinator_once(ctx)
+
+    assert [%{state: "exited", resolved_at: resolved_at, last_error: "preserved cleanup history"}] =
+             HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+    refute HarnessProcess.fenced?(ctx.db, key)
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "harness_launch_process_absent" and event.detail =~ launch_id
+           end) == 1
+  end
+
+  defp scenario(38, ctx) do
+    key = {:claude, "shared", "legacy-live"}
+    {_port, row} = launch_stubborn(ctx, key)
+    File.rm!(row.identity_path <> ".authority")
+
+    boot_coordinator_once(ctx)
+
+    assert [%{state: "kill_failed", last_error: error}] = HarnessProcess.list(ctx.db)
+    assert error =~ "harness identity authority could not be opened"
+    assert HarnessProcess.fenced?(ctx.db, key)
+    assert process_alive?(row.os_pid)
+  end
+
+  defp scenario(39, ctx) do
+    key = {:codex, "shared", "legacy-capability"}
+    {_port, row} = launch_stubborn(ctx, key)
+    old_helper = Path.join(ctx.test_dir, "old-satellite-helper")
+    group_command = Path.join(ctx.test_dir, "old-helper-group-command")
+
+    File.write!(
+      old_helper,
+      """
+      #!/bin/sh
+      if [ "$1" = "harness-group" ]; then touch '#{group_command}'; fi
+      echo "unknown subcommand: $1" >&2
+      exit 2
+      """
+    )
+
+    File.chmod!(old_helper, 0o755)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE harness_processes SET helperPath = ?2 WHERE launchId = ?1", [
+        row.launch_id,
+        old_helper
+      ])
+
+    boot_coordinator_once(ctx)
+
+    assert [%{state: "kill_failed", last_error: error}] = HarnessProcess.list(ctx.db)
+    assert error =~ "unknown subcommand: harness-group"
+    assert HarnessProcess.fenced?(ctx.db, key)
+    assert process_alive?(row.os_pid)
+    assert File.exists?(group_command)
+  end
+
+  defp scenario(40, ctx) do
+    key = {:claude, "shared", "reused-pid"}
+    {_port, row} = launch_stubborn(ctx, key)
+    authority_path = row.identity_path <> ".authority"
+    fields = authority_path |> File.read!() |> String.trim() |> String.split("\t")
+    assert length(fields) == 7
+    {start_seconds, ""} = Integer.parse(Enum.at(fields, 3))
+
+    File.write!(
+      authority_path,
+      (fields |> List.replace_at(3, Integer.to_string(start_seconds + 1)) |> Enum.join("\t")) <>
+        "\n"
+    )
+
+    boot_coordinator_once(ctx)
+
+    assert [%{state: "kill_failed", last_error: error}] = HarnessProcess.list(ctx.db)
+    assert error =~ "pid/pgid reuse"
+    assert HarnessProcess.fenced?(ctx.db, key)
+    assert process_alive?(row.os_pid)
+  end
+
+  defp scenario(41, ctx) do
+    key = {:codex, "shared", "uncertain-remote"}
+    {_port, row} = launch_stubborn(ctx, key)
+    fake_bin = Path.join(ctx.test_dir, "unreachable-bin")
+    fake_ssh = Path.join(fake_bin, "ssh")
+    File.mkdir_p!(fake_bin)
+    File.write!(fake_ssh, "#!/bin/sh\necho 'ssh: connection unavailable' >&2\nexit 255\n")
+    File.chmod!(fake_ssh, 0o755)
+
+    prior_path = System.get_env("PATH")
+    System.put_env("PATH", fake_bin <> ":" <> (prior_path || ""))
+
+    on_exit(fn ->
+      if prior_path, do: System.put_env("PATH", prior_path), else: System.delete_env("PATH")
+    end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET ssh = 'unreachable-host', lastError = 'prior cleanup refusal' WHERE launchId = ?1",
+        [row.launch_id]
+      )
+
+    boot_coordinator_once(ctx)
+
+    assert [%{state: "kill_failed", last_error: "prior cleanup refusal"}] =
+             HarnessProcess.list(ctx.db)
+
+    assert HarnessProcess.fenced?(ctx.db, key)
+    assert process_alive?(row.os_pid)
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "harness_launch_process_state_uncertain" and
+               event.detail =~ row.launch_id and event.detail =~ "process_snapshot_failed"
+           end)
+  end
+
+  defp scenario(42, ctx) do
+    key = {:claude, "shared", "terminal-before-identity"}
+
+    HarnessProcess.prepare_launch(
+      [
+        cmd: [System.find_executable("false")],
+        stderr_path: Path.join(ctx.test_dir, "terminal-before-identity.stderr"),
+        process_helper: @helper
+      ],
+      ctx.db,
+      key
+    )
+
+    assert [%{launch_id: launch_id, identity_path: identity_path}] = HarnessProcess.list(ctx.db)
+
+    File.write!(
+      identity_path <> ".failed",
+      "tightbeam-launch-failed-v1\t#{launch_id}\tfork\t1\n"
+    )
+
+    boot_coordinator_once(ctx)
+
+    assert [%{state: "exited", resolved_at: resolved_at}] = HarnessProcess.list(ctx.db)
+    assert is_integer(resolved_at)
+    refute HarnessProcess.fenced?(ctx.db, key)
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "harness_launch_settled" and
+               event.subject == "claude:shared@terminal-before-identity" and
+               event.detail =~ "terminal_pre_identity"
+           end)
+  end
+
+  defp scenario(43, ctx) do
+    key = {:claude, "shared", "live-identity-nil-pid"}
+    {_port, row} = launch_stubborn(ctx, key)
+
+    assert row.state == "running"
+    assert process_alive?(row.os_pid)
+    assert File.exists?(row.identity_path)
+    assert File.exists?(row.identity_path <> ".authority")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET osPid = NULL, processGroupId = NULL WHERE launchId = ?1",
+        [row.launch_id]
+      )
+
+    assert [%{os_pid: nil, process_group_id: nil, state: "running"}] =
+             HarnessProcess.list(ctx.db)
+
+    boot_coordinator_once(ctx)
+
+    assert [
+             %{
+               state: "killed",
+               os_pid: pid,
+               process_group_id: process_group_id,
+               kill_sent_at: sent_at,
+               resolved_at: resolved_at
+             }
+           ] = HarnessProcess.list(ctx.db)
+
+    assert pid == row.os_pid
+    assert process_group_id == row.process_group_id
+    assert is_integer(sent_at)
+    assert is_integer(resolved_at)
+    refute process_alive?(pid)
+    refute HarnessProcess.fenced?(ctx.db, key)
+    refute File.exists?(row.identity_path)
+    refute File.exists?(row.identity_path <> ".authority")
+  end
+
+  defp boot_coordinator_once(ctx) do
+    {:ok, coordinator} =
+      AdapterCoordinator.start_link(
+        adapter_sup: ctx.sup,
+        adapter_context: fn _ -> [] end,
+        adapter_opts: fn _, _ -> [] end,
+        db: ctx.db,
+        name: nil
+      )
+
+    GenServer.stop(coordinator)
+  end
+
+  defp process_alive?(pid) when is_integer(pid) do
+    case System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {_, 0} -> true
+      _ -> false
+    end
   end
 
   defp launch_stubborn(ctx, key) do

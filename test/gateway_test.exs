@@ -283,14 +283,15 @@ defmodule Tightbeam.GatewayTest do
     def start_link({name, db, parent}),
       do: GenServer.start_link(__MODULE__, {db, parent}, name: name)
 
-    def init({db, parent}), do: {:ok, %{db: db, parent: parent, armed: true}}
+    def init({db, parent}), do: {:ok, %{db: db, parent: parent, transaction_count: 0}}
 
-    def handle_call({:query, sql, params} = request, _from, state) do
+    def handle_call({:transaction, _fun} = request, _from, state) do
+      transaction_count = state.transaction_count + 1
+      state = %{state | transaction_count: transaction_count}
+
       state =
-        if state.armed and params != [] and
-             String.contains?(sql, "DELETE FROM harness_park_fences") and
-             String.contains?(sql, "adapterKey = ?1") do
-          send(state.parent, {:before_reconciled_fence_delete, self()})
+        if transaction_count == 3 do
+          send(state.parent, {:before_reconciled_fence_delete, self(), transaction_count})
 
           receive do
             :release_reconciled_fence_delete -> :ok
@@ -298,7 +299,7 @@ defmodule Tightbeam.GatewayTest do
             5_000 -> raise "timed out waiting to release reconciled fence delete"
           end
 
-          %{state | armed: false}
+          state
         else
           state
         end
@@ -4269,7 +4270,7 @@ defmodule Tightbeam.GatewayTest do
     proxy = start_supervised!({FenceDeleteRaceDB, {race_db, ctx.db, self()}})
     reconciliation = Task.async(fn -> Tightbeam.HarnessProcess.reconcile(race_db) end)
 
-    assert_receive {:before_reconciled_fence_delete, ^proxy}
+    assert_receive {:before_reconciled_fence_delete, ^proxy, 3}
 
     assert {:opened, incident} =
              HarnessHealth.observe(ctx.db, %{
