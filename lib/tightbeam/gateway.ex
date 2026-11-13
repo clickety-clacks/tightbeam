@@ -9639,7 +9639,7 @@ defmodule Tightbeam.Gateway do
   # The current provider request retains its inference settings; acceptance is not
   # a claim that tokens already being generated use the requested configuration.
   defp model_change_boundary(config, db, session, allow_queued, apply) do
-    if session.harness in ["claude", "codex"] do
+    if Harness.running_model_tuning_supported?(session.harness) do
       LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session.session_key)
 
       Tightbeam.SessionLane.change_at_boundary(
