@@ -995,7 +995,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            end)
   end
 
-  test "an open circuit suppresses automatic restart but permits authoritative recovery", ctx do
+  test "an open circuit automatically retries and recovers after a successful boot", ctx do
     old_value = Application.get_env(:tightbeam, :adapter_failure_circuit)
 
     on_exit(fn ->
@@ -1012,34 +1012,67 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     owner = self()
     boot_attempt = :atomics.new(1, signed: false)
 
+    # The timeout event is triggered explicitly below. Keep a generous
+    # readiness deadline, then cancel the held retry's deadline before its
+    # authoritative refusal replacement so that step cannot race the timer.
     coordinator =
-      start_supervised!(
-        {AdapterCoordinator,
-         adapter_sup: ctx.sup,
-         backoff_base_ms: 1,
-         adapter_context: fn _ -> [] end,
-         adapter_opts: fn _, context ->
-           attempt = :atomics.add_get(boot_attempt, 1, 1)
+      start_supervised!({
+        AdapterCoordinator,
+        adapter_sup: ctx.sup,
+        backoff_base_ms: 250,
+        readiness_timeout_ms: 300_000,
+        adapter_context: fn _ -> [] end,
+        adapter_opts: fn _, context ->
+          attempt = :atomics.add_get(boot_attempt, 1, 1)
 
-           if attempt == 1 do
-             [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
-           else
-             send(owner, {:recovery_boot_started, self(), context})
+          cond do
+            attempt == 1 ->
+              [
+                harness: :claude,
+                cmd: [System.find_executable("false")],
+                home: "/tmp",
+                cwd: "/tmp"
+              ]
 
-             receive do
-               {:release_recovery_boot, pid} when pid == self() ->
-                 [
-                   harness: :claude,
-                   cmd: [System.find_executable("node"), path],
-                   home: ctx.test_dir,
-                   cwd: ctx.test_dir
-                 ]
-             end
-           end
-         end,
-         db: ctx.db,
-         name: :circuit_latch_recovery_coordinator}
-      )
+            attempt == 2 ->
+              send(owner, {:automatic_recovery_timeout_started, self(), context})
+              Process.sleep(:infinity)
+
+            attempt == 3 ->
+              send(owner, {:automatic_recovery_preflight_exit_started, self(), context})
+
+              receive do
+                {:exit_automatic_recovery_preflight, pid} when pid == self() ->
+                  exit(:simulated_preflight_exit)
+              end
+
+            attempt == 4 ->
+              send(owner, {:automatic_recovery_pending_started, self(), context})
+              Process.sleep(:infinity)
+
+            attempt == 5 ->
+              send(owner, {:automatic_recovery_refusal_started, self(), context})
+
+              {:error,
+               %{code: "temporary_refusal", message: "The launch refusal remains visible"}}
+
+            true ->
+              send(owner, {:automatic_recovery_boot_started, self(), context})
+
+              receive do
+                {:release_automatic_recovery_boot, pid} when pid == self() ->
+                  [
+                    harness: :claude,
+                    cmd: [System.find_executable("node"), path],
+                    home: ctx.test_dir,
+                    cwd: ctx.test_dir
+                  ]
+              end
+          end
+        end,
+        db: ctx.db,
+        name: :circuit_latch_recovery_coordinator
+      })
 
     key = {:claude, "default", "testhost"}
     assert {:ok, _first_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
@@ -1051,33 +1084,78 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
-    # The threshold opens the latch before any restart can be admitted. The
-    # public checkout must not observe a generation started by an automatic
-    # restart while the latch is open.
-    refute wait_until(fn -> :atomics.get(boot_attempt, 1) > 1 end, 100)
+    assert_receive {:automatic_recovery_timeout_started, timed_out_readiness_task, []}, 10_000
+    assert is_pid(timed_out_readiness_task)
 
-    assert {:error,
-            {:diagnosed, :degraded,
-             %{
-               "kind" => "circuit_open",
-               "consecutiveFailures" => 1,
-               "cause" => %{"generation" => 1}
-             }}} = AdapterCoordinator.adapter_for(coordinator, key)
+    timed_out_entry = :sys.get_state(coordinator).adapters[key]
 
-    # Credential lifecycle recovery is the authoritative boundary: it may
-    # start a replacement while ordinary checkout remains degraded.
-    recovery =
-      Task.async(fn ->
-        AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
-      end)
+    # Exercise the scheduled timeout handler without depending on the configured
+    # wall-clock deadline. The next automatic preflight proves it re-armed restart.
+    send(
+      coordinator,
+      {:adapter_readiness_timeout, key, timed_out_entry.generation,
+       timed_out_entry.readiness_token}
+    )
 
-    assert_receive {:recovery_boot_started, readiness_task, [credential_kind: :subscription]}
+    assert_receive {:automatic_recovery_preflight_exit_started, exited_readiness_task, []}, 10_000
+    assert is_pid(exited_readiness_task)
 
-    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 1}}} =
+    timeout_recovery_entry = :sys.get_state(coordinator).adapters[key]
+    assert timeout_recovery_entry.circuit == :open
+    assert timeout_recovery_entry.failures == 2
+    send(exited_readiness_task, {:exit_automatic_recovery_preflight, exited_readiness_task})
+
+    assert_receive {:automatic_recovery_pending_started, pending_readiness_task, []}, 10_000
+    assert is_pid(pending_readiness_task)
+
+    down_recovery_entry = :sys.get_state(coordinator).adapters[key]
+    assert down_recovery_entry.circuit == :open
+    assert down_recovery_entry.failures == 3
+
+    # Freeze the coordinator and cancel this intentionally held attempt's
+    # readiness deadline before queuing the credential reset. The reset then
+    # replaces the pending preflight in mailbox order, without racing a timer.
+    :ok = :sys.suspend(coordinator)
+
+    request =
+      try do
+        refusal_entry = :sys.get_state(coordinator).adapters[key]
+        assert refusal_entry.readiness_task == pending_readiness_task
+        remaining_timeout = Process.cancel_timer(refusal_entry.readiness_timer)
+        assert is_integer(remaining_timeout) and remaining_timeout > 0
+
+        :gen_server.send_request(
+          coordinator,
+          {:adapter_for, key, [credential_kind: :subscription]}
+        )
+      after
+        :sys.resume(coordinator)
+      end
+
+    assert {:reply,
+            {:error,
+             {:launch_refused,
+              %{code: "temporary_refusal", message: "The launch refusal remains visible"}}}} =
+             :gen_server.wait_response(request, 10_000)
+
+    assert_receive {:automatic_recovery_refusal_started, refusal_readiness_task,
+                    [credential_kind: :subscription]},
+                   10_000
+
+    assert is_pid(refusal_readiness_task)
+
+    # The next automatic attempt proves the explicit refusal re-armed restart.
+
+    assert_receive {:automatic_recovery_boot_started, readiness_task, []}, 10_000
+
+    recovery_entry = :sys.get_state(coordinator).adapters[key]
+    assert recovery_entry.circuit == :open
+    assert recovery_entry.failures == 4
+
+    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 4}}} =
              AdapterCoordinator.adapter_for(coordinator, key)
 
-    send(readiness_task, {:release_recovery_boot, readiness_task})
-    assert {:ok, recovery_adapter, 2} = Task.await(recovery)
+    send(readiness_task, {:release_automatic_recovery_boot, readiness_task})
 
     assert wait_until(fn ->
              match?(
@@ -1086,7 +1164,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
-    assert {:ok, ^recovery_adapter, 2} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert :atomics.get(boot_attempt, 1) == 6
+    assert AdapterCoordinator.ready?(coordinator, key)
+    assert {:ok, _recovered_adapter, 4} = AdapterCoordinator.adapter_for(coordinator, key)
   end
 
   # What the coordinator itself says it is doing: {holding a slot, waiting for one}.

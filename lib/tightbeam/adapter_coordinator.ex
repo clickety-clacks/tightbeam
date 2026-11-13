@@ -22,7 +22,8 @@ defmodule Tightbeam.AdapterCoordinator do
     `adapter_for/2` returns {:error, :degraded} so affected turns fail fast
     with a clear reason (carried as `{:diagnosed, :degraded, node}` naming the
     consecutive failures and the last cause), /version|/health reflects it, the gateway stays up.
-    A successful restart closes the circuit and resets the count.
+    The existing backoff retries continue while it is open; a successful
+    restart closes the circuit and resets the count.
   - Re-adoption semaphore: at most the configured number of concurrent session/load
     calls per machine (no thundering herd after an adapter bounce, and no machine
     queues behind another machine's recovery). session/load failure → that session
@@ -1058,6 +1059,16 @@ defmodule Tightbeam.AdapterCoordinator do
             ErrorDiagnostic.of(reason)
           )
 
+        entry = Map.fetch!(state.adapters, readiness_key)
+
+        state =
+          retry_open_circuit_after_failure(
+            state,
+            readiness_key,
+            entry,
+            entry.generation
+          )
+
         {:noreply, finish_readiness(state, readiness_key, {:error, {:launch_refused, refusal}})}
 
       key = state.monitors[ref] ->
@@ -1114,7 +1125,7 @@ defmodule Tightbeam.AdapterCoordinator do
           # this adapter checked out, and the only one it can ask about.
           died_at = entry.generation
           generation = entry.generation + 1
-          timer = schedule_restart(state, key, generation, failures, circuit)
+          timer = schedule_restart(state, key, generation, failures)
 
           entry = %{
             entry
@@ -1190,6 +1201,14 @@ defmodule Tightbeam.AdapterCoordinator do
             {:noreply, start_adapter_unfenced(key, entry, state, opts)}
 
           {:error, refusal} ->
+            state =
+              retry_open_circuit_after_failure(
+                state,
+                key,
+                entry,
+                entry.generation
+              )
+
             {:noreply, finish_readiness(state, key, {:error, {:launch_refused, refusal}})}
         end
 
@@ -1201,6 +1220,7 @@ defmodule Tightbeam.AdapterCoordinator do
   def handle_info({:adapter_readiness_timeout, key, generation, token}, state) do
     case state.adapters[key] do
       %{generation: ^generation, readiness_token: ^token} = entry ->
+        failed_generation = entry.generation
         state = terminate_readiness_generation(key, entry, state, true)
 
         entry = %{
@@ -1212,6 +1232,7 @@ defmodule Tightbeam.AdapterCoordinator do
         }
 
         state = %{state | adapters: Map.put(state.adapters, key, entry)}
+        state = retry_open_circuit_after_failure(state, key, entry, failed_generation)
 
         refusal = %{code: "adapter_readiness_timeout", message: "Adapter readiness timed out"}
         {:noreply, finish_readiness(state, key, {:error, {:launch_refused, refusal}})}
@@ -1223,7 +1244,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_info({:restart_adapter, key, generation}, state) do
     case state.adapters[key] do
-      %{generation: ^generation, pid: nil, circuit: :closed} = entry ->
+      %{generation: ^generation, pid: nil} = entry ->
         cond do
           readiness_pending?(entry) ->
             {:noreply, state}
@@ -1462,7 +1483,7 @@ defmodule Tightbeam.AdapterCoordinator do
         circuit = if failures >= state.failure_circuit, do: :open, else: :closed
         generation = max(entry.generation, 1)
 
-        timer = schedule_restart(state, key, generation, failures, circuit)
+        timer = schedule_restart(state, key, generation, failures)
 
         entry = %{
           entry
@@ -1612,14 +1633,27 @@ defmodule Tightbeam.AdapterCoordinator do
     do: MapSet.put(ready_refs, monitor)
 
   defp put_ready_ref(ready_refs, _monitor), do: ready_refs
-  defp schedule_restart(_state, _key, _generation, _failures, :open), do: nil
 
-  defp schedule_restart(state, key, generation, failures, :closed) do
+  defp schedule_restart(state, key, generation, failures) do
     Process.send_after(
       self(),
       {:restart_adapter, key, generation},
       backoff(state, failures)
     )
+  end
+
+  defp retry_open_circuit_after_failure(state, key, entry, previous_generation) do
+    if entry.circuit == :open do
+      cancel_timer_flush(entry.timer, {:restart_adapter, key, previous_generation})
+
+      failures = entry.failures + 1
+      timer = schedule_restart(state, key, entry.generation, failures)
+      entry = %{entry | failures: failures, timer: timer}
+
+      %{state | adapters: Map.put(state.adapters, key, entry)}
+    else
+      state
+    end
   end
 
   defp ready_entry?(entry),
