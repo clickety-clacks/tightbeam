@@ -3459,32 +3459,65 @@ defmodule Tightbeam.Gateway do
     """
   end
 
-  @doc false
-  def turn_prompt_content(db, turn, session_key, harness, base_dir) do
-    messages = turn_human_messages(db, turn, session_key)
+  @inline_image_mime_types ["image/jpeg", "image/png", "image/gif", "image/webp"]
 
-    entries =
-      Enum.flat_map(messages, fn message ->
+  @doc false
+  def turn_prompt_content(config, turn, session, harness) do
+    db = Map.fetch!(config, :db)
+    messages = turn_human_messages(db, turn, session.session_key)
+
+    with {:ok, entries} <- turn_attachment_entries(config, turn, session, messages, harness) do
+      case entries do
+        [] -> {:ok, turn.prompt}
+        _entries -> {:ok, append_turn_attachment_labels(turn.prompt, entries)}
+      end
+    end
+  end
+
+  defp turn_attachment_entries(config, turn, session, messages, harness) do
+    Enum.reduce_while(messages, {:ok, []}, fn message, {:ok, entries_reversed} ->
+      result =
         message.attachments
         |> Enum.with_index(1)
-        |> Enum.map(fn {attachment, index} ->
-          turn_attachment_entry(
-            db,
-            base_dir,
-            message,
-            attachment,
-            index,
-            Harness.inline_attachments?(harness)
-          )
+        |> Enum.reduce_while({:ok, entries_reversed}, fn {attachment, index},
+                                                         {:ok, current_entries_reversed} ->
+          current_entries = Enum.reverse(current_entries_reversed)
+
+          with {:ok, entry} <-
+                 turn_attachment_entry(
+                   config,
+                   turn,
+                   session,
+                   message,
+                   attachment,
+                   index,
+                   harness
+                 ),
+               {:ok, bounded_entries} <-
+                 enforce_codex_text_limit(
+                   config,
+                   turn,
+                   session,
+                   current_entries ++ [entry],
+                   harness
+                 ) do
+            {:cont, {:ok, Enum.reverse(bounded_entries)}}
+          else
+            {:error, _reason} = error -> {:halt, error}
+          end
         end)
-      end)
 
-    case entries do
-      [] ->
-        turn.prompt
+      case result do
+        {:ok, next_entries_reversed} ->
+          {:cont, {:ok, next_entries_reversed}}
 
-      _entries ->
-        append_turn_attachment_labels(turn.prompt, entries)
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, entries_reversed} -> {:ok, Enum.reverse(entries_reversed)}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -3532,7 +3565,15 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp turn_attachment_entry(db, base_dir, message, attachment, index, covered_harness?) do
+  defp turn_attachment_entry(
+         config,
+         turn,
+         session,
+         message,
+         attachment,
+         index,
+         harness
+       ) do
     marker =
       case Map.get(message, :publication_seq) do
         publication_seq when is_integer(publication_seq) -> "[#{publication_seq}]"
@@ -3546,37 +3587,228 @@ defmodule Tightbeam.Gateway do
     mime_type = attachment["mimeType"]
     asset_id = attachment["assetId"]
 
-    cond do
-      mime_type not in ["image/jpeg", "image/png"] ->
-        {label <>
-           "original-file delivery is not included in this Gateway release; bytes were not sent.",
-         nil}
+    if not Harness.inline_attachments?(harness) do
+      {:ok,
+       {label <> "content delivery is not enabled for this harness; bytes were not sent.", nil,
+        nil}}
+    else
+      case read_turn_attachment(config, asset_id) do
+        {:error, :missing_metadata} ->
+          {:ok, {label <> "unavailable: the stored attachment could not be found.", nil, nil}}
 
-      not covered_harness? ->
-        {label <>
-           "image content blocks are not enabled for this harness; bytes were not sent.", nil}
+        {:error, :unreadable_bytes} ->
+          {:ok,
+           {label <> "unavailable: the stored attachment bytes could not be read.", nil, nil}}
 
-      true ->
-        case Assets.get(db, asset_id) do
-          nil ->
-            {label <> "unavailable: the stored attachment could not be found.", nil}
+        {:ok, bytes} ->
+          build_turn_attachment_entry(
+            config,
+            turn,
+            session,
+            message,
+            attachment,
+            index,
+            label,
+            mime_type,
+            bytes
+          )
+      end
+    end
+  end
 
-          _asset ->
-            case File.read(Assets.file_path(base_dir, asset_id)) do
-              {:ok, bytes} ->
-                {label <> "included inline.",
-                 %{type: "image", data: Base.encode64(bytes), mimeType: mime_type}}
+  defp read_turn_attachment(config, asset_id) do
+    db = Map.fetch!(config, :db)
+    base_dir = Map.fetch!(config, :base_dir)
 
-              {:error, _reason} ->
-                {label <> "unavailable: the stored attachment bytes could not be read.", nil}
-            end
+    case Assets.get(db, asset_id) do
+      nil ->
+        {:error, :missing_metadata}
+
+      _asset ->
+        case File.read(Assets.file_path(base_dir, asset_id)) do
+          {:ok, bytes} -> {:ok, bytes}
+          {:error, _reason} -> {:error, :unreadable_bytes}
         end
     end
   end
 
+  defp build_turn_attachment_entry(
+         config,
+         turn,
+         session,
+         message,
+         attachment,
+         index,
+         label,
+         mime_type,
+         bytes
+       ) do
+    cond do
+      mime_type in @inline_image_mime_types ->
+        inline_image_attachment(label, mime_type, bytes)
+
+      text_file?(mime_type, bytes) ->
+        uri = attachment_resource_uri(turn, message, index)
+        inline_label = label <> "included inline as #{uri}."
+        resource = %{type: "resource", resource: %{uri: uri, mimeType: mime_type, text: bytes}}
+
+        file_fallback = %{
+          message: message,
+          attachment: attachment,
+          index: index,
+          bytes: bytes,
+          label: label
+        }
+
+        {:ok, {inline_label, resource, file_fallback}}
+
+      true ->
+        deliver_turn_attachment_file(
+          config,
+          turn,
+          session,
+          message,
+          attachment,
+          index,
+          label,
+          bytes
+        )
+    end
+  end
+
+  defp inline_image_attachment(label, mime_type, bytes) do
+    {:ok,
+     {label <> "included inline.",
+      %{type: "image", data: Base.encode64(bytes), mimeType: mime_type}, nil}}
+  end
+
+  defp text_file?(mime_type, bytes),
+    do: is_binary(mime_type) and String.starts_with?(mime_type, "text/") and String.valid?(bytes)
+
+  defp attachment_resource_uri(turn, message, index),
+    do: "urn:tightbeam:attachment:turn-#{turn.seq}:message-#{message.seq}:#{index}"
+
+  defp enforce_codex_text_limit(config, turn, session, entries, harness) do
+    case Harness.submission_text_limit(harness) do
+      nil ->
+        {:ok, entries}
+
+      limit ->
+        if codex_text_item_count(turn.prompt, entries) <= limit do
+          {:ok, entries}
+        else
+          fallback_last_text_resource(config, turn, session, entries, harness)
+        end
+    end
+  end
+
+  defp fallback_last_text_resource(config, turn, session, entries, harness) do
+    fallback_index =
+      entries
+      |> Enum.with_index()
+      |> Enum.reverse()
+      |> Enum.find_value(fn
+        {{_label, %{type: "resource"}, fallback}, index} when is_map(fallback) -> index
+        _entry -> nil
+      end)
+
+    case fallback_index do
+      nil ->
+        {:error, "attachment labels and message text exceed the Codex text limit"}
+
+      index ->
+        {_label, _resource, fallback} = Enum.at(entries, index)
+
+        case deliver_turn_attachment_file(
+               config,
+               turn,
+               session,
+               fallback.message,
+               fallback.attachment,
+               fallback.index,
+               fallback.label,
+               fallback.bytes
+             ) do
+          {:ok, entry} ->
+            updated_entries = List.replace_at(entries, index, entry)
+            enforce_codex_text_limit(config, turn, session, updated_entries, harness)
+
+          {:error, _reason} = error ->
+            error
+        end
+    end
+  end
+
+  defp codex_text_item_count(prompt, entries) do
+    case append_turn_attachment_labels(prompt, entries) do
+      blocks when is_list(blocks) ->
+        Enum.reduce(blocks, 0, fn
+          %{type: "text", text: text}, total ->
+            total + unicode_scalar_count(text)
+
+          %{type: "resource", resource: %{uri: uri, text: text}}, total ->
+            total + codex_resource_text_count(uri, text)
+
+          _other, total ->
+            total
+        end)
+
+      text when is_binary(text) ->
+        unicode_scalar_count(text)
+    end
+  end
+
+  defp codex_resource_text_count(uri, text) do
+    # The Codex adapter (v1.12.0) wraps this resource as `uri\n<context ref="uri">\ntext\n</context>`.
+    # Count the adapter's final text item, not just resource.text, against Codex's limit.
+    unicode_scalar_count(uri) + 1 + unicode_scalar_count("<context ref=\"") +
+      unicode_scalar_count(uri) + unicode_scalar_count("\">\n") +
+      unicode_scalar_count(text) + unicode_scalar_count("\n</context>")
+  end
+
+  defp deliver_turn_attachment_file(
+         config,
+         turn,
+         session,
+         message,
+         attachment,
+         index,
+         label,
+         bytes
+       ) do
+    filename = attachment["filename"]
+    workspace_filename = if single_filename?(filename), do: filename, else: "attachment-#{index}"
+
+    relative_path =
+      Path.join([
+        ".tightbeam-attachments",
+        Integer.to_string(turn.seq),
+        "message-#{message.seq}-attachment-#{index}",
+        workspace_filename
+      ])
+
+    case Placement.deliver_workdir_file(config, session, relative_path, bytes) do
+      {:ok, path} ->
+        file_label = label <> "delivered as a file at #{inspect(path)}."
+        {:ok, {file_label, nil, nil}}
+
+      {:error, reason} ->
+        {:error,
+         "attachment #{inspect(filename)} could not be placed in the agent's workspace: #{reason}"}
+    end
+  end
+
+  defp single_filename?(filename) when is_binary(filename) do
+    filename not in ["", ".", ".."] and Path.type(filename) == :relative and
+      not String.contains?(filename, "/") and not String.contains?(filename, <<0>>)
+  end
+
+  defp single_filename?(_filename), do: false
+
+  defp unicode_scalar_count(text) when is_binary(text), do: length(String.to_charlist(text))
+
   defp append_turn_attachment_labels(prompt, entries) do
-    entries = Enum.map(entries, fn {label, image} -> {"#{label}", image} end)
-    [{first_label, first_image} | remaining] = entries
+    [{first_label, first_content, _first_fallback} | remaining] = entries
 
     first_text =
       [prompt, first_label]
@@ -3584,15 +3816,15 @@ defmodule Tightbeam.Gateway do
       |> Enum.join("\n\n")
 
     blocks = [%{type: "text", text: first_text}]
-    blocks = if first_image, do: blocks ++ [first_image], else: blocks
+    blocks = if first_content, do: blocks ++ [first_content], else: blocks
 
     blocks =
-      Enum.reduce(remaining, blocks, fn {label, image}, acc ->
+      Enum.reduce(remaining, blocks, fn {label, content, _fallback}, acc ->
         acc = acc ++ [%{type: "text", text: label}]
-        if image, do: acc ++ [image], else: acc
+        if content, do: acc ++ [content], else: acc
       end)
 
-    if Enum.any?(blocks, &(&1.type == "image")) do
+    if Enum.any?(blocks, &(Map.get(&1, :type) in ["image", "resource"])) do
       blocks
     else
       Enum.map_join(blocks, "\n\n", & &1.text)
@@ -3665,19 +3897,19 @@ defmodule Tightbeam.Gateway do
                    )
                  end)
                ),
+             {:ok, prompt_content} <-
+               stage_with_session(
+                 :prompt,
+                 turn_prompt_content(config, turn, active_session, active_session.harness),
+                 active_session
+               ),
              {:ok, result} <-
                stage_with_session(
                  :prompt,
                  Adapter.prompt(
                    prompt_adapter,
                    harness_session_id,
-                   turn_prompt_content(
-                     db,
-                     turn,
-                     active_session.session_key,
-                     active_session.harness,
-                     config.base_dir
-                   ),
+                   prompt_content,
                    trace_dispatch: fn request_id ->
                      case Tightbeam.TurnLifecycle.append(db, turn.seq, %{
                             event_key: "prompt:dispatched",

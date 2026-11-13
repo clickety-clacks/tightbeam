@@ -1586,6 +1586,9 @@ defmodule Tightbeam.GatewayTest do
       model: Model.new("fable")
     })
 
+    session_record = Org.get(ctx.db, session)
+    prompt_config = %{db: ctx.db, base_dir: ctx.catalog_base}
+
     human_content = "human message in the batch"
     second_human_content = "second human message in the batch"
     agent_content = "agent notice in the batch"
@@ -1844,18 +1847,18 @@ defmodule Tightbeam.GatewayTest do
 
     prompt_turn = %{seq: turn_seq, message_id: carrier_message_id, prompt: queued_prompt}
 
-    assert [
-             %{type: "text", text: first_label},
-             %{type: "image", mimeType: "image/png", data: first_data},
-             %{type: "text", text: second_label},
-             %{type: "image", mimeType: "image/jpeg", data: second_data}
-           ] =
+    assert {:ok,
+            [
+              %{type: "text", text: first_label},
+              %{type: "image", mimeType: "image/png", data: first_data},
+              %{type: "text", text: second_label},
+              %{type: "image", mimeType: "image/jpeg", data: second_data}
+            ]} =
              Gateway.turn_prompt_content(
-               ctx.db,
+               prompt_config,
                prompt_turn,
-               session,
-               "claude",
-               ctx.catalog_base
+               session_record,
+               "claude"
              )
 
     assert first_label =~ "[1] attachment 1"
@@ -1865,13 +1868,13 @@ defmodule Tightbeam.GatewayTest do
     assert Base.decode64!(first_data) == image_bytes
     assert Base.decode64!(second_data) == second_image_bytes
 
-    assert Gateway.turn_prompt_content(
-             ctx.db,
-             %{seq: -1, message_id: "missing-message", prompt: "text only"},
-             session,
-             "claude",
-             ctx.catalog_base
-           ) == "text only"
+    assert {:ok, "text only"} =
+             Gateway.turn_prompt_content(
+               prompt_config,
+               %{seq: -1, message_id: "missing-message", prompt: "text only"},
+               session_record,
+               "claude"
+             )
 
     {:appended, attachment_only} =
       Projection.append(ctx.db, %{
@@ -1881,29 +1884,28 @@ defmodule Tightbeam.GatewayTest do
         attachments: [attachment]
       })
 
-    assert [
-             %{type: "text", text: attachment_only_label},
-             %{type: "image", mimeType: "image/png", data: attachment_only_data}
-           ] =
+    assert {:ok,
+            [
+              %{type: "text", text: attachment_only_label},
+              %{type: "image", mimeType: "image/png", data: attachment_only_data}
+            ]} =
              Gateway.turn_prompt_content(
-               ctx.db,
+               prompt_config,
                %{seq: -1, message_id: attachment_only.id, prompt: ""},
-               session,
-               "codex",
-               ctx.catalog_base
+               session_record,
+               "codex"
              )
 
     assert attachment_only_label != ""
     assert attachment_only_label =~ "diagram.png"
     assert Base.decode64!(attachment_only_data) == image_bytes
 
-    legacy_prompt =
+    {:ok, legacy_prompt} =
       Gateway.turn_prompt_content(
-        ctx.db,
+        prompt_config,
         %{seq: -1, message_id: attachment_only.id, prompt: ""},
-        session,
-        "pi",
-        ctx.catalog_base
+        session_record,
+        "pi"
       )
 
     assert is_binary(legacy_prompt)
@@ -2234,6 +2236,249 @@ defmodule Tightbeam.GatewayTest do
     refute StateResources.message(StateResources.query_message(ctx.db, carrier_message_id))[
              "isBatchCarrier"
            ]
+  end
+
+  test "turn prompts inline readable text and deliver PDFs as byte-exact workspace files", ctx do
+    session_key = "attachment-file-turn-session"
+    create_session(ctx.db, session_key, "flynn")
+    session = Org.get(ctx.db, session_key)
+    config = %{db: ctx.db, base_dir: ctx.catalog_base}
+
+    note_bytes = "The launch code is PERIWINKLE-42"
+
+    note_asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        "flynn",
+        "text/plain",
+        "note.txt",
+        note_bytes
+      )
+
+    note_attachment = %{
+      "assetId" => note_asset.asset_id,
+      "mimeType" => "text/plain",
+      "filename" => "note.txt",
+      "size" => note_asset.size
+    }
+
+    {:appended, note_message} =
+      Projection.append(ctx.db, %{
+        session_key: session_key,
+        role: "user",
+        content: "What does the file say?",
+        attachments: [note_attachment]
+      })
+
+    note_turn = %{seq: 91001, message_id: note_message.id, prompt: "What does the file say?"}
+
+    assert {:ok,
+            [
+              %{type: "text", text: note_label},
+              %{type: "resource", resource: note_resource}
+            ]} = Gateway.turn_prompt_content(config, note_turn, session, "claude")
+
+    assert note_label =~ "note.txt"
+    assert note_label =~ note_resource.uri
+    assert note_resource.uri =~ "urn:tightbeam:attachment:turn-91001:message-"
+    assert note_resource.mimeType == "text/plain"
+    assert note_resource.text == note_bytes
+
+    pdf_bytes = <<"%PDF-1.7\nQuarterly total: 7,315 units\n%%EOF\n">>
+
+    pdf_asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        "flynn",
+        "application/pdf",
+        "report.pdf",
+        pdf_bytes
+      )
+
+    pdf_attachment = %{
+      "assetId" => pdf_asset.asset_id,
+      "mimeType" => "application/pdf",
+      "filename" => "report.pdf",
+      "size" => pdf_asset.size
+    }
+
+    {:appended, pdf_message} =
+      Projection.append(ctx.db, %{
+        session_key: session_key,
+        role: "user",
+        content: "What does the PDF say?",
+        attachments: [pdf_attachment]
+      })
+
+    pdf_message = Projection.get(ctx.db, pdf_message.id)
+    pdf_turn = %{seq: 91002, message_id: pdf_message.id, prompt: "What does the PDF say?"}
+
+    assert {:ok, pdf_prompt} = Gateway.turn_prompt_content(config, pdf_turn, session, "codex")
+    assert pdf_prompt =~ "report.pdf"
+    assert pdf_prompt =~ "delivered as a file at"
+
+    pdf_path =
+      Path.join([
+        Placement.workdir_path(config, session),
+        ".tightbeam-attachments",
+        "91002",
+        "message-#{pdf_message.seq}-attachment-1",
+        "report.pdf"
+      ])
+
+    assert pdf_prompt =~ inspect(pdf_path)
+    assert File.read!(pdf_path) == pdf_bytes
+
+    large_text = String.duplicate("x", 1_048_200)
+    assert String.length(large_text) < 1_048_576
+
+    large_asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        "flynn",
+        "text/plain",
+        "large.txt",
+        large_text
+      )
+
+    large_attachment = %{
+      "assetId" => large_asset.asset_id,
+      "mimeType" => "text/plain",
+      "filename" => "large.txt",
+      "size" => large_asset.size
+    }
+
+    large_pdf_bytes = <<"%PDF-1.7\nQuarterly total: 7,315 units\n%%EOF\n">>
+
+    large_pdf_asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        "flynn",
+        "application/pdf",
+        "report.pdf",
+        large_pdf_bytes
+      )
+
+    large_pdf_attachment = %{
+      "assetId" => large_pdf_asset.asset_id,
+      "mimeType" => "application/pdf",
+      "filename" => "report.pdf",
+      "size" => large_pdf_asset.size
+    }
+
+    {:appended, large_message} =
+      Projection.append(ctx.db, %{
+        session_key: session_key,
+        role: "user",
+        content: "What is the final line?",
+        attachments: [large_attachment, large_pdf_attachment]
+      })
+
+    large_message = Projection.get(ctx.db, large_message.id)
+    large_turn = %{seq: 91003, message_id: large_message.id, prompt: "What is the final line?"}
+
+    large_text_uri =
+      "urn:tightbeam:attachment:turn-#{large_turn.seq}:message-#{large_message.seq}:1"
+
+    inline_text_label =
+      "message [#{large_message.seq}] attachment 1 \"large.txt\" (#{large_asset.size} bytes): included inline as #{large_text_uri}."
+
+    inline_text_resource =
+      "#{large_text_uri}\n<context ref=\"#{large_text_uri}\">\n#{large_text}\n</context>"
+
+    inline_only_count =
+      String.length(large_turn.prompt <> "\n\n" <> inline_text_label) +
+        String.length(inline_text_resource)
+
+    large_pdf_path =
+      Path.join([
+        Placement.workdir_path(config, session),
+        ".tightbeam-attachments",
+        "91003",
+        "message-#{large_message.seq}-attachment-2",
+        "report.pdf"
+      ])
+
+    large_pdf_label =
+      "message [#{large_message.seq}] attachment 2 \"report.pdf\" (#{large_pdf_asset.size} bytes): delivered as a file at #{inspect(large_pdf_path)}."
+
+    assert inline_only_count < 1_048_576
+    assert inline_only_count + String.length(large_pdf_label) > 1_048_576
+
+    assert {:ok, large_prompt} = Gateway.turn_prompt_content(config, large_turn, session, "codex")
+    assert large_prompt =~ "large.txt"
+    assert large_prompt =~ "delivered as a file at"
+    assert large_prompt =~ inspect(large_pdf_path)
+
+    large_path =
+      Path.join([
+        Placement.workdir_path(config, session),
+        ".tightbeam-attachments",
+        "91003",
+        "message-#{large_message.seq}-attachment-1",
+        "large.txt"
+      ])
+
+    assert File.read!(large_path) == large_text
+    assert File.read!(large_pdf_path) == large_pdf_bytes
+  end
+
+  test "a workspace copy failure refuses prompt content instead of returning a false file label",
+       ctx do
+    session_key = "attachment-file-copy-failure-session"
+    create_session(ctx.db, session_key, "flynn")
+    session = Org.get(ctx.db, session_key)
+    config = %{db: ctx.db, base_dir: ctx.catalog_base}
+    pdf_bytes = <<"%PDF-1.7\nQuarterly total: 7,315 units\n%%EOF\n">>
+
+    asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        "flynn",
+        "application/pdf",
+        "blocked.pdf",
+        pdf_bytes
+      )
+
+    attachment = %{
+      "assetId" => asset.asset_id,
+      "mimeType" => "application/pdf",
+      "filename" => "blocked.pdf",
+      "size" => asset.size
+    }
+
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: session_key,
+        role: "user",
+        content: "Read this PDF",
+        attachments: [attachment]
+      })
+
+    message = Projection.get(ctx.db, message.id)
+    turn = %{seq: 91004, message_id: message.id, prompt: "Read this PDF"}
+
+    blocked_path =
+      Path.join([
+        Placement.workdir_path(config, session),
+        ".tightbeam-attachments",
+        "91004",
+        "message-#{message.seq}-attachment-1",
+        "blocked.pdf"
+      ])
+
+    File.mkdir_p!(Path.dirname(blocked_path))
+    File.mkdir_p!(blocked_path)
+
+    assert {:error, reason} = Gateway.turn_prompt_content(config, turn, session, "claude")
+    assert reason =~ "blocked.pdf"
+    assert reason =~ "could not be placed in the agent's workspace"
+    refute reason =~ "delivered as a file at"
   end
 
   @tag recipient_readiness: true
