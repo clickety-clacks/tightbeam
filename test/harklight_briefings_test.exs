@@ -7,6 +7,7 @@ defmodule Tightbeam.HarklightBriefingsTest do
     Escalation,
     Gateway,
     HarklightBriefings,
+    HarklightFollows,
     HarklightWakes,
     Model,
     Org,
@@ -162,6 +163,28 @@ defmodule Tightbeam.HarklightBriefingsTest do
     assert session_key == ctx.consumer.session_key
     assert briefing_wake_count(ctx.db) == 1
 
+    follow_call = %{
+      session_call(ctx.main.session_key)
+      | verb: "harklight-follow",
+        params: %{handle: handle}
+    }
+
+    status_runner = fn ["status", "--session", session_handle] ->
+      {JSON.encode!(%{
+         "session_handle" => session_handle,
+         "open_requests" => 1,
+         "open_chats" => 1,
+         "pending_undelivered" => 0,
+         "pending_delivered_unacted" => 0
+       }), 0}
+    end
+
+    assert %{outcome: "committed"} =
+             HarklightFollows.follow(ctx.db, follow_call,
+               runner: status_runner,
+               activate: false
+             )
+
     chat_entry =
       JSON.encode!(%{
         "kind" => "event",
@@ -191,6 +214,32 @@ defmodule Tightbeam.HarklightBriefingsTest do
     assert prompt =~ request.id
     assert prompt =~ "same session and thread"
     assert prompt =~ "quote the exact choice"
+
+    assert {:ok, [[prior_follower_wake, prior_follower_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT w.wakeId,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.sessionKey=?1",
+               [ctx.main.session_key]
+             )
+
+    assert prior_follower_prompt =~ request.id
+    assert prior_follower_prompt =~ "same session and thread"
+    assert %{state: "retired"} = Org.retire(ctx.db, session_key, "user:#{@owner}", 60_000)
+
+    assert {:ok, [[new_follower_wake, handoff_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT w.wakeId,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.sessionKey=?1",
+               [ctx.main.session_key]
+             )
+
+    refute new_follower_wake == prior_follower_wake
+    assert handoff_prompt =~ "has retired"
+    assert handoff_prompt =~ request.id
+    assert handoff_prompt =~ "same session and thread"
+
+    assert {:ok, [[^prior_follower_prompt]]} =
+             DB.query(ctx.db, "SELECT prompt FROM wakes WHERE wakeId=?1", [prior_follower_wake])
   end
 
   test "catchup excludes resolved requests and reports all remaining requests", ctx do

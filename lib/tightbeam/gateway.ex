@@ -11167,6 +11167,16 @@ defmodule Tightbeam.Gateway do
           %{session_key: member.session_key, assignments: assignments}
         end)
 
+      # Resolve receivers only after the whole retiring set is inactive. A
+      # parent retiring in this transaction cannot take its child's conversation.
+      Enum.each(retired, fn member ->
+        Txn.handoff(
+          txn,
+          Tightbeam.HarklightWakes,
+          Tightbeam.HarklightWakes.retirement_handoff_in_txn(txn, member.session_key)
+        )
+      end)
+
       retired
       |> Enum.flat_map(& &1.assignments)
       |> Enum.map(& &1.work_item_id)
@@ -11271,7 +11281,7 @@ defmodule Tightbeam.Gateway do
          drain_reason
        ) do
     assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
-    Org.retire_in_txn(txn, session_key, principal)
+    Org.retire_in_txn(txn, session_key, principal, defer_harklight: true)
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
     assignments
   end

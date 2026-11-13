@@ -248,6 +248,45 @@ defmodule Tightbeam.HarklightWakes do
         [session_key]
       )
 
+    # Ended handles never acquire receivers from a later retirement.
+    rows =
+      Enum.reject(rows, fn [handle, _, _, state] ->
+        state == "complete" or
+          Txn.q(
+            txn,
+            "SELECT 1 FROM harklight_wake_handles WHERE handle=?1 AND state='unavailable' AND lastError='origin_unavailable'",
+            [handle]
+          ) != []
+      end)
+
+    Enum.each(rows, fn [handle, origin, host, _] ->
+      follows_conversation =
+        Txn.q(
+          txn,
+          "SELECT 1 FROM harklight_wake_follows WHERE handle=?1 AND sessionKey=?2 AND kind='conversation' AND state='open'",
+          [handle, session_key]
+        ) != []
+
+      if origin == session_key or
+           (follows_conversation and
+              match?(%{state: "retired"}, Org.get_in_txn(txn, origin)) and
+              not actual_receiver_eligible_in_txn?(txn, handle, origin, host)) do
+        case successor_in_txn(txn, session_key) do
+          %{session_key: successor, host: ^host} ->
+            Txn.q(
+              txn,
+              "INSERT OR IGNORE INTO harklight_wake_follows(followId,sessionKey,kind,handle,senderId,messageId,state,createdAt) VALUES(?1,?2,'conversation',?3,NULL,'','open',?4)",
+              [Tightbeam.Id.uuid4(), successor, handle, System.system_time(:millisecond)]
+            )
+
+            handoff_pending_in_txn(txn, handle, session_key, successor, origin)
+
+          _ ->
+            :ok
+        end
+      end
+    end)
+
     handles = Enum.map(rows, fn [handle, _origin_session_key, _host, _state] -> handle end)
 
     gone_handles =
@@ -256,6 +295,159 @@ defmodule Tightbeam.HarklightWakes do
           do: handle
 
     {:origin_retired, session_key, handles, gone_handles}
+  end
+
+  @doc false
+  def successor_in_txn(txn, session_key),
+    do: successor_in_txn(txn, session_key, MapSet.new())
+
+  defp successor_in_txn(txn, session_key, visited) do
+    if MapSet.member?(visited, session_key) do
+      nil
+    else
+      office =
+        Txn.q(
+          txn,
+          """
+          SELECT r.boundSessionKey FROM retirement_blockers b
+          JOIN unfinished_retirements u ON u.id=b.retirementId
+          JOIN roles r ON r.name=b.reference
+          WHERE b.kind='role' AND b.sessionKey=?1 AND r.createdAt<u.createdAt
+            AND r.boundSessionKey IS NOT NULL AND r.boundSessionKey<>?1
+          ORDER BY r.name LIMIT 1
+          """,
+          [session_key]
+        )
+
+      candidate =
+        case office do
+          [[key]] ->
+            key
+
+          [] ->
+            case Txn.q(
+                   txn,
+                   "SELECT newOwnerSessionKey FROM retirement_owner_transfers WHERE formerOwnerSessionKey=?1 ORDER BY id LIMIT 1",
+                   [session_key]
+                 ) do
+              [[key]] -> key
+              [] -> Supervision.ladder_target(txn, session_key, 1)
+            end
+        end
+
+      case candidate && Org.get_in_txn(txn, candidate) do
+        %{state: "active"} = session ->
+          session
+
+        %{state: "retired"} ->
+          successor_in_txn(txn, candidate, MapSet.put(visited, session_key))
+
+        _ ->
+          nil
+      end
+    end
+  end
+
+  defp handoff_pending_in_txn(txn, handle, retiring, successor, origin) do
+    entries =
+      Txn.q(
+        txn,
+        """
+        SELECT e.eventId,e.rawLine,e.senderId,e.messageId,e.entryKind,e.entryAuthor,d.wakeId
+        FROM harklight_wake_deliveries d
+        JOIN harklight_wake_entries e ON e.handle=d.handle AND e.eventId=d.eventId
+        JOIN wakes w ON w.wakeId=d.wakeId
+        WHERE d.handle=?1 AND d.sessionKey=?2 AND w.state<>'canceled' AND
+          (NOT EXISTS (
+            SELECT 1 FROM turn_lifecycle_events dispatched
+            WHERE dispatched.turnSeq=w.deliveredTurnSeq AND dispatched.kind='prompt_dispatched'
+          ) OR (e.entryKind='discussion'
+            AND NOT EXISTS (
+              SELECT 1 FROM turns t WHERE t.seq=w.deliveredTurnSeq AND t.status='delivered'
+            ) AND NOT EXISTS (
+              SELECT 1 FROM wake_retry_attempts retry
+              JOIN wakes receipt ON receipt.wakeId=retry.wakeId
+              JOIN turns t ON t.seq=receipt.deliveredTurnSeq
+              WHERE retry.rootWakeId=d.wakeId AND t.status='delivered'
+            )))
+        ORDER BY e.feedCursor
+        """,
+        [handle, retiring]
+      )
+
+    Enum.each(entries, fn [event, line, sender, message, kind, author, root] ->
+      existing =
+        Txn.q(
+          txn,
+          "SELECT wakeId FROM harklight_wake_deliveries WHERE handle=?1 AND eventId=?2 AND sessionKey=?3",
+          [handle, event, successor]
+        )
+
+      # Retirement is a new handling context even when this recipient already
+      # saw the event as a follower. Keep that authored payload in history and
+      # make one contextual copy the delivery's new receipt/retry baseline.
+      wake =
+        Wakes.schedule_in_txn(txn, %{
+          session_key: successor,
+          origin: "process:tightbeam",
+          prompt: entry_prompt(txn, origin, line, handle, event, sender, message, kind, author),
+          due_at: System.system_time(:millisecond),
+          creator_session_key: origin,
+          class: "blocker"
+        })
+
+      replacement = wake.wake_id
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO harklight_wake_deliveries(handle,eventId,sessionKey,wakeId)
+        VALUES(?1,?2,?3,?4)
+        ON CONFLICT(handle,eventId,sessionKey) DO UPDATE SET wakeId=excluded.wakeId
+        """,
+        [handle, event, successor, replacement]
+      )
+
+      Wakes.publish_change_in_txn(txn, "wake.scheduled", replacement)
+
+      # The retired target is the conversation's former responsible session;
+      # its transition replaces even an active follower's old handling context.
+      Enum.each(existing, fn [prior] ->
+        cancel_handoff_attempts_in_txn(txn, prior, %{
+          requester: %{kind: "process", id: "tightbeam:retirement"},
+          reason_kind: "target_retired",
+          causal_source: %{kind: "session_transition", id: retiring},
+          outcome: %{kind: "replacement", replacement_wake_id: replacement}
+        })
+      end)
+
+      cancel_handoff_attempts_in_txn(txn, root, %{
+        requester: %{kind: "process", id: "tightbeam:retirement"},
+        reason_kind: "target_retired",
+        causal_source: %{kind: "session_transition", id: retiring},
+        outcome: %{kind: "replacement", replacement_wake_id: replacement}
+      })
+    end)
+  end
+
+  defp cancel_handoff_attempts_in_txn(txn, root, command) do
+    # Withdraw the old recipient's pending attempts, including a sealed source.
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId FROM wakes WHERE wakeId=?1 AND state='pending'
+      UNION
+      SELECT w.wakeId FROM wake_retry_attempts retry
+      JOIN wakes w ON w.wakeId=retry.wakeId
+      WHERE retry.rootWakeId=?1 AND w.state='pending'
+      """,
+      [root]
+    )
+    |> Enum.each(fn [wake_id] ->
+      result = Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id))
+
+      if result == false, do: raise("Harklight retirement cancellation refused for #{wake_id}")
+    end)
   end
 
   # The caller of these functions is the runtime-owned send boundary. Its
@@ -2557,15 +2749,17 @@ defmodule Tightbeam.HarklightWakes do
       wake_id = "w_harklight_" <> handle <> "_" <> String.pad_leading(event_id, 20, "0")
 
       prompt =
-        line <>
-          "\n\n" <>
-          handling_instruction(handle, event_id, message_id, kind, author) <>
-          Tightbeam.HarklightBriefings.chat_prompt_context_in_txn(
-            txn,
-            handle,
-            sender_id,
-            message_id
-          )
+        entry_prompt(
+          txn,
+          session_key,
+          line,
+          handle,
+          event_id,
+          sender_id,
+          message_id,
+          kind,
+          author
+        )
 
       now = System.system_time(:millisecond)
 
@@ -2714,6 +2908,18 @@ defmodule Tightbeam.HarklightWakes do
       end
 
     (own_recipients ++ conversation_recipients ++ message_recipients)
+    |> Enum.filter(fn recipient ->
+      case Org.get_in_txn(txn, recipient) do
+        %{state: "active", host: host} ->
+          Txn.q(txn, "SELECT 1 FROM harklight_wake_handles WHERE handle=?1 AND host=?2", [
+            handle,
+            host
+          ]) != []
+
+        _ ->
+          false
+      end
+    end)
     |> Enum.reject(&(terminal and &1 == superseding_session))
     |> Enum.uniq()
     |> Enum.sort()
@@ -2729,6 +2935,29 @@ defmodule Tightbeam.HarklightWakes do
   defp recipient_suffix(session_key) do
     :crypto.hash(:sha256, session_key)
     |> Base.encode16(case: :lower)
+  end
+
+  defp entry_prompt(txn, origin, line, handle, event, sender, message, kind, author) do
+    instruction = handling_instruction(handle, event, message, kind, author)
+
+    instruction =
+      case Org.get_in_txn(txn, origin) do
+        %{state: "retired", display_name: name} ->
+          String.replace(
+            instruction,
+            "Handle this Harklight entry from your originating session.",
+            "This Harklight entry was addressed to #{name} (#{origin}), who has retired. Handle it as the conversation's agent in their place.",
+            global: false
+          )
+
+        _ ->
+          instruction
+      end
+
+    line <>
+      "\n\n" <>
+      instruction <>
+      Tightbeam.HarklightBriefings.chat_prompt_context_in_txn(txn, handle, sender, message)
   end
 
   defp handling_instruction(handle, event_id, message_id, _kind, _author) do
