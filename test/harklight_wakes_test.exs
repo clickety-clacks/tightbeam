@@ -2180,6 +2180,73 @@ defmodule Tightbeam.HarklightWakesTest do
     refute prompt =~ "listen-payload-canary"
   end
 
+  test "a follow listener remains active through reconnect diagnostics and captures the resumed reply",
+       %{db: db, call: call} do
+    nonce = Tightbeam.Id.uuid4()
+    started = Path.join(System.tmp_dir!(), "harklight-reconnect-#{nonce}.started")
+    resume = Path.join(System.tmp_dir!(), "harklight-reconnect-#{nonce}.resume")
+    attached = JSON.encode!(%{kind: "attached", ready_for_listen: true})
+    event_line = event(1, "discussion", "reply after server restart")
+
+    on_exit(fn ->
+      File.rm(started)
+      File.rm(resume)
+    end)
+
+    fake_harklight_agent!("""
+    if [ "$1" = "attach" ]; then
+      printf '%s\\n' '#{attached}'
+      exit 0
+    fi
+
+    if [ "$1" = "listen" ]; then
+      printf '%s\\n' 'Harklight origin stream unavailable; retrying after disconnect' >&2
+      touch '#{started}'
+      while [ ! -e '#{resume}' ]; do sleep 0.01; done
+      printf '%s\\n' '#{event_line}'
+      exec sleep 600
+    fi
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn -> File.exists?(started) end)
+
+    assert {:ok, [["active", nil]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
+               "w_harklight_notice_recovery_" <> @handle
+             ])
+
+    File.write!(resume, "server returned")
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT count(*) FROM harklight_wake_entries WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [[1]]}
+           end)
+
+    assert {:ok, [["active", nil]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ])
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT w.prompt FROM harklight_wake_entries e JOIN wakes w ON w.wakeId=e.wakeId WHERE e.handle=?1 LIMIT 1",
+               [@handle]
+             )
+
+    assert prompt =~ "reply after server restart"
+  end
+
   test "a final unterminated listen refusal remains in the failure details", %{
     db: db,
     call: call
