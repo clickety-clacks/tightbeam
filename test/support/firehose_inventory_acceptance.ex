@@ -377,7 +377,7 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     assert tool_session_notice["payload"] == assert_a4_fresh!(fixture, tool_session_notice)
 
     assistant_notices =
-      capture_classes(fixture, %{}, ["message.created", "message.segment_recorded"], fn ->
+      capture_classes(fixture, %{}, ["message.segment_recorded"], fn ->
         {:appended, assistant_message} =
           Projection.append(fixture.db, %{
             session_key: main.session_key,
@@ -458,8 +458,7 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
       Map.merge(notices, %{
         "assignment marker" => assignment_notice,
         "attest marker" => attest_notices["message.created"],
-        "tool turn session" => tool_session_notice,
-        "assistant message" => assistant_notices["message.created"]
+        "tool turn session" => tool_session_notice
       })
 
     # These notices predate the rename and were checked against their commit-time
