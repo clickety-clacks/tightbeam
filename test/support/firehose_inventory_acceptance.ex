@@ -10,6 +10,7 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     ReadMarkers,
     StateResources,
     SubagentMarkers,
+    TurnEvents,
     ToolCalls,
     Toplines,
     Wakes
@@ -375,8 +376,30 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
 
     assert tool_session_notice["payload"] == assert_a4_fresh!(fixture, tool_session_notice)
 
+    assistant_notices =
+      capture_classes(fixture, %{}, ["message.created", "message.segment_recorded"], fn ->
+        {:appended, assistant_message} =
+          Projection.append(fixture.db, %{
+            session_key: main.session_key,
+            role: "assistant",
+            content: "A4 assistant segment"
+          })
+
+        assert {:ok, _event} =
+                 TurnEvents.append_assistant_segment(
+                   fixture.db,
+                   main.session_key,
+                   tool_turn.seq,
+                   assistant_message.id,
+                   %{"type" => "text", "text" => "A4 assistant segment"}
+                 )
+      end)
+
     notices =
-      capture_classes(fixture, notices, ["tool_call.started"], fn ->
+      Map.put(notices, "message.segment_recorded", assistant_notices["message.segment_recorded"])
+
+    notices =
+      capture_classes(fixture, notices, ["tool_call.started", "tool_call.event_recorded"], fn ->
         assert {:ok, :started} =
                  ToolCalls.observe(
                    fixture.db,
@@ -435,7 +458,8 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
       Map.merge(notices, %{
         "assignment marker" => assignment_notice,
         "attest marker" => attest_notices["message.created"],
-        "tool turn session" => tool_session_notice
+        "tool turn session" => tool_session_notice,
+        "assistant message" => assistant_notices["message.created"]
       })
 
     # These notices predate the rename and were checked against their commit-time
