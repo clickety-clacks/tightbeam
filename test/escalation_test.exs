@@ -1005,6 +1005,55 @@ defmodule Tightbeam.EscalationTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
   end
 
+  test "withdrawing an open agent request succeeds after its linked assignment closes", ctx do
+    insert_assignment!(ctx.db, "a-withdraw-closed", ctx.raiser.session_key, "open")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO assignment_effects (assignmentId,effectKind) VALUES ('a-withdraw-closed','coordination')"
+      )
+
+    asked = session(ctx.db, "withdraw-target", "other")
+
+    request =
+      Escalation.ask(
+        ctx.db,
+        agent_call(
+          ctx.raiser,
+          %{question: "Withdraw after assignment closure?", assignment_id: "a-withdraw-closed"},
+          %{verb: "ask", session_key: asked.session_key}
+        )
+      )
+
+    assert %{assignment: %{id: "a-withdraw-closed", state: "closed", outcome: "completed"}} =
+             Tightbeam.Assignments.__handle__(ctx.db, "attest", %{
+               verb: "attest",
+               origin: "agent:raiser",
+               principal: {:session, ctx.raiser.session_key},
+               params: %{assignment_id: "a-withdraw-closed", kind: "completion"}
+             })
+
+    assert Escalation.raw_by_id(ctx.db, request.id).status == "open"
+
+    assert %{code: "invalid", message: "agent requests use withdraw"} =
+             Escalation.operator_withdraw(ctx.db, %{
+               origin: "agent:raiser",
+               principal: {:session, ctx.raiser.session_key},
+               params: %{request: request.id, reason: "no longer needed"}
+             })
+
+    assert %{id: withdrawn_id, status: "withdrawn", withdrawn_reason: "no longer needed"} =
+             Escalation.withdraw(ctx.db, %{
+               origin: "agent:raiser",
+               principal: {:session, ctx.raiser.session_key},
+               params: %{request_id: request.id, reason: "no longer needed"}
+             })
+
+    assert withdrawn_id == request.id
+    assert Escalation.raw_by_id(ctx.db, request.id).status == "withdrawn"
+  end
+
   test "ruled operator list and exact reads share the complete terminal projection", ctx do
     {:decision_pending, statute_id} =
       open(ctx, call(ctx.raiser, %{assignment_id: "operator-wrong-kind"}), statute())
