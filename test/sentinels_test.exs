@@ -196,6 +196,130 @@ defmodule Tightbeam.SentinelsTest do
       refute inspect(setup) =~ "synthetic-secret-value"
       refute inspect(listed) =~ "synthetic-secret-value"
     end
+
+    test "relearn reports installed bundle setup while learn keeps its existing result", ctx do
+      Identity.init!(ctx.base)
+      handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})
+
+      learned =
+        handlers["learn"].(%{
+          verb: "learn",
+          origin: "user:flynn",
+          params: %{name: "alpha-bundle"},
+          invocation_id: "learn-before-relearn-setup"
+        })
+
+      assert %{
+               state: "published",
+               kungfu: "alpha-bundle",
+               setup: %{bundle: "alpha-bundle", pending: learn_pending}
+             } = learned
+
+      assert Enum.map(learn_pending, & &1.state) == [
+               "setting-missing",
+               "setting-missing",
+               "disabled"
+             ]
+
+      add_monitor_sentinel!(ctx, "alpha-bundle")
+
+      relearned =
+        handlers["identity-relearn"].(%{
+          verb: "identity-relearn",
+          origin: "user:flynn",
+          params: %{},
+          invocation_id: "relearn-installed-setup"
+        })
+
+      assert %{state: "published", setup: [%{bundle: "alpha-bundle", pending: pending}]} =
+               relearned
+
+      assert Enum.any?(pending, fn item ->
+               item.sentinel == "alpha-bundle/monitor" and item.state == "setting-missing" and
+                 item.setting == "MONITOR_TARGET"
+             end)
+
+      set_settings!(ctx, "alpha-bundle/watch", %{
+        "WATCH_TARGET" => "watch-target",
+        "WATCH_EXTRA" => "watch-extra"
+      })
+
+      set_settings!(ctx, "alpha-bundle/monitor", %{"MONITOR_TARGET" => "monitor-target"})
+      enable!(ctx, "alpha-bundle/watch")
+      enable!(ctx, "alpha-bundle/monitor")
+      File.write!(Path.join([ctx.bundles, "alpha-bundle", "setup.md"]), "Updated setup.\n")
+
+      configured =
+        handlers["identity-relearn"].(%{
+          verb: "identity-relearn",
+          origin: "user:flynn",
+          params: %{},
+          invocation_id: "relearn-no-pending-setup"
+        })
+
+      assert %{state: "published", setup: [%{bundle: "alpha-bundle", pending: []}]} = configured
+    end
+
+    test "successful relearn resolve reports setup and unresolved conflicts remain explicit",
+         ctx do
+      Identity.init!(ctx.base)
+      handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})
+      role_guidance = "guidance/alpha-bundle-role.md"
+
+      assert %{state: "published"} =
+               handlers["learn"].(%{
+                 verb: "learn",
+                 origin: "user:flynn",
+                 params: %{name: "alpha-bundle"},
+                 invocation_id: "learn-before-relearn-resolve"
+               })
+
+      candidate =
+        Identity.edit!(
+          ctx.base,
+          "alpha-bundle-role",
+          :guidance,
+          "Organization's local guidance.\n",
+          "user:flynn"
+        )
+
+      assert {:ok, _revision} = Identity.publish_live!(ctx.base, candidate)
+
+      File.write!(
+        Path.join([ctx.bundles, "alpha-bundle", role_guidance]),
+        "Installed guidance.\n"
+      )
+
+      add_monitor_sentinel!(ctx, "alpha-bundle")
+
+      conflicted =
+        handlers["identity-relearn"].(%{
+          verb: "identity-relearn",
+          origin: "user:flynn",
+          params: %{},
+          invocation_id: "relearn-unresolved-conflict"
+        })
+
+      assert %{state: "relearn-conflicted", conflicting_paths: [^role_guidance]} = conflicted
+      refute Map.has_key?(conflicted, :setup)
+
+      identity_dir = Path.join(ctx.base, "identity")
+      File.write!(Path.join(identity_dir, role_guidance), "Organization's local guidance.\n")
+      {_, 0} = System.cmd("git", ["add", "--", role_guidance], cd: identity_dir)
+
+      resolved =
+        handlers["identity-relearn"].(%{
+          verb: "identity-relearn",
+          origin: "user:flynn",
+          params: %{action: "resolve"},
+          invocation_id: "relearn-resolve-setup"
+        })
+
+      assert %{state: "published", setup: [%{bundle: "alpha-bundle", pending: pending}]} =
+               resolved
+
+      assert Enum.any?(pending, &(&1.sentinel == "alpha-bundle/monitor"))
+    end
   end
 
   describe "sentinel settings" do
@@ -666,6 +790,24 @@ defmodule Tightbeam.SentinelsTest do
     root_archetype = "#{bundle}-role"
 
     #{sentinels}
+    """)
+  end
+
+  defp add_monitor_sentinel!(ctx, bundle) do
+    path = Path.join([ctx.bundles, bundle, "sentinels", "monitor"])
+    File.write!(path, command_bytes(bundle <> "-monitor"))
+    File.chmod!(path, 0o755)
+
+    write_manifest!(ctx.bundles, bundle, """
+    [[sentinels]]
+    name = "watch"
+    command = "sentinels/watch"
+    requires = ["WATCH_TARGET", "WATCH_EXTRA"]
+
+    [[sentinels]]
+    name = "monitor"
+    command = "sentinels/monitor"
+    requires = ["MONITOR_TARGET"]
     """)
   end
 

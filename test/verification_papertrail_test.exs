@@ -8,6 +8,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   alias Tightbeam.Model
 
   alias Tightbeam.{
+    ArtifactContent,
     Artifacts,
     Archetypes,
     Assignments,
@@ -259,6 +260,70 @@ defmodule Tightbeam.VerificationPapertrailTest do
     assert RailRemedy.episode(ctx.db, @artifact_rule, review.id) == nil
   end
 
+  test "non-code verification on a captured report satisfies completion", ctx do
+    learn_engineering_rules!(ctx)
+
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, "flynn"},
+        params: %{title: "non-code report #{System.unique_integer([:positive])}", is_bug: false}
+      })
+
+    work =
+      assign(ctx, ctx.holder.session_key, item.id, "verify captured non-code result",
+        effect_kind: "evidence"
+      )
+
+    :ok = ArtifactContent.ensure_schema(ctx.db)
+
+    report =
+      record_captured_report(
+        ctx,
+        item.id,
+        work.id,
+        ctx.holder.session_key,
+        "Observed packet bytes"
+      )
+
+    artifact_id = report.artifact_id
+    digest = report.content_sha256
+
+    verification =
+      attest_call(ctx.holder.session_key, work.id, "verdict", "verified")
+      |> update_in([:params], fn params ->
+        params
+        |> Map.delete(:commit_refs)
+        |> Map.put(:artifact_id, artifact_id)
+        |> Map.put(:content_sha256, digest)
+      end)
+
+    assert :none = Rules.select_policy(ctx.db, "attest-operational-evidence", verification)
+
+    assert {:ok,
+            %{
+              attest: %{
+                verdictKind: "verified",
+                artifactId: ^artifact_id,
+                contentSha256: ^digest,
+                commitRefs: nil
+              }
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, verification)
+
+    assert {:ok, [[^artifact_id, ^digest]]} =
+             DB.query(
+               ctx.db,
+               "SELECT artifactId,contentSha256 FROM attests WHERE assignmentId=?1 AND kind='verdict' AND verdictKind='verified'",
+               [work.id]
+             )
+
+    assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               attest_call(ctx.holder.session_key, work.id, "completion")
+             )
+  end
+
   test "A3: back-to-back re-attempts rewake the live episode with no new episode", ctx do
     learn_engineering_rules!(ctx)
     %{work: work} = reviewed_clean_assignment(ctx)
@@ -459,6 +524,23 @@ defmodule Tightbeam.VerificationPapertrailTest do
         "commit" => String.trim(commit)
       }
     ]
+  end
+
+  defp record_captured_report(ctx, work_item_id, assignment_id, session_key, bytes) do
+    ctx.handlers["artifact-record"].(%{
+      verb: "artifact-record",
+      origin: "agent:#{session_key}",
+      principal: {:session, session_key},
+      session_key: session_key,
+      params: %{
+        kind: "report",
+        title: "non-code verification evidence",
+        origin_path: "/unavailable/non-code-evidence",
+        work_item_id: work_item_id,
+        produced_by_assignment_id: assignment_id,
+        content_base64: Base.encode64(bytes)
+      }
+    })
   end
 
   defp record_report_artifact(ctx, work_item_id, session_key) do

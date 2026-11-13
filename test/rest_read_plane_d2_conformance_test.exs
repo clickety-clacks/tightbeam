@@ -21,7 +21,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
   alias Tightbeam.Wire.Router
 
   @artifact_fields ~w(
-    artifactId kind title description createdBySession workItemId parentSession
+    artifactId kind title description createdBySession createdByProcess workItemId parentSession
     originPath contentSha256 recordedMessageId recordedTurnEvidence state home
     createdAt updatedAt rowVersion
   )

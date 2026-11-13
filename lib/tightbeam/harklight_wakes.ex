@@ -507,6 +507,82 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
+  # Revise/retract operations use the existing operation journal. Their tagged
+  # payload keeps the exact argv (including the original operation ID) apart
+  # from the send payload shape consumed by send recovery and registration.
+  def prepare_change(db, call, op_id, message_id, command, request) do
+    session_key = call.session_key
+
+    with true <- authenticated_origin?(call),
+         true <- is_binary(op_id) and Regex.match?(@uuid4, op_id),
+         true <- is_binary(message_id) and message_id != "",
+         true <- command in ["revise", "retract"],
+         true <- is_list(request) and request != [] and Enum.all?(request, &is_binary/1),
+         %{state: "active", host: host} <- Org.get(db, session_key),
+         true <- host == Placement.local_host_name() do
+      now = System.system_time(:millisecond)
+
+      payload =
+        JSON.encode!(%{
+          "operation_kind" => "change",
+          "command" => command,
+          "message_id" => message_id,
+          "request" => request
+        })
+
+      case DB.transaction(db, fn txn ->
+             case Txn.q(
+                    txn,
+                    "SELECT sessionKey,host,payload,state FROM harklight_send_operations WHERE opId=?1",
+                    [op_id]
+                  ) do
+               [] ->
+                 unresolved =
+                   Txn.q(
+                     txn,
+                     """
+                     SELECT s.opId
+                     FROM harklight_send_operations s
+                     LEFT JOIN harklight_command_results r ON r.opId=s.opId
+                     WHERE json_extract(s.payload,'$.operation_kind')='change'
+                       AND json_extract(s.payload,'$.message_id')=?1
+                       AND s.state='pending' AND r.opId IS NULL
+                     LIMIT 1
+                     """,
+                     [message_id]
+                   )
+
+                 if unresolved == [] do
+                   Txn.q(
+                     txn,
+                     "INSERT INTO harklight_send_operations(opId,sessionKey,host,payload,attemptedAt,state,createdAt,updatedAt) VALUES(?1,?2,?3,?4,?5,'pending',?5,?5)",
+                     [op_id, session_key, host, payload, now]
+                   )
+
+                   {:ok, "pending"}
+                 else
+                   {:error, "harklight_operation_unresolved"}
+                 end
+
+               [[^session_key, ^host, ^payload, "pending"]] ->
+                 case Txn.q(txn, "SELECT 1 FROM harklight_command_results WHERE opId=?1", [op_id]) do
+                   [] -> {:ok, "pending"}
+                   _ -> {:error, "harklight_change_already_settled"}
+                 end
+
+               _ ->
+                 {:error, "harklight_change_mismatch"}
+             end
+           end) do
+        {:ok, {:ok, state}} -> %{op_id: op_id, payload: payload, state: state}
+        {:ok, {:error, reason}} -> %{code: reason}
+        {:error, reason} -> %{code: "harklight_change_unavailable", message: inspect(reason)}
+      end
+    else
+      _ -> %{code: "harklight_origin_unavailable"}
+    end
+  end
+
   def bind_send(db, call, op_id, payload, result, handle, sender_id, message_id) do
     session_key = call.session_key
 
@@ -702,7 +778,7 @@ defmodule Tightbeam.HarklightWakes do
   def pending_send_attempts(db) do
     DB.query(
       db,
-      "SELECT opId,sessionKey,payload FROM harklight_send_operations WHERE state='pending' AND attemptedAt IS NOT NULL AND opId NOT IN (SELECT opId FROM harklight_command_results) ORDER BY attemptedAt,opId"
+      "SELECT opId,sessionKey,payload FROM harklight_send_operations WHERE state='pending' AND attemptedAt IS NOT NULL AND COALESCE(json_extract(payload,'$.operation_kind'),'send')<>'change' AND opId NOT IN (SELECT opId FROM harklight_command_results) ORDER BY attemptedAt,opId"
     )
   end
 
@@ -833,6 +909,36 @@ defmodule Tightbeam.HarklightWakes do
   def activate(handle, force \\ false) do
     if pid = Process.whereis(__MODULE__), do: GenServer.cast(pid, {:activate, handle, force})
     :ok
+  end
+
+  def restore_listener(db, call, handle) do
+    with true <- authenticated_origin?(call),
+         true <- is_binary(handle) and Regex.match?(@uuid4, handle),
+         %{state: "active", host: host} <- Org.get(db, call.session_key),
+         true <- host == Placement.local_host_name(),
+         pid when is_pid(pid) <- Process.whereis(__MODULE__) do
+      case GenServer.call(pid, {:restore_listener, call.session_key, handle}, :infinity) do
+        {:ok, listener_state} ->
+          %{
+            command: "listener-restore",
+            outcome: "requested",
+            listener_state: listener_state,
+            handle: handle,
+            session_key: call.session_key
+          }
+
+        {:error, reason} ->
+          %{command: "listener-restore", code: reason, outcome: "refused", handle: handle}
+      end
+    else
+      _ ->
+        %{
+          command: "listener-restore",
+          code: "harklight_origin_unavailable",
+          outcome: "refused",
+          reason: "listener restoration requires its active originating session on this host"
+        }
+    end
   end
 
   def origin_ready(session_key) do
@@ -1177,7 +1283,7 @@ defmodule Tightbeam.HarklightWakes do
       SELECT DISTINCT h.handle
       FROM harklight_wake_handles h
       JOIN harklight_wake_entries e ON e.handle=h.handle
-      WHERE h.state IN ('active','unavailable') AND e.entryKind='terminal' AND e.entryAuthor='person'
+      WHERE h.state IN ('active','unavailable') AND e.entryKind='terminal'
         AND (?1 IS NULL OR h.sessionKey=?1)
       ORDER BY h.handle
       """,
@@ -1407,6 +1513,41 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   @impl true
+  def handle_call({:restore_listener, session_key, handle}, _from, state) do
+    case DB.query(
+           state.db,
+           "SELECT sessionKey,host,state FROM harklight_wake_handles WHERE handle=?1",
+           [handle]
+         ) do
+      {:ok, [[^session_key, host, handle_state]]}
+      when handle_state in ["active", "unavailable"] ->
+        if listener_eligible?(state.db, handle, session_key, host) do
+          already_running? =
+            Map.has_key?(state.workers, handle) and not Map.has_key?(state.failures, handle)
+
+          state =
+            cond do
+              already_running? -> state
+              Map.has_key?(state.workers, handle) -> force_worker(state, handle, :existing)
+              true -> start_worker(state, handle, :existing)
+            end
+
+          {:reply, {:ok, if(already_running?, do: "active", else: "restoring")}, state}
+        else
+          {:reply, {:error, "harklight_origin_unavailable"}, state}
+        end
+
+      {:ok, [[_other_session, _host, _state]]} ->
+        {:reply, {:error, "harklight_origin_mismatch"}, state}
+
+      {:ok, []} ->
+        {:reply, {:error, "harklight_handle_unknown"}, state}
+
+      {:error, _reason} ->
+        {:reply, {:error, "harklight_listener_unavailable"}, state}
+    end
+  end
+
   def handle_call({:capture, handle, line}, from, state) do
     result =
       if valid_worker?(state, handle, from),
@@ -2822,7 +2963,7 @@ defmodule Tightbeam.HarklightWakes do
   defp handling_instruction(handle, event_id, message_id, _kind, _author) do
     "Handle this Harklight entry from your originating session. First run `harklight-agent ack --session #{handle} --event #{event_id}`. " <>
       "For a person discussion, reply with `harklight-agent reply --session #{handle} --request #{message_id} --in-reply-to #{event_id} --body <reply>`. " <>
-      "For an answered terminal by a person, reconcile any earlier effect before applying once, then report with `harklight-agent result --session #{handle} --request #{message_id} --in-reply-to #{event_id} --status applied|refused`. An agent-authored terminal is not the person's choice. " <>
+      "For an answered terminal, reconcile any earlier effect before applying once, then report with `harklight-agent result --session #{handle} --request #{message_id} --in-reply-to #{event_id} --status applied|refused`. " <>
       "For cleared, expired or superseded, stop work on that request; do not treat it as approval. " <>
       "If delivered is true, check prior effects before acting again. Do not run listen; the controller listens."
   end

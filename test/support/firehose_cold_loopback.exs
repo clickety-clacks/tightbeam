@@ -8,7 +8,8 @@ Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
-alias Tightbeam.{Boot, DB, Harness, Model, Org, ReadMarkers}
+alias Tightbeam.{Boot, DB, Harness, Ledger, Model, Org, Projection, ReadMarkers, ToolCalls}
+alias Tightbeam.Firehose.Publisher
 
 {:ok, db} =
   DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])
@@ -150,6 +151,126 @@ try do
 
     assert %{"type" => "subscription_ready", "subscriptionId" => "credentialless"} =
              JSON.decode!(observer_ready)
+
+    {:ok, archetype_ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
+
+    try do
+      :ok =
+        WS.send_text(
+          archetype_ws,
+          JSON.encode!(%{
+            "type" => "subscribe",
+            "protocolVersion" => 2,
+            "subscriptionId" => "late-product-owners",
+            "filters" => %{
+              "classes" => ["message.created", "tool_call."],
+              "archetype" => "product-owner"
+            }
+          })
+        )
+
+      {:ok, {:text, archetype_ready}, archetype_ws} = WS.recv(archetype_ws, 2_000)
+
+      assert %{
+               "type" => "subscription_ready",
+               "subscriptionId" => "late-product-owners"
+             } = JSON.decode!(archetype_ready)
+
+      late_session = fn session_key, archetype ->
+        Org.create(DB, %{
+          session_key: session_key,
+          display_name: session_key,
+          owner_user_id: device.user_id,
+          origin: "user:#{device.user_id}",
+          archetype: archetype,
+          host: "testhost",
+          harness: "claude",
+          provider: "anthropic",
+          model: Model.new("fable")
+        })
+      end
+
+      product_owner = late_session.("agent:late-product-owner", "product-owner")
+      coder = late_session.("agent:late-coder", "coder")
+
+      for {session, suffix} <- [{product_owner, "po"}, {coder, "coder"}] do
+        prompt = "late session #{suffix} prompt"
+
+        {:ok, {:appended, message}} =
+          DB.transaction(DB, fn txn ->
+            {:appended, message} =
+              Projection.append_in_txn(txn, %{
+                session_key: session.session_key,
+                role: "user",
+                content: prompt
+              })
+
+            :ok = Publisher.message_in_txn(txn, session.session_key, message)
+            {:appended, message}
+          end)
+
+        {:ok, _turn_seq} =
+          Ledger.enqueue(DB, %{
+            session_key: session.session_key,
+            message_id: message.id,
+            origin: "user:#{device.user_id}",
+            prompt: prompt
+          })
+
+        {:ok, turn} = Ledger.claim_next(DB, session.session_key, "firehose-archetype-test")
+
+        start =
+          ToolCalls.normalize_notification(%{
+            "title" => "Read fixture",
+            "kind" => "read",
+            "status" => "in_progress",
+            "rawInput" => %{"path" => "#{suffix}.txt"}
+          })
+
+        assert {:ok, :started} =
+                 ToolCalls.observe(
+                   DB,
+                   session.session_key,
+                   turn.seq,
+                   "call-#{suffix}",
+                   start,
+                   %{},
+                   nil
+                 )
+
+        terminal = ToolCalls.normalize_notification(%{"status" => "completed"})
+
+        assert {:ok, :ended} =
+                 ToolCalls.observe(
+                   DB,
+                   session.session_key,
+                   turn.seq,
+                   "call-#{suffix}",
+                   terminal,
+                   start,
+                   nil
+                 )
+      end
+
+      {archetype_notices, archetype_ws} =
+        Enum.reduce(1..3, {[], archetype_ws}, fn _, {notices, ws} ->
+          {:ok, {:text, raw}, next_ws} = WS.recv(ws, 2_000)
+          {[JSON.decode!(raw) | notices], next_ws}
+        end)
+
+      archetype_notices = Enum.reverse(archetype_notices)
+
+      assert Enum.map(archetype_notices, & &1["class"]) |> Enum.sort() ==
+               ["message.created", "tool_call.ended", "tool_call.started"]
+
+      assert Enum.all?(archetype_notices, fn notice ->
+               notice["refs"]["sessionKey"] == product_owner.session_key
+             end)
+
+      assert {:error, :timeout, _archetype_ws} = WS.recv(archetype_ws, 250)
+    after
+      WS.close(archetype_ws)
+    end
 
     {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
 

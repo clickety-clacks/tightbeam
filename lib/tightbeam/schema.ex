@@ -45,6 +45,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Idempotency,
     Tightbeam.ConditionFacts,
     Tightbeam.FactProducers,
+    Tightbeam.RuntimeChanges,
     Tightbeam.SubagentMarkers,
     Tightbeam.Escalation,
     Tightbeam.Wakes,
@@ -415,6 +416,7 @@ defmodule Tightbeam.Schema do
   @evidence_release_shape "launch-preparation-evidence-v1-0112"
   @session_identity_shape "session-identity-v1-0114"
   @closed_assignment_reconciliation_shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
+  @artifact_process_attribution_shape "artifact-process-attribution-v1-015"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -444,6 +446,7 @@ defmodule Tightbeam.Schema do
     @launch_preparation_boot_shape,
     @session_identity_shape,
     @closed_assignment_reconciliation_shape,
+    @artifact_process_attribution_shape,
     @evidence_release_shape,
     @decision_request_row_schema_shape,
     @assignment_source_replacement_shape,
@@ -1811,6 +1814,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @artifact_process_attribution_shape,
       @closed_assignment_reconciliation_shape,
       @session_identity_shape,
       @evidence_release_shape,
@@ -1959,6 +1963,7 @@ defmodule Tightbeam.Schema do
             @launch_preparation_boot_shape,
             @session_identity_shape,
             @closed_assignment_reconciliation_shape,
+            @artifact_process_attribution_shape,
             @evidence_release_shape,
             @decision_request_row_schema_shape,
             @assignment_source_replacement_shape,
@@ -2107,8 +2112,10 @@ defmodule Tightbeam.Schema do
     end
 
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
+    :ok = Tightbeam.TurnEvents.ensure_schema(db)
     :ok = upgrade_session_identity(db)
     :ok = upgrade_closed_assignment_reconciliation(db)
+    :ok = upgrade_artifact_process_attribution(db)
     :ok = upgrade_retirement_parent_moves(db)
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
@@ -2733,6 +2740,7 @@ defmodule Tightbeam.Schema do
                       @launch_preparation_boot_shape,
                       @session_identity_shape,
                       @closed_assignment_reconciliation_shape,
+                      @artifact_process_attribution_shape,
                       @evidence_release_shape
                     ] ->
                  validate_notice_source_payload_in_txn!(txn)
@@ -3685,7 +3693,8 @@ defmodule Tightbeam.Schema do
           sql =
             if Txn.q(txn, "SELECT shape FROM schema_stamp") in [
                  [[@session_identity_shape]],
-                 [[@closed_assignment_reconciliation_shape]]
+                 [[@closed_assignment_reconciliation_shape]],
+                 [[@artifact_process_attribution_shape]]
                ],
                do: process_actor_table_sql(object.name, object.sql),
                else: object.sql
@@ -3726,7 +3735,8 @@ defmodule Tightbeam.Schema do
     expected =
       if Txn.q(txn, "SELECT shape FROM schema_stamp") in [
            [[@session_identity_shape]],
-           [[@closed_assignment_reconciliation_shape]]
+           [[@closed_assignment_reconciliation_shape]],
+           [[@artifact_process_attribution_shape]]
          ],
          do: process_actor_table_sql(name, expected),
          else: expected
@@ -3775,6 +3785,7 @@ defmodule Tightbeam.Schema do
                  @launch_preparation_boot_shape,
                  @session_identity_shape,
                  @closed_assignment_reconciliation_shape,
+                 @artifact_process_attribution_shape,
                  @evidence_release_shape,
                  @decision_request_row_schema_shape
                ],
@@ -3789,6 +3800,7 @@ defmodule Tightbeam.Schema do
           @launch_preparation_boot_shape,
           @session_identity_shape,
           @closed_assignment_reconciliation_shape,
+          @artifact_process_attribution_shape,
           @evidence_release_shape,
           @decision_request_row_schema_shape
         ] ->
@@ -3880,6 +3892,7 @@ defmodule Tightbeam.Schema do
           @launch_preparation_boot_shape,
           @session_identity_shape,
           @closed_assignment_reconciliation_shape,
+          @artifact_process_attribution_shape,
           @evidence_release_shape,
           @decision_request_row_schema_shape,
           @assignment_source_replacement_shape,
@@ -3904,6 +3917,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] and
@@ -4774,7 +4788,8 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @evidence_release_shape,
                     @session_identity_shape,
-                    @closed_assignment_reconciliation_shape
+                    @closed_assignment_reconciliation_shape,
+                    @artifact_process_attribution_shape
                   ] ->
                # A stamped successor missing its required columns is corruption, not a
                # second opportunity to migrate an inferred shape.
@@ -4880,7 +4895,11 @@ defmodule Tightbeam.Schema do
                  :ok
 
                [[shape]]
-               when shape in [@session_identity_shape, @closed_assignment_reconciliation_shape] ->
+               when shape in [
+                      @session_identity_shape,
+                      @closed_assignment_reconciliation_shape,
+                      @artifact_process_attribution_shape
+                    ] ->
                  :ok
 
                rows ->
@@ -4923,6 +4942,9 @@ defmodule Tightbeam.Schema do
               {:migrated, report}
 
             [[@closed_assignment_reconciliation_shape]] ->
+              :current
+
+            [[@artifact_process_attribution_shape]] ->
               :current
 
             rows ->
@@ -5068,7 +5090,8 @@ defmodule Tightbeam.Schema do
              when shape in [
                     @evidence_release_shape,
                     @session_identity_shape,
-                    @closed_assignment_reconciliation_shape
+                    @closed_assignment_reconciliation_shape,
+                    @artifact_process_attribution_shape
                   ] ->
                Tightbeam.EvidenceSchemaRelease.validate_in_txn!(txn)
 
@@ -5115,6 +5138,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @artifact_process_attribution_shape,
                     @evidence_release_shape
                   ] ->
                :ok =
@@ -5230,6 +5254,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] do
@@ -5409,6 +5434,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] ->
@@ -5570,6 +5596,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape
            ] ->
         if effort_holder_activity_cancellation_active?(txn) do
@@ -5978,6 +6005,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape
            ] ->
         :ok = check_work_item_owner_link_shape(db)
@@ -6089,7 +6117,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@closed_assignment_reconciliation_shape}
+          this build: #{@artifact_process_attribution_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -6105,7 +6133,8 @@ defmodule Tightbeam.Schema do
         then #{@work_item_owner_link_shape}, #{@assignment_source_replacement_shape},
         and #{@notice_source_payload_shape}, #{@decision_request_row_schema_shape},
         then #{@launch_preparation_boot_shape}, followed by #{@evidence_release_shape} and
-        #{@closed_assignment_reconciliation_shape}.
+        #{@closed_assignment_reconciliation_shape}, followed by
+        #{@artifact_process_attribution_shape}.
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
         """
@@ -6118,7 +6147,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@closed_assignment_reconciliation_shape}
+          this build: #{@artifact_process_attribution_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
@@ -6208,6 +6237,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @artifact_process_attribution_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -6316,6 +6346,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6348,6 +6379,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6474,6 +6506,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @artifact_process_attribution_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -6659,6 +6692,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7785,6 +7819,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7826,6 +7861,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7945,6 +7981,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8210,6 +8247,7 @@ defmodule Tightbeam.Schema do
              @launch_preparation_boot_shape,
              @session_identity_shape,
              @closed_assignment_reconciliation_shape,
+             @artifact_process_attribution_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8239,6 +8277,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @artifact_process_attribution_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8281,6 +8320,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @artifact_process_attribution_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8350,6 +8390,7 @@ defmodule Tightbeam.Schema do
                       @launch_preparation_boot_shape,
                       @session_identity_shape,
                       @closed_assignment_reconciliation_shape,
+                      @artifact_process_attribution_shape,
                       @evidence_release_shape,
                       @decision_request_row_schema_shape,
                       @assignment_source_replacement_shape,
@@ -8409,6 +8450,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @artifact_process_attribution_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8466,6 +8508,266 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  defp upgrade_artifact_process_attribution(db) do
+    result =
+      DB.migration_transaction(
+        db,
+        :artifact_process_attribution,
+        ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+        ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+        fn txn ->
+          case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+            [[@closed_assignment_reconciliation_shape]] ->
+              case artifact_process_table_kind!(txn) do
+                :predecessor ->
+                  migrate_artifact_process_attribution_in_txn(txn)
+
+                :current ->
+                  validate_artifact_process_schema!(
+                    txn,
+                    Tightbeam.Artifacts.current_table_definition()
+                  )
+              end
+
+              stamp_artifact_process_attribution!(txn, @closed_assignment_reconciliation_shape)
+              :migrated
+
+            [[@artifact_process_attribution_shape]] ->
+              validate_artifact_process_schema!(
+                txn,
+                Tightbeam.Artifacts.current_table_definition()
+              )
+
+              :current
+
+            rows ->
+              raise ShapeError,
+                message: "incompatible artifact process attribution predecessor: #{inspect(rows)}"
+          end
+        end
+      )
+
+    case result do
+      {:ok, :current} ->
+        :ok
+
+      {:ok, :migrated} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "artifact process attribution migration rolled back: #{Exception.message(error)}"
+    end
+  end
+
+  defp artifact_process_table_kind!(txn) do
+    expected_sql = fn definition ->
+      ("CREATE TABLE IF NOT EXISTS artifacts (\n" <> definition <> "\n);")
+      |> normalize_schema_sql()
+    end
+
+    case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='artifacts'") do
+      [[actual]] when is_binary(actual) ->
+        actual = normalize_schema_sql(actual)
+        predecessor_definitions = Tightbeam.Artifacts.legacy_current_table_definitions()
+
+        predecessor_definition =
+          Enum.find(predecessor_definitions, &(actual == expected_sql.(&1)))
+
+        cond do
+          predecessor_definition != nil ->
+            validate_artifact_process_schema!(txn, predecessor_definition)
+
+            :predecessor
+
+          actual == expected_sql.(Tightbeam.Artifacts.current_table_definition()) ->
+            validate_artifact_process_schema!(txn, Tightbeam.Artifacts.current_table_definition())
+            :current
+
+          true ->
+            raise ShapeError, message: "incompatible artifacts table for process attribution"
+        end
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible artifacts table for process attribution: #{inspect(rows)}"
+    end
+  end
+
+  defp validate_artifact_process_schema!(txn, table_definition) do
+    expected_table_sql =
+      ("CREATE TABLE IF NOT EXISTS artifacts (\n" <> table_definition <> "\n);")
+      |> normalize_schema_sql()
+
+    case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='artifacts'") do
+      [[actual]] when is_binary(actual) ->
+        if normalize_schema_sql(actual) != expected_table_sql do
+          raise ShapeError, message: "incompatible artifacts table for process attribution"
+        end
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible artifacts table for process attribution: #{inspect(rows)}"
+    end
+
+    expected_foreign_keys =
+      MapSet.new([
+        {"createdBySession", "sessions"},
+        {"workItemId", "work_items"},
+        {"producedByAssignmentId", "assignments"},
+        {"parentSession", "sessions"},
+        {"recordedMessageId", "messages"}
+      ])
+
+    actual_foreign_keys =
+      Txn.q(txn, "PRAGMA foreign_key_list(artifacts)")
+      |> Enum.map(fn row -> {Enum.at(row, 3), Enum.at(row, 2)} end)
+      |> MapSet.new()
+
+    if actual_foreign_keys != expected_foreign_keys do
+      raise ShapeError, message: "incompatible artifacts foreign keys for process attribution"
+    end
+
+    expected_indexes =
+      Tightbeam.Artifacts.index_ddl()
+      |> Map.new(fn sql ->
+        [_, name] = Regex.run(~r/CREATE INDEX IF NOT EXISTS ([A-Za-z0-9_]+)/i, sql)
+        {name, sql}
+      end)
+
+    actual_indexes =
+      Txn.q(
+        txn,
+        "SELECT name,sql FROM sqlite_master WHERE type='index' AND tbl_name='artifacts' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+      )
+      |> Map.new(fn [name, sql] -> {name, sql} end)
+
+    actual_index_names = actual_indexes |> Map.keys() |> MapSet.new()
+    expected_index_names = expected_indexes |> Map.keys() |> MapSet.new()
+
+    if actual_index_names != expected_index_names do
+      raise ShapeError, message: "incompatible artifacts indexes for process attribution"
+    end
+
+    Enum.each(expected_indexes, fn {name, expected_sql} ->
+      if normalize_schema_sql(actual_indexes[name]) != normalize_schema_sql(expected_sql) do
+        raise ShapeError, message: "incompatible artifacts index for process attribution: #{name}"
+      end
+    end)
+
+    expected_triggers = artifact_process_attribution_triggers()
+
+    actual_triggers =
+      Txn.q(
+        txn,
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name='artifacts' ORDER BY name"
+      )
+      |> Map.new(fn [name, sql] -> {name, sql} end)
+
+    actual_trigger_names = actual_triggers |> Map.keys() |> MapSet.new()
+    expected_trigger_names = expected_triggers |> Map.keys() |> MapSet.new()
+
+    if actual_trigger_names != expected_trigger_names do
+      raise ShapeError, message: "incompatible artifacts triggers for process attribution"
+    end
+
+    Enum.each(expected_triggers, fn {name, expected_sql} ->
+      if normalize_schema_sql(actual_triggers[name]) != normalize_schema_sql(expected_sql) do
+        raise ShapeError,
+          message: "incompatible artifacts trigger for process attribution: #{name}"
+      end
+    end)
+
+    :ok
+  end
+
+  defp artifact_process_attribution_triggers do
+    content_triggers =
+      Tightbeam.ArtifactContent.schema_objects()
+      |> Enum.filter(fn
+        {"trigger", name, _sql} ->
+          String.starts_with?(name, "artifacts_released_requires_content_")
+
+        _ ->
+          false
+      end)
+      |> Map.new(fn {"trigger", name, sql} -> {name, sql} end)
+
+    Map.put(content_triggers, "artifacts_origin_immutable", @artifact_origin_trigger)
+  end
+
+  defp migrate_artifact_process_attribution_in_txn(txn) do
+    foreign_key_tables = ~w(artifacts artifact_contents attests assignment_commit_ref_corrections)
+
+    previous_foreign_keys = migration_foreign_keys_in_txn(txn, foreign_key_tables)
+    triggers = artifact_process_attribution_triggers()
+
+    Enum.each(Map.keys(triggers), fn name ->
+      :ok = Txn.exec(txn, "DROP TRIGGER #{name}")
+    end)
+
+    :ok = Txn.exec(txn, "ALTER TABLE artifacts RENAME TO artifacts_process_attribution_source_v1")
+
+    :ok =
+      Txn.exec(txn, "CREATE TABLE artifacts (#{Tightbeam.Artifacts.current_table_definition()})")
+
+    [[source_count]] =
+      Txn.q(txn, "SELECT COUNT(*) FROM artifacts_process_attribution_source_v1")
+
+    Txn.q(txn, """
+    INSERT INTO artifacts
+      (artifactId,kind,title,description,createdBySession,createdByProcess,workItemId,
+       producedByAssignmentId,parentSession,originPath,contentSha256,recordedMessageId,
+       recordedTurnEvidence,state,home,createdAt,updatedAt,originHost,originWorkspace)
+    SELECT artifactId,kind,title,description,createdBySession,NULL,workItemId,
+       producedByAssignmentId,parentSession,originPath,contentSha256,recordedMessageId,
+       recordedTurnEvidence,state,home,createdAt,updatedAt,originHost,originWorkspace
+    FROM artifacts_process_attribution_source_v1
+    """)
+
+    if Txn.changes(txn) != source_count do
+      raise ShapeError,
+        message: "artifact process attribution copied #{Txn.changes(txn)} of #{source_count} rows"
+    end
+
+    :ok = Txn.exec(txn, "DROP TABLE artifacts_process_attribution_source_v1")
+    :ok = Tightbeam.Artifacts.ensure_indexes_in_txn(txn)
+    :ok = Tightbeam.ArtifactContent.schema_in_txn(txn)
+    :ok = Txn.exec(txn, @artifact_origin_trigger)
+    :ok = validate_artifact_process_schema!(txn, Tightbeam.Artifacts.current_table_definition())
+
+    new_foreign_keys = migration_foreign_keys_in_txn(txn, foreign_key_tables)
+
+    case new_foreign_keys -- previous_foreign_keys do
+      [] ->
+        :ok
+
+      added ->
+        raise ShapeError,
+          message: "artifact process attribution introduced foreign key errors: #{inspect(added)}"
+    end
+
+    :ok
+  end
+
+  defp stamp_artifact_process_attribution!(txn, predecessor) do
+    Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+      @artifact_process_attribution_shape,
+      System.system_time(:millisecond),
+      predecessor
+    ])
+
+    if Txn.changes(txn) != 1 do
+      raise ShapeError, message: "artifact process attribution stamp transition was not exact"
+    end
+
+    :ok
+  end
+
   defp upgrade_identity_publication_denial_diagnostic(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
@@ -8476,6 +8778,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @artifact_process_attribution_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8527,6 +8830,7 @@ defmodule Tightbeam.Schema do
                     @launch_preparation_boot_shape,
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
+                    @artifact_process_attribution_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape
                   ] ->

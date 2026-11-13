@@ -3,6 +3,7 @@ defmodule Tightbeam.Firehose.Hub do
   use GenServer
   require Logger
   alias Tightbeam.Firehose.Publisher
+  alias Tightbeam.StateResources
 
   # An approximately 2 GB held-backlog budget across 30 stalled apps gives each app about 64 MB.
   @max_app_backlog_bytes 64 * 1_024 * 1_024
@@ -11,6 +12,7 @@ defmodule Tightbeam.Firehose.Hub do
     @moduledoc false
     defstruct monitor: nil,
               mode: :pending,
+              db: Tightbeam.DB,
               user_id: nil,
               device_id: nil,
               principal_kind: nil,
@@ -102,6 +104,7 @@ defmodule Tightbeam.Firehose.Hub do
           socket,
           Map.take(opts, [
             :mode,
+            :db,
             :user_id,
             :device_id,
             :principal_kind,
@@ -145,14 +148,16 @@ defmodule Tightbeam.Firehose.Hub do
             pending_notices = Enum.reverse(pending_notices)
             remaining_notices = Enum.reverse(remaining_notices)
 
-            {snapshot_frames, seq} = matching_notice_frames(notices, id, filters, socket.seq)
+            {snapshot_frames, seq} =
+              matching_notice_frames(notices, id, filters, socket.seq, socket.db)
 
             {pending_frames, seq} =
               matching_notice_frames(
                 Enum.map(pending_notices, fn {_subscription_id, notice} -> notice end),
                 id,
                 filters,
-                seq
+                seq,
+                socket.db
               )
 
             ready = %{"type" => "subscription_ready", "subscriptionId" => id}
@@ -273,7 +278,7 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp interested?(socket, notice) do
     Enum.any?(Map.merge(socket.subscriptions, socket.pending_subscriptions), fn {_id, filters} ->
-      matches?(notice, filters)
+      matches?(notice, filters, socket.db)
     end)
   end
 
@@ -312,12 +317,12 @@ defmodule Tightbeam.Firehose.Hub do
   defp deliver_matching_notice(socket, pid, notice) do
     pending_subscriptions =
       socket.pending_subscriptions
-      |> Enum.filter(fn {_id, filters} -> matches?(notice, filters) end)
+      |> Enum.filter(fn {_id, filters} -> matches?(notice, filters, socket.db) end)
 
     frames =
       if socket.mode == :all,
         do: [notice],
-        else: matching_frames(notice, socket.subscriptions, socket.seq)
+        else: matching_frames(notice, socket.subscriptions, socket.seq, socket.db)
 
     if (frames == [] and pending_subscriptions == []) or secret_payload?(notice["payload"]) do
       socket
@@ -423,10 +428,10 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp outbound_message(frame), do: {:firehose_notice, Publisher.wire_notice(frame)}
 
-  defp matching_notice_frames(notices, id, filters, seq) do
+  defp matching_notice_frames(notices, id, filters, seq, db) do
     {frames, seq} =
       Enum.reduce(notices, {[], seq}, fn notice, {frames, seq} ->
-        case matching_frames(notice, %{id => filters}, seq) do
+        case matching_frames(notice, %{id => filters}, seq, db) do
           [] ->
             {frames, seq}
 
@@ -438,11 +443,11 @@ defmodule Tightbeam.Firehose.Hub do
     {Enum.reverse(frames), seq}
   end
 
-  defp matching_frames(notice, subscriptions, seq) do
+  defp matching_frames(notice, subscriptions, seq, db) do
     {frames, _seq} =
       Enum.sort(subscriptions)
       |> Enum.reduce({[], seq}, fn {id, filters}, {frames, n} ->
-        if matches?(notice, filters),
+        if matches?(notice, filters, db),
           do:
             {[
                Map.merge(notice, %{
@@ -460,6 +465,10 @@ defmodule Tightbeam.Firehose.Hub do
   end
 
   def matches?(notice, filters) do
+    matches?(notice, filters, Tightbeam.DB)
+  end
+
+  def matches?(notice, filters, db) do
     refs = notice["refs"] || %{}
     classes = filters["classes"]
 
@@ -472,7 +481,29 @@ defmodule Tightbeam.Firehose.Hub do
       Enum.all?(
         ~w(sessionKey workItemId origin principal),
         &(is_nil(filters[&1]) or filters[&1] == refs[&1])
-      )
+      ) and archetype_matches?(db, notice, filters)
+  end
+
+  defp archetype_matches?(db, notice, filters) do
+    case filters["archetype"] do
+      nil ->
+        true
+
+      archetype when is_binary(archetype) ->
+        case get_in(notice, ["refs", "sessionKey"]) do
+          session_key when is_binary(session_key) ->
+            case StateResources.query_session(db, session_key) do
+              %{archetype: ^archetype} -> true
+              _ -> false
+            end
+
+          _ ->
+            false
+        end
+
+      _ ->
+        false
+    end
   end
 
   defp revoked?(_notice, %{principal_kind: :observer}), do: false

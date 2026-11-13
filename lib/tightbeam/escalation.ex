@@ -819,15 +819,6 @@ defmodule Tightbeam.Escalation do
 
               inserted? = Txn.changes(txn) == 1
 
-              if inserted? and is_binary(raiser_session_key) do
-                Tightbeam.Supervision.activity_in_txn(
-                  txn,
-                  assignment_id,
-                  raiser_session_key,
-                  now
-                )
-              end
-
               [row] =
                 Txn.q(
                   txn,
@@ -1333,13 +1324,6 @@ defmodule Tightbeam.Escalation do
         ]
       )
 
-      Tightbeam.Supervision.activity_in_txn(
-        txn,
-        resolved_input.assignment_id,
-        resolved_input.asker_session_key,
-        raised_at
-      )
-
       EventLog.lifecycle_in_txn(
         txn,
         "decision_request_asked",
@@ -1776,7 +1760,7 @@ defmodule Tightbeam.Escalation do
 
     case request && request.kind do
       "effort" ->
-        error("invalid", "effort requests use effort-rule")
+        error("invalid", "effort requests are retired")
 
       "operator" ->
         error("invalid", "operator requests use operator-rule")
@@ -1899,7 +1883,7 @@ defmodule Tightbeam.Escalation do
             error("not_found", "decision request not found")
 
           %{kind: "effort"} ->
-            error("invalid", "effort requests require effort-rule")
+            error("invalid", "effort requests are retired")
 
           %{kind: "operator"} ->
             error("invalid", "operator requests require operator-withdraw")
@@ -2634,13 +2618,6 @@ defmodule Tightbeam.Escalation do
       ]
     )
 
-    Tightbeam.Supervision.activity_in_txn(
-      txn,
-      ask.assignment_id,
-      session_key,
-      raised_at
-    )
-
     request = request_in_txn(txn, request_id)
 
     file_filing_fact_in_txn(txn, request, raiser_id, "operator-ask")
@@ -2714,7 +2691,7 @@ defmodule Tightbeam.Escalation do
           {error("invalid", "statute requests use rule"), nil}
 
         %{kind: "effort"} ->
-          {error("invalid", "effort requests use effort-rule"), nil}
+          {error("invalid", "effort requests are retired"), nil}
 
         %{kind: "agent"} ->
           {error("invalid", "agent requests use answer or return"), nil}
@@ -3054,7 +3031,10 @@ defmodule Tightbeam.Escalation do
         error("invalid", "statute requests use withdraw")
 
       %{kind: "effort"} ->
-        error("invalid", "effort requests use effort-rule")
+        error("invalid", "effort requests are retired")
+
+      %{kind: "agent"} ->
+        error("invalid", "agent requests use withdraw")
 
       request ->
         with {:ok, by} <- operator_withdrawer_in_txn(txn, call, request) do
@@ -3594,19 +3574,6 @@ defmodule Tightbeam.Escalation do
       DB.query(db, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id])
 
     case rows do
-      [row] -> request_from_row(row)
-      [] -> nil
-    end
-  end
-
-  @doc "EFFORT ONLY: the durable terminal request for an exact id, if present."
-  @spec effort_terminal_in_txn(Txn.t(), String.t()) :: map() | nil
-  def effort_terminal_in_txn(txn, request_id) do
-    case Txn.q(
-           txn,
-           "SELECT #{@request_columns} FROM decision_requests WHERE kind = 'effort' AND id = ?1 AND status = 'ruled' AND decision IN ('continue', 'dismiss')",
-           [request_id]
-         ) do
       [row] -> request_from_row(row)
       [] -> nil
     end

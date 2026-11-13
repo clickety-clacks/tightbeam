@@ -1,7 +1,7 @@
 defmodule Tightbeam.Wire.ChangeSocketTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Devices, Gateway, Ledger, Model, Org, StateResources}
+  alias Tightbeam.{DB, Devices, Gateway, Ledger, Model, Org, Projection, Roles, StateResources}
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.Wire.ChangeSocket
 
@@ -32,8 +32,8 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       Org.create(ctx.db, %{
         session_key: "agent:session",
         display_name: "Session",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: ctx.device.user_id,
+        origin: "user:#{ctx.device.user_id}",
         archetype: "default",
         host: "testhost",
         harness: "claude",
@@ -201,8 +201,8 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       Org.create(ctx.db, %{
         session_key: "agent:notice-recovery",
         display_name: "Notice recovery",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: ctx.device.user_id,
+        origin: "user:#{ctx.device.user_id}",
         archetype: "default",
         host: "testhost",
         harness: "claude",
@@ -334,6 +334,314 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert heartbeat_state.principal_kind == :observer
     assert heartbeat_state.subscriptions == observer_state.subscriptions
     ChangeSocket.terminate(:normal, heartbeat_state)
+  end
+
+  test "archetype filters match the subject session and compose with existing filters", ctx do
+    {:push, {:text, ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "product-owners",
+          "filters" => %{
+            "classes" => ["message.created", "topline.created"],
+            "archetype" => "product-owner"
+          }
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(ready)["type"] == "subscription_ready"
+
+    {:push, {:text, scoped_ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "wrong-session",
+          "filters" => %{
+            "classes" => ["message.created"],
+            "archetype" => "product-owner",
+            "sessionKey" => "agent:late-coder"
+          }
+        },
+        state
+      )
+
+    assert JSON.decode!(scoped_ready)["type"] == "subscription_ready"
+
+    {:push, {:text, unknown_ready}, _state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "unknown-archetype",
+          "filters" => %{
+            "classes" => ["message.created"],
+            "archetype" => "no-such-archetype"
+          }
+        },
+        state
+      )
+
+    assert JSON.decode!(unknown_ready)["type"] == "subscription_ready"
+
+    product_owner =
+      Org.create(ctx.db, %{
+        session_key: "agent:late-product-owner",
+        display_name: "Late product owner",
+        owner_user_id: ctx.device.user_id,
+        origin: "user:#{ctx.device.user_id}",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    coder =
+      Org.create(ctx.db, %{
+        session_key: "agent:late-coder",
+        display_name: "Late coder",
+        owner_user_id: ctx.device.user_id,
+        origin: "user:#{ctx.device.user_id}",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM roles WHERE boundSessionKey=?1", [
+               product_owner.session_key
+             ])
+
+    for session <- [product_owner, coder] do
+      Hub.publish(ctx.hub, %{
+        "class" => "message.created",
+        "refs" => %{"sessionKey" => session.session_key},
+        "payload" => %{
+          "sessionKey" => session.session_key,
+          "sender" => "user:#{ctx.device.user_id}"
+        }
+      })
+    end
+
+    Hub.publish(ctx.hub, %{"class" => "topline.created", "refs" => %{}, "payload" => %{}})
+    _barrier = Hub.sequence(ctx.hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "message.created",
+                      "subscriptionId" => "product-owners",
+                      "refs" => %{"sessionKey" => "agent:late-product-owner"}
+                    }}
+
+    :ok = Hub.delivered(ctx.hub, self())
+    refute_receive {:firehose_notice, _}
+  end
+
+  test "archetype filters use the current committed archetype after retirement and repointing",
+       ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:archetype-repoint",
+        display_name: "Archetype repoint",
+        owner_user_id: ctx.device.user_id,
+        origin: "user:#{ctx.device.user_id}",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    coder =
+      Org.create(ctx.db, %{
+        session_key: "agent:archetype-role-coder",
+        display_name: "Archetype role coder",
+        owner_user_id: ctx.device.user_id,
+        origin: "user:#{ctx.device.user_id}",
+        archetype: "coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    Roles.create!(ctx.db, "archetype-filter-role", ctx.device.user_id, session.session_key)
+
+    {:push, {:text, po_ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "product-owner",
+          "filters" => %{
+            "classes" => ["message.created", "session."],
+            "archetype" => "product-owner"
+          }
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(po_ready)["type"] == "subscription_ready"
+
+    {:push, {:text, reviewer_ready}, _state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "reviewer-code",
+          "filters" => %{"classes" => ["session."], "archetype" => "reviewer-code"}
+        },
+        state
+      )
+
+    assert JSON.decode!(reviewer_ready)["type"] == "subscription_ready"
+    assert :ok = Roles.bind(ctx.db, "archetype-filter-role", coder.session_key)
+
+    for subject <- [session, coder] do
+      Hub.publish(ctx.hub, %{
+        "class" => "message.created",
+        "refs" => %{"sessionKey" => subject.session_key},
+        "payload" => %{"sessionKey" => subject.session_key}
+      })
+    end
+
+    _barrier = Hub.sequence(ctx.hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "message.created",
+                      "subscriptionId" => "product-owner",
+                      "refs" => %{"sessionKey" => "agent:archetype-repoint"}
+                    }}
+
+    :ok = Hub.delivered(ctx.hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert %{state: "retired"} =
+             retired =
+             Org.retire(ctx.db, session.session_key, "user:#{ctx.device.user_id}", 1_000)
+
+    :ok =
+      Hub.committed(ctx.hub, "session.retired", retired, %{"sessionKey" => session.session_key})
+
+    _barrier = Hub.sequence(ctx.hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session.retired",
+                      "subscriptionId" => "product-owner",
+                      "refs" => %{"sessionKey" => "agent:archetype-repoint"}
+                    }}
+
+    :ok = Hub.delivered(ctx.hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, repointed} =
+             Org.repoint_retired_archetype(ctx.db, session.session_key, "reviewer-code")
+
+    :ok =
+      Hub.committed(ctx.hub, "session.updated", repointed, %{"sessionKey" => session.session_key})
+
+    _barrier = Hub.sequence(ctx.hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session.updated",
+                      "subscriptionId" => "reviewer-code",
+                      "refs" => %{"sessionKey" => "agent:archetype-repoint"}
+                    }}
+
+    :ok = Hub.delivered(ctx.hub, self())
+    refute_receive {:firehose_notice, _}
+  end
+
+  test "archetype filters accept null and reject non-string values", ctx do
+    {:push, {:text, error}, _state} =
+      inbound(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "invalid-archetype",
+          "filters" => %{"archetype" => 7}
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(error) == %{
+             "type" => "error",
+             "code" => "invalid_request",
+             "message" => "invalid filters"
+           }
+
+    {:push, {:text, ready}, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "no-archetype",
+          "filters" => %{"archetype" => nil}
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(ready) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => "no-archetype"
+           }
+
+    assert state.subscriptions["no-archetype"] == %{"archetype" => nil}
+
+    Hub.publish(ctx.hub, %{"class" => "topline.created", "refs" => %{}, "payload" => %{}})
+    _barrier = Hub.sequence(ctx.hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "topline.created",
+                      "subscriptionId" => "no-archetype"
+                    }}
+
+    :ok = Hub.delivered(ctx.hub, self())
+  end
+
+  test "archetype-only subscriptions do not add active-turn snapshots", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:active-product-owner",
+        display_name: "Active product owner",
+        owner_user_id: ctx.device.user_id,
+        origin: "user:#{ctx.device.user_id}",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "queued before subscribe"
+      })
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: session.session_key,
+               message_id: message.id,
+               origin: "user:#{ctx.device.user_id}",
+               prompt: message.content
+             })
+
+    {:push, {:text, ready}, _state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "archetype-only",
+          "filters" => %{"classes" => ["turn."], "archetype" => "product-owner"}
+        },
+        ctx.state
+      )
+
+    assert JSON.decode!(ready)["type"] == "subscription_ready"
+    refute_receive {:firehose_notice, _}
   end
 
   test "credentialless observer remains connected on session retirement without owner", ctx do
@@ -721,16 +1029,33 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert_receive {:firehose_notice, %{"refs" => %{"workItemId" => "wi_after"}, "seq" => 1}}
   end
 
-  test "a matching event over the byte backlog closes the connection with retryable code", ctx do
+  test "a matching archetype event over the byte backlog closes with retryable code", ctx do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
-    :ok = Hub.subscribe(ctx.hub, self(), "work", %{"classes" => ["work_item."]})
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:backlog-product-owner",
+        display_name: "Backlog product owner",
+        owner_user_id: ctx.device.user_id,
+        origin: "user:#{ctx.device.user_id}",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    :ok =
+      Hub.subscribe(ctx.hub, self(), "work", %{
+        "classes" => ["message.created"],
+        "archetype" => "product-owner"
+      })
 
     Hub.publish(ctx.hub, %{
-      "class" => "work_item.updated",
-      "refs" => %{"workItemId" => "large-item"},
-      "payload" => %{"id" => String.duplicate("x", 65 * 1_024 * 1_024)}
+      "class" => "message.created",
+      "refs" => %{"sessionKey" => session.session_key},
+      "payload" => %{"content" => String.duplicate("x", 65 * 1_024 * 1_024)}
     })
 
     assert Hub.sequence(ctx.hub, self()) == 1

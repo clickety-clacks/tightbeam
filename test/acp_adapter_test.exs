@@ -5,6 +5,8 @@ defmodule Tightbeam.Acp.AdapterTest do
   doctest Tightbeam.Acp.Adapter
 
   alias Tightbeam.Acp.Adapter
+  alias Tightbeam.{Archetypes, DB, Devices, Identity, Ledger, Projection, TurnEvents}
+  alias Tightbeam.Firehose.Hub
   alias Tightbeam.Model
   alias Tightbeam.ErrorDiagnostic
 
@@ -230,6 +232,8 @@ defmodule Tightbeam.Acp.AdapterTest do
   const efforts = {};
   const fastValues = {};
   const offeredModels = {};
+  const liveSessions = new Set();
+  const conversationHistory = {};
   const defaultOfferedModels = [
     "default", "opus[1m]", "claude-fable-5[1m]", "nova[1m]", "sonnet", "haiku",
     "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol", "orbit-9"
@@ -317,6 +321,12 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "initialize":
         capture(m);
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { protocolVersion: 1 } }), 75);
+        if (failMode === "resident-two-claude-models") {
+          return send({ id: m.id, result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true, sessionCapabilities: { fork: {} } }
+          } });
+        }
         return send({ id: m.id, result: { protocolVersion: 1 } });
       case "session/new": {
         newCalls += 1;
@@ -324,11 +334,15 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = gateMode !== "none" && gateMode !== "delay-setup" && newCalls === 1 ? "probe-sess" : "sess-1";
         models[sid] = models[sid] || "haiku";
         offeredModels[sid] = [...offeredModelMenu];
+        liveSessions.add(sid);
+        conversationHistory[sid] = [];
         if (failMode === "resident-default-context-variant") offeredModels[sid].push("orbit-9[1m]");
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } }), 75);
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/load": {
+        liveSessions.add(m.params.sessionId);
+        conversationHistory[m.params.sessionId] ||= [];
         if (failMode === "load-slow" && m.params.sessionId === "slow") {
           capture(m);
           return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 1500);
@@ -347,11 +361,32 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = "sess-fork-" + forkCalls;
         models[sid] = models[m.params.sessionId] || "haiku";
         offeredModels[sid] = [...offeredModelMenu];
+        conversationHistory[sid] = [...(conversationHistory[m.params.sessionId] || [])];
+        if (failMode === "resident-two-claude-models") {
+          return send({ id: m.id, result: { sessionId: sid } });
+        }
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
-      case "session/close": capture(m); return send({ id: m.id, result: {} });
+      case "session/close": {
+        capture(m);
+        const sid = m.params.sessionId;
+        if (failMode === "resident-two-claude-models" && sid.startsWith("sess-fork-") && !liveSessions.has(sid)) {
+          return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
+        }
+        liveSessions.delete(sid);
+        return send({ id: m.id, result: {} });
+      }
       case "session/set_config_option": {
         capture(m);
+        if (failMode === "resident-two-claude-models" &&
+            m.params.sessionId.startsWith("sess-fork-") && !liveSessions.has(m.params.sessionId)) {
+          return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
+        }
+        if (failMode === "resident-two-claude-models" &&
+            m.params.configId === "model" && m.params.value === "claude-sonnet-5") {
+          models[m.params.sessionId] = "sonnet";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
         if (gateMode === "delay-setup") {
           if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
           if (m.params.configId === "effort" || m.params.configId === "reasoning_effort") efforts[m.params.sessionId] = m.params.value;
@@ -526,6 +561,17 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = m.params.sessionId;
         capture(m);
         const text = m.params.prompt?.[0]?.text;
+        if (failMode === "resident-two-claude-models") {
+          if (sid.startsWith("sess-fork-") && !liveSessions.has(sid)) {
+            return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
+          }
+          if (sid.startsWith("sess-fork-") &&
+              !conversationHistory[sid]?.includes("persist the resident Claude conversation")) {
+            return send({ id: m.id, error: { code: -32000, message: "Forked conversation history missing" } });
+          }
+          conversationHistory[sid] ||= [];
+          conversationHistory[sid].push(text);
+        }
         if (text === "fail after dispatch") {
           return send({ id: m.id, error: { code: -32000, message: "post-dispatch failure" } });
         }
@@ -673,6 +719,12 @@ defmodule Tightbeam.Acp.AdapterTest do
         cwd: "/tmp",
         name: :"adapter_#{System.unique_integer([:positive])}"
       ]
+      |> then(fn adapter_opts ->
+        case Keyword.fetch(opts, :db) do
+          {:ok, db} -> Keyword.put(adapter_opts, :db, db)
+          :error -> adapter_opts
+        end
+      end)
       |> then(fn adapter_opts ->
         case Keyword.get(opts, :stderr_path, stderr_path) do
           :omit -> adapter_opts
@@ -1066,6 +1118,79 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]"]
 
     refute Enum.any?(requests, fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-fork-1"
+           end)
+  end
+
+  test "resident Claude switch loads its fork between two Claude models and preserves conversation" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "resident-two-claude-models")
+
+    first_model = Model.new("claude-fable-5", context: "1m", effort: "high")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, first_model, "/tmp", [], "guidance")
+
+    assert {:ok, %Model{family: "claude-fable-5", context: "1m", effort: "high"}} =
+             Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, %{stop_reason: "end_turn"}} =
+             Adapter.prompt(adapter, "sess-1", "persist the resident Claude conversation")
+
+    requested_model = Model.new("claude-sonnet-5")
+
+    assert {:ok, "sess-fork-1"} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               requested_model,
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert {:ok, %Model{family: "sonnet"}} = Adapter.current_model(adapter, "sess-fork-1")
+
+    assert {:ok, %{stop_reason: "end_turn"}} =
+             Adapter.prompt(adapter, "sess-fork-1", "continue the resident Claude conversation")
+
+    requests = captured_requests(capture_path)
+    fork_index = Enum.find_index(requests, &(&1["method"] == "session/fork"))
+
+    load_index =
+      Enum.find_index(
+        requests,
+        &(&1["method"] == "session/load" and &1["sessionId"] == "sess-fork-1")
+      )
+
+    model_index =
+      Enum.find_index(
+        requests,
+        &(&1["method"] == "session/set_config_option" and
+            &1["sessionId"] == "sess-fork-1" and &1["configId"] == "model")
+      )
+
+    assert is_integer(fork_index)
+    assert is_integer(load_index)
+    assert is_integer(model_index)
+    assert fork_index < load_index
+    assert load_index < model_index
+
+    fork_request = Enum.at(requests, fork_index)
+    load_request = Enum.at(requests, load_index)
+
+    assert %{"cwd" => "/tmp", "mcpServers" => [], "sessionId" => "sess-fork-1"} = load_request
+    assert load_request["meta"] == fork_request["meta"]
+
+    assert :ok = Adapter.close_session(adapter, "sess-fork-1")
+
+    requests = captured_requests(capture_path)
+
+    refute Enum.any?(requests, fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+
+    assert Enum.any?(requests, fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-fork-1"
            end)
   end
@@ -2960,7 +3085,10 @@ defmodule Tightbeam.Acp.AdapterTest do
       captured_requests(capture_path)
       |> Enum.filter(&(&1["method"] in ["session/new", "session/load", "session/fork"]))
 
-    assert Enum.map(requests, & &1["method"]) == ["session/new", "session/load", "session/fork"]
+    assert Enum.map(requests, & &1["method"]) ==
+             ["session/new", "session/load", "session/fork", "session/load"]
+
+    assert Enum.at(requests, 3)["sessionId"] == "sess-fork-1"
 
     for request <- requests do
       assert get_in(request, ["meta", "claudeCode", "options", "settings"]) == %{
@@ -4140,10 +4268,204 @@ defmodule Tightbeam.Acp.AdapterTest do
               stop_reason: "end_turn",
               text: "first messagesecond message",
               messages: [
-                %{message_id: "msg-1", text: "first message"},
-                %{message_id: "msg-2", text: "second message"}
+                %{message_id: "msg-1", logical_message_id: first_id, text: "first message"},
+                %{message_id: "msg-2", logical_message_id: second_id, text: "second message"}
               ]
             }} = Adapter.prompt(adapter, sid, "preserve boundaries")
+
+    assert first_id =~ ~r/^s_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+    assert second_id =~
+             ~r/^s_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+    refute first_id == second_id
+  end
+
+  test "mixed ACP messageId chunks keep anonymous groups distinct in ordered events" do
+    base_dir =
+      Path.join(System.tmp_dir!(), "tightbeam-turn-events-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(base_dir)
+    :initialized = Identity.init!(base_dir)
+    Archetypes.load!(base_dir)
+
+    db = String.to_atom("turn_events_db_#{System.unique_integer([:positive])}")
+    start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!({Hub, name: Hub})
+    :ok = ensure_all_schemas(db)
+
+    {:paired, _device} =
+      Devices.pair(db, %{
+        device_id: "turn-events-device",
+        claimed_name: "Test Device",
+        platform: nil,
+        model: nil
+      })
+
+    session = ensure_main_session(db, "turn-event-owner")
+
+    {:appended, prompt_message} =
+      Projection.append(db, %{
+        session_key: session.session_key,
+        role: "user",
+        content: "Start the ordered turn."
+      })
+
+    {:ok, turn_seq} =
+      Ledger.enqueue(db, %{
+        session_key: session.session_key,
+        message_id: prompt_message.id,
+        origin: "user:turn-event-owner",
+        prompt: prompt_message.content
+      })
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    {adapter, _capture_path} = start_adapter(db: db, probe: false)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    :sys.replace_state(adapter, fn state ->
+      %{
+        state
+        | chunks: Map.put(state.chunks, sid, []),
+          tool_turns:
+            Map.put(state.tool_turns, sid, %{session_key: session.session_key, turn_seq: turn_seq})
+      }
+    end)
+
+    send_update = fn update ->
+      send(
+        adapter,
+        {:acp_notification, "session/update", %{"sessionId" => sid, "update" => update}}
+      )
+    end
+
+    send_update.(%{
+      "sessionUpdate" => "agent_message_chunk",
+      "content" => %{"type" => "text", "text" => "A"}
+    })
+
+    send_update.(%{
+      "sessionUpdate" => "tool_call_update",
+      "toolCallId" => "provider-tool-1",
+      "title" => "Run command",
+      "kind" => "execute",
+      "status" => "in_progress",
+      "rawInput" => %{"command" => "printf result"}
+    })
+
+    send_update.(%{
+      "sessionUpdate" => "agent_message_chunk",
+      "content" => %{"type" => "text", "text" => "A2"}
+    })
+
+    send_update.(%{
+      "sessionUpdate" => "agent_message_chunk",
+      "messageId" => "provider-message-1",
+      "content" => %{"type" => "text", "text" => "B"}
+    })
+
+    send_update.(%{
+      "sessionUpdate" => "tool_call_update",
+      "toolCallId" => "provider-tool-1",
+      "status" => "completed",
+      "rawOutput" => %{"stdout" => "result"}
+    })
+
+    send_update.(%{
+      "sessionUpdate" => "agent_message_chunk",
+      "content" => %{"type" => "text", "text" => "C"}
+    })
+
+    image_content = %{"type" => "image", "data" => "YWJj"}
+
+    send_update.(%{
+      "sessionUpdate" => "agent_message_chunk",
+      "content" => image_content
+    })
+
+    state = :sys.get_state(adapter)
+
+    assert [
+             %{
+               message_id: nil,
+               logical_message_id: later_anonymous_id,
+               chunks: ["C"]
+             },
+             %{
+               message_id: "provider-message-1",
+               logical_message_id: identified_id,
+               chunks: ["B"]
+             },
+             %{
+               message_id: nil,
+               logical_message_id: first_anonymous_id,
+               chunks: ["A2", "A"]
+             }
+           ] = state.chunks[sid]
+
+    for logical_message_id <- [first_anonymous_id, identified_id, later_anonymous_id] do
+      assert logical_message_id =~
+               ~r/^s_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    end
+
+    assert length(Enum.uniq([first_anonymous_id, identified_id, later_anonymous_id])) == 3
+
+    %{rows: events} =
+      TurnEvents.page_for_session(db, session.session_key, :latest, 20, turn_seq)
+
+    assert Enum.map(events, &{&1.turn_event_seq, &1.kind}) == [
+             {1, "assistant.segment"},
+             {2, "tool.started"},
+             {3, "assistant.segment"},
+             {4, "assistant.segment"},
+             {5, "tool.ended"},
+             {6, "assistant.segment"},
+             {7, "assistant.segment"}
+           ]
+
+    assert events
+           |> Enum.filter(&(&1.kind == "assistant.segment"))
+           |> Enum.map(& &1.message_id) == [
+             first_anonymous_id,
+             first_anonymous_id,
+             identified_id,
+             later_anonymous_id,
+             later_anonymous_id
+           ]
+
+    assert Enum.at(events, 1).tool_call["rowVersion"] == 1
+    assert Enum.at(events, 4).tool_call["rowVersion"] == 2
+    assert List.last(events).content == image_content
+
+    whole_replies =
+      state.chunks[sid]
+      |> Enum.reverse()
+      |> Enum.map(fn group ->
+        {group.logical_message_id, group.chunks |> Enum.reverse() |> Enum.join()}
+      end)
+
+    assert whole_replies == [
+             {first_anonymous_id, "AA2"},
+             {identified_id, "B"},
+             {later_anonymous_id, "C"}
+           ]
+
+    appended_replies =
+      Enum.map(whole_replies, fn {logical_message_id, text} ->
+        {:appended, message} =
+          Projection.append(db, %{
+            id: logical_message_id,
+            session_key: session.session_key,
+            role: "assistant",
+            content: text
+          })
+
+        message
+      end)
+
+    assert Enum.map(appended_replies, & &1.id) ==
+             [first_anonymous_id, identified_id, later_anonymous_id]
   end
 
   test "consecutive prompts reset the accumulator" do

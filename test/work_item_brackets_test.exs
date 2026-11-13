@@ -225,7 +225,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
                  SELECT
                    (SELECT count(*) FROM assignments WHERE subject=?1),
                    (SELECT count(*) FROM wakes w JOIN assignments a ON a.id=w.assignmentId
-                      WHERE a.subject=?1 AND w.consumer='assignment_inactivity_deadline'),
+                      WHERE a.subject=?1 AND w.consumer LIKE 'assignment_inactivity_%'),
                    (SELECT count(*) FROM effort_checkin_generations g
                       JOIN assignments a ON a.id=g.assignmentId WHERE a.subject=?1),
                    (SELECT count(*) FROM wake_cancellations WHERE wakeId=?2),
@@ -276,7 +276,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
                  SELECT
                    (SELECT count(*) FROM assignments WHERE subject=?1),
                    (SELECT count(*) FROM wakes w JOIN assignments a ON a.id=w.assignmentId
-                      WHERE a.subject=?1 AND w.consumer='assignment_inactivity_deadline'),
+                      WHERE a.subject=?1 AND w.consumer LIKE 'assignment_inactivity_%'),
                    (SELECT count(*) FROM effort_checkin_generations g
                       JOIN assignments a ON a.id=g.assignmentId WHERE a.subject=?1),
                    (SELECT count(*) FROM wake_cancellations WHERE wakeId=?2),
@@ -309,7 +309,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
            )
 
     assert %{ok: true, workItem: %{state: "iceboxed"}} =
-             dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
+             dispose(ctx, "work-item-icebox", {:user, ctx.holder.owner_user_id}, item.id, %{
+               reason: "waiting for the next review"
+             })
 
     assert routing_wake_id(ctx.db, item.id) == nil
     assert Wakes.get(ctx.db, new).state == "canceled"
@@ -403,7 +405,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert is_binary(slate)
 
     assert %{ok: true, workItem: %{state: "iceboxed"}} =
-             dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
+             dispose(ctx, "work-item-icebox", {:user, ctx.holder.owner_user_id}, item.id, %{
+               reason: "waiting for the next review"
+             })
 
     # Cancels BOTH brackets (slate wake canceled, both ids cleared).
     assert Wakes.get(ctx.db, slate).state == "canceled"
@@ -416,7 +420,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     # Same-state disposition is a no-op success.
     assert %{ok: true, workItem: %{state: "iceboxed"}} =
-             dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
+             dispose(ctx, "work-item-icebox", {:user, ctx.holder.owner_user_id}, item.id, %{
+               reason: "waiting for the next review"
+             })
 
     # Reopen re-arms bracket 1.
     assert %{ok: true, workItem: %{state: "open"}} =
@@ -463,7 +469,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
     danas_item = create(ctx, {:user, "dana"}, %{title: "Dana's item"})
 
     assert %{ok: true, workItem: %{state: "iceboxed"}} =
-             dispose(ctx, "work-item-icebox", {:session, "dsession"}, danas_item.id)
+             dispose(ctx, "work-item-icebox", {:session, "dsession"}, danas_item.id, %{
+               reason: "waiting for the next review"
+             })
   end
 
   ## Proof 6 — owner resolution: session-created items anchor to the session's owning user.
@@ -598,32 +606,53 @@ defmodule Tightbeam.WorkItemBracketsTest do
     {:ok, _a} = disp_assign(ctx, {:user, "flynn"}, "holder", "w", item.id)
 
     for verb <- ["work-item-icebox", "work-item-close", "work-item-fail"] do
-      assert %{code: "assignments_open"} = dispose(ctx, verb, {:user, "flynn"}, item.id)
+      extra = if verb == "work-item-icebox", do: %{reason: "waiting for review"}, else: %{}
+
+      assert %{code: "assignments_open"} =
+               dispose(ctx, verb, {:user, ctx.holder.owner_user_id}, item.id, extra)
     end
   end
 
-  ## Proof 13 — failReason column truth.
+  ## Proof 13 — fail and icebox reasons share the persisted failReason field.
 
-  test "Proof 13: work-item-fail --reason persists and surfaces; icebox/close leave it NULL",
-       ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Reasoned"})
+  test "Proof 13: work-item-fail and work-item-icebox reasons persist and surface", ctx do
+    owner = ctx.holder.owner_user_id
+    iceboxed = create(ctx, {:user, owner}, %{title: "Iceboxed with reason"})
+
+    assert %{code: "missing_reason"} =
+             dispose(ctx, "work-item-icebox", {:user, owner}, iceboxed.id)
+
+    assert %{code: "missing_reason"} =
+             dispose(ctx, "work-item-icebox", {:user, owner}, iceboxed.id, %{reason: " \t "})
+
+    assert %{workItem: %{state: "open", failReason: nil}} = get(ctx, iceboxed.id)
+
+    assert %{workItem: %{state: "iceboxed", failReason: "waiting for a decision"}} =
+             dispose(ctx, "work-item-icebox", {:user, owner}, iceboxed.id, %{
+               reason: "waiting for a decision"
+             })
+
+    assert get(ctx, iceboxed.id).workItem.failReason == "waiting for a decision"
+
+    assert Enum.find(list(ctx).workItems, &(&1.id == iceboxed.id)).failReason ==
+             "waiting for a decision"
+
+    assert WorkState.item_detail(ctx.db, iceboxed.id).workItem.failReason ==
+             "waiting for a decision"
+
+    item = create(ctx, {:user, owner}, %{title: "Failed with reason"})
 
     assert %{workItem: %{failReason: "cannot repro"}} =
-             dispose(ctx, "work-item-fail", {:user, "flynn"}, item.id, %{reason: "cannot repro"})
+             dispose(ctx, "work-item-fail", {:user, owner}, item.id, %{reason: "cannot repro"})
 
     assert get(ctx, item.id).workItem.failReason == "cannot repro"
     assert Enum.find(list(ctx).workItems, &(&1.id == item.id)).failReason == "cannot repro"
     assert WorkState.item_detail(ctx.db, item.id).workItem.failReason == "cannot repro"
 
-    closed = create(ctx, {:user, "flynn"}, %{title: "Closed"})
+    closed = create(ctx, {:user, owner}, %{title: "Closed"})
 
     assert %{workItem: %{failReason: nil}} =
-             dispose(ctx, "work-item-close", {:user, "flynn"}, closed.id)
-
-    iceboxed = create(ctx, {:user, "flynn"}, %{title: "Iced"})
-
-    assert %{workItem: %{failReason: nil}} =
-             dispose(ctx, "work-item-icebox", {:user, "flynn"}, iceboxed.id)
+             dispose(ctx, "work-item-close", {:user, owner}, closed.id)
   end
 
   ## Proof 14 — response shapes carry owner/state/failReason; never wake ids.
@@ -766,19 +795,20 @@ defmodule Tightbeam.WorkItemBracketsTest do
   ## Proof 19 — disposition doorbells fire on real transitions, stay silent on no-ops.
 
   test "Proof 19: each real disposition emits a doorbell; a same-state no-op emits none", ctx do
-    item = create(ctx, {:user, "flynn"}, %{title: "Doorbells"})
+    owner = ctx.holder.owner_user_id
+    item = create(ctx, {:user, owner}, %{title: "Doorbells"})
     base = doorbell_count(ctx.db, item.id)
 
     # A disposition on an UNASSIGNED item still reaches the owner's board.
-    flynn = observe("flynn")
-    dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
+    observer = observe(owner)
+    dispose(ctx, "work-item-icebox", {:user, owner}, item.id, %{reason: "waiting for review"})
     assert doorbell_count(ctx.db, item.id) == base + 1
-    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(flynn)
+    assert [%{"type" => "work_item_event", "kind" => "metadata"}] = Observer.drain(observer)
 
     # Same-state no-op: no doorbell, no publish.
-    dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id)
+    dispose(ctx, "work-item-icebox", {:user, owner}, item.id, %{reason: "same-state retry"})
     assert doorbell_count(ctx.db, item.id) == base + 1
-    assert Observer.drain(flynn) == []
+    assert Observer.drain(observer) == []
 
     dispose(ctx, "work-item-reopen", {:user, "flynn"}, item.id)
     assert doorbell_count(ctx.db, item.id) == base + 2

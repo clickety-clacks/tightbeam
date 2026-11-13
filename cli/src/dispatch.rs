@@ -611,6 +611,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("messageId", message)],
         )),
+        Command::HarklightListenerRestore { identity, handle } => Ok(request(
+            identity,
+            "harklight-listener-restore",
+            vec![],
+            vec![string_field("handle", handle)],
+        )),
         Command::HarklightFollow {
             identity,
             message,
@@ -910,19 +916,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
-        Command::EffortRule {
-            identity,
-            request_id,
-            action,
-        } => Ok(request(
-            identity,
-            "effort-rule",
-            vec![],
-            vec![
-                string_field("request", request_id),
-                string_field("action", action),
-            ],
-        )),
         Command::Ask {
             identity,
             target,
@@ -1410,11 +1403,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         Command::WorkItemIcebox {
             identity,
             work_item_id,
+            reason,
         } => Ok(request(
             identity,
             "work-item-icebox",
             vec![],
-            vec![string_field("workItemId", work_item_id)],
+            vec![
+                string_field("workItemId", work_item_id),
+                string_field("reason", reason),
+            ],
         )),
         Command::WorkItemReopen {
             identity,
@@ -1546,6 +1543,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             "attests",
             vec![],
             vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::CheckAttest {
+            identity,
+            attest_id,
+        } => Ok(request(
+            identity,
+            "check-attest",
+            vec![],
+            vec![string_field("attestId", attest_id)],
         )),
         Command::AssignmentGet {
             identity,
@@ -3987,6 +3993,7 @@ fn local_harklight_identity_refusal(
         Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
+        | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
         {
@@ -4016,6 +4023,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
+        | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
@@ -4028,7 +4036,6 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::SessionConnect { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
-        | Command::EffortRule { identity, .. }
         | Command::Ask { identity, .. }
         | Command::Answer { identity, .. }
         | Command::Return { identity, .. }
@@ -4064,6 +4071,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::MementoSet { identity, .. }
         | Command::Mementos { identity, .. }
         | Command::Attests { identity, .. }
+        | Command::CheckAttest { identity, .. }
         | Command::AssignmentGet { identity, .. }
         | Command::Assignments { identity, .. }
         | Command::CancelWake { identity, .. }
@@ -4271,6 +4279,10 @@ mod tests {
                 "harklight-settle",
             ),
             (
+                vec!["harklight-listener-restore", "--handle", "h"],
+                "harklight-listener-restore",
+            ),
+            (
                 vec!["harklight-follow", "--message", "m"],
                 "harklight-follow",
             ),
@@ -4297,6 +4309,8 @@ mod tests {
                 assert_eq!(body["params"]["byWhen"], "2026-11-01T17:00:00Z");
                 assert_eq!(body["params"]["reply"], true);
             } else if verb == "harklight-follow" && body["params"].get("handle").is_some() {
+                assert_eq!(body["params"]["handle"], "h");
+            } else if verb == "harklight-listener-restore" {
                 assert_eq!(body["params"]["handle"], "h");
             } else {
                 assert_eq!(body["params"]["messageId"], "m");
@@ -5413,18 +5427,6 @@ mod tests {
         );
 
         assert_eq!(
-            body(&[
-                "effort-rule",
-                "--request",
-                "dr_1",
-                "--action",
-                "continue",
-                "--as",
-                "parent",
-            ]),
-            r#"{"as":"parent","verb":"effort-rule","params":{"request":"dr_1","action":"continue"}}"#
-        );
-        assert_eq!(
             body(&["decision-requests", "--status", "open", "--as", "parent"]),
             r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#
         );
@@ -5639,6 +5641,10 @@ mod tests {
         assert_eq!(
             body(&["attests", "asg_1", "--as", "reviewer"]),
             r#"{"as":"reviewer","verb":"attests","params":{"assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&["check-attest", "att_1", "--as", "reviewer"]),
+            r#"{"as":"reviewer","verb":"check-attest","params":{"attestId":"att_1"}}"#
         );
         assert_eq!(
             body(&[
@@ -5857,8 +5863,15 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null,"priority":1}}"#
         );
         assert_eq!(
-            body(&["work-item-icebox", "wi_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"work-item-icebox","params":{"workItemId":"wi_1"}}"#
+            body(&[
+                "work-item-icebox",
+                "wi_1",
+                "--reason",
+                "waiting on a decision",
+                "--as-user",
+                "fixture-user"
+            ]),
+            r#"{"asUser":"fixture-user","verb":"work-item-icebox","params":{"workItemId":"wi_1","reason":"waiting on a decision"}}"#
         );
         assert_eq!(
             body(&["work-item-reopen", "wi_1", "--as-user", "flynn"]),

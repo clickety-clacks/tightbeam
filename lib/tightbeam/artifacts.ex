@@ -59,6 +59,27 @@ defmodule Tightbeam.Artifacts do
     CHECK ((state = 'archived') = (home IS NOT NULL))
   """
 
+  # Keep the historical R1 definition above immutable. Current artifacts may
+  # be attributed to a process when an organization credential has no session
+  # key; a session-authenticated process call retains both its session context
+  # and its selected process origin.
+  @current_table_definition @table_definition
+                            |> String.replace(
+                              "createdBySession  TEXT NOT NULL REFERENCES sessions(sessionKey),",
+                              "createdBySession  TEXT NULL REFERENCES sessions(sessionKey),\n    createdByProcess  TEXT NULL,",
+                              global: false
+                            )
+                            |> String.replace(
+                              "updatedAt         INTEGER NOT NULL,",
+                              "updatedAt         INTEGER NOT NULL,\n    originHost        TEXT,\n    originWorkspace   TEXT,",
+                              global: false
+                            )
+                            |> String.replace(
+                              "CHECK ((state = 'archived') = (home IS NOT NULL))",
+                              "CHECK ((state = 'archived') = (home IS NOT NULL)),\n    CHECK (createdBySession IS NOT NULL OR createdByProcess IS NOT NULL)",
+                              global: false
+                            )
+
   @index_ddl [
     "CREATE INDEX IF NOT EXISTS artifacts_work_item ON artifacts (workItemId)",
     "CREATE INDEX IF NOT EXISTS artifacts_producer ON artifacts (producedByAssignmentId)",
@@ -73,14 +94,57 @@ defmodule Tightbeam.Artifacts do
   #{Enum.join(@index_ddl, ";\n")};
   """
 
-  @current_ddl String.replace(
-                 @ddl,
-                 "updatedAt         INTEGER NOT NULL,",
-                 "updatedAt         INTEGER NOT NULL,\n    originHost        TEXT,\n    originWorkspace   TEXT,"
-               )
+  @current_ddl """
+  CREATE TABLE IF NOT EXISTS artifacts (
+  #{@current_table_definition}
+  );
+  #{Enum.join(@index_ddl, ";\n")};
+  """
 
   @doc false
   def ensure_r1_schema(db), do: DB.execute(db, @ddl)
+
+  @doc false
+  def legacy_current_table_definition do
+    String.replace(
+      @table_definition,
+      "updatedAt         INTEGER NOT NULL,",
+      "updatedAt         INTEGER NOT NULL,\n    originHost        TEXT,\n    originWorkspace   TEXT,",
+      global: false
+    )
+  end
+
+  @doc false
+  def legacy_altered_current_table_definition do
+    @table_definition
+    |> String.replace(
+      "producedByAssignmentId TEXT NULL REFERENCES assignments(id),\n",
+      "",
+      global: false
+    )
+    |> String.replace(
+      "updatedAt         INTEGER NOT NULL,",
+      "updatedAt         INTEGER NOT NULL,\n    producedByAssignmentId TEXT NULL REFERENCES assignments(id),\n    originHost        TEXT,\n    originWorkspace   TEXT,",
+      global: false
+    )
+  end
+
+  @doc false
+  def legacy_current_table_definitions do
+    [legacy_current_table_definition(), legacy_altered_current_table_definition()]
+  end
+
+  @doc false
+  def current_table_definition, do: @current_table_definition
+
+  @doc false
+  def index_ddl, do: @index_ddl
+
+  @doc false
+  def ensure_indexes_in_txn(%Txn{} = txn) do
+    Enum.each(@index_ddl, &Txn.exec(txn, &1))
+    :ok
+  end
 
   @doc "Create the artifact registry schema."
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
@@ -176,7 +240,7 @@ defmodule Tightbeam.Artifacts do
 
     select_from = """
     SELECT a.artifactId, a.kind, a.title, a.description, a.createdBySession,
-           a.workItemId, a.parentSession, a.originPath, a.contentSha256,
+           a.createdByProcess, a.workItemId, a.parentSession, a.originPath, a.contentSha256,
            a.recordedMessageId, a.recordedTurnEvidence, a.state, a.home,
            a.createdAt, a.updatedAt, f.rowVersion
     FROM artifacts AS a
@@ -202,7 +266,7 @@ defmodule Tightbeam.Artifacts do
         ["a.createdAt", "a.artifactId"],
         boundary,
         limit,
-        fn row -> [Enum.at(row, 13), hd(row)] end
+        fn row -> [Enum.at(row, 14), hd(row)] end
       )
 
     %{page | rows: Enum.map(page.rows, &artifact_collection_row/1)}
@@ -230,6 +294,7 @@ defmodule Tightbeam.Artifacts do
          title,
          description,
          created_by_session,
+         created_by_process,
          work_item_id,
          parent_session,
          origin_path,
@@ -248,6 +313,7 @@ defmodule Tightbeam.Artifacts do
       title,
       description,
       created_by_session,
+      created_by_process,
       work_item_id,
       nil,
       parent_session,
@@ -285,19 +351,24 @@ defmodule Tightbeam.Artifacts do
   end
 
   defp record_with_content(db, call, digest, captured_bytes) do
-    case {call[:principal], call[:session_key], call[:params][:work_item_id]} do
-      {{:session, session_key}, session_key, work_item_id}
-      when is_binary(session_key) and is_binary(work_item_id) ->
+    case {artifact_creator(call), call[:params][:work_item_id]} do
+      {{:ok, session_key, created_by_process}, work_item_id}
+      when is_binary(work_item_id) ->
         artifact_id = "art_" <> (:crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower))
-        parent_session = parent_session(db, session_key)
-        {recorded_message_id, evidence, evidence_diagnostic} = turn_evidence(db, session_key)
+        parent_session = if is_binary(session_key), do: parent_session(db, session_key), else: nil
+
+        {recorded_message_id, evidence, evidence_diagnostic} =
+          if is_binary(session_key),
+            do: turn_evidence(db, session_key),
+            else: {nil, "none", nil}
+
         now = now()
         producer_id = call.params[:produced_by_assignment_id]
 
         case DB.transaction_then(
                db,
                fn txn ->
-                 with :ok <- validate_session_active_in_txn(txn, session_key),
+                 with :ok <- validate_session_context_in_txn(txn, session_key),
                       :ok <- validate_work_item_in_txn(txn, work_item_id),
                       :ok <- validate_producer_in_txn(txn, producer_id, session_key, work_item_id) do
                    {origin_host, origin_workspace} =
@@ -309,12 +380,12 @@ defmodule Tightbeam.Artifacts do
                      txn,
                      """
                      INSERT INTO artifacts
-                       (artifactId, kind, title, description, createdBySession, workItemId,
+                       (artifactId, kind, title, description, createdBySession, createdByProcess, workItemId,
                         producedByAssignmentId, parentSession, originPath, contentSha256,
                         recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt,
                         originHost, originWorkspace)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                             'in-workspace', NULL, ?13, ?13, ?14, ?15)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                             'in-workspace', NULL, ?14, ?14, ?15, ?16)
                      """,
                      [
                        artifact_id,
@@ -322,6 +393,7 @@ defmodule Tightbeam.Artifacts do
                        call.params.title,
                        call.params[:description],
                        session_key,
+                       created_by_process,
                        work_item_id,
                        producer_id,
                        parent_session,
@@ -345,15 +417,6 @@ defmodule Tightbeam.Artifacts do
                      )
                    end
 
-                   if is_binary(producer_id) do
-                     Tightbeam.Supervision.activity_in_txn(
-                       txn,
-                       producer_id,
-                       session_key,
-                       now
-                     )
-                   end
-
                    Publisher.maybe_observed_accepted_in_txn(txn, call)
                    publish_in_txn(txn, "artifact.recorded", artifact_id, call)
                    {:created, artifact_in_txn(txn, artifact_id)}
@@ -367,12 +430,14 @@ defmodule Tightbeam.Artifacts do
                      [[owner]] =
                        Txn.q(txn, "SELECT ownerUserId FROM work_items WHERE id=?1", [work_item_id])
 
+                     commit_principal = created_by_process || "session:#{session_key}"
+
                      Tightbeam.Wakes.row_commit_in_txn(txn, %{
                        verb: "artifact-record",
                        domain: "artifact",
                        row_id: artifact_id,
                        owner_user_id: owner,
-                       principal: "session:#{session_key}",
+                       principal: commit_principal,
                        bindings: %{
                          artifact: %{
                            artifactId: artifact_id,
@@ -405,13 +470,48 @@ defmodule Tightbeam.Artifacts do
             raise error
         end
 
-      {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->
+      {{:ok, _session_key, _created_by_process}, nil} ->
         %{code: "invalid", message: "artifact-record requires provenance edges"}
 
       _ ->
         %{code: "invalid", message: "artifact-record requires a session caller"}
     end
   end
+
+  defp artifact_creator(%{
+         principal: {:session, session_key},
+         session_key: session_key,
+         origin: origin
+       })
+       when is_binary(session_key) do
+    case origin do
+      "process:" <> process_name when process_name != "" ->
+        {:ok, session_key, origin}
+
+      _ ->
+        {:ok, session_key, nil}
+    end
+  end
+
+  defp artifact_creator(%{
+         principal: {:session, session_key},
+         session_key: session_key
+       })
+       when is_binary(session_key),
+       do: {:ok, session_key, nil}
+
+  defp artifact_creator(%{
+         principal: {:process, process_name},
+         session_key: nil,
+         origin: origin
+       })
+       when is_binary(process_name) and process_name != "" do
+    if origin == "process:" <> process_name,
+      do: {:ok, nil, origin},
+      else: :error
+  end
+
+  defp artifact_creator(_call), do: :error
 
   defp captured_input(params) do
     if Map.has_key?(params, :content_base64) do
@@ -447,7 +547,9 @@ defmodule Tightbeam.Artifacts do
       message: "contentBase64 must be strict standard Base64"
     }
 
-  defp validate_session_active_in_txn(txn, session_key) do
+  defp validate_session_context_in_txn(_txn, nil), do: :ok
+
+  defp validate_session_context_in_txn(txn, session_key) do
     case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [session_key]) do
       [["active"]] ->
         :ok
@@ -973,7 +1075,7 @@ defmodule Tightbeam.Artifacts do
 
   defp columns do
     """
-    artifactId, kind, title, description, createdBySession, workItemId,
+    artifactId, kind, title, description, createdBySession, createdByProcess, workItemId,
     producedByAssignmentId, parentSession, originPath, contentSha256, recordedMessageId,
     recordedTurnEvidence, state, home, createdAt, updatedAt, originHost, originWorkspace
     """
@@ -985,6 +1087,7 @@ defmodule Tightbeam.Artifacts do
          title,
          description,
          created_by_session,
+         created_by_process,
          work_item_id,
          produced_by_assignment_id,
          parent_session,
@@ -1005,6 +1108,7 @@ defmodule Tightbeam.Artifacts do
       title: title,
       description: description,
       created_by_session: created_by_session,
+      created_by_process: created_by_process,
       work_item_id: work_item_id,
       produced_by_assignment_id: produced_by_assignment_id,
       parent_session: parent_session,

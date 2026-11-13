@@ -13,6 +13,17 @@ each change with what is ahead of it on the tip about to exist and merges in
 arrival order, so the commit that was reviewed is the commit that lands. A
 refused merge request is not permission to land another way.
 
+## Delivery destination and watcher coverage
+
+The opener of a code assignment follows its completion through observed landing
+and records the destination; a returned result is not proof that it landed.
+Carry reviewed work through the authorized PR and queue route below. If the work
+item declares local-only delivery, it names the clone and branch, merge target
+and readback; merge there through that agreement and record the observed target
+head. Do not infer local-only delivery from a private checkout.
+
+For a new project or target branch, its PDO makes sure the landing watcher is set up, using the bundle's setup instructions from tightbeam kungfu setup agentic-engineering. The watcher follows a pull request or branch once an agent waits on its landing; listing the branch in LANDING_REPOS only adds standing alerts when its required checks fail. If the watcher is not set up or not running, use a bounded timed check of the actual PR or branch instead of waiting on a watcher fact that will not arrive. Follow the operating manual's record-wait preference and bounded fallback for real waits.
+
 ## Waiting on PR checks
 
 Where a landing watcher supplies `pr.checks-completed`, end your turn with a
@@ -23,7 +34,7 @@ losing the news. This route requires that fact producer; a subscription alone
 does not create it:
 
     tightbeam wake --role <your role> --when-fact pr.checks-completed \
-      --when-scope <owner>/<repo>#<n> --fallback-after 2h \
+      --when-scope <owner>/<repo>#<n> --fallback-after 3h \
       --prompt "Read PR <n>'s current checks and act on their result"
 
 The fact reports that checks finished, on pass or fail; read the latest required
@@ -34,14 +45,15 @@ checks passed.
 
 ## Landing your own change
 
-Open the pull request from your branch to the authorized target, with
-`Tightbeam-Assignment: <assignment>` and `Tightbeam-Work-Item: <work item>` in
-its body, and record the pull request on your assignment. Subscribe to the
-outcome before you request the merge, so the fact cannot arrive before you are
-listening. Write the scope with the owner and repository in lowercase:
+Open the pull request from your branch to the authorized target. Public PRs
+contain product terms and verification evidence; keep internal Tightbeam IDs
+only in Tightbeam records linked to the public PR or commit URL. Record the PR
+on your assignment. Where the target's watcher supplies landing facts, subscribe
+to the outcome before requesting the merge, so the fact cannot arrive before
+you are listening. Write the scope with the owner and repository in lowercase:
 
     tightbeam wake --role <your role> --when-fact landing.settled \
-      --when-scope <owner>/<repo>#<n> --fallback-after 2h \
+      --when-scope <owner>/<repo>#<n> --fallback-after 3h \
       --prompt "PR <n> settled or silent: read it and finish landing <assignment>"
 
 Then request the merge with the reviewed commit pinned:
@@ -74,12 +86,13 @@ change's can be resubmitted once you have looked. A failure that keeps
 recurring is a defect in the branch: name it to your delivery owner so it gets
 an owner.
 
-When the fallback fires, subscribe again before rereading the pull request, so
-settlement cannot race through the gap between the read and the next
+When a watcher subscription's fallback fires, subscribe again before rereading
+the pull request, so settlement cannot race through the gap between the read and the next
 subscription. Keep the replacement subscription if the pull request is still
 open and moving; cancel it if the reread shows that it already settled. Handing
-over the assignment hands over the pull request. Whoever takes it subscribes,
-then reads the pull request, since it may already have settled.
+over the assignment hands over the pull request. Whoever takes it arranges the
+applicable fact wait or timed check, then reads the pull request, since it may
+already have settled.
 
 ## Owning a branch
 

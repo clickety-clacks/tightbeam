@@ -460,7 +460,7 @@ defmodule Tightbeam.ArtifactsTest do
     assert {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(artifacts)")
 
     assert Enum.map(columns, &Enum.at(&1, 1)) == ~w(
-             artifactId kind title description createdBySession workItemId producedByAssignmentId parentSession
+             artifactId kind title description createdBySession createdByProcess workItemId producedByAssignmentId parentSession
              originPath contentSha256 recordedMessageId recordedTurnEvidence state home
              createdAt updatedAt originHost originWorkspace
            )

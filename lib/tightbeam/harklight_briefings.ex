@@ -198,7 +198,7 @@ defmodule Tightbeam.HarklightBriefings do
                [handle]
              ) do
           [[^session_key]] ->
-            "\n\nThis Harklight thread is associated with decision request #{request_id}. Continue in this same session and thread. Reread the exact request and current status before acting. A question or ambiguous reply needs clarification in the thread and no ruling. For an explicit unambiguous answer to an open request, use `rule` for a statute request, `operator-rule` for an operator request, `effort-rule` for an effort request, or `answer` for an agent request, always as this same session. Preserve the user's exact words; quote the exact choice and cite this Harklight entry ID in ruling rationale, or include the exact answer and entry ID in an agent answer. Then reply in this Harklight thread with what was recorded. If the request is already resolved, withdrawn or superseded, explain the current state in the thread and preserve the existing result."
+            "\n\nThis Harklight thread is associated with decision request #{request_id}. Continue in this same session and thread. Reread the exact request and current status before acting. A question or ambiguous reply needs clarification in the thread and no ruling. For an explicit unambiguous answer to an open request, use `rule` for a statute request, `operator-rule` for an operator request, or `answer` for an agent request, always as this same session. Preserve the user's exact words; quote the exact choice and cite this Harklight entry ID in ruling rationale, or include the exact answer and entry ID in an agent answer. Then reply in this Harklight thread with what was recorded. If the request is already resolved, withdrawn or superseded, explain the current state in the thread and preserve the existing result."
 
           _ ->
             ""
@@ -931,7 +931,7 @@ defmodule Tightbeam.HarklightBriefings do
   defp send_operations(db) do
     case DB.query(
            db,
-           "SELECT opId,sessionKey,payload,handle,senderId,messageId,state,attemptedAt FROM harklight_send_operations ORDER BY createdAt,opId"
+           "SELECT opId,sessionKey,payload,handle,senderId,messageId,state,attemptedAt FROM harklight_send_operations WHERE COALESCE(json_extract(payload,'$.operation_kind'),'send')<>'change' ORDER BY createdAt,opId"
          ) do
       {:ok, rows} ->
         Enum.reduce_while(rows, {:ok, []}, fn [

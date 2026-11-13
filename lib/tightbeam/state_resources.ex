@@ -241,12 +241,14 @@ defmodule Tightbeam.StateResources do
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "harness processes" => ~w(id host harness pid state createdAt resolvedAt),
     "artifacts" =>
-      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
+      ~w(artifactId kind title description createdBySession createdByProcess workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
     "transcript messages" =>
       ~w(id seq sessionKey role messageType marker content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq turnIncludesHuman isBatchCarrier assignmentId jobRef harness provider model effort context rowVersion),
     "tool calls" =>
       ~w(id seq sessionKey turnSeq afterMessageSeq harnessToolCallId title kind toolName status rawInput rawOutput content truncated startedAt endedAt rowVersion),
+    "turn events" =>
+      ~w(id sessionKey turnSeq turnEventSeq kind messageId toolCallId content toolCall rowVersion),
     "condition facts" => ~w(id ts kind scope origin rowVersion),
     "critical state" =>
       ~w(sessionKey reason startedAt expiresAt hardDeadline updatedAt rowVersion),
@@ -263,6 +265,7 @@ defmodule Tightbeam.StateResources do
     "decision-requests" => "decision requests",
     "read-markers" => "read markers",
     "messages" => "transcript messages",
+    "turn-events" => "turn events",
     "condition-facts" => "condition facts",
     "critical-state" => "critical state"
   }
@@ -355,10 +358,11 @@ defmodule Tightbeam.StateResources do
     },
     "artifacts" => %{
       strings:
-        ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home),
+        ~w(artifactId kind title description createdBySession createdByProcess workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home),
       integers: ~w(createdAt updatedAt rowVersion),
       booleans: [],
-      nullable: ~w(description parentSession contentSha256 recordedMessageId home)
+      nullable:
+        ~w(description createdBySession createdByProcess parentSession contentSha256 recordedMessageId home)
     },
     "read markers" => %{
       strings: ~w(userId scopeKey),
@@ -379,6 +383,12 @@ defmodule Tightbeam.StateResources do
       integers: ~w(seq turnSeq afterMessageSeq startedAt endedAt rowVersion),
       booleans: [],
       nullable: ~w(toolName rawInput rawOutput content endedAt)
+    },
+    "turn events" => %{
+      strings: ~w(id sessionKey kind messageId toolCallId),
+      integers: ~w(turnSeq turnEventSeq rowVersion),
+      booleans: [],
+      nullable: ~w(messageId toolCallId content toolCall)
     },
     "condition facts" => %{
       strings: ~w(kind scope origin),
@@ -444,6 +454,8 @@ defmodule Tightbeam.StateResources do
     {"tool calls", "rawOutput"} => :json,
     {"tool calls", "content"} => :json,
     {"tool calls", "truncated"} => {:array, :tool_call_truncation, :preserve},
+    {"turn events", "content"} => :json,
+    {"turn events", "toolCall"} => :json,
     {"identity", "sessionRevisions"} => :string_map,
     {"identity", "staleness"} => {:array, :string, :sort},
     {"identity", "conflicts"} => {:array, :string, :sort},
@@ -499,6 +511,7 @@ defmodule Tightbeam.StateResources do
     {"transcript messages", "role"} => ~w(user assistant),
     {"transcript messages", "attentionTier"} => [-1, 0, 1],
     {"tool calls", "status"} => ~w(pending in_progress completed failed),
+    {"turn events", "kind"} => ~w(assistant.segment tool.started tool.ended),
     {"identity", "state"} => ~w(ready relearn_conflicted),
     {"kungfu", "status"} => ~w(available installed)
   }
@@ -802,16 +815,18 @@ defmodule Tightbeam.StateResources do
   end
 
   @doc "Return a bounded page of sessions visible to one REST principal."
-  def query_sessions_page(db, principal, boundary, limit) do
+  def query_sessions_page(db, principal, boundary, limit, archetypes \\ nil) do
     trace_core_detail(principal, {:au4_visibility, "sessions"})
 
-    {where, params} =
+    {visibility_where, visibility_params} =
       cond do
         principal.kind == "observer" -> {nil, []}
         principal.is_admin -> {nil, []}
         principal.kind == "session" -> {nil, []}
         true -> {"sessions.ownerUserId = ?", [principal.id]}
       end
+
+    {where, params} = sessions_page_filter(visibility_where, visibility_params, archetypes)
 
     case DB.transaction(db, fn txn ->
            query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
@@ -832,6 +847,23 @@ defmodule Tightbeam.StateResources do
       {:error, error} -> raise error
     end
   end
+
+  defp sessions_page_filter(where, params, archetypes)
+       when is_list(archetypes) and archetypes != [] do
+    archetype_where =
+      archetypes
+      |> Enum.map_join(" OR ", fn _ -> "sessions.archetype = ?" end)
+      |> then(&("(" <> &1 <> ")"))
+
+    where =
+      if is_binary(where),
+        do: "(" <> where <> ") AND " <> archetype_where,
+        else: archetype_where
+
+    {where, params ++ archetypes}
+  end
+
+  defp sessions_page_filter(where, params, _archetypes), do: {where, params}
 
   def query_session(db, id) when is_binary(id) do
     case query(db, @session_select <> " WHERE sessions.sessionKey = ?1", [id]) do
@@ -889,6 +921,20 @@ defmodule Tightbeam.StateResources do
     %{rows: page.rows, flags: page.flags}
   end
 
+  @doc "Return one bounded page of a session's ordered turn events."
+  def query_turn_events_for_session_page(source, session_key, boundary, limit, turn_seq_filter) do
+    page =
+      Tightbeam.TurnEvents.page_for_session(
+        source,
+        session_key,
+        boundary,
+        limit,
+        turn_seq_filter
+      )
+
+    %{rows: page.rows, flags: page.flags}
+  end
+
   @doc "Return one tool-call record under the transcript-message AU4 detail grant."
   def query_tool_call(source, %{key: {session_key, id}, principal: principal}) do
     detail_selection(source, "transcript messages", principal, fn txn ->
@@ -905,6 +951,23 @@ defmodule Tightbeam.StateResources do
   @doc false
   def query_tool_call_for_rebuild(source, id),
     do: Tightbeam.ToolCalls.query_for_rebuild(source, id)
+
+  @doc "Return one turn event under the transcript-message AU4 detail grant."
+  def query_turn_event(source, %{key: {session_key, id}, principal: principal}) do
+    detail_selection(source, "transcript messages", principal, fn txn ->
+      case Tightbeam.TurnEvents.query_by_id_in_txn(txn, session_key, id) do
+        %{session_key: ^session_key} = row -> row
+        _ -> nil
+      end
+    end)
+  end
+
+  def query_turn_event(source, id) when is_binary(id),
+    do: Tightbeam.TurnEvents.query_by_id(source, id)
+
+  @doc false
+  def query_turn_event_for_rebuild(source, id),
+    do: Tightbeam.TurnEvents.query_for_rebuild(source, id)
 
   @doc "Return the complete wake projection for one session."
   def query_wakes_for_session(db, session_key),
@@ -2149,6 +2212,23 @@ defmodule Tightbeam.StateResources do
     exact!("tool calls", item)
   end
 
+  def turn_event(row) do
+    item = %{
+      "id" => required_string!(row, :id),
+      "sessionKey" => required_string!(row, :session_key),
+      "turnSeq" => required_integer!(row, :turn_seq),
+      "turnEventSeq" => required_integer!(row, :turn_event_seq),
+      "kind" => required_wire_string!(value(row, :kind), "kind"),
+      "messageId" => nullable_string!(value(row, :message_id), "messageId"),
+      "toolCallId" => nullable_string!(value(row, :tool_call_id), "toolCallId"),
+      "content" => value(row, :content),
+      "toolCall" => value(row, :tool_call),
+      "rowVersion" => required_integer!(row, :row_version)
+    }
+
+    exact!("turn events", item)
+  end
+
   def condition_fact(row) do
     fields = ~w(id ts kind scope origin rowVersion)
 
@@ -2724,6 +2804,39 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  defp validate_item_invariants!("turn events", item) do
+    unless Regex.match?(
+             ~r/\Ate_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/,
+             item["id"]
+           ) do
+      raise ArgumentError, "turn events id is not a te_ UUIDv4"
+    end
+
+    unless item["turnSeq"] > 0 and item["turnEventSeq"] > 0 and item["rowVersion"] == 1 do
+      raise ArgumentError, "turn-event sequence and row version are invalid"
+    end
+
+    case item["kind"] do
+      "assistant.segment" ->
+        unless is_binary(item["messageId"]) and item["messageId"] != "" and
+                 is_map(item["content"]) and is_nil(item["toolCallId"]) and
+                 is_nil(item["toolCall"]) do
+          raise ArgumentError, "assistant turn event has an invalid projection"
+        end
+
+      kind when kind in ["tool.started", "tool.ended"] ->
+        tool_call = item["toolCall"]
+
+        unless is_binary(item["toolCallId"]) and is_map(tool_call) and
+                 tool_call["id"] == item["toolCallId"] and
+                 tool_call["sessionKey"] == item["sessionKey"] and
+                 tool_call["turnSeq"] == item["turnSeq"] and is_nil(item["messageId"]) and
+                 is_nil(item["content"]) do
+          raise ArgumentError, "tool turn event has an invalid snapshot"
+        end
+    end
+  end
+
   defp validate_item_invariants!(
          "attests",
          %{
@@ -2820,6 +2933,9 @@ defmodule Tightbeam.StateResources do
   defp encode_item_field("transcript messages", "context", value), do: encode_j!(value)
 
   defp encode_item_field("tool calls", field, value) when field in ~w(rawInput rawOutput content),
+    do: encode_j!(value)
+
+  defp encode_item_field("turn events", field, value) when field in ~w(content toolCall),
     do: encode_j!(value)
 
   defp encode_item_field("tool calls", "truncated", value) do

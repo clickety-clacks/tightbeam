@@ -99,11 +99,3 @@ After relearn (or `relearn --resolve`) publishes the merged identity, run
 `tightbeam identity apply --all` at a boundary that does not interrupt running
 turns, then read `tightbeam identity status`. Do not call the relearn done while
 any session you are responsible for remains stale.
-
-## Repeated effort requests
-
-Compare the specific obligation's records, actual execution and current pending
-wakes. Activity elsewhere in a shared session is not its progress. If supervision
-contradicts coverage, record one specimen and route the defect to its owner; keep
-the next action and reassessment explicit. Dismissing a request merely to quiet it
-can restart the cycle. Containment is not recovery. Do not manufacture activity.

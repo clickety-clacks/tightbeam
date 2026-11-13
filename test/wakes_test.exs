@@ -228,7 +228,7 @@ defmodule Tightbeam.WakesTest do
     assert cancellation_event_count(db, wake.wake_id) == 1
   end
 
-  test "sender can retract its linked pending notice after the inactivity ladder is exhausted", %{
+  test "sender can retract its linked pending notice while the assignment remains live", %{
     db: db
   } do
     parent_relation_fixture(db, false)
@@ -247,7 +247,7 @@ defmodule Tightbeam.WakesTest do
     assert {:ok, [[0]]} =
              DB.query(
                db,
-               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND state='pending' AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND state='pending' AND consumer LIKE 'assignment_inactivity_%'",
                ["asg_parent_relation"]
              )
 

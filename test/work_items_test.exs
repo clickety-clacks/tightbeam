@@ -207,7 +207,7 @@ defmodule Tightbeam.WorkItemsTest do
       Enum.reduce(
         [
           {"work-item-update", %{title: "Changed lifecycle"}, "work_item.updated"},
-          {"work-item-icebox", %{}, "work_item.iceboxed"},
+          {"work-item-icebox", %{reason: "paused for review"}, "work_item.iceboxed"},
           {"work-item-reopen", %{}, "work_item.reopened"},
           {"work-item-#{terminal}", %{reason: "explicit fixture disposition"},
            "work_item.#{if terminal == "close", do: "closed", else: "failed"}"}
@@ -762,6 +762,23 @@ defmodule Tightbeam.WorkItemsTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
+  test "handoff refuses an unknown work item and identifies its ID", ctx do
+    work_item_id = "wi_missing_handoff"
+
+    request =
+      handoff_call({:user, "flynn"}, %{
+        work_item_id: work_item_id,
+        delivery_owner_session_key: ctx.holder.session_key,
+        brief: "A complete brief."
+      })
+      |> Map.put(:session_key, ctx.holder.session_key)
+
+    assert {:error, %{code: "unknown_work_item", message: message}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, request)
+
+    assert message =~ work_item_id
+  end
+
   test "handoff wake failure rolls back both new and existing item state", ctx do
     existing = create(ctx, {:user, "flynn"}, %{title: "Atomic existing handoff"})
 
@@ -1073,7 +1090,8 @@ defmodule Tightbeam.WorkItemsTest do
     assert cleared.workItem.specRefSha256 == @sha
   end
 
-  test "body updates leave every work-item lifecycle state and failure reason unchanged", ctx do
+  test "body updates leave every work-item lifecycle state and disposition reason unchanged",
+       ctx do
     open = create(ctx, {:user, "flynn"}, %{title: "Open body"})
     iceboxed = create(ctx, {:user, "flynn"}, %{title: "Iceboxed body"})
     closed = create(ctx, {:user, "flynn"}, %{title: "Closed body"})
@@ -1083,7 +1101,10 @@ defmodule Tightbeam.WorkItemsTest do
              WorkItems.__handle__(
                ctx.db,
                "work-item-icebox",
-               call("work-item-icebox", {:user, "flynn"}, %{work_item_id: iceboxed.id})
+               call("work-item-icebox", {:user, ctx.holder.owner_user_id}, %{
+                 work_item_id: iceboxed.id,
+                 reason: "paused for review"
+               })
              )
 
     assert %{ok: true} =
@@ -1105,7 +1126,7 @@ defmodule Tightbeam.WorkItemsTest do
 
     for {item, state, fail_reason} <- [
           {open, "open", nil},
-          {iceboxed, "iceboxed", nil},
+          {iceboxed, "iceboxed", "paused for review"},
           {closed, "closed", nil},
           {failed, "failed", "body lifecycle fixture"}
         ] do

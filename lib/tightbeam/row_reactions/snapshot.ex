@@ -8,6 +8,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
     SessionReparent,
     Wakes
   }
+
   alias Tightbeam.DB.Txn
 
   @assignment ~w(id holderKey workItemId openedBySession openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
@@ -33,8 +34,9 @@ defmodule Tightbeam.RowReactions.Snapshot do
           Txn.q(
             txn,
             """
-            WITH terminal_observations AS (
-              SELECT o.correlationId,o.harness,o.host,o.failureClass,o.observedAt,o.id,
+            WITH candidate_observations AS (
+              SELECT o.correlationId,o.harness,o.host,o.failureClass,o.evidenceKind,
+                     o.observedAt,o.id,
                      CASE
                        WHEN substr(o.correlationId,1,13)='harness-turn:'
                          AND instr(substr(o.correlationId,14),':') > 1
@@ -53,10 +55,20 @@ defmodule Tightbeam.RowReactions.Snapshot do
                        ELSE NULL
                      END AS turnSeq
               FROM harness_health_observations o
-              WHERE o.incidentId=?1 AND o.evidenceKind='terminal-failure'
+              WHERE o.incidentId=?1
+                AND o.evidenceKind IN ('terminal-failure','authoritative-provider')
+            ), routed_turn_observations AS (
+              SELECT *
+              FROM candidate_observations o
+              WHERE o.evidenceKind='terminal-failure'
+                 OR (
+                   o.evidenceKind='authoritative-provider'
+                   AND o.turnSeq IS NOT NULL
+                   AND o.correlationId='harness-turn:' || o.turnSeq || ':' || o.failureClass
+                 )
             )
             SELECT o.correlationId,o.harness,o.host,t.model
-            FROM terminal_observations o
+            FROM routed_turn_observations o
             LEFT JOIN turns t
               ON t.seq=o.turnSeq
              AND o.correlationId='harness-turn:' || t.seq || ':' || o.failureClass
