@@ -167,7 +167,9 @@ defmodule Tightbeam.JobForensicsTest do
   } do
     work_item(db, "wi_disp")
 
-    assert %{workItem: %{state: "iceboxed"}} = dispose(db, "work-item-icebox", "wi_disp")
+    assert %{workItem: %{state: "iceboxed"}} =
+             dispose(db, "work-item-icebox", "wi_disp", %{reason: "paused for review"})
+
     assert %{workItem: %{state: "open"}} = dispose(db, "work-item-reopen", "wi_disp")
     assert %{workItem: %{state: "closed"}} = dispose(db, "work-item-close", "wi_disp")
 

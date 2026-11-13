@@ -4540,7 +4540,7 @@ defmodule Tightbeam.Wire.Router do
     "work-item-fail" => ~w(reason work_item_id)a,
     "work-item-get" => ~w(work_item_id)a,
     "work-item-handoff" => ~w(work_item_id title delivery_owner_session_key brief owner_user_id)a,
-    "work-item-icebox" => ~w(work_item_id)a,
+    "work-item-icebox" => ~w(reason work_item_id)a,
     "work-item-reopen" => ~w(work_item_id)a,
     "work-item-trace" => ~w(work_item_id)a,
     "work-item-update" =>
