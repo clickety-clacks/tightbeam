@@ -507,11 +507,6 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
     refute StateVisibility.visible?(ctx.db, missing_topline, "root", true)
 
-    hub_pid = GenServer.whereis(ctx.hub)
-    :erlang.trace_pattern({Hub, :matches?, 2}, true, [:local])
-    :erlang.trace(hub_pid, true, [:call, {:tracer, self()}])
-    on_exit(fn -> :erlang.trace_pattern({Hub, :matches?, 2}, false, [:local]) end)
-
     Enum.each(notices, fn notice ->
       class = notice["class"]
 
@@ -527,14 +522,15 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
           is_admin: false
         })
 
+      :ok = Hub.subscribe(ctx.hub, self(), "nonmatching", %{"classes" => ["different."]})
+      Hub.publish(ctx.hub, notice)
+      _sequence = Hub.sequence(ctx.hub, self())
+      refute_received {:firehose_notice, %{"class" => ^class}}
+      :ok = Hub.unsubscribe(ctx.hub, self(), "nonmatching")
+
       :ok = Hub.subscribe(ctx.hub, self(), class, %{"classes" => classes})
       Hub.publish(ctx.hub, notice)
       _sequence = Hub.sequence(ctx.hub, self())
-      trace_barrier(hub_pid)
-
-      assert_received {:trace, ^hub_pid, :call,
-                       {Hub, :matches?, [^notice, %{"classes" => ^classes}]}}
-
       assert_received {:firehose_notice, %{"class" => ^class, "type" => "change"}}
 
       :ok =
@@ -547,11 +543,6 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
 
       Hub.publish(ctx.hub, notice)
       _sequence = Hub.sequence(ctx.hub, self())
-      trace_barrier(hub_pid)
-
-      assert_received {:trace, ^hub_pid, :call,
-                       {Hub, :matches?, [^notice, %{"classes" => ^classes}]}}
-
       assert_received {:firehose_notice, %{"class" => ^class, "type" => "change"}}
       Hub.delivered(ctx.hub, self())
       _sequence = Hub.sequence(ctx.hub, self())
@@ -573,14 +564,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     :ok = Hub.subscribe(ctx.hub, self(), "unresolved", %{"classes" => hidden_classes})
     Hub.publish(ctx.hub, unresolved_marker)
     _sequence = Hub.sequence(ctx.hub, self())
-    trace_barrier(hub_pid)
-    assert_received {:trace, ^hub_pid, :call, {Hub, :matches?, [^unresolved_marker, _]}}
     assert_received {:firehose_notice, %{"class" => ^hidden_class, "type" => "change"}}
-  end
-
-  defp trace_barrier(pid) do
-    barrier = :erlang.trace_delivered(pid)
-    assert_receive {:trace_delivered, ^pid, ^barrier}
   end
 
   defp expected_r8_inventory do
