@@ -1416,11 +1416,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         Command::WorkItemIcebox {
             identity,
             work_item_id,
+            reason,
         } => Ok(request(
             identity,
             "work-item-icebox",
             vec![],
-            vec![string_field("workItemId", work_item_id)],
+            vec![
+                string_field("workItemId", work_item_id),
+                string_field("reason", reason),
+            ],
         )),
         Command::WorkItemReopen {
             identity,
@@ -5871,8 +5875,15 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null,"priority":1}}"#
         );
         assert_eq!(
-            body(&["work-item-icebox", "wi_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"work-item-icebox","params":{"workItemId":"wi_1"}}"#
+            body(&[
+                "work-item-icebox",
+                "wi_1",
+                "--reason",
+                "waiting on a decision",
+                "--as-user",
+                "fixture-user"
+            ]),
+            r#"{"asUser":"fixture-user","verb":"work-item-icebox","params":{"workItemId":"wi_1","reason":"waiting on a decision"}}"#
         );
         assert_eq!(
             body(&["work-item-reopen", "wi_1", "--as-user", "flynn"]),
