@@ -776,6 +776,19 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("idempotencyKey", idempotency_key),
             ],
         )),
+        Command::SessionRename {
+            identity,
+            session_key,
+            display_name,
+        } => Ok(request(
+            identity,
+            "tune",
+            vec![string_field("sessionKey", session_key)],
+            vec![
+                string_field("setting", "rename"),
+                string_field("displayName", display_name),
+            ],
+        )),
         Command::Tune {
             identity,
             session_key,
@@ -4033,6 +4046,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Tune { identity, .. }
         | Command::SessionReparent { identity, .. }
         | Command::SessionPoSet { identity, .. }
+        | Command::SessionRename { identity, .. }
         | Command::SessionConnect { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
@@ -4664,6 +4678,47 @@ mod tests {
                 }
             }
             assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn session_rename_sends_the_display_name_on_the_stable_session_target() {
+        assert_eq!(
+            body(&[
+                "session-rename",
+                "--session",
+                "session key with spaces",
+                "--display-name",
+                "  ATC PO  ",
+                "--as-user",
+                "rename-owner"
+            ]),
+            r#"{"asUser":"rename-owner","verb":"tune","sessionKey":"session key with spaces","params":{"setting":"rename","displayName":"  ATC PO  "}}"#
+        );
+
+        // The CLI preserves an explicit empty value for the server's shared
+        // parameter-specific validation instead of treating it as a missing flag.
+        assert_eq!(
+            body(&[
+                "session-rename",
+                "--session",
+                "session-key",
+                "--display-name",
+                ""
+            ]),
+            r#"{"verb":"tune","sessionKey":"session-key","params":{"setting":"rename","displayName":""}}"#
+        );
+
+        for missing in ["--session", "--display-name"] {
+            let mut args = vec!["session-rename"];
+            for (flag, value) in [("--session", "session-key"), ("--display-name", "New Name")] {
+                if flag != missing {
+                    args.extend([flag, value]);
+                }
+            }
+            assert!(
+                crate::args::parse(args.iter().map(|value| (*value).to_owned()).collect()).is_err()
+            );
         }
     }
 

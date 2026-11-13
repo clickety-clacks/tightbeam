@@ -1,3 +1,8 @@
+defmodule Tightbeam.Org.DisplayNameError do
+  @moduledoc false
+  defexception [:code, :message]
+end
+
 defmodule Tightbeam.Org do
   @moduledoc """
   Session registry for wire identity, organization identity, model provenance,
@@ -573,6 +578,7 @@ defmodule Tightbeam.Org do
   @spec create_in_txn(Txn.t(), map()) :: session()
   def create_in_txn(%Txn{} = txn, input) do
     Txn.assert_archetype_available!(txn, Map.fetch!(input, :archetype))
+    validate_display_name!(txn, Map.fetch!(input, :display_name))
 
     session_key =
       Map.get(input, :session_key) || custom_session_key(Map.fetch!(input, :owner_user_id))
@@ -635,6 +641,25 @@ defmodule Tightbeam.Org do
     session
   end
 
+  @doc false
+  @spec initial_display_name_in_txn(Txn.t(), String.t()) :: String.t()
+  def initial_display_name_in_txn(%Txn{} = txn, base_name) when is_binary(base_name) do
+    available_initial_display_name!(txn, base_name, 1)
+  end
+
+  defp available_initial_display_name!(txn, base_name, suffix) do
+    candidate = if suffix == 1, do: base_name, else: "#{base_name} (#{suffix})"
+    validate_display_name!(txn, candidate)
+    candidate
+  rescue
+    error in Tightbeam.Org.DisplayNameError ->
+      if error.code == "display_name_taken" do
+        available_initial_display_name!(txn, base_name, suffix + 1)
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
   # Main may be virtual until its first connection. Only an explicitly supplied
   # parent requires a stored session; the derived fallback never creates one.
   defp validate_topology_creation!(txn, key, input) do
@@ -665,6 +690,56 @@ defmodule Tightbeam.Org do
             raise ArgumentError, "invalid organizational parent"
         end
     end
+  end
+
+  defp validate_display_name!(
+         txn,
+         display_name,
+         excluding_session_key \\ nil,
+         unchanged? \\ false
+       )
+
+  defp validate_display_name!(txn, display_name, excluding_session_key, unchanged?)
+       when is_binary(display_name) do
+    if String.trim(display_name) == "" do
+      raise Tightbeam.Org.DisplayNameError,
+        code: "display_name_empty",
+        message: "display name must not be empty"
+    end
+
+    unless unchanged? do
+      normalized = normalized_display_name(display_name)
+
+      collision? =
+        txn
+        |> Txn.q("SELECT sessionKey, displayName FROM sessions ORDER BY sessionKey", [])
+        |> Enum.any?(fn [session_key, existing_name] ->
+          session_key != excluding_session_key and
+            normalized_display_name(existing_name) == normalized
+        end)
+
+      if collision? do
+        raise Tightbeam.Org.DisplayNameError,
+          code: "display_name_taken",
+          message: "display name is already in use"
+      end
+    end
+
+    :ok
+  end
+
+  defp validate_display_name!(_txn, _display_name, _excluding_session_key, _unchanged?) do
+    raise Tightbeam.Org.DisplayNameError,
+      code: "display_name_invalid",
+      message: "display name must be text"
+  end
+
+  defp normalized_display_name(display_name) do
+    display_name
+    |> String.trim()
+    |> String.to_charlist()
+    |> :string.casefold()
+    |> List.to_string()
   end
 
   defp validate_topology_ancestry!(txn, key, owner, seen) do
@@ -871,7 +946,18 @@ defmodule Tightbeam.Org do
   @doc "Rename a session (raises if unknown). Returns the updated session."
   @spec rename(db(), String.t(), String.t()) :: session()
   def rename(db \\ Tightbeam.DB, session_key, display_name) do
-    update(db, session_key, "displayName = ?2", [display_name])
+    transaction!(db, fn txn ->
+      current = must_get(txn, session_key)
+
+      validate_display_name!(
+        txn,
+        display_name,
+        session_key,
+        display_name == current.display_name
+      )
+
+      update_in_txn(txn, session_key, "displayName = ?2", [display_name])
+    end)
   end
 
   @doc """

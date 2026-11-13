@@ -86,6 +86,7 @@ impl CommandContext {
             RetireWithdraw { .. } => ("cli.retire_withdraw", DispatchPath),
             SessionReparent { .. } => ("cli.session_reparent", DispatchPath),
             SessionPoSet { .. } => ("cli.session_po_set", DispatchPath),
+            SessionRename { .. } => ("cli.session_rename", DispatchPath),
             Tune { .. } => ("cli.tune", DispatchPath),
             Assign { .. } => ("cli.assign", DispatchPath),
             Dispatch { .. } => ("cli.dispatch", DispatchPath),
@@ -367,6 +368,9 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         // A handoff commits the owner change and notification together, but
         // the command does not accept an idempotency key.
         WorkItemHandoff { .. } | RetireWithdraw { .. } => WriteWithoutIdempotency,
+
+        // Rename updates one stable session record and has no replay key.
+        SessionRename { .. } => WriteWithoutIdempotency,
 
         Wake {
             idempotency_key, ..

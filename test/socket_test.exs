@@ -55,6 +55,31 @@ defmodule Tightbeam.Wire.SocketTest do
       do: {:reply, GenServer.call(state.db, request), state}
   end
 
+  defmodule MainSeedFailureDB do
+    use GenServer
+
+    def start_link({name, db, error}),
+      do: GenServer.start_link(__MODULE__, {db, error}, name: name)
+
+    def init(state), do: {:ok, state}
+
+    def handle_call({:db_call, _envelope, {:transaction, _fun}}, _from, {db, error}) do
+      {:reply, {:error, error}, {db, error}}
+    end
+
+    def handle_call({:db_call, envelope, request}, _from, {db, error}) do
+      {:reply, GenServer.call(db, {:db_call, envelope, request}), {db, error}}
+    end
+
+    def handle_call({:transaction, _fun}, _from, {db, error}) do
+      {:reply, {:error, error}, {db, error}}
+    end
+
+    def handle_call(request, _from, {db, error}) do
+      {:reply, GenServer.call(db, request), {db, error}}
+    end
+  end
+
   setup do
     db = :"socket_db_#{System.unique_integer([:positive])}"
     registry = :"socket_registry_#{System.unique_integer([:positive])}"
@@ -780,6 +805,103 @@ defmodule Tightbeam.Wire.SocketTest do
 
     assert [%{session_key: key}] = Org.list_for_user(ctx.db, device.user_id, false)
     assert key == Org.personal_session_key(device.user_id)
+  end
+
+  test "personal Main chooses a free global label without changing stable keys", ctx do
+    {:paired, first} =
+      Devices.pair(ctx.db, %{
+        device_id: "main-first",
+        claimed_name: "First",
+        platform: nil,
+        model: nil
+      })
+
+    {:ok, first_socket} = Socket.init(ctx.deps)
+    first_auth = %{"type" => "auth", "token" => first.token, "deviceId" => first.device_id}
+
+    {:push, _frames, _first_replay} =
+      Socket.handle_in({JSON.encode!(first_auth), opcode: :text}, first_socket)
+
+    first_key = Org.personal_session_key(first.user_id)
+    first_main = Org.get(ctx.db, first_key)
+    assert first_main.display_name == "Main"
+
+    Org.create(ctx.db, %{
+      session_key: "reserved-main-two",
+      display_name: " main (2) ",
+      kind: "custom",
+      owner_user_id: first.user_id,
+      origin: "user:#{first.user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    {:pending, pending} =
+      Devices.pair(ctx.db, %{
+        device_id: "main-second",
+        claimed_name: "Second",
+        platform: nil,
+        model: nil
+      })
+
+    second = Devices.approve(ctx.db, pending.device_id)
+
+    {:ok, second_socket} = Socket.init(ctx.deps)
+    second_auth = %{"type" => "auth", "token" => second.token, "deviceId" => second.device_id}
+
+    {:push, frames, _second_replay} =
+      Socket.handle_in({JSON.encode!(second_auth), opcode: :text}, second_socket)
+
+    assert Enum.map(frames, fn {:text, frame} -> JSON.decode!(frame)["type"] end) == [
+             "auth_result",
+             "stream_snapshot"
+           ]
+
+    second_key = Org.personal_session_key(second.user_id)
+    second_main = Org.get(ctx.db, second_key)
+    assert second_key != first_key
+    assert second_main.display_name == "Main (3)"
+    assert second_main.owner_user_id == second.user_id
+    assert Org.get(ctx.db, first_key).display_name == "Main"
+    assert Org.get(ctx.db, first_key).owner_user_id == first.user_id
+    assert Org.get(ctx.db, "Main (3)") == nil
+  end
+
+  test "personal Main allocation failure ends auth without creating or registering a session",
+       ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "main-failure",
+        claimed_name: "Failure",
+        platform: nil,
+        model: nil
+      })
+
+    error = %Tightbeam.Org.DisplayNameError{
+      code: "display_name_taken",
+      message: "display name is already in use"
+    }
+
+    proxy = :main_seed_failure_db
+    start_supervised!({MainSeedFailureDB, {proxy, ctx.db, error}})
+    deps = %{ctx.deps | db: proxy}
+    {:ok, state} = Socket.init(deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    assert {:stop, :normal, 1000, {:text, error_frame}, _state} =
+             Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
+
+    assert JSON.decode!(error_frame) == %{
+             "type" => "error",
+             "code" => "display_name_taken",
+             "message" => "display name is already in use"
+           }
+
+    assert Org.get(ctx.db, Org.personal_session_key(device.user_id)) == nil
+    assert map_size(:sys.get_state(ctx.registry).conns) == 0
   end
 
   test "drain filters a mid-replay push already covered by the replay window", ctx do
