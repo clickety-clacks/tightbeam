@@ -320,7 +320,7 @@ defmodule Tightbeam.JobForensicsTest do
       DB.transaction(db, fn txn ->
         Wakes.cancel_in_txn(txn, %{
           wake_id: wake.wake_id,
-          requester: %{kind: "process", id: "tightbeam:supervision"},
+          requester: %{kind: "process", id: "tightbeam:assignments"},
           reason_kind: "superseded",
           causal_source: %{kind: "wake", id: replacement.wake_id},
           outcome: %{kind: "replacement", replacement_wake_id: replacement.wake_id}
@@ -594,7 +594,7 @@ defmodule Tightbeam.JobForensicsTest do
           })
 
         assert typed_cancel_in_txn(txn, original.wake_id, %{
-                 requester: %{kind: "process", id: "tightbeam:supervision"},
+                 requester: %{kind: "process", id: "tightbeam:assignments"},
                  reason_kind: "superseded",
                  causal_source: %{kind: "wake", id: replacement.wake_id},
                  outcome: %{kind: "replacement", replacement_wake_id: replacement.wake_id}
@@ -607,7 +607,7 @@ defmodule Tightbeam.JobForensicsTest do
 
     assert_proven_cancellation(entry, %{
       requesterKind: "process",
-      requesterId: "tightbeam:supervision",
+      requesterId: "tightbeam:assignments",
       reasonKind: "superseded",
       causalSourceKind: "wake",
       causalSourceId: replacement.wake_id,
@@ -642,7 +642,7 @@ defmodule Tightbeam.JobForensicsTest do
                })
 
                assert typed_cancel_in_txn(txn, rollback_original.wake_id, %{
-                        requester: %{kind: "process", id: "tightbeam:supervision"},
+                        requester: %{kind: "process", id: "tightbeam:assignments"},
                         reason_kind: "superseded",
                         causal_source: %{kind: "wake", id: rollback_replacement_id},
                         outcome: %{
