@@ -229,7 +229,6 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
         nil,
         %{assignment_id: child_assignment.id, reason: "continue after the first close"}
       )
-      |> Map.put(:supervision_interval_ms, 1_000)
 
     assert %{state: "open"} = Assignments.__handle__(ctx.db, "reopen-assignment", reopen)
 
@@ -1969,9 +1968,6 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
   defp handle(ctx, verb, call) when verb in ["assign", "attest"] do
     routed = %{call | verb: verb}
-
-    routed =
-      if verb == "assign", do: Map.put_new(routed, :supervision_interval_ms, 1_000), else: routed
 
     Assignments.__handle__(ctx.db, verb, routed)
   end
