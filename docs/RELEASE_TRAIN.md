@@ -2,12 +2,12 @@
 
 Status: **SUPERSEDED — MUST NOT IMPLEMENT.**
 
-The authority for branch and release process on both product lines is
-[CONTRIBUTING.md on main](https://github.com/clickety-clacks/tightbeam/blob/main/CONTRIBUTING.md).
-The 0.1 line uses per-version scratchpad branches. The highest `0.1.*` branch (currently
-`0.1.9`) is active until Mike calls quits. Its last build is the release: tag the branch
-tip, run proof at that tag SHA, spin the successor branch from the same tip, and never move
-the released version branch again.
+The candidate workflow below is retained as historical context only. Current
+branch and release conventions are in [AGENTS.md](../AGENTS.md): `main` holds
+the latest approved release; work on the next `0.1.N` release stays on its
+version branch (currently `0.1.16`). After approval, the tagged release commit
+is merged into `main`; docs-only corrections may also land on `main` between
+releases and should be mirrored to the current open `0.1.N` branch.
 
 The old `release-candidate/*` mechanism and `0.1.x` series branch are retired. Do not create,
 advance, or retain candidate branches. The contract below remains only to explain historical
