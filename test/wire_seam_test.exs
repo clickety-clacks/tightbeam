@@ -64,6 +64,7 @@ defmodule Tightbeam.Wire.SeamTest do
 
   test "work-item-icebox reason crosses the camelCase wire into the handler", ctx do
     owner = "wire-test-owner"
+
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 0, 1)", [owner])
 
