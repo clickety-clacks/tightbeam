@@ -14,6 +14,7 @@ defmodule Tightbeam.StaleTurnSettlement do
     Idempotency,
     Ledger,
     Org,
+    Placement,
     TurnLifecycle
   }
 
@@ -104,7 +105,14 @@ defmodule Tightbeam.StaleTurnSettlement do
   def settle(db, request, fence_valid? \\ fn -> true end) do
     case preliminary(db, request) do
       {:ok, %{adapter_gen: adapter_gen, harness: harness, host: host}} ->
-        key = {Harness.parse!(harness).id(), "shared", host}
+        harness_id = Harness.parse!(harness).id()
+
+        key =
+          if harness_id == :pi do
+            Placement.pi_session_adapter_key(request.session_key, host)
+          else
+            {harness_id, "shared", host}
+          end
 
         callback = fn adapter, connection_generation, coordinator_fence_valid? ->
           valid? = fn -> fence_valid?.() and coordinator_fence_valid?.() end

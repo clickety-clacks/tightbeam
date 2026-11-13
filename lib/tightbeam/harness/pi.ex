@@ -22,32 +22,9 @@ defmodule Tightbeam.Harness.Pi do
     )
   end
 
-  @adapter_version "0.0.33"
+  @adapter_version "0.0.34"
   @adapter_package "pi-acp"
   @adapter_bundle "index.js"
-  @adapter_replacements [
-    {
-      "          list: {},\n          delete: {}",
-      "          list: {},\n          delete: {},\n          close: {}"
-    },
-    {
-      "    this.sessions.closeAllExcept?.(session.sessionId);\n    const response = {",
-      "    // Tightbeam owns explicit session/close; keep sibling sessions alive.\n    const response = {"
-    },
-    {
-      "    const fileCommands = loadSlashCommands(params.cwd);\n    this.sessions.closeAllExcept?.(session.sessionId);\n    this.store.upsert({",
-      "    const fileCommands = loadSlashCommands(params.cwd);\n    this.store.upsert({"
-    },
-    {
-      "  async closeSession(params) {\n    this.sessions.close(params.sessionId);\n    return {};\n  }\n  async listSessions(params) {",
-      "  async closeSession(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    try {\n      if (session) await session.cancel();\n    } finally {\n      this.sessions.close(params.sessionId);\n    }\n    return {};\n  }\n  async listSessions(params) {",
-      [optional: true]
-    },
-    {
-      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {",
-      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async closeSession(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    try {\n      if (session) await session.cancel();\n    } finally {\n      this.sessions.close(params.sessionId);\n    }\n    return {};\n  }\n  async listSessions(params) {"
-    }
-  ]
   @credential_file "auth.json"
   @probe_model %Model{family: "opencode-go/gpt-5.6-luna", effort: "medium", context: nil}
   @identity_skill "served-identity"
@@ -95,7 +72,15 @@ defmodule Tightbeam.Harness.Pi do
   @impl true
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
-    controlled = ["PI_CODING_AGENT_DIR", "PI_ACP_PI_COMMAND"]
+
+    private_home =
+      Keyword.get(
+        opts,
+        :pi_private_home,
+        Path.join(target.host_config.base_dir, "work/pi-readiness-home")
+      )
+
+    controlled = ["HOME", "PI_REAL_HOME", "PI_CODING_AGENT_DIR", "PI_ACP_PI_COMMAND"]
 
     if Enum.any?(Keyword.fetch!(opts, :common_env), fn {name, _} -> name in controlled end) or
          Enum.any?(Keyword.fetch!(opts, :remote_env), fn entry ->
@@ -106,9 +91,11 @@ defmodule Tightbeam.Harness.Pi do
 
     ssh =
       if Support.local?(target) do
+        ensure_private_home!(target, private_home)
         nil
       else
         {:ok, ssh} = absolute_executable(target, "ssh")
+        ensure_private_home!(target, private_home, ssh)
         ssh
       end
 
@@ -152,13 +139,18 @@ defmodule Tightbeam.Harness.Pi do
           cmd: [binary],
           env: [
             {"PI_CODING_AGENT_DIR", home},
-            {"PI_ACP_PI_COMMAND", Path.join(home, @launcher)} | Keyword.fetch!(opts, :common_env)
+            {"PI_ACP_PI_COMMAND", Path.join(home, @launcher)},
+            {"HOME", private_home},
+            {"PI_REAL_HOME", Keyword.get(opts, :pi_real_home, local_real_home())}
+            | Keyword.fetch!(opts, :common_env)
           ]
         ]
       else
         remote_env = [
           "PI_CODING_AGENT_DIR=#{Support.shell_quote(home)}",
-          "PI_ACP_PI_COMMAND=#{Support.shell_quote(Path.join(home, @launcher))}"
+          "PI_ACP_PI_COMMAND=#{Support.shell_quote(Path.join(home, @launcher))}",
+          "PI_REAL_HOME=\"$HOME\"",
+          "HOME=#{Support.shell_quote(private_home)}"
           | Keyword.fetch!(opts, :remote_env)
         ]
 
@@ -216,12 +208,9 @@ defmodule Tightbeam.Harness.Pi do
 
   @impl true
   def ensure_adapter(target) do
-    target =
-      target
-      |> Map.put_new(:patch_adapter, &patch_local/1)
-      |> Map.put_new(:remote_patch, &patch_remote(target, &1, &2))
-
-    Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
+    Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target),
+      verify_version: @adapter_version
+    )
   end
 
   @impl true
@@ -479,7 +468,7 @@ defmodule Tightbeam.Harness.Pi do
 
   @impl true
   def conformance_vectors do
-    adapter_source = adapter_patch_fixture()
+    adapter_source = "stock pi-acp 0.0.34 fixture bytes\n"
 
     valid_model = %{
       "id" => "pi-vector",
@@ -521,13 +510,22 @@ defmodule Tightbeam.Harness.Pi do
       skills_path: Path.join([".pi", "skills"]),
       local_extra_env: %{subscription: [], api_key: []},
       rails_env: nil,
-      local_home_env: fn _base, home ->
-        [{"PI_CODING_AGENT_DIR", home}, {"PI_ACP_PI_COMMAND", Path.join(home, @launcher)}]
+      local_home_env: fn base, home ->
+        private_home = Path.join(base, "work/pi-readiness-home")
+
+        [
+          {"PI_CODING_AGENT_DIR", home},
+          {"PI_ACP_PI_COMMAND", Path.join(home, @launcher)},
+          {"HOME", private_home},
+          {"PI_REAL_HOME", local_real_home()}
+        ]
       end,
-      remote_prefix: fn _base, home, _kind ->
+      remote_prefix: fn base, home, _kind ->
         [
           "PI_CODING_AGENT_DIR=#{Support.shell_quote(home)}",
-          "PI_ACP_PI_COMMAND=#{Support.shell_quote(Path.join(home, @launcher))}"
+          "PI_ACP_PI_COMMAND=#{Support.shell_quote(Path.join(home, @launcher))}",
+          "PI_REAL_HOME=\"$HOME\"",
+          "HOME=#{Support.shell_quote(Path.join(base, "work/pi-readiness-home"))}"
         ]
       end,
       remote_rails_env: nil,
@@ -555,9 +553,10 @@ defmodule Tightbeam.Harness.Pi do
       adapter_scope: :unscoped,
       adapter_bundle: @adapter_bundle,
       adapter_version: @adapter_version,
+      stock_adapter: true,
       source: adapter_source,
-      patched: patch_adapter_source(adapter_source),
-      remote_patch_detail: "; pi adapter patched",
+      patched: adapter_source,
+      remote_patch_detail: "",
       session_meta: %{},
       cli_name: cli_binary(),
       cli_version: "0.84.1",
@@ -707,79 +706,24 @@ defmodule Tightbeam.Harness.Pi do
       ])
   end
 
-  @doc false
-  def patch_adapter_source(source) do
-    Tightbeam.Harness.AdapterPatch.patch(
-      source,
-      @adapter_replacements,
-      wire_name(),
-      @adapter_version
-    )
-  end
+  defp local_real_home, do: System.get_env("HOME") || System.user_home!()
 
-  defp patch_local(path) do
-    Tightbeam.Harness.AdapterPatch.ensure!(
-      path,
-      @adapter_package,
-      @adapter_bundle,
-      @adapter_version,
-      @adapter_replacements,
-      wire_name(),
-      scope: :unscoped
-    )
-  end
-
-  defp patch_remote(target, path, detail) do
-    script = remote_patch_script(path)
-
-    with {:ok, ssh} <- absolute_executable(target, "ssh"),
-         node when is_binary(node) <-
-           Enum.find_value(Map.get(target.host_config, :toolchain_dirs, []), fn dir ->
-             path = Path.join(dir, "node")
-
-             if Path.type(path) == :absolute do
-               case target.sh.(
-                      [ssh | Support.ssh_opts()] ++
-                        [target.host_config.ssh, "/bin/test", "-x", path]
-                    ) do
-                 {_output, 0} -> path
-                 _ -> nil
-               end
-             end
-           end) do
-      case target.sh.(
-             [ssh | Support.ssh_opts()] ++
-               [target.host_config.ssh, node, "-e", script]
-           ) do
-        {_output, 0} -> {:ok, detail <> "; pi adapter patched"}
-        {output, _exit} -> {:error, %{code: "host_unready", message: String.trim(output)}}
-      end
-    else
-      :error -> {:error, %{code: "host_unready", message: "ssh executable not found"}}
-      nil -> {:error, %{code: "host_unready", message: "remote node executable not found"}}
+  defp ensure_private_home!(target, path) do
+    if Support.local?(target) do
+      File.mkdir_p!(path)
+      File.chmod!(path, 0o700)
     end
   end
 
-  defp remote_patch_script(path) do
-    Tightbeam.Harness.AdapterPatch.remote_script(
-      path,
-      @adapter_package,
-      @adapter_bundle,
-      @adapter_replacements,
-      wire_name(),
-      scope: :unscoped,
-      version: @adapter_version
-    )
-  end
+  defp ensure_private_home!(target, path, ssh) do
+    script =
+      "umask 077; mkdir -p -- #{Support.shell_quote(path)} && chmod 700 -- #{Support.shell_quote(path)}"
 
-  defp adapter_patch_fixture do
-    [
-      "          list: {},\n          delete: {}",
-      "    this.sessions.closeAllExcept?.(session.sessionId);\n    const response = {",
-      "    const fileCommands = loadSlashCommands(params.cwd);\n    this.sessions.closeAllExcept?.(session.sessionId);\n    this.store.upsert({",
-      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {"
-    ]
-    |> Enum.join("\n")
+    Support.run!(
+      target,
+      [ssh | Support.ssh_opts()] ++
+        [target.host_config.ssh, "/bin/sh", "-c", Support.shell_quote(script)]
+    )
   end
 
   defp absolute_executable(container, name) do
