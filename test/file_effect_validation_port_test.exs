@@ -765,11 +765,75 @@ defmodule Tightbeam.FileEffectValidationPortTest do
         }
     }
 
+    # Startup can finish while its process remains under separately recorded
+    # custody. Both holder and opener may report it before review arrives.
+    completion_call =
+      %{
+        call
+        | params: %{
+            assignment_id: ctx.assignment_id,
+            kind: "completion",
+            note: "Startup observed; holder retains the foreground stop route"
+          }
+      }
+      |> Map.put(:review_pending, true)
+
+    assert %{assignment: %{state: "open"}, attest: holder_completion} = file.(completion_call)
+
+    opener = Org.personal_session_key("owner")
+
+    opener_call = %{
+      completion_call
+      | principal: {:session, opener},
+        session_key: opener,
+        origin: opener
+    }
+
+    assert %{assignment: %{state: "open"}, attest: opener_completion} = file.(opener_call)
+    assert opener_completion.id != holder_completion.id
+
+    reviewer_report =
+      capture(
+        %{ctx | assignment_id: review_id, holder: reviewer.session_key},
+        "Independent clean review of the startup evidence"
+      )
+
+    wrong_subject = %{
+      review_call
+      | params: %{
+          review_call.params
+          | artifact_id: reviewer_report.id,
+            content_sha256: reviewer_report.hash
+        }
+    }
+
+    assert %{code: "operational_evidence_invalid"} = file.(wrong_subject)
+
+    assert {:ok, [["open", nil]]} =
+             DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
+               ctx.assignment_id
+             ])
+
     wrong_review = put_in(review_call, [:params, :content_sha256], String.duplicate("0", 64))
     assert %{code: "operational_evidence_invalid"} = file.(wrong_review)
     assert Tightbeam.Assignments.list_attests(ctx.db, review_id) == []
     assert %{attest: review} = file.(review_call)
     assert {review.artifactId, review.contentSha256} == {captured.id, captured.hash}
+
+    assert {:ok, [["closed", "completed", closing_id, closer]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closingAttestId,closedBySession FROM assignments WHERE id=?1",
+               [ctx.assignment_id]
+             )
+
+    assert closing_id == holder_completion.id
+    assert closer == ctx.holder
+
+    assert Enum.any?(
+             Tightbeam.Assignments.list_attests(ctx.db, ctx.assignment_id),
+             &(&1.id == opener_completion.id)
+           )
   end
 
   test "create, assign, and dispatch attach declared metadata only on creation", ctx do
