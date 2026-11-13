@@ -99,7 +99,10 @@ defmodule Tightbeam.VerificationPapertrailTest do
         params: %{title: "papertrail #{System.unique_integer([:positive])}", is_bug: false}
       })
 
-    work = assign(ctx, ctx.holder.session_key, item.id, "implement the feature")
+    work =
+      assign(ctx, ctx.holder.session_key, item.id, "implement the feature",
+        effect_kind: "code"
+      )
 
     review =
       assign(ctx, ctx.reviewer.session_key, item.id, "review of the feature",
@@ -125,7 +128,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
   test "completion remedies still precede blocked verdict and review-placement refusals", ctx do
     learn_engineering_rules!(ctx)
-    work = assign(ctx, ctx.holder.session_key, nil, "blocked producer")
+    work = assign(ctx, ctx.holder.session_key, nil, "blocked producer", effect_kind: "code")
 
     assert {:ok, %{attest: _}} =
              Dispatch.dispatch(
@@ -168,7 +171,10 @@ defmodule Tightbeam.VerificationPapertrailTest do
           params: %{title: "refused verdict closure #{rule} #{kind}", is_bug: false}
         })
 
-      work = assign(ctx, ctx.holder.session_key, item.id, "refused verdict closure")
+      work =
+        assign(ctx, ctx.holder.session_key, item.id, "refused verdict closure",
+          effect_kind: "code"
+        )
 
       if rule == @artifact_rule do
         assert {:ok, %{attest: _}} =

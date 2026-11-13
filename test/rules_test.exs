@@ -5364,7 +5364,8 @@ defmodule Tightbeam.RulesTest do
       if op == "not_in" and
            fact in [
              "assignment.verdicts",
-             "assignment.independent_verdict_kinds"
+             "assignment.independent_verdict_kinds",
+             "assignment.qualifying_review_verdict_kinds"
            ] do
         "external_producer = true"
       else
