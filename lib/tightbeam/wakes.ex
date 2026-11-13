@@ -3382,7 +3382,7 @@ defmodule Tightbeam.Wakes do
               JOIN harness_health_incidents incident ON incident.id=observation.incidentId
               WHERE observation.correlationId =
                 'harness-turn:' || a.sourceTurnSeq || ':' || a.failureClass
-                AND observation.evidenceKind='terminal-failure'
+                AND observation.evidenceKind IN ('terminal-failure','authoritative-provider')
                 AND incident.state='open'
             )
           )
@@ -3487,7 +3487,7 @@ defmodule Tightbeam.Wakes do
         ON a.sessionKey=observed.sessionKey AND a.sourceMessageId=observed.messageId
       WHERE observation.incidentId=?1
         AND observation.failureClass=?2
-        AND observation.evidenceKind='terminal-failure'
+        AND observation.evidenceKind IN ('terminal-failure','authoritative-provider')
         AND observed.status='failed'
         AND observed.messageId IS NOT NULL
         AND a.failureClass=?2
