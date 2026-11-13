@@ -4845,13 +4845,16 @@ defmodule Tightbeam.Gateway do
 
   defp identity_relearn_result(config, db, %{params: %{action: "resolve"}} = call) do
     candidate = Identity.resolve_relearn!(config.base_dir, call.origin)
+
     publish_identity_candidate(config, db, call, candidate, %{state: "published"})
+    |> with_relearn_setup(config, db)
   end
 
   defp identity_relearn_result(config, db, call) do
     case Identity.relearn!(config.base_dir, call.origin) do
       {:ok, candidate} ->
         publish_identity_candidate(config, db, call, candidate, %{state: "published"})
+        |> with_relearn_setup(config, db)
 
       {:conflict, paths} ->
         %{
@@ -4869,6 +4872,12 @@ defmodule Tightbeam.Gateway do
         }
     end
   end
+
+  defp with_relearn_setup(%{state: "published"} = result, config, db) do
+    Map.put(result, :setup, Sentinels.setup_all(config.base_dir, db, Placement.local_host_name()))
+  end
+
+  defp with_relearn_setup(result, _config, _db), do: result
 
   defp harness_env_set(db, call) do
     p = call.params

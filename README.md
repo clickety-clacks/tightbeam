@@ -273,6 +273,11 @@ For a foreground instance after a fresh install, start
 `/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`. A service-managed
 instance starts from the same selected path after its service restart.
 
+After the service is ready, run `tightbeam kungfu setup <bundle>` for each
+learned bundle. Complete every pending item it reports, or tell the user what
+remains and why. This command reports setup requirements; it does not perform
+setup for you.
+
 ### UPGRADING AN EARLIER INSTALLATION
 
 Start with the complete [upgrade procedure](docs/UPGRADE.md): back up the
