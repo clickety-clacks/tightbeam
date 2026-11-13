@@ -126,11 +126,14 @@ defmodule Tightbeam.Harness do
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
 
   @callback records_tool_calls?() :: boolean()
+  @doc "Whether a running turn accepts model tuning without replacing its conversation."
+  @callback running_model_tuning_supported?() :: boolean()
 
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       records_tool_calls?: 0,
+                      running_model_tuning_supported?: 0,
                       submission_text_limit: 0,
                       project_session_identity: 3,
                       verify_session_identity_hook: 2
@@ -195,6 +198,22 @@ defmodule Tightbeam.Harness do
     module = module!(harness)
     Code.ensure_loaded!(module)
     function_exported?(module, :records_tool_calls?, 0) and module.records_tool_calls?()
+  end
+
+  @spec running_model_tuning_supported?(atom() | binary()) :: boolean()
+  def running_model_tuning_supported?(harness) do
+    case Enum.find(known(), fn module ->
+           harness in [module, module.id(), module.wire_name()]
+         end) do
+      nil ->
+        false
+
+      module ->
+        Code.ensure_loaded!(module)
+
+        function_exported?(module, :running_model_tuning_supported?, 0) and
+          module.running_model_tuning_supported?()
+    end
   end
 
   @callback conformance_vectors() :: %{
