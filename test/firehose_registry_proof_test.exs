@@ -26,6 +26,8 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     {~w(read_marker.updated), "read-markers", "upsert", ["userId", "scopeKey"], :read_marker},
     {~w(message.created), "messages", "upsert", ["messageId", "sessionKey"], :message},
     {~w(transition.recorded), "messages", "upsert", ["messageId", "sessionKey"], :message},
+    {~w(message.segment_recorded tool_call.event_recorded), "turn events", "upsert",
+     ["turnEventId"], :turn_event},
     {~w(tool_call.started tool_call.ended), "tool calls", "upsert", ["toolCallId", "sessionKey"],
      :tool_call},
     {~w(condition_fact.filed), "condition-facts", "upsert", ["factId"], :condition_fact},
