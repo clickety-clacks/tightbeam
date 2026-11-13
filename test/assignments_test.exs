@@ -3691,6 +3691,54 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
+  test "a settled cannot-proceed replays identically and permits a new lifecycle after reopen",
+       ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, "reopened dependency")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    first_filing =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "wait for the opener to decide")
+
+    first_block = handle(ctx, "attest", first_filing)
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "resume the dependency")
+             )
+
+    settled_replay = handle(ctx, "attest", first_filing)
+
+    assert settled_replay.replayed
+    assert settled_replay.cannotProceed.id == first_block.cannotProceed.id
+    assert settled_replay.cannotProceed.state == "settled"
+    assert Assignments.attest_count(ctx.db, assignment.id) == 1
+
+    second_filing =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the dependency is blocked for a new reason")
+
+    second_block = handle(ctx, "attest", second_filing)
+
+    assert %{assignment: %{state: "open"}, cannotProceed: %{state: "standing"}} = second_block
+    assert second_block.cannotProceed.id != first_block.cannotProceed.id
+    assert second_block.decisionRequest.id != first_block.decisionRequest.id
+
+    third_filing = put_in(second_filing, [:params, :note], "a third reason")
+    assert %{code: "cannot_proceed_conflict"} = handle(ctx, "attest", third_filing)
+
+    assert Assignments.attest_count(ctx.db, assignment.id) == 2
+  end
+
   test "install reconciliation disposes a closed completed hold by its completion attest", ctx do
     {assignment, blocked, closing_attest_id, closed_at} =
       stranded_completed_assignment(ctx, "stranded completed assignment")
