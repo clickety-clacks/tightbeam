@@ -314,8 +314,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert closed.revocationReason == "first REST close"
     closed_notice = Publisher.state_notice(ctx.db, call, closed)
 
-    assert JSON.decode!(get(ctx, "/api/assignments/#{ctx.assignment.id}").resp_body)["item"] ==
-             closed_notice["payload"]
+    closed_response = get(ctx, "/api/assignments/#{ctx.assignment.id}")
+    assert closed_response.status == 200
+    closed_item = JSON.decode!(closed_response.resp_body)["item"]
+    assert closed_item["effectKind"] == "evidence"
+    assert closed_notice["payload"]["effectKind"] == nil
+    assert Map.put(closed_notice["payload"], "effectKind", "evidence") == closed_item
 
     :ok = Hub.register(Hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: true})
 
@@ -363,7 +367,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert refs["assignmentId"] == ctx.assignment.id
     response = get(ctx, "/api/assignments/#{ctx.assignment.id}")
     assert response.status == 200
-    assert JSON.decode!(response.resp_body)["item"] == payload
+    reopened_item = JSON.decode!(response.resp_body)["item"]
+    assert payload["effectKind"] == nil
+    assert reopened_item["effectKind"] == "evidence"
+    assert Map.put(payload, "effectKind", "evidence") == reopened_item
     assert payload["revocationReason"] == nil
     notice = %{"class" => "assignment.reopened", "payload" => payload, "refs" => refs}
     assert StateVisibility.visible?(ctx.db, notice, "flynn", false)
@@ -379,8 +386,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert second.revocationReason == "second REST close"
     second_notice = Publisher.state_notice(ctx.db, second_call, second)
 
-    assert JSON.decode!(get(ctx, "/api/assignments/#{ctx.assignment.id}").resp_body)["item"] ==
-             second_notice["payload"]
+    second_response = get(ctx, "/api/assignments/#{ctx.assignment.id}")
+    assert second_response.status == 200
+    second_item = JSON.decode!(second_response.resp_body)["item"]
+    assert second_notice["payload"]["effectKind"] == nil
+    assert second_item["effectKind"] == "evidence"
+    assert Map.put(second_notice["payload"], "effectKind", "evidence") == second_item
 
     assert second_notice["payload"]["rowVersion"] > payload["rowVersion"]
     assert Assignments.__handle__(ctx.db, "revoke-assignment", second_call) == second
@@ -391,6 +402,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     for %{resource: resource, path: path, item: item} <- cases do
       item_bytes = StateResources.encode_item(resource, item, ctx.catalog)
+
+      if resource == "assignments" do
+        assert item["effectKind"] == nil
+        assert JSON.decode!(item_bytes)["effectKind"] == "evidence"
+      end
+
       response = get(ctx, path)
 
       assert response.status == 200, "#{path}: #{response.resp_body}"
@@ -1754,7 +1771,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       response = get(ctx, path, "tbc_core_detail")
       assert response.status == 200, "#{path}: #{response.resp_body}"
       assert_application_headers(response)
-      assert JSON.decode!(response.resp_body)["resource"] == resource
+      decoded = JSON.decode!(response.resp_body)
+      assert decoded["resource"] == resource
+
+      if resource == "assignments" do
+        assert decoded["item"]["effectKind"] == "evidence"
+      end
     end
   end
 
@@ -1767,6 +1789,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert success.status == 200
       assert_application_headers(success)
       assert_trace(success_trace, row, :success)
+
+      if row.resource == "assignments" do
+        assert JSON.decode!(success.resp_body)["item"]["effectKind"] == "evidence"
+      end
 
       {forbidden, forbidden_trace} = traced_get(ctx, row.path, outsider.token)
       {unknown, unknown_trace} = traced_get(ctx, unknown_path(row), outsider.token)
@@ -2530,7 +2556,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   end
 
   test "AC9 ignores conditional validators and emits only the closed application headers", ctx do
-    for %{path: path} <- core_detail_cases(ctx) do
+    for %{path: path, resource: resource} <- core_detail_cases(ctx) do
       ordinary = get(ctx, path)
 
       conditional =
@@ -2542,6 +2568,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert conditional.status == 200
       assert conditional.resp_body == ordinary.resp_body
       assert_application_headers(conditional)
+
+      if resource == "assignments" do
+        assert JSON.decode!(conditional.resp_body)["item"]["effectKind"] == "evidence"
+      end
     end
   end
 
@@ -2560,10 +2590,18 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       expected_keys = Map.fetch!(@r7_fields, resource) |> MapSet.new()
       assert MapSet.new(Map.keys(item)) == expected_keys
       refute StateResources.item_has_secret_fields?(item)
-      assert_wire_contract(resource, item)
       assert_populated_contract(resource, item)
 
       expected = StateResources.encode_item(resource, item, ctx.catalog)
+      wire_item = JSON.decode!(expected)
+      assert_wire_contract(resource, wire_item)
+
+      if resource == "assignments" do
+        assert item["reviewsAssignmentId"] == item["id"]
+        assert item["effectKind"] == nil
+        assert wire_item["effectKind"] == "review"
+      end
+
       assert_ordered_fields(expected, Map.fetch!(@r7_fields, resource))
       response = get(ctx, path)
       assert response.status == 200

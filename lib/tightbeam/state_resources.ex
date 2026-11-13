@@ -2306,6 +2306,7 @@ defmodule Tightbeam.StateResources do
   def encode_item(resource, item, catalog)
       when is_binary(resource) and is_map(item) and is_map(catalog) do
     resource = Map.get(@item_resource_aliases, resource, resource)
+    item = assignment_wire_item(resource, item)
     fields = Map.fetch!(@item_field_order, resource)
     fields = conditional_fields!(resource, fields, item)
     exact_item_keys!(resource, item, fields)
@@ -2319,6 +2320,13 @@ defmodule Tightbeam.StateResources do
 
     "{" <> encoded <> "}"
   end
+
+  defp assignment_wire_item("assignments", %{"effectKind" => nil} = item) do
+    effect_kind = if is_nil(item["reviewsAssignmentId"]), do: "evidence", else: "review"
+    Map.put(item, "effectKind", effect_kind)
+  end
+
+  defp assignment_wire_item(_resource, item), do: item
 
   @doc false
   def item_shape_complete?(resource, item) when is_binary(resource) and is_map(item) do
