@@ -383,7 +383,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
              prepare.(call, legacy)
   end
 
-  test "artifact presence alone cannot select operational evidence", ctx do
+  test "attached non-code artifact is retained without a selected operational policy", ctx do
     assert Rules.active_admission_contract("attest") == "legacy"
 
     {:ok, _} =
@@ -394,11 +394,14 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       )
 
     captured = capture(ctx, "operation and observed result")
+    snapshot = Rules.effective_snapshot() |> Map.put(:policies, [])
 
     call = %{
       verb: "attest",
       principal: {:session, ctx.holder},
+      session_key: ctx.holder,
       origin: ctx.holder,
+      rules_prechecked: true,
       params: %{
         assignment_id: ctx.assignment_id,
         kind: "verdict",
@@ -408,8 +411,70 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       }
     }
 
-    assert {:error, %Mementos.Refusal{code: "non_file_operational_evidence_policy_inactive"}} =
-             DB.transaction(ctx.db, fn txn -> AttestEvidence.prepare_in_txn!(txn, call) end)
+    assert :none =
+             Rules.with_snapshot(snapshot, fn ->
+               Rules.select_policy(ctx.db, "attest-operational-evidence", call)
+             end)
+
+    file = fn candidate ->
+      Rules.with_snapshot(snapshot, fn -> ctx.handlers["attest"].(candidate) end)
+    end
+
+    verified = file.(call)
+
+    assert %{
+             attest: %{
+               verdictKind: "verified",
+               artifactId: artifact_id,
+               contentSha256: digest,
+               commitRefs: nil
+             }
+           } = verified
+
+    assert artifact_id == captured.id
+    assert digest == captured.hash
+
+    assert {:ok, [[^artifact_id, ^digest]]} =
+             DB.query(
+               ctx.db,
+               "SELECT artifactId,contentSha256 FROM attests WHERE id=?1",
+               [verified.attest.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND artifactId=?2 AND contentSha256=?3",
+               [ctx.assignment_id, artifact_id, digest]
+             )
+  end
+
+  test "a captured artifact does not replace code commit refs", ctx do
+    captured = capture(ctx, "code result")
+    snapshot = Rules.effective_snapshot() |> Map.put(:policies, [])
+
+    call = %{
+      verb: "attest",
+      principal: {:session, ctx.holder},
+      session_key: ctx.holder,
+      origin: ctx.holder,
+      rules_prechecked: true,
+      params: %{
+        assignment_id: ctx.assignment_id,
+        kind: "verdict",
+        verdict_kind: "verified",
+        artifact_id: captured.id,
+        content_sha256: captured.hash
+      }
+    }
+
+    assert %{code: "invalid_commit_refs"} =
+             Rules.with_snapshot(snapshot, fn -> ctx.handlers["attest"].(call) end)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM attests WHERE assignmentId=?1", [
+               ctx.assignment_id
+             ])
   end
 
   test "legacy code remains outside operational evidence under an overbroad policy", ctx do

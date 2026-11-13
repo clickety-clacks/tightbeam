@@ -161,6 +161,13 @@ defmodule Tightbeam.AttestEvidence do
         require_pair!(call)
         Map.put(call, :validated_operational_evidence, OperationalEvidence.validate!(txn, call))
 
+      not assignment.files_present and assignment.effect_kind != "code" and artifact_supplied? ->
+        # A captured artifact can substantiate non-code work even when no
+        # operational evidence policy is selected. Keep validating its bytes
+        # and attribution, and leave code verification on its commit-ref path.
+        require_pair!(call)
+        Map.put(call, :validated_operational_evidence, OperationalEvidence.validate!(txn, call))
+
       not assignment.files_present and artifact_supplied? ->
         refuse!(
           "non_file_operational_evidence_policy_inactive",

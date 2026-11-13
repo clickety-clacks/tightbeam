@@ -6629,6 +6629,15 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
 
+    artifact_only_verification =
+      attest_call({:session, "holder"}, producer.id, "verdict")
+      |> put_in([:params, :verdict_kind], "verified")
+      |> put_in([:params, :artifact_id], "art_code_report")
+      |> put_in([:params, :content_sha256], String.duplicate("a", 64))
+
+    assert %{code: "invalid_commit_refs"} =
+             handle(ctx, "attest", artifact_only_verification)
+
     assert %{attest: %{verdictKind: "verified"}} =
              attest_call({:session, "holder"}, producer.id, "verdict")
              |> put_in([:params, :verdict_kind], "verified")
