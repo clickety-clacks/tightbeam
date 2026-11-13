@@ -7242,6 +7242,159 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
+  test "attest records without probing and check-attest checks only its files", ctx do
+    item = create_work_item(ctx, "file check")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+
+    for {id, producer, origin, state, home} <- [
+          {"art_attached", nil, "lab1:/files/attached", "in-workspace", nil},
+          {"art_present", assignment.id, "lab1:/files/present", "in-workspace", nil},
+          {"art_missing", assignment.id, "lab1:/files/missing", "in-workspace", nil},
+          {"art_unreachable", assignment.id, "lab1:/files/unreachable", "in-workspace", nil},
+          {"art_disappeared_host", assignment.id, "missinghost:/files/unknown", "in-workspace", nil},
+          {"art_archived", assignment.id, "lab1:/files/old", "archived", "/files/archive"},
+          {"art_unrelated", nil, "lab1:/files/unrelated", "in-workspace", nil}
+        ] do
+      seed_file_artifact(ctx.db, item.id, id, producer, origin, state, home)
+    end
+
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        sh: fn _ -> send(parent, :attest_probe); {"", 0} end,
+        file_stat: fn path ->
+          send(parent, {:checked, path})
+
+          case path do
+            "/files/missing" -> {:error, :enoent}
+            "/files/unreachable" -> {:error, :eacces}
+            _ -> {:ok, %{}}
+          end
+        end
+      })
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> then(&handlers["attest"].(&1))
+
+    assert attested.attest.kind == "progress"
+    refute Map.has_key?(attested, :referents)
+    refute_received :attest_probe
+    refute_received {:checked, _}
+
+    # Only verdict attests can carry an attached artifact. Seed that existing
+    # record shape so the check exercises both file sources.
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO attests
+          (id, assignmentId, kind, verdictKind, byUser, artifactId, contentSha256, ts)
+        VALUES ('att_with_artifact', ?1, 'verdict', 'user-ruling', 'flynn',
+                'art_attached', ?2, 2)
+        """,
+        [assignment.id, String.duplicate("a", 64)]
+      )
+
+    assert {:ok, result} =
+             Dispatch.dispatch(
+               ctx.db,
+               handlers,
+               call("check-attest", {:session, "holder"}, nil, %{attest_id: "att_with_artifact"})
+             )
+
+    assert Enum.map(result.files, &{&1.artifactId, &1.status, &1[:error]}) == [
+             {"art_archived", "present", nil},
+             {"art_attached", "present", nil},
+             {"art_disappeared_host", "could_not_access", "unknown host: missinghost"},
+             {"art_missing", "absent", nil},
+             {"art_present", "present", nil},
+             {"art_unreachable", "could_not_access", "eacces"}
+           ]
+
+    assert result.summary ==
+             "absent: lab1:/files/missing; could not access: missinghost:/files/unknown, lab1:/files/unreachable"
+    assert_received {:checked, "/files/archive"}
+    refute_received {:checked, "/files/old"}
+    refute_received {:checked, "/files/unrelated"}
+    refute_received :attest_probe
+  end
+
+  test "a blocked requested file check does not block another attest", ctx do
+    item = create_work_item(ctx, "blocked check")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+    seed_file_artifact(ctx.db, item.id, "art_blocked", assignment.id, "lab1:/files/blocked")
+    first = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        file_stat: fn _path ->
+          send(parent, {:check_entered, self()})
+          receive do
+            :release_check -> {:ok, %{}}
+          end
+        end
+      })
+
+    check =
+      Task.async(fn ->
+        Dispatch.dispatch(
+          ctx.db,
+          handlers,
+          call("check-attest", {:session, "holder"}, nil, %{attest_id: first.attest.id})
+        )
+      end)
+
+    assert_receive {:check_entered, check_pid}, 5_000
+    assert check_pid == check.pid
+
+    another =
+      Task.async(fn ->
+        handlers["attest"].(attest_call({:session, "holder"}, assignment.id, "progress"))
+      end)
+
+    assert %{attest: %{kind: "progress"}} = Task.await(another, 10_000)
+    send(check.pid, :release_check)
+    assert {:ok, %{files: [%{status: "present"}], summary: "All 1 files are present on disk."}} =
+             Task.await(check, 10_000)
+  end
+
+  test "check-attest reports real local file presence and disappearance", ctx do
+    item = create_work_item(ctx, "local file")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+    path = Path.join(Application.fetch_env!(:tightbeam, :base_dir), "checked-file")
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, "recorded bytes")
+
+    seed_file_artifact(
+      ctx.db,
+      item.id,
+      "art_local",
+      assignment.id,
+      "#{Tightbeam.Placement.local_host_name()}:#{path}"
+    )
+
+    attested = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
+    check = fn ->
+      Gateway.handlers(%{db: ctx.db, base_dir: Application.fetch_env!(:tightbeam, :base_dir)})[
+        "check-attest"
+      ].(%{params: %{attest_id: attested.attest.id}})
+    end
+
+    assert %{files: [%{status: "present"}], summary: "All 1 files are present on disk."} =
+             check.()
+
+    File.rm!(path)
+    assert %{files: [%{status: "absent"}]} = check.()
+  end
+
   test "accepted handler rolls back when its event append fails", ctx do
     {:ok, _} = DB.query(ctx.db, "DROP TABLE events")
 
@@ -7433,6 +7586,20 @@ defmodule Tightbeam.AssignmentsTest do
     assert settled.releaseFactCheck.matcherPredicate == true
     assert settled.releaseFactCheck.eligible == false
     assert snapshot.() == before_settled_reads
+  end
+
+  defp seed_file_artifact(db, work_item_id, id, producer, origin, state \\ "in-workspace", home \\ nil) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO artifacts
+          (artifactId, kind, title, createdBySession, workItemId,
+           producedByAssignmentId, originPath, state, home, createdAt, updatedAt)
+        VALUES (?1, 'report', ?1, 'holder', ?2, ?3, ?4, ?5, ?6, 1, 1)
+        """,
+        [id, work_item_id, producer, origin, state, home]
+      )
   end
 
   defp handle(ctx, verb, call)

@@ -73,7 +73,7 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-follow harklight-briefings-catchup spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-follow harklight-briefings-catchup spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests check-attest revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
                    "fact-demand",
@@ -4355,7 +4355,7 @@ defmodule Tightbeam.Wire.Router do
   # delivery uses it to bind the wake to its authoritative decision row.
   #
   # Scoped per verb deliberately: `assignmentId` is an ORDINARY caller param on
-  # attest/assign/dispatch/effort-rule, which name the assignment they act on. A
+  # attest/assign/dispatch, which name the assignment they act on. A
   # blanket strip breaks all of those (the CLI round-trip suite proves it), so the
   # spec's "stripped from any agent/dispatch param map" is read as scoped to the
   # carrier it is written about, not to the parameter name everywhere.
@@ -4447,6 +4447,7 @@ defmodule Tightbeam.Wire.Router do
     "attest" =>
       ~w(artifact_id assignment_id commit_refs content_sha256 kind mementos note release_fact_kind release_fact_principal_ref release_fact_scope verdict_kind wait_id)a,
     "attests" => ~w(assignment_id)a,
+    "check-attest" => ~w(attest_id)a,
     "breathing" => ~w(target_id target_kind)a,
     "cancel" => ~w(assignment_id reason)a,
     "condition" => ~w(idempotency_key kind payload scope)a,
@@ -4456,7 +4457,6 @@ defmodule Tightbeam.Wire.Router do
     "decision-requests" => ~w(status)a,
     "dispatch" =>
       ~w(brief effect_kind holder_key idempotency_key mementos prompt session_key subject succeeds_assignment_id parent_assignment_id work_item_id workdir_root owner_user_id)a,
-    "effort-rule" => ~w(action request request_id)a,
     "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
     "execution-map-select" =>
       ~w(assignments under origin owner state spec spec_sha session quiet_over)a,

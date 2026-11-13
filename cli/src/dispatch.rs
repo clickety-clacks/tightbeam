@@ -916,19 +916,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
-        Command::EffortRule {
-            identity,
-            request_id,
-            action,
-        } => Ok(request(
-            identity,
-            "effort-rule",
-            vec![],
-            vec![
-                string_field("request", request_id),
-                string_field("action", action),
-            ],
-        )),
         Command::Ask {
             identity,
             target,
@@ -1552,6 +1539,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             "attests",
             vec![],
             vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::CheckAttest {
+            identity,
+            attest_id,
+        } => Ok(request(
+            identity,
+            "check-attest",
+            vec![],
+            vec![string_field("attestId", attest_id)],
         )),
         Command::AssignmentGet {
             identity,
@@ -4036,7 +4032,6 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::SessionConnect { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
-        | Command::EffortRule { identity, .. }
         | Command::Ask { identity, .. }
         | Command::Answer { identity, .. }
         | Command::Return { identity, .. }
@@ -4072,6 +4067,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::MementoSet { identity, .. }
         | Command::Mementos { identity, .. }
         | Command::Attests { identity, .. }
+        | Command::CheckAttest { identity, .. }
         | Command::AssignmentGet { identity, .. }
         | Command::Assignments { identity, .. }
         | Command::CancelWake { identity, .. }
@@ -5427,18 +5423,6 @@ mod tests {
         );
 
         assert_eq!(
-            body(&[
-                "effort-rule",
-                "--request",
-                "dr_1",
-                "--action",
-                "continue",
-                "--as",
-                "parent",
-            ]),
-            r#"{"as":"parent","verb":"effort-rule","params":{"request":"dr_1","action":"continue"}}"#
-        );
-        assert_eq!(
             body(&["decision-requests", "--status", "open", "--as", "parent"]),
             r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#
         );
@@ -5653,6 +5637,10 @@ mod tests {
         assert_eq!(
             body(&["attests", "asg_1", "--as", "reviewer"]),
             r#"{"as":"reviewer","verb":"attests","params":{"assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&["check-attest", "att_1", "--as", "reviewer"]),
+            r#"{"as":"reviewer","verb":"check-attest","params":{"attestId":"att_1"}}"#
         );
         assert_eq!(
             body(&[

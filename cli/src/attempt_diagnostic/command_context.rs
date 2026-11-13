@@ -89,7 +89,6 @@ impl CommandContext {
             Tune { .. } => ("cli.tune", DispatchPath),
             Assign { .. } => ("cli.assign", DispatchPath),
             Dispatch { .. } => ("cli.dispatch", DispatchPath),
-            EffortRule { .. } => ("cli.effort_rule", DispatchPath),
             Ask { .. } => ("cli.ask", DispatchPath),
             Answer { .. } => ("cli.answer", DispatchPath),
             // Current spelling changed; preserve the existing operation.
@@ -130,6 +129,7 @@ impl CommandContext {
             MementoSet { .. } => ("cli.memento_set", DispatchPath),
             Mementos { .. } => ("cli.mementos", DispatchPath),
             Attests { .. } => ("cli.attests", DispatchPath),
+            CheckAttest { .. } => ("cli.check_attest", DispatchPath),
             AssignmentGet { .. } => ("cli.assignment_get", DispatchPath),
             Assignments { .. } => ("cli.assignments", DispatchPath),
             CancelWake { .. } => ("cli.cancel_wake", DispatchPath),
@@ -340,6 +340,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | DurableTopline { .. }
         | Mementos { .. }
         | Attests { .. }
+        | CheckAttest { .. }
         | AssignmentGet { .. }
         | Assignments { .. }
         | IdentityStatus { .. }
@@ -458,7 +459,6 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | ToolCallObserved
         | RoleBind { .. }
         | Tune { .. }
-        | EffortRule { .. }
         | Ask { .. }
         | Answer { .. }
         | Return { .. }

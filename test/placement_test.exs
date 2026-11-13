@@ -304,11 +304,6 @@ defmodule Tightbeam.PlacementTest do
     assert error.message == expected
   end
 
-  test "origin checks name a disappeared host", %{base_dir: base_dir, db: db} do
-    assert %{"/work/file" => {:error, "no host named eurisko is registered"}} =
-             Placement.check_origins(%{base_dir: base_dir, db: db}, "eurisko", ["/work/file"])
-  end
-
   test "move_workdir copies local to local", %{base_dir: base_dir, db: db} do
     old_base = Path.join(base_dir, "old-local")
     new_base = Path.join(base_dir, "new-local")

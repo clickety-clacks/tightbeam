@@ -75,6 +75,7 @@ defmodule Tightbeam.Gateway do
     DB,
     Devices,
     EffortCheckin,
+    AttestFileCheck,
     ErrorDiagnostic,
     Escalation,
     EventLog,
@@ -977,9 +978,6 @@ defmodule Tightbeam.Gateway do
           scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
         )
       end,
-      {"effort-rule", ["decision_request.ruled"]} => fn call ->
-        EffortCheckin.rule(db, config, call)
-      end,
       {"waive", []} => fn call ->
         Escalation.waive(db, call,
           authorized: admin_caller?(db, call),
@@ -1590,11 +1588,9 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:wake_scheduler, Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
-          # Referent verification reaches hosts, so it needs the same placement
-          # config and injectable runner as the gateway.
-          |> Map.put(:placement_config, config)
         )
       end,
+      {"check-attest", []} => fn call -> AttestFileCheck.check(db, config, call) end,
       {"attests", []} => fn call -> Assignments.__handle__(db, "attests", call) end,
       {"assignment-get", []} => fn call -> Assignments.__handle__(db, "assignment-get", call) end,
       {"assignment-commitref-correct", []} => fn call ->

@@ -3015,8 +3015,8 @@ defmodule Tightbeam.CliIntegrationTest do
     refute_receive {:cli_call, %{verb: "assignments"}}
   end
 
-  test "real CLI retired producer verbs are unknown commands", ctx do
-    for verb <- ["run-tests", "run-smoke", "cancel-producer-job"] do
+  test "real CLI retired verbs are unknown commands", ctx do
+    for verb <- ["run-tests", "run-smoke", "cancel-producer-job", "effort-rule"] do
       {output, status} =
         System.cmd(ctx.binary, [verb, "asg_1"],
           cd: ctx.workdir,
@@ -3026,135 +3026,6 @@ defmodule Tightbeam.CliIntegrationTest do
       assert status != 0
       assert output =~ "unknown command"
     end
-  end
-
-  test "real CLI prefers the expecter but permits an exact-id delegate with canonical replay",
-       ctx do
-    continue_request = open_effort_request(ctx, "continue")
-    worker_dir = session_workdir!(ctx, ctx.worker)
-
-    {requests, 0} =
-      System.cmd(ctx.binary, ["decision-requests", "--status", "open"],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert requests =~ continue_request
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "decision-requests",
-                      principal: {:session, "cli-holder"},
-                      params: %{status: "open"}
-                    }}
-
-    {worker_requests, 0} =
-      System.cmd(ctx.binary, ["decision-requests", "--status", "open"],
-        cd: worker_dir,
-        stderr_to_stdout: true
-      )
-
-    refute worker_requests =~ continue_request
-
-    {exact, 0} =
-      System.cmd(ctx.binary, ["decision-request", "--request", continue_request],
-        cd: worker_dir,
-        stderr_to_stdout: true
-      )
-
-    assert %{
-             "decisionRequest" => %{
-               "id" => ^continue_request,
-               "kind" => "effort",
-               "expecterSessionKey" => "cli-holder",
-               "assignmentId" => assignment_id
-             }
-           } = JSON.decode!(exact)
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "decision-request",
-                      principal: {:session, "cli-worker"},
-                      params: %{request: ^continue_request}
-                    }}
-
-    {:ok, [[generation_count]]} =
-      DB.query(
-        ctx.db,
-        "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId = ?1",
-        [assignment_id]
-      )
-
-    {continued, 0} =
-      System.cmd(
-        ctx.binary,
-        ["effort-rule", "--request", continue_request, "--action", "continue"],
-        cd: worker_dir,
-        stderr_to_stdout: true
-      )
-
-    assert continued =~ "continue"
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "effort-rule",
-                      principal: {:session, "cli-worker"},
-                      params: %{request: ^continue_request, action: "continue"}
-                    }}
-
-    assert {:ok, [["session:cli-worker"]]} =
-             DB.query(ctx.db, "SELECT ruledBy FROM decision_requests WHERE id = ?1", [
-               continue_request
-             ])
-
-    {replayed, 0} =
-      System.cmd(
-        ctx.binary,
-        ["effort-rule", "--request", continue_request, "--action", "continue"],
-        cd: worker_dir,
-        stderr_to_stdout: true
-      )
-
-    assert replayed =~ "continue"
-
-    assert {:ok, [[count_after_replay]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId = ?1",
-               [assignment_id]
-             )
-
-    assert count_after_replay == generation_count
-
-    {refused_replay, refused_status} =
-      System.cmd(
-        ctx.binary,
-        ["effort-rule", "--request", continue_request, "--action", "continue"],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert refused_status != 0
-    assert refused_replay =~ "not_open"
-
-    dismiss_request = open_effort_request(ctx, "dismiss")
-
-    {dismissed, 0} =
-      System.cmd(
-        ctx.binary,
-        ["effort-rule", "--request", dismiss_request, "--action", "dismiss"],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert dismissed =~ "dismiss"
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "effort-rule",
-                      principal: {:session, "cli-holder"},
-                      params: %{request: ^dismiss_request, action: "dismiss"}
-                    }}
   end
 
   test "real gateway dispatch preserves ruled list and exact response equality",
@@ -3726,70 +3597,6 @@ defmodule Tightbeam.CliIntegrationTest do
                         priority: 7
                       }
                     }}
-  end
-
-  defp open_effort_request(ctx, action) do
-    key = "effort-#{action}-#{System.unique_integer([:positive])}"
-
-    {dispatched, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "dispatch",
-          "--holder",
-          "cli-worker",
-          "--subject",
-          "effort #{action}",
-          "--brief",
-          "Exercise the #{action} ruling path.",
-          "--key",
-          key
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assignment_id = JSON.decode!(dispatched)["id"]
-
-    assert_receive {:cli_call, %{verb: "dispatch", params: %{idempotency_key: ^key}}}
-
-    request_id = "dr_" <> Tightbeam.Id.uuid4()
-    now = System.system_time(:millisecond)
-
-    legacy_deadline =
-      Wakes.schedule(ctx.db, %{
-        session_key: "cli-holder",
-        origin: "process:tightbeam",
-        consumer: "effort_deadline",
-        prompt: nil,
-        due_at: now + 60_000,
-        assignment_id: assignment_id
-      })
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        """
-        INSERT INTO decision_requests
-          (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
-           lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
-           question, options, context, status)
-        VALUES (?1, 'effort', 'process:tightbeam', 'flynn', ?2, 'cli-holder',
-                1, 1, ?3, ?4, ?5, ?6, ?7, ?8, 'open')
-        """,
-        [
-          request_id,
-          assignment_id,
-          legacy_deadline.wake_id,
-          now,
-          now + 60_000,
-          "Continue or dismiss?",
-          JSON.encode!(["continue", "dismiss"]),
-          JSON.encode!(%{"actions" => ["continue", "dismiss"]})
-        ]
-      )
-
-    request_id
   end
 
   test "real CLI rejects closed or retired Topline shapes before router dispatch", ctx do

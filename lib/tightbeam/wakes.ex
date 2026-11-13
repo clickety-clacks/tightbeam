@@ -4379,7 +4379,6 @@ defmodule Tightbeam.Wakes do
     "tightbeam:escalation" => ~w(obligation_disposed),
     "tightbeam:sentinel-supervisor" => ~w(condition_cleared),
     "tightbeam:harness-health" => ~w(condition_cleared),
-    "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
     "tightbeam:supervision" => ~w(superseded),
     "tightbeam:row-reactions" => ~w(superseded),
     "tightbeam:rail-remedy" => ~w(superseded),
@@ -4835,23 +4834,6 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp durable_source(
-         txn,
-         %{
-           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-           reason_kind: "superseded"
-         },
-         "progress_attest",
-         source_id,
-         wake,
-         _canceled_at
-       )
-       when is_binary(source_id) and source_id != "" do
-    if effort_holder_prod_attest?(txn, source_id, wake),
-      do: {:ok, source_id, nil},
-      else: :error
-  end
-
   defp durable_source(txn, _command, source_kind, source_id, wake, _canceled_at)
        when source_kind != "verb_call" and is_binary(source_id) and source_id != "" do
     case validate_source(txn, source_kind, source_id, wake) do
@@ -5114,8 +5096,6 @@ defmodule Tightbeam.Wakes do
       nil ->
         if inactivity_policy_action_cancellation?(command, outcome, wake, primary) or
              retirement_no_replacement_without_liveness?(command, outcome) or
-             exact_terminal_effort_request?(txn, command, outcome, wake, primary) or
-             cleared_effort_holder_prod_without_liveness?(txn, command, outcome, wake, primary) or
              completed_assignment_without_liveness?(txn, command, outcome, wake, primary) or
              cleared_decision_notice_without_liveness?(txn, command, outcome, wake, primary) or
              ladder_ended_source_cancellation?(txn, command, outcome, primary),
@@ -5175,20 +5155,6 @@ defmodule Tightbeam.Wakes do
            causal_source: %{kind: "assignment_transition", id: id}
          },
          %{kind: "disposition", disposition_kind: "assignment_transition", disposition_id: id}
-       ),
-       do: true
-
-  defp ladder_ended_source_shape?(
-         %{
-           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-           reason_kind: "obligation_disposed",
-           causal_source: %{kind: "decision_request", id: id}
-         },
-         %{
-           kind: "disposition",
-           disposition_kind: "decision_request_transition",
-           disposition_id: id
-         }
        ),
        do: true
 
@@ -5267,77 +5233,6 @@ defmodule Tightbeam.Wakes do
 
   defp cleared_decision_notice_without_liveness?(_txn, _command, _outcome, _wake, _primary),
     do: false
-
-  # An open effort request is itself the agent's exit. Once the current
-  # expecter transitions that exact request, the transition is sufficient
-  # typed proof to cancel only its own deadline controller. This does not
-  # stand in for liveness on any other wake: every identity and carrier field
-  # is joined back to the terminal request row in this transaction.
-  defp exact_terminal_effort_request?(
-         txn,
-         command,
-         %{
-           kind: "disposition",
-           disposition_kind: "decision_request_transition",
-           disposition_id: request_id
-         },
-         %{
-           wake_id: wake_id,
-           assignment_id: assignment_id,
-           consumer: "effort_deadline"
-         },
-         %{kind: "assignment", id: assignment_id, impact: "linked_work_open"}
-       ) do
-    with %{
-           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-           reason_kind: "obligation_disposed",
-           causal_source: %{kind: "decision_request", id: ^request_id}
-         } <- command,
-         %{id: ^request_id, assignment_id: ^assignment_id, deadline_wake_id: ^wake_id} <-
-           Escalation.effort_terminal_in_txn(txn, request_id) do
-      true
-    else
-      _ -> false
-    end
-  end
-
-  defp exact_terminal_effort_request?(_txn, _command, _outcome, _wake, _primary), do: false
-
-  defp cleared_effort_holder_prod_without_liveness?(
-         txn,
-         %{
-           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-           reason_kind: "superseded",
-           causal_source: %{kind: "progress_attest", id: attest_id},
-           outcome: %{kind: "no_replacement"} = outcome
-         },
-         %{kind: "no_replacement"} = outcome,
-         wake,
-         %{kind: "assignment", id: assignment_id, impact: "linked_work_open"}
-       )
-       when wake.assignment_id == assignment_id and is_binary(attest_id) do
-    effort_holder_prod_attest?(txn, attest_id, wake)
-  end
-
-  defp cleared_effort_holder_prod_without_liveness?(_txn, _command, _outcome, _wake, _primary),
-    do: false
-
-  defp effort_holder_prod_attest?(txn, attest_id, wake) do
-    assignment_id = wake.assignment_id
-    holder = wake.session_key
-
-    is_binary(assignment_id) and is_binary(holder) and
-      wake.obligation_ref == Tightbeam.EffortCheckin.holder_prod_ref(assignment_id) and
-      Txn.q(
-        txn,
-        """
-        SELECT 1 FROM attests t JOIN assignments a ON a.id=t.assignmentId
-        WHERE t.id=?1 AND t.assignmentId=?2 AND t.bySession=?3
-          AND a.holderKey=?3 AND a.state='open'
-        """,
-        [attest_id, assignment_id, holder]
-      ) == [[1]]
-  end
 
   # The plain 3-arity form is every OTHER caller of this check (today, only
   # `validate_liveness/5`'s `pending_wake` clause, which is not a batcher
