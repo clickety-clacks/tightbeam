@@ -607,6 +607,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     for verb <- ["work-item-icebox", "work-item-close", "work-item-fail"] do
       extra = if verb == "work-item-icebox", do: %{reason: "waiting for review"}, else: %{}
+
       assert %{code: "assignments_open"} =
                dispose(ctx, verb, {:user, ctx.holder.owner_user_id}, item.id, extra)
     end
