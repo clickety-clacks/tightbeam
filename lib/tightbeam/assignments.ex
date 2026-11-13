@@ -3610,6 +3610,9 @@ defmodule Tightbeam.Assignments do
     :ok
   end
 
+  # Closing evidence belongs to the holder. An opener may also report the
+  # result while review is pending, but that report cannot replace the
+  # holder's completion in the exact terminal-notification relation.
   defp latest_completion_attest_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
@@ -3619,6 +3622,8 @@ defmodule Tightbeam.Assignments do
              waitId,ts
            FROM attests
            WHERE assignmentId=?1 AND kind='completion'
+             AND bySession=(SELECT holderKey FROM assignments WHERE id=?1)
+             AND byUser IS NULL
            ORDER BY ts DESC,rowid DESC
            LIMIT 1
            """,
