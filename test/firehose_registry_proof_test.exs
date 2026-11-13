@@ -153,7 +153,15 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
          decision_request.withdrawn decision_request.superseded)
       |> Map.new(&{&1, &1})
 
-    production_classes = Map.merge(gateway_classes, committed_decision_classes)
+    turn_event_classes =
+      ~w(message.segment_recorded tool_call.event_recorded)
+      |> Map.new(&{&1, &1})
+
+    production_classes =
+      gateway_classes
+      |> Map.merge(committed_decision_classes)
+      |> Map.merge(turn_event_classes)
+
     assert Registry.rows()["turn.queued"].snapshot_only
 
     registry_classes =
