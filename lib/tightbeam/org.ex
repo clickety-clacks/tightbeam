@@ -1141,7 +1141,7 @@ defmodule Tightbeam.Org do
   # source line; current callers that defer handoff pass options directly.
   def retire_in_txn(%Txn{} = txn, session_key, principal, _legacy_supervision_interval_ms)
       when is_binary(principal) and principal != "",
-    do: retire_in_txn(txn, session_key, principal)
+      do: retire_in_txn(txn, session_key, principal)
 
   def retire_in_txn(%Txn{}, _session_key, _principal) do
     raise ArgumentError, "retirement requires a non-empty principal"
