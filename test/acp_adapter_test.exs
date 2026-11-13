@@ -2660,7 +2660,17 @@ defmodule Tightbeam.Acp.AdapterTest do
                  guidance
                )
 
-      assert Enum.all?(session_requests(capture_path), &(&1["meta"] == expected))
+      requests = session_requests(capture_path)
+      created = Enum.find(requests, &(&1["method"] == "session/new"))
+      loaded = Enum.find(requests, &(&1["method"] == "session/load"))
+
+      expected_load =
+        if harness == :codex,
+          do: Map.put(expected, "developerInstructions", guidance),
+          else: expected
+
+      assert created["meta"] == expected
+      assert loaded["meta"] == expected_load
 
       assert_receive {:projected_guidance, ^harness, "sess-1", ^guidance}
       assert_receive {:projected_guidance, ^harness, "sess-1", ^guidance}
