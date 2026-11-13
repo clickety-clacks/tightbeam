@@ -415,22 +415,29 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
                  )
       end)
 
+    tool_call_started_event_notice = notices["tool_call.event_recorded"]
+
     notices =
-      capture_classes(fixture, notices, ["tool_call.ended", "transition.recorded"], fn ->
-        assert {:ok, :ended} =
-                 ToolCalls.observe(
-                   fixture.db,
-                   main.session_key,
-                   tool_turn,
-                   "inventory-compaction-call",
-                   ToolCalls.normalize_notification(%{
-                     "title" => "Compact",
-                     "status" => "completed"
-                   }),
-                   %{},
-                   "100/200 tokens"
-                 )
-      end)
+      capture_classes(
+        fixture,
+        notices,
+        ["tool_call.ended", "tool_call.event_recorded", "transition.recorded"],
+        fn ->
+          assert {:ok, :ended} =
+                   ToolCalls.observe(
+                     fixture.db,
+                     main.session_key,
+                     tool_turn,
+                     "inventory-compaction-call",
+                     ToolCalls.normalize_notification(%{
+                       "title" => "Compact",
+                       "status" => "completed"
+                     }),
+                     %{},
+                     "100/200 tokens"
+                   )
+        end
+      )
 
     notices =
       capture_classes(fixture, notices, ["session.updated"], fn ->
@@ -458,7 +465,8 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
       Map.merge(notices, %{
         "assignment marker" => assignment_notice,
         "attest marker" => attest_notices["message.created"],
-        "tool turn session" => tool_session_notice
+        "tool turn session" => tool_session_notice,
+        "tool call started event" => tool_call_started_event_notice
       })
 
     # These notices predate the rename and were checked against their commit-time
