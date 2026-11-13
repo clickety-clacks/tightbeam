@@ -774,24 +774,36 @@ mix run --no-halt                  # boots the gateway; creates state.db and bin
 
 ### Cutting a release
 
-Releases are version tags on canonical `main`, not release branches. First set
-the version in `cli/Cargo.toml`, land it on `main`, and wait for the ordinary
-`main` CI run to pass. In the same change, re-check each external-agent skill that
-`tightbeam skill install` ships (listed in `cli/src/skills.rs`) against the new
-`tightbeam --help`, and update its `Written for Tightbeam <version>.` line. CI runs
-`scripts/verify_external_skills.py` on every push and refuses a version whose skills
-are stamped for another. Then create and push the matching annotated tag:
+`main` holds the latest approved release. Prepare each upcoming 0.1 release on
+its own version branch (currently `0.1.16`), not `main`. Set the version in
+`cli/Cargo.toml` on that branch. In the same reviewed change, re-check each
+external-agent skill that `tightbeam skill install` ships (listed in
+`cli/src/skills.rs`) against the new `tightbeam --help`, and update its
+`Written for Tightbeam <version>.` line. CI checks `scripts/verify_external_skills.py`
+on pull requests and pushes to `0.1.*` branches.
+
+Tag the approved release commit while checked out on its version branch. The tag
+must be exactly `v<major>.<minor>.<patch>+<build>`: the version must match
+`cli/Cargo.toml`, and the build number is `git rev-list --count` for the tagged
+commit. For the current 0.1 release, fast-forward to the branch tip and create
+the tag with:
 
 ```sh
-git fetch origin
-git merge --ff-only origin/main
-git tag -a v<version> -m "Tightbeam v<version>"
-git push origin v<version>
+release_branch=0.1.16 # replace with the 0.1.N branch for this release
+git fetch origin "$release_branch"
+git switch "$release_branch"
+git pull --ff-only origin "$release_branch"
+test "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$release_branch")"
+
+version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cli/Cargo.toml)
+build=$(git rev-list --count HEAD)
+tag="v${version}+${build}"
+git tag -a "$tag" -m "Tightbeam $tag"
+git push origin "$tag"
 ```
 
-The tag must be exactly `v<major>.<minor>.<patch>`, must match the Cargo package
-version, and must point to the current `origin/main` tip. The tag workflow reruns
-the unchanged macOS and Linux test gates, builds both packages from that tagged
-commit, and creates one GitHub Release containing the packages, checksums, and
-provenance record. If any gate or either platform build fails, no GitHub Release
-is created.
+Pushing the tag starts the release workflow, which validates that it names the
+current version-branch tip, reruns the full Linux and macOS test gates, builds
+both packages, and creates a GitHub Release. After approval, merge the tagged
+release commit into `main` through the normal pull-request path. `main` is the
+approved release line, not the 0.1 candidate branch or tag target.

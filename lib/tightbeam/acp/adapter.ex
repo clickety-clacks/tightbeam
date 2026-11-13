@@ -1167,13 +1167,7 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp session_load_meta(state, cwd, guidance) do
-    meta = Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
-
-    if state.harness == :codex do
-      Map.put(meta, "developerInstructions", guidance)
-    else
-      meta
-    end
+    Harness.session_load_meta(state.harness, %{cwd: cwd}, guidance)
   end
 
   defp fork_model_session_reply(

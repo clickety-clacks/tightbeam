@@ -631,12 +631,13 @@ defmodule Tightbeam.RetireOpenDescendantsTest do
     intermediary = key.("session:intermediary")
     role_holder = key.("session:role-holder")
     assignment_holder = key.("session:assignment-holder")
+    display_name = fn name -> if prefix == "", do: name, else: "#{name} #{prefix}" end
 
-    create_session(db, coordinator, @main, "Coordinator")
-    create_session(db, target, coordinator, "Retiring session")
-    create_session(db, intermediary, target, "Unprotected intermediary")
-    create_session(db, role_holder, intermediary, "Role holder")
-    create_session(db, assignment_holder, role_holder, "Assignment holder")
+    create_session(db, coordinator, @main, display_name.("Coordinator"))
+    create_session(db, target, coordinator, display_name.("Retiring session"))
+    create_session(db, intermediary, target, display_name.("Unprotected intermediary"))
+    create_session(db, role_holder, intermediary, display_name.("Role holder"))
+    create_session(db, assignment_holder, role_holder, display_name.("Assignment holder"))
 
     role_name = if prefix == "", do: "conversation-owner", else: "conversation-owner-#{prefix}"
     Roles.create!(db, role_name, @owner, nil)

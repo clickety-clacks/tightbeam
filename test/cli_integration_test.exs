@@ -133,7 +133,12 @@ defmodule Tightbeam.CliIntegrationTest do
           {"tune",
            fn call ->
              send(test_pid, {:cli_call, call})
-             %{ok: false, code: "same_harness", message: "omit --harness"}
+
+             if call.params[:setting] == "rename" do
+               real_handlers["tune"].(call)
+             else
+               %{ok: false, code: "same_harness", message: "omit --harness"}
+             end
            end}
 
         {verb, handler} ->
@@ -383,6 +388,151 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='cli-worker'")
+  end
+
+  test "session rename uses stable keys and preserves history, assignment, and ownership", ctx do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+    owner_id = ctx.session.owner_user_id
+
+    {:appended, history} =
+      Projection.append(ctx.db, %{
+        session_key: ctx.worker.session_key,
+        role: "user",
+        content: "history before rename"
+      })
+
+    assert {created, 0} =
+             run.(["work-item-create", "--title", "rename wire", "--as-user", owner_id])
+
+    work_item_id = JSON.decode!(created)["id"]
+
+    assert {assigned, 0} =
+             run.([
+               "assign",
+               "--session",
+               "cli-worker",
+               "--subject",
+               "existing work",
+               "--effect-kind",
+               "coordination",
+               "--work-item",
+               work_item_id,
+               "--as-user",
+               owner_id
+             ])
+
+    assignment_id = JSON.decode!(assigned)["id"]
+
+    # Prove this is the existing same-owner path, not an administrator shortcut.
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE users SET isAdmin=0 WHERE userId=?1", [owner_id])
+
+    {renamed_output, rename_status} =
+      run.([
+        "session-rename",
+        "--session",
+        "cli-worker",
+        "--display-name",
+        "  New Worker  "
+      ])
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "tune",
+                      session_key: "cli-worker",
+                      principal: {:session, "cli-holder"},
+                      params: %{setting: "rename", display_name: "  New Worker  "}
+                    }}
+
+    assert rename_status == 0, renamed_output
+    assert JSON.decode!(renamed_output)["stream"]["displayName"] == "  New Worker  "
+
+    assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
+    assert Org.get(ctx.db, "  New Worker  ") == nil
+    assert {:ok, "cli-worker", false} = Roles.resolve(ctx.db, "cli-worker")
+
+    assert {:ok, [["cli-worker", "open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT holderKey,state FROM assignments WHERE id=?1",
+               [assignment_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE id=?1 AND sessionKey='cli-worker'",
+               [history.id]
+             )
+
+    # A session owned by another user remains protected by the existing tune
+    # authorization rule, even though the CLI command accepts its stable key.
+    outsider_id = "rename-outsider"
+
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 0, 1)", [
+        outsider_id
+      ])
+
+    other =
+      Org.create(ctx.db, %{
+        session_key: "other-owner-worker",
+        display_name: "Other Worker",
+        owner_user_id: outsider_id,
+        origin: "user:" <> outsider_id,
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    {collision, status} =
+      run.(["session-rename", "--session", "cli-worker", "--display-name", " other worker "])
+
+    assert status != 0
+    assert %{"code" => "display_name_taken", "ok" => false} = JSON.decode!(collision)
+    assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
+
+    {empty_name, status} =
+      run.(["session-rename", "--session", "cli-worker", "--display-name", "  \t "])
+
+    assert status != 0
+    assert %{"code" => "display_name_empty", "ok" => false} = JSON.decode!(empty_name)
+    assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
+
+    {denied, status} =
+      run.([
+        "session-rename",
+        "--session",
+        other.session_key,
+        "--display-name",
+        "Changed by owner"
+      ])
+
+    assert status != 0
+    assert %{"code" => "not_found", "ok" => false} = JSON.decode!(denied)
+    assert Org.get(ctx.db, other.session_key).display_name == "Other Worker"
+
+    assert {self_renamed, 0} =
+             run.([
+               "session-rename",
+               "--session",
+               "cli-holder",
+               "--display-name",
+               "Renamed Holder"
+             ])
+
+    assert JSON.decode!(self_renamed)["stream"]["sessionKey"] == "cli-holder"
+    assert Org.get(ctx.db, "cli-holder").display_name == "Renamed Holder"
+
+    {empty_name, status} =
+      run.(["session-rename", "--session", "cli-worker", "--display-name", "  "])
+
+    assert status != 0
+    assert %{"code" => "display_name_empty", "ok" => false} = JSON.decode!(empty_name)
+    assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
   end
 
   test "typed consequence crosses the real CLI wire with authenticated assignment custody", ctx do

@@ -125,7 +125,7 @@ defmodule Tightbeam.TestCase do
       nil ->
         Tightbeam.Org.create(db, %{
           session_key: key,
-          display_name: "Main",
+          display_name: fixture_main_display_name(db, owner),
           kind: "main",
           is_built_in: true,
           owner_user_id: owner,
@@ -143,6 +143,33 @@ defmodule Tightbeam.TestCase do
       session ->
         raise "invalid Main fixture for #{owner}: #{inspect(session)}"
     end
+  end
+
+  defp fixture_main_display_name(db, owner) do
+    used_names =
+      db
+      |> Tightbeam.Org.list_all()
+      |> MapSet.new(fn session -> normalized_display_name(session.display_name) end)
+
+    Stream.iterate(1, &(&1 + 1))
+    |> Enum.find_value(fn index ->
+      candidate =
+        case index do
+          1 -> "Main"
+          2 -> "Main (#{owner})"
+          suffix -> "Main (#{owner} #{suffix - 1})"
+        end
+
+      if MapSet.member?(used_names, normalized_display_name(candidate)), do: nil, else: candidate
+    end)
+  end
+
+  defp normalized_display_name(display_name) do
+    display_name
+    |> String.trim()
+    |> String.to_charlist()
+    |> :string.casefold()
+    |> List.to_string()
   end
 
   @doc """
