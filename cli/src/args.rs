@@ -484,6 +484,7 @@ pub enum Command {
     WorkItemIcebox {
         identity: Identity,
         work_item_id: String,
+        reason: String,
     },
     WorkItemReopen {
         identity: Identity,
@@ -1061,9 +1062,9 @@ COMMANDS:
   topline-concern-unlink-work <concernId> <workItemId> --reason <text> --key <idempotencyKey>
   topline-work-leave-unlinked <workItemId> --reason <text> --key <idempotencyKey>
   topline-placement-list [--state pending|resolved|all]
-  work-item-icebox <workItemId>
+  work-item-icebox <workItemId> --reason <text>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
-      assignments; work-item-reopen resumes it.
+      assignments; records the reason; work-item-reopen resumes it.
   work-item-reopen <workItemId>
   work-item-close <workItemId>
       Conclude an item (→ closed). Requires zero open assignments.
@@ -3597,11 +3598,17 @@ fn parse_with_optional_catalog(
         }
         "work-item-icebox" => {
             if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam work-item-icebox <workItemId>".to_owned());
+                return Err(
+                    "usage: tightbeam work-item-icebox <workItemId> --reason <text>".to_owned(),
+                );
             }
+            let reason = nonempty(flags, "reason")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "--reason is required and must be non-empty".to_owned())?;
             Ok(Command::WorkItemIcebox {
                 identity: identity(flags)?,
                 work_item_id: parsed.positional[1].clone(),
+                reason,
             })
         }
         "work-item-reopen" => {
@@ -7950,6 +7957,38 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn work_item_icebox_requires_a_non_blank_reason() {
+        for args in [
+            strings(&["work-item-icebox", "wi_1"]),
+            strings(&["work-item-icebox", "wi_1", "--reason", ""]),
+            strings(&["work-item-icebox", "wi_1", "--reason", " \t "]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("--reason is required and must be non-empty".to_owned())
+            );
+        }
+
+        assert!(matches!(
+            parse(strings(&[
+                "work-item-icebox",
+                "wi_1",
+                "--reason",
+                "waiting on a decision",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::WorkItemIcebox {
+                identity: Identity::User(user_id),
+                work_item_id,
+                reason,
+            }) if user_id == "flynn"
+                && work_item_id == "wi_1"
+                && reason == "waiting on a decision"
+        ));
     }
 
     #[test]
