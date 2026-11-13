@@ -3,7 +3,7 @@ defmodule Tightbeam.Harness.Codex do
   @behaviour Tightbeam.Harness
   require Logger
 
-  alias Tightbeam.Harness.Support
+  alias Tightbeam.Harness.{AdapterPatch, Support}
   alias Tightbeam.{ErrorDiagnostic, Model, Placement}
 
   @adapter_version "1.12.0"
@@ -47,6 +47,13 @@ defmodule Tightbeam.Harness.Codex do
   # provider IDs are intersected with the selected engine's offered IDs.
 
   @adapter_bundle "index.js"
+  @adapter_replacements [
+    {
+      "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
+      "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId,\n      developerInstructions: request._meta?.developerInstructions\n",
+      global: true
+    }
+  ]
 
   @doc false
   def adapter_version, do: @adapter_version
@@ -226,6 +233,11 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def ensure_adapter(target) do
+    target =
+      target
+      |> Map.put_new(:patch_adapter, &patch_local/1)
+      |> Map.put_new(:remote_patch, &patch_remote(target, &1, &2))
+
     Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
   end
 
@@ -1076,7 +1088,7 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def conformance_vectors do
-    source = "stock codex adapter fixture"
+    source = Enum.map_join(@adapter_replacements, "\n", &elem(&1, 0))
     levels = [%{"effort" => "medium"}]
 
     valid_entry = %{
@@ -1118,9 +1130,8 @@ defmodule Tightbeam.Harness.Codex do
       adapter_bundle: @adapter_bundle,
       adapter_version: @adapter_version,
       source: source,
-      patched: source,
-      remote_patch_detail: "",
-      stock_adapter: true,
+      patched: patch_adapter_source(source),
+      remote_patch_detail: "; codex adapter patched",
       session_meta: %{},
       cli_name: "codex",
       cli_version: "codex vector 1.0",
@@ -1487,5 +1498,40 @@ defmodule Tightbeam.Harness.Codex do
         ".bin",
         "codex-acp"
       ])
+  end
+
+  @doc false
+  def patch_adapter_source(source) do
+    AdapterPatch.patch(source, @adapter_replacements, wire_name(), @adapter_version)
+  end
+
+  defp patch_local(path) do
+    AdapterPatch.ensure!(
+      path,
+      @adapter_package,
+      @adapter_bundle,
+      @adapter_version,
+      @adapter_replacements,
+      wire_name()
+    )
+  end
+
+  defp patch_remote(target, path, detail) do
+    script =
+      AdapterPatch.remote_script(
+        path,
+        @adapter_package,
+        @adapter_bundle,
+        @adapter_replacements,
+        wire_name(),
+        version: @adapter_version
+      )
+
+    command = "node -e " <> Support.shell_quote(script)
+
+    case target.sh.(Support.catalog_probe_argv(target.host_config.ssh, command)) do
+      {_output, 0} -> {:ok, detail <> "; codex adapter patched"}
+      {output, _exit} -> {:error, %{code: "host_unready", message: String.trim(output)}}
+    end
   end
 end

@@ -1117,7 +1117,7 @@ defmodule Tightbeam.Acp.Adapter do
                sessionId: sid,
                cwd: cwd,
                mcpServers: mcp_servers,
-               _meta: Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
+               _meta: session_load_meta(state, cwd, guidance)
              },
              timeout: request_timeout,
              diagnostic: true
@@ -1166,6 +1166,16 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  defp session_load_meta(state, cwd, guidance) do
+    meta = Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
+
+    if state.harness == :codex do
+      Map.put(meta, "developerInstructions", guidance)
+    else
+      meta
+    end
+  end
+
   defp fork_model_session_reply(
          state,
          sid,
@@ -1182,7 +1192,7 @@ defmodule Tightbeam.Acp.Adapter do
              sessionId: sid,
              cwd: cwd,
              mcpServers: mcp_servers,
-             _meta: Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
+             _meta: session_load_meta(state, cwd, guidance)
            },
            timeout: request_timeout,
            diagnostic: true
