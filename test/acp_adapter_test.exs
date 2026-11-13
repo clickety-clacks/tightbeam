@@ -232,6 +232,8 @@ defmodule Tightbeam.Acp.AdapterTest do
   const efforts = {};
   const fastValues = {};
   const offeredModels = {};
+  const liveSessions = new Set();
+  const conversationHistory = {};
   const defaultOfferedModels = [
     "default", "opus[1m]", "claude-fable-5[1m]", "nova[1m]", "sonnet", "haiku",
     "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol", "orbit-9"
@@ -319,6 +321,12 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "initialize":
         capture(m);
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { protocolVersion: 1 } }), 75);
+        if (failMode === "resident-two-claude-models") {
+          return send({ id: m.id, result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true, sessionCapabilities: { fork: {} } }
+          } });
+        }
         return send({ id: m.id, result: { protocolVersion: 1 } });
       case "session/new": {
         newCalls += 1;
@@ -326,11 +334,15 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = gateMode !== "none" && gateMode !== "delay-setup" && newCalls === 1 ? "probe-sess" : "sess-1";
         models[sid] = models[sid] || "haiku";
         offeredModels[sid] = [...offeredModelMenu];
+        liveSessions.add(sid);
+        conversationHistory[sid] = [];
         if (failMode === "resident-default-context-variant") offeredModels[sid].push("orbit-9[1m]");
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } }), 75);
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/load": {
+        liveSessions.add(m.params.sessionId);
+        conversationHistory[m.params.sessionId] ||= [];
         if (failMode === "load-slow" && m.params.sessionId === "slow") {
           capture(m);
           return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 1500);
@@ -349,11 +361,32 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = "sess-fork-" + forkCalls;
         models[sid] = models[m.params.sessionId] || "haiku";
         offeredModels[sid] = [...offeredModelMenu];
+        conversationHistory[sid] = [...(conversationHistory[m.params.sessionId] || [])];
+        if (failMode === "resident-two-claude-models") {
+          return send({ id: m.id, result: { sessionId: sid } });
+        }
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
-      case "session/close": capture(m); return send({ id: m.id, result: {} });
+      case "session/close": {
+        capture(m);
+        const sid = m.params.sessionId;
+        if (failMode === "resident-two-claude-models" && sid.startsWith("sess-fork-") && !liveSessions.has(sid)) {
+          return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
+        }
+        liveSessions.delete(sid);
+        return send({ id: m.id, result: {} });
+      }
       case "session/set_config_option": {
         capture(m);
+        if (failMode === "resident-two-claude-models" &&
+            m.params.sessionId.startsWith("sess-fork-") && !liveSessions.has(m.params.sessionId)) {
+          return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
+        }
+        if (failMode === "resident-two-claude-models" &&
+            m.params.configId === "model" && m.params.value === "claude-sonnet-5") {
+          models[m.params.sessionId] = "sonnet";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
         if (gateMode === "delay-setup") {
           if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
           if (m.params.configId === "effort" || m.params.configId === "reasoning_effort") efforts[m.params.sessionId] = m.params.value;
@@ -528,6 +561,17 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = m.params.sessionId;
         capture(m);
         const text = m.params.prompt?.[0]?.text;
+        if (failMode === "resident-two-claude-models") {
+          if (sid.startsWith("sess-fork-") && !liveSessions.has(sid)) {
+            return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
+          }
+          if (sid.startsWith("sess-fork-") &&
+              !conversationHistory[sid]?.includes("persist the resident Claude conversation")) {
+            return send({ id: m.id, error: { code: -32000, message: "Forked conversation history missing" } });
+          }
+          conversationHistory[sid] ||= [];
+          conversationHistory[sid].push(text);
+        }
         if (text === "fail after dispatch") {
           return send({ id: m.id, error: { code: -32000, message: "post-dispatch failure" } });
         }
@@ -1074,6 +1118,79 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]"]
 
     refute Enum.any?(requests, fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-fork-1"
+           end)
+  end
+
+  test "resident Claude switch loads its fork between two Claude models and preserves conversation" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "resident-two-claude-models")
+
+    first_model = Model.new("claude-fable-5", context: "1m", effort: "high")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, first_model, "/tmp", [], "guidance")
+
+    assert {:ok, %Model{family: "claude-fable-5", context: "1m", effort: "high"}} =
+             Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, %{stop_reason: "end_turn"}} =
+             Adapter.prompt(adapter, "sess-1", "persist the resident Claude conversation")
+
+    requested_model = Model.new("claude-sonnet-5")
+
+    assert {:ok, "sess-fork-1"} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               requested_model,
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert {:ok, %Model{family: "sonnet"}} = Adapter.current_model(adapter, "sess-fork-1")
+
+    assert {:ok, %{stop_reason: "end_turn"}} =
+             Adapter.prompt(adapter, "sess-fork-1", "continue the resident Claude conversation")
+
+    requests = captured_requests(capture_path)
+    fork_index = Enum.find_index(requests, &(&1["method"] == "session/fork"))
+
+    load_index =
+      Enum.find_index(
+        requests,
+        &(&1["method"] == "session/load" and &1["sessionId"] == "sess-fork-1")
+      )
+
+    model_index =
+      Enum.find_index(
+        requests,
+        &(&1["method"] == "session/set_config_option" and
+            &1["sessionId"] == "sess-fork-1" and &1["configId"] == "model")
+      )
+
+    assert is_integer(fork_index)
+    assert is_integer(load_index)
+    assert is_integer(model_index)
+    assert fork_index < load_index
+    assert load_index < model_index
+
+    fork_request = Enum.at(requests, fork_index)
+    load_request = Enum.at(requests, load_index)
+
+    assert %{"cwd" => "/tmp", "mcpServers" => [], "sessionId" => "sess-fork-1"} = load_request
+    assert load_request["meta"] == fork_request["meta"]
+
+    assert :ok = Adapter.close_session(adapter, "sess-fork-1")
+
+    requests = captured_requests(capture_path)
+
+    refute Enum.any?(requests, fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+
+    assert Enum.any?(requests, fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-fork-1"
            end)
   end
@@ -2968,7 +3085,10 @@ defmodule Tightbeam.Acp.AdapterTest do
       captured_requests(capture_path)
       |> Enum.filter(&(&1["method"] in ["session/new", "session/load", "session/fork"]))
 
-    assert Enum.map(requests, & &1["method"]) == ["session/new", "session/load", "session/fork"]
+    assert Enum.map(requests, & &1["method"]) ==
+             ["session/new", "session/load", "session/fork", "session/load"]
+
+    assert Enum.at(requests, 3)["sessionId"] == "sess-fork-1"
 
     for request <- requests do
       assert get_in(request, ["meta", "claudeCode", "options", "settings"]) == %{
