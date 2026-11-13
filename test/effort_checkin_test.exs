@@ -2,7 +2,7 @@ defmodule Tightbeam.EffortCheckinTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Assignments, DB, Gateway, Org, Placement, Wakes}
+  alias Tightbeam.{Assignments, DB, Gateway, Org, Placement, Wakes, WorkItems}
 
   setup do
     db = :"effort_retirement_#{System.unique_integer([:positive])}"
@@ -228,7 +228,53 @@ defmodule Tightbeam.EffortCheckinTest do
     assert %{state: "pending"} = Wakes.get(ctx.db, deadline.wake_id)
   end
 
-  defp assign(db) do
+  test "retired effort wake drains while an open child keeps the work item live", ctx do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:owner",
+        principal: {:user, "owner"},
+        params: %{title: "parent remains live through child"}
+      })
+
+    assign(ctx.db, item.id, "parent assignment", "coordination")
+    child = assign(ctx.db, item.id, "open child assignment", "coordination")
+
+    deadline =
+      old_wake(
+        ctx.db,
+        child.id,
+        "effort_deadline",
+        System.system_time(:millisecond) + 60_000
+      )
+
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         name: :effort_retired_child_scheduler,
+         tick_ms: 60_000,
+         deliver: fn _wake -> :ok end}
+      )
+
+    due!(ctx.db, deadline.wake_id)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert %{state: "canceled"} = Wakes.get(ctx.db, deadline.wake_id)
+
+    assert [["open"]] = rows(ctx.db, "SELECT state FROM work_items WHERE id=?1", [item.id])
+
+    item_id = item.id
+
+    assert [["open", ^item_id]] =
+             rows(
+               ctx.db,
+               "SELECT state,workItemId FROM assignments WHERE id=?1",
+               [child.id]
+             )
+  end
+
+  defp assign(db, work_item_id \\ nil, subject \\ "retired check-in proof", effect_kind \\ nil) do
     result =
       Assignments.__handle__(db, "assign", %{
         verb: "assign",
@@ -237,8 +283,12 @@ defmodule Tightbeam.EffortCheckinTest do
         session_key: "holder",
         target_role: nil,
         role_fallback: false,
-        supervision_interval_ms: 1_000,
-        params: %{subject: "retired check-in proof", brief: "exercise assignment behavior"}
+        params: %{
+          subject: subject,
+          brief: "exercise assignment behavior",
+          work_item_id: work_item_id,
+          effect_kind: effect_kind
+        }
       })
 
     assert %{id: id} = result

@@ -708,24 +708,6 @@ defmodule Tightbeam.JobForensicsTest do
     session(db, "open-holder")
     assignment(db, "asg_open_cancel", "wi_open_cancel", "open-holder")
 
-    opened_at = System.system_time(:millisecond)
-
-    assert {:ok, _} =
-             DB.query(db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
-               "asg_open_cancel",
-               opened_at
-             ])
-
-    assert {:ok, :ok} =
-             DB.transaction(db, fn txn ->
-               Tightbeam.Supervision.assignment_opened_in_txn(
-                 txn,
-                 "asg_open_cancel",
-                 opened_at,
-                 60_000
-               )
-             end)
-
     wake =
       Wakes.schedule(db, %{
         session_key: "open-holder",
@@ -760,17 +742,10 @@ defmodule Tightbeam.JobForensicsTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
     refute Enum.any?(trace(db, "wi_open_cancel").timeline, &(&1.type == "wake_canceled"))
 
-    assert {:ok, [[trigger_id]]} =
-             DB.query(
-               db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
-               ["asg_open_cancel"]
-             )
-
     assert {:ok, true} =
              DB.transaction(db, fn txn ->
                {:ok, trigger} =
-                 Tightbeam.Supervision.inactivity_deadline_trigger_in_txn(
+                 Tightbeam.Supervision.liveness_trigger_in_txn(
                    txn,
                    {:assignment, "asg_open_cancel"}
                  )
@@ -797,8 +772,8 @@ defmodule Tightbeam.JobForensicsTest do
       primaryWorkKind: "assignment",
       primaryWorkId: "asg_open_cancel",
       workImpactKind: "linked_work_open",
-      livenessTriggerKind: "pending_wake",
-      livenessTriggerId: trigger_id,
+      livenessTriggerKind: "supervision_entitlement",
+      livenessTriggerId: "asg_open_cancel",
       actionNeeded: true
     })
 
@@ -824,7 +799,7 @@ defmodule Tightbeam.JobForensicsTest do
 
     # Later progress does not rewrite the recorded cancellation provenance.
     after_progress = canceled_entry(db, "wi_open_cancel", wake.wake_id)
-    assert after_progress.livenessTriggerId == trigger_id
+    assert after_progress.livenessTriggerId == "asg_open_cancel"
     assert after_progress.actionNeeded
   end
 
