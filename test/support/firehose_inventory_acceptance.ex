@@ -389,7 +389,7 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
                  TurnEvents.append_assistant_segment(
                    fixture.db,
                    main.session_key,
-                   tool_turn.seq,
+                   tool_turn,
                    assistant_message.id,
                    %{"type" => "text", "text" => "A4 assistant segment"}
                  )
