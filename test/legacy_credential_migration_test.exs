@@ -495,6 +495,44 @@ defmodule Tightbeam.LegacyCredentialMigrationTest do
       File.write!(Path.join(package, "package.json"), JSON.encode!(%{"version" => "0.81.0"}))
       File.write!(bundle, Tightbeam.Harness.ClaudeFoldedPrompt.fixture())
     end
+
+    if harness == :codex do
+      package =
+        Path.join([
+          base_dir,
+          "adapters",
+          "node_modules",
+          "@agentclientprotocol",
+          "codex-acp"
+        ])
+
+      bundle = Path.join([package, "dist", "index.js"])
+      File.mkdir_p!(Path.dirname(bundle))
+
+      File.write!(
+        Path.join(package, "package.json"),
+        JSON.encode!(%{"version" => Tightbeam.Harness.Codex.adapter_version()})
+      )
+
+      File.write!(bundle, codex_adapter_fixture_source())
+    end
+  end
+
+  defp codex_adapter_fixture_source do
+    "  async resumeSession(request) {\n" <>
+      "    await this.codexClient.threadResume({\n" <>
+      "      excludeTurns: true,\n" <>
+      "      modelProvider: await this.getResumeModelProvider(),\n" <>
+      "      threadId: request.sessionId\n" <>
+      "    });\n" <>
+      "  }\n" <>
+      "  async loadSession(request) {\n" <>
+      "    await this.codexClient.threadResume({\n" <>
+      "      excludeTurns: true,\n" <>
+      "      modelProvider: await this.getResumeModelProvider(),\n" <>
+      "      threadId: request.sessionId\n" <>
+      "    });\n" <>
+      "  }\n"
   end
 
   defp assert_claude_adapter_patched(base_dir, :claude) do
