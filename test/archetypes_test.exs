@@ -90,7 +90,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert Rules.load!(ctx.base_dir, []) == []
     refute File.exists?(Path.join(identity_dir, "skills"))
     refute File.exists?(Path.join(identity_dir, "rails"))
-    refute File.exists?(Path.join(identity_dir, "rules"))
+    assert File.regular?(Path.join(identity_dir, "rules/substrate.toml"))
 
     assert Archetypes.init_identity!(ctx.base_dir) == :noop
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
