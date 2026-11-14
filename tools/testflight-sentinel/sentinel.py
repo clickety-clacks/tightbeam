@@ -516,6 +516,11 @@ def build_wake(
             if report.app_version:
                 build = f"{report.app_version} ({build})"
             build_field = f"build {_single_line(build)}"
+        elif report.build_bundle_id:
+            build_field = (
+                f"buildBundleId: {_single_line(report.build_bundle_id)}; "
+                "build not reported"
+            )
         fields = [
             report.report_id,
             f"{_single_line(report.app_name)} ({report.app_id})",
@@ -527,8 +532,6 @@ def build_wake(
         ]
         if not report.build_number and report.app_version:
             fields.append(f"app version: {_single_line(report.app_version)}")
-        if not report.build_number and report.build_bundle_id:
-            fields.append(f"buildBundleId: {_single_line(report.build_bundle_id)}")
         if delivery.log_path:
             relative = delivery.log_path.relative_to(workspace_root)
             fields.append(f"log: {delivery.log_path} ({relative.as_posix()})")

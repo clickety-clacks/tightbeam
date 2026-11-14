@@ -250,8 +250,7 @@ class SentinelTests(unittest.TestCase):
         )
         self.assertEqual(2, result["reports"])
         self.assertIn("crash log not saved: App Store Connect returned no crash log", wakes[0])
-        self.assertIn("build not reported", wakes[0])
-        self.assertIn("buildBundleId: com.example.app", wakes[0])
+        self.assertIn("buildBundleId: com.example.app; build not reported", wakes[0])
         self.assertNotIn(".crash", wakes[0])
 
     def test_registered_apps_with_no_reports_send_nothing(self):
