@@ -38,20 +38,23 @@ history; other registered apps continue.
 
 New reports are batched into one `tightbeam wake` per recipient, submitted with
 the process identity `testflight-sentinel`. A wake contains each report ID, app
-name and ID, build number and available app version, device model, OS version,
+name and ID, which build crashed, device model, OS version,
 submission time including its time zone, tester comment, and the crash-log
-location or a reason it was not saved. Tester names and email addresses are
-not included. A report is recorded as delivered only after Tightbeam accepts
-the wake. A later check sends nothing for reports already delivered to that
-recipient.
+location or a reason it was not saved. Build identification uses the App Store
+Connect build relationship when a read-only call returns it, then version and
+build lines in the crash-log header, then `buildBundleId` with the literal
+`build not reported`. Missing build data does not block delivery. Tester names
+and email addresses are not included. A report is recorded as delivered only
+after Tightbeam accepts the wake. A later check sends nothing for reports
+already delivered to that recipient.
 
-The saved crash-log root on the execution host is
-`/mnt/shared-workspace/shared/testflight-sentinel/crash-logs/`; each report is
-saved at `<app-id>/<report-id>.crash`. A wake includes both the execution-host
-path and the path relative to the shared workspace. The shared workspace mount
-root varies by host; common forms are `/mnt/shared-workspace`,
-`~/shared-workspace`, and `/home/<local-user>/shared-workspace`. Use the mount
-configured for the current host in the organization environment inventory.
+Crash logs are saved at
+`<shared-workspace>/shared/testflight-sentinel/crash-logs/<appId>/<reportId>.crash`.
+Here, `<shared-workspace>` means the shared-workspace mount on the host where
+you read the log; the mount point differs between hosts. See the organization's
+private environment inventory, `environment/environments.md`, section
+“Shared access and paths,” for each host's mount point. A wake gives both the
+path on the host that saved the log and the shared-workspace relative path.
 
 Registration and delivery history are kept in
 `~/.local/state/testflight-sentinel/state.json`; the log is
