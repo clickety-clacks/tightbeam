@@ -2844,6 +2844,24 @@ defmodule Tightbeam.Wire.RouterTest do
     assert after_turns == before_turns
   end
 
+  test "agent dispatch refuses the retired effort-rule verb", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "effort-rule",
+        asUser: ctx.device.user_id,
+        params: %{}
+      })
+
+    assert response.status == 400
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{
+               "code" => "invalid_message",
+               "message" => "verb not allowed: effort-rule"
+             }
+           }
+  end
+
   test "the dispatch boundary carries an immediate wake's assignment reference but strips request provenance",
        ctx do
     # An immediate assignment reference is a message pointer, not a continuation.
