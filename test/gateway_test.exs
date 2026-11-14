@@ -887,7 +887,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag recipient_readiness: true
-  test "an idle post keeps its own row when an eligible role source moves", ctx do
+  test "an idle post joins an eligible role batch with its own row when the role moves", ctx do
     alias Tightbeam.{Roles, Wakes}
 
     Org.create(ctx.db, %{
@@ -949,7 +949,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{dedupe: "duplicate"} = post.(call)
 
-    assert [^post_wake_id, carrier] =
+    assert [carrier] =
              NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000,
                conn_registry: ctx.registry,
                lane_manager: ctx.lane
@@ -971,24 +971,32 @@ defmodule Tightbeam.GatewayTest do
                "SELECT id,role,content,sender,deviceId,clientMessageId FROM messages WHERE clientMessageId='alias-post-1'"
              )
 
-    assert {:ok, [[^human_message_id, "queued", "new direct post"]]} =
+    assert {:ok, [["k1", carrier_message_id, "queued", prompt]]} =
              DB.query(
                ctx.db,
-               "SELECT messageId,status,prompt FROM turns WHERE wakeId=?1",
-               [post_wake_id]
+               "SELECT sessionKey,messageId,status,prompt FROM turns WHERE wakeId=?1",
+               [carrier]
              )
 
-    assert {:ok, [["k1", prompt]]} =
-             DB.query(ctx.db, "SELECT sessionKey,prompt FROM turns WHERE wakeId=?1", [carrier])
-
+    refute carrier_message_id == human_message_id
     assert prompt =~ "urgent role source"
-    refute prompt =~ "new direct post"
-    assert [%{delivery_wake_id: ^carrier}] = NoticeBatcher.source_refs(ctx.db, source.wake_id)
-    assert NoticeBatcher.source_refs(ctx.db, post_wake_id) == []
+    assert prompt =~ "new direct post"
+    assert prompt =~ ~r/urgent role source.*new direct post/s
+
+    for wake_id <- [source.wake_id, post_wake_id] do
+      assert [
+               %{
+                 delivery_wake_id: ^carrier,
+                 batch_state: "delivered",
+                 member_state: "included"
+               }
+             ] = NoticeBatcher.source_refs(ctx.db, wake_id)
+    end
+
     assert Wakes.get(ctx.db, source.wake_id).session_key == "k2"
     assert Wakes.get(ctx.db, source.wake_id).target_role == "post-recipient"
     assert %{dedupe: "duplicate"} = post.(call)
-    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -1450,7 +1458,7 @@ defmodule Tightbeam.GatewayTest do
     assert :ok =
              Tightbeam.Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
 
-    [^source_wake_id, carrier_id] =
+    [carrier_id] =
       Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000,
         conn_registry: ctx.registry,
         lane_manager: ctx.lane
@@ -1478,14 +1486,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert JSON.decode!(encoded_attachments) == [attachment]
 
-    assert {:ok, [[human_turn_seq, "queued", ^human_message_id, "queued human message"]]} =
-             DB.query(
-               ctx.db,
-               "SELECT seq,status,messageId,prompt FROM turns WHERE wakeId=?1",
-               [source_wake_id]
-             )
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [source_wake_id])
 
-    assert {:ok, [["delivered", 2]]} =
+    assert {:ok, [["delivered", 3]]} =
              DB.query(
                ctx.db,
                "SELECT state,memberCount FROM notice_batches WHERE deliveryWakeId=?1",
@@ -1499,21 +1503,29 @@ defmodule Tightbeam.GatewayTest do
                [carrier_id]
              )
 
-    assert {:ok, [[carrier_message_id, "user", "process:tightbeam", batched_content, "[]"]]} =
+    assert {:ok,
+            [
+              [
+                carrier_message_id,
+                "user",
+                "process:tightbeam",
+                batched_content,
+                carrier_attachments
+              ]
+            ]} =
              DB.query(
                ctx.db,
                "SELECT m.id,m.role,m.sender,m.content,m.attachments FROM messages m JOIN turns t ON t.messageId=m.id WHERE t.wakeId=?1",
                [carrier_id]
              )
 
+    assert JSON.decode!(carrier_attachments) == [attachment]
     assert batched_content =~ "first ready notice"
     assert batched_content =~ "second ready notice"
-    refute batched_content =~ "queued human message"
+    assert batched_content =~ "queued human message"
 
     assert {:ok, [[carrier_turn_seq]]} =
              DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [carrier_id])
-
-    assert human_turn_seq < carrier_turn_seq
 
     assert_receive {:firehose_notice,
                     %{"class" => "message.created", "payload" => human_payload} = human_notice}
@@ -1521,7 +1533,7 @@ defmodule Tightbeam.GatewayTest do
     assert human_payload["id"] == accepted_message_id
     assert human_payload["role"] == "user"
     assert human_payload["sender"] == human_origin
-    assert human_payload["turnSeq"] == human_turn_seq
+    assert human_payload["turnSeq"] == carrier_turn_seq
     assert human_payload["turnIncludesHuman"]
     assert human_payload["rowVersion"] > accepted_message["rowVersion"]
     assert human_notice["refs"]["messageId"] == human_message_id
@@ -1550,7 +1562,13 @@ defmodule Tightbeam.GatewayTest do
              ] = NoticeBatcher.source_refs(ctx.db, notice.wake_id)
     end
 
-    assert NoticeBatcher.source_refs(ctx.db, source_wake_id) == []
+    assert [
+             %{
+               delivery_wake_id: ^carrier_id,
+               batch_state: "delivered",
+               member_state: "included"
+             }
+           ] = NoticeBatcher.source_refs(ctx.db, source_wake_id)
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -10465,8 +10483,27 @@ defmodule Tightbeam.GatewayTest do
     assert %{"error" => %{"code" => "principal_required"}} = JSON.decode!(refused.resp_body)
   end
 
-  test "REST post enqueues now even when socket posts would stage for notice readiness", ctx do
+  test "REST post stages behind a running turn and keeps its identity receipt", ctx do
     Roles.create!(ctx.db, "rest-recipient", "flynn", "k1")
+
+    {:appended, current_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        content: "current running work",
+        sender: "session:k1"
+      })
+
+    {:ok, current_seq} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: current_message.id,
+        origin: "session:k1",
+        prompt: "current running work"
+      })
+
+    assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
+             Tightbeam.Ledger.claim_next(ctx.db, "k1", "rest-post-test")
 
     Wakes.schedule(ctx.db, %{
       session_key: "k1",
@@ -10487,14 +10524,87 @@ defmodule Tightbeam.GatewayTest do
     response = rest_post(ctx, "tbc_test", body)
     assert response.status == 200
 
-    assert %{"result" => %{"outcome" => "recorded", "turnSeq" => turn_seq}} =
-             JSON.decode!(response.resp_body)
+    assert %{
+             "result" => %{
+               "outcome" => "recorded",
+               "sessionKey" => "k1",
+               "deviceId" => "chat_test",
+               "clientMessageId" => "c_now",
+               "messageId" => message_id,
+               "turnSeq" => nil
+             }
+           } = JSON.decode!(response.resp_body)
 
-    assert {:ok, [[^turn_seq]]} = DB.query(ctx.db, "SELECT seq FROM turns")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[^message_id, "user", "chat_test", "c_now"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,role,deviceId,clientMessageId FROM messages WHERE clientMessageId='c_now'"
+             )
+
+    assert {:ok, [[source_wake_id]]} =
+             DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE prompt='now'")
+
+    assert {:ok, [["k1", "chat_test", "c_now", source_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT json_extract(sourceClientIdentity,'$.targetSessionKey'), json_extract(sourceClientIdentity,'$.deviceId'), json_extract(sourceClientIdentity,'$.clientMessageId'), json_extract(sourceClientIdentity,'$.sourceWakeId') FROM wakes WHERE wakeId=?1",
+               [source_wake_id]
+             )
+
+    assert NoticeBatcher.recover(ctx.db) == []
+
+    assert :ok =
+             Tightbeam.Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
+
+    [carrier_id] =
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000,
+        conn_registry: ctx.registry,
+        lane_manager: ctx.lane
+      )
+
+    assert {:ok, [[turn_seq, ^carrier_id, carrier_prompt]]} =
+             DB.query(ctx.db, "SELECT seq,wakeId,prompt FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert carrier_prompt =~ "earlier source"
+    assert carrier_prompt =~ "now"
+
+    assert :binary.match(carrier_prompt, "earlier source") < :binary.match(carrier_prompt, "now")
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, source_wake_id)
+
+    assert {:ok, [[^turn_seq]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+               source_wake_id
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [message_id])
   end
 
-  test "REST retry completes a socket post staged without a turn", ctx do
+  test "REST retry does not pull a staged socket post out of the ready-time batch", ctx do
     Roles.create!(ctx.db, "rest-recipient", "flynn", "k1")
+
+    {:appended, current_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        content: "current running work",
+        sender: "session:k1"
+      })
+
+    {:ok, current_seq} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: current_message.id,
+        origin: "session:k1",
+        prompt: "current running work"
+      })
+
+    assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
+             Tightbeam.Ledger.claim_next(ctx.db, "k1", "rest-retry-test")
 
     Wakes.schedule(ctx.db, %{
       session_key: "k1",
@@ -10518,7 +10628,7 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
     body = %{
       verb: "post",
@@ -10534,17 +10644,62 @@ defmodule Tightbeam.GatewayTest do
              "result" => %{
                "outcome" => "duplicate",
                "messageId" => message_id,
-               "turnSeq" => turn_seq
+               "turnSeq" => nil
              }
            } = JSON.decode!(response.resp_body)
 
-    assert {:ok, [[^turn_seq, ^message_id]]} =
-             DB.query(ctx.db, "SELECT seq,messageId FROM turns")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+
+    assert {:ok, [[source_wake_id]]} =
+             DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE prompt='staged text'")
+
+    assert NoticeBatcher.recover(ctx.db) == []
+
+    assert :ok =
+             Tightbeam.Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
+
+    [carrier_id] =
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000,
+        conn_registry: ctx.registry,
+        lane_manager: ctx.lane
+      )
+
+    assert {:ok, [[turn_seq, ^carrier_id, carrier_prompt]]} =
+             DB.query(ctx.db, "SELECT seq,wakeId,prompt FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert carrier_prompt =~ "earlier source"
+    assert carrier_prompt =~ "staged text"
+
+    assert :binary.match(carrier_prompt, "earlier source") <
+             :binary.match(carrier_prompt, "staged text")
 
     assert {:ok, [[^turn_seq]]} =
-             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE prompt='staged text'")
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+               source_wake_id
+             ])
 
-    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, source_wake_id)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE messageId=(SELECT id FROM messages WHERE clientMessageId='c_staged')"
+             )
+
+    retry = rest_post(ctx, "tbc_test", body)
+
+    assert %{
+             "result" => %{
+               "outcome" => "duplicate",
+               "messageId" => ^message_id,
+               "turnSeq" => ^turn_seq
+             }
+           } = JSON.decode!(retry.resp_body)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId='c_staged'")
   end
 
   test "REST retry uses the original turn from a directly delivered socket post", ctx do
