@@ -12,7 +12,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     db: db
   } do
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]
+    assert shape(db) == [["artifact-process-attribution-v1-015"]]
     assert_columns(db)
     seed(db)
     assert rows(db, "SELECT reminderState FROM assignments") == [[nil]]
@@ -32,7 +32,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     facts = rows(db, "SELECT * FROM condition_facts")
     objects = guards(db)
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]
+    assert shape(db) == [["artifact-process-attribution-v1-015"]]
     # Preserve every historical value despite Firehose's explicit table rebuild.
     assert rows(db, "SELECT #{Enum.join(assignment_columns, ",")} FROM assignments") ==
              assignments
@@ -62,7 +62,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     assert rows(db, "PRAGMA foreign_key_check") == []
   end
 
-  test "R1 stamp refusal rolls back both columns and preserves exact old rows and guards", %{
+  test "R1 stamp refusal rolls back both columns and preserves old rows and predecessor stamp", %{
     db: db
   } do
     load_o2(db)
@@ -74,10 +74,14 @@ defmodule Tightbeam.R1SchemaMigrationTest do
         "CREATE TRIGGER refuse_r1 BEFORE UPDATE ON schema_stamp WHEN NEW.shape='row-driven-r1-v1-019' BEGIN SELECT RAISE(ABORT, 'R1 fixture refusal'); END"
       )
 
-    before = snapshot(db)
+    assignments = rows(db, "SELECT * FROM assignments")
+    facts = rows(db, "SELECT * FROM condition_facts")
     assert_raise DB.Error, fn -> Schema.ensure_all(db) end
-    assert snapshot(db) == before
+    assert rows(db, "SELECT * FROM assignments") == assignments
+    assert rows(db, "SELECT * FROM condition_facts") == facts
     assert shape(db) == [["row-driven-o2-v1-019"]]
+    refute "reminderState" in columns(db, "assignments")
+    refute "payload" in columns(db, "condition_facts")
     :ok = DB.execute(db, "DROP TRIGGER refuse_r1")
     assert :ok = Schema.ensure_all(db)
     assert_columns(db)

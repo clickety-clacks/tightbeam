@@ -3,7 +3,7 @@ defmodule Tightbeam.AssignmentsTest do
   alias Tightbeam.Model
 
   @session_identity_shape "session-identity-v1-0114"
-  @closed_assignment_reconciliation_shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
+  @artifact_process_attribution_shape "artifact-process-attribution-v1-015"
 
   alias Tightbeam.{
     Assignments,
@@ -186,22 +186,14 @@ defmodule Tightbeam.AssignmentsTest do
     end
   end
 
-  test "gateway opens and retires with supervision reminders off", ctx do
-    File.cp!(
-      Path.join([
-        :code.priv_dir(:tightbeam),
-        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
-      ]),
-      Path.join(ctx.law, "identity/rules/row-reaction-assignment-inactivity.toml")
-    )
+  test "gateway assignment lifecycle works without inactivity reminders", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 101})
 
-    Rules.load!(ctx.law, Map.keys(ctx.handlers))
-    handlers = Gateway.handlers(%{db: ctx.db, supervision_interval_ms: :off, wake_tick_ms: 101})
-
-    assignment = handlers["assign"].(assign_call({:session, "holder"}, "off interval"))
+    assignment = handlers["assign"].(assign_call({:session, "holder"}, "quiet assignment"))
     assert assignment.id
 
     item = create_work_item(ctx, "Off interval linked item")
+    set_delivery_owner(ctx, item.id, "holder")
 
     assert {:ok, [[routing_id]]} =
              DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
@@ -213,14 +205,16 @@ defmodule Tightbeam.AssignmentsTest do
              ])
 
     linked =
-      handlers["assign"].(assign_call({:session, "holder"}, "off interval linked", nil, item.id))
+      handlers["assign"].(
+        assign_call({:session, "holder"}, "quiet linked assignment", nil, item.id)
+      )
 
     assert linked.workItemId == item.id
 
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'",
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
                [linked.id]
              )
 
@@ -240,7 +234,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     reopened =
       handlers["reopen-assignment"].(
-        reopen_call({:user, "flynn"}, linked.id, "continue without reminders")
+        reopen_call({:user, "flynn"}, linked.id, "continue quiet work")
       )
 
     assert reopened.state == "open"
@@ -248,7 +242,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'",
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
                [linked.id]
              )
 
@@ -682,12 +676,19 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
   end
 
-  test "dispatch and a bound plain-after recheck teach the exact card fact", ctx do
+  test "dispatch omits a child check hint while a bound plain-after recheck teaches the card fact",
+       ctx do
     dispatch =
       dispatch_call({:user, "flynn"}, "waitable card", "Inspect the card.", "wait-hint")
 
     assignment = dispatch!(ctx, dispatch)
-    hint = assignment.condition_wake_hint
+    refute Map.has_key?(assignment, :condition_wake_hint)
+
+    replay = dispatch!(ctx, dispatch)
+    assert replay.id == assignment.id
+    refute Map.has_key?(replay, :condition_wake_hint)
+
+    hint = Assignments.condition_wait_hint(ctx.db, assignment.id)
     assert hint.kind == "assignment-landed"
     assert hint.scope == assignment.id
     assert hint.fallback_after == "2h"
@@ -700,13 +701,6 @@ defmodule Tightbeam.AssignmentsTest do
     assert hint.record_dependency.message =~ "not a complete --predicate"
     assert hint.record_dependency.message =~ "caller-selected resolverRef"
     assert hint.record_dependency.message =~ "No necessity or verifier assignment is required"
-    assert hint.message =~ "--when-fact assignment-landed"
-    assert hint.message =~ "assignmentId=#{assignment.id}"
-    assert hint.message =~ "assignment.state"
-    assert hint.message =~ "completion attestation only"
-
-    assert %{condition_wake_hint: replay_hint} = dispatch!(ctx, dispatch)
-    assert replay_hint.scope == assignment.id
 
     recheck =
       call("wake", {:user, "flynn"}, "holder", %{
@@ -973,8 +967,9 @@ defmodule Tightbeam.AssignmentsTest do
       assert readdressed.obligation_ref == notice.obligation_ref
     end
 
-    test "assignment completion remains valid after its inactivity ladder is exhausted", ctx do
-      item = create_work_item(ctx, "finish after inactivity ladder")
+    test "assignment completion remains valid without inactivity wakes while sibling work stays live",
+         ctx do
+      item = create_work_item(ctx, "finish quiet assignment")
 
       assignment =
         handle(
@@ -982,7 +977,7 @@ defmodule Tightbeam.AssignmentsTest do
           "assign",
           terminal_notice_assign_call(
             {:user, "flynn"},
-            "close without a pending deadline",
+            "close without an inactivity wake",
             item.id
           )
         )
@@ -998,31 +993,12 @@ defmodule Tightbeam.AssignmentsTest do
           )
         )
 
-      assert {:ok, [[1]]} =
+      assert {:ok, [[0]]} =
                DB.query(
                  ctx.db,
                  "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb') AND state='pending'",
                  [assignment.id]
                )
-
-      assert {:ok, _} =
-               DB.query(
-                 ctx.db,
-                 "UPDATE wakes SET state='fired',firedAt=?3 WHERE assignmentId IN (?1,?2) AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb') AND state='pending'",
-                 [assignment.id, sibling.id, System.system_time(:millisecond)]
-               )
-
-      assert {:ok, [[0]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT COUNT(*) FROM wakes WHERE assignmentId IN (?1,?2) AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb') AND state='pending'",
-                 [assignment.id, sibling.id]
-               )
-
-      assert {:ok, :none} =
-               DB.transaction(ctx.db, fn txn ->
-                 Supervision.inactivity_deadline_trigger_in_txn(txn, {:work_item, item.id})
-               end)
 
       assert %{assignment: %{state: "closed", outcome: "completed"}} =
                handle(
@@ -1033,6 +1009,13 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert {:ok, [["open"]]} =
                DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [sibling.id])
+
+      assert {:ok, {:ok, %{kind: "supervision_entitlement", id: sibling_id}}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Supervision.liveness_trigger_in_txn(txn, {:work_item, item.id})
+               end)
+
+      assert sibling_id == sibling.id
     end
 
     test "human opener without a work item admits to its durable owner's main", ctx do
@@ -2487,15 +2470,12 @@ defmodule Tightbeam.AssignmentsTest do
     assert prior_closed_at == closed.assignment.closedAt
     assert prior_attest_id == closed.assignment.closingAttestId
 
-    assert {:ok, [[deadline_wake_id, "pending", 1_000]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId,state,json_extract(prompt, '$.intervalMs') FROM wakes " <>
-                 "WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
                [assignment.id]
              )
-
-    assert is_binary(deadline_wake_id)
 
     assert {:ok, []} =
              DB.query(
@@ -2614,8 +2594,7 @@ defmodule Tightbeam.AssignmentsTest do
       Gateway.handlers(%{
         db: ctx.db,
         base_dir: System.tmp_dir!(),
-        wake_tick_ms: 1000,
-        supervision_interval_ms: 3000
+        wake_tick_ms: 1000
       })
 
     assert Map.has_key?(handlers, "reopen-assignment")
@@ -2633,11 +2612,10 @@ defmodule Tightbeam.AssignmentsTest do
     assert payload["outcome"] == nil
     Hub.delivered(hub, self())
 
-    assert {:ok, [[3000, "pending"]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT json_extract(prompt, '$.intervalMs'),state FROM wakes " <>
-                 "WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
                [assignment.id]
              )
 
@@ -2894,9 +2872,8 @@ defmodule Tightbeam.AssignmentsTest do
              |> then(&handle(ctx, "attest", &1))
   end
 
-  test "a standing cannot-proceed block suppresses reminders and still releases on its fact",
+  test "a standing cannot-proceed block keeps its decision wake and releases on its fact",
        ctx do
-    load_inactivity_policy!(ctx)
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
     blocked =
@@ -2912,19 +2889,17 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :release_fact_principal_ref], "agent:holder")
       |> then(&handle(ctx, "attest", &1))
 
-    assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", blocked.id)
-
-    assert {:ok, {:ok, %{kind: "pending_wake"}}} =
+    assert {:ok, {:ok, %{kind: "supervision_entitlement", id: blocked_id}}} =
              DB.transaction(ctx.db, fn txn ->
-               Supervision.inactivity_deadline_trigger_in_txn(txn, {:assignment, blocked.id})
+               Supervision.liveness_trigger_in_txn(txn, {:assignment, blocked.id})
              end)
 
-    refute fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", blocked.id)
+    assert blocked_id == blocked.id
 
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'",
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
                [blocked.id]
              )
 
@@ -2956,29 +2931,6 @@ defmodule Tightbeam.AssignmentsTest do
                "SELECT reasonKind,actionNeeded FROM wake_cancellations WHERE wakeId=?1",
                [filed.decisionWake.wake_id]
              )
-  end
-
-  defp fire_inactivity_wake!(db, consumer, assignment_id) do
-    case DB.query(
-           db,
-           "SELECT wakeId FROM wakes WHERE consumer=?1 AND assignmentId=?2 AND state='pending' ORDER BY dueAt,wakeId LIMIT 1",
-           [consumer, assignment_id]
-         ) do
-      {:ok, [[wake_id]]} ->
-        assert {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
-        wake = Wakes.get(db, wake_id)
-
-        assert {:ok, _} =
-                 if(consumer == "assignment_inactivity_deadline",
-                   do: Supervision.deadline(db, wake),
-                   else: Supervision.climb(db, wake)
-                 )
-
-        true
-
-      {:ok, []} ->
-        false
-    end
   end
 
   test "cannot-proceed is session-filed, idempotent, pauses one card, and releases on its exact custom fact",
@@ -3739,6 +3691,54 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
+  test "a settled cannot-proceed replays identically and permits a new lifecycle after reopen",
+       ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, "reopened dependency")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    first_filing =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "wait for the opener to decide")
+
+    first_block = handle(ctx, "attest", first_filing)
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "resume the dependency")
+             )
+
+    settled_replay = handle(ctx, "attest", first_filing)
+
+    assert settled_replay.replayed
+    assert settled_replay.cannotProceed.id == first_block.cannotProceed.id
+    assert settled_replay.cannotProceed.state == "settled"
+    assert Assignments.attest_count(ctx.db, assignment.id) == 1
+
+    second_filing =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the dependency is blocked for a new reason")
+
+    second_block = handle(ctx, "attest", second_filing)
+
+    assert %{assignment: %{state: "open"}, cannotProceed: %{state: "standing"}} = second_block
+    assert second_block.cannotProceed.id != first_block.cannotProceed.id
+    assert second_block.decisionRequest.id != first_block.decisionRequest.id
+
+    third_filing = put_in(second_filing, [:params, :note], "a third reason")
+    assert %{code: "cannot_proceed_conflict"} = handle(ctx, "attest", third_filing)
+
+    assert Assignments.attest_count(ctx.db, assignment.id) == 2
+  end
+
   test "install reconciliation disposes a closed completed hold by its completion attest", ctx do
     {assignment, blocked, closing_attest_id, closed_at} =
       stranded_completed_assignment(ctx, "stranded completed assignment")
@@ -3822,7 +3822,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert event_detail =~ closing_attest_id
 
-    assert {:ok, [[@closed_assignment_reconciliation_shape]]} =
+    assert {:ok, [[@artifact_process_attribution_shape]]} =
              DB.query(ctx.db, "SELECT shape FROM schema_stamp")
   end
 
@@ -3959,8 +3959,7 @@ defmodule Tightbeam.AssignmentsTest do
              before
   end
 
-  test "a pending holder reminder does not block opener revocation after reparenting", ctx do
-    load_inactivity_policy!(ctx)
+  test "opener revocation after reparenting does not depend on inactivity reminders", ctx do
     main = Org.personal_session_key("flynn")
     session(ctx.db, main, "flynn")
     session(ctx.db, "parent-a", "flynn", %{spawned_by: main})
@@ -3973,7 +3972,6 @@ defmodule Tightbeam.AssignmentsTest do
     opener_work =
       assign_call({:user, "flynn"}, "opener has continuing work", nil, item.id)
       |> Map.put(:session_key, "opener")
-      |> Map.put(:supervision_interval_ms, 1)
       |> then(&handle(ctx, "assign", &1))
 
     blocked_assignment =
@@ -3987,17 +3985,12 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Supervision.ladder_target(ctx.db, "opener", 1) == "parent-a"
 
-    assert fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", opener_work.id)
-
-    assert [reminder] =
-             Enum.filter(
-               Wakes.list_pending(ctx.db),
-               &(&1.assignment_id == opener_work.id and &1.consumer == "prompt")
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
+               [opener_work.id]
              )
-
-    assert reminder.session_key == "opener"
-
-    assert Wakes.get(ctx.db, reminder.wake_id).state == "pending"
 
     assert {:ok, [["standing"]]} =
              DB.query(
@@ -4016,8 +4009,6 @@ defmodule Tightbeam.AssignmentsTest do
                  idempotency_key: "reparent-after-escalation"
                }
              })
-
-    assert Wakes.get(ctx.db, reminder.wake_id).session_key == "opener"
 
     assert %{outcome: "revoked"} =
              handle(
@@ -4685,35 +4676,18 @@ defmodule Tightbeam.AssignmentsTest do
                assign_call({:user, "flynn"}, "x", String.duplicate("k", 201))
              )
 
-    baseline = assignment_count(ctx.db)
-
-    for interval <- [nil, 0, -1] do
-      call =
-        Map.put(assign_call({:user, "flynn"}, "no interval"), :supervision_interval_ms, interval)
-
-      assert %{code: "invalid_supervision_interval"} =
-               Assignments.__handle__(ctx.db, "assign", call)
-    end
-
-    assert assignment_count(ctx.db) == baseline
-
     user_opened = handle(ctx, "assign", assign_call({:user, "flynn"}, "user work"))
+
     assert user_opened.openedByUser == "flynn"
     assert user_opened.openedBySession == nil
     assert user_opened.workItemId == nil
 
-    assert {:ok, [[wake_id, due_at, "pending", user_assignment_id, 1_000]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId,dueAt,state,json_extract(prompt, '$.assignmentId'), " <>
-                 "json_extract(prompt, '$.intervalMs') FROM wakes " <>
-                 "WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
                [user_opened.id]
              )
-
-    assert user_assignment_id == user_opened.id
-    assert is_binary(wake_id)
-    assert due_at == user_opened.openedAt + 1_000
 
     session_opened = handle(ctx, "assign", assign_call({:session, "holder"}, "session work"))
     assert session_opened.openedBySession == "holder"
@@ -4741,27 +4715,22 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'once'")
   end
 
-  test "raw dispatch precheck leaves supervision interval validation to the mutation seam", ctx do
+  test "raw dispatch precheck and assignment mutation have no inactivity timer dependency", ctx do
     baseline = assignment_count(ctx.db)
 
-    raw_call =
-      assign_call({:user, "flynn"}, "Gateway will attach interval")
-      |> Map.delete(:supervision_interval_ms)
+    raw_call = assign_call({:user, "test-owner"}, "Gateway assignment")
 
     assert :proceed = Assignments.dispatch_precheck(ctx.db, raw_call)
 
-    for invalid <- [nil, 0, -1, "1000"] do
-      assert :proceed =
-               Assignments.dispatch_precheck(
-                 ctx.db,
-                 Map.put(raw_call, :supervision_interval_ms, invalid)
-               )
-    end
+    assert %{id: assignment_id} = Assignments.__handle__(ctx.db, "assign", raw_call)
+    assert assignment_count(ctx.db) == baseline + 1
 
-    assert assignment_count(ctx.db) == baseline
-
-    assert %{code: "invalid_supervision_interval"} =
-             Assignments.__handle__(ctx.db, "assign", raw_call)
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
+               [assignment_id]
+             )
   end
 
   test "dispatch atomically opens an assignment and enqueues its brief with the card id", ctx do
@@ -5185,14 +5154,6 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a fired owner routing bracket permits only the first rumination deferral", ctx do
-    File.cp!(
-      Path.join([
-        :code.priv_dir(:tightbeam),
-        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
-      ]),
-      Path.join(ctx.law, "identity/rules/row-reaction-assignment-inactivity.toml")
-    )
-
     Rules.load!(ctx.law, Map.keys(ctx.handlers))
     work_item = create_work_item(ctx, "Fired routing bracket")
     caller = "holder"
@@ -6629,6 +6590,15 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
 
+    artifact_only_verification =
+      attest_call({:session, "holder"}, producer.id, "verdict")
+      |> put_in([:params, :verdict_kind], "verified")
+      |> put_in([:params, :artifact_id], "art_code_report")
+      |> put_in([:params, :content_sha256], String.duplicate("a", 64))
+
+    assert %{code: "invalid_commit_refs"} =
+             handle(ctx, "attest", artifact_only_verification)
+
     assert %{attest: %{verdictKind: "verified"}} =
              attest_call({:session, "holder"}, producer.id, "verdict")
              |> put_in([:params, :verdict_kind], "verified")
@@ -7242,6 +7212,159 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
+  test "attest records without probing and check-attest checks only its files", ctx do
+    item = create_work_item(ctx, "file check")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+
+    for {id, producer, origin, state, home} <- [
+          {"art_attached", nil, "lab1:/files/attached", "in-workspace", nil},
+          {"art_present", assignment.id, "lab1:/files/present", "in-workspace", nil},
+          {"art_missing", assignment.id, "lab1:/files/missing", "in-workspace", nil},
+          {"art_unreachable", assignment.id, "lab1:/files/unreachable", "in-workspace", nil},
+          {"art_disappeared_host", assignment.id, "missinghost:/files/unknown", "in-workspace", nil},
+          {"art_archived", assignment.id, "lab1:/files/old", "archived", "/files/archive"},
+          {"art_unrelated", nil, "lab1:/files/unrelated", "in-workspace", nil}
+        ] do
+      seed_file_artifact(ctx.db, item.id, id, producer, origin, state, home)
+    end
+
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        sh: fn _ -> send(parent, :attest_probe); {"", 0} end,
+        file_stat: fn path ->
+          send(parent, {:checked, path})
+
+          case path do
+            "/files/missing" -> {:error, :enoent}
+            "/files/unreachable" -> {:error, :eacces}
+            _ -> {:ok, %{}}
+          end
+        end
+      })
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> then(&handlers["attest"].(&1))
+
+    assert attested.attest.kind == "progress"
+    refute Map.has_key?(attested, :referents)
+    refute_received :attest_probe
+    refute_received {:checked, _}
+
+    # Only verdict attests can carry an attached artifact. Seed that existing
+    # record shape so the check exercises both file sources.
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO attests
+          (id, assignmentId, kind, verdictKind, byUser, artifactId, contentSha256, ts)
+        VALUES ('att_with_artifact', ?1, 'verdict', 'user-ruling', 'flynn',
+                'art_attached', ?2, 2)
+        """,
+        [assignment.id, String.duplicate("a", 64)]
+      )
+
+    assert {:ok, result} =
+             Dispatch.dispatch(
+               ctx.db,
+               handlers,
+               call("check-attest", {:session, "holder"}, nil, %{attest_id: "att_with_artifact"})
+             )
+
+    assert Enum.map(result.files, &{&1.artifactId, &1.status, &1[:error]}) == [
+             {"art_archived", "present", nil},
+             {"art_attached", "present", nil},
+             {"art_disappeared_host", "could_not_access", "unknown host: missinghost"},
+             {"art_missing", "absent", nil},
+             {"art_present", "present", nil},
+             {"art_unreachable", "could_not_access", "eacces"}
+           ]
+
+    assert result.summary ==
+             "absent: lab1:/files/missing; could not access: missinghost:/files/unknown, lab1:/files/unreachable"
+    assert_received {:checked, "/files/archive"}
+    refute_received {:checked, "/files/old"}
+    refute_received {:checked, "/files/unrelated"}
+    refute_received :attest_probe
+  end
+
+  test "a blocked requested file check does not block another attest", ctx do
+    item = create_work_item(ctx, "blocked check")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+    seed_file_artifact(ctx.db, item.id, "art_blocked", assignment.id, "lab1:/files/blocked")
+    first = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        file_stat: fn _path ->
+          send(parent, {:check_entered, self()})
+          receive do
+            :release_check -> {:ok, %{}}
+          end
+        end
+      })
+
+    check =
+      Task.async(fn ->
+        Dispatch.dispatch(
+          ctx.db,
+          handlers,
+          call("check-attest", {:session, "holder"}, nil, %{attest_id: first.attest.id})
+        )
+      end)
+
+    assert_receive {:check_entered, check_pid}, 5_000
+    assert check_pid == check.pid
+
+    another =
+      Task.async(fn ->
+        handlers["attest"].(attest_call({:session, "holder"}, assignment.id, "progress"))
+      end)
+
+    assert %{attest: %{kind: "progress"}} = Task.await(another, 10_000)
+    send(check.pid, :release_check)
+    assert {:ok, %{files: [%{status: "present"}], summary: "All 1 files are present on disk."}} =
+             Task.await(check, 10_000)
+  end
+
+  test "check-attest reports real local file presence and disappearance", ctx do
+    item = create_work_item(ctx, "local file")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+    path = Path.join(Application.fetch_env!(:tightbeam, :base_dir), "checked-file")
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, "recorded bytes")
+
+    seed_file_artifact(
+      ctx.db,
+      item.id,
+      "art_local",
+      assignment.id,
+      "#{Tightbeam.Placement.local_host_name()}:#{path}"
+    )
+
+    attested = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
+    check = fn ->
+      Gateway.handlers(%{db: ctx.db, base_dir: Application.fetch_env!(:tightbeam, :base_dir)})[
+        "check-attest"
+      ].(%{params: %{attest_id: attested.attest.id}})
+    end
+
+    assert %{files: [%{status: "present"}], summary: "All 1 files are present on disk."} =
+             check.()
+
+    File.rm!(path)
+    assert %{files: [%{status: "absent"}]} = check.()
+  end
+
   test "accepted handler rolls back when its event append fails", ctx do
     {:ok, _} = DB.query(ctx.db, "DROP TABLE events")
 
@@ -7249,11 +7372,7 @@ defmodule Tightbeam.AssignmentsTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               Map.put(
-                 assign_call({:session, "holder"}, "committed"),
-                 :supervision_interval_ms,
-                 1_000
-               )
+               assign_call({:session, "holder"}, "committed")
              )
 
     assert message =~ "events"
@@ -7435,6 +7554,20 @@ defmodule Tightbeam.AssignmentsTest do
     assert snapshot.() == before_settled_reads
   end
 
+  defp seed_file_artifact(db, work_item_id, id, producer, origin, state \\ "in-workspace", home \\ nil) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO artifacts
+          (artifactId, kind, title, createdBySession, workItemId,
+           producedByAssignmentId, originPath, state, home, createdAt, updatedAt)
+        VALUES (?1, 'report', ?1, 'holder', ?2, ?3, ?4, ?5, ?6, 1, 1)
+        """,
+        [id, work_item_id, producer, origin, state, home]
+      )
+  end
+
   defp handle(ctx, verb, call)
        when verb in [
               "assign",
@@ -7450,13 +7583,7 @@ defmodule Tightbeam.AssignmentsTest do
          Assignments.__handle__(
            ctx.db,
            verb,
-           call
-           |> Map.put(:verb, verb)
-           |> then(fn routed ->
-             if verb in ["assign", "dispatch", "reopen-assignment"],
-               do: Map.put_new(routed, :supervision_interval_ms, 1_000),
-               else: routed
-           end)
+           Map.put(call, :verb, verb)
          )
 
   defp handle(ctx, verb, call), do: WorkItems.__handle__(ctx.db, verb, %{call | verb: verb})
@@ -7523,12 +7650,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp dispatch!(ctx, call) do
-    assert {:ok, result} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               Map.put_new(call, :supervision_interval_ms, 1_000)
-             )
+    assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
     result
   end
@@ -7553,11 +7675,11 @@ defmodule Tightbeam.AssignmentsTest do
         assignment_id
       ])
 
-    {:ok, inactivity_deadlines} =
+    {:ok, assignment_wakes} =
       DB.query(
         db,
-        "SELECT wakeId,state,dueAt,prompt FROM wakes " <>
-          "WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' ORDER BY createdAt,wakeId",
+        "SELECT wakeId,state,dueAt,consumer FROM wakes " <>
+          "WHERE assignmentId=?1 ORDER BY createdAt,wakeId",
         [assignment_id]
       )
 
@@ -7571,7 +7693,7 @@ defmodule Tightbeam.AssignmentsTest do
     %{
       assignment: assignment,
       reopeningCount: reopening_count,
-      inactivityDeadlines: inactivity_deadlines,
+      wakes: assignment_wakes,
       effort: effort
     }
   end
@@ -7768,7 +7890,7 @@ defmodule Tightbeam.AssignmentsTest do
       idempotency_key: key,
       work_item_id: work_item_id
     })
-    |> Map.merge(%{target_role: nil, role_fallback: false, supervision_interval_ms: 1_000})
+    |> Map.merge(%{target_role: nil, role_fallback: false})
   end
 
   defp work_item_call(verb, principal, params), do: call(verb, principal, nil, params)
@@ -7880,12 +8002,5 @@ defmodule Tightbeam.AssignmentsTest do
     Enum.filter(rows, fn [_seq, _session_key, _status, wake_id] ->
       MapSet.member?(wake_ids, wake_id)
     end)
-  end
-
-  defp load_inactivity_policy!(ctx) do
-    name = "row-reaction-assignment-inactivity.toml"
-    source = Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name])
-    File.cp!(source, Path.join(ctx.law, "identity/rules/#{name}"))
-    Rules.load!(ctx.law, Map.keys(ctx.handlers))
   end
 end

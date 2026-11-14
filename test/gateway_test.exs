@@ -12,7 +12,7 @@ defmodule Tightbeam.GatewayTest do
     effects = Tightbeam.Gateway.handler_effects(%{db: :registry_test_unused})
 
     expected =
-      ~w(post wake condition facts-read fact-demand fact-producer-claim fact-producers artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-handoff work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-po-set retire assignment-commitref-correct)
+      ~w(post wake condition facts-read fact-demand fact-producer-claim fact-producers artifact-record artifact-get artifacts rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-handoff work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests check-attest assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-po-set retire assignment-commitref-correct)
 
     expected = expected ++ ~w(breathing)
 
@@ -25,7 +25,7 @@ defmodule Tightbeam.GatewayTest do
 
     expected =
       expected ++
-        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow harklight-briefings-catchup)
+        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-follow harklight-briefings-catchup)
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 
@@ -283,14 +283,15 @@ defmodule Tightbeam.GatewayTest do
     def start_link({name, db, parent}),
       do: GenServer.start_link(__MODULE__, {db, parent}, name: name)
 
-    def init({db, parent}), do: {:ok, %{db: db, parent: parent, armed: true}}
+    def init({db, parent}), do: {:ok, %{db: db, parent: parent, transaction_count: 0}}
 
-    def handle_call({:query, sql, params} = request, _from, state) do
+    def handle_call({:transaction, _fun} = request, _from, state) do
+      transaction_count = state.transaction_count + 1
+      state = %{state | transaction_count: transaction_count}
+
       state =
-        if state.armed and params != [] and
-             String.contains?(sql, "DELETE FROM harness_park_fences") and
-             String.contains?(sql, "adapterKey = ?1") do
-          send(state.parent, {:before_reconciled_fence_delete, self()})
+        if transaction_count == 3 do
+          send(state.parent, {:before_reconciled_fence_delete, self(), transaction_count})
 
           receive do
             :release_reconciled_fence_delete -> :ok
@@ -298,7 +299,7 @@ defmodule Tightbeam.GatewayTest do
             5_000 -> raise "timed out waiting to release reconciled fence delete"
           end
 
-          %{state | armed: false}
+          state
         else
           state
         end
@@ -368,6 +369,8 @@ defmodule Tightbeam.GatewayTest do
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
 
+    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
+
     def handle_call({:new_candidate_session, _model, _cwd, _mcp, _guidance}, _from, parent) do
       send(parent, :candidate_prepare_attempted)
       {:reply, {:error, :deliberate_candidate_failure}, parent}
@@ -431,6 +434,15 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:knows_session?, sid}, _from, {parent, opts} = state) do
       send(parent, {:tune_residency_checked, sid})
       {:reply, Keyword.get(opts, :resident, true), state}
+    end
+
+    def handle_call(
+          {:apply_model_strict, sid, model, _prior, _deadline},
+          _from,
+          {parent, opts} = state
+        ) do
+      send(parent, {:tune_config_applied, sid, model})
+      {:reply, Keyword.get(opts, :apply_result, {:ok, model}), state}
     end
 
     def handle_call({:current_model, _sid}, _from, {_parent, opts} = state),
@@ -698,7 +710,7 @@ defmodule Tightbeam.GatewayTest do
 
     Org.create(db, %{
       session_key: "k1",
-      display_name: "Main",
+      display_name: "Flynn session",
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
@@ -2462,134 +2474,60 @@ defmodule Tightbeam.GatewayTest do
              DB.query(ctx.db, "SELECT seq FROM turns WHERE sessionKey='k1' AND status='queued'")
   end
 
-  for {cadence, expected_interval} <- [
-        {%{}, 1_800_000},
-        {%{wake_tick_ms: 1_234}, 1_800_000},
-        {%{wake_tick_ms: 10, supervision_interval_ms: 4_321}, 4_321},
-        {%{wake_tick_ms: 900, supervision_interval_ms: 4_321}, 4_321}
-      ] do
-    test "assignment interval wiring #{inspect(cadence)}",
-         ctx do
-      ensure_global_registry()
-      base_dir = role_test_base("gateway-supervision-interval")
+  test "assignment and dispatch do not create inactivity wakes", ctx do
+    handlers = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))
 
-      register_hosts(ctx.db, %{
-        "testhost" => %{ssh: "testhost", base_dir: base_dir, cli_bin: nil}
-      })
+    owner = "test-owner"
 
-      cadence = unquote(Macro.escape(cadence))
-      expected_interval = unquote(expected_interval)
+    assert {:ok, []} =
+             DB.query(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES (?1,0,?2)", [
+               owner,
+               System.system_time(:millisecond)
+             ])
 
-      handlers =
-        Gateway.handlers(
-          gateway_config(base_dir, ctx.db, 0)
-          |> Map.delete(:wake_tick_ms)
-          |> Map.merge(cadence)
-          # Former settings are intentionally ignored after E's removal.
-          |> Map.put(:effort_checkins_enabled, true)
-          |> Map.put(:effort_checkin_horizon_ms, 123)
-        )
+    owner_session = ensure_main_session(ctx.db, owner)
 
-      File.mkdir_p!(Path.join(base_dir, "identity/rules"))
-      name = "row-reaction-assignment-inactivity.toml"
+    common = %{
+      origin: "user:#{owner}",
+      principal: {:user, owner},
+      session_key: owner_session.session_key,
+      target_role: nil,
+      role_fallback: false
+    }
 
-      File.cp!(
-        Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
-        Path.join(base_dir, "identity/rules/#{name}")
-      )
+    assert %{id: assign_id} =
+             handlers["assign"].(
+               Map.merge(common, %{verb: "assign", params: %{subject: "quiet assignment"}})
+             )
 
-      Tightbeam.Rules.load!(base_dir, Map.keys(handlers))
+    assert %{id: dispatch_id} =
+             handlers["dispatch"].(
+               Map.merge(common, %{
+                 verb: "dispatch",
+                 params: %{subject: "quiet dispatch", brief: "continue the assigned work"}
+               })
+             )
 
-      common = %{
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
-        session_key: "k1",
-        target_role: nil,
-        role_fallback: false
-      }
+    for assignment_id <- [assign_id, dispatch_id] do
+      assert %{attest: %{id: _}} =
+               handlers["attest"].(%{
+                 origin: "agent:#{owner_session.session_key}",
+                 principal: {:session, owner_session.session_key},
+                 session_key: owner_session.session_key,
+                 params: %{assignment_id: assignment_id, kind: "progress"}
+               })
 
-      assert %{id: assign_id} =
-               handlers["assign"].(
-                 Map.merge(common, %{
-                   verb: "assign",
-                   params: %{subject: "gateway interval assign"}
-                 })
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND (consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb') OR (consumer='prompt' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'))",
+                 [assignment_id]
                )
-
-      assert %{id: dispatch_id} =
-               handlers["dispatch"].(
-                 Map.merge(common, %{
-                   verb: "dispatch",
-                   params: %{
-                     subject: "gateway interval dispatch",
-                     brief: "prove the configured interval"
-                   }
-                 })
-               )
-
-      for assignment_id <- [assign_id, dispatch_id] do
-        assert {:ok, [[0]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
-                   [assignment_id]
-                 )
-
-        assert {:ok, [[0]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer IN ('effort_probe','effort_deadline')",
-                   [assignment_id]
-                 )
-
-        assert {:ok, [[0]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1 AND kind='effort'",
-                   [assignment_id]
-                 )
-      end
-
-      for assignment_id <- [assign_id, dispatch_id] do
-        assert {:ok, [[^expected_interval, ^expected_interval]]} =
-                 DB.query(
-                   ctx.db,
-                   """
-                   SELECT w.dueAt - a.openedAt, json_extract(w.prompt, '$.intervalMs')
-                   FROM assignments a
-                   JOIN wakes w ON w.assignmentId=a.id
-                   WHERE a.id=?1 AND w.consumer='assignment_inactivity_deadline'
-                     AND w.state='pending'
-                   """,
-                   [assignment_id]
-                 )
-
-        assert %{attest: %{id: _}} =
-                 handlers["attest"].(%{
-                   origin: "agent:k1",
-                   principal: {:session, "k1"},
-                   session_key: "k1",
-                   params: %{assignment_id: assignment_id, kind: "progress"}
-                 })
-
-        assert {:ok, [[^expected_interval, ^expected_interval]]} =
-                 DB.query(
-                   ctx.db,
-                   """
-                   SELECT dueAt - json_extract(prompt, '$.activityAt'),
-                          json_extract(prompt, '$.intervalMs')
-                   FROM wakes
-                   WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'
-                     AND state='pending'
-                   """,
-                   [assignment_id]
-                 )
-      end
     end
   end
 
   @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-  test "wake polling cadence ignores the inactivity interval", %{tmp_dir: tmp} do
+  test "wake polling cadence follows only its own setting", %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
       tmp,
       "live_base_gateway_cadence.exs",
@@ -2600,7 +2538,7 @@ defmodule Tightbeam.GatewayTest do
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
     Org.create(ctx.db, %{
       session_key: Org.personal_session_key("flynn"),
-      display_name: "Main",
+      display_name: "Flynn built-in main",
       kind: "main",
       is_built_in: true,
       owner_user_id: "flynn",
@@ -3434,55 +3372,35 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
-  for {override, script} <- [
-        {%{}, "live_base_gateway_liveness_default.exs"},
-        {%{supervision_interval_ms: 4_321}, "live_base_gateway_liveness_override.exs"}
-      ] do
-    @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-    test "children backfills an inactivity deadline with interval #{inspect(override)}", %{
-      tmp_dir: tmp
-    } do
-      Tightbeam.GuardRuntimeFixture.run!(tmp, unquote(script), "guarded-gateway-liveness: ok")
-    end
+  @tag cold_gateway: true, tmp_dir: true
+  test "gateway startup drains pending legacy inactivity wakes", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "legacy_assignment_inactivity_startup.exs",
+      "legacy-assignment-inactivity-startup: ok"
+    )
   end
 
-  test "invalid inactivity settings leave gateway assignment operations available", ctx do
-    rule_base =
-      Path.join(
-        System.tmp_dir!(),
-        "gateway-invalid-assignment-inactivity-#{System.unique_integer([:positive])}"
-      )
-
-    rules_dir = Path.join(rule_base, "identity/rules")
-    File.mkdir_p!(rules_dir)
-
-    source =
-      Path.join(
-        :code.priv_dir(:tightbeam),
-        "kungfu/agentic-engineering/rules/row-reaction-assignment-inactivity.toml"
-      )
-
-    invalid =
-      source
-      |> File.read!()
-      |> String.replace("period_ms = 1800000", "period_ms = 0", global: false)
-
-    File.write!(Path.join(rules_dir, "row-reaction-assignment-inactivity.toml"), invalid)
-    on_exit(fn -> File.rm_rf!(rule_base) end)
-
+  test "assignment operations and retirement need no inactivity policy", ctx do
     config = gateway_config(ctx.catalog_base, ctx.db, 0)
     handlers = Gateway.handlers(config)
-    assert [] = Rules.load!(rule_base, Map.keys(handlers))
-    assert %{settings: %{"period_ms" => 0}} = Rules.reaction_policy("assignment-inactivity")
-    assert :off = Tightbeam.Supervision.policy_default_interval_ms()
+    assert [] = Rules.load!(ctx.catalog_base, Map.keys(handlers))
+    assert is_nil(Rules.reaction_policy("assignment-inactivity"))
 
-    # This is the same recovery call Gateway.children makes after law loading.
-    assert :ok = Tightbeam.Supervision.migrate_open_assignments(ctx.db, 1_800_000)
+    owner = "test-owner"
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES (?1,0,?2)", [
+               owner,
+               System.system_time(:millisecond)
+             ])
+
+    owner_session = ensure_main_session(ctx.db, owner)
 
     common = %{
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      session_key: "k1",
+      origin: "user:#{owner}",
+      principal: {:user, owner},
+      session_key: owner_session.session_key,
       target_role: nil,
       role_fallback: false
     }
@@ -3491,7 +3409,7 @@ defmodule Tightbeam.GatewayTest do
              handlers["assign"].(
                Map.merge(common, %{
                  verb: "assign",
-                 params: %{subject: "invalid rail assignment"}
+                 params: %{subject: "assignment without inactivity policy"}
                })
              )
 
@@ -3499,37 +3417,37 @@ defmodule Tightbeam.GatewayTest do
              handlers["dispatch"].(
                Map.merge(common, %{
                  verb: "dispatch",
-                 params: %{subject: "invalid rail dispatch", brief: "continue without reminders"}
+                 params: %{subject: "dispatch without inactivity policy", brief: "continue work"}
                })
              )
 
     for assignment_id <- [assignment_id, dispatch_id] do
       assert %{attest: %{id: _}} =
                handlers["attest"].(%{
-                 origin: "agent:k1",
-                 principal: {:session, "k1"},
-                 session_key: "k1",
+                 origin: "agent:#{owner_session.session_key}",
+                 principal: {:session, owner_session.session_key},
+                 session_key: owner_session.session_key,
                  params: %{assignment_id: assignment_id, kind: "progress"}
                })
     end
 
     assert %{state: "closed"} =
              handlers["revoke-assignment"].(%{
-               origin: "agent:k1",
-               principal: {:session, "k1"},
-               session_key: "k1",
+               origin: "agent:#{owner_session.session_key}",
+               principal: {:session, owner_session.session_key},
+               session_key: owner_session.session_key,
                params: %{assignment_id: assignment_id, reason: "reopen after progress"}
              })
 
     assert %{state: "open"} =
              handlers["reopen-assignment"].(%{
-               origin: "agent:k1",
-               principal: {:session, "k1"},
-               session_key: "k1",
+               origin: "agent:#{owner_session.session_key}",
+               principal: {:session, owner_session.session_key},
+               session_key: owner_session.session_key,
                params: %{assignment_id: assignment_id, reason: "continue work"}
              })
 
-    retiree = create_session(ctx.db, "invalid-rail-retiree", "flynn")
+    retiree = create_session(ctx.db, "no-inactivity-retiree", owner)
 
     assert %{id: _} =
              handlers["assign"].(
@@ -3540,27 +3458,23 @@ defmodule Tightbeam.GatewayTest do
                })
              )
 
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId IN (?1,?2) AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
+               [assignment_id, dispatch_id]
+             )
+
     assert %{retired_session_keys: [retired_key]} =
              handlers["retire"].(%{
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
+               origin: "user:#{owner}",
+               principal: {:user, owner},
                session_key: retiree.session_key,
                params: %{}
              })
 
     assert retired_key == retiree.session_key
     assert Org.get(ctx.db, retiree.session_key).state == "retired"
-  end
-
-  @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-  test "gateway startup treats invalid inactivity settings as an unavailable reaction", %{
-    tmp_dir: tmp
-  } do
-    Tightbeam.GuardRuntimeFixture.run!(
-      tmp,
-      "invalid_assignment_inactivity_startup.exs",
-      "invalid-assignment-inactivity-startup: ok"
-    )
   end
 
   @tag cold_gateway: true, gateway_retired: true, tmp_dir: true
@@ -4356,7 +4270,7 @@ defmodule Tightbeam.GatewayTest do
     proxy = start_supervised!({FenceDeleteRaceDB, {race_db, ctx.db, self()}})
     reconciliation = Task.async(fn -> Tightbeam.HarnessProcess.reconcile(race_db) end)
 
-    assert_receive {:before_reconciled_fence_delete, ^proxy}
+    assert_receive {:before_reconciled_fence_delete, ^proxy, 3}
 
     assert {:opened, incident} =
              HarnessHealth.observe(ctx.db, %{
@@ -6977,7 +6891,7 @@ defmodule Tightbeam.GatewayTest do
       spawn.(%{
         origin: "user:flynn",
         session_key: nil,
-        params: %{display_name: "S", host: host, model: model, idempotency_key: key}
+        params: %{display_name: "S #{key}", host: host, model: model, idempotency_key: key}
       })
     end
 
@@ -7644,45 +7558,133 @@ defmodule Tightbeam.GatewayTest do
     assert Org.current_pointer(ctx.db, "k1").harness_session_id == "candidate-reported"
   end
 
-  test "set_model refuses while the lane owns a running turn", ctx do
-    base_dir = role_test_base("resident-set-model-busy")
+  for {harness, provider, family} <- [
+        {"claude", "anthropic", "claude-sonnet-4-6"},
+        {"codex", "openai", "gpt-5.6-sol"}
+      ] do
+    test "#{harness} model and effort requests apply in place during a running turn", ctx do
+      harness = unquote(harness)
+      provider = unquote(provider)
+      family = unquote(family)
+      base_dir = role_test_base("resident-set-model-running-" <> harness)
+      Archetypes.load!(base_dir)
+      config = gateway_config(base_dir, ctx.db, 0)
+      local_host = Placement.local_host_name()
+      origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+      Org.set_host(ctx.db, "k1", local_host)
+
+      Org.set_harness(
+        ctx.db,
+        "k1",
+        harness,
+        provider,
+        Model.new("source-model", effort: "medium")
+      )
+
+      Org.append_pointer(ctx.db, "k1", "running-session", "created")
+      put_host_catalog(local_host, harness, [family])
+      adapter = start_supervised!({TuneAdapterStub, {self(), resident: true}})
+      start_supervised!({CoordinatorStub, {adapter, self()}})
+      {seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "finish once")
+      parent = self()
+
+      start_lane!(ctx.db, "k1", fn _turn ->
+        send(parent, {:set_model_turn_started, self()})
+
+        receive do
+          :finish_set_model_turn -> {:ok, %{}}
+        end
+      end)
+
+      assert_receive {:set_model_turn_started, runner}
+
+      for params <- [
+            %{setting: "set_model", model: family, effort: "high"},
+            %{setting: "set_reasoning", reasoningLevel: "low"}
+          ] do
+        assert %{
+                 ok: true,
+                 accepted: true,
+                 applies: "after_turn",
+                 projection_committed: true,
+                 running_model: nil,
+                 running_status: "current inference not observed"
+               } =
+                 Gateway.handlers(config)["tune"].(%{
+                   origin: origin,
+                   session_key: "k1",
+                   params: params
+                 })
+
+        assert_receive {:tune_config_applied, "running-session", %Model{family: ^family}}
+        assert Org.current_pointer(ctx.db, "k1").harness_session_id == "running-session"
+        assert Ledger.running?(ctx.db, "k1")
+        refute_received {:tune_session_switched, _, _, _, _, _}
+        refute_received {:tune_session_closed, _}
+      end
+
+      assert Org.get(ctx.db, "k1").model == Model.new(family, effort: "low")
+      send(runner, :finish_set_model_turn)
+
+      assert eventually(fn ->
+               DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+                 {:ok, [["delivered"]]}
+             end)
+
+      assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE sessionKey='k1'")
+    end
+  end
+
+  test "running configuration records the provider alias without replacing the session",
+       ctx do
+    base_dir = role_test_base("running-config-alias")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
-    before = Org.get(ctx.db, "k1").model
-    local_host = Placement.local_host_name()
-    Org.set_host(ctx.db, "k1", local_host)
-    put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
+    host = Placement.local_host_name()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    Org.set_host(ctx.db, "k1", host)
+    Org.append_pointer(ctx.db, "k1", "running-session", "created")
+    put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+    actual = Model.new("sonnet", effort: "high")
 
-    assert {:ok, _seq} =
-             Ledger.enqueue(ctx.db, %{
-               session_key: "k1",
-               message_id: "set-model-running",
-               origin: "user:flynn",
-               prompt: "hold the boundary"
-             })
+    adapter =
+      start_supervised!(
+        {TuneAdapterStub,
+         {self(), resident: true, apply_result: {:ok, actual}, current_model: actual}}
+      )
 
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    {_seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "keep running")
     parent = self()
 
-    start_lane!(ctx.db, "k1", fn _turn ->
-      send(parent, {:set_model_turn_started, self()})
+    start_lane!(ctx.db, "k1", fn _ ->
+      send(parent, {:alias_runner, self()})
 
       receive do
-        :finish_set_model_turn -> {:ok, %{}}
+        :finish -> {:ok, %{}}
       end
     end)
 
-    assert_receive {:set_model_turn_started, runner}
+    assert_receive {:alias_runner, worker}
 
-    assert %{ok: false, code: "turn_in_progress", message: message} =
+    assert %{
+             ok: true,
+             applies: "after_turn",
+             model: "sonnet",
+             effort: "high",
+             projection_committed: true
+           } =
              Gateway.handlers(config)["tune"].(%{
-               origin: "user:flynn",
+               origin: origin,
                session_key: "k1",
-               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+               params: %{setting: "set_model", model: "claude-sonnet-4-6", effort: "high"}
              })
 
-    assert message =~ "Try again once the current turn finishes"
-    assert Org.get(ctx.db, "k1").model == before
-    send(runner, :finish_set_model_turn)
+    assert Org.get(ctx.db, "k1").model == actual
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "running-session"
+    assert Ledger.running?(ctx.db, "k1")
+    refute_received {:tune_session_closed, _}
+    send(worker, :finish)
   end
 
   describe "session status reports its host's credential kind" do
@@ -7881,7 +7883,7 @@ defmodule Tightbeam.GatewayTest do
       Gateway.handlers(config)["spawn"].(%{
         origin: "user:flynn",
         session_key: nil,
-        params: Map.merge(%{display_name: "Partial", idempotency_key: key}, params)
+        params: Map.merge(%{display_name: "Partial #{key}", idempotency_key: key}, params)
       })
     end
 
@@ -7991,7 +7993,7 @@ defmodule Tightbeam.GatewayTest do
                  origin: "user:flynn",
                  session_key: nil,
                  params: %{
-                   display_name: "Nil Family",
+                   display_name: "Nil Family #{inspect(empty)}",
                    idempotency_key: key,
                    model: empty,
                    effort: "high"
@@ -9379,6 +9381,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "set_harness readiness denial leaves Org unchanged", ctx do
     base_dir = role_test_base("harness-unready", false)
+    start_lane!(ctx.db, "k1")
     tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"]
     before = Org.get(ctx.db, "k1")
 
@@ -9660,7 +9663,7 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
-  test "set_harness refuses before writing the new home while a turn runs", ctx do
+  test "set_harness durably accepts without writing the new home while a turn runs", ctx do
     base_dir = role_test_base("harness-running-turn")
     codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
@@ -9707,7 +9710,7 @@ defmodule Tightbeam.GatewayTest do
     assert File.read!(Path.join(home, "auth.json")) == "test-token"
     refute File.exists?(Path.join([home, ".tightbeam", "manifest"]))
 
-    assert %{ok: false, code: "turn_in_progress", message: message} =
+    assert %{ok: true, accepted: true, applies: "after_turn", change_id: change_id} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
@@ -9719,14 +9722,16 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert message =~ "Try again once the current turn finishes"
+    assert [{^change_id, %{"harness" => "codex"}}] =
+             Tightbeam.RuntimeChanges.pending(ctx.db, "k1")
+
     assert Org.get(ctx.db, "k1") == before
     assert File.read!(Path.join(home, "auth.json")) == "test-token"
     refute File.exists?(Path.join([home, ".tightbeam", "manifest"]))
     send(runner, :finish_set_harness_turn)
   end
 
-  test "set_harness refuses a durable running turn after its lane becomes idle", ctx do
+  test "set_harness defers over a durable running turn after its lane becomes idle", ctx do
     candidate = start_supervised!({FailingCandidateAdapterStub, self()})
 
     {config, _local_host} =
@@ -9758,14 +9763,16 @@ defmodule Tightbeam.GatewayTest do
     assert Ledger.running?(ctx.db, "k1")
     assert Ledger.pending_count(ctx.db, "k1") == 2
 
-    assert %{ok: false, code: "turn_in_progress", message: message} =
+    assert %{ok: true, accepted: true, applies: "after_turn", change_id: change_id} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
                params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
              })
 
-    assert message =~ "Try again once the current turn finishes"
+    assert [{^change_id, %{"harness" => "codex"}}] =
+             Tightbeam.RuntimeChanges.pending(ctx.db, "k1")
+
     refute_received :candidate_prepare_attempted
     assert Org.get(ctx.db, "k1") == before
     assert Org.current_pointer(ctx.db, "k1") == before_pointer
@@ -9786,6 +9793,165 @@ defmodule Tightbeam.GatewayTest do
     refute Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn message ->
              message.marker && message.marker.kind == "harness-switch"
            end)
+  end
+
+  test "accepted handoff applies after the real terminal and retains its result", ctx do
+    ensure_global_registry()
+    parent = self()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    candidate = start_supervised!({CandidateAdapterStub, parent})
+    {config, _host} = queued_harness_switch_config!(ctx, "deferred-handoff", candidate)
+    stop_supervised!({:lane, "k1"})
+    {seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "finish once")
+
+    start_lane!(
+      ctx.db,
+      "k1",
+      fn _turn ->
+        send(parent, {:deferred_runner, self()})
+
+        receive do
+          :finish ->
+            {:appended, result} =
+              Projection.append(ctx.db, %{
+                session_key: "k1",
+                role: "assistant",
+                sender: "agent:author",
+                content: "finished once"
+              })
+
+            send(parent, {:kept_result, result.id})
+            {:ok, %{}}
+        end
+      end,
+      before_turn: fn key ->
+        :ok = Gateway.apply_pending_runtime_changes(config, ctx.db, key)
+        send(parent, :changes_processed)
+        :ok
+      end
+    )
+
+    assert_receive {:deferred_runner, worker}
+    assert_receive :changes_processed
+
+    assert %{accepted: true, applies: "after_turn", change_id: id} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: origin,
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    assert %{accepted: true, change_id: second_id} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: origin,
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    refute_received {:candidate_created, _, _}
+    assert Org.get(ctx.db, "k1").harness == "claude"
+    send(worker, :finish)
+    assert_receive {:kept_result, result_id}
+    assert_receive {:candidate_created, "candidate-1", _}, 5_000
+    assert_receive {:candidate_created, "candidate-2", _}, 5_000
+    assert_receive :changes_processed, 5_000
+    assert Org.get(ctx.db, "k1").harness == "codex"
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "candidate-2"
+
+    assert {:ok, [["applied"]]} =
+             DB.query(ctx.db, "SELECT state FROM runtime_changes WHERE id=?1", [id])
+
+    assert {:ok, [["applied"]]} =
+             DB.query(ctx.db, "SELECT state FROM runtime_changes WHERE id=?1", [second_id])
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert {:ok, [["finished once"]]} =
+             DB.query(ctx.db, "SELECT content FROM messages WHERE id=?1", [result_id])
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE sessionKey='k1'")
+    refute_received {:deferred_runner, _}
+  end
+
+  test "accepted handoff failure is readable after terminal and does not replay", ctx do
+    parent = self()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    candidate = start_supervised!({FailingCandidateAdapterStub, parent})
+    {config, _host} = queued_harness_switch_config!(ctx, "deferred-failure", candidate)
+    Org.append_pointer(ctx.db, "k1", "source-session", "created")
+    stop_supervised!({:lane, "k1"})
+    {seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "complete before failure")
+
+    start_lane!(
+      ctx.db,
+      "k1",
+      fn _ ->
+        send(parent, {:failure_runner, self()})
+
+        receive do
+          :finish -> {:ok, %{}}
+        end
+      end,
+      before_turn: fn key ->
+        :ok = Gateway.apply_pending_runtime_changes(config, ctx.db, key)
+        send(parent, :failure_changes_processed)
+        :ok
+      end
+    )
+
+    assert_receive {:failure_runner, worker}
+    assert_receive :failure_changes_processed
+
+    assert %{ok: true, accepted: true, change_id: id, applies: "after_turn"} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: origin,
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    assert %{runtimeChanges: [%{changeId: ^id, state: "pending", result: nil}]} =
+             Gateway.session_status("k1", ctx.db)
+
+    refute_received :candidate_prepare_attempted
+    send(worker, :finish)
+    assert_receive :candidate_prepare_attempted, 5_000
+    assert_receive :failure_changes_processed, 5_000
+
+    assert %{
+             runtimeChanges: [
+               %{
+                 changeId: ^id,
+                 state: "failed",
+                 result: %{"ok" => false, "code" => "model_apply_failed"}
+               }
+             ]
+           } =
+             Gateway.session_status("k1", ctx.db)
+
+    assert Org.get(ctx.db, "k1").harness == "claude"
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "source-session"
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE sessionKey='k1'")
+    assert Tightbeam.RuntimeChanges.pending(ctx.db, "k1") == []
   end
 
   test "queued set_harness handoff preserves plain notices and excludes sender-retracted sources",
@@ -11307,57 +11473,10 @@ defmodule Tightbeam.GatewayTest do
     assert setting_message =~ "default-archetype setting: coder"
     :ok = Org.put_setting(ctx.db, "default-archetype", "default")
 
-    opened_at = System.system_time(:millisecond) - 5_000
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state) " <>
-          "VALUES ('asg_runtime_r06_removal','runtime removal','k1','flynn',?1,'open')",
-        [opened_at]
-      )
-
-    assert {:ok, :ok} =
-             DB.transaction(ctx.db, fn txn ->
-               Tightbeam.Supervision.assignment_opened_in_txn(
-                 txn,
-                 "asg_runtime_r06_removal",
-                 opened_at,
-                 1_000
-               )
-             end)
-
-    assert {:ok, [[deadline_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId='asg_runtime_r06_removal' " <>
-                 "AND consumer='assignment_inactivity_deadline' AND state='pending'"
-             )
-
-    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [deadline_id])
-    assert {:ok, :ok} = Tightbeam.Supervision.deadline(ctx.db, Wakes.get(ctx.db, deadline_id))
-
-    assert {:ok, [[notice_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId='asg_runtime_r06_removal' " <>
-                 "AND consumer='prompt' AND state='pending' " <>
-                 "AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
-             )
-
-    assert {:ok, [[climb_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId='asg_runtime_r06_removal' " <>
-                 "AND consumer='assignment_inactivity_climb' AND state='pending'"
-             )
-
     assert %{state: "published", kungfu: "agentic-engineering"} =
              unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
 
     assert is_nil(Rules.reaction_policy("assignment-inactivity"))
-    assert Wakes.get(ctx.db, notice_id).state == "canceled"
-    assert Wakes.get(ctx.db, climb_id).state == "canceled"
 
     assert Archetypes.get("coder") == nil
     refute Rails.statutes?()
@@ -11435,7 +11554,7 @@ defmodule Tightbeam.GatewayTest do
     main =
       Org.create(ctx.db, %{
         session_key: Org.personal_session_key("bundle-owner"),
-        display_name: "Main",
+        display_name: "Bundle owner main",
         kind: "main",
         is_built_in: true,
         owner_user_id: "bundle-owner",
@@ -13559,7 +13678,7 @@ defmodule Tightbeam.GatewayTest do
   # A REAL lane for a session, because identity apply now decides its boundary in
   # the lane's mailbox: a session without one cannot be applied to at all. The
   # default runner is inert — these lanes exist to own a boundary, not to work.
-  defp start_lane!(db, session_key, runner \\ fn _turn -> {:ok, %{}} end) do
+  defp start_lane!(db, session_key, runner \\ fn _turn -> {:ok, %{}} end, opts \\ []) do
     task_sup =
       start_supervised!(
         {Task.Supervisor, name: :"lane_tasks_#{System.unique_integer([:positive])}"}
@@ -13569,7 +13688,7 @@ defmodule Tightbeam.GatewayTest do
       id: {:lane, session_key},
       start:
         {SessionLane, :start_link,
-         [[session_key: session_key, db: db, task_sup: task_sup, runner: runner]]}
+         [[session_key: session_key, db: db, task_sup: task_sup, runner: runner] ++ opts]}
     })
   end
 

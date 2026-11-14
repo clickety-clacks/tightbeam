@@ -126,7 +126,7 @@ defmodule Tightbeam.Projection do
         conflict
 
       :new ->
-        id = "s_" <> Tightbeam.Id.uuid4()
+        id = Map.get(input, :id) || "s_" <> Tightbeam.Id.uuid4()
         client_message_id = Map.get(input, :client_message_id)
         message_type = message_type(input)
 

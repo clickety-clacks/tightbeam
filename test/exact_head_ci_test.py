@@ -1,4 +1,5 @@
 """Deterministic contract checks for exact-candidate CI (stdlib only)."""
+import json
 import os
 from pathlib import Path
 import re
@@ -17,12 +18,14 @@ def evaluate(expression, context):
     if ''.join(tokens) != re.sub(r'\s+', '', expression):
         raise ValueError('unsupported expression: ' + expression)
     words = {'&&': ' and ', '||': ' or ', '!=': ' != ', '==': ' == ',
-             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts'}
+             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts',
+             'fromJSON': '_json'}
     code = ''.join(
         words.get(token) or (repr(token[1:-1]) if token.startswith("'")
                              else repr(context[token]))
         for token in tokens)
-    return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p)})
+    return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p),
+                       '_json': json.loads})
 
 
 class ExactHeadCI(unittest.TestCase):
@@ -52,6 +55,30 @@ class ExactHeadCI(unittest.TestCase):
                        'github.event.pull_request.head.sha': 'a' * 40,
                        'inputs.candidate_sha': 'c' * 40}
             self.assertEqual(evaluate(source, context), expected, event)
+
+    def test_macos_uses_pool_for_trusted_ci_and_linux_stays_hosted(self):
+        source = re.search(
+            r'(?m)^    runs-on: \$\{\{ (.*?) \}\}$', self.jobs['test']).group(1)
+        pool = ['self-hosted', 'tb-macos']
+        cases = [
+            ('macos', 'pull_request', 'clickety-clacks/tightbeam', pool),
+            ('macos', 'pull_request', 'contributor/project', 'macos-latest'),
+            ('macos', 'push', '', pool),
+            ('macos', 'merge_group', '', pool),
+            ('macos', 'workflow_dispatch', '', pool),
+            ('linux', 'pull_request', 'clickety-clacks/tightbeam', 'ubuntu-latest'),
+            ('linux', 'pull_request', 'contributor/project', 'ubuntu-latest'),
+            ('linux', 'push', '', 'ubuntu-latest'),
+        ]
+        for name, event, head_repo, expected in cases:
+            context = {
+                'matrix.name': name,
+                'matrix.os': 'ubuntu-latest' if name == 'linux' else 'macos-latest',
+                'github.event_name': event,
+                'github.event.pull_request.head.repo.full_name': head_repo,
+                'github.repository': 'clickety-clacks/tightbeam',
+            }
+            self.assertEqual(evaluate(source, context), expected, (name, event, head_repo))
 
     def test_both_jobs_validate_before_exact_checkout(self):
         for name in ('test', 'release'):

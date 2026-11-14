@@ -97,11 +97,6 @@ Each request has a kind:
 - `operator`: a choice that belongs to the person. Before you present it, read its
   linked assignment and attests. If the assignment is closed or revoked, or later
   records already settle the question, say so instead of presenting it as live.
-- `effort`: an automated check-in raised when a session spent effort without a recorded
-  effect. It is not a product decision. Read one with
-  `tightbeam decision-request --request <id>` and rule it with
-  `tightbeam effort-rule --request <id> --action continue|dismiss` only when the person
-  chooses that disposition.
 - `agent`: a question an agent asked through `tightbeam ask`. Reply with
   `tightbeam answer --request <id> --answer "<text>"`, or send it back with
   `tightbeam return --request <id> --reason "<text>"`, only with the person's answer.

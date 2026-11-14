@@ -362,21 +362,25 @@ defmodule Tightbeam.Wire.Socket do
   defp auth_success(msg, device, %{conn_ref: nil} = state) do
     case parse_subscriptions(msg, MapSet.new(["chat"])) do
       {:ok, subscriptions} ->
-        if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
+        case seed_main_stream_for_chat(subscriptions, device.user_id, state) do
+          :ok ->
+            registry = GenServer.whereis(conn_registry(state))
+            monitor = Process.monitor(registry)
 
-        registry = GenServer.whereis(conn_registry(state))
-        monitor = Process.monitor(registry)
+            {:ok, conn_ref, _replaced} =
+              ConnRegistry.register(registry, %{
+                pid: self(),
+                user_id: device.user_id,
+                device_id: device.device_id,
+                is_admin: device.is_admin,
+                subscriptions: subscriptions
+              })
 
-        {:ok, conn_ref, _replaced} =
-          ConnRegistry.register(registry, %{
-            pid: self(),
-            user_id: device.user_id,
-            device_id: device.device_id,
-            is_admin: device.is_admin,
-            subscriptions: subscriptions
-          })
+            auth_replay(msg, device, conn_ref, subscriptions, %{state | registry_monitor: monitor})
 
-        auth_replay(msg, device, conn_ref, subscriptions, %{state | registry_monitor: monitor})
+          {:error, code, message} ->
+            stop_with(Payloads.wire_error(code, message), state)
+        end
 
       :error ->
         stop_with(Payloads.wire_error("invalid_message"), state)
@@ -386,8 +390,13 @@ defmodule Tightbeam.Wire.Socket do
   defp auth_success(msg, device, state) do
     case parse_subscriptions(msg, state.subscriptions) do
       {:ok, subscriptions} when subscriptions == state.subscriptions ->
-        if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
-        auth_replay(msg, device, state.conn_ref, subscriptions, state)
+        case seed_main_stream_for_chat(subscriptions, device.user_id, state) do
+          :ok ->
+            auth_replay(msg, device, state.conn_ref, subscriptions, state)
+
+          {:error, code, message} ->
+            stop_with(Payloads.wire_error(code, message), state)
+        end
 
       _ ->
         stop_with(Payloads.wire_error("invalid_message"), state)
@@ -590,49 +599,73 @@ defmodule Tightbeam.Wire.Socket do
   defp seed_main_stream(user_id, state) do
     key = Org.personal_session_key(user_id)
 
-    unless Org.get(db(state), key) do
+    if Org.get(db(state), key) do
+      :ok
+    else
       defaults = Map.fetch!(state.deps, :defaults)
       provider = Map.fetch!(defaults, :provider)
       provider = if is_function(provider, 0), do: provider.(), else: provider
 
-      try do
-        {:ok, _session} =
-          DB.transaction(db(state), fn txn ->
-            case DB.Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [key]) do
-              [[1]] ->
-                :ok
+      case DB.transaction(db(state), fn txn ->
+             case DB.Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [key]) do
+               [[1]] ->
+                 :ok
 
-              [] ->
-                archetype =
-                  case DB.Txn.q(
-                         txn,
-                         "SELECT value FROM org_settings WHERE key = 'default-archetype'"
-                       ) do
-                    [[configured]] -> configured
-                    [] -> "default"
-                  end
+               [] ->
+                 archetype =
+                   case DB.Txn.q(
+                          txn,
+                          "SELECT value FROM org_settings WHERE key = 'default-archetype'"
+                        ) do
+                     [[configured]] -> configured
+                     [] -> "default"
+                   end
 
-                Org.create_in_txn(txn, %{
-                  session_key: key,
-                  display_name: "Main",
-                  kind: "main",
-                  is_built_in: true,
-                  order_index: 0,
-                  owner_user_id: user_id,
-                  origin: "user:#{user_id}",
-                  archetype: archetype,
-                  host: Tightbeam.Placement.local_host_name(),
-                  harness: defaults |> Map.fetch!(:harness) |> to_string(),
-                  provider: to_string(provider),
-                  model: Map.fetch!(defaults, :model)
-                })
-            end
-          end)
-      rescue
-        error in Tightbeam.DB.Error ->
-          if Org.get(db(state), key), do: :ok, else: reraise(error, __STACKTRACE__)
+                 Org.create_in_txn(txn, %{
+                   session_key: key,
+                   display_name: Org.initial_display_name_in_txn(txn, "Main"),
+                   kind: "main",
+                   is_built_in: true,
+                   order_index: 0,
+                   owner_user_id: user_id,
+                   origin: "user:#{user_id}",
+                   archetype: archetype,
+                   host: Tightbeam.Placement.local_host_name(),
+                   harness: defaults |> Map.fetch!(:harness) |> to_string(),
+                   provider: to_string(provider),
+                   model: Map.fetch!(defaults, :model)
+                 })
+             end
+           end) do
+        {:ok, _session} ->
+          :ok
+
+        {:error, %Tightbeam.Org.DisplayNameError{} = error} ->
+          {:error, error.code, error.message}
+
+        {:error, %Tightbeam.DB.Error{}} ->
+          if Org.get(db(state), key) do
+            :ok
+          else
+            main_seed_error()
+          end
+
+        {:error, _error} ->
+          if Org.get(db(state), key) do
+            :ok
+          else
+            main_seed_error()
+          end
       end
     end
+  end
+
+  defp seed_main_stream_for_chat(subscriptions, user_id, state) do
+    if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(user_id, state), else: :ok
+  end
+
+  defp main_seed_error do
+    {:error, "server_error", "could not initialize the personal session"}
   end
 
   defp replay_cursors(msg, user_id, state) do

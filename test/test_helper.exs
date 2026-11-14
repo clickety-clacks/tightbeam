@@ -273,9 +273,27 @@ end
 # the prerequisites above, cursor-agent is not something every contributor or
 # CI runner installs, so absence here is a DECLARED exclusion — visible in the
 # run's excluded count — rather than a suite refusal or a silent skip. Where
-# the binary exists, the test always runs.
-cursor_bundle_exclusions =
-  if System.find_executable("cursor-agent"), do: [], else: [cursor_bundle: true]
+# the resolved launcher has its vendor bundle, the test always runs.
+cursor_bundle_installed? =
+  case System.find_executable("cursor-agent") do
+    nil ->
+      false
+
+    launcher ->
+      case System.cmd("realpath", [launcher], stderr_to_stdout: true) do
+        {canonical, 0} ->
+          canonical
+          |> String.trim()
+          |> Path.dirname()
+          |> Path.join("index.js")
+          |> File.regular?()
+
+        _ ->
+          false
+      end
+  end
+
+cursor_bundle_exclusions = if cursor_bundle_installed?, do: [], else: [cursor_bundle: true]
 
 ExUnit.start(assert_receive_timeout: 1_000, exclude: cursor_bundle_exclusions)
 

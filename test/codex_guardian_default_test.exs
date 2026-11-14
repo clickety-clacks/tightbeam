@@ -2,6 +2,33 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Harness.Codex
+  alias Tightbeam.Harness.Support
+
+  test "remote stamp command failure includes captured output" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "tb-codex-guardian-remote-stamp-failure-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    home = Path.join(root, "homes/worker/codex")
+    output = "fixture remote stamp command failed"
+
+    target =
+      target(:remote, root)
+      |> Map.put(:sh, fn
+        ["ssh" | _command] -> {output, 3}
+        command -> run_remote_fixture(command)
+      end)
+
+    desired = %{harness: :codex, machine: "worker", rails: nil, default_model: nil}
+
+    assert_raise RuntimeError, "remote stamp check failed with exit 3: #{output}", fn ->
+      Codex.reconcile_home(target, home, desired)
+    end
+  end
 
   test "managed Codex homes default Guardian only when absent across reconciliation routes" do
     cases = [
@@ -116,7 +143,7 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
   defp run_remote_fixture(["ssh" | _] = command) do
     command
     |> Enum.drop(6)
-    |> Enum.join(" ")
+    |> remote_fixture_script()
     |> then(&System.cmd("sh", ["-c", &1], stderr_to_stdout: true))
   end
 
@@ -135,7 +162,7 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
   end
 
   defp run_macos_remote_fixture(["ssh" | _] = command, shim_dir) do
-    script = command |> Enum.drop(6) |> Enum.join(" ")
+    script = command |> Enum.drop(6) |> remote_fixture_script()
     path = shim_dir <> ":" <> System.fetch_env!("PATH")
 
     System.cmd("sh", ["-c", script],
@@ -147,6 +174,9 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
   defp run_macos_remote_fixture(["rsync" | _] = command, _shim_dir) do
     run_remote_fixture(command)
   end
+
+  defp remote_fixture_script(["cat", path]), do: "cat #{Support.shell_quote(path)}"
+  defp remote_fixture_script(command), do: Enum.join(command, " ")
 
   defp install_macos_remote_shims!(root) do
     shim_dir = Path.join(root, "macos-command-shims")

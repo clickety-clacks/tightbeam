@@ -89,6 +89,517 @@ defmodule Tightbeam.HarklightWakesTest do
     %{db: db, call: call, session: session, main: main}
   end
 
+  test "retirement transfers pending and later chats through a conversation follow", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    line = event(1, "discussion", "pending successor")
+    assert :ok = HarklightWakes.capture_line(db, @handle, line)
+    assert %{state: "retired"} = Org.retire(db, session.session_key, "user:owner", 60_000)
+
+    assert {:ok, [["conversation", "open"]]} =
+             DB.query(db, "SELECT kind,state FROM harklight_wake_follows WHERE sessionKey=?1", [
+               main.session_key
+             ])
+
+    assert {:ok, [[wake_id, prompt]]} =
+             DB.query(
+               db,
+               "SELECT w.wakeId,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.sessionKey=?1",
+               [main.session_key]
+             )
+
+    assert String.starts_with?(prompt, line <> "\n\n")
+    assert prompt =~ session.session_key
+    assert prompt =~ "Origin"
+    assert prompt =~ "has retired"
+    refute prompt =~ "from your originating session"
+    assert prompt =~ "harklight-agent ack --session #{@handle} --event 1"
+    turn = deliver_discussion_turn!(db, wake_id, main.session_key)
+    assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    assert :ok =
+             HarklightWakes.capture_line(db, @handle, event(2, "discussion", "later successor"))
+
+    assert {:ok, [[key]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey FROM harklight_wake_deliveries WHERE eventId='2'"
+             )
+
+    assert key == main.session_key
+    assert {:ok, [["active"]]} = DB.query(db, "SELECT state FROM harklight_wake_handles")
+  end
+
+  test "failed discussion retry remains with the successor after retirement", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "failed chat"))
+    assert {:ok, [[root]]} = DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries")
+    turn = deliver_discussion_turn!(db, root, session.session_key)
+    assert :ok = Ledger.finish(db, turn.seq, "failed_unknown", nil, owner_lease: turn.owner_lease)
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               main.session_key
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM wakes w JOIN wake_retry_attempts r ON r.wakeId=w.wakeId WHERE r.rootWakeId=?1 AND w.state='pending'",
+               [root]
+             )
+  end
+
+  test "retiring an ordinary follower of a historical retiree passes custody along its own lineage",
+       %{db: db, session: session, main: main, call: call} do
+    parent = follower_session(db, main, "agent:next")
+    follower = follower_session(db, parent, "agent:prior-follower")
+
+    assert %{outcome: "committed"} =
+             HarklightFollows.follow(
+               db,
+               follow_call(call, follower, %{handle: @handle}),
+               runner: lifecycle_runner(db),
+               activate: false
+             )
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        session.session_key
+      ])
+
+    line = event(1, "discussion", "historical conversation")
+    assert :ok = HarklightWakes.capture_line(db, @handle, line)
+    Org.retire(db, follower.session_key, "user:owner", 60_000)
+
+    assert {:ok, [[key, prompt]]} =
+             DB.query(
+               db,
+               "SELECT d.sessionKey,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.sessionKey<>?1",
+               [follower.session_key]
+             )
+
+    assert key == parent.session_key
+    assert String.starts_with?(prompt, line <> "\n\n")
+    assert prompt =~ session.session_key
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(2, "discussion", "next"))
+
+    assert {:ok, [[^key]]} =
+             DB.query(db, "SELECT sessionKey FROM harklight_wake_deliveries WHERE eventId='2'")
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_follows WHERE sessionKey=?1", [
+               main.session_key
+             ])
+  end
+
+  test "successor deliveries retry with identical authored payload and rerouted ACK2", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    assert :ok =
+             HarklightWakes.capture_line(db, @handle, event(1, "discussion", "retry successor"))
+
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+
+    assert {:ok, [[root, prompt]]} =
+             DB.query(
+               db,
+               "SELECT w.wakeId,w.prompt FROM wakes w JOIN harklight_wake_deliveries d ON d.wakeId=w.wakeId WHERE d.sessionKey=?1",
+               [main.session_key]
+             )
+
+    turn = deliver_discussion_turn!(db, root, main.session_key)
+    Ledger.stamp_adapter(db, turn.seq, 1)
+    record_prompt_dispatched!(db, turn)
+
+    assert :ok =
+             HarklightWakes.ack2_for_dispatched_turn(db, turn.seq, main.session_key, "Successor",
+               runner: fn args ->
+                 send(self(), {:ack2, args})
+                 {"", 0}
+               end
+             )
+
+    assert_received {:ack2,
+                     [
+                       "ack2",
+                       "--session",
+                       @handle,
+                       "--event",
+                       "1",
+                       "--agent",
+                       "Successor",
+                       "--rerouted"
+                     ]}
+
+    assert :ok = Ledger.finish(db, turn.seq, "failed_unknown", nil, owner_lease: turn.owner_lease)
+
+    assert {:ok, [[^prompt]]} =
+             DB.query(
+               db,
+               "SELECT w.prompt FROM wakes w JOIN wake_retry_attempts r ON r.wakeId=w.wakeId WHERE r.rootWakeId=?1 AND w.state='pending'",
+               [root]
+             )
+  end
+
+  test "successor lookup orders office, duty transfers and reporting lineage with cycle termination",
+       %{db: db, session: session, main: main} do
+    other = follower_session(db, main, "agent:duty")
+    office = follower_session(db, main, "agent:office")
+    insert_retirement_fixture(db, "retirement", session.session_key, main.session_key)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO retirement_owner_transfers(id,retirementId,formerOwnerSessionKey,newOwnerSessionKey,successorId,createdAt) VALUES(1,'retirement',?1,?2,'retirement',2)",
+        [session.session_key, other.session_key]
+      )
+
+    assert successor(db, session.session_key).session_key == other.session_key
+    Tightbeam.Roles.create!(db, "m-office", "owner", office.session_key)
+    {:ok, _} = DB.query(db, "UPDATE roles SET createdAt=1 WHERE name='m-office'")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO retirement_blockers(retirementId,kind,reference,sessionKey) VALUES('retirement','role','m-office',?1)",
+        [session.session_key]
+      )
+
+    assert successor(db, session.session_key).session_key == office.session_key
+    # A retired office holder passes on before the original holder's duty source.
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [office.session_key])
+
+    assert successor(db, session.session_key).session_key == main.session_key
+    # A recreated office, including a same-millisecond creation, falls through.
+    {:ok, _} = DB.query(db, "UPDATE roles SET createdAt=10 WHERE name='m-office'")
+    assert successor(db, session.session_key).session_key == other.session_key
+    {:ok, _} = DB.query(db, "UPDATE roles SET createdAt=11 WHERE name='m-office'")
+    assert successor(db, session.session_key).session_key == other.session_key
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO retirement_owner_transfers(id,retirementId,formerOwnerSessionKey,newOwnerSessionKey,successorId,createdAt) VALUES(2,'retirement',?1,?2,'retirement',2)",
+        [other.session_key, session.session_key]
+      )
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1,?2)", [
+        other.session_key,
+        session.session_key
+      ])
+
+    assert successor(db, session.session_key) == nil
+  end
+
+  test "a remote successor is selected without admitting it or falling back locally", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    remote = follower_session(db, main, "agent:remote-successor")
+    Org.set_host(db, remote.session_key, "other-host")
+    insert_retirement_fixture(db, "remote-duty", session.session_key, main.session_key)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO retirement_owner_transfers(retirementId,formerOwnerSessionKey,newOwnerSessionKey,successorId,createdAt) VALUES('remote-duty',?1,?2,'remote-duty',2)",
+        [session.session_key, remote.session_key]
+      )
+
+    assert successor(db, session.session_key).session_key == remote.session_key
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "remote"))
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+    assert {:ok, []} = DB.query(db, "SELECT * FROM harklight_wake_follows")
+    assert {:ok, [[key]]} = DB.query(db, "SELECT sessionKey FROM harklight_wake_deliveries")
+    assert key == session.session_key
+  end
+
+  for {state, error} <- [{"complete", nil}, {"unavailable", "origin_unavailable"}] do
+    test "ended #{state}/#{error} conversation is not revived by follower retirement", %{
+      db: db,
+      session: session,
+      main: main,
+      call: call
+    } do
+      follower = follower_session(db, main, "agent:ended-follower")
+
+      assert %{outcome: "committed"} =
+               HarklightFollows.follow(
+                 db,
+                 follow_call(call, follower, %{handle: @handle}),
+                 runner: lifecycle_runner(db),
+                 activate: false
+               )
+
+      {:ok, _} =
+        DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+          session.session_key
+        ])
+
+      {:ok, _} =
+        DB.query(db, "UPDATE harklight_wake_handles SET state=?1,lastError=?2", [
+          unquote(state),
+          unquote(error)
+        ])
+
+      assert {:error, "harklight_origin_unavailable"} =
+               HarklightWakes.capture_line(db, @handle, event(1, "discussion", "ended"))
+
+      Org.retire(db, follower.session_key, "user:owner", 60_000)
+      assert {:ok, [[key]]} = DB.query(db, "SELECT sessionKey FROM harklight_wake_follows")
+      assert key == follower.session_key
+      assert {:ok, []} = DB.query(db, "SELECT * FROM harklight_wake_deliveries")
+
+      assert {:ok, [[unquote(state), unquote(error)]]} =
+               DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+    end
+  end
+
+  test "recoverable listener failure permits successor follow and pending delivery", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "recoverable"))
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE harklight_wake_handles SET state='unavailable',lastError='listener_exit_1'"
+      )
+
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+    assert {:ok, [[key]]} = DB.query(db, "SELECT sessionKey FROM harklight_wake_follows")
+    assert key == main.session_key
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               key
+             ])
+
+    test_pid = self()
+
+    listener = fn manager, handle, _ ->
+      GenServer.call(manager, {:attached, handle})
+      send(test_pid, :successor_listener_restored)
+
+      receive do
+        :never -> :ok
+      end
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener})
+    assert_receive :successor_listener_restored
+
+    assert {:ok, [["active", nil]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+  end
+
+  test "a whole retiring set resolves directly to its first surviving receiver", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    parent = follower_session(db, main, "agent:retiring-parent")
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+        session.session_key,
+        parent.session_key
+      ])
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "subtree"))
+
+    assert {:ok, _} =
+             DB.transaction(db, fn txn ->
+               for key <- [session.session_key, parent.session_key] do
+                 Org.retire_in_txn(txn, key, "user:owner", defer_harklight: true)
+               end
+
+               for key <- [session.session_key, parent.session_key] do
+                 HarklightWakes.retirement_handoff_in_txn(txn, key)
+               end
+             end)
+
+    assert {:ok, [[key]]} = DB.query(db, "SELECT sessionKey FROM harklight_wake_follows")
+    assert key == main.session_key
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               parent.session_key
+             ])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               main.session_key
+             ])
+  end
+
+  test "a terminal queued but not dispatched transfers, while a received discussion does not", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "received"))
+    assert {:ok, [[discussion]]} = DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries")
+    received = deliver_discussion_turn!(db, discussion, session.session_key)
+    Ledger.stamp_adapter(db, received.seq, 1)
+    record_prompt_dispatched!(db, received)
+
+    assert :ok =
+             Ledger.finish(db, received.seq, "delivered", nil, owner_lease: received.owner_lease)
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(2, "terminal", "not dispatched"))
+
+    assert {:ok, [[terminal]]} =
+             DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries WHERE eventId='2'")
+
+    # A carrying turn has been created, but no prompt-dispatched event exists.
+    deliver_discussion_turn!(db, terminal, session.session_key)
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+
+    assert {:ok, [["2"]]} =
+             DB.query(db, "SELECT eventId FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               main.session_key
+             ])
+  end
+
+  for earlier_status <- ["pending", "running", "failed_unknown", "delivered"] do
+    test "existing follower gets a contextual handoff after #{earlier_status} prior delivery", %{
+      db: db,
+      session: session,
+      main: main,
+      call: call
+    } do
+      assert %{outcome: "committed"} =
+               HarklightFollows.follow(
+                 db,
+                 follow_call(call, main, %{handle: @handle}),
+                 runner: lifecycle_runner(db),
+                 activate: false
+               )
+
+      line = event(1, "discussion", "same event, new responsibility")
+      assert :ok = HarklightWakes.capture_line(db, @handle, line)
+
+      assert {:ok, [[old, old_prompt]]} =
+               DB.query(
+                 db,
+                 "SELECT w.wakeId,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.sessionKey=?1",
+                 [main.session_key]
+               )
+
+      earlier =
+        if unquote(earlier_status) != "pending" do
+          earlier = deliver_discussion_turn!(db, old, main.session_key)
+          Ledger.stamp_adapter(db, earlier.seq, 1)
+          record_prompt_dispatched!(db, earlier)
+
+          if unquote(earlier_status) != "running" do
+            assert :ok =
+                     Ledger.finish(db, earlier.seq, unquote(earlier_status), nil,
+                       owner_lease: earlier.owner_lease
+                     )
+          end
+
+          earlier
+        end
+
+      Org.retire(db, session.session_key, "user:owner", 60_000)
+
+      if unquote(earlier_status) == "running" do
+        assert :ok =
+                 Ledger.finish(db, earlier.seq, "failed_unknown", nil,
+                   owner_lease: earlier.owner_lease
+                 )
+      end
+
+      assert {:ok, [[handoff, prompt]]} =
+               DB.query(
+                 db,
+                 "SELECT w.wakeId,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.sessionKey=?1",
+                 [main.session_key]
+               )
+
+      refute handoff == old
+      assert String.starts_with?(prompt, line <> "\n\n")
+      assert prompt =~ "Origin (#{session.session_key}), who has retired"
+      refute prompt =~ "from your originating session"
+
+      assert {:ok, [[^old_prompt]]} =
+               DB.query(db, "SELECT prompt FROM wakes WHERE wakeId=?1", [old])
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 db,
+                 "SELECT count(*) FROM wakes w LEFT JOIN wake_retry_attempts r ON r.wakeId=w.wakeId WHERE COALESCE(r.rootWakeId,w.wakeId)=?1 AND w.state='pending'",
+                 [old]
+               )
+
+      carrying = deliver_discussion_turn!(db, handoff, main.session_key)
+      Ledger.stamp_adapter(db, carrying.seq, 1)
+      record_prompt_dispatched!(db, carrying)
+
+      assert :ok =
+               Ledger.finish(db, carrying.seq, "failed_unknown", nil,
+                 owner_lease: carrying.owner_lease
+               )
+
+      assert {:ok, [[retry, ^prompt]]} =
+               DB.query(
+                 db,
+                 "SELECT w.wakeId,w.prompt FROM wakes w JOIN wake_retry_attempts r ON r.wakeId=w.wakeId WHERE r.rootWakeId=?1 AND w.state='pending'",
+                 [handoff]
+               )
+
+      received = deliver_discussion_turn!(db, retry, main.session_key)
+
+      assert :ok =
+               Ledger.finish(db, received.seq, "delivered", nil,
+                 owner_lease: received.owner_lease
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 db,
+                 "SELECT count(*) FROM wakes w JOIN wake_retry_attempts r ON r.wakeId=w.wakeId WHERE r.rootWakeId=?1 AND w.state='pending'",
+                 [handoff]
+               )
+
+      assert {:ok, [[2]]} =
+               DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries WHERE eventId='1'")
+
+      assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
+      assert {:ok, [["active"]]} = DB.query(db, "SELECT state FROM harklight_wake_handles")
+    end
+  end
+
+  defp successor(db, key) do
+    {:ok, result} = DB.transaction(db, &HarklightWakes.successor_in_txn(&1, key))
+    result
+  end
+
+  defp insert_retirement_fixture(db, id, target, owner) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO unfinished_retirements(id,targetSessionKey,ownerSessionKey,principalRef,keepOpenDescendants,blockerKind,wakeId,state,createdAt) VALUES(?1,?2,?3,'user:owner',0,'work','fixture','retired',10)",
+        [id, target, owner]
+      )
+  end
+
   test "a prepared send cannot bind through a different payload or origin", %{db: db, call: call} do
     assert %{code: "harklight_send_mismatch"} =
              HarklightWakes.prepare_send(db, call, @send_op, @payload <> " ")
@@ -1010,6 +1521,11 @@ defmodule Tightbeam.HarklightWakesTest do
                owner_lease: turn.owner_lease
              )
 
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
+
     assert %{state: "retired"} = Org.retire(db, session.session_key, "user:owner", 60_000)
 
     assert eventually(fn ->
@@ -1154,6 +1670,91 @@ defmodule Tightbeam.HarklightWakesTest do
              )
 
     assert String.contains?(prompt, @handle)
+  end
+
+  test "Gateway listener restoration preserves the original session delivery route", %{
+    db: db,
+    call: call,
+    session: session,
+    main: main
+  } do
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1",
+               [@handle]
+             )
+
+    parent = self()
+
+    listener = fn manager, handle, vendor_id ->
+      send(parent, {:listener_started, handle, vendor_id})
+      :ok = GenServer.call(manager, {:attached, handle})
+
+      :ok =
+        GenServer.call(
+          manager,
+          {:capture, handle, event(1, "discussion", "same-session reply")}
+        )
+
+      send(parent, :reply_captured)
+
+      receive do
+        :stop -> :ok
+      end
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: listener, send_runner: lifecycle_runner(db)}
+      )
+
+    assert :sys.get_state(manager).workers == %{}
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable',lastError='listener_stopped' WHERE handle=?1",
+               [@handle]
+             )
+
+    other_call = %{
+      call
+      | session_key: main.session_key,
+        principal: {:session, main.session_key},
+        transport_session_key: main.session_key
+    }
+
+    assert %{code: "harklight_origin_mismatch", outcome: "refused"} =
+             HarklightWakes.restore_listener(db, other_call, @handle)
+
+    assert %{
+             command: "listener-restore",
+             outcome: "requested",
+             listener_state: "restoring",
+             handle: @handle,
+             session_key: origin_key
+           } = HarklightWakes.restore_listener(db, call, @handle)
+
+    assert origin_key == session.session_key
+    assert_receive {:listener_started, @handle, _vendor_id}
+    assert_receive :reply_captured
+
+    assert {:ok, [[^origin_key, prompt]]} =
+             DB.query(
+               db,
+               """
+               SELECT w.sessionKey,w.prompt
+               FROM harklight_wake_entries e
+               JOIN wakes w ON w.wakeId=e.wakeId
+               WHERE e.handle=?1
+               """,
+               [@handle]
+             )
+
+    assert prompt =~ "same-session reply"
   end
 
   for saved_error <- ["listener_stopped", "attachment_refused"] do
@@ -1510,6 +2111,16 @@ defmodule Tightbeam.HarklightWakesTest do
       else
         await_handle_error(db, "attachment_")
         origin = session.session_key
+
+        assert eventually(fn ->
+                 case DB.query(
+                        db,
+                        "SELECT sessionKey,prompt FROM wakes WHERE wakeId LIKE 'w_harklight_notice_%'"
+                      ) do
+                   {:ok, [[^origin, _prompt]]} -> true
+                   _ -> false
+                 end
+               end)
 
         assert {:ok, [[^origin, prompt]]} =
                  DB.query(
@@ -2085,6 +2696,73 @@ defmodule Tightbeam.HarklightWakesTest do
     refute prompt =~ "listen-payload-canary"
   end
 
+  test "a follow listener remains active through reconnect diagnostics and captures the resumed reply",
+       %{db: db, call: call} do
+    nonce = Tightbeam.Id.uuid4()
+    started = Path.join(System.tmp_dir!(), "harklight-reconnect-#{nonce}.started")
+    resume = Path.join(System.tmp_dir!(), "harklight-reconnect-#{nonce}.resume")
+    attached = JSON.encode!(%{kind: "attached", ready_for_listen: true})
+    event_line = event(1, "discussion", "reply after server restart")
+
+    on_exit(fn ->
+      File.rm(started)
+      File.rm(resume)
+    end)
+
+    fake_harklight_agent!("""
+    if [ "$1" = "attach" ]; then
+      printf '%s\\n' '#{attached}'
+      exit 0
+    fi
+
+    if [ "$1" = "listen" ]; then
+      printf '%s\\n' 'Harklight origin stream unavailable; retrying after disconnect' >&2
+      touch '#{started}'
+      while [ ! -e '#{resume}' ]; do sleep 0.01; done
+      printf '%s\\n' '#{event_line}'
+      exec sleep 600
+    fi
+    exit 0
+    """)
+
+    assert %{state: "registered"} = HarklightWakes.register(db, call)
+    start_supervised!({HarklightWakes, db: db})
+
+    assert eventually(fn -> File.exists?(started) end)
+
+    assert {:ok, [["active", nil]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
+               "w_harklight_notice_recovery_" <> @handle
+             ])
+
+    File.write!(resume, "server returned")
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT count(*) FROM harklight_wake_entries WHERE handle=?1", [
+               @handle
+             ]) == {:ok, [[1]]}
+           end)
+
+    assert {:ok, [["active", nil]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ])
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               db,
+               "SELECT w.prompt FROM harklight_wake_entries e JOIN wakes w ON w.wakeId=e.wakeId WHERE e.handle=?1 LIMIT 1",
+               [@handle]
+             )
+
+    assert prompt =~ "reply after server restart"
+  end
+
   test "a final unterminated listen refusal remains in the failure details", %{
     db: db,
     call: call
@@ -2307,6 +2985,12 @@ defmodule Tightbeam.HarklightWakesTest do
              HarklightWakes.capture_line(db, @handle, event(2, "discussion", "later"))
 
     Org.set_host(db, session.session_key, Placement.local_host_name())
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
+
     Org.retire(db, session.session_key, "user:owner", 60_000)
     session_key = session.session_key
 
@@ -2339,6 +3023,11 @@ defmodule Tightbeam.HarklightWakesTest do
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive {:listener_running, worker}
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
 
     retired = Org.retire(db, session.session_key, "user:owner", 60_000)
     assert retired.state == "retired"
@@ -2391,6 +3080,11 @@ defmodule Tightbeam.HarklightWakesTest do
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive {:listener_running, worker}
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
 
     retired = Org.retire(db, session.session_key, "user:owner", 60_000)
     assert retired.state == "retired"
@@ -2469,6 +3163,11 @@ defmodule Tightbeam.HarklightWakesTest do
     :sys.suspend(HarklightWakes)
 
     try do
+      {:ok, _} =
+        DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+          Org.personal_session_key("owner")
+        ])
+
       assert %{state: "retired"} = Org.retire(db, session.session_key, "user:owner", 60_000)
       assert %{state: "retired"} = Org.retire(db, follower.session_key, "user:owner", 60_000)
     after
@@ -2526,6 +3225,11 @@ defmodule Tightbeam.HarklightWakesTest do
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive {:listener_running, worker}
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
 
     retired_follower = Org.retire(db, follower.session_key, "user:owner", 60_000)
     assert retired_follower.state == "retired"
@@ -2591,6 +3295,11 @@ defmodule Tightbeam.HarklightWakesTest do
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive {:listener_running, worker}
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
 
     retired_origin = Org.retire(db, session.session_key, "user:owner", 60_000)
     assert retired_origin.state == "retired"
@@ -3175,6 +3884,11 @@ defmodule Tightbeam.HarklightWakesTest do
     start_supervised!({HarklightWakes, db: db, listener: listener})
     assert_receive {:listener_running, _worker}
 
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        Org.personal_session_key("owner")
+      ])
+
     retired = Org.retire(db, session.session_key, "user:owner", 60_000)
     assert retired.state == "retired"
     :sys.get_state(HarklightWakes)
@@ -3244,11 +3958,10 @@ defmodule Tightbeam.HarklightWakesTest do
     refute old_worker == new_worker
   end
 
-  test "completed captured wakes stay with the retired origin and notify its owner", %{
+  test "completed conversations acquire no successor or recovery wake at retirement", %{
     db: db,
     call: call,
-    session: session,
-    main: main
+    session: session
   } do
     assert %{state: "registered"} = HarklightWakes.register(db, call)
     assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "terminal", "final"))
@@ -3265,14 +3978,15 @@ defmodule Tightbeam.HarklightWakesTest do
     Org.retire(db, session.session_key, "user:owner", 60_000)
     :sys.get_state(HarklightWakes)
     session_key = session.session_key
-    main_key = main.session_key
 
     assert {:ok, [[^session_key, "pending"]]} =
              DB.query(db, "SELECT sessionKey,state FROM wakes WHERE wakeId LIKE ?1", [
                "w_harklight_" <> @handle <> "_%"
              ])
 
-    assert {:ok, [[^main_key]]} =
+    assert {:ok, []} = DB.query(db, "SELECT * FROM harklight_wake_follows")
+
+    assert {:ok, []} =
              DB.query(
                db,
                "SELECT sessionKey FROM wakes WHERE wakeId=?1",
@@ -3675,7 +4389,7 @@ defmodule Tightbeam.HarklightWakesTest do
     assert reason =~ "already settled as refused"
   end
 
-  test "cross-session retract is allowed and an uncertain command may be reissued", %{
+  test "cross-session retract settles the original uncertain operation", %{
     db: db,
     call: call,
     main: main
@@ -3688,29 +4402,44 @@ defmodule Tightbeam.HarklightWakesTest do
         params: %{message_id: "request"}
     }
 
-    runner = fn ["retract", "--session", @handle, "--request", "request", "--op-id", op] ->
-      send(self(), {:operation, op})
-      {JSON.encode!(%{kind: "outcome_unknown", op_id: op}), 7}
+    parent = self()
+
+    uncertain = fn args ->
+      op = List.last(args)
+      send(parent, {:operation, op, args})
+      frame(%{kind: "outcome_unknown", op_id: op})
     end
 
-    assert %{outcome: "outcome_unknown", wake_effect: "none"} =
-             HarklightSend.change_request(db, caller, "retract", runner: runner)
+    assert %{outcome: "outcome_unknown", wake_effect: "none", op_id: first} =
+             HarklightSend.change_request(db, caller, "retract", runner: uncertain)
 
-    assert_receive {:operation, first}
+    assert_receive {:operation, ^first, saved_request}
 
-    assert %{outcome: "outcome_unknown"} =
-             HarklightSend.change_request(db, caller, "retract", runner: runner)
+    assert %{op_id: ^first, request: ^saved_request, state: "pending"} =
+             HarklightLifecycle.lookup_change(db, "request")
 
-    assert_receive {:operation, second}
-    refute first == second
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_subscription_ends")
+    no_op = fn _ -> flunk("unresolved retract ran a new operation") end
 
-    committed = fn args ->
-      frame(%{kind: "committed", operation: "withdraw", op_id: List.last(args), response: %{}})
-    end
+    assert %{outcome: "refused", code: "harklight_operation_unresolved"} =
+             HarklightSend.change_request(db, caller, "retract", runner: no_op)
 
-    assert %{outcome: "committed", wake_effect: "ended"} =
-             HarklightSend.change_request(db, caller, "retract", runner: committed)
+    settled =
+      HarklightSend.settle(db, caller,
+        runner: fn args ->
+          assert args == ["retry", "--op-id", first]
+          frame(%{kind: "committed", operation: "retry", op_id: first, response: %{}})
+        end
+      )
+
+    assert %{
+             command: "settle",
+             settled_command: "retract",
+             outcome: "committed",
+             op_id: ^first,
+             wake_effect: "ended"
+           } = settled
+
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM harklight_subscription_ends")
   end
 
   test "revise passes its base revision and keeps the reply subscription", %{db: db, call: call} do
@@ -3751,6 +4480,193 @@ defmodule Tightbeam.HarklightWakesTest do
     assert %{outcome: "refused", reason: "request is at revision 2"} =
              HarklightSend.change_request(db, revised, "revise",
                runner: fn _ -> {"request is at revision 2", 2} end
+             )
+  end
+
+  test "uncertain revise is settled with its original operation ID and saved request", %{
+    db: db,
+    call: call
+  } do
+    assert_change_recovery(
+      db,
+      call,
+      "revise",
+      %{message_id: "request", base_revision: 1, title: "Updated", body: "Saved text"},
+      "revise",
+      %{revision: 2}
+    )
+  end
+
+  test "uncertain retract is settled with its original operation ID and saved request", %{
+    db: db,
+    call: call
+  } do
+    assert_change_recovery(
+      db,
+      call,
+      "retract",
+      %{message_id: "request"},
+      "withdraw",
+      %{}
+    )
+  end
+
+  test "an unrecorded change falls back to its saved request after same-ID retry", %{
+    db: db,
+    call: call
+  } do
+    change_call = %{
+      call
+      | params: %{message_id: "request", base_revision: 1, title: "Updated", body: "Saved text"}
+    }
+
+    assert %{outcome: "outcome_unknown", op_id: op_id} =
+             HarklightSend.change_request(db, change_call, "revise",
+               runner: fn args ->
+                 assert hd(args) == "revise"
+                 frame(%{kind: "outcome_unknown", op_id: List.last(args)})
+               end
+             )
+
+    assert %{request: saved_request, state: "pending"} =
+             HarklightLifecycle.lookup_change(db, "request")
+
+    settle_call = %{call | params: %{message_id: "request"}}
+    parent = self()
+
+    runner = fn
+      ["retry", "--op-id", ^op_id] ->
+        send(parent, :retry_missing)
+        {"no recorded operation with key #{op_id}\n", 1}
+
+      ^saved_request ->
+        send(parent, :saved_request_replayed)
+
+        frame(%{
+          kind: "committed",
+          operation: "revise",
+          op_id: op_id,
+          response: %{revision: 2}
+        })
+
+      args ->
+        flunk("unexpected Harklight command during settlement: #{inspect(args)}")
+    end
+
+    assert %{command: "settle", settled_command: "revise", outcome: "committed", revision: 2} =
+             HarklightSend.settle(db, settle_call, runner: runner)
+
+    assert_receive :retry_missing
+    assert_receive :saved_request_replayed
+
+    assert %{op_id: ^op_id, request: ^saved_request, state: "committed"} =
+             HarklightLifecycle.lookup_change(db, "request")
+  end
+
+  test "a non-missing retry failure does not replay the saved change request", %{
+    db: db,
+    call: call
+  } do
+    change_call = %{
+      call
+      | params: %{message_id: "request", base_revision: 1, title: "Updated"}
+    }
+
+    assert %{outcome: "outcome_unknown", op_id: op_id} =
+             HarklightSend.change_request(db, change_call, "revise",
+               runner: fn args ->
+                 frame(%{kind: "outcome_unknown", op_id: List.last(args)})
+               end
+             )
+
+    assert %{request: saved_request, state: "pending"} =
+             HarklightLifecycle.lookup_change(db, "request")
+
+    settle_call = %{call | params: %{message_id: "request"}}
+    parent = self()
+
+    runner = fn
+      ["retry", "--op-id", ^op_id] ->
+        send(parent, :retry_failed)
+        {"operation journal unavailable", 1}
+
+      args ->
+        flunk(
+          "settlement replayed a request without a missing-operation result: #{inspect(args)}"
+        )
+    end
+
+    assert %{outcome: "outcome_unknown", op_id: ^op_id} =
+             HarklightSend.settle(db, settle_call, runner: runner)
+
+    assert_receive :retry_failed
+
+    assert %{op_id: ^op_id, request: ^saved_request, state: "pending"} =
+             HarklightLifecycle.lookup_change(db, "request")
+  end
+
+  test "a thrown revise command preserves its saved operation for settlement", %{
+    db: db,
+    call: call
+  } do
+    change_call = %{
+      call
+      | params: %{
+          message_id: "request",
+          base_revision: 1,
+          title: "Updated",
+          body: "Saved text"
+        }
+    }
+
+    assert %{
+             outcome: "outcome_unknown",
+             code: "harklight_cli_failed",
+             op_id: op_id
+           } =
+             HarklightSend.change_request(db, change_call, "revise",
+               runner: fn _args -> raise "connection lost" end
+             )
+
+    assert %{
+             op_id: ^op_id,
+             request: saved_request,
+             state: "pending"
+           } = HarklightLifecycle.lookup_change(db, "request")
+
+    assert saved_request == [
+             "revise",
+             "--session",
+             @handle,
+             "--request",
+             "request",
+             "--base-revision",
+             "1",
+             "--title",
+             "Updated",
+             "--body",
+             "Saved text",
+             "--op-id",
+             op_id
+           ]
+
+    assert %{
+             command: "settle",
+             settled_command: "revise",
+             outcome: "committed",
+             op_id: ^op_id
+           } =
+             HarklightSend.settle(db, %{call | params: %{message_id: "request"}},
+               runner: fn args ->
+                 assert args == ["retry", "--op-id", op_id]
+
+                 frame(%{
+                   kind: "committed",
+                   operation: "retry",
+                   op_id: op_id,
+                   response: %{revision: 2}
+                 })
+               end
              )
   end
 
@@ -5082,9 +5998,11 @@ defmodule Tightbeam.HarklightWakesTest do
                       "--event",
                       "105",
                       "--agent",
-                      "Follower",
+                      agent_name,
                       "--rerouted"
                     ]}
+
+    assert agent_name == follower.display_name
 
     refute_receive {:ack2, _args}
   end
@@ -5259,6 +6177,95 @@ defmodule Tightbeam.HarklightWakesTest do
     :ok
   end
 
+  defp assert_change_recovery(db, call, command, params, committed_operation, response) do
+    request_call = %{call | params: params}
+    settle_call = %{call | params: %{message_id: "request"}}
+    parent = self()
+
+    uncertain_runner = fn args ->
+      op_id = List.last(args)
+
+      assert {:ok, [[payload, nil, "pending"]]} =
+               DB.query(
+                 db,
+                 "SELECT payload,result,state FROM harklight_send_operations WHERE opId=?1",
+                 [op_id]
+               )
+
+      decoded = JSON.decode!(payload)
+      assert decoded["operation_kind"] == "change"
+      assert decoded["command"] == command
+      assert decoded["message_id"] == "request"
+      assert decoded["request"] == args
+      send(parent, {:external_change_request, command, args})
+
+      frame(%{kind: "outcome_unknown", op_id: op_id, reason: "connection lost"})
+    end
+
+    assert %{
+             command: ^command,
+             outcome: "outcome_unknown",
+             op_id: op_id,
+             reason: reason
+           } = HarklightSend.change_request(db, request_call, command, runner: uncertain_runner)
+
+    assert reason =~ "harklight-settle"
+    assert_receive {:external_change_request, ^command, saved_request}
+
+    assert %{op_id: ^op_id, request: ^saved_request, state: "pending"} =
+             HarklightLifecycle.lookup_change(db, "request")
+
+    no_op = fn _ -> flunk("unresolved change operation ran a new request") end
+
+    assert %{outcome: "refused", code: "harklight_operation_unresolved"} =
+             HarklightSend.change_request(db, request_call, command, runner: no_op)
+
+    settled =
+      HarklightSend.settle(db, settle_call,
+        runner: fn args ->
+          assert args == ["retry", "--op-id", op_id]
+
+          assert %{op_id: ^op_id, request: ^saved_request, state: "pending"} =
+                   HarklightLifecycle.lookup_change(db, "request")
+
+          # Agent 0.1.9 emits "retry" after resubmitting a Prepared/Unknown
+          # operation. A committed operation instead returns its saved kind.
+          operation = if command == "retract", do: committed_operation, else: "retry"
+
+          frame(%{
+            kind: "committed",
+            operation: operation,
+            op_id: op_id,
+            response: response
+          })
+        end
+      )
+
+    assert %{
+             command: "settle",
+             settled_command: ^command,
+             outcome: "committed",
+             op_id: ^op_id
+           } = settled
+
+    assert %{op_id: ^op_id, request: ^saved_request, state: "committed"} =
+             HarklightLifecycle.lookup_change(db, "request")
+
+    assert :ok = HarklightSend.recover_pending(db, runner: no_op)
+
+    assert %{outcome: "refused", reason: reason} =
+             HarklightSend.settle(db, settle_call, runner: no_op)
+
+    assert reason =~ "already settled as committed"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_send_operations WHERE json_extract(payload,'$.operation_kind')='change' AND json_extract(payload,'$.message_id')=?1",
+               ["request"]
+             )
+  end
+
   defp frame(value), do: {JSON.encode!(value) <> "\n", 0}
 
   defp bind_extra(db, call, message) do
@@ -5406,7 +6413,7 @@ defmodule Tightbeam.HarklightWakesTest do
   defp follower_session(db, main, key) do
     Org.create(db, %{
       session_key: key,
-      display_name: "Follower",
+      display_name: "Follower #{key}",
       owner_user_id: "owner",
       origin: "user:owner",
       spawned_by: main.session_key,
@@ -5986,7 +6993,7 @@ defmodule Tightbeam.HarklightWakesTest do
     listener = completion_notifying_listener(parent)
 
     unchanged =
-      Map.new([p2, k1, k2, k3], fn h ->
+      Map.new([p2, k1, k2], fn h ->
         {h, DB.query(db, "SELECT * FROM harklight_wake_handles WHERE handle=?1", [h])}
       end)
 
@@ -6006,6 +7013,9 @@ defmodule Tightbeam.HarklightWakesTest do
 
       assert {:ok, [["complete"]]} =
                DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [p1])
+
+      assert {:ok, [["complete"]]} =
+               DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [k3])
 
       for {handle, row} <- unchanged,
           do:
@@ -6165,7 +7175,7 @@ defmodule Tightbeam.HarklightWakesTest do
     end
   end
 
-  test "an agent-authored answer alone does not complete a handle", %{db: db} do
+  test "an agent-authored answered terminal completes a handle", %{db: db} do
     answer = completion_event(@handle, 1, "request", "terminal", "agent")
     assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
     mark_completion_wakes_delivered(db, @handle)
@@ -6182,9 +7192,57 @@ defmodule Tightbeam.HarklightWakesTest do
       ["status", "--session", @handle] -> {JSON.encode!(status), 0}
     end
 
-    assert :active = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+    assert :completed = HarklightLifecycle.complete_answered(db, @handle, runner: runner)
+
+    assert {:ok, [["complete"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+  end
+
+  test "an agent-authored answered terminal completes when its turn ends", %{
+    db: db,
+    session: session
+  } do
+    answer = completion_event(@handle, 1, "request", "terminal", "agent")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+    mark_completion_wakes_delivered(db, @handle)
+
+    status = %{
+      "session_handle" => @handle,
+      "open_requests" => 1,
+      "pending_undelivered" => 0,
+      "pending_delivered_unacted" => 0
+    }
+
+    {:ok, responses} =
+      Agent.start_link(fn -> %{status: status, events: %{@handle => []}, commands: []} end)
+
+    Process.unlink(responses)
+    on_exit(fn -> Agent.stop(responses) end)
+    parent = self()
+    runner = completion_runner(responses, parent)
+
+    start_supervised!(
+      {HarklightWakes,
+       db: db, listener: completion_notifying_listener(parent), send_runner: runner}
+    )
+
+    assert_receive {:restored, @handle, nil}
 
     assert {:ok, [["active"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+
+    Agent.update(responses, fn current ->
+      put_in(current, [:status, "open_requests"], 0)
+    end)
+
+    HarklightWakes.origin_turn_ended(session.session_key)
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle]) ==
+               {:ok, [["complete"]]}
+           end)
+
+    assert {:ok, [["complete"]]} =
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
   end
 

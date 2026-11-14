@@ -21,6 +21,14 @@ defmodule Tightbeam.HarnessSeamTest do
     assert get_in(config, [:tightbeam, :default_harness]) == :fixture
   end
 
+  test "running model tuning capability belongs to the harness registry" do
+    assert Harness.running_model_tuning_supported?(:claude)
+    assert Harness.running_model_tuning_supported?(:codex)
+    refute Harness.running_model_tuning_supported?(:pi)
+    refute Harness.running_model_tuning_supported?(:cursor)
+    refute Harness.running_model_tuning_supported?("unknown")
+  end
+
   test "the shipped offline registry is the production registry projection" do
     rows =
       Application.app_dir(:tightbeam, "priv/harness_registry.json")

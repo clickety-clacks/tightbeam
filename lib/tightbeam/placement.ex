@@ -28,8 +28,9 @@ defmodule Tightbeam.Placement do
      expects (%{code: ...}), citing what was denied and the allowed set, so
      agents learn the law by hitting it.
 
-  2. `adapter_opts/2` — build the Acp.Adapter start opts for an adapter key
-     {harness, "shared", host}:
+  2. `adapter_opts/2` — build Acp.Adapter start opts for a placement key
+     {harness, "shared", host}; Pi also uses one session-keyed worker key:
+     {pi, "pi-session:" <> sessionKey, host}.
      - local: exactly the previous behavior (local binary path, local home
        from Homes.project, env in the local Port).
      - remote: cmd is SSH-WRAPPED — ["ssh", dest, "exec", "env", "K=V"...,
@@ -103,8 +104,36 @@ defmodule Tightbeam.Placement do
           optional(:toolchain_dirs) => [String.t()]
         }
 
-  @typedoc "Adapter key. The reserved identity `shared` is the one runtime per harness+host."
+  @typedoc "Adapter key. `shared` is placement-scoped; Pi also has private session keys."
   @type adapter_key :: {harness :: atom(), archetype :: String.t(), host :: String.t()}
+
+  @pi_session_identity_prefix "pi-session:"
+
+  @doc false
+  def pi_session_adapter_key(session_key, host) when is_binary(session_key) and is_binary(host),
+    do: {:pi, @pi_session_identity_prefix <> session_key, host}
+
+  @doc false
+  def pi_session_adapter?({:pi, @pi_session_identity_prefix <> _session_key, _host}), do: true
+  def pi_session_adapter?(_key), do: false
+
+  @doc false
+  def pi_session_key({:pi, @pi_session_identity_prefix <> session_key, _host}),
+    do: {:ok, session_key}
+
+  def pi_session_key(_key), do: :error
+
+  @doc false
+  def placement_adapter_key({harness, _identity, host}), do: {harness, "shared", host}
+
+  @doc false
+  def pi_private_home(%{base_dir: base_dir}, "shared") do
+    Path.join([base_dir, "work", "pi-readiness-home"])
+  end
+
+  def pi_private_home(%{base_dir: _base_dir} = host, @pi_session_identity_prefix <> session_key) do
+    Path.join([host_workdir_path(host, session_key), ".tightbeam", "pi-home"])
+  end
 
   @hosts_ddl """
   CREATE TABLE IF NOT EXISTS hosts (
@@ -729,86 +758,6 @@ defmodule Tightbeam.Placement do
   end
 
   @doc """
-  Stat paths on the host that holds them — the write-detection half of referent
-  verification. Local and remote hosts use a bounded shell invocation.
-
-  A present path returns its mtime, so the answer is evidence of a write and not
-  merely of existence. `stat` spells its format differently on BSD and GNU, so
-  the command tries both; a host with neither reports the path unverifiable
-  rather than guessing.
-
-  A host that cannot be reached reports THAT. The answer is about the check, so
-  a caller can never turn it into a statement about the claim that named the
-  path, or about the credential that failed to reach the host.
-  """
-  @spec check_origins(map(), String.t(), [String.t()]) ::
-          %{String.t() => {:present, integer()} | :absent | {:error, String.t()}}
-  def check_origins(_config, _host_name, []), do: %{}
-
-  def check_origins(config, host_name, paths) do
-    case hosts_for(config)[host_name] do
-      nil ->
-        Map.new(paths, &{&1, {:error, "no host named #{host_name} is registered"}})
-
-      host ->
-        command = check_origins_command(paths)
-        runner = Map.get(config, :sh, &system_cmd/1)
-
-        invocation =
-          if host.ssh == nil do
-            ["sh", "-lc", command]
-          else
-            ["ssh" | @ssh_opts] ++ [host.ssh, "sh", "-lc", shell_quote(command)]
-          end
-
-        result =
-          if host.ssh == nil do
-            run_probe(runner, invocation)
-          else
-            run_bounded(runner, invocation, 8_000)
-          end
-
-        case result do
-          {:ok, output} -> parse_origin_checks(output, paths)
-          {:error, reason} -> Map.new(paths, &{&1, {:error, reason}})
-        end
-    end
-  end
-
-  defp check_origins_command(paths) do
-    """
-    set -u
-    for p in #{Enum.map_join(paths, " ", &shell_quote/1)}; do
-      if test ! -e "$p"; then
-        printf 'A\\t0\\t%s\\n' "$p"
-      elif m=$(stat -f %m "$p" 2>/dev/null) || m=$(stat -c %Y "$p" 2>/dev/null); then
-        printf 'P\\t%s\\t%s\\n' "$m" "$p"
-      else
-        printf 'U\\t0\\t%s\\n' "$p"
-      fi
-    done
-    """
-  end
-
-  defp parse_origin_checks(output, paths) do
-    seen =
-      output
-      |> String.split("\n", trim: true)
-      |> Enum.reduce(%{}, fn line, acc ->
-        case String.split(line, "\t", parts: 3) do
-          ["P", mtime, path] -> Map.put(acc, path, {:present, String.to_integer(mtime)})
-          ["A", _mtime, path] -> Map.put(acc, path, :absent)
-          ["U", _mtime, path] -> Map.put(acc, path, {:error, "this host has no usable stat"})
-          _ -> acc
-        end
-      end)
-
-    Map.new(paths, fn path ->
-      {path, Map.get(seen, path, {:error, "the check returned no answer for this path"})}
-    end)
-  end
-
-  @doc """
   Record (or update) a host in the instance registry — the DUMB half of
   assimilation: the CLI ceremony prepares the machine; this writes the fact.
   Admin gating happens in the verb handler, not here. Returns the stored
@@ -956,59 +905,6 @@ defmodule Tightbeam.Placement do
     end
 
     :ok
-  end
-
-  defp run_bounded(runner, invocation, timeout_ms) do
-    caller = self()
-    tag = make_ref()
-
-    {pid, monitor} =
-      spawn_monitor(fn ->
-        result =
-          try do
-            case runner.(invocation) do
-              {output, 0} -> {:ok, output}
-              {output, status} -> {:error, "probe exited #{status}: #{String.trim(output)}"}
-            end
-          rescue
-            error -> {:error, "probe failed: #{Exception.message(error)}"}
-          catch
-            kind, reason -> {:error, "probe failed: #{kind}: #{inspect(reason)}"}
-          end
-
-        send(caller, {tag, result})
-      end)
-
-    receive do
-      {^tag, result} ->
-        Process.demonitor(monitor, [:flush])
-        result
-
-      {:DOWN, ^monitor, :process, ^pid, reason} ->
-        {:error, "probe failed: #{Exception.format_exit(reason)}"}
-    after
-      timeout_ms ->
-        Process.exit(pid, :kill)
-
-        receive do
-          {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
-        end
-
-        {:error, "probe timed out"}
-    end
-  end
-
-  defp run_probe(runner, invocation) do
-    try do
-      case runner.(invocation) do
-        {output, 0} -> {:ok, output}
-        {output, status} -> {:error, "probe exited #{status}: #{String.trim(output)}"}
-      end
-    rescue
-      error -> {:error, "probe failed: #{Exception.message(error)}"}
-    catch
-      kind, reason -> {:error, "probe failed: #{kind}: #{inspect(reason)}"}
-    end
   end
 
   defp upsert_host_in_txn(txn, name, entry) do
@@ -1518,6 +1414,15 @@ defmodule Tightbeam.Placement do
         end
       end)
       |> Kernel.++(checked_opts)
+
+    launch_opts =
+      if harness == :pi do
+        launch_opts
+        |> Keyword.put(:pi_private_home, pi_private_home(host_config, identity_name))
+        |> Keyword.put(:statutes, identity_name == "shared" and Rails.statutes?())
+      else
+        launch_opts
+      end
 
     process_identity_dir =
       if harness == :cursor and is_nil(host_config.ssh),
