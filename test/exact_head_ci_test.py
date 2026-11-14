@@ -230,6 +230,28 @@ class ExactHeadCI(unittest.TestCase):
                 'github.event_name': 'workflow_dispatch',
                 'inputs.docs_validation': mode}), expected)
 
+    def test_full_suite_runs_before_trusted_branch_push_packaging(self):
+        source = re.search(
+            r'(?m)^      FULL_SUITE: \$\{\{ (.*?) \}\}$', self.jobs['test']).group(1)
+        cases = [
+            ('push', 'refs/heads/0.1.16', True),
+            ('push', 'refs/tags/v0.1.16', True),
+            ('workflow_dispatch', 'refs/heads/0.1.16', True),
+            ('pull_request', 'refs/pull/12/merge', False),
+            ('merge_group', 'refs/heads/gh-readonly-queue/0.1.16/pr-12-abc', False),
+        ]
+        for event, ref, expected in cases:
+            self.assertEqual(evaluate(source, {
+                'github.event_name': event,
+                'github.ref': ref,
+            }), expected, (event, ref))
+
+        test_job = self.jobs['test']
+        release_job = self.jobs['release']
+        self.assertIn("if: env.FULL_SUITE == 'true'\n        run: scripts/verify_mix.sh", test_job)
+        self.assertIn("if: env.FULL_SUITE == 'true'\n        working-directory: cli\n        run: cargo test", test_job)
+        self.assertIn('    needs: test', release_job)
+
     def test_docs_dispatch_is_hosted_read_only_and_subject_bound(self):
         job = self.text.split('\n  docs-validation:\n', 1)[1]
         condition = re.search(r'(?m)^    if: (.*)$', job).group(1)
