@@ -906,6 +906,30 @@ defmodule Tightbeam.Wire.RouterTest do
     assert agent_verbs -- handler_keys == []
   end
 
+  test "existing sentinel unsubscribe remains available through agent dispatch", ctx do
+    session = create_session(ctx.db, "sentinel-unsubscribe-wire", ctx.device.user_id)
+    subscription_id = "sub_router_allowlist"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO sentinel_subscriptions(subscriptionId,sessionKey,event,filter,createdAt) VALUES(?1,?2,?3,?4,?5)",
+               [subscription_id, session.session_key, "example/event", "[]", 1]
+             )
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    response =
+      dispatch_cli(ctx, session.cli_token, %{
+        verb: "sentinel-unsubscribe",
+        params: %{subscriptionId: subscription_id}
+      })
+
+    assert response.status == 200, response.resp_body
+    assert JSON.decode!(response.resp_body)["result"] == %{"unsubscribed" => subscription_id}
+  end
+
   test "fact producer verbs cross agent dispatch for sessions, users and processes", ctx do
     session = create_session(ctx.db, "fact-wire-reader", ctx.device.user_id)
     handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})

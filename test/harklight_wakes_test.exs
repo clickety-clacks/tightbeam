@@ -3737,6 +3737,444 @@ defmodule Tightbeam.HarklightWakesTest do
     refute File.exists?(calls)
   end
 
+  test "manual retry resolves an answered message to its mixed unanswered handle", %{db: db} do
+    parent = self()
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_wake_requests(senderId,messageId,handle) VALUES('sender','sibling',?1)",
+               [@handle]
+             )
+
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1",
+               [@handle]
+             )
+
+    runner = fn ["status", "--session", @handle] ->
+      send(parent, :retry_status_read)
+
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 1,
+         "pending_undelivered" => 0,
+         "pending_delivered_unacted" => 0
+       }), 0}
+    end
+
+    listener = fn manager, handle, _vendor ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      send(parent, {:retry_listener_started, self()})
+
+      receive do
+        :hold -> :ok
+      end
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         listener: listener,
+         send_runner: runner,
+         retry_delays: [1],
+         attach_retry_delays: []}
+      )
+
+    assert eventually(fn ->
+             Process.info(manager, :message_queue_len) == {:message_queue_len, 0}
+           end)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable',lastError='previous failure' WHERE handle=?1",
+               [@handle]
+             )
+
+    result = HarklightWakes.retry_command(db, %{params: %{message_id: "request"}})
+    assert_receive :retry_status_read
+    assert_receive {:retry_listener_started, listener_pid}
+
+    assert %{selector: "message", counts: %{listening: 1}, results: [handle_result]} = result
+    assert handle_result.outcome == "listening"
+    assert handle_result.selected_message == %{message_id: "request", state: "answered"}
+    assert Enum.find(handle_result.messages, &(&1.message_id == "request")).state == "answered"
+    assert Enum.find(handle_result.messages, &(&1.message_id == "sibling")).state == "waiting"
+    assert handle_result.started_for.waiting_messages == ["sibling"]
+
+    repeated = HarklightWakes.retry_command(db, %{params: %{message_id: "request"}})
+
+    assert %{
+             counts: %{not_failed: 1},
+             results: [
+               %{
+                 outcome: "not_failed",
+                 state: "active",
+                 selected_message: %{message_id: "request", state: "answered"}
+               }
+             ]
+           } = repeated
+
+    refute_receive :retry_status_read, 0
+    assert Process.alive?(listener_pid)
+  end
+
+  test "manual retry leaves a scheduled automatic recovery in flight", %{db: db} do
+    parent = self()
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    runner = fn ["status", "--session", @handle] ->
+      send(parent, :retry_status_read)
+
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 1,
+         "pending_undelivered" => 0,
+         "pending_delivered_unacted" => 0
+       }), 0}
+    end
+
+    listener = fn manager, handle, _vendor ->
+      attempt = Agent.get_and_update(attempts, fn current -> {current, current + 1} end)
+      send(parent, {:recovery_listener_started, attempt})
+
+      if attempt == 0 do
+        :ok = GenServer.call(manager, {:finished, handle, "listener_stopped"})
+      else
+        :ok = GenServer.call(manager, {:attached, handle})
+        send(parent, :recovery_listener_attached)
+        receive do: (:hold -> :ok)
+      end
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         listener: listener,
+         send_runner: runner,
+         retry_delays: [5_000],
+         attach_retry_delays: []}
+      )
+
+    assert_receive :retry_status_read
+    assert_receive {:recovery_listener_started, 0}
+    assert eventually(fn -> Map.has_key?(:sys.get_state(manager).retry_timers, @handle) end)
+    timer_before = :sys.get_state(manager).retry_timers
+
+    assert %{counts: %{in_progress: 1}, results: [%{outcome: "in_progress"}]} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+    assert :sys.get_state(manager).retry_timers == timer_before
+    refute_receive :retry_status_read, 0
+    refute_receive {:recovery_listener_started, 1}, 0
+
+    assert_receive :retry_status_read, 6_000
+    assert_receive {:recovery_listener_started, 1}, 1_000
+    assert_receive :recovery_listener_attached, 1_000
+
+    assert %{counts: %{not_failed: 1}, results: [%{outcome: "not_failed", state: "active"}]} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+  end
+
+  test "retry rejects invalid targets without reading Harklight", %{db: db} do
+    parent = self()
+
+    runner = fn _args ->
+      send(parent, :unexpected_harklight_contact)
+      {"{}", 0}
+    end
+
+    assert %{code: "invalid_harklight_retry_selector"} =
+             HarklightWakes.retry_command(db, %{params: %{}})
+
+    assert %{code: "invalid_harklight_retry_selector"} =
+             HarklightWakes.retry_command(db, %{params: %{all: true, handle: @handle}})
+
+    assert %{code: "harklight_message_unknown"} =
+             HarklightWakes.retry_command(db, %{params: %{message_id: "unknown-message"}})
+
+    assert %{code: "harklight_handle_unknown"} =
+             HarklightWakes.retry_command(db, %{params: %{handle: "unknown-handle"}})
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1", [
+               @handle
+             ])
+
+    start_supervised!({HarklightWakes, db: db, send_runner: runner})
+
+    assert eventually(fn ->
+             Process.info(Process.whereis(HarklightWakes), :message_queue_len) ==
+               {:message_queue_len, 0}
+           end)
+
+    assert %{
+             results: [],
+             counts: %{failed: 0, in_progress: 0, listening: 0, not_failed: 0, skipped_closed: 0}
+           } =
+             HarklightWakes.retry_command(db, %{params: %{all: true}})
+
+    refute_receive :unexpected_harklight_contact, 0
+  end
+
+  test "retry reports an active handle as not failed without another start", %{db: db} do
+    parent = self()
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1", [
+               @handle
+             ])
+
+    runner = fn ["status", "--session", @handle] ->
+      send(parent, :retry_status_read)
+      {"{}", 0}
+    end
+
+    manager = start_supervised!({HarklightWakes, db: db, send_runner: runner})
+
+    assert eventually(fn ->
+             Process.info(manager, :message_queue_len) == {:message_queue_len, 0}
+           end)
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE harklight_wake_handles SET state='active' WHERE handle=?1", [
+               @handle
+             ])
+
+    assert %{counts: %{not_failed: 1}, results: [%{outcome: "not_failed", state: "active"}]} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+    refute_receive :retry_status_read, 0
+    assert :sys.get_state(manager).workers == %{}
+  end
+
+  test "manual retry reports an in-flight startup without starting a second listener", %{db: db} do
+    parent = self()
+
+    runner = fn ["status", "--session", @handle] ->
+      send(parent, :retry_status_read)
+
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 1,
+         "pending_undelivered" => 0
+       }), 0}
+    end
+
+    listener = fn _manager, _handle, _vendor ->
+      send(parent, {:startup_listener_started, self()})
+      receive do: (:hold -> :ok)
+    end
+
+    start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+    assert_receive :retry_status_read
+    assert_receive {:startup_listener_started, listener_pid}
+
+    assert %{counts: %{in_progress: 1}, results: [%{outcome: "in_progress"}]} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+    refute_receive :retry_status_read, 0
+    refute_receive {:startup_listener_started, _}, 0
+    assert Process.alive?(listener_pid)
+  end
+
+  test "manual retry uses the existing bounded transport attach path", %{db: db} do
+    path = Path.join(System.tmp_dir!(), "retry-attach-#{System.unique_integer([:positive])}")
+
+    on_exit(fn ->
+      File.rm(path)
+      File.rm(path <> ".attempted")
+    end)
+
+    fake_harklight_agent!("""
+    printf '%s\\n' "$*" >> '#{path}'
+    if [ "$1" = attach ]; then
+      if [ ! -e '#{path}.attempted' ]; then
+        touch '#{path}.attempted'
+        printf '%s\\n' '{"kind":"connection_error","reason_source":"agent","reason_code":"transport_error","reason":"temporary origin failure"}'
+        exit 1
+      fi
+      printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+    elif [ "$1" = listen ]; then
+      printf '%s\\n' '{"kind":"idle","open_requests":0}'
+    fi
+    """)
+
+    runner = fn ["status", "--session", @handle] ->
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 1,
+         "pending_undelivered" => 0
+       }), 0}
+    end
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1", [
+               @handle
+             ])
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         send_runner: runner,
+         retry_delays: [],
+         attach_retry_delays: [1],
+         attach_retry_window_ms: 1_000}
+      )
+
+    assert eventually(fn ->
+             Process.info(manager, :message_queue_len) == {:message_queue_len, 0}
+           end)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable' WHERE handle=?1",
+               [
+                 @handle
+               ]
+             )
+
+    assert %{counts: %{listening: 1}, results: [%{outcome: "listening"}]} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+    calls = File.read!(path) |> String.split("\n", trim: true)
+    assert Enum.count(calls, &String.starts_with?(&1, "attach ")) == 2
+    assert Enum.count(calls, &String.starts_with?(&1, "listen ")) == 1
+    refute Enum.any?(calls, &String.starts_with?(&1, "session end "))
+  end
+
+  test "manual retry reports its recorded failure without scheduling another start", %{db: db} do
+    parent = self()
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1", [
+               @handle
+             ])
+
+    runner = fn ["status", "--session", @handle] ->
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 1,
+         "pending_undelivered" => 0,
+         "pending_delivered_unacted" => 0
+       }), 0}
+    end
+
+    listener = fn manager, handle, _vendor ->
+      send(parent, :retry_listener_attempted)
+      GenServer.call(manager, {:finished, handle, "scripted_attach_failure"})
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         listener: listener,
+         send_runner: runner,
+         retry_delays: [1],
+         attach_retry_delays: []}
+      )
+
+    assert eventually(fn ->
+             Process.info(manager, :message_queue_len) == {:message_queue_len, 0}
+           end)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable',lastError='previous failure' WHERE handle=?1",
+               [@handle]
+             )
+
+    result = HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+    assert_receive :retry_listener_attempted
+    assert %{selector: "session", counts: %{failed: 1}, results: [handle_result]} = result
+    assert handle_result.outcome == "failed"
+    assert handle_result.reason == "scripted_attach_failure"
+
+    assert eventually(fn ->
+             state = :sys.get_state(manager)
+             state.workers == %{} and state.retry_timers == %{} and state.gone_tasks == %{}
+           end)
+
+    assert :sys.get_state(manager).manual_starts == MapSet.new()
+
+    assert {:ok, [["unavailable", "scripted_attach_failure"]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ])
+  end
+
+  test "closed manual retry leaves its handle row untouched", %{db: db} do
+    parent = self()
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1",
+               [@handle]
+             )
+
+    runner = fn ["status", "--session", @handle] ->
+      send(parent, :retry_status_read)
+
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 0,
+         "pending_undelivered" => 0,
+         "pending_delivered_unacted" => 0
+       }), 0}
+    end
+
+    listener = fn _manager, _handle, _vendor -> send(parent, :unexpected_retry_listener) end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: listener, send_runner: runner, retry_delays: []}
+      )
+
+    assert eventually(fn ->
+             Process.info(manager, :message_queue_len) == {:message_queue_len, 0}
+           end)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable',lastError='preserve this' WHERE handle=?1",
+               [@handle]
+             )
+
+    assert {:ok, before} =
+             DB.query(
+               db,
+               "SELECT handle,sessionKey,host,vendorSessionId,state,lastCursor,lastError,createdAt,updatedAt FROM harklight_wake_handles WHERE handle=?1",
+               [@handle]
+             )
+
+    result = HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+    assert_receive :retry_status_read
+    assert %{counts: %{skipped_closed: 1}, results: [%{outcome: "skipped_closed"}]} = result
+    refute_receive :unexpected_retry_listener, 0
+
+    assert {:ok, ^before} =
+             DB.query(
+               db,
+               "SELECT handle,sessionKey,host,vendorSessionId,state,lastCursor,lastError,createdAt,updatedAt FROM harklight_wake_handles WHERE handle=?1",
+               [@handle]
+             )
+  end
+
   test "deferred existing starts skip while deferred new-request starts remain ungated", %{
     db: db,
     session: session
