@@ -2790,15 +2790,14 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call,
                     %{verb: "wake", origin: "agent:orchestrator:demo", session_key: "orch"}}
 
-    # `post` remains an internal handler-backed verb: the public wire must
-    # reject it before the handler can append a message or enqueue a turn.
+    # An unknown verb is refused before a handler can append a message or turn.
     {:ok, [[before_events]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
     {:ok, [[before_messages]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     {:ok, [[before_turns]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
     disallowed =
       dispatch_cli(ctx, "tbc_test", %{
-        verb: "post",
+        verb: "not-a-verb",
         asUser: "flynn",
         params: %{content: "must not be delivered", clientMessageId: "internal-post-negative"}
       })
@@ -2808,7 +2807,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(disallowed.resp_body) == %{
              "error" => %{
                "code" => "invalid_message",
-               "message" => "verb not allowed: post"
+               "message" => "verb not allowed: not-a-verb"
              }
            }
 
