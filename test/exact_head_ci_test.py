@@ -13,9 +13,16 @@ WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml'
 
 def evaluate(expression, context):
     """Evaluate the small GitHub expression subset this workflow uses."""
-    tokens = re.findall(
-        r"\s*(&&|\|\||!=|==|[(),]|'[^']*'|startsWith|[A-Za-z_][\w.-]*)", expression)
-    if ''.join(tokens) != re.sub(r'\s+', '', expression):
+    token_pattern = re.compile(
+        r"\s*(&&|\|\||!=|==|[(),]|'[^']*'|startsWith|[A-Za-z_][\w.-]*)")
+    tokens = []
+    position = 0
+    for match in token_pattern.finditer(expression):
+        if expression[position:match.start()].strip():
+            raise ValueError('unsupported expression: ' + expression)
+        tokens.append(match.group(1))
+        position = match.end()
+    if expression[position:].strip():
         raise ValueError('unsupported expression: ' + expression)
     words = {'&&': ' and ', '||': ' or ', '!=': ' != ', '==': ' == ',
              '(': '(', ')': ')', ',': ',', 'startsWith': '_starts',
@@ -79,6 +86,42 @@ class ExactHeadCI(unittest.TestCase):
                 'github.repository': 'clickety-clacks/tightbeam',
             }
             self.assertEqual(evaluate(source, context), expected, (name, event, head_repo))
+
+    def test_release_macos_uses_pool_for_trusted_release_events_only(self):
+        source = re.search(
+            r'(?m)^    runs-on: \$\{\{ (.*?) \}\}$', self.jobs['release']).group(1)
+        release_condition = re.search(
+            r'(?m)^    if: (.*)$', self.jobs['release']).group(1)
+        pool = ['self-hosted', 'tb-macos']
+        cases = [
+            ('push', 'refs/heads/0.1.16', '', pool),
+            ('push', 'refs/tags/v0.1.16', '', pool),
+            ('workflow_dispatch', 'refs/heads/0.1.16', '', pool),
+            ('pull_request', 'refs/pull/12/merge', 'contributor/project', 'macos-latest'),
+        ]
+        for event, ref, head_repo, expected in cases:
+            context = {
+                'matrix.name': 'darwin-aarch64',
+                'matrix.os': 'macos-latest',
+                'github.event_name': event,
+                'github.event.pull_request.head.repo.full_name': head_repo,
+                'github.repository': 'clickety-clacks/tightbeam',
+                'github.ref': ref,
+            }
+            self.assertEqual(evaluate(source, context), expected, (event, ref, head_repo))
+            self.assertEqual(evaluate(release_condition, context), event != 'pull_request')
+
+        linux = {
+            'matrix.name': 'linux-x86_64',
+            'matrix.os': 'ubuntu-latest',
+            'github.event_name': 'push',
+            'github.event.pull_request.head.repo.full_name': '',
+            'github.repository': 'clickety-clacks/tightbeam',
+            'github.ref': 'refs/heads/0.1.16',
+        }
+        self.assertEqual(evaluate(source, linux), ['self-hosted', 'tb-linux'])
+        self.assertIn('clean: true', self.jobs['release'])
+        self.assertIn('ImageOS=macos26', self.jobs['release'])
 
     def test_both_jobs_validate_before_exact_checkout(self):
         for name in ('test', 'release'):
