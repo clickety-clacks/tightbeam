@@ -10364,6 +10364,243 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
+  test "REST human post records an attributed message and turn and returns the same IDs on retry",
+       ctx do
+    attachment = %{
+      "assetId" => "a_test",
+      "mimeType" => "image/png",
+      "filename" => "plot.png",
+      "size" => 2048
+    }
+
+    body = %{
+      verb: "post",
+      asUser: "flynn",
+      sessionKey: "k1",
+      params: %{
+        clientMessageId: "c_rest_1",
+        deviceId: "chat_test",
+        content: "hello",
+        attachments: [attachment]
+      }
+    }
+
+    first = rest_post(ctx, "tbc_test", body)
+    assert first.status == 200
+
+    assert %{
+             "result" => %{
+               "outcome" => "recorded",
+               "sessionKey" => "k1",
+               "deviceId" => "chat_test",
+               "clientMessageId" => "c_rest_1",
+               "messageId" => message_id,
+               "turnSeq" => turn_seq
+             }
+           } = JSON.decode!(first.resp_body)
+
+    message = Projection.get(ctx.db, message_id)
+    assert message.content == "hello"
+    assert message.sender == "user:flynn"
+    assert message.attachments == [attachment]
+
+    assert {:ok, [[^turn_seq, ^message_id]]} =
+             DB.query(ctx.db, "SELECT seq,messageId FROM turns WHERE seq=?1", [turn_seq])
+
+    assert_receive {:ensure_lane, "k1"}
+    duplicate = rest_post(ctx, "tbc_test", body)
+    assert duplicate.status == 200
+
+    assert %{
+             "result" => %{
+               "outcome" => "duplicate",
+               "messageId" => ^message_id,
+               "turnSeq" => ^turn_seq
+             }
+           } = JSON.decode!(duplicate.resp_body)
+
+    conflict = rest_post(ctx, "tbc_test", put_in(body, [:params, :content], "different"))
+    assert conflict.status == 400
+    assert %{"error" => %{"code" => "invalid_message"}} = JSON.decode!(conflict.resp_body)
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+  end
+
+  test "REST human post rejects device sign-in, missing user, bad target and invalid content",
+       ctx do
+    body = %{
+      verb: "post",
+      asUser: "flynn",
+      sessionKey: "k1",
+      params: %{clientMessageId: "c_rest_2", deviceId: "chat_test", content: "hello"}
+    }
+
+    assert rest_post(ctx, ctx.device.token, body).status == 401
+
+    no_user = rest_post(ctx, "tbc_test", Map.delete(body, :asUser))
+    assert no_user.status == 403
+    assert %{"error" => %{"code" => "principal_required"}} = JSON.decode!(no_user.resp_body)
+
+    assert rest_post(ctx, "tbc_test", Map.put(body, :role, "other")).status == 400
+    assert rest_post(ctx, "tbc_test", Map.put(body, :sessionKey, "missing")).status == 404
+
+    assert rest_post(ctx, "tbc_test", put_in(body, [:params, :clientMessageId], "bad")).status ==
+             400
+
+    oversized =
+      rest_post(ctx, "tbc_test", put_in(body, [:params, :content], String.duplicate("x", 65_537)))
+
+    assert oversized.status == 400
+
+    assert %{"error" => %{"code" => "payload_too_large"}} =
+             JSON.decode!(oversized.resp_body)
+
+    :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='k1'")
+    retired = rest_post(ctx, "tbc_test", body)
+    assert retired.status == 400
+    assert %{"error" => %{"code" => "not_deliverable"}} = JSON.decode!(retired.resp_body)
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+  end
+
+  test "REST human post accepts the owner's session token with asUser", ctx do
+    token = Org.get(ctx.db, "k1").cli_token
+
+    body = %{
+      verb: "post",
+      asUser: "flynn",
+      sessionKey: "k1",
+      params: %{clientMessageId: "c_session_1", deviceId: "chat_test", content: "hello"}
+    }
+
+    accepted = rest_post(ctx, token, body)
+    assert accepted.status == 200
+    assert %{"result" => %{"outcome" => "recorded"}} = JSON.decode!(accepted.resp_body)
+
+    as_role = body |> Map.delete(:asUser) |> Map.put(:as, "coder")
+    refused = rest_post(ctx, token, as_role)
+    assert refused.status == 403
+    assert %{"error" => %{"code" => "principal_required"}} = JSON.decode!(refused.resp_body)
+  end
+
+  test "REST post enqueues now even when socket posts would stage for notice readiness", ctx do
+    Roles.create!(ctx.db, "rest-recipient", "flynn", "k1")
+
+    Wakes.schedule(ctx.db, %{
+      session_key: "k1",
+      target_role: "rest-recipient",
+      origin: "user:flynn",
+      prompt: "earlier source",
+      due_at: 0,
+      class: "blocker"
+    })
+
+    body = %{
+      verb: "post",
+      asUser: "flynn",
+      sessionKey: "k1",
+      params: %{clientMessageId: "c_now", deviceId: "chat_test", content: "now"}
+    }
+
+    response = rest_post(ctx, "tbc_test", body)
+    assert response.status == 200
+
+    assert %{"result" => %{"outcome" => "recorded", "turnSeq" => turn_seq}} =
+             JSON.decode!(response.resp_body)
+
+    assert {:ok, [[^turn_seq]]} = DB.query(ctx.db, "SELECT seq FROM turns")
+  end
+
+  test "REST retry completes a socket post staged without a turn", ctx do
+    Roles.create!(ctx.db, "rest-recipient", "flynn", "k1")
+
+    Wakes.schedule(ctx.db, %{
+      session_key: "k1",
+      target_role: "rest-recipient",
+      origin: "user:flynn",
+      prompt: "earlier source",
+      due_at: 0,
+      class: "blocker"
+    })
+
+    socket_post = Gateway.handlers(%{db: ctx.db})["post"]
+
+    assert %{ack: "c_staged"} =
+             socket_post.(%{
+               session_key: "k1",
+               origin: "user:flynn",
+               params: %{
+                 content: "staged text",
+                 device_id: "chat_test",
+                 client_message_id: "c_staged"
+               }
+             })
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    body = %{
+      verb: "post",
+      asUser: "flynn",
+      sessionKey: "k1",
+      params: %{clientMessageId: "c_staged", deviceId: "chat_test", content: "staged text"}
+    }
+
+    response = rest_post(ctx, "tbc_test", body)
+    assert response.status == 200
+
+    assert %{
+             "result" => %{
+               "outcome" => "duplicate",
+               "messageId" => message_id,
+               "turnSeq" => turn_seq
+             }
+           } = JSON.decode!(response.resp_body)
+
+    assert {:ok, [[^turn_seq, ^message_id]]} =
+             DB.query(ctx.db, "SELECT seq,messageId FROM turns")
+
+    assert {:ok, [[^turn_seq]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE prompt='staged text'")
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+  end
+
+  test "REST retry uses the original turn from a directly delivered socket post", ctx do
+    socket_post =
+      Gateway.handlers(%{db: ctx.db, conn_registry: ctx.registry, lane_manager: ctx.lane})["post"]
+
+    assert %{ack: "c_socket_direct"} =
+             socket_post.(%{
+               session_key: "k1",
+               origin: "user:flynn",
+               params: %{
+                 content: "direct text",
+                 device_id: "chat_test",
+                 client_message_id: "c_socket_direct"
+               }
+             })
+
+    body = %{
+      verb: "post",
+      asUser: "flynn",
+      sessionKey: "k1",
+      params: %{
+        clientMessageId: "c_socket_direct",
+        deviceId: "chat_test",
+        content: "direct text"
+      }
+    }
+
+    response = rest_post(ctx, "tbc_test", body)
+    assert response.status == 200
+
+    assert %{"result" => %{"outcome" => "duplicate", "turnSeq" => turn_seq}} =
+             JSON.decode!(response.resp_body)
+
+    assert {:ok, [[^turn_seq]]} = DB.query(ctx.db, "SELECT seq FROM turns")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+  end
+
   @tag :tmp_dir
   test "a checkout refusal keeps its stable code through the real runner and turn wire", %{
     tmp_dir: tmp
@@ -13220,6 +13457,28 @@ defmodule Tightbeam.GatewayTest do
       credential_kind: fn _provider -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end
     }
+  end
+
+  defp rest_post(ctx, bearer, body) do
+    config =
+      gateway_config(ctx.catalog_base, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    opts = [
+      db: ctx.db,
+      base_dir: ctx.catalog_base,
+      handlers: Gateway.handlers(config),
+      cli_token: "tbc_test"
+    ]
+
+    Plug.Test.conn(:post, "/agent/dispatch", JSON.encode!(body))
+    |> Plug.Conn.put_req_header("authorization", "Bearer #{bearer}")
+    |> Plug.Conn.put_req_header(
+      "x-tightbeam-cli-version",
+      Tightbeam.CliCompatibility.required_version()
+    )
+    |> Tightbeam.Wire.Router.call(Tightbeam.Wire.Router.init(opts))
   end
 
   # Exercise background cleanup explicitly after the retirement request returns.

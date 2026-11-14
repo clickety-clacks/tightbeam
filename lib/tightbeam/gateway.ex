@@ -778,6 +778,8 @@ defmodule Tightbeam.Gateway do
 
         case canonical_post_attachments(Map.get(p, :attachments)) do
           {:ok, attachments} ->
+            rest_send? = call[:transport] == :rest
+
             outcome =
               deliver_prompt(call.session_key, call.origin, p.content,
                 db: db,
@@ -785,12 +787,39 @@ defmodule Tightbeam.Gateway do
                 client_message_id: p.client_message_id,
                 attachments: attachments,
                 creator_session_key: call.session_key,
-                queue_when_busy: true
+                queue_when_busy: true,
+                conn_registry: config[:conn_registry] || Tightbeam.ConnRegistry,
+                lane_manager: config[:lane_manager] || Tightbeam.LaneManager,
+                require_turn_now: rest_send?,
+                return_receipt: rest_send?
               )
 
-            if outcome in [:appended, :queued],
-              do: %{ack: p.client_message_id},
-              else: %{dedupe: to_string(outcome)}
+            case outcome do
+              {kind, message_id, turn_seq} when kind in [:recorded, :duplicate] ->
+                %{
+                  outcome: to_string(kind),
+                  sessionKey: call.session_key,
+                  deviceId: p.device_id,
+                  clientMessageId: p.client_message_id,
+                  messageId: message_id,
+                  turnSeq: turn_seq
+                }
+
+              status when status in [:appended, :queued] ->
+                %{ack: p.client_message_id}
+
+              :conflict when rest_send? ->
+                %{
+                  code: "invalid_message",
+                  message: "clientMessageId reused with different content"
+                }
+
+              :skipped when rest_send? ->
+                %{code: "not_deliverable"}
+
+              status ->
+                %{dedupe: to_string(status)}
+            end
 
           :error ->
             %{
@@ -2190,6 +2219,7 @@ defmodule Tightbeam.Gateway do
           | :duplicate
           | :conflict
           | :skipped
+          | {:recorded | :duplicate, String.t(), pos_integer()}
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -2207,8 +2237,13 @@ defmodule Tightbeam.Gateway do
       {:ok, {:staged, _wake}} ->
         :queued
 
+      {:ok, {:rest_staged_duplicate, delivery}} ->
+        :appended = complete_delivery(db, delivery)
+        delivery_receipt(db, delivery, :duplicate)
+
       {:ok, delivery} ->
-        complete_delivery(db, delivery)
+        status = complete_delivery(db, delivery)
+        if opts[:return_receipt], do: delivery_receipt(db, delivery, status), else: status
 
       {:error, %{message: message}} when is_binary(message) ->
         if String.contains?(message, "UNIQUE"),
@@ -2219,6 +2254,27 @@ defmodule Tightbeam.Gateway do
         raise error
     end
   end
+
+  defp delivery_receipt(db, delivery, status) when status in [:appended, :duplicate] do
+    message =
+      case delivery do
+        {:appended, _target, message, _opts} -> message
+        {:duplicate, message} -> message
+      end
+
+    case DB.query(db, "SELECT seq FROM turns WHERE messageId = ?1 ORDER BY seq ASC LIMIT 1", [
+           message.id
+         ]) do
+      {:ok, [[turn_seq]]} ->
+        kind = if status == :appended, do: :recorded, else: :duplicate
+        {kind, message.id, turn_seq}
+
+      {:ok, []} ->
+        :skipped
+    end
+  end
+
+  defp delivery_receipt(_db, _delivery, status), do: status
 
   @doc "Delivery's DB-only core for callers already inside the DB owner transaction."
   @spec deliver_prompt_in_txn(DB.Txn.t(), String.t(), String.t(), String.t(), keyword()) ::
@@ -2347,6 +2403,15 @@ defmodule Tightbeam.Gateway do
                 )
               end
 
+            {:duplicate, %{id: _id} = message} = duplicate ->
+              if opts[:require_turn_now] == true and
+                   DB.Txn.q(txn, "SELECT 1 FROM turns WHERE messageId=?1 LIMIT 1", [message.id]) ==
+                     [] do
+                finish_staged_rest_post_in_txn(txn, target, prompt, opts, message)
+              else
+                duplicate
+              end
+
             duplicate_or_conflict ->
               duplicate_or_conflict
           end
@@ -2357,8 +2422,57 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # A socket post may have stored its source message before the notice batcher
+  # has admitted its turn. A REST retry completes that same source now, so the
+  # duplicate receipt can name the stored message and its first turn.
+  defp finish_staged_rest_post_in_txn(txn, target, prompt, opts, message) do
+    rows =
+      DB.Txn.q(
+        txn,
+        """
+        SELECT wakeId,origin,prompt,sourceClientIdentity
+        FROM wakes
+        WHERE sessionKey=?1 AND consumer='prompt' AND digest=0
+          AND state IN ('pending','fired') AND deliveredTurnSeq IS NULL
+          AND json_extract(sourceClientIdentity,'$.deviceId')=?2
+          AND json_extract(sourceClientIdentity,'$.clientMessageId')=?3
+        ORDER BY createdAt DESC LIMIT 1
+        """,
+        [target, message.device_id, message.client_message_id]
+      )
+
+    case rows do
+      [[wake_id, source_origin, ^prompt, encoded_identity]]
+      when is_binary(wake_id) and is_binary(source_origin) and is_binary(encoded_identity) ->
+        delivery_opts =
+          opts
+          |> Keyword.put(:wake_id, wake_id)
+          |> Keyword.put(:target_gate, %{target_gate: 1})
+          |> Keyword.put(:fire_wake_in_txn, true)
+          |> Keyword.put(:attachments, message.attachments || [])
+
+        case deliver_waiting_human_post_in_txn(
+               txn,
+               target,
+               source_origin,
+               prompt,
+               JSON.decode!(encoded_identity),
+               delivery_opts
+             ) do
+          {:appended, ^target, _message, _opts} = delivery ->
+            {:rest_staged_duplicate, delivery}
+
+          _ ->
+            :skipped
+        end
+
+      _ ->
+        :skipped
+    end
+  end
+
   defp stage_for_queue?(txn, target, opts) do
-    not batch_carrier_wake?(txn, opts[:wake_id]) and
+    opts[:require_turn_now] != true and not batch_carrier_wake?(txn, opts[:wake_id]) and
       NoticeBatcher.queued_sources_ready_for_delivery_in_txn?(
         txn,
         target,
