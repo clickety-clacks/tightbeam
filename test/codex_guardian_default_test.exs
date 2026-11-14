@@ -22,7 +22,7 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
       root =
         Path.join(
           System.tmp_dir!(),
-          "tb-codex-guardian-#{route}-#{label}-#{System.unique_integer([:positive])}"
+          "tb-codex-guardian-#{route}-#{path_slug(label)}-#{System.unique_integer([:positive])}"
         )
 
       on_exit(fn -> File.rm_rf!(root) end)
@@ -48,6 +48,15 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
       first = File.read!(config)
       assert %{home_path: ^home} = Codex.reconcile_home(target, home, desired)
       assert File.read!(config) == first
+
+      if route != :local do
+        # The fixture runs the stamp read through `sh -c`, as ssh does on a real
+        # host, so the manifest path must reach `cat` as one operand: the first
+        # read finds no stamp (exit 1), the second finds the published one.
+        assert_received {:remote_stamp_read, 1}
+        assert_received {:remote_stamp_read, 0}
+        refute_received {:remote_stamp_read, _}
+      end
 
       if expected_mode do
         assert Bitwise.band(File.stat!(config).mode, 0o777) == expected_mode
@@ -98,7 +107,7 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
       base_dir: root,
       host_name: "worker",
       host_config: %{ssh: "worker", base_dir: root},
-      sh: &run_remote_fixture/1
+      sh: recording(&run_remote_fixture/1)
     }
   end
 
@@ -109,8 +118,23 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
       base_dir: root,
       host_name: "worker",
       host_config: %{ssh: "worker", base_dir: root},
-      sh: &run_macos_remote_fixture(&1, shim_dir)
+      sh: recording(&run_macos_remote_fixture(&1, shim_dir))
     }
+  end
+
+  # Case labels carry spaces; a remote path built from one would reach the
+  # fixture's `sh -c` as several words.
+  defp path_slug(label), do: String.replace(label, ~r/[^a-z0-9]+/, "-")
+
+  # Reports every remote stamp read (`ssh ... cat <manifest>`) with its exit status.
+  defp recording(run) do
+    owner = self()
+
+    fn command ->
+      {_output, status} = result = run.(command)
+      if "cat" in command, do: send(owner, {:remote_stamp_read, status})
+      result
+    end
   end
 
   defp run_remote_fixture(["ssh" | _] = command) do
