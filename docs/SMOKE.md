@@ -274,10 +274,17 @@ on 2026-07-25:
 
 9. [auto: J4] Post three messages back-to-back in Main without waiting: "say ONE",
    "say TWO", "say THREE".
-   PASS: three echoes immediately; exactly one turn runs at a time (DB:
-   never more than one `running` for the session); three assistant bubbles
-   arrive IN ORDER; all three turn rows `delivered`. The indicator stays
-   sane throughout (on while running, cleared at the end).
+   PASS: three echoes immediately, and three distinct post rows in history in
+   post order, each with its own deviceId and clientMessageId. "say ONE" runs as
+   its own turn; its assistant reply carries ONE's clientMessageId. "say TWO" and
+   "say THREE", accepted while ONE's turn is queued or running, get no separate
+   turn: they are delivered together in the next ready-time batch, in post order,
+   as one carrier turn whose reply is not tied to either post's clientMessageId.
+   (If ONE's turn ends between those two posts, THREE may be a later carrier.)
+   The action does not ensure ONE reaches `running`; `queued` is busy. If ONE is
+   terminal before TWO is accepted, mark this row INCOMPLETE unless membership
+   proves TWO was staged. Never more than one Main turn `running`; every Main
+   turn reaches `delivered`; the indicator clears after the last carrier.
 
 ## 5. Concurrency — multiple chats in parallel
 
@@ -340,8 +347,11 @@ once: a `/new` that died pre-model with `Session not found`).
     fresh post works and the model still has its context (same harness
     session re-adopted — pointer chain shows `loaded`, not `fallback`).
 15. [auto: J7] Queue two messages, SIGTERM before the first completes, restart.
-    PASS: queued (not-yet-running) turns survive and run to `delivered`
-    after the restart without re-sending.
+    PASS: the first turn reaches a terminal state; the queued post's separate
+    history row, with its deviceId and clientMessageId, survives. After the
+    recipient is ready, that post is included exactly once in the next
+    ready-time batch in class order, with no own turn or post-specific reply.
+    The carrier turn reaches `delivered` after restart without re-sending.
 
 ## 8. Wakes (agent comms surface)
 
