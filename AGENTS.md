@@ -1,15 +1,12 @@
 # tightbeam_ex — agent notes
 
-## THIS LINE: highest 0.1.* branch (currently 0.1.9) — see CONTRIBUTING.md on main
+## Branch and release conventions
 
-The branch and release ruling for both product lines is in
-[CONTRIBUTING.md on main](https://github.com/clickety-clacks/tightbeam/blob/main/CONTRIBUTING.md).
-Integrate maintenance work into the highest `0.1.*` branch (currently `0.1.9`),
-not main. main is now the 0.2 fabric program line — never target it from this
-line; fixes cross to it only by maintainer-authorized cherry-pick. Where
-older guidance, specs, or task instructions name another default integration
-branch, read "highest `0.1.*` branch" on this line. If task instructions name
-a branch explicitly, that branch takes precedence.
+`main` holds the latest approved release. Work on the next `0.1.N` release stays
+on that release's version branch (currently `0.1.16`), not `main`. After a
+release is approved, merge its tagged commit into `main`. Docs-only corrections
+may also land on `main` between releases and should be mirrored to the current
+open `0.1.N` branch. Follow a task's explicit target branch.
 
 ## Keep the substrate neutral
 
