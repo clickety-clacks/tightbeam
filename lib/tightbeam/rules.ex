@@ -159,6 +159,7 @@ defmodule Tightbeam.Rules do
     "target.state" => :string,
     "target.delivery_responsibility" => :string,
     "spawn.archetype" => :string,
+    "spawn.itemless_ephemeral_caller_qualified" => :bool,
     "org.live_sessions_owned_by_caller" => :int,
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
@@ -2639,6 +2640,17 @@ defmodule Tightbeam.Rules do
       end
 
     {value, cache}
+  end
+
+  defp compute_fact("spawn.itemless_ephemeral_caller_qualified", db, call, cache) do
+    target_archetype =
+      Map.get(call.params, :archetype) || Org.get_setting(db, "default-archetype") || "default"
+
+    {DeliveryResponsibilities.qualified_itemless_ephemeral_spawn?(
+       db,
+       call,
+       target_archetype
+     ), cache}
   end
 
   defp compute_fact("org.live_sessions_owned_by_caller", db, call, cache) do

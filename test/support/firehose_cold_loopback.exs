@@ -253,7 +253,7 @@ try do
       end
 
       {archetype_notices, archetype_ws} =
-        Enum.reduce(1..3, {[], archetype_ws}, fn _, {notices, ws} ->
+        Enum.reduce(1..5, {[], archetype_ws}, fn _, {notices, ws} ->
           {:ok, {:text, raw}, next_ws} = WS.recv(ws, 2_000)
           {[JSON.decode!(raw) | notices], next_ws}
         end)
@@ -261,7 +261,13 @@ try do
       archetype_notices = Enum.reverse(archetype_notices)
 
       assert Enum.map(archetype_notices, & &1["class"]) |> Enum.sort() ==
-               ["message.created", "tool_call.ended", "tool_call.started"]
+               [
+                 "message.created",
+                 "tool_call.ended",
+                 "tool_call.event_recorded",
+                 "tool_call.event_recorded",
+                 "tool_call.started"
+               ]
 
       assert Enum.all?(archetype_notices, fn notice ->
                notice["refs"]["sessionKey"] == product_owner.session_key

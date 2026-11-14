@@ -10,6 +10,7 @@ effect = "deny"
 deny_when = [
   { fact = "spawn.archetype", op = "not_in", value = ["orchestrator", "product-owner", "pdo"] },
   { fact = "work_item.reference_state", op = "ne", value = "known" },
+  { fact = "spawn.itemless_ephemeral_caller_qualified", op = "eq", value = false },
 ]
 
 [[rule]]

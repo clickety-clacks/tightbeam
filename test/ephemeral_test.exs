@@ -21,6 +21,26 @@ defmodule Tightbeam.EphemeralTest do
     Tightbeam.GuardRuntimeFixture.run!(tmp, "live_base_ephemeral.exs", "ephemeral-runtime: ok")
   end
 
+  @tag tmp_dir: true, timeout: 180_000
+  test "WI3FE full Dispatch admits a qualified helper and delivers its final result once",
+       %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_itemless_spawn_dispatch.exs",
+      "itemless-spawn-dispatch: ok"
+    )
+
+    loaded_rule_set =
+      tmp
+      |> Path.join("runtime.log")
+      |> File.read!()
+      |> String.split("\n")
+      |> Enum.find(&String.starts_with?(&1, "loaded-rule-set: "))
+
+    assert is_binary(loaded_rule_set)
+    IO.puts(loaded_rule_set)
+  end
+
   setup do
     db =
       start_supervised!(

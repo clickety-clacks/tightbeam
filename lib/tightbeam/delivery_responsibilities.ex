@@ -54,6 +54,21 @@ defmodule Tightbeam.DeliveryResponsibilities do
   def current_accountable_recipient_in_txn(%Txn{}, _work_item_id, _owner_user_id), do: nil
 
   @doc false
+  def qualified_itemless_ephemeral_spawn?(db_or_txn, call, target_archetype) do
+    params = Map.get(call, :params, %{})
+
+    case Map.get(call, :principal) do
+      {:session, session_key}
+      when is_binary(session_key) and is_map(params) and not is_map_key(params, :work_item_id) ->
+        Map.get(call, :verb) == "spawn" and ephemeral_archetype?(target_archetype) and
+          caller_holds_open_assignment?(db_or_txn, session_key)
+
+      _ ->
+        false
+    end
+  end
+
+  @doc false
   def legacy_owner_link_backfill_in_txn(%Txn{} = txn) do
     case legacy_owner_history_table_count_in_txn(txn) do
       0 ->
@@ -109,7 +124,12 @@ defmodule Tightbeam.DeliveryResponsibilities do
         :ok
 
       production_staffing_operation?(call, opts) and
-          not itemless_non_owner_link_control?(call) ->
+        not itemless_non_owner_link_control?(call) and
+          not qualified_itemless_ephemeral_spawn?(
+            txn,
+            call,
+            Keyword.get(opts, :target_archetype, Map.get(params, :archetype))
+          ) ->
         work_item_id = Map.get(params, :work_item_id)
 
         with :ok <- validate_supplied_owner_reference(params),
@@ -128,6 +148,36 @@ defmodule Tightbeam.DeliveryResponsibilities do
         :ok
     end
   end
+
+  defp caller_holds_open_assignment?(%Txn{} = txn, session_key) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM assignments WHERE holderKey=?1 AND state='open' LIMIT 1",
+      [session_key]
+    ) != []
+  end
+
+  defp caller_holds_open_assignment?(db, session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT 1 FROM assignments WHERE holderKey=?1 AND state='open' LIMIT 1",
+        [session_key]
+      )
+
+    rows != []
+  end
+
+  defp ephemeral_archetype?(name) when is_binary(name) do
+    case Tightbeam.Archetypes.get(name) do
+      %{ephemeral: true} -> true
+      _ -> false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  defp ephemeral_archetype?(_name), do: false
 
   defp internal_spawn_remedy?(
          %{verb: "spawn", principal: {:remedy, %{action: "spawn", owner: owner}}},
