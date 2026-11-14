@@ -482,6 +482,37 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
           "g"
         )
 
+      reviewer =
+        Driver.ok!(ctx.state, "spawn", %{
+          "archetype" => "reviewer-code",
+          "workItemId" => wi,
+          "displayName" => "dry reviewer",
+          "idempotencyKey" => "reviewer-#{wi}"
+        })
+
+      key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
+      Roles.create!(ctx.db, "reviewer-code", "mike", key)
+      reviewer_token = Driver.session_token(ctx.state, key)
+
+      # The grounded assignment defaults to evidence. The v40 document rule
+      # requires its verification to cite a saved copy produced by that assignment.
+      copy_name = "verified-copy-#{System.unique_integer([:positive])}.md"
+      holder_workdir = Driver.local_workdir_path(ctx.base, holder.key)
+      File.mkdir_p!(holder_workdir)
+      copy_path = Path.join(holder_workdir, copy_name)
+      copy_bytes = File.read!(holder.check.path)
+      File.write!(copy_path, copy_bytes)
+
+      saved_copy =
+        Driver.ok_as!(ctx.state, holder.token, "artifact-record", %{
+          "kind" => "doc",
+          "title" => "saved fixture source copy",
+          "originPath" => copy_name,
+          "workItemId" => wi,
+          "producedByAssignmentId" => holder.assignment_id,
+          "contentBase64" => Base.encode64(copy_bytes)
+        })
+
       # Supply an observed producer verification; the driver must preserve it
       # while showing that a linked review does not itself close the producer.
       verification =
@@ -490,6 +521,8 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
           "kind" => "verdict",
           "verdictKind" => "verified",
           "commitRefs" => holder.check.commit_refs,
+          "artifactId" => saved_copy["artifactId"],
+          "contentSha256" => saved_copy["contentSha256"],
           "note" => holder.check.note
         })
 
@@ -505,17 +538,6 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                    "AND verdictKind='verified' AND bySession=?2 AND commitRefs=?3",
                  [holder.assignment_id, holder.key, JSON.encode!(holder.check.commit_refs)]
                )
-
-      reviewer =
-        Driver.ok!(ctx.state, "spawn", %{
-          "archetype" => "reviewer-code",
-          "workItemId" => wi,
-          "displayName" => "dry reviewer",
-          "idempotencyKey" => "reviewer-#{wi}"
-        })
-
-      key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-      Roles.create!(ctx.db, "reviewer-code", "mike", key)
 
       ExUnit.CaptureIO.capture_io(fn ->
         Driver.gate_chain_enforced(

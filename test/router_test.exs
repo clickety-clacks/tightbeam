@@ -2084,7 +2084,9 @@ defmodule Tightbeam.Wire.RouterTest do
       })
 
     shared_item = Tightbeam.StateResources.assignment(shared_row)
-    assert is_binary(Tightbeam.StateResources.encode_item("assignments", shared_item, catalog))
+    assert shared_item["effectKind"] == nil
+    assignment_bytes = Tightbeam.StateResources.encode_item("assignments", shared_item, catalog)
+    assert JSON.decode!(assignment_bytes)["effectKind"] == "evidence"
     assignment_detail = get_device(core_ctx, ctx.device, "/api/assignments/#{assignment.id}")
     assert assignment_detail.status == 200
 
@@ -2094,6 +2096,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert public_assignment["id"] == assignment.id
     assert public_assignment["holderKey"] == "holder"
     assert public_assignment["workItemId"] == item.id
+    assert public_assignment["effectKind"] == "evidence"
     assert public_assignment["closedByProcess"] == nil
     assert public_assignment["closingAttestId"] == nil
 

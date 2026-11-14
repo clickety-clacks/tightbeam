@@ -7366,14 +7366,20 @@ mod tests {
         }
         for args in [
             strings(&["retire", "s", "--as-user", "flynn"]),
-            strings(&["retire", "--role", "r", "--as-user", "flynn"]),
-            strings(&["retire", "--user", "u", "--as-user", "flynn"]),
         ] {
             assert_eq!(
                 parse(args),
                 Err("usage: tightbeam retire --session <key> [--keep-open-descendants] [--key <idempotencyKey>]".to_owned())
             );
         }
+        assert_eq!(
+            parse(strings(&["retire", "--user", "u", "--as-user", "flynn"])),
+            Err("usage: tightbeam retire does not accept --user".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&["retire", "--role", "r", "--as-user", "flynn"])),
+            Err("usage: tightbeam retire does not accept --role".to_owned())
+        );
     }
 
     #[test]

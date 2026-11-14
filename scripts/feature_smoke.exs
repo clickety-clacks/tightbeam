@@ -648,6 +648,22 @@ defmodule FeatureSmoke do
     reviewer_tok = session_token(state, reviewer_key)
     asg_id = holder.assignment_id
 
+    # The separate artifact-gate work item also needs its own delivery owner
+    # before the production-effect assignment is opened.
+    gate_work =
+      ok!(state, "work-item-create", %{
+        "title" => "completion verification and artifact gates #{u}"
+      })
+
+    gate_wi_id = gate_work["workItemId"] || gate_work["id"]
+
+    gate_topology =
+      prepare_fixture_topology!(
+        state,
+        gate_wi_id,
+        "One separate completion-artifact gate coordinator"
+      )
+
     complete = fn ->
       post_as(state, holder.token, "attest", %{
         "assignmentId" => asg_id,
@@ -657,6 +673,66 @@ defmodule FeatureSmoke do
     end
 
     try do
+      # The holder's grounded assignment defaults to evidence. v40 requires its
+      # verification to cite a captured copy produced by this assignment, so save
+      # the exact fixture bytes under the holder's workdir before that verdict.
+      copy_bytes = File.read!(holder.check.path)
+      copy_sha256 = :crypto.hash(:sha256, copy_bytes) |> Base.encode16(case: :lower)
+
+      existing_verified_copy =
+        sqlite(
+          state,
+          """
+          SELECT COALESCE(artifactId, '') || '|' || COALESCE(contentSha256, '')
+          FROM attests
+          WHERE assignmentId = #{sql_quote(asg_id)} AND kind = 'verdict'
+            AND verdictKind = 'verified' AND bySession = #{sql_quote(holder.key)}
+          ORDER BY ts DESC, rowid DESC LIMIT 1
+          """
+        )
+
+      saved_copy =
+        case String.split(existing_verified_copy, "|", parts: 2) do
+          [artifact_id, digest] when artifact_id != "" and digest != "" ->
+            %{"artifactId" => artifact_id, "contentSha256" => digest}
+
+          _ ->
+            copy_name = "verified-copy-#{u}.md"
+            holder_workdir = local_workdir_path(state.base_dir, holder.key)
+            File.mkdir_p!(holder_workdir)
+            copy_path = Path.join(holder_workdir, copy_name)
+            File.write!(copy_path, copy_bytes)
+
+            ok_as!(state, holder.token, "artifact-record", %{
+              "kind" => "doc",
+              "title" => "saved fixture source copy #{u}",
+              "originPath" => copy_name,
+              "workItemId" => wi_id,
+              "producedByAssignmentId" => asg_id,
+              "contentBase64" => Base.encode64(copy_bytes)
+            })
+        end
+
+      assert(
+        state,
+        is_binary(saved_copy["artifactId"]) and saved_copy["contentSha256"] == copy_sha256,
+        "gate chain: the saved verification copy did not capture the fixture source: " <>
+          "#{inspect(saved_copy)}"
+      )
+
+      captured_copy =
+        ok_as!(state, reviewer_tok, "artifact-content-fetch", %{
+          "artifactId" => saved_copy["artifactId"]
+        })
+
+      assert(
+        state,
+        captured_copy["contentSha256"] == copy_sha256 and
+          captured_copy["contentBase64"] == Base.encode64(copy_bytes),
+        "gate chain: the saved verification copy did not retain the exact fixture bytes: " <>
+          "#{inspect(captured_copy)}"
+      )
+
       # This is the operator's real fixture run, filed using the holder's credential;
       # it is not an inferred claim that the holder or a provider ran the check.
       ok_as!(state, holder.token, "attest", %{
@@ -688,6 +764,8 @@ defmodule FeatureSmoke do
             "kind" => "verdict",
             "verdictKind" => "verified",
             "commitRefs" => holder.check.commit_refs,
+            "artifactId" => saved_copy["artifactId"],
+            "contentSha256" => saved_copy["contentSha256"],
             "note" => holder.check.note
           })
 
@@ -726,6 +804,8 @@ defmodule FeatureSmoke do
           "kind" => "verdict",
           "verdictKind" => "reviewed-clean",
           "commitRefs" => holder.check.commit_refs,
+          "artifactId" => saved_copy["artifactId"],
+          "contentSha256" => saved_copy["contentSha256"],
           "note" => review_note
         })
 
@@ -745,13 +825,14 @@ defmodule FeatureSmoke do
       )
 
       # Exercise missing-verdict and missing-artifact refusals on a separate
-      # coder-held assignment with no verification or linked review yet.
+      # work item so the saved source copy above cannot satisfy its artifact gate;
+      # this coder-held assignment has no verification or linked review yet.
       gate_assignment =
         ok!(state, "assign", %{
           "sessionKey" => holder.key,
           "subject" => "completion verification and artifact gates #{u}",
-          "workItemId" => wi_id,
-          "effectKind" => "evidence",
+          "workItemId" => gate_wi_id,
+          "effectKind" => "code",
           "idempotencyKey" => "gate-evidence-#{u}"
         })
 
@@ -826,7 +907,7 @@ defmodule FeatureSmoke do
           # assertion. Every CLI-driven record worked all night precisely because the CLI
           # does this translation; an HTTP caller has to do it itself.
           "originPath" => results,
-          "workItemId" => wi_id
+          "workItemId" => gate_wi_id
         })
 
       assert(
@@ -935,7 +1016,7 @@ defmodule FeatureSmoke do
       reports =
         state
         |> ok!("artifacts", %{
-          "workItemId" => wi_id,
+          "workItemId" => gate_wi_id,
           "sessionKey" => holder.key,
           "kind" => "report"
         })
@@ -945,7 +1026,8 @@ defmodule FeatureSmoke do
       assert(
         state,
         Enum.map(reports, & &1["artifactId"]) == [recorded["artifactId"]],
-        "gate chain: the only report on #{wi_id} should be the operator's #{recorded["artifactId"]}, " <>
+        "gate chain: the only report on #{gate_wi_id} should be the operator's " <>
+          "#{recorded["artifactId"]}, " <>
           "but the work item carries " <>
           "#{inspect(Enum.map(reports, &{&1["artifactId"], &1["recordedTurnEvidence"]}))}. A second " <>
           "row is the holder having recorded one of its own, which means the release proven above " <>
@@ -967,6 +1049,7 @@ defmodule FeatureSmoke do
       retire(state, reviewer)
       retire(state, holder.session)
       retire(state, holder.topology)
+      retire(state, gate_topology)
     end
   end
 
