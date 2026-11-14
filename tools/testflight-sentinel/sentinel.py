@@ -10,7 +10,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -47,8 +47,9 @@ class Report:
     app_id: str
     app_name: str
     report_id: str
-    build_number: str
+    build_number: str | None
     app_version: str | None
+    build_bundle_id: str | None
     device_model: str
     os_version: str
     submitted_at: str
@@ -316,12 +317,18 @@ def _relationship_id(resource: dict[str, Any], name: str) -> str | None:
     return data["id"]
 
 
-def _fetch_build(helper: Any, build_id: str) -> tuple[str, str | None]:
-    resource = _data_resource(api_get(helper, f"builds/{quote(build_id, safe='')}"), "build details")
+def _fetch_build(helper: Any, build_id: str) -> tuple[str | None, str | None]:
+    try:
+        resource = _data_resource(
+            api_get(helper, f"builds/{quote(build_id, safe='')}"),
+            "build details",
+        )
+    except APIReadError:
+        return None, None
     attributes = resource.get("attributes") if isinstance(resource.get("attributes"), dict) else {}
     build_number = attributes.get("version")
     if not isinstance(build_number, (str, int)) or not str(build_number):
-        raise APIReadError("App Store Connect did not return a build number")
+        build_number = None
     pre_release_id = _relationship_id(resource, "preReleaseVersion")
     app_version = None
     if pre_release_id:
@@ -337,9 +344,9 @@ def _fetch_build(helper: Any, build_id: str) -> tuple[str, str | None]:
             if isinstance(version, str) and version:
                 app_version = version
         except APIReadError:
-            # App version is optional in the contract; the build number is not.
+            # A crash-log header can supply version/build lines when this read is incomplete.
             app_version = None
-    return str(build_number), app_version
+    return str(build_number) if build_number is not None else None, app_version
 
 
 def _string_attribute(attributes: dict[str, Any], name: str, fallback: str) -> str:
@@ -371,15 +378,15 @@ def _pending_reports(
         for submission in submissions
         if any(submission["id"] not in delivered.get(recipient, []) for recipient in recipients)
     ]
-    builds: dict[str, tuple[str, str | None]] = {}
+    builds: dict[str, tuple[str | None, str | None]] = {}
     reports: list[Report] = []
     for submission in pending:
         build_id = _relationship_id(submission, "build")
-        if not build_id:
-            raise APIReadError("App Store Connect did not return a report's build")
-        if build_id not in builds:
+        if build_id and build_id not in builds:
             builds[build_id] = _fetch_build(helper, build_id)
-        build_number, app_version = builds[build_id]
+        build_number, app_version = (
+            builds[build_id] if build_id else (None, None)
+        )
         attributes = submission.get("attributes") if isinstance(submission.get("attributes"), dict) else {}
         submitted_at = _required_string_attribute(attributes, "createdDate", "submission time")
         try:
@@ -395,6 +402,7 @@ def _pending_reports(
                 report_id=submission["id"],
                 build_number=build_number,
                 app_version=app_version,
+                build_bundle_id=_string_attribute(attributes, "buildBundleId", "") or None,
                 device_model=_required_string_attribute(attributes, "deviceModel", "device model"),
                 os_version=_required_string_attribute(attributes, "osVersion", "OS version"),
                 submitted_at=submitted_at,
@@ -410,24 +418,27 @@ def _save_crash_log(
     report_id: str,
     crash_log_root: Path,
     secrets: Iterable[str],
-) -> tuple[Path | None, str | None]:
+) -> tuple[Path | None, str | None, str | None]:
     path = crash_log_root / app_id / f"{report_id}.crash"
     if path.is_file():
-        return path, None
+        try:
+            return path, None, path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return path, None, None
     try:
         body = api_get(
             helper,
             f"betaFeedbackCrashSubmissions/{quote(report_id, safe='')}/crashLog",
         )
         if not isinstance(body, dict) or not isinstance(body.get("data"), dict):
-            return None, "App Store Connect returned no crash log"
+            return None, "App Store Connect returned no crash log", None
         resource = body["data"]
         attributes = resource.get("attributes") if isinstance(resource.get("attributes"), dict) else {}
         log_text = attributes.get("logText")
         if not isinstance(log_text, str):
-            return None, "App Store Connect returned no crash log text"
+            return None, "App Store Connect returned no crash log text", None
     except APIReadError as error:
-        return None, str(error)
+        return None, str(error), None
     safe_log_text = sanitize(log_text, secrets)
     try:
         path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -446,12 +457,47 @@ def _save_crash_log(
             except FileNotFoundError:
                 pass
     except OSError as error:
-        return None, f"crash log could not be saved ({error.errno or 'file error'})"
-    return path, None
+        return None, f"crash log could not be saved ({error.errno or 'file error'})", None
+    return path, None, safe_log_text
 
 
 def _single_line(value: str) -> str:
     return re.sub(r"[\r\n\t]+", " ", value).strip()
+
+
+def _crash_header_build(log_text: str) -> tuple[str | None, str | None]:
+    app_version = None
+    build_number = None
+    for line in log_text.splitlines():
+        version_match = re.fullmatch(r"\s*Version:\s*(.*?)\s*", line, re.IGNORECASE)
+        if version_match and version_match.group(1):
+            value = version_match.group(1)
+            combined = re.fullmatch(r"(.+?)\s+\(([^()]+)\)", value)
+            if combined:
+                app_version = app_version or combined.group(1).strip()
+                build_number = build_number or combined.group(2).strip()
+            else:
+                app_version = app_version or value.strip()
+        build_match = re.fullmatch(r"\s*Build:\s*(\S+)\s*", line, re.IGNORECASE)
+        if build_match:
+            build_number = build_number or build_match.group(1)
+        if re.match(
+            r"^(?:Exception Type|Exception Subtype|Termination Reason|Triggered by Thread|Thread \d+|Binary Images):",
+            line,
+        ):
+            break
+    return app_version, build_number
+
+
+def _report_with_crash_header(report: Report, log_text: str | None) -> Report:
+    if not log_text:
+        return report
+    header_version, header_build = _crash_header_build(log_text)
+    return replace(
+        report,
+        build_number=report.build_number or header_build,
+        app_version=report.app_version or header_version,
+    )
 
 
 def build_wake(
@@ -463,19 +509,26 @@ def build_wake(
     lines = [f"{TOOL_NAME}: {count} new crash report{'s' if count != 1 else ''}"]
     for delivery in reports:
         report = delivery.report
-        build = f"{report.build_number}"
-        if report.app_version:
-            build = f"{report.app_version} ({build})"
         comment = json.dumps(report.comment, ensure_ascii=False)
+        build_field = "build not reported"
+        if report.build_number:
+            build = report.build_number
+            if report.app_version:
+                build = f"{report.app_version} ({build})"
+            build_field = f"build {_single_line(build)}"
         fields = [
             report.report_id,
             f"{_single_line(report.app_name)} ({report.app_id})",
-            f"build {build}",
+            build_field,
             _single_line(report.device_model),
             f"iOS {_single_line(report.os_version)}",
             _single_line(report.submitted_at),
             f"comment: {comment}",
         ]
+        if not report.build_number and report.app_version:
+            fields.append(f"app version: {_single_line(report.app_version)}")
+        if not report.build_number and report.build_bundle_id:
+            fields.append(f"buildBundleId: {_single_line(report.build_bundle_id)}")
         if delivery.log_path:
             relative = delivery.log_path.relative_to(workspace_root)
             fields.append(f"log: {delivery.log_path} ({relative.as_posix()})")
@@ -532,14 +585,20 @@ def run_check(
             failed_apps += 1
             continue
         for report in reports:
-            for recipient in recipients:
-                if report.report_id in delivered.get(recipient, []):
-                    continue
-                log_path_for_report, log_reason = _save_crash_log(
-                    helper, app_id, report.report_id, crash_log_root, secrets
-                )
-                if log_reason:
-                    log_event(f"app {app_id} report {report.report_id}: {log_reason}", log_path, secrets)
+            pending_recipients = [
+                recipient
+                for recipient in recipients
+                if report.report_id not in delivered.get(recipient, [])
+            ]
+            if not pending_recipients:
+                continue
+            log_path_for_report, log_reason, log_text = _save_crash_log(
+                helper, app_id, report.report_id, crash_log_root, secrets
+            )
+            if log_reason:
+                log_event(f"app {app_id} report {report.report_id}: {log_reason}", log_path, secrets)
+            report = _report_with_crash_header(report, log_text)
+            for recipient in pending_recipients:
                 by_recipient.setdefault(recipient, []).append(
                     PendingDelivery(report, log_path_for_report, log_reason)
                 )

@@ -12,7 +12,12 @@ RECIPIENT = "agent:test:po:main s_test"
 NEXT_PAGE = "https://api.appstoreconnect.apple.com/v1/apps/1/betaFeedbackCrashSubmissions?cursor=second"
 
 
-def submission(report_id, build_id, comment="a crash comment"):
+def submission(
+    report_id,
+    build_id=None,
+    comment="a crash comment",
+    build_bundle_id="com.example.app",
+):
     return {
         "type": "betaFeedbackCrashSubmissions",
         "id": report_id,
@@ -23,8 +28,9 @@ def submission(report_id, build_id, comment="a crash comment"):
             "osVersion": "27.2",
             "testerEmail": "tester@example.invalid",
             "testerName": "Private Tester",
+            "buildBundleId": build_bundle_id,
         },
-        "relationships": {"build": {"data": {"type": "builds", "id": build_id}}},
+        "relationships": {"build": {"data": {"type": "builds", "id": build_id}}} if build_id else {},
     }
 
 
@@ -32,11 +38,23 @@ class FakeASC:
     KEY_ID = "test-key-id"
     ISSUER_ID = "test-issuer-id"
 
-    def __init__(self, include_reports=True, missing_log=False, fail_submissions=False):
+    def __init__(
+        self,
+        include_reports=True,
+        missing_log=False,
+        fail_submissions=False,
+        fail_build_read=False,
+    ):
         self.calls = []
         self.include_reports = include_reports
         self.missing_log = missing_log
         self.fail_submissions = fail_submissions
+        self.fail_build_read = fail_build_read
+        self.crash_log_texts = {
+            "r1": "Version: 9.9.9 (999)\nCrash header\neyJheader.secret.signature\ntest-key-id test-issuer-id\nlog tail\n",
+            "r2": "Version: 0.2.0\nBuild: 190\nCrash header\n",
+            "r3": "Version: 0.3.0 (191)\nCrash header\n",
+        }
 
     def api_get(self, endpoint):
         self.calls.append(endpoint)
@@ -51,10 +69,12 @@ class FakeASC:
                 return {"data": [], "links": {}}
             return {"data": [submission("r1", "b1")], "links": {"next": NEXT_PAGE}}
         if endpoint == "apps/1/betaFeedbackCrashSubmissions?cursor=second":
-            return {"data": [submission("r2", "b2", "second comment")], "links": {}}
+            return {"data": [submission("r2", comment="second comment")], "links": {}}
         if endpoint == "apps/2/betaFeedbackCrashSubmissions?limit=200":
-            return {"data": [submission("r3", "b1", "third comment")] if self.include_reports else [], "links": {}}
+            return {"data": [submission("r3", comment="third comment")] if self.include_reports else [], "links": {}}
         if endpoint == "builds/b1":
+            if self.fail_build_read:
+                return {"errors": [{"status": "404", "code": "NOT_FOUND"}]}
             return {
                 "data": {
                     "id": "b1",
@@ -62,8 +82,6 @@ class FakeASC:
                     "relationships": {"preReleaseVersion": {"data": {"id": "v1"}}},
                 }
             }
-        if endpoint == "builds/b2":
-            return {"data": {"id": "b2", "attributes": {"version": "190"}, "relationships": {}}}
         if endpoint == "preReleaseVersions/v1":
             return {"data": {"id": "v1", "attributes": {"version": "0.1.0"}}}
         if endpoint in {
@@ -77,7 +95,7 @@ class FakeASC:
                 "data": {
                     "type": "betaCrashLogs",
                     "attributes": {
-                        "logText": "Crash header\neyJheader.secret.signature\ntest-key-id test-issuer-id\nlog tail\n"
+                        "logText": self.crash_log_texts[endpoint.split("/")[1]]
                     },
                 }
             }
@@ -132,6 +150,10 @@ class SentinelTests(unittest.TestCase):
         self.assertIn("App One (1)", prompt)
         self.assertIn("App Two (2)", prompt)
         self.assertIn("0.1.0 (189)", prompt)
+        self.assertIn("0.2.0 (190)", prompt)
+        self.assertIn("0.3.0 (191)", prompt)
+        self.assertNotIn("9.9.9 (999)", prompt)
+        self.assertNotIn("buildBundleId:", prompt)
         self.assertIn("iPhone19_4", prompt)
         self.assertIn("iOS 27.2", prompt)
         self.assertIn("2026-11-13T13:09:00-07:00", prompt)
@@ -141,7 +163,7 @@ class SentinelTests(unittest.TestCase):
         self.assertNotIn("Private Tester", prompt)
         saved_log = (self.crash_root / "1/r1.crash").read_text(encoding="utf-8")
         self.assertEqual(
-            "Crash header\n[redacted token]\n[redacted] [redacted]\nlog tail\n",
+            "Version: 9.9.9 (999)\nCrash header\n[redacted token]\n[redacted] [redacted]\nlog tail\n",
             saved_log,
         )
         self.assertNotIn("eyJheader", saved_log)
@@ -179,6 +201,22 @@ class SentinelTests(unittest.TestCase):
         self.assertIn("App Store Connect error 401 NOT_AUTHORIZED", log)
         self.assertNotIn("discarded", log)
 
+    def test_failed_build_relationship_read_falls_back_to_crash_header(self):
+        self.register()
+        helper = FakeASC(fail_build_read=True)
+        wakes = []
+        result = sentinel.run_check(
+            self.state,
+            self.log,
+            self.crash_root,
+            self.workspace,
+            helper,
+            lambda recipient, prompt: wakes.append(prompt) or True,
+        )
+        self.assertEqual({"reports": 2, "wakes": 1, "errors": 0}, result)
+        self.assertIn("build 9.9.9 (999)", wakes[0])
+        self.assertIn("builds/b1", helper.calls)
+
     def test_failed_wake_stays_undelivered_then_succeeds_once(self):
         self.register()
         helper = FakeASC()
@@ -212,6 +250,8 @@ class SentinelTests(unittest.TestCase):
         )
         self.assertEqual(2, result["reports"])
         self.assertIn("crash log not saved: App Store Connect returned no crash log", wakes[0])
+        self.assertIn("build not reported", wakes[0])
+        self.assertIn("buildBundleId: com.example.app", wakes[0])
         self.assertNotIn(".crash", wakes[0])
 
     def test_registered_apps_with_no_reports_send_nothing(self):
