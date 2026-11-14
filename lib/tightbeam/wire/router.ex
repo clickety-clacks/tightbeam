@@ -3801,7 +3801,8 @@ defmodule Tightbeam.Wire.Router do
           is_nil(session) or (session.owner_user_id != user_id and not admin?) ->
             {:error, 404, "not_found", nil}
 
-          session.state != "active" ->
+          session.state != "active" and
+              not rest_post_identity_exists?(db(conn), key, body["params"]) ->
             {:error, 400, "not_deliverable", nil}
 
           true ->
@@ -3809,6 +3810,28 @@ defmodule Tightbeam.Wire.Router do
         end
     end
   end
+
+  defp rest_post_identity_exists?(db, session_key, params) when is_map(params) do
+    case {params["deviceId"], params["clientMessageId"]} do
+      {device_id, client_message_id}
+      when is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
+             client_message_id != "" ->
+        case DB.query(
+               db,
+               "SELECT 1 FROM messages WHERE sessionKey=?1 AND deviceId=?2 AND clientMessageId=?3 LIMIT 1",
+               [session_key, device_id, client_message_id]
+             ) do
+          {:ok, [[1]]} -> true
+          {:ok, []} -> false
+          {:error, error} -> raise error
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp rest_post_identity_exists?(_db, _session_key, _params), do: false
 
   defp rest_post_params(params) when is_map(params) do
     id = params["clientMessageId"]

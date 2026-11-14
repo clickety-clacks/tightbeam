@@ -2268,10 +2268,16 @@ defmodule Tightbeam.Gateway do
         {kind, message.id, turn_seq}
 
       {:ok, []} ->
-        if staged_human_post?(db, message) do
-          {kind, message.id, nil}
-        else
-          :skipped
+        case human_post_delivery_turn_seq(db, message) do
+          turn_seq when is_integer(turn_seq) ->
+            {kind, message.id, turn_seq}
+
+          _ ->
+            if staged_human_post?(db, message) do
+              {kind, message.id, nil}
+            else
+              :skipped
+            end
         end
     end
   end
@@ -2305,6 +2311,26 @@ defmodule Tightbeam.Gateway do
 
       {:error, error} ->
         raise error
+    end
+  end
+
+  defp human_post_delivery_turn_seq(db, message) do
+    case DB.query(
+           db,
+           """
+           SELECT deliveredTurnSeq FROM wakes
+           WHERE sessionKey=?1 AND consumer='prompt' AND digest=0
+             AND sourceClientIdentity IS NOT NULL
+             AND json_extract(sourceClientIdentity,'$.targetSessionKey')=?1
+             AND json_extract(sourceClientIdentity,'$.deviceId')=?2
+             AND json_extract(sourceClientIdentity,'$.clientMessageId')=?3
+           LIMIT 1
+           """,
+           [message.session_key, message.device_id, message.client_message_id]
+         ) do
+      {:ok, [[turn_seq]]} -> turn_seq
+      {:ok, []} -> nil
+      {:error, error} -> raise error
     end
   end
 
@@ -2408,31 +2434,46 @@ defmodule Tightbeam.Gateway do
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
-        record_undeliverable_in_txn(txn, session_key, origin, opts, "no_delivery_target")
-        :skipped
+        message_result =
+          if queued_human_post_delivery? or not is_nil(opts[:target_gate]) do
+            :new
+          else
+            prompt_identity_result(txn, session_key, stamped, prompt, opts)
+          end
+
+        case message_result do
+          {:duplicate, _message} = duplicate ->
+            duplicate
+
+          {:conflict, _message} = conflict ->
+            conflict
+
+          :new ->
+            record_undeliverable_in_txn(txn, session_key, origin, opts, "no_delivery_target")
+            :skipped
+        end
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
-        if Ledger.enqueueable_in_txn?(txn, target) do
-          message_result =
-            if queued_human_post_delivery? do
-              # The staged source's own sidecar is the identity being materialized.
-              # Its wake id and the message table's unique client identity guard
-              # replay; querying the sidecar here would mistake the source itself
-              # for an earlier post.
-              :new
-            else
-              Projection.prompt_message_result_in_txn(txn, %{
-                session_key: target,
-                role: "user",
-                content: stamped,
-                raw_content: prompt,
-                device_id: opts[:device_id],
-                client_message_id: opts[:client_message_id]
-              })
-            end
+        message_result =
+          if queued_human_post_delivery? do
+            # The staged source's own sidecar is the identity being materialized.
+            # Its wake id and the message table's unique client identity guard
+            # replay; querying the sidecar here would mistake the source itself
+            # for an earlier post.
+            :new
+          else
+            prompt_identity_result(txn, target, stamped, prompt, opts)
+          end
 
-          case message_result do
-            :new ->
+        case message_result do
+          {:duplicate, _message} = duplicate ->
+            duplicate
+
+          {:conflict, _message} = conflict ->
+            conflict
+
+          :new ->
+            if Ledger.enqueueable_in_txn?(txn, target) do
               if not queued_human_post_delivery? and stage_for_queue?(txn, target, opts) do
                 stage_prompt_in_txn(
                   txn,
@@ -2453,18 +2494,23 @@ defmodule Tightbeam.Gateway do
                   opts
                 )
               end
-
-            {:duplicate, _message} = duplicate ->
-              duplicate
-
-            duplicate_or_conflict ->
-              duplicate_or_conflict
-          end
-        else
-          # Ask before the echo: a message with no turn is history nobody can answer.
-          refuse_undeliverable_turn(txn, target, origin, opts)
+            else
+              # Ask before the echo: a message with no turn is history nobody can answer.
+              refuse_undeliverable_turn(txn, target, origin, opts)
+            end
         end
     end
+  end
+
+  defp prompt_identity_result(txn, target, stamped, prompt, opts) do
+    Projection.prompt_message_result_in_txn(txn, %{
+      session_key: target,
+      role: "user",
+      content: stamped,
+      raw_content: prompt,
+      device_id: opts[:device_id],
+      client_message_id: opts[:client_message_id]
+    })
   end
 
   defp stage_for_queue?(txn, target, opts) do
