@@ -214,13 +214,10 @@ jobs:
         working-directory: cli
         run: cargo test
 
-  # THE DEPLOY ARTIFACT IS BUILT HERE, from the pushed SHA, by a machine nobody
-  # develops or smoke-tests on. Building it from a dev tree conflates "what I
-  # have" with "what was reviewed"; building it on the smoke host conflates the
-  # gate with the artifact (caught by Flynn, 2026-08-04: "you're bundling up a
-  # deploy from a smoke test?!"). The runners are exactly the two supported
-  # platforms — ubuntu x86_64 and macOS arm64 — so `assemble.sh`'s refusal of
-  # anything else composes with this matrix rather than fighting it.
+  # THE DEPLOY ARTIFACT IS BUILT HERE from the exact pushed SHA, only after the
+  # same-platform test suite passes. The dedicated CI account starts from a
+  # clean checkout, so packaging never uses a developer working tree or leftovers
+  # from an earlier job. Both matrix entries are supported native build targets.
   #
   # Gated on the test matrix: an artifact never exists for a SHA the suite did
   # not pass on that platform.
@@ -235,7 +232,7 @@ jobs:
           - os: macos-latest
             name: darwin-aarch64
     name: release ${{ matrix.name }}
-    runs-on: ${{ matrix.name == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || matrix.os }}
+    runs-on: ${{ matrix.name == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || matrix.name == 'darwin-aarch64' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "tb-macos"]') || matrix.os }}
     steps:
       - name: Validate exact source SHA
         shell: bash
@@ -245,6 +242,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.CI_SOURCE_SHA }}
+          clean: true
           # A tagged 0.1 release must prove that its commit is the highest 0.1.* tip.
           fetch-depth: 0
 
@@ -263,6 +261,10 @@ jobs:
       - name: Set setup-beam target for the self-hosted Linux runner
         if: matrix.name == 'linux-x86_64' && runner.environment == 'self-hosted'
         run: echo "ImageOS=ubuntu24" >> "$GITHUB_ENV"
+
+      - name: Set setup-beam target for the self-hosted macOS runner
+        if: matrix.name == 'darwin-aarch64' && runner.environment == 'self-hosted'
+        run: echo "ImageOS=macos26" >> "$GITHUB_ENV"
 
       - name: Install BEAM (pinned, same as the gate)
         uses: erlef/setup-beam@v1
