@@ -4815,10 +4815,15 @@ defmodule Tightbeam.Assignments do
           review
         )
 
+    review_refs =
+      if review_pending?,
+        do: nil,
+        else: completion_review_commit_refs_in_txn(txn, review, assignment.holderKey)
+
     review_covers_producer_commits? =
       review_pending? or
         review_covers_commit_refs?(
-          review && review.commit_refs,
+          review_refs,
           verification && verification.commit_refs
         )
 
@@ -4827,7 +4832,7 @@ defmodule Tightbeam.Assignments do
           not review_covers_producer_commits? ->
         uncovered_commits =
           uncovered_producer_commits(
-            review && review.commit_refs,
+            review_refs,
             verification && verification.commit_refs
           )
 
@@ -4857,7 +4862,7 @@ defmodule Tightbeam.Assignments do
     case Txn.q(
            txn,
            """
-           SELECT v.verdictKind,r.holderKey,v.commitRefs,r.reviewsAssignmentId
+           SELECT v.verdictKind,r.holderKey,v.commitRefs,r.reviewsAssignmentId,r.id,r.state
            FROM attests v
            JOIN assignments r ON r.id=v.assignmentId
            JOIN assignments producer ON producer.id=?1
@@ -4881,11 +4886,13 @@ defmodule Tightbeam.Assignments do
            """,
            [assignment_id]
          ) do
-      [[kind, holder, encoded_refs, reviews_assignment_id]] ->
+      [[kind, holder, encoded_refs, reviews_assignment_id, review_assignment_id, review_state]] ->
         %{
           kind: kind,
           holder: holder,
           commit_refs: if(is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil),
+          review_assignment_id: review_assignment_id,
+          review_state: review_state,
           linked?: not is_nil(reviews_assignment_id)
         }
 
@@ -4893,6 +4900,37 @@ defmodule Tightbeam.Assignments do
         nil
     end
   end
+
+  # A correction supplements a closed clean review only when its verdict omitted refs.
+  defp completion_review_commit_refs_in_txn(
+         txn,
+         %{
+           kind: "reviewed-clean",
+           review_state: "closed",
+           review_assignment_id: review_id,
+           commit_refs: nil
+         },
+         producer_holder
+       ) do
+    case Txn.q(
+           txn,
+           """
+           SELECT commitRefs
+           FROM assignment_commit_ref_corrections
+           WHERE assignmentId=?1 AND verifiedAt IS NOT NULL
+             AND NOT (actorKind='session' AND actorRef=?2)
+           """,
+           [review_id, producer_holder]
+         ) do
+      [[encoded_refs]] -> JSON.decode!(encoded_refs)
+      [] -> nil
+    end
+  end
+
+  defp completion_review_commit_refs_in_txn(_txn, %{commit_refs: review_refs}, _producer_holder),
+    do: review_refs
+
+  defp completion_review_commit_refs_in_txn(_txn, _review, _producer_holder), do: nil
 
   defp review_covers_commit_refs?(_review_refs, nil), do: true
   defp review_covers_commit_refs?(_review_refs, []), do: true
