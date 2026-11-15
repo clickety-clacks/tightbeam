@@ -88,6 +88,7 @@ defmodule Tightbeam.Wire.Router do
                    "harness-health-close-promotion",
                    "harness-health-review-other",
                    "harness-health-evidence-other",
+                   "harness-health-retry",
                    "subtree-guidance-set",
                    "subtree-guidance-withdraw",
                    "subtree-guidance-show"
@@ -4010,7 +4011,8 @@ defmodule Tightbeam.Wire.Router do
                         "assignment-commitref-correct",
                         "harness-health-observe-other",
                         "harness-health-resolve-other",
-                        "harness-health-close-promotion"
+                        "harness-health-close-promotion",
+                        "harness-health-retry"
                       ]
 
   # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
@@ -4635,6 +4637,7 @@ defmodule Tightbeam.Wire.Router do
     "harness-health-close-promotion" =>
       ~w(candidate_commit idempotency_key named_class promotion_id review_artifact_id review_assignment_id review_attest_id spec_artifact_id spec_ref spec_sha256)a,
     "harness-health-evidence-other" => ~w(incident_id)a,
+    "harness-health-retry" => ~w(incident_id)a,
     "harness-health-observe-other" =>
       ~w(accepted_at session_key correlation_id description evidence_mode exact_observed_error exact_probe harness host idempotency_key not_known_class_reason observed_at observed_state output_digest recovery_condition redaction_confirmed source_session_key valid_until world_status)a,
     "harness-health-resolve-other" =>

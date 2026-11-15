@@ -3505,18 +3505,17 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='rate_limit_reset'")
 
+    assert {:ok, ^cycle_one} =
+             Tightbeam.HarnessHealth.RecoverySchedule.retry_now(ctx.db, incident.id)
+
     started_one = System.system_time(:millisecond)
 
-    assert {:ok, 1} =
-             DB.transaction(ctx.db, fn txn ->
-               Tightbeam.DB.Txn.q(
-                 txn,
-                 "UPDATE harness_health_recovery_schedules SET dueAt=?2 WHERE holdId=?1 AND cycleId=?3 AND status='pending'",
-                 [incident.id, started_one, cycle_one]
-               )
+    assert {:ok, [[due_at]]} =
+             DB.query(ctx.db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [
+               incident.id
+             ])
 
-               Tightbeam.DB.Txn.changes(txn)
-             end)
+    assert due_at <= started_one
 
     assert [%{"cycle_id" => ^cycle_one}] =
              Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, started_one)
