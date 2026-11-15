@@ -16,11 +16,15 @@ defmodule Tightbeam.RowReactions.Cutover do
         [[watermark]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
         # One finite source population. Never replay old closes that had no
         # output, and never grow this population on later rule publication.
+        # Only notices still waiting to be delivered are adopted. Fired and
+        # canceled history keeps the behavior it had before the cutover; on a
+        # long-lived org that history is tens of thousands of rows, and adopting
+        # it in this one startup transaction kept the gateway from starting.
         ids =
           Txn.q(
             txn,
             """
-            SELECT wakeId FROM wakes WHERE rowid<=?1 AND
+            SELECT wakeId FROM wakes WHERE rowid<=?1 AND state='pending' AND
               (obligationRef LIKE ?2 OR obligationRef LIKE ?3)
             ORDER BY CASE WHEN obligationRef LIKE ?2 THEN 0 ELSE 1 END,rowid
             """,
