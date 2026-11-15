@@ -659,7 +659,11 @@ defmodule Tightbeam.Harness.Claude do
         Support.executable_selection_command(adapter, "CLAUDE_CODE_EXECUTABLE", cli_binary())
       end,
       remote_command: fn adapter ->
-        Support.remote_executable_selection_command(adapter, "CLAUDE_CODE_EXECUTABLE", cli_binary())
+        Support.remote_executable_selection_command(
+          adapter,
+          "CLAUDE_CODE_EXECUTABLE",
+          cli_binary()
+        )
       end,
       rails_env: nil,
       remote_prefix: fn _base, home, kind ->

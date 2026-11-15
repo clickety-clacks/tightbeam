@@ -856,6 +856,7 @@ defmodule Tightbeam.PlacementTest do
 
     for module <- Tightbeam.Harness.all() do
       opts = Placement.adapter_opts!(config, {module.id(), "shared", "testhost"})
+
       binary =
         if module.id() == :claude do
           opts[:cmd] |> List.last() |> String.trim("'")
