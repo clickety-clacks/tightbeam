@@ -39,10 +39,12 @@ SHA. Never repair or reuse a failed candidate run.
 
 ## Approve, install, and soak the exact candidate
 
-After separate explicit approval to install the exact full candidate SHA,
-install those candidate bytes and complete the production soak. Keep the
-candidate SHA in the approval and soak records. A `healthy` outcome applies only
-to the bytes identified by that SHA.
+After the user separately approves installing that exact candidate SHA,
+install those bytes and complete the soak on the maintainers' production
+deployment. Every candidate or release installation requires the user's exact
+approval. Keep the full candidate SHA in the approval and soak records. A
+`healthy` outcome applies only to the bytes identified by that SHA. The soak
+is the final check; other testing stays in CI and isolated environments.
 
 If the soak fails or finds a defect, do not publish the candidate. Fix the
 source through a reviewed change to `main` and build a fresh candidate. The
@@ -81,8 +83,8 @@ A failed candidate or unhealthy soak is never published. After a source fix,
 prepare a new candidate from the new `main` tip and repeat the exact-commit
 checks, separate install approval, and soak.
 
-Retain a defective published release. Put a do-not-install warning at the top
-of its notes naming the failure and the safe replacement, and mark it as a
-prerelease so it is not latest. Delete it only for a leaked secret or a legal
+Retain a broken published release. Put a do-not-install warning at the top
+of its notes naming the failure and safe replacement, and mark it prerelease
+so it cannot be latest. Delete a release only for a leaked secret or a legal
 problem. For a source rollback, use a reviewed revert on `main` and cut a new
 release from a fresh candidate. Never move an earlier tag backward.

@@ -779,26 +779,34 @@ external-agent skill that `tightbeam skill install` ships (listed in
 for existing `0.1.*` branches.
 
 For each release, manually dispatch `.github/workflows/release-candidate.yml`
-from `main`, with `candidate_branch=main` and the full SHA of the exact current
+from `main` to build the final unpublished candidate from the exact release
+commit. Supply `candidate_branch=main` and the full SHA of the exact current
 `main` tip. The workflow refuses a different SHA, runs the full Linux and macOS
 test gates, builds both native packages, and uploads the candidate proof
-manifest and `SHA256SUMS`. This candidate is unpublished; the workflow does not
-create a GitHub Release.
+manifest and `SHA256SUMS`. It does not create a GitHub Release.
 
-Keep `main` at that candidate SHA through the install and soak. The release tag
-must be exactly `v<major>.<minor>.<patch>+<build>`: the version must match
-`cli/Cargo.toml`, and the build number is `git rev-list --count` for the
-candidate commit. If `main` advances before publication, or a candidate check
-or soak fails, prepare a new candidate from the resulting current `main` tip.
+Keep `main` at that candidate SHA through the install, soak, and publication.
+The release tag must be exactly `v<major>.<minor>.<patch>+<build>`: the version
+must match `cli/Cargo.toml`, and the build number is `git rev-list --count`
+for the candidate commit. If `main` advances before publication, or a
+candidate check or soak fails, prepare a new candidate from the resulting
+current `main` tip.
 
-Only after separate explicit approval to install that exact candidate SHA,
-install those candidate bytes and complete the production soak. If the soak is
-`healthy`, manually dispatch `.github/workflows/publish-release.yml` from `main`
-with the candidate run ID and SHA, release tag, the matching install-approval
-SHA, `healthy` soak outcome, and the matching soaked SHA. The publisher
-rechecks the successful candidate run, manifest, and checksums, then publishes
-the downloaded package bytes without rebuilding them. It records the candidate,
-approval, soak, checksums, and publication run in release provenance. A failed
-candidate or unhealthy soak remains unpublished; fix the source through a
-reviewed change to `main` and build a fresh candidate. Release tags are
-immutable and must not be reused or moved.
+After the user separately approves installing that exact candidate SHA, install
+those bytes and complete the soak on the maintainers' production deployment.
+Every candidate or release installation requires the user's exact approval.
+The soak is the final check; other testing stays in CI and isolated
+environments. If the soak is `healthy`, manually dispatch
+`.github/workflows/publish-release.yml` from `main` with the candidate run ID
+and SHA, release tag, the matching install-approval SHA, `healthy` soak
+outcome, and the matching soaked SHA. The publisher rechecks the successful
+candidate run, manifest, and checksums, then publishes the downloaded package
+bytes without rebuilding them. It records the candidate, approval, soak,
+checksums, and publication run in release provenance. A failed candidate or
+unhealthy soak remains unpublished; fix the source through a reviewed change
+to `main` and build a fresh candidate. Release tags are immutable and must
+not be reused or moved.
+
+Retain a broken published release. Put a do-not-install warning at the top of
+its notes naming the failure and safe replacement, and mark it prerelease so
+it cannot be latest. Delete it only for a leaked secret or legal problem.
