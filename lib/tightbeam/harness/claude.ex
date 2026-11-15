@@ -51,6 +51,8 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def cli_binary, do: "claude"
+  @impl true
+  def executable_path_env_var, do: "CLAUDE_CODE_EXECUTABLE"
 
   @impl true
   def wire_projection do
@@ -653,6 +655,12 @@ defmodule Tightbeam.Harness.Claude do
         subscription: [],
         api_key: [{"ANTHROPIC_API_KEY", "vector-token"}]
       },
+      local_command: fn adapter ->
+        Support.executable_selection_command(adapter, "CLAUDE_CODE_EXECUTABLE", cli_binary())
+      end,
+      remote_command: fn adapter ->
+        Support.remote_executable_selection_command(adapter, "CLAUDE_CODE_EXECUTABLE", cli_binary())
+      end,
       rails_env: nil,
       remote_prefix: fn _base, home, kind ->
         case kind do

@@ -904,7 +904,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert script =~ Path.join([ctx.base, "adapters", "node_modules", ".bin", "codex"])
 
       assert script =~
-               ~s|"$codex_path" #{Support.shell_quote(Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :codex))}|
+               ~s|"$codex_path" #{Tightbeam.Harness.Support.shell_quote(Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :codex))}|
 
       refute script =~ "includeHidden"
       refute script =~ "fixture-key"

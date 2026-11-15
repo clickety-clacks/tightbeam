@@ -84,6 +84,12 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def cli_binary, do: "codex"
+  @impl true
+  def executable_path_env_var, do: "CODEX_PATH"
+
+  @impl true
+  def managed_cli_path(base_dir),
+    do: Path.join([base_dir, "adapters", "node_modules", ".bin", cli_binary()])
 
   @impl true
   def wire_projection do

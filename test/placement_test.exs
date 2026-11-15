@@ -856,12 +856,24 @@ defmodule Tightbeam.PlacementTest do
 
     for module <- Tightbeam.Harness.all() do
       opts = Placement.adapter_opts!(config, {module.id(), "shared", "testhost"})
-      binary = hd(opts[:cmd])
+      binary =
+        if module.id() == :claude do
+          opts[:cmd] |> List.last() |> String.trim("'")
+        else
+          hd(opts[:cmd])
+        end
 
       if module.id() == :cursor do
         assert opts[:cmd] == [binary, "acp"]
         assert Path.basename(Path.dirname(binary)) == "2026.08.11-e8db854"
       else
+        if module.id() == :claude do
+          assert Enum.take(opts[:cmd], 2) == ["sh", "-c"]
+          assert Enum.at(opts[:cmd], 2) =~ "CLAUDE_CODE_EXECUTABLE"
+          assert Enum.at(opts[:cmd], 2) =~ "command -v"
+          assert Enum.at(opts[:cmd], 2) =~ "exec \"$@\""
+        end
+
         assert String.ends_with?(
                  binary,
                  Path.join(["adapters", "node_modules", ".bin", Path.basename(binary)])
