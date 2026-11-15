@@ -44,7 +44,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned: ubuntu-latest moved to 26.04, where the Codex home
+          # reconciliation fixture fails; 0.1.15 was proved on 24.04.
+          - os: ubuntu-24.04
             name: linux
           - os: macos-latest
             name: macos
