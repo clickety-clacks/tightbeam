@@ -28,7 +28,7 @@ carries the edition that matches its own version. After installing or upgrading
 Tightbeam, install the matching skills with:
 
 ```sh
-`tightbeam skill install`
+tightbeam skill install
 ```
 
 This copies both skills into `~/.claude/skills` and `~/.codex/skills` (or
@@ -54,7 +54,7 @@ and verify the package against its published checksums and release provenance.
 This is the only installation path for users and agents installing for them.
 
 A git checkout is for developing Tightbeam. Nothing built from a checkout is a
-release, including a build from ``main`` or a release tag. See
+release, including a build from `main` or a release tag. See
 [Developing Tightbeam](#developing-tightbeam) for source builds; do not use them
 as an installation or upgrade substitute.
 
@@ -203,18 +203,18 @@ pi --version
 Download the package for your platform from the
 [GitHub Releases](https://github.com/clickety-clacks/tightbeam/releases) page.
 Each release contains packages for `darwin-aarch64` and `linux-x86_64`, a
-``SHA256SUMS`` file, and `release-provenance.json` naming the exact tagged commit
+`SHA256SUMS` file, and `release-provenance.json` naming the exact tagged commit
 and workflow run that produced them. (Exception: `v0.1.8+1325` was published
 manually from the e2e-proven packages; its SHA-256 hashes are in the release
-notes instead of a ``SHA256SUMS`` asset.) Verify the downloaded package before
+notes instead of a `SHA256SUMS` asset.) Verify the downloaded package before
 installing it:
 
 ```sh
 # Linux
-sha256sum -c `SHA256SUMS` --ignore-missing
+sha256sum -c SHA256SUMS --ignore-missing
 
 # macOS
-shasum -a 256 -c `SHA256SUMS` --ignore-missing
+shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
 
 For an existing installation, start with the complete [upgrade procedure](docs/UPGRADE.md).
@@ -234,7 +234,7 @@ tar -xzf "$PACKAGE" -C "$TOOLS" tightbeam/bin/tightbeam-select
 
 sudo env "PATH=$PATH" "$TOOLS/tightbeam/bin/tightbeam-select" stage \
   --root /opt/tightbeam --package "$PACKAGE" \
-  --checksums `SHA256SUMS` --provenance release-provenance.json
+  --checksums SHA256SUMS --provenance release-provenance.json
 ```
 
 `stage` checks the package digest, release source commit, host platform, package
@@ -706,7 +706,7 @@ A clean start is not a working install. Read the **last** lines of the log, not
 the `Running … (http)` line above them: boot ends with a readiness summary that
 says either `READY: <harness> can run turns.` or `NOT READY` followed by each
 gap and the command that closes it. That summary is the check — `systemctl
-is-active` and a listening port will both look `healthy` on an instance that
+is-active` and a listening port will both look healthy on an instance that
 cannot run a single turn.
 
 ## Operating
@@ -729,7 +729,7 @@ already compiled into it:
   every command below fails as `mix: command not found`; nothing in this
   repository can report that for you.
 - **Rust >= 1.85**, to build the `tightbeam` CLI (`cargo build --release
-  --manifest-path `cli/Cargo.toml``). The CLI is edition 2024, so older toolchains
+  --manifest-path cli/Cargo.toml`). The CLI is edition 2024, so older toolchains
   cannot build it at all. **Install via [rustup](https://rustup.rs), not your
   distro** — Ubuntu 24.04 LTS packages 1.75, which looks like a satisfied
   prerequisite and then fails the build. `cargo --version` must report 1.85 or
@@ -738,7 +738,7 @@ already compiled into it:
   Do not skip this step and continue. Gateway boot still succeeds without the
   CLI and installs a `bin/tightbeam` that refuses to run — but the very next
   documented step, onboarding a credential, *is* that binary. You would get a
-  gateway that looks `healthy`, cannot be onboarded, cannot run a turn, and
+  gateway that looks healthy, cannot be onboarded, cannot run a turn, and
   reports its problem as missing credentials rather than a missing CLI.
 - **A C toolchain** (`gcc`/`clang` + `make`) — `exqlite` builds a native NIF.
 - **Hex and rebar3**, Elixir's package and build tools. They do NOT ship with
@@ -761,7 +761,7 @@ mix local.rebar --force --if-missing    # rebar3, to build Erlang deps
 
 mix deps.get
 mix compile
-cargo build --release --manifest-path `cli/Cargo.toml`
+cargo build --release --manifest-path cli/Cargo.toml
 
 mix tightbeam.init                 # creates <base_dir>/identity
 mix run --no-halt                  # boots the gateway; creates state.db and bin/
