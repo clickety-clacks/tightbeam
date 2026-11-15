@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-  echo "usage: scripts/release_candidate.sh [--check] release-candidate/<name> <protected-base-sha> <reviewed-feature-sha>..." >&2
+  echo "usage: scripts/release_candidate.sh [--check] main|release-candidate/<name> <protected-base-sha> <reviewed-feature-sha>..." >&2
   exit 2
 }
 
@@ -19,9 +19,15 @@ base=$2
 shift 2
 
 case "$branch" in
+  main)
+    [ "$check_only" -eq 1 ] || {
+      echo "release candidate: main is accepted only with --check." >&2
+      exit 1
+    }
+    ;;
   release-candidate/*) ;;
   *)
-    echo "release candidate: branch must start with release-candidate/." >&2
+    echo "release candidate: branch must be main or start with release-candidate/." >&2
     exit 1
     ;;
 esac
@@ -59,7 +65,10 @@ git cat-file -e "$base^{commit}" 2>/dev/null || {
 }
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-protected_ref=$(sh "$script_dir/highest_0_1_branch.sh") || exit 1
+case "$branch" in
+  main) protected_ref=refs/remotes/origin/main ;;
+  *) protected_ref=$(sh "$script_dir/highest_0_1_branch.sh") || exit 1 ;;
+esac
 remote_protected=$(git rev-parse --verify "$protected_ref" 2>/dev/null) || {
   echo "release candidate: $protected_ref is missing." >&2
   exit 1
@@ -103,6 +112,11 @@ done
 
 candidate=$1
 for feature in "$@"; do candidate=$feature; done
+
+if [ "$branch" = main ] && [ "$candidate" != "$remote_protected" ]; then
+  echo "release candidate: main candidate $candidate is not the fetched main tip $remote_protected." >&2
+  exit 1
+fi
 
 git merge-base --is-ancestor "$base" "$candidate" || {
   echo "release candidate: candidate $candidate is not descended from protected base $base." >&2

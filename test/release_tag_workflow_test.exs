@@ -3,10 +3,10 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
 
   @root Path.expand("..", __DIR__)
   @script Path.join(@root, "scripts/validate_release_tag.sh")
-  @workflow Path.join(@root, ".github/workflows/ci.yml")
 
-  test "a 0.1 release tag binds its version, build count, and canonical branch" do
-    fixture = git_fixture!("0.1.8", "0.1.8")
+  test "a 0.1 release tag binds its version, build count, and current main" do
+    fixture = git_fixture!("0.1.8", "main")
+    git!(fixture.repo, ["push", "origin", "#{fixture.parent}:refs/heads/0.1.8"])
 
     assert {_, 0} =
              command("sh", [@script, "v0.1.8+#{fixture.build}", fixture.head], cd: fixture.repo)
@@ -24,7 +24,7 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
     assert status != 0
   end
 
-  test "a later release uses main and rejects a superseded main tip" do
+  test "a later release rejects a superseded main tip" do
     fixture = git_fixture!("0.2.0", "main")
     git!(fixture.repo, ["push", "origin", "#{fixture.parent}:refs/heads/0.2.0"])
 
@@ -39,12 +39,22 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
     assert status != 0
   end
 
-  test "the publish job uses the base version for package filenames" do
-    workflow = File.read!(@workflow)
+  test "the publish workflow validates and publishes the selected candidate" do
+    workflow = File.read!(Path.join(@root, ".github/workflows/publish-release.yml"))
 
-    assert workflow =~ "identity=${GITHUB_REF_NAME#v}"
-    assert workflow =~ "version=${identity%%+*}"
-    assert workflow =~ ~s(sh scripts/validate_release_tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA")
+    assert workflow =~ "workflow_dispatch:"
+    assert workflow =~ "candidate_run_id:"
+    assert workflow =~ "candidate_sha:"
+    assert workflow =~ "install_approved_sha:"
+    assert workflow =~ "soak_outcome:"
+    assert workflow =~ "soaked_sha:"
+    assert workflow =~ ~s(sh scripts/validate_release_tag.sh "$RELEASE_TAG" "$CANDIDATE_SHA")
+    assert workflow =~ ("release-candidate-proof-" <> <<36>> <> "{{ inputs.candidate_sha }}")
+    assert workflow =~ ("run-id: " <> <<36>> <> "{{ inputs.candidate_run_id }}")
+    assert workflow =~ ("target_commitish: " <> <<36>> <> "{{ inputs.candidate_sha }}")
+    assert workflow =~ "Create the GitHub Release"
+    refute workflow =~ "packaging/assemble.sh"
+    refute workflow =~ "cargo build"
   end
 
   defp git_fixture!(version, canonical_branch) do
