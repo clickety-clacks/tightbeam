@@ -12,19 +12,21 @@ Keep large features behind default-off flags so unfinished work can merge withou
 changing default behavior. Document each flag, its owner and removal condition in
 [the feature-flag register](docs/feature-flags.md).
 
-Before a cut, CI builds a candidate and `SHA256SUMS` from the exact commit without
-publishing a release. After the user separately approves installing that exact
-candidate, soak those bytes on the maintainers' production deployment. The soak
-is the final check; other testing stays in CI and isolated environments. Publish
-the same artifacts only if the soak is healthy. On failure, fix the problem and
-build a new candidate. Record the candidate hash, soak outcome and publication
-identity. Every candidate or release installation needs the user's exact approval.
-If the release tooling cannot support this flow, report the gap rather than
-substitute a rebuild or publish before the soak.
+Before a cut, CI builds a candidate and `SHA256SUMS` from the exact release
+commit without publishing a release. After the user separately approves
+installing that exact candidate, soak those bytes on the maintainers’ production
+deployment. The soak is the final check; other testing stays in CI and isolated
+environments. Publish the identical bytes only if the soak is healthy. Failed
+candidates remain unpublished; fix the problem and build a new candidate. Record
+the candidate hash, soak outcome and publication identity. Every candidate or
+release installation needs the user's exact approval. If the release tooling
+cannot support this flow, report the gap rather than substitute a rebuild or
+publish before the soak.
 
-Retain a broken published release. Put a do-not-install warning at the top of its
-notes naming the failure and safe replacement, and mark it prerelease so it cannot
-be latest. Delete a release only for a leaked secret or a legal problem.
+Keep a broken published release available. Put a clear do-not-install warning at
+the top of its notes naming the failure and safe replacement, and mark it
+prerelease so it cannot be latest. Delete a release only for a leaked secret or
+a legal problem.
 
 ## Keep the substrate neutral
 
