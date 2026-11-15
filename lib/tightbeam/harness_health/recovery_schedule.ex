@@ -153,40 +153,60 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
   def retry_now(db, incident_id) when is_binary(incident_id) do
     now = System.system_time(:millisecond)
 
-    result = DB.transaction(db, fn txn ->
-      case Snapshot.harness_health_hold(txn, incident_id) do
-        %{"state" => "open", "failureClass" => "rate-limit-dead",
-          "routesComplete" => true, "routes" => [_ | _]} = hold ->
-          source = "harness-health-hold:#{incident_id}:opened"
-          reconcile_hold_in_txn(txn, hold, source, now)
+    result =
+      DB.transaction(db, fn txn ->
+        case Snapshot.harness_health_hold(txn, incident_id) do
+          %{
+            "state" => "open",
+            "failureClass" => "rate-limit-dead",
+            "routesComplete" => true,
+            "routes" => [_ | _]
+          } = hold ->
+            source = "harness-health-hold:#{incident_id}:opened"
+            reconcile_hold_in_txn(txn, hold, source, now)
 
-          case Txn.q(txn,
-                 "SELECT cycleId,status FROM harness_health_recovery_schedules WHERE holdId=?1",
-                 [incident_id]) do
-            [[cycle_id, "pending"]] ->
-              Txn.q(txn,
-                "UPDATE harness_health_recovery_schedules SET dueAt=?2,updatedAt=?2 WHERE holdId=?1 AND cycleId=?3 AND status='pending'",
-                [incident_id, now, cycle_id])
-              {:ok, cycle_id}
-            [[cycle_id, "due"]] -> {:already_running, cycle_id}
-            _ -> {:error, "rate-limit recovery is not available for this incident"}
-          end
+            case Txn.q(
+                   txn,
+                   "SELECT cycleId,status FROM harness_health_recovery_schedules WHERE holdId=?1",
+                   [incident_id]
+                 ) do
+              [[cycle_id, "pending"]] ->
+                Txn.q(
+                  txn,
+                  "UPDATE harness_health_recovery_schedules SET dueAt=?2,updatedAt=?2 WHERE holdId=?1 AND cycleId=?3 AND status='pending'",
+                  [incident_id, now, cycle_id]
+                )
 
-        %{"state" => "open", "failureClass" => "rate-limit-dead"} ->
-          {:error, "the affected harness routes are incomplete"}
-        %{"state" => "open"} ->
-          {:error, "only a usage-limit incident can be retried"}
-        _ ->
-          {:error, "no open incident has that ID"}
-      end
-    end)
+                {:ok, cycle_id}
+
+              [[cycle_id, "due"]] ->
+                {:already_running, cycle_id}
+
+              _ ->
+                {:error, "rate-limit recovery is not available for this incident"}
+            end
+
+          %{"state" => "open", "failureClass" => "rate-limit-dead"} ->
+            {:error, "the affected harness routes are incomplete"}
+
+          %{"state" => "open"} ->
+            {:error, "only a usage-limit incident can be retried"}
+
+          _ ->
+            {:error, "no open incident has that ID"}
+        end
+      end)
 
     case result do
       {:ok, {:ok, cycle_id}} ->
         RecoveryScheduler.refresh()
         {:ok, cycle_id}
-      {:ok, other} -> other
-      {:error, error} -> {:error, inspect(error)}
+
+      {:ok, other} ->
+        other
+
+      {:error, error} ->
+        {:error, inspect(error)}
     end
   end
 
