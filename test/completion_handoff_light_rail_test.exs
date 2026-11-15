@@ -1444,6 +1444,15 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     # The earlier notice is still an ordinary pending wake and still delivers.
     assert Wakes.get(ctx.db, root.wake_id).state == "pending"
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        forget_reaction_ledger!(ctx.db)
+        assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+      end)
+
+    assert log =~ "OPERATOR NOTICE: terminal-notice cutover recorded"
+    assert log =~ "1 notice wake(s) created before this upgrade are still pending"
     start_scheduler(ctx.db)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert_delivered_carrier(ctx.db, root.wake_id)
