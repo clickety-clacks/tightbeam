@@ -14,7 +14,7 @@ change. In that change, re-check each external-agent skill shipped by
 Pull request CI runs `scripts/verify_external_skills.py`; the existing push
 checks for `0.1.*` branches remain for compatibility.
 
-## Build an unpublished candidate
+## Build the final unpublished candidate
 
 1. Select the reviewed commit at the current `main` tip and record its full
    40-character SHA.
@@ -83,7 +83,7 @@ A failed candidate or unhealthy soak is never published. After a source fix,
 prepare a new candidate from the new `main` tip and repeat the exact-commit
 checks, separate install approval, and soak.
 
-Retain a broken published release. Put a do-not-install warning at the top
+Retain a broken published release in the release list. Put a do-not-install warning at the top
 of its notes naming the failure and safe replacement, and mark it prerelease
 so it cannot be latest. Delete a release only for a leaked secret or a legal
 problem. For a source rollback, use a reviewed revert on `main` and cut a new
