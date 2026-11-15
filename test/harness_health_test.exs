@@ -3511,9 +3511,13 @@ defmodule Tightbeam.HarnessHealthTest do
     started_one = System.system_time(:millisecond)
 
     assert {:ok, [[due_at]]} =
-             DB.query(ctx.db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [
-               incident.id
-             ])
+             DB.query(
+               ctx.db,
+               "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [
+                 incident.id
+               ]
+             )
 
     assert due_at <= started_one
 
