@@ -5,7 +5,7 @@ description: Work an assigned Tightbeam card through the tightbeam CLI. Use when
 
 # Work an assigned card through the Tightbeam CLI
 
-Written for Tightbeam 0.1.15. Check `tightbeam --version` and command help against this
+Written for Tightbeam 0.1.16. Check `tightbeam --version` and command help against this
 edition. If they differ, ask Main which edition applies before using the affected
 operation. `tightbeam skill install` copies the installed CLI's bundled edition; do not
 use it to overwrite a separately supplied reviewed skill without checking that choice.
