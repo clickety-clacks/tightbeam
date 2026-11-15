@@ -907,38 +907,7 @@ defmodule Tightbeam.NoticeBatcher do
     do: {:deliveries, [], []}
 
   defp admit_session_snapshot_in_txn(txn, target, sources, at, delivery_opts) do
-    sources_with_client_identity =
-      Enum.map(sources, fn source ->
-        Map.put(
-          source,
-          :source_client_identity,
-          source_client_identity_in_txn(txn, source.wake_id)
-        )
-      end)
-
-    {human_posts, batch_sources} =
-      Enum.split_with(sources_with_client_identity, fn source ->
-        # Only the post handler writes client identity sidecars; keep every other
-        # source, including agent and process wakes, in the established batch path.
-        is_binary(source.origin) and String.starts_with?(source.origin, "user:") and
-          is_map(source.source_client_identity)
-      end)
-
-    human_deliveries =
-      Enum.map(human_posts, fn source ->
-        admit_waiting_human_post_in_txn(txn, target, source, at, delivery_opts)
-      end)
-
-    case batch_sources do
-      [] ->
-        {:deliveries, human_deliveries, []}
-
-      _ ->
-        {:deliveries, batch_deliveries, notices} =
-          admit_notice_batch_snapshot_in_txn(txn, target, batch_sources, at, delivery_opts)
-
-        {:deliveries, human_deliveries ++ batch_deliveries, notices}
-    end
+    admit_notice_batch_snapshot_in_txn(txn, target, sources, at, delivery_opts)
   end
 
   defp source_client_identity_in_txn(txn, wake_id) do
@@ -951,33 +920,6 @@ defmodule Tightbeam.NoticeBatcher do
 
       _ ->
         nil
-    end
-  end
-
-  defp admit_waiting_human_post_in_txn(txn, target, source, _at, delivery_opts) do
-    identity = source.source_client_identity
-
-    opts =
-      Keyword.merge(delivery_opts,
-        wake_id: source.wake_id,
-        target_gate: if(source.target_gate == 0, do: nil, else: source),
-        fire_wake_in_txn: true,
-        attachments: delivery_attachments_in_txn(txn, source.wake_id)
-      )
-
-    case Gateway.deliver_waiting_human_post_in_txn(
-           txn,
-           target,
-           source.origin,
-           source.prompt,
-           identity,
-           opts
-         ) do
-      {:appended, ^target, _, _} = delivery ->
-        {:delivered, source.wake_id, delivery}
-
-      other ->
-        raise DB.Error, message: "notice_human_post_admission_refused: #{inspect(other)}"
     end
   end
 
