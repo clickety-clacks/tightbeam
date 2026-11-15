@@ -197,10 +197,11 @@ defmodule Tightbeam.DiagnosticSinkTest do
 
     # 20,480 records cross the 4,096-record segment bound four times, so the
     # oldest segment must be discarded rather than accumulate a fifth file.
-    # Batches stay under the 8,192 ingress bound and each sync drains the
-    # writer: the pacing is what keeps this a rotation test and not a drop test.
-    for _batch <- 1..10 do
-      for index <- 1..2_048 do
+    # Keep each disk-write burst modest and sync after it. This limits queued
+    # work ahead of each existing barrier; the pacing keeps this a rotation test
+    # and not a drop test.
+    for _batch <- 1..20 do
+      for index <- 1..1_024 do
         assert Diagnostics.emit(%{event: "db_call_abandoned", db_call_id: "dbc_#{index}"}, sink) ==
                  :accepted
       end
