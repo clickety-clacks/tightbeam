@@ -68,6 +68,7 @@ impl CommandContext {
             HarnessHealthEvidenceOther { .. } => {
                 ("cli.harness_health_evidence_other", DispatchPath)
             }
+            HarnessHealthRetry { .. } => ("cli.harness_health_retry", DispatchPath),
             ArtifactRecord { .. } => ("cli.artifact_record", DispatchPath),
             HarklightSend { .. } => ("cli.harklight_send", DispatchPath),
             HarklightRevise { .. } => ("cli.harklight_revise", DispatchPath),
@@ -453,6 +454,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         },
 
         ArtifactRecord { .. }
+        | HarnessHealthRetry { .. }
         | FactProducerClaim { .. }
         | HarklightSend { .. }
         | HarklightRevise { .. }
