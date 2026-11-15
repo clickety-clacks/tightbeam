@@ -28,7 +28,7 @@ carries the edition that matches its own version. After installing or upgrading
 Tightbeam, install the matching skills with:
 
 ```sh
-tightbeam skill install
+`tightbeam skill install`
 ```
 
 This copies both skills into `~/.claude/skills` and `~/.codex/skills` (or
@@ -54,7 +54,7 @@ and verify the package against its published checksums and release provenance.
 This is the only installation path for users and agents installing for them.
 
 A git checkout is for developing Tightbeam. Nothing built from a checkout is a
-release, including a build from `main` or a release tag. See
+release, including a build from ``main`` or a release tag. See
 [Developing Tightbeam](#developing-tightbeam) for source builds; do not use them
 as an installation or upgrade substitute.
 
@@ -203,18 +203,18 @@ pi --version
 Download the package for your platform from the
 [GitHub Releases](https://github.com/clickety-clacks/tightbeam/releases) page.
 Each release contains packages for `darwin-aarch64` and `linux-x86_64`, a
-`SHA256SUMS` file, and `release-provenance.json` naming the exact tagged commit
+``SHA256SUMS`` file, and `release-provenance.json` naming the exact tagged commit
 and workflow run that produced them. (Exception: `v0.1.8+1325` was published
 manually from the e2e-proven packages; its SHA-256 hashes are in the release
-notes instead of a `SHA256SUMS` asset.) Verify the downloaded package before
+notes instead of a ``SHA256SUMS`` asset.) Verify the downloaded package before
 installing it:
 
 ```sh
 # Linux
-sha256sum -c SHA256SUMS --ignore-missing
+sha256sum -c `SHA256SUMS` --ignore-missing
 
 # macOS
-shasum -a 256 -c SHA256SUMS --ignore-missing
+shasum -a 256 -c `SHA256SUMS` --ignore-missing
 ```
 
 For an existing installation, start with the complete [upgrade procedure](docs/UPGRADE.md).
@@ -234,7 +234,7 @@ tar -xzf "$PACKAGE" -C "$TOOLS" tightbeam/bin/tightbeam-select
 
 sudo env "PATH=$PATH" "$TOOLS/tightbeam/bin/tightbeam-select" stage \
   --root /opt/tightbeam --package "$PACKAGE" \
-  --checksums SHA256SUMS --provenance release-provenance.json
+  --checksums `SHA256SUMS` --provenance release-provenance.json
 ```
 
 `stage` checks the package digest, release source commit, host platform, package
@@ -706,7 +706,7 @@ A clean start is not a working install. Read the **last** lines of the log, not
 the `Running … (http)` line above them: boot ends with a readiness summary that
 says either `READY: <harness> can run turns.` or `NOT READY` followed by each
 gap and the command that closes it. That summary is the check — `systemctl
-is-active` and a listening port will both look healthy on an instance that
+is-active` and a listening port will both look `healthy` on an instance that
 cannot run a single turn.
 
 ## Operating
@@ -729,7 +729,7 @@ already compiled into it:
   every command below fails as `mix: command not found`; nothing in this
   repository can report that for you.
 - **Rust >= 1.85**, to build the `tightbeam` CLI (`cargo build --release
-  --manifest-path cli/Cargo.toml`). The CLI is edition 2024, so older toolchains
+  --manifest-path `cli/Cargo.toml``). The CLI is edition 2024, so older toolchains
   cannot build it at all. **Install via [rustup](https://rustup.rs), not your
   distro** — Ubuntu 24.04 LTS packages 1.75, which looks like a satisfied
   prerequisite and then fails the build. `cargo --version` must report 1.85 or
@@ -738,7 +738,7 @@ already compiled into it:
   Do not skip this step and continue. Gateway boot still succeeds without the
   CLI and installs a `bin/tightbeam` that refuses to run — but the very next
   documented step, onboarding a credential, *is* that binary. You would get a
-  gateway that looks healthy, cannot be onboarded, cannot run a turn, and
+  gateway that looks `healthy`, cannot be onboarded, cannot run a turn, and
   reports its problem as missing credentials rather than a missing CLI.
 - **A C toolchain** (`gcc`/`clang` + `make`) — `exqlite` builds a native NIF.
 - **Hex and rebar3**, Elixir's package and build tools. They do NOT ship with
@@ -761,7 +761,7 @@ mix local.rebar --force --if-missing    # rebar3, to build Erlang deps
 
 mix deps.get
 mix compile
-cargo build --release --manifest-path cli/Cargo.toml
+cargo build --release --manifest-path `cli/Cargo.toml`
 
 mix tightbeam.init                 # creates <base_dir>/identity
 mix run --no-halt                  # boots the gateway; creates state.db and bin/
@@ -769,36 +769,36 @@ mix run --no-halt                  # boots the gateway; creates state.db and bin
 
 ### Cutting a release
 
-`main` holds the latest approved release. Prepare each upcoming 0.1 release on
-its own version branch (currently `0.1.16`), not `main`. Set the version in
-`cli/Cargo.toml` on that branch. In the same reviewed change, re-check each
+`main` is the only long-lived development branch. Prepare release source through
+reviewed pull requests to `main`; do not use a version branch. Set the version
+in `cli/Cargo.toml` in the reviewed change. In the same change, re-check each
 external-agent skill that `tightbeam skill install` ships (listed in
 `cli/src/skills.rs`) against the new `tightbeam --help`, and update its
-`Written for Tightbeam <version>.` line. CI checks `scripts/verify_external_skills.py`
-on pull requests and pushes to `0.1.*` branches.
+`Written for Tightbeam <version>.` line. CI checks
+`scripts/verify_external_skills.py` on pull requests and retains push checks
+for existing `0.1.*` branches.
 
-Tag the approved release commit while checked out on its version branch. The tag
+For each release, manually dispatch `.github/workflows/release-candidate.yml`
+from `main`, with `candidate_branch=main` and the full SHA of the exact current
+`main` tip. The workflow refuses a different SHA, runs the full Linux and macOS
+test gates, builds both native packages, and uploads the candidate proof
+manifest and `SHA256SUMS`. This candidate is unpublished; the workflow does not
+create a GitHub Release.
+
+Keep `main` at that candidate SHA through the install and soak. The release tag
 must be exactly `v<major>.<minor>.<patch>+<build>`: the version must match
-`cli/Cargo.toml`, and the build number is `git rev-list --count` for the tagged
-commit. For the current 0.1 release, fast-forward to the branch tip and create
-the tag with:
+`cli/Cargo.toml`, and the build number is `git rev-list --count` for the
+candidate commit. If `main` advances before publication, or a candidate check
+or soak fails, prepare a new candidate from the resulting current `main` tip.
 
-```sh
-release_branch=0.1.16 # replace with the 0.1.N branch for this release
-git fetch origin "$release_branch"
-git switch "$release_branch"
-git pull --ff-only origin "$release_branch"
-test "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$release_branch")"
-
-version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cli/Cargo.toml)
-build=$(git rev-list --count HEAD)
-tag="v${version}+${build}"
-git tag -a "$tag" -m "Tightbeam $tag"
-git push origin "$tag"
-```
-
-Pushing the tag starts the release workflow, which validates that it names the
-current version-branch tip, reruns the full Linux and macOS test gates, builds
-both packages, and creates a GitHub Release. After approval, merge the tagged
-release commit into `main` through the normal pull-request path. `main` is the
-approved release line, not the 0.1 candidate branch or tag target.
+Only after separate explicit approval to install that exact candidate SHA,
+install those candidate bytes and complete the production soak. If the soak is
+`healthy`, manually dispatch `.github/workflows/publish-release.yml` from `main`
+with the candidate run ID and SHA, release tag, the matching install-approval
+SHA, `healthy` soak outcome, and the matching soaked SHA. The publisher
+rechecks the successful candidate run, manifest, and checksums, then publishes
+the downloaded package bytes without rebuilding them. It records the candidate,
+approval, soak, checksums, and publication run in release provenance. A failed
+candidate or unhealthy soak remains unpublished; fix the source through a
+reviewed change to `main` and build a fresh candidate. Release tags are
+immutable and must not be reused or moved.
