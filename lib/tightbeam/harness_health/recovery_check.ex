@@ -802,6 +802,13 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
            )
          end) do
       {:ok, {:released, release}} ->
+        harness = if release.harness == "codex", do: :codex, else: :claude
+
+        Tightbeam.AdapterCoordinator.release_recovered_circuit(
+          Tightbeam.AdapterCoordinator,
+          {harness, "shared", release.host}
+        )
+
         Wakes.redeliver_cycle_release(
           db,
           release.correlation,
