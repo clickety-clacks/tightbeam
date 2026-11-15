@@ -274,10 +274,23 @@ on 2026-07-25:
 
 9. [auto: J4] Post three messages back-to-back in Main without waiting: "say ONE",
    "say TWO", "say THREE".
-   PASS: three echoes immediately; exactly one turn runs at a time (DB:
-   never more than one `running` for the session); three assistant bubbles
-   arrive IN ORDER; all three turn rows `delivered`. The indicator stays
-   sane throughout (on while running, cleared at the end).
+   PASS: three identified user history rows and echoes appear in post order
+   before any assistant reply. ONE gets its own delivered turn and assistant
+   reply correlated by `clientMessageId`. TWO and THREE accepted while an
+   earlier turn or carrier is still pending have no own turn or post-specific
+   reply; each is recorded as a member of the next ready-time batch, whose
+   delivered carrier turns preserve source order. If readiness changes between
+   posts, later posts may use separate carriers; a post accepted only after all
+   earlier work is terminal may instead get its own turn and correlated reply.
+   DB: every post keeps its own ordered history row with `deviceId` and
+   `clientMessageId`; staged posts have one included batch membership and a
+   delivered carrier turn; never more than one `running` turn for the session.
+   The indicator stays sane throughout (on while running, cleared at the end).
+   Setup limit: back-to-back posts do not force ONE to reach `running`; `queued`
+   is busy. If ONE is terminal before TWO is accepted, J4 is INCOMPLETE unless
+   persisted membership proves TWO was staged. The action does not guarantee
+   ONE reaches `running`, so the membership checks establish whether the batch
+   scenario actually occurred.
 
 ## 5. Concurrency — multiple chats in parallel
 
@@ -340,8 +353,13 @@ once: a `/new` that died pre-model with `Session not found`).
     fresh post works and the model still has its context (same harness
     session re-adopted — pointer chain shows `loaded`, not `fallback`).
 15. [auto: J7] Queue two messages, SIGTERM before the first completes, restart.
-    PASS: queued (not-yet-running) turns survive and run to `delivered`
-    after the restart without re-sending.
+    PASS: the second post's identified history row survives the restart and is
+    replayed after reconnect without re-sending. It has no own turn or
+    post-specific reply; its persisted batch membership is included in one
+    ready-time carrier turn that is created and delivered after the restarted
+    gateway is up. DB: the source row retains its `deviceId` and
+    `clientMessageId`, exactly one included membership points to the delivered
+    batch, and the first turn reaches a terminal status.
 
 ## 8. Wakes (agent comms surface)
 

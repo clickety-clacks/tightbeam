@@ -58,6 +58,57 @@ defmodule Tightbeam.ClientE2E.Substrate do
     |> List.first()
   end
 
+  @doc "The identified user history rows for one post, in stream order."
+  @spec human_post_rows(base_dir(), String.t(), String.t()) :: [map()]
+  def human_post_rows(base_dir, session_key, client_message_id) do
+    query(base_dir, """
+    SELECT seq, id, deviceId, clientMessageId, timestamp
+    FROM messages
+    WHERE sessionKey = #{quote_string(session_key)}
+      AND role = 'user'
+      AND clientMessageId = #{quote_string(client_message_id)}
+    ORDER BY seq
+    """)
+  end
+
+  @doc """
+  Persisted batch paths for one staged human post, including its source identity,
+  membership, delivery wake and carrier turn. The joins deliberately start at
+  `staged_message_dedupes`: a staged post has no source-owned turn row.
+  """
+  @spec staged_post_members(base_dir(), String.t(), String.t()) :: [map()]
+  def staged_post_members(base_dir, session_key, client_message_id) do
+    query(base_dir, """
+    SELECT d.sourceWakeId, d.deviceId, d.clientMessageId, d.createdAt AS stagedAt,
+           member.memberId, member.batchId, member.state AS memberState,
+           member.publicationSeq,
+           batch.state AS batchState, batch.deliveryWakeId,
+           carrier.deliveredTurnSeq AS carrierTurnSeq,
+           carrier_turn.seq AS carrierSeq, carrier_turn.status AS carrierStatus,
+           carrier_turn.createdAt AS carrierCreatedAt,
+           carrier_turn.startedAt AS carrierStartedAt,
+           carrier_turn.endedAt AS carrierEndedAt,
+           carrier_turn.isBatchCarrier AS carrierIsBatchCarrier,
+           history.seq AS historySeq, history.id AS historyMessageId,
+           history.deviceId AS historyDeviceId,
+           history.clientMessageId AS historyClientMessageId,
+           history.timestamp AS historyTimestamp
+    FROM staged_message_dedupes AS d
+    LEFT JOIN notice_batch_members AS member ON member.sourceWakeId = d.sourceWakeId
+    LEFT JOIN notice_batches AS batch ON batch.batchId = member.batchId
+    LEFT JOIN wakes AS carrier ON carrier.wakeId = batch.deliveryWakeId
+    LEFT JOIN turns AS carrier_turn ON carrier_turn.seq = carrier.deliveredTurnSeq
+    LEFT JOIN messages AS history
+      ON history.sessionKey = d.targetSessionKey
+     AND history.deviceId = d.deviceId
+     AND history.clientMessageId = d.clientMessageId
+     AND history.role = 'user'
+    WHERE d.targetSessionKey = #{quote_string(session_key)}
+      AND d.clientMessageId = #{quote_string(client_message_id)}
+    ORDER BY member.addedAt, member.memberId
+    """)
+  end
+
   @doc """
   Waits until the turn for `client_message_id` reaches a terminal status.
 
