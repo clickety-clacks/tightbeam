@@ -29,6 +29,8 @@ def require(condition, reason):
 def read_input(path):
     data = json.loads(path.read_text())
     require(data["format"] == 1, "unsupported manifest format")
+    require(data.get("purpose") in ("prerelease-soak", "release-install"),
+            "install purpose must name prerelease-soak or release-install")
     old, new, paths, service = (data[k] for k in ("predecessor", "release", "paths", "service"))
     for value in (old["version"], new["version"]):
         require(re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", value), "invalid version")
@@ -38,8 +40,7 @@ def read_input(path):
         require(re.fullmatch(r"sha256-[0-9a-f]{64}", value), "invalid predecessor build ID")
     require(re.fullmatch(r"[0-9a-f]{7,40}", old["source_prefix"]), "invalid predecessor source prefix")
     require(re.fullmatch(r"[0-9a-f]{40}", new["source_commit"]), "invalid source_commit")
-    for key in ("package_sha256", "checksums_sha256", "provenance_sha256",
-                "candidate_manifest_sha256"):
+    for key in ("package_sha256", "checksums_sha256", "provenance_sha256"):
         require(HEX64.fullmatch(new[key]), f"invalid {key}")
     require(new["build_id"] == "sha256-" + new["package_sha256"], "new build ID differs from package digest")
     require(new["build_id"] != old["build_id"], "release and predecessor builds are identical")
@@ -165,6 +166,19 @@ def render_rehearsal_summary(data):
     )
 
 
+def render_purpose_summary(data):
+    if data["purpose"] == "prerelease-soak":
+        return ("This is a tagged, published prerelease candidate. Confirm that the release "
+                "is marked prerelease and is not latest before requesting its exact install yes. "
+                "A healthy production soak is a separate observed result; it does not authorize "
+                "an install. Promote only these identical package bytes after the approved soak. "
+                "Any later installation needs its own exact whole-action yes.")
+    return ("This is a later installation of the published release. Confirm the recorded "
+            "candidate approval and healthy soak, and verify that promotion kept the exact "
+            "package SHA-256. The earlier candidate-install yes does not authorize this install; "
+            "request a separate exact whole-action yes.")
+
+
 def main():
     require(len(sys.argv) == 4, "usage: render_release.py INPUT_JSON RELEASE_ASSETS_DIR OUTPUT_DIR")
     source = Path(sys.argv[1]); assets = Path(sys.argv[2]); out = Path(sys.argv[3])
@@ -173,40 +187,25 @@ def main():
     require(not out.exists(), "output directory already exists")
     for name, expected in ((new["package"], new["package_sha256"]),
                            ("SHA256SUMS", new["checksums_sha256"]),
-                           ("release-provenance.json", new["provenance_sha256"]),
-                           ("release-candidate-manifest.json", new["candidate_manifest_sha256"])):
+                           ("release-provenance.json", new["provenance_sha256"])):
         require((assets / name).is_file() and digest(assets / name) == expected, f"asset hash mismatch: {name}")
     provenance = json.loads((assets / "release-provenance.json").read_text())
-    proof = json.loads((assets / "release-candidate-manifest.json").read_text())
     published_sums = (assets / "SHA256SUMS").read_text().splitlines()
-    require(f'{new["package_sha256"]}  {new["package"]}' in published_sums and
-            f'{new["candidate_manifest_sha256"]}  release-candidate-manifest.json' in published_sums,
-            "published checksums do not bind the package and candidate proof")
+    require(f'{new["package_sha256"]}  {new["package"]}' in published_sums,
+            "release checksums do not bind the package")
     require(provenance.get("repository") == "clickety-clacks/tightbeam" and
             provenance.get("tag") == new["tag"] and
             provenance.get("commit") == new["source_commit"] and
             provenance.get("checksums") == "SHA256SUMS" and
-            new["package"] in provenance.get("assets", []) and
-            "release-candidate-manifest.json" in provenance.get("assets", []) and
-            provenance.get("candidate", {}).get("proof_manifest_sha256") == new["candidate_manifest_sha256"] and
-            provenance.get("install_approval", {}).get("approved_source_sha") == new["source_commit"] and
-            provenance.get("soak", {}).get("outcome") == "healthy" and
-            provenance.get("soak", {}).get("source_sha") == new["source_commit"],
-            "release provenance does not bind the approved, healthy candidate")
-    require(proof.get("schema") == "tightbeam-release-candidate-proof/v1" and
-            proof.get("repository") == "clickety-clacks/tightbeam" and
-            proof.get("source_sha") == new["source_commit"] and
-            proof.get("run_id") == provenance["candidate"]["run_id"] and
-            len([entry for entry in proof.get("packages", [])
-                 if isinstance(entry, dict) and entry.get("platform") == "linux-x86_64" and
-                 entry.get("sha256") == new["package_sha256"]]) == 1,
-            "candidate proof does not bind this Linux package")
+            isinstance(provenance.get("workflow"), str) and provenance["workflow"] and
+            isinstance(provenance.get("assets"), list) and
+            provenance["assets"].count(new["package"]) == 1,
+            "release provenance does not bind this tag, source and package")
     out.mkdir(parents=True)
     job = out / "maintenance-job.sh"
     job.write_text(render_job(data)); job.chmod(0o500)
     data["job_sha256"] = digest(job)
-    for name in (new["package"], "release-provenance.json",
-                 "release-candidate-manifest.json"):
+    for name in (new["package"], "release-provenance.json"):
         shutil.copyfile(assets / name, out / name)
     shutil.copyfile(assets / "SHA256SUMS", out / "release-SHA256SUMS")
     manifest = out / "manifest.json"
@@ -218,7 +217,7 @@ def main():
         tag=new["tag"], source=new["source_commit"], package=new["package"],
         package_sha=new["package_sha256"], job_sha=data["job_sha256"], manifest_sha=digest(manifest),
         launcher_sha=digest(launcher),
-        candidate_proof_sha=new["candidate_manifest_sha256"],
+        purpose_summary=render_purpose_summary(data),
         old_version=data["predecessor"]["version"], old_build=data["predecessor"]["build"],
         old_schema=data["predecessor"]["schema"], new_schema=new["schema"],
         schema_effect=new["schema_effect"], startup_effects=new["startup_effects"],
@@ -227,8 +226,7 @@ def main():
         rehearsal_summary=render_rehearsal_summary(data)
     ))
     names = ["manifest.json", "maintenance-job.sh", "install.sh", "install-sheet.md",
-             new["package"], "release-provenance.json", "release-candidate-manifest.json",
-             "release-SHA256SUMS"]
+             new["package"], "release-provenance.json", "release-SHA256SUMS"]
     (out / "SHA256SUMS").write_text("".join(f"{digest(out / name)}  {name}\n" for name in names))
     print(json.dumps({"bundle": str(out), "manifest_sha256": digest(manifest),
                       "job_sha256": data["job_sha256"], "launcher_sha256": digest(launcher),

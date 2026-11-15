@@ -1,5 +1,6 @@
 {
   "format": 1,
+  "purpose": "prerelease-soak",
   "predecessor": {
     "version": "0.0.1",
     "build": 1,
@@ -17,7 +18,6 @@
     "build_id": "sha256-1111111111111111111111111111111111111111111111111111111111111111",
     "checksums_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
     "provenance_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
-    "candidate_manifest_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
     "schema": "example-schema-2",
     "schema_effect": "Example only: a new schema stamp would be expected after the first boot.",
     "startup_effects": "Example only: list any connector or client file changes before approval."
