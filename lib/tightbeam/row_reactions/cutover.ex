@@ -40,7 +40,9 @@ defmodule Tightbeam.RowReactions.Cutover do
 
         # Missing historical output is not evidence that a destination existed
         # at delivery. Mark consumed deliveries without manufacturing reminders.
-        for [id] <- ids,
+        # Only deliveries the turn sweeper has not passed yet can be replayed
+        # into admission, so only those need marking.
+        for [id] <- unswept_deliveries(txn, watermark),
             event = RowReactions.delivery_event(txn, id),
             not is_nil(event),
             is_nil(Store.event(txn, event["org"], event["id"])) do
@@ -54,6 +56,32 @@ defmodule Tightbeam.RowReactions.Cutover do
         )
 
         :ok
+    end
+  end
+
+  defp unswept_deliveries(txn, watermark) do
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId FROM wakes WHERE rowid<=?1 AND deliveredTurnSeq>?2 AND
+        (obligationRef LIKE ?3 OR obligationRef LIKE ?4)
+      ORDER BY rowid
+      """,
+      [watermark, sweep_cursor(txn), @root <> "%", @reminder <> "%"]
+    )
+  end
+
+  # The turn sweeper's durable cursor; absent means it has swept nothing yet.
+  defp sweep_cursor(txn) do
+    case Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='production_cursors'") do
+      [[1]] ->
+        case Txn.q(txn, "SELECT seq FROM production_cursors WHERE name='bubble'") do
+          [[seq]] -> seq
+          [] -> 0
+        end
+
+      [] ->
+        0
     end
   end
 

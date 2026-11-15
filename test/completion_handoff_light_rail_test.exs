@@ -1472,6 +1472,38 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
              )
   end
 
+  test "cutover marks deliveries the turn sweeper has not passed and leaves swept history alone",
+       ctx do
+    {_parent, _child, root} = completed_child(ctx)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert_delivered_carrier(ctx.db, root.wake_id)
+    [reminder] = pending_reminders(ctx.db, root.wake_id)
+    stop_supervised!(ctx.scheduler)
+
+    # A delivered root with no live successor: nothing pending to adopt.
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE wakes SET state='canceled' WHERE wakeId=?1", [reminder.wake_id])
+
+    {:ok, [[delivered_seq]]} =
+      DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [root.wake_id])
+
+    assert :ok = Tightbeam.Productions.BubbleSweeper.ensure_schema(ctx.db)
+
+    # Sweeper behind the delivery: the delivery could be replayed, so it is marked.
+    set_bubble_cursor!(ctx.db, delivered_seq - 1)
+    forget_reaction_ledger!(ctx.db)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert delivery_remembered?(ctx.db, root.wake_id)
+    assert pending_reminders(ctx.db, root.wake_id) == []
+
+    # Sweeper past the delivery: swept history is not walked.
+    set_bubble_cursor!(ctx.db, delivered_seq)
+    forget_reaction_ledger!(ctx.db)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    refute delivery_remembered?(ctx.db, root.wake_id)
+    assert pending_reminders(ctx.db, root.wake_id) == []
+  end
+
   test "unproven historical output is held with a reason while other pending output proceeds",
        ctx do
     stop_supervised!(ctx.scheduler)
@@ -1775,6 +1807,28 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     assert length(facts["attests"]) == 2
     assert Enum.count(facts["attests"], &is_map(&1["disposition"])) == 1
+  end
+
+  defp set_bubble_cursor!(db, seq) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO production_cursors(name,seq) VALUES('bubble',?1) ON CONFLICT(name) DO UPDATE SET seq=excluded.seq",
+        [seq]
+      )
+
+    :ok
+  end
+
+  defp delivery_remembered?(db, wake_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT 1 FROM row_reaction_events WHERE eventId LIKE ?1",
+        ["wake-delivery:" <> wake_id <> ":%"]
+      )
+
+    rows != []
   end
 
   defp forget_reaction_ledger!(db) do
