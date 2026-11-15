@@ -339,7 +339,14 @@ defmodule Tightbeam.Gateway do
           },
           tick_ms: config.wake_tick_ms,
           name: Tightbeam.WakeScheduler},
-         {Tightbeam.HarklightWakes, db: db, send_runner: Map.get(config, :harklight_send_runner)},
+         {Tightbeam.HarklightWakes,
+          db: db,
+          send_runner: Map.get(config, :harklight_send_runner),
+          child_opts: [base_dir: config.base_dir, cli_path: Path.join(cli_bin, "tightbeam")]},
+         {Tightbeam.HarklightOriginListener,
+          db: db,
+          runner: Map.get(config, :harklight_send_runner),
+          child_opts: [base_dir: config.base_dir, cli_path: Path.join(cli_bin, "tightbeam")]},
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
@@ -942,6 +949,9 @@ defmodule Tightbeam.Gateway do
       end,
       {"harklight-settle", []} => fn call ->
         HarklightSend.settle(db, call, runner: Map.get(config, :harklight_send_runner))
+      end,
+      {"harklight-cover", []} => fn call ->
+        Tightbeam.HarklightOriginListener.cover(call)
       end,
       {"harklight-follow", []} => fn call ->
         Tightbeam.HarklightFollows.follow(db, call,

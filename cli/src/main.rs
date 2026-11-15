@@ -11,6 +11,7 @@ mod cursor_execution_identity;
 mod cursor_rails;
 mod dispatch;
 mod github_auth;
+mod harklight_child;
 mod harness_process;
 mod harnesses;
 mod lease;
@@ -34,6 +35,16 @@ fn main() {
             "Cursor execution launcher refused: only cursor-exec is permitted (rail guards only when invoked unprivileged)"
         );
         std::process::exit(1);
+    }
+
+    if args.first().is_some_and(|arg| arg == "harklight-child") {
+        match harklight_child::run(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
     }
 
     if args.first().is_some_and(|arg| arg == "cursor-exec") {
