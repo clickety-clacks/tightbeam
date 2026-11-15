@@ -1639,6 +1639,14 @@ defmodule Tightbeam.Gateway do
           {:ok, detail} -> %{ok: true, evidence: detail}
         end
       end,
+      {"harness-health-retry", []} =>
+        admin_call_handler(db, fn call ->
+          case Tightbeam.HarnessHealth.RecoverySchedule.retry_now(db, call.params.incident_id) do
+            {:ok, cycle_id} -> %{status: "probe_scheduled", cycle_id: cycle_id}
+            {:already_running, cycle_id} -> %{status: "probe_running", cycle_id: cycle_id}
+            {:error, message} -> %{code: "recovery_retry_refused", message: message}
+          end
+        end),
       {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
       {"inspect", []} => fn call -> inspect_result(config, db, call) end,
       {"cancel", ["turn.ended", "session.updated"]} => fn call ->

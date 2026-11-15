@@ -158,6 +158,10 @@ pub enum Command {
         identity: Identity,
         incident_id: String,
     },
+    HarnessHealthRetry {
+        identity: Identity,
+        incident_id: String,
+    },
     ArtifactRecord {
         identity: Identity,
         kind: String,
@@ -899,6 +903,8 @@ COMMANDS:
       Close a recurrence promotion after the Gateway verifies canonical provenance.
   harness-health-evidence-other <incidentId>
       Read exact retained evidence as the authorized source, custodian, owner, or admin.
+  harness-health-retry <incidentId>
+      Run the existing recovery probe now for an open usage-limit incident.
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
@@ -2519,6 +2525,18 @@ fn parse_with_optional_catalog(
             }
 
             Ok(Command::HarnessHealthEvidenceOther {
+                identity: identity(flags)?,
+                incident_id: parsed.positional[1].clone(),
+            })
+        }
+        "harness-health-retry" => {
+            let allowed = ["as", "as-user", "as-process"];
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-retry <incidentId>".to_owned());
+            }
+            Ok(Command::HarnessHealthRetry {
                 identity: identity(flags)?,
                 incident_id: parsed.positional[1].clone(),
             })
@@ -6471,6 +6489,7 @@ mod tests {
                 "harness-health-review-other",
                 "harness-health-close-promotion",
                 "harness-health-evidence-other",
+                "harness-health-retry",
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",
