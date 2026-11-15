@@ -1462,6 +1462,14 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert adopted.wake_id == reminder.wake_id
     assert adopted.due_at == reminder.due_at
     assert length(terminal_notices(ctx.db)) == 1
+
+    # Delivered history is not adopted; only the pending successor is.
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT 1 FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [root.wake_id]
+             )
   end
 
   test "unproven historical output is held with a reason while other pending output proceeds",
