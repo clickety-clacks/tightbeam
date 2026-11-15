@@ -1474,15 +1474,28 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
   test "cutover marks deliveries the turn sweeper has not passed and leaves swept history alone",
        ctx do
-    {_parent, _child, root} = completed_child(ctx)
+    {parent, child, root} = completed_child(ctx)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert_delivered_carrier(ctx.db, root.wake_id)
     [reminder] = pending_reminders(ctx.db, root.wake_id)
-    stop_supervised!(ctx.scheduler)
 
-    # A delivered root with no live successor: nothing pending to adopt.
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE wakes SET state='canceled' WHERE wakeId=?1", [reminder.wake_id])
+    # A delivered root with no live successor: the owner's receipt cancels the
+    # reminder, so nothing is pending to adopt.
+    [kind, token] = terminal_source(root.prompt)
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call(
+                 {:session, "notice-parent"},
+                 parent.id,
+                 "completion-handoff-action #{child.id} #{kind} #{token} kept: retained this child"
+               )
+             )
+
+    assert Wakes.get(ctx.db, reminder.wake_id).state == "canceled"
+    stop_supervised!(ctx.scheduler)
 
     {:ok, [[delivered_seq]]} =
       DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [root.wake_id])
