@@ -339,7 +339,8 @@ defmodule Tightbeam.RowReactions do
         RecoveryScheduler.refresh()
         :ok
 
-      {:error, error} -> raise error
+      {:error, error} ->
+        raise error
     end
   end
 
