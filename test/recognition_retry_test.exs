@@ -32,6 +32,62 @@ defmodule Tightbeam.RecognitionRetryTest do
     %{db: db, retry: :sys.get_state(db).retry}
   end
 
+  test "a slow boot migration keeps pending recognition uncounted until commit" do
+    base = Path.join(System.tmp_dir!(), "recognition-boot-#{Tightbeam.Id.uuid4()}")
+    File.mkdir_p!(base)
+    path = Path.join(base, "state.db")
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    {:ok, initial} = DB.start_link(path: path, name: nil, guard_inputs: [])
+    :ok = Tightbeam.Schema.ensure_all(initial)
+
+    {:ok, _} =
+      DB.transaction(initial, fn txn ->
+        pending =
+          Tightbeam.Recognition.record(
+            txn,
+            fn txn, _ -> Txn.q(txn, "INSERT INTO recognized_rows VALUES(1)") end,
+            :committed,
+            [],
+            []
+          )
+
+        Txn.q(txn, "UPDATE pending_recognition SET nextAt=0 WHERE id=?1", [pending.id])
+      end)
+
+    :ok = GenServer.stop(initial)
+    {:ok, db} = DB.start_link(path: path, name: nil, guard_inputs: [])
+    on_exit(fn -> if Process.alive?(db), do: GenServer.stop(db) end)
+    retry = :sys.get_state(db).retry
+
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    # Boot still has migrations to run. Repeated due signals must not consume
+    # the five-attempt budget while the callback's table is unavailable.
+    for _ <- 1..5 do
+      send(retry, :retry)
+      :sys.get_state(retry)
+    end
+
+    assert {:ok, [[0, 0]]} =
+             DB.query(db, "SELECT attempts,flagged FROM pending_recognition")
+
+    assert {:ok, :committed} =
+             DB.transaction(db, fn txn ->
+               Process.sleep(300)
+               Txn.exec(txn, "CREATE TABLE recognized_rows(id INTEGER PRIMARY KEY)")
+               :committed
+             end)
+
+    assert {:ok, [[0, 0]]} =
+             DB.query(db, "SELECT attempts,flagged FROM pending_recognition")
+
+    :ok = Tightbeam.Recognition.activate(db)
+    :sys.get_state(retry)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT id FROM recognized_rows")
+    assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
+  end
+
   test "arity two returns the committed value, rolls back recognition and retries it", %{
     db: db,
     retry: retry
