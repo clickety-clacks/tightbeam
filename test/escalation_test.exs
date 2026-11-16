@@ -884,12 +884,18 @@ defmodule Tightbeam.EscalationTest do
     assert raiser_key == ctx.raiser.session_key
     assert request.deadline_at >= before_open + 12_345
 
-    assert [%{session_key: main_key, target_gate: 0, state: "pending"} = wake] =
+    assert [
+             %{session_key: main_key, target_gate: 0, state: "pending"} = wake,
+             %{session_key: main_key, target_gate: 0, state: "pending"} = deadline_wake
+           ] =
              notification_wakes(ctx)
 
     assert main_key == Org.personal_session_key("flynn")
     assert wake.prompt =~ request.id
     assert wake.prompt =~ "ship window?"
+    assert deadline_wake.due_at == request.deadline_at
+    assert deadline_wake.prompt =~ "Asked by: agent:raiser"
+    assert deadline_wake.prompt =~ "ship window?"
 
     replay =
       operator_call(ctx.raiser, %{
@@ -902,7 +908,7 @@ defmodule Tightbeam.EscalationTest do
     assert %{id: id, deadline_at: deadline_at} = Escalation.operator_ask(ctx.db, replay)
     assert id == request.id
     assert deadline_at == request.deadline_at
-    assert length(notification_wakes(ctx)) == 1
+    assert length(notification_wakes(ctx)) == 2
 
     defaulted =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "defaults?"}))
@@ -943,6 +949,95 @@ defmodule Tightbeam.EscalationTest do
     assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "decision_request_opened" and event.subject == request.id
            end) == 1
+  end
+
+  test "an unanswered operator deadline notifies Main once and leaves the request open", ctx do
+    stop_supervised!(Wakes)
+
+    Org.create(ctx.db, %{
+      session_key: Org.personal_session_key("flynn"),
+      display_name: "Owner Main",
+      kind: "main",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_call(ctx.raiser, %{question: "Which release window?", deadline: 10})
+      )
+
+    [opening, deadline] = notification_wakes(ctx)
+    assert deadline.due_at == request.deadline_at
+    assert deadline.state == "pending"
+    assert deadline.prompt =~ request.id
+    assert deadline.prompt =~ "Asked by: agent:raiser"
+    assert deadline.prompt =~ request.question
+
+    Process.sleep(20)
+    scheduler = start_gateway_scheduler(ctx)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert Escalation.raw_by_id(ctx.db, request.id).status == "open"
+    assert Wakes.get(ctx.db, deadline.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, opening.wake_id).state == "fired"
+
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, deadline.wake_id)
+
+    assert turn_count(ctx.db, carrier_id) == 1
+
+    assert {:ok, [[content]]} =
+             DB.query(
+               ctx.db,
+               "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert content =~ deadline.prompt
+    assert :ok = Wakes.fire_due(scheduler)
+    assert turn_count(ctx.db, carrier_id) == 1
+    assert length(notification_wakes(ctx)) == 2
+  end
+
+  test "resolved operator requests retract their pending deadline reminder", ctx do
+    stop_supervised!(Wakes)
+
+    ruled = Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "Rule?"}))
+    [_, ruled_deadline] = notification_wakes(ctx)
+
+    assert %{status: "ruled"} =
+             Escalation.operator_rule(
+               ctx.db,
+               owner_operator_rule(ruled.id, %{decision: "accept"})
+             )
+
+    assert Wakes.get(ctx.db, ruled_deadline.wake_id).state == "canceled"
+
+    withdrawn =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "Withdraw?"}))
+
+    withdrawn_deadline =
+      Enum.find(notification_wakes(ctx), fn wake ->
+        String.starts_with?(wake.prompt, "Operator decision #{withdrawn.id} passed")
+      end)
+
+    assert withdrawn_deadline
+
+    assert %{status: "withdrawn"} =
+             Escalation.operator_withdraw(ctx.db, %{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{request: withdrawn.id, reason: "resolved"}
+             })
+
+    assert Wakes.get(ctx.db, withdrawn_deadline.wake_id).state == "canceled"
   end
 
   test "operator ask validates the linked assignment in the winning transaction", ctx do
@@ -1854,7 +1949,9 @@ defmodule Tightbeam.EscalationTest do
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "rollback?"}))
 
-    assert [%{wake_id: opening_id, state: "pending"}] = notification_wakes(ctx)
+    assert [%{wake_id: opening_id, state: "pending"}, %{state: "pending"}] =
+             notification_wakes(ctx)
+
     before_events = EventLog.lifecycle_events(ctx.db)
 
     assert {:ok, [[wake_count, fact_count, event_count]]} =
