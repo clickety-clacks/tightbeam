@@ -291,7 +291,7 @@ defmodule Tightbeam.Supervision do
       ),
       max_row(
         txn,
-        "SELECT MAX(raisedAt) FROM decision_requests WHERE assignmentId=?1 AND raiserSessionKey=?2 AND raisedAt>=?3",
+        "SELECT MAX(raisedAt) FROM decision_requests WHERE assignmentId=?1 AND COALESCE(currentRaiserSessionKey,raiserSessionKey)=?2 AND raisedAt>=?3",
         [assignment_id, holder, opened_at]
       )
     ]

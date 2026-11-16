@@ -14,10 +14,11 @@ defmodule Tightbeam.AssignmentQueue do
     case Txn.q(
            txn,
            """
-           SELECT a.holderKey,a.openedByUser,a.openedBySession,w.ownerUserId,s.ownerUserId
+           SELECT a.holderKey,a.openedByUser,
+                  COALESCE(a.currentOpenerSessionKey,a.openedBySession),w.ownerUserId,s.ownerUserId
            FROM assignments AS a
            LEFT JOIN work_items AS w ON w.id=a.workItemId
-           LEFT JOIN sessions AS s ON s.sessionKey=a.openedBySession
+           LEFT JOIN sessions AS s ON s.sessionKey=COALESCE(a.currentOpenerSessionKey,a.openedBySession)
            WHERE a.id=?1
            """,
            [assignment_id]

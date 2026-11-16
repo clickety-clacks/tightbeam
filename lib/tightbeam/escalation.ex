@@ -307,7 +307,7 @@ defmodule Tightbeam.Escalation do
   withdrawnReason, withdrawnAt
   """
 
-  @request_columns """
+  @pre_custody_request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
   expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
   raisedAt, deadlineAt,
@@ -316,6 +316,9 @@ defmodule Tightbeam.Escalation do
   withdrawnReason, withdrawnAt, askedOfRole, answer, answeredBy, answeredAt,
   returnedBy, returnReason, returnedAt, rowVersion, rowSchemaRevision
   """
+
+  @request_columns @pre_custody_request_columns <>
+                     ", currentRaiserSessionKey, currentExpecterSessionKey"
 
   @decision_request_collection_columns %{
     "status" => "status",
@@ -1459,7 +1462,7 @@ defmodule Tightbeam.Escalation do
           # Preserve the asker's existing prompt wake; the state notice below
           # is a separate best-effort snapshot for Firehose clients.
           Wakes.schedule_in_txn(txn, %{
-            session_key: request.raiser_session_key,
+            session_key: request.current_raiser_session_key,
             origin: "process:tightbeam",
             prompt: answer_notification(request, text, answered_by),
             due_at: answered_at,
@@ -1520,7 +1523,7 @@ defmodule Tightbeam.Escalation do
           )
 
           Wakes.schedule_in_txn(txn, %{
-            session_key: request.raiser_session_key,
+            session_key: request.current_raiser_session_key,
             origin: "process:tightbeam",
             prompt: return_notification(request, reason, returned_by),
             due_at: returned_at,
@@ -1624,7 +1627,7 @@ defmodule Tightbeam.Escalation do
   defp askable_assignment_in_txn?(txn, assignment_id, asker_session_key) do
     case Txn.q(
            txn,
-           "SELECT holderKey, openedBySession, reviewsAssignmentId FROM assignments WHERE id = ?1",
+           "SELECT holderKey, COALESCE(currentOpenerSessionKey,openedBySession), reviewsAssignmentId FROM assignments WHERE id = ?1",
            [assignment_id]
          ) do
       [[holder_key, opened_by_session, reviews_id]] ->
@@ -1911,7 +1914,7 @@ defmodule Tightbeam.Escalation do
           rows =
             Txn.q(
               txn,
-              "SELECT id, ownerUserId, context FROM decision_requests WHERE raiserSessionKey = ?1 AND kind != 'operator' AND status = 'open'",
+              "SELECT id, ownerUserId, context FROM decision_requests WHERE COALESCE(currentRaiserSessionKey,raiserSessionKey) = ?1 AND kind != 'operator' AND status = 'open'",
               [session_key]
             )
             |> Enum.reject(fn [_id, _owner_user_id, context] ->
@@ -2088,7 +2091,7 @@ defmodule Tightbeam.Escalation do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT s.sessionKey FROM sessions s WHERE s.state = 'retired' AND (EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.kind != 'operator' AND dr.status = 'open') OR EXISTS (SELECT 1 FROM escalation_waivers ew WHERE ew.raiserId = 'session:' || s.sessionKey AND ew.revokedAt IS NULL))"
+        "SELECT s.sessionKey FROM sessions s WHERE s.state = 'retired' AND (EXISTS (SELECT 1 FROM decision_requests dr WHERE COALESCE(dr.currentRaiserSessionKey,dr.raiserSessionKey) = s.sessionKey AND dr.kind != 'operator' AND dr.status = 'open') OR EXISTS (SELECT 1 FROM escalation_waivers ew WHERE ew.raiserId = 'session:' || s.sessionKey AND ew.revokedAt IS NULL))"
       )
 
     Enum.each(rows, fn [key] ->
@@ -2852,7 +2855,7 @@ defmodule Tightbeam.Escalation do
   defp ruling_recipient_in_txn(txn, request) do
     case late_ruling_route_in_txn(txn, request) do
       :ordinary ->
-        {:ok, request.raiser_session_key, false}
+        {:ok, request.current_raiser_session_key, false}
 
       {:late, session_key, _accountable_owner} ->
         {:ok, session_key, true}
@@ -2872,7 +2875,7 @@ defmodule Tightbeam.Escalation do
     case Txn.q(
            txn,
            """
-           SELECT a.state, a.holderKey, a.openedBySession, a.openedByUser,
+           SELECT a.state, a.holderKey, COALESCE(a.currentOpenerSessionKey,a.openedBySession), a.openedByUser,
                   COALESCE(w.ownerUserId, ?2)
            FROM assignments a
            LEFT JOIN work_items w ON w.id = a.workItemId
@@ -2892,7 +2895,7 @@ defmodule Tightbeam.Escalation do
         recipient =
           candidates
           |> Enum.uniq()
-          |> Enum.reject(&(&1 in [holder, request.raiser_session_key]))
+          |> Enum.reject(&(&1 in [holder, request.current_raiser_session_key]))
           |> Enum.find(&active_session_in_txn?(txn, &1))
 
         if recipient,
@@ -3566,7 +3569,15 @@ defmodule Tightbeam.Escalation do
   end
 
   defp request_in_txn(txn, id) do
-    [row] = Txn.q(txn, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id])
+    # Closed-assignment reconciliation runs while the exact predecessor stamp
+    # is still active. Its request rows have no custody columns yet.
+    columns =
+      case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+        [["session-identity-v1-0114"]] -> @pre_custody_request_columns <> ", NULL, NULL"
+        _ -> @request_columns
+      end
+
+    [row] = Txn.q(txn, "SELECT #{columns} FROM decision_requests WHERE id = ?1", [id])
     request_from_row(row)
   end
 
@@ -3620,16 +3631,20 @@ defmodule Tightbeam.Escalation do
          return_reason,
          returned_at,
          row_version,
-         row_schema_revision
+         row_schema_revision,
+         current_raiser_session_key,
+         current_expecter_session_key
        ]) do
     %{
       id: id,
       kind: kind,
       raiser_id: raiser_id,
       raiser_session_key: raiser_session_key,
+      current_raiser_session_key: current_raiser_session_key || raiser_session_key,
       owner_user_id: owner_user_id,
       assignment_id: assignment_id,
       expecter_session_key: expecter_session_key,
+      current_expecter_session_key: current_expecter_session_key || expecter_session_key,
       expecter_user_id: expecter_user_id,
       lineage_rung: lineage_rung,
       effort_generation: effort_generation,
@@ -3668,7 +3683,7 @@ defmodule Tightbeam.Escalation do
   end
 
   defp request_from_terminal_row(row) do
-    request_from_row(row ++ [nil, nil, nil, nil, nil, nil, nil, 1, 1])
+    request_from_row(row ++ [nil, nil, nil, nil, nil, nil, nil, 1, 1, nil, nil])
   end
 
   defp list_projection(%{kind: "operator"} = request) do
@@ -3740,6 +3755,7 @@ defmodule Tightbeam.Escalation do
           :options,
           :raiser_id,
           :raiser_session_key,
+          :current_raiser_session_key,
           :owner_user_id,
           :assignment_id,
           :raised_at,
@@ -3771,6 +3787,7 @@ defmodule Tightbeam.Escalation do
           :raised_at,
           :deadline_at,
           :raiser_id,
+          :current_raiser_session_key,
           :assignment_id
         ])
       else
@@ -4128,7 +4145,7 @@ defmodule Tightbeam.Escalation do
           AND ((?8 = 0 AND sessionKey = ?1) OR (?8 = 1 AND sessionKey != ?1))
         """,
         [
-          request.raiser_session_key,
+          request.current_raiser_session_key,
           terminal_notification(request.id),
           @terminal_condition_kind,
           request.id,
@@ -4366,7 +4383,7 @@ defmodule Tightbeam.Escalation do
 
     effort =
       case call.principal do
-        {:session, key} -> {"expecterSessionKey = ?", key}
+        {:session, key} -> {"COALESCE(currentExpecterSessionKey,expecterSessionKey) = ?", key}
         {:user, user} -> {"expecterUserId = ?", user}
         _ -> {"0", nil}
       end
@@ -4407,7 +4424,7 @@ defmodule Tightbeam.Escalation do
   defp agent_visibility(call, raiser, owner_user_id) do
     {asked_sql, asked_params} =
       case call.principal do
-        {:session, key} -> {"expecterSessionKey = ?", [key]}
+        {:session, key} -> {"COALESCE(currentExpecterSessionKey,expecterSessionKey) = ?", [key]}
         {:user, user} -> {"expecterUserId = ?", [user]}
         _ -> {"0", []}
       end

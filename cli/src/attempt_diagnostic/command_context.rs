@@ -85,6 +85,7 @@ impl CommandContext {
             Retire { .. } => ("cli.retire", DispatchPath),
             RetireWithdraw { .. } => ("cli.retire_withdraw", DispatchPath),
             SessionReparent { .. } => ("cli.session_reparent", DispatchPath),
+            SessionCustodyTransfer { .. } => ("cli.session_custody_transfer", DispatchPath),
             SessionPoSet { .. } => ("cli.session_po_set", DispatchPath),
             Tune { .. } => ("cli.tune", DispatchPath),
             Assign { .. } => ("cli.assign", DispatchPath),
@@ -402,6 +403,9 @@ fn dispatch_effect(command: &Command) -> EffectContract {
             idempotency_key, ..
         }
         | SessionReparent {
+            idempotency_key, ..
+        }
+        | SessionCustodyTransfer {
             idempotency_key, ..
         }
         | SessionPoSet {

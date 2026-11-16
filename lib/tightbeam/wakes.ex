@@ -329,7 +329,9 @@ defmodule Tightbeam.Wakes do
                   "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1",
                   [@health_redelivery_cycle_migration]
                 ) do
-             [[1]] -> :ok
+             [[1]] ->
+               :ok
+
              [] ->
                Txn.q(
                  txn,
@@ -2244,7 +2246,9 @@ defmodule Tightbeam.Wakes do
     case Txn.q(
            txn,
            """
-           SELECT status,ownerUserId,expecterSessionKey,raiserSessionKey
+           SELECT status,ownerUserId,
+                  COALESCE(currentExpecterSessionKey,expecterSessionKey),
+                  COALESCE(currentRaiserSessionKey,raiserSessionKey)
            FROM decision_requests WHERE id=?1
            """,
            [id]
@@ -3039,9 +3043,10 @@ defmodule Tightbeam.Wakes do
           ON delivery.wakeId=COALESCE(retry.rootWakeId,w.wakeId)
         JOIN harklight_wake_entries entry
           ON entry.handle=delivery.handle AND entry.eventId=delivery.eventId
-        JOIN sessions session ON session.sessionKey=delivery.sessionKey
+        JOIN sessions session ON session.sessionKey=COALESCE(delivery.currentRecipientSessionKey,delivery.sessionKey)
         WHERE t.seq=?1 AND t.status=?2 AND entry.entryKind='discussion'
-          AND delivery.sessionKey=t.sessionKey AND w.sessionKey=t.sessionKey
+          AND COALESCE(delivery.currentRecipientSessionKey,delivery.sessionKey)=t.sessionKey
+          AND w.sessionKey=t.sessionKey
           AND session.state='active' AND w.consumer='prompt' AND w.digest=0
         ORDER BY w.wakeId
         """,
@@ -3192,7 +3197,7 @@ defmodule Tightbeam.Wakes do
                """
                SELECT parent.sessionKey
                FROM assignments assignment
-               JOIN sessions parent ON parent.sessionKey=assignment.openedBySession
+               JOIN sessions parent ON parent.sessionKey=COALESCE(assignment.currentOpenerSessionKey,assignment.openedBySession)
                WHERE assignment.id=?1 AND parent.state='active'
                  AND parent.sessionKey!=?2
                """,

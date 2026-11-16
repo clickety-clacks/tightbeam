@@ -5,12 +5,14 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     Assignments,
     ConnRegistry,
     DB,
+    Escalation,
     Gateway,
     Ledger,
     Model,
     NoticeBatcher,
     Org,
     Rules,
+    SessionCustodyTransfer,
     Wakes,
     WorkItems
   }
@@ -25,6 +27,148 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     def handle_call({:ensure_lane, _session_key}, _from, parent),
       do: {:reply, :ok, parent}
+  end
+
+  test "transferred opener and raiser duties route to the successor after transfer", ctx do
+    session(ctx.db, "successor", "flynn")
+    item = create_work_item(ctx, "transferred accountability")
+
+    parent =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "notice-parent", "continuing parent work", item.id,
+          effect_kind: "coordination"
+        )
+      )
+
+    child =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "notice-parent"}, "holder", "child work", item.id,
+          effect_kind: "coordination"
+        )
+      )
+
+    blocked_assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:session, "notice-parent"}, "holder", "blocked work", item.id,
+          effect_kind: "coordination"
+        )
+      )
+
+    blocked =
+      attest_call({:session, "holder"}, blocked_assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "needs the opener's decision")
+      |> then(&handle(ctx, "attest", &1))
+
+    direct =
+      Escalation.ask(
+        ctx.db,
+        call("ask", {:session, "notice-parent"}, "holder", %{
+          question: "Which predecessor should this use?"
+        })
+      )
+
+    assert %{id: _} = direct
+
+    assert %{"eventId" => _} =
+             SessionCustodyTransfer.handle(ctx.db, %{
+               principal: {:user, "flynn"},
+               params: %{
+                 from_session_key: "notice-parent",
+                 to_session_key: "successor",
+                 idempotency_key: "transfer-accountability"
+               }
+             })
+
+    assert {:ok, [["session:successor", "standing"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef,state FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert %{status: "returned", returned_by: "session:holder"} =
+             Escalation.return_request(
+               ctx.db,
+               call("return", {:session, "holder"}, nil, %{
+                 request: direct.id,
+                 reason: "Name the predecessor"
+               })
+             )
+
+    assert {:ok, [[decision_wake_id, "successor"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,sessionKey FROM wakes WHERE prompt LIKE '%Name the predecessor%' AND origin='process:tightbeam'"
+             )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+
+    assert [%{delivery_wake_id: decision_carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, decision_wake_id)
+
+    assert {:ok, [["successor"]]} =
+             DB.query(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [
+               decision_carrier_id
+             ])
+
+    drain_successor_queued!(ctx.db)
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, child.id, "completion"))
+
+    [root] = terminal_notices(ctx.db)
+    assert root.session_key == "successor"
+    assert root.prompt =~ ~s(opened_by_id="notice-parent")
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    carrier_id = assert_delivered_carrier(ctx.db, root.wake_id)
+
+    assert {:ok, [["successor"]]} =
+             DB.query(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [carrier_id])
+
+    drain_successor_queued!(ctx.db)
+    assert [reminder] = await_pending_reminders(ctx.db, root.wake_id)
+
+    assert %{attest: %{kind: "progress", bySession: "successor"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call(
+                 {:session, "successor"},
+                 parent.id,
+                 action_note(child.id, root, "kept", "accepted the child's result")
+               )
+             )
+
+    assert Wakes.get(ctx.db, reminder.wake_id).state == "canceled"
+
+    assert %{outcome: "revoked", closedBySession: "successor"} =
+             Assignments.__handle__(
+               ctx.db,
+               "revoke-assignment",
+               call("revoke-assignment", {:session, "successor"}, nil, %{
+                 assignment_id: blocked_assignment.id,
+                 reason: "Accepted the successor's disposition"
+               })
+             )
+
+    assert {:ok, [["settled", "disposed", "withdrawn"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT cp.state,cp.settlementKind,dr.status
+               FROM assignment_cannot_proceed cp
+               JOIN decision_requests dr ON dr.id=cp.decisionRequestId
+               WHERE cp.id=?1
+               """,
+               [blocked.cannotProceed.id]
+             )
   end
 
   setup tags do
@@ -1922,6 +2066,22 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     assert :ok =
              Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+  end
+
+  defp drain_successor_queued!(db) do
+    case Ledger.claim_next(db, "successor", "custody-handoff-test") do
+      {:ok, turn} ->
+        assert :ok =
+                 Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+        drain_successor_queued!(db)
+
+      :none ->
+        :ok
+
+      other ->
+        flunk("successor turn could not settle: #{inspect(other)}")
+    end
   end
 
   defp start_scheduler(db) do

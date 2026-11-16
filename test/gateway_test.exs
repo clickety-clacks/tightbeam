@@ -12,7 +12,7 @@ defmodule Tightbeam.GatewayTest do
     effects = Tightbeam.Gateway.handler_effects(%{db: :registry_test_unused})
 
     expected =
-      ~w(post wake condition facts-read fact-demand fact-producer-claim fact-producers artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-handoff work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-po-set retire assignment-commitref-correct)
+      ~w(post wake condition facts-read fact-demand fact-producer-claim fact-producers artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-handoff work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-custody-transfer session-po-set retire assignment-commitref-correct)
 
     expected = expected ++ ~w(breathing)
 
@@ -21,7 +21,7 @@ defmodule Tightbeam.GatewayTest do
 
     expected =
       expected ++
-        ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other harness-health-close-promotion harness-health-evidence-other)
+        ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other harness-health-close-promotion harness-health-evidence-other harness-health-retry)
 
     expected =
       expected ++
@@ -10402,6 +10402,16 @@ defmodule Tightbeam.GatewayTest do
       ctx.tmp_dir,
       "live_base_gateway_remote_url.exs",
       "guarded-gateway-remote-url: ok"
+    )
+  end
+
+  @tag timeout: 180_000
+  @tag cold_gateway: true, gateway_dispatch_identity_refresh: true, tmp_dir: true
+  test "assignment brief refreshes stale identity at the next turn boundary", ctx do
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_dispatch_identity_refresh.exs",
+      "guarded-gateway-dispatch-identity-refresh: ok"
     )
   end
 

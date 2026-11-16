@@ -3,7 +3,7 @@ defmodule Tightbeam.AssignmentsTest do
   alias Tightbeam.Model
 
   @session_identity_shape "session-identity-v1-0114"
-  @closed_assignment_reconciliation_shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
+  @current_shape "session-custody-v1-0116"
 
   alias Tightbeam.{
     Assignments,
@@ -3774,7 +3774,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert event_detail =~ closing_attest_id
 
-    assert {:ok, [[@closed_assignment_reconciliation_shape]]} =
+    assert {:ok, [[@current_shape]]} =
              DB.query(ctx.db, "SELECT shape FROM schema_stamp")
   end
 
@@ -7586,6 +7586,8 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp force_closed_assignment_reconciliation(ctx) do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_custody!(ctx.db)
+
     assert {:ok, []} =
              DB.query(
                ctx.db,

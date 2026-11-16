@@ -206,7 +206,7 @@ defmodule Tightbeam.ConditionFacts do
       rows =
         Txn.q(
           txn,
-          "SELECT holderKey, openedBySession, openedByUser FROM assignments WHERE id=?1 AND state='open'",
+          "SELECT holderKey, COALESCE(currentOpenerSessionKey,openedBySession), openedByUser FROM assignments WHERE id=?1 AND state='open'",
           [scope]
         )
 

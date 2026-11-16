@@ -997,7 +997,8 @@ defmodule Tightbeam.SessionLane do
     case DB.Txn.q(
            txn,
            """
-           SELECT a.holderKey, a.state, a.openedByUser, a.openedBySession,
+           SELECT a.holderKey, a.state, a.openedByUser,
+                  COALESCE(a.currentOpenerSessionKey,a.openedBySession),
                   t.sessionKey, t.assignmentId, t.status, t.owner, t.messageId
            FROM assignments a
            JOIN turns t ON t.seq=?2
