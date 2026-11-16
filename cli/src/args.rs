@@ -212,6 +212,10 @@ pub enum Command {
         identity: Identity,
         message: String,
     },
+    HarklightCover {
+        identity: Identity,
+        session: String,
+    },
     HarklightFollow {
         identity: Identity,
         message: Option<String>,
@@ -911,6 +915,8 @@ COMMANDS:
   harklight-retract --message <id>
   harklight-settle --message <id>
       Settle one unresolved send using its original operation and inputs.
+  harklight-cover --session <handle>
+      Explicitly move your conversation to the shared origin listener.
   harklight-follow (--message <id> | --handle <handle>)
       Follow a message or conversation sent through Tightbeam.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
@@ -2695,6 +2701,19 @@ fn parse_with_optional_catalog(
                     })
                 }
             }
+        }
+        "harklight-cover" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "session")
+                })
+            {
+                return Err("usage: tightbeam harklight-cover --session <handle>".to_owned());
+            }
+            Ok(Command::HarklightCover {
+                identity: identity(flags)?,
+                session: nonempty(flags, "session").ok_or("--session is required")?,
+            })
         }
         "harklight-follow" => {
             if parsed.positional.len() != 1
@@ -6466,6 +6485,7 @@ mod tests {
                 "harklight-retract",
                 "harklight-settle",
                 "harklight-follow",
+                "harklight-cover",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",
