@@ -825,7 +825,7 @@ defmodule Tightbeam.Harness.Codex do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
     executable = catalog_executable(state, kind)
     path = catalog_path(state)
-    managed_cli = managed_cli_path(state)
+    managed_cli = managed_cli_path(state.base_dir)
 
     auth =
       Tightbeam.Credentials.credential_path(
@@ -876,9 +876,6 @@ defmodule Tightbeam.Harness.Codex do
         end
     end
   end
-
-  defp managed_cli_path(state),
-    do: Path.join([state.base_dir, "adapters", "node_modules", ".bin", "codex"])
 
   defp catalog_path_assignment(path) do
     if String.ends_with?(path, ":$PATH") do
@@ -989,7 +986,7 @@ defmodule Tightbeam.Harness.Codex do
     host = Map.get(state, :host_name, Placement.local_host_name())
     home = Tightbeam.Homes.home_path(state.base_dir, host, :codex)
     path_setup = catalog_path_assignment(catalog_path(state)) <> "\nexport PATH"
-    codex_path = codex_path_resolution(executable, managed_cli_path(state))
+    codex_path = codex_path_resolution(executable, managed_cli_path(state.base_dir))
 
     script =
       "#{path_setup}\n#{codex_path}\n" <>
