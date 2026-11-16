@@ -2,7 +2,72 @@ defmodule Tightbeam.RowReactions do
   @moduledoc false
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.HarnessHealth.RecoverySchedule
+  alias Tightbeam.HarnessHealth.RecoveryScheduler
   alias Tightbeam.RowReactions.{Cutover, Notice, Snapshot, Store}
+
+  def harness_health_hold_in_txn(
+        txn,
+        incident_id,
+        transition,
+        at,
+        before \\ nil,
+        cycle_release \\ false
+      )
+      when transition in ["opened", "resolved"] do
+    Cutover.adopt(txn)
+    after_snapshot = Snapshot.harness_health_hold(txn, incident_id)
+
+    event = %{
+      "id" => "harness-health-hold:#{incident_id}:#{transition}",
+      # Harness-health incidents may have no session owner. They are still
+      # global product events; the system namespace keeps them distinct from
+      # any user's assignment and wake reactions.
+      "org" => after_snapshot["ownerUserId"] || "system",
+      "kind" => "harness_health_hold",
+      "at" => at,
+      "generation" => incident_id <> ":" <> transition,
+      "source" => %{"kind" => "harness_health_incident", "id" => incident_id},
+      "transition" => transition,
+      "resolutionCorrelation" => after_snapshot["resolutionCorrelation"],
+      "cycleRelease" => transition == "resolved" and cycle_release == true,
+      "principal" => %{"kind" => "process", "id" => "tightbeam"},
+      "before" => before,
+      "after" => after_snapshot
+    }
+
+    admit(txn, event)
+    RecoverySchedule.reconcile_hold_in_txn(txn, after_snapshot, event["id"], at)
+    :ok
+  end
+
+  @doc false
+  def remember_harness_health_recovery_check_in_txn(txn, check) do
+    Cutover.adopt(txn)
+
+    event = %{
+      "id" => check.event_id,
+      "org" => check.org,
+      "kind" => "harness_health_recovery_check",
+      "at" => check.finished_at,
+      "generation" => check.cycle_id,
+      "source" => %{"kind" => "harness_health_recovery_check", "id" => check.event_id},
+      "holdId" => check.hold_id,
+      "cycleId" => check.cycle_id,
+      "route" => check.route,
+      "startedAt" => check.started_at,
+      "finishedAt" => check.finished_at,
+      "outcome" => check.outcome,
+      "errorExcerpt" => check.error_excerpt,
+      "principal" => %{"kind" => "process", "id" => "tightbeam"},
+      "before" => nil,
+      "after" => nil
+    }
+
+    facts = Snapshot.current(txn, event, %{})
+    Store.remember(txn, event, facts)
+    :ok
+  end
 
   def terminal_in_txn(txn, terminal, before) do
     Cutover.adopt(txn)
@@ -116,11 +181,15 @@ defmodule Tightbeam.RowReactions do
            if ready?(txn) do
              Cutover.adopt(txn)
              for {event, _} <- Store.pending_events(txn), do: reconcile_safely(txn, event)
+             RecoverySchedule.reconcile_open_holds_in_txn(txn, System.system_time(:millisecond))
            end
 
            :ok
          end) do
-      {:ok, :ok} -> :ok
+      {:ok, :ok} ->
+        RecoveryScheduler.refresh()
+        :ok
+
       {:error, error} -> raise error
     end
   end

@@ -75,6 +75,11 @@ defmodule Tightbeam.TestCase do
     rule_dir = Path.join(base_dir, "identity/rules")
     File.mkdir_p!(rule_dir)
 
+    recovery_rule_source =
+      Path.join(:code.priv_dir(:tightbeam), "seed/rules/harness-health-recovery.toml")
+
+    File.cp!(recovery_rule_source, Path.join(rule_dir, "harness-health-recovery.toml"))
+
     Tightbeam.Rules.load!(base_dir, [])
     on_exit(fn -> File.rm_rf!(base_dir) end)
 

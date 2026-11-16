@@ -11,6 +11,7 @@ defmodule Tightbeam.HarnessHealthTest do
     Model,
     Org,
     Projection,
+    HarnessHealth.RecoveryCheck,
     Wakes
   }
 
@@ -270,6 +271,27 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert {:resolved, resolved} = HarnessHealth.resolve_other(ctx.db, recovery)
     assert resolved.state == "resolved"
+
+    assert {:ok, [[event_json]]} =
+             DB.query(
+               ctx.db,
+               "SELECT event FROM row_reaction_events WHERE eventId=?1",
+               ["harness-health-hold:#{opened.id}:resolved"]
+             )
+
+    event = JSON.decode!(event_json)
+    assert event["cycleRelease"] == false
+
+    assert {:ok, [[resolution_correlation]]} =
+             DB.query(
+               ctx.db,
+               "SELECT correlationId FROM harness_health_observations WHERE id=?1",
+               [resolved.resolutionObservationId]
+             )
+
+    assert event["resolutionCorrelation"] == resolution_correlation
+    assert event["after"]["resolutionCorrelation"] == resolution_correlation
+
     refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "testhost", "other")
   end
 
@@ -2964,12 +2986,25 @@ defmodule Tightbeam.HarnessHealthTest do
       observed_at: 20,
       correlation_id: "normal-turn-20",
       cause: "normal turn delivered",
-      principal: "process:tightbeam"
+      principal: "process:tightbeam",
+      cycle_release: true
     }
 
     assert {:resolved, resolved} = HarnessHealth.resolve(ctx.db, resolution)
     assert resolved.id == opened.id
     assert resolved.state == "resolved"
+
+    assert {:ok, [[event_json]]} =
+             DB.query(
+               ctx.db,
+               "SELECT event FROM row_reaction_events WHERE eventId=?1",
+               ["harness-health-hold:#{opened.id}:resolved"]
+             )
+
+    event = JSON.decode!(event_json)
+    assert event["resolutionCorrelation"] == "normal-turn-20"
+    assert event["cycleRelease"] == false
+
     refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "testhost", "auth-dead")
 
     assert {:duplicate, duplicate} = HarnessHealth.resolve(ctx.db, resolution)
@@ -3141,6 +3176,645 @@ defmodule Tightbeam.HarnessHealthTest do
            end)
   end
 
+  test "hold row events snapshot routes and carry the recorded resolution correlation", ctx do
+    [first | _] = ctx.sessions
+
+    failed_turn =
+      fail_health_turn!(
+        ctx.db,
+        first.session,
+        "hold-row-event-failure",
+        "bounded health failure",
+        @captured_claude_rate_limit
+      )
+
+    [second | _] = Enum.reject(ctx.sessions, &(&1.session == first.session))
+
+    fail_health_turn!(
+      ctx.db,
+      second.session,
+      "hold-row-event-second-failure",
+      "bounded health failure",
+      @captured_claude_rate_limit
+    )
+
+    [incident] = HarnessHealth.active(ctx.db)
+    opened_id = "harness-health-hold:#{incident.id}:opened"
+
+    assert {:ok, [[opened_json, opened_facts_json]]} =
+             DB.query(
+               ctx.db,
+               "SELECT event,facts FROM row_reaction_events WHERE eventId=?1",
+               [opened_id]
+             )
+
+    opened = JSON.decode!(opened_json)
+    opened_facts = JSON.decode!(opened_facts_json)
+
+    assert {:ok, [[failed_model]]} =
+             DB.query(ctx.db, "SELECT model FROM turns WHERE seq=?1", [failed_turn.seq])
+
+    assert opened["kind"] == "harness_health_hold"
+    assert opened["transition"] == "opened"
+    assert opened["cycleRelease"] == false
+    assert opened["after"]["state"] == "open"
+    assert opened["after"]["failureClass"] == "rate-limit-dead"
+    assert opened["after"]["routesComplete"]
+    assert opened["after"]["routes"] == [
+             %{
+               "harness" => "claude",
+               "host" => "testhost",
+               "sharedAccount" => "shared",
+               "model" => failed_model
+             }
+           ]
+    assert opened["after"]["fencePresent"]
+    assert opened_facts["hold"]["state"] == "open"
+    assert opened_facts["hold"]["routes"] == opened["after"]["routes"]
+    assert opened_facts["hold"]["fencePresent"]
+
+    restored_turn = restore_health_turn!(ctx.db, first.session, "hold-row-event-restored")
+    resolved_id = "harness-health-hold:#{incident.id}:resolved"
+
+    assert {:ok, [[resolved_json, resolved_facts_json]]} =
+             DB.query(
+               ctx.db,
+               "SELECT event,facts FROM row_reaction_events WHERE eventId=?1",
+               [resolved_id]
+             )
+
+    resolved = JSON.decode!(resolved_json)
+    resolved_facts = JSON.decode!(resolved_facts_json)
+
+    assert {:ok, [[correlation]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT o.correlationId FROM harness_health_incidents i
+               JOIN harness_health_observations o ON o.id=i.resolutionObservationId
+               WHERE i.id=?1
+               """,
+               [incident.id]
+             )
+
+    assert correlation == "harness-turn:#{restored_turn.seq}:normal-success:rate-limit-dead"
+    assert resolved["transition"] == "resolved"
+    assert resolved["resolutionCorrelation"] == correlation
+    assert resolved["cycleRelease"] == false
+    assert resolved["after"]["resolutionCorrelation"] == correlation
+    assert resolved["after"]["state"] == "resolved"
+    refute resolved["after"]["fencePresent"]
+    assert resolved_facts["hold"]["state"] == "resolved"
+    assert resolved_facts["hold"]["resolutionCorrelation"] == correlation
+  end
+
+  test "recovery cycle records each route and releases only after all current routes succeed", ctx do
+    [first | _] = ctx.sessions
+    assert {:ok, [[owner_user_id]]} =
+             DB.query(ctx.db, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [first.session])
+
+    second_session = "agent:harness-health:recovery-route-two"
+    second_assignment = "asg_health_recovery_route_two"
+
+    Org.create(ctx.db, %{
+      session_key: second_session,
+      display_name: "Recovery route two",
+      owner_user_id: owner_user_id,
+      origin: "user:" <> owner_user_id,
+      archetype: "coder",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5-alt")
+    })
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+               VALUES (?1,'recovery route two',?2,?2,5,'open','claude','anthropic')
+               """,
+               [second_assignment, second_session]
+             )
+
+    _first_failure =
+      fail_health_turn!(
+        ctx.db,
+        first.session,
+        "recovery-cycle-route-one",
+        "bounded health failure",
+        @captured_claude_rate_limit
+      )
+
+    _second_failure =
+      fail_health_turn!(
+        ctx.db,
+        second_session,
+        "recovery-cycle-route-two",
+        "bounded health failure",
+        @captured_claude_rate_limit,
+        assignment_id: second_assignment
+      )
+
+    [incident] = HarnessHealth.active(ctx.db)
+
+    assert {:ok, %{"routesComplete" => true, "routes" => routes}} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.RowReactions.Snapshot.harness_health_hold(txn, incident.id)
+             end)
+
+    assert length(routes) == 2
+
+    assert {:ok, [[cycle_one, _due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cycleId,dueAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [incident.id]
+             )
+
+    started_one = System.system_time(:millisecond)
+
+    assert {:ok, 1} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE harness_health_recovery_schedules SET dueAt=?2 WHERE holdId=?1 AND cycleId=?3 AND status='pending'",
+                 [incident.id, started_one, cycle_one]
+               )
+
+               Tightbeam.DB.Txn.changes(txn)
+             end)
+
+    assert [%{"cycle_id" => ^cycle_one}] =
+             Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, started_one)
+
+    assert {:ok, [[wake_count_before_cycle]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+    seed_running_recovery_checks!(ctx.db, incident.id, cycle_one, routes, started_one, owner_user_id)
+    [route_one, route_two] = Enum.sort_by(routes, &Tightbeam.HarnessHealth.RecoveryCheck.route_key/1)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.HarnessHealth.RecoveryCheck.record_result_in_txn(
+                 txn,
+                 incident.id,
+                 cycle_one,
+                 Tightbeam.HarnessHealth.RecoveryCheck.route_key(route_one),
+                 "succeeded",
+                 nil,
+                 started_one + 1
+               )
+             end)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.HarnessHealth.RecoveryCheck.record_result_in_txn(
+                 txn,
+                 incident.id,
+                 cycle_one,
+                 Tightbeam.HarnessHealth.RecoveryCheck.route_key(route_one),
+                 "failed",
+                 "duplicate result must not replace the first observation",
+                 started_one + 3
+               )
+             end)
+
+    assert {:ok, [["succeeded", nil, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT outcome,errorExcerpt,(SELECT COUNT(*) FROM row_reaction_events WHERE eventId=(SELECT eventId FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND routeKey=?3)) FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND routeKey=?3",
+               [incident.id, cycle_one, Tightbeam.HarnessHealth.RecoveryCheck.route_key(route_one)]
+             )
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.HarnessHealth.RecoveryCheck.record_result_in_txn(
+                 txn,
+                 incident.id,
+                 cycle_one,
+                 Tightbeam.HarnessHealth.RecoveryCheck.route_key(route_two),
+                 "failed",
+                 "bounded provider error",
+                   started_one + 3_600_100
+               )
+             end)
+
+    assert HarnessHealth.get(ctx.db, incident.id).state == "open"
+    assert {:ok, [[^wake_count_before_cycle]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    assert {:ok, [["pending", next_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,dueAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [incident.id]
+             )
+
+    assert next_due_at == started_one + 3_600_000
+    assert next_due_at < started_one + 3_600_100
+
+    assert {:ok, [[cycle_two]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cycleId FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [incident.id]
+             )
+
+    started_two = max(next_due_at, started_one + 3_600_101)
+
+    assert [%{"cycle_id" => ^cycle_two}] =
+             Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, started_two)
+
+    seed_running_recovery_checks!(ctx.db, incident.id, cycle_two, routes, started_two, owner_user_id)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.HarnessHealth.RecoveryCheck.record_result_in_txn(
+                 txn,
+                 incident.id,
+                 cycle_two,
+                 Tightbeam.HarnessHealth.RecoveryCheck.route_key(route_one),
+                 "succeeded",
+                 nil,
+                 started_two + 1
+               )
+             end)
+
+    assert {:ok, {:released, release}} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.HarnessHealth.RecoveryCheck.record_result_in_txn(
+                 txn,
+                 incident.id,
+                 cycle_two,
+                 Tightbeam.HarnessHealth.RecoveryCheck.route_key(route_two),
+                 "succeeded",
+                 nil,
+                 started_two + 2
+               )
+             end)
+
+    assert release.correlation == "harness-health-check-cycle:#{incident.id}:#{cycle_two}"
+    assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts WHERE cycleReleaseCorrelation=?1 AND cycleReleaseTurnSeq IS NULL",
+               [release.correlation]
+             )
+
+    start_supervised!({RecoveryLane, {ctx.db, self()}})
+    assert :ok = Wakes.redeliver_cycle_release(ctx.db, release.correlation, "claude", "testhost")
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts WHERE cycleReleaseCorrelation=?1 AND cycleReleaseTurnSeq IS NOT NULL",
+               [release.correlation]
+             )
+
+    assert :ok = Wakes.redeliver_cycle_release(ctx.db, release.correlation, "claude", "testhost")
+
+    assert {:ok, [[4]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE messageId IN ('recovery-cycle-route-one','recovery-cycle-route-two')"
+             )
+
+    assert {:ok, [[resolved_json]]} =
+             DB.query(
+               ctx.db,
+               "SELECT event FROM row_reaction_events WHERE eventId=?1",
+               ["harness-health-hold:#{incident.id}:resolved"]
+             )
+
+    resolved = JSON.decode!(resolved_json)
+    assert resolved["resolutionCorrelation"] == release.correlation
+    assert resolved["cycleRelease"] == true
+    assert resolved["after"]["resolutionCorrelation"] == release.correlation
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND outcome='succeeded'",
+               [incident.id, cycle_two]
+             )
+  end
+
+  test "eligible hold owns one durable due cycle without delivering an agent wake", ctx do
+    [first | _] = ctx.sessions
+
+    assert {:opened, opened} =
+             HarnessHealth.observe(
+               ctx.db,
+               authoritative(first, "rate-limit-dead", 100, "recovery-schedule-open")
+             )
+
+    assert {:ok, [[cycle_id, due_at, "pending", 3_600_000, hold_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cycleId,dueAt,status,intervalMs,holdId FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [opened.id]
+             )
+
+    assert hold_id == opened.id
+    assert due_at == 3_600_100
+    assert {:ok, [[wake_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    assert [cycle] =
+             Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, due_at)
+
+    assert cycle == %{
+             "hold_id" => opened.id,
+             "cycle_id" => cycle_id,
+             "routes" => []
+           }
+
+    assert [%{"hold_id" => id, "cycle_id" => ^cycle_id}] =
+             Tightbeam.HarnessHealth.RecoverySchedule.due_cycles(ctx.db)
+
+    assert id == opened.id
+    assert {:ok, [[^due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT previousStartedAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [opened.id]
+             )
+
+    assert {:ok, [[wake_count_after]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+    assert wake_count_after == wake_count_before
+  end
+
+  test "recovery rail changes move one cycle and preserve the last cycle start", ctx do
+    [first | _] = ctx.sessions
+
+    assert {:opened, opened} =
+             HarnessHealth.observe(
+               ctx.db,
+               authoritative(first, "rate-limit-dead", 100, "recovery-schedule-policy-change")
+             )
+
+    assert {:ok, [[cycle_id, initial_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cycleId,dueAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [opened.id]
+             )
+
+    load_recovery_policy!(["rate-limit-dead"], 1_800_000)
+    assert :ok = Tightbeam.HarnessHealth.RecoverySchedule.reconcile_open_holds(ctx.db, 500)
+
+    assert {:ok, [[^cycle_id, revised_due_at, "pending", 1_800_000]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cycleId,dueAt,status,intervalMs FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [opened.id]
+             )
+
+    assert initial_due_at == 3_600_100
+    assert revised_due_at == 1_800_100
+
+    assert [%{"cycle_id" => ^cycle_id}] =
+             Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, revised_due_at)
+
+    load_recovery_policy!([], 1_800_000)
+    assert :ok =
+             Tightbeam.HarnessHealth.RecoverySchedule.reconcile_open_holds(
+               ctx.db,
+               revised_due_at + 1
+             )
+
+    assert {:ok, [["withdrawn", ^revised_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,previousStartedAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [opened.id]
+             )
+
+    load_recovery_policy!(["rate-limit-dead"], 600_000)
+    assert :ok =
+             Tightbeam.HarnessHealth.RecoverySchedule.reconcile_open_holds(
+               ctx.db,
+               revised_due_at + 1_000
+             )
+
+    assert {:ok, [[next_cycle_id, next_due_at, "pending", 600_000, ^revised_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cycleId,dueAt,status,intervalMs,previousStartedAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [opened.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [opened.id]
+             )
+
+    refute next_cycle_id == cycle_id
+    assert next_due_at == revised_due_at + 600_000
+    assert next_due_at > revised_due_at + 1_000
+  end
+
+  test "missing recovery rail leaves an eligible hold on its existing path", ctx do
+    no_rules =
+      Path.join(
+        System.tmp_dir!(),
+        "harness-health-no-recovery-rail-#{System.unique_integer([:positive])}"
+      )
+
+    assert [] = Tightbeam.Rules.load!(no_rules, [])
+    [first | _] = ctx.sessions
+
+    assert {:opened, opened} =
+             HarnessHealth.observe(
+               ctx.db,
+               authoritative(first, "rate-limit-dead", 200, "recovery-schedule-no-rail")
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [opened.id]
+             )
+  end
+
+  test "recovery scheduler delivers the persisted hold cycle without an agent wake", ctx do
+    [first, second | _] = ctx.sessions
+    route_host = "recovery-unregistered-fixture"
+    Org.set_host(ctx.db, first.session, route_host)
+    Org.set_host(ctx.db, second.session, route_host)
+    Org.set_model(ctx.db, second.session, Model.new("claude-fable-5-alt"), "anthropic")
+
+    fail_health_turn!(
+      ctx.db,
+      first.session,
+      "recovery-scheduler-timer-route-one",
+      "bounded health failure",
+      @captured_claude_rate_limit
+    )
+
+    fail_health_turn!(
+      ctx.db,
+      second.session,
+      "recovery-scheduler-timer-route-two",
+      "bounded health failure",
+      @captured_claude_rate_limit
+    )
+
+    [opened] = HarnessHealth.active(ctx.db)
+
+    assert {:ok, %{"routesComplete" => true, "routes" => routes}} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.RowReactions.Snapshot.harness_health_hold(txn, opened.id)
+             end)
+
+    assert length(routes) == 2
+
+    assert {:ok, [[wake_count_before]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    now = System.system_time(:millisecond)
+
+    assert {:ok, 1} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE harness_health_recovery_schedules SET dueAt=?2 WHERE holdId=?1 AND status='pending'",
+                 [opened.id, now]
+               )
+
+               Tightbeam.DB.Txn.changes(txn)
+             end)
+
+    scheduler_name = {:global, {:harness_health_recovery_test, make_ref()}}
+    task_sup = start_supervised!(Task.Supervisor)
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "harness-health-scheduler-no-route-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    start_supervised!(
+      {Tightbeam.HarnessHealth.RecoveryScheduler,
+       db: ctx.db, base_dir: base_dir, task_sup: task_sup, name: scheduler_name}
+    )
+
+    assert eventually(fn ->
+             case DB.query(
+                    ctx.db,
+                    "SELECT COUNT(*),MIN(outcome),MAX(outcome) FROM harness_health_recovery_checks WHERE holdId=?1",
+                    [opened.id]
+                  ) do
+               {:ok, [[2, "uncheckable", "uncheckable"]]} ->
+                 case DB.query(
+                        ctx.db,
+                        "SELECT status,dueAt,previousStartedAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+                        [opened.id]
+                      ) do
+                   {:ok, [["pending", due_at, started_at]]} -> due_at > started_at
+                   _ -> false
+                 end
+
+               _ ->
+                 false
+             end
+           end)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM harness_health_recovery_warnings WHERE holdId=?1",
+               [opened.id]
+             )
+
+    assert {:ok, [[^wake_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  test "recovery CLI selection follows pin, validated PATH, then adapter bundle" do
+    node = System.find_executable("node")
+    assert is_binary(node)
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "harness-health-binary-selection-#{System.unique_integer([:positive])}"
+      )
+
+    adapter_root = Path.join(root, "adapters")
+    path_dir = Path.join(root, "path")
+    bad_path_dir = Path.join(root, "bad-path")
+    File.mkdir_p!(adapter_root)
+    File.mkdir_p!(path_dir)
+    File.mkdir_p!(bad_path_dir)
+    File.write!(Path.join(adapter_root, "package.json"), "{}")
+
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    Enum.each(["claude", "codex"], fn harness ->
+      bundles = create_recovery_adapter_bundle!(node, adapter_root, harness)
+      cli = Path.join(path_dir, harness)
+      bad_cli = Path.join(bad_path_dir, harness)
+      File.write!(cli, "#!/bin/sh\necho 'fixture 1.0.0'\n")
+      File.chmod!(cli, 0o755)
+      File.write!(bad_cli, "#!/bin/sh\nexit 1\n")
+      File.chmod!(bad_cli, 0o755)
+
+      pin = Path.join(root, "pinned-#{harness}")
+
+      assert %{"command" => [^pin], "source" => "pin"} =
+               recovery_binary_selection!(node, adapter_root, harness, path_dir, pin)
+
+      assert %{"command" => [^cli], "source" => "path"} =
+               recovery_binary_selection!(node, adapter_root, harness, path_dir, "")
+
+      selected = recovery_binary_selection!(node, adapter_root, harness, bad_path_dir, "")
+
+      if harness == "codex" do
+        bundle = bundles
+        assert %{"command" => [selected_node, selected_bundle], "source" => "bundle"} = selected
+        assert same_file?(node, selected_node)
+        assert same_file?(bundle, selected_bundle)
+      else
+        assert %{"command" => [bundle], "source" => "bundle"} = selected
+        assert Enum.any?(bundles, &same_file?(&1, bundle))
+      end
+    end)
+  end
+
+  test "resolution withdraws the hold cycle before its deadline", ctx do
+    [first | _] = ctx.sessions
+
+    assert {:opened, opened} =
+             HarnessHealth.observe(
+               ctx.db,
+               authoritative(first, "rate-limit-dead", 100, "recovery-schedule-withdraw")
+             )
+
+    assert {:ok, [[due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1 AND status='pending'",
+               [opened.id]
+             )
+
+    _restored_turn = restore_health_turn!(ctx.db, first.session, "recovery-schedule-resolved")
+
+    assert {:ok, [["withdrawn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [opened.id]
+             )
+
+    assert [] = Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, due_at)
+  end
+
   test "serialized concurrent observations open exactly one incident", ctx do
     [first, second | _] = ctx.sessions
 
@@ -3163,6 +3837,126 @@ defmodule Tightbeam.HarnessHealthTest do
                ctx.db,
                "SELECT COUNT(*) FROM condition_facts WHERE kind='harness-rate-limit-dead'"
              )
+  end
+
+  defp seed_running_recovery_checks!(db, hold_id, cycle_id, routes, started_at, org) do
+    routes
+    |> Enum.sort_by(&Tightbeam.HarnessHealth.RecoveryCheck.route_key/1)
+    |> Enum.with_index()
+    |> Enum.each(fn {route, index} ->
+      route_key = Tightbeam.HarnessHealth.RecoveryCheck.route_key(route)
+      event_id = "test-harness-health-recovery-check:#{hold_id}:#{cycle_id}:#{index}"
+
+      assert {:ok, []} =
+               DB.query(
+                 db,
+                 """
+                 INSERT INTO harness_health_recovery_checks
+                   (holdId,cycleId,routeKey,routeJson,harness,host,sharedAccount,model,startedAt,
+                    finishedAt,outcome,errorExcerpt,eventId,org)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,'running',NULL,?10,?11)
+                 """,
+                 [
+                   hold_id,
+                   cycle_id,
+                   route_key,
+                   JSON.encode!(route),
+                   route["harness"],
+                   route["host"],
+                   route["sharedAccount"],
+                   route["model"],
+                   started_at,
+                   event_id,
+                   org
+                 ]
+               )
+    end)
+  end
+
+  defp recovery_binary_selection!(node, adapter_root, harness, path, pin) do
+    script = RecoveryCheck.binary_selection_program(harness)
+
+    {output, 0} =
+      System.cmd(
+        node,
+        ["-e", script, adapter_root, harness, pin],
+        env: [{"PATH", path}],
+        stderr_to_stdout: true
+      )
+
+    JSON.decode!(output)
+  end
+
+  defp create_recovery_adapter_bundle!(_node, adapter_root, "codex") do
+    adapter = Path.join(adapter_root, "node_modules/@agentclientprotocol/codex-acp")
+    codex = Path.join(adapter_root, "node_modules/@openai/codex/bin/codex.js")
+    File.mkdir_p!(adapter)
+    File.mkdir_p!(Path.dirname(codex))
+
+    File.write!(
+      Path.join(adapter, "package.json"),
+      ~s|{"name":"@agentclientprotocol/codex-acp","main":"index.js"}|
+    )
+
+    File.write!(Path.join(adapter, "index.js"), "")
+
+    File.write!(
+      Path.join(adapter_root, "node_modules/@openai/codex/package.json"),
+      ~s|{"name":"@openai/codex"}|
+    )
+
+    File.write!(codex, "process.stdout.write('fixture 1.0.0')\n")
+    codex
+  end
+
+  defp create_recovery_adapter_bundle!(node, adapter_root, "claude") do
+    adapter = Path.join(adapter_root, "node_modules/@agentclientprotocol/claude-agent-acp")
+    sdk = Path.join(adapter_root, "node_modules/@anthropic-ai/claude-agent-sdk")
+    File.mkdir_p!(adapter)
+    File.mkdir_p!(sdk)
+
+    File.write!(
+      Path.join(adapter, "package.json"),
+      ~s|{"name":"@agentclientprotocol/claude-agent-acp","main":"index.js"}|
+    )
+
+    entry = Path.join(adapter, "index.js")
+    File.write!(entry, "")
+
+    File.write!(
+      Path.join(sdk, "package.json"),
+      ~s|{"name":"@anthropic-ai/claude-agent-sdk","main":"index.js"}|
+    )
+
+    File.write!(Path.join(sdk, "index.js"), "")
+    {runtime, 0} = System.cmd(node, ["-p", "process.platform + ' ' + process.arch"])
+    [platform, arch] = String.split(String.trim(runtime))
+
+    packages =
+      if platform == "linux" do
+        ["claude-agent-sdk-linux-#{arch}", "claude-agent-sdk-linux-#{arch}-musl"]
+      else
+        ["claude-agent-sdk-#{platform}-#{arch}"]
+      end
+
+    Enum.map(packages, fn package ->
+      binary = Path.join([adapter_root, "node_modules/@anthropic-ai", package, "claude"])
+      File.mkdir_p!(Path.dirname(binary))
+      File.write!(binary, "")
+      File.chmod!(binary, 0o755)
+      binary
+    end)
+  end
+
+  defp same_file?(left, right) do
+    with {:ok, left_stat} <- File.stat(left),
+         {:ok, right_stat} <- File.stat(right) do
+      left_stat.inode == right_stat.inode and
+        left_stat.major_device == right_stat.major_device and
+        left_stat.minor_device == right_stat.minor_device
+    else
+      _ -> false
+    end
   end
 
   defp fail_health_turn!(db, session_key, message_id, prompt, reason, opts \\ []) do
@@ -3262,5 +4056,53 @@ defmodule Tightbeam.HarnessHealthTest do
     ref
     |> failure(failure_class, observed_at, correlation_id)
     |> Map.put(:evidence_kind, "authoritative-provider")
+  end
+
+  defp load_recovery_policy!(eligible_classes, interval_ms) do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "harness-health-recovery-policy-#{System.unique_integer([:positive])}"
+      )
+
+    rules_dir = Path.join(root, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    seed =
+      File.read!(
+        Path.join(:code.priv_dir(:tightbeam), "seed/rules/harness-health-recovery.toml")
+      )
+
+    changed =
+      seed
+      |> String.replace(
+        "eligible_failure_classes = [\"rate-limit-dead\"]",
+        "eligible_failure_classes = #{JSON.encode!(eligible_classes)}"
+      )
+      |> String.replace("interval_ms = 3600000", "interval_ms = #{interval_ms}")
+
+    if changed == seed do
+      raise "recovery policy fixture did not change the shipped seed"
+    end
+
+    File.write!(Path.join(rules_dir, "harness-health-recovery.toml"), changed)
+    on_exit(fn -> File.rm_rf!(root) end)
+    Tightbeam.Rules.load!(root, [])
+
+    assert %{settings: settings} = Tightbeam.Rules.reaction_policy("harness-health-recovery")
+    assert settings["eligible_failure_classes"] == eligible_classes
+    assert settings["interval_ms"] == interval_ms
+  end
+
+  defp eventually(fun, attempts \\ 500)
+  defp eventually(fun, 0), do: fun.()
+
+  defp eventually(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(10)
+      eventually(fun, attempts - 1)
+    end
   end
 end
