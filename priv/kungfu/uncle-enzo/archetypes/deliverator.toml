@@ -1,0 +1,26 @@
+name = "deliverator"
+skills = ["tightbeam-dispatching"]
+
+[defaults]
+harness = "claude"
+model = "claude-fable-5-2"
+effort = "high"
+
+[[model_preferences]]
+model = "claude-fable-5-2"
+effort = "high"
+
+[[model_preferences]]
+model = "gpt-6-astra"
+effort = "high"
+
+[guidance]
+text = """
+#include "operating-manual.md"
+
+#include "uncle-enzo.md"
+
+#include "deliverator.md"
+
+#include "enzo-preferred-models.md"
+"""

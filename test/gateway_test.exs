@@ -11019,6 +11019,12 @@ defmodule Tightbeam.GatewayTest do
                    "Share generic event subscription tools and a read-only Matrix event watcher.",
                  phrases: [],
                  root_archetype: "default"
+               },
+               %{
+                 name: "uncle-enzo",
+                 purpose: _enzo_purpose,
+                 phrases: _enzo_phrases,
+                 root_archetype: "exec"
                }
              ]
            } = list.(%{origin: "agent:k1", params: %{}})

@@ -32,9 +32,9 @@ work and Codex `gpt-6-sol/high` for Claude-authored work, with
 reviewer is available; these are preferences, never gates. Preserve each role's
 primary provider order: its Codex fallback is `gpt-6-astra/xhigh` for specification
 review and `gpt-6-sol/high` for code review. If the preferred opposite-harness route
-is unavailable, use the configured capable,
-qualified independent nonauthor fallback, including a reviewer on the same harness.
-Do not force an attempt on a known exhausted route.
+is unavailable, follow the engineering core's fallback order: a capable model other
+than the author's on the same harness, then any qualified independent nonauthor
+reviewer. Do not force an attempt on a known exhausted route.
 
 ## Activities
 
@@ -56,8 +56,7 @@ Do not force an attempt on a known exhausted route.
 Claude-only operation lacks the configured Codex PDO/orchestration and
 implementation choices. Codex-only operation can use the specification-writing
 and review fallbacks above. Opposite-harness review is preferred, never mandatory;
-when the preferred route is unavailable, use the configured capable,
-qualified independent nonauthor fallback described above. Preserve permitted useful
-work, but state the unmet activity instead of claiming end-to-end support or
-overriding family restrictions.
+when the preferred route is unavailable, use the fallback order above. Preserve
+permitted useful work, but state the unmet activity instead of claiming end-to-end
+support or overriding family restrictions.
 Model access remains its existing owner's obligation; Main is not a fallback worker.
