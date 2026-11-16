@@ -30,7 +30,7 @@ class ExactHeadCI(unittest.TestCase):
     def setUpClass(cls):
         cls.text = WORKFLOW.read_text()
         cls.jobs = dict(re.findall(
-            r'^  (test|release|publish-release):\n(.*?)(?=^  [\w-]+:\n|\Z)',
+            r'^  (test|release):\n(.*?)(?=^  [\w-]+:\n|\Z)',
             cls.text, re.M | re.S))
 
     def test_dispatch_keeps_019_and_tag_triggers(self):
@@ -119,21 +119,27 @@ class ExactHeadCI(unittest.TestCase):
 
     def test_manual_tag_verification_cannot_publish_or_get_write_permission(self):
         release = self.jobs['release']
-        publish = self.jobs['publish-release']
+        publish = (WORKFLOW.parent / 'publish-release.yml').read_text()
         self.assertIn(
             "if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')",
             release)
         self.assertIn(
             'run: sh scripts/validate_release_tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA"',
             release)
-        self.assertIn('permissions:\n      contents: write', publish)
-        self.assertIn('    needs: release', publish)
-        self.assertIn(
-            "if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')",
-            publish)
+        self.assertNotIn('publish-release:', self.text)
+        self.assertNotIn('Create the GitHub Release', self.text)
+        self.assertIn('workflow_dispatch:', publish)
+        self.assertIn('contents: write', publish)
+        self.assertIn('actions: read', publish)
+        self.assertIn('run-id: ${{ inputs.candidate_run_id }}', publish)
+        self.assertIn('install_approved_sha:', publish)
+        self.assertIn('soak_outcome:', publish)
+        self.assertIn('sha256sum --check SHA256SUMS', publish)
+        self.assertIn('release-candidate-proof-${{ inputs.candidate_sha }}', publish)
+        self.assertIn('contents: read', self.text)
         self.assertNotIn('contents: write', self.jobs['test'])
         self.assertNotIn('contents: write', release)
-        self.assertIn('permissions:\n  contents: read', self.text)
+
 
     def test_merge_group_tests_group_head_under_required_names(self):
         self.assertRegex(self.text, r'(?m)^  merge_group:$')
@@ -183,21 +189,16 @@ class ExactHeadCI(unittest.TestCase):
 
     def test_merge_group_never_packages_or_publishes(self):
         queue_ref = 'refs/heads/gh-readonly-queue/0.1.9/pr-12-' + 'a' * 40
-        conditions = {name: re.search(r'(?m)^    if: (.*)$', self.jobs[name]).group(1)
-                      for name in ('release', 'publish-release')}
+        condition = re.search(r'(?m)^    if: (.*)$', self.jobs['release']).group(1)
         # Packaging refuses the event itself, whatever ref it carries.
         for ref in (queue_ref, 'refs/heads/0.1.9', 'refs/tags/v0.1.9'):
-            context = {'github.event_name': 'merge_group', 'github.ref': ref}
-            self.assertFalse(evaluate(conditions['release'], context), ref)
-        # Publication needs packaging, and refuses the queue ref on its own.
-        self.assertIn('    needs: release', self.jobs['publish-release'])
-        context = {'github.event_name': 'merge_group', 'github.ref': queue_ref}
-        self.assertFalse(evaluate(conditions['publish-release'], context))
-        for name in ('release', 'publish-release'):
-            context = {'github.event_name': 'push', 'github.ref': 'refs/tags/v0.1.9'}
-            self.assertTrue(evaluate(conditions[name], context), name)
-        context = {'github.event_name': 'push', 'github.ref': 'refs/heads/0.1.9'}
-        self.assertTrue(evaluate(conditions['release'], context))
+            self.assertFalse(evaluate(condition, {
+                'github.event_name': 'merge_group', 'github.ref': ref}), ref)
+        publish = (WORKFLOW.parent / 'publish-release.yml').read_text()
+        self.assertIn('workflow_dispatch:', publish)
+        self.assertNotIn('merge_group:', publish)
+        self.assertNotIn('on:\n  push:', publish)
+
 
     def test_no_retired_branch_dependency(self):
         self.assertNotIn('release-candidate/', self.text)

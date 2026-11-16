@@ -1253,7 +1253,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     assert {:ok, %{status: "withdrawn"}} = Dispatch.dispatch(db, handlers, withdraw)
-    assert observed_state_classes() == ["decision_request.withdrawn"]
+    # The opening notice and the future deadline reminder are both retracted
+    # with the request. Their cancellation is independently observable.
+    assert observed_state_classes() == [
+             "wake.canceled",
+             "wake.canceled",
+             "decision_request.withdrawn"
+           ]
 
     assert Gateway.handler_effects(%{db: db})["operator-withdraw"] == [
              "decision_request.withdrawn"

@@ -158,6 +158,10 @@ pub enum Command {
         identity: Identity,
         incident_id: String,
     },
+    HarnessHealthRetry {
+        identity: Identity,
+        incident_id: String,
+    },
     ArtifactRecord {
         identity: Identity,
         kind: String,
@@ -211,6 +215,10 @@ pub enum Command {
     HarklightSettle {
         identity: Identity,
         message: String,
+    },
+    HarklightCover {
+        identity: Identity,
+        session: String,
     },
     HarklightFollow {
         identity: Identity,
@@ -899,6 +907,8 @@ COMMANDS:
       Close a recurrence promotion after the Gateway verifies canonical provenance.
   harness-health-evidence-other <incidentId>
       Read exact retained evidence as the authorized source, custodian, owner, or admin.
+  harness-health-retry <incidentId>
+      Run the existing recovery probe now for an open usage-limit incident.
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
@@ -911,6 +921,8 @@ COMMANDS:
   harklight-retract --message <id>
   harklight-settle --message <id>
       Settle one unresolved send using its original operation and inputs.
+  harklight-cover --session <handle>
+      Explicitly move your conversation to the shared origin listener.
   harklight-follow (--message <id> | --handle <handle>)
       Follow a message or conversation sent through Tightbeam.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
@@ -2523,6 +2535,18 @@ fn parse_with_optional_catalog(
                 incident_id: parsed.positional[1].clone(),
             })
         }
+        "harness-health-retry" => {
+            let allowed = ["as", "as-user", "as-process"];
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-retry <incidentId>".to_owned());
+            }
+            Ok(Command::HarnessHealthRetry {
+                identity: identity(flags)?,
+                incident_id: parsed.positional[1].clone(),
+            })
+        }
         "artifact-content-fetch" => {
             if parsed.positional.len() != 2
                 || parsed.positional[1].is_empty()
@@ -2695,6 +2719,19 @@ fn parse_with_optional_catalog(
                     })
                 }
             }
+        }
+        "harklight-cover" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "session")
+                })
+            {
+                return Err("usage: tightbeam harklight-cover --session <handle>".to_owned());
+            }
+            Ok(Command::HarklightCover {
+                identity: identity(flags)?,
+                session: nonempty(flags, "session").ok_or("--session is required")?,
+            })
         }
         "harklight-follow" => {
             if parsed.positional.len() != 1
@@ -6466,11 +6503,13 @@ mod tests {
                 "harklight-retract",
                 "harklight-settle",
                 "harklight-follow",
+                "harklight-cover",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",
                 "harness-health-close-promotion",
                 "harness-health-evidence-other",
+                "harness-health-retry",
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",

@@ -1,0 +1,54 @@
+{
+  "format": 1,
+  "purpose": "prerelease-soak",
+  "predecessor": {
+    "version": "0.0.1",
+    "build": 1,
+    "source_prefix": "0000000",
+    "build_id": "sha256-0000000000000000000000000000000000000000000000000000000000000000",
+    "schema": "example-schema-1"
+  },
+  "release": {
+    "version": "0.0.2",
+    "build": 2,
+    "tag": "v0.0.2+2",
+    "source_commit": "1111111111111111111111111111111111111111",
+    "package": "tightbeam-0.0.2-linux-x86_64-1111111.tgz",
+    "package_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "build_id": "sha256-1111111111111111111111111111111111111111111111111111111111111111",
+    "checksums_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "provenance_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "schema": "example-schema-2",
+    "schema_effect": "Example only: a new schema stamp would be expected after the first boot.",
+    "startup_effects": "Example only: list any connector or client file changes before approval."
+  },
+  "paths": {
+    "root": "/opt/tightbeam",
+    "current": "/opt/tightbeam/current",
+    "base": "/var/lib/tightbeam",
+    "database": "/var/lib/tightbeam/state.db",
+    "backup_parent": "/var/backups/tightbeam",
+    "backup": "/var/backups/tightbeam/example-release-2",
+    "log": "/var/log/tightbeam/example-release-2.log",
+    "job_dir": "/var/lib/tightbeam-maintenance/example-release-2",
+    "node": "/usr/bin/node"
+  },
+  "service": {
+    "gateway": "tightbeam.service",
+    "maintenance": "tightbeam-example-maintenance.service",
+    "user": "service",
+    "group": "service",
+    "working_directory": "/var/lib/tightbeam",
+    "stop_timeout_usec": "2min",
+    "start_timeout_usec": "1min 30s"
+  },
+  "preflight_files": [],
+  "required_paths": [
+    "/var/lib/tightbeam/state.db",
+    "/var/lib/tightbeam/gateway.json",
+    "/var/lib/tightbeam/identity",
+    "/var/lib/tightbeam/adapters",
+    "/var/lib/tightbeam/homes",
+    "/var/lib/tightbeam/state/users"
+  ]
+}
