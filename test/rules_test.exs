@@ -3781,16 +3781,19 @@ defmodule Tightbeam.RulesTest do
     assert question =~ "Session: #{no_context.session_key}"
     assert context =~ "stretch=initial:#{no_context.session_key}"
 
-    assert {:ok, [[main_session, notification_prompt]]} =
+    assert {:ok, [[main_session, notification_prompt], [deadline_session, deadline_prompt]]} =
              DB.query(
                ctx.db,
                "SELECT sessionKey,prompt FROM wakes WHERE origin='process:tightbeam' " <>
-                 "AND prompt LIKE ?1",
+                 "AND prompt LIKE ?1 ORDER BY dueAt,wakeId",
                ["%#{request_id}%"]
              )
 
     assert main_session == Org.personal_session_key("flynn")
     assert notification_prompt =~ question
+    assert deadline_session == main_session
+    assert deadline_prompt =~ question
+    assert deadline_prompt =~ raiser_id
 
     assert {:ok, [["running"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [no_context_seq])
@@ -3818,7 +3821,7 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[2]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE origin='process:tightbeam' AND prompt LIKE ?1",

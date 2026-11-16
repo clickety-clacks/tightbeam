@@ -146,12 +146,19 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert request.status == "open"
     assert request.deadline_wake_id == nil
 
-    assert [%{session_key: main, consumer: "prompt", target_gate: 0, state: "pending"} = wake] =
+    assert [
+             %{session_key: main, consumer: "prompt", target_gate: 0, state: "pending"} = wake,
+             %{session_key: main, consumer: "prompt", target_gate: 0, state: "pending"} =
+               deadline_wake
+           ] =
              notification_wakes(ctx.db)
 
     assert main == Org.personal_session_key("flynn")
     assert wake.prompt =~ request.id
     assert wake.prompt =~ "ship window?"
+    assert deadline_wake.due_at == request.deadline_at
+    assert deadline_wake.prompt =~ request.id
+    assert deadline_wake.prompt =~ request.raiser_id
   end
 
   ## Proof 4 — crash before delivery, boot recovery
