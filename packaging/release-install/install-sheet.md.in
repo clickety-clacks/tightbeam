@@ -2,7 +2,7 @@
 
 Before requesting installation, require a successful isolated rehearsal of this exact bundle at the supported database, WAL, archive and writer scale. The record must name this bundle's `SHA256SUMS` digest and measure the whole action, outage and failure boundaries. If it is absent or failed, record the exact gap and hold the install request. Do not substitute a smaller fixture or a prior job's result.
 
-The tagged release package `{package}` comes from source `{source}` and has SHA-256 `{package_sha}`. Its release provenance names the tag, exact source commit, workflow and package. The maintenance job has SHA-256 `{job_sha}`. The launcher has SHA-256 `{launcher_sha}`. The exact manifest has SHA-256 `{manifest_sha}`; `SHA256SUMS` verifies all bundle files before staging. The supported installed predecessor is Tightbeam {old_version} build {old_build} with schema stamp `{old_schema}`. The expected post-migration stamp is `{new_schema}`. Any build, schema, path, unit, package or hash mismatch stops before service control.
+The package `{package}` comes from source `{source}` and has SHA-256 `{package_sha}`. Its provenance names the exact source commit, workflow and package. The maintenance job has SHA-256 `{job_sha}`. The launcher has SHA-256 `{launcher_sha}`. The exact manifest has SHA-256 `{manifest_sha}`; `SHA256SUMS` verifies all bundle files before staging. The supported installed predecessor is Tightbeam {old_version} build {old_build} with schema stamp `{old_schema}`. The expected post-migration stamp is `{new_schema}`. Any build, schema, path, unit, package or hash mismatch stops before service control.
 
 {purpose_summary}
 

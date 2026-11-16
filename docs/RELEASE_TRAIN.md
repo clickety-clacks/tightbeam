@@ -23,10 +23,16 @@ checks for `0.1.*` branches remain for compatibility.
 3. The workflow checks that the dispatched SHA is the current `main` tip, runs
    the full Linux and macOS release test gates, builds both native packages,
    verifies the candidate evidence, and uploads the proof artifact
-   `release-candidate-proof-<sha>`. The artifact contains the canonical
-   manifest, `SHA256SUMS`, package files, and supporting build evidence.
-4. Treat the candidate as unpublished. No GitHub Release or release tag is
-   created by this workflow.
+   `release-candidate-proof-<sha>`. It contains the canonical manifest,
+   `SHA256SUMS`, raw package files and supporting build evidence. For `main`,
+   it also uploads `release-candidate-stage-<sha>` with selector-ready package
+   names and the identical package bytes, candidate manifest,
+   `release-provenance.json`, and `SHA256SUMS`. The candidate provenance has a
+   top-level `workflow` URL and binds the candidate run, workflow SHA, source
+   commit, planned release tag and proof-manifest hash.
+4. Treat the candidate as unpublished. The tag in candidate provenance is
+   metadata for the later publication step; this workflow creates no Git tag
+   or GitHub Release.
 
 The publisher accepts only a successful manual candidate run from `main`.
 Legacy candidate-branch runs are not eligible for publication. Keep `main` at
@@ -63,12 +69,13 @@ from `main` with these values:
 The publisher requires the approval SHA and soaked SHA to equal the candidate
 SHA. It verifies that the selected run completed successfully as a manual
 dispatch from `main`, and checks the run, source SHA, proof manifest, and
-`SHA256SUMS`. It downloads the proof artifact from that exact run, copies the
-verified package files into the release payload without rebuilding them, and
-rechecks the payload before creating the GitHub Release. The provenance records
-the candidate run, source SHA, proof-manifest hash, approval SHA, `healthy` soak,
-and publication run. The published assets include the same native package
-bytes, candidate manifest, checksums, and provenance.
+`SHA256SUMS`. It downloads both artifacts from that exact run, verifies the
+selector-ready stage against the proof, and copies those package files into the
+release payload without rebuilding them. It rechecks the payload before
+creating the GitHub Release. The provenance records the candidate run,
+candidate workflow, source SHA, proof-manifest hash, approval SHA, `healthy`
+soak, and publication workflow at top level. The published assets include the
+same native package bytes, candidate manifest, checksums, and provenance.
 
 Use an unused tag exactly in the form
 `v<major>.<minor>.<patch>+<build>`. Its version must match

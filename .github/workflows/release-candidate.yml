@@ -370,7 +370,34 @@ jobs:
             sha256sum release-candidate-manifest.json
           ) > evidence/SHA256SUMS
 
-      # No proof artifact exists unless metadata, both test jobs, and both package jobs passed.
+      - name: Create the selector-ready staging payload for a main candidate
+        if: needs.metadata.outputs.candidate_branch == 'main'
+        env:
+          CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cli/Cargo.toml)
+          build=$(git rev-list --count "$CANDIDATE_SHA")
+          release_tag="v$version+$build"
+          sh scripts/validate_release_tag.sh "$release_tag" "$CANDIDATE_SHA"
+          python3 scripts/verify_release_candidate_stage.py create \
+            --proof-manifest evidence/release-candidate-manifest.json \
+            --evidence-root evidence \
+            --stage-root candidate-stage \
+            --repository-root . \
+            --repository "$GITHUB_REPOSITORY" \
+            --server-url "$GITHUB_SERVER_URL" \
+            --run-id "$GITHUB_RUN_ID" \
+            --source-sha "$CANDIDATE_SHA" \
+            --workflow-sha "$WORKFLOW_SHA" \
+            --release-tag "$release_tag" \
+            --version "$version"
+          (
+            cd candidate-stage
+            sha256sum --check SHA256SUMS
+          )
+
+      # Neither candidate artifact exists unless metadata, both test jobs, and both package jobs passed.
       - uses: actions/upload-artifact@v4
         with:
           name: release-candidate-proof-${{ needs.metadata.outputs.candidate_sha }}
@@ -379,5 +406,13 @@ jobs:
             evidence/SHA256SUMS
             evidence/packages/
             evidence/toolchains/
+          retention-days: 90
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: needs.metadata.outputs.candidate_branch == 'main'
+        with:
+          name: release-candidate-stage-${{ needs.metadata.outputs.candidate_sha }}
+          path: candidate-stage/
           retention-days: 90
           if-no-files-found: error

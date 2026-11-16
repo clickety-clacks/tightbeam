@@ -782,8 +782,13 @@ For each release, manually dispatch `.github/workflows/release-candidate.yml`
 from `main` to build the final unpublished candidate from the exact release
 commit. Supply `candidate_branch=main` and the full SHA of the exact current
 `main` tip. The workflow refuses a different SHA, runs the full Linux and macOS
-test gates, builds both native packages, and uploads the candidate proof
-manifest and `SHA256SUMS`. It does not create a GitHub Release.
+test gates, builds both native packages, and uploads a proof artifact with the
+canonical manifest, package bytes and `SHA256SUMS`. For a main candidate it
+also uploads `release-candidate-stage-<sha>` with selector-ready package names,
+the same package bytes, candidate manifest, candidate provenance and
+`SHA256SUMS`. The top-level `workflow` field binds the candidate run; the
+planned release tag in that provenance is metadata only. Neither a Git tag nor
+a GitHub Release is created before the soak.
 
 Keep `main` at that candidate SHA through the install, soak, and publication.
 The release tag must be exactly `v<major>.<minor>.<patch>+<build>`: the version
@@ -801,11 +806,12 @@ environments. If the soak is `healthy`, manually dispatch
 and SHA, release tag, the matching install-approval SHA, `healthy` soak
 outcome, and the matching soaked SHA. The publisher rechecks the successful
 candidate run, manifest, and checksums, then publishes the downloaded package
-bytes without rebuilding them. It records the candidate, approval, soak,
-checksums, and publication run in release provenance. A failed candidate or
-unhealthy soak remains unpublished; fix the source through a reviewed change
-to `main` and build a fresh candidate. Release tags are immutable and must
-not be reused or moved.
+bytes from the selector-ready stage artifact without rebuilding them. It
+checks those bytes against the proof artifact, then records the candidate,
+approval, soak, checksums, and publication workflow at top level in the release
+provenance. A failed candidate or unhealthy soak remains unpublished; fix the
+source through a reviewed change to `main` and build a fresh candidate.
+Release tags are immutable and must not be reused or moved.
 
 Retain a broken published release. Put a do-not-install warning at the top of
 its notes naming the failure and safe replacement, and mark it prerelease so
