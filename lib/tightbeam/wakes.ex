@@ -4393,6 +4393,9 @@ defmodule Tightbeam.Wakes do
       sender_withdrew_own_notice?(command) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
+      sender_replaced_own_prod?(txn, command, wake) ->
+        {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
+
       scheduler_delivery_without_source?(command, wake) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
@@ -4412,6 +4415,27 @@ defmodule Tightbeam.Wakes do
        do: true
 
   defp sender_withdrew_own_notice?(_command), do: false
+
+  # A sender's prod revision replaces its message, not the assignment or work
+  # item mentioned by that message. A closed link must not block withdrawal.
+  defp sender_replaced_own_prod?(
+         txn,
+         %{
+           requester: %{kind: "process", id: "tightbeam:assignments"},
+           reason_kind: "superseded",
+           causal_source: %{kind: "wake", id: replacement_id},
+           outcome: %{kind: "replacement", replacement_wake_id: replacement_id}
+         },
+         wake
+       ) do
+    Tightbeam.QueuedMessageSuppression.same_prod_scope_in_txn(
+      txn,
+      wake.wake_id,
+      replacement_id
+    )
+  end
+
+  defp sender_replaced_own_prod?(_txn, _command, _wake), do: false
 
   defp decision_request_notice_clear?(
          txn,

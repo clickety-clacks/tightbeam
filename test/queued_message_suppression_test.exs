@@ -136,6 +136,68 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
              ])
   end
 
+  @tag prod_id_replacement: true
+  test "a prod replaces its predecessor after linked work closes", %{db: db} do
+    :ok = DB.execute(db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1)")
+    work_item!(db, "wi_prod_closed")
+
+    for {assignment_id, work_item_id, prod_id} <- [
+          {"asg_prod_closed", nil, "closed-assignment"},
+          {"asg_prod_closed_item", "wi_prod_closed", "closed-work-item"}
+        ] do
+      assignment!(db, assignment_id)
+
+      if work_item_id do
+        assert {:ok, _} =
+                 DB.query(db, "UPDATE assignments SET workItemId=?1 WHERE id=?2", [
+                   work_item_id,
+                   assignment_id
+                 ])
+      end
+
+      old =
+        Wakes.schedule(db, %{
+          session_key: "k1",
+          origin: "process:bridge",
+          prompt: "stale notice",
+          due_at: System.system_time(:millisecond) + 60_000,
+          sender_scheduled: true,
+          assignment_id: assignment_id,
+          prod_id: prod_id,
+          prod_sender: %{kind: "process", id: "bridge"}
+        })
+
+      assert %{assignment: %{state: "closed", outcome: "completed"}} =
+               Assignments.__handle__(db, "attest", %{
+                 principal: {:session, "k1"},
+                 origin: "session:k1",
+                 params: %{
+                   assignment_id: assignment_id,
+                   kind: "completion",
+                   note: "fixture completion"
+                 }
+               })
+
+      if work_item_id do
+        assert {:ok, _} =
+                 DB.query(db, "UPDATE work_items SET state='closed' WHERE id=?1", [work_item_id])
+      end
+
+      assert Wakes.get(db, old.wake_id).state == "pending"
+      newest = prod_wake!(db, "current notice", prod_id, "bridge", "k1", 120_000)
+      assert Wakes.get(db, old.wake_id).state == "canceled"
+      assert Wakes.get(db, newest.wake_id).state == "pending"
+      newest_id = newest.wake_id
+
+      assert {:ok, [["superseded", ^newest_id]]} =
+               DB.query(
+                 db,
+                 "SELECT reasonKind,replacementWakeId FROM wake_cancellations WHERE wakeId=?1",
+                 [old.wake_id]
+               )
+    end
+  end
+
   test "legacy liveness evidence does not suppress a stored notice", %{db: db} do
     assignment!(db, "asg_liveness")
     wake = liveness_wake!(db, "asg_liveness", "old liveness notice")
