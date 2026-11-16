@@ -30,10 +30,7 @@ actual_build=$(git rev-list --count "$tagged_sha")
   exit 1
 }
 
-case "$version" in
-  0.1.*) canonical_ref="refs/heads/$version" ;;
-  *) canonical_ref="refs/heads/main" ;;
-esac
+canonical_ref="refs/heads/main"
 
 canonical_sha=$(git ls-remote --heads origin "$canonical_ref" | awk 'NR == 1 {print $1}')
 [ -n "$canonical_sha" ] || {

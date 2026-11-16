@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       candidate_branch:
-        description: "Existing release-candidate/* branch"
+        description: "main or an existing release-candidate/* branch"
         required: true
         type: string
       candidate_sha:
@@ -41,18 +41,34 @@ jobs:
             echo "release candidate: candidate SHA must be exact lower-case 40-hex" >&2
             exit 1
           }
-          printf '%s\n' "$CANDIDATE_BRANCH" | grep -Eq '^release-candidate/[A-Za-z0-9._/-]+$' || {
-            echo "release candidate: invalid candidate branch" >&2
-            exit 1
-          }
           git check-ref-format "refs/heads/$CANDIDATE_BRANCH"
-          git fetch --no-tags origin \
-            "+refs/heads/0.1.*:refs/remotes/origin/0.1.*" \
-            "+refs/heads/$CANDIDATE_BRANCH:refs/remotes/origin/$CANDIDATE_BRANCH"
           [ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ]
-          [ "$(git rev-parse "refs/remotes/origin/$CANDIDATE_BRANCH")" = "$CANDIDATE_SHA" ]
-          protected_ref=$(sh scripts/highest_0_1_branch.sh)
-          base=$(git merge-base "$protected_ref" "$CANDIDATE_SHA")
+
+          if [ "$CANDIDATE_BRANCH" = main ]; then
+            [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || {
+              echo "release candidate: main candidates require manual dispatch" >&2
+              exit 1
+            }
+            [ "$CANDIDATE_SHA" = "$GITHUB_SHA" ] || {
+              echo "release candidate: main candidate SHA must match the dispatched main head" >&2
+              exit 1
+            }
+            git fetch --no-tags origin \
+              "+refs/heads/main:refs/remotes/origin/main"
+            base=$(git rev-parse "$CANDIDATE_SHA^")
+          else
+            printf '%s\n' "$CANDIDATE_BRANCH" | grep -Eq '^release-candidate/[A-Za-z0-9._/-]+$' || {
+              echo "release candidate: invalid candidate branch" >&2
+              exit 1
+            }
+            git fetch --no-tags origin \
+              "+refs/heads/0.1.*:refs/remotes/origin/0.1.*" \
+              "+refs/heads/$CANDIDATE_BRANCH:refs/remotes/origin/$CANDIDATE_BRANCH"
+            [ "$(git rev-parse "refs/remotes/origin/$CANDIDATE_BRANCH")" = "$CANDIDATE_SHA" ]
+            protected_ref=$(sh scripts/highest_0_1_branch.sh)
+            base=$(git merge-base "$protected_ref" "$CANDIDATE_SHA")
+          fi
+
           features=$(git rev-list --reverse --topo-order "$base..$CANDIDATE_SHA")
           [ -n "$features" ] || {
             echo "release candidate: candidate range is empty" >&2
