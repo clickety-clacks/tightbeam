@@ -146,6 +146,7 @@ defmodule Tightbeam.GatewayTurnFixture do
       end
 
       send(parent, {:prompt_started, self()})
+      send(parent, {:prompt_content, prompt})
 
       messages =
         case prompt do
