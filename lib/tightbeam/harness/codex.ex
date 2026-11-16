@@ -137,13 +137,7 @@ defmodule Tightbeam.Harness.Codex do
         config = [{"CODEX_CONFIG", config_json}]
 
         [
-          cmd:
-            Support.executable_selection_command(
-              binary,
-              "CODEX_PATH",
-              cli_binary(),
-              absolute_executable?: true
-            ),
+          cmd: [binary],
           env: [{"CODEX_HOME", home} | Keyword.fetch!(opts, :common_env) ++ config]
         ]
       else
@@ -155,13 +149,7 @@ defmodule Tightbeam.Harness.Codex do
         [
           cmd:
             ["ssh" | Support.ssh_opts()] ++
-              [target.host_config.ssh, "exec", "env" | remote_env] ++
-              Support.remote_executable_selection_command(
-                binary,
-                "CODEX_PATH",
-                cli_binary(),
-                absolute_executable?: true
-              ),
+              [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
           env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
         ]
       end

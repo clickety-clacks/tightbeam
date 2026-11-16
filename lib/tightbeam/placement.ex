@@ -1639,7 +1639,7 @@ defmodule Tightbeam.Placement do
   def harness_binary_probe(harness, cli_bin, opts \\ []) do
     module = Harness.module!(harness)
     base_dir = Keyword.get(opts, :base_dir, Path.dirname(cli_bin))
-    db = Keyword.get(opts, :db, DB)
+    db = opts |> Keyword.get(:db, DB) |> available_probe_db()
     host = Keyword.get(opts, :host, local_host_name())
 
     launch_path =
@@ -1695,6 +1695,18 @@ defmodule Tightbeam.Placement do
         else: target
 
     Harness.probe_cli(module, target)
+  end
+
+  defp available_probe_db(nil), do: nil
+
+  defp available_probe_db(server) do
+    case GenServer.whereis(server) do
+      pid when is_pid(pid) ->
+        if Process.alive?(pid), do: server
+
+      _ ->
+        nil
+    end
   end
 
   defp probe_launch_path(cli_bin, _base_dir, nil, _host) do

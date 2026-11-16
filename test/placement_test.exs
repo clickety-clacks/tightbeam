@@ -204,6 +204,22 @@ defmodule Tightbeam.PlacementTest do
              )
   end
 
+  test "harness binary probe falls back to PATH when the DB owner is unavailable", %{
+    base_dir: base_dir
+  } do
+    cli_bin = Path.join(base_dir, "bin")
+    executable = Path.join(base_dir, "cursor-agent")
+    unavailable_db = String.to_atom("missing_probe_db_#{System.unique_integer([:positive])}")
+
+    assert {:ok, %{bin: ^executable, version: "cursor 1.0"}} =
+             Placement.harness_binary_probe(:cursor, cli_bin,
+               base_dir: base_dir,
+               db: unavailable_db,
+               find_executable: fn "cursor-agent" -> executable end,
+               run: fn [^executable, "--version"] -> {"cursor 1.0\n", 0} end
+             )
+  end
+
   test "a bounded run that outlives its budget is a tagged timeout" do
     assert {:error, {:timeout, 10}} =
              Tightbeam.Harness.Support.bounded_run(fn _ -> Process.sleep(100) end, [], 10)
@@ -1263,6 +1279,31 @@ defmodule Tightbeam.PlacementTest do
     refute_receive {:unexpected_sh, _}
   end
 
+  test "codex adapter passes the explicit executable path without changing its command", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    explicit = Path.join(base_dir, "Codex Builds/codex")
+
+    assert {:ok, _} =
+             Placement.set_env_overlay(db, "testhost", "codex", "CODEX_PATH", explicit, "test")
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable"),
+      sh_out: &inventory_shell/1
+    }
+
+    opts = Placement.adapter_opts!(config, {:codex, "default", "testhost"})
+    expected_binary = Path.join([base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
+
+    assert opts[:cmd] == [expected_binary]
+    assert {"CODEX_PATH", explicit} in opts[:env]
+  end
+
   test "adapter_opts passes configured synthetic model data to launch preparation", %{
     base_dir: base_dir,
     db: db
@@ -1870,6 +1911,11 @@ defmodule Tightbeam.PlacementTest do
       }
     })
 
+    explicit = "/opt/codex builds/codex"
+
+    assert {:ok, _} =
+             Placement.set_env_overlay(db, "worker", "codex", "CODEX_PATH", explicit, "test")
+
     sh = fn command ->
       if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
            Enum.any?(command, &String.contains?(&1, "cat")),
@@ -1904,6 +1950,7 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_MACHINE=worker",
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "PATH=/srv/tb/bin:$PATH",
+             "CODEX_PATH='/opt/codex builds/codex'",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
              "GH_CONFIG_DIR='/srv/tb/auth/github/gh'",
              "CODEX_CONFIG=#{Tightbeam.Harness.Support.shell_quote(inventory_config())}",
