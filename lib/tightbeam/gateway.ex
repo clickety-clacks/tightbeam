@@ -160,7 +160,10 @@ defmodule Tightbeam.Gateway do
 
   @doc false
   @spec children_after_preflight(config()) :: [Supervisor.child_spec() | {module(), term()}]
-  def children_after_preflight(config) do
+  def children_after_preflight(config),
+    do: DB.startup_wait(fn -> build_children_after_preflight(config) end)
+
+  defp build_children_after_preflight(config) do
     db = Map.get(config, :db, Tightbeam.DB)
     :ok = DB.assert_base_admitted!(db, config.base_dir)
     Identity.init_after_admission!(config.base_dir, db)
