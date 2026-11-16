@@ -60,7 +60,9 @@ defmodule Tightbeam.UnresponsiveBounceTest do
     assert notice =~ "original message remains queued"
 
     case first do
-      {:staged, source} -> assert source.state == "pending"
+      {:staged, source} ->
+        assert source.state == "pending"
+
       {:appended, _, _, _} ->
         assert {:ok, [["queued"]]} =
                  DB.query(ctx.db, "SELECT status FROM turns WHERE wakeId='w_unresponsive_source'")
@@ -118,7 +120,10 @@ defmodule Tightbeam.UnresponsiveBounceTest do
              )
 
     assert {:ok, [["queued"]]} =
-             DB.query(ctx.db, "SELECT status FROM turns WHERE wakeId='w_unresponsive_lane_source'")
+             DB.query(
+               ctx.db,
+               "SELECT status FROM turns WHERE wakeId='w_unresponsive_lane_source'"
+             )
 
     assert {:ok, [[notice]]} = bounce_prompts(ctx.db)
     assert notice =~ "lane is down"
@@ -138,7 +143,10 @@ defmodule Tightbeam.UnresponsiveBounceTest do
   end
 
   defp bounce_prompts(db) do
-    DB.query(db, "SELECT prompt FROM wakes WHERE wakeId LIKE 'w_unresponsive_%' AND origin='process:tightbeam'")
+    DB.query(
+      db,
+      "SELECT prompt FROM wakes WHERE wakeId LIKE 'w_unresponsive_%' AND origin='process:tightbeam'"
+    )
   end
 
   defp assert_source_queued(_db, _wake_id, {:staged, source}),
