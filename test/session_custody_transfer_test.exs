@@ -1,7 +1,17 @@
 defmodule Tightbeam.SessionCustodyTransferTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway, Model, Org, Schema, SessionCustodyTransfer, Wakes}
+  alias Tightbeam.{
+    DB,
+    Gateway,
+    Ledger,
+    Model,
+    NoticeBatcher,
+    Org,
+    Schema,
+    SessionCustodyTransfer,
+    Wakes
+  }
 
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
@@ -212,6 +222,95 @@ defmodule Tightbeam.SessionCustodyTransferTest do
              })
 
     assert rows(ctx.db, "SELECT COUNT(*) FROM session_reparent_events") == [[1]]
+  end
+
+  test "captured pending wake is delivered and its turn settles for the successor", ctx do
+    {:ok, _} =
+      DB.query(ctx.db, """
+      INSERT INTO harklight_wake_handles
+        (handle,sessionKey,host,state,createdAt,updatedAt)
+      VALUES ('captured-handle','old','synthetic-host','active',1,1)
+      """)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO harklight_wake_entries
+          (handle,eventId,feedCursor,senderId,messageId,entryKind,entryAuthor,rawLine,wakeId,capturedAt)
+        VALUES ('captured-handle','one',1,'sender','message','discussion','person','{}',?1,1)
+        """,
+        [ctx.wake_id]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO harklight_wake_deliveries(handle,eventId,sessionKey,wakeId)
+        VALUES ('captured-handle','one','old',?1)
+        """,
+        [ctx.wake_id]
+      )
+
+    assert %{"eventId" => _} =
+             SessionCustodyTransfer.handle(ctx.db, %{
+               principal: {:user, "owner"},
+               params: %{
+                 from_session_key: "old",
+                 to_session_key: "successor",
+                 idempotency_key: "deliver-captured"
+               }
+             })
+
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
+    scheduler = :"custody_scheduler_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {Wakes,
+         db: ctx.db,
+         name: scheduler,
+         tick_ms: 60_000,
+         deliver: fn wake ->
+           Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+             db: ctx.db,
+             wake_id: wake.wake_id,
+             sender: wake.origin,
+             target_gate: if(wake.target_gate == 0, do: nil, else: wake),
+             fire_wake_in_txn: wake.origin == "process:tightbeam",
+             wake_scheduler: scheduler
+           )
+         end},
+        id: scheduler
+      )
+    )
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [ctx.wake_id])
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, ctx.wake_id)
+
+    assert Wakes.get(ctx.db, ctx.wake_id).state == "fired"
+
+    assert rows(ctx.db, "SELECT currentRecipientSessionKey FROM harklight_wake_deliveries") ==
+             [["successor"]]
+
+    assert {:ok, [[seq, "successor", "queued"]]} =
+             DB.query(ctx.db, "SELECT seq,sessionKey,status FROM turns WHERE wakeId=?1", [
+               carrier_id
+             ])
+
+    assert {:ok, %{seq: ^seq} = turn} =
+             Ledger.claim_next(ctx.db, "successor", "custody-test")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    assert rows(ctx.db, "SELECT status FROM turns WHERE seq=#{seq}") == [["delivered"]]
   end
 
   test "parent cycle refuses the entire transfer", ctx do

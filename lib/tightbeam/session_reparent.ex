@@ -96,20 +96,40 @@ defmodule Tightbeam.SessionReparent do
           message: "incompatible session reparent predecessor for multi-assignment topology"
         )
 
-    [[version]] = Txn.q(txn, "PRAGMA schema_version")
-    :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
+    [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events")
 
-    Txn.q(
-      txn,
-      "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='session_reparent_events'",
-      [replacement]
-    )
+    holding_ddl =
+      String.replace(
+        replacement,
+        "CREATE TABLE session_reparent_events (",
+        "CREATE TABLE session_reparent_events_custody (",
+        global: false
+      )
 
-    if Txn.changes(txn) != 1,
-      do: raise(Tightbeam.Schema.ShapeError, message: "session reparent schema row changed")
+    :ok = Txn.exec(txn, holding_ddl)
 
-    :ok = Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
-    :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
+    :ok =
+      Txn.exec(
+        txn,
+        "INSERT INTO session_reparent_events_custody SELECT * FROM session_reparent_events"
+      )
+
+    [[^count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events_custody")
+    :ok = Txn.exec(txn, "DROP TABLE session_reparent_events")
+
+    # Restore the original name before dropping the holding table. Other
+    # schema objects read session_reparent_events while SQLite reparses them.
+    :ok = Txn.exec(txn, replacement)
+
+    :ok =
+      Txn.exec(
+        txn,
+        "INSERT INTO session_reparent_events SELECT * FROM session_reparent_events_custody"
+      )
+
+    [[^count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events")
+    :ok = Txn.exec(txn, "DROP TABLE session_reparent_events_custody")
+    :ok = Txn.exec(txn, @indexes_and_triggers_ddl)
     :ok
   end
 

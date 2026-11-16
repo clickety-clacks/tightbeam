@@ -2127,7 +2127,7 @@ defmodule Tightbeam.Schema do
            db,
            :session_custody_v1,
            [],
-           ["PRAGMA writable_schema = OFF"],
+           [],
            fn txn ->
              case Txn.q(txn, "SELECT shape FROM schema_stamp") do
                [[@closed_assignment_reconciliation_shape]] ->

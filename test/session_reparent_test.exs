@@ -717,6 +717,61 @@ defmodule Tightbeam.SessionReparentTest do
     assert :ok = Schema.ensure_all(legacy)
   end
 
+  test "populated predecessor reparent history rebuilds its unique index and retains replay",
+       ctx do
+    call = call(ctx.params)
+    original = SessionReparent.handle(ctx.db, call)
+    assert is_binary(original["eventId"])
+    before = rows(ctx.db, "SELECT * FROM session_reparent_events")
+
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_custody!(ctx.db)
+
+    # The historical fixture's SQL-only rewind is enough for empty tables.
+    # Materialize its predecessor UNIQUE index for this populated upgrade case.
+    assert {:ok, :ok} =
+             DB.migration_transaction(ctx.db, :populated_reparent_predecessor, [], [], fn txn ->
+               objects =
+                 Txn.q(
+                   txn,
+                   "SELECT sql FROM sqlite_master WHERE tbl_name='session_reparent_events' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name"
+                 )
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "CREATE TABLE session_reparent_events_holding AS SELECT * FROM session_reparent_events"
+                 )
+
+               :ok = Txn.exec(txn, "DROP TABLE session_reparent_events")
+               :ok = Txn.exec(txn, SessionReparent.predecessor_table_sql())
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "INSERT INTO session_reparent_events SELECT * FROM session_reparent_events_holding"
+                 )
+
+               :ok = Txn.exec(txn, "DROP TABLE session_reparent_events_holding")
+               Enum.each(objects, fn [sql] -> :ok = Txn.exec(txn, sql) end)
+               :ok
+             end)
+
+    assert rows(ctx.db, "PRAGMA integrity_check") == [["ok"]]
+    assert rows(ctx.db, "SELECT * FROM session_reparent_events") == before
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE schema_stamp SET shape='closed-assignment-cannot-proceed-reconciliation-v1-015',stampedAt=1"
+             )
+
+    assert :ok = Schema.ensure_all(ctx.db)
+    assert rows(ctx.db, "PRAGMA integrity_check") == [["ok"]]
+    assert rows(ctx.db, "SELECT * FROM session_reparent_events") == before
+    assert SessionReparent.handle(ctx.db, call) == original
+    assert count(ctx.db, "session_reparent_events") == 1
+  end
+
   defp accountable_fixture(ctx) do
     session(ctx.db, "lead")
     session(ctx.db, "coordinator", %{spawned_by: "lead"})

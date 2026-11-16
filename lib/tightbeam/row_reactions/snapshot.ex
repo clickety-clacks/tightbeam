@@ -150,6 +150,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
       "delivery_owner" => delivery_owner,
       "coordination_parent" => coordination_parent,
       "personal_session_key" => personal,
+      "current_opener" => current_opener,
       "opener_responsibility" =>
         DeliveryResponsibilities.responsibility_in_txn(
           txn,
