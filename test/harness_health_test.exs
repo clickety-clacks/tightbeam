@@ -3268,7 +3268,259 @@ defmodule Tightbeam.HarnessHealthTest do
     assert resolved_facts["hold"]["resolutionCorrelation"] == correlation
   end
 
-  test "recovery cycle records each route and releases only after all current routes succeed", ctx do
+  test "Codex usage-limit hold releases on its first successful recovery probe", ctx do
+    second_session = "agent:harness-health:codex-recovery-two"
+
+    Org.create(ctx.db, %{
+      session_key: second_session,
+      display_name: "Codex recovery two",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "coder",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("gpt-5")
+    })
+
+    failure_prompt = "Codex rate limit"
+
+    failure_turn =
+      fail_health_turn!(
+        ctx.db,
+        ctx.main_session,
+        "codex-rate-limit-recovery",
+        failure_prompt,
+        @captured_codex_rate_limit
+      )
+
+    assert {:ok, [[incident_id, "authoritative-provider"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT incidentId,evidenceKind FROM harness_health_observations WHERE correlationId=?1",
+               ["harness-turn:#{failure_turn.seq}:rate-limit-dead"]
+             )
+
+    assert is_binary(incident_id)
+    incident = HarnessHealth.get(ctx.db, incident_id)
+    assert incident.state == "open"
+
+    assert incident.harness == "codex"
+    assert incident.failureClass == "rate-limit-dead"
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+
+    second_failure_prompt = "Codex rate limit on the second session"
+
+    second_failure_turn =
+      fail_health_turn!(
+        ctx.db,
+        second_session,
+        "codex-rate-limit-recovery-two",
+        second_failure_prompt,
+        @captured_codex_rate_limit
+      )
+
+    assert {:ok, [[^incident_id, "authoritative-provider"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT incidentId,evidenceKind FROM harness_health_observations WHERE correlationId=?1",
+               ["harness-turn:#{second_failure_turn.seq}:rate-limit-dead"]
+             )
+
+    assert {:ok,
+            %{
+              "ownerUserId" => owner_user_id,
+              "routesComplete" => true,
+              "routes" => [route]
+            }} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.RowReactions.Snapshot.harness_health_hold(txn, incident.id)
+             end)
+
+    assert route["harness"] == "codex"
+
+    assert {:ok, [[cycle_one, _due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cycleId,dueAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [incident.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='rate_limit_reset'")
+
+    assert {:ok, ^cycle_one} =
+             Tightbeam.HarnessHealth.RecoverySchedule.retry_now(ctx.db, incident.id)
+
+    started_one = System.system_time(:millisecond)
+
+    assert {:ok, [[due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [
+                 incident.id
+               ]
+             )
+
+    assert due_at <= started_one
+
+    assert [%{"cycle_id" => ^cycle_one}] =
+             Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, started_one)
+
+    seed_running_recovery_checks!(
+      ctx.db,
+      incident.id,
+      cycle_one,
+      [route],
+      started_one,
+      owner_user_id || "system"
+    )
+
+    assert {:ok, {:released, release}} =
+             DB.transaction(ctx.db, fn txn ->
+               RecoveryCheck.record_result_in_txn(
+                 txn,
+                 incident.id,
+                 cycle_one,
+                 Tightbeam.HarnessHealth.RecoveryCheck.route_key(route),
+                 "succeeded",
+                 nil,
+                 started_one + 1
+               )
+             end)
+
+    assert release.harness == "codex"
+    assert release.host == "testhost"
+    assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+
+    assert {:ok, [[notice, session_key]]} =
+             DB.query(
+               ctx.db,
+               "SELECT prompt,sessionKey FROM wakes WHERE wakeId=?1",
+               ["w_harness_retry_" <> cycle_one]
+             )
+
+    assert session_key == ctx.main_session
+    assert notice =~ "fence was released"
+    assert notice =~ "codex on testhost"
+    assert notice =~ "probe succeeded"
+
+    start_supervised!({RecoveryLane, {ctx.db, self()}})
+
+    assert :ok =
+             Wakes.redeliver_cycle_release(
+               ctx.db,
+               release.correlation,
+               release.harness,
+               release.host
+             )
+
+    assert {:ok, [[first_redelivery_seq, "queued", ^failure_prompt, cycle_correlation]]} =
+             DB.query(
+               ctx.db,
+               "SELECT a.cycleReleaseTurnSeq,t.status,t.prompt,a.cycleReleaseCorrelation " <>
+                 "FROM health_redelivery_attempts a JOIN turns t ON t.seq=a.cycleReleaseTurnSeq " <>
+                 "WHERE a.sourceTurnSeq=?1",
+               [failure_turn.seq]
+             )
+
+    assert cycle_correlation == release.correlation
+
+    assert {:ok, [[second_redelivery_seq, "queued", ^second_failure_prompt, ^cycle_correlation]]} =
+             DB.query(
+               ctx.db,
+               "SELECT a.cycleReleaseTurnSeq,t.status,t.prompt,a.cycleReleaseCorrelation " <>
+                 "FROM health_redelivery_attempts a JOIN turns t ON t.seq=a.cycleReleaseTurnSeq " <>
+                 "WHERE a.sourceTurnSeq=?1",
+               [second_failure_turn.seq]
+             )
+
+    assert {:ok, first_resumed_turn} =
+             Ledger.claim_next(ctx.db, ctx.main_session, "codex-rate-limit-recovery")
+
+    assert first_resumed_turn.seq == first_redelivery_seq
+    assert first_resumed_turn.message_id == "codex-rate-limit-recovery"
+    assert first_resumed_turn.prompt == failure_prompt
+
+    assert {:ok, second_resumed_turn} =
+             Ledger.claim_next(ctx.db, second_session, "codex-rate-limit-recovery-two")
+
+    assert second_resumed_turn.seq == second_redelivery_seq
+    assert second_resumed_turn.message_id == "codex-rate-limit-recovery-two"
+    assert second_resumed_turn.prompt == second_failure_prompt
+  end
+
+  test "operator retry reports provider limit and credential refusal without releasing the fence", ctx do
+    failure_turn =
+      fail_health_turn!(
+        ctx.db,
+        ctx.main_session,
+        "codex-retry-notice",
+        "Codex usage limit",
+        @captured_codex_rate_limit
+      )
+
+    assert {:ok, [[incident_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT incidentId FROM harness_health_observations WHERE correlationId=?1",
+               ["harness-turn:#{failure_turn.seq}:rate-limit-dead"]
+             )
+
+    assert {:ok, %{"ownerUserId" => owner, "routes" => [route]}} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.RowReactions.Snapshot.harness_health_hold(txn, incident_id)
+             end)
+
+    for {provider_response, expected} <- [
+          {"You've hit your usage limit. Try again later.", "still over limit"},
+          {"HTTP 401: invalid token", "credential refused; sign in again"}
+        ] do
+      assert {:ok, cycle_id} =
+               Tightbeam.HarnessHealth.RecoverySchedule.retry_now(ctx.db, incident_id)
+
+      started_at = System.system_time(:millisecond)
+
+      assert [%{"cycle_id" => ^cycle_id}] =
+               Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, started_at)
+
+      seed_running_recovery_checks!(ctx.db, incident_id, cycle_id, [route], started_at, owner)
+
+      assert {:ok, :ok} =
+               DB.transaction(ctx.db, fn txn ->
+                 RecoveryCheck.record_result_in_txn(
+                   txn,
+                   incident_id,
+                   cycle_id,
+                   RecoveryCheck.route_key(route),
+                   "failed",
+                   provider_response,
+                   started_at + 1
+                 )
+               end)
+
+      assert HarnessHealth.get(ctx.db, incident_id).state == "open"
+      assert Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+
+      assert {:ok, [[notice, session_key]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT prompt,sessionKey FROM wakes WHERE wakeId=?1",
+                 ["w_harness_retry_" <> cycle_id]
+               )
+
+      assert session_key == ctx.main_session
+      assert notice =~ "fence remains in place"
+      assert notice =~ expected
+      assert notice =~ provider_response
+      if expected == "still over limit", do: refute(notice =~ "sign in")
+    end
+  end
+
+  test "recovery cycle records each route and releases only after all current routes succeed",
+       ctx do
     [first | _] = ctx.sessions
     assert {:ok, [[owner_user_id]]} =
              DB.query(ctx.db, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [first.session])

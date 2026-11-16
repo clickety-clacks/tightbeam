@@ -1,7 +1,7 @@
 defmodule Tightbeam.HarnessHealth.RecoveryCheck do
   @moduledoc false
 
-  alias Tightbeam.{DB, ErrorDiagnostic, EventLog, Homes, Placement, Wakes}
+  alias Tightbeam.{DB, ErrorDiagnostic, EventLog, Homes, Org, Placement, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
   alias Tightbeam.HarnessHealth.{RecoverySchedule, RecoveryScheduler}
@@ -802,6 +802,13 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
            )
          end) do
       {:ok, {:released, release}} ->
+        harness = if release.harness == "codex", do: :codex, else: :claude
+
+        Tightbeam.AdapterCoordinator.release_recovered_circuit(
+          Tightbeam.AdapterCoordinator,
+          {harness, "shared", release.host}
+        )
+
         Wakes.redeliver_cycle_release(
           db,
           release.correlation,
@@ -860,7 +867,13 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
 
           Tightbeam.RowReactions.remember_harness_health_recovery_check_in_txn(txn, check)
           if outcome == "uncheckable", do: warn_uncheckable_in_txn(txn, hold_id, "route capability unavailable", finished_at)
-          finalize_cycle_in_txn(txn, hold_id, cycle_id, finished_at)
+          operator_retry? = RecoverySchedule.operator_requested_in_txn?(txn, hold_id, cycle_id)
+          result = finalize_cycle_in_txn(txn, hold_id, cycle_id, finished_at)
+
+          if operator_retry? and cycle_finished_in_txn?(txn, hold_id, cycle_id),
+            do: notify_operator_retry_in_txn(txn, hold_id, cycle_id, org, result, finished_at)
+
+          result
         else
           :ok
         end
@@ -869,6 +882,53 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
         :ok
     end
   end
+
+  defp cycle_finished_in_txn?(txn, hold_id, cycle_id) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND outcome='running' LIMIT 1",
+      [hold_id, cycle_id]
+    ) == []
+  end
+
+  defp notify_operator_retry_in_txn(txn, hold_id, cycle_id, owner, result, at)
+       when is_binary(owner) and owner != "system" do
+    rows =
+      Txn.q(
+        txn,
+        "SELECT harness,host,model,outcome,errorExcerpt FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 ORDER BY routeKey",
+        [hold_id, cycle_id]
+      )
+
+    details =
+      Enum.map_join(rows, "\n", fn [harness, host, model, outcome, excerpt] ->
+        label = "#{harness} on #{host} (#{model})"
+
+        case {outcome, Tightbeam.HarnessHealth.classify_turn_failure(excerpt)} do
+          {"succeeded", _} -> "#{label}: probe succeeded"
+          {"failed", "rate-limit-dead"} -> "#{label}: still over limit; provider response: #{excerpt}"
+          {"failed", "auth-dead"} -> "#{label}: credential refused; sign in again. Provider response: #{excerpt}"
+          {"failed", _} -> "#{label}: probe failed; fence remains. Response: #{excerpt}"
+          {other, _} -> "#{label}: probe #{other}; fence remains. Response: #{excerpt || "none"}"
+        end
+      end)
+
+    summary =
+      if match?({:released, _}, result),
+        do: "The usage-limit fence was released; circuit recovery and parked-work redelivery are proceeding.",
+        else: "The usage-limit fence remains in place."
+
+    Wakes.schedule_in_txn(txn, %{
+      wake_id: "w_harness_retry_" <> cycle_id,
+      session_key: Org.personal_session_key(owner),
+      origin: "process:tightbeam",
+      prompt: "Usage-limit retry for incident #{hold_id} finished. #{summary}\n#{details}",
+      due_at: at,
+      target_gate: 1
+    })
+  end
+
+  defp notify_operator_retry_in_txn(_txn, _hold_id, _cycle_id, _owner, _result, _at), do: :ok
 
   defp finalize_cycle_in_txn(txn, hold_id, cycle_id, now) do
     running =
