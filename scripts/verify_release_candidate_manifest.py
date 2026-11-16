@@ -85,10 +85,12 @@ def validate_input(value: dict[str, Any]) -> None:
         refuse("candidate input: wrong schema")
     if not isinstance(value["repository"], str) or not value["repository"]:
         refuse("candidate input: repository is required")
-    if not isinstance(value["candidate_ref"], str) or not value["candidate_ref"].startswith(
-        "refs/heads/release-candidate/"
+    candidate_ref = value["candidate_ref"]
+    if not isinstance(candidate_ref, str) or not (
+        candidate_ref == "refs/heads/main"
+        or candidate_ref.startswith("refs/heads/release-candidate/")
     ):
-        refuse("candidate input: candidate_ref must name release-candidate/*")
+        refuse("candidate input: candidate_ref must name main or release-candidate/*")
     base = exact_sha(value["protected_base_sha"], "candidate input protected_base_sha")
     source = exact_sha(value["source_sha"], "candidate input source_sha")
     features = value["reviewed_feature_shas"]

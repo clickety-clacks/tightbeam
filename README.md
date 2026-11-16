@@ -769,36 +769,44 @@ mix run --no-halt                  # boots the gateway; creates state.db and bin
 
 ### Cutting a release
 
-`main` holds the latest approved release. Prepare each upcoming 0.1 release on
-its own version branch (currently `0.1.16`), not `main`. Set the version in
-`cli/Cargo.toml` on that branch. In the same reviewed change, re-check each
+`main` is the only long-lived development branch. Prepare release source through
+reviewed pull requests to `main`; do not use a version branch. Set the version
+in `cli/Cargo.toml` in the reviewed change. In the same change, re-check each
 external-agent skill that `tightbeam skill install` ships (listed in
 `cli/src/skills.rs`) against the new `tightbeam --help`, and update its
-`Written for Tightbeam <version>.` line. CI checks `scripts/verify_external_skills.py`
-on pull requests and pushes to `0.1.*` branches.
+`Written for Tightbeam <version>.` line. CI checks
+`scripts/verify_external_skills.py` on pull requests and retains push checks
+for existing `0.1.*` branches.
 
-Tag the approved release commit while checked out on its version branch. The tag
-must be exactly `v<major>.<minor>.<patch>+<build>`: the version must match
-`cli/Cargo.toml`, and the build number is `git rev-list --count` for the tagged
-commit. For the current 0.1 release, fast-forward to the branch tip and create
-the tag with:
+For each release, manually dispatch `.github/workflows/release-candidate.yml`
+from `main` to build the final unpublished candidate from the exact release
+commit. Supply `candidate_branch=main` and the full SHA of the exact current
+`main` tip. The workflow refuses a different SHA, runs the full Linux and macOS
+test gates, builds both native packages, and uploads the candidate proof
+manifest and `SHA256SUMS`. It does not create a GitHub Release.
 
-```sh
-release_branch=0.1.16 # replace with the 0.1.N branch for this release
-git fetch origin "$release_branch"
-git switch "$release_branch"
-git pull --ff-only origin "$release_branch"
-test "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$release_branch")"
+Keep `main` at that candidate SHA through the install, soak, and publication.
+The release tag must be exactly `v<major>.<minor>.<patch>+<build>`: the version
+must match `cli/Cargo.toml`, and the build number is `git rev-list --count`
+for the candidate commit. If `main` advances before publication, or a
+candidate check or soak fails, prepare a new candidate from the resulting
+current `main` tip.
 
-version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cli/Cargo.toml)
-build=$(git rev-list --count HEAD)
-tag="v${version}+${build}"
-git tag -a "$tag" -m "Tightbeam $tag"
-git push origin "$tag"
-```
+After the user separately approves installing that exact candidate SHA, install
+those bytes and complete the soak on the maintainers' production deployment.
+Every candidate or release installation requires the user's exact approval.
+The soak is the final check; other testing stays in CI and isolated
+environments. If the soak is `healthy`, manually dispatch
+`.github/workflows/publish-release.yml` from `main` with the candidate run ID
+and SHA, release tag, the matching install-approval SHA, `healthy` soak
+outcome, and the matching soaked SHA. The publisher rechecks the successful
+candidate run, manifest, and checksums, then publishes the downloaded package
+bytes without rebuilding them. It records the candidate, approval, soak,
+checksums, and publication run in release provenance. A failed candidate or
+unhealthy soak remains unpublished; fix the source through a reviewed change
+to `main` and build a fresh candidate. Release tags are immutable and must
+not be reused or moved.
 
-Pushing the tag starts the release workflow, which validates that it names the
-current version-branch tip, reruns the full Linux and macOS test gates, builds
-both packages, and creates a GitHub Release. After approval, merge the tagged
-release commit into `main` through the normal pull-request path. `main` is the
-approved release line, not the 0.1 candidate branch or tag target.
+Retain a broken published release. Put a do-not-install warning at the top of
+its notes naming the failure and safe replacement, and mark it prerelease so
+it cannot be latest. Delete it only for a leaked secret or legal problem.

@@ -70,6 +70,26 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert manifest == String.trim(manifest) <> "\n"
   end
 
+  test "main candidates are accepted only at the fetched main tip" do
+    fixture = git_fixture!()
+    git!(fixture.repo, ["push", "origin", "#{fixture.f2}:refs/heads/main"])
+    git!(fixture.repo, ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"])
+
+    {manifest, 0} =
+      command("sh", [@script, "--check", "main", fixture.base, fixture.f1, fixture.f2],
+        cd: fixture.repo
+      )
+
+    assert manifest =~ ~s("candidate_ref":"refs/heads/main")
+    assert manifest =~ ~s("source_sha":"#{fixture.f2}")
+
+    {stale, status} =
+      command("sh", [@script, "--check", "main", fixture.base, fixture.f1], cd: fixture.repo)
+
+    assert status != 0
+    assert stale =~ "is not the fetched main tip"
+  end
+
   test "preparation refuses dirty trees before it creates a branch" do
     fixture = git_fixture!()
     File.write!(Path.join(fixture.repo, "untracked"), "dirt")
@@ -202,6 +222,9 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
 
     assert workflow =~ ~s(- "release-candidate/**")
     assert workflow =~ "workflow_dispatch:"
+    assert workflow =~ "main or an existing release-candidate/* branch"
+    assert workflow =~ ~s(CANDIDATE_SHA" = "$GITHUB_SHA")
+    assert workflow =~ "+refs/heads/main:refs/remotes/origin/main"
     refute workflow =~ "tags:"
     assert workflow =~ "permissions:\n  contents: read"
     assert workflow =~ ~s(ref: ${{ needs.metadata.outputs.candidate_sha }})
@@ -249,6 +272,14 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert manifest =~ ~s("toolchains":[)
   end
 
+  test "manifest verifier accepts a main candidate", evidence do
+    fixture = proof_fixture!(evidence, "main")
+
+    assert {"", 0} = create_manifest(fixture)
+    assert {"", 0} = verify_manifest(fixture)
+    assert File.read!(fixture.manifest) =~ ~s("candidate_ref":"refs/heads/main")
+  end
+
   test "manifest verifier fails closed on wrong source and package hashes", evidence do
     fixture = proof_fixture!(evidence)
     assert {"", 0} = create_manifest(fixture)
@@ -293,7 +324,16 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
   end
 
   defp proof_fixture!(real_evidence) do
+    proof_fixture!(real_evidence, "release-candidate/proof")
+  end
+
+  defp proof_fixture!(real_evidence, candidate_branch) do
     fixture = git_fixture!()
+
+    if candidate_branch == "main" do
+      git!(fixture.repo, ["push", "origin", "#{fixture.f2}:refs/heads/main"])
+      git!(fixture.repo, ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"])
+    end
 
     git!(fixture.repo, [
       "remote",
@@ -305,7 +345,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     {candidate_input, 0} =
       command(
         "sh",
-        [@script, "--check", "release-candidate/proof", fixture.base, fixture.f1, fixture.f2],
+        [@script, "--check", candidate_branch, fixture.base, fixture.f1, fixture.f2],
         cd: fixture.repo
       )
 
@@ -334,7 +374,8 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
       evidence: evidence,
       manifest: Path.join(evidence, "release-candidate-manifest.json"),
       package: linux_package,
-      workflow_sha: String.duplicate("a", 40)
+      workflow_sha: String.duplicate("a", 40),
+      expected_ref: "refs/heads/#{candidate_branch}"
     })
   end
 
@@ -370,7 +411,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
       "--expected-repository",
       "clickety-clacks/tightbeam",
       "--expected-ref",
-      "refs/heads/release-candidate/proof",
+      fixture.expected_ref,
       "--expected-source-sha",
       source,
       "--expected-workflow-sha",

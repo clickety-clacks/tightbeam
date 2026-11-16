@@ -1,0 +1,233 @@
+name: publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: "Successful release-candidate workflow run ID"
+        required: true
+        type: string
+      candidate_sha:
+        description: "Exact 40-hex source commit on main"
+        required: true
+        type: string
+      release_tag:
+        description: "Release tag to create for this candidate"
+        required: true
+        type: string
+      install_approved_sha:
+        description: "Full candidate SHA that received separate approval for exact installation"
+        required: true
+        type: string
+      soak_outcome:
+        description: "Select healthy only after the exact candidate completes a production soak; a failed candidate must be fixed and rebuilt"
+        required: true
+        default: failed
+        type: choice
+        options: [failed, healthy]
+      soaked_sha:
+        description: "Full candidate SHA that completed the production soak"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    env:
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      INSTALL_APPROVED_SHA: ${{ inputs.install_approved_sha }}
+      SOAK_OUTCOME: ${{ inputs.soak_outcome }}
+      SOAKED_SHA: ${{ inputs.soaked_sha }}
+    steps:
+      - name: Validate exact candidate and release confirmations
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]] || {
+            echo "release: candidate run ID must contain decimal digits only" >&2
+            exit 1
+          }
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "release: candidate SHA must be exact lower-case 40-hex" >&2
+            exit 1
+          }
+          [ "$INSTALL_APPROVED_SHA" = "$CANDIDATE_SHA" ] || {
+            echo "release: install approval must name the exact candidate SHA" >&2
+            exit 1
+          }
+          [ "$SOAKED_SHA" = "$CANDIDATE_SHA" ] || {
+            echo "release: production soak must name the exact candidate SHA" >&2
+            exit 1
+          }
+          [ "$SOAK_OUTCOME" = healthy ] || {
+            echo "release: only a healthy production soak can be published" >&2
+            exit 1
+          }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify main commit and unused release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          sh scripts/validate_release_tag.sh "$RELEASE_TAG" "$CANDIDATE_SHA"
+          existing_tag=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")
+          [ -z "$existing_tag" ] || {
+            echo "release: tag already exists; refusing to replace a release" >&2
+            exit 1
+          }
+
+      - name: Verify successful candidate workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_json="$RUNNER_TEMP/candidate-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" > "$run_json"
+          test "$(jq -r '.id | tostring' "$run_json")" = "$CANDIDATE_RUN_ID"
+          test "$(jq -r '.event' "$run_json")" = workflow_dispatch
+          test "$(jq -r '.head_branch' "$run_json")" = main
+          test "$(jq -r '.head_sha' "$run_json")" = "$CANDIDATE_SHA"
+          test "$(jq -r '.status' "$run_json")" = completed
+          test "$(jq -r '.conclusion' "$run_json")" = success
+          workflow_id=$(jq -er '.workflow_id | tostring' "$run_json")
+          workflow_path=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id" --jq '.path')
+          test "$workflow_path" = .github/workflows/release-candidate.yml
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-proof-${{ inputs.candidate_sha }}
+          path: candidate-evidence
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify candidate proof and package checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd candidate-evidence
+            sha256sum --check SHA256SUMS
+          )
+          jq -e --arg repository "$GITHUB_REPOSITORY" --arg run "$CANDIDATE_RUN_ID" --arg sha "$CANDIDATE_SHA" '
+            .repository == $repository
+            and .run_id == $run
+            and .candidate_ref == "refs/heads/main"
+            and .source_sha == $sha
+            and .workflow_sha == $sha
+          ' candidate-evidence/release-candidate-manifest.json > /dev/null
+          python3 scripts/verify_release_candidate_manifest.py verify --manifest candidate-evidence/release-candidate-manifest.json --evidence-root candidate-evidence --repository-root . --expected-repository "$GITHUB_REPOSITORY" --expected-ref refs/heads/main --expected-source-sha "$CANDIDATE_SHA" --expected-workflow-sha "$CANDIDATE_SHA"
+
+      - name: Prepare release from the verified candidate bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity=${RELEASE_TAG#v}
+          version=${identity%%+*}
+          short_sha=${CANDIDATE_SHA::7}
+          darwin_source=$(find candidate-evidence/packages/darwin-aarch64 -maxdepth 1 -type f -name 'tightbeam-*.tgz' -print)
+          linux_source=$(find candidate-evidence/packages/linux-x86_64 -maxdepth 1 -type f -name 'tightbeam-*.tgz' -print)
+          [ "$(printf '%s\n' "$darwin_source" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ]
+          [ "$(printf '%s\n' "$linux_source" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ]
+
+          release_dir="$RUNNER_TEMP/release"
+          mkdir -p "$release_dir"
+          darwin="tightbeam-$version-darwin-aarch64-$short_sha.tgz"
+          linux="tightbeam-$version-linux-x86_64-$short_sha.tgz"
+          cp "$darwin_source" "$release_dir/$darwin"
+          cp "$linux_source" "$release_dir/$linux"
+          cp candidate-evidence/release-candidate-manifest.json "$release_dir/release-candidate-manifest.json"
+
+          (
+            cd "$release_dir"
+            sha256sum "$darwin" "$linux" release-candidate-manifest.json > SHA256SUMS
+            manifest_sha=$(sha256sum release-candidate-manifest.json | awk '{print $1}')
+            jq -n --arg repository "$GITHUB_REPOSITORY" --arg tag "$RELEASE_TAG" --arg commit "$CANDIDATE_SHA" --arg candidate_run "$CANDIDATE_RUN_ID" --arg candidate_workflow "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --arg manifest_sha "$manifest_sha" --arg install_approval_sha "$INSTALL_APPROVED_SHA" --arg soak_outcome "$SOAK_OUTCOME" --arg soak_sha "$SOAKED_SHA" --arg publication_run "$GITHUB_RUN_ID" --arg publication_workflow "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --arg darwin "$darwin" --arg linux "$linux" '
+              {
+                repository: $repository,
+                tag: $tag,
+                commit: $commit,
+                candidate: {
+                  run_id: $candidate_run,
+                  workflow: $candidate_workflow,
+                  proof_manifest_sha256: $manifest_sha
+                },
+                install_approval: {approved_source_sha: $install_approval_sha},
+                soak: {outcome: $soak_outcome, source_sha: $soak_sha},
+                publication: {run_id: $publication_run, workflow: $publication_workflow},
+                assets: [$darwin, $linux, "release-candidate-manifest.json"],
+                checksums: "SHA256SUMS"
+              }
+            ' > release-provenance.json
+          )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-payload-${{ inputs.candidate_sha }}
+          path: ${{ runner.temp }}/release/
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-payload-${{ inputs.candidate_sha }}
+          path: release
+
+      - name: Recheck release payload identity and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd release
+            sha256sum --check SHA256SUMS
+          )
+          jq -e --arg tag "$RELEASE_TAG" --arg sha "$CANDIDATE_SHA" --arg run "$CANDIDATE_RUN_ID" '
+            .tag == $tag
+            and .commit == $sha
+            and .candidate.run_id == $run
+            and .install_approval.approved_source_sha == $sha
+            and .soak.outcome == "healthy"
+            and .soak.source_sha == $sha
+          ' release/release-provenance.json > /dev/null
+
+      - name: Create the GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          token: ${{ github.token }}
+          tag_name: ${{ inputs.release_tag }}
+          target_commitish: ${{ inputs.candidate_sha }}
+          name: Tightbeam ${{ inputs.release_tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/tightbeam-*.tgz
+            release/release-candidate-manifest.json
+            release/SHA256SUMS
+            release/release-provenance.json
