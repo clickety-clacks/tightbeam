@@ -430,8 +430,10 @@ defmodule Tightbeam.AssignmentsTest do
 
       holder_verdict =
         attest_call({:session, "holder"}, assignment.id, "verdict")
-        |> put_in([:params, :verdict_kind], "reviewed-clean")
+        |> put_in([:params, :verdict_kind], "blocked")
         |> then(&handle(ctx, "attest", &1))
+
+      assert holder_verdict.fact.kind == "assignment-blocked"
 
       assert {:ok, [[_wake_id, "successor-opener", prompt]]} =
                DB.query(
@@ -449,10 +451,12 @@ defmodule Tightbeam.AssignmentsTest do
                  [assignment.id]
                )
 
-      _successor_verdict =
+      successor_verdict =
         attest_call({:session, "successor-opener"}, assignment.id, "verdict")
-        |> put_in([:params, :verdict_kind], "reviewed-clean")
+        |> put_in([:params, :verdict_kind], "blocked")
         |> then(&handle(ctx, "attest", &1))
+
+      assert successor_verdict.fact.kind == "assignment-blocked"
 
       assert {:ok, [[1]]} =
                DB.query(
