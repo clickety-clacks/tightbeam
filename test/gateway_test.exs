@@ -4395,6 +4395,36 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
+  @tag prod_id_replacement: true
+  test "wake handler derives prod sender identity from its principal", ctx do
+    wake = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))["wake"]
+    due_at = System.system_time(:millisecond) + 60_000
+
+    call = fn sender, prompt ->
+      %{
+        origin: "process:#{sender}",
+        principal: {:process, sender},
+        session_key: "k1",
+        params: %{prompt: prompt, at: due_at, prod_id: "page"}
+      }
+    end
+
+    first = wake.(call.("bridge", "first"))
+    other = wake.(call.("other", "other sender"))
+    latest = wake.(call.("bridge", "revised"))
+
+    assert Wakes.get(ctx.db, first.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, other.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, latest.wake_id).state == "pending"
+
+    assert {:ok, [["process", "bridge", "page"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT senderKind,senderId,prodId FROM queued_message_prod_requests WHERE wakeId=?1",
+               [latest.wake_id]
+             )
+  end
+
   test "process inspect includes ordinary session and wake visibility", ctx do
     base_dir = role_test_base("process-inspect")
     Archetypes.load!(base_dir)

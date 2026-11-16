@@ -72,6 +72,7 @@ pub enum Command {
         assignment_id: Option<String>,
         after_turn: bool,
         replace_queued: bool,
+        prod_id: Option<String>,
         idempotency_key: Option<String>,
         /// Sender-elected delivery class. The vocabulary is extensible, so the
         /// CLI validates only that a supplied name is non-empty.
@@ -823,6 +824,7 @@ COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
        [--after 30s|5m|2h] [--at <epochMs>] [--cron "<schedule>"] [--assignment <id>] [--replace-queued]
        [--class fyi|status-query|input-needed|blocker|algedonic]
+       [--prod-id <id>]
       Condition wake:
         tightbeam wake (--session <key> | --role <name> | --user <id>)
           --when-fact <kind> [--when-scope <scope>]
@@ -847,6 +849,8 @@ COMMANDS:
       It never resumes or replays prior work. The fact stamp reports why the prompt arrived.
       --replace-queued requires --assignment and asks delivery to cancel only your own
       eligible queued messages to that assignment's holder.
+      --prod-id replaces your older queued, undelivered prod with the same id to
+      the same session; the newest prompt and delivery time win.
       The accountable agent re-reads durable state and decides the next action.
       The fallback timer detects silence only; it does not select an action.
       A dependency predicate names conditions, optional bindings, and resolverRef.
@@ -2179,6 +2183,7 @@ fn parse_with_optional_catalog(
             let assignment_id = nonempty(flags, "assignment");
             let after_turn = flags.contains_key("after-turn");
             let replace_queued = flags.contains_key("replace-queued");
+            let prod_id = nonempty(flags, "prod-id");
             let wait = predicate.is_some() || after_turn;
 
             if condition_scope.is_some() && condition_kind.is_none() {
@@ -2216,6 +2221,14 @@ fn parse_with_optional_catalog(
                         .to_owned(),
                 );
             }
+            if flags.get("prod-id").is_some_and(|id| id.trim().is_empty()) {
+                return Err("--prod-id requires a non-empty id".to_owned());
+            }
+            if prod_id.is_some()
+                && (wait || condition_kind.is_some() || cron.is_some() || replace_queued)
+            {
+                return Err("--prod-id requires an ordinary prompt wake".to_owned());
+            }
             if predicate.is_some() && fallback_after_ms.is_none() && at.is_none() {
                 return Err(
                     "a predicate wake requires a fallback (--fallback-after / --at)".to_owned(),
@@ -2250,6 +2263,7 @@ fn parse_with_optional_catalog(
                 assignment_id,
                 after_turn,
                 replace_queued,
+                prod_id,
                 idempotency_key,
                 class: nonempty(flags, "class"),
             })
@@ -7053,6 +7067,7 @@ mod tests {
                 assignment_id: None,
                 after_turn: false,
                 replace_queued: false,
+                prod_id: None,
                 idempotency_key: Some("wake-1".to_owned()),
                 class: None,
             })
@@ -7084,6 +7099,7 @@ mod tests {
                 assignment_id: None,
                 after_turn: false,
                 replace_queued: false,
+                prod_id: None,
                 idempotency_key: None,
                 class: None,
             })
@@ -7181,6 +7197,7 @@ mod tests {
             Ok(Command::Wake {
                 assignment_id: Some(id),
                 replace_queued: true,
+            prod_id: None,
                 ..
             }) if id == "asg_a"
         ));
@@ -7210,6 +7227,58 @@ mod tests {
                 "continue",
             ])),
             Err("--replace-queued cannot be combined with --predicate or --after-turn".to_owned())
+        );
+    }
+
+    #[test]
+    fn prod_id_is_a_sender_elected_prompt_scope() {
+        assert!(matches!(
+            parse(strings(&[
+                "wake", "--session", "agent:holder", "--prod-id", "page",
+                "--after", "1m", "--prompt", "revised"
+            ])),
+            Ok(Command::Wake { prod_id: Some(id), prompt, .. })
+                if id == "page" && prompt == "revised"
+        ));
+        assert!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--prod-id",
+                "",
+                "--prompt",
+                "missing id"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--prod-id",
+                "   ",
+                "--prompt",
+                "blank id"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--prod-id",
+                "page",
+                "--when-fact",
+                "done",
+                "--fallback-after",
+                "1h",
+                "--prompt",
+                "protected"
+            ]))
+            .is_err()
         );
     }
 
@@ -7246,6 +7315,7 @@ mod tests {
                 assignment_id: Some("asg_a".to_owned()),
                 after_turn: false,
                 replace_queued: false,
+                prod_id: None,
                 idempotency_key: None,
                 class: None,
             })
@@ -7277,6 +7347,7 @@ mod tests {
                 assignment_id: Some("asg_a".to_owned()),
                 after_turn: true,
                 replace_queued: false,
+                prod_id: None,
                 idempotency_key: None,
                 class: None,
             })
@@ -8326,6 +8397,7 @@ mod tests {
                     assignment_id: None,
                     after_turn: false,
                     replace_queued: false,
+                    prod_id: None,
                     idempotency_key: None,
                     class: None,
                 },

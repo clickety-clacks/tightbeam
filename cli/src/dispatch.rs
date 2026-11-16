@@ -187,6 +187,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             assignment_id,
             after_turn,
             replace_queued,
+            prod_id,
             idempotency_key,
             class,
         } => {
@@ -216,6 +217,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if *replace_queued {
                 params.push("\"replaceQueued\":true".to_owned());
+            }
+            if let Some(value) = prod_id {
+                params.push(string_field("prodId", value));
             }
             for (name, value) in [
                 ("cron", cron),

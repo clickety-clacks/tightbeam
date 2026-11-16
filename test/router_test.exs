@@ -40,6 +40,15 @@ defmodule Tightbeam.Wire.RouterTest do
     def handle_call({:fire_matching, _fact_id}, _from, state), do: {:reply, :ok, state}
   end
 
+  @tag prod_id_replacement: true
+  test "wake prod id crosses the wire parameter boundary" do
+    assert %{prod_id: "page", prompt: "revised"} =
+             Router.atomize_params_for_test("wake", %{
+               "prodId" => "page",
+               "prompt" => "revised"
+             })
+  end
+
   test "unknown keys cannot create atoms or borrow another verb's parameters" do
     key = "unrecognized_wire_key_#{System.unique_integer([:positive])}"
     assert_raise ArgumentError, fn -> String.to_existing_atom(key) end
