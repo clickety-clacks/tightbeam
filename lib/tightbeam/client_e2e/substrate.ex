@@ -73,13 +73,16 @@ defmodule Tightbeam.ClientE2E.Substrate do
 
   @doc """
   Persisted batch paths for one staged human post, including its source identity,
-  membership, delivery wake and carrier turn. The joins deliberately start at
-  `staged_message_dedupes`: a staged post has no source-owned turn row.
+  membership, delivery wake and carrier turn. The source identity is retained on
+  its wake; direct posts have no batch membership and are not returned here.
   """
   @spec staged_post_members(base_dir(), String.t(), String.t()) :: [map()]
   def staged_post_members(base_dir, session_key, client_message_id) do
     query(base_dir, """
-    SELECT d.sourceWakeId, d.deviceId, d.clientMessageId, d.createdAt AS stagedAt,
+    SELECT source.wakeId AS sourceWakeId,
+           json_extract(source.sourceClientIdentity, '$.deviceId') AS deviceId,
+           json_extract(source.sourceClientIdentity, '$.clientMessageId') AS clientMessageId,
+           json_extract(source.sourceClientIdentity, '$.createdAt') AS stagedAt,
            member.memberId, member.batchId, member.state AS memberState,
            member.publicationSeq,
            batch.state AS batchState, batch.deliveryWakeId,
@@ -93,18 +96,19 @@ defmodule Tightbeam.ClientE2E.Substrate do
            history.deviceId AS historyDeviceId,
            history.clientMessageId AS historyClientMessageId,
            history.timestamp AS historyTimestamp
-    FROM staged_message_dedupes AS d
-    LEFT JOIN notice_batch_members AS member ON member.sourceWakeId = d.sourceWakeId
+    FROM messages AS history
+    JOIN wakes AS source INDEXED BY notice_source_client_identity
+      ON json_extract(source.sourceClientIdentity, '$.targetSessionKey') = history.sessionKey
+     AND json_extract(source.sourceClientIdentity, '$.deviceId') = history.deviceId
+     AND json_extract(source.sourceClientIdentity, '$.clientMessageId') = history.clientMessageId
+    JOIN notice_batch_members AS member ON member.sourceWakeId = source.wakeId
     LEFT JOIN notice_batches AS batch ON batch.batchId = member.batchId
     LEFT JOIN wakes AS carrier ON carrier.wakeId = batch.deliveryWakeId
     LEFT JOIN turns AS carrier_turn ON carrier_turn.seq = carrier.deliveredTurnSeq
-    LEFT JOIN messages AS history
-      ON history.sessionKey = d.targetSessionKey
-     AND history.deviceId = d.deviceId
-     AND history.clientMessageId = d.clientMessageId
-     AND history.role = 'user'
-    WHERE d.targetSessionKey = #{quote_string(session_key)}
-      AND d.clientMessageId = #{quote_string(client_message_id)}
+    WHERE source.sourceClientIdentity IS NOT NULL
+      AND history.sessionKey = #{quote_string(session_key)}
+      AND history.clientMessageId = #{quote_string(client_message_id)}
+      AND history.role = 'user'
     ORDER BY member.addedAt, member.memberId
     """)
   end
