@@ -99,6 +99,13 @@ Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 if missing_executable do
   empty_bin = Path.join(base, "empty-executable-path")
   File.mkdir_p!(empty_bin)
+
+  # Pi's conformance vector resolves ssh while constructing its expected argv.
+  # Keep that helper executable discoverable without permitting a remote call.
+  ssh = Path.join(empty_bin, "ssh")
+  File.write!(ssh, "#!/bin/sh\necho 'ssh: forbidden' >> \"$GUARD_TRIPWIRE\"\nexit 64\n")
+  File.chmod!(ssh, 0o755)
+
   System.put_env("PATH", empty_bin)
 
   # The refusal case must exclude managed adapter fallbacks as well as usable
