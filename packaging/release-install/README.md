@@ -4,9 +4,9 @@ Every native Tightbeam package carries this directory. It is a template, not
 permission to install a package. Render a fresh bundle for each tagged release
 and its exact supported installed predecessor.
 
-The release flow publishes a tagged candidate as a prerelease, kept out of the
-latest-release position during its production soak. That candidate is built
-and checked at its exact source commit by the normal release workflow. Its
+The normal release workflow builds and checks a tagged candidate at its exact
+source commit. Before a production soak, confirm the tagged GitHub Release is
+marked prerelease and is not the latest release. Its
 package, `SHA256SUMS` and `release-provenance.json` are the inputs to this
 renderer and to the existing selector. Candidate installation needs a separate
 exact whole-action yes. After a healthy soak, promote the same release with
