@@ -8,9 +8,20 @@ defmodule Tightbeam.IdentityTest do
     base = Path.join(System.tmp_dir!(), "tb-identity-#{System.unique_integer([:positive])}")
     source = Path.join(base, "source")
     runtime = Path.join(base, "runtime")
+    seed = Path.join(base, "seed")
+    product_guidance = Path.join(base, "product-guidance")
     write_source!(source, "role-v1", "skill-v1")
+    File.cp_r!(Application.app_dir(:tightbeam, "priv/seed"), seed)
+    File.cp_r!(Application.app_dir(:tightbeam, "priv/guidance"), product_guidance)
     previous = Application.get_env(:tightbeam, :identity_source_dir)
+    previous_seed = Application.get_env(:tightbeam, :identity_seed_dir)
+
+    previous_product_guidance =
+      Application.get_env(:tightbeam, :identity_product_guidance_dir)
+
     Application.put_env(:tightbeam, :identity_source_dir, source)
+    Application.put_env(:tightbeam, :identity_seed_dir, seed)
+    Application.put_env(:tightbeam, :identity_product_guidance_dir, product_guidance)
 
     on_exit(fn ->
       if previous do
@@ -19,10 +30,22 @@ defmodule Tightbeam.IdentityTest do
         Application.delete_env(:tightbeam, :identity_source_dir)
       end
 
+      if previous_seed do
+        Application.put_env(:tightbeam, :identity_seed_dir, previous_seed)
+      else
+        Application.delete_env(:tightbeam, :identity_seed_dir)
+      end
+
+      if previous_product_guidance do
+        Application.put_env(:tightbeam, :identity_product_guidance_dir, previous_product_guidance)
+      else
+        Application.delete_env(:tightbeam, :identity_product_guidance_dir)
+      end
+
       File.rm_rf!(base)
     end)
 
-    %{base: runtime, root: base, source: source}
+    %{base: runtime, root: base, source: source, seed: seed, product_guidance: product_guidance}
   end
 
   test "served bootstrap seeds exact identity and raw kungfu without notices", ctx do
@@ -65,13 +88,18 @@ defmodule Tightbeam.IdentityTest do
     refute_receive {:firehose_notice, _}
   end
 
-  test "neutral seed creates the exact three refs and all seed files", ctx do
+  test "neutral seed creates a product baseline and all current seed files", ctx do
     assert :initialized = Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")
     refs = git!(dir, ["branch", "--format=%(refname:short)"])
 
     assert MapSet.new(String.split(refs, "\n", trim: true)) ==
-             MapSet.new(["main", "tightbeam/live", "tightbeam/upstream"])
+             MapSet.new([
+               "main",
+               "tightbeam/live",
+               "tightbeam/product-baseline",
+               "tightbeam/upstream"
+             ])
 
     assert git!(dir, ["log", "--max-parents=0", "-1", "--format=%s", "main"]) ==
              "seed: neutral-identity"
@@ -160,7 +188,13 @@ defmodule Tightbeam.IdentityTest do
     assert identity_dir
            |> git!(["branch", "--format=%(refname:short)"])
            |> String.split("\n", trim: true)
-           |> MapSet.new() == MapSet.new(["main", "tightbeam/live", "tightbeam/upstream"])
+           |> MapSet.new() ==
+             MapSet.new([
+               "main",
+               "tightbeam/live",
+               "tightbeam/product-baseline",
+               "tightbeam/upstream"
+             ])
   end
 
   # Neutral identity points to the operating manual, which owns artifact custody.
@@ -495,6 +529,506 @@ defmodule Tightbeam.IdentityTest do
     refute File.exists?(Path.join(ctx.base, "identity/skills/role-skill"))
   end
 
+  test "product snapshots include the actual shipped operating manual", ctx do
+    previous_product_guidance =
+      Application.get_env(:tightbeam, :identity_product_guidance_dir)
+
+    Application.delete_env(:tightbeam, :identity_product_guidance_dir)
+
+    try do
+      manual_path = "guidance/operating-manual.md"
+      manual = File.read!(Application.app_dir(:tightbeam, "priv/#{manual_path}"))
+
+      assert Tightbeam.Archetypes.builtin_fragments()["operating-manual.md"] == manual
+      assert :initialized = Identity.init!(ctx.base)
+      assert {:ok, candidate} = Identity.learn!(ctx.base, "agentic-engineering", "test")
+
+      assert Identity.revision_file_bytes!(ctx.base, "tightbeam/product-incoming", manual_path) ==
+               manual
+
+      assert {:ok, revision} = Identity.publish_live!(ctx.base, candidate)
+      assert Identity.live_revision!(ctx.base) == revision
+      assert File.read!(Path.join([ctx.base, "identity", manual_path])) == manual
+
+      baseline =
+        git!(Path.join(ctx.base, "identity"), ["rev-parse", "tightbeam/product-baseline"])
+
+      assert baseline ==
+               git!(Path.join(ctx.base, "identity"), ["rev-parse", "tightbeam/upstream"])
+
+      assert Identity.revision_file_bytes!(ctx.base, baseline, manual_path) == manual
+    after
+      if previous_product_guidance do
+        Application.put_env(:tightbeam, :identity_product_guidance_dir, previous_product_guidance)
+      else
+        Application.delete_env(:tightbeam, :identity_product_guidance_dir)
+      end
+    end
+  end
+
+  test "relearn adopts seed and bundle updates while preserving org-only files", ctx do
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    baseline_before = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+    org_only = Path.join(dir, "guidance/operator-only.md")
+    File.write!(org_only, "organization-owned")
+    git!(dir, ["add", "--", "guidance/operator-only.md"])
+    git!(dir, ["commit", "-m", "identity: add org-only guidance"], "operator")
+
+    seed_updates =
+      [
+        "archetypes/default.toml",
+        "guidance/operating-model.md",
+        "rules/harness-health-recovery.toml",
+        "rules/harness-recovery-main-wake.toml"
+      ]
+      |> Map.new(fn relative ->
+        path = Path.join(ctx.seed, relative)
+        updated = File.read!(path) <> "\n# product update\n"
+        File.write!(path, updated)
+        {relative, updated}
+      end)
+
+    File.write!(Path.join(ctx.source, "guidance/coder.md"), "role-v2")
+
+    assert {:ok, revision} = relearn!(ctx.base, "relearn operator")
+    assert revision == Identity.live_revision!(ctx.base)
+    assert File.read!(Path.join(dir, "guidance/coder.md")) == "role-v2"
+    assert File.read!(Path.join(dir, "guidance/operator-only.md")) == "organization-owned"
+
+    Enum.each(seed_updates, fn {relative, expected} ->
+      assert File.read!(Path.join(dir, relative)) == expected
+    end)
+
+    baseline_after = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+    assert baseline_after == git!(dir, ["rev-parse", "tightbeam/upstream"])
+    assert git!(dir, ["rev-parse", "#{baseline_after}^1"]) == baseline_before
+
+    refute git!(dir, ["branch", "--list", "tightbeam/product-incoming"]) =~
+             "tightbeam/product-incoming"
+  end
+
+  test "conflicting seed edits preserve org bytes and product refs until abort", ctx do
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    path = "guidance/operating-model.md"
+    organization_bytes = "organization operating model\n"
+    product_bytes = "updated product operating model\n"
+    File.write!(Path.join(dir, path), organization_bytes)
+    git!(dir, ["add", "--", path])
+    git!(dir, ["commit", "-m", "identity: customize operating model"], "operator")
+
+    live_before = Identity.live_revision!(ctx.base)
+    upstream_before = git!(dir, ["rev-parse", "tightbeam/upstream"])
+    baseline_before = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+    File.write!(Path.join(ctx.seed, path), product_bytes)
+
+    assert {:conflict, [^path]} = relearn!(ctx.base, "relearn operator")
+    assert Identity.live_revision!(ctx.base) == live_before
+    assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
+    assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) == baseline_before
+    assert Identity.status(ctx.base).conflicting_paths == [path]
+
+    assert :ok = Identity.abort_relearn!(ctx.base)
+    assert Identity.live_revision!(ctx.base) == live_before
+    assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
+    assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) == baseline_before
+    assert File.read!(Path.join(dir, path)) == organization_bytes
+
+    assert {_, 1} =
+             System.cmd(
+               "git",
+               ["show-ref", "--verify", "--quiet", "refs/heads/tightbeam/product-incoming"],
+               cd: dir
+             )
+  end
+
+  test "relearn merges shipped manual edits against its recorded product base", ctx do
+    manual_path = "guidance/operating-manual.md"
+    manual_v1 = "alpha\nbeta\ngamma\n"
+    File.write!(Path.join(ctx.product_guidance, "operating-manual.md"), manual_v1)
+    learn_test_bundle!(ctx)
+
+    dir = Path.join(ctx.base, "identity")
+    manual = Path.join(dir, manual_path)
+    organization_manual = "organization-alpha\nbeta\ngamma\n"
+    File.write!(manual, organization_manual)
+    git!(dir, ["add", "--", manual_path])
+    git!(dir, ["commit", "-m", "identity: customize the operating manual"], "operator")
+
+    manual_v2 = "alpha\nbeta\nproduct-gamma\n"
+    File.write!(Path.join(ctx.product_guidance, "operating-manual.md"), manual_v2)
+
+    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+    assert File.read!(manual) == "organization-alpha\nbeta\nproduct-gamma\n"
+
+    baseline = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+    assert baseline == git!(dir, ["rev-parse", "tightbeam/upstream"])
+    assert Identity.revision_file_bytes!(ctx.base, baseline, manual_path) == manual_v2
+  end
+
+  test "shipped operating-manual override conflicts when its product base is unavailable", ctx do
+    previous_product_guidance =
+      Application.get_env(:tightbeam, :identity_product_guidance_dir)
+
+    Application.delete_env(:tightbeam, :identity_product_guidance_dir)
+
+    try do
+      manual_path = "guidance/operating-manual.md"
+      assert :initialized = Identity.init!(ctx.base)
+      dir = Path.join(ctx.base, "identity")
+      org_manual = "organization copy from the prior product\n"
+      File.write!(Path.join(dir, manual_path), org_manual)
+      git!(dir, ["add", "--", manual_path])
+      git!(dir, ["commit", "-m", "identity: retain older operating manual"], "operator")
+
+      live_before = Identity.live_revision!(ctx.base)
+      upstream_before = git!(dir, ["rev-parse", "tightbeam/upstream"])
+      baseline_before = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+
+      incoming_manual =
+        File.read!(Application.app_dir(:tightbeam, "priv/#{manual_path}"))
+
+      assert {:conflict, [^manual_path]} =
+               Identity.learn!(ctx.base, "agentic-engineering", "test")
+
+      assert Identity.revision_file_bytes!(ctx.base, "tightbeam/product-incoming", manual_path) ==
+               incoming_manual
+
+      assert [
+               %{"path" => ^manual_path, "base_source" => "historical-base-unavailable"} =
+                 conflict
+             ] =
+               Identity.provenance_conflicts(ctx.base)
+
+      assert conflict["base"]["present"] == false
+      assert conflict["org"]["present"] and conflict["incoming"]["present"]
+      assert Identity.status(ctx.base).live_revision == live_before
+      assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
+      assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) == baseline_before
+      assert File.read!(Path.join(dir, manual_path)) == org_manual
+
+      assert :ok = Identity.abort_relearn!(ctx.base)
+      assert Identity.live_revision!(ctx.base) == live_before
+      assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
+      assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) == baseline_before
+      assert File.read!(Path.join(dir, manual_path)) == org_manual
+    after
+      if previous_product_guidance do
+        Application.put_env(:tightbeam, :identity_product_guidance_dir, previous_product_guidance)
+      else
+        Application.delete_env(:tightbeam, :identity_product_guidance_dir)
+      end
+    end
+  end
+
+  test "a deleted shipped manual conflicts when its prior product base is unavailable", ctx do
+    previous_product_guidance =
+      Application.get_env(:tightbeam, :identity_product_guidance_dir)
+
+    Application.delete_env(:tightbeam, :identity_product_guidance_dir)
+
+    try do
+      manual_path = "guidance/operating-manual.md"
+      assert :initialized = Identity.init!(ctx.base)
+      dir = Path.join(ctx.base, "identity")
+      manual = Path.join(dir, manual_path)
+
+      File.write!(manual, "legacy organization manual\n")
+      git!(dir, ["add", "--", manual_path])
+      git!(dir, ["commit", "-m", "identity: add legacy manual"], "operator")
+
+      File.rm!(manual)
+      git!(dir, ["add", "-A", "--", manual_path])
+      git!(dir, ["commit", "-m", "identity: delete legacy manual"], "operator")
+
+      live_before = Identity.live_revision!(ctx.base)
+      upstream_before = git!(dir, ["rev-parse", "tightbeam/upstream"])
+      baseline_before = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+      incoming_manual = File.read!(Application.app_dir(:tightbeam, "priv/#{manual_path}"))
+
+      assert {:conflict, [^manual_path]} =
+               Identity.learn!(ctx.base, "agentic-engineering", "test")
+
+      assert Identity.revision_file_bytes!(ctx.base, "tightbeam/product-incoming", manual_path) ==
+               incoming_manual
+
+      assert [
+               %{"path" => ^manual_path, "base_source" => "historical-base-unavailable"} =
+                 conflict
+             ] =
+               Identity.provenance_conflicts(ctx.base)
+
+      assert conflict["base"]["present"] == false
+      assert conflict["org"]["present"] == false
+      assert conflict["incoming"]["present"]
+      assert Identity.live_revision!(ctx.base) == live_before
+      assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
+      assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) == baseline_before
+      refute File.exists?(manual)
+
+      assert :ok = Identity.abort_relearn!(ctx.base)
+      assert Identity.live_revision!(ctx.base) == live_before
+      assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
+      assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) == baseline_before
+
+      assert {_, 1} =
+               System.cmd(
+                 "git",
+                 ["show-ref", "--verify", "--quiet", "refs/heads/tightbeam/product-incoming"],
+                 cd: dir
+               )
+
+      refute File.exists?(manual)
+    after
+      if previous_product_guidance do
+        Application.put_env(:tightbeam, :identity_product_guidance_dir, previous_product_guidance)
+      else
+        Application.delete_env(:tightbeam, :identity_product_guidance_dir)
+      end
+    end
+  end
+
+  test "publishing an edit above an interrupted relearn advances product provenance", ctx do
+    path = "guidance/coder.md"
+    File.write!(Path.join(ctx.source, path), "alpha\nbeta\ngamma\n")
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    live_before = Identity.live_revision!(ctx.base)
+    upstream_before = git!(dir, ["rev-parse", "tightbeam/upstream"])
+    baseline_before = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+    product_v2 = "alpha\nbeta\nproduct-gamma\n"
+    File.write!(Path.join(ctx.source, path), product_v2)
+
+    assert {:ok, relearn_candidate} = Identity.relearn!(ctx.base, "relearn operator")
+    relearn_revision = relearn_candidate.candidate_revision
+    incoming = git!(dir, ["rev-parse", "tightbeam/product-incoming"])
+
+    assert git!(dir, ["rev-parse", "main"]) == relearn_revision
+    assert git!(dir, ["rev-parse", "tightbeam/live"]) == live_before
+    assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
+    assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) == baseline_before
+    assert git!(dir, ["rev-parse", "#{relearn_revision}^2"]) == incoming
+
+    organization_v2 = "organization-alpha\nbeta\nproduct-gamma\n"
+    edit_candidate = Identity.edit!(ctx.base, "coder", :guidance, organization_v2, "operator")
+    edit_revision = edit_candidate.candidate_revision
+
+    assert git!(dir, ["rev-parse", "#{edit_revision}^1"]) == relearn_revision
+    assert edit_candidate.expected_prior == live_before
+    assert {:ok, ^edit_revision} = Identity.publish_live!(ctx.base, edit_candidate)
+
+    assert git!(dir, ["rev-parse", "tightbeam/live"]) == edit_revision
+    assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == incoming
+    assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) == incoming
+    assert Identity.revision_file_bytes!(ctx.base, incoming, path) == product_v2
+    assert File.read!(Path.join(dir, path)) == organization_v2
+
+    File.write!(Path.join(ctx.source, path), "alpha\nbeta\nproduct-delta\n")
+    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+    assert File.read!(Path.join(dir, path)) == "organization-alpha\nbeta\nproduct-delta\n"
+  end
+
+  test "relearn preserves an org edit when product bytes are unchanged", ctx do
+    learn_test_bundle!(ctx)
+    path = "guidance/coder.md"
+    edit!(ctx.base, "coder", :guidance, "organization-owned", "operator")
+
+    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+    assert File.read!(Path.join(ctx.base, "identity/#{path}")) == "organization-owned"
+  end
+
+  test "relearn combines disjoint org and product edits from the recorded base", ctx do
+    File.write!(Path.join(ctx.source, "guidance/coder.md"), "alpha\nbeta\ngamma\n")
+    learn_test_bundle!(ctx)
+
+    edit!(
+      ctx.base,
+      "coder",
+      :guidance,
+      "organization-alpha\nbeta\ngamma\n",
+      "operator"
+    )
+
+    File.write!(Path.join(ctx.source, "guidance/coder.md"), "alpha\nbeta\nproduct-gamma\n")
+
+    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+
+    assert File.read!(Path.join(ctx.base, "identity/guidance/coder.md")) ==
+             "organization-alpha\nbeta\nproduct-gamma\n"
+  end
+
+  test "relearn accepts identical org and product edits from the recorded base", ctx do
+    File.write!(Path.join(ctx.source, "guidance/coder.md"), "alpha\nbeta\ngamma\n")
+    learn_test_bundle!(ctx)
+    shared = "shared-alpha\nbeta\ngamma\n"
+    edit!(ctx.base, "coder", :guidance, shared, "operator")
+    File.write!(Path.join(ctx.source, "guidance/coder.md"), shared)
+
+    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+    assert File.read!(Path.join(ctx.base, "identity/guidance/coder.md")) == shared
+  end
+
+  test "relearn adopts product path additions and deletions when org content is unchanged", ctx do
+    deleted_path = "guidance/product-retired.md"
+    File.write!(Path.join(ctx.source, deleted_path), "product guidance to retire")
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    added_path = "guidance/product-added.md"
+
+    File.write!(Path.join(ctx.source, added_path), "new product guidance")
+    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+    assert File.read!(Path.join(dir, added_path)) == "new product guidance"
+
+    File.rm!(Path.join(ctx.source, deleted_path))
+    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+    refute File.exists?(Path.join(dir, deleted_path))
+
+    receipt =
+      dir
+      |> Path.join("kungfu/agentic-engineering/installed.toml")
+      |> File.read!()
+      |> Toml.decode!()
+
+    assert added_path in receipt["paths"]
+    refute deleted_path in receipt["paths"]
+  end
+
+  test "relearn preserves an org deletion when product bytes are unchanged", ctx do
+    path = "guidance/product-optional.md"
+    File.write!(Path.join(ctx.source, path), "optional product guidance")
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    File.rm!(Path.join(dir, path))
+    git!(dir, ["add", "-A", "--", path])
+    git!(dir, ["commit", "-m", "identity: delete product guidance"], "operator")
+
+    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+    refute File.exists?(Path.join(dir, path))
+  end
+
+  test "legacy product history recovers unchanged seed bytes as the base", ctx do
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    git!(dir, ["update-ref", "-d", "refs/heads/tightbeam/product-baseline"])
+
+    File.write!(Path.join(ctx.seed, "guidance/operating-model.md"), "seed-v2")
+    File.write!(Path.join(ctx.source, "guidance/coder.md"), "product-v2")
+
+    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+    assert File.read!(Path.join(dir, "guidance/operating-model.md")) == "seed-v2"
+    assert File.read!(Path.join(dir, "guidance/coder.md")) == "product-v2"
+
+    assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) ==
+             git!(dir, ["rev-parse", "tightbeam/upstream"])
+  end
+
+  test "missing product history accepts identical bytes and records the exact new baseline",
+       ctx do
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    live_before = Identity.live_revision!(ctx.base)
+    prior_upstream = git!(dir, ["rev-parse", "tightbeam/upstream"])
+    prior_tree = git!(dir, ["rev-parse", "#{prior_upstream}^{tree}"])
+    git!(dir, ["update-ref", "-d", "refs/heads/tightbeam/product-baseline"])
+
+    unrelated_product =
+      git!(dir, ["commit-tree", prior_tree, "-m", "synthetic unrelated product root"], "test")
+
+    git!(dir, ["update-ref", "refs/heads/tightbeam/upstream", unrelated_product])
+
+    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+    assert Identity.live_revision!(ctx.base) != live_before
+    baseline = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+    assert baseline == git!(dir, ["rev-parse", "tightbeam/upstream"])
+    assert git!(dir, ["rev-parse", "#{baseline}^{tree}"]) == prior_tree
+    assert Identity.provenance_conflicts(ctx.base) == []
+  end
+
+  test "missing product history reports provenance and abort preserves all published refs", ctx do
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    edit!(ctx.base, "coder", :guidance, "org-customized", "operator")
+    live_before = Identity.live_revision!(ctx.base)
+    baseline_before = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+    prior_upstream = git!(dir, ["rev-parse", "tightbeam/upstream"])
+    git!(dir, ["update-ref", "-d", "refs/heads/tightbeam/product-baseline"])
+
+    assert {_, 1} =
+             System.cmd(
+               "git",
+               ["show-ref", "--verify", "--quiet", "refs/heads/tightbeam/product-baseline"],
+               cd: dir
+             )
+
+    # Keep the exact prior product tree while making its history genuinely
+    # unrelated to the organization publication.
+    product_tree = git!(dir, ["rev-parse", "#{prior_upstream}^{tree}"])
+
+    unrelated_product =
+      git!(dir, ["commit-tree", product_tree, "-m", "synthetic unrelated product root"], "test")
+
+    git!(dir, ["update-ref", "refs/heads/tightbeam/upstream", unrelated_product])
+    upstream_before = git!(dir, ["rev-parse", "tightbeam/upstream"])
+
+    File.write!(Path.join(ctx.source, "guidance/coder.md"), "product-updated")
+    new_product_path = "guidance/new-product.md"
+    File.write!(Path.join(ctx.source, new_product_path), "new product bytes")
+
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil, guard_inputs: []})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    relearn = Tightbeam.Gateway.handlers(%{base_dir: ctx.base, db: db})["identity-relearn"]
+
+    assert %{
+             state: "relearn-conflicted",
+             conflicting_paths: ["guidance/coder.md", ^new_product_path],
+             provenance_conflicts: [content_conflict, addition_conflict],
+             live_revision: ^live_before
+           } =
+             relearn.(%{
+               origin: "process:test",
+               principal: {:process, "test"},
+               params: %{}
+             })
+
+    status = Identity.status(ctx.base)
+    assert status.live_revision == live_before
+    assert [content_conflict, addition_conflict] = status.provenance_conflicts
+    assert content_conflict["path"] == "guidance/coder.md"
+    assert content_conflict["base_source"] == "historical-base-unavailable"
+    assert content_conflict["org"]["present"] and is_binary(content_conflict["org"]["oid"])
+
+    assert content_conflict["incoming"]["present"] and
+             is_binary(content_conflict["incoming"]["oid"])
+
+    assert addition_conflict["path"] == new_product_path
+    assert addition_conflict["base_source"] == "historical-base-unavailable"
+    assert addition_conflict["org"]["present"] == false
+    assert addition_conflict["incoming"]["present"]
+
+    assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
+    assert File.read!(Path.join(dir, "guidance/coder.md")) == "org-customized"
+    assert :ok = Identity.abort_relearn!(ctx.base)
+    assert Identity.live_revision!(ctx.base) == live_before
+    assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
+
+    assert {_, 1} =
+             System.cmd(
+               "git",
+               ["show-ref", "--verify", "--quiet", "refs/heads/tightbeam/product-baseline"],
+               cd: dir
+             )
+
+    assert {_, 1} =
+             System.cmd(
+               "git",
+               ["show-ref", "--verify", "--quiet", "refs/heads/tightbeam/product-incoming"],
+               cd: dir
+             )
+
+    assert baseline_before != ""
+  end
+
   # A host with NO git identity anywhere: no global config, no system config, and
   # nothing in the environment. That is a fresh satellite, and it is where #58 was
   # found -- `relearn!` reported a phantom `{:conflict, []}` because git refused the
@@ -616,13 +1150,27 @@ defmodule Tightbeam.IdentityTest do
 
     edit!(ctx.base, "coder", :guidance, "local-change", "test")
     stable = Identity.live_revision!(ctx.base)
+    product_baseline = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+    upstream = git!(dir, ["rev-parse", "tightbeam/upstream"])
     File.write!(Path.join(ctx.source, "guidance/coder.md"), "source-change")
     assert {:conflict, ["guidance/coder.md"]} = relearn!(ctx.base, "test")
     assert Identity.live_revision!(ctx.base) == stable
+    assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) == product_baseline
+    assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream
+    assert git!(dir, ["rev-parse", "tightbeam/product-incoming"]) != ""
     assert stable != live
     assert Identity.status(ctx.base).state == :relearn_conflicted
     assert :ok = Identity.abort_relearn!(ctx.base)
     assert Identity.live_revision!(ctx.base) == stable
+    assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) == product_baseline
+    assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream
+
+    assert {_, 1} =
+             System.cmd(
+               "git",
+               ["show-ref", "--verify", "--quiet", "refs/heads/tightbeam/product-incoming"],
+               cd: dir
+             )
   end
 
   test "pending recovery loads published law and runs published checks without changing the merge",
@@ -843,15 +1391,28 @@ defmodule Tightbeam.IdentityTest do
     refute File.exists?(receipt_path)
   end
 
-  test "unlearn restores the pre-learn identity tree without empty directories", ctx do
+  test "unlearn retains the product manual and removes empty bundle directories", ctx do
     Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")
+    manual_path = "guidance/operating-manual.md"
     before = identity_tree(dir)
 
     assert {:ok, _revision} = learn!(ctx.base, "agentic-engineering", "operator")
+
+    product_manual =
+      Identity.revision_file_bytes!(ctx.base, "tightbeam/product-baseline", manual_path)
+
     assert unlearn!(ctx.base, "agentic-engineering", "operator")
 
-    assert identity_tree(dir) == before
+    assert File.read!(Path.join(dir, manual_path)) == product_manual
+
+    assert identity_tree(dir) ==
+             Enum.sort_by(
+               before ++ [{manual_path, {:file, product_manual}}],
+               &elem(&1, 0)
+             )
+
+    refute File.dir?(Path.join(dir, "kungfu"))
   end
 
   test "unlearn keeps a bundle-created directory populated by the org", ctx do
@@ -987,7 +1548,7 @@ defmodule Tightbeam.IdentityTest do
     assert traversal.message =~ "available bundles: agentic-engineering"
   end
 
-  test "legacy enriched roots mint one receipt without changing their seed-owned paths", ctx do
+  test "legacy enriched roots preserve seed choices when product provenance is ambiguous", ctx do
     dir = build_legacy_org!(ctx)
     enriched_default = File.read!(Path.join(dir, "archetypes/default.toml"))
 
@@ -1002,8 +1563,60 @@ defmodule Tightbeam.IdentityTest do
            |> String.split("\n", trim: true)
            |> Enum.count(&(&1 == "learn-receipt: agentic-engineering")) == 1
 
-    assert {:ok, _revision} = relearn!(ctx.base, "operator")
+    live_before = Identity.live_revision!(ctx.base)
+
+    conflicts = [
+      "archetypes/default.toml",
+      "guidance/operating-manual.md",
+      "rules/harness-health-recovery.toml",
+      "rules/harness-recovery-main-wake.toml"
+    ]
+
+    assert {:conflict, ^conflicts} = relearn!(ctx.base, "operator")
+    assert Identity.live_revision!(ctx.base) == live_before
+
+    provenance_conflicts = Identity.status(ctx.base).provenance_conflicts
+    assert Enum.sort(Enum.map(provenance_conflicts, & &1["path"])) == Enum.sort(conflicts)
+
+    expected_base_sources = %{
+      "archetypes/default.toml" => "legacy-upstream-history",
+      "guidance/operating-manual.md" => "historical-base-unavailable",
+      "rules/harness-health-recovery.toml" => "historical-base-unavailable",
+      "rules/harness-recovery-main-wake.toml" => "historical-base-unavailable"
+    }
+
+    assert Map.new(provenance_conflicts, &{&1["path"], &1["base_source"]}) ==
+             expected_base_sources
+
+    assert Map.new(provenance_conflicts, &{&1["path"], &1["base"]["present"]}) == %{
+             "archetypes/default.toml" => true,
+             "guidance/operating-manual.md" => false,
+             "rules/harness-health-recovery.toml" => false,
+             "rules/harness-recovery-main-wake.toml" => false
+           }
+
+    Enum.each(tl(conflicts), fn path ->
+      refute File.exists?(Path.join(dir, path))
+    end)
+
+    File.write!(Path.join(dir, "archetypes/default.toml"), enriched_default)
+    git!(dir, ["add", "--", "archetypes/default.toml"])
+
+    Enum.each(tl(conflicts), fn path ->
+      git!(dir, ["add", "-A", "--", path])
+    end)
+
+    assert resolve_relearn!(ctx.base, "operator")
+    assert Identity.live_revision!(ctx.base) != live_before
+
+    assert git!(dir, ["rev-parse", "tightbeam/product-baseline"]) ==
+             git!(dir, ["rev-parse", "tightbeam/upstream"])
+
     assert File.read!(Path.join(dir, "archetypes/default.toml")) == enriched_default
+
+    Enum.each(tl(conflicts), fn path ->
+      refute File.exists?(Path.join(dir, path))
+    end)
 
     receipt =
       dir

@@ -29,7 +29,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert Archetypes.init_identity!(ctx.base_dir) == :initialized
     identity_dir = Path.join(ctx.base_dir, "identity")
 
-    for ref <- ["tightbeam/upstream", "main", "tightbeam/live"] do
+    for ref <- ["tightbeam/upstream", "main", "tightbeam/live", "tightbeam/product-baseline"] do
       assert {oid, 0} = System.cmd("git", ["rev-parse", ref], cd: identity_dir)
       assert String.trim(oid) != ""
     end
@@ -284,7 +284,9 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     assert role_guidance.("product-owner") =~ "have delivery ownership commission its\nbytes"
-    assert role_guidance.("pdo") =~ "You own landing order and branch health"
+    pdo_guidance = role_guidance.("pdo")
+    assert pdo_guidance =~ "You own landing order"
+    assert pdo_guidance =~ "branch health"
 
     for role <- ~w(product-owner orchestrator) do
       refute role_guidance.(role) =~ heading
@@ -408,7 +410,12 @@ defmodule Tightbeam.ArchetypesTest do
       snapshot =
         Identity.snapshot_at!(ctx.base_dir, Identity.live_revision!(ctx.base_dir), role, :codex)
 
-      assert Map.keys(snapshot.skills) == ["repository-retirement"]
+      expected_skills =
+        if role == "integrator",
+          do: ["landing", "repository-retirement"],
+          else: ["repository-retirement"]
+
+      assert Map.keys(snapshot.skills) |> Enum.sort() == expected_skills
       assert snapshot.guidance =~ "# How Tightbeam works"
       refute Regex.match?(~r/^#include/m, snapshot.guidance)
     end

@@ -5053,6 +5053,7 @@ defmodule Tightbeam.Gateway do
         %{
           state: "relearn-conflicted",
           conflicting_paths: paths,
+          provenance_conflicts: Identity.provenance_conflicts(config.base_dir),
           live_revision: Identity.live_revision!(config.base_dir)
         }
 
@@ -5253,6 +5254,7 @@ defmodule Tightbeam.Gateway do
           state: "relearn-conflicted",
           kungfu: call.params.name,
           conflicting_paths: paths,
+          provenance_conflicts: Identity.provenance_conflicts(config.base_dir),
           live_revision: Identity.live_revision!(config.base_dir)
         }
 
