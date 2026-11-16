@@ -237,6 +237,13 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.cast(server, {:close_adapter, key})
   end
 
+  @doc "Clear an open adapter circuit after a real recovery probe succeeds."
+  def release_recovered_circuit(server \\ __MODULE__, key) do
+    GenServer.call(server, {:release_recovered_circuit, key})
+  catch
+    :exit, reason -> {:error, {:coordinator_unavailable, reason}}
+  end
+
   @impl true
   def init(opts) do
     # Supervisor shutdown must reach terminate/2 before AdapterSupervisor goes
@@ -514,6 +521,27 @@ defmodule Tightbeam.AdapterCoordinator do
       true ->
         {:noreply, begin_readiness(key, entry, state, context, from)}
     end
+  end
+
+  def handle_call({:release_recovered_circuit, key}, _from, state) do
+    state =
+      case state.adapters[key] do
+        %{circuit: :open} = entry ->
+          if entry.timer, do: Process.cancel_timer(entry.timer)
+
+          put_in(state.adapters[key], %{
+            entry
+            | circuit: :closed,
+              failures: 0,
+              timer: nil,
+              last_failure: nil
+          })
+
+        _ ->
+          state
+      end
+
+    {:reply, :ok, state}
   end
 
   @impl true
