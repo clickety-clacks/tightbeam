@@ -193,6 +193,18 @@ defmodule Tightbeam.ToolCallsTest do
     assert item["content"] == terminal_content
     assert ended["payload"] == item
 
+    assert {:ok, [[raw_output_gzip, content_gzip]]} =
+             DB.query(
+               ctx.db,
+               "SELECT rawOutputGzip,contentGzip FROM tool_call_full_outputs WHERE toolCallId=?1",
+               [row.id]
+             )
+
+    assert :zlib.gunzip(raw_output_gzip) ==
+             StateResources.encode_json_value(%{"lines" => ["module Tightbeam.Gateway"]})
+
+    assert :zlib.gunzip(content_gzip) == StateResources.encode_json_value(terminal_content)
+
     item_bytes = StateResources.encode_item("tool calls", item)
     assert String.contains?(Publisher.encode_wire_notice(ended), "\"payload\":" <> item_bytes)
 
