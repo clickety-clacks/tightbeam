@@ -454,7 +454,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
   @tag :tmp_dir
   @tag :cold_executable_refusal
   @tag timeout: 60_000
-  test "cold startup refuses absent registered executables and leaves no serving child", %{
+  test "cold startup refuses unusable executables and leaves no serving child", %{
     tmp_dir: tmp
   } do
     plan = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "firehose_cold_restart.exs")
