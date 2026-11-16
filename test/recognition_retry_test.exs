@@ -33,12 +33,13 @@ defmodule Tightbeam.RecognitionRetryTest do
   end
 
   test "a slow boot migration keeps pending recognition uncounted until commit" do
-    base = Path.join(System.tmp_dir!(), "recognition-boot-#{Tightbeam.Id.uuid4()}")
-    File.mkdir_p!(base)
-    path = Path.join(base, "state.db")
-    on_exit(fn -> File.rm_rf!(base) end)
+    root = Path.join(System.tmp_dir!(), "recognition-boot-#{Tightbeam.Id.uuid4()}")
+    prepared = Tightbeam.GuardRuntimeFixture.prepare!(root, "schema_shape_runtime.exs")
+    path = Path.join(prepared.base, "state.db")
+    on_exit(fn -> File.rm_rf!(root) end)
 
-    {:ok, initial} = DB.start_link(path: path, name: nil, guard_inputs: [])
+    {:ok, initial} =
+      DB.start_link(path: path, name: nil, guard_inputs: [], payload_root: prepared.payload)
     :ok = Tightbeam.Schema.ensure_all(initial)
 
     {:ok, _} =
@@ -56,7 +57,7 @@ defmodule Tightbeam.RecognitionRetryTest do
       end)
 
     :ok = GenServer.stop(initial)
-    {:ok, db} = DB.start_link(path: path, name: nil, guard_inputs: [])
+    {:ok, db} = DB.start_link(path: path, name: nil, guard_inputs: [], payload_root: prepared.payload)
     on_exit(fn -> if Process.alive?(db), do: GenServer.stop(db) end)
     retry = :sys.get_state(db).retry
 
