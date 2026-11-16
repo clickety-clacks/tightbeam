@@ -2899,10 +2899,14 @@ defmodule Tightbeam.Wakes do
 
   defp request_unowned_agent_stretch_decision_in_txn(
          txn,
-         %{name: "ac6a-unassigned-agent-turn"},
+         %{name: name},
          call,
          evidence
-       ) do
+       )
+       when name in [
+              "ac6a-unassigned-agent-turn",
+              "agentic-engineering.ac6a-unassigned-agent-turn"
+            ] do
     session_key = Map.get(call.params, :session_key)
     caller_origin = Map.get(call.params, :caller_origin)
 
@@ -2924,7 +2928,7 @@ defmodule Tightbeam.Wakes do
           EventLog.lifecycle_in_txn(
             txn,
             "rule_notice_failed",
-            "ac6a-unassigned-agent-turn",
+            name,
             "operator decision request failed (#{code}): #{message}"
           )
 

@@ -16,6 +16,6 @@ record that the operator explicitly deferred it.
    in `identity/archetypes/<name>-role.toml`.
 5. What enforceable law protects this way of working?
    Destination: `identity/rails/<name>-example.toml`.
-6. Should `<name>-role` become the everyday default after adoption?
+6. Should `<name>.<name>-role` become the everyday default after adoption?
    Destination: apply the answer with
-   `tightbeam config set default-archetype <name>-role`.
+   `tightbeam config set default-archetype <name>.<name>-role`.

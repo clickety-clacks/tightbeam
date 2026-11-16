@@ -48,7 +48,10 @@ impl CommandContext {
             // than the shared RequestSpec dispatcher and attempt/receipt path.
             // Do not claim that this command has that metadata until its
             // dedicated transport callers are explicitly integrated.
-            IdentityCurrent | GithubAuthCheck | SessionConnect { .. } | SessionDiagnose { .. } => {
+            IdentityCurrent
+            | GithubAuthCheck { .. }
+            | SessionConnect { .. }
+            | SessionDiagnose { .. } => {
                 return None;
             }
             Help => ("cli.help", Catalog),
@@ -315,7 +318,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
     use Command::*;
     use EffectContract::*;
     match command {
-        IdentityCurrent | GithubAuthCheck | SessionConnect { .. } => Unknown,
+        IdentityCurrent | GithubAuthCheck { .. } | SessionConnect { .. } => Unknown,
         Help
         | CommandHelp(_)
         | Doctor { .. }
@@ -802,7 +805,12 @@ mod tests {
     #[test]
     fn local_commands_and_separate_tool_endpoint_cannot_borrow_dispatch_context() {
         assert!(CommandContext::for_command(&Command::IdentityCurrent).is_none());
-        assert!(CommandContext::for_command(&Command::GithubAuthCheck).is_none());
+        assert!(
+            CommandContext::for_command(&Command::GithubAuthCheck {
+                text_template: None
+            })
+            .is_none()
+        );
         let context = CommandContext::for_command(&Command::ToolCallObserved).unwrap();
         assert_eq!(
             context

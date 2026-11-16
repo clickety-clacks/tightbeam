@@ -99,7 +99,18 @@ try do
   :ok = DB.assert_base_admitted!(DB, base)
   stamp = hd(Tightbeam.Schema.guard_compatible_stamps())
   {:ok, [[^stamp]]} = DB.query(DB, "SELECT shape FROM schema_stamp", [])
-  ^identity_revision = Tightbeam.Identity.live_revision!(base)
+  migrated_identity_revision = Tightbeam.Identity.live_revision!(base)
+  true = is_binary(migrated_identity_revision)
+  false = migrated_identity_revision == identity_revision
+
+  seed_rails = Path.join(:code.priv_dir(:tightbeam), "seed/rails")
+
+  for filename <- ["github-auth.toml", "tightbeam-probe.toml"] do
+    expected = Toml.decode!(File.read!(Path.join(seed_rails, filename)))
+    actual = Toml.decode!(File.read!(Path.join([base, "identity", "rails", filename])))
+    ^expected = actual
+  end
+
   true = File.regular?(Path.join(base, "build-owner.json"))
   true = File.regular?(Path.join(base, "gateway.json"))
   {:ok, [[0]]} = DB.query(DB, "SELECT COUNT(*) FROM users", [])

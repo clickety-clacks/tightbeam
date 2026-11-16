@@ -373,9 +373,16 @@ defmodule Tightbeam.Identity do
     # Absence of the shipped file is a broken install: File.read! raises.
     catalog = revision_catalog!(identity_dir, revision)
 
-    manifest_path = "archetypes/#{archetype_name}.toml"
+    {manifest_path, qualified_archetype_name} =
+      archetype_manifest_at!(identity_dir, revision, archetype_name)
+
     manifest = git_show!(identity_dir, revision, manifest_path)
-    archetype = Archetypes.parse_manifest!(manifest, manifest_path)
+
+    archetype =
+      manifest
+      |> Archetypes.parse_manifest!(manifest_path)
+      |> Map.put(:name, qualified_archetype_name)
+
     substrate_skills = MapSet.new(Tightbeam.Homes.baseline_skill_names())
 
     skills =
@@ -753,8 +760,15 @@ defmodule Tightbeam.Identity do
     dir
     |> read_receipt!(revision, name)
     |> Map.fetch!(:paths)
-    |> Enum.filter(&(Path.dirname(&1) == "archetypes" and String.ends_with?(&1, ".toml")))
-    |> Enum.map(&(&1 |> Path.basename() |> Path.rootname()))
+    |> Enum.flat_map(fn path ->
+      case Path.split(path) do
+        ["archetypes", file] when is_binary(file) -> [file]
+        ["kungfu", ^name, "archetypes", file] when is_binary(file) -> [file]
+        _ -> []
+      end
+    end)
+    |> Enum.filter(&String.ends_with?(&1, ".toml"))
+    |> Enum.map(&Tightbeam.Identity.Provenance.qualify({:kungfu, name}, Path.rootname(&1)))
     |> Enum.sort()
   end
 
@@ -1284,10 +1298,20 @@ defmodule Tightbeam.Identity do
     bundle
     |> source_entries()
     |> Enum.map(fn {relative, bytes} ->
-      if relative in namespaced,
-        do: {Path.join(["kungfu", name, relative]), bytes},
-        else: {relative, bytes}
+      destination =
+        if relative in namespaced or bundle_item_path?(relative),
+          do: Path.join(["kungfu", name, relative]),
+          else: relative
+
+      {destination, bytes}
     end)
+  end
+
+  defp bundle_item_path?(relative) do
+    case Path.split(relative) do
+      [kind | _] when kind in ["archetypes", "rules", "rails"] -> true
+      _ -> false
+    end
   end
 
   # Declared sentinel commands, each checked to be a file the bundle ships.
@@ -1687,11 +1711,16 @@ defmodule Tightbeam.Identity do
     end
   end
 
-  defp edit_path(dir, archetype, :guidance),
-    do: Path.join([dir, "guidance", "#{archetype}.md"])
+  defp edit_path(dir, archetype, :guidance) do
+    {manifest_path, _qualified_name} = archetype_manifest_at!(dir, @live, archetype)
+    short_name = Path.basename(manifest_path, ".toml")
+    Path.join([dir, "guidance", "#{short_name}.md"])
+  end
 
-  defp edit_path(dir, archetype, :manifest),
-    do: Path.join([dir, "archetypes", "#{archetype}.toml"])
+  defp edit_path(dir, archetype, :manifest) do
+    {manifest_path, _qualified_name} = archetype_manifest_at!(dir, @live, archetype, true)
+    Path.join(dir, manifest_path)
+  end
 
   defp edit_path(dir, _archetype, {:skill, name, _remove?}) do
     validate_name!(name)
@@ -1783,8 +1812,7 @@ defmodule Tightbeam.Identity do
       |> MapSet.union(MapSet.new(Tightbeam.Homes.baseline_skill_names()))
 
     dir
-    |> Path.join("archetypes/*.toml")
-    |> Path.wildcard()
+    |> archetype_paths()
     |> Enum.each(fn path ->
       archetype = Archetypes.parse_manifest!(File.read!(path), Path.relative_to(path, dir))
       _ = Archetypes.guidance_render(archetype, catalog)
@@ -1806,9 +1834,11 @@ defmodule Tightbeam.Identity do
     end)
 
     dir
-    |> git_output!(["ls-tree", "-r", "--name-only", revision, "--", "archetypes"])
+    |> git_output!(["ls-tree", "-r", "--name-only", revision, "--", "archetypes", "kungfu"])
     |> String.split("\n", trim: true)
-    |> Enum.filter(&String.ends_with?(&1, ".toml"))
+    |> Enum.filter(fn path ->
+      String.ends_with?(path, ".toml") and archetype_identity_path?(path)
+    end)
     |> Enum.each(fn path ->
       archetype = Archetypes.parse_manifest!(git_show!(dir, revision, path), path)
       _ = Archetypes.guidance_render(archetype, catalog)
@@ -1844,13 +1874,87 @@ defmodule Tightbeam.Identity do
 
   defp skill_electors(dir, skill) do
     dir
-    |> Path.join("archetypes/*.toml")
-    |> Path.wildcard()
+    |> archetype_paths()
     |> Enum.flat_map(fn path ->
       archetype = Archetypes.parse_manifest!(File.read!(path), Path.relative_to(path, dir))
-      if skill in archetype.skills, do: [archetype.name], else: []
+      owner = Tightbeam.Identity.Provenance.owner_for_path(dir, Path.relative_to(path, dir))
+      name = Tightbeam.Identity.Provenance.qualify(owner, archetype.name)
+      if skill in archetype.skills, do: [name], else: []
     end)
     |> Enum.sort()
+  end
+
+  defp archetype_paths(dir) do
+    (Path.wildcard(Path.join(dir, "archetypes/*.toml")) ++
+       Path.wildcard(Path.join(dir, "kungfu/*/archetypes/*.toml")))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp archetype_identity_path?(path) do
+    case Path.split(path) do
+      ["archetypes", _file] -> true
+      ["kungfu", _name, "archetypes", _file] -> true
+      _ -> false
+    end
+  end
+
+  defp archetype_manifest_at!(identity_dir, revision, requested_name, create_substrate? \\ false) do
+    files =
+      identity_dir
+      |> git_output!(["ls-tree", "-r", "--name-only", revision, "--", "archetypes", "kungfu"])
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&archetype_identity_path?/1)
+
+    candidates =
+      Enum.flat_map(files, fn path ->
+        short_name = Path.basename(path, ".toml")
+
+        owner =
+          Tightbeam.Identity.Provenance.owner_for_path_at_revision(
+            identity_dir,
+            path,
+            revision
+          )
+
+        [
+          %{
+            path: path,
+            short_name: short_name,
+            owner: owner,
+            name: Tightbeam.Identity.Provenance.qualify(owner, short_name)
+          }
+        ]
+      end)
+
+    case Enum.find(candidates, &(&1.name == requested_name)) do
+      %{path: path, name: name} ->
+        {path, name}
+
+      nil ->
+        if is_binary(requested_name) and not String.contains?(requested_name, ".") do
+          names =
+            candidates
+            |> Enum.filter(&(&1.short_name == requested_name))
+            |> Enum.map(& &1.name)
+            |> Enum.uniq()
+            |> Enum.sort()
+
+          case names do
+            [] when create_substrate? ->
+              {"archetypes/#{requested_name}.toml", requested_name}
+
+            [] ->
+              raise ArgumentError, "unknown archetype: #{requested_name}"
+
+            names ->
+              raise ArgumentError,
+                    "plain archetype #{requested_name} is not a substrate archetype; use one of: #{Enum.join(names, ", ")}"
+          end
+        else
+          raise ArgumentError, "unknown archetype: #{requested_name}"
+        end
+    end
   end
 
   defp previous_target(path) do

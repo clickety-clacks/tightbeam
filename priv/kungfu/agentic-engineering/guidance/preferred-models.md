@@ -42,7 +42,7 @@ Do not force an attempt on a known exhausted route.
 | --- | --- | --- |
 | Product ownership and spirit | gpt-6-astra[high], fable[high], opus[xhigh], sol[xhigh] | Challenge technically sound work against intent, sustain product context and decide topology. |
 | Product delivery orchestration | gpt-6-sol[low] | Obtain the PO's plan, reconcile current records, staff and execute within it, recognize revision needs and resolve routine traffic. |
-| Executive or delegated lane orchestration | gpt-6-luna[max] | Coordinate within actual scope, carry dependencies and follow-through, route consequential judgment to its qualified owner. |
+| Organization-level or delegated lane orchestration | gpt-6-luna[max] | Coordinate within actual scope, carry dependencies and follow-through, route consequential judgment to its qualified owner. |
 | Bounded team design or recovery planning | astra[high], fable[high], sol[xhigh], opus[xhigh] | Discover coupling, ownership, communication and evidence that invalidates the plan. |
 | Difficult sustained topology or recovery exploration | astra[xhigh], fable[xhigh], sol[max], opus[xhigh] | Sustain investigation and revise advice from evidence; the PO decides topology. |
 | Specification under product rulings | claude-opus-5-5[high], gpt-6-astra[high] fallback | Compose a coherent contract and expose unresolved intent. |

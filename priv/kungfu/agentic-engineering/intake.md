@@ -10,8 +10,8 @@ bootstrap route when delivery ownership is missing. Preserve the complete reques
 and work-item identity through acceptance by the delivery owner; distinguish a
 request to file for later from authorization to begin delivery.
 
-The bundle root remains executive orchestration; a bare-spawn default does not name
-a product's delivery owner. Learning supplies the PDO archetype and its shared
+The bundle root remains organization-level orchestration; a bare-spawn default does
+not name a product's delivery owner. Learning supplies the PDO archetype and its shared
 guidance through the bundle's installation inventory. It does not migrate incumbent
 sessions or their obligations. Use supported publication, refresh and handoff for
 current-org adoption and verify what affected sessions actually receive.

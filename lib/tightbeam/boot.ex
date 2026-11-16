@@ -26,8 +26,12 @@ defmodule Tightbeam.Boot do
   def start_link(%{base_dir: base_dir} = config) do
     :ok = Tightbeam.DB.assert_base_admitted!(Tightbeam.DB, base_dir)
     Tightbeam.Identity.init_after_admission!(base_dir, Tightbeam.DB)
-    Tightbeam.Gateway.load_law!(config)
     :ok = Schema.ensure_all(Tightbeam.DB)
+    _ = Tightbeam.Identity.RailScopeMigration.run!(base_dir, Tightbeam.DB)
+    Tightbeam.Gateway.load_law!(config)
+    # Schema setup precedes law loading for migration. Enable recognition now,
+    # before recovery commits transitions that can produce rule notices.
+    :ok = Tightbeam.Wakes.activate_wait_recognition(Tightbeam.DB)
     epoch = EventLog.boot()
     Application.put_env(:tightbeam, :boot_epoch, epoch)
     # Boot recovery: any 'running' turn from a prior life is UNKNOWN-terminal.
