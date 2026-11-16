@@ -31,7 +31,7 @@ exception =
 
 message = Exception.message(exception)
 assert message =~ "no usable harness CLI"
-assert message =~ "codex: exec failed"
+assert message =~ "codex: selected executable failed: exit=1 output=\"broken\""
 assert message =~ "Install a registered harness CLI"
 refute File.exists?(base)
 IO.puts("guarded-gateway-refusal: ok")

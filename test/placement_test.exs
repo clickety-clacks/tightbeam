@@ -208,15 +208,15 @@ defmodule Tightbeam.PlacementTest do
     base_dir: base_dir
   } do
     cli_bin = Path.join(base_dir, "bin")
-    executable = Path.join(base_dir, "cursor-agent")
+    executable = Path.join(base_dir, "codex")
     unavailable_db = String.to_atom("missing_probe_db_#{System.unique_integer([:positive])}")
 
-    assert {:ok, %{bin: ^executable, version: "cursor 1.0"}} =
-             Placement.harness_binary_probe(:cursor, cli_bin,
+    assert {:ok, %{bin: ^executable, version: "codex 1.0"}} =
+             Placement.harness_binary_probe(:codex, cli_bin,
                base_dir: base_dir,
                db: unavailable_db,
-               find_executable: fn "cursor-agent" -> executable end,
-               run: fn [^executable, "--version"] -> {"cursor 1.0\n", 0} end
+               find_executable: fn "codex" -> executable end,
+               run: fn [^executable, "--version"] -> {"codex 1.0\n", 0} end
              )
   end
 
@@ -1963,9 +1963,9 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_MACHINE=worker",
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "PATH=/srv/tb/bin:$PATH",
-             "CODEX_PATH='/opt/codex builds/codex'",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
              "GH_CONFIG_DIR='/srv/tb/auth/github/gh'",
+             "CODEX_PATH='/opt/codex builds/codex'",
              "CODEX_CONFIG=#{Tightbeam.Harness.Support.shell_quote(inventory_config())}",
              "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]

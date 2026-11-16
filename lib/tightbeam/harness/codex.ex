@@ -736,12 +736,16 @@ defmodule Tightbeam.Harness.Codex do
   defp probe_managed_cli(nil, _target), do: {:error, :not_found}
 
   defp probe_managed_cli(executable, target) do
-    case Support.bounded_probe(executable, target) do
-      {:ok, %{version: version}} ->
-        {:ok, %{bin: "managed #{executable}", version: "#{version} (managed)"}}
+    if File.regular?(executable) and File.access?(executable, :execute) do
+      case Support.bounded_probe(executable, target) do
+        {:ok, %{version: version}} ->
+          {:ok, %{bin: "managed #{executable}", version: "#{version} (managed)"}}
 
-      {:error, _reason} = error ->
-        error
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      {:error, :not_found}
     end
   end
 
