@@ -44,6 +44,98 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     %{db: db}
   end
 
+  @tag prod_id_replacement: true
+  test "newest prod replaces only the same sender, recipient and id", %{db: db} do
+    session!(db, "k2")
+    first = prod_wake!(db, "first", "page", "bridge", "k1", 60_000)
+    second = prod_wake!(db, "changed text", "page", "bridge", "k1", 120_000)
+    third = prod_wake!(db, "newest", "page", "bridge", "k1", 180_000)
+    other_id = prod_wake!(db, "other id", "other", "bridge", "k1", 60_000)
+    other_sender = prod_wake!(db, "other sender", "page", "another", "k1", 60_000)
+    other_recipient = prod_wake!(db, "other recipient", "page", "bridge", "k2", 60_000)
+
+    ordinary =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "process:bridge",
+        prompt: "ordinary",
+        due_at: System.system_time(:millisecond) + 60_000,
+        sender_scheduled: true
+      })
+
+    assert Wakes.get(db, first.wake_id).state == "canceled"
+    assert Wakes.get(db, second.wake_id).state == "canceled"
+    assert Wakes.get(db, third.wake_id).state == "pending"
+    assert third.due_at > second.due_at
+
+    for wake <- [other_id, other_sender, other_recipient, ordinary] do
+      assert Wakes.get(db, wake.wake_id).state == "pending"
+    end
+
+    second_id = second.wake_id
+    third_id = third.wake_id
+
+    assert {:ok, [["superseded", ^second_id]]} =
+             DB.query(
+               db,
+               "SELECT reasonKind,replacementWakeId FROM wake_cancellations WHERE wakeId=?1",
+               [first.wake_id]
+             )
+
+    assert {:ok, [["superseded", ^third_id]]} =
+             DB.query(
+               db,
+               "SELECT reasonKind,replacementWakeId FROM wake_cancellations WHERE wakeId=?1",
+               [second.wake_id]
+             )
+  end
+
+  @tag prod_id_replacement: true
+  test "queued prod withdraws while running and delivered prods remain", %{db: db} do
+    queued = prod_wake!(db, "queued", "page", "bridge", "k1", 60_000)
+    queued_seq = deliver_wake!(db, queued)
+    newest = prod_wake!(db, "replacement", "page", "bridge", "k1", 120_000)
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [queued_seq])
+
+    assert Wakes.get(db, newest.wake_id).state == "pending"
+
+    running = prod_wake!(db, "running", "running", "bridge", "k1", 60_000)
+    running_seq = deliver_wake!(db, running)
+    assert {:ok, %{seq: ^running_seq, owner_lease: lease}} = Ledger.claim_next(db, "k1", "lane")
+    _later = prod_wake!(db, "later", "running", "bridge", "k1", 120_000)
+
+    assert {:ok, [["running"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [running_seq])
+
+    assert :ok = Ledger.finish(db, running_seq, "delivered", nil, owner_lease: lease)
+    _after_delivery = prod_wake!(db, "after delivery", "running", "bridge", "k1", 180_000)
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [running_seq])
+  end
+
+  @tag prod_id_replacement: true
+  test "a sealed notice batch retains its earlier prod", %{db: db} do
+    start_supervised!({ConnRegistry, name: ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+    old = prod_wake!(db, "already sealed", "page", "bridge", "k1", 0)
+    [carrier] = NoticeBatcher.recover(db)
+
+    assert [%{delivery_wake_id: ^carrier, member_state: "included"}] =
+             NoticeBatcher.source_refs(db, old.wake_id)
+
+    _new = prod_wake!(db, "newer prod", "page", "bridge", "k1", 60_000)
+    assert {:ok, [[prompt]]} = DB.query(db, "SELECT prompt FROM turns WHERE wakeId=?1", [carrier])
+    assert prompt =~ "already sealed"
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT replacementWakeId FROM wake_cancellations WHERE wakeId=?1", [
+               old.wake_id
+             ])
+  end
+
   test "legacy liveness evidence does not suppress a stored notice", %{db: db} do
     assignment!(db, "asg_liveness")
     wake = liveness_wake!(db, "asg_liveness", "old liveness notice")
@@ -1135,5 +1227,17 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
       })
 
     seq
+  end
+
+  defp prod_wake!(db, prompt, prod_id, sender, recipient, delay_ms) do
+    Wakes.schedule(db, %{
+      session_key: recipient,
+      origin: "process:#{sender}",
+      prompt: prompt,
+      due_at: System.system_time(:millisecond) + delay_ms,
+      sender_scheduled: true,
+      prod_id: prod_id,
+      prod_sender: %{kind: "process", id: sender}
+    })
   end
 end
