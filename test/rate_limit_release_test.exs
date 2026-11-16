@@ -22,6 +22,11 @@ defmodule Tightbeam.RateLimitReleaseTest do
     "data" => %{"errorKind" => "rate_limit"},
     "message" => "Internal error: You've hit your weekly limit · resets Aug 15, 12am (UTC)"
   }
+  @codex_error %{
+    "code" => -32_603,
+    "data" => %{"codexErrorInfo" => "usageLimitExceeded"},
+    "message" => "Internal error"
+  }
 
   setup do
     db = :"reset_release_#{System.unique_integer([:positive])}"
@@ -296,6 +301,45 @@ defmodule Tightbeam.RateLimitReleaseTest do
              ])
 
     assert next_due == first_due + 240_000
+  end
+
+  test "OpenAI credential change rechecks an open Codex usage-limit hold", %{db: db} do
+    for key <- ["c1", "c2"] do
+      Org.create(db, %{
+        session_key: key,
+        display_name: key,
+        owner_user_id: "tester",
+        origin: "user:tester",
+        archetype: "coder",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Tightbeam.Model.new("gpt-5")
+      })
+
+      fail_turn(db, key, @codex_error)
+    end
+
+    assert {:ok, [[incident_id, opened_at]]} =
+             DB.query(
+               db,
+               "SELECT id,openedAt FROM harness_health_incidents WHERE harness='codex' AND state='open' AND failureClass='rate-limit-dead'"
+             )
+
+    assert {:ok, [[initial_due]]} =
+             DB.query(db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [
+               incident_id
+             ])
+
+    assert initial_due == opened_at + 120_000
+    assert :ok = RecoverySchedule.credential_changed(db, :openai, "testhost")
+
+    assert {:ok, [[due_at]]} =
+             DB.query(db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [
+               incident_id
+             ])
+
+    assert due_at <= System.system_time(:millisecond)
   end
 
   defp reset_error(reset_at) do

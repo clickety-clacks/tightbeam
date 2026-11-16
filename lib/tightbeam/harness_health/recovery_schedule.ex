@@ -217,12 +217,15 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
     end
   end
 
-  @doc "Recheck open Claude usage-limit holds after its credential changes."
-  def credential_changed(db, :anthropic, host) when is_binary(host) do
+  @doc "Recheck open usage-limit holds after the harness credential changes."
+  def credential_changed(db, provider, host)
+      when provider in [:anthropic, :openai] and is_binary(host) do
+    harness = if provider == :anthropic, do: "claude", else: "codex"
+
     case DB.query(
            db,
-           "SELECT id FROM harness_health_incidents WHERE harness='claude' AND host=?1 AND failureClass='rate-limit-dead' AND state='open'",
-           [host]
+           "SELECT id FROM harness_health_incidents WHERE harness=?1 AND host=?2 AND failureClass='rate-limit-dead' AND state='open'",
+           [harness, host]
          ) do
       {:ok, rows} ->
         Enum.reduce_while(rows, :ok, fn [id], :ok ->
