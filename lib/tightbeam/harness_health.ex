@@ -1006,6 +1006,14 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
+  # Codex's typed provider error makes this single rate-limit observation authoritative.
+  defp authoritative_provider_turn_failure?(%{harness: harness}, %{
+         "data" => %{"codexErrorInfo" => "usageLimitExceeded"}
+       }),
+       do: Tightbeam.Harness.parse!(to_string(harness)) == Tightbeam.Harness.Codex
+
+  defp authoritative_provider_turn_failure?(_session, _reason), do: false
+
   # Health classification retains legacy text fallback for incident diagnosis.
   # A replay uses the typed class only when it matches that diagnosis; otherwise
   # the terminal failure takes the bounded unclassified-recovery path. Assistant
@@ -1105,13 +1113,18 @@ defmodule Tightbeam.HarnessHealth do
 
         observed_at = System.system_time(:millisecond)
 
+        evidence_kind =
+          if authoritative_provider_turn_failure?(session, reason),
+            do: "authoritative-provider",
+            else: "terminal-failure"
+
         result =
           observe_in_txn(txn, %{
             correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
             harness: to_string(session.harness),
             host: session.host,
             failure_class: failure_class,
-            evidence_kind: "terminal-failure",
+            evidence_kind: evidence_kind,
             session_key: turn.session_key,
             assignment_id: assignment_id,
             observed_at: observed_at,

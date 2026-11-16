@@ -455,6 +455,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("incidentId", incident_id)],
         )),
+        Command::HarnessHealthRetry {
+            identity,
+            incident_id,
+        } => Ok(request(
+            identity,
+            "harness-health-retry",
+            vec![],
+            vec![string_field("incidentId", incident_id)],
+        )),
         Command::ArtifactContentFetch {
             identity,
             artifact_id,
@@ -606,6 +615,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             "harklight-settle",
             vec![],
             vec![string_field("messageId", message)],
+        )),
+        Command::HarklightCover { identity, session } => Ok(request(
+            identity,
+            "harklight-cover",
+            vec![],
+            vec![string_field("handle", session)],
         )),
         Command::HarklightFollow {
             identity,
@@ -3967,6 +3982,7 @@ fn local_harklight_identity_refusal(
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightFollow { identity, .. }
+        | Command::HarklightCover { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
         {
             Some("invalid Harklight command flags")
@@ -3987,6 +4003,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessHealthReviewOther { identity, .. }
         | Command::HarnessHealthClosePromotion { identity, .. }
         | Command::HarnessHealthEvidenceOther { identity, .. }
+        | Command::HarnessHealthRetry { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
@@ -3995,6 +4012,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightFollow { identity, .. }
+        | Command::HarklightCover { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::RoleBind { identity, .. }
@@ -4256,6 +4274,7 @@ mod tests {
                 vec!["harklight-follow", "--handle", "h"],
                 "harklight-follow",
             ),
+            (vec!["harklight-cover", "--session", "h"], "harklight-cover"),
         ];
         for (args, verb) in commands {
             let command =
@@ -4274,7 +4293,9 @@ mod tests {
                 assert_eq!(body["params"]["stake"], "the demo slips");
                 assert_eq!(body["params"]["byWhen"], "2026-11-01T17:00:00Z");
                 assert_eq!(body["params"]["reply"], true);
-            } else if verb == "harklight-follow" && body["params"].get("handle").is_some() {
+            } else if (verb == "harklight-follow" || verb == "harklight-cover")
+                && body["params"].get("handle").is_some()
+            {
                 assert_eq!(body["params"]["handle"], "h");
             } else {
                 assert_eq!(body["params"]["messageId"], "m");
