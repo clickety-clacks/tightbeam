@@ -208,15 +208,15 @@ defmodule Tightbeam.PlacementTest do
     base_dir: base_dir
   } do
     cli_bin = Path.join(base_dir, "bin")
-    executable = Path.join(base_dir, "cursor-agent")
+    executable = Path.join(base_dir, "codex")
     unavailable_db = String.to_atom("missing_probe_db_#{System.unique_integer([:positive])}")
 
-    assert {:ok, %{bin: ^executable, version: "cursor 1.0"}} =
-             Placement.harness_binary_probe(:cursor, cli_bin,
+    assert {:ok, %{bin: ^executable, version: "codex 1.0"}} =
+             Placement.harness_binary_probe(:codex, cli_bin,
                base_dir: base_dir,
                db: unavailable_db,
-               find_executable: fn "cursor-agent" -> executable end,
-               run: fn [^executable, "--version"] -> {"cursor 1.0\n", 0} end
+               find_executable: fn "codex" -> executable end,
+               run: fn [^executable, "--version"] -> {"codex 1.0\n", 0} end
              )
   end
 
@@ -856,12 +856,25 @@ defmodule Tightbeam.PlacementTest do
 
     for module <- Tightbeam.Harness.all() do
       opts = Placement.adapter_opts!(config, {module.id(), "shared", "testhost"})
-      binary = hd(opts[:cmd])
+
+      binary =
+        if module.id() == :claude do
+          opts[:cmd] |> List.last() |> String.trim("'")
+        else
+          hd(opts[:cmd])
+        end
 
       if module.id() == :cursor do
         assert opts[:cmd] == [binary, "acp"]
         assert Path.basename(Path.dirname(binary)) == "2026.08.11-e8db854"
       else
+        if module.id() == :claude do
+          assert Enum.take(opts[:cmd], 2) == ["sh", "-c"]
+          assert Enum.at(opts[:cmd], 2) =~ "CLAUDE_CODE_EXECUTABLE"
+          assert Enum.at(opts[:cmd], 2) =~ "command -v"
+          assert Enum.at(opts[:cmd], 2) =~ "exec \"$@\""
+        end
+
         assert String.ends_with?(
                  binary,
                  Path.join(["adapters", "node_modules", ".bin", Path.basename(binary)])
@@ -1950,9 +1963,9 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_MACHINE=worker",
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "PATH=/srv/tb/bin:$PATH",
-             "CODEX_PATH='/opt/codex builds/codex'",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
              "GH_CONFIG_DIR='/srv/tb/auth/github/gh'",
+             "CODEX_PATH='/opt/codex builds/codex'",
              "CODEX_CONFIG=#{Tightbeam.Harness.Support.shell_quote(inventory_config())}",
              "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]

@@ -628,7 +628,7 @@ defmodule Tightbeam.Harness.Support do
         end
 
       [
-        cmd: [adapter],
+        cmd: Map.get(profile, :local_command, fn binary -> [binary] end).(adapter),
         env: home_entries ++ [{"COMMON", "1"} | extra]
       ]
     else
@@ -646,7 +646,8 @@ defmodule Tightbeam.Harness.Support do
       [
         cmd:
           [ssh | ssh_opts()] ++
-            ["vector@remote", "exec", env | remote_env] ++ [adapter],
+            ["vector@remote", "exec", env | remote_env] ++
+            Map.get(profile, :remote_command, fn binary -> [binary] end).(adapter),
         env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
       ]
     end

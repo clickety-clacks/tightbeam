@@ -84,6 +84,12 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def cli_binary, do: "codex"
+  @impl true
+  def executable_path_env_var, do: "CODEX_PATH"
+
+  @impl true
+  def managed_cli_path(base_dir),
+    do: Path.join([base_dir, "adapters", "node_modules", ".bin", cli_binary()])
 
   @impl true
   def wire_projection do
@@ -730,12 +736,16 @@ defmodule Tightbeam.Harness.Codex do
   defp probe_managed_cli(nil, _target), do: {:error, :not_found}
 
   defp probe_managed_cli(executable, target) do
-    case Support.bounded_probe(executable, target) do
-      {:ok, %{version: version}} ->
-        {:ok, %{bin: "managed #{executable}", version: "#{version} (managed)"}}
+    if File.regular?(executable) and File.access?(executable, :execute) do
+      case Support.bounded_probe(executable, target) do
+        {:ok, %{version: version}} ->
+          {:ok, %{bin: "managed #{executable}", version: "#{version} (managed)"}}
 
-      {:error, _reason} = error ->
-        error
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      {:error, :not_found}
     end
   end
 
@@ -819,7 +829,7 @@ defmodule Tightbeam.Harness.Codex do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
     executable = catalog_executable(state, kind)
     path = catalog_path(state)
-    managed_cli = managed_cli_path(state)
+    managed_cli = managed_cli_path(state.base_dir)
 
     auth =
       Tightbeam.Credentials.credential_path(
@@ -870,9 +880,6 @@ defmodule Tightbeam.Harness.Codex do
         end
     end
   end
-
-  defp managed_cli_path(state),
-    do: Path.join([state.base_dir, "adapters", "node_modules", ".bin", "codex"])
 
   defp catalog_path_assignment(path) do
     if String.ends_with?(path, ":$PATH") do
@@ -983,7 +990,7 @@ defmodule Tightbeam.Harness.Codex do
     host = Map.get(state, :host_name, Placement.local_host_name())
     home = Tightbeam.Homes.home_path(state.base_dir, host, :codex)
     path_setup = catalog_path_assignment(catalog_path(state)) <> "\nexport PATH"
-    codex_path = codex_path_resolution(executable, managed_cli_path(state))
+    codex_path = codex_path_resolution(executable, managed_cli_path(state.base_dir))
 
     script =
       "#{path_setup}\n#{codex_path}\n" <>

@@ -78,6 +78,10 @@ defmodule Tightbeam.Harness do
   projected on the wire so the satellite probe can check for it by name.
   """
   @callback cli_binary() :: binary()
+  @doc "Environment variable used by this harness to select an explicit native CLI, when supported."
+  @callback executable_path_env_var() :: String.t()
+  @doc "Optional CLI shipped with this harness adapter, used only as its reported fallback."
+  @callback managed_cli_path(base_dir :: String.t()) :: String.t()
   @callback wire_projection() :: binary()
   @callback preflight_launch(target(), String.t(), keyword()) :: preflight_result()
   @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan() | launch_result()
@@ -139,7 +143,9 @@ defmodule Tightbeam.Harness do
                       submission_text_limit: 0,
                       session_load_meta: 2,
                       project_session_identity: 3,
-                      verify_session_identity_hook: 2
+                      verify_session_identity_hook: 2,
+                      executable_path_env_var: 0,
+                      managed_cli_path: 1
 
   @spec preflight_launch(module(), target(), String.t(), keyword()) :: preflight_result()
   def preflight_launch(module, target, home, opts) do
@@ -186,6 +192,41 @@ defmodule Tightbeam.Harness do
 
   @spec probe_cli(module(), target()) :: probe_result()
   def probe_cli(module, target), do: module.probe_cli(target)
+
+  @doc "Return the registered harness's explicit native executable environment variable, if it has one."
+  @spec executable_path_env_var(module()) :: String.t() | nil
+  def executable_path_env_var(harness) do
+    module = module!(harness)
+    Code.ensure_loaded!(module)
+
+    if function_exported?(module, :executable_path_env_var, 0),
+      do: module.executable_path_env_var(),
+      else: nil
+  end
+
+  @doc "All explicit native executable environment variables supported by known harnesses."
+  @spec executable_path_env_vars() :: [String.t()]
+  def executable_path_env_vars do
+    known()
+    |> Enum.flat_map(fn module ->
+      case executable_path_env_var(module) do
+        nil -> []
+        name -> [name]
+      end
+    end)
+    |> Enum.uniq()
+  end
+
+  @doc "Return a harness-owned bundled CLI path for fallback reporting, when it has one."
+  @spec managed_cli_path(module(), String.t()) :: String.t() | nil
+  def managed_cli_path(harness, base_dir) do
+    module = module!(harness)
+    Code.ensure_loaded!(module)
+
+    if function_exported?(module, :managed_cli_path, 1),
+      do: module.managed_cli_path(base_dir),
+      else: nil
+  end
 
   @doc "Resolve the registered receiver's text limit; nil claims no fixed ACP text maximum."
   def submission_text_limit(nil), do: nil

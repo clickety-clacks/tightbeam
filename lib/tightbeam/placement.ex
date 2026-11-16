@@ -1667,6 +1667,7 @@ defmodule Tightbeam.Placement do
     adapter_bin = Path.basename(module.install_package())
 
     target = %{
+      base_dir: base_dir,
       cli_bin: cli_bin,
       launch_path: launch_path,
       find_executable: find,
@@ -1677,16 +1678,9 @@ defmodule Tightbeam.Placement do
     }
 
     target =
-      case module.id() do
-        :codex ->
-          Map.put(
-            target,
-            :managed_cli,
-            Path.join([base_dir, "adapters", "node_modules", ".bin", module.cli_binary()])
-          )
-
-        _ ->
-          target
+      case Harness.managed_cli_path(module, base_dir) do
+        nil -> target
+        path -> Map.put(target, :managed_cli, path)
       end
 
     target =
@@ -1737,12 +1731,7 @@ defmodule Tightbeam.Placement do
   end
 
   defp configured_executable_override(module, db, host) do
-    variable =
-      case module.id() do
-        :claude -> "CLAUDE_CODE_EXECUTABLE"
-        :codex -> "CODEX_PATH"
-        _ -> nil
-      end
+    variable = Harness.executable_path_env_var(module)
 
     if is_nil(variable) do
       :error
