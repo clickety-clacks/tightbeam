@@ -10,7 +10,7 @@ end
 
 defmodule GuardDispatchIdentityRefresh do
   import ExUnit.Assertions
-  alias Tightbeam.{DB, Gateway, Identity, Ledger, Model, Org, Placement, Wakes}
+  alias Tightbeam.{DB, Gateway, Identity, Ledger, Model, NoticeBatcher, Org, Placement, Wakes}
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
 
   def run do
@@ -132,6 +132,27 @@ defmodule GuardDispatchIdentityRefresh do
         assert assignment_id(db, wake_turn) == assignment_id
         assert Org.get(db, session.session_key).identity_revision == third
         assert File.read!(skill) == "third served revision"
+
+        fourth = publish_skill!(base, "fourth served revision")
+
+        {first_assignment, first_wake} =
+          assign_and_wake!(handlers, session.session_key, "mixed batch assignment brief")
+
+        {second_assignment, second_wake} =
+          assign_and_wake!(handlers, session.session_key, "another assignment notice")
+
+        assert first_assignment != second_assignment
+        :ok = Wakes.fire_due(scheduler)
+        mixed_turn = run_next!(db, runner, adapter, session.session_key)
+        assert assignment_id(db, mixed_turn) == nil
+
+        assert {:ok, [[carrier_wake]]} =
+                 DB.query(db, "SELECT wakeId FROM turns WHERE seq=?1", [mixed_turn.seq])
+
+        assert [%{delivery_wake_id: ^carrier_wake}] = NoticeBatcher.source_refs(db, first_wake)
+        assert [%{delivery_wake_id: ^carrier_wake}] = NoticeBatcher.source_refs(db, second_wake)
+        assert Org.get(db, session.session_key).identity_revision == fourth
+        assert File.read!(skill) == "fourth served revision"
       after
         if Process.whereis(Tightbeam.WakeScheduler), do: GenServer.stop(Tightbeam.WakeScheduler)
         GenServer.stop(coordinator)
@@ -163,6 +184,32 @@ defmodule GuardDispatchIdentityRefresh do
 
     assert %{id: id} = result
     id
+  end
+
+  defp assign_and_wake!(handlers, session_key, brief) do
+    assert %{id: assignment_id} =
+             handlers["assign"].(%{
+               verb: "assign",
+               origin: "user:test-owner",
+               principal: {:user, "test-owner"},
+               session_key: session_key,
+               target_role: nil,
+               role_fallback: false,
+               params: %{subject: brief}
+             })
+
+    assert %{wake_id: wake_id} =
+             handlers["wake"].(%{
+               verb: "wake",
+               origin: "user:test-owner",
+               principal: {:user, "test-owner"},
+               session_key: session_key,
+               target_role: nil,
+               role_fallback: false,
+               params: %{prompt: brief, assignment_id: assignment_id, after_ms: 0}
+             })
+
+    {assignment_id, wake_id}
   end
 
   defp run_next!(db, runner, adapter, session_key) do

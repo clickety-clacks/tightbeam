@@ -3685,9 +3685,21 @@ defmodule Tightbeam.Gateway do
   end
 
   defp assignment_brief_turn?(db, turn) do
-    case DB.query(db, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq]) do
-      {:ok, [[assignment_id]]} when is_binary(assignment_id) -> true
-      {:ok, [[nil]]} -> false
+    case DB.query(
+           db,
+           """
+           SELECT CASE WHEN t.assignmentId IS NOT NULL OR EXISTS (
+             SELECT 1 FROM notice_batches b
+             JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+             JOIN wakes w ON w.wakeId=m.sourceWakeId
+             WHERE b.deliveryWakeId=t.wakeId AND w.assignmentId IS NOT NULL
+           ) THEN 1 ELSE 0 END
+           FROM turns t WHERE t.seq=?1
+           """,
+           [turn.seq]
+         ) do
+      {:ok, [[1]]} -> true
+      {:ok, [[0]]} -> false
       {:error, error} -> raise error
     end
   end
