@@ -1,0 +1,7 @@
+name = "generic"
+skills = []
+
+[guidance]
+text = """
+#include "operating-manual.md"
+"""

@@ -11019,6 +11019,12 @@ defmodule Tightbeam.GatewayTest do
                    "Share generic event subscription tools and a read-only Matrix event watcher.",
                  phrases: [],
                  root_archetype: "default"
+               },
+               %{
+                 name: "uncle-enzo",
+                 purpose: _enzo_purpose,
+                 phrases: _enzo_phrases,
+                 root_archetype: "exec"
                }
              ]
            } = list.(%{origin: "agent:k1", params: %{}})
@@ -13121,13 +13127,26 @@ defmodule Tightbeam.GatewayTest do
     manifest_path = Path.join([base_dir, "identity", "archetypes", "coder.toml"])
     manifest = File.read!(manifest_path)
 
-    assert manifest =~ ~s(skills = ["repository-retirement"])
+    skills_line =
+      manifest
+      |> String.split("\n")
+      |> Enum.find(&String.starts_with?(&1, "skills = "))
+
+    assert skills_line in [
+             ~s(skills = ["repository-retirement"]),
+             ~s(skills = ["repository-retirement", "landing"])
+           ]
+
+    inherited_skills =
+      skills_line
+      |> String.replace_prefix("skills = [", "")
+      |> String.trim_trailing("]")
 
     fixture_manifest =
       String.replace(
         manifest,
-        ~s(skills = ["repository-retirement"]),
-        ~s(skills = ["human-communication", "model-release-intake", "repository-retirement"]),
+        skills_line,
+        ~s(skills = ["human-communication", "model-release-intake", #{inherited_skills}]),
         global: false
       )
 

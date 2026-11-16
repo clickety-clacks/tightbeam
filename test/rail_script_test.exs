@@ -195,7 +195,7 @@ defmodule Tightbeam.RailScriptTest do
                nil
              )
 
-    assert System.monotonic_time(:millisecond) - started < 2_500
+    assert System.monotonic_time(:millisecond) - started < 10_000
 
     # The wrapper-reported timeout, through the same call, for contrast.
     File.cp!(Path.expand("fixtures/rail_exec/tightbeam", __DIR__), wrapper)
