@@ -245,19 +245,57 @@ defmodule Tightbeam.RateLimitReleaseTest do
 
   test "credential change moves an open usage-limit recovery cycle to now", %{db: db} do
     now = System.system_time(:millisecond)
-    {incident, _wake} = observe_reset(db, "credential-change", reset_error(now + 3_600_000), now)
+    error = reset_error(now + 3_600_000)
+    fail_turn(db, "k1", error)
+    fail_turn(db, "k2", error)
+
+    assert {:ok, [[incident_id, opened_at]]} =
+             DB.query(
+               db,
+               "SELECT id,openedAt FROM harness_health_incidents WHERE state='open' AND failureClass='rate-limit-dead'"
+             )
 
     assert {:ok, [[initial_due]]} =
-             DB.query(db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [incident.id])
+             DB.query(db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [
+               incident_id
+             ])
 
-    assert initial_due == now + 120_000
+    assert initial_due == opened_at + 120_000
     assert :ok = RecoverySchedule.credential_changed(db, :anthropic, "testhost")
 
     assert {:ok, [[due_at]]} =
-             DB.query(db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [incident.id])
+             DB.query(db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [
+               incident_id
+             ])
 
     assert due_at <= System.system_time(:millisecond)
     assert :ok = RecoverySchedule.credential_changed(db, :openai, "testhost")
+  end
+
+  test "an unresolved recovery cycle backs off after the two-minute first check", %{db: db} do
+    opened_at = System.system_time(:millisecond)
+
+    {incident, _wake} =
+      observe_reset(db, "backoff", reset_error(opened_at + 3_600_000), opened_at)
+
+    first_due = opened_at + 120_000
+
+    assert [%{"hold_id" => hold_id, "cycle_id" => cycle_id}] =
+             RecoverySchedule.fire_due(db, first_due)
+
+    assert hold_id == incident.id
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               RecoverySchedule.finish_cycle_in_txn(txn, hold_id, cycle_id, first_due)
+             end)
+
+    assert {:ok, [[next_due]]} =
+             DB.query(db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [
+               hold_id
+             ])
+
+    assert next_due == first_due + 240_000
   end
 
   defp reset_error(reset_at) do

@@ -219,7 +219,11 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
 
   @doc "Recheck open Claude usage-limit holds after its credential changes."
   def credential_changed(db, :anthropic, host) when is_binary(host) do
-    case DB.query(db, "SELECT id FROM harness_health_incidents WHERE harness='claude' AND host=?1 AND failureClass='rate-limit-dead' AND state='open'", [host]) do
+    case DB.query(
+           db,
+           "SELECT id FROM harness_health_incidents WHERE harness='claude' AND host=?1 AND failureClass='rate-limit-dead' AND state='open'",
+           [host]
+         ) do
       {:ok, rows} ->
         Enum.reduce_while(rows, :ok, fn [id], :ok ->
           case retry_now(db, id) do
@@ -294,10 +298,17 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
            db,
            "SELECT MIN(dueAt) FROM harness_health_recovery_schedules WHERE status='pending'"
          ) do
-      {:ok, [[nil]]} -> nil
-      {:ok, [[due_at]]} when is_integer(due_at) -> due_at
-      {:ok, rows} -> raise ArgumentError, "invalid recovery schedule deadline rows: #{inspect(rows)}"
-      {:error, error} -> raise error
+      {:ok, [[nil]]} ->
+        nil
+
+      {:ok, [[due_at]]} when is_integer(due_at) ->
+        due_at
+
+      {:ok, rows} ->
+        raise ArgumentError, "invalid recovery schedule deadline rows: #{inspect(rows)}"
+
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -307,7 +318,17 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
            "SELECT holdId,cycleId,sourceEventId,failureClass,eligibleClasses,intervalMs,timeoutMs,dueAt,startedAt FROM harness_health_recovery_schedules WHERE status='due' ORDER BY startedAt,holdId"
          ) do
       {:ok, rows} ->
-        Enum.map(rows, fn [hold_id, cycle_id, event_id, failure_class, classes, interval, timeout, due, started] ->
+        Enum.map(rows, fn [
+                            hold_id,
+                            cycle_id,
+                            event_id,
+                            failure_class,
+                            classes,
+                            interval,
+                            timeout,
+                            due,
+                            started
+                          ] ->
           %{
             "hold_id" => hold_id,
             "cycle_id" => cycle_id,
@@ -382,8 +403,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
         case {hold, policy()} do
           {%{"state" => "open"} = hold, {:ok, settings, _digest}} ->
             if eligible?(hold, settings) do
-              {:ok,
-               %{cycle_id: cycle_id, started_at: started_at, timeout_ms: timeout_ms}, hold}
+              {:ok, %{cycle_id: cycle_id, started_at: started_at, timeout_ms: timeout_ms}, hold}
             else
               finish_cycle_in_txn(txn, hold_id, cycle_id, now)
               :withdrawn
@@ -516,7 +536,11 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
   defp initial_due_at(hold, settings, now, opts, previous_started_at) do
     interval_ms =
       if previous_started_at,
-        do: backoff_interval(max(previous_started_at - hold["openedAt"], 0), settings["interval_ms"]),
+        do:
+          backoff_interval(
+            max(previous_started_at - hold["openedAt"], 0),
+            settings["interval_ms"]
+          ),
         else: settings["interval_ms"]
 
     due_at =

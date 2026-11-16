@@ -6034,15 +6034,25 @@ defmodule Tightbeam.Gateway do
     %{code: "invalid_message", message: "unsupported onboarding provider"}
   end
 
-  defp recheck_rate_limit_after_onboard(%{status: "onboarded"} = result, config, provider, machine) do
+  defp recheck_rate_limit_after_onboard(
+         %{status: "onboarded"} = result,
+         config,
+         provider,
+         machine
+       ) do
     case Tightbeam.HarnessHealth.RecoverySchedule.credential_changed(
            gateway_db(config),
            provider,
            machine
          ) do
-      :ok -> result
+      :ok ->
+        result
+
       {:error, reason} ->
-        Logger.warning("rate-limit recovery recheck after credential change failed: #{inspect(reason)}")
+        Logger.warning(
+          "rate-limit recovery recheck after credential change failed: #{inspect(reason)}"
+        )
+
         result
     end
   end
