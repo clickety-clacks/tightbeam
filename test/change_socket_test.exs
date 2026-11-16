@@ -738,8 +738,13 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert_receive :firehose_overflow, 5_000
     refute_receive {:firehose_notice, _notice}
 
-    assert {:stop, :normal, 4008, ^state} =
+    assert {:stop, :normal, 4008, {:text, reload}, ^state} =
              ChangeSocket.handle_info(:firehose_overflow, state)
+
+    assert JSON.decode!(reload) == %{
+             "type" => "reload_required",
+             "reason" => "backlog_overflow"
+           }
 
     ChangeSocket.terminate(:normal, state)
   end
