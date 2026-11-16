@@ -16,7 +16,6 @@ The 1st entry is the model that users' reports and independent tests, weighed to
 | Narrow lookup, extraction, classification, summary | claude: claude-haiku-5-5 medium | codex: gpt-6.1-terra low | Users: Haiku strong for bulk extraction; Luna hallucinates and skips items |
 | Complex research across many sources | codex: gpt-6-astra high | claude: claude-opus-5-5 high | Users: Astra finds more sources, with taste; knowledge-work test favours Opus |
 | Writing for people | claude: claude-opus-5-5 high | codex: gpt-6-astra high | Tests favour Opus; users split between Opus and Astra |
-| Graphical and creative design | claude: claude-fable-5-2 high | codex: gpt-6-astra high | User-directed preference |
 | Computer use, screenshots, visual interpretation | codex: gpt-6-astra high | claude: claude-opus-5-5 high | Users: Astra strong but slow; no computer-use test |
 | Simple messaging, status relay, routing | codex: gpt-6.1-terra low | claude: claude-haiku-5-5 medium | Thin; AutomationBench; Luna leaks tool markers into messages |
 | When unsure | claude: claude-opus-5-5 medium | codex: gpt-6.1-sol high | Users' default; users rate Sol high about equal to Opus medium |
