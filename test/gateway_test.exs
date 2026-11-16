@@ -14,6 +14,8 @@ defmodule Tightbeam.GatewayTest do
     expected =
       ~w(post wake condition facts-read fact-demand fact-producer-claim fact-producers artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-handoff work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-custody-transfer session-po-set retire assignment-commitref-correct)
 
+    expected = expected ++ ~w(assess_attachments)
+
     expected = expected ++ ~w(breathing)
 
     expected =
@@ -1337,7 +1339,11 @@ defmodule Tightbeam.GatewayTest do
     assert accepted_message["sender"] == human_origin
     assert accepted_message["deviceId"] == "post-device"
     assert accepted_message["clientMessageId"] == "post-queued-1"
-    assert accepted_message["attachments"] == [attachment]
+
+    assert accepted_message["attachments"] == [
+             Map.put(attachment, "delivery", %{"outcome" => "pending", "reason" => nil})
+           ]
+
     assert is_nil(accepted_message["turnSeq"])
     refute Map.has_key?(accepted_message, "turnIncludesHuman")
     refute accepted_message["isBatchCarrier"]
@@ -1938,13 +1944,16 @@ defmodule Tightbeam.GatewayTest do
           payload["clientMessageId"] == "human-batch-message"
       end)
 
+    pending_attachment =
+      Map.put(attachment, "delivery", %{"outcome" => "pending", "reason" => nil})
+
     assert %{
              "payload" => %{
                "role" => "user",
                "sender" => ^human_sender,
                "deviceId" => "chat-device",
                "clientMessageId" => "human-batch-message",
-               "attachments" => [^attachment],
+               "attachments" => [^pending_attachment],
                "turnSeq" => ^turn_seq,
                "turnIncludesHuman" => true
              }
@@ -12983,6 +12992,717 @@ defmodule Tightbeam.GatewayTest do
     shim
   end
 
+  test "REST post records a canonical attachment with its existing identity", ctx do
+    owner = ctx.device.user_id
+
+    asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/zip",
+        "sample.zip",
+        "original file bytes"
+      )
+
+    attachment = attachment_ref(asset, "sample.zip")
+
+    body = %{
+      verb: "post",
+      asUser: owner,
+      sessionKey: "k1",
+      params: %{
+        clientMessageId: "c_rest_attachment",
+        deviceId: "chat_test",
+        content: "open sample.zip",
+        attachments: [attachment]
+      }
+    }
+
+    response = rest_post(ctx, "tbc_test", body)
+    assert response.status == 200
+    assert JSON.decode!(response.resp_body) == %{"result" => %{"ack" => "c_rest_attachment"}}
+    assert_receive {:ensure_lane, "k1"}
+
+    message_id = rest_post_message_id!(ctx.db, "k1", "chat_test", "c_rest_attachment")
+    raw = Projection.get(ctx.db, message_id)
+    assert raw.content == "open sample.zip"
+    assert raw.sender == "user:#{owner}"
+    assert raw.attachments == [attachment]
+
+    projected = StateResources.message(StateResources.query_message(ctx.db, message_id))
+
+    assert projected["attachments"] == [
+             Map.put(attachment, "delivery", %{"outcome" => "pending", "reason" => nil})
+           ]
+  end
+
+  test "attachment assessment is ordered, selected-session scoped, and keeps uncertainty explicit",
+       ctx do
+    owner = ctx.device.user_id
+
+    {:ok, {_name, zip_bytes}} =
+      :zip.create('sample.zip', [{'note.txt', "original bytes"}], [:memory])
+
+    zip =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/zip",
+        "sample.zip",
+        zip_bytes
+      )
+
+    missing =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/octet-stream",
+        "missing.bin",
+        <<1, 2, 3>>
+      )
+
+    File.rm!(Tightbeam.Assets.file_path(ctx.catalog_base, missing.asset_id))
+
+    changed =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/octet-stream",
+        "changed.bin",
+        <<1, 2, 3>>
+      )
+
+    File.write!(Tightbeam.Assets.file_path(ctx.catalog_base, changed.asset_id), <<1, 2>>)
+
+    oversized_bytes = repeated_attachment_bytes(25_000_001)
+
+    oversized =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/octet-stream",
+        "oversized.bin",
+        oversized_bytes
+      )
+
+    assessment =
+      rest_post(ctx, "tbc_test", %{
+        verb: "assess_attachments",
+        asUser: owner,
+        sessionKey: "k1",
+        params: %{
+          clientMessageId: "c_assess_ordered",
+          assetIds: [zip.asset_id, changed.asset_id, missing.asset_id, oversized.asset_id]
+        }
+      })
+
+    assert assessment.status == 200
+
+    assert %{
+             "result" => %{
+               "sessionKey" => "k1",
+               "clientMessageId" => "c_assess_ordered",
+               "maxDeliverableAttachmentBytes" => 25_000_000,
+               "attachments" => [
+                 %{"assetId" => zip_id, "assessment" => "will-deliver", "reason" => nil},
+                 %{
+                   "assetId" => changed_id,
+                   "assessment" => "unknown",
+                   "reason" => %{"code" => "assessment-unavailable"}
+                 },
+                 %{
+                   "assetId" => missing_id,
+                   "assessment" => "will-not-deliver",
+                   "reason" => %{"code" => "attachment-unavailable"}
+                 },
+                 %{
+                   "assetId" => oversized_id,
+                   "assessment" => "will-not-deliver",
+                   "reason" => %{"code" => "over-limit"}
+                 }
+               ]
+             }
+           } = JSON.decode!(assessment.resp_body)
+
+    assert [zip.asset_id, changed.asset_id, missing.asset_id, oversized.asset_id] ==
+             [zip_id, changed_id, missing_id, oversized_id]
+
+    atomic_preflight =
+      rest_post(ctx, "tbc_test", %{
+        verb: "assess_attachments",
+        asUser: owner,
+        sessionKey: "k1",
+        params: %{
+          clientMessageId: "c_atomic_over_limit",
+          assetIds: [zip.asset_id, oversized.asset_id]
+        }
+      })
+
+    assert atomic_preflight.status == 200
+
+    assert %{
+             "result" => %{
+               "clientMessageId" => "c_atomic_over_limit",
+               "attachments" => [
+                 %{"assetId" => ^zip_id, "assessment" => "will-deliver"},
+                 %{"assetId" => ^oversized_id, "assessment" => "will-not-deliver"}
+               ]
+             }
+           } = JSON.decode!(atomic_preflight.resp_body)
+
+    Org.create(ctx.db, %{
+      session_key: "k2",
+      display_name: "alternate destination",
+      owner_user_id: owner,
+      origin: "user:#{owner}",
+      archetype: "default",
+      host: "testhost",
+      harness: "pi",
+      provider: "opencode_go",
+      model: Model.new("test-model")
+    })
+
+    selected_other_session =
+      rest_post(ctx, "tbc_test", %{
+        verb: "assess_attachments",
+        asUser: owner,
+        sessionKey: "k2",
+        params: %{clientMessageId: "c_assess_other_session", assetIds: [zip.asset_id]}
+      })
+
+    assert selected_other_session.status == 200
+
+    assert %{
+             "result" => %{
+               "sessionKey" => "k2",
+               "attachments" => [
+                 %{
+                   "assetId" => ^zip_id,
+                   "assessment" => "will-not-deliver",
+                   "reason" => %{"code" => "unsupported-delivery"}
+                 }
+               ]
+             }
+           } = JSON.decode!(selected_other_session.resp_body)
+
+    unavailable =
+      rest_post_with_handlers(
+        ctx,
+        "tbc_test",
+        %{
+          verb: "assess_attachments",
+          asUser: owner,
+          sessionKey: "k1",
+          params: %{
+            clientMessageId: "c_assess_application_failure",
+            assetIds: [zip.asset_id, missing.asset_id]
+          }
+        },
+        %{
+          "assess_attachments" => fn _call ->
+            %{code: "assessment-unavailable", message: "internal failure detail"}
+          end
+        }
+      )
+
+    assert unavailable.status == 503
+
+    assert JSON.decode!(unavailable.resp_body) == %{
+             "error" => %{
+               "code" => "assessment-unavailable",
+               "message" => "Attachment delivery could not be confirmed."
+             },
+             "sessionKey" => "k1",
+             "clientMessageId" => "c_assess_application_failure",
+             "maxDeliverableAttachmentBytes" => 25_000_000,
+             "attachments" => [
+               %{
+                 "assetId" => zip.asset_id,
+                 "assessment" => "unknown",
+                 "reason" => %{
+                   "code" => "assessment-unavailable",
+                   "message" => "Attachment delivery could not be confirmed."
+                 }
+               },
+               %{
+                 "assetId" => missing.asset_id,
+                 "assessment" => "unknown",
+                 "reason" => %{
+                   "code" => "assessment-unavailable",
+                   "message" => "Attachment delivery could not be confirmed."
+                 }
+               }
+             ]
+           }
+
+    unknown_asset =
+      rest_post(ctx, "tbc_test", %{
+        verb: "assess_attachments",
+        asUser: owner,
+        sessionKey: "k1",
+        params: %{clientMessageId: "c_assess_missing_id", assetIds: ["a_unknown"]}
+      })
+
+    assert unknown_asset.status == 400
+    assert JSON.decode!(unknown_asset.resp_body)["error"]["code"] == "invalid_message"
+
+    post = %{
+      verb: "post",
+      asUser: owner,
+      sessionKey: "k1",
+      params: %{
+        clientMessageId: "c_atomic_over_limit",
+        deviceId: "chat_test",
+        content: "mixed attachment send",
+        attachments: [
+          attachment_ref(zip, "sample.zip"),
+          attachment_ref(oversized, "oversized.bin")
+        ]
+      }
+    }
+
+    refused = rest_post(ctx, "tbc_test", post)
+    assert refused.status == 413
+
+    assert JSON.decode!(refused.resp_body) == %{
+             "error" => %{
+               "code" => "attachment_over_limit",
+               "message" => "This file exceeds the delivery limit."
+             },
+             "sessionKey" => "k1",
+             "clientMessageId" => "c_atomic_over_limit",
+             "maxDeliverableAttachmentBytes" => 25_000_000,
+             "offendingAssetIds" => [oversized.asset_id]
+           }
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId=?1", [
+               "c_atomic_over_limit"
+             ])
+
+    missing_post =
+      rest_post(ctx, "tbc_test", %{
+        verb: "post",
+        asUser: owner,
+        sessionKey: "k1",
+        params: %{
+          clientMessageId: "c_metadata_without_bytes",
+          deviceId: "chat_test",
+          content: "the metadata row remains valid",
+          attachments: [attachment_ref(missing, "missing.bin")]
+        }
+      })
+
+    assert missing_post.status == 200
+    assert_receive {:ensure_lane, "k1"}
+
+    missing_message_id =
+      rest_post_message_id!(ctx.db, "k1", "chat_test", "c_metadata_without_bytes")
+
+    missing_session = Org.get(ctx.db, "k1")
+
+    missing_prompt =
+      Gateway.prepare_turn_prompt_content(
+        ctx.db,
+        %{seq: -1, message_id: missing_message_id, prompt: ""},
+        missing_session,
+        gateway_config(ctx.catalog_base, ctx.db, 0)
+      )
+
+    assert missing_prompt.content =~ "stored attachment bytes could not be read"
+
+    assert [%{outcome: "not-delivered", reason: %{code: "attachment-unavailable"}}] =
+             missing_prompt.attempts
+
+    :ok = Tightbeam.AttachmentDelivery.record_attempts(ctx.db, missing_prompt.attempts, :unknown)
+
+    assert StateResources.message(StateResources.query_message(ctx.db, missing_message_id))[
+             "attachments"
+           ] ==
+             [
+               Map.put(attachment_ref(missing, "missing.bin"), "delivery", %{
+                 "outcome" => "not-delivered",
+                 "reason" => %{
+                   "code" => "attachment-unavailable",
+                   "message" => "The stored attachment bytes are unavailable."
+                 }
+               })
+             ]
+  end
+
+  test "a failed workspace transfer replaces a favorable assessment with its persisted reason",
+       ctx do
+    owner = ctx.device.user_id
+
+    register_hosts(ctx.db, %{
+      "remote-test" => %{ssh: "test@unreachable", base_dir: "/remote/tightbeam", cli_bin: nil}
+    })
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "k3",
+        display_name: "remote destination",
+        owner_user_id: owner,
+        origin: "user:#{owner}",
+        archetype: "default",
+        host: "remote-test",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("test-model")
+      })
+
+    asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/octet-stream",
+        "transfer.bin",
+        "workspace transfer fixture"
+      )
+
+    assessment =
+      rest_post(ctx, "tbc_test", %{
+        verb: "assess_attachments",
+        asUser: owner,
+        sessionKey: "k3",
+        params: %{clientMessageId: "c_remote_transfer_failure", assetIds: [asset.asset_id]}
+      })
+
+    assert assessment.status == 200
+
+    assert %{
+             "result" => %{
+               "sessionKey" => "k3",
+               "attachments" => [%{"assessment" => "will-deliver", "reason" => nil}]
+             }
+           } = JSON.decode!(assessment.resp_body)
+
+    post =
+      rest_post(ctx, "tbc_test", %{
+        verb: "post",
+        asUser: owner,
+        sessionKey: "k3",
+        params: %{
+          clientMessageId: "c_remote_transfer_failure",
+          deviceId: "chat_test",
+          content: "open transfer.bin",
+          attachments: [attachment_ref(asset, "transfer.bin")]
+        }
+      })
+
+    assert post.status == 200
+    assert_receive {:ensure_lane, "k3"}
+    message_id = rest_post_message_id!(ctx.db, "k3", "chat_test", "c_remote_transfer_failure")
+
+    config =
+      gateway_config(ctx.catalog_base, ctx.db, 0)
+      |> Map.put(:sh, fn _command -> {"fixture transfer failure", 255} end)
+
+    prepared =
+      Gateway.prepare_turn_prompt_content(
+        ctx.db,
+        %{seq: -1, message_id: message_id, prompt: ""},
+        session,
+        config
+      )
+
+    assert prepared.content =~ "could not be transferred"
+    assert [%{outcome: "not-delivered", reason: %{code: "transfer-failed"}}] = prepared.attempts
+
+    :ok = Tightbeam.AttachmentDelivery.record_attempts(ctx.db, prepared.attempts, :unknown)
+
+    assert StateResources.message(StateResources.query_message(ctx.db, message_id))["attachments"] ==
+             [
+               Map.put(attachment_ref(asset, "transfer.bin"), "delivery", %{
+                 "outcome" => "not-delivered",
+                 "reason" => %{
+                   "code" => "transfer-failed",
+                   "message" => "This file could not be delivered to the agent."
+                 }
+               })
+             ]
+  end
+
+  test "ephemeral turns receive originals in the temporary agent workspace", ctx do
+    owner = ctx.device.user_id
+    :ok = Tightbeam.Ephemeral.migrate(ctx.db)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "k4",
+        display_name: "temporary destination",
+        owner_user_id: owner,
+        origin: "user:#{owner}",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("test-model")
+      })
+
+    {:ok, :ok} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.Ephemeral.stamp_in_txn(txn, "k4", "k1")
+        :ok
+      end)
+
+    bytes = "temporary workspace attachment"
+
+    asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/octet-stream",
+        "temporary.bin",
+        bytes
+      )
+
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: "k4",
+        role: "user",
+        content: "open temporary.bin",
+        client_message_id: "c_ephemeral_attachment",
+        attachments: [attachment_ref(asset, "temporary.bin")]
+      })
+
+    config = gateway_config(ctx.catalog_base, ctx.db, 0)
+
+    Placement.with_turn_directory(config, session, fn ->
+      prepared =
+        Gateway.prepare_turn_prompt_content(
+          ctx.db,
+          %{seq: -1, message_id: message.id, prompt: ""},
+          session,
+          config
+        )
+
+      path = original_attachment_path!(prepared.content)
+      assert File.read!(path) == bytes
+      assert path =~ "/.tightbeam/attachments/#{message.id}/"
+      assert [%{outcome: "delivered"}] = prepared.attempts
+      :ok
+    end)
+  end
+
+  test "ZIP and both inclusive size boundaries reach the selected workspace byte-for-byte", ctx do
+    owner = ctx.device.user_id
+
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
+    :ok =
+      Tightbeam.Firehose.Hub.register(Tightbeam.Firehose.Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: owner,
+        is_admin: false
+      })
+
+    :ok =
+      Tightbeam.Firehose.Hub.subscribe(
+        Tightbeam.Firehose.Hub,
+        self(),
+        "attachment-delivery-test",
+        %{
+          "classes" => ["message.attachment_delivery.updated"],
+          "sessionKey" => "k1"
+        }
+      )
+
+    {:ok, {_name, zip_bytes}} =
+      :zip.create('sample.zip', [{'note.txt', "ZIP reaches the receiver"}], [:memory])
+
+    zip =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/zip",
+        "r\u00e9sum\u00e9 notes.zip",
+        zip_bytes
+      )
+
+    near_bytes = repeated_attachment_bytes(24_999_999)
+
+    near =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/octet-stream",
+        "near.bin",
+        near_bytes
+      )
+
+    limit_bytes = repeated_attachment_bytes(25_000_000)
+
+    limit =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/octet-stream",
+        "limit.bin",
+        limit_bytes
+      )
+
+    for {client_message_id, asset, filename, expected_bytes} <- [
+          {"c_zip_original", zip, "r\u00e9sum\u00e9 notes.zip", zip_bytes},
+          {"c_near_limit", near, "near.bin", near_bytes},
+          {"c_limit_inclusive", limit, "limit.bin", limit_bytes}
+        ] do
+      response =
+        rest_post(ctx, "tbc_test", %{
+          verb: "post",
+          asUser: owner,
+          sessionKey: "k1",
+          params: %{
+            clientMessageId: client_message_id,
+            deviceId: "chat_test",
+            content: "open #{filename}",
+            attachments: [attachment_ref(asset, filename)]
+          }
+        })
+
+      assert response.status == 200
+      assert_receive {:ensure_lane, "k1"}
+      message_id = rest_post_message_id!(ctx.db, "k1", "chat_test", client_message_id)
+
+      raw = Projection.get(ctx.db, message_id)
+      assert raw.attachments == [attachment_ref(asset, filename)]
+
+      pending = StateResources.message(StateResources.query_message(ctx.db, message_id))
+
+      assert pending["attachments"] == [
+               Map.put(attachment_ref(asset, filename), "delivery", %{
+                 "outcome" => "pending",
+                 "reason" => nil
+               })
+             ]
+
+      prepared =
+        Gateway.prepare_turn_prompt_content(
+          ctx.db,
+          %{seq: -1, message_id: message_id, prompt: ""},
+          Org.get(ctx.db, "k1"),
+          gateway_config(ctx.catalog_base, ctx.db, 0)
+        )
+
+      path = original_attachment_path!(prepared.content)
+      assert Path.basename(path) == "1-#{filename}"
+      delivered_bytes = File.read!(path)
+      assert byte_size(delivered_bytes) == byte_size(expected_bytes)
+      assert :crypto.hash(:sha256, delivered_bytes) == :crypto.hash(:sha256, expected_bytes)
+
+      if filename == "r\u00e9sum\u00e9 notes.zip" do
+        assert {:ok, [{'note.txt', "ZIP reaches the receiver"}]} =
+                 :zip.extract(delivered_bytes, [:memory])
+      end
+
+      previous_version = pending["rowVersion"]
+      :ok = Tightbeam.AttachmentDelivery.record_attempts(ctx.db, prepared.attempts, :accepted)
+
+      delivered = StateResources.message(StateResources.query_message(ctx.db, message_id))
+      assert delivered["rowVersion"] > previous_version
+
+      assert delivered["attachments"] == [
+               Map.put(attachment_ref(asset, filename), "delivery", %{
+                 "outcome" => "delivered",
+                 "reason" => nil
+               })
+             ]
+
+      page = StateResources.query_messages_for_session_page(ctx.db, "k1", nil, 100)
+      page_message = Enum.find(page.rows, &(&1.id == message_id))
+      assert StateResources.message(page_message)["attachments"] == delivered["attachments"]
+
+      notice =
+        receive_firehose_notice_matching!(Tightbeam.Firehose.Hub, fn notice ->
+          notice["class"] == "message.attachment_delivery.updated" and
+            notice["payload"]["messageId"] == message_id
+        end)
+
+      assert notice["op"] == "observe"
+      assert notice["refs"] == %{"messageId" => message_id, "sessionKey" => "k1"}
+
+      assert notice["payload"] == %{
+               "messageId" => message_id,
+               "sessionKey" => "k1",
+               "clientMessageId" => client_message_id,
+               "assetId" => asset.asset_id,
+               "delivery" => %{"outcome" => "delivered", "reason" => nil}
+             }
+
+      :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+    end
+  end
+
+  test "the existing inline image path still sends the same bytes", ctx do
+    owner = ctx.device.user_id
+    image_bytes = <<137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4>>
+
+    asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "image/png",
+        "diagram.png",
+        image_bytes
+      )
+
+    response =
+      rest_post(ctx, "tbc_test", %{
+        verb: "post",
+        asUser: owner,
+        sessionKey: "k1",
+        params: %{
+          clientMessageId: "c_image_unchanged",
+          deviceId: "chat_test",
+          content: "inspect the image",
+          attachments: [attachment_ref(asset, "diagram.png")]
+        }
+      })
+
+    assert response.status == 200
+    assert_receive {:ensure_lane, "k1"}
+    message_id = rest_post_message_id!(ctx.db, "k1", "chat_test", "c_image_unchanged")
+
+    prepared =
+      Gateway.prepare_turn_prompt_content(
+        ctx.db,
+        %{seq: -1, message_id: message_id, prompt: ""},
+        Org.get(ctx.db, "k1"),
+        gateway_config(ctx.catalog_base, ctx.db, 0)
+      )
+
+    assert [
+             %{type: "text", text: label},
+             %{type: "image", mimeType: "image/png", data: encoded}
+           ] = prepared.content
+
+    assert label =~ "diagram.png"
+    assert label =~ "included inline."
+    assert Base.decode64!(encoded) == image_bytes
+
+    :ok = Tightbeam.AttachmentDelivery.record_attempts(ctx.db, prepared.attempts, :accepted)
+
+    assert StateResources.message(StateResources.query_message(ctx.db, message_id))["attachments"] ==
+             [
+               Map.put(attachment_ref(asset, "diagram.png"), "delivery", %{
+                 "outcome" => "delivered",
+                 "reason" => nil
+               })
+             ]
+  end
+
   defp gateway_config(base_dir, db, port) do
     %{
       base_dir: base_dir,
@@ -12998,6 +13718,66 @@ defmodule Tightbeam.GatewayTest do
       credential_kind: fn _provider -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end
     }
+  end
+
+  defp rest_post(ctx, bearer, body), do: rest_post_with_handlers(ctx, bearer, body, %{})
+
+  defp rest_post_with_handlers(ctx, bearer, body, handler_overrides) do
+    config =
+      gateway_config(ctx.catalog_base, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    handlers = Gateway.handlers(config) |> Map.merge(handler_overrides)
+
+    opts = [
+      db: ctx.db,
+      base_dir: ctx.catalog_base,
+      handlers: handlers,
+      cli_token: "tbc_test"
+    ]
+
+    Plug.Test.conn(:post, "/agent/dispatch", JSON.encode!(body))
+    |> Plug.Conn.put_req_header("authorization", "Bearer #{bearer}")
+    |> Plug.Conn.put_req_header(
+      "x-tightbeam-cli-version",
+      Tightbeam.CliCompatibility.required_version()
+    )
+    |> Tightbeam.Wire.Router.call(Tightbeam.Wire.Router.init(opts))
+  end
+
+  defp rest_post_message_id!(db, session_key, device_id, client_message_id) do
+    case DB.query(
+           db,
+           "SELECT id FROM messages WHERE sessionKey=?1 AND deviceId=?2 AND clientMessageId=?3",
+           [session_key, device_id, client_message_id]
+         ) do
+      {:ok, [[message_id]]} -> message_id
+      other -> flunk("REST post message lookup failed: #{inspect(other)}")
+    end
+  end
+
+  defp attachment_ref(asset, filename) do
+    %{
+      "assetId" => asset.asset_id,
+      "mimeType" => asset.mime_type,
+      "filename" => filename,
+      "size" => asset.size
+    }
+  end
+
+  defp repeated_attachment_bytes(size) do
+    pattern = for byte <- 0..255, into: <<>>, do: <<byte>>
+    copies = div(size, byte_size(pattern))
+    remainder = rem(size, byte_size(pattern))
+    :binary.copy(pattern, copies) <> binary_part(pattern, 0, remainder)
+  end
+
+  defp original_attachment_path!(content) when is_binary(content) do
+    case Regex.run(~r/original file bytes are available at (.+)\./, content) do
+      [_, path] -> path
+      _ -> flunk("prompt did not identify an agent-readable original file path")
+    end
   end
 
   # Exercise background cleanup explicitly after the retirement request returns.
