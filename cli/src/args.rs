@@ -6485,6 +6485,7 @@ mod tests {
                 "harklight-retract",
                 "harklight-settle",
                 "harklight-follow",
+                "harklight-cover",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",
