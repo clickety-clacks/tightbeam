@@ -90,8 +90,8 @@ defmodule Tightbeam.UnresponsiveBounceTest do
                })
              end)
 
-    assert {:ok, {:staged, source}} = deliver_in_txn(ctx, "w_unresponsive_hold_source")
-    assert source.state == "pending"
+    assert {:ok, delivery} = deliver_in_txn(ctx, "w_unresponsive_hold_source")
+    assert_source_queued(ctx.db, "w_unresponsive_hold_source", delivery)
     assert {:ok, [[notice]]} = bounce_prompts(ctx.db)
     assert notice =~ "held by a harness incident"
   end
@@ -99,8 +99,8 @@ defmodule Tightbeam.UnresponsiveBounceTest do
   test "a recipient not admitting turns queues the sender notice", ctx do
     :persistent_term.put({Tightbeam.Application, :draining}, true)
 
-    assert {:ok, {:staged, source}} = deliver_in_txn(ctx, "w_unresponsive_drain_source")
-    assert source.state == "pending"
+    assert {:ok, delivery} = deliver_in_txn(ctx, "w_unresponsive_drain_source")
+    assert_source_queued(ctx.db, "w_unresponsive_drain_source", delivery)
     assert {:ok, [[notice]]} = bounce_prompts(ctx.db)
     assert notice =~ "not admitting turns"
   end
@@ -119,5 +119,13 @@ defmodule Tightbeam.UnresponsiveBounceTest do
 
   defp bounce_prompts(db) do
     DB.query(db, "SELECT prompt FROM wakes WHERE wakeId LIKE 'w_unresponsive_%' AND origin='process:tightbeam'")
+  end
+
+  defp assert_source_queued(_db, _wake_id, {:staged, source}),
+    do: assert(source.state == "pending")
+
+  defp assert_source_queued(db, wake_id, {:appended, _, _, _}) do
+    assert {:ok, [["queued"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE wakeId=?1", [wake_id])
   end
 end
