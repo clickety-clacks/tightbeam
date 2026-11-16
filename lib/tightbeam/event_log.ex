@@ -83,6 +83,10 @@ defmodule Tightbeam.EventLog do
     detail  TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS rail_sweep_cleanup (
+    id INTEGER PRIMARY KEY CHECK (id = 0)
+  );
+
   CREATE TABLE IF NOT EXISTS boot_epochs (
     epoch           INTEGER PRIMARY KEY AUTOINCREMENT,
     bootedAt        INTEGER NOT NULL,

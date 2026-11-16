@@ -1441,7 +1441,17 @@ defmodule Tightbeam.Rules do
 
               []
             else
-              [{:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}]
+              if unsupported_policy_purpose?(policy) do
+                require Logger
+
+                Logger.warning(
+                  "#{path}: policy #{inspect(Map.get(policy, "name"))}: unsupported purpose: #{inspect(Map.get(policy, "purpose"))}"
+                )
+
+                []
+              else
+                [{:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}]
+              end
             end
           end)
 
@@ -1461,10 +1471,11 @@ defmodule Tightbeam.Rules do
         contents
       )
 
-    only_retired_policies? =
-      rules == [] and policy_entries != [] and Enum.all?(policy_entries, &retired_policy?/1)
+    only_skipped_policies? =
+      rules == [] and policy_entries != [] and
+        Enum.all?(policy_entries, &(retired_policy?(&1) or unsupported_policy_purpose?(&1)))
 
-    if rules == [] and policies == [] and reactions == [] and not only_retired_policies?,
+    if rules == [] and policies == [] and reactions == [] and not only_skipped_policies?,
       do: raise(ArgumentError, "#{path}: must contain one or more [[rule]] or [[policy]] tables")
 
     rules ++ policies ++ reactions
@@ -1474,6 +1485,13 @@ defmodule Tightbeam.Rules do
     do:
       is_map(policy) and
         Map.get(policy, "purpose") in ~w(wait-effort-relief wait-verification-admission)
+
+  defp unsupported_policy_purpose?(policy) when is_map(policy) do
+    purpose = Map.get(policy, "purpose")
+    is_binary(purpose) and purpose not in @policy_purposes
+  end
+
+  defp unsupported_policy_purpose?(_policy), do: false
 
   defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
     raw_name = Map.get(policy, "name")

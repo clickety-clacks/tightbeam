@@ -271,6 +271,7 @@ defmodule Tightbeam.NoticeSubmission do
 
         copy_source_in_txn(txn, source_id, successor_id, due_at)
         QueuedMessageSuppression.copy_replacement_request_in_txn(txn, source_id, successor_id)
+        QueuedMessageSuppression.copy_prod_request_in_txn(txn, source_id, successor_id)
 
         case ReminderDelivery.rebind_wake_in_txn(
                txn,

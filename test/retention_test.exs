@@ -2,9 +2,9 @@ defmodule Tightbeam.RetentionTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, EventLog, Retention}
-  alias Tightbeam.DB.Txn
 
-  @day_ms 86_400_000
+  @first DateTime.to_unix(~U[2026-09-19 00:00:00Z], :millisecond)
+  @after_last DateTime.to_unix(~U[2026-10-15 00:00:00Z], :millisecond)
 
   setup do
     db = :"retention_db_#{System.unique_integer([:positive])}"
@@ -13,170 +13,94 @@ defmodule Tightbeam.RetentionTest do
     %{db: db}
   end
 
-  test "startup leaves a large history untouched and batches yield to other database work", %{
+  test "only the historical rail_sweep window is deleted, including its first and last days", %{
     db: db
   } do
-    now = System.system_time(:millisecond)
-    insert_rows(db, 6_001, now - 61 * @day_ms)
-    pid = start_supervised!({Retention, db: db, name: nil})
-    assert %{cursor: 0, cutoff: nil, days: 60} = :sys.get_state(pid)
-    assert count(db) == 6_001
+    rows = [
+      {@first - 1, "rail_sweep"},
+      {@first, "rail_sweep"},
+      {@after_last - 1, "rail_sweep"},
+      {@after_last, "rail_sweep"},
+      {@first, "rail_remedy"},
+      {@first, "decision_request_ruled"},
+      {@first - 90 * 86_400_000, "adapter_down"}
+    ]
+
+    for {ts, kind} <- rows, do: insert_row(db, ts, kind)
+    {:ok, pid} = Retention.start_link(db: db, name: nil)
+    drain(pid)
+
+    assert {:ok, retained} = DB.query(db, "SELECT ts,kind FROM lifecycle_events ORDER BY id")
+
+    assert retained == [
+             [@first - 1, "rail_sweep"],
+             [@after_last, "rail_sweep"],
+             [@first, "rail_remedy"],
+             [@first, "decision_request_ruled"],
+             [@first - 90 * 86_400_000, "adapter_down"]
+           ]
+
+    assert {:ok, [[0]]} = DB.query(db, "SELECT id FROM rail_sweep_cleanup")
+    GenServer.stop(pid)
+  end
+
+  test "a completed pass never deletes later backfilled events, including after restart", %{
+    db: db
+  } do
+    insert_row(db, @first, "rail_sweep")
+    {:ok, pid} = Retention.start_link(db: db, name: nil)
+    drain(pid)
+    assert count(db) == 0
+    GenServer.stop(pid)
+
+    insert_row(db, @first, "rail_sweep")
+    {:ok, restarted} = Retention.start_link(db: db, name: nil)
+    drain(restarted)
+    assert count(db) == 1
+    GenServer.stop(restarted)
+  end
+
+  test "large history is processed in bounded batches without blocking other reads", %{db: db} do
+    for _ <- 1..2_001, do: insert_row(db, @first, "rail_sweep")
+    {:ok, pid} = Retention.start_link(db: db, name: nil)
+    assert count(db) == 2_001
 
     send(pid, :trim)
-    assert %{cursor: 2_000} = :sys.get_state(pid)
-    assert count(db) == 4_001
+    assert %{cursor: 2_000, complete: false} = :sys.get_state(pid)
+    assert count(db) == 1
     assert {:ok, [[42]]} = DB.query(db, "SELECT 42")
-    eventually(fn -> count(db) == 0 end)
+    drain(pid)
+    assert count(db) == 0
+    GenServer.stop(pid)
   end
 
-  test "configured days preserve the cutoff and younger rows with out-of-order timestamps", %{
-    db: db
-  } do
-    previous = Application.get_env(:tightbeam, :retention_days)
-    Application.put_env(:tightbeam, :retention_days, 7)
-
-    on_exit(fn ->
-      if previous == nil,
-        do: Application.delete_env(:tightbeam, :retention_days),
-        else: Application.put_env(:tightbeam, :retention_days, previous)
-    end)
-
-    pid = start_supervised!({Retention, db: db, name: nil})
-    assert %{days: 7} = :sys.get_state(pid)
-    cutoff = System.system_time(:millisecond) - 7 * @day_ms
-    :sys.replace_state(pid, &%{&1 | cutoff: cutoff})
-    insert_rows(db, 1, cutoff)
-    insert_rows(db, 1, cutoff - 1)
-    insert_rows(db, 1, cutoff + @day_ms)
-    insert_rows(db, 1, cutoff - @day_ms)
-
-    send(pid, :trim)
-    :sys.get_state(pid)
-
-    assert {:ok, [[^cutoff], [young]]} =
-             DB.query(db, "SELECT ts FROM lifecycle_events ORDER BY id")
-
-    assert young == cutoff + @day_ms
-  end
-
-  test "a failed batch is logged without stopping the trimmer or unrelated reads", %{db: db} do
+  test "a failed pass leaves the process alive and does not mark cleanup complete", %{db: db} do
     assert :ok = DB.execute(db, "DROP TABLE lifecycle_events")
-    pid = start_supervised!({Retention, db: db, name: nil})
+    {:ok, pid} = Retention.start_link(db: db, name: nil)
     send(pid, :trim)
-    assert %{cursor: 0} = :sys.get_state(pid)
+    assert %{complete: false} = :sys.get_state(pid)
     assert Process.alive?(pid)
-    assert {:ok, [[1]]} = DB.query(db, "SELECT 1")
+    assert {:ok, []} = DB.query(db, "SELECT id FROM rail_sweep_cleanup")
+    GenServer.stop(pid)
   end
 
-  test "invalid retention configuration logs an error and keeps the default", %{db: db} do
-    previous = Application.get_env(:tightbeam, :retention_days)
-    Application.put_env(:tightbeam, :retention_days, "invalid")
-
-    on_exit(fn ->
-      if previous == nil,
-        do: Application.delete_env(:tightbeam, :retention_days),
-        else: Application.put_env(:tightbeam, :retention_days, previous)
-    end)
-
-    log =
-      ExUnit.CaptureLog.capture_log(fn ->
-        pid = start_supervised!({Retention, db: db, name: nil})
-        assert %{days: 60} = :sys.get_state(pid)
-      end)
-
-    assert log =~ "invalid retention_days"
-  end
-
-  for kind <- ~w(
-        decision_request_ruled
-        supervision_entitlement_armed
-        supervision_entitlement_claimed
-        supervision_entitlement_cleared
-        supervision_entitlement_deferred
-        supervision_entitlement_rearmed
-        supervision_entitlement_rebased
-        supervision_entitlement_recovered
-        supervision_entitlement_recovery_refused
-        supervision_entitlement_terminated
-        supervision_entitlement_transferred
-        idle_cleanup_pending_observed
-        lineage_exhausted
-        queued_message_suppressed
-        wake_undeliverable
-        retired_workspace_cleanup_completed
-        retired_workspace_cleanup_incomplete
-        supervision_entitlement_future
-        unknown_future_kind
-      ) do
-    @kind kind
-    test "retention preserves expired #{@kind} state", %{db: db} do
-      expired = System.system_time(:millisecond) - 61 * @day_ms
-
-      assert {:ok, []} =
-               DB.query(
-                 db,
-                 "INSERT INTO lifecycle_events (ts,kind,subject,detail) VALUES (?1,?2,'state','evidence')",
-                 [expired, @kind]
-               )
-
-      insert_rows(db, 1, expired)
-      pid = start_supervised!({Retention, db: db, name: nil})
-      send(pid, :trim)
-      :sys.get_state(pid)
-
-      assert {:ok, [[@kind, "state", "evidence"]]} =
-               DB.query(db, "SELECT kind,subject,detail FROM lifecycle_events ORDER BY id")
-    end
-  end
-
-  test "a pass stops after the first nondeleting batch at or past the cutoff", %{db: db} do
-    cutoff = System.system_time(:millisecond) - 60 * @day_ms
-    insert_rows(db, 2_000, cutoff - 1)
-    insert_rows(db, 4_001, cutoff)
-    pid = start_supervised!({Retention, db: db, name: nil})
-    :sys.replace_state(pid, &%{&1 | cutoff: cutoff})
-
-    send(pid, :trim)
-    assert %{cursor: 2_000, cutoff: ^cutoff} = :sys.get_state(pid)
-    eventually(fn -> :sys.get_state(pid).cutoff == nil end)
-    assert %{cursor: 0, cutoff: nil} = :sys.get_state(pid)
-    assert count(db) == 4_001
-    # Another expired row cannot be visited until the next hourly pass.
-    insert_rows(db, 1, cutoff - 1)
-    Process.sleep(250)
-    assert count(db) == 4_002
-  end
-
-  test "a nondeleting batch of old protected rows does not end the pass", %{db: db} do
-    expired = System.system_time(:millisecond) - 61 * @day_ms
-    insert_rows(db, 2_000, expired)
-    assert :ok = DB.execute(db, "UPDATE lifecycle_events SET kind='decision_request_ruled'")
-    insert_rows(db, 1, expired)
-    pid = start_supervised!({Retention, db: db, name: nil})
-    send(pid, :trim)
-    assert %{cursor: 2_000} = :sys.get_state(pid)
-    eventually(fn -> count(db) == 2_000 end)
-
-    assert {:ok, [["decision_request_ruled", 2_000]]} =
-             DB.query(db, "SELECT kind,COUNT(*) FROM lifecycle_events GROUP BY kind")
-  end
-
-  defp insert_rows(db, count, ts) do
-    assert {:ok, _} =
-             DB.transaction(db, fn txn ->
-               for _ <- 1..count do
-                 Txn.q(
-                   txn,
-                   "INSERT INTO lifecycle_events (ts,kind,subject) VALUES (?1,'rail_sweep','sample')",
-                   [ts]
-                 )
-               end
-             end)
+  defp insert_row(db, ts, kind) do
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "INSERT INTO lifecycle_events (ts,kind,subject) VALUES (?1,?2,'sample')",
+               [ts, kind]
+             )
   end
 
   defp count(db) do
     {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM lifecycle_events")
     count
+  end
+
+  defp drain(pid) do
+    send(pid, :trim)
+    eventually(fn -> :sys.get_state(pid).complete end)
   end
 
   defp eventually(fun, attempts \\ 100)

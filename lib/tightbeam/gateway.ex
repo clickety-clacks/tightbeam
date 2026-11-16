@@ -7401,7 +7401,8 @@ defmodule Tightbeam.Gateway do
              :condition_kind,
              :predicate,
              :after_turn,
-             :replace_queued
+             :replace_queued,
+             :prod_id
            ],
            &is_nil(p[&1])
          ))
@@ -7414,6 +7415,7 @@ defmodule Tightbeam.Gateway do
     after_turn? = p[:after_turn] == true
     replace_present? = Map.has_key?(p, :replace_queued)
     replace_queued? = p[:replace_queued] == true
+    prod_id = p[:prod_id]
     wait? = predicate? or after_turn?
 
     cond do
@@ -7424,6 +7426,14 @@ defmodule Tightbeam.Gateway do
         false
 
       replace_present? and p[:replace_queued] not in [true, false] ->
+        false
+
+      Map.has_key?(p, :prod_id) and
+          (not is_binary(prod_id) or String.trim(prod_id) == "") ->
+        false
+
+      is_binary(prod_id) and
+          (wait? or is_binary(p[:condition_kind]) or is_binary(p[:cron]) or replace_queued?) ->
         false
 
       predicate? and after_turn? ->
@@ -7562,6 +7572,8 @@ defmodule Tightbeam.Gateway do
         # Typed waits validate the assignment through register_wait_in_txn/2.
         # Internal process and bound remedy wakes continue to use their carriers.
         assignment_id: assignment_id,
+        prod_id: p[:prod_id],
+        prod_sender: prod_sender(call[:principal]),
         activity_assignment_id: activity_assignment_id
       })
 
@@ -7627,6 +7639,11 @@ defmodule Tightbeam.Gateway do
        do: scheduled_wake_assignment_id(params) || immediate_wake_assignment_id(params)
 
   defp wake_assignment_id_in_txn(_txn, _call), do: nil
+
+  defp prod_sender({kind, id}) when kind in [:session, :user, :process] and is_binary(id),
+    do: %{kind: Atom.to_string(kind), id: id}
+
+  defp prod_sender(_), do: nil
 
   defp scheduled_wake_assignment_id(params) do
     if is_number(params[:after_ms]) or is_number(params[:at]) or

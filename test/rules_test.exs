@@ -120,6 +120,51 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
+  test "unsupported purpose skips only its policy while sibling policy and verbs continue", ctx do
+    path =
+      put_raw(
+        ctx,
+        rule("deny-post", "post", "caller.origin_class", "eq", "user") <>
+          rule("deny-wake", "wake", "caller.origin_class", "eq", "user") <>
+          """
+          [[policy]]
+          name = "supported-evidence"
+          purpose = "attest-operational-evidence"
+          when = [{ fact = "assignment.effect_kind", op = "eq", value = "evidence" }]
+
+          [[policy]]
+          name = "unknown-purpose"
+          purpose = "wait-unknown-x"
+          when = [{ fact = "unknown.fact", op = "eq", value = true }]
+          """
+      )
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        loaded = Rules.load!(ctx.base_dir, ["post", "wake", "status"])
+        assert Enum.map(loaded, & &1.name) == ["deny-post", "deny-wake"]
+        assert Enum.map(Rules.effective_snapshot().policies, & &1.name) == ["supported-evidence"]
+      end)
+
+    assert log =~ "#{path}: policy \"unknown-purpose\": unsupported purpose: \"wait-unknown-x\""
+    assert {:deny, %{code: "rule_denied"}} = Rules.evaluate(ctx.db, call())
+    assert {:deny, %{code: "rule_denied"}} = Rules.evaluate(ctx.db, %{call() | verb: "wake"})
+    assert :ok = Rules.evaluate(ctx.db, %{call() | verb: "status"})
+  end
+
+  test "a file with only an unsupported-purpose policy leaves verbs available", ctx do
+    path =
+      put_raw(ctx, "[[policy]]\nname = 'unknown-purpose'\npurpose = 'wait-unknown-x'\n")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert [] = Rules.load!(ctx.base_dir, ["post"])
+      end)
+
+    assert log =~ "#{path}: policy \"unknown-purpose\": unsupported purpose: \"wait-unknown-x\""
+    assert :ok = Rules.evaluate(ctx.db, call())
+  end
+
   test "a malformed rule leaves a healthy sibling rule active", ctx do
     put_raw(
       ctx,

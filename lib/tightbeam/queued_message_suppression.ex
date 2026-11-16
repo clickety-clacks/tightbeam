@@ -18,6 +18,16 @@ defmodule Tightbeam.QueuedMessageSuppression do
   );
   CREATE INDEX IF NOT EXISTS queued_message_replacement_assignment
     ON queued_message_replacement_requests(assignmentId, requestedAt);
+  CREATE TABLE IF NOT EXISTS queued_message_prod_requests (
+    wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId) ON DELETE RESTRICT,
+    recipientSessionKey TEXT NOT NULL,
+    senderKind TEXT NOT NULL,
+    senderId TEXT NOT NULL,
+    prodId TEXT NOT NULL,
+    requestedAt INTEGER NOT NULL CHECK(requestedAt >= 0)
+  );
+  CREATE INDEX IF NOT EXISTS queued_message_prod_scope
+    ON queued_message_prod_requests(recipientSessionKey,senderKind,senderId,prodId,requestedAt);
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
@@ -72,6 +82,142 @@ defmodule Tightbeam.QueuedMessageSuppression do
     )
 
     :ok
+  end
+
+  @doc "Preserve a sender's explicit prod scope when delivery retries create a new wake."
+  def copy_prod_request_in_txn(%Txn{} = txn, source_wake_id, replacement_wake_id) do
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO queued_message_prod_requests
+        (wakeId,recipientSessionKey,senderKind,senderId,prodId,requestedAt)
+      SELECT ?2,recipientSessionKey,senderKind,senderId,prodId,requestedAt
+      FROM queued_message_prod_requests WHERE wakeId=?1
+      """,
+      [source_wake_id, replacement_wake_id]
+    )
+
+    :ok
+  end
+
+  @doc "Record a new prod and withdraw only older eligible prods in the same scope."
+  def replace_prod_in_txn(%Txn{} = txn, wake, %{kind: kind, id: sender}, prod_id) do
+    [[latest]] =
+      Txn.q(
+        txn,
+        """
+          SELECT MAX(requestedAt) FROM queued_message_prod_requests
+          WHERE recipientSessionKey=?1 AND senderKind=?2 AND senderId=?3 AND prodId=?4
+        """,
+        [wake.session_key, kind, sender, prod_id]
+      )
+
+    requested_at = max(System.system_time(:millisecond), (latest || -1) + 1)
+
+    Txn.q(
+      txn,
+      """
+        INSERT INTO queued_message_prod_requests
+          (wakeId,recipientSessionKey,senderKind,senderId,prodId,requestedAt)
+        VALUES (?1,?2,?3,?4,?5,?6)
+      """,
+      [wake.wake_id, wake.session_key, kind, sender, prod_id, requested_at]
+    )
+
+    candidates =
+      Txn.q(
+        txn,
+        """
+          SELECT w.wakeId,w.createdAt
+          FROM queued_message_prod_requests p JOIN wakes w ON w.wakeId=p.wakeId
+          WHERE p.recipientSessionKey=?1 AND p.senderKind=?2 AND p.senderId=?3
+            AND p.prodId=?4 AND p.requestedAt<?5 AND w.state='pending'
+            AND w.deliveredTurnSeq IS NULL
+            AND w.consumer='prompt' AND w.digest=0 AND w.targetGate<>0
+            AND w.conditionKind IS NULL AND w.waitMode IS NULL AND w.obligationRef IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM notice_batch_members m JOIN notice_batches b ON b.batchId=m.batchId
+              WHERE m.sourceWakeId=w.wakeId AND m.state='included'
+                AND b.state IN ('sealed','delivery_pending','delivered','delivery_failed')
+            )
+          ORDER BY p.requestedAt,w.rowid
+        """,
+        [wake.session_key, kind, sender, prod_id, requested_at]
+      )
+
+    Enum.each(candidates, fn [source_id, created_at] ->
+      case Wakes.cancel_in_txn(txn, %{
+             wake_id: source_id,
+             requester: %{kind: "process", id: "tightbeam:assignments"},
+             reason_kind: "superseded",
+             causal_source: %{kind: "wake", id: wake.wake_id},
+             outcome: %{kind: "replacement", replacement_wake_id: wake.wake_id}
+           }) do
+        true -> record_prod_replacement(txn, source_id, created_at, wake, kind, sender, prod_id)
+        _ -> raise DB.Error, message: "prod replacement refused for wake #{source_id}"
+      end
+    end)
+
+    queued =
+      Txn.q(
+        txn,
+        """
+          SELECT t.seq,w.wakeId,t.createdAt
+          FROM queued_message_prod_requests p
+          JOIN wakes w ON w.wakeId=p.wakeId
+          JOIN turns t ON t.wakeId=w.wakeId
+          WHERE p.recipientSessionKey=?1 AND p.senderKind=?2 AND p.senderId=?3
+            AND p.prodId=?4 AND p.requestedAt<?5 AND t.status='queued'
+            AND w.consumer='prompt' AND w.digest=0 AND w.targetGate<>0
+            AND w.conditionKind IS NULL AND w.waitMode IS NULL AND w.obligationRef IS NULL
+          ORDER BY p.requestedAt,t.seq
+        """,
+        [wake.session_key, kind, sender, prod_id, requested_at]
+      )
+
+    Enum.each(queued, fn [seq, source_id, created_at] ->
+      if Ledger.cancel_queued_in_txn(txn, seq, "sender_requested_replacement") do
+        record_prod_replacement(txn, source_id, created_at, wake, kind, sender, prod_id)
+      end
+    end)
+
+    :ok
+  end
+
+  defp record_prod_replacement(txn, source_id, created_at, wake, kind, sender, prod_id) do
+    EventLog.lifecycle_in_txn(
+      txn,
+      "queued_message_suppressed",
+      source_id,
+      JSON.encode!(%{
+        messageKind: "sender-replacement",
+        scopeKind: "prod-id",
+        scopeId: prod_id,
+        sourceKind: "wake",
+        sourceId: source_id,
+        sourceCreatedAt: created_at,
+        senderKind: kind,
+        senderId: sender,
+        holderSessionKey: wake.session_key,
+        replacementWakeId: wake.wake_id
+      })
+    )
+  end
+
+  def same_prod_scope_in_txn(txn, source_id, replacement_id) do
+    Txn.q(
+      txn,
+      """
+        SELECT 1 FROM queued_message_prod_requests source
+        JOIN queued_message_prod_requests replacement
+          ON source.recipientSessionKey=replacement.recipientSessionKey
+         AND source.senderKind=replacement.senderKind AND source.senderId=replacement.senderId
+         AND source.prodId=replacement.prodId
+        WHERE source.wakeId=?1 AND replacement.wakeId=?2
+          AND source.requestedAt<replacement.requestedAt
+      """,
+      [source_id, replacement_id]
+    ) == [[1]]
   end
 
   @doc "Return the explicit assignment scope requested for one wake, if any."
