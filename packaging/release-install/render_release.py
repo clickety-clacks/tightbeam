@@ -28,9 +28,10 @@ def require(condition, reason):
 
 def read_input(path):
     data = json.loads(path.read_text())
+    data.pop("candidate", None)
     require(data["format"] == 1, "unsupported manifest format")
-    require(data.get("purpose") in ("prerelease-soak", "release-install"),
-            "install purpose must name prerelease-soak or release-install")
+    require(data.get("purpose") in ("candidate-soak", "release-install"),
+            "install purpose must name candidate-soak or release-install")
     old, new, paths, service = (data[k] for k in ("predecessor", "release", "paths", "service"))
     for value in (old["version"], new["version"]):
         require(re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", value), "invalid version")
@@ -167,16 +168,91 @@ def render_rehearsal_summary(data):
 
 
 def render_purpose_summary(data):
-    if data["purpose"] == "prerelease-soak":
-        return ("This is a tagged, published prerelease candidate. Confirm that the release "
-                "is marked prerelease and is not latest before requesting its exact install yes. "
-                "A healthy production soak is a separate observed result; it does not authorize "
-                "an install. Promote only these identical package bytes after the approved soak. "
-                "Any later installation needs its own exact whole-action yes.")
+    if data["purpose"] == "candidate-soak":
+        candidate = data["candidate"]
+        return (
+            "This is an unpublished candidate built from main at the exact source commit above. "
+            f"Candidate workflow run {candidate['run_id']} produced the package and proof manifest "
+            f"{candidate['proof_manifest_sha256']}. The release tag {data['release']['tag']} is "
+            "planned metadata only; no tag or GitHub Release exists for this candidate. "
+            "The user must separately approve this exact install before its production soak. "
+            "Publish these identical package bytes only if the soak is healthy. If the candidate "
+            "fails a check or the soak finds a defect, keep it unpublished, fix the source through "
+            "a reviewed main change, and build a fresh candidate."
+        )
     return ("This is a later installation of the published release. Confirm the recorded "
             "candidate approval and healthy soak, and verify that promotion kept the exact "
             "package SHA-256. The earlier candidate-install yes does not authorize this install; "
             "request a separate exact whole-action yes.")
+
+
+def verify_candidate_proof(data, assets, provenance, candidate_artifact=False):
+    release = data["release"]
+    candidate = provenance.get("candidate")
+    require(type(candidate) is dict, "candidate provenance is missing its candidate run")
+    run_id = candidate.get("run_id")
+    workflow = candidate.get("workflow")
+    workflow_sha = candidate.get("workflow_sha")
+    proof_sha = candidate.get("proof_manifest_sha256")
+    require(type(run_id) is str and run_id.isdigit(), "candidate provenance has an invalid run ID")
+    require(type(workflow) is str and workflow.startswith("https://"),
+            "candidate provenance has no HTTPS workflow run")
+    require(type(workflow_sha) is str and re.fullmatch(r"[0-9a-f]{40}", workflow_sha),
+            "candidate provenance has an invalid workflow SHA")
+    require(type(proof_sha) is str and HEX64.fullmatch(proof_sha),
+            "candidate provenance has an invalid proof-manifest digest")
+    require(workflow.endswith(f"/clickety-clacks/tightbeam/actions/runs/{run_id}"),
+            "candidate workflow URL does not bind its run ID and repository")
+
+    proof_path = assets / "release-candidate-manifest.json"
+    require(proof_path.is_file() and digest(proof_path) == proof_sha,
+            "candidate proof manifest hash mismatch")
+    proof_bytes = proof_path.read_bytes()
+    proof = json.loads(proof_bytes)
+    require(proof_bytes == (json.dumps(proof, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+            "candidate proof manifest is not canonical JSON")
+    require(proof.get("schema") == "tightbeam-release-candidate-proof/v1" and
+            proof.get("repository") == "clickety-clacks/tightbeam" and
+            proof.get("candidate_ref") == "refs/heads/main" and
+            proof.get("run_id") == run_id and
+            proof.get("source_sha") == release["source_commit"] and
+            proof.get("workflow_sha") == workflow_sha == release["source_commit"],
+            "candidate proof does not bind this main run and exact source commit")
+
+    packages = proof.get("packages")
+    require(type(packages) is list and len(packages) == 2,
+            "candidate proof must contain both platform packages")
+    expected_platforms = ("darwin-aarch64", "linux-x86_64")
+    selected_digest = None
+    for row, platform in zip(packages, expected_platforms):
+        require(type(row) is dict and row.get("platform") == platform and
+                row.get("path") == f"packages/{platform}/tightbeam-{release['version']}-{platform}.tgz" and
+                type(row.get("sha256")) is str and HEX64.fullmatch(row["sha256"]),
+                f"candidate proof has an invalid {platform} package row")
+        if platform == "linux-x86_64":
+            selected_digest = row["sha256"]
+    require(selected_digest == release["package_sha256"],
+            "candidate Linux package bytes differ from the proof manifest")
+    require(provenance.get("repository") == "clickety-clacks/tightbeam" and
+            provenance.get("tag") == release["tag"] and
+            provenance.get("commit") == release["source_commit"] and
+            provenance.get("checksums") == "SHA256SUMS" and
+            isinstance(provenance.get("workflow"), str) and provenance["workflow"] and
+            (not candidate_artifact or provenance.get("workflow") == workflow) and
+            isinstance(provenance.get("assets"), list) and
+            provenance["assets"].count(release["package"]) == 1 and
+            provenance["assets"].count("release-candidate-manifest.json") == 1,
+            "candidate provenance does not bind this run, tag, source and assets")
+    checksum_lines = (assets / "SHA256SUMS").read_text().splitlines()
+    require(f"{release['package_sha256']}  {release['package']}" in checksum_lines and
+            f"{proof_sha}  release-candidate-manifest.json" in checksum_lines,
+            "candidate SHA256SUMS does not bind the package and proof manifest")
+    return {
+        "run_id": run_id,
+        "workflow": workflow,
+        "workflow_sha": workflow_sha,
+        "proof_manifest_sha256": proof_sha,
+    }
 
 
 def main():
@@ -193,20 +269,33 @@ def main():
     published_sums = (assets / "SHA256SUMS").read_text().splitlines()
     require(f'{new["package_sha256"]}  {new["package"]}' in published_sums,
             "release checksums do not bind the package")
-    require(provenance.get("repository") == "clickety-clacks/tightbeam" and
-            provenance.get("tag") == new["tag"] and
-            provenance.get("commit") == new["source_commit"] and
-            provenance.get("checksums") == "SHA256SUMS" and
-            isinstance(provenance.get("workflow"), str) and provenance["workflow"] and
-            isinstance(provenance.get("assets"), list) and
-            provenance["assets"].count(new["package"]) == 1,
-            "release provenance does not bind this tag, source and package")
+    if data["purpose"] == "candidate-soak":
+        require(provenance.get("format") == "tightbeam-release-candidate-provenance/v1",
+                "candidate-soak requires unpublished candidate provenance")
+        data["candidate"] = verify_candidate_proof(data, assets, provenance, candidate_artifact=True)
+    else:
+        require(provenance.get("repository") == "clickety-clacks/tightbeam" and
+                provenance.get("tag") == new["tag"] and
+                provenance.get("commit") == new["source_commit"] and
+                provenance.get("checksums") == "SHA256SUMS" and
+                isinstance(provenance.get("workflow"), str) and provenance["workflow"] and
+                isinstance(provenance.get("assets"), list) and
+                provenance["assets"].count(new["package"]) == 1,
+                "release provenance does not bind this tag, source and package")
+        candidate = provenance.get("candidate")
+        if (data["purpose"] == "release-install" and type(candidate) is dict and
+                type(candidate.get("workflow_sha")) is str and
+                (assets / "release-candidate-manifest.json").is_file()):
+            data["candidate"] = verify_candidate_proof(data, assets, provenance)
     out.mkdir(parents=True)
     job = out / "maintenance-job.sh"
     job.write_text(render_job(data)); job.chmod(0o500)
     data["job_sha256"] = digest(job)
     for name in (new["package"], "release-provenance.json"):
         shutil.copyfile(assets / name, out / name)
+    if "candidate" in data:
+        shutil.copyfile(assets / "release-candidate-manifest.json",
+                        out / "release-candidate-manifest.json")
     shutil.copyfile(assets / "SHA256SUMS", out / "release-SHA256SUMS")
     manifest = out / "manifest.json"
     manifest.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -227,6 +316,8 @@ def main():
     ))
     names = ["manifest.json", "maintenance-job.sh", "install.sh", "install-sheet.md",
              new["package"], "release-provenance.json", "release-SHA256SUMS"]
+    if "candidate" in data:
+        names.append("release-candidate-manifest.json")
     (out / "SHA256SUMS").write_text("".join(f"{digest(out / name)}  {name}\n" for name in names))
     print(json.dumps({"bundle": str(out), "manifest_sha256": digest(manifest),
                       "job_sha256": data["job_sha256"], "launcher_sha256": digest(launcher),
