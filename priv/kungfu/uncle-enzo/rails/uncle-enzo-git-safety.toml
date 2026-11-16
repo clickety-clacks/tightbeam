@@ -1,0 +1,41 @@
+[[statute]]
+name = "uncle-enzo-no-git-stash"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+action = "git-stash"
+text = "You ran a mutating git stash; destructive git is forbidden on any worktree because it silently hides another agent's uncommitted work."
+
+[[statute]]
+name = "uncle-enzo-no-git-reset-hard"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+action = "git-reset-hard"
+text = "You ran git reset --hard; destructive git is forbidden on any worktree because it discards another agent's uncommitted work."
+
+[[statute]]
+name = "uncle-enzo-no-git-clean-force"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+action = "git-clean-force"
+text = "You ran a forced git clean; destructive git is forbidden on any worktree because it deletes another agent's untracked work."
+
+[[statute]]
+name = "uncle-enzo-no-git-checkout-discard"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+action = "git-checkout-discard"
+text = "You ran git checkout -- to discard paths; destructive git is forbidden on any worktree because it overwrites another agent's uncommitted work."
+
+# The argv classifier permits explicit index-only unstaging.
+# Default and mixed worktree restores remain protected, including nested commands.
+[[statute]]
+name = "uncle-enzo-no-git-restore"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+action = "git-restore"
+text = "You ran git restore; destructive git is forbidden on any worktree because it discards another agent's uncommitted work."

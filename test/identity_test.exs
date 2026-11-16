@@ -107,6 +107,18 @@ defmodule Tightbeam.IdentityTest do
                  "Share generic event subscription tools and a read-only Matrix event watcher.",
                phrases: [],
                root_archetype: "default"
+             },
+             %{
+               name: "uncle-enzo",
+               purpose:
+                 "Run your organization with executives who hold your intent and talk to you, and deliverators who own getting each feature or concern delivered.",
+               phrases: [
+                 "I want one agent to talk to, and I don't want it buried in status traffic.",
+                 "My coordinators spend more time messaging each other than shipping.",
+                 "I want each feature to have one owner who sees it through.",
+                 "I want my agents to coordinate with each other directly."
+               ],
+               root_archetype: "exec"
              }
            ]
   end
