@@ -13,6 +13,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
   }
 
   alias Tightbeam.DB.Txn
+  alias Tightbeam.HarnessHealth.RecoverySchedule
 
   @key {:claude, "shared", "testhost"}
   @past DateTime.to_unix(~U[2025-08-14 23:00:00Z], :millisecond)
@@ -240,6 +241,23 @@ defmodule Tightbeam.RateLimitReleaseTest do
 
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT count(*) FROM wakes WHERE consumer='rate_limit_reset'")
+  end
+
+  test "credential change moves an open usage-limit recovery cycle to now", %{db: db} do
+    now = System.system_time(:millisecond)
+    {incident, _wake} = observe_reset(db, "credential-change", reset_error(now + 3_600_000), now)
+
+    assert {:ok, [[initial_due]]} =
+             DB.query(db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [incident.id])
+
+    assert initial_due == now + 120_000
+    assert :ok = RecoverySchedule.credential_changed(db, :anthropic, "testhost")
+
+    assert {:ok, [[due_at]]} =
+             DB.query(db, "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1", [incident.id])
+
+    assert due_at <= System.system_time(:millisecond)
+    assert :ok = RecoverySchedule.credential_changed(db, :openai, "testhost")
   end
 
   defp reset_error(reset_at) do

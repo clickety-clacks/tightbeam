@@ -4331,7 +4331,7 @@ defmodule Tightbeam.HarnessHealthTest do
         "eligible_failure_classes = [\"rate-limit-dead\"]",
         "eligible_failure_classes = #{JSON.encode!(eligible_classes)}"
       )
-      |> String.replace("interval_ms = 3600000", "interval_ms = #{interval_ms}")
+      |> String.replace("interval_ms = 120000", "interval_ms = #{interval_ms}")
 
     if changed == seed do
       raise "recovery policy fixture did not change the shipped seed"
