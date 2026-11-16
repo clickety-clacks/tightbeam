@@ -173,13 +173,19 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
               [[cycle_id, "pending"]] ->
                 Txn.q(
                   txn,
-                  "UPDATE harness_health_recovery_schedules SET dueAt=?2,updatedAt=?2 WHERE holdId=?1 AND cycleId=?3 AND status='pending'",
-                  [incident_id, now, cycle_id]
+                  "UPDATE harness_health_recovery_schedules SET dueAt=?2,updatedAt=?2,sourceEventId=?4 WHERE holdId=?1 AND cycleId=?3 AND status='pending'",
+                  [incident_id, now, cycle_id, "operator-retry:" <> cycle_id]
                 )
 
                 {:ok, cycle_id}
 
               [[cycle_id, "due"]] ->
+                Txn.q(
+                  txn,
+                  "UPDATE harness_health_recovery_schedules SET sourceEventId=?3,updatedAt=?2 WHERE holdId=?1 AND cycleId=?4 AND status='due'",
+                  [incident_id, now, "operator-retry:" <> cycle_id, cycle_id]
+                )
+
                 {:already_running, cycle_id}
 
               _ ->
@@ -208,6 +214,15 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
       {:error, error} ->
         {:error, inspect(error)}
     end
+  end
+
+  @doc false
+  def operator_requested_in_txn?(txn, hold_id, cycle_id) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM harness_health_recovery_schedules WHERE holdId=?1 AND cycleId=?2 AND sourceEventId=?3",
+      [hold_id, cycle_id, "operator-retry:" <> cycle_id]
+    ) == [[1]]
   end
 
   def fire_due(db, now \\ System.system_time(:millisecond)) do
