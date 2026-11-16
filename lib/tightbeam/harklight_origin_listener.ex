@@ -122,7 +122,8 @@ defmodule Tightbeam.HarklightOriginListener do
         state.db,
         """
         SELECT m.handle FROM harklight_origin_moves m
-        JOIN harklight_wake_handles h ON h.handle=m.handle WHERE h.sessionKey=?1 AND h.host=?2
+        JOIN harklight_wake_handles h ON h.handle=m.handle
+        WHERE (h.sessionKey=?1 OR h.currentReceiverSessionKey=?1) AND h.host=?2
         """,
         [session_key, Placement.local_host_name()]
       )

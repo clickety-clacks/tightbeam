@@ -744,7 +744,9 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
           {"assignments", "currentOpenerSessionKey"},
           {"decision_requests", "currentRaiserSessionKey"},
           {"decision_requests", "currentExpecterSessionKey"},
-          {"harklight_wake_deliveries", "currentRecipientSessionKey"}
+          {"harklight_wake_deliveries", "currentRecipientSessionKey"},
+          {"harklight_wake_handles", "currentReceiverSessionKey"},
+          {"harklight_send_operations", "currentReceiverSessionKey"}
         ] do
       assert {:ok, [[0]]} =
                DB.query(db, "SELECT COUNT(*) FROM #{table} WHERE #{column} IS NOT NULL")

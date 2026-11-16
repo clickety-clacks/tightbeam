@@ -283,6 +283,7 @@ pub enum Command {
         identity: Identity,
         from_session_key: String,
         to_session_key: String,
+        parent_session_key: Option<String>,
         idempotency_key: String,
     },
     SessionPoSet {
@@ -980,7 +981,7 @@ COMMANDS:
   session-reparent --session <key> --parent <key> [--assignment <id>] --key <key>
       Correct one custom session's parent and its current held assignments.
 
-  session-custody-transfer --from <source> --to <successor> --key <key>
+  session-custody-transfer --from <source> --to <successor> [--parent <parent>] --key <key>
       Transfer current assignment and notice custody as the owner.
 
   session-po-set --session <key> --po-role <role> --key <key>
@@ -2871,12 +2872,13 @@ fn parse_with_optional_catalog(
                 || nonempty(flags, "role").is_some()
                 || nonempty(flags, "user").is_some()
             {
-                return Err("usage: tightbeam session-custody-transfer --from <source> --to <successor> --key <key>".to_owned());
+                return Err("usage: tightbeam session-custody-transfer --from <source> --to <successor> [--parent <parent>] --key <key>".to_owned());
             }
             Ok(Command::SessionCustodyTransfer {
                 identity: identity(flags)?,
                 from_session_key: nonempty(flags, "from").ok_or("--from is required")?,
                 to_session_key: nonempty(flags, "to").ok_or("--to is required")?,
+                parent_session_key: nonempty(flags, "parent"),
                 idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
             })
         }

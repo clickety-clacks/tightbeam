@@ -1,7 +1,7 @@
 defmodule Tightbeam.SessionCustodyTransfer do
   @moduledoc "Operator transfer of current session custody without changing origin records."
 
-  alias Tightbeam.{DB, EventLog, Idempotency, Wakes}
+  alias Tightbeam.{DB, EventLog, Idempotency, Org, SessionReparent, Wakes}
   alias Tightbeam.DB.Txn
 
   defmodule Refusal do
@@ -11,10 +11,12 @@ defmodule Tightbeam.SessionCustodyTransfer do
   def handle(db, %{principal: {:user, owner}, params: params}) do
     source = params[:from_session_key]
     target = params[:to_session_key]
+    parent = params[:parent_session_key]
     key = params[:idempotency_key]
 
-    if valid_key?(key) and valid_session?(source) and valid_session?(target) do
-      case DB.transaction(db, &transfer_in_txn(&1, owner, source, target, key)) do
+    if valid_key?(key) and valid_session?(source) and valid_session?(target) and
+         (is_nil(parent) or valid_session?(parent)) do
+      case DB.transaction(db, &transfer_in_txn(&1, owner, source, target, parent, key)) do
         {:ok, result} -> result
         {:error, %Refusal{code: code}} -> refusal(code)
         {:error, error} -> raise error
@@ -26,9 +28,9 @@ defmodule Tightbeam.SessionCustodyTransfer do
 
   def handle(_db, _call), do: refusal("user_principal_required")
 
-  defp transfer_in_txn(txn, owner, source, target, key) do
+  defp transfer_in_txn(txn, owner, source, target, parent, key) do
     fingerprint =
-      :crypto.hash(:sha256, JSON.encode!([owner, source, target]))
+      :crypto.hash(:sha256, JSON.encode!([owner, source, target, parent]))
       |> Base.encode16(case: :lower)
 
     case Idempotency.custody_result_in_txn(txn, owner, key) do
@@ -36,14 +38,14 @@ defmodule Tightbeam.SessionCustodyTransfer do
         response
 
       nil ->
-        transfer_new_in_txn(txn, owner, source, target, key, fingerprint)
+        transfer_new_in_txn(txn, owner, source, target, parent, key, fingerprint)
 
       _ ->
         refusal("idempotency_conflict")
     end
   end
 
-  defp transfer_new_in_txn(txn, owner, source, target, key, fingerprint) do
+  defp transfer_new_in_txn(txn, owner, source, target, parent, key, fingerprint) do
     if source == target, do: raise(Refusal, code: "no_change")
 
     active_owner_host!(txn, source, owner)
@@ -85,8 +87,30 @@ defmodule Tightbeam.SessionCustodyTransfer do
           txn,
           "SELECT wakeId FROM wakes WHERE sessionKey=?1 AND targetRole IS NULL AND consumer='prompt' AND reresolve IS NULL AND state='pending' AND deliveredTurnSeq IS NULL ORDER BY createdAt,wakeId",
           [source]
+        ),
+      handles:
+        ids(
+          txn,
+          "SELECT handle FROM harklight_wake_handles WHERE COALESCE(currentReceiverSessionKey,sessionKey)=?1 ORDER BY createdAt,handle",
+          [source]
+        ),
+      sends:
+        ids(
+          txn,
+          "SELECT opId FROM harklight_send_operations WHERE COALESCE(currentReceiverSessionKey,sessionKey)=?1 ORDER BY createdAt,opId",
+          [source]
         )
     }
+
+    if Enum.any?(selected.handles, fn handle ->
+         Txn.q(txn, "SELECT host FROM harklight_wake_handles WHERE handle=?1", [handle]) !=
+           [[target_host]]
+       end) or
+         Enum.any?(selected.sends, fn op_id ->
+           Txn.q(txn, "SELECT host FROM harklight_send_operations WHERE opId=?1", [op_id]) !=
+             [[target_host]]
+         end),
+       do: raise(Refusal, code: "harklight_receiver_host_mismatch")
 
     captured =
       ids(
@@ -133,9 +157,23 @@ defmodule Tightbeam.SessionCustodyTransfer do
        ) != [],
        do: raise(Refusal, code: "captured_delivery_already_addressed")
 
-    before = snapshot(txn, selected, captured)
+    before = snapshot(txn, source, selected, captured)
     event = "sct_" <> Tightbeam.Id.uuid4()
     at = System.system_time(:millisecond)
+
+    # A parent correction sees the source's held assignments before custody
+    # moves. Both operations share this transaction and its replay key.
+    if parent do
+      case SessionReparent.apply_in_txn(txn, owner, %{
+             session_key: source,
+             parent_session_key: parent,
+             idempotency_key: "custody:" <> fingerprint
+           }) do
+        %{ok: false, code: "no_change"} -> :ok
+        %{ok: false, code: code} -> raise Refusal, code: code
+        _ -> :ok
+      end
+    end
 
     update_ids!(
       txn,
@@ -186,7 +224,21 @@ defmodule Tightbeam.SessionCustodyTransfer do
       [target, source]
     )
 
-    after_state = snapshot(txn, selected, captured)
+    update_ids!(
+      txn,
+      selected.handles,
+      "UPDATE harklight_wake_handles SET currentReceiverSessionKey=?2,updatedAt=?4 WHERE handle=?1 AND COALESCE(currentReceiverSessionKey,sessionKey)=?3",
+      [target, source, at]
+    )
+
+    update_ids!(
+      txn,
+      selected.sends,
+      "UPDATE harklight_send_operations SET currentReceiverSessionKey=?2,updatedAt=?4 WHERE opId=?1 AND COALESCE(currentReceiverSessionKey,sessionKey)=?3",
+      [target, source, at]
+    )
+
+    after_state = snapshot(txn, source, selected, captured)
 
     if before == after_state, do: raise(Refusal, code: "no_change")
 
@@ -195,6 +247,7 @@ defmodule Tightbeam.SessionCustodyTransfer do
       "principal" => "user:" <> owner,
       "fromSessionKey" => source,
       "toSessionKey" => target,
+      "parentSessionKey" => parent,
       "before" => before,
       "after" => after_state,
       "appliedAt" => at
@@ -209,6 +262,7 @@ defmodule Tightbeam.SessionCustodyTransfer do
           "principal" => response["principal"],
           "fromSessionKey" => source,
           "toSessionKey" => target,
+          "parentSessionKey" => parent,
           "key" => key,
           "before" => before,
           "after" => after_state
@@ -230,8 +284,13 @@ defmodule Tightbeam.SessionCustodyTransfer do
     response
   end
 
-  defp snapshot(txn, selected, captured) do
+  defp snapshot(txn, source, selected, captured) do
     %{
+      "currentParent" => Org.current_parent(txn, source),
+      "coordinationParents" =>
+        Map.new(selected.holders, fn id ->
+          {id, SessionReparent.current_coordination_parent(txn, id)}
+        end),
       "assignments" =>
         rows_for(
           txn,
@@ -271,6 +330,22 @@ defmodule Tightbeam.SessionCustodyTransfer do
           "wakeId,sessionKey,currentRecipientSessionKey,handle,eventId",
           "wakeId",
           captured
+        ),
+      "harklightHandles" =>
+        rows_for(
+          txn,
+          "harklight_wake_handles",
+          "handle,sessionKey,currentReceiverSessionKey,state,host",
+          "handle",
+          selected.handles
+        ),
+      "harklightSends" =>
+        rows_for(
+          txn,
+          "harklight_send_operations",
+          "opId,sessionKey,currentReceiverSessionKey,state,handle",
+          "opId",
+          selected.sends
         )
     }
   end

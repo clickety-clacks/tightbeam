@@ -2164,6 +2164,18 @@ defmodule Tightbeam.Schema do
                      "ALTER TABLE harklight_wake_deliveries ADD COLUMN currentRecipientSessionKey TEXT REFERENCES sessions(sessionKey)"
                    )
 
+                 :ok =
+                   Txn.exec(
+                     txn,
+                     "ALTER TABLE harklight_wake_handles ADD COLUMN currentReceiverSessionKey TEXT REFERENCES sessions(sessionKey)"
+                   )
+
+                 :ok =
+                   Txn.exec(
+                     txn,
+                     "ALTER TABLE harklight_send_operations ADD COLUMN currentReceiverSessionKey TEXT REFERENCES sessions(sessionKey)"
+                   )
+
                  Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
                    @session_custody_shape,
                    System.system_time(:millisecond),
@@ -6241,7 +6253,9 @@ defmodule Tightbeam.Schema do
           {"assignments", "currentOpenerSessionKey"},
           {"decision_requests", "currentRaiserSessionKey"},
           {"decision_requests", "currentExpecterSessionKey"},
-          {"harklight_wake_deliveries", "currentRecipientSessionKey"}
+          {"harklight_wake_deliveries", "currentRecipientSessionKey"},
+          {"harklight_wake_handles", "currentReceiverSessionKey"},
+          {"harklight_send_operations", "currentReceiverSessionKey"}
         ] do
       {:ok, columns} = DB.query(db, "PRAGMA table_info(#{table})")
 

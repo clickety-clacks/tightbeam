@@ -770,17 +770,24 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             from_session_key,
             to_session_key,
+            parent_session_key,
             idempotency_key,
-        } => Ok(request(
-            identity,
-            "session-custody-transfer",
-            vec![],
-            vec![
+        } => {
+            let mut params = vec![
                 string_field("fromSessionKey", from_session_key),
                 string_field("toSessionKey", to_session_key),
-                string_field("idempotencyKey", idempotency_key),
-            ],
-        )),
+            ];
+            if let Some(parent_session_key) = parent_session_key {
+                params.push(string_field("parentSessionKey", parent_session_key));
+            }
+            params.push(string_field("idempotencyKey", idempotency_key));
+            Ok(request(
+                identity,
+                "session-custody-transfer",
+                vec![],
+                params,
+            ))
+        }
         Command::SessionPoSet {
             identity,
             session_key,
@@ -4651,6 +4658,23 @@ mod tests {
                 "owner",
             ]),
             r#"{"asUser":"owner","verb":"session-custody-transfer","params":{"fromSessionKey":"old seat","toSessionKey":"new seat","idempotencyKey":"move-one"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "session-custody-transfer",
+                "--from",
+                "old seat",
+                "--to",
+                "new seat",
+                "--parent",
+                "new parent",
+                "--key",
+                "move-two",
+                "--as-user",
+                "owner",
+            ]),
+            r#"{"asUser":"owner","verb":"session-custody-transfer","params":{"fromSessionKey":"old seat","toSessionKey":"new seat","parentSessionKey":"new parent","idempotencyKey":"move-two"}}"#
         );
 
         for missing in ["--from", "--to", "--key"] {

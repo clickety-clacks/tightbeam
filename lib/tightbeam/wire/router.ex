@@ -4424,7 +4424,8 @@ defmodule Tightbeam.Wire.Router do
     "sentinel-unsubscribe" => ~w(subscription_id)a,
     "session-po-set" => ~w(idempotency_key po_role po_session_key session_key)a,
     "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
-    "session-custody-transfer" => ~w(from_session_key idempotency_key to_session_key)a,
+    "session-custody-transfer" =>
+      ~w(from_session_key idempotency_key parent_session_key to_session_key)a,
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
     "spawn" =>
       ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id owner_user_id)a,

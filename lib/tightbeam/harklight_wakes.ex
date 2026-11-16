@@ -239,7 +239,7 @@ defmodule Tightbeam.HarklightWakes do
         """
         SELECT handle,sessionKey,host,state
         FROM harklight_wake_handles
-        WHERE sessionKey=?1
+        WHERE sessionKey=?1 OR currentReceiverSessionKey=?1
         UNION
         SELECT h.handle,h.sessionKey,h.host,h.state
         FROM harklight_wake_handles h
@@ -540,12 +540,12 @@ defmodule Tightbeam.HarklightWakes do
     provenance =
       Txn.q(
         txn,
-        "SELECT 1 FROM harklight_send_operations WHERE sessionKey=?1 AND host=?2 AND handle=?3 AND senderId=?4 AND messageId=?5 AND state='bound'",
+        "SELECT COALESCE(currentReceiverSessionKey,sessionKey) FROM harklight_send_operations WHERE sessionKey=?1 AND host=?2 AND handle=?3 AND senderId=?4 AND messageId=?5 AND state='bound'",
         [session_key, host, handle, sender_id, message_id]
       )
 
     cond do
-      provenance != [[1]] ->
+      provenance == [] ->
         {:error, "harklight_send_pending"}
 
       existing != [] and Enum.take(hd(existing), 2) != [session_key, host] ->
@@ -564,10 +564,19 @@ defmodule Tightbeam.HarklightWakes do
                (not completed and Enum.at(hd(existing), 3) != vendor_id))
 
         if existing == [] do
+          [[receiver]] = provenance
+
           Txn.q(
             txn,
-            "INSERT INTO harklight_wake_handles(handle,sessionKey,host,vendorSessionId,state,createdAt,updatedAt) VALUES(?1,?2,?3,?4,'active',?5,?5)",
-            [handle, session_key, host, vendor_id, now]
+            "INSERT INTO harklight_wake_handles(handle,sessionKey,host,vendorSessionId,state,createdAt,updatedAt,currentReceiverSessionKey) VALUES(?1,?2,?3,?4,'active',?5,?5,?6)",
+            [
+              handle,
+              session_key,
+              host,
+              vendor_id,
+              now,
+              if(receiver == session_key, do: nil, else: receiver)
+            ]
           )
         else
           [[_, _, state, previous_vendor]] = existing
@@ -919,7 +928,7 @@ defmodule Tightbeam.HarklightWakes do
     {:ok, rows} =
       DB.query(
         state.db,
-        "SELECT handle FROM harklight_wake_handles WHERE sessionKey=?1 AND state IN ('active','unavailable') AND NOT EXISTS (SELECT 1 FROM harklight_origin_moves m WHERE m.handle=harklight_wake_handles.handle) ORDER BY createdAt,handle",
+        "SELECT handle FROM harklight_wake_handles WHERE (sessionKey=?1 OR currentReceiverSessionKey=?1) AND state IN ('active','unavailable') AND NOT EXISTS (SELECT 1 FROM harklight_origin_moves m WHERE m.handle=harklight_wake_handles.handle) ORDER BY createdAt,handle",
         [session_key]
       )
 
@@ -961,7 +970,7 @@ defmodule Tightbeam.HarklightWakes do
       FROM harklight_wake_handles h
       JOIN harklight_wake_entries e ON e.handle=h.handle
       WHERE h.state IN ('active','unavailable') AND e.entryKind='terminal' AND e.entryAuthor='person'
-        AND (?1 IS NULL OR h.sessionKey=?1)
+        AND (?1 IS NULL OR COALESCE(h.currentReceiverSessionKey,h.sessionKey)=?1)
       ORDER BY h.handle
       """,
       [session_key]
@@ -988,7 +997,7 @@ defmodule Tightbeam.HarklightWakes do
     {:ok, rows} =
       DB.query(
         state.db,
-        "SELECT handle,sessionKey,host,state FROM harklight_wake_handles WHERE sessionKey=?1",
+        "SELECT handle,sessionKey,host,state FROM harklight_wake_handles WHERE sessionKey=?1 OR currentReceiverSessionKey=?1",
         [session_key]
       )
 
@@ -1034,8 +1043,15 @@ defmodule Tightbeam.HarklightWakes do
     end)
   end
 
-  defp actual_receiver_eligible?(db, handle, session_key, host) do
-    match?(%{state: "active", host: ^host}, Org.get(db, session_key)) or
+  defp actual_receiver_eligible?(db, handle, _session_key, host) do
+    {:ok, [[receiver]]} =
+      DB.query(
+        db,
+        "SELECT COALESCE(currentReceiverSessionKey,sessionKey) FROM harklight_wake_handles WHERE handle=?1",
+        [handle]
+      )
+
+    match?(%{state: "active", host: ^host}, Org.get(db, receiver)) or
       match?(
         {:ok, [[1]]},
         DB.query(
@@ -1052,8 +1068,15 @@ defmodule Tightbeam.HarklightWakes do
       )
   end
 
-  defp actual_receiver_eligible_in_txn?(txn, handle, session_key, host) do
-    match?(%{state: "active", host: ^host}, Org.get_in_txn(txn, session_key)) or
+  defp actual_receiver_eligible_in_txn?(txn, handle, _session_key, host) do
+    [[receiver]] =
+      Txn.q(
+        txn,
+        "SELECT COALESCE(currentReceiverSessionKey,sessionKey) FROM harklight_wake_handles WHERE handle=?1",
+        [handle]
+      )
+
+    match?(%{state: "active", host: ^host}, Org.get_in_txn(txn, receiver)) or
       Txn.q(
         txn,
         """
@@ -1416,10 +1439,17 @@ defmodule Tightbeam.HarklightWakes do
     wake_id = "w_harklight_notice_recovery_" <> handle
 
     if Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) == [] do
+      [[current_receiver]] =
+        Txn.q(
+          txn,
+          "SELECT COALESCE(currentReceiverSessionKey,sessionKey) FROM harklight_wake_handles WHERE handle=?1",
+          [handle]
+        )
+
       recipient =
-        case Org.get_in_txn(txn, session_key) do
-          %{state: "active"} -> session_key
-          _ -> Supervision.ladder_target(txn, session_key, 1)
+        case Org.get_in_txn(txn, current_receiver) do
+          %{state: "active"} -> current_receiver
+          _ -> Supervision.ladder_target(txn, current_receiver, 1)
         end
 
       if recipient do
@@ -1446,7 +1476,7 @@ defmodule Tightbeam.HarklightWakes do
             origin: "process:tightbeam",
             creator_session_key: session_key,
             prompt:
-              "Harklight listening for session #{session_key} and handle #{handle} stopped (#{error}).#{cli_output} Replies on this thread will not reach the originating session while it is unavailable. Pending entries remain at the origin. The origin may re-ask; do not transfer the conversation.",
+              "Harklight listening for session #{session_key} and handle #{handle} stopped (#{error}).#{cli_output} Replies on this thread will not reach the current receiver while it is unavailable. Pending entries remain recorded for recovery.",
             due_at: now,
             class: "blocker"
           })
@@ -2465,7 +2495,14 @@ defmodule Tightbeam.HarklightWakes do
 
         :ok
       else
-        primary = if session_key in recipients, do: session_key, else: hd(recipients)
+        [[current_receiver]] =
+          Txn.q(
+            txn,
+            "SELECT COALESCE(currentReceiverSessionKey,sessionKey) FROM harklight_wake_handles WHERE handle=?1",
+            [handle]
+          )
+
+        primary = if current_receiver in recipients, do: current_receiver, else: hd(recipients)
 
         wakes =
           Enum.map(recipients, fn recipient ->
@@ -2542,7 +2579,7 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp delivery_recipients_in_txn(txn, handle, owner_session, sender_id, message_id, kind, line) do
+  defp delivery_recipients_in_txn(txn, handle, _owner_session, sender_id, message_id, kind, line) do
     terminal = superseded_terminal?(kind, line)
 
     superseding_session =
@@ -2559,7 +2596,14 @@ defmodule Tightbeam.HarklightWakes do
         [sender_id, message_id]
       ) == []
 
-    own_recipients = if owner_open, do: [owner_session], else: []
+    [[current_receiver]] =
+      Txn.q(
+        txn,
+        "SELECT COALESCE(currentReceiverSessionKey,sessionKey) FROM harklight_wake_handles WHERE handle=?1",
+        [handle]
+      )
+
+    own_recipients = if owner_open, do: [current_receiver], else: []
 
     conversation_recipients =
       Txn.q(

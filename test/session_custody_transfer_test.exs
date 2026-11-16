@@ -157,6 +157,11 @@ defmodule Tightbeam.SessionCustodyTransferTest do
              "SELECT sessionKey,currentRecipientSessionKey,wakeId FROM harklight_wake_deliveries"
            ) == [["old", "successor", ctx.wake_id]]
 
+    assert rows(
+             ctx.db,
+             "SELECT sessionKey,currentReceiverSessionKey FROM harklight_wake_handles"
+           ) == [["old", "successor"]]
+
     assert rows(ctx.db, "SELECT openerRef,disposerRef FROM assignment_cannot_proceed") ==
              [["session:old", "session:successor"]]
 
@@ -175,6 +180,54 @@ defmodule Tightbeam.SessionCustodyTransferTest do
              })
 
     assert :ok = Schema.ensure_all(ctx.db)
+  end
+
+  test "optional parent correction commits with custody and replays one exact readback", ctx do
+    call = %{
+      principal: {:user, "owner"},
+      params: %{
+        from_session_key: "old",
+        to_session_key: "successor",
+        parent_session_key: "holder",
+        idempotency_key: "move-with-parent"
+      }
+    }
+
+    result = SessionCustodyTransfer.handle(ctx.db, call)
+    assert is_binary(result["eventId"])
+    assert result["before"]["currentParent"] == nil
+    assert result["after"]["currentParent"] == "holder"
+    assert result["after"]["coordinationParents"]["asg_held"] == "holder"
+
+    assert rows(ctx.db, "SELECT holderKey FROM assignments WHERE id='asg_held'") ==
+             [["successor"]]
+
+    assert SessionCustodyTransfer.handle(ctx.db, call) == result
+    assert rows(ctx.db, "SELECT COUNT(*) FROM session_reparent_events") == [[1]]
+
+    assert %{code: "idempotency_conflict"} =
+             SessionCustodyTransfer.handle(ctx.db, %{
+               call
+               | params: %{call.params | parent_session_key: "successor"}
+             })
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM session_reparent_events") == [[1]]
+  end
+
+  test "parent cycle refuses the entire transfer", ctx do
+    assert %{code: "cycle_detected"} =
+             SessionCustodyTransfer.handle(ctx.db, %{
+               principal: {:user, "owner"},
+               params: %{
+                 from_session_key: "old",
+                 to_session_key: "successor",
+                 parent_session_key: "old",
+                 idempotency_key: "cycle"
+               }
+             })
+
+    assert rows(ctx.db, "SELECT holderKey FROM assignments WHERE id='asg_held'") == [["old"]]
+    assert rows(ctx.db, "SELECT COUNT(*) FROM session_reparent_events") == [[0]]
   end
 
   test "non-operator and cross-owner calls cannot transfer custody", ctx do
