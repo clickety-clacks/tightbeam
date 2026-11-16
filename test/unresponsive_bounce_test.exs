@@ -105,6 +105,25 @@ defmodule Tightbeam.UnresponsiveBounceTest do
     assert notice =~ "not admitting turns"
   end
 
+  test "a down lane leaves the original turn and the bounce queued", ctx do
+    assert :appended =
+             Gateway.deliver_prompt(
+               ctx.target,
+               "user:flynn",
+               "Please read this",
+               db: ctx.db,
+               wake_id: "w_unresponsive_lane_source",
+               lane_manager: :missing_lane_manager
+             )
+
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE wakeId='w_unresponsive_lane_source'")
+
+    assert {:ok, [[notice]]} = bounce_prompts(ctx.db)
+    assert notice =~ "lane is down"
+    assert notice =~ "original message remains queued"
+  end
+
   defp deliver_in_txn(ctx, wake_id) do
     DB.transaction(ctx.db, fn txn ->
       Gateway.deliver_prompt_in_txn(
