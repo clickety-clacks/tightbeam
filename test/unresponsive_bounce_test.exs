@@ -6,6 +6,7 @@ defmodule Tightbeam.UnresponsiveBounceTest do
   setup do
     db = :"unresponsive_bounce_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     :ok = ensure_all_schemas(db)
     sender = ensure_main_session(db, "flynn")
 
