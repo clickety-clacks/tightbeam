@@ -580,4 +580,14 @@ defmodule Mix.Tasks.Tightbeam.DoctorRuntimeTest do
       "guarded-doctor-readonly: ok"
     )
   end
+
+  @tag :tmp_dir
+  test "standalone doctor runs its real default binary probes without a database owner",
+       %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "doctor_no_db_default_probe.exs",
+      "doctor-no-db-default-probe: ok"
+    )
+  end
 end

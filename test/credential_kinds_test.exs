@@ -305,6 +305,247 @@ defmodule Tightbeam.CredentialKindsTest do
       }
     end
 
+    defp executable(path, contents \\ "#!/bin/sh\nexit 0\n") do
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, contents)
+      File.chmod!(path, 0o755)
+      path
+    end
+
+    defp run_launch(plan) do
+      [shell | args] = Keyword.fetch!(plan, :cmd)
+
+      env =
+        [{"CLAUDE_CODE_EXECUTABLE", nil}, {"CODEX_PATH", nil} | Keyword.fetch!(plan, :env)]
+        |> Map.new()
+        |> Map.to_list()
+
+      System.cmd(
+        shell,
+        args,
+        env: env,
+        stderr_to_stdout: true
+      )
+    end
+
+    test "native launch selection follows explicit overrides and leaves managed defaults intact",
+         ctx do
+      inherited =
+        Map.new(["CLAUDE_CODE_EXECUTABLE", "CODEX_PATH"], &{&1, System.get_env(&1)})
+
+      System.delete_env("CLAUDE_CODE_EXECUTABLE")
+      System.delete_env("CODEX_PATH")
+
+      on_exit(fn ->
+        Enum.each(inherited, fn
+          {name, nil} -> System.delete_env(name)
+          {name, value} -> System.put_env(name, value)
+        end)
+      end)
+
+      File.mkdir_p!(ctx.base)
+      native_dir = Path.join(ctx.base, "native-bin")
+      managed_only_path = Path.join(ctx.base, "empty-bin")
+      File.mkdir_p!(managed_only_path)
+
+      native_claude =
+        executable(
+          Path.join(native_dir, "claude"),
+          "#!/bin/sh\nprintf 'Claude Code 5.2.322\\n'\n"
+        )
+
+      native_codex =
+        executable(Path.join(native_dir, "codex"), "#!/bin/sh\nprintf 'codex-cli 0.167.0\\n'\n")
+
+      adapter =
+        executable(
+          Path.join(ctx.base, "adapter"),
+          "#!/bin/sh\nset -e\nselected_codex=${CODEX_PATH:-$(command -v codex || true)}\nprintf 'claude=%s\\ncodex_env=%s\\ncodex=%s\\n' \"${CLAUDE_CODE_EXECUTABLE-<unset>}\" \"${CODEX_PATH-<unset>}\" \"${selected_codex:-<unset>}\"\n" <>
+            "if [ \"${CLAUDE_CODE_EXECUTABLE+x}\" = x ]; then \"$CLAUDE_CODE_EXECUTABLE\" --version; fi\n" <>
+            "if [ -n \"$selected_codex\" ]; then \"$selected_codex\" --version; fi\n"
+        )
+
+      base_target = target(ctx.base, nil)
+
+      inventory = fn command ->
+        assert "node" in command and "-e" in command
+        {~s({"bypass_hook_trust":true,"skills":{"config":[]}}), 0}
+      end
+
+      native_opts =
+        launch_opts(:subscription)
+        |> Keyword.put(:common_env, [{"PATH", native_dir}])
+        |> Keyword.put(:sh_out, inventory)
+
+      claude_native =
+        Claude.prepare_launch(%{base_target | adapter_binary: adapter}, ctx.base, native_opts)
+
+      codex_native =
+        Codex.prepare_launch(%{base_target | adapter_binary: adapter}, ctx.base, native_opts)
+
+      assert {claude_output, 0} = run_launch(claude_native)
+      assert claude_output =~ "claude=#{native_claude}"
+      assert claude_output =~ "codex_env=<unset>"
+      assert claude_output =~ "Claude Code 5.2.322"
+
+      assert {codex_output, 0} = run_launch(codex_native)
+      assert codex_output =~ "codex=#{native_codex}"
+      assert codex_output =~ "codex_env=<unset>"
+      assert codex_output =~ "claude=<unset>"
+      assert codex_output =~ "codex-cli 0.167.0"
+
+      cli_bin = Path.join(ctx.base, "bin")
+
+      assert {:ok, %{bin: ^native_claude, version: "Claude Code 5.2.322"}} =
+               Tightbeam.Placement.harness_binary_probe(:claude, cli_bin,
+                 base_dir: ctx.base,
+                 db: nil,
+                 launch_path: native_dir
+               )
+
+      assert {:ok, %{bin: ^native_codex, version: "codex-cli 0.167.0"}} =
+               Tightbeam.Placement.harness_binary_probe(:codex, cli_bin,
+                 base_dir: ctx.base,
+                 db: nil,
+                 launch_path: native_dir
+               )
+
+      explicit_claude =
+        executable(
+          Path.join(ctx.base, "selected-claude"),
+          "#!/bin/sh\nprintf 'Claude Code 5.2.401\\n'\n"
+        )
+
+      explicit_codex =
+        executable(
+          Path.join(ctx.base, "selected-codex"),
+          "#!/bin/sh\nprintf 'codex-cli 0.200.1\\n'\n"
+        )
+
+      explicit_opts =
+        native_opts
+        |> Keyword.put(:common_env, [
+          {"PATH", native_dir},
+          {"CLAUDE_CODE_EXECUTABLE", explicit_claude},
+          {"CODEX_PATH", explicit_codex}
+        ])
+
+      claude_explicit =
+        Claude.prepare_launch(%{base_target | adapter_binary: adapter}, ctx.base, explicit_opts)
+
+      codex_explicit =
+        Codex.prepare_launch(%{base_target | adapter_binary: adapter}, ctx.base, explicit_opts)
+
+      assert {claude_output, 0} = run_launch(claude_explicit)
+      assert claude_output =~ "claude=#{explicit_claude}"
+      assert claude_output =~ "Claude Code 5.2.401"
+
+      assert {codex_output, 0} = run_launch(codex_explicit)
+      assert codex_output =~ "codex=#{explicit_codex}"
+      assert codex_output =~ "codex-cli 0.200.1"
+
+      assert {:ok, %{bin: ^explicit_claude, version: "Claude Code 5.2.401"}} =
+               Tightbeam.Placement.harness_binary_probe(:claude, cli_bin,
+                 base_dir: ctx.base,
+                 db: nil,
+                 launch_path: native_dir,
+                 executable_override: explicit_claude
+               )
+
+      assert {:ok, %{bin: ^explicit_codex, version: "codex-cli 0.200.1"}} =
+               Tightbeam.Placement.harness_binary_probe(:codex, cli_bin,
+                 base_dir: ctx.base,
+                 db: nil,
+                 launch_path: native_dir,
+                 executable_override: explicit_codex
+               )
+
+      remote_target = %{
+        base_target
+        | host_config: %{base_dir: ctx.base, ssh: "fixture@example.invalid"}
+      }
+
+      remote_opts =
+        native_opts
+        |> Keyword.put(:remote_env, ["PATH='/remote/bin:/usr/bin'"])
+
+      remote_codex = Codex.prepare_launch(remote_target, ctx.base, remote_opts)
+      remote_command = Enum.join(Keyword.fetch!(remote_codex, :cmd), " ")
+
+      assert remote_command =~ "fixture@example.invalid"
+      assert List.last(Keyword.fetch!(remote_codex, :cmd)) == adapter
+      refute remote_command =~ "sh -c"
+      refute remote_command =~ "command -v"
+      refute remote_command =~ "CODEX_PATH"
+      assert remote_command =~ "PATH='/remote/bin:/usr/bin'"
+
+      managed_opts =
+        native_opts
+        |> Keyword.put(:common_env, [{"PATH", managed_only_path}])
+
+      claude_managed =
+        Claude.prepare_launch(%{base_target | adapter_binary: adapter}, ctx.base, managed_opts)
+
+      codex_managed =
+        Codex.prepare_launch(%{base_target | adapter_binary: adapter}, ctx.base, managed_opts)
+
+      assert {managed_output, 0} = run_launch(claude_managed)
+      assert managed_output =~ "claude=<unset>"
+      assert {managed_output, 0} = run_launch(codex_managed)
+      assert managed_output =~ "codex=<unset>"
+
+      invalid_codex_path = Path.join(ctx.base, "missing-codex")
+
+      invalid_codex_opts =
+        native_opts
+        |> Keyword.put(:common_env, [
+          {"PATH", native_dir},
+          {"CODEX_PATH", invalid_codex_path}
+        ])
+
+      invalid_codex =
+        Codex.prepare_launch(
+          %{base_target | adapter_binary: adapter},
+          ctx.base,
+          invalid_codex_opts
+        )
+
+      assert {invalid_codex_output, invalid_codex_exit} = run_launch(invalid_codex)
+      assert invalid_codex_exit != 0
+      assert invalid_codex_output =~ "codex_env=#{invalid_codex_path}"
+      assert invalid_codex_output =~ "codex=#{invalid_codex_path}"
+      refute invalid_codex_output =~ "codex-cli 0.167.0"
+
+      invalid_claude_path = Path.join(ctx.base, "missing-claude")
+
+      invalid_claude_opts =
+        native_opts
+        |> Keyword.put(:common_env, [
+          {"PATH", native_dir},
+          {"CLAUDE_CODE_EXECUTABLE", invalid_claude_path}
+        ])
+
+      invalid_claude =
+        Claude.prepare_launch(
+          %{base_target | adapter_binary: adapter},
+          ctx.base,
+          invalid_claude_opts
+        )
+
+      assert {invalid_output, exit_code} = run_launch(invalid_claude)
+      assert exit_code != 0
+      assert invalid_output =~ "claude=#{invalid_claude_path}"
+      refute invalid_output =~ "Claude Code 5.2.322"
+
+      assert {:error, {:exec_failed, _detail}} =
+               Tightbeam.Placement.harness_binary_probe(:claude, cli_bin,
+                 base_dir: ctx.base,
+                 db: nil,
+                 launch_path: native_dir,
+                 executable_override: invalid_claude_path
+               )
+    end
+
     test "a local api-key host gets ANTHROPIC_API_KEY and nothing else", ctx do
       stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-local\n")
 
@@ -667,6 +908,12 @@ defmodule Tightbeam.CredentialKindsTest do
       assert_receive {:stock_engine_probe, script}
       assert script =~ "CODEX_HOME"
       assert script =~ "model/list"
+      assert script =~ "command -v codex"
+      assert script =~ Path.join([ctx.base, "adapters", "node_modules", ".bin", "codex"])
+
+      assert script =~
+               ~s|"$codex_path" #{Tightbeam.Harness.Support.shell_quote(Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :codex))}|
+
       refute script =~ "includeHidden"
       refute script =~ "fixture-key"
     end
