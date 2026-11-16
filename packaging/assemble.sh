@@ -44,6 +44,7 @@ cp cli/target/release/tightbeam "$OUT/bin/tightbeam"
 cp packaging/tightbeam-gateway "$OUT/bin/tightbeam-gateway"
 cp packaging/tightbeam-select "$OUT/bin/tightbeam-select"
 cp -R _build/prod/rel/tightbeam_gateway "$OUT/release"
+cp -R packaging/release-install "$OUT/release-install"
 
 # Only the validated tagged push release carries automatic live-base adoption
 # authority. Candidate and manually dispatched workflows intentionally omit this
