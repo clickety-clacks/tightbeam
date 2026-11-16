@@ -1,7 +1,7 @@
 defmodule Tightbeam.UnresponsiveBounceTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway, Model, Org}
+  alias Tightbeam.{DB, Gateway, HarnessHealth, Model, Org}
 
   setup do
     db = :"unresponsive_bounce_#{System.unique_integer([:positive])}"
@@ -64,5 +64,60 @@ defmodule Tightbeam.UnresponsiveBounceTest do
         assert {:ok, [["queued"]]} =
                  DB.query(ctx.db, "SELECT status FROM turns WHERE wakeId='w_unresponsive_source'")
     end
+  end
+
+  test "an open harness hold tells the sender why the recipient has not read the message", ctx do
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider) VALUES('asg_unresponsive_hold','held work',?1,?1,1,'open','claude','anthropic')",
+               [ctx.target]
+             )
+
+    assert {:ok, {:opened, _incident}} =
+             DB.transaction(ctx.db, fn txn ->
+               HarnessHealth.observe_in_txn(txn, %{
+                 harness: "claude",
+                 host: "testhost",
+                 failure_class: "auth-dead",
+                 evidence_kind: "authoritative-provider",
+                 session_key: ctx.target,
+                 assignment_id: "asg_unresponsive_hold",
+                 observed_at: System.system_time(:millisecond),
+                 correlation_id: "unresponsive-hold",
+                 cause: "credential refused",
+                 principal: "process:tightbeam"
+               })
+             end)
+
+    assert {:ok, {:staged, source}} = deliver_in_txn(ctx, "w_unresponsive_hold_source")
+    assert source.state == "pending"
+    assert {:ok, [[notice]]} = bounce_prompts(ctx.db)
+    assert notice =~ "held by a harness incident"
+  end
+
+  test "a recipient not admitting turns queues the sender notice", ctx do
+    :persistent_term.put({Tightbeam.Application, :draining}, true)
+
+    assert {:ok, {:staged, source}} = deliver_in_txn(ctx, "w_unresponsive_drain_source")
+    assert source.state == "pending"
+    assert {:ok, [[notice]]} = bounce_prompts(ctx.db)
+    assert notice =~ "not admitting turns"
+  end
+
+  defp deliver_in_txn(ctx, wake_id) do
+    DB.transaction(ctx.db, fn txn ->
+      Gateway.deliver_prompt_in_txn(
+        txn,
+        ctx.target,
+        "user:flynn",
+        "Please read this",
+        wake_id: wake_id
+      )
+    end)
+  end
+
+  defp bounce_prompts(db) do
+    DB.query(db, "SELECT prompt FROM wakes WHERE wakeId LIKE 'w_unresponsive_%' AND origin='process:tightbeam'")
   end
 end
