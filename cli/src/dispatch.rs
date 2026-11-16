@@ -455,6 +455,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("incidentId", incident_id)],
         )),
+        Command::HarnessHealthRetry {
+            identity,
+            incident_id,
+        } => Ok(request(
+            identity,
+            "harness-health-retry",
+            vec![],
+            vec![string_field("incidentId", incident_id)],
+        )),
         Command::ArtifactContentFetch {
             identity,
             artifact_id,
@@ -3994,6 +4003,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessHealthReviewOther { identity, .. }
         | Command::HarnessHealthClosePromotion { identity, .. }
         | Command::HarnessHealthEvidenceOther { identity, .. }
+        | Command::HarnessHealthRetry { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
