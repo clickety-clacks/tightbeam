@@ -33,6 +33,7 @@ defmodule Tightbeam.RecognitionRetryTest do
   end
 
   test "a slow boot migration keeps pending recognition uncounted until commit" do
+    parent = self()
     root = Path.join(System.tmp_dir!(), "recognition-boot-#{Tightbeam.Id.uuid4()}")
     prepared = Tightbeam.GuardRuntimeFixture.prepare!(root, "schema_shape_runtime.exs")
     path = Path.join(prepared.base, "state.db")
@@ -47,7 +48,10 @@ defmodule Tightbeam.RecognitionRetryTest do
         pending =
           Tightbeam.Recognition.record(
             txn,
-            fn txn, _ -> Txn.q(txn, "INSERT INTO recognized_rows VALUES(1)") end,
+            fn txn, _ ->
+              Txn.q(txn, "INSERT INTO recognized_rows VALUES(1)")
+              send(parent, :boot_recognized)
+            end,
             :committed,
             [],
             []
@@ -84,6 +88,7 @@ defmodule Tightbeam.RecognitionRetryTest do
              DB.query(db, "SELECT attempts,flagged FROM pending_recognition")
 
     :ok = Tightbeam.Recognition.activate(db)
+    assert_receive :boot_recognized, 1_500
     :sys.get_state(retry)
     assert {:ok, [[1]]} = DB.query(db, "SELECT id FROM recognized_rows")
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
