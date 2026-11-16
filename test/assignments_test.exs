@@ -382,6 +382,86 @@ defmodule Tightbeam.AssignmentsTest do
       assert prompt =~ result.attest.id
     end
 
+    test "attest and first-start notices follow transferred opener custody", ctx do
+      session(ctx.db, "old-opener", "flynn")
+      session(ctx.db, "successor-opener", "flynn")
+
+      assignment =
+        dispatch!(
+          ctx,
+          dispatch_call({:session, "old-opener"}, "transferred opener", "Start the assignment.")
+        )
+
+      assert %{"eventId" => _event_id} =
+               ctx.handlers["session-custody-transfer"].(%{
+                 principal: {:user, "flynn"},
+                 params: %{
+                   from_session_key: "old-opener",
+                   to_session_key: "successor-opener",
+                   idempotency_key: "move-r01-opener"
+                 }
+               })
+
+      assert {:ok, [["successor-opener"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT currentOpenerSessionKey FROM assignments WHERE id=?1",
+                 [assignment.id]
+               )
+
+      assert {:ok, first_turn} = Ledger.claim_next(ctx.db, "holder", "r01-custody-start")
+      finish_running_turn(ctx.db, first_turn)
+
+      assert {:ok, [[_wake_id, "successor-opener", start_prompt]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId,sessionKey,prompt FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'The first holder turn %'",
+                 [assignment.id]
+               )
+
+      assert start_prompt =~ assignment.id
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='old-opener' AND prompt LIKE 'The first holder turn %'",
+                 [assignment.id]
+               )
+
+      holder_verdict =
+        attest_call({:session, "holder"}, assignment.id, "verdict")
+        |> put_in([:params, :verdict_kind], "reviewed-clean")
+        |> then(&handle(ctx, "attest", &1))
+
+      assert {:ok, [[_wake_id, "successor-opener", prompt]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId,sessionKey,prompt FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+                 [assignment.id]
+               )
+
+      assert prompt =~ holder_verdict.attest.id
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='old-opener' AND prompt LIKE 'Attest %'",
+                 [assignment.id]
+               )
+
+      _successor_verdict =
+        attest_call({:session, "successor-opener"}, assignment.id, "verdict")
+        |> put_in([:params, :verdict_kind], "reviewed-clean")
+        |> then(&handle(ctx, "attest", &1))
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+                 [assignment.id]
+               )
+    end
+
     test "idle dispatch start emits once and a later wake-carried turn stays quiet", ctx do
       session(ctx.db, "notice-parent", "flynn")
 

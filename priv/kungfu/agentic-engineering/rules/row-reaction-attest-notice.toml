@@ -9,7 +9,7 @@ when = { op = "and", args = [
   { op = "or", args = [
     { op = "and", args = [
       { op = "eq", args = [{ ref = "event.kind" }, "assignment_start"] },
-      { op = "not", args = [{ op = "eq", args = [{ ref = "assignment.openedBySession" }, { ref = "event.after.turn.sessionKey" }] }] }
+      { op = "not", args = [{ op = "eq", args = [{ ref = "opener_session" }, { ref = "event.after.turn.sessionKey" }] }] }
     ] },
     { op = "and", args = [
       { op = "eq", args = [{ ref = "event.kind" }, "assignment_attest"] },
@@ -38,9 +38,14 @@ when = { op = "and", args = [
 bind = [
   { name = "assignment", value = { ref = "event.after.assignment" } },
   { name = "attest", value = { ref = "event.after.attest" } },
+  { name = "opener_session", value = { op = "if", args = [
+    { op = "not", args = [{ op = "is_null", args = [{ ref = "assignment.currentOpenerSessionKey" }] }] },
+    { ref = "assignment.currentOpenerSessionKey" },
+    { ref = "assignment.openedBySession" }
+  ] } },
   { name = "recipient", value = { op = "if", args = [
-    { op = "not", args = [{ op = "is_null", args = [{ ref = "assignment.openedBySession" }] }] },
-    { ref = "assignment.openedBySession" },
+    { op = "not", args = [{ op = "is_null", args = [{ ref = "opener_session" }] }] },
+    { ref = "opener_session" },
     { op = "if", args = [
       { op = "not", args = [{ op = "is_null", args = [{ ref = "assignment.openedByUser" }] }] },
       { ref = "facts.personal_session_key" },
@@ -53,11 +58,11 @@ bind = [
   ] } } },
   { name = "same_author", value = { op = "if", args = [
     { op = "eq", args = [{ ref = "event.kind" }, "assignment_start"] },
-    { op = "eq", args = [{ ref = "assignment.openedBySession" }, { ref = "event.after.turn.sessionKey" }] },
+    { op = "eq", args = [{ ref = "opener_session" }, { ref = "event.after.turn.sessionKey" }] },
     { op = "or", args = [
       { op = "and", args = [
-        { op = "not", args = [{ op = "is_null", args = [{ ref = "assignment.openedBySession" }] }] },
-        { op = "eq", args = [{ ref = "assignment.openedBySession" }, { ref = "attest.bySession" }] }
+        { op = "not", args = [{ op = "is_null", args = [{ ref = "opener_session" }] }] },
+        { op = "eq", args = [{ ref = "opener_session" }, { ref = "attest.bySession" }] }
       ] },
       { op = "and", args = [
         { op = "not", args = [{ op = "is_null", args = [{ ref = "assignment.openedByUser" }] }] },

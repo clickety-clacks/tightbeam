@@ -4498,36 +4498,6 @@ defmodule Tightbeam.Assignments do
     :ok
   end
 
-  defp same_attest_principal_as_opener?(
-         %{currentOpenerSessionKey: opener},
-         %{byUser: nil, bySession: opener}
-       )
-       when is_binary(opener),
-       do: true
-
-  defp same_attest_principal_as_opener?(
-         %{openedByUser: opener, openedBySession: nil},
-         %{byUser: opener, bySession: nil}
-       )
-       when is_binary(opener),
-       do: true
-
-  defp same_attest_principal_as_opener?(
-         %{openedByUser: nil, openedBySession: opener, currentOpenerSessionKey: nil},
-         %{byUser: nil, bySession: opener}
-       )
-       when is_binary(opener),
-       do: true
-
-  defp same_attest_principal_as_opener?(_assignment, _attest), do: false
-
-  defp attest_notice_origin(%{bySession: session}, _call) when is_binary(session),
-    do: "agent:" <> session
-
-  defp attest_notice_origin(%{byUser: user}, _call) when is_binary(user), do: "user:" <> user
-
-  defp attest_notice_origin(_attest, %{principal: {:process, name}}), do: "process:" <> name
-
   defp append_assignment_marker(txn, assignment, :opened) do
     append_substrate(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
   end

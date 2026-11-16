@@ -353,6 +353,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
     keys =
       [
         assignment && assignment["holderKey"],
+        assignment && assignment["currentOpenerSessionKey"],
         assignment && assignment["openedBySession"],
         personal,
         process_recipient && process_recipient["sessionKey"]
