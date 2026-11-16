@@ -3626,6 +3626,72 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp assignment_identity_refresh_brief(turn, nil), do: turn
+
+  defp assignment_identity_refresh_brief(turn, revision) do
+    notice =
+      "Tightbeam identity files were refreshed to revision #{revision} before this " <>
+        "assignment brief. Re-read your Tightbeam skills before working."
+
+    Map.update!(turn, :prompt, &(&1 <> "\n\n" <> notice))
+  end
+
+  defp refresh_assignment_identity_before_turn(config, db, session, turn) do
+    if assignment_brief_turn?(db, turn) and
+         not Tightbeam.Ephemeral.session?(db, session.session_key) and
+         Org.current_pointer(db, session.session_key) do
+      case Identity.with_live_revision_lock(config.base_dir, fn revision ->
+             if session.identity_revision == revision do
+               nil
+             else
+               harness = Harness.parse!(session.harness).id()
+               snapshot = complete_session_snapshot(config, session, harness, revision)
+               Placement.materialize_identity(config, session, snapshot)
+               stamp_session_identity(db, session.session_key, snapshot)
+               revision
+             end
+           end) do
+        revision when is_binary(revision) ->
+          revision
+
+        nil ->
+          nil
+
+        failure ->
+          Logger.error(
+            "assignment identity refresh failed for #{session.session_key}; " <>
+              "continuing at received revision: #{inspect(failure)}"
+          )
+
+          nil
+      end
+    end
+  rescue
+    error ->
+      Logger.error(
+        "assignment identity refresh failed for #{session.session_key}; " <>
+          "continuing at received revision: #{Exception.message(error)}"
+      )
+
+      nil
+  catch
+    kind, reason ->
+      Logger.error(
+        "assignment identity refresh failed for #{session.session_key}; " <>
+          "continuing at received revision: #{inspect({kind, reason})}"
+      )
+
+      nil
+  end
+
+  defp assignment_brief_turn?(db, turn) do
+    case DB.query(db, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq]) do
+      {:ok, [[assignment_id]]} when is_binary(assignment_id) -> true
+      {:ok, [[nil]]} -> false
+      {:error, error} -> raise error
+    end
+  end
+
   defp turn_runner(config) do
     db = Map.get(config, :db, Tightbeam.DB)
 
@@ -3672,7 +3738,8 @@ defmodule Tightbeam.Gateway do
                 harness_session_id: harness_session_id,
                 adapter: prompt_adapter,
                 generation: prompt_generation,
-                session: active_session
+                session: active_session,
+                identity_refresh_revision: identity_refresh_revision
               }} <-
                stage(
                  :session,
@@ -3682,14 +3749,32 @@ defmodule Tightbeam.Gateway do
                    # pre-checkout snapshot or interleave with that sequence.
                    current = Org.get(db, turn.session_key)
 
-                   configured_turn_session(
-                     config,
-                     db,
-                     adapter,
-                     generation,
-                     %{session | model: current.model},
-                     turn.seq
-                   )
+                   identity_refresh_revision =
+                     refresh_assignment_identity_before_turn(config, db, current, turn)
+
+                   current = Org.get(db, turn.session_key)
+
+                   case configured_turn_session(
+                          config,
+                          db,
+                          adapter,
+                          generation,
+                          %{
+                            session
+                            | model: current.model,
+                              identity_revision: current.identity_revision,
+                              identity_render_contract: current.identity_render_contract,
+                              identity_guidance_digest: current.identity_guidance_digest
+                          },
+                          turn.seq
+                        ) do
+                     {:ok, selected} ->
+                       {:ok,
+                        Map.put(selected, :identity_refresh_revision, identity_refresh_revision)}
+
+                     error ->
+                       error
+                   end
                  end)
                ),
              {:ok, result} <-
@@ -3700,7 +3785,7 @@ defmodule Tightbeam.Gateway do
                    harness_session_id,
                    turn_prompt_content(
                      db,
-                     turn,
+                     assignment_identity_refresh_brief(turn, identity_refresh_revision),
                      active_session.session_key,
                      active_session.harness,
                      config.base_dir
