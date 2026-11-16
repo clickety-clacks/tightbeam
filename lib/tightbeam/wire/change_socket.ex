@@ -88,8 +88,10 @@ defmodule Tightbeam.Wire.ChangeSocket do
   end
 
   def handle_info(:firehose_heartbeat, state), do: {:ok, state}
+
   def handle_info(:firehose_overflow, state),
     do: stop_with(%{"type" => "reload_required", "reason" => "backlog_overflow"}, 4008, state)
+
   def handle_info(:firehose_revoked, state), do: {:stop, :normal, 1008, state}
 
   def handle_info(:firehose_shutdown, state) do
