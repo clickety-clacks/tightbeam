@@ -4,8 +4,8 @@ defmodule Tightbeam.HarnessHealth do
 
   Observations are append-only evidence. An authoritative provider observation
   opens an incident immediately. Inferred failure evidence needs two distinct
-  sessions on the same shared harness and in the same class inside the bounded
-  window. Resolution appends normal-turn evidence and retracts the class fact;
+  sessions on the same shared harness and in the same class after the last
+  recovery. Resolution appends normal-turn evidence and retracts the class fact;
   neither observations nor incidents are deleted.
 
   Runtime producers call the transaction-owned helpers here so a failed turn
@@ -42,8 +42,6 @@ defmodule Tightbeam.HarnessHealth do
   )
   @prod_shape_consumers ["assignment_prodder"]
   @failure_evidence ~w(authoritative-provider terminal-failure)
-  @evidence_window_ms 120_000
-  @other_max_validity_ms 900_000
   @harness_health_schema_stamp "harness-health-other-v1-019"
   # Schema.ensure_all invokes module bootstraps before the repository's final
   # stamp is installed. HarnessHealth must not migrate at any intermediate
@@ -892,10 +890,6 @@ defmodule Tightbeam.HarnessHealth do
 
   defp raise_schema_conflict!(message),
     do: raise(ArgumentError, "harness_health_other_schema_conflict: #{message}")
-
-  @doc "The fixed inference window established by the reviewed patrol design."
-  @spec evidence_window_ms() :: pos_integer()
-  def evidence_window_ms, do: @evidence_window_ms
 
   @doc "Whether either incident class currently stands for one shared harness."
   @spec unavailable?(DB.server(), String.t(), String.t()) :: boolean()
@@ -2547,7 +2541,7 @@ defmodule Tightbeam.HarnessHealth do
           AND evidenceKind='terminal-failure' AND incidentId IS NULL
           AND observedAt BETWEEN ?4 AND ?5
         """,
-        window_params(input)
+        failure_evidence_params(txn, input)
       )
 
     count
@@ -2573,19 +2567,29 @@ defmodule Tightbeam.HarnessHealth do
           AND observedAt BETWEEN ?4 AND ?5
         ORDER BY observedAt,id
         """,
-        window_params(input)
+        failure_evidence_params(txn, input)
       )
       |> List.flatten()
 
     Enum.uniq(authoritative ++ inferred)
   end
 
-  defp window_params(input) do
+  defp failure_evidence_params(txn, input) do
+    # A completed recovery is the boundary for a new failure. Evidence from
+    # before it cannot establish or clear the later failure, however long the
+    # new failure takes to produce a second observation.
+    [[last_recovery]] =
+      Txn.q(
+        txn,
+        "SELECT MAX(resolvedAt) FROM harness_health_incidents WHERE harness=?1 AND host=?2 AND failureClass=?3 AND state='resolved'",
+        [input.harness, input.host, input.failure_class]
+      )
+
     [
       input.harness,
       input.host,
       input.failure_class,
-      max(0, input.observed_at - @evidence_window_ms),
+      if(last_recovery, do: last_recovery + 1, else: 0),
       input.observed_at
     ]
   end
@@ -2906,11 +2910,6 @@ defmodule Tightbeam.HarnessHealth do
     unless is_integer(valid_until) and valid_until > accepted_at,
       do: raise(ArgumentError, "invalid_other_evidence")
 
-    if valid_until > observed_at + @other_max_validity_ms do
-      raise ArgumentError,
-            "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
-    end
-
     unless evidence_mode in ~w(exact_error probe_digest),
       do: raise(ArgumentError, "invalid_other_evidence")
 
@@ -3020,9 +3019,6 @@ defmodule Tightbeam.HarnessHealth do
            do: raise(ArgumentError, "invalid_recovery_evidence")
 
     unless observed_at <= accepted_at,
-      do: raise(ArgumentError, "stale_recovery_evidence")
-
-    unless accepted_at - observed_at <= @evidence_window_ms,
       do: raise(ArgumentError, "stale_recovery_evidence")
 
     if credential_shaped?(Enum.join([observed_state, exact_probe, cause], "\n")),
@@ -3421,6 +3417,9 @@ defmodule Tightbeam.HarnessHealth do
       [row] ->
         incident = incident(row)
         opening = observation_by_id(txn, incident.openObservationId)
+
+        unless input.observed_at >= incident.openedAt,
+          do: raise(ArgumentError, "stale_recovery_evidence")
 
         if incident.expiresAt && input.observed_at >= incident.expiresAt do
           expire_other_incidents_in_txn(txn, input.harness, input.host, input.observed_at)

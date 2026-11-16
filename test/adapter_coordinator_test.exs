@@ -85,12 +85,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
-  test "all public checkout APIs retain the reviewed 190s budget over the 185s generation deadline" do
+  test "all public checkout APIs wait for the live adapter instead of expiring" do
     source = File.read!("lib/tightbeam/adapter_coordinator.ex")
-    assert source =~ "@adapter_readiness_timeout 185_000"
-    assert source =~ "@adapter_checkout_timeout 190_000"
-    assert length(Regex.scan(~r/GenServer\.call\([^\n]+@adapter_checkout_timeout\)/, source)) == 3
-    refute source =~ "{:adapter_for, key}, 30_000"
+    assert source =~ "@adapter_readiness_timeout :infinity"
+    assert length(Regex.scan(~r/GenServer\.call\([^\n]+:infinity\)/, source)) >= 3
   end
 
   test "gateway turn checkout reuses an ordinary live adapter while initialize is pending", ctx do
@@ -570,7 +568,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     assert wait_until(fn -> :sys.get_state(coordinator).adapters[key].waiters == [] end)
     entry = :sys.get_state(coordinator).adapters[key]
-    assert is_reference(entry.readiness_timer)
+    assert entry.readiness_timer == nil
   end
 
   test "duplicate restart messages coalesce behind one generation readiness task", ctx do
@@ -1284,7 +1282,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   @tag timeout: 5_000
-  test "adapter shutdown uses the application's remaining deadline", ctx do
+  test "explicit finite shutdown uses the application's remaining deadline", ctx do
     coordinator =
       start_supervised!(
         {AdapterCoordinator,
@@ -1292,6 +1290,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          db: ctx.db,
          adapter_context: fn _ -> [] end,
          adapter_opts: fn _key, _context -> [] end,
+         shutdown_budget_ms: 2_000,
          name: :shared_shutdown_deadline_coordinator}
       )
 
@@ -1316,11 +1315,11 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     end
   end
 
-  test "supervisor allowance exceeds the configured shutdown budget" do
+  test "normal shutdown waits for a definitive park result" do
     # The child_spec must read the configured option, not the module attribute:
     # a caller raising shutdown_budget_ms above the default would otherwise be
     # brutal-killed before its own internal deadline.
-    assert AdapterCoordinator.child_spec([]).shutdown > 30_000
+    assert AdapterCoordinator.child_spec([]).shutdown == :infinity
     assert AdapterCoordinator.child_spec(shutdown_budget_ms: 45_000).shutdown > 45_000
   end
 
