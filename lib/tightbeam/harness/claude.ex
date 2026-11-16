@@ -13,7 +13,6 @@ defmodule Tightbeam.Harness.Claude do
   @adapter_version "0.81.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
-  @managed_cli_version "Claude Code 2.1.280 (managed by claude-agent-acp@0.81.0)"
   @warm_timeout_ms 30_000
   @credential_env_vars %{
     subscription: "CLAUDE_CODE_OAUTH_TOKEN",
@@ -87,15 +86,7 @@ defmodule Tightbeam.Harness.Claude do
           {:api_key, _} -> []
         end
 
-      [
-        cmd:
-          Support.executable_selection_command(
-            binary,
-            "CLAUDE_CODE_EXECUTABLE",
-            cli_binary()
-          ),
-        env: [{"CLAUDE_CONFIG_DIR", home} | common ++ credential_env]
-      ]
+      [cmd: [binary], env: [{"CLAUDE_CONFIG_DIR", home} | common ++ credential_env]]
     else
       remote_env =
         case kind do
@@ -113,12 +104,7 @@ defmodule Tightbeam.Harness.Claude do
       [
         cmd:
           ["ssh" | Support.ssh_opts()] ++
-            [target.host_config.ssh, "exec", "env" | remote_env] ++
-            Support.remote_executable_selection_command(
-              binary,
-              "CLAUDE_CODE_EXECUTABLE",
-              cli_binary()
-            ),
+            [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
         env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
       ]
     end
@@ -410,39 +396,7 @@ defmodule Tightbeam.Harness.Claude do
   @impl true
   def probe_cli(target) do
     find = Map.get(target, :find_executable, &System.find_executable/1)
-
-    case Map.fetch(target, :executable_override) do
-      {:ok, ""} ->
-        {:error, {:exec_failed, "CLAUDE_CODE_EXECUTABLE is set but empty"}}
-
-      {:ok, executable} ->
-        Support.bounded_probe(resolve_explicit_executable(executable, find), target)
-
-      :error ->
-        case find.(cli_binary()) do
-          executable when is_binary(executable) ->
-            Support.bounded_probe(executable, target)
-
-          nil ->
-            if Map.get(target, :managed_adapter_available?, false) do
-              {:ok,
-               %{
-                 bin: "managed by @agentclientprotocol/claude-agent-acp@#{@adapter_version}",
-                 version: @managed_cli_version
-               }}
-            else
-              {:error, :not_found}
-            end
-        end
-    end
-  end
-
-  defp resolve_explicit_executable(executable, find) do
-    if Path.type(executable) == :absolute or String.contains?(executable, "/") do
-      executable
-    else
-      find.(executable)
-    end
+    Support.bounded_probe(find.(cli_binary()), target)
   end
 
   @impl true

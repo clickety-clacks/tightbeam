@@ -1628,8 +1628,8 @@ defmodule Tightbeam.Placement do
   end
 
   @doc """
-  Resolve and execute the same vendor CLI version selected at adapter launch,
-  without contacting the harness service.
+  Resolve and execute a harness CLI's version command without contacting the
+  harness service. Codex prefers the projected operator-controlled shim.
   """
   @spec harness_binary_probe(atom(), String.t(), keyword()) ::
           {:ok, %{bin: String.t(), version: String.t()}}
@@ -1638,127 +1638,13 @@ defmodule Tightbeam.Placement do
           | {:error, Harness.launch_refusal()}
   def harness_binary_probe(harness, cli_bin, opts \\ []) do
     module = Harness.module!(harness)
-    base_dir = Keyword.get(opts, :base_dir, Path.dirname(cli_bin))
-    db = opts |> Keyword.get(:db, DB) |> available_probe_db()
-    host = Keyword.get(opts, :host, local_host_name())
 
-    launch_path =
-      Keyword.get(opts, :launch_path) || probe_launch_path(cli_bin, base_dir, db, host)
-
-    override =
-      case Keyword.fetch(opts, :executable_override) do
-        {:ok, value} -> {:ok, value}
-        :error -> configured_executable_override(module, db, host)
-      end
-
-    find =
-      Keyword.get(opts, :find_executable) ||
-        fn executable -> find_launch_path_executable(executable, launch_path) end
-
-    run =
-      Keyword.get(opts, :run) ||
-        fn [executable | args] ->
-          System.cmd(executable, args,
-            stderr_to_stdout: true,
-            env: [{"PATH", launch_path}]
-          )
-        end
-
-    adapter_bin = Path.basename(module.install_package())
-
-    target = %{
+    Harness.probe_cli(module, %{
       cli_bin: cli_bin,
-      launch_path: launch_path,
-      find_executable: find,
+      find_executable: Keyword.get(opts, :find_executable, &System.find_executable/1),
       timeout: Keyword.get(opts, :timeout, 2_000),
-      run: run,
-      managed_adapter_available?:
-        File.exists?(Path.join([base_dir, "adapters", "node_modules", ".bin", adapter_bin]))
-    }
-
-    target =
-      case module.id() do
-        :codex ->
-          Map.put(
-            target,
-            :managed_cli,
-            Path.join([base_dir, "adapters", "node_modules", ".bin", module.cli_binary()])
-          )
-
-        _ ->
-          target
-      end
-
-    target =
-      if match?({:ok, _}, override),
-        do: Map.put(target, :executable_override, elem(override, 1)),
-        else: target
-
-    Harness.probe_cli(module, target)
-  end
-
-  defp available_probe_db(nil), do: nil
-
-  defp available_probe_db(server) do
-    case GenServer.whereis(server) do
-      pid when is_pid(pid) ->
-        if Process.alive?(pid), do: server
-
-      _ ->
-        nil
-    end
-  end
-
-  defp probe_launch_path(cli_bin, _base_dir, nil, _host) do
-    [cli_bin, System.get_env("PATH") || ""]
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.join(":")
-  end
-
-  defp probe_launch_path(_cli_bin, base_dir, db, host) do
-    toolchain_path_preview(%{base_dir: base_dir, db: db}, host)
-  end
-
-  defp find_launch_path_executable(executable, launch_path) do
-    Enum.find_value(String.split(launch_path, ":", trim: false), fn directory ->
-      candidate =
-        if directory == "",
-          do: Path.expand(executable),
-          else: Path.expand(Path.join(directory, executable))
-
-      case File.stat(candidate) do
-        {:ok, %File.Stat{type: :regular, mode: mode}} ->
-          if Bitwise.band(mode, 0o111) != 0, do: candidate
-
-        _ ->
-          nil
-      end
-    end)
-  end
-
-  defp configured_executable_override(module, db, host) do
-    variable =
-      case module.id() do
-        :claude -> "CLAUDE_CODE_EXECUTABLE"
-        :codex -> "CODEX_PATH"
-        _ -> nil
-      end
-
-    if is_nil(variable) do
-      :error
-    else
-      overlay =
-        if is_nil(db) do
-          nil
-        else
-          Enum.find(env_overlays(db, host, module.wire_name()), &(&1.name == variable))
-        end
-
-      case overlay do
-        %{value: value} -> {:ok, value}
-        nil -> System.fetch_env(variable)
-      end
-    end
+      run: Keyword.get(opts, :run, &system_cmd/1)
+    })
   end
 
   defp auth_event_handler(config, host, module) do

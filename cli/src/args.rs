@@ -221,10 +221,6 @@ pub enum Command {
         identity: Identity,
         handle: String,
     },
-    HarklightCover {
-        identity: Identity,
-        session: String,
-    },
     HarklightFollow {
         identity: Identity,
         message: Option<String>,
@@ -937,8 +933,6 @@ COMMANDS:
       Settle one unresolved Harklight operation using its saved request and original operation ID.
   harklight-listener-restore --handle <handle>
       Restore this session's Gateway-managed listener on its existing delivery route.
-  harklight-cover --session <handle>
-      Explicitly move your conversation to the shared origin listener.
   harklight-follow (--message <id> | --handle <handle>)
       Follow a message or conversation sent through Tightbeam.
   harklight-retry (--all | --message <id> | --session <handle>)
@@ -2754,19 +2748,6 @@ fn parse_with_optional_catalog(
             Ok(Command::HarklightListenerRestore {
                 identity: identity(flags)?,
                 handle: nonempty(flags, "handle").ok_or("--handle is required")?,
-            })
-        }
-        "harklight-cover" => {
-            if parsed.positional.len() != 1
-                || flags.keys().any(|flag| {
-                    !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "session")
-                })
-            {
-                return Err("usage: tightbeam harklight-cover --session <handle>".to_owned());
-            }
-            Ok(Command::HarklightCover {
-                identity: identity(flags)?,
-                session: nonempty(flags, "session").ok_or("--session is required")?,
             })
         }
         "harklight-follow" => {
@@ -6739,7 +6720,6 @@ mod tests {
                 "harklight-follow",
                 "harklight-listener-restore",
                 "harklight-retry",
-                "harklight-cover",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",
