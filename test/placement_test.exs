@@ -41,8 +41,7 @@ defmodule Tightbeam.PlacementTest do
   end
 
   test "harness binary probe resolves versions and classifies missing and failed executables", %{
-    base_dir: base_dir,
-    db: db
+    base_dir: base_dir
   } do
     cli_bin = Path.join(base_dir, "bin")
     shim = Path.join(cli_bin, "codex")
@@ -53,10 +52,7 @@ defmodule Tightbeam.PlacementTest do
 
     assert {:ok, %{bin: ^shim, version: "codex-cli 1.2.3"}} =
              Placement.harness_binary_probe(:codex, cli_bin,
-               base_dir: base_dir,
-               db: db,
-               launch_path: cli_bin,
-               find_executable: fn "codex" -> shim end,
+               find_executable: fn _ -> flunk("projected codex shim was not preferred") end,
                run: fn command ->
                  send(parent, {:probe_command, command})
                  {"codex-cli 1.2.3\n", 0}
@@ -67,18 +63,12 @@ defmodule Tightbeam.PlacementTest do
 
     assert {:error, :not_found} =
              Placement.harness_binary_probe(:claude, cli_bin,
-               base_dir: base_dir,
-               db: db,
-               launch_path: cli_bin,
                find_executable: fn "claude" -> nil end,
                run: fn _ -> flunk("missing executable must not run") end
              )
 
     assert {:error, {:exec_failed, detail}} =
              Placement.harness_binary_probe(:claude, cli_bin,
-               base_dir: base_dir,
-               db: db,
-               launch_path: cli_bin,
                find_executable: fn "claude" -> "/fake/claude" end,
                run: fn ["/fake/claude", "--version"] -> {"broken install\n", 9} end
              )
@@ -88,9 +78,6 @@ defmodule Tightbeam.PlacementTest do
 
     assert {:error, {:exec_failed, "timed out after 10ms"}} =
              Placement.harness_binary_probe(:claude, cli_bin,
-               base_dir: base_dir,
-               db: db,
-               launch_path: cli_bin,
                find_executable: fn "claude" -> "/fake/claude" end,
                run: fn _ -> Process.sleep(100) end,
                timeout: 10
@@ -100,124 +87,17 @@ defmodule Tightbeam.PlacementTest do
     # probe output carries a secret onward.
     assert {:error, {:exec_failed, "raised: exec saw [REDACTED:token]"}} =
              Placement.harness_binary_probe(:claude, cli_bin,
-               base_dir: base_dir,
-               db: db,
-               launch_path: cli_bin,
                find_executable: fn "claude" -> "/fake/claude" end,
                run: fn _ -> raise "exec saw sk-fixture-SENTINEL-0123456789abcdef" end
              )
 
     assert {:error, {:exec_failed, detail}} =
              Placement.harness_binary_probe(:claude, cli_bin,
-               base_dir: base_dir,
-               db: db,
-               launch_path: cli_bin,
                find_executable: fn "claude" -> "/fake/claude" end,
                run: fn _ -> {"bad key sk-fixture-SENTINEL-0123456789abcdef\n", 3} end
              )
 
     assert detail == ~s(exit=3 output="bad key [REDACTED:token]")
-  end
-
-  test "managed probe versions remain visible when launch PATH has no native CLI", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    cli_bin = Path.join(base_dir, "bin")
-    empty_path = Path.join(base_dir, "empty-path")
-    managed_bin = Path.join([base_dir, "adapters", "node_modules", ".bin"])
-    File.mkdir_p!(empty_path)
-    File.mkdir_p!(managed_bin)
-    File.write!(Path.join(managed_bin, "claude-agent-acp"), "adapter present\n")
-    File.write!(Path.join(managed_bin, "codex"), "#!/bin/sh\nprintf 'codex-cli 0.154.0\\n'\n")
-    File.chmod!(Path.join(managed_bin, "codex"), 0o755)
-
-    assert {:ok,
-            %{
-              bin: "managed by @agentclientprotocol/claude-agent-acp@0.81.0",
-              version: "Claude Code 2.1.280 (managed by claude-agent-acp@0.81.0)"
-            }} =
-             Placement.harness_binary_probe(:claude, cli_bin,
-               base_dir: base_dir,
-               db: db,
-               launch_path: empty_path,
-               find_executable: fn _ -> nil end
-             )
-
-    assert {:ok, %{bin: managed_codex, version: "codex-cli 0.154.0 (managed)"}} =
-             Placement.harness_binary_probe(:codex, cli_bin,
-               base_dir: base_dir,
-               db: db,
-               launch_path: empty_path,
-               find_executable: fn _ -> nil end
-             )
-
-    assert managed_codex == "managed #{Path.join(managed_bin, "codex")}"
-  end
-
-  test "an explicit Codex path wins the version probe and does not fall back", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    cli_bin = Path.join(base_dir, "bin")
-    explicit = Path.join(base_dir, "selected codex")
-    File.mkdir_p!(Path.dirname(explicit))
-    File.write!(explicit, "#!/bin/sh\nprintf 'codex-cli 0.200.1\\n'\n")
-    File.chmod!(explicit, 0o755)
-    File.mkdir_p!(Path.join([base_dir, "adapters", "node_modules", ".bin"]))
-    File.write!(Path.join([base_dir, "adapters", "node_modules", ".bin", "codex"]), "managed\n")
-
-    assert {:ok, _} =
-             Placement.set_env_overlay(
-               db,
-               Placement.local_host_name(),
-               "codex",
-               "CODEX_PATH",
-               explicit,
-               "test"
-             )
-
-    assert {:ok, %{bin: ^explicit, version: "codex-cli 0.200.1"}} =
-             Placement.harness_binary_probe(:codex, cli_bin,
-               base_dir: base_dir,
-               db: db,
-               find_executable: fn _ -> flunk("explicit CODEX_PATH must win over launch PATH") end
-             )
-
-    assert {:ok, _} =
-             Placement.set_env_overlay(
-               db,
-               Placement.local_host_name(),
-               "codex",
-               "CODEX_PATH",
-               Path.join(base_dir, "missing codex"),
-               "test"
-             )
-
-    assert {:error, {:exec_failed, _}} =
-             Placement.harness_binary_probe(:codex, cli_bin,
-               base_dir: base_dir,
-               db: db,
-               find_executable: fn _ ->
-                 flunk("invalid explicit CODEX_PATH must not fall back")
-               end
-             )
-  end
-
-  test "harness binary probe falls back to PATH when the DB owner is unavailable", %{
-    base_dir: base_dir
-  } do
-    cli_bin = Path.join(base_dir, "bin")
-    executable = Path.join(base_dir, "cursor-agent")
-    unavailable_db = String.to_atom("missing_probe_db_#{System.unique_integer([:positive])}")
-
-    assert {:ok, %{bin: ^executable, version: "cursor 1.0"}} =
-             Placement.harness_binary_probe(:cursor, cli_bin,
-               base_dir: base_dir,
-               db: unavailable_db,
-               find_executable: fn "cursor-agent" -> executable end,
-               run: fn [^executable, "--version"] -> {"cursor 1.0\n", 0} end
-             )
   end
 
   test "a bounded run that outlives its budget is a tagged timeout" do
@@ -1279,31 +1159,6 @@ defmodule Tightbeam.PlacementTest do
     refute_receive {:unexpected_sh, _}
   end
 
-  test "codex adapter passes the explicit executable path without changing its command", %{
-    base_dir: base_dir,
-    db: db
-  } do
-    explicit = Path.join(base_dir, "Codex Builds/codex")
-
-    assert {:ok, _} =
-             Placement.set_env_overlay(db, "testhost", "codex", "CODEX_PATH", explicit, "test")
-
-    config = %{
-      base_dir: base_dir,
-      db: db,
-      cwd: "/work",
-      cli_bin: "/local/bin",
-      default_model: Model.new("fable"),
-      sh_out: &inventory_shell/1
-    }
-
-    opts = Placement.adapter_opts!(config, {:codex, "default", "testhost"})
-    expected_binary = Path.join([base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
-
-    assert opts[:cmd] == [expected_binary]
-    assert {"CODEX_PATH", explicit} in opts[:env]
-  end
-
   test "adapter_opts passes configured synthetic model data to launch preparation", %{
     base_dir: base_dir,
     db: db
@@ -1911,11 +1766,6 @@ defmodule Tightbeam.PlacementTest do
       }
     })
 
-    explicit = "/opt/codex builds/codex"
-
-    assert {:ok, _} =
-             Placement.set_env_overlay(db, "worker", "codex", "CODEX_PATH", explicit, "test")
-
     sh = fn command ->
       if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
            Enum.any?(command, &String.contains?(&1, "cat")),
@@ -1950,7 +1800,6 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_MACHINE=worker",
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "PATH=/srv/tb/bin:$PATH",
-             "CODEX_PATH='/opt/codex builds/codex'",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
              "GH_CONFIG_DIR='/srv/tb/auth/github/gh'",
              "CODEX_CONFIG=#{Tightbeam.Harness.Support.shell_quote(inventory_config())}",

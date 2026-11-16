@@ -617,12 +617,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("handle", handle)],
         )),
-        Command::HarklightCover { identity, session } => Ok(request(
-            identity,
-            "harklight-cover",
-            vec![],
-            vec![string_field("handle", session)],
-        )),
         Command::HarklightFollow {
             identity,
             message,
@@ -4041,7 +4035,6 @@ fn local_harklight_identity_refusal(
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
-        | Command::HarklightCover { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
         {
             Some("invalid Harklight command flags")
@@ -4073,7 +4066,6 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
         | Command::HarklightRetry { identity, .. }
-        | Command::HarklightCover { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::RoleBind { identity, .. }
@@ -4343,7 +4335,6 @@ mod tests {
             (vec!["harklight-retry", "--all"], "harklight-retry"),
             (vec!["harklight-retry", "--message", "m"], "harklight-retry"),
             (vec!["harklight-retry", "--session", "h"], "harklight-retry"),
-            (vec!["harklight-cover", "--session", "h"], "harklight-cover"),
         ];
         for (args, verb) in commands {
             let command =
@@ -4362,9 +4353,7 @@ mod tests {
                 assert_eq!(body["params"]["stake"], "the demo slips");
                 assert_eq!(body["params"]["byWhen"], "2026-11-01T17:00:00Z");
                 assert_eq!(body["params"]["reply"], true);
-            } else if (verb == "harklight-follow" || verb == "harklight-cover")
-                && body["params"].get("handle").is_some()
-            {
+            } else if verb == "harklight-follow" && body["params"].get("handle").is_some() {
                 assert_eq!(body["params"]["handle"], "h");
             } else if verb == "harklight-listener-restore" {
                 assert_eq!(body["params"]["handle"], "h");
