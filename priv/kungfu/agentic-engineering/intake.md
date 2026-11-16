@@ -25,9 +25,9 @@ within authority to actual availability. Selection mechanics live in
 Read the engineering core's Evidence rule alongside repository checks and the
 organization's completion rules. Preserve truthful evidence, independent review
 and explicit user acceptance where required. Select qualified independent
-nonauthor reviewers under the engineering core's opposite-harness preference and
-available fallback; record actual authorship and reviewer harness. Report unmet
-capability or access rather than claiming a review that did not occur.
+nonauthor reviewers under the engineering core's harness and model preference and
+fallback order; record actual authorship and the reviewer's harness and model.
+Report unmet capability or access rather than claiming a review that did not occur.
 
 Record material product or capability decisions in their existing homes. A new
 bundle election is not authority to change another owner's product commitments,

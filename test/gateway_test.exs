@@ -25,7 +25,7 @@ defmodule Tightbeam.GatewayTest do
 
     expected =
       expected ++
-        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-follow)
+        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow)
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 
@@ -11056,6 +11056,12 @@ defmodule Tightbeam.GatewayTest do
                    "Share generic event subscription tools and a read-only Matrix event watcher.",
                  phrases: [],
                  root_archetype: "default"
+               },
+               %{
+                 name: "uncle-enzo",
+                 purpose: _enzo_purpose,
+                 phrases: _enzo_phrases,
+                 root_archetype: "exec"
                }
              ]
            } = list.(%{origin: "agent:k1", params: %{}})

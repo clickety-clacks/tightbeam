@@ -810,3 +810,19 @@ not be reused or moved.
 Retain a broken published release. Put a do-not-install warning at the top of
 its notes naming the failure and safe replacement, and mark it prerelease so
 it cannot be latest. Delete it only for a leaked secret or legal problem.
+
+## Shared Harklight origin listener
+
+With an origin-capable Harklight Agent and Server, the sending Tightbeam session can explicitly move one of its existing conversations to the shared listener:
+
+```sh
+tightbeam harklight-cover --session <Harklight-handle>
+```
+
+Each handle is opted in separately. The gateway runs one origin listener for its configured Agent enrollment, using the same identity and granted sender scope as its existing Harklight commands. Conversations that have not been opted in continue using their per-handle listeners. The shared listener stays running when conversations finish; entries for handles without a Tightbeam send record or without an explicit move are ignored without acknowledgment or a session wake.
+
+A move is recorded before coverage is requested. Tightbeam confirms coverage, stops the old per-handle reader and waits for its CLI process to exit, then confirms coverage again to settle any earlier support declaration. Offers arriving during that handover are retained and share the existing durable delivery deduplication. The Agent retains the feed journal and cursor. On gateway restart, recorded moves resume through the exit barrier and final coverage request; other handles are not migrated.
+
+The command reports `covered` only after the final confirmation. A `pending` result retains the move and any captured offers; repeat `harklight-cover` for that handle to continue. An unresolved support operation is retried with its original operation ID before coverage is requested again. This does not resend the conversation.
+
+Harklight support declarations replace the whole per-handle support record. An external per-handle attach or support declaration that omits `origin_listener` withdraws coverage. Tightbeam suppresses its own later per-handle starts for moving and moved handles, and does not automatically re-cover completed moves after an external withdrawal. Ack, reply and result remain separate short Agent requests; they are not sent over the standing connection. No unrelated listeners or conversations are automatically migrated or cleaned up.
