@@ -41,6 +41,7 @@ defmodule Tightbeam.RecognitionRetryTest do
 
     {:ok, initial} =
       DB.start_link(path: path, name: nil, guard_inputs: [], payload_root: prepared.payload)
+
     :ok = Tightbeam.Schema.ensure_all(initial)
 
     {:ok, _} =
@@ -61,7 +62,10 @@ defmodule Tightbeam.RecognitionRetryTest do
       end)
 
     :ok = GenServer.stop(initial)
-    {:ok, db} = DB.start_link(path: path, name: nil, guard_inputs: [], payload_root: prepared.payload)
+
+    {:ok, db} =
+      DB.start_link(path: path, name: nil, guard_inputs: [], payload_root: prepared.payload)
+
     on_exit(fn -> if Process.alive?(db), do: GenServer.stop(db) end)
     retry = :sys.get_state(db).retry
 
