@@ -101,6 +101,22 @@ if missing_executable do
   File.mkdir_p!(empty_bin)
   System.put_env("PATH", empty_bin)
 
+  # The refusal case must exclude managed adapter fallbacks as well as PATH
+  # executables. RecoveryFixture installs adapter placeholders for ordinary
+  # startup tests; their presence makes Claude's managed probe usable.
+  for module <- Harness.all() do
+    %{input: %{profile: profile}} =
+      Enum.find(
+        module.conformance_vectors()["ensure_adapter"],
+        &(&1.case == "local_present")
+      )
+
+    File.rm!(Path.join([base, "adapters", "node_modules", ".bin", profile.adapter_bin]))
+  end
+
+  managed_codex = Path.join([base, "adapters", "node_modules", ".bin", "codex"])
+  if File.exists?(managed_codex), do: File.rm!(managed_codex)
+
   for module <- Harness.all() do
     nil = System.find_executable(module.cli_binary())
     false = File.exists?(Path.join([base, "bin", module.cli_binary()]))
