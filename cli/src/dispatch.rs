@@ -4284,7 +4284,8 @@ mod tests {
                 assert_eq!(body["params"]["byWhen"], "2026-11-01T17:00:00Z");
                 assert_eq!(body["params"]["reply"], true);
             } else if (verb == "harklight-follow" || verb == "harklight-cover")
-                && body["params"].get("handle").is_some() {
+                && body["params"].get("handle").is_some()
+            {
                 assert_eq!(body["params"]["handle"], "h");
             } else {
                 assert_eq!(body["params"]["messageId"], "m");
