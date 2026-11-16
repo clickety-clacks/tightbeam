@@ -4052,7 +4052,38 @@ defmodule Tightbeam.RulesTest do
                [no_context.session_key]
              )
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[no_context_target]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:ac6a-queue-backlog' AND sessionKey=?1",
+               [no_context.session_key]
+             )
+
+    assert no_context_target == no_context.session_key
+
+    main = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    other_no_context = session(ctx.db, "ac6a-owner-main-fallback-holder", "flynn")
+
+    for index <- 1..20 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: other_no_context.session_key,
+                 message_id: "ac6a-owner-main-fallback-#{index}",
+                 origin: "process:seed",
+                 prompt: "no assignment or work item, with an owner Main"
+               })
+    end
+
+    assert {:ok, [[main_target]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:ac6a-queue-backlog' AND sessionKey=?1",
+               [main.session_key]
+             )
+
+    assert main_target == main.session_key
+
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed' AND subject='ac6a-queue-backlog'"

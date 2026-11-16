@@ -13,7 +13,7 @@ deny_when = [
 ]
 
 [rule.notice]
-target_session = "{assignment_opener_or_coordinator_session}"
+target_session = "{queue_backlog_recipient_session}"
 prompt = "Agent {session_key} has 20 or more queued turns or a queued turn at least 60 minutes old. Review the assignment or work-item queue and direct the next step."
 idempotency_key = "backlog:{turn_backlog_episode_id}"
 
