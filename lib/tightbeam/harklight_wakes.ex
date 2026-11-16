@@ -143,10 +143,11 @@ defmodule Tightbeam.HarklightWakes do
     FROM wakes w
     LEFT JOIN wake_retry_attempts retry ON retry.wakeId=w.wakeId
     JOIN harklight_wake_deliveries d
-      ON d.wakeId=COALESCE(retry.rootWakeId,w.wakeId) AND d.sessionKey=w.sessionKey
+      ON d.wakeId=COALESCE(retry.rootWakeId,w.wakeId)
+        AND COALESCE(d.currentRecipientSessionKey,d.sessionKey)=w.sessionKey
     JOIN harklight_wake_entries e ON e.handle=d.handle AND e.eventId=d.eventId
     JOIN harklight_wake_handles h ON h.handle=e.handle
-    WHERE w.deliveredTurnSeq=?1 AND d.sessionKey=?2
+    WHERE w.deliveredTurnSeq=?1 AND COALESCE(d.currentRecipientSessionKey,d.sessionKey)=?2
       AND e.entryKind IN ('discussion','terminal') AND e.entryAuthor='person'
       AND EXISTS (
         SELECT 1 FROM turn_lifecycle_events event

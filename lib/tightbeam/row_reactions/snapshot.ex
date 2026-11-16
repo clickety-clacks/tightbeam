@@ -8,9 +8,10 @@ defmodule Tightbeam.RowReactions.Snapshot do
     SessionReparent,
     Wakes
   }
+
   alias Tightbeam.DB.Txn
 
-  @assignment ~w(id holderKey workItemId openedBySession openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
+  @assignment ~w(id holderKey workItemId openedBySession currentOpenerSessionKey openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
   def assignment(txn, id), do: one(txn, "assignments", @assignment, "id=?1", [id])
 
   def harness_health_hold(txn, incident_id) do
@@ -128,10 +129,16 @@ defmodule Tightbeam.RowReactions.Snapshot do
     coordination_parent =
       SessionReparent.current_coordination_parent(txn, terminal["assignment_id"])
 
+    assignment =
+      one(txn, "assignments", ~w(currentOpenerSessionKey), "id=?1", [terminal["assignment_id"]])
+
+    current_opener =
+      (assignment && assignment["currentOpenerSessionKey"]) || terminal["opened_by_id"]
+
     personal = Org.personal_session_key(terminal["owner_user_id"])
 
     keys = [
-      terminal["opened_by_id"],
+      current_opener,
       terminal["child_session_key"],
       personal,
       delivery_owner && delivery_owner["accountableSessionKey"],
@@ -146,7 +153,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
       "opener_responsibility" =>
         DeliveryResponsibilities.responsibility_in_txn(
           txn,
-          terminal["opened_by_id"],
+          current_opener,
           terminal["work_item_id"]
         ),
       "sessions" => sessions(txn, keys),
@@ -192,7 +199,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
     attests =
       Enum.flat_map(sources, fn source ->
         parents =
-          [delivery["sessionKey"], opener_session(source)]
+          [delivery["sessionKey"], opener_session(txn, source)]
           |> Enum.filter(&is_binary/1)
           |> Enum.uniq()
 
@@ -239,10 +246,19 @@ defmodule Tightbeam.RowReactions.Snapshot do
     |> Enum.map(&Map.put(&1, "disposition", disposition(&1["note"])))
   end
 
-  defp opener_session(%{"openedByKind" => "session", "openedById" => id}) when is_binary(id),
-    do: id
+  defp opener_session(txn, %{
+         "assignmentId" => assignment_id,
+         "openedByKind" => "session",
+         "openedById" => id
+       })
+       when is_binary(id) do
+    case Txn.q(txn, "SELECT currentOpenerSessionKey FROM assignments WHERE id=?1", [assignment_id]) do
+      [[current]] when is_binary(current) -> current
+      _ -> id
+    end
+  end
 
-  defp opener_session(_source), do: nil
+  defp opener_session(_txn, _source), do: nil
 
   def wake(txn, id) do
     row =

@@ -202,6 +202,61 @@ defmodule Tightbeam.SessionReparentTest do
     assert count(ctx.db, "wire_idempotency") == 0
   end
 
+  test "parent correction covers multiple held assignments without rewriting their openers",
+       ctx do
+    assignment(ctx.db, "asg_two", "child", "wi_one")
+
+    params =
+      ctx.params
+      |> Map.delete(:assignment_id)
+      |> Map.put(:parent_session_key, "old")
+      |> Map.put(:idempotency_key, "multi-parent")
+
+    result = SessionReparent.handle(ctx.db, call(params))
+    assert result["session"]["currentParent"] == "old"
+    assert Enum.map(result["assignments"], & &1["assignmentId"]) == ["asg_one", "asg_two"]
+    assert SessionReparent.current_coordination_parent(ctx.db, "asg_one") == "old"
+    assert SessionReparent.current_coordination_parent(ctx.db, "asg_two") == "old"
+
+    assert rows(ctx.db, "SELECT openedByUser,openedBySession FROM assignments ORDER BY id") ==
+             [["owner", nil], ["owner", nil]]
+
+    assert SessionReparent.handle(ctx.db, call(params)) == result
+    assert count(ctx.db, "session_reparent_events") == 2
+  end
+
+  test "parent correction records a zero-held child and rejects a descendant cycle", ctx do
+    session(ctx.db, "descendant", %{spawned_by: "old"})
+    assert Org.topology_parent(ctx.db, "descendant") == "old"
+
+    params = %{
+      session_key: "old",
+      parent_session_key: "child",
+      idempotency_key: "zero-parent"
+    }
+
+    result = SessionReparent.handle(ctx.db, call(params))
+    assert result["assignments"] == []
+    assert Org.topology_parent(ctx.db, "old") == "child"
+    assert Org.topology_parent(ctx.db, "descendant") == "old"
+
+    assert rows(ctx.db, "SELECT assignmentId,workItemId FROM session_reparent_events") ==
+             [[nil, nil]]
+
+    assert SessionReparent.handle(ctx.db, call(params)) == result
+
+    assert %{code: "cycle_detected"} =
+             SessionReparent.handle(
+               ctx.db,
+               call(%{
+                 params
+                 | session_key: "child",
+                   parent_session_key: "old",
+                   idempotency_key: "cycle"
+               })
+             )
+  end
+
   test "a delivery owner reparent is recorded, replayable, and idempotent across principals",
        ctx do
     accountable_fixture(ctx)

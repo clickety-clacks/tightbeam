@@ -1216,7 +1216,7 @@ defmodule Tightbeam.Rules do
   defp assignment_opener_session(db, assignment_id) do
     case DB.query(
            db,
-           "SELECT openedByUser,openedBySession FROM assignments WHERE id=?1",
+           "SELECT openedByUser,COALESCE(currentOpenerSessionKey,openedBySession) FROM assignments WHERE id=?1",
            [assignment_id]
          ) do
       {:ok, [[_opened_by_user, session_key]]} when is_binary(session_key) ->

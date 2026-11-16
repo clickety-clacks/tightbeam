@@ -314,12 +314,13 @@ defmodule Tightbeam.HarklightLifecycle do
     Txn.q(
       txn,
       """
-      SELECT COALESCE(d.wakeId,e.wakeId),e.handle,e.eventId,COALESCE(d.sessionKey,h.sessionKey)
+      SELECT COALESCE(d.wakeId,e.wakeId),e.handle,e.eventId,
+             COALESCE(d.currentRecipientSessionKey,d.sessionKey,h.sessionKey)
       FROM harklight_wake_entries e
       JOIN harklight_wake_handles h ON h.handle=e.handle
       LEFT JOIN harklight_wake_deliveries d ON d.handle=e.handle AND d.eventId=e.eventId
       WHERE e.senderId=?1 AND e.messageId=?2
-      ORDER BY e.feedCursor,COALESCE(d.sessionKey,h.sessionKey)
+      ORDER BY e.feedCursor,COALESCE(d.currentRecipientSessionKey,d.sessionKey,h.sessionKey)
       """,
       [record.sender_id, record.message_id]
     )
@@ -1022,7 +1023,7 @@ defmodule Tightbeam.HarklightLifecycle do
         deliveries =
           Txn.q(
             txn,
-            "SELECT sessionKey,wakeId FROM harklight_wake_deliveries WHERE handle=?1 AND eventId=?2 ORDER BY sessionKey",
+            "SELECT sessionKey,COALESCE(currentRecipientSessionKey,sessionKey),wakeId FROM harklight_wake_deliveries WHERE handle=?1 AND eventId=?2 ORDER BY sessionKey",
             [handle, entry.event_id]
           )
 
@@ -1031,7 +1032,7 @@ defmodule Tightbeam.HarklightLifecycle do
         deliveries =
           if deliveries == [] do
             case Txn.q(txn, "SELECT sessionKey FROM wakes WHERE wakeId=?1", [entry.wake_id]) do
-              [[session_key]] -> [[session_key, entry.wake_id]]
+              [[session_key]] -> [[session_key, session_key, entry.wake_id]]
               _ -> []
             end
           else
@@ -1040,9 +1041,9 @@ defmodule Tightbeam.HarklightLifecycle do
 
         # The origin must have its own delivery row; another recipient's
         # receipt never stands in for it.
-        Enum.any?(deliveries, fn [session_key, _wake_id] -> session_key == origin_session end) and
-          Enum.all?(deliveries, fn [session_key, wake_id] ->
-            delivered_to_recipient?(txn, session_key, wake_id)
+        Enum.any?(deliveries, fn [origin, _recipient, _wake_id] -> origin == origin_session end) and
+          Enum.all?(deliveries, fn [_origin, recipient, wake_id] ->
+            delivered_to_recipient?(txn, recipient, wake_id)
           end)
       end)
   rescue

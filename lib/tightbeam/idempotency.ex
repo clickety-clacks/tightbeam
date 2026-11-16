@@ -131,6 +131,67 @@ defmodule Tightbeam.Idempotency do
   end
 
   @doc false
+  def upgrade_custody_in_txn(%Txn{} = txn) do
+    [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM wire_idempotency")
+
+    :ok =
+      Txn.exec(txn, """
+      CREATE TABLE wire_idempotency_custody (
+        ownerUserId TEXT NOT NULL,
+        operation TEXT NOT NULL CHECK (operation IN
+          ('spawn','retire','wake','assign','condition','work-item-create',
+           'session-reparent','session-po-set','settle-turn','session-custody-transfer')),
+        idempotencyKey TEXT NOT NULL,
+        sessionKey TEXT NOT NULL,
+        requestFingerprint TEXT,
+        canonicalResponse TEXT,
+        responseJson TEXT,
+        PRIMARY KEY(ownerUserId,operation,idempotencyKey),
+        CHECK (operation NOT IN ('session-reparent','session-po-set','session-custody-transfer') OR
+          (requestFingerprint IS NOT NULL AND canonicalResponse IS NOT NULL)),
+        CHECK (operation != 'settle-turn' OR
+          (requestFingerprint IS NOT NULL AND responseJson IS NOT NULL))
+      );
+      INSERT INTO wire_idempotency_custody
+        (ownerUserId,operation,idempotencyKey,sessionKey,requestFingerprint,canonicalResponse,responseJson)
+        SELECT ownerUserId,operation,idempotencyKey,sessionKey,requestFingerprint,canonicalResponse,responseJson
+        FROM wire_idempotency;
+      DROP TABLE wire_idempotency;
+      ALTER TABLE wire_idempotency_custody RENAME TO wire_idempotency;
+      """)
+
+    [[^count]] = Txn.q(txn, "SELECT COUNT(*) FROM wire_idempotency")
+    :ok
+  end
+
+  @doc false
+  def custody_result_in_txn(txn, owner, key) do
+    case Txn.q(
+           txn,
+           "SELECT requestFingerprint,canonicalResponse FROM wire_idempotency WHERE ownerUserId=?1 AND operation='session-custody-transfer' AND idempotencyKey=?2",
+           [owner, key]
+         ) do
+      [[fingerprint, response]] -> %{fingerprint: fingerprint, response: JSON.decode!(response)}
+      [] -> nil
+    end
+  end
+
+  @doc false
+  def put_custody_in_txn(txn, owner, key, fingerprint, event, response) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO wire_idempotency
+        (ownerUserId,operation,idempotencyKey,sessionKey,requestFingerprint,canonicalResponse)
+      VALUES (?1,'session-custody-transfer',?2,?3,?4,?5)
+      """,
+      [owner, key, event, fingerprint, JSON.encode!(response)]
+    )
+
+    :ok
+  end
+
+  @doc false
   def reparent_result_in_txn(txn, owner, key) do
     case Txn.q(
            txn,

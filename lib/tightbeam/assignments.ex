@@ -3207,6 +3207,11 @@ defmodule Tightbeam.Assignments do
         opener_ref = assignment_opener_ref(assignment)
         target = assignment_opener_session(txn, assignment)
 
+        disposer_ref =
+          if is_binary(assignment.currentOpenerSessionKey),
+            do: "session:" <> assignment.currentOpenerSessionKey,
+            else: opener_ref
+
         [[asker_owner]] =
           Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [
             assignment.holderKey
@@ -3244,7 +3249,7 @@ defmodule Tightbeam.Assignments do
             (id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
              disposerRef, reason,
              releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state, createdAt)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, 'standing', ?11)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?12, ?7, ?8, ?9, ?10, 'standing', ?11)
           """,
           [
             condition_id,
@@ -3257,7 +3262,8 @@ defmodule Tightbeam.Assignments do
             release_kind,
             release_scope,
             release_principal,
-            attest.ts
+            attest.ts,
+            disposer_ref
           ]
         )
 
@@ -3398,6 +3404,10 @@ defmodule Tightbeam.Assignments do
   defp assignment_opener_ref(%{openedByUser: user}) when is_binary(user), do: "user:" <> user
 
   defp assignment_opener_ref(_assignment), do: nil
+
+  defp assignment_opener_session(_txn, %{currentOpenerSessionKey: session})
+       when is_binary(session),
+       do: session
 
   defp assignment_opener_session(_txn, %{openedBySession: session}) when is_binary(session),
     do: session
@@ -4522,6 +4532,13 @@ defmodule Tightbeam.Assignments do
   end
 
   defp same_attest_principal_as_opener?(
+         %{currentOpenerSessionKey: opener},
+         %{byUser: nil, bySession: opener}
+       )
+       when is_binary(opener),
+       do: true
+
+  defp same_attest_principal_as_opener?(
          %{openedByUser: opener, openedBySession: nil},
          %{byUser: opener, bySession: nil}
        )
@@ -4529,7 +4546,7 @@ defmodule Tightbeam.Assignments do
        do: true
 
   defp same_attest_principal_as_opener?(
-         %{openedByUser: nil, openedBySession: opener},
+         %{openedByUser: nil, openedBySession: opener, currentOpenerSessionKey: nil},
          %{byUser: nil, bySession: opener}
        )
        when is_binary(opener),
@@ -5538,7 +5555,7 @@ defmodule Tightbeam.Assignments do
     do: assignment.closedBySession == session
 
   defp columns do
-    "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, " <>
+    "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, currentOpenerSessionKey, " <>
       "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closedByProcess, closingAttestId, " <>
       "(SELECT r.reason FROM assignment_revocation_generations g " <>
       "JOIN assignment_revocations r ON r.id = g.revocationId " <>
@@ -5561,6 +5578,7 @@ defmodule Tightbeam.Assignments do
          holder_fallback,
          opened_by_user,
          opened_by_session,
+         current_opener_session_key,
          opened_at,
          state,
          outcome,
@@ -5586,6 +5604,7 @@ defmodule Tightbeam.Assignments do
       holderFallback: holder_fallback == 1,
       openedByUser: opened_by_user,
       openedBySession: opened_by_session,
+      currentOpenerSessionKey: current_opener_session_key,
       openedAt: opened_at,
       state: state,
       outcome: outcome,

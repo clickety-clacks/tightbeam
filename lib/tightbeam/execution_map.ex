@@ -914,7 +914,7 @@ defmodule Tightbeam.ExecutionMap do
       FROM assignments AS a
       LEFT JOIN work_items AS wi ON wi.id = a.workItemId
       WHERE ?1 = 1 OR
-            (?2 = 'session' AND (a.holderKey = ?3 OR a.openedBySession = ?3)) OR
+            (?2 = 'session' AND (a.holderKey = ?3 OR COALESCE(a.currentOpenerSessionKey,a.openedBySession) = ?3)) OR
             (?2 = 'user' AND (wi.ownerUserId = ?3 OR a.openedByUser = ?3))
       ORDER BY a.id
       """,

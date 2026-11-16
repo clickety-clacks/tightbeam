@@ -276,7 +276,13 @@ pub enum Command {
         identity: Identity,
         session_key: String,
         parent_session_key: String,
-        assignment_id: String,
+        assignment_id: Option<String>,
+        idempotency_key: String,
+    },
+    SessionCustodyTransfer {
+        identity: Identity,
+        from_session_key: String,
+        to_session_key: String,
         idempotency_key: String,
     },
     SessionPoSet {
@@ -971,8 +977,11 @@ COMMANDS:
       valid model catalog per harness — and, for admins, pending devices.
         tightbeam list --as orchestrator:news
 
-  session-reparent --session <key> --parent <key> --assignment <id> --key <key>
-      Correct one custom session and its sole open assignment.
+  session-reparent --session <key> --parent <key> [--assignment <id>] --key <key>
+      Correct one custom session's parent and its current held assignments.
+
+  session-custody-transfer --from <source> --to <successor> --key <key>
+      Transfer current assignment and notice custody as the owner.
 
   session-po-set --session <key> --po-role <role> --key <key>
       Explicitly associate an exact session with its addressed product-owner role.
@@ -2847,13 +2856,27 @@ fn parse_with_optional_catalog(
                 || nonempty(flags, "role").is_some()
                 || nonempty(flags, "user").is_some()
             {
-                return Err("usage: tightbeam session-reparent --session <key> --parent <key> --assignment <id> --key <key>".to_owned());
+                return Err("usage: tightbeam session-reparent --session <key> --parent <key> [--assignment <id>] --key <key>".to_owned());
             }
             Ok(Command::SessionReparent {
                 identity: identity(flags)?,
                 session_key: nonempty(flags, "session").ok_or("--session is required")?,
                 parent_session_key: nonempty(flags, "parent").ok_or("--parent is required")?,
-                assignment_id: nonempty(flags, "assignment").ok_or("--assignment is required")?,
+                assignment_id: nonempty(flags, "assignment"),
+                idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
+            })
+        }
+        "session-custody-transfer" => {
+            if parsed.positional.len() != 1
+                || nonempty(flags, "role").is_some()
+                || nonempty(flags, "user").is_some()
+            {
+                return Err("usage: tightbeam session-custody-transfer --from <source> --to <successor> --key <key>".to_owned());
+            }
+            Ok(Command::SessionCustodyTransfer {
+                identity: identity(flags)?,
+                from_session_key: nonempty(flags, "from").ok_or("--from is required")?,
+                to_session_key: nonempty(flags, "to").ok_or("--to is required")?,
                 idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
             })
         }
@@ -6530,6 +6553,7 @@ mod tests {
                 "sentinel",
                 "session-connect",
                 "session-reparent",
+                "session-custody-transfer",
                 "skill",
                 "session-po-set",
                 "settle-turn",

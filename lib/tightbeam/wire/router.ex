@@ -76,6 +76,7 @@ defmodule Tightbeam.Wire.Router do
   @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
+                   "session-custody-transfer",
                    "fact-demand",
                    "sentinel-demand",
                    "fact-producer-claim",
@@ -4423,6 +4424,7 @@ defmodule Tightbeam.Wire.Router do
     "sentinel-unsubscribe" => ~w(subscription_id)a,
     "session-po-set" => ~w(idempotency_key po_role po_session_key session_key)a,
     "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
+    "session-custody-transfer" => ~w(from_session_key idempotency_key to_session_key)a,
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
     "spawn" =>
       ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id owner_user_id)a,
