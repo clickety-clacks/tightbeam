@@ -131,14 +131,23 @@ defmodule Tightbeam.ToolCalls do
         raise error
     end
 
-    case DB.migration_transaction(db, :tool_call_full_output, [], [], &ensure_full_output_in_txn/1) do
+    case DB.migration_transaction(
+           db,
+           :tool_call_full_output,
+           [],
+           [],
+           &ensure_full_output_in_txn/1
+         ) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
     end
   end
 
   defp ensure_full_output_in_txn(txn) do
-    case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='tool_call_full_output_migration'") do
+    case Txn.q(
+           txn,
+           "SELECT sql FROM sqlite_master WHERE type='table' AND name='tool_call_full_output_migration'"
+         ) do
       [[_sql]] ->
         for {name, expected} <- [
               {"tool_call_full_outputs", @full_output_ddl},
@@ -154,16 +163,27 @@ defmodule Tightbeam.ToolCalls do
           end
         end
 
-        unless Txn.q(txn, "SELECT id,shape FROM tool_call_full_output_migration") == [[0, "tool-call-full-output-v1"]],
-          do: raise(Tightbeam.Schema.ShapeError, message: "incompatible_tool_call_full_output_stamp")
+        unless Txn.q(txn, "SELECT id,shape FROM tool_call_full_output_migration") == [
+                 [0, "tool-call-full-output-v1"]
+               ],
+               do:
+                 raise(Tightbeam.Schema.ShapeError,
+                   message: "incompatible_tool_call_full_output_stamp"
+                 )
 
       [] ->
         :ok = Txn.exec(txn, @full_output_ddl)
         :ok = Txn.exec(txn, @full_output_stamp_ddl)
-        Txn.q(txn, "INSERT INTO tool_call_full_output_migration VALUES (0,'tool-call-full-output-v1',?1)", [System.system_time(:millisecond)])
+
+        Txn.q(
+          txn,
+          "INSERT INTO tool_call_full_output_migration VALUES (0,'tool-call-full-output-v1',?1)",
+          [System.system_time(:millisecond)]
+        )
 
       rows ->
-        raise Tightbeam.Schema.ShapeError, message: "incompatible_tool_call_full_output_stamp_table: #{inspect(rows)}"
+        raise Tightbeam.Schema.ShapeError,
+          message: "incompatible_tool_call_full_output_stamp_table: #{inspect(rows)}"
     end
 
     :ok
