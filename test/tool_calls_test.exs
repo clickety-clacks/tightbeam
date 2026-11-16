@@ -193,6 +193,18 @@ defmodule Tightbeam.ToolCallsTest do
     assert item["content"] == terminal_content
     assert ended["payload"] == item
 
+    assert {:ok, [[raw_output_gzip, content_gzip]]} =
+             DB.query(
+               ctx.db,
+               "SELECT rawOutputGzip,contentGzip FROM tool_call_full_outputs WHERE toolCallId=?1",
+               [row.id]
+             )
+
+    assert :zlib.gunzip(raw_output_gzip) ==
+             StateResources.encode_json_value(%{"lines" => ["module Tightbeam.Gateway"]})
+
+    assert :zlib.gunzip(content_gzip) == StateResources.encode_json_value(terminal_content)
+
     item_bytes = StateResources.encode_item("tool calls", item)
     assert String.contains?(Publisher.encode_wire_notice(ended), "\"payload\":" <> item_bytes)
 
@@ -287,6 +299,16 @@ defmodule Tightbeam.ToolCallsTest do
     canonical_input = StateResources.encode_json_value(input)
     expected_input_prefix = utf8_prefix(canonical_input, 65_536)
 
+    assert {:ok, [[raw_output_gzip, content_gzip]]} =
+             DB.query(
+               ctx.db,
+               "SELECT rawOutputGzip,contentGzip FROM tool_call_full_outputs WHERE toolCallId=?1",
+               [row.id]
+             )
+
+    assert :zlib.gunzip(raw_output_gzip) == StateResources.encode_json_value(output)
+    assert :zlib.gunzip(content_gzip) == StateResources.encode_json_value(content)
+
     assert item["rawInput"] == expected_input_prefix
     assert byte_size(item["rawInput"]) <= 65_536
     assert String.valid?(item["rawInput"])
@@ -306,6 +328,9 @@ defmodule Tightbeam.ToolCallsTest do
 
     assert JSON.decode!(StateResources.encode_item("tool calls", item))["truncated"] ==
              item["truncated"]
+
+    refute Map.has_key?(item, "rawOutputGzip")
+    refute Map.has_key?(item, "contentGzip")
   end
 
   test "keeps late tool records visible and announces terminal updates after a history reset",
