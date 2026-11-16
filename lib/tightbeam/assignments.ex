@@ -1472,6 +1472,15 @@ defmodule Tightbeam.Assignments do
   @doc "Log legacy review/item conflicts without mutating assignment rows."
   @spec audit_review_item_conflicts(DB.server()) :: :ok
   def audit_review_item_conflicts(db) do
+    if DB.overloaded?(db) do
+      Logger.debug("database overloaded; review item audit deferred")
+      :ok
+    else
+      DB.background_pass(fn -> audit_review_item_conflicts_now(db) end)
+    end
+  end
+
+  defp audit_review_item_conflicts_now(db) do
     {:ok, conflicts} =
       DB.transaction(db, fn txn ->
         Txn.q(

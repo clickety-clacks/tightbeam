@@ -146,6 +146,46 @@ defmodule Tightbeam.DBCallTimeoutTest do
     end
   end
 
+  test "a slow migration stays alive and reports progress before it finishes" do
+    Application.put_env(:tightbeam, :db_call_timeout_ms, 20)
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+
+    log =
+      capture_log(fn ->
+        assert {:ok, :finished} =
+                 DB.migration_transaction(db, :slow_step, [], [], fn _txn ->
+                   Process.sleep(5_100)
+                   :finished
+                 end)
+      end)
+
+    assert log =~ "database startup call migration_transaction: still waiting"
+    assert log =~ "database startup call migration_transaction: finished"
+  end
+
+  test "startup wait covers ordinary boot calls without changing the runtime timeout" do
+    Application.put_env(:tightbeam, :db_call_timeout_ms, 20)
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :sys.suspend(db)
+
+    caller = Task.async(fn -> DB.startup_wait(fn -> DB.query(db, "SELECT 1") end) end)
+    await_queued_call(db)
+    Process.sleep(80)
+    :sys.resume(db)
+
+    assert Task.await(caller) == {:ok, [[1]]}
+
+    assert_raise DB.Timeout, fn ->
+      :sys.suspend(db)
+
+      try do
+        DB.query(db, "SELECT 1")
+      after
+        :sys.resume(db)
+      end
+    end
+  end
+
   defp await_queued_call(db) do
     case Process.info(db, :messages) do
       {:messages, [{:"$gen_call", _, _} | _]} ->
