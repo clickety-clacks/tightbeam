@@ -2640,6 +2640,18 @@ defmodule Tightbeam.Escalation do
       obligation_ref: Wakes.decision_request_notice_ref(request.id)
     })
 
+    # The same request ref lets every terminal transition retract this reminder
+    # if the operator answers before the deadline. A delivered wake is already
+    # terminal, so the deadline can notify Main only once.
+    Wakes.schedule_in_txn(txn, %{
+      session_key: Org.personal_session_key(owner_user_id),
+      origin: "process:tightbeam",
+      prompt: operator_deadline_notification(request),
+      due_at: deadline_at,
+      target_gate: 0,
+      obligation_ref: Wakes.decision_request_notice_ref(request.id)
+    })
+
     request
   end
 
@@ -2825,6 +2837,7 @@ defmodule Tightbeam.Escalation do
           case validate_terminal_request_in_txn(txn, ruled) do
             %{failures: []} ->
               terminal_test_step(opts, :after_validate)
+              Wakes.clear_decision_request_notice_in_txn(txn, request.id)
               {terminal_projection(ruled), fact_id}
 
             %{failures: failures} ->
@@ -3025,6 +3038,7 @@ defmodule Tightbeam.Escalation do
                 "by=#{by} reason=#{reason}"
               )
 
+              Wakes.clear_decision_request_notice_in_txn(txn, request.id)
               withdrawn = request_in_txn(txn, request.id)
               Publisher.maybe_accepted_in_txn(txn, call, withdrawn)
               withdrawn
@@ -4540,6 +4554,13 @@ defmodule Tightbeam.Escalation do
 
   defp operator_notification(request) do
     "Decision #{request.id}: #{request.question}\nOptions: #{JSON.encode!(request.options)}"
+  end
+
+  defp operator_deadline_notification(request) do
+    "Operator decision #{request.id} passed its deadline unanswered.\n" <>
+      "Asked by: #{request.raiser_id}\n" <>
+      "Request: #{request.question}\n" <>
+      "Read it with tightbeam decision-request --request #{request.id}."
   end
 
   defp changed_decision_transition(
