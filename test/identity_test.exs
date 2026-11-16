@@ -127,7 +127,7 @@ defmodule Tightbeam.IdentityTest do
                  "I want each feature to have one owner who sees it through.",
                  "I want my agents to coordinate with each other directly."
                ],
-               root_archetype: "exec"
+               root_archetype: "uncle-enzo.exec"
              }
            ]
   end

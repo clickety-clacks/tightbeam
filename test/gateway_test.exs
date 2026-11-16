@@ -11061,7 +11061,7 @@ defmodule Tightbeam.GatewayTest do
                  name: "uncle-enzo",
                  purpose: _enzo_purpose,
                  phrases: _enzo_phrases,
-                 root_archetype: "exec"
+                 root_archetype: "uncle-enzo.exec"
                }
              ]
            } = list.(%{origin: "agent:k1", params: %{}})
