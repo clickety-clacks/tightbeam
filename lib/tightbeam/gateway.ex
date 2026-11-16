@@ -1679,6 +1679,9 @@ defmodule Tightbeam.Gateway do
           tune_result(config, db, call)
         end,
       {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
+      {"session-custody-transfer", ["wake.scheduled"]} => fn call ->
+        Tightbeam.SessionCustodyTransfer.handle(db, call)
+      end,
       {"session-po-set", ["wake.scheduled"]} => fn call ->
         SessionPoAssociations.handle(db, call)
       end,
@@ -1900,7 +1903,8 @@ defmodule Tightbeam.Gateway do
     case DB.query(
            db,
            """
-           SELECT id,subject,holderKey,openedByUser,openedBySession,workItemId,state
+           SELECT id,subject,holderKey,openedByUser,
+                  COALESCE(currentOpenerSessionKey,openedBySession),workItemId,state
            FROM assignments WHERE id=?1
            """,
            [assignment_id]
@@ -11475,7 +11479,7 @@ defmodule Tightbeam.Gateway do
   defp assignment_stop_target(db, assignment_id, principal) do
     case DB.query(
            db,
-           "SELECT holderKey,state,openedByUser,openedBySession FROM assignments WHERE id=?1",
+           "SELECT holderKey,state,openedByUser,COALESCE(currentOpenerSessionKey,openedBySession) FROM assignments WHERE id=?1",
            [assignment_id]
          ) do
       {:ok, [[holder, assignment_state, opened_by_user, opened_by_session]]} ->

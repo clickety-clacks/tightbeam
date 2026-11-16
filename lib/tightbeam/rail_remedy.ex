@@ -673,11 +673,11 @@ defmodule Tightbeam.RailRemedy do
     case Txn.q(
            txn,
            """
-           SELECT a.openedByUser,a.openedBySession,a.workItemId,
+           SELECT a.openedByUser,COALESCE(a.currentOpenerSessionKey,a.openedBySession),a.workItemId,
              COALESCE(w.ownerUserId,a.openedByUser,opener.ownerUserId)
            FROM assignments a
            LEFT JOIN work_items w ON w.id=a.workItemId
-           LEFT JOIN sessions opener ON opener.sessionKey=a.openedBySession
+           LEFT JOIN sessions opener ON opener.sessionKey=COALESCE(a.currentOpenerSessionKey,a.openedBySession)
            WHERE a.id=?1
            """,
            [assignment_id]

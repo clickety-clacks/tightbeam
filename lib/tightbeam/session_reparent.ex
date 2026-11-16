@@ -47,8 +47,107 @@ defmodule Tightbeam.SessionReparent do
 
   @ddl @table_ddl <> @indexes_and_triggers_ddl
 
+  @multi_table_ddl @table_ddl
+                   |> String.replace("assignmentId TEXT NOT NULL", "assignmentId TEXT")
+                   |> String.replace("workItemId TEXT NOT NULL", "workItemId TEXT")
+                   |> String.replace(
+                     "originAssignmentOpenerKind TEXT NOT NULL",
+                     "originAssignmentOpenerKind TEXT"
+                   )
+                   |> String.replace(
+                     "originAssignmentOpenerRef TEXT NOT NULL",
+                     "originAssignmentOpenerRef TEXT"
+                   )
+                   |> String.replace(
+                     "UNIQUE(ownerUserId,idempotencyKey),",
+                     """
+                     UNIQUE(ownerUserId,idempotencyKey,assignmentId),
+                     CHECK ((assignmentId IS NULL AND workItemId IS NULL AND
+                             originAssignmentOpenerKind IS NULL AND originAssignmentOpenerRef IS NULL) OR
+                            (assignmentId IS NOT NULL AND originAssignmentOpenerKind IS NOT NULL AND
+                             originAssignmentOpenerRef IS NOT NULL)),
+                     """
+                   )
+
   @doc false
   def migrate_in_txn(txn), do: Txn.exec(txn, @ddl)
+
+  @doc false
+  def upgrade_multi_in_txn(txn) do
+    expected =
+      Tightbeam.Schema.process_actor_table_sql("session_reparent_events", @table_ddl)
+      |> stored_sql()
+
+    replacement =
+      Tightbeam.Schema.process_actor_table_sql("session_reparent_events", @multi_table_ddl)
+      |> stored_sql()
+
+    [[actual]] =
+      Txn.q(
+        txn,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_reparent_events'"
+      )
+
+    # Earlier exact predecessor fixtures retained SQLite's original DDL
+    # spacing. Compare the same token sequence before replacing the table SQL.
+    unless sql_tokens(actual) == sql_tokens(expected),
+      do:
+        raise(Tightbeam.Schema.ShapeError,
+          message: "incompatible session reparent predecessor for multi-assignment topology"
+        )
+
+    [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events")
+
+    holding_ddl =
+      String.replace(
+        replacement,
+        "CREATE TABLE session_reparent_events (",
+        "CREATE TABLE session_reparent_events_custody (",
+        global: false
+      )
+
+    :ok = Txn.exec(txn, holding_ddl)
+
+    :ok =
+      Txn.exec(
+        txn,
+        "INSERT INTO session_reparent_events_custody SELECT * FROM session_reparent_events"
+      )
+
+    [[^count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events_custody")
+    :ok = Txn.exec(txn, "DROP TABLE session_reparent_events")
+
+    # Restore the original name before dropping the holding table. Other
+    # schema objects read session_reparent_events while SQLite reparses them.
+    :ok = Txn.exec(txn, replacement)
+
+    :ok =
+      Txn.exec(
+        txn,
+        "INSERT INTO session_reparent_events SELECT * FROM session_reparent_events_custody"
+      )
+
+    [[^count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events")
+    :ok = Txn.exec(txn, "DROP TABLE session_reparent_events_custody")
+    :ok = Txn.exec(txn, @indexes_and_triggers_ddl)
+    :ok
+  end
+
+  defp stored_sql(sql), do: sql |> String.trim() |> String.trim_trailing(";")
+
+  defp sql_tokens(sql), do: String.replace(sql, ~r/\s+/, "")
+
+  @doc false
+  def multi_table_sql,
+    do:
+      Tightbeam.Schema.process_actor_table_sql("session_reparent_events", @multi_table_ddl)
+      |> stored_sql()
+
+  @doc false
+  def predecessor_table_sql,
+    do:
+      Tightbeam.Schema.process_actor_table_sql("session_reparent_events", @table_ddl)
+      |> stored_sql()
 
   @doc false
   def upgrade_agent_principals_in_txn(txn) do
@@ -140,7 +239,8 @@ defmodule Tightbeam.SessionReparent do
            key = params[:idempotency_key]
 
            with true <- valid_key?(key),
-                true <- Enum.all?([child, parent, assignment], &(is_binary(&1) and &1 != "")),
+                true <- Enum.all?([child, parent], &(is_binary(&1) and &1 != "")),
+                true <- is_nil(assignment) or (is_binary(assignment) and assignment != ""),
                 [[owner]] <-
                   Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [child]) do
              fingerprint =
@@ -155,7 +255,7 @@ defmodule Tightbeam.SessionReparent do
                  response
 
                nil ->
-                 correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint, %{
+                 correct_route_in_txn(txn, owner, child, parent, assignment, key, fingerprint, %{
                    kind: "process",
                    ref: "process:" <> name,
                    cause: "owner_topology_correction"
@@ -184,7 +284,8 @@ defmodule Tightbeam.SessionReparent do
     key = params[:idempotency_key]
 
     with true <- valid_key?(key),
-         true <- Enum.all?([child, parent, assignment], &(is_binary(&1) and &1 != "")) do
+         true <- Enum.all?([child, parent], &(is_binary(&1) and &1 != "")),
+         true <- is_nil(assignment) or (is_binary(assignment) and assignment != "") do
       fingerprint =
         :crypto.hash(:sha256, JSON.encode!([child, parent, assignment]))
         |> Base.encode16(case: :lower)
@@ -194,7 +295,7 @@ defmodule Tightbeam.SessionReparent do
           response
 
         nil ->
-          correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint, %{
+          correct_route_in_txn(txn, owner, child, parent, assignment, key, fingerprint, %{
             kind: "user",
             ref: "user:" <> owner,
             cause: "owner_topology_correction"
@@ -215,7 +316,8 @@ defmodule Tightbeam.SessionReparent do
     key = params[:idempotency_key]
 
     with true <- valid_key?(key),
-         true <- Enum.all?([child, parent, assignment], &(is_binary(&1) and &1 != "")),
+         true <- Enum.all?([child, parent], &(is_binary(&1) and &1 != "")),
+         true <- is_nil(assignment) or (is_binary(assignment) and assignment != ""),
          {:ok, owner} <- active_caller_in_txn(txn, caller) do
       fingerprint =
         :crypto.hash(:sha256, JSON.encode!([caller, child, parent, assignment]))
@@ -226,7 +328,7 @@ defmodule Tightbeam.SessionReparent do
           response
 
         nil ->
-          correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint, %{
+          correct_route_in_txn(txn, owner, child, parent, assignment, key, fingerprint, %{
             kind: "session",
             ref: "session:" <> caller,
             cause: "delivery_owner_reparent"
@@ -249,6 +351,12 @@ defmodule Tightbeam.SessionReparent do
   end
 
   defp active_caller_in_txn(_txn, _caller), do: {:error, "not_authorized"}
+
+  defp correct_route_in_txn(txn, owner, child, parent, nil, key, fingerprint, actor),
+    do: correct_topology_in_txn(txn, owner, child, parent, key, fingerprint, actor)
+
+  defp correct_route_in_txn(txn, owner, child, parent, assignment, key, fingerprint, actor),
+    do: correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint, actor)
 
   defp correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint, actor) do
     with {:ok, origin_parent} <- child_in_txn(txn, owner, child),
@@ -318,6 +426,136 @@ defmodule Tightbeam.SessionReparent do
             )
 
             :ok = Idempotency.put_reparent_in_txn(txn, owner, key, fingerprint, event, response)
+            response
+          end)
+
+        response
+      end
+    else
+      {:error, code} -> refusal(code)
+    end
+  end
+
+  # With no assignment selector the parent correction covers the child's current
+  # topology and every assignment it presently holds. A child with no held work
+  # still needs an event: the parent edge is independent of assignment custody.
+  defp correct_topology_in_txn(txn, owner, child, parent, key, fingerprint, actor) do
+    with {:ok, origin_parent} <- child_in_txn(txn, owner, child),
+         :ok <- parent_in_txn(txn, owner, parent),
+         :ok <- acyclic(txn, parent, MapSet.new([child])) do
+      assignments =
+        Txn.q(
+          txn,
+          """
+          SELECT id,workItemId,openedByUser,openedBySession FROM assignments
+          WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id
+          """,
+          [child]
+        )
+
+      before =
+        Enum.map(assignments, fn [id, item, user, session] ->
+          {kind, ref} =
+            cond do
+              user ->
+                {"user", "user:" <> user}
+
+              session ->
+                {"session", "session:" <> session}
+
+              true ->
+                {"process", Tightbeam.Assignments.process_event_in_txn(txn, id)["principal"]}
+            end
+
+          %{
+            id: id,
+            item: item,
+            opener_kind: kind,
+            opener_ref: ref,
+            previous: current_coordination_parent(txn, id)
+          }
+        end)
+
+      previous_parent = Org.current_parent(txn, child)
+
+      if previous_parent == parent and Enum.all?(before, &(&1.previous == parent)) do
+        refusal("no_change")
+      else
+        {_change, _session, response} =
+          Org.mutate_session_in_txn(txn, child, fn ->
+            at = Org.next_current_parent_event_at_in_txn(txn, child)
+            rows = if before == [], do: [nil], else: before
+
+            events =
+              Enum.map(rows, fn assignment ->
+                event = "trp_" <> Tightbeam.Id.uuid4()
+
+                Txn.q(
+                  txn,
+                  """
+                  INSERT INTO session_reparent_events
+                    (eventId,ownerUserId,childSessionKey,assignmentId,workItemId,
+                     originParentSessionKey,previousCurrentParentSessionKey,newCurrentParentSessionKey,
+                     originAssignmentOpenerKind,originAssignmentOpenerRef,
+                     previousCurrentCoordinationParentSessionKey,newCurrentCoordinationParentSessionKey,
+                     cause,principalKind,principalRef,idempotencyKey,requestFingerprint,createdAt)
+                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?8,
+                    ?12,?13,?14,?15,?16,?17)
+                  """,
+                  [
+                    event,
+                    owner,
+                    child,
+                    assignment && assignment.id,
+                    assignment && assignment.item,
+                    origin_parent,
+                    previous_parent,
+                    parent,
+                    assignment && assignment.opener_kind,
+                    assignment && assignment.opener_ref,
+                    assignment && assignment.previous,
+                    actor.cause,
+                    actor.kind,
+                    actor.ref,
+                    key,
+                    fingerprint,
+                    at
+                  ]
+                )
+
+                %{
+                  "eventId" => event,
+                  "assignmentId" => assignment && assignment.id,
+                  "workItemId" => assignment && assignment.item,
+                  "originOpenerRef" => assignment && assignment.opener_ref,
+                  "previousCurrentCoordinationParentRef" =>
+                    assignment && session_ref(assignment.previous),
+                  "currentCoordinationParentRef" => assignment && session_ref(parent)
+                }
+              end)
+
+            response = %{
+              "eventId" => hd(events)["eventId"],
+              "session" => %{
+                "sessionKey" => child,
+                "originParent" => origin_parent,
+                "previousCurrentParent" => previous_parent,
+                "currentParent" => parent
+              },
+              "assignments" => if(before == [], do: [], else: events),
+              "appliedAt" => at
+            }
+
+            :ok =
+              Idempotency.put_reparent_in_txn(
+                txn,
+                owner,
+                key,
+                fingerprint,
+                hd(events)["eventId"],
+                response
+              )
+
             response
           end)
 

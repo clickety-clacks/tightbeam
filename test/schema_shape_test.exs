@@ -23,7 +23,7 @@ defmodule Tightbeam.SchemaShapeTest do
     Wakes
   }
 
-  @shape "closed-assignment-cannot-proceed-reconciliation-v1-015"
+  @shape "session-custody-v1-0116"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @owner_link_history_ddl """
   CREATE TABLE work_item_delivery_scope_events (
@@ -2533,6 +2533,9 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_assignment_source_replacement_cancellation!(db) do
+    if DB.query(db, "SELECT shape FROM schema_stamp") == {:ok, [[@shape]]},
+      do: Tightbeam.SchemaShapeRuntimeFixture.downgrade_custody!(db)
+
     restore_predecessor_attribution!(db)
     Tightbeam.SchemaShapeRuntimeFixture.downgrade_effort_holder_activity_cancellation!(db)
     downgrade_notice_source_storage!(db)

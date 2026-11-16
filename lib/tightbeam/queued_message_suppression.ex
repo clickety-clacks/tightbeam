@@ -232,7 +232,7 @@ defmodule Tightbeam.QueuedMessageSuppression do
             AND (
               (t.wakeId IS NULL AND t.assignmentId=?3 AND t.origin=?5 AND EXISTS (
                 SELECT 1 FROM assignments a
-                WHERE a.id=t.assignmentId AND a.openedBySession=?4
+                WHERE a.id=t.assignmentId AND COALESCE(a.currentOpenerSessionKey,a.openedBySession)=?4
               ))
               OR
               -- A wake's assignment association is not replacement consent; only
@@ -321,7 +321,11 @@ defmodule Tightbeam.QueuedMessageSuppression do
   defp replacement_sender_session_in_txn(_txn, nil, _wake_id), do: nil
 
   defp replacement_sender_session_in_txn(txn, assignment_id, nil) do
-    case Txn.q(txn, "SELECT openedBySession FROM assignments WHERE id=?1", [assignment_id]) do
+    case Txn.q(
+           txn,
+           "SELECT COALESCE(currentOpenerSessionKey,openedBySession) FROM assignments WHERE id=?1",
+           [assignment_id]
+         ) do
       [[session_key]] -> session_key
       [] -> nil
     end

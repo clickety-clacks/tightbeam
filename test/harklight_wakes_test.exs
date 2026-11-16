@@ -12,6 +12,7 @@ defmodule Tightbeam.HarklightWakesTest do
     Model,
     Org,
     Placement,
+    SessionCustodyTransfer,
     TurnLifecycle,
     Wakes
   }
@@ -87,6 +88,64 @@ defmodule Tightbeam.HarklightWakesTest do
              )
 
     %{db: db, call: call, session: session, main: main}
+  end
+
+  test "custody successor receives future replies on the original handle", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    successor =
+      Org.create(db, %{
+        session_key: "agent:successor:one",
+        display_name: "Successor",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        spawned_by: main.session_key,
+        archetype: "default",
+        host: Placement.local_host_name(),
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("fable")
+      })
+
+    origin_key = session.session_key
+    successor_key = successor.session_key
+
+    assert %{"eventId" => _} =
+             SessionCustodyTransfer.handle(db, %{
+               principal: {:user, "owner"},
+               params: %{
+                 from_session_key: origin_key,
+                 to_session_key: successor_key,
+                 idempotency_key: "receiver-succession"
+               }
+             })
+
+    assert {:ok, [[^origin_key, ^successor_key]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,currentReceiverSessionKey FROM harklight_wake_handles"
+             )
+
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "Later"))
+
+    assert {:ok, [[^successor_key]]} =
+             DB.query(db, "SELECT sessionKey FROM wakes WHERE origin='process:tightbeam'")
+
+    assert {:ok, [[^successor_key]]} =
+             DB.query(db, "SELECT sessionKey FROM harklight_wake_deliveries")
+
+    assert {:ok, [[^origin_key, ^successor_key]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,currentReceiverSessionKey FROM harklight_send_operations"
+             )
+
+    assert {:ok, {:origin_retired, ^successor_key, [@handle], []}} =
+             DB.transaction(db, fn txn ->
+               HarklightWakes.retirement_handoff_in_txn(txn, successor_key)
+             end)
   end
 
   @tag :origin_consumer

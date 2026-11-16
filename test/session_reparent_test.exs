@@ -202,6 +202,61 @@ defmodule Tightbeam.SessionReparentTest do
     assert count(ctx.db, "wire_idempotency") == 0
   end
 
+  test "parent correction covers multiple held assignments without rewriting their openers",
+       ctx do
+    assignment(ctx.db, "asg_two", "child", "wi_one")
+
+    params =
+      ctx.params
+      |> Map.delete(:assignment_id)
+      |> Map.put(:parent_session_key, "old")
+      |> Map.put(:idempotency_key, "multi-parent")
+
+    result = SessionReparent.handle(ctx.db, call(params))
+    assert result["session"]["currentParent"] == "old"
+    assert Enum.map(result["assignments"], & &1["assignmentId"]) == ["asg_one", "asg_two"]
+    assert SessionReparent.current_coordination_parent(ctx.db, "asg_one") == "old"
+    assert SessionReparent.current_coordination_parent(ctx.db, "asg_two") == "old"
+
+    assert rows(ctx.db, "SELECT openedByUser,openedBySession FROM assignments ORDER BY id") ==
+             [["owner", nil], ["owner", nil]]
+
+    assert SessionReparent.handle(ctx.db, call(params)) == result
+    assert count(ctx.db, "session_reparent_events") == 2
+  end
+
+  test "parent correction records a zero-held child and rejects a descendant cycle", ctx do
+    session(ctx.db, "descendant", %{spawned_by: "old"})
+    assert Org.topology_parent(ctx.db, "descendant") == "old"
+
+    params = %{
+      session_key: "old",
+      parent_session_key: "child",
+      idempotency_key: "zero-parent"
+    }
+
+    result = SessionReparent.handle(ctx.db, call(params))
+    assert result["assignments"] == []
+    assert Org.topology_parent(ctx.db, "old") == "child"
+    assert Org.topology_parent(ctx.db, "descendant") == "old"
+
+    assert rows(ctx.db, "SELECT assignmentId,workItemId FROM session_reparent_events") ==
+             [[nil, nil]]
+
+    assert SessionReparent.handle(ctx.db, call(params)) == result
+
+    assert %{code: "cycle_detected"} =
+             SessionReparent.handle(
+               ctx.db,
+               call(%{
+                 params
+                 | session_key: "child",
+                   parent_session_key: "old",
+                   idempotency_key: "cycle"
+               })
+             )
+  end
+
   test "a delivery owner reparent is recorded, replayable, and idempotent across principals",
        ctx do
     accountable_fixture(ctx)
@@ -660,6 +715,61 @@ defmodule Tightbeam.SessionReparentTest do
 
     assert Org.current_parent(legacy, "legacy") == nil
     assert :ok = Schema.ensure_all(legacy)
+  end
+
+  test "populated predecessor reparent history rebuilds its unique index and retains replay",
+       ctx do
+    call = call(ctx.params)
+    original = SessionReparent.handle(ctx.db, call)
+    assert is_binary(original["eventId"])
+    before = rows(ctx.db, "SELECT * FROM session_reparent_events")
+
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_custody!(ctx.db)
+
+    # The historical fixture's SQL-only rewind is enough for empty tables.
+    # Materialize its predecessor UNIQUE index for this populated upgrade case.
+    assert {:ok, :ok} =
+             DB.migration_transaction(ctx.db, :populated_reparent_predecessor, [], [], fn txn ->
+               objects =
+                 Txn.q(
+                   txn,
+                   "SELECT sql FROM sqlite_master WHERE tbl_name='session_reparent_events' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name"
+                 )
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "CREATE TABLE session_reparent_events_holding AS SELECT * FROM session_reparent_events"
+                 )
+
+               :ok = Txn.exec(txn, "DROP TABLE session_reparent_events")
+               :ok = Txn.exec(txn, SessionReparent.predecessor_table_sql())
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "INSERT INTO session_reparent_events SELECT * FROM session_reparent_events_holding"
+                 )
+
+               :ok = Txn.exec(txn, "DROP TABLE session_reparent_events_holding")
+               Enum.each(objects, fn [sql] -> :ok = Txn.exec(txn, sql) end)
+               :ok
+             end)
+
+    assert rows(ctx.db, "PRAGMA integrity_check") == [["ok"]]
+    assert rows(ctx.db, "SELECT * FROM session_reparent_events") == before
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE schema_stamp SET shape='closed-assignment-cannot-proceed-reconciliation-v1-015',stampedAt=1"
+             )
+
+    assert :ok = Schema.ensure_all(ctx.db)
+    assert rows(ctx.db, "PRAGMA integrity_check") == [["ok"]]
+    assert rows(ctx.db, "SELECT * FROM session_reparent_events") == before
+    assert SessionReparent.handle(ctx.db, call) == original
+    assert count(ctx.db, "session_reparent_events") == 1
   end
 
   defp accountable_fixture(ctx) do

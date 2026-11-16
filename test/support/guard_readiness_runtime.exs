@@ -17,7 +17,7 @@ try do
   marker = File.read!(Path.join(base, "build-owner.json"))
   alias Tightbeam.DeployReadiness, as: Ready
 
-  assert {:ok, [["closed-assignment-cannot-proceed-reconciliation-v1-015"]]} =
+  assert {:ok, [["session-custody-v1-0116"]]} =
            DB.query(db, "SELECT shape FROM schema_stamp")
 
   :ok =

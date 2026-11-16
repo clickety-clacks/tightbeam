@@ -755,17 +755,39 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             parent_session_key,
             assignment_id,
             idempotency_key,
-        } => Ok(request(
-            identity,
-            "session-reparent",
-            vec![],
-            vec![
+        } => Ok(request(identity, "session-reparent", vec![], {
+            let mut params = vec![
                 string_field("sessionKey", session_key),
                 string_field("parentSessionKey", parent_session_key),
-                string_field("assignmentId", assignment_id),
-                string_field("idempotencyKey", idempotency_key),
-            ],
-        )),
+            ];
+            if let Some(assignment_id) = assignment_id {
+                params.push(string_field("assignmentId", assignment_id));
+            }
+            params.push(string_field("idempotencyKey", idempotency_key));
+            params
+        })),
+        Command::SessionCustodyTransfer {
+            identity,
+            from_session_key,
+            to_session_key,
+            parent_session_key,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("fromSessionKey", from_session_key),
+                string_field("toSessionKey", to_session_key),
+            ];
+            if let Some(parent_session_key) = parent_session_key {
+                params.push(string_field("parentSessionKey", parent_session_key));
+            }
+            params.push(string_field("idempotencyKey", idempotency_key));
+            Ok(request(
+                identity,
+                "session-custody-transfer",
+                vec![],
+                params,
+            ))
+        }
         Command::SessionPoSet {
             identity,
             session_key,
@@ -4020,6 +4042,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::RetireWithdraw { identity, .. }
         | Command::Tune { identity, .. }
         | Command::SessionReparent { identity, .. }
+        | Command::SessionCustodyTransfer { identity, .. }
         | Command::SessionPoSet { identity, .. }
         | Command::SessionConnect { identity, .. }
         | Command::Assign { identity, .. }
@@ -4589,7 +4612,22 @@ mod tests {
             ]),
             r#"{"asUser":"owner","verb":"session-reparent","params":{"sessionKey":"child with space","parentSessionKey":"parent","assignmentId":"asg_one","idempotencyKey":"correction"}}"#
         );
-        for missing in ["--session", "--parent", "--assignment", "--key"] {
+        assert_eq!(
+            body(&[
+                "session-reparent",
+                "--session",
+                "empty child",
+                "--parent",
+                "parent",
+                "--key",
+                "topology",
+                "--as-user",
+                "owner",
+            ]),
+            r#"{"asUser":"owner","verb":"session-reparent","params":{"sessionKey":"empty child","parentSessionKey":"parent","idempotencyKey":"topology"}}"#
+        );
+
+        for missing in ["--session", "--parent", "--key"] {
             let mut args = vec!["session-reparent"];
             for (flag, value) in [
                 ("--session", "child"),
@@ -4597,6 +4635,51 @@ mod tests {
                 ("--assignment", "asg_one"),
                 ("--key", "correction"),
             ] {
+                if flag != missing {
+                    args.extend([flag, value]);
+                }
+            }
+            assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn session_custody_transfer_requires_exact_endpoints_and_retry_key() {
+        assert_eq!(
+            body(&[
+                "session-custody-transfer",
+                "--from",
+                "old seat",
+                "--to",
+                "new seat",
+                "--key",
+                "move-one",
+                "--as-user",
+                "owner",
+            ]),
+            r#"{"asUser":"owner","verb":"session-custody-transfer","params":{"fromSessionKey":"old seat","toSessionKey":"new seat","idempotencyKey":"move-one"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "session-custody-transfer",
+                "--from",
+                "old seat",
+                "--to",
+                "new seat",
+                "--parent",
+                "new parent",
+                "--key",
+                "move-two",
+                "--as-user",
+                "owner",
+            ]),
+            r#"{"asUser":"owner","verb":"session-custody-transfer","params":{"fromSessionKey":"old seat","toSessionKey":"new seat","parentSessionKey":"new parent","idempotencyKey":"move-two"}}"#
+        );
+
+        for missing in ["--from", "--to", "--key"] {
+            let mut args = vec!["session-custody-transfer"];
+            for (flag, value) in [("--from", "old"), ("--to", "new"), ("--key", "move-one")] {
                 if flag != missing {
                     args.extend([flag, value]);
                 }

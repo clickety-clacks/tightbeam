@@ -351,7 +351,8 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     case Txn.q(
            txn,
            """
-           SELECT a.state, a.holderKey, a.openedBySession, a.workItemId, w.ownerUserId
+           SELECT a.state, a.holderKey,
+                  COALESCE(a.currentOpenerSessionKey,a.openedBySession), a.workItemId, w.ownerUserId
            FROM assignments AS a
            LEFT JOIN work_items AS w ON w.id = a.workItemId
            WHERE a.id = ?1
