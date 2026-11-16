@@ -7586,6 +7586,8 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp force_closed_assignment_reconciliation(ctx) do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_custody!(ctx.db)
+
     assert {:ok, []} =
              DB.query(
                ctx.db,

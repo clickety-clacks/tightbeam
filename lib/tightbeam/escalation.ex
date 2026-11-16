@@ -307,16 +307,18 @@ defmodule Tightbeam.Escalation do
   withdrawnReason, withdrawnAt
   """
 
-  @request_columns """
+  @pre_custody_request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
   expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
   raisedAt, deadlineAt,
   statuteName, actionKey, question, options, context, status, decision, rationale,
   ruledBy, ruledViaPrincipal, ruledViaSessionKey, ruledViaSessionState, ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy,
   withdrawnReason, withdrawnAt, askedOfRole, answer, answeredBy, answeredAt,
-  returnedBy, returnReason, returnedAt, rowVersion, rowSchemaRevision,
-  currentRaiserSessionKey, currentExpecterSessionKey
+  returnedBy, returnReason, returnedAt, rowVersion, rowSchemaRevision
   """
+
+  @request_columns @pre_custody_request_columns <>
+                     ", currentRaiserSessionKey, currentExpecterSessionKey"
 
   @decision_request_collection_columns %{
     "status" => "status",
@@ -3567,7 +3569,15 @@ defmodule Tightbeam.Escalation do
   end
 
   defp request_in_txn(txn, id) do
-    [row] = Txn.q(txn, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id])
+    # Closed-assignment reconciliation runs while the exact predecessor stamp
+    # is still active. Its request rows have no custody columns yet.
+    columns =
+      case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+        [["session-identity-v1-0114"]] -> @pre_custody_request_columns <> ", NULL, NULL"
+        _ -> @request_columns
+      end
+
+    [row] = Txn.q(txn, "SELECT #{columns} FROM decision_requests WHERE id = ?1", [id])
     request_from_row(row)
   end
 

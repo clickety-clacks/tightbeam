@@ -646,6 +646,9 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   end
 
   def downgrade_assignment_source_replacement_cancellation!(db) do
+    if DB.query(db, "SELECT shape FROM schema_stamp") == {:ok, [[@shape]]},
+      do: downgrade_custody!(db)
+
     downgrade_effort_holder_activity_cancellation!(db)
     downgrade_notice_source_storage!(db)
 
@@ -724,6 +727,78 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
              DROP TABLE IF EXISTS ephemeral_sessions;
              DROP TABLE IF EXISTS ephemeral_migration;
              """)
+  end
+
+  # A synthetic predecessor must remove the current custody additions before
+  # assigning an older stamp. Historical rows and origin fields are retained.
+  def downgrade_custody!(db) do
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM wire_idempotency WHERE operation='session-custody-transfer'"
+             )
+
+    for {table, column} <- [
+          {"assignments", "currentOpenerSessionKey"},
+          {"decision_requests", "currentRaiserSessionKey"},
+          {"decision_requests", "currentExpecterSessionKey"},
+          {"harklight_wake_deliveries", "currentRecipientSessionKey"}
+        ] do
+      assert {:ok, [[0]]} =
+               DB.query(db, "SELECT COUNT(*) FROM #{table} WHERE #{column} IS NOT NULL")
+
+      assert :ok = DB.execute(db, "ALTER TABLE #{table} DROP COLUMN #{column}")
+    end
+
+    assert {:ok, :ok} =
+             DB.migration_transaction(
+               db,
+               :schema_shape_custody_predecessor,
+               [],
+               ["PRAGMA writable_schema = OFF"],
+               fn txn ->
+                 expected_reparent_sql = Tightbeam.SessionReparent.multi_table_sql()
+
+                 assert [[^expected_reparent_sql]] =
+                          Tightbeam.DB.Txn.q(
+                            txn,
+                            "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_reparent_events'"
+                          )
+
+                 [[wire_sql]] =
+                   Tightbeam.DB.Txn.q(
+                     txn,
+                     "SELECT sql FROM sqlite_master WHERE type='table' AND name='wire_idempotency'"
+                   )
+
+                 assert String.contains?(wire_sql, "'session-custody-transfer'")
+                 previous_wire_sql = String.replace(wire_sql, ",'session-custody-transfer'", "")
+                 [[version]] = Tightbeam.DB.Txn.q(txn, "PRAGMA schema_version")
+                 :ok = Tightbeam.DB.Txn.exec(txn, "PRAGMA writable_schema = ON")
+
+                 Tightbeam.DB.Txn.q(
+                   txn,
+                   "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='session_reparent_events'",
+                   [Tightbeam.SessionReparent.predecessor_table_sql()]
+                 )
+
+                 assert Tightbeam.DB.Txn.changes(txn) == 1
+
+                 Tightbeam.DB.Txn.q(
+                   txn,
+                   "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='wire_idempotency'",
+                   [previous_wire_sql]
+                 )
+
+                 assert Tightbeam.DB.Txn.changes(txn) == 1
+
+                 :ok = Tightbeam.DB.Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+                 :ok = Tightbeam.DB.Txn.exec(txn, "PRAGMA writable_schema = RESET")
+                 :ok
+               end
+             )
   end
 
   def downgrade_notice_source_storage!(db) do

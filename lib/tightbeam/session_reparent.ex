@@ -88,7 +88,9 @@ defmodule Tightbeam.SessionReparent do
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_reparent_events'"
       )
 
-    unless actual == expected,
+    # Earlier exact predecessor fixtures retained SQLite's original DDL
+    # spacing. Compare the same token sequence before replacing the table SQL.
+    unless sql_tokens(actual) == sql_tokens(expected),
       do:
         raise(Tightbeam.Schema.ShapeError,
           message: "incompatible session reparent predecessor for multi-assignment topology"
@@ -113,10 +115,18 @@ defmodule Tightbeam.SessionReparent do
 
   defp stored_sql(sql), do: sql |> String.trim() |> String.trim_trailing(";")
 
+  defp sql_tokens(sql), do: String.replace(sql, ~r/\s+/, "")
+
   @doc false
   def multi_table_sql,
     do:
       Tightbeam.Schema.process_actor_table_sql("session_reparent_events", @multi_table_ddl)
+      |> stored_sql()
+
+  @doc false
+  def predecessor_table_sql,
+    do:
+      Tightbeam.Schema.process_actor_table_sql("session_reparent_events", @table_ddl)
       |> stored_sql()
 
   @doc false
