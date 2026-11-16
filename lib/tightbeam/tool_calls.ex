@@ -19,6 +19,22 @@ defmodule Tightbeam.ToolCalls do
   @terminal_statuses ["completed", "failed"]
   @truncation_order %{"rawInput" => 0, "rawOutput" => 1, "content" => 2}
 
+  @full_output_ddl """
+  CREATE TABLE tool_call_full_outputs (
+    toolCallId TEXT PRIMARY KEY REFERENCES tool_calls(id) ON DELETE CASCADE,
+    rawOutputGzip BLOB,
+    contentGzip BLOB,
+    CHECK (rawOutputGzip IS NOT NULL OR contentGzip IS NOT NULL)
+  )
+  """
+  @full_output_stamp_ddl """
+  CREATE TABLE tool_call_full_output_migration (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    shape TEXT NOT NULL CHECK (shape = 'tool-call-full-output-v1'),
+    appliedAt INTEGER NOT NULL CHECK (appliedAt >= 0)
+  )
+  """
+
   @tool_calls_ddl """
   CREATE TABLE tool_calls (
     seq               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,6 +130,43 @@ defmodule Tightbeam.ToolCalls do
       {:error, error} ->
         raise error
     end
+
+    case DB.migration_transaction(db, :tool_call_full_output, [], [], &ensure_full_output_in_txn/1) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp ensure_full_output_in_txn(txn) do
+    case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='tool_call_full_output_migration'") do
+      [[_sql]] ->
+        for {name, expected} <- [
+              {"tool_call_full_outputs", @full_output_ddl},
+              {"tool_call_full_output_migration", @full_output_stamp_ddl}
+            ] do
+          case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1", [name]) do
+            [[sql]] ->
+              unless normalize_schema_sql(sql) == normalize_schema_sql(expected),
+                do: raise(Tightbeam.Schema.ShapeError, message: "incompatible_#{name}_ddl")
+
+            _ ->
+              raise Tightbeam.Schema.ShapeError, message: "missing_#{name}_ddl"
+          end
+        end
+
+        unless Txn.q(txn, "SELECT id,shape FROM tool_call_full_output_migration") == [[0, "tool-call-full-output-v1"]],
+          do: raise(Tightbeam.Schema.ShapeError, message: "incompatible_tool_call_full_output_stamp")
+
+      [] ->
+        :ok = Txn.exec(txn, @full_output_ddl)
+        :ok = Txn.exec(txn, @full_output_stamp_ddl)
+        Txn.q(txn, "INSERT INTO tool_call_full_output_migration VALUES (0,'tool-call-full-output-v1',?1)", [System.system_time(:millisecond)])
+
+      rows ->
+        raise Tightbeam.Schema.ShapeError, message: "incompatible_tool_call_full_output_stamp_table: #{inspect(rows)}"
+    end
+
+    :ok
   end
 
   defp migrate_in_txn(%Txn{} = txn) do
@@ -503,6 +556,7 @@ defmodule Tightbeam.ToolCalls do
     }
 
     truncated = truncations(values)
+    id = "tc_" <> Tightbeam.Id.uuid4()
 
     Txn.q(
       txn,
@@ -514,7 +568,7 @@ defmodule Tightbeam.ToolCalls do
       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1)
       """,
       [
-        "tc_" <> Tightbeam.Id.uuid4(),
+        id,
         session_key,
         turn_seq,
         after_message_seq,
@@ -531,6 +585,8 @@ defmodule Tightbeam.ToolCalls do
         if(terminal?, do: now, else: nil)
       ]
     )
+
+    store_full_output_in_txn(txn, id, values)
 
     :ok
   end
@@ -575,6 +631,36 @@ defmodule Tightbeam.ToolCalls do
 
     if Txn.changes(txn) != 1 do
       raise ArgumentError, "tool-call terminal update lost its nonterminal row"
+    end
+
+    store_full_output_in_txn(txn, existing.id, attributes)
+  end
+
+  defp store_full_output_in_txn(txn, id, fields) do
+    raw_output = full_output(fields, :raw_output)
+    content = full_output(fields, :content)
+
+    if raw_output || content do
+      Txn.q(
+        txn,
+        """
+        INSERT INTO tool_call_full_outputs (toolCallId,rawOutputGzip,contentGzip)
+        VALUES (?1,?2,?3)
+        ON CONFLICT(toolCallId) DO UPDATE SET
+          rawOutputGzip=COALESCE(excluded.rawOutputGzip,rawOutputGzip),
+          contentGzip=COALESCE(excluded.contentGzip,contentGzip)
+        """,
+        [id, raw_output, content]
+      )
+    end
+
+    :ok
+  end
+
+  defp full_output(fields, field) do
+    case Map.get(fields, field) do
+      %{full: full} -> full
+      _ -> nil
     end
   end
 
@@ -739,9 +825,10 @@ defmodule Tightbeam.ToolCalls do
 
       {:ok, value} ->
         encoded = StateResources.encode_json_value(value)
+        full = if target in [:raw_output, :content], do: :zlib.gzip(encoded)
 
         if byte_size(encoded) <= @field_limit do
-          Map.put(fields, target, %{encoded: encoded, truncated: nil})
+          Map.put(fields, target, %{encoded: encoded, truncated: nil, full: full})
         else
           prefix = utf8_prefix(encoded, @field_limit)
 
@@ -753,7 +840,8 @@ defmodule Tightbeam.ToolCalls do
 
           Map.put(fields, target, %{
             encoded: JSON.encode!(prefix),
-            truncated: %{"field" => field, "originalBytes" => byte_size(encoded)}
+            truncated: %{"field" => field, "originalBytes" => byte_size(encoded)},
+            full: full
           })
         end
 
