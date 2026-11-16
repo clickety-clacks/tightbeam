@@ -3515,6 +3515,7 @@ defmodule Tightbeam.HarnessHealthTest do
       assert notice =~ "fence remains in place"
       assert notice =~ expected
       assert notice =~ provider_response
+      if expected == "still over limit", do: refute(notice =~ "sign in")
     end
   end
 
