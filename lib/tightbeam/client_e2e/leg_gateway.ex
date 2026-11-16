@@ -49,8 +49,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
           os_pid: pos_integer() | nil,
           os_command: String.t() | nil,
           port_ref: port() | nil,
-          log_path: String.t(),
-          ready_at: integer() | nil
+          log_path: String.t()
         }
 
   defstruct [
@@ -60,7 +59,6 @@ defmodule Tightbeam.ClientE2E.LegGateway do
     :os_command,
     :port_ref,
     :log_path,
-    :ready_at,
     boot_opts: []
   ]
 
@@ -177,8 +175,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
         {:ok,
          %{
            gateway
-           | os_command: process_command(gateway.os_pid),
-             ready_at: System.system_time(:millisecond)
+           | os_command: process_command(gateway.os_pid)
          }}
 
       {:error, reason} ->

@@ -1970,6 +1970,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
          journey: "J7"
        )}
     else
+      # Recovery may create the carrier before the restarted HTTP listener answers.
+      restart_started_at = System.system_time(:millisecond)
+
       case LegGateway.restart(ctx.gateway) do
         {:error, reason} ->
           {ctx,
@@ -2075,11 +2078,11 @@ defmodule Tightbeam.ClientE2E.Journeys do
                     )
 
                   not is_integer(member["carrierCreatedAt"]) or
-                      member["carrierCreatedAt"] <= gateway.ready_at ->
+                      member["carrierCreatedAt"] <= restart_started_at ->
                     Scorecard.fail(
                       "15",
                       "restart queue survival",
-                      "the carrier turn was created before the restarted gateway was up",
+                      "the carrier turn was created before the restart began",
                       journey: "J7"
                     )
 
