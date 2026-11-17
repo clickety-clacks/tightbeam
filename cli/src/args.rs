@@ -983,8 +983,8 @@ COMMANDS:
       Reconcile all of your open decision requests, stage every disposition, and
       admit at most the requested number of uncovered briefings (default: stage only).
   harklight-briefing --request <decisionRequestId> [--rearm-to-session <sessionKey>]
-      Read one request's original briefing wake and linked send. With a named active
-      owner session, rearm only that request's stable wake and return the readback.
+      Queue one exact-request briefing retry to the addressed owner's session by
+      default, or an active owner session you name, and read back its delivery.
   artifact-content-fetch <artifactId>
       Fetch captured bytes as contentBase64 with contentSha256 and contentSize.
       Reads stored custody only, never the origin path; uncaptured content is reported unavailable.

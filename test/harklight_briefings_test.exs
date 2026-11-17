@@ -178,6 +178,8 @@ defmodule Tightbeam.HarklightBriefingsTest do
                authorized: true
              )
 
+    assert briefing_wake_count(ctx.db) == 1
+
     assert {:ok, %{action: :existing, op_id: ^first_op, message_id: ^message_id}} =
              HarklightBriefings.reserve_send(ctx.db, send_call, request.id)
 
@@ -342,9 +344,13 @@ defmodule Tightbeam.HarklightBriefingsTest do
 
     assert briefing_wake_count(ctx.db) == 1
 
-    assert %{ok: true, wake_state: nil, send_op_id: nil} =
-             HarklightBriefings.exact(ctx.db, %{ctx.call | params: %{request_id: second.id}},
-               authorized: true
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT requestId FROM harklight_decision_briefings WHERE requestId=?1",
+               [
+                 second.id
+               ]
              )
 
     assert {:ok, [[^target, "remedy:harklight-decision-request-briefing"]]} =
@@ -381,6 +387,99 @@ defmodule Tightbeam.HarklightBriefingsTest do
              HarklightBriefings.exact(ctx.db, second, authorized: true)
 
     assert briefing_wake_count(ctx.db) == 1
+  end
+
+  test "exact retry queues once after an automatic wake fired without a send", ctx do
+    request = open_request(ctx, "Retry this briefing?")
+    root_id = briefing_wake_id(request.id)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=1 WHERE wakeId=?1", [
+               root_id
+             ])
+
+    call = %{ctx.call | params: %{request_id: request.id}}
+
+    assert %{
+             ok: true,
+             wake_id: retry_id,
+             wake_state: "pending",
+             wake_session_key: owner_session,
+             original_wake_id: ^root_id,
+             original_wake_state: "fired",
+             send_op_id: nil
+           } = HarklightBriefings.exact(ctx.db, call, authorized: true)
+
+    assert retry_id != root_id
+    assert owner_session == ctx.main.session_key
+    assert briefing_wake_count(ctx.db) == 2
+
+    assert %{ok: true, wake_id: ^retry_id} =
+             HarklightBriefings.exact(ctx.db, call, authorized: true)
+
+    assert briefing_wake_count(ctx.db) == 2
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=2 WHERE wakeId=?1", [
+               retry_id
+             ])
+
+    assert %{ok: true, wake_id: ^retry_id, wake_state: "fired"} =
+             HarklightBriefings.exact(ctx.db, call, authorized: true)
+
+    assert briefing_wake_count(ctx.db) == 2
+
+    assert {:ok, %{action: :start}} =
+             HarklightBriefings.reserve_send(
+               ctx.db,
+               %{session_call(ctx.main.session_key) | params: %{}},
+               request.id
+             )
+  end
+
+  test "exact retry overrides a pending automatic wake for an explicit active destination", ctx do
+    request = open_request(ctx, "Route this briefing?")
+    root_id = briefing_wake_id(request.id)
+
+    assert %{
+             ok: true,
+             wake_id: retry_id,
+             wake_state: "pending",
+             wake_session_key: target,
+             original_wake_id: ^root_id,
+             original_wake_state: "pending"
+           } =
+             HarklightBriefings.exact(
+               ctx.db,
+               %{
+                 ctx.call
+                 | params: %{request_id: request.id, rearm_to_session: ctx.consumer.session_key}
+               },
+               authorized: true
+             )
+
+    assert retry_id != root_id
+    assert target == ctx.consumer.session_key
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='remedy:harklight-decision-request-briefing' AND state='pending'"
+             )
+
+    assert {:error, "harklight_briefing_origin_mismatch", _} =
+             HarklightBriefings.reserve_send(
+               ctx.db,
+               %{session_call(ctx.main.session_key) | params: %{}},
+               request.id
+             )
+
+    assert {:ok, %{action: :start}} =
+             HarklightBriefings.reserve_send(
+               ctx.db,
+               %{session_call(ctx.consumer.session_key) | params: %{}},
+               request.id
+             )
   end
 
   test "exact rearm plainly refuses a closed request without creating a wake", ctx do

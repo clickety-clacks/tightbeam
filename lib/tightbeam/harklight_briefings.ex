@@ -63,14 +63,14 @@ defmodule Tightbeam.HarklightBriefings do
     :ok
   end
 
-  @doc "Read the exact request's briefing wake and bound send, or admit its stable wake to one named session."
+  @doc "Queue one exact-request briefing retry and read back its wake and bound send."
   def exact(db, call, opts \\ []) do
     request_id = call.params[:request_id]
-    target_session = call.params[:rearm_to_session]
 
     with true <- is_binary(request_id) and Regex.match?(@request_id, request_id),
          :ok <- active_admin_origin(db, call, Keyword.get(opts, :authorized, false)),
          {:ok, owner} <- owner_user_id(db, call),
+         target_session = retry_target(owner, call.params[:rearm_to_session]),
          :ok <- maybe_rearm(db, call, request_id, owner, target_session) do
       exact_readback(db, request_id, owner, call.session_key)
     else
@@ -79,8 +79,6 @@ defmodule Tightbeam.HarklightBriefings do
     end
   end
 
-  defp maybe_rearm(_db, _call, _request_id, _owner, nil), do: :ok
-
   defp maybe_rearm(db, call, request_id, owner, target_session)
        when is_binary(target_session) and target_session != "" do
     now = System.system_time(:millisecond)
@@ -88,8 +86,11 @@ defmodule Tightbeam.HarklightBriefings do
     case DB.transaction(db, fn txn ->
            request = Escalation.raw_by_id_in_txn(txn, request_id)
            existing = progress_in_txn(txn, request_id)
-           wake_id = wake_id(request_id)
-           wake = wake_in_txn(txn, wake_id)
+           root_id = wake_id(request_id)
+           root = wake_in_txn(txn, root_id)
+           retry_id = retry_wake_id(request_id)
+           retry = wake_in_txn(txn, retry_id)
+           operation = operation_in_txn(txn, existing && existing.send_op_id)
 
            cond do
              request == nil or request.owner_user_id != owner ->
@@ -103,6 +104,9 @@ defmodule Tightbeam.HarklightBriefings do
                {:error, "decision_request_address_mismatch",
                 "decision request is not addressed to this owner"}
 
+             operation && operation.state in ["bound", "pending"] ->
+               :ok
+
              Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2", [
                target_session,
                owner
@@ -110,32 +114,49 @@ defmodule Tightbeam.HarklightBriefings do
                {:error, "harklight_briefing_target_unavailable",
                 "target must be an active session of this owner"}
 
+             existing && existing.state in ["unresolved", "excluded"] ->
+               {:error, "harklight_briefing_association_unresolved", existing.disposition}
+
+             existing && existing.send_op_id && is_nil(operation) &&
+                 existing.state not in ["reserved", "reuse_staged"] ->
+               {:error, "harklight_briefing_association_unresolved",
+                "stored Harklight operation is missing; refusing another send"}
+
              existing && existing.send_op_id && existing.session_key != target_session ->
                {:error, "harklight_briefing_origin_mismatch",
                 "an existing send belongs to another session"}
 
-             existing && existing.state in ["unresolved", "excluded"] ->
-               {:error, "harklight_briefing_association_unresolved", existing.disposition}
-
-             wake &&
-                 (wake.origin != @wake_origin or wake.session_key != target_session or
-                    wake.state == "canceled") ->
+             root && root.origin != @wake_origin ->
                {:error, "harklight_briefing_wake_conflict",
-                "the original request wake cannot be moved or revived"}
+                "the original request wake has an unexpected origin"}
+
+             retry && (retry.origin != @wake_origin or retry.session_key != target_session) ->
+               {:error, "harklight_briefing_wake_conflict",
+                "the one request retry already targets another session"}
+
+             retry ->
+               :ok
 
              true ->
-               unless wake do
-                 Wakes.schedule_in_txn(txn, %{
-                   wake_id: wake_id,
-                   session_key: target_session,
-                   origin: @wake_origin,
-                   prompt:
-                     "Investigate the exact open decision request #{request_id}, its cause and supporting evidence. Brief the owner in plain language through `tightbeam harklight-send --session new --type request --reply --decision-request-id #{request_id} ...`. Keep the originating session and thread for replies; reread the request before any ruling. Do not create a replacement decision.",
-                   due_at: now,
-                   creator_session_key: call.session_key,
-                   summon: true
-                 })
+               wake_id =
+                 if root && root.state == "pending" && root.session_key == target_session do
+                   root_id
+                 else
+                   Wakes.schedule_in_txn(txn, %{
+                     wake_id: retry_id,
+                     session_key: target_session,
+                     origin: @wake_origin,
+                     prompt:
+                       "Investigate the exact open decision request #{request_id}, its cause and supporting evidence. Brief the owner in plain language through `tightbeam harklight-send --session new --type request --reply --decision-request-id #{request_id} ...`. Keep the originating session and thread for replies; reread the request before any ruling. Do not create a replacement decision.",
+                     due_at: now,
+                     creator_session_key: call.session_key,
+                     summon: true
+                   })
 
+                   retry_id
+                 end
+
+               if wake_id == retry_id do
                  Tightbeam.EventLog.lifecycle_in_txn(
                    txn,
                    "harklight_briefing_exact_rearmed",
@@ -148,15 +169,16 @@ defmodule Tightbeam.HarklightBriefings do
                  )
                end
 
-               if is_nil(existing) or existing.state in ["staged", "reuse_staged", "admitted"] do
+               if is_nil(existing) or
+                    existing.state in ["staged", "reuse_staged", "admitted", "reserved"] do
                  persist_in_txn(
                    txn,
                    request_id,
                    owner,
-                   "admitted",
-                   if(wake,
-                     do: "original request wake reused",
-                     else: "original request wake rearmed to named session"
+                   if(existing && existing.state == "reserved", do: "reserved", else: "admitted"),
+                   if(wake_id == root_id,
+                     do: "pending original request wake reused",
+                     else: "one exact request retry queued"
                    ),
                    call.session_key,
                    target_session,
@@ -188,8 +210,9 @@ defmodule Tightbeam.HarklightBriefings do
          ]) do
       {:ok, [[request_status]]} ->
         progress = progress(db, request_id)
-        wake_id = wake_id(request_id)
+        wake_id = (progress && progress.wake_id) || wake_id(request_id)
         wake = wake(db, wake_id)
+        original_wake = wake(db, wake_id(request_id))
         operation = operation_by_id(db, progress && progress.send_op_id)
 
         bound? =
@@ -214,6 +237,8 @@ defmodule Tightbeam.HarklightBriefings do
           wake_state: wake && wake.state,
           wake_session_key: wake && wake.session_key,
           wake_origin: wake && wake.origin,
+          original_wake_id: wake_id(request_id),
+          original_wake_state: original_wake && original_wake.state,
           briefing_state: progress && progress.state,
           send_op_id: progress && progress.send_op_id,
           send_state: operation && operation.state,
@@ -276,9 +301,10 @@ defmodule Tightbeam.HarklightBriefings do
          :ok <- authenticated_origin(db, call),
          {:ok, owner_user_id} <- owner_user_id(db, call) do
       now = System.system_time(:millisecond)
-      wake_id = wake_id(request_id)
 
       case DB.transaction(db, fn txn ->
+             existing = progress_in_txn(txn, request_id)
+             wake_id = (existing && existing.wake_id) || wake_id(request_id)
              reserve_send_in_txn(txn, call, owner_user_id, request_id, wake_id, now)
            end) do
         {:ok, {:ok, result}} ->
@@ -738,7 +764,7 @@ defmodule Tightbeam.HarklightBriefings do
   end
 
   defp existing_wake_state(db, call, owner_user_id, request, existing, rule) do
-    wake_id = wake_id(request.id)
+    wake_id = (existing && existing.wake_id) || wake_id(request.id)
 
     case wake(db, wake_id) do
       %{origin: @wake_origin, session_key: session_key, state: state}
@@ -1502,6 +1528,11 @@ defmodule Tightbeam.HarklightBriefings do
 
     "w_rule_" <> digest
   end
+
+  defp retry_wake_id(request_id), do: wake_id(request_id) <> "_exact_retry"
+
+  defp retry_target(owner, nil), do: Org.personal_session_key(owner)
+  defp retry_target(_owner, explicit_target), do: explicit_target
 
   defp owner_user_id(db, call) do
     case Org.get(db, call.session_key) do
