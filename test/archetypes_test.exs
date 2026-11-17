@@ -90,11 +90,14 @@ defmodule Tightbeam.ArchetypesTest do
     assert Rules.load!(ctx.base_dir, []) == []
     refute File.exists?(Path.join(identity_dir, "skills"))
     refute File.exists?(Path.join(identity_dir, "rails"))
+
     assert Path.wildcard(Path.join(identity_dir, "rules/*.toml")) ==
              [Path.join(identity_dir, "rules/harness-health-recovery.toml")]
 
     assert File.read!(Path.join(identity_dir, "rules/harness-health-recovery.toml")) ==
-             File.read!(Application.app_dir(:tightbeam, "priv/seed/rules/harness-health-recovery.toml"))
+             File.read!(
+               Application.app_dir(:tightbeam, "priv/seed/rules/harness-health-recovery.toml")
+             )
 
     assert %{settings: recovery_settings} = Rules.reaction_policy("harness-health-recovery")
     assert recovery_settings["eligible_failure_classes"] == ["rate-limit-dead"]

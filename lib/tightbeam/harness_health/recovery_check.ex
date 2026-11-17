@@ -58,7 +58,7 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
     now = System.system_time(:millisecond)
 
     case DB.transaction(db, fn txn ->
-             case RecoverySchedule.due_cycle_for_delivery_in_txn(txn, hold_id, cycle_id, now) do
+           case RecoverySchedule.due_cycle_for_delivery_in_txn(txn, hold_id, cycle_id, now) do
              {:ok, schedule, hold} ->
                if hold["routesComplete"] and hold["routes"] != [] do
                  checks =
@@ -191,10 +191,19 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
 
   defp start_check(task_sup, db, base_dir, check) do
     case Task.Supervisor.start_child(task_sup, fn ->
-           result = Tightbeam.Harness.RecoveryProbe.run_route(base_dir, db, check.route, check.timeout_ms)
+           result =
+             Tightbeam.Harness.RecoveryProbe.run_route(
+               base_dir,
+               db,
+               check.route,
+               check.timeout_ms
+             )
+
            record_result(db, check, result)
          end) do
-      {:ok, _pid} -> :ok
+      {:ok, _pid} ->
+        :ok
+
       {:error, reason} ->
         record_result(db, check, {:inconclusive, diagnostic(reason)})
     end
@@ -256,7 +265,7 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
           integer()
         ) :: :ok | {:released, map()}
   def record_result_in_txn(txn, hold_id, cycle_id, route_key, outcome, excerpt, finished_at)
-       when outcome in ["succeeded", "failed", "inconclusive", "uncheckable"] do
+      when outcome in ["succeeded", "failed", "inconclusive", "uncheckable"] do
     case Txn.q(
            txn,
            "SELECT routeJson,startedAt,eventId,org,outcome FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND routeKey=?3",
@@ -283,7 +292,10 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
           }
 
           Tightbeam.RowReactions.remember_harness_health_recovery_check_in_txn(txn, check)
-          if outcome == "uncheckable", do: warn_uncheckable_in_txn(txn, hold_id, "route capability unavailable", finished_at)
+
+          if outcome == "uncheckable",
+            do: warn_uncheckable_in_txn(txn, hold_id, "route capability unavailable", finished_at)
+
           operator_retry? = RecoverySchedule.operator_requested_in_txn?(txn, hold_id, cycle_id)
           result = finalize_cycle_in_txn(txn, hold_id, cycle_id, finished_at)
 
@@ -322,17 +334,27 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
         label = "#{harness} on #{host} (#{model})"
 
         case {outcome, Tightbeam.HarnessHealth.classify_turn_failure(excerpt)} do
-          {"succeeded", _} -> "#{label}: probe succeeded"
-          {"failed", "rate-limit-dead"} -> "#{label}: still over limit; provider response: #{excerpt}"
-          {"failed", "auth-dead"} -> "#{label}: credential refused; sign in again. Provider response: #{excerpt}"
-          {"failed", _} -> "#{label}: probe failed; fence remains. Response: #{excerpt}"
-          {other, _} -> "#{label}: probe #{other}; fence remains. Response: #{excerpt || "none"}"
+          {"succeeded", _} ->
+            "#{label}: probe succeeded"
+
+          {"failed", "rate-limit-dead"} ->
+            "#{label}: still over limit; provider response: #{excerpt}"
+
+          {"failed", "auth-dead"} ->
+            "#{label}: credential refused; sign in again. Provider response: #{excerpt}"
+
+          {"failed", _} ->
+            "#{label}: probe failed; fence remains. Response: #{excerpt}"
+
+          {other, _} ->
+            "#{label}: probe #{other}; fence remains. Response: #{excerpt || "none"}"
         end
       end)
 
     summary =
       if match?({:released, _}, result),
-        do: "The usage-limit fence was released; circuit recovery and parked-work redelivery are proceeding.",
+        do:
+          "The usage-limit fence was released; circuit recovery and parked-work redelivery are proceeding.",
         else: "The usage-limit fence remains in place."
 
     Wakes.schedule_in_txn(txn, %{
@@ -359,7 +381,12 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
       case RecoverySchedule.due_cycle_for_delivery_in_txn(txn, hold_id, cycle_id, now) do
         {:ok, _schedule, hold} ->
           if all_current_routes_succeeded?(txn, hold_id, hold, cycle_id) do
-            case Tightbeam.HarnessHealth.resolve_recovery_cycle_in_txn(txn, hold_id, cycle_id, now) do
+            case Tightbeam.HarnessHealth.resolve_recovery_cycle_in_txn(
+                   txn,
+                   hold_id,
+                   cycle_id,
+                   now
+                 ) do
               {:resolved, incident, correlation} ->
                 RecoverySchedule.complete_cycle_in_txn(txn, hold_id, cycle_id, now)
 
@@ -430,7 +457,10 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
   end
 
   defp check_event_id(hold_id, cycle_id, route_key) do
-    digest = :crypto.hash(:sha256, JSON.encode!([hold_id, cycle_id, route_key])) |> Base.url_encode64(padding: false)
+    digest =
+      :crypto.hash(:sha256, JSON.encode!([hold_id, cycle_id, route_key]))
+      |> Base.url_encode64(padding: false)
+
     "harness-health-recovery-check:" <> digest
   end
 

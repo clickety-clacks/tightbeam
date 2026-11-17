@@ -1,25 +1,51 @@
 defmodule Tightbeam.Harness.RecoveryProbe do
   @moduledoc false
 
-  alias Tightbeam.{ErrorDiagnostic, Homes, Placement}
+  alias Tightbeam.{DB, ErrorDiagnostic, Homes, Placement}
   alias Tightbeam.Harness.Support
 
   @error_limit 512
   @help_output_limit 65_536
   @selection_output_limit 4_096
   @schema_text """
-              {"type":"object",
-               "properties":{"ok":{"type":"boolean","enum":[true]}},
-               "required":["ok"],
-               "additionalProperties":false}
-              """
+  {"type":"object",
+   "properties":{"ok":{"type":"boolean","enum":[true]}},
+   "required":["ok"],
+   "additionalProperties":false}
+  """
   @prompt ~s(Reply with exactly {"ok":true}.)
   @codex_features ~w(
     shell_tool unified_exec code_mode_host multi_agent apps plugins hooks browser_use
     browser_use_external computer_use in_app_browser image_generation view_image sleep_tool
     goals tool_suggest skill_search memories workspace_dependencies skill_mcp_dependency_install
   )
-  @codex_disable_args Enum.flat_map(@codex_features, & ["--disable", &1])
+  @codex_disable_args Enum.flat_map(@codex_features, &["--disable", &1])
+
+  @doc "Recheck open usage-limit holds after the harness credential changes."
+  def credential_changed(db, provider, host)
+      when provider in [:anthropic, :openai] and is_binary(host) do
+    harness = if provider == :anthropic, do: "claude", else: "codex"
+
+    case DB.query(
+           db,
+           "SELECT id FROM harness_health_incidents WHERE harness=?1 AND host=?2 AND failureClass='rate-limit-dead' AND state='open'",
+           [harness, host]
+         ) do
+      {:ok, rows} ->
+        Enum.reduce_while(rows, :ok, fn [id], :ok ->
+          case Tightbeam.HarnessHealth.RecoverySchedule.retry_now(db, id) do
+            {:ok, _} -> {:cont, :ok}
+            {:already_running, _} -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  def credential_changed(_db, _provider, _host), do: :ok
 
   def run_route(base_dir, db, route, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
@@ -374,7 +400,16 @@ defmodule Tightbeam.Harness.RecoveryProbe do
     Regex.match?(~r/(?<![A-Za-z0-9_])#{Regex.escape(feature)}(?![A-Za-z0-9_])/, output)
   end
 
-  defp execute_route("claude", binary, host_config, path, home, credential_kind, model, timeout_ms) do
+  defp execute_route(
+         "claude",
+         binary,
+         host_config,
+         path,
+         home,
+         credential_kind,
+         model,
+         timeout_ms
+       ) do
     args = [
       "-p",
       "--tools",
@@ -401,7 +436,16 @@ defmodule Tightbeam.Harness.RecoveryProbe do
     end
   end
 
-  defp execute_route("codex", binary, host_config, path, home, _credential_kind, model, timeout_ms) do
+  defp execute_route(
+         "codex",
+         binary,
+         host_config,
+         path,
+         home,
+         _credential_kind,
+         model,
+         timeout_ms
+       ) do
     args = [
       "exec",
       "--ephemeral",
@@ -470,7 +514,17 @@ defmodule Tightbeam.Harness.RecoveryProbe do
     end
   end
 
-  defp cli_script(binary, args, harness, path, home, _capture_limit, schema, capture_stdout?, credential_kind) do
+  defp cli_script(
+         binary,
+         args,
+         harness,
+         path,
+         home,
+         _capture_limit,
+         schema,
+         capture_stdout?,
+         credential_kind
+       ) do
     schema_setup =
       if schema do
         "schema=$(mktemp \"${TMPDIR:-/tmp}/tightbeam-hhrc-schema.XXXXXX\") || exit 70\n" <>
@@ -502,6 +556,7 @@ defmodule Tightbeam.Harness.RecoveryProbe do
       end
 
     path_assignment = shell_path_assignment(path)
+
     executable =
       binary
       |> List.wrap()
@@ -550,7 +605,8 @@ defmodule Tightbeam.Harness.RecoveryProbe do
         {:args, args}
       ])
 
-    result = collect_port(port, System.monotonic_time(:millisecond) + timeout_ms, capture_limit, "")
+    result =
+      collect_port(port, System.monotonic_time(:millisecond) + timeout_ms, capture_limit, "")
 
     case result do
       {:exit, 255, output} when not local? -> {:transport_error, output}
@@ -579,7 +635,10 @@ defmodule Tightbeam.Harness.RecoveryProbe do
 
   defp append_bounded(existing, data, limit) do
     remaining = max(limit - byte_size(existing), 0)
-    if remaining == 0, do: existing, else: existing <> binary_part(data, 0, min(remaining, byte_size(data)))
+
+    if remaining == 0,
+      do: existing,
+      else: existing <> binary_part(data, 0, min(remaining, byte_size(data)))
   end
 
   defp close_port(port) do
@@ -600,5 +659,4 @@ defmodule Tightbeam.Harness.RecoveryProbe do
   end
 
   defp diagnostic(reason), do: reason |> inspect() |> sanitize_excerpt()
-
 end

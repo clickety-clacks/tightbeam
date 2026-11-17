@@ -85,7 +85,11 @@ defmodule Tightbeam.IdentityTest do
              ]
 
     assert git!(dir, ["show", "main:rules/harness-health-recovery.toml"]) ==
-             String.trim(File.read!(Application.app_dir(:tightbeam, "priv/seed/rules/harness-health-recovery.toml")))
+             String.trim(
+               File.read!(
+                 Application.app_dir(:tightbeam, "priv/seed/rules/harness-health-recovery.toml")
+               )
+             )
 
     snapshot = Identity.snapshot!(ctx.base, "default", :codex)
     assert snapshot.skills == %{}
