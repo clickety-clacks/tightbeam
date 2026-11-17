@@ -129,6 +129,68 @@ defmodule Tightbeam.RestReadConnectionsTest do
     assert JSON.decode!(responses.tool_calls.resp_body)["items"] == []
   end
 
+  test "the other REST read resources answer while the database writer is busy", ctx do
+    key = ctx.session.session_key
+
+    {:ok, [[message_id]]} =
+      DB.query(ctx.db, "SELECT id FROM messages WHERE sessionKey=?1 ORDER BY seq LIMIT 1", [key])
+
+    paths = [
+      "/api/sessions",
+      "/api/sessions/#{key}/messages/#{message_id}",
+      "/api/sessions/#{key}/tool-calls/tc_missing",
+      "/api/wakes/w_missing",
+      "/api/turns/1",
+      "/api/artifacts",
+      "/api/artifacts/art_missing",
+      "/api/attests",
+      "/api/attests/att_missing",
+      "/api/assignments/asg_missing/attests",
+      "/api/read-markers",
+      "/api/read-markers/scope_missing",
+      "/api/roles/role-missing",
+      "/api/facts/1",
+      "/api/critical-state/#{key}",
+      "/api/devices/d1",
+      "/api/decision-requests/dr_missing"
+    ]
+
+    parent = self()
+
+    writer =
+      Task.async(fn ->
+        DB.transaction(ctx.db, fn _txn ->
+          send(parent, {:writer_held, self()})
+
+          receive do
+            :release -> :released
+          after
+            30_000 -> raise "writer was not released"
+          end
+        end)
+      end)
+
+    assert_receive {:writer_held, owner}, 5_000
+
+    reads =
+      Task.async(fn ->
+        Map.new(paths, fn path -> {path, get(ctx, path, ctx.device.token)} end)
+      end)
+
+    answered = Task.yield(reads, 10_000)
+    send(owner, :release)
+    assert {:ok, :released} = Task.await(writer, 5_000)
+    assert {:ok, responses} = answered || {:after_writer, Task.await(reads, 60_000)}
+
+    for path <- paths do
+      response = responses[path]
+      assert response.status in [200, 404], "#{path}: #{response.status} #{response.resp_body}"
+    end
+
+    assert responses["/api/sessions/#{key}/messages/#{message_id}"].status == 200
+    assert responses["/api/sessions"].status == 200
+  end
+
   test "a read right after a committed write sees the write", ctx do
     key = ctx.session.session_key
 

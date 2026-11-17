@@ -362,22 +362,27 @@ defmodule Tightbeam.DB do
         when result: term()
   def read_transaction!(server \\ __MODULE__, fun) when is_function(fun, 1) do
     case read_transaction(server, fun) do
-      {:ok, result} ->
-        result
-
-      {:error, %DeadlineExceeded{}} ->
-        raise Timeout,
-          request_id: Tightbeam.RequestContext.capture().request_id,
-          operation: "db.read_transaction",
-          effect_kind: "read",
-          budget_ms: call_timeout(),
-          timeout_source: "reader_deadline",
-          effect_state: "none"
-
-      {:error, error} ->
-        raise error
+      {:ok, result} -> result
+      {:error, error} -> raise_read_error!(error)
     end
   end
+
+  @doc """
+  Raise the error a failed `read_transaction/2` returned. A read that ran out
+  of time on its read connection becomes the sanitized `Timeout`.
+  """
+  @spec raise_read_error!(Exception.t() | term()) :: no_return()
+  def raise_read_error!(%DeadlineExceeded{}) do
+    raise Timeout,
+      request_id: Tightbeam.RequestContext.capture().request_id,
+      operation: "db.read_transaction",
+      effect_kind: "read",
+      budget_ms: call_timeout(),
+      timeout_source: "reader_deadline",
+      effect_state: "none"
+  end
+
+  def raise_read_error!(error), do: raise(error)
 
   @doc """
   Commit one transaction, then run a publication callback after the owner has replied.

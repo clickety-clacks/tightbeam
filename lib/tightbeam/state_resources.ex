@@ -727,9 +727,9 @@ defmodule Tightbeam.StateResources do
   end
 
   def query_wake(db, id) do
-    case DB.transaction(db, &wake_projection_in_txn(&1, id)) do
+    case DB.read_transaction(db, &wake_projection_in_txn(&1, id)) do
       {:ok, wake} -> wake
-      {:error, error} -> raise error
+      {:error, error} -> DB.raise_read_error!(error)
     end
   end
 
@@ -831,7 +831,7 @@ defmodule Tightbeam.StateResources do
         true -> {"sessions.ownerUserId = ?", [principal.id]}
       end
 
-    case DB.transaction(db, fn txn ->
+    case DB.read_transaction(db, fn txn ->
            query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
 
            Keyset.page(
@@ -847,7 +847,7 @@ defmodule Tightbeam.StateResources do
            )
          end) do
       {:ok, page} -> %{rows: Enum.map(page.rows, &session_query_row/1), flags: page}
-      {:error, error} -> raise error
+      {:error, error} -> DB.raise_read_error!(error)
     end
   end
 
@@ -1100,7 +1100,7 @@ defmodule Tightbeam.StateResources do
     principal = request.principal
     visibility = StateVisibility.artifact_collection_scope(principal)
 
-    case DB.transaction(db, fn txn ->
+    case DB.read_transaction(db, fn txn ->
            txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
 
            page =
@@ -1125,7 +1125,7 @@ defmodule Tightbeam.StateResources do
            }
          end) do
       {:ok, page} -> page
-      {:error, error} -> raise error
+      {:error, error} -> DB.raise_read_error!(error)
     end
   end
 
@@ -1136,16 +1136,16 @@ defmodule Tightbeam.StateResources do
   def query_artifact(%Txn{} = txn, id), do: Artifacts.canonical_in_txn(txn, id)
 
   def query_artifact(db, id) do
-    case DB.transaction(db, &Artifacts.canonical_in_txn(&1, id)) do
+    case DB.read_transaction(db, &Artifacts.canonical_in_txn(&1, id)) do
       {:ok, row} -> row
-      {:error, error} -> raise error
+      {:error, error} -> DB.raise_read_error!(error)
     end
   end
 
   def query_attest(db, %{collection: request}) do
     principal = request.principal
 
-    case DB.transaction(db, fn txn ->
+    case DB.read_transaction(db, fn txn ->
            txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
 
            case query_assignment(txn, request.parent_id, %{rest_principal: principal}) do
@@ -1176,14 +1176,14 @@ defmodule Tightbeam.StateResources do
            end
          end) do
       {:ok, result} -> result
-      {:error, error} -> raise error
+      {:error, error} -> DB.raise_read_error!(error)
     end
   end
 
   def query_attests(db, %{collection: request}) do
     principal = request.principal
 
-    case DB.transaction(db, fn txn ->
+    case DB.read_transaction(db, fn txn ->
            txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
 
            Assignments.list_attests(txn, %{
@@ -1194,7 +1194,7 @@ defmodule Tightbeam.StateResources do
            })
          end) do
       {:ok, page} -> page
-      {:error, error} -> raise error
+      {:error, error} -> DB.raise_read_error!(error)
     end
   end
 
@@ -1540,7 +1540,7 @@ defmodule Tightbeam.StateResources do
   defp query_read_markers_page(db, principal, where, params, boundary, limit) do
     trace_core_detail(principal, {:au4_visibility, "read markers"})
 
-    case DB.transaction(db, fn txn ->
+    case DB.read_transaction(db, fn txn ->
            query = fn sql, params -> observed_query(txn, principal, sql, params) end
 
            Keyset.page(
@@ -1570,7 +1570,7 @@ defmodule Tightbeam.StateResources do
         }
 
       {:error, error} ->
-        raise error
+        DB.raise_read_error!(error)
     end
   end
 
@@ -1643,9 +1643,9 @@ defmodule Tightbeam.StateResources do
   end
 
   def query_turn_by_seq(db, seq) do
-    case DB.transaction(db, &query_turn_in_txn(&1, seq)) do
+    case DB.read_transaction(db, &query_turn_in_txn(&1, seq)) do
       {:ok, row} -> row
-      {:error, error} -> raise error
+      {:error, error} -> DB.raise_read_error!(error)
     end
   end
 
@@ -1909,7 +1909,7 @@ defmodule Tightbeam.StateResources do
   defp principal_trace(_principal), do: nil
 
   defp detail_selection(db, resource, principal, lookup) do
-    case DB.transaction(db, fn txn ->
+    case DB.read_transaction(db, fn txn ->
            txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
            row = lookup.(txn)
 
@@ -1918,7 +1918,7 @@ defmodule Tightbeam.StateResources do
              else: nil
          end) do
       {:ok, row} -> row
-      {:error, error} -> raise error
+      {:error, error} -> DB.raise_read_error!(error)
     end
   end
 
