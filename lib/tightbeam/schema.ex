@@ -6463,6 +6463,10 @@ defmodule Tightbeam.Schema do
   # until every exact predecessor migration has succeeded.
   defp bootstrap_module(_db, Tightbeam.DeliveryResponsibilities, _current?), do: :ok
 
+  # Attachment delivery outcomes are additive current-build storage. Delay
+  # their DDL until the exact predecessor migrations, including R1, succeed.
+  defp bootstrap_module(_db, Tightbeam.AttachmentDelivery, _current?), do: :ok
+
   defp bootstrap_module(db, Tightbeam.AdminProjection, _current?),
     do: Tightbeam.AdminProjection.ensure_storage(db)
 

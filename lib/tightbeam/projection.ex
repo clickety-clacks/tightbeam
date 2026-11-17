@@ -101,8 +101,9 @@ defmodule Tightbeam.Projection do
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
+    # AttachmentDelivery has its own schema entry and must be created after
+    # predecessor migrations, not as a side effect of this bootstrap.
     :ok = DB.execute(db, @ddl)
-    :ok = AttachmentDelivery.ensure_schema(db)
   end
 
   @doc false
