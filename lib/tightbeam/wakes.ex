@@ -5650,7 +5650,8 @@ defmodule Tightbeam.Wakes do
               "Assignment #{assignment_id} brief to #{holder} undelivered: " <>
                 "delivery turn #{seq} is #{status}." <> failed_delivery_uncertainty(status)
 
-            {:notices, List.wrap(append_failed_delivery_notice_in_txn(txn, seq, recipient, content))}
+            {:notices,
+             List.wrap(append_failed_delivery_notice_in_txn(txn, seq, recipient, content))}
 
           true ->
             :not_applicable

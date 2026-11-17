@@ -746,7 +746,8 @@ defmodule Tightbeam.Productions.BubbleTest do
 
       assert wake.creator_session_key == nil
 
-      busy = if @senderless_fixture == :batched, do: hold_recipient!(ctx.db, ctx.holder.session_key)
+      busy =
+        if @senderless_fixture == :batched, do: hold_recipient!(ctx.db, ctx.holder.session_key)
 
       delivery =
         Tightbeam.Gateway.deliver_prompt(ctx.holder.session_key, wake.origin, wake.prompt,
