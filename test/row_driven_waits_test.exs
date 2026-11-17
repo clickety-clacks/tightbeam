@@ -935,6 +935,47 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert attest_count(ctx.db, "V") == 2
   end
 
+  test "fired wait owner can record a verdict after its verifier closes", ctx do
+    verified_wait =
+      register_legacy_wait(
+        ctx.db,
+        System.system_time(:millisecond) - 1,
+        predicate("R")
+      )
+
+    challenged_wait =
+      register_legacy_wait(
+        ctx.db,
+        System.system_time(:millisecond) - 1,
+        predicate("R")
+      )
+
+    assert %{outcome: "revoked"} = revoke(ctx.db, "V")
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, verified_wait.wake_id).fired_at
+    assert Wakes.get(ctx.db, challenged_wait.wake_id).fired_at
+
+    closed_verifier =
+      attest(ctx.db, "V", "verifier", "verdict", "wait-verified", verified_wait.wake_id)
+
+    assert closed_verifier.code == "assignment_closed"
+    assert attest_count(ctx.db, "V") == 0
+
+    non_owner = attest(ctx.db, "A", "intruder", "verdict", "wait-verified", verified_wait.wake_id)
+    assert non_owner.code == "invalid_wait_verdict"
+    assert attest_count(ctx.db, "A") == 0
+
+    verified = attest(ctx.db, "A", "holder", "verdict", "wait-verified", verified_wait.wake_id)
+    assert verified.attest.waitId == verified_wait.wake_id
+    assert Wakes.get(ctx.db, verified_wait.wake_id).verification_state == "confirmed"
+
+    challenged =
+      attest(ctx.db, "A", "holder", "verdict", "wait-challenged", challenged_wait.wake_id)
+
+    assert challenged.attest.waitId == challenged_wait.wake_id
+    assert Wakes.get(ctx.db, challenged_wait.wake_id).verification_state == "challenged"
+  end
+
   test "terminal verifier and fallback end provisional waiting without inventing confirmation",
        ctx do
     verifier_terminal = register_legacy_wait(ctx.db, due_after(), predicate("R"))
