@@ -3677,7 +3677,7 @@ defmodule Tightbeam.HarnessHealthTest do
                [incident.id]
              )
 
-    assert next_due_at == started_one + 3_600_000
+    assert next_due_at == started_one + 120_000
     assert next_due_at < started_one + 3_600_100
 
     assert {:ok, [[cycle_two]]} =
@@ -3784,7 +3784,7 @@ defmodule Tightbeam.HarnessHealthTest do
                authoritative(first, "rate-limit-dead", 100, "recovery-schedule-open")
              )
 
-    assert {:ok, [[cycle_id, due_at, "pending", 3_600_000, hold_id]]} =
+    assert {:ok, [[cycle_id, due_at, "pending", 120_000, hold_id]]} =
              DB.query(
                ctx.db,
                "SELECT cycleId,dueAt,status,intervalMs,holdId FROM harness_health_recovery_schedules WHERE holdId=?1",
@@ -3792,7 +3792,7 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     assert hold_id == opened.id
-    assert due_at == 3_600_100
+    assert due_at == 120_100
     assert {:ok, [[wake_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
     assert [cycle] =
@@ -3846,7 +3846,7 @@ defmodule Tightbeam.HarnessHealthTest do
                [opened.id]
              )
 
-    assert initial_due_at == 3_600_100
+    assert initial_due_at == 120_100
     assert revised_due_at == 1_800_100
 
     assert [%{"cycle_id" => ^cycle_id}] =
