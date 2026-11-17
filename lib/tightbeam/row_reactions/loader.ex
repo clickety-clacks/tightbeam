@@ -8,36 +8,33 @@ defmodule Tightbeam.RowReactions.Loader do
         []
 
       {:ok, rails} when is_list(rails) and rails != [] ->
+        relative = Path.relative_to(path, Path.join(law_base, "identity"))
+        owner = Tightbeam.Identity.Provenance.owner_for_path(law_base, relative)
+
         provenance = %{
-          "source" => Path.relative_to(path, Path.join(law_base, "identity")),
-          "bundle" => bundle!(path, law_base),
+          "source" => relative,
+          "bundle" =>
+            case owner do
+              {:kungfu, name} -> name
+              :substrate -> "substrate"
+            end,
           "revision" => revision,
           "content_sha256" => Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
         }
 
+        owned_archetypes =
+          case owner do
+            {:kungfu, name} -> Tightbeam.Identity.Provenance.archetype_names(law_base, name)
+            :substrate -> []
+          end
+
         Enum.map(rails, fn rail ->
-          {:reaction, Map.put(Plan.compile!(rail, provenance), :source, path)}
+          {:reaction,
+           Map.put(Plan.compile!(rail, provenance, owner, owned_archetypes), :source, path)}
         end)
 
       _ ->
         raise ArgumentError, "#{path}: reaction must be a nonempty array of tables"
-    end
-  end
-
-  defp bundle!(path, law_base) do
-    relative = Path.relative_to(path, Path.join(law_base, "identity"))
-
-    owners =
-      Path.wildcard(Path.join(law_base, "identity/kungfu/*/installed.toml"))
-      |> Enum.flat_map(fn receipt_path ->
-        receipt = receipt_path |> File.read!() |> Toml.decode!()
-        if relative in Map.fetch!(receipt, "paths"), do: [Map.fetch!(receipt, "name")], else: []
-      end)
-
-    case owners do
-      [] -> "seed"
-      [owner] -> owner
-      _ -> raise ArgumentError, "#{path}: multiple bundle receipts claim this rule"
     end
   end
 end

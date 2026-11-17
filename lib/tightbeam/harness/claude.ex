@@ -224,7 +224,7 @@ defmodule Tightbeam.Harness.Claude do
     # this (identity change — context-reset markers will show; expected).
     # Binary rails are OPAQUE — the pre-map contract, still used by tests — and
     # pass through untouched (no pin can be merged into bytes we do not parse).
-    # The production path always arrives here as a map (Rails.hook_settings/0)
+    # The production path always arrives here as a map (Rails.hook_settings/1)
     # or nil, and those take the pin.
     rails =
       case {desired.rails, Map.get(desired, :default_model)} do

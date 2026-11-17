@@ -37,6 +37,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config, base: base} ->
 
   File.write!(Path.join(rules_dir, "boot-recovery.toml"), """
   [[rule]]
+  archetypes = ["*"]
   name = "observe-boot-recovery"
   verb = "retire"
   edges = ["row-commit"]

@@ -191,7 +191,8 @@ defmodule Tightbeam.Harness.Cursor do
   @doc """
   Root-owned directory the dedicated execution identity resolves `tightbeam`
   from: it holds a `tightbeam` symlink to the Cursor execution launcher, which
-  admits the read-only rail guards (`github-auth-check`, `tool-call-observed`)
+  admits the read-only rail guards (`github-auth-check`, `rail-scope-check`,
+  `tool-call-observed`)
   when invoked unprivileged. Nothing under the operator's home is traversed.
   """
   @helper_path_dir "/usr/local/libexec/tightbeam-cursor-path"

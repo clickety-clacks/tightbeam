@@ -250,23 +250,42 @@ pub(super) fn check_github_ready(
     remote: Option<&str>,
     gh: &impl Gh,
 ) -> Result<(), String> {
+    check_github_ready_with_template(hostname, remote, gh, None)
+}
+
+pub(super) fn check_github_ready_with_template(
+    hostname: &str,
+    remote: Option<&str>,
+    gh: &impl Gh,
+    text_template: Option<&str>,
+) -> Result<(), String> {
     let status = probe_with(hostname, gh);
     if status.state != GithubState::Live {
-        return Err(github_refusal(hostname, remote, &status));
+        return Err(github_refusal(hostname, remote, &status, text_template));
     }
 
     if let Some(remote) = remote {
         let status = probe_git_remote(&status, remote, gh);
         if status.state != GithubState::Live {
-            return Err(github_refusal(hostname, Some(remote), &status));
+            return Err(github_refusal(
+                hostname,
+                Some(remote),
+                &status,
+                text_template,
+            ));
         }
     }
     Ok(())
 }
 
-fn github_refusal(hostname: &str, remote: Option<&str>, status: &GithubStatus) -> String {
+fn github_refusal(
+    hostname: &str,
+    remote: Option<&str>,
+    status: &GithubStatus,
+    text_template: Option<&str>,
+) -> String {
     let host = projected_host_label();
-    github_refusal_for(&host, hostname, remote, status)
+    github_refusal_for(&host, hostname, remote, status, text_template)
 }
 
 fn github_refusal_for(
@@ -274,6 +293,7 @@ fn github_refusal_for(
     hostname: &str,
     remote: Option<&str>,
     status: &GithubStatus,
+    text_template: Option<&str>,
 ) -> String {
     let mut repair = format!("tightbeam onboard github --hostname {hostname}");
     if let Some(remote) = remote {
@@ -281,14 +301,48 @@ fn github_refusal_for(
         repair.push_str(Scrubbed::new(remote).as_str());
     }
 
-    format!(
-        "Tightbeam cannot use GitHub from {host} for {hostname}: failed phase {phase}; \
-         {state}: {detail}. \
-         Run: {repair}. Do not paste a PAT into an agent.",
-        phase = status.failed_phase,
-        state = status.state.as_str(),
-        detail = status.detail
-    )
+    let values = [
+        ("host", host),
+        ("hostname", hostname),
+        ("phase", status.failed_phase),
+        ("state", status.state.as_str()),
+        ("detail", status.detail.as_str()),
+        ("repair", repair.as_str()),
+    ];
+
+    let template = text_template.unwrap_or(
+        "Tightbeam cannot use GitHub from {host} for {hostname}: failed phase {phase}; {state}: {detail}. Run: {repair}. Do not paste a PAT into an agent.",
+    );
+    render_refusal_template(template, &values)
+}
+
+fn render_refusal_template(template: &str, values: &[(&str, &str)]) -> String {
+    let mut output = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(open) = rest.find('{') {
+        output.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+
+        let Some(close) = after_open.find('}') else {
+            output.push_str(&rest[open..]);
+            return output;
+        };
+
+        let key = &after_open[..close];
+        if let Some((_, value)) = values.iter().find(|(name, _)| *name == key) {
+            output.push_str(value);
+        } else {
+            output.push('{');
+            output.push_str(key);
+            output.push('}');
+        }
+
+        rest = &after_open[close + 1..];
+    }
+
+    output.push_str(rest);
+    output
 }
 
 fn projected_host_label() -> String {
@@ -444,6 +498,36 @@ mod tests {
                 .detail
                 .contains("tightbeam onboard github --hostname github.com")
         );
+    }
+
+    #[test]
+    fn refusal_template_matches_the_previous_message_and_renders_each_field_once() {
+        let status = GithubStatus {
+            hostname: "github.com".to_owned(),
+            state: GithubState::MissingCli,
+            failed_phase: "gh discovery",
+            account: None,
+            git_protocol: None,
+            git_remote: None,
+            git_ready: None,
+            detail: Scrubbed::new("gh is missing from PATH"),
+        };
+        let template = "Tightbeam cannot use GitHub from {host} for {hostname}: failed phase {phase}; {state}: {detail}. Run: {repair}. Do not paste a PAT into an agent.";
+        let expected = "Tightbeam cannot use GitHub from this host for github.com: failed phase gh discovery; missing_cli: gh is missing from PATH. Run: tightbeam onboard github --hostname github.com. Do not paste a PAT into an agent.";
+
+        assert_eq!(
+            github_refusal_for("this host", "github.com", None, &status, None),
+            expected
+        );
+        assert_eq!(
+            github_refusal_for("this host", "github.com", None, &status, Some(template)),
+            expected
+        );
+
+        let literal_value = "value containing {host}";
+        let rendered =
+            render_refusal_template("{detail} / {unknown}", &[("detail", literal_value)]);
+        assert_eq!(rendered, "value containing {host} / {unknown}");
     }
 
     #[test]

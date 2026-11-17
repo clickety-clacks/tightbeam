@@ -20,5 +20,5 @@
 {"case":"stash-attest-note-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"tightbeam attest asg_1 --kind progress --note 'git stash was refused'\"}}"}
 {"case":"stash-report-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"printf '%s' 'report: git stash is forbidden'\"}}"}
 {"case":"stash-heredoc-report-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cat <<'REPORT'\\ngit stash\\nREPORT\"}}"}
-{"case":"stash-classifier-fault-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"not-json"}
+{"case":"stash-classifier-fault-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{}}"}
 {"case":"stash-denial-is-legible","kind":"legibility","expect":"deny","reason":"no-git-stash","emits":"gate:no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash clear\"}}"}

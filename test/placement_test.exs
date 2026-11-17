@@ -406,6 +406,126 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Path.join(base_dir, "work"))
   end
 
+  test "holder_workdir writes the current qualified archetype scope beside the session", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    register_hosts(db, %{
+      "testhost" => %{ssh: nil, base_dir: base_dir, cli_bin: nil}
+    })
+
+    rails_dir = Path.join([base_dir, "identity", "rails"])
+    File.mkdir_p!(rails_dir)
+
+    File.write!(Path.join(rails_dir, "scoped.toml"), """
+    [[statute]]
+    name = "coder-only"
+    on = "tool-call"
+    archetypes = ["agentic-engineering.coder"]
+    tool = "Bash"
+    pattern = "protected"
+    text = "Coder-only law"
+    """)
+
+    Rails.load!(base_dir)
+
+    session = %{
+      session_key: "scope-holder",
+      host: "testhost",
+      harness: "codex",
+      archetype: "agentic-engineering.coder",
+      cli_token: "test-token"
+    }
+
+    path = Placement.holder_workdir(%{base_dir: base_dir, db: db, port: 4321}, session)
+    scope_path = Path.join(path, Rails.session_scope_filename())
+    scope = File.read!(scope_path) |> JSON.decode!()
+
+    assert scope == %{
+             "archetype" => "agentic-engineering.coder",
+             "statutes" => ["coder-only"]
+           }
+
+    assert Bitwise.band(File.stat!(scope_path).mode, 0o777) == 0o644
+    assert File.read!(Path.join(path, ".tightbeam-session")) =~ "test-token"
+    refute File.read!(scope_path) =~ "test-token"
+
+    Placement.holder_workdir(
+      %{base_dir: base_dir, db: db, port: 4321},
+      %{session | archetype: "agentic-engineering.reviewer-code"}
+    )
+
+    updated_scope = File.read!(scope_path) |> JSON.decode!()
+
+    assert updated_scope == %{
+             "archetype" => "agentic-engineering.reviewer-code",
+             "statutes" => []
+           }
+  end
+
+  test "remote holder_workdir stages the current archetype without the session token", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    register_hosts(db, %{
+      "worker" => %{ssh: "worker", base_dir: "/srv/tightbeam", cli_bin: nil}
+    })
+
+    Application.put_env(:tightbeam, :advertised_url, "https://gateway.example")
+    parent = self()
+
+    sh_out = fn command ->
+      send(parent, {:remote_scope_read, command})
+      if "cat" in command, do: {"", 1}, else: {"", 0}
+    end
+
+    sh = fn command ->
+      case command do
+        ["rsync" | _] ->
+          stage_file = Enum.at(command, -2)
+
+          send(
+            parent,
+            {:staged_workdir_file, Path.basename(stage_file), File.read!(stage_file),
+             Bitwise.band(File.stat!(stage_file).mode, 0o777), command}
+          )
+
+        ["ssh" | _] ->
+          send(parent, {:remote_scope_chmod, command})
+      end
+
+      {"", 0}
+    end
+
+    session = %{
+      session_key: "remote-scope-holder",
+      host: "worker",
+      harness: "codex",
+      archetype: "agentic-engineering.coder",
+      cli_token: "test-token"
+    }
+
+    path =
+      Placement.holder_workdir(
+        %{base_dir: base_dir, db: db, port: 4321, sh: sh, sh_out: sh_out},
+        session
+      )
+
+    assert_receive {:staged_workdir_file, ".tightbeam-session", token_content, 0o600, _}
+    assert token_content =~ "test-token"
+
+    assert_receive {:staged_workdir_file, ".tightbeam-rail-scope.json", scope_content, 0o644,
+                    scope_rsync}
+
+    assert scope_content == Rails.session_scope_content("agentic-engineering.coder")
+    refute scope_content =~ "test-token"
+    assert List.last(scope_rsync) == "worker:#{path}/"
+
+    assert_receive {:remote_scope_chmod, chmod}
+    assert List.last(chmod) == Path.join(path, Rails.session_scope_filename())
+    assert Enum.at(chmod, -2) == "644"
+  end
+
   test "materialize_identity names a disappeared session host", %{
     base_dir: base_dir,
     db: db
@@ -482,10 +602,13 @@ defmodule Tightbeam.PlacementTest do
     exclude = Path.join([path, ".git", "info", "exclude"])
     File.write!(exclude, "*.beam")
     assert :ok = Placement.ensure_workdir(%{ssh: nil, base_dir: base_dir}, path, content, [])
-    assert File.read!(exclude) == "*.beam\n.tightbeam-session\n"
+
+    assert File.read!(exclude) ==
+             "*.beam\n.tightbeam-session\n.tightbeam-rail-scope.json\n"
 
     assert :ok = Placement.ensure_workdir(%{ssh: nil, base_dir: base_dir}, path, content, [])
     assert length(Regex.scan(~r/^\.tightbeam-session$/m, File.read!(exclude))) == 1
+    assert length(Regex.scan(~r/^\.tightbeam-rail-scope\.json$/m, File.read!(exclude))) == 1
 
     File.write!(file, "tampered")
     assert :ok = Placement.ensure_workdir(%{ssh: nil, base_dir: base_dir}, path, content, [])
@@ -535,7 +658,7 @@ defmodule Tightbeam.PlacementTest do
     assert command =~ "mkdir -p #{path} &&"
     assert command =~ "find #{path}/.tightbeam-session -maxdepth 0 -perm 600 -print"
     assert command =~ "| grep -q . && cat #{path}/.tightbeam-session"
-    assert command =~ ~s(printf "\\n%s\\n" .tightbeam-session)
+    assert command =~ "for entry in .tightbeam-session .tightbeam-rail-scope.json"
     assert_receive {:stage, ^content, 0o600}
     assert_receive {:sh, rsync}
     assert List.last(rsync) == "worker:#{path}/"
@@ -938,7 +1061,7 @@ defmodule Tightbeam.PlacementTest do
     File.mkdir_p!(execution_home)
 
     expected_digest =
-      Rails.hook_settings()
+      Rails.hook_settings(:cursor)
       |> Tightbeam.Harness.CursorRails.compile(
         path:
           Tightbeam.Harness.Cursor.helper_path_dir() <>
@@ -2118,16 +2241,11 @@ defmodule Tightbeam.PlacementTest do
     assert File.read!(marker) == "keep"
     refute File.exists?(Path.join(home, "settings.json"))
 
-    # Zero statutes is no longer zero hooks: the home carries the substrate's
-    # reserved entries — the observation, plus codex's own wiring-check probe —
-    # and no law at all.
+    # The compiled home hook map is sourced from the loaded seed and org statutes.
     hooks = File.read!(Path.join(home, "hooks.json")) |> JSON.decode!()
 
-    assert hooks["hooks"]["PreToolUse"] == [
-             Rails.github_auth_entry(),
-             Rails.observation_entry(),
-             Rails.probe_entry()
-           ]
+    assert hooks["hooks"]["PreToolUse"] ==
+             get_in(Rails.hook_settings(:codex), ["hooks", "PreToolUse"])
 
     assert Map.keys(hooks["hooks"]) |> Enum.sort() == ["PreToolUse", "SessionStart"]
     assert [%{"hooks" => [handler]}] = hooks["hooks"]["SessionStart"]
@@ -2453,9 +2571,7 @@ defmodule Tightbeam.PlacementTest do
   end
 
   defp codex_hooks_bytes do
-    Rails.hook_settings()
-    |> update_in(["hooks", "PreToolUse"], &(&1 ++ [Rails.probe_entry()]))
-    |> JSON.encode!()
+    Rails.hook_settings(:codex) |> JSON.encode!()
   end
 
   defp put_skill!(base_dir, name, body) do
