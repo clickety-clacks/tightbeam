@@ -197,6 +197,8 @@ defmodule Tightbeam.Recognition do
 
   def handle_info({:retry, _}, state), do: {:noreply, state}
 
+  def handle_info(:retry, %{ready: false} = state), do: {:noreply, state}
+
   def handle_info(:check_misses, state) do
     if state.ready do
       safely(fn ->

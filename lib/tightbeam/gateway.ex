@@ -310,6 +310,10 @@ defmodule Tightbeam.Gateway do
       )
     end
 
+    # The schema pass is only the first part of boot. Keep durable recognition
+    # dormant through the remaining migrations and reconciliations above.
+    :ok = Tightbeam.Recognition.activate(db)
+
     (credential_children(config, db) ++
        [
          {ModelCatalog, base_dir: config.base_dir, db: db},
@@ -6309,6 +6313,7 @@ defmodule Tightbeam.Gateway do
         params[:reason],
         source
       )
+      |> recheck_rate_limit_after_onboard(config, provider_atom(provider), machine)
       |> finish_oauth_recovery_wake(config, call, provider_atom(provider), machine, phase, kind)
       |> with_owner_user_id(phase, gateway_db(config), call)
     else
@@ -6354,6 +6359,31 @@ defmodule Tightbeam.Gateway do
   defp onboard_result(_config, %{params: %{provider: _provider}}) do
     %{code: "invalid_message", message: "unsupported onboarding provider"}
   end
+
+  defp recheck_rate_limit_after_onboard(
+         %{status: "onboarded"} = result,
+         config,
+         provider,
+         machine
+       ) do
+    case Tightbeam.HarnessHealth.RecoverySchedule.credential_changed(
+           gateway_db(config),
+           provider,
+           machine
+         ) do
+      :ok ->
+        result
+
+      {:error, reason} ->
+        Logger.warning(
+          "rate-limit recovery recheck after credential change failed: #{inspect(reason)}"
+        )
+
+        result
+    end
+  end
+
+  defp recheck_rate_limit_after_onboard(result, _config, _provider, _machine), do: result
 
   defp onboard_phase(
          config,

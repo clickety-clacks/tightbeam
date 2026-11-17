@@ -18,6 +18,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
   }
   @classes ~w(auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash interrupted-outcome-unknown)
   @migration "harness-health-recovery-schedules/v1"
+  @max_backoff_ms 3_600_000
 
   @ddl """
   CREATE TABLE harness_health_recovery_schedules (
@@ -216,6 +217,32 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
     end
   end
 
+  @doc "Recheck open usage-limit holds after the harness credential changes."
+  def credential_changed(db, provider, host)
+      when provider in [:anthropic, :openai] and is_binary(host) do
+    harness = if provider == :anthropic, do: "claude", else: "codex"
+
+    case DB.query(
+           db,
+           "SELECT id FROM harness_health_incidents WHERE harness=?1 AND host=?2 AND failureClass='rate-limit-dead' AND state='open'",
+           [harness, host]
+         ) do
+      {:ok, rows} ->
+        Enum.reduce_while(rows, :ok, fn [id], :ok ->
+          case retry_now(db, id) do
+            {:ok, _} -> {:cont, :ok}
+            {:already_running, _} -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  def credential_changed(_db, _provider, _host), do: :ok
+
   @doc false
   def operator_requested_in_txn?(txn, hold_id, cycle_id) do
     Txn.q(
@@ -274,10 +301,17 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
            db,
            "SELECT MIN(dueAt) FROM harness_health_recovery_schedules WHERE status='pending'"
          ) do
-      {:ok, [[nil]]} -> nil
-      {:ok, [[due_at]]} when is_integer(due_at) -> due_at
-      {:ok, rows} -> raise ArgumentError, "invalid recovery schedule deadline rows: #{inspect(rows)}"
-      {:error, error} -> raise error
+      {:ok, [[nil]]} ->
+        nil
+
+      {:ok, [[due_at]]} when is_integer(due_at) ->
+        due_at
+
+      {:ok, rows} ->
+        raise ArgumentError, "invalid recovery schedule deadline rows: #{inspect(rows)}"
+
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -287,7 +321,17 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
            "SELECT holdId,cycleId,sourceEventId,failureClass,eligibleClasses,intervalMs,timeoutMs,dueAt,startedAt FROM harness_health_recovery_schedules WHERE status='due' ORDER BY startedAt,holdId"
          ) do
       {:ok, rows} ->
-        Enum.map(rows, fn [hold_id, cycle_id, event_id, failure_class, classes, interval, timeout, due, started] ->
+        Enum.map(rows, fn [
+                            hold_id,
+                            cycle_id,
+                            event_id,
+                            failure_class,
+                            classes,
+                            interval,
+                            timeout,
+                            due,
+                            started
+                          ] ->
           %{
             "hold_id" => hold_id,
             "cycle_id" => cycle_id,
@@ -362,8 +406,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
         case {hold, policy()} do
           {%{"state" => "open"} = hold, {:ok, settings, _digest}} ->
             if eligible?(hold, settings) do
-              {:ok,
-               %{cycle_id: cycle_id, started_at: started_at, timeout_ms: timeout_ms}, hold}
+              {:ok, %{cycle_id: cycle_id, started_at: started_at, timeout_ms: timeout_ms}, hold}
             else
               finish_cycle_in_txn(txn, hold_id, cycle_id, now)
               :withdrawn
@@ -494,7 +537,14 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
   end
 
   defp initial_due_at(hold, settings, now, opts, previous_started_at) do
-    interval_ms = settings["interval_ms"]
+    interval_ms =
+      if previous_started_at,
+        do:
+          backoff_interval(
+            max(previous_started_at - hold["openedAt"], 0),
+            settings["interval_ms"]
+          ),
+        else: settings["interval_ms"]
 
     due_at =
       max(
@@ -504,6 +554,14 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
 
     if Keyword.get(opts, :cutover, false), do: max(due_at, now), else: due_at
   end
+
+  defp backoff_interval(_elapsed, interval) when interval >= @max_backoff_ms,
+    do: @max_backoff_ms
+
+  defp backoff_interval(elapsed, interval) when elapsed < interval, do: interval
+
+  defp backoff_interval(elapsed, interval),
+    do: backoff_interval(elapsed, min(interval * 2, @max_backoff_ms))
 
   defp withdraw(txn, hold_id, now) do
     Txn.q(
