@@ -14,6 +14,24 @@ change. In that change, re-check each external-agent skill shipped by
 Pull request CI runs `scripts/verify_external_skills.py`; the existing push
 checks for `0.1.*` branches remain for compatibility.
 
+## Pass the pre-candidate gates
+
+Before building any release candidate, all three gates must pass:
+
+1. **Release parity:** Every change shipped in every earlier release must be on
+   `main`, or be accounted for by a recorded equivalent implementation or an
+   intentional removal explicitly ruled by the product owner. Any missing
+   feature blocks the candidate. Listing it under **Breaking changes** does
+   not satisfy this gate.
+2. **Upgrade:** The proposed release commit must boot and migrate cleanly from a
+   database shaped like the previous release's. Run this on an isolated host
+   and database; never use the live installation.
+3. **Pull-request suites:** CI must run and pass the full Linux and macOS test
+   suites on every pull request targeting `main`. A compile-only pull-request
+   check does not pass this gate.
+
+Do not build a release candidate until all three gates hold.
+
 ## Build the final unpublished candidate
 
 1. Select the reviewed commit at the current `main` tip and record its full
