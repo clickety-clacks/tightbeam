@@ -13156,6 +13156,13 @@ defmodule Tightbeam.GatewayTest do
   test "REST skipped post result returns not-deliverable without a success receipt", ctx do
     owner = ctx.device.user_id
 
+    config =
+      gateway_config(ctx.catalog_base, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    post_handler = Gateway.handlers(config)["post"]
+
     response =
       rest_post_with_handlers(
         ctx,
@@ -13171,7 +13178,15 @@ defmodule Tightbeam.GatewayTest do
             attachments: []
           }
         },
-        %{"post" => fn _call -> %{dedupe: "skipped"} end}
+        %{
+          "post" => fn call ->
+            # Retire the target after REST validation but before delivery's transaction.
+            {:ok, _} =
+              DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='k1'")
+
+            post_handler.(call)
+          end
+        }
       )
 
     assert response.status == 409
