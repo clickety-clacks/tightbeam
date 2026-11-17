@@ -245,6 +245,32 @@ defmodule Tightbeam.HarklightBriefingsTest do
     assert briefing_wake_count(ctx.db) == 1
   end
 
+  test "catchup ignores a persisted change operation from an earlier release", ctx do
+    request = open_request(ctx, "Still waiting for a briefing?")
+
+    payload =
+      JSON.encode!(%{
+        "operation_kind" => "change",
+        "message_id" => "earlier-message",
+        "request" => ["retract", "--request", "earlier-message"]
+      })
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO harklight_send_operations(opId,sessionKey,host,payload,attemptedAt,state,createdAt,updatedAt) VALUES(?1,?2,?3,?4,1,'pending',1,1)",
+               [
+                 "2f83074b-529a-4bd8-bb5a-c9c9c2638878",
+                 ctx.compiler.session_key,
+                 Placement.local_host_name(),
+                 payload
+               ]
+             )
+
+    assert %{ok: true, listed: 1, requests: [%{request_id: id}]} = catchup(ctx, 0)
+    assert id == request.id
+  end
+
   test "catchup refuses callers without the gateway admin authorization", ctx do
     assert %{ok: false, code: "not_owner"} =
              HarklightBriefings.catchup(ctx.db, ctx.call, authorized: false)

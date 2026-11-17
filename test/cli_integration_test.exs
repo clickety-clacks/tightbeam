@@ -3385,8 +3385,6 @@ defmodule Tightbeam.CliIntegrationTest do
       {"harklight-settle", ["harklight-settle", "--message", "message-example"],
        "invalid Harklight command flags"},
       {"harklight-follow", ["harklight-follow", "--message", "message-example"],
-       "invalid Harklight command flags"},
-      {"harklight-listener-restore", ["harklight-listener-restore", "--handle", "handle-example"],
        "invalid Harklight command flags"}
     ]
 

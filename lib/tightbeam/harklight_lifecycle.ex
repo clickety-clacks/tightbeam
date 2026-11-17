@@ -87,45 +87,6 @@ defmodule Tightbeam.HarklightLifecycle do
     end
   end
 
-  def lookup_change(db, message_id) do
-    case DB.query(
-           db,
-           """
-           SELECT s.opId,s.sessionKey,s.payload,r.outcome
-           FROM harklight_send_operations s
-           LEFT JOIN harklight_command_results r ON r.opId=s.opId
-           WHERE json_extract(s.payload,'$.operation_kind')='change'
-             AND json_extract(s.payload,'$.message_id')=?1
-           ORDER BY CASE WHEN r.opId IS NULL THEN 0 ELSE 1 END,s.createdAt DESC,s.opId DESC
-           LIMIT 1
-           """,
-           [message_id]
-         ) do
-      {:ok, [[op_id, session_key, payload, outcome]]} ->
-        prepared = JSON.decode!(payload)
-
-        %{
-          op_id: op_id,
-          session_key: session_key,
-          payload: payload,
-          request: prepared["request"],
-          command: prepared["command"],
-          message_id: prepared["message_id"],
-          state: outcome || "pending"
-        }
-
-      {:ok, []} ->
-        nil
-    end
-  end
-
-  def unresolved_change(db, message_id) do
-    case lookup_change(db, message_id) do
-      %{state: "pending"} = operation -> operation
-      _ -> nil
-    end
-  end
-
   def unresolved(db, ids) do
     Enum.find(ids, fn id -> match?(%{state: "pending"}, lookup(db, id)) end)
   end
@@ -167,34 +128,6 @@ defmodule Tightbeam.HarklightLifecycle do
     DB.transaction(db, fn txn ->
       effects_in_txn(txn, op_id) ||
         record_result_in_txn(txn, op_id, "refused", %{wake_effect: "none"})
-    end)
-  end
-
-  def record_change_result(db, record, op_id, command, outcome)
-      when command in ["revise", "retract"] and outcome in ["committed", "refused", "failed"] do
-    DB.transaction(db, fn txn ->
-      case effects_in_txn(txn, op_id) do
-        nil ->
-          effects =
-            case {command, outcome} do
-              {"retract", "committed"} ->
-                %{
-                  wake_effect: "ended",
-                  pending_delivery: end_in_txn(txn, record, op_id, nil, "not_needed")
-                }
-
-              {"revise", "committed"} ->
-                %{wake_effect: "kept"}
-
-              _ ->
-                %{wake_effect: "none"}
-            end
-
-          record_result_in_txn(txn, op_id, outcome, effects)
-
-        effects ->
-          effects
-      end
     end)
   end
 
