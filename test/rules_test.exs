@@ -3427,6 +3427,8 @@ defmodule Tightbeam.RulesTest do
     path = Path.join(base, "state.db")
     {:ok, _} = DB.start_link(path: path, name: db, guard_inputs: [], payload_root: payload)
     :ok = Tightbeam.Schema.ensure_all(db)
+    # Gateway boot activates recognition after the schema pass (main 95404352).
+    :ok = Tightbeam.Recognition.activate(db)
     :ok = Wakes.activate_wait_recognition(db)
     :ok = Tightbeam.FilingRemedy.install_handlers(db, Gateway.handlers(%{db: db}))
 
@@ -3495,6 +3497,8 @@ defmodule Tightbeam.RulesTest do
 
     {:ok, _} = DB.start_link(path: path, name: db, guard_inputs: [], payload_root: payload)
     :ok = Tightbeam.Schema.ensure_all(db)
+    # Gateway boot activates recognition after the schema pass (main 95404352).
+    :ok = Tightbeam.Recognition.activate(db)
     :ok = Wakes.activate_wait_recognition(db)
     :ok = Tightbeam.FilingRemedy.install_handlers(db, Gateway.handlers(%{db: db}))
 
