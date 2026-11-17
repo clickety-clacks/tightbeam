@@ -106,6 +106,7 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
 
   test "remote identity and terminal-record timeouts stay pending", ctx do
     {row, _} = prepare(ctx)
+
     {:ok, _} =
       DB.query(ctx.db, "UPDATE harness_processes SET ssh = 'fixture' WHERE launchId = ?1", [
         row.launch_id
