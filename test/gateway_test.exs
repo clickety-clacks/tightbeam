@@ -13655,6 +13655,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "a failed workspace transfer replaces a favorable assessment with its persisted reason",
        ctx do
+    ensure_global_registry()
     owner = ctx.device.user_id
 
     register_hosts(ctx.db, %{
