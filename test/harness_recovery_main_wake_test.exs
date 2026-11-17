@@ -174,7 +174,7 @@ defmodule Tightbeam.HarnessRecoveryMainWakeTest do
                _ -> false
              end)
 
-    assert rule_provenance["bundle"] == "seed"
+    assert rule_provenance["bundle"] == "substrate"
     assert rule_provenance["source"] == "rules/harness-recovery-main-wake.toml"
     assert english =~ "cycle release (`cycleRelease` true)"
     assert english =~ "ordinary-turn resolution"
