@@ -1472,6 +1472,15 @@ defmodule Tightbeam.Assignments do
   @doc "Log legacy review/item conflicts without mutating assignment rows."
   @spec audit_review_item_conflicts(DB.server()) :: :ok
   def audit_review_item_conflicts(db) do
+    if DB.overloaded?(db) do
+      Logger.debug("database overloaded; review item audit deferred")
+      :ok
+    else
+      DB.background_pass(fn -> audit_review_item_conflicts_now(db) end)
+    end
+  end
+
+  defp audit_review_item_conflicts_now(db) do
     {:ok, conflicts} =
       DB.transaction(db, fn txn ->
         Txn.q(
@@ -2244,7 +2253,7 @@ defmodule Tightbeam.Assignments do
         best_effort(fn -> notify(call, :on_assignment_change, assignment_id, from) end)
       end
 
-      Map.delete(result, :revocation_replayed)
+      result |> Map.delete(:revocation_replayed) |> warn_non_owner_assignment(db, call)
     end
   rescue
     TransitionRace ->
@@ -2283,11 +2292,59 @@ defmodule Tightbeam.Assignments do
         best_effort(fn -> notify(call, :on_assignment_change, assignment_id, prior_state) end)
       end
 
-      result
+      warn_non_owner_assignment(result, db, call)
     end
   rescue
     TransitionRace ->
       error("transition_race", "assignment changed state during the reopen; read it and retry")
+  end
+
+  defp warn_non_owner_assignment(%{code: _} = result, _db, _call), do: result
+
+  defp warn_non_owner_assignment(result, db, %{principal: principal, params: params})
+       when is_map(result) do
+    case DB.query(
+           db,
+           """
+           SELECT COALESCE(w.ownerUserId, a.openedByUser, s.ownerUserId)
+           FROM assignments a
+           LEFT JOIN work_items w ON w.id = a.workItemId
+           LEFT JOIN sessions s ON s.sessionKey = COALESCE(a.currentOpenerSessionKey, a.openedBySession)
+           WHERE a.id = ?1
+           """,
+           [params[:assignment_id]]
+         ) do
+      {:ok, [[owner]]} ->
+        caller_owner =
+          case principal do
+            {:user, user} ->
+              user
+
+            {:session, session} ->
+              case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [
+                     session
+                   ]) do
+                {:ok, [[user]]} -> user
+                _ -> nil
+              end
+
+            _ ->
+              owner
+          end
+
+        if caller_owner != owner do
+          warning =
+            "#{principal_id(principal)} acted on an assignment owned by #{owner}; the action proceeded."
+
+          Logger.warning(warning)
+          Map.put(result, :warning, warning)
+        else
+          result
+        end
+
+      _ ->
+        result
+    end
   end
 
   defp assignments_result(db, call) do
@@ -4890,6 +4947,17 @@ defmodule Tightbeam.Assignments do
                    if Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit) do
                      {:cont,
                       {:ok, [%{"repo" => repo, "commit" => String.downcase(commit)} | acc]}}
+                   else
+                     {:halt, :error}
+                   end
+
+                 {["commit", "ref", "remote", "repo"], repo, commit}
+                 when is_binary(repo) and is_binary(commit) and
+                        byte_size(commit) in [40, 64] ->
+                   if is_binary(ref["remote"]) and ref["remote"] != "" and
+                        is_binary(ref["ref"]) and ref["ref"] != "" and
+                        Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit) do
+                     {:cont, {:ok, [Map.put(ref, "commit", String.downcase(commit)) | acc]}}
                    else
                      {:halt, :error}
                    end

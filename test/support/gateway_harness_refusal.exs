@@ -120,8 +120,8 @@ defmodule GatewayHarnessRefusal do
         |> Enum.map(& &1["text"])
         |> Enum.join("\n")
 
-      assert prompt == content
-      assert byte_size(prompt) == 65_537
+      assert prompt == "[from You]\n\n" <> content
+      assert byte_size(prompt) == 65_549
       assert {:ok, [[^content, 65_537]]} =
                Tightbeam.DB.query(
                  db,

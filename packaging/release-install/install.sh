@@ -14,7 +14,8 @@ absent() { [[ ! -e "$1" && ! -L "$1" ]] || fail "planned output already exists: 
 [[ $(/usr/bin/uname -s):$(/usr/bin/uname -m) == Linux:x86_64 ]] || fail 'unsupported platform'
 (cd "$DIR" && /usr/bin/sha256sum -c SHA256SUMS) || fail 'release bundle hash mismatch'
 [[ $(value '.format') == 1 ]] || fail 'unsupported manifest format'
-[[ $(value '.purpose') == prerelease-soak || $(value '.purpose') == release-install ]] || fail 'unsupported install purpose'
+PURPOSE=$(value '.purpose')
+[[ $PURPOSE == candidate-soak || $PURPOSE == release-install ]] || fail 'unsupported install purpose'
 
 OLD_VERSION=$(value '.predecessor.version')
 OLD_BUILD=$(value '.predecessor.build')
@@ -57,13 +58,41 @@ JOB_TARGET=$JOB_DIR/maintenance-job.sh
 [[ $(/usr/bin/sha256sum "$DIR/maintenance-job.sh" | /usr/bin/awk '{print $1}') == "$JOB_SHA" ]] || fail 'job does not match manifest'
 [[ $(/usr/bin/sha256sum "$DIR/$NEW_PACKAGE" | /usr/bin/awk '{print $1}') == "$NEW_PACKAGE_SHA" ]] || fail 'package does not match manifest'
 [[ $(/usr/bin/sha256sum "$DIR/release-provenance.json" | /usr/bin/awk '{print $1}') == "$(value '.release.provenance_sha256')" ]] || fail 'provenance hash mismatch'
-[[ $(/usr/bin/sha256sum "$DIR/release-SHA256SUMS" | /usr/bin/awk '{print $1}') == "$(value '.release.checksums_sha256')" ]] || fail 'published checksum file mismatch'
-(cd "$DIR" && /usr/bin/sha256sum -c release-SHA256SUMS --ignore-missing) || fail 'published package checksum mismatch'
+[[ $(/usr/bin/sha256sum "$DIR/release-SHA256SUMS" | /usr/bin/awk '{print $1}') == "$(value '.release.checksums_sha256')" ]] || fail 'release checksum file mismatch'
+(cd "$DIR" && /usr/bin/sha256sum -c release-SHA256SUMS --ignore-missing) || fail 'release package checksum mismatch'
 /usr/bin/jq -e --arg tag "$NEW_TAG" --arg source "$NEW_SOURCE" --arg package "$NEW_PACKAGE" '
   .repository == "clickety-clacks/tightbeam" and .tag == $tag and .commit == $source
   and .checksums == "SHA256SUMS" and (.workflow | type == "string" and length > 0)
   and ([.assets[] | select(. == $package)] | length) == 1
 ' "$DIR/release-provenance.json" >/dev/null || fail 'release provenance mismatch'
+if [[ $PURPOSE == candidate-soak || -f "$DIR/release-candidate-manifest.json" ]]; then
+  CANDIDATE_RUN=$(value '.candidate.run_id')
+  CANDIDATE_WORKFLOW=$(value '.candidate.workflow')
+  CANDIDATE_WORKFLOW_SHA=$(value '.candidate.workflow_sha')
+  CANDIDATE_PROOF_SHA=$(value '.candidate.proof_manifest_sha256')
+  [[ $(/usr/bin/sha256sum "$DIR/release-candidate-manifest.json" | /usr/bin/awk '{print $1}') == "$CANDIDATE_PROOF_SHA" ]] || fail 'candidate proof manifest hash mismatch'
+  /usr/bin/jq -e --arg source "$NEW_SOURCE" --arg run "$CANDIDATE_RUN" --arg workflow_sha "$CANDIDATE_WORKFLOW_SHA" --arg package_sha "$NEW_PACKAGE_SHA" --arg version "$NEW_VERSION" '
+    .schema == "tightbeam-release-candidate-proof/v1"
+    and .repository == "clickety-clacks/tightbeam"
+    and .candidate_ref == "refs/heads/main"
+    and .run_id == $run
+    and .source_sha == $source
+    and .workflow_sha == $workflow_sha
+    and $workflow_sha == $source
+    and ([.packages[] | select(.platform == "linux-x86_64" and .sha256 == $package_sha and .path == ("packages/linux-x86_64/tightbeam-" + $version + "-linux-x86_64.tgz"))] | length) == 1
+  ' "$DIR/release-candidate-manifest.json" >/dev/null || fail 'candidate proof manifest identity mismatch'
+  /usr/bin/jq -e --arg tag "$NEW_TAG" --arg source "$NEW_SOURCE" --arg run "$CANDIDATE_RUN" --arg candidate_workflow "$CANDIDATE_WORKFLOW" --arg workflow_sha "$CANDIDATE_WORKFLOW_SHA" --arg proof_sha "$CANDIDATE_PROOF_SHA" --arg purpose "$PURPOSE" '
+    .repository == "clickety-clacks/tightbeam"
+    and .tag == $tag
+    and .commit == $source
+    and .candidate.run_id == $run
+    and .candidate.workflow == $candidate_workflow
+    and .candidate.workflow_sha == $workflow_sha
+    and .candidate.proof_manifest_sha256 == $proof_sha
+    and (.candidate.workflow | type == "string" and length > 0)
+    and ($purpose != "candidate-soak" or (.format == "tightbeam-release-candidate-provenance/v1" and .workflow == .candidate.workflow))
+  ' "$DIR/release-provenance.json" >/dev/null || fail 'candidate release provenance mismatch'
+fi
 while IFS= read -r required; do [[ -e "$required" ]] || fail "required path is absent: $required"; done < <(/usr/bin/jq -er '.required_paths[]' "$MANIFEST")
 while IFS=' ' read -r expected path; do
   [[ -r "$path" ]] || fail "required file is absent: $path"
@@ -92,7 +121,7 @@ absent "$NEW_TARGET"; absent "$JOB_DIR"; absent "$LOG"; absent "$BACKUP"
 TMP=$(/usr/bin/mktemp -d /tmp/tightbeam-release-stage.XXXXXX)
 trap '/usr/bin/rm -rf -- "$TMP"' EXIT
 /usr/bin/tar -xzf "$DIR/$NEW_PACKAGE" -C "$TMP" tightbeam/bin/tightbeam-select
-[[ -x "$TMP/tightbeam/bin/tightbeam-select" ]] || fail 'published selector is absent'
+[[ -x "$TMP/tightbeam/bin/tightbeam-select" ]] || fail 'release selector is absent'
 /usr/bin/env PATH="$(/usr/bin/dirname "$NODE"):/usr/local/bin:/usr/bin:/bin" "$TMP/tightbeam/bin/tightbeam-select" stage \
   --root "$ROOT" --package "$DIR/$NEW_PACKAGE" \
   --checksums "$DIR/release-SHA256SUMS" --provenance "$DIR/release-provenance.json" > "$TMP/stage-receipt.json"

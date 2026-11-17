@@ -876,6 +876,9 @@ defmodule Tightbeam.ModelCatalog do
         {:unavailable, detail} ->
           {:error, {:credential_status_unavailable, detail}}
 
+        {:pending, nil} ->
+          {:error, :credential_status_pending}
+
         # Onboarded, but the harness-home metadata records no kind. Refused rather than
         # defaulted: the two kinds read different routes, so a catalog derived
         # against a guessed kind would be a confident answer about the wrong
@@ -953,6 +956,9 @@ defmodule Tightbeam.ModelCatalog do
 
       match?({:unavailable, _}, local) ->
         local
+
+      go == {:pending, nil} or local == {:pending, nil} ->
+        {:pending, nil}
 
       true ->
         {:needs_onboarding, :missing}

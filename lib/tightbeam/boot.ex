@@ -9,7 +9,7 @@ defmodule Tightbeam.Boot do
   startup and does not linger as a process.
   """
 
-  alias Tightbeam.{Escalation, EventLog, Ledger, Schema}
+  alias Tightbeam.{DB, Escalation, EventLog, Ledger, Schema}
 
   @spec child_spec(term()) :: Supervisor.child_spec()
   def child_spec(base_dir) do
@@ -23,7 +23,9 @@ defmodule Tightbeam.Boot do
 
   @doc "Run the boot sequence; returns :ignore so no process lingers."
   @spec start_link(map()) :: :ignore
-  def start_link(%{base_dir: base_dir} = config) do
+  def start_link(config), do: DB.startup_wait(fn -> boot(config) end)
+
+  defp boot(%{base_dir: base_dir} = config) do
     :ok = Tightbeam.DB.assert_base_admitted!(Tightbeam.DB, base_dir)
     Tightbeam.Identity.init_after_admission!(base_dir, Tightbeam.DB)
     Tightbeam.Gateway.load_law!(config)

@@ -24,10 +24,9 @@ defmodule Tightbeam.Acp.Adapter do
   alias Tightbeam.{ErrorDiagnostic, Harness, Model}
   alias Tightbeam.Acp.{Conn, ContextUsage}
 
-  # Boot may spend 60s initializing ACP before the separate 120s gate
-  # deadline starts. Residency calls queue behind handle_continue, so their
-  # caller budget must clear the full boot boundary.
-  @boot_boundary_timeout 185_000
+  # Residency calls queue behind handle_continue while ACP boots. A healthy
+  # adapter can take longer than any fixed boot budget; its exit resolves calls.
+  @boot_boundary_timeout :infinity
   # A prompt waits until the harness finishes it. Only a caller that passes an
   # explicit `:timeout` gets an absolute deadline; only the owning connection
   # may escalate after that cancellation fails.
@@ -476,7 +475,7 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, launch_id} ->
         db = Keyword.get(opts, :db, Tightbeam.DB)
 
-        case Tightbeam.HarnessProcess.capture_identity(db, launch_id, 5_000, conn) do
+        case capture_launch_identity(db, launch_id, conn, 250) do
           :ok ->
             :ok
 
@@ -540,6 +539,17 @@ defmodule Tightbeam.Acp.Adapter do
            offset,
            Keyword.get(opts, :harness_process_satellite_host)
          ), state}
+    end
+  end
+
+  defp capture_launch_identity(db, launch_id, conn, delay_ms) do
+    case Tightbeam.HarnessProcess.capture_identity(db, launch_id, 5_000, conn) do
+      {:pending, _reason} ->
+        Process.sleep(delay_ms)
+        capture_launch_identity(db, launch_id, conn, min(delay_ms * 2, 5_000))
+
+      answer ->
+        answer
     end
   end
 

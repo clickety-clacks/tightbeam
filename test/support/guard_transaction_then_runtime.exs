@@ -101,6 +101,7 @@ try do
   try do
     :ok = Schema.ensure_all(reopened)
     :ok = DB.execute(reopened, "UPDATE pending_recognition SET nextAt=0")
+    :ok = Tightbeam.Recognition.activate(reopened)
     retry = :sys.get_state(reopened).retry
     # The permanently failing earlier publication may be selected first.
     for _ <- 1..2 do
