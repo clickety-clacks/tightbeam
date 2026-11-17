@@ -6523,6 +6523,8 @@ defmodule Tightbeam.Wakes do
     Tightbeam.RowReactions.recover(Keyword.get(opts, :db, Tightbeam.DB))
 
     state = %{
+      identity_staleness_check: Keyword.get(opts, :identity_staleness_check),
+      identity_staleness_interval_ms: Keyword.get(opts, :identity_staleness_interval_ms),
       deliver: Keyword.fetch!(opts, :deliver),
       db: Keyword.get(opts, :db, Tightbeam.DB),
       timer: nil,
@@ -6536,6 +6538,10 @@ defmodule Tightbeam.Wakes do
       delivery_opts: Keyword.get(opts, :delivery_opts, []),
       internal_consumers: Keyword.get(opts, :internal_consumers, %{})
     }
+
+    if state.identity_staleness_check do
+      Process.send_after(self(), :identity_staleness_check, state.identity_staleness_interval_ms)
+    end
 
     Process.send_after(self(), :detect_misses, @miss_detector_ms)
     send(self(), :recover_notices)
@@ -6644,6 +6650,12 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_info({:timeout, _stale_timer, :due}, state), do: {:noreply, state}
+
+  def handle_info(:identity_staleness_check, state) do
+    DB.background_pass(state.identity_staleness_check)
+    Process.send_after(self(), :identity_staleness_check, state.identity_staleness_interval_ms)
+    {:noreply, state}
+  end
 
   def handle_info(:detect_misses, state) do
     state = DB.background_pass(fn -> detect_misses(state) end, state)

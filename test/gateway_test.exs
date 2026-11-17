@@ -11089,6 +11089,36 @@ defmodule Tightbeam.GatewayTest do
     assert AdminProjection.stamped_item(ctx.db, "identity", "served") == stamp
   end
 
+  test "turn end performs no identity staleness query", ctx do
+    session = create_session(ctx.db, "agent:terminal-no-staleness", "flynn")
+    ensure_global_registry()
+
+    :ok =
+      DB.execute(ctx.db, "ALTER TABLE admin_projection_versions RENAME TO identity_out_of_reach")
+
+    try do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok =
+                   Gateway.terminal_publisher_for_test(ctx.db).(%{
+                     session_key: session.session_key,
+                     message_id: "terminal-no-staleness",
+                     status: "delivered",
+                     seq: 1
+                   })
+        end)
+
+      refute log =~ "admin_projection_versions"
+      refute log =~ "identity_out_of_reach"
+    after
+      :ok =
+        DB.execute(
+          ctx.db,
+          "ALTER TABLE identity_out_of_reach RENAME TO admin_projection_versions"
+        )
+    end
+  end
+
   test "identity staleness alarm counts only active post-publication turns and dedupes by revision day",
        ctx do
     base_dir = role_test_base("identity-staleness-alarm")
@@ -11154,13 +11184,39 @@ defmodule Tightbeam.GatewayTest do
 
     assert Org.get(ctx.db, quiet.session_key).state == "active"
 
-    assert :ok =
-             Gateway.terminal_publisher_for_test(ctx.db).(%{
-               session_key: late_one.session_key,
-               message_id: "identity-staleness-publish",
-               status: "delivered",
-               seq: first_seq
-             })
+    # A terminal publication must not even read identity staleness state.
+    # Removing its source table makes any staleness query observable, including
+    # a failure swallowed by the publisher's best-effort boundary.
+    :ok =
+      DB.execute(ctx.db, "ALTER TABLE admin_projection_versions RENAME TO identity_out_of_reach")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok =
+                 Gateway.terminal_publisher_for_test(ctx.db).(%{
+                   session_key: late_one.session_key,
+                   message_id: "identity-staleness-publish",
+                   status: "delivered",
+                   seq: first_seq
+                 })
+      end)
+
+    :ok =
+      DB.execute(ctx.db, "ALTER TABLE identity_out_of_reach RENAME TO admin_projection_versions")
+
+    refute log =~ "identity_out_of_reach"
+    refute log =~ "admin_projection_versions"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    # Exercise the actual scheduler message handler after publication and a
+    # post-publication turn, without sleeping for the production interval.
+    tick_state = %{
+      identity_staleness_check: fn -> Gateway.identity_staleness_alarm_for_test(ctx.db, now) end,
+      identity_staleness_interval_ms: :timer.hours(1)
+    }
+
+    assert {:noreply, ^tick_state} =
+             Tightbeam.Wakes.handle_info(:identity_staleness_check, tick_state)
 
     assert {:ok, [[target, owner, prompt, "process:tightbeam", 0]]} =
              DB.query(
@@ -11181,11 +11237,14 @@ defmodule Tightbeam.GatewayTest do
     assert :already_notified = Gateway.identity_staleness_alarm_for_test(ctx.db, now)
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
-    # wi_0b608f33: once today's notice exists, a turn end does not count late
+    # wi_0b608f33: once today's notice exists, a tick does not count late
     # sessions again. With the turn history out of reach, any count would fail.
     assert :ok = DB.execute(ctx.db, "ALTER TABLE turns RENAME TO turns_out_of_reach")
 
     try do
+      assert {:noreply, ^tick_state} =
+               Tightbeam.Wakes.handle_info(:identity_staleness_check, tick_state)
+
       assert :already_notified = Gateway.identity_staleness_alarm_for_test(ctx.db, now)
     after
       assert :ok = DB.execute(ctx.db, "ALTER TABLE turns_out_of_reach RENAME TO turns")
@@ -11214,10 +11273,10 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[3]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
-  # wi_0b608f33: this check runs at every turn end. Asking it must not need the
+  # wi_0b608f33: publication/timer checks must not need the
   # database writer: while the writer is busy with something slow, a turn end
   # still learns that today's notice exists, and also that nobody is late.
-  test "identity staleness check at turn end answers while the database writer is busy",
+  test "identity staleness timer check answers while the database writer is busy",
        _ctx do
     base_dir =
       System.tmp_dir!()
@@ -11320,7 +11379,7 @@ defmodule Tightbeam.GatewayTest do
     # Somebody is late and no notice exists yet: this one needs the writer.
     assert {:scheduled, 1, ^revision} = Gateway.identity_staleness_alarm_for_test(db, now)
 
-    # Today's notice exists: every later turn end answers without the writer.
+    # Today's notice exists: every later tick answers without the writer.
     assert {:ok, :already_notified} = check_while_held.()
     assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
   end

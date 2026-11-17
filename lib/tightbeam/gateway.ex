@@ -60,6 +60,8 @@ defmodule Tightbeam.Gateway do
     "agent:role" → the active role holder's owner; anything else → unknown_caller.
   """
 
+  @identity_staleness_interval_ms :timer.minutes(5)
+
   alias Tightbeam.{
     AdapterCoordinator,
     AttachmentDelivery,
@@ -350,6 +352,8 @@ defmodule Tightbeam.Gateway do
             "effort_deadline" => &EffortCheckin.ignore_retired_wake(db, &1)
           },
           tick_ms: config.wake_tick_ms,
+          identity_staleness_check: fn -> emit_identity_staleness_alarm(db) end,
+          identity_staleness_interval_ms: @identity_staleness_interval_ms,
           name: Tightbeam.WakeScheduler},
          {Tightbeam.HarklightWakes,
           db: db,
@@ -4438,8 +4442,6 @@ defmodule Tightbeam.Gateway do
             session_key: turn.session_key
           })
         )
-
-        emit_identity_staleness_alarm(db)
       end
 
       outcome =
@@ -4659,8 +4661,6 @@ defmodule Tightbeam.Gateway do
                   session_key: turn.session_key
                 })
               )
-
-              emit_identity_staleness_alarm(db)
             end
 
             # The RECORD half of the substrate's obligation. `Ledger.finish_in_txn`
@@ -4848,8 +4848,6 @@ defmodule Tightbeam.Gateway do
         )
       end
 
-      emit_identity_staleness_alarm(db)
-
       :ok
     end
   end
@@ -4862,14 +4860,12 @@ defmodule Tightbeam.Gateway do
     best_effort(fn -> identity_staleness_alarm(db, System.system_time(:millisecond)) end)
   end
 
-  # This runs at every turn end. Nearly every time there is nothing to do: no
-  # active session is late, or today's notice for the live revision already
-  # exists. So the question is asked on a reader, and the database writer is
-  # used only when a notice is to be scheduled, once per revision per day.
+  # Publication and the slow scheduler tick are the only callers. Counts run
+  # exclusively on readers; the writer only confirms revision and notice ID.
   defp identity_staleness_alarm(db, now) do
     case DB.read_transaction(db, &identity_staleness_check_in_txn(&1, now)) do
-      {:ok, {:late, _revision, _late_count, _wake_id, _owner, _target}} ->
-        case DB.transaction(db, &identity_staleness_alarm_in_txn(&1, now)) do
+      {:ok, {:late, _, _, _, _, _} = late} ->
+        case DB.transaction(db, &identity_staleness_alarm_in_txn(&1, now, late)) do
           {:ok, result} -> result
           {:error, error} -> raise error
         end
@@ -4882,9 +4878,13 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp identity_staleness_alarm_in_txn(txn, now) do
-    case identity_staleness_check_in_txn(txn, now) do
-      {:late, revision, late_count, wake_id, owner, target} ->
+  defp identity_staleness_alarm_in_txn(
+         txn,
+         now,
+         {:late, revision, late_count, wake_id, owner, target}
+       ) do
+    case identity_staleness_notice_in_txn(txn, now) do
+      {:pending, ^revision, _published_at, ^wake_id} ->
         Wakes.schedule_in_txn(txn, %{
           wake_id: wake_id,
           session_key: target,
@@ -4901,17 +4901,37 @@ defmodule Tightbeam.Gateway do
 
         {:scheduled, late_count, revision}
 
+      {:pending, _, _, _} ->
+        :revision_changed
+
       result ->
         result
     end
   end
 
   # Reads only. The day's notice is looked up before anything is counted, so
-  # once it exists a turn end costs two key lookups and no count. The live
+  # once it exists a tick costs two key lookups and no count. The live
   # revision is read out of the served projection in SQL: the item carries
   # per-session data, and decoding all of it to read one field grew with the
   # number of sessions.
   defp identity_staleness_check_in_txn(txn, now) do
+    case identity_staleness_notice_in_txn(txn, now) do
+      {:pending, revision, published_at, wake_id} ->
+        with late_count when late_count > 0 <-
+               identity_staleness_late_count(txn, revision, published_at),
+             {owner, target} <- identity_staleness_owner(txn) do
+          {:late, revision, late_count, wake_id, owner, target}
+        else
+          0 -> :current
+          nil -> :no_owner_surface
+        end
+
+      result ->
+        result
+    end
+  end
+
+  defp identity_staleness_notice_in_txn(txn, now) do
     case Txn.q(
            txn,
            "SELECT json_extract(item, '$.liveRevision'), updatedAt " <>
@@ -4927,14 +4947,7 @@ defmodule Tightbeam.Gateway do
             :already_notified
 
           [] ->
-            with late_count when late_count > 0 <-
-                   identity_staleness_late_count(txn, revision, published_at),
-                 {owner, target} <- identity_staleness_owner(txn) do
-              {:late, revision, late_count, wake_id, owner, target}
-            else
-              0 -> :current
-              nil -> :no_owner_surface
-            end
+            {:pending, revision, published_at, wake_id}
         end
 
       [[revision, _published_at]] ->
@@ -5987,8 +6000,14 @@ defmodule Tightbeam.Gateway do
            AdminProjection.served_entries(db, config.base_dir),
            opts
          ) do
-      {:ok, _changed} -> result
-      {:error, error} -> error
+      {:ok, changed} ->
+        if Enum.any?(changed, &Map.has_key?(&1, "liveRevision")),
+          do: emit_identity_staleness_alarm(db)
+
+        result
+
+      {:error, error} ->
+        error
     end
   end
 
