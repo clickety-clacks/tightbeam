@@ -12028,6 +12028,13 @@ defmodule Tightbeam.GatewayTest do
     revision = Identity.live_revision!(base_dir)
     [first, second] = for n <- 1..2, do: identity_apply_step_session(ctx.db, "sup-#{n}", revision)
 
+    second_cwd =
+      Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), Org.get(ctx.db, second))
+
+    Identity.provision_at!(base_dir, revision, "coder", :codex, second_cwd)
+    second_skill = Path.join(second_cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+    second_body = File.read!(second_skill)
+
     started =
       identity_edit!(
         base_dir,
@@ -12070,6 +12077,9 @@ defmodule Tightbeam.GatewayTest do
              } = result
     end
 
+    # Nothing of the overtaken revision reached the session: not its files,
+    # not its stamp, not a prompt.
+    assert File.read!(second_skill) == second_body
     assert Org.get(ctx.db, second).identity_revision == revision
     assert Tightbeam.Wakes.list_for_session(ctx.db, second) == []
   end
@@ -12522,6 +12532,11 @@ defmodule Tightbeam.GatewayTest do
 
     assert session_key == session.session_key
     assert Identity.live_revision!(base_dir) == newer
+
+    # The files of the run's revision were already written when the newer one
+    # was published; the stamp still names the revision before the run, so the
+    # session reads as behind and the next apply rewrites the files.
+    assert File.read!(skill) == "captured revision"
     assert Org.get(ctx.db, session.session_key).identity_revision == original
     assert Tightbeam.Wakes.list_for_session(ctx.db, session.session_key) == []
 

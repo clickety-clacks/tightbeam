@@ -6338,8 +6338,9 @@ defmodule Tightbeam.Gateway do
   end
 
   # A session whose stamp already matches and whose reread prompt is already
-  # recorded needs no write. No lock is taken and the database writer is not
-  # used, so a repeated pass over an applied org is reads only.
+  # recorded needs no write. No lock is taken, and on a file-backed database
+  # these reads go to the reader pool, so a repeated pass over an applied org
+  # does not use the writer.
   defp identity_apply_already_current(db, session, snapshot, revision) do
     if identity_stamp_matches?(session, snapshot) do
       prompt = identity_apply_prompt(revision)
