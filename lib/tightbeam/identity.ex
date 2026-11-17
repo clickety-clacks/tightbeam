@@ -1539,6 +1539,14 @@ defmodule Tightbeam.Identity do
          ) do
       {_output, 0} -> true
       {_output, 1} -> false
+      {output, 128} ->
+        if String.trim_trailing(output) ==
+             "fatal: path '#{path}' does not exist in '#{revision}'" do
+          false
+        else
+          raise "git cat-file failed (128): #{output}"
+        end
+
       {output, status} -> raise "git cat-file failed (#{status}): #{output}"
     end
   end
