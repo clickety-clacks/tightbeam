@@ -1894,15 +1894,13 @@ defmodule Tightbeam.StateResources do
     |> query(sql, params)
   end
 
+  # A read: it runs on a read connection, never in the database writer.
   defp observed_query(db, principal, sql, params) do
-    case DB.transaction(db, fn txn ->
-           txn
-           |> Txn.observe_queries(principal_trace(principal))
-           |> query(sql, params)
-         end) do
-      {:ok, rows} -> rows
-      {:error, error} -> raise error
-    end
+    DB.read_transaction!(db, fn txn ->
+      txn
+      |> Txn.observe_queries(principal_trace(principal))
+      |> query(sql, params)
+    end)
   end
 
   defp principal_trace(principal) when is_map(principal),
@@ -3629,12 +3627,9 @@ defmodule Tightbeam.StateResources do
 
   defp with_read_transaction(%Txn{} = txn, fun), do: fun.(txn)
 
-  defp with_read_transaction(db, fun) do
-    case DB.transaction(db, fun) do
-      {:ok, result} -> result
-      {:error, error} -> raise error
-    end
-  end
+  # Session history, turns, wakes, work items and assignments pages read here.
+  # They run on a read connection, never in the database writer.
+  defp with_read_transaction(db, fun), do: DB.read_transaction!(db, fun)
 
   defp query(db, sql, params) do
     {:ok, rows} = DB.query(db, sql, params)
