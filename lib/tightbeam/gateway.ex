@@ -2736,15 +2736,24 @@ defmodule Tightbeam.Gateway do
   defp unresponsive_reason_in_txn(txn, target) do
     case DB.Txn.q(txn, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [target]) do
       [[harness, host]] ->
+        parked? =
+          HarnessProcess.parked_in_txn?(txn, {Harness.parse!(harness).id(), "shared", host})
+
+        # Incident membership is a snapshot of affected sessions, not a hold.
+        # A rate-limit incident establishes the adapter park fence that stops turns.
+        incident_hold? =
+          parked? and
+            DB.Txn.q(
+              txn,
+              "SELECT 1 FROM harness_health_incidents WHERE harness=?1 AND host=?2 AND failureClass='rate-limit-dead' AND state='open' LIMIT 1",
+              [harness, host]
+            ) != []
+
         cond do
-          DB.Txn.q(
-            txn,
-            "SELECT i.failureClass FROM harness_health_incidents i JOIN harness_health_members m ON m.incidentId=i.id WHERE m.sessionKey=?1 AND i.state='open' LIMIT 1",
-            [target]
-          ) != [] ->
+          incident_hold? ->
             "the recipient is held by a harness incident"
 
-          HarnessProcess.parked_in_txn?(txn, {Harness.parse!(harness).id(), "shared", host}) ->
+          parked? ->
             "the recipient's harness is parked"
 
           Tightbeam.Application.draining?() ->

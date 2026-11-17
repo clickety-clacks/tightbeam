@@ -69,7 +69,7 @@ defmodule Tightbeam.UnresponsiveBounceTest do
     end
   end
 
-  test "an open harness hold tells the sender why the recipient has not read the message", ctx do
+  test "a rate-limit incident with a park fence tells the sender why", ctx do
     assert {:ok, []} =
              DB.query(
                ctx.db,
@@ -82,21 +82,53 @@ defmodule Tightbeam.UnresponsiveBounceTest do
                HarnessHealth.observe_in_txn(txn, %{
                  harness: "claude",
                  host: "testhost",
-                 failure_class: "auth-dead",
+                 failure_class: "rate-limit-dead",
                  evidence_kind: "authoritative-provider",
                  session_key: ctx.target,
                  assignment_id: "asg_unresponsive_hold",
                  observed_at: System.system_time(:millisecond),
                  correlation_id: "unresponsive-hold",
-                 cause: "credential refused",
+                 cause: "provider usage limit",
                  principal: "process:tightbeam"
                })
              end)
+
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
 
     assert {:ok, delivery} = deliver_in_txn(ctx, "w_unresponsive_hold_source")
     assert_source_queued(ctx.db, "w_unresponsive_hold_source", delivery)
     assert {:ok, [[notice]]} = bounce_prompts(ctx.db)
     assert notice =~ "held by a harness incident"
+  end
+
+  test "incident membership without a park fence does not claim the recipient is held", ctx do
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider) VALUES('asg_unresponsive_unparked','affected work',?1,?1,1,'open','claude','anthropic')",
+               [ctx.target]
+             )
+
+    assert {:ok, {:opened, _incident}} =
+             DB.transaction(ctx.db, fn txn ->
+               HarnessHealth.observe_in_txn(txn, %{
+                 harness: "claude",
+                 host: "testhost",
+                 failure_class: "auth-dead",
+                 evidence_kind: "authoritative-provider",
+                 session_key: ctx.target,
+                 assignment_id: "asg_unresponsive_unparked",
+                 observed_at: System.system_time(:millisecond),
+                 correlation_id: "unresponsive-unparked",
+                 cause: "credential refused",
+                 principal: "process:tightbeam"
+               })
+             end)
+
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
+    assert {:ok, delivery} = deliver_in_txn(ctx, "w_unresponsive_unparked_source")
+    assert_source_queued(ctx.db, "w_unresponsive_unparked_source", delivery)
+    assert {:ok, []} = bounce_prompts(ctx.db)
   end
 
   test "a recipient not admitting turns queues the sender notice", ctx do
