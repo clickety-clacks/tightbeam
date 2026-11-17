@@ -156,7 +156,7 @@ defmodule Tightbeam.IdentityTest do
                purpose:
                  "Route decision requests through a configurable investigator, preserve its Harklight conversation, and reconcile staged catchup without duplicate briefings.",
                phrases: [],
-               root_archetype: "orchestrator"
+               root_archetype: "harklight-decision-briefings.orchestrator"
              },
              %{
                name: "sentinels",
