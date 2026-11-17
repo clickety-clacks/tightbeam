@@ -7178,7 +7178,7 @@ defmodule Tightbeam.GatewayTest do
 
     sh = fn command ->
       send(parent, {:spinup_command, command})
-      {"", 0}
+      successful_readiness_probe(command)
     end
 
     start_supervised!(%{
@@ -7206,7 +7206,10 @@ defmodule Tightbeam.GatewayTest do
   test "explicit spawn and tune do not gate model names on either host catalog", ctx do
     base_dir = move_test_base(ctx.db, "per-host-validate", "worker")
     parent = self()
-    sh = fn command -> send(parent, {:spinup_command, command}) && {"", 0} end
+    sh = fn command ->
+      send(parent, {:spinup_command, command})
+      successful_readiness_probe(command)
+    end
 
     start_supervised!(%{
       id: :per_host_validate_registry,
@@ -7290,7 +7293,10 @@ defmodule Tightbeam.GatewayTest do
   test "a harness with no GATEWAY credential still spawns on a satellite that has one", ctx do
     base_dir = move_test_base(ctx.db, "satellite-only-harness", "worker")
     parent = self()
-    sh = fn command -> send(parent, {:spinup_command, command}) && {"", 0} end
+    sh = fn command ->
+      send(parent, {:spinup_command, command})
+      successful_readiness_probe(command)
+    end
 
     start_supervised!(%{
       id: :satellite_only_registry,
@@ -9733,7 +9739,7 @@ defmodule Tightbeam.GatewayTest do
     File.write!(Path.join(source, "memory.md"), "keep")
 
     sh = fn command ->
-      if hd(command) == "rsync", do: {"copy failed", 23}, else: {"", 0}
+      if hd(command) == "rsync", do: {"copy failed", 23}, else: successful_readiness_probe(command)
     end
 
     tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
@@ -9756,7 +9762,7 @@ defmodule Tightbeam.GatewayTest do
 
     sh = fn command ->
       if hd(command) == "rsync", do: send(parent, {:unexpected_command, command})
-      {"", 0}
+      successful_readiness_probe(command)
     end
 
     tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
@@ -9775,7 +9781,9 @@ defmodule Tightbeam.GatewayTest do
     base_dir = move_test_base(ctx.db, "readiness-denial")
 
     sh = fn command ->
-      if String.contains?(List.last(command), "test -f"), do: {"", 1}, else: {"", 0}
+      if String.contains?(List.last(command), "test -f"),
+        do: {"", 1},
+        else: successful_readiness_probe(command)
     end
 
     tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
@@ -15620,8 +15628,14 @@ defmodule Tightbeam.GatewayTest do
     # checks the adapter BEFORE credentials, so a test asking for a credentials
     # denial needs the adapter present regardless. These used to be satisfied by a
     # sibling checkout that happened to exist on the developer's machine (#46).
-    for bin <- ["claude-agent-acp", "codex-acp"] do
+    for {bin, module} <- [
+          {"claude-agent-acp", Tightbeam.Harness.Claude},
+          {"codex-acp", Tightbeam.Harness.Codex}
+        ] do
       adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", bin])
+      manifest = Path.join([base_dir, "adapters", "node_modules", module.install_package(), "package.json"])
+      File.mkdir_p!(Path.dirname(manifest))
+      File.write!(manifest, JSON.encode!(%{"version" => module.adapter_version()}))
       File.mkdir_p!(Path.dirname(adapter))
       File.write!(adapter, "#!/bin/sh\nexit 0\n")
       File.chmod!(adapter, 0o755)
@@ -15889,6 +15903,17 @@ defmodule Tightbeam.GatewayTest do
       {:credential_command, command} -> collect_credential_commands([command | commands])
     after
       0 -> Enum.reverse(commands)
+    end
+  end
+
+  defp successful_readiness_probe(command) do
+    script = Enum.join(command, " ")
+
+    if String.contains?(script, "cat ") and
+         String.contains?(script, "/@agentclientprotocol/claude-agent-acp/package.json") do
+      {JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()}), 0}
+    else
+      {"", 0}
     end
   end
 
