@@ -90,7 +90,17 @@ defmodule Tightbeam.ArchetypesTest do
     assert Rules.load!(ctx.base_dir, []) == []
     refute File.exists?(Path.join(identity_dir, "skills"))
     refute File.exists?(Path.join(identity_dir, "rails"))
-    refute File.exists?(Path.join(identity_dir, "rules"))
+
+    assert Path.wildcard(Path.join(identity_dir, "rules/*.toml")) ==
+             [Path.join(identity_dir, "rules/harness-health-recovery.toml")]
+
+    assert File.read!(Path.join(identity_dir, "rules/harness-health-recovery.toml")) ==
+             File.read!(
+               Application.app_dir(:tightbeam, "priv/seed/rules/harness-health-recovery.toml")
+             )
+
+    assert %{settings: recovery_settings} = Rules.reaction_policy("harness-health-recovery")
+    assert recovery_settings["eligible_failure_classes"] == ["rate-limit-dead"]
 
     assert Archetypes.init_identity!(ctx.base_dir) == :noop
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
@@ -206,7 +216,10 @@ defmodule Tightbeam.ArchetypesTest do
         "user's stated goal before any tool call."
 
     section = heading <> "\n\n" <> intro <> "\n\n" <> facts
-    boundary = section <> "\n# Served identity\n"
+    # The renderer trims the bundle section and joins the next section after a
+    # blank line, so the boundary holds whichever bundle sorts last, with or
+    # without phrases.
+    boundary = String.trim_trailing(section) <> "\n\n# Served identity\n"
 
     validate_facts = fn guidance ->
       assert length(:binary.matches(guidance, heading)) == 1

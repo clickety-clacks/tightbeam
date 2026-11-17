@@ -275,11 +275,7 @@ defmodule Tightbeam.Wire.Router do
 
   get "/version" do
     coordinator = deps(conn)[:adapter_coordinator] || Tightbeam.AdapterCoordinator
-
-    health =
-      if Process.whereis(coordinator),
-        do: Tightbeam.AdapterCoordinator.health(coordinator),
-        else: %{}
+    snapshot = Tightbeam.AdapterHealthSnapshot.read(coordinator)
 
     # builds-identify-bytes: a running gateway states which bytes it is. version is
     # the release version (single home: the CLI-compat policy); build/sha are the
@@ -291,7 +287,8 @@ defmodule Tightbeam.Wire.Router do
       "build" => Tightbeam.BuildStamp.build(),
       "sha" => Tightbeam.BuildStamp.sha(),
       "features" => ["stale-turn-settlement-v1"],
-      "adapters" => health,
+      "adapters" => snapshot.adapters,
+      "adaptersAsOf" => snapshot.as_of,
       "diagnostics" => diagnostic_health(),
       "schedulerMisses" => Tightbeam.SchedulerMisses.count(),
       "eventPaths" => Tightbeam.SchedulerMisses.health()
@@ -3657,19 +3654,14 @@ defmodule Tightbeam.Wire.Router do
              params.attachments
            ) do
         :ok ->
-          dispatch_response(
-            conn,
-            %{
-              verb: "post",
-              origin: "user:#{user_id}",
-              principal: {:user, user_id},
-              session_key: session_key,
-              params: params,
-              transport: :rest
-            },
-            200,
-            &%{"result" => &1}
-          )
+          rest_post_dispatch_response(conn, %{
+            verb: "post",
+            origin: "user:#{user_id}",
+            principal: {:user, user_id},
+            session_key: session_key,
+            params: params,
+            transport: :rest
+          })
 
         {:error, :invalid_asset} ->
           error(conn, 400, "invalid_message", "attachment asset is unavailable")
@@ -3688,6 +3680,25 @@ defmodule Tightbeam.Wire.Router do
       end
     else
       {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  defp rest_post_dispatch_response(conn, call) do
+    case Dispatch.dispatch(db(conn), handlers(conn), call) do
+      {:ok, %{dedupe: "conflict"}} ->
+        error(conn, 409, "client_message_conflict")
+
+      {:ok, %{dedupe: "skipped"}} ->
+        error(conn, 409, "not_deliverable")
+
+      {:ok, result} ->
+        json(conn, 200, %{"result" => result})
+
+      {:error, result} ->
+        dispatch_error(conn, call, error_status(result[:code]), result)
+
+      {:decision_pending, decision_request_id} ->
+        decision_pending(conn, decision_request_id)
     end
   end
 
@@ -4674,7 +4685,8 @@ defmodule Tightbeam.Wire.Router do
       ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body mementos owner_user_id)a,
     "work-item-fail" => ~w(reason work_item_id)a,
     "work-item-get" => ~w(work_item_id)a,
-    "work-item-handoff" => ~w(work_item_id title delivery_owner_session_key brief owner_user_id)a,
+    "work-item-handoff" =>
+      ~w(work_item_id title delivery_owner_session_key brief owner_user_id spec_ref_name spec_ref_sha256 is_bug priority)a,
     "work-item-icebox" => ~w(work_item_id)a,
     "work-item-reopen" => ~w(work_item_id)a,
     "work-item-trace" => ~w(work_item_id)a,

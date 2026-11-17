@@ -2313,7 +2313,15 @@ defmodule Tightbeam.Wire.RouterTest do
     for {verb, params} <- [
           {"work-item-create", %{title: "Create"}},
           {"work-item-handoff",
-           %{workItemId: "wi_test", deliveryOwnerSessionKey: "pdo-a", brief: "Take delivery."}},
+           %{
+             workItemId: "wi_test",
+             deliveryOwnerSessionKey: "pdo-a",
+             brief: "Take delivery.",
+             specRefName: "agreed-spec",
+             specRefSha256: String.duplicate("a", 64),
+             isBug: true,
+             priority: 2
+           }},
           {"work-item-get", %{workItemId: "wi_test"}},
           {"work-item-trace", %{workItemId: "wi_test"}},
           {"work-item-list", %{}},
@@ -2336,7 +2344,11 @@ defmodule Tightbeam.Wire.RouterTest do
         assert received_params == %{
                  work_item_id: "wi_test",
                  delivery_owner_session_key: "pdo-a",
-                 brief: "Take delivery."
+                 brief: "Take delivery.",
+                 spec_ref_name: "agreed-spec",
+                 spec_ref_sha256: String.duplicate("a", 64),
+                 is_bug: true,
+                 priority: 2
                }
       end
     end
