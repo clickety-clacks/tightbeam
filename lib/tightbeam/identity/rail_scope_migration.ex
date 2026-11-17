@@ -265,16 +265,18 @@ defmodule Tightbeam.Identity.RailScopeMigration do
       stops: duplicate_stops ++ reaction_scan.stops
     }
 
+    initial = plan_decision_briefing(initial)
     upstream = plan_upstream(initial)
 
     initial
     |> plan_archetypes()
     |> plan_scoped_files()
-    |> plan_receipts(reaction_scan.removed_paths)
+    |> plan_receipts(initial.removals)
     |> plan_manifests()
     |> plan_seed_reactions(seed_reactions, reaction_scan)
     |> plan_seed_rails(seed_rails)
     |> plan_rail_names()
+    |> Map.put(:entries, entries)
     |> finalize_plan()
     |> Map.put(:upstream, upstream)
     |> then(fn plan ->
@@ -293,6 +295,27 @@ defmodule Tightbeam.Identity.RailScopeMigration do
               Enum.map(upstream.flagged_conditions, &Map.put(&1, "ref", "tightbeam/upstream"))
       }
     end)
+  end
+
+  # 0.1.16 shipped this org-wide rule in an optional bundle. Preserve its
+  # configured bytes as substrate law before applying kungfu scope isolation.
+  defp plan_decision_briefing(plan) do
+    source = "kungfu/harklight-decision-briefings/rules/briefings.toml"
+    destination = "rules/harklight-decision-request-briefing.toml"
+
+    if Map.has_key?(plan.entries, source) and not Map.has_key?(plan.entries, destination) do
+      bytes = Map.fetch!(plan.entries, source)
+
+      %{
+        plan
+        | entries: plan.entries |> Map.delete(source) |> Map.put(destination, bytes),
+          removals: MapSet.put(plan.removals, source),
+          removed_entries:
+            plan.removed_entries ++ [%{"file" => source, "moved_to" => destination}]
+      }
+    else
+      plan
+    end
   end
 
   defp plan_upstream(main) do
