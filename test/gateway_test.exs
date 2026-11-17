@@ -11036,6 +11036,7 @@ defmodule Tightbeam.GatewayTest do
       )
 
     :ok = ensure_all_schemas(db)
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',1,1)")
     identity_base = role_test_base("identity-staleness-reader")
     assert :initialized = Identity.init!(identity_base)
     :ok = Tightbeam.AdminProjection.bootstrap_served(db, identity_base)
