@@ -43,6 +43,31 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     :ok
   end
 
+  # The smoke acts as the user named by TIGHTBEAM_SMOKE_OWNER and has no default.
+  setup do
+    previous = System.get_env("TIGHTBEAM_SMOKE_OWNER")
+    System.put_env("TIGHTBEAM_SMOKE_OWNER", "mike")
+
+    on_exit(fn ->
+      if previous,
+        do: System.put_env("TIGHTBEAM_SMOKE_OWNER", previous),
+        else: System.delete_env("TIGHTBEAM_SMOKE_OWNER")
+    end)
+
+    :ok
+  end
+
+  test "the smoke stops before any request when no owner is supplied" do
+    for unset <- [nil, ""] do
+      if unset, do: System.put_env("TIGHTBEAM_SMOKE_OWNER", unset),
+        else: System.delete_env("TIGHTBEAM_SMOKE_OWNER")
+
+      error = assert_raise Driver.Failure, fn -> Driver.run() end
+      assert error.message =~ "TIGHTBEAM_SMOKE_OWNER"
+      assert error.message =~ "admin user id"
+    end
+  end
+
   setup do
     base = Path.join(System.tmp_dir!(), "smoke-rail-path-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base)
