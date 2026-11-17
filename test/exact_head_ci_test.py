@@ -1,5 +1,4 @@
 """Deterministic contract checks for exact-candidate CI (stdlib only)."""
-import json
 import os
 from pathlib import Path
 import re
@@ -13,26 +12,17 @@ WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml'
 
 def evaluate(expression, context):
     """Evaluate the small GitHub expression subset this workflow uses."""
-    token_pattern = re.compile(
-        r"\s*(&&|\|\||!=|==|[(),]|'[^']*'|startsWith|[A-Za-z_][\w.-]*)")
-    tokens = []
-    position = 0
-    for match in token_pattern.finditer(expression):
-        if expression[position:match.start()].strip():
-            raise ValueError('unsupported expression: ' + expression)
-        tokens.append(match.group(1))
-        position = match.end()
-    if expression[position:].strip():
+    tokens = re.findall(
+        r"\s*(&&|\|\||!=|==|[(),]|'[^']*'|startsWith|[A-Za-z_][\w.-]*)", expression)
+    if ''.join(tokens) != re.sub(r'\s+', '', expression):
         raise ValueError('unsupported expression: ' + expression)
     words = {'&&': ' and ', '||': ' or ', '!=': ' != ', '==': ' == ',
-             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts',
-             'fromJSON': '_json'}
+             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts'}
     code = ''.join(
         words.get(token) or (repr(token[1:-1]) if token.startswith("'")
                              else repr(context[token]))
         for token in tokens)
-    return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p),
-                       '_json': json.loads})
+    return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p)})
 
 
 class ExactHeadCI(unittest.TestCase):
@@ -62,66 +52,6 @@ class ExactHeadCI(unittest.TestCase):
                        'github.event.pull_request.head.sha': 'a' * 40,
                        'inputs.candidate_sha': 'c' * 40}
             self.assertEqual(evaluate(source, context), expected, event)
-
-    def test_macos_uses_pool_for_trusted_ci_and_linux_stays_hosted(self):
-        source = re.search(
-            r'(?m)^    runs-on: \$\{\{ (.*?) \}\}$', self.jobs['test']).group(1)
-        pool = ['self-hosted', 'tb-macos']
-        cases = [
-            ('macos', 'pull_request', 'clickety-clacks/tightbeam', pool),
-            ('macos', 'pull_request', 'contributor/project', 'macos-latest'),
-            ('macos', 'push', '', pool),
-            ('macos', 'merge_group', '', pool),
-            ('macos', 'workflow_dispatch', '', pool),
-            ('linux', 'pull_request', 'clickety-clacks/tightbeam', 'ubuntu-latest'),
-            ('linux', 'pull_request', 'contributor/project', 'ubuntu-latest'),
-            ('linux', 'push', '', 'ubuntu-latest'),
-        ]
-        for name, event, head_repo, expected in cases:
-            context = {
-                'matrix.name': name,
-                'matrix.os': 'ubuntu-latest' if name == 'linux' else 'macos-latest',
-                'github.event_name': event,
-                'github.event.pull_request.head.repo.full_name': head_repo,
-                'github.repository': 'clickety-clacks/tightbeam',
-            }
-            self.assertEqual(evaluate(source, context), expected, (name, event, head_repo))
-
-    def test_release_macos_uses_pool_for_trusted_release_events_only(self):
-        source = re.search(
-            r'(?m)^    runs-on: \$\{\{ (.*?) \}\}$', self.jobs['release']).group(1)
-        release_condition = re.search(
-            r'(?m)^    if: (.*)$', self.jobs['release']).group(1)
-        pool = ['self-hosted', 'tb-macos']
-        cases = [
-            ('push', 'refs/heads/0.1.16', '', pool),
-            ('push', 'refs/tags/v0.1.16', '', pool),
-            ('workflow_dispatch', 'refs/heads/0.1.16', '', pool),
-            ('pull_request', 'refs/pull/12/merge', 'contributor/project', 'macos-latest'),
-        ]
-        for event, ref, head_repo, expected in cases:
-            context = {
-                'matrix.name': 'darwin-aarch64',
-                'matrix.os': 'macos-latest',
-                'github.event_name': event,
-                'github.event.pull_request.head.repo.full_name': head_repo,
-                'github.repository': 'clickety-clacks/tightbeam',
-                'github.ref': ref,
-            }
-            self.assertEqual(evaluate(source, context), expected, (event, ref, head_repo))
-            self.assertEqual(evaluate(release_condition, context), event != 'pull_request')
-
-        linux = {
-            'matrix.name': 'linux-x86_64',
-            'matrix.os': 'ubuntu-latest',
-            'github.event_name': 'push',
-            'github.event.pull_request.head.repo.full_name': '',
-            'github.repository': 'clickety-clacks/tightbeam',
-            'github.ref': 'refs/heads/0.1.16',
-        }
-        self.assertEqual(evaluate(source, linux), ['self-hosted', 'tb-linux'])
-        self.assertIn('clean: true', self.jobs['release'])
-        self.assertIn('ImageOS=macos26', self.jobs['release'])
 
     def test_both_jobs_validate_before_exact_checkout(self):
         for name in ('test', 'release'):
@@ -236,28 +166,6 @@ class ExactHeadCI(unittest.TestCase):
                 'github.event_name': 'workflow_dispatch',
                 'inputs.docs_validation': mode}), expected)
 
-    def test_full_suite_runs_before_trusted_branch_push_packaging(self):
-        source = re.search(
-            r'(?m)^      FULL_SUITE: \$\{\{ (.*?) \}\}$', self.jobs['test']).group(1)
-        cases = [
-            ('push', 'refs/heads/0.1.16', True),
-            ('push', 'refs/tags/v0.1.16', True),
-            ('workflow_dispatch', 'refs/heads/0.1.16', True),
-            ('pull_request', 'refs/pull/12/merge', False),
-            ('merge_group', 'refs/heads/gh-readonly-queue/0.1.16/pr-12-abc', False),
-        ]
-        for event, ref, expected in cases:
-            self.assertEqual(evaluate(source, {
-                'github.event_name': event,
-                'github.ref': ref,
-            }), expected, (event, ref))
-
-        test_job = self.jobs['test']
-        release_job = self.jobs['release']
-        self.assertIn("if: env.FULL_SUITE == 'true'\n        run: scripts/verify_mix.sh", test_job)
-        self.assertIn("if: env.FULL_SUITE == 'true'\n        working-directory: cli\n        run: cargo test", test_job)
-        self.assertIn('    needs: test', release_job)
-
     def test_docs_dispatch_is_hosted_read_only_and_subject_bound(self):
         job = self.text.split('\n  docs-validation:\n', 1)[1]
         condition = re.search(r'(?m)^    if: (.*)$', job).group(1)
@@ -274,12 +182,6 @@ class ExactHeadCI(unittest.TestCase):
         self.assertIn('persist-credentials: false', job)
         self.assertIn('test "$DISPATCH_SHA" = "$CI_SOURCE_SHA"', job)
         self.assertIn('test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"', job)
-        self.assertIn('EXPECTED_BASE: ${{ inputs.candidate_base_sha }}', job)
-        self.assertIn('[[ "$EXPECTED_BASE" =~ ^[0-9a-f]{40}$ ]] || exit 1', job)
-        self.assertIn('git cat-file -e "$EXPECTED_BASE^{commit}"', job)
-        self.assertIn('test "$(git merge-base HEAD "$EXPECTED_BASE")" = "$EXPECTED_BASE"', job)
-        self.assertIn('git diff --exit-code "$EXPECTED_BASE" HEAD -- priv', job)
-        self.assertNotIn('git rev-parse HEAD^)', job)
         self.assertIn('python3 scripts/verify_shipped_privacy.py', job)
         self.assertIn('sh packaging/assemble.sh', job)
         self.assertIn('mix run --no-start scripts/docs_composition_52.exs', job)

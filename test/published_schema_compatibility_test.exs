@@ -46,6 +46,65 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
     assert_topline_cause_actors(db)
   end
 
+  # Captured by Schema.ensure_all/1 from published v0.1.16+4283,
+  # commit 78b32ec7f3e501d843c4216ae786a3e1e5abd8e4, using its pinned toolchain, then
+  # given synthetic rows in the tables and columns 0.1.16 added: record-event ids on
+  # a message and a wake, a turn event, a runtime change, a process-attributed
+  # artifact, a decision briefing and a harness recovery notice. This is a synthetic
+  # database, never an installation snapshot.
+  @fixture_0_1_16 Path.join(__DIR__, "fixtures/published_0_1_16_4283.sql.gz.b64")
+
+  test "published 0.1.16 database upgrades to the combined stamp and keeps its 0.1.16 rows" do
+    bytes =
+      @fixture_0_1_16 |> File.read!() |> String.trim() |> Base.decode64!() |> :zlib.gunzip()
+
+    db = start_supervised!({DB, path: ":memory:", name: :published_0_1_16_compatibility})
+
+    assert Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) ==
+             "dcad069f1b8afd34e5fd48232217c6ee3b72d267b68889b25c918db6e3e09f79"
+
+    # In-memory owners create these empty retry tables before schema activation.
+    assert :ok = DB.execute(db, "DROP TABLE pending_recognition_waits")
+    assert :ok = DB.execute(db, "DROP TABLE pending_recognition")
+    assert :ok = DB.execute(db, bytes)
+    assert :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+
+    assert {:ok, [["artifact-process-attribution-v1-015"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    refute "currentOpenerSessionKey" in columns(db, "assignments")
+    rows_before = release_rows(db)
+
+    assert rows_before == %{
+             messages_with_record_event_ids: [["[\"evt_seed_1\"]"]],
+             wakes_with_record_event_ids: [["[\"evt_seed_2\"]"]],
+             turn_events: [["assistant.segment", "agent:seed-one", 1]],
+             runtime_changes: [["agent:seed-one", "pending"]],
+             artifacts: [
+               ["art_seedproc", nil, "process:ci"],
+               ["art_seedsess", "agent:seed-one", nil]
+             ],
+             briefings: [["dr_seed_briefing", "flynn", "staged"]],
+             recovery_notices: [["hh_seed", "flynn", "awaiting_main"]]
+           }
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [["session-custody-artifact-process-attribution-v1-0117"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert release_rows(db) == rows_before
+    assert "currentOpenerSessionKey" in columns(db, "assignments")
+    assert ["recordEventIds", "submitter"] -- columns(db, "messages") == []
+
+    schema_after = full_schema(db)
+    assert :ok = Schema.ensure_all(db)
+    assert full_schema(db) == schema_after
+    assert release_rows(db) == rows_before
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+    assert {:ok, [["ok"]]} = DB.query(db, "PRAGMA integrity_check")
+  end
+
   test "new database migration permits single or process verdict actors but never both typed actors" do
     db = start_supervised!({DB, path: ":memory:", name: :fresh_actor_compatibility})
     assert :ok = Schema.ensure_all(db)
@@ -140,5 +199,39 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
   defp assert_check_failure(db, sql) do
     assert {:error, error} = DB.query(db, sql)
     assert Exception.message(error) =~ "CHECK constraint failed"
+  end
+
+  defp release_rows(db) do
+    q = fn sql ->
+      {:ok, rows} = DB.query(db, sql)
+      rows
+    end
+
+    %{
+      messages_with_record_event_ids:
+        q.("SELECT recordEventIds FROM messages WHERE recordEventIds IS NOT NULL ORDER BY seq"),
+      wakes_with_record_event_ids:
+        q.("SELECT recordEventIds FROM wakes WHERE recordEventIds IS NOT NULL ORDER BY rowid"),
+      turn_events: q.("SELECT kind,sessionKey,turnEventSeq FROM turn_events ORDER BY id"),
+      runtime_changes: q.("SELECT sessionKey,state FROM runtime_changes ORDER BY seq"),
+      artifacts:
+        q.(
+          "SELECT artifactId,createdBySession,createdByProcess FROM artifacts ORDER BY artifactId"
+        ),
+      briefings: q.("SELECT requestId,ownerUserId,state FROM harklight_decision_briefings"),
+      recovery_notices: q.("SELECT holdId,ownerUserId,state FROM harness_recovery_notices")
+    }
+  end
+
+  defp columns(db, table) do
+    {:ok, rows} = DB.query(db, "PRAGMA table_info(#{table})")
+    Enum.map(rows, fn [_cid, name | _] -> name end)
+  end
+
+  defp full_schema(db) do
+    {:ok, rows} =
+      DB.query(db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+    rows
   end
 end

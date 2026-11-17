@@ -1822,10 +1822,11 @@ defmodule Tightbeam.Schema do
 
   @doc false
   def guard_compatible_stamps do
+    # The first entry is the target stamp a successful boot must reach.
     [
+      @session_custody_artifact_process_shape,
       @session_custody_shape,
       @artifact_process_attribution_shape,
-      @session_custody_artifact_process_shape,
       @closed_assignment_reconciliation_shape,
       @session_identity_shape,
       @evidence_release_shape,
