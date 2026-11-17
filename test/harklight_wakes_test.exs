@@ -3444,14 +3444,14 @@ defmodule Tightbeam.HarklightWakesTest do
     parent = self()
     {:ok, attempts} = Agent.start_link(fn -> 0 end)
 
+    # A saved change operation from an earlier release has a list-shaped request.
+    # Main no longer creates one, but retry must still read its persisted state.
     assert %{state: "pending"} =
-             HarklightWakes.prepare_change(
+             HarklightWakes.prepare_send(
                db,
                call,
                Tightbeam.Id.uuid4(),
-               "request",
-               "revise",
-               ["--message", "request"]
+               JSON.encode!(%{"operation_kind" => "change", "request" => ["--message", "request"]})
              )
 
     runner = fn ["status", "--session", @handle] ->
