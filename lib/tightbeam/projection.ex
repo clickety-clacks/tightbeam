@@ -10,6 +10,7 @@ defmodule Tightbeam.Projection do
   older ever wrote a -1, and nothing older reads this table.
   """
 
+  alias Tightbeam.AttachmentDelivery
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
@@ -98,7 +99,12 @@ defmodule Tightbeam.Projection do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    with :ok <- DB.execute(db, @ddl),
+         :ok <- AttachmentDelivery.ensure_schema(db) do
+      :ok
+    end
+  end
 
   @doc """
   Append a message, idempotently per client send. Dedupe scope is
@@ -161,6 +167,17 @@ defmodule Tightbeam.Projection do
             marker_to
           ]
         )
+
+        if Map.get(input, :role) == "user" do
+          :ok =
+            AttachmentDelivery.append_pending_in_txn(
+              txn,
+              id,
+              Map.fetch!(input, :session_key),
+              client_message_id,
+              Map.get(input, :attachments, [])
+            )
+        end
 
         [row] = select_by_id(txn, id)
         {:appended, to_message(row)}
