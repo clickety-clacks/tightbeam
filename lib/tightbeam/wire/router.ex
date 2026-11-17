@@ -4445,7 +4445,8 @@ defmodule Tightbeam.Wire.Router do
       ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body mementos owner_user_id)a,
     "work-item-fail" => ~w(reason work_item_id)a,
     "work-item-get" => ~w(work_item_id)a,
-    "work-item-handoff" => ~w(work_item_id title delivery_owner_session_key brief owner_user_id)a,
+    "work-item-handoff" =>
+      ~w(work_item_id title delivery_owner_session_key brief owner_user_id spec_ref_name spec_ref_sha256 is_bug priority)a,
     "work-item-icebox" => ~w(work_item_id)a,
     "work-item-reopen" => ~w(work_item_id)a,
     "work-item-trace" => ~w(work_item_id)a,

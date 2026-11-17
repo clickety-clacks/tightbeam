@@ -25,6 +25,14 @@ defmodule Tightbeam.IdentityTest do
     %{base: runtime, root: base, source: source}
   end
 
+  test "an unlearned bundle probe does not emit expected git fatal stderr", ctx do
+    assert :initialized = Identity.init!(ctx.base)
+
+    assert ExUnit.CaptureIO.capture_io(:stderr, fn ->
+             assert Identity.public_kungfu(ctx.base, "unlearned-bundle") == nil
+           end) == ""
+  end
+
   test "served bootstrap seeds exact identity and raw kungfu without notices", ctx do
     alias Tightbeam.{AdminProjection, DB, Schema, StateResources, Firehose.Hub}
     assert :initialized = Identity.init!(ctx.base)

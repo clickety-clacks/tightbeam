@@ -1533,9 +1533,13 @@ defmodule Tightbeam.Identity do
   end
 
   defp path_exists_at?(dir, revision, path) do
-    case System.cmd("git", ["cat-file", "-e", "#{revision}:#{path}"], cd: dir) do
+    case System.cmd("git", ["cat-file", "-e", "#{revision}:#{path}"],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
       {_output, 0} -> true
-      {_output, _status} -> false
+      {_output, 1} -> false
+      {output, status} -> raise "git cat-file failed (#{status}): #{output}"
     end
   end
 
