@@ -456,8 +456,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
       [[_cycle_id, "due", _old_digest, _old_interval, _previous_started_at]] ->
         :ok
 
-      [[_cycle_id, "withdrawn", old_digest, _old_interval, previous_started_at]] ->
-        opts = Keyword.put(opts, :backoff, old_digest == digest)
+      [[_cycle_id, "withdrawn", _old_digest, _old_interval, previous_started_at]] ->
         due_at = initial_due_at(hold, settings, now, opts, previous_started_at)
         insert_cycle(txn, hold, source_event_id, settings, digest, due_at, now, replace: true)
     end
@@ -516,7 +515,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
 
   defp initial_due_at(hold, settings, now, opts, previous_started_at) do
     interval_ms =
-      if previous_started_at && Keyword.get(opts, :backoff, true),
+      if previous_started_at,
         do:
           backoff_interval(
             max(previous_started_at - hold["openedAt"], 0),

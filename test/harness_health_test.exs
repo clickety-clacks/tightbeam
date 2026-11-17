@@ -3580,14 +3580,15 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert length(routes) == 2
 
-    assert {:ok, [[cycle_one, _due_at]]} =
+    assert {:ok, [[cycle_one, initial_due_at, 120_000, opened_at]]} =
              DB.query(
                ctx.db,
-               "SELECT cycleId,dueAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               "SELECT s.cycleId,s.dueAt,s.intervalMs,h.openedAt FROM harness_health_recovery_schedules s JOIN harness_health_incidents h ON h.id=s.holdId WHERE s.holdId=?1",
                [incident.id]
              )
 
-    started_one = System.system_time(:millisecond)
+    assert initial_due_at == opened_at + 120_000
+    started_one = initial_due_at
 
     assert {:ok, 1} =
              DB.transaction(ctx.db, fn txn ->
@@ -3677,7 +3678,7 @@ defmodule Tightbeam.HarnessHealthTest do
                [incident.id]
              )
 
-    assert next_due_at == started_one + 3_600_000
+    assert next_due_at == started_one + 240_000
     assert next_due_at < started_one + 3_600_100
 
     assert {:ok, [[cycle_two]]} =
@@ -3784,7 +3785,7 @@ defmodule Tightbeam.HarnessHealthTest do
                authoritative(first, "rate-limit-dead", 100, "recovery-schedule-open")
              )
 
-    assert {:ok, [[cycle_id, due_at, "pending", 3_600_000, hold_id]]} =
+    assert {:ok, [[cycle_id, due_at, "pending", 120_000, hold_id]]} =
              DB.query(
                ctx.db,
                "SELECT cycleId,dueAt,status,intervalMs,holdId FROM harness_health_recovery_schedules WHERE holdId=?1",
@@ -3792,7 +3793,7 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     assert hold_id == opened.id
-    assert due_at == 3_600_100
+    assert due_at == 120_100
     assert {:ok, [[wake_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
     assert [cycle] =
@@ -3829,10 +3830,10 @@ defmodule Tightbeam.HarnessHealthTest do
                authoritative(first, "rate-limit-dead", 100, "recovery-schedule-policy-change")
              )
 
-    assert {:ok, [[cycle_id, initial_due_at]]} =
+    assert {:ok, [[cycle_id, initial_due_at, 120_000]]} =
              DB.query(
                ctx.db,
-               "SELECT cycleId,dueAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               "SELECT cycleId,dueAt,intervalMs FROM harness_health_recovery_schedules WHERE holdId=?1",
                [opened.id]
              )
 
@@ -3846,7 +3847,7 @@ defmodule Tightbeam.HarnessHealthTest do
                [opened.id]
              )
 
-    assert initial_due_at == 3_600_100
+    assert initial_due_at == 120_100
     assert revised_due_at == 1_800_100
 
     assert [%{"cycle_id" => ^cycle_id}] =
@@ -3890,8 +3891,31 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     refute next_cycle_id == cycle_id
-    assert next_due_at == revised_due_at + 600_000
+    # The last start is 30 minutes after opening: 10-minute backoff doubles to 40 minutes.
+    assert next_due_at == revised_due_at + 2_400_000
     assert next_due_at > revised_due_at + 1_000
+
+    assert [%{"cycle_id" => ^next_cycle_id}] =
+             Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, next_due_at)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.HarnessHealth.RecoverySchedule.finish_cycle_in_txn(
+                 txn,
+                 opened.id,
+                 next_cycle_id,
+                 next_due_at + 1
+               )
+             end)
+
+    assert {:ok, [["pending", capped_due_at, 600_000, ^next_due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,dueAt,intervalMs,previousStartedAt FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [opened.id]
+             )
+
+    assert capped_due_at == next_due_at + 3_600_000
   end
 
   test "missing recovery rail leaves an eligible hold on its existing path", ctx do
@@ -4355,7 +4379,7 @@ defmodule Tightbeam.HarnessHealthTest do
         "eligible_failure_classes = [\"rate-limit-dead\"]",
         "eligible_failure_classes = #{JSON.encode!(eligible_classes)}"
       )
-      |> String.replace("interval_ms = 3600000", "interval_ms = #{interval_ms}")
+      |> String.replace("interval_ms = 120000", "interval_ms = #{interval_ms}")
 
     if changed == seed do
       raise "recovery policy fixture did not change the shipped seed"

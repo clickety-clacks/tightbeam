@@ -12,14 +12,14 @@ defmodule Tightbeam.RowReactionPolicyTest do
              Rules.reaction_policy("harness-health-recovery")
 
     assert settings["eligible_failure_classes"] == ["rate-limit-dead"]
-    assert settings["interval_ms"] == 3_600_000
+    assert settings["interval_ms"] == 120_000
     assert settings["timeout_ms"] == 120_000
     assert settings["start"] == "schedule_one_cycle_for_eligible_open_hold"
     assert settings["withdraw"] == "withdraw_resolved_or_ineligible_cycle_at_delivery"
     assert settings["reschedule"] == "move_the_single_pending_cycle_in_place"
     assert settings["release"] == "resolve_only_after_all_constituent_routes_succeed"
     assert english =~ "Owning bundle: substrate base seed."
-    assert english =~ "one hour by default"
+    assert english =~ "first cycle is due after two minutes"
     assert provenance["source"] == "rules/harness-health-recovery.toml"
   end
 

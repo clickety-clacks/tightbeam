@@ -265,7 +265,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
                incident_id
              ])
 
-    assert initial_due == opened_at + 3_600_000
+    assert initial_due == opened_at + 120_000
     assert :ok = RecoverySchedule.credential_changed(db, :anthropic, "testhost")
 
     assert {:ok, [[due_at]]} =
@@ -277,26 +277,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
     assert :ok = RecoverySchedule.credential_changed(db, :openai, "testhost")
   end
 
-  test "an unresolved recovery cycle backs off from an explicitly configured two-minute interval",
-       %{db: db} do
-    root = Path.join(System.tmp_dir!(), "recovery-backoff-#{System.unique_integer([:positive])}")
-    rules_dir = Path.join(root, "identity/rules")
-    File.mkdir_p!(rules_dir)
-
-    seed =
-      File.read!(Path.join(:code.priv_dir(:tightbeam), "seed/rules/harness-health-recovery.toml"))
-
-    File.write!(
-      Path.join(rules_dir, "harness-health-recovery.toml"),
-      String.replace(seed, "interval_ms = 3600000", "interval_ms = 120000")
-    )
-
-    on_exit(fn -> File.rm_rf!(root) end)
-    Tightbeam.Rules.load!(root, [])
-
-    assert %{settings: %{"interval_ms" => 120_000}} =
-             Tightbeam.Rules.reaction_policy("harness-health-recovery")
-
+  test "an unresolved recovery cycle backs off after the two-minute first check", %{db: db} do
     opened_at = System.system_time(:millisecond)
 
     {incident, _wake} =
@@ -350,7 +331,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
                incident_id
              ])
 
-    assert initial_due == opened_at + 3_600_000
+    assert initial_due == opened_at + 120_000
     assert :ok = RecoverySchedule.credential_changed(db, :openai, "testhost")
 
     assert {:ok, [[due_at]]} =
