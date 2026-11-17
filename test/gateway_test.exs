@@ -13022,10 +13022,23 @@ defmodule Tightbeam.GatewayTest do
 
     response = rest_post(ctx, "tbc_test", body)
     assert response.status == 200
-    assert JSON.decode!(response.resp_body) == %{"result" => %{"ack" => "c_rest_attachment"}}
+    assert %{
+             "result" => %{
+               "ack" => "c_rest_attachment",
+               "outcome" => "recorded",
+               "sessionKey" => "k1",
+               "deviceId" => "chat_test",
+               "clientMessageId" => "c_rest_attachment",
+               "messageId" => receipt_message_id,
+               "turnSeq" => turn_seq
+             }
+           } = JSON.decode!(response.resp_body)
+
+    assert is_integer(turn_seq)
     assert_receive {:ensure_lane, "k1"}
 
     message_id = rest_post_message_id!(ctx.db, "k1", "chat_test", "c_rest_attachment")
+    assert receipt_message_id == message_id
     raw = Projection.get(ctx.db, message_id)
     assert raw.content == "open sample.zip"
     assert raw.sender == "user:#{owner}"
@@ -13036,6 +13049,116 @@ defmodule Tightbeam.GatewayTest do
     assert projected["attachments"] == [
              Map.put(attachment, "delivery", %{"outcome" => "pending", "reason" => nil})
            ]
+  end
+
+  test "REST text post returns a stable recorded and duplicate receipt", ctx do
+    ensure_global_registry()
+    owner = ctx.device.user_id
+
+    body = %{
+      verb: "post",
+      asUser: owner,
+      sessionKey: "k1",
+      params: %{
+        clientMessageId: "c_rest_text_receipt",
+        deviceId: "chat_test",
+        content: "open the text prompt",
+        attachments: []
+      }
+    }
+
+    recorded = rest_post(ctx, "tbc_test", body)
+    assert recorded.status == 200
+    assert_receive {:ensure_lane, "k1"}
+
+    assert %{
+             "result" => %{
+               "ack" => "c_rest_text_receipt",
+               "outcome" => "recorded",
+               "sessionKey" => "k1",
+               "deviceId" => "chat_test",
+               "clientMessageId" => "c_rest_text_receipt",
+               "messageId" => message_id,
+               "turnSeq" => turn_seq
+             }
+           } = JSON.decode!(recorded.resp_body)
+
+    assert is_integer(turn_seq)
+
+    duplicate = rest_post(ctx, "tbc_test", body)
+    assert duplicate.status == 200
+
+    assert %{
+             "result" => %{
+               "dedupe" => "duplicate",
+               "outcome" => "duplicate",
+               "sessionKey" => "k1",
+               "deviceId" => "chat_test",
+               "clientMessageId" => "c_rest_text_receipt",
+               "messageId" => ^message_id,
+               "turnSeq" => ^turn_seq
+             }
+           } = JSON.decode!(duplicate.resp_body)
+
+    assert rest_post_message_id!(ctx.db, "k1", "chat_test", "c_rest_text_receipt") == message_id
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId=?1", [
+               "c_rest_text_receipt"
+             ])
+  end
+
+  @tag recipient_readiness: true
+  test "REST post receipt leaves turnSeq null while the human post is queued", ctx do
+    ensure_global_registry()
+    owner = ctx.device.user_id
+
+    {:appended, current_message} =
+      Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        content: "current running work",
+        sender: "session:k1"
+      })
+
+    {:ok, current_seq} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: current_message.id,
+        origin: "session:k1",
+        prompt: "current running work"
+      })
+
+    assert {:ok, %{seq: ^current_seq}} =
+             Tightbeam.Ledger.claim_next(ctx.db, "k1", "rest-post-receipt-test")
+
+    response =
+      rest_post(ctx, "tbc_test", %{
+        verb: "post",
+        asUser: owner,
+        sessionKey: "k1",
+        params: %{
+          clientMessageId: "c_rest_queued_receipt",
+          deviceId: "chat_test",
+          content: "queue this text prompt",
+          attachments: []
+        }
+      })
+
+    assert response.status == 200
+    assert %{
+             "result" => %{
+               "ack" => "c_rest_queued_receipt",
+               "outcome" => "recorded",
+               "sessionKey" => "k1",
+               "deviceId" => "chat_test",
+               "clientMessageId" => "c_rest_queued_receipt",
+               "messageId" => message_id,
+               "turnSeq" => nil
+             }
+           } = JSON.decode!(response.resp_body)
+
+    assert rest_post_message_id!(ctx.db, "k1", "chat_test", "c_rest_queued_receipt") == message_id
   end
 
   test "shared post handler rechecks attachment size before accepting dispatch", ctx do

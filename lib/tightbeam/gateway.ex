@@ -831,9 +831,31 @@ defmodule Tightbeam.Gateway do
                     queue_when_busy: true
                   )
 
-                if outcome in [:appended, :queued],
-                  do: %{ack: p.client_message_id},
-                  else: %{dedupe: to_string(outcome)}
+                if outcome in [:appended, :queued, :duplicate] do
+                  receipt =
+                    human_post_receipt(
+                      db,
+                      call.session_key,
+                      p.device_id,
+                      p.client_message_id
+                    )
+
+                  legacy_result =
+                    if outcome in [:appended, :queued],
+                      do: %{ack: p.client_message_id},
+                      else: %{dedupe: "duplicate"}
+
+                  Map.merge(legacy_result, %{
+                    outcome: if(outcome == :duplicate, do: "duplicate", else: "recorded"),
+                    session_key: call.session_key,
+                    device_id: p.device_id,
+                    client_message_id: p.client_message_id,
+                    message_id: receipt.message_id,
+                    turn_seq: receipt.turn_seq
+                  })
+                else
+                  %{dedupe: to_string(outcome)}
+                end
 
               {:error, :invalid_asset} ->
                 %{code: "invalid_message", message: "attachment asset is unavailable"}
@@ -1815,6 +1837,32 @@ defmodule Tightbeam.Gateway do
   end
 
   defp canonical_post_attachments(_attachments), do: :error
+
+  defp human_post_receipt(db, session_key, device_id, client_message_id) do
+    case DB.query(
+           db,
+           """
+           SELECT m.id,
+             (SELECT t.seq FROM turns t
+              WHERE t.sessionKey=m.sessionKey AND t.messageId=m.id
+              ORDER BY t.seq LIMIT 1)
+           FROM messages m
+           WHERE m.sessionKey=?1 AND m.deviceId=?2 AND m.clientMessageId=?3
+           ORDER BY m.seq DESC LIMIT 1
+           """,
+           [session_key, device_id, client_message_id]
+         ) do
+      {:ok, [[message_id, turn_seq]]} ->
+        %{message_id: message_id, turn_seq: turn_seq}
+
+      {:ok, []} ->
+        raise DB.Error,
+          message: "persisted human post is missing its canonical message receipt"
+
+      {:error, error} ->
+        raise error
+    end
+  end
 
   defp canonical_attachment?(attachment) when is_map(attachment) do
     Enum.sort(Map.keys(attachment)) == ~w(assetId filename mimeType size) and
