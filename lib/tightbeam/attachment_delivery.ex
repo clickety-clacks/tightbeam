@@ -25,16 +25,6 @@ defmodule Tightbeam.AttachmentDelivery do
   );
   CREATE INDEX IF NOT EXISTS message_attachment_delivery_latest
     ON message_attachment_delivery_results (messageId, assetId, seq DESC);
-  CREATE TRIGGER IF NOT EXISTS message_attachment_delivery_results_no_update
-  BEFORE UPDATE ON message_attachment_delivery_results
-  BEGIN
-    SELECT RAISE(ABORT, 'attachment delivery results are append-only');
-  END;
-  CREATE TRIGGER IF NOT EXISTS message_attachment_delivery_results_no_delete
-  BEFORE DELETE ON message_attachment_delivery_results
-  BEGIN
-    SELECT RAISE(ABORT, 'attachment delivery results are append-only');
-  END;
   """
 
   @doc false
