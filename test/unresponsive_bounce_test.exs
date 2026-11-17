@@ -3,6 +3,14 @@ defmodule Tightbeam.UnresponsiveBounceTest do
 
   alias Tightbeam.{DB, Gateway, HarnessHealth, Model, Org}
 
+  defmodule AcceptingLaneManager do
+    use GenServer
+
+    def start_link(_opts), do: GenServer.start_link(__MODULE__, :ok)
+    def init(state), do: {:ok, state}
+    def handle_call({:ensure_lane, _session_key}, _from, state), do: {:reply, :ok, state}
+  end
+
   setup do
     db = :"unresponsive_bounce_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -160,6 +168,26 @@ defmodule Tightbeam.UnresponsiveBounceTest do
     assert {:ok, [[notice]]} = bounce_prompts(ctx.db)
     assert notice =~ "lane is down"
     assert notice =~ "original message remains queued"
+  end
+
+  test "an accepted nudge without a lane registry does not claim the lane is down", ctx do
+    lane_manager = start_supervised!(AcceptingLaneManager)
+    refute Process.whereis(Tightbeam.LaneRegistry)
+
+    assert :appended =
+             Gateway.deliver_prompt(
+               ctx.target,
+               "user:flynn",
+               "Please read this",
+               db: ctx.db,
+               wake_id: "w_unresponsive_accepted_source",
+               lane_manager: lane_manager
+             )
+
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE wakeId='w_unresponsive_accepted_source'")
+
+    assert {:ok, []} = bounce_prompts(ctx.db)
   end
 
   defp deliver_in_txn(ctx, wake_id) do

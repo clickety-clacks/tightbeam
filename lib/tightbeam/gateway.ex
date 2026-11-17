@@ -3123,7 +3123,9 @@ defmodule Tightbeam.Gateway do
         [] -> :lane_down
       end
     else
-      :lane_down
+      # The manager accepted the nudge; without a registry there is no lane
+      # state to inspect (for example, a manager supplied by a caller).
+      :ok
     end
   catch
     :exit, reason ->
