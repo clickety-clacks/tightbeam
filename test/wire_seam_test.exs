@@ -613,7 +613,6 @@ defmodule Tightbeam.Wire.SeamTest do
            }
   end
 
-
   test "follow crosses the CLI, router, and gateway and refuses an unknown message", ctx do
     session = create_session(ctx.db, "wire-harklight-follow", "test-agent")
     Org.set_host(ctx.db, session.session_key, Tightbeam.Placement.local_host_name())

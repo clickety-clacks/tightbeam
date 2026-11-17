@@ -191,7 +191,8 @@ defmodule Tightbeam.PackagingActivationTest do
     fallback = package_fixture(root, "0.1.11", String.duplicate("2", 40))
     fallback_stage = stage!(fallback, install_root)
 
-    {incomplete_output, incomplete_status} = select(install_root, fallback_stage["buildId"], "fail")
+    {incomplete_output, incomplete_status} =
+      select(install_root, fallback_stage["buildId"], "fail")
 
     assert incomplete_status == 0
     assert incomplete_output =~ "rule check could not complete"
@@ -243,6 +244,7 @@ defmodule Tightbeam.PackagingActivationTest do
         "fi\n" <>
         "exit 0\n"
     )
+
     File.write!(Path.join(package_root, "release/bin/tightbeam_gateway"), "#!/bin/sh\nexit 0\n")
     File.write!(Path.join(package_root, "release/releases/start_erl.data"), "28.5 #{version}\n")
 
@@ -350,6 +352,7 @@ defmodule Tightbeam.PackagingActivationTest do
 
   defp select!(install_root, build_id) do
     {output, 0} = select(install_root, build_id)
+
     output
     |> String.split(~r/\r?\n/, trim: true)
     |> Enum.find(&String.starts_with?(&1, "{"))
