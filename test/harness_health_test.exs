@@ -127,7 +127,7 @@ defmodule Tightbeam.HarnessHealthTest do
     %{db: db, main_session: main_session, sessions: sessions, outside_session: outside_session}
   end
 
-  test "inference accepts distinct evidence beyond two minutes", ctx do
+  test "inference needs two distinct sessions in the bounded window", ctx do
     [first, second, third] = ctx.sessions
 
     assert {:pending, %{distinctSessions: 1, requiredSessions: 2}} =
@@ -139,16 +139,26 @@ defmodule Tightbeam.HarnessHealthTest do
     assert HarnessHealth.active(ctx.db) == []
     refute ConditionFacts.harness_unavailable?(ctx.db, "claude", "testhost")
 
+    assert {:pending, %{distinctSessions: 1}} =
+             HarnessHealth.observe(
+               ctx.db,
+               failure(
+                 second,
+                 "auth-dead",
+                 1_000 + HarnessHealth.evidence_window_ms() + 1,
+                 "late"
+               )
+             )
+
     assert {:opened, opened} =
              HarnessHealth.observe(
                ctx.db,
-               failure(second, "auth-dead", 121_001, "late")
-             )
-
-    assert {:attached, _} =
-             HarnessHealth.observe(
-               ctx.db,
-               failure(third, "auth-dead", 121_002, "failure-3")
+               failure(
+                 third,
+                 "auth-dead",
+                 1_000 + HarnessHealth.evidence_window_ms() + 2,
+                 "failure-3"
+               )
              )
 
     assert opened.failureClass == "auth-dead"
@@ -160,11 +170,7 @@ defmodule Tightbeam.HarnessHealthTest do
     refute ctx.outside_session in incident.affectedSessions
     refute "asg_health_outside" in incident.affectedAssignments
 
-    assert Enum.map(incident.observations, & &1.correlation_id) == [
-             "failure-1",
-             "late",
-             "failure-3"
-           ]
+    assert Enum.map(incident.observations, & &1.correlation_id) == ["late", "failure-3"]
   end
 
   test "authoritative evidence opens at one and the two classes never collapse", ctx do

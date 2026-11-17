@@ -4,8 +4,8 @@ defmodule Tightbeam.HarnessHealth do
 
   Observations are append-only evidence. An authoritative provider observation
   opens an incident immediately. Inferred failure evidence needs two distinct
-  sessions on the same shared harness and in the same class after the last
-  recovery. Resolution appends normal-turn evidence and retracts the class fact;
+  sessions on the same shared harness and in the same class inside the bounded
+  window. Resolution appends normal-turn evidence and retracts the class fact;
   neither observations nor incidents are deleted.
 
   Runtime producers call the transaction-owned helpers here so a failed turn
@@ -42,6 +42,7 @@ defmodule Tightbeam.HarnessHealth do
   )
   @prod_shape_consumers ["assignment_prodder"]
   @failure_evidence ~w(authoritative-provider terminal-failure)
+  @evidence_window_ms 120_000
   @harness_health_schema_stamp "harness-health-other-v1-019"
   # Schema.ensure_all invokes module bootstraps before the repository's final
   # stamp is installed. HarnessHealth must not migrate at any intermediate
@@ -890,6 +891,10 @@ defmodule Tightbeam.HarnessHealth do
 
   defp raise_schema_conflict!(message),
     do: raise(ArgumentError, "harness_health_other_schema_conflict: #{message}")
+
+  @doc "The inference window for distinct terminal failures."
+  @spec evidence_window_ms() :: pos_integer()
+  def evidence_window_ms, do: @evidence_window_ms
 
   @doc "Whether either incident class currently stands for one shared harness."
   @spec unavailable?(DB.server(), String.t(), String.t()) :: boolean()
@@ -2541,7 +2546,7 @@ defmodule Tightbeam.HarnessHealth do
           AND evidenceKind='terminal-failure' AND incidentId IS NULL
           AND observedAt BETWEEN ?4 AND ?5
         """,
-        failure_evidence_params(txn, input)
+        inference_window_params(input)
       )
 
     count
@@ -2567,29 +2572,19 @@ defmodule Tightbeam.HarnessHealth do
           AND observedAt BETWEEN ?4 AND ?5
         ORDER BY observedAt,id
         """,
-        failure_evidence_params(txn, input)
+        inference_window_params(input)
       )
       |> List.flatten()
 
     Enum.uniq(authoritative ++ inferred)
   end
 
-  defp failure_evidence_params(txn, input) do
-    # A completed recovery is the boundary for a new failure. Evidence from
-    # before it cannot establish or clear the later failure, however long the
-    # new failure takes to produce a second observation.
-    [[last_recovery]] =
-      Txn.q(
-        txn,
-        "SELECT MAX(resolvedAt) FROM harness_health_incidents WHERE harness=?1 AND host=?2 AND failureClass=?3 AND state='resolved'",
-        [input.harness, input.host, input.failure_class]
-      )
-
+  defp inference_window_params(input) do
     [
       input.harness,
       input.host,
       input.failure_class,
-      if(last_recovery, do: last_recovery + 1, else: 0),
+      max(0, input.observed_at - @evidence_window_ms),
       input.observed_at
     ]
   end
