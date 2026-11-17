@@ -55,6 +55,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Projection,
     Tightbeam.AttachmentDelivery,
     Tightbeam.Org,
+    Tightbeam.HarnessSwitchContext,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
     Tightbeam.WorkItems,
