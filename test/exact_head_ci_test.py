@@ -17,12 +17,14 @@ def evaluate(expression, context):
     if ''.join(tokens) != re.sub(r'\s+', '', expression):
         raise ValueError('unsupported expression: ' + expression)
     words = {'&&': ' and ', '||': ' or ', '!=': ' != ', '==': ' == ',
-             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts'}
+             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts',
+             'format': '_format'}
     code = ''.join(
         words.get(token) or (repr(token[1:-1]) if token.startswith("'")
                              else repr(context[token]))
         for token in tokens)
-    return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p)})
+    return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p),
+                       '_format': lambda f, *a: f.format(*a)})
 
 
 class ExactHeadCI(unittest.TestCase):
@@ -199,6 +201,42 @@ class ExactHeadCI(unittest.TestCase):
         self.assertNotIn('merge_group:', publish)
         self.assertNotIn('on:\n  push:', publish)
 
+
+    def test_full_suites_run_on_every_event(self):
+        # The suites are the gate on pull requests too: no event switch may
+        # turn the test job back into a compile-only check.
+        self.assertNotIn('FULL_SUITE', self.text)
+        job = self.jobs['test']
+        steps = job.split('\n      - ')
+        for command in ('run: cargo build --release', 'run: scripts/verify_mix.sh',
+                        'run: cargo test'):
+            matching = [step for step in steps if command in step]
+            self.assertEqual(len(matching), 1, command)
+            self.assertNotRegex(matching[0], r'(?m)^        if:', command)
+        condition = re.search(r'(?m)^    if: (.*)$', job).group(1)
+        for event in ('pull_request', 'merge_group', 'push', 'workflow_dispatch'):
+            self.assertTrue(evaluate(condition, {
+                'github.event_name': event, 'inputs.docs_validation': 'off'}), event)
+
+    def test_pull_request_suites_stay_off_the_release_pools(self):
+        # Release-candidate and release packaging use the few self-hosted
+        # runners; pull request suites run on hosted runners beside them.
+        job = self.jobs['test']
+        self.assertIn('    runs-on: ${{ matrix.os }}', job)
+        self.assertEqual(re.findall(r'(?m)^          - os: (\S+)$', job),
+                         ['ubuntu-24.04', 'macos-latest'])
+
+    def test_only_a_superseded_pull_request_run_is_cancelled(self):
+        group = re.search(r'(?m)^  group: \$\{\{ (.*) \}\}$', self.text).group(1)
+        cancel = re.search(r'(?m)^  cancel-in-progress: \$\{\{ (.*) \}\}$', self.text).group(1)
+        base = {'github.event.pull_request.number': 12, 'github.run_id': 99}
+        self.assertEqual(
+            evaluate(group, {**base, 'github.event_name': 'pull_request'}), 'ci-pr-12')
+        self.assertTrue(evaluate(cancel, {'github.event_name': 'pull_request'}))
+        for event in ('push', 'merge_group', 'workflow_dispatch'):
+            self.assertEqual(
+                evaluate(group, {**base, 'github.event_name': event}), 'ci-run-99', event)
+            self.assertFalse(evaluate(cancel, {'github.event_name': event}), event)
 
     def test_no_retired_branch_dependency(self):
         self.assertNotIn('release-candidate/', self.text)

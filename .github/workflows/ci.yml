@@ -34,6 +34,13 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that pull request's older run, so the
+# runners only spend time on the head under review. Every other event gets a
+# group of its own and is never cancelled.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name != 'workflow_dispatch' && github.sha || inputs.candidate_sha }}
 
@@ -44,19 +51,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned: the release line was proved on 24.04, and the release
+          # packages are built on 24.04 hosts.
+          - os: ubuntu-24.04
             name: linux
           - os: macos-latest
             name: macos
     name: ${{ matrix.name }}
+    # Every event runs the full mix and cargo suites on both platforms: pull
+    # requests, the merge queue, branch and tag pushes, and manual runs. No
+    # event, path or label turns them into a compile-only check; a failure of
+    # either suite fails the check.
+    #
+    # Pull request runs stay on GitHub-hosted runners. The self-hosted pools
+    # are few and also carry release-candidate and release packaging, so
+    # pull request suites there would queue release work behind them.
     runs-on: ${{ matrix.os }}
-    # Changes land on the fast checks: pull requests, the merge queue and
-    # branch pushes run source checks, the gate scripts, and a compile (which
-    # builds the Rust NIF, so the Rust toolchain stays). The full mix and cargo
-    # suites run once per release, on the version tag, before packaging, and on
-    # manual runs.
-    env:
-      FULL_SUITE: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - name: Validate exact source SHA
         shell: bash
@@ -113,7 +123,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Toolchain versions (the parity record)
-        if: env.FULL_SUITE == 'true'
         run: |
           elixir --version
           rustc --version
@@ -131,7 +140,6 @@ jobs:
       # registered harness in the test registry (config/test.exs) and this is its
       # own CLI: nothing here imitates another harness's behaviour.
       - name: Put the in-repo harness CLI on PATH (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
         run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
 
       # The undeclared dependency that lied loudest: the identity suite commits
@@ -142,7 +150,6 @@ jobs:
       # nothing to resolve. Every dev mac has a global identity; the test host and the
       # runners have none, which is the whole 2-failure IdentityTest delta.
       - name: Declare a git identity (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
         run: |
           git config --global user.name "tightbeam ci"
           git config --global user.email "ci@tightbeam.invalid"
@@ -163,12 +170,10 @@ jobs:
           key: cargo-registry-${{ matrix.name }}-${{ hashFiles('cli/Cargo.lock') }}
 
       - name: cargo build --release (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
         working-directory: cli
         run: cargo build --release
 
       - name: Put the source-built Tightbeam CLI on PATH (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
         run: echo "$GITHUB_WORKSPACE/cli/target/release" >> "$GITHUB_PATH"
 
       # Make the runner's containment environment VISIBLE. Three fleet hosts at one
@@ -178,7 +183,7 @@ jobs:
       # node — so the cause is read from the runner's own output, not guessed from a
       # kernel number. Never fails the job; it only reports.
       - name: Containment environment (diagnostic)
-        if: env.FULL_SUITE == 'true' && matrix.name == 'linux'
+        if: matrix.name == 'linux'
         run: |
           uname -a
           echo "--- /dev/null as the shell sees it ---"
@@ -202,11 +207,9 @@ jobs:
         run: mix compile
 
       - name: mix test
-        if: env.FULL_SUITE == 'true'
         run: scripts/verify_mix.sh
 
       - name: cargo test
-        if: env.FULL_SUITE == 'true'
         working-directory: cli
         run: cargo test
 
