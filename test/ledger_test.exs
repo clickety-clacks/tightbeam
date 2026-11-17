@@ -38,6 +38,66 @@ defmodule Tightbeam.LedgerTest do
     seq
   end
 
+  # wi_0b608f33: a lane asks for the next turn every time a turn ends, in the
+  # database writer. Finding it, or finding there is none, must go through the
+  # pending-turns index, not walk every turn the session ever had: on a large
+  # org a busy session has tens of thousands of finished turns.
+  test "claiming the next turn reads only pending turns, not the session's history",
+       %{db: db} do
+    for _ <- 1..3 do
+      seq = enqueue!(db, "k1", "history")
+      {:ok, turn} = Ledger.claim_next(db, "k1", "lane")
+      :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: turn.owner_lease)
+    end
+
+    enqueue!(db, "k1", "next")
+    assert {{:ok, turn}, claimed} = traced_queries(db, fn -> Ledger.claim_next(db, "k1", "lane") end)
+    assert {:busy, busy} = traced_queries(db, fn -> Ledger.claim_next(db, "k1", "lane") end)
+    :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    assert {:none, empty} = traced_queries(db, fn -> Ledger.claim_next(db, "k1", "lane") end)
+
+    turn_lookups =
+      Enum.filter(claimed ++ busy ++ empty, fn {sql, _params} ->
+        sql =~ ~r/FROM turns(\s+AS t)?\s+WHERE\s+(t\.)?sessionKey\s*=\s*\?1/
+      end)
+
+    assert turn_lookups != []
+
+    for {sql, params} <- turn_lookups do
+      {:ok, plan} = DB.query(db, "EXPLAIN QUERY PLAN " <> sql, params)
+      details = Enum.map_join(plan, "\n", &List.last/1)
+
+      refute details =~ "turns_session",
+             "walks the session's turn history:\n#{sql}\n#{details}"
+    end
+  end
+
+  # Every statement the database owner runs while `fun` runs.
+  defp traced_queries(db, fun) do
+    owner = GenServer.whereis(db)
+    :erlang.trace(owner, true, [:call, {:tracer, self()}])
+    :erlang.trace_pattern({DB, :run_query, 3}, true, [:global])
+
+    result =
+      try do
+        fun.()
+      after
+        :erlang.trace_pattern({DB, :run_query, 3}, false, [:global])
+        :erlang.trace(owner, false, [:call])
+      end
+
+    {result, traced_statements([])}
+  end
+
+  defp traced_statements(acc) do
+    receive do
+      {:trace, _pid, :call, {DB, :run_query, [_conn, sql, params]}} ->
+        traced_statements([{sql, params} | acc])
+    after
+      200 -> Enum.reverse(acc)
+    end
+  end
+
   test "ordinary terminals without prewrite evidence commit once", %{db: db} do
     for terminal <- ~w(delivered canceled failed failed_unknown),
         evidence_opts <- [[], [prewrite_evidence: nil]] do
