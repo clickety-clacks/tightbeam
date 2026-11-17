@@ -1061,12 +1061,7 @@ defmodule Tightbeam.Rules do
         row_commit_candidate_calls_in_txn(txn, rule, call)
         |> Enum.flat_map(fn candidate_call ->
           candidates =
-            artifact_candidates_in_txn(
-              txn,
-              rule.conditions,
-              candidate_call.predicate_bindings,
-              owner
-            )
+            artifact_candidates_in_txn(txn, rule.conditions, candidate_call.predicate_bindings)
 
           Enum.reduce_while(candidates, [], fn candidate, [] ->
             candidate_call = Map.put(candidate_call, :artifact_candidate, candidate)

@@ -2057,12 +2057,12 @@ defmodule Tightbeam.HarnessHealth do
 
   defp promotion_close_authorized?(_txn, {:process, _name}, _id), do: true
 
+  defp promotion_close_authorized?(_txn, _principal, _promotion_id), do: false
+
   defp promotion_exists?(txn, promotion_id),
     do:
       Txn.q(txn, "SELECT 1 FROM harness_health_class_promotions WHERE id=?1", [promotion_id]) !=
         []
-
-  defp promotion_close_authorized?(_txn, _principal, _promotion_id), do: false
 
   defp review_authorized?(_txn, _id, {:process, _name}), do: true
 
