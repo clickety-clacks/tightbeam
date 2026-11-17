@@ -23,8 +23,9 @@ defmodule Tightbeam.Wire.Router do
   (the real client and the black-box drivers speak these; never rename):
   - GET  /version              — no auth; protocolVersion + health numbers.
   - POST /agent/dispatch       — cliToken auth; body {verb, target?, params,
-    as|asUser} → origin resolution; verb must be in the closed AGENT_VERBS
-    set (post excluded on purpose: an agent DM IS a wake-with-prompt).
+    as|asUser} → origin resolution; agent verbs use the closed AGENT_VERBS set.
+    The Chat service's human `post` path uses the org credential; session
+    credentials cannot invoke it.
   - POST /agent/tool-call-observed — SESSION token only; no body. The
     substrate-reserved PreToolUse hook reporting that this session is about to
     run `tightbeam artifact-record`. Not a verb: it writes no domain state, only
@@ -74,11 +75,10 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow harklight-briefings-catchup harklight-briefing spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow harklight-briefings-catchup harklight-briefing spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
                    "assess_attachments",
-                   "post",
                    "session-custody-transfer",
                    "fact-demand",
                    "sentinel-demand",
@@ -333,12 +333,11 @@ defmodule Tightbeam.Wire.Router do
     with {:ok, auth} <- agent_dispatch_auth(conn) do
       with_json(conn, fn body, conn ->
         cond do
+          body["verb"] == "post" and auth == :org ->
+            dispatch_rest_post(conn, auth, body)
+
           body["verb"] == "post" ->
-            with :ok <- allowed_agent_verb("post", auth) do
-              dispatch_rest_post(conn, auth, body)
-            else
-              {:error, status, code, message} -> error(conn, status, code, message)
-            end
+            error(conn, 400, "invalid_message", "verb not allowed: post")
 
           body["verb"] == "assess_attachments" ->
             with :ok <- allowed_agent_verb("assess_attachments", auth) do
@@ -3977,7 +3976,7 @@ defmodule Tightbeam.Wire.Router do
   # `--session <key>` is a COHORT FILTER over creator identity, not a target, so
   # resolving it as one would turn a roster filter into a session-existence
   # oracle. Both verbs' selectors travel as ordinary body params.
-  @non_target_verbs ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow harklight-briefings-catchup harklight-briefing settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
+  @non_target_verbs ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow harklight-briefings-catchup harklight-briefing settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
 
   @non_target_verbs @non_target_verbs ++
                       [
@@ -4082,7 +4081,7 @@ defmodule Tightbeam.Wire.Router do
     do: session_key
 
   defp artifact_caller_session(verb, nil, {:session, session_key})
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow),
+       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow),
        do: session_key
 
   defp artifact_caller_session(_verb, session_key, _principal), do: session_key
@@ -4549,6 +4548,7 @@ defmodule Tightbeam.Wire.Router do
     "harklight-cover" => ~w(handle)a,
     "harklight-briefings-catchup" => ~w(limit)a,
     "harklight-briefing" => ~w(request_id rearm_to_session)a,
+    "harklight-retry" => ~w(all message_id handle)a,
     "work-item-list" =>
       ~w(state status owner_user_id created_by_session created_by_user is_bug spec_ref_name holder_key limit after)a,
     "topline-placement-list" => ~w(state)a,
@@ -4624,7 +4624,7 @@ defmodule Tightbeam.Wire.Router do
     "host-env-set" => ~w(harness host key name sentinel value)a,
     "host-env-unset" => ~w(harness host key name sentinel)a,
     "host-toolchain-set" => ~w(dirs host)a,
-    "identity-apply" => ~w(all session_key)a,
+    "identity-apply" => ~w(all cursor limit session_key)a,
     "identity-edit" =>
       ~w(archetype content expected_revision idempotency_key manifest name path remove skill)a,
     "identity-relearn" => ~w(action idempotency_key)a,
@@ -4778,7 +4778,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp dispatch_error(conn, %{verb: verb}, status, result)
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow) do
+       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow) do
     json(conn, status, %{"error" => wire_value(result)})
   end
 

@@ -313,9 +313,33 @@ defmodule Tightbeam.Identity do
     with_live_revision_lock_in_dir(identity_dir(base_dir), fun)
   end
 
-  # Apply holds this lock for one target's materialization and durable stamp.
-  # Live-ref writers take the same lock so an older projection cannot write
-  # after a newer revision becomes live.
+  @doc false
+  # For a caller that resolved the live revision earlier in the same pass and
+  # takes the lock once per session: the same lock without repeating the
+  # repository checks of `init!/1`, and with a bounded wait. Returns `:aborted`
+  # when the lock stayed held for all `retries` further attempts.
+  def with_live_revision_lock(base_dir, retries, fun)
+      when is_integer(retries) and retries >= 0 and is_function(fun, 1) do
+    identity_dir = identity_dir(base_dir)
+    lock = {{__MODULE__, :live_revision, Path.expand(identity_dir)}, self()}
+
+    :global.trans(
+      lock,
+      fn -> fun.(git_output!(identity_dir, ["rev-parse", @live])) end,
+      [node() | Node.list()],
+      retries
+    )
+  end
+
+  @doc false
+  # The publication pointer alone, for a caller that already ran
+  # `live_revision!/1` in the same pass.
+  def current_live_revision!(base_dir),
+    do: git_output!(identity_dir(base_dir), ["rev-parse", @live])
+
+  # A session's stamp is committed under this lock. Live-ref writers take the
+  # same lock so an older projection cannot write after a newer revision
+  # becomes live.
   defp with_live_revision_lock_in_dir(identity_dir, fun) do
     lock = {{__MODULE__, :live_revision, Path.expand(identity_dir)}, self()}
 
@@ -1211,14 +1235,74 @@ defmodule Tightbeam.Identity do
     live = live_revision!(base_dir)
     source = git_output!(dir, ["rev-parse", "main"])
     conflicts = conflict_paths(dir)
+    missing = missing_installed_kungfu(base_dir, live)
 
     %{
       live_revision: live,
       source_revision: source,
       source_notice: source_notice(dir, source, live),
+      missing_installed_kungfu: missing,
+      missing_installed_kungfu_notice: format_missing_installed_kungfu_notice(missing),
       state: if(conflicts == [], do: :ready, else: :relearn_conflicted),
       conflicting_paths: conflicts
     }
+  end
+
+  @doc "Missing shipped paths and named rules for bundles learned into the live identity."
+  def missing_installed_kungfu(base_dir, revision \\ nil) do
+    dir = identity_dir(base_dir)
+    revision = revision || live_revision!(base_dir)
+
+    learned_bundle_names(dir, revision)
+    |> Enum.filter(&(&1 in available_bundle_names()))
+    |> Enum.flat_map(fn name ->
+      bundle_entries(name, bundle_dir(name))
+      |> Enum.flat_map(fn {path, shipped_bytes} ->
+        if path_exists_at?(dir, revision, path) do
+          missing_rule_names(path, shipped_bytes, git_show_bytes!(dir, revision, path))
+        else
+          [path]
+        end
+      end)
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  rescue
+    _error -> ["installed kungfu comparison unavailable"]
+  end
+
+  @doc false
+  def missing_installed_kungfu_notice(base_dir, revision \\ nil) do
+    base_dir |> missing_installed_kungfu(revision) |> format_missing_installed_kungfu_notice()
+  end
+
+  defp format_missing_installed_kungfu_notice(missing) do
+    case missing do
+      [] ->
+        nil
+
+      paths ->
+        "Installed kungfu is missing or unreadable in the live identity: " <>
+          Enum.join(paths, ", ") <> ". Run `tightbeam identity relearn` to install it."
+    end
+  end
+
+  defp missing_rule_names(path, shipped, live) do
+    if String.starts_with?(path, "rules/") or String.starts_with?(path, "rails/") do
+      shipped = Toml.decode!(shipped)
+      live = Toml.decode!(live)
+
+      for kind <- ~w(rule policy reaction statute),
+          entry <- Map.get(shipped, kind, []),
+          name = Map.get(entry, "name"),
+          is_binary(name),
+          not Enum.any?(Map.get(live, kind, []), &(Map.get(&1, "name") == name)),
+          do: "#{path} (#{kind} #{name})"
+    else
+      []
+    end
+  rescue
+    _error -> ["#{path} (live rule entries could not be inspected)"]
   end
 
   # A commit on the identity source (main) is not live until it is published.

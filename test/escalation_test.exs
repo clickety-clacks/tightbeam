@@ -272,7 +272,7 @@ defmodule Tightbeam.EscalationTest do
              Escalation.escalate(ctx.db, call, statute(), Map.put(escalation_ctx(), :dr_id, id))
   end
 
-  test "statute filing leaves no automatic owner opening notice even when Main exists", ctx do
+  test "statute filing briefs the addressed owner without an opening notice", ctx do
     call = call(ctx.raiser, %{assignment_id: "a-delivery", kind: "completion"})
     owner_session = Org.personal_session_key("flynn")
 
@@ -299,7 +299,11 @@ defmodule Tightbeam.EscalationTest do
     assert {:ok, [["decision-request-filed"]]} =
              DB.query(ctx.db, "SELECT kind FROM condition_facts WHERE scope=?1", [id])
 
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[^owner_session]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:harklight-decision-request-briefing'"
+             )
 
     assert {:decision_pending, ^id} =
              Escalation.escalate(
@@ -315,7 +319,12 @@ defmodule Tightbeam.EscalationTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE scope=?1", [id])
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='remedy:harklight-decision-request-briefing'"
+             )
   end
 
   test "an operator ruling condition notice stays an editable source while its recipient is busy",

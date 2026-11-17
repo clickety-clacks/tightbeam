@@ -36,6 +36,33 @@ defmodule Tightbeam.HarklightBriefings do
 
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
+  @doc false
+  def filed_request_in_txn(%Txn{} = txn, request) do
+    owner = request.owner_user_id
+
+    if addressed_principal(request) == "user:" <> owner and is_nil(briefing_rule(owner)) do
+      session_key = Org.personal_session_key(owner)
+      wake_id = wake_id(request.id)
+
+      if Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2", [
+           session_key,
+           owner
+         ]) == [["active"]] and is_nil(wake_in_txn(txn, wake_id)) do
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: wake_id,
+          session_key: session_key,
+          origin: @wake_origin,
+          prompt:
+            "Investigate the exact open decision request #{request.id} for its addressed owner. Read the request and supporting records, then brief the owner in plain language with its options and your recommendation through `tightbeam harklight-send --session new --type request --reply --decision-request-id #{request.id} ...`. Reread its status before sending or ruling; do not present a closed request or create a replacement decision. Keep replies in the originating Harklight conversation and reconcile an uncertain send before retrying.",
+          due_at: System.system_time(:millisecond),
+          summon: true
+        })
+      end
+    end
+
+    :ok
+  end
+
   @doc "Read the exact request's briefing wake and bound send, or admit its stable wake to one named session."
   def exact(db, call, opts \\ []) do
     request_id = call.params[:request_id]

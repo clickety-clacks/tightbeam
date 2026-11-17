@@ -49,6 +49,7 @@ defmodule Tightbeam.HarklightBriefingsTest do
 
   test "catchup stages every open request and admits only the requested number once", ctx do
     requests = Enum.map(1..3, fn n -> open_request(ctx, "Question #{n}?") end)
+    remove_automatic_wakes(ctx)
     load_briefing_rule(ctx, ctx.consumer.session_key)
 
     assert %{ok: true, listed: 3, admitted: 1, staged: 2, requests: first} =
@@ -232,6 +233,7 @@ defmodule Tightbeam.HarklightBriefingsTest do
     assert %{status: "ruled", decision: "accept"} =
              Escalation.operator_rule(ctx.db, rule_call, authorized: true)
 
+    remove_automatic_wakes(ctx)
     load_briefing_rule(ctx, ctx.consumer.session_key)
 
     assert %{ok: true, listed: 2, admitted: 1, excluded: 1, requests: entries} = catchup(ctx, 5)
@@ -282,6 +284,7 @@ defmodule Tightbeam.HarklightBriefingsTest do
   test "exact rearm admits only the named open request without a configured rule", ctx do
     first = open_request(ctx, "First choice?")
     second = open_request(ctx, "Second choice?")
+    remove_automatic_wakes(ctx)
 
     assert {:ok, [[question, options]]} =
              DB.query(ctx.db, "SELECT question,options FROM decision_requests WHERE id=?1", [
@@ -337,6 +340,7 @@ defmodule Tightbeam.HarklightBriefingsTest do
 
   test "exact rearm refuses a target change for an existing request wake", ctx do
     request = open_request(ctx, "Which route?")
+    remove_automatic_wakes(ctx)
 
     first = %{
       ctx.call
@@ -358,6 +362,7 @@ defmodule Tightbeam.HarklightBriefingsTest do
 
   test "exact rearm plainly refuses a closed request without creating a wake", ctx do
     request = open_request(ctx, "Already decided?")
+    remove_automatic_wakes(ctx)
 
     assert %{status: "ruled"} =
              Escalation.operator_rule(
@@ -384,6 +389,39 @@ defmodule Tightbeam.HarklightBriefingsTest do
     assert briefing_wake_count(ctx.db) == 0
   end
 
+  test "filing automatically binds the briefing wake to the addressed owner", ctx do
+    request = open_request(ctx, "Which option should we take?")
+
+    assert {:ok, [[session_key, origin]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,origin FROM wakes WHERE wakeId=?1",
+               [briefing_wake_id(request.id)]
+             )
+
+    assert session_key == ctx.main.session_key
+    assert session_key != ctx.compiler.session_key
+    assert origin == "remedy:harklight-decision-request-briefing"
+    assert briefing_wake_count(ctx.db) == 1
+
+    assert {:ok, %{action: :start}} =
+             HarklightBriefings.reserve_send(
+               ctx.db,
+               %{session_call(ctx.main.session_key) | params: %{}},
+               request.id
+             )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               ctx.compiler.session_key
+             ])
+
+    assert {:ok, [[^session_key]]} =
+             DB.query(ctx.db, "SELECT sessionKey FROM wakes WHERE wakeId=?1", [
+               briefing_wake_id(request.id)
+             ])
+  end
+
   defp catchup(ctx, limit) do
     HarklightBriefings.catchup(ctx.db, Map.put(ctx.call, :params, %{limit: limit}),
       authorized: true
@@ -396,6 +434,22 @@ defmodule Tightbeam.HarklightBriefingsTest do
       | verb: "operator-ask",
         params: %{question: question}
     })
+  end
+
+  defp remove_automatic_wakes(ctx) do
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM wakes WHERE origin='remedy:harklight-decision-request-briefing'"
+             )
+  end
+
+  defp briefing_wake_id(request_id) do
+    digest =
+      :crypto.hash(:sha256, "harklight-decision-request-briefing" <> <<0>> <> request_id)
+      |> Base.encode16(case: :lower)
+
+    "w_rule_" <> digest
   end
 
   defp load_briefing_rule(ctx, target) do
