@@ -3121,6 +3121,7 @@ defmodule Tightbeam.HarklightWakesTest do
     if [ "$1" = attach ]; then
       printf '%s\n' '{"kind":"attached","ready_for_listen":true}'
     else
+      printf '%s\\n' "$$" > "$0.pid"
       exec sleep 300
     fi
     """)
@@ -3138,11 +3139,14 @@ defmodule Tightbeam.HarklightWakesTest do
     listen_call = "listen --follow --controller --session #{@handle} --ack2"
 
     assert eventually(fn ->
-             File.exists?(script <> ".calls") and File.read!(script <> ".calls") =~ listen_call
+             File.exists?(script <> ".pid") and File.read!(script <> ".pid") != "" and
+               File.exists?(script <> ".calls") and File.read!(script <> ".calls") =~ listen_call
            end)
 
     port = await_listener_port()
     {:os_pid, pid} = Port.info(port, :os_pid)
+
+    child_pid = File.read!(script <> ".pid") |> String.trim()
 
     calls = File.read!(script <> ".calls")
     assert calls =~ "attach --session #{@handle}"
@@ -3152,12 +3156,19 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {_, 0} =
              System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
 
+    assert {_, 0} = System.cmd("/bin/kill", ["-0", child_pid], stderr_to_stdout: true)
+
     :ok = stop_supervised(HarklightWakes)
 
-    assert {_, status} =
-             System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+    # Port.close requests cleanup; the wrapper kills and reaps its child
+    # asynchronously. Observe both exits before restoring the controller.
+    assert eventually(fn ->
+             Enum.all?([Integer.to_string(pid), child_pid], fn os_pid ->
+               {_, status} = System.cmd("/bin/kill", ["-0", os_pid], stderr_to_stdout: true)
+               status != 0
+             end)
+           end)
 
-    assert status != 0
     start_supervised!({HarklightWakes, db: db})
 
     assert eventually(fn ->
