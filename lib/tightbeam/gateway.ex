@@ -3972,7 +3972,7 @@ defmodule Tightbeam.Gateway do
               {:error, :prompt_timeout},
               {:error, {:acp_request_not_dispatched, :prompt_timeout}}
             ],
-    do: {:error, :timeout}
+       do: {:error, :timeout}
 
   defp compactor_result(
          {:error, {:prompt_interrupted, {:cancel_unacknowledged, _session_id}}},
@@ -3980,7 +3980,7 @@ defmodule Tightbeam.Gateway do
          _model,
          _input
        ),
-    do: {:error, :timeout}
+       do: {:error, :timeout}
 
   defp compactor_result({:error, reason}, _close_result, _model, _input),
     do: {:error, {:prompt_failed, reason}}
