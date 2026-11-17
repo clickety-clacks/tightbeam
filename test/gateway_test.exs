@@ -13061,6 +13061,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     assert response.status == 200
+
     assert %{"result" => %{"ack" => "c_rest_submitter", "outcome" => "recorded"}} =
              JSON.decode!(response.resp_body)
 

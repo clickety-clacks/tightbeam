@@ -834,7 +834,8 @@ defmodule Tightbeam.Gateway do
                 )
 
               if outcome in [:appended, :queued, :duplicate] do
-                receipt = human_post_receipt(db, call.session_key, p.device_id, p.client_message_id)
+                receipt =
+                  human_post_receipt(db, call.session_key, p.device_id, p.client_message_id)
 
                 legacy_result =
                   if outcome in [:appended, :queued],
@@ -866,10 +867,16 @@ defmodule Tightbeam.Gateway do
           end
         else
           :error ->
-            %{code: "invalid_message", message: "attachments must be canonical attachment references"}
+            %{
+              code: "invalid_message",
+              message: "attachments must be canonical attachment references"
+            }
 
           {:error, :submitter} ->
-            %{code: "invalid_message", message: "submitter must contain nullable identity and displayName strings"}
+            %{
+              code: "invalid_message",
+              message: "submitter must contain nullable identity and displayName strings"
+            }
         end
       end,
       {"wake",
