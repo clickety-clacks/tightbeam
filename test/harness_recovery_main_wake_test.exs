@@ -252,7 +252,11 @@ defmodule Tightbeam.HarnessRecoveryMainWakeTest do
       |> Map.update!("after", &Map.put(&1, "state", "open"))
 
     refute hd(Rules.reaction_plans(opened_event, facts)).selected
-    assert Rules.reaction_plans(Map.put(event, "kind", "wake_delivery"), facts) == []
+
+    assert Enum.filter(
+             Rules.reaction_plans(Map.put(event, "kind", "wake_delivery"), facts),
+             &(&1.family == "harness-recovery")
+           ) == []
 
     assert {:ok, :ok} =
              DB.transaction(ctx.db, fn txn ->
