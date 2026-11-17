@@ -4700,90 +4700,121 @@ defmodule Tightbeam.Gateway do
     best_effort(fn -> identity_staleness_alarm(db, System.system_time(:millisecond)) end)
   end
 
+  # This runs at every turn end. Nearly every time there is nothing to do: no
+  # active session is late, or today's notice for the live revision already
+  # exists. So the question is asked on a reader, and the database writer is
+  # used only when a notice is to be scheduled, once per revision per day.
   defp identity_staleness_alarm(db, now) do
-    case DB.transaction(db, fn txn -> identity_staleness_alarm_in_txn(txn, now) end) do
-      {:ok, result} -> result
-      {:error, error} -> raise error
+    case DB.read_transaction(db, &identity_staleness_check_in_txn(&1, now)) do
+      {:ok, {:late, _revision, _late_count, _wake_id, _owner, _target}} ->
+        case DB.transaction(db, &identity_staleness_alarm_in_txn(&1, now)) do
+          {:ok, result} -> result
+          {:error, error} -> raise error
+        end
+
+      {:ok, result} ->
+        result
+
+      {:error, error} ->
+        raise error
     end
   end
 
   defp identity_staleness_alarm_in_txn(txn, now) do
+    case identity_staleness_check_in_txn(txn, now) do
+      {:late, revision, late_count, wake_id, owner, target} ->
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: wake_id,
+          session_key: target,
+          owner_user_id: owner,
+          origin: "process:tightbeam",
+          prompt:
+            Tightbeam.Reminders.render(txn, "identity-staleness", %{
+              late_count: late_count,
+              revision: revision
+            }),
+          due_at: now,
+          target_gate: 0
+        })
+
+        {:scheduled, late_count, revision}
+
+      result ->
+        result
+    end
+  end
+
+  # Reads only. The day's notice is looked up before anything is counted, so
+  # once it exists a turn end costs two key lookups and no count. The live
+  # revision is read out of the served projection in SQL: the item carries
+  # per-session data, and decoding all of it to read one field grew with the
+  # number of sessions.
+  defp identity_staleness_check_in_txn(txn, now) do
     case Txn.q(
            txn,
-           "SELECT item, updatedAt FROM admin_projection_versions " <>
+           "SELECT json_extract(item, '$.liveRevision'), updatedAt " <>
+             "FROM admin_projection_versions " <>
              "WHERE resource = 'identity' AND primaryKey = 'served'",
            []
          ) do
-      [[item, published_at]] ->
-        %{"liveRevision" => revision} = JSON.decode!(item)
+      [[revision, published_at]] when is_binary(revision) ->
+        wake_id = identity_staleness_wake_id(revision, now)
 
-        # This runs in the database writer at every turn end, so its cost must
-        # not grow with turn history. A session's turns start in `seq` order, so
-        # its newest started turn alone decides whether it ran after the
-        # publication: one index step per session. Asking instead whether ANY
-        # turn started after the publication reads every turn row of every
-        # session that is behind, which on a large org held the writer for
-        # seconds per turn end from the moment a revision was published.
-        [[late_count]] =
-          Txn.q(
-            txn,
-            """
-            SELECT COUNT(*)
-            FROM sessions AS session
-            WHERE session.state = 'active'
-              AND session.identityRevision IS NOT ?1
-              AND (
-                SELECT turn.startedAt FROM turns AS turn
-                WHERE turn.sessionKey = session.sessionKey
-                  AND turn.startedAt IS NOT NULL
-                ORDER BY turn.seq DESC
-                LIMIT 1
-              ) >= ?2
-            """,
-            [revision, published_at]
-          )
+        case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId = ?1", [wake_id]) do
+          [[1]] ->
+            :already_notified
 
-        maybe_schedule_identity_staleness_notice(txn, revision, late_count, now)
+          [] ->
+            with late_count when late_count > 0 <-
+                   identity_staleness_late_count(txn, revision, published_at),
+                 {owner, target} <- identity_staleness_owner(txn) do
+              {:late, revision, late_count, wake_id, owner, target}
+            else
+              0 -> :current
+              nil -> :no_owner_surface
+            end
+        end
+
+      [[revision, _published_at]] ->
+        raise "identity/served projection has no live revision: #{inspect(revision)}"
 
       [] ->
         :no_published_identity
     end
   end
 
-  defp maybe_schedule_identity_staleness_notice(_txn, _revision, 0, _now), do: :current
+  defp identity_staleness_wake_id(revision, now) do
+    epoch_day = div(now, 86_400_000)
+    digest = :crypto.hash(:sha256, "identity-staleness:#{revision}:#{epoch_day}")
+    "w_" <> Base.encode16(digest, case: :lower)
+  end
 
-  defp maybe_schedule_identity_staleness_notice(txn, revision, late_count, now) do
-    case identity_staleness_owner(txn) do
-      nil ->
-        :no_owner_surface
+  # A session's turns start in `seq` order, so its newest started turn alone
+  # decides whether it ran after the publication: one index step per session.
+  # Asking instead whether ANY turn started after the publication reads every
+  # turn row of every session that is behind, which on a large org held the
+  # writer for seconds per turn end from the moment a revision was published.
+  defp identity_staleness_late_count(txn, revision, published_at) do
+    [[late_count]] =
+      Txn.q(
+        txn,
+        """
+        SELECT COUNT(*)
+        FROM sessions AS session
+        WHERE session.state = 'active'
+          AND session.identityRevision IS NOT ?1
+          AND (
+            SELECT turn.startedAt FROM turns AS turn
+            WHERE turn.sessionKey = session.sessionKey
+              AND turn.startedAt IS NOT NULL
+            ORDER BY turn.seq DESC
+            LIMIT 1
+          ) >= ?2
+        """,
+        [revision, published_at]
+      )
 
-      {owner, target} ->
-        epoch_day = div(now, 86_400_000)
-        digest = :crypto.hash(:sha256, "identity-staleness:#{revision}:#{epoch_day}")
-        wake_id = "w_" <> Base.encode16(digest, case: :lower)
-
-        case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId = ?1", [wake_id]) do
-          [] ->
-            Wakes.schedule_in_txn(txn, %{
-              wake_id: wake_id,
-              session_key: target,
-              owner_user_id: owner,
-              origin: "process:tightbeam",
-              prompt:
-                Tightbeam.Reminders.render(txn, "identity-staleness", %{
-                  late_count: late_count,
-                  revision: revision
-                }),
-              due_at: now,
-              target_gate: 0
-            })
-
-            {:scheduled, late_count, revision}
-
-          [[1]] ->
-            :already_notified
-        end
-    end
+    late_count
   end
 
   defp identity_staleness_owner(txn) do

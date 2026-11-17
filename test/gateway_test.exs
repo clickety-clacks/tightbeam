@@ -10967,6 +10967,16 @@ defmodule Tightbeam.GatewayTest do
     assert :already_notified = Gateway.identity_staleness_alarm_for_test(ctx.db, now)
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
+    # wi_0b608f33: once today's notice exists, a turn end does not count late
+    # sessions again. With the turn history out of reach, any count would fail.
+    assert :ok = DB.execute(ctx.db, "ALTER TABLE turns RENAME TO turns_out_of_reach")
+
+    try do
+      assert :already_notified = Gateway.identity_staleness_alarm_for_test(ctx.db, now)
+    after
+      assert :ok = DB.execute(ctx.db, "ALTER TABLE turns_out_of_reach RENAME TO turns")
+    end
+
     next_revision = "next-published-revision"
     next_published_at = published_at + 10_000
     next_item = item |> JSON.decode!() |> Map.put("liveRevision", next_revision) |> JSON.encode!()
@@ -10988,6 +10998,116 @@ defmodule Tightbeam.GatewayTest do
              Gateway.identity_staleness_alarm_for_test(ctx.db, now + 86_400_000)
 
     assert {:ok, [[3]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  # wi_0b608f33: this check runs at every turn end. Asking it must not need the
+  # database writer: while the writer is busy with something slow, a turn end
+  # still learns that today's notice exists, and also that nobody is late.
+  test "identity staleness check at turn end answers while the database writer is busy",
+       _ctx do
+    base_dir =
+      System.tmp_dir!()
+      |> Path.join("tightbeam-staleness-reader-#{System.unique_integer([:positive])}")
+      |> Tightbeam.LiveBaseAdmission.canonical!()
+
+    File.mkdir_p!(base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    payload_root = Path.join(base_dir, "payload")
+    File.mkdir_p!(Path.join(payload_root, "ebin"))
+    File.mkdir_p!(Path.join(payload_root, "priv"))
+    File.write!(Path.join(payload_root, "priv/staleness-reader-test"), "test payload")
+
+    {:ok, manifest} =
+      Tightbeam.LiveBaseGuard.generate_manifest(Tightbeam.LiveBasePayload.files!(payload_root))
+
+    File.write!(Path.join(payload_root, "build-manifest.json"), JSON.encode!(manifest))
+
+    db =
+      start_supervised!(
+        Supervisor.child_spec(
+          {DB,
+           path: Path.join(base_dir, "state.db"),
+           name: nil,
+           guard_inputs: [],
+           payload_root: payload_root},
+          id: {:staleness_reader, System.unique_integer([:positive])}
+        )
+      )
+
+    :ok = ensure_all_schemas(db)
+    identity_base = role_test_base("identity-staleness-reader")
+    assert :initialized = Identity.init!(identity_base)
+    :ok = Tightbeam.AdminProjection.bootstrap_served(db, identity_base)
+    ensure_main_session(db, "flynn")
+    ensure_global_registry()
+
+    {:ok, [[item, published_at]]} =
+      DB.query(
+        db,
+        "SELECT item, updatedAt FROM admin_projection_versions " <>
+          "WHERE resource = 'identity' AND primaryKey = 'served'"
+      )
+
+    %{"liveRevision" => revision} = JSON.decode!(item)
+    now = System.system_time(:millisecond)
+
+    hold_writer = fn ->
+      parent = self()
+
+      writer =
+        Task.async(fn ->
+          DB.transaction(db, fn _txn ->
+            send(parent, {:writer_held, self()})
+
+            receive do
+              :release -> :released
+            after
+              10_000 -> raise "writer was not released"
+            end
+          end)
+        end)
+
+      assert_receive {:writer_held, owner}, 5_000
+      {writer, owner}
+    end
+
+    check_while_held = fn ->
+      {writer, owner} = hold_writer.()
+      check = Task.async(fn -> Gateway.identity_staleness_alarm_for_test(db, now) end)
+      answered = Task.yield(check, 2_000)
+      send(owner, :release)
+      assert {:ok, :released} = Task.await(writer, 5_000)
+      answered || {:late, Task.await(check, 5_000)}
+    end
+
+    # Nobody is late.
+    assert {:ok, :current} = check_while_held.()
+
+    late = create_session(db, "agent:identity-reader-late", "flynn")
+    Org.set_identity_revision(db, late.session_key, "older-revision")
+
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: late.session_key,
+        message_id: "identity-staleness-reader-#{System.unique_integer([:positive])}",
+        origin: "user:flynn",
+        prompt: "fixture"
+      })
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE turns SET status = 'delivered', startedAt = ?2, endedAt = ?2 WHERE seq = ?1",
+        [seq, published_at + 1]
+      )
+
+    # Somebody is late and no notice exists yet: this one needs the writer.
+    assert {:scheduled, 1, ^revision} = Gateway.identity_staleness_alarm_for_test(db, now)
+
+    # Today's notice exists: every later turn end answers without the writer.
+    assert {:ok, :already_notified} = check_while_held.()
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
   end
 
   # wi_47c7e2eb: this count runs in the database writer at every turn end. It
