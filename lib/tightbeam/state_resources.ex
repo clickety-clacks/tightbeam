@@ -177,12 +177,6 @@ defmodule Tightbeam.StateResources do
                FROM wakes AS notice_wake
                CROSS JOIN json_each(COALESCE(notice_wake.recordEventIds, '[]')) AS wake_id
                WHERE notice_wake.wakeId = t.wakeId
-               UNION ALL
-               SELECT member_id.value AS event_id
-               FROM wake_cancellations AS cancellation
-               JOIN wakes AS member_wake ON member_wake.wakeId = cancellation.wakeId
-               CROSS JOIN json_each(COALESCE(member_wake.recordEventIds, '[]')) AS member_id
-               WHERE cancellation.replacementWakeId = t.wakeId
              )
              ORDER BY event_id
            )
@@ -897,9 +891,12 @@ defmodule Tightbeam.StateResources do
 
   @doc "Return the complete transcript projection for one session."
   def query_messages_for_session(source, session_key) do
-    source
-    |> query(@message_select <> " WHERE m.sessionKey = ?1 ORDER BY m.seq ASC", [session_key])
-    |> Enum.map(&message_row/1)
+    with_read_transaction(source, fn txn ->
+      txn
+      |> query(@message_select <> " WHERE m.sessionKey = ?1 ORDER BY m.seq ASC", [session_key])
+      |> Enum.map(&message_row/1)
+      |> with_replaced_wake_record_events(txn)
+    end)
   end
 
   @doc "Return one bounded page of the retained transcript for a session."
@@ -918,8 +915,64 @@ defmodule Tightbeam.StateResources do
         limit,
         fn [seq | _] -> [seq] end
       )
+      |> then(fn page ->
+        rows =
+          page.rows
+          |> Enum.map(&message_row/1)
+          |> with_replaced_wake_record_events(txn)
+
+        %{rows: rows, flags: page}
+      end)
     end)
-    |> then(fn page -> %{rows: Enum.map(page.rows, &message_row/1), flags: page} end)
+  end
+
+  # A batch digest's turn also carries the record events of the wakes it
+  # replaced. They are read for all of a page's turns in one pass over
+  # wake_cancellations: that table has no index on replacementWakeId, so the
+  # per-message lookup this replaces scanned the whole table once per message.
+  # The merged list is the same distinct, sorted list the per-message lookup
+  # produced.
+  defp with_replaced_wake_record_events(rows, txn) do
+    seqs = rows |> Enum.map(& &1.turn_seq) |> Enum.filter(&is_integer/1) |> Enum.uniq()
+
+    wake_by_seq =
+      if seqs == [],
+        do: %{},
+        else:
+          txn
+          |> query(
+            "SELECT seq, wakeId FROM turns " <>
+              "WHERE seq IN (SELECT value FROM json_each(?1)) AND wakeId IS NOT NULL",
+            [JSON.encode!(seqs)]
+          )
+          |> Map.new(fn [seq, wake_id] -> {seq, wake_id} end)
+
+    members =
+      if wake_by_seq == %{},
+        do: %{},
+        else:
+          txn
+          |> query(
+            """
+            SELECT cancellation.replacementWakeId, member_id.value
+            FROM wake_cancellations AS cancellation
+            JOIN wakes AS member_wake ON member_wake.wakeId = cancellation.wakeId
+            CROSS JOIN json_each(COALESCE(member_wake.recordEventIds, '[]')) AS member_id
+            WHERE cancellation.replacementWakeId IN (SELECT value FROM json_each(?1))
+            """,
+            [JSON.encode!(Map.values(wake_by_seq))]
+          )
+          |> Enum.group_by(&hd/1, &List.last/1)
+
+    Enum.map(rows, fn row ->
+      case Map.get(members, Map.get(wake_by_seq, row.turn_seq)) do
+        nil ->
+          row
+
+        extra ->
+          %{row | record_event_ids: Enum.sort(Enum.uniq(row.record_event_ids ++ extra))}
+      end
+    end)
   end
 
   @doc "Return one bounded page of active record events tied to a session."
@@ -1362,11 +1415,13 @@ defmodule Tightbeam.StateResources do
   end
 
   def query_message(source, id) do
-    case query(source, @message_select <> " WHERE m.id = ?1", [id]) do
-      [row] -> message_row(row)
-      [] -> nil
-      _rows -> raise ArgumentError, "transcript message resolves to more than one turn"
-    end
+    with_read_transaction(source, fn txn ->
+      case query(txn, @message_select <> " WHERE m.id = ?1", [id]) do
+        [row] -> [message_row(row)] |> with_replaced_wake_record_events(txn) |> hd()
+        [] -> nil
+        _rows -> raise ArgumentError, "transcript message resolves to more than one turn"
+      end
+    end)
   end
 
   @doc false
@@ -1970,15 +2025,13 @@ defmodule Tightbeam.StateResources do
     |> query(sql, params)
   end
 
+  # A read: it runs on a read connection, never in the database writer.
   defp observed_query(db, principal, sql, params) do
-    case DB.transaction(db, fn txn ->
-           txn
-           |> Txn.observe_queries(principal_trace(principal))
-           |> query(sql, params)
-         end) do
-      {:ok, rows} -> rows
-      {:error, error} -> raise error
-    end
+    DB.read_transaction!(db, fn txn ->
+      txn
+      |> Txn.observe_queries(principal_trace(principal))
+      |> query(sql, params)
+    end)
   end
 
   defp principal_trace(principal) when is_map(principal),
@@ -3660,12 +3713,9 @@ defmodule Tightbeam.StateResources do
 
   defp with_read_transaction(%Txn{} = txn, fun), do: fun.(txn)
 
-  defp with_read_transaction(db, fun) do
-    case DB.transaction(db, fun) do
-      {:ok, result} -> result
-      {:error, error} -> raise error
-    end
-  end
+  # Session history, turns, wakes, work items and assignments pages read here.
+  # They run on a read connection, never in the database writer.
+  defp with_read_transaction(db, fun), do: DB.read_transaction!(db, fun)
 
   defp query(db, sql, params) do
     {:ok, rows} = DB.query(db, sql, params)
