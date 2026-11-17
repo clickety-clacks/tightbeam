@@ -532,7 +532,10 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
 
       manifest =
         File.read!(Path.join(shipped, "manifest.toml"))
-        |> String.replace("root_archetype = \"orchestrator\"", "root_archetype = \"default\"")
+        |> String.replace(
+          "root_archetype = \"agentic-engineering.orchestrator\"",
+          "root_archetype = \"default\""
+        )
 
       File.write!(Path.join(destination, "manifest.toml"), manifest)
 

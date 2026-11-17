@@ -151,7 +151,15 @@ defmodule Tightbeam.RowReactions.Snapshot do
 
     personal = Org.personal_session_key(terminal["owner_user_id"])
 
+    actor =
+      case event["principal"] do
+        %{"kind" => "session", "id" => key} -> key
+        _ -> nil
+      end
+
     keys = [
+      actor,
+      terminal["opened_by_id"],
       current_opener,
       terminal["child_session_key"],
       personal,
@@ -252,7 +260,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
       end)
 
     %{
-      "sessions" => sessions(txn, [delivery["sessionKey"]]),
+      "sessions" => sessions(txn, [delivery["sessionKey"], delivered["creatorSessionKey"]]),
       "assignments" =>
         rows(txn, "assignments", @assignment, "holderKey=?1", [delivery["sessionKey"]]),
       "attests" => attests,
@@ -471,7 +479,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
       |> Enum.filter(&is_binary/1)
       |> Enum.uniq()
       |> Enum.flat_map(
-        &rows(txn, "sessions", ~w(sessionKey ownerUserId state), "sessionKey=?1", [&1])
+        &rows(txn, "sessions", ~w(sessionKey ownerUserId state archetype), "sessionKey=?1", [&1])
       )
 
   defp one(txn, table, fields, where, params),

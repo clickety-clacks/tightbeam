@@ -177,7 +177,8 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
       session_key: "agent:coder:app",
       host: "worker",
       harness: "codex",
-      cli_token: "tbs_test"
+      cli_token: "tbs_test",
+      archetype: "agentic-engineering.coder"
     }
 
     config = %{base_dir: ctx.base, db: ctx.db, port: 4321, sh: sh, sh_out: sh}

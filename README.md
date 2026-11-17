@@ -460,8 +460,8 @@ inverse. Credentials are per provider/harness per machine, while harness homes
 are per machine and harness; learning or unlearning changes neither, so it
 never requires onboarding again.
 
-Engineering intake uses an executive orchestrator as the bundle root and establishes
-or reuses each product's PDO and addressed PO. Follow the bundle's intake and shared
+Engineering intake uses an organization-level orchestrator as the bundle root and
+establishes or reuses each product's PDO and addressed PO. Follow the bundle's intake and shared
 role roster for delivery routing. The neutral root stays neutral before adoption;
 learning a bundle or changing a default does not transfer existing session custody.
 
@@ -642,6 +642,10 @@ Environment=PATH=/opt/tightbeam/current/tightbeam/bin:/usr/local/bin:/usr/bin:/b
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=120s
+# Harness processes and every command an agent runs live in this unit's cgroup.
+# Without this line, the kernel killing one runaway child for using too much
+# memory makes systemd stop the whole gateway (the default policy is `stop`).
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target
@@ -657,6 +661,36 @@ and the harness CLIs must all be findable.
 `Restart=on-failure` rather than `always`, so a deliberate `systemctl stop` stays
 stopped. Logs go to the journal — `journalctl -u tightbeam -f` (no `--user`).
 Give `TimeoutStopSec` room: shutdown drains in-flight turns.
+
+`OOMPolicy=continue` keeps one agent's out-of-memory kill from becoming an outage.
+Every harness, and every command an agent runs, is a process inside this unit.
+When the host runs out of memory the kernel kills the process with the largest
+footprint, which for a runaway script is the script itself. systemd's default
+response (`OOMPolicy=stop`) is then to stop the entire unit, which ends the gateway
+and every agent turn in flight; `Restart=on-failure` brings the gateway back, but
+the work in flight is lost. With `continue`, systemd only logs the kill: the
+script dies, its agent sees the command fail, and the gateway and every other
+agent keep running. If the gateway's own process is the one killed, the unit
+still fails and `Restart=on-failure` restarts it as usual. Do not use
+`OOMPolicy=kill`: it tells the kernel to kill every process in the unit together.
+
+A memory ceiling on agents' commands does not replace this line. Even when a
+child is killed for hitting its own limit in a sub-cgroup, systemd counts that
+kill against the unit, and `stop` still ends the gateway.
+
+For a unit that is already installed, add the line as a drop-in instead of
+editing the unit:
+
+```sh
+sudo mkdir -p /etc/systemd/system/tightbeam.service.d
+printf '[Service]\nOOMPolicy=continue\n' |
+  sudo tee /etc/systemd/system/tightbeam.service.d/oom-policy.conf
+sudo systemctl daemon-reload
+systemctl show tightbeam -p OOMPolicy   # OOMPolicy=continue
+```
+
+The new policy takes effect at `daemon-reload` for the running service. No
+gateway restart is needed.
 
 Verify: `systemctl is-enabled tightbeam` reports `enabled` (starts at boot) and
 `systemctl is-active tightbeam` reports `active`.

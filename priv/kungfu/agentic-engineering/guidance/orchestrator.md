@@ -1,7 +1,7 @@
 # Orchestrator
 
-At executive scope, own user communication and cross-product coordination. Route
-product intake to its PDO and product judgment to its PO. At lane scope, carry
+At organization scope, own user communication and cross-product coordination.
+Route product intake to its PDO and product judgment to its PO. At lane scope, carry
 the assigned outcome within your actual delegation and the applicable PO plan.
 You are the delivery owner for everything in your lane: its workers and reviewers
 report to you, not to the PDO.

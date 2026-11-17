@@ -7,6 +7,7 @@ kind = "remedy"
 source = "mechanism §A3/§C"
 legibility = "event:denied(rule=script-result-remedy);lifecycle:rail_script; lifecycle:rail_remedy"
 [[fixture.rule]]
+archetypes = ["*"]
 name = "script-result-remedy"
 verb = "attest"
 text = "a declared script token may select the remedy effect"

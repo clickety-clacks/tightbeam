@@ -319,7 +319,7 @@ defmodule Tightbeam.RowReactions do
   end
 
   def admit(txn, event) do
-    facts = Snapshot.current(txn, event, %{})
+    facts = event_scope_facts(event, Snapshot.current(txn, event, %{}))
     actions = Store.admit(txn, event, facts)
     Enum.each(actions, &Notice.execute(txn, &1, event["at"]))
     Store.actions(txn, event["org"], event["id"])
@@ -438,7 +438,7 @@ defmodule Tightbeam.RowReactions do
     {_event, original} = Store.event(txn, event["org"], event["id"])
 
     facts =
-      Snapshot.current(txn, event, original)
+      event_scope_facts(event, Snapshot.current(txn, event, original))
       |> Map.put("transition", transition)
       |> Map.put(
         "reaction_actions",
@@ -529,6 +529,44 @@ defmodule Tightbeam.RowReactions do
 
   defp attest_principal(_attest, principal),
     do: raise(ArgumentError, "attest source has unsupported principal: #{inspect(principal)}")
+
+  defp event_scope_facts(event, facts) do
+    record_keys =
+      case event["kind"] do
+        "assignment" ->
+          after_row = event["after"] || %{}
+          Enum.filter([after_row["openedBySession"], after_row["holderKey"]], &is_binary/1)
+
+        "wake_delivery" ->
+          after_row = event["after"] || %{}
+          Enum.filter([after_row["creatorSessionKey"]], &is_binary/1)
+
+        _ ->
+          []
+      end
+
+    record_groups = if record_keys == [], do: [[]], else: [record_keys]
+
+    caller_key =
+      if get_in(event, ["principal", "kind"]) == "session",
+        do: get_in(event, ["principal", "id"])
+
+    delivery_key = get_in(event, ["delivery", "sessionKey"])
+
+    participant_keys = [caller_key, delivery_key] |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+    participant_archetypes =
+      Enum.map(participant_keys, fn key ->
+        case Enum.find(facts["sessions"] || [], &(&1["sessionKey"] == key)) do
+          %{"archetype" => archetype} -> archetype
+          _ -> nil
+        end
+      end)
+
+    facts
+    |> Map.put("scope_participant_archetypes", participant_archetypes)
+    |> Map.put("scope_record_session_groups", record_groups)
+  end
 
   defp stringify(map),
     do:

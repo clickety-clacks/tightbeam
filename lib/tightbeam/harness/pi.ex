@@ -283,9 +283,7 @@ defmodule Tightbeam.Harness.Pi do
           bytes
 
         hooks ->
-          hooks
-          |> update_in(["hooks", "PreToolUse"], &(&1 ++ [Tightbeam.Rails.probe_entry()]))
-          |> extension_source()
+          extension_source(hooks)
       end
 
     result =
@@ -633,7 +631,7 @@ defmodule Tightbeam.Harness.Pi do
 
     """
     import { readFileSync } from "node:fs";
-    import { join } from "node:path";
+    import { join, resolve } from "node:path";
     import { spawnSync } from "node:child_process";
 
     const settings = JSON.parse(Buffer.from(#{JSON.encode!(encoded)}, "base64").toString("utf8"));
@@ -648,6 +646,12 @@ defmodule Tightbeam.Harness.Pi do
     }
 
     export default function (pi) {
+      let sessionWorkdir = "";
+
+      pi.on("session_start", async (_event, ctx) => {
+        sessionWorkdir = typeof ctx?.cwd === "string" && ctx.cwd ? resolve(ctx.cwd) : "";
+      });
+
       pi.on("before_agent_start", async (event) => {
         const guidance = identityGuidance();
         if (!guidance) return undefined;
@@ -665,9 +669,10 @@ defmodule Tightbeam.Harness.Pi do
             if (hook?.type !== "command" || typeof hook?.command !== "string") continue;
 
             const result = spawnSync("/bin/sh", ["-c", hook.command], {
+              cwd: sessionWorkdir || process.cwd(),
               input: payload,
               encoding: "utf8",
-              env: process.env,
+              env: { ...process.env, TIGHTBEAM_SESSION_WORKDIR: sessionWorkdir },
               timeout: 30000,
             });
 

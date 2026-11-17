@@ -1091,6 +1091,7 @@ defmodule Tightbeam.ConditionFactsTest do
 
           File.write!(Path.join(base, "identity/rules/verification.toml"), """
           [[policy]]
+          archetypes = ["*"]
           name = "synthetic-condition-verification"
           purpose = "wait-verification-admission"
           when = [

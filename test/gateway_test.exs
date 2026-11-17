@@ -1,6 +1,7 @@
 defmodule Tightbeam.GatewayTest do
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.HarnessSwitchContext
   alias Tightbeam.Model
   alias Tightbeam.Wire.ChangeSocket
 
@@ -4920,10 +4921,14 @@ defmodule Tightbeam.GatewayTest do
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
     spawn = handlers["spawn"]
 
-    assert %{setting: "default-archetype", value: "pdo"} =
+    assert %{setting: "default-archetype", value: "agentic-engineering.pdo"} =
              handlers["config"].(%{
                origin: "user:flynn",
-               params: %{action: "set", setting: "default-archetype", value: "pdo"}
+               params: %{
+                 action: "set",
+                 setting: "default-archetype",
+                 value: "agentic-engineering.pdo"
+               }
              })
 
     assert %{session_key: default_pdo_key} =
@@ -4936,15 +4941,15 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    assert %{archetype: "pdo", harness: "codex", provider: "openai"} =
+    assert %{archetype: "agentic-engineering.pdo", harness: "codex", provider: "openai"} =
              Org.get(ctx.db, default_pdo_key)
 
     assert Org.get(ctx.db, default_pdo_key).model ==
              Model.new("gpt-6-sol", effort: "low")
 
     for {archetype, family, effort} <- [
-          {"pdo", "gpt-6-sol", "low"},
-          {"orchestrator", "gpt-6-luna", "max"}
+          {"agentic-engineering.pdo", "gpt-6-sol", "low"},
+          {"agentic-engineering.orchestrator", "gpt-6-luna", "max"}
         ] do
       assert %{session_key: key} =
                spawn.(%{
@@ -4968,7 +4973,7 @@ defmodule Tightbeam.GatewayTest do
                session_key: nil,
                params: %{
                  display_name: "Fresh coder",
-                 archetype: "coder",
+                 archetype: "agentic-engineering.coder",
                  idempotency_key: "fresh-coder"
                }
              })
@@ -5218,7 +5223,7 @@ defmodule Tightbeam.GatewayTest do
       display_name: "Swap me",
       owner_user_id: "flynn",
       origin: "user:flynn",
-      archetype: "coder",
+      archetype: "agentic-engineering.coder",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
@@ -5350,6 +5355,219 @@ defmodule Tightbeam.GatewayTest do
       DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", ["swapme"])
 
     assert total == 3, "the two earlier rows must still exist beneath the barrier"
+  end
+
+  test "enabled switch context is captured atomically and bound once to the first destination prompt",
+       ctx do
+    base_dir = role_test_base("swap-context")
+    host = Placement.local_host_name()
+    auth_dir = Tightbeam.Homes.home_path(base_dir, host, :codex)
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "auth.json"), "test-token")
+    learn_engineering_identity!(base_dir)
+    candidate = start_supervised!({CandidateAdapterStub, self()})
+    start_supervised!({CoordinatorStub, candidate})
+
+    start_supervised!(%{
+      id: :swap_context_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    Archetypes.load!(base_dir)
+    put_host_catalog(host, "codex", [])
+
+    put_host_catalog_entry(host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["medium"],
+      max_input_tokens: 272_000,
+      provider: :openai
+    })
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:harness_switch_context_enabled, true)
+      |> Map.put(
+        :harness_switch_context,
+        Application.fetch_env!(:tightbeam, :harness_switch_context)
+      )
+
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               "INSERT OR IGNORE INTO users (userId,isAdmin,createdAt) VALUES ('context-owner',0,1)"
+             )
+
+    Org.create(ctx.db, %{
+      session_key: "swap-context",
+      display_name: "Context switch",
+      owner_user_id: "context-owner",
+      origin: "user:context-owner",
+      archetype: "coder",
+      host: host,
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("before-model")
+    })
+
+    Org.set_identity_revision(ctx.db, "swap-context", Tightbeam.Identity.live_revision!(base_dir))
+
+    {source_seq, source_message} =
+      enqueue_gateway_prompt!(
+        ctx.db,
+        "swap-context",
+        "user:context-owner",
+        "WID19B_CAPTURED=keep-once"
+      )
+
+    assert {:ok, source_turn} = Ledger.claim_next(ctx.db, "swap-context", "source-fixture")
+    assert source_turn.seq == source_seq
+
+    assert :ok =
+             Ledger.finish(ctx.db, source_turn.seq, "delivered", nil,
+               owner_lease: source_turn.owner_lease
+             )
+
+    start_lane!(ctx.db, "swap-context")
+    before = Org.get(ctx.db, "swap-context")
+    handlers = Gateway.handlers(config)
+
+    assert %{ok: true, harness: "codex", model: "gpt-5.6-sol"} =
+             handlers["tune"].(%{
+               origin: "user:context-owner",
+               session_key: "swap-context",
+               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+             })
+
+    assert_receive {:candidate_guidance, "candidate-1", guidance}
+    refute guidance =~ "WID19B_CAPTURED=keep-once"
+
+    after_switch = Org.get(ctx.db, "swap-context")
+    assert after_switch.cleared_through_seq == before.cleared_through_seq
+
+    assert {:ok,
+            [
+              [
+                "claude",
+                "before-model",
+                "codex",
+                "gpt-5.6-sol",
+                processed_json,
+                "[]",
+                payload_evidence_json,
+                "pending"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT sourceHarness,sourceModel,destinationHarness,destinationModel,
+                      processedMessageIds,pendingMessageIds,destinationPayloadEvidence,state
+               FROM harness_switch_contexts WHERE sessionKey='swap-context'
+               """
+             )
+
+    assert JSON.decode!(processed_json) == [source_message.id]
+
+    destination_payload_evidence = JSON.decode!(payload_evidence_json)
+    destination_cwd = Placement.holder_workdir(config, after_switch)
+
+    expected_identity_bytes =
+      byte_size(guidance) +
+        byte_size(
+          JSON.encode!(%{
+            _meta: Tightbeam.Harness.Codex.session_config(%{cwd: destination_cwd}, guidance).meta
+          })
+        )
+
+    expected_tool_bytes =
+      byte_size(JSON.encode!(Gateway.mcp_servers_for_archetype("coder")))
+
+    assert destination_payload_evidence["identity_tokens_upper"] == expected_identity_bytes
+    assert destination_payload_evidence["tool_definition_tokens_upper"] == expected_tool_bytes
+
+    visible =
+      Projection.list_after(ctx.db, "swap-context", nil, 50, before.cleared_through_seq)
+
+    assert Enum.any?(visible, &(&1.id == source_message.id))
+    assert Enum.any?(visible, &(&1.marker && &1.marker.kind == "harness-switch"))
+
+    {destination_seq, _destination_message} =
+      enqueue_gateway_prompt!(
+        ctx.db,
+        "swap-context",
+        "user:context-owner",
+        "WID19B_CURRENT=verbatim"
+      )
+
+    assert {:ok, destination_turn} =
+             Ledger.claim_next(ctx.db, "swap-context", "destination-fixture")
+
+    assert destination_turn.seq == destination_seq
+    destination_turn = Map.put(destination_turn, :session_key, "swap-context")
+
+    destination_config =
+      config
+      |> Map.put(:base_dir, base_dir)
+      |> Map.put(:model_catalog, Tightbeam.ModelCatalog)
+
+    outbound_content = [
+      %{type: "text", text: "WID19B_CURRENT=verbatim\n\nimage [image bytes]"},
+      %{type: "image", data: "fixture-image-data", mimeType: "image/png"}
+    ]
+
+    assert {:ok, prepared} =
+             HarnessSwitchContext.prepare_turn(
+               ctx.db,
+               destination_turn,
+               Org.get(ctx.db, "swap-context"),
+               %{content: outbound_content, attempts: []},
+               destination_config
+             )
+
+    assert [
+             %{type: "text", text: historical_and_current},
+             image_block
+           ] = prepared.prompt
+
+    assert {:ok, [[persisted_turn_prompt]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE seq=?1", [destination_turn.seq])
+
+    assert persisted_turn_prompt == destination_turn.prompt
+
+    assert historical_and_current =~ "## Historical working context"
+    assert historical_and_current =~ "WID19B_CAPTURED=keep-once"
+    assert length(Regex.scan(~r/WID19B_CAPTURED=keep-once/, historical_and_current)) == 1
+    assert historical_and_current =~ "## Current input (verbatim; this turn only)"
+    assert historical_and_current =~ "WID19B_CURRENT=verbatim"
+    assert image_block == Enum.at(outbound_content, 1)
+
+    assert {:ok, [["bound", "fit_no_call"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,handoffOutcome FROM harness_switch_contexts WHERE sessionKey='swap-context'"
+             )
+
+    assert {:ok, [[budget_evidence_json]]} =
+             DB.query(
+               ctx.db,
+               "SELECT budgetEvidence FROM harness_switch_contexts WHERE sessionKey='swap-context'"
+             )
+
+    budget_evidence = JSON.decode!(budget_evidence_json)
+    assert budget_evidence["identity_tokens_upper"] == expected_identity_bytes
+    assert budget_evidence["tool_definition_tokens_upper"] == expected_tool_bytes
+    assert budget_evidence["reserve_tokens"] == 16_384
+
+    assert {:ok, retry_prompt} =
+             HarnessSwitchContext.prepare_turn(
+               ctx.db,
+               destination_turn,
+               Org.get(ctx.db, "swap-context"),
+               "recomputed current text must not replace the durable bind",
+               destination_config
+             )
+
+    assert retry_prompt.prompt == prepared.prompt
   end
 
   test "a failure between the barrier and its tombstone rolls BOTH back", ctx do
@@ -5517,7 +5735,7 @@ defmodule Tightbeam.GatewayTest do
     assert replayed_request == fallback.requested
     assert replayed_status == fallback.running_status
 
-    assert %{code: "unknown_archetype", message: "no such archetype: missing"} =
+    assert %{code: "unknown_archetype", message: "unknown archetype: missing"} =
              config.(%{
                origin: "user:flynn",
                params: %{action: "set", setting: "default-archetype", value: "missing"}
@@ -6831,7 +7049,8 @@ defmodule Tightbeam.GatewayTest do
     parent = self()
 
     sh = fn command ->
-      if hd(command) == "rsync" do
+      if hd(command) == "rsync" and
+           Path.basename(Enum.at(command, -2)) == "gateway.json" do
         stage_file = Enum.at(command, -2)
 
         send(
@@ -7191,10 +7410,37 @@ defmodule Tightbeam.GatewayTest do
     rail_manifest = Toml.decode!(File.read!(Path.join(identity_dir, "rails/demo-example.toml")))
     assert [starter_statute] = rail_manifest["statute"]
     assert starter_statute["name"] == "demo-example"
+    assert starter_statute["archetypes"] == ["demo-role"]
 
     statutes = Rails.load!(base_dir)
     statute = Enum.find(statutes, &(&1.name == "demo-example"))
     assert statute.pattern == "TIGHTBEAM_KUNGFU_TEMPLATE_PLACEHOLDER_NEVER_MATCHES"
+
+    template_manifest =
+      File.read!(Path.expand("../priv/kungfu-template/kungfu/<name>/manifest.toml", __DIR__))
+
+    assert template_manifest =~ ~s(root_archetype = "<name>.<name>-role")
+
+    template_capabilities =
+      File.read!(Path.expand("../priv/kungfu-template/kungfu/<name>/capabilities.md", __DIR__))
+
+    assert template_capabilities =~ "Root archetype: `<name>.<name>-role`."
+
+    template_intake =
+      File.read!(Path.expand("../priv/kungfu-template/kungfu/<name>/intake.md", __DIR__))
+
+    assert template_intake =~
+             "`tightbeam config set default-archetype <name>.<name>-role`."
+
+    template_skill =
+      File.read!(Path.expand("../priv/kungfu-template/skills/<name>-example/SKILL.md", __DIR__))
+
+    assert template_skill =~ "`<name>.<name>-role`"
+
+    template_rail =
+      File.read!(Path.expand("../priv/kungfu-template/rails/<name>-example.toml", __DIR__))
+
+    assert template_rail =~ ~s(archetypes = ["<name>.<name>-role"])
 
     assert {"2\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
 
@@ -11090,7 +11336,7 @@ defmodule Tightbeam.GatewayTest do
              learn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
 
     assert revision == Identity.live_revision!(base_dir)
-    assert Archetypes.get("coder").name == "coder"
+    assert Archetypes.get("agentic-engineering.coder").name == "agentic-engineering.coder"
     assert Rails.statutes?()
     assert :persistent_term.get(Rules, []) != []
 
@@ -11101,7 +11347,7 @@ defmodule Tightbeam.GatewayTest do
         owner_user_id: "flynn",
         origin: "user:flynn",
         principal: {:user, "flynn"},
-        archetype: "coder",
+        archetype: "agentic-engineering.coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
@@ -11115,7 +11361,7 @@ defmodule Tightbeam.GatewayTest do
         owner_user_id: "flynn",
         origin: "user:flynn",
         principal: {:user, "flynn"},
-        archetype: "coder",
+        archetype: "agentic-engineering.coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
@@ -11168,12 +11414,17 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, retired.session_key).archetype == "default"
     assert Org.get(ctx.db, retired.session_key).identity_name == "default"
 
-    :ok = Org.put_setting(ctx.db, "default-archetype", "coder")
+    :ok = Org.put_setting(ctx.db, "default-archetype", "agentic-engineering.coder")
 
-    assert %{state: "referenced", sessions: [], setting: "coder", message: setting_message} =
+    assert %{
+             state: "referenced",
+             sessions: [],
+             setting: "agentic-engineering.coder",
+             message: setting_message
+           } =
              unlearn.(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
 
-    assert setting_message =~ "default-archetype setting: coder"
+    assert setting_message =~ "default-archetype setting: agentic-engineering.coder"
     :ok = Org.put_setting(ctx.db, "default-archetype", "default")
 
     assert %{state: "published", kungfu: "agentic-engineering"} =
@@ -11181,7 +11432,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert is_nil(Rules.reaction_policy("assignment-inactivity"))
 
-    assert Archetypes.get("coder") == nil
+    assert Archetypes.get("agentic-engineering.coder") == nil
     refute Rails.statutes?()
     assert :persistent_term.get(Rules, []) == []
   end
@@ -11197,7 +11448,7 @@ defmodule Tightbeam.GatewayTest do
                  name: "agentic-engineering",
                  purpose: purpose,
                  phrases: phrases,
-                 root_archetype: "orchestrator"
+                 root_archetype: "agentic-engineering.orchestrator"
                },
                %{
                  name: "sentinels",
@@ -11210,7 +11461,7 @@ defmodule Tightbeam.GatewayTest do
                  name: "uncle-enzo",
                  purpose: _enzo_purpose,
                  phrases: _enzo_phrases,
-                 root_archetype: "exec"
+                 root_archetype: "uncle-enzo.exec"
                }
              ]
            } = list.(%{origin: "agent:k1", params: %{}})
@@ -11235,7 +11486,7 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Clear active",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
+        archetype: "agentic-engineering.coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
@@ -11248,7 +11499,7 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Clear retired",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
+        archetype: "agentic-engineering.coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
@@ -11264,7 +11515,7 @@ defmodule Tightbeam.GatewayTest do
         is_built_in: true,
         owner_user_id: "bundle-owner",
         origin: "user:bundle-owner",
-        archetype: "coder",
+        archetype: "agentic-engineering.coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
@@ -11275,7 +11526,7 @@ defmodule Tightbeam.GatewayTest do
     start_lane!(ctx.db, main.session_key)
     adapter = start_supervised!({IdentityApplyAdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
-    :ok = Org.put_setting(ctx.db, "default-archetype", "coder")
+    :ok = Org.put_setting(ctx.db, "default-archetype", "agentic-engineering.coder")
 
     assert %{state: "referenced", references: references} =
              handlers["unlearn"].(%{
@@ -11348,8 +11599,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -11359,14 +11610,14 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-stable", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
     skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
     old_body = File.read!(skill)
 
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "new served skill",
         "test"
@@ -11453,8 +11704,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply running",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -11464,14 +11715,14 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-running", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
     alpha = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
     beta = Path.join(cwd, ".codex/skills/tightbeam__human-communication/SKILL.md")
     old_alpha = File.read!(alpha)
 
     identity_edit!(
       base_dir,
-      "coder",
+      "agentic-engineering.coder",
       {:skill, "model-release-intake", false},
       "alpha next",
       "test"
@@ -11480,7 +11731,7 @@ defmodule Tightbeam.GatewayTest do
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "human-communication", false},
         "beta next",
         "test"
@@ -11603,8 +11854,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply unstarted",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -11621,7 +11872,7 @@ defmodule Tightbeam.GatewayTest do
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "unstarted served skill",
         "test"
@@ -11678,8 +11929,8 @@ defmodule Tightbeam.GatewayTest do
           display_name: key,
           owner_user_id: "flynn",
           origin: "user:flynn",
-          archetype: "coder",
-          identity_name: "coder",
+          archetype: "agentic-engineering.coder",
+          identity_name: "agentic-engineering.coder",
           identity_revision: revision,
           host: "testhost",
           harness: "codex",
@@ -11689,7 +11940,7 @@ defmodule Tightbeam.GatewayTest do
 
       Org.append_pointer(ctx.db, key, "thread-#{key}", "created")
       cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-      Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+      Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
       {session, cwd}
     end
 
@@ -11714,7 +11965,7 @@ defmodule Tightbeam.GatewayTest do
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "only the selected session gets this",
         "test"
@@ -11755,8 +12006,8 @@ defmodule Tightbeam.GatewayTest do
           display_name: key,
           owner_user_id: "flynn",
           origin: "user:flynn",
-          archetype: "coder",
-          identity_name: "coder",
+          archetype: "agentic-engineering.coder",
+          identity_name: "agentic-engineering.coder",
           identity_revision: revision,
           host: "testhost",
           harness: "codex",
@@ -11774,7 +12025,7 @@ defmodule Tightbeam.GatewayTest do
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "org-wide guidance",
         "test"
@@ -11821,8 +12072,8 @@ defmodule Tightbeam.GatewayTest do
           display_name: key,
           owner_user_id: "flynn",
           origin: "user:flynn",
-          archetype: "coder",
-          identity_name: "coder",
+          archetype: "agentic-engineering.coder",
+          identity_name: "agentic-engineering.coder",
           identity_revision: revision,
           order_index: order,
           host: "testhost",
@@ -11845,7 +12096,7 @@ defmodule Tightbeam.GatewayTest do
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "partial pass guidance",
         "test"
@@ -11894,7 +12145,7 @@ defmodule Tightbeam.GatewayTest do
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "stepped guidance",
         "test"
@@ -11962,7 +12213,7 @@ defmodule Tightbeam.GatewayTest do
 
     identity_edit!(
       base_dir,
-      "coder",
+      "agentic-engineering.coder",
       {:skill, "model-release-intake", false},
       "spaced guidance",
       "test"
@@ -12003,7 +12254,7 @@ defmodule Tightbeam.GatewayTest do
 
     identity_edit!(
       base_dir,
-      "coder",
+      "agentic-engineering.coder",
       {:skill, "model-release-intake", false},
       "budgeted guidance",
       "test"
@@ -12038,7 +12289,7 @@ defmodule Tightbeam.GatewayTest do
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "busy pass guidance",
         "test"
@@ -12118,14 +12369,14 @@ defmodule Tightbeam.GatewayTest do
     second_cwd =
       Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), Org.get(ctx.db, second))
 
-    Identity.provision_at!(base_dir, revision, "coder", :codex, second_cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, second_cwd)
     second_skill = Path.join(second_cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
     second_body = File.read!(second_skill)
 
     started =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "run revision",
         "test"
@@ -12141,7 +12392,7 @@ defmodule Tightbeam.GatewayTest do
     published =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "newer revision",
         "test"
@@ -12182,7 +12433,7 @@ defmodule Tightbeam.GatewayTest do
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "read once guidance",
         "test"
@@ -12236,12 +12487,12 @@ defmodule Tightbeam.GatewayTest do
              snapshot_reads.("identity-apply", %{all: true})
 
     assert length(applied) >= 3
-    assert Enum.count(reads, &(&1 == {next, "coder", :codex})) == 1
+    assert Enum.count(reads, &(&1 == {next, "agentic-engineering.coder", :codex})) == 1
     assert reads == Enum.uniq(reads)
 
     assert {%{sessions: sessions}, reads} = snapshot_reads.("identity-status", %{})
     assert length(sessions) >= 3
-    assert Enum.count(reads, &(&1 == {next, "coder", :codex})) == 1
+    assert Enum.count(reads, &(&1 == {next, "agentic-engineering.coder", :codex})) == 1
     assert reads == Enum.uniq(reads)
   end
 
@@ -12258,8 +12509,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply writer fail",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -12277,7 +12528,7 @@ defmodule Tightbeam.GatewayTest do
 
     identity_edit!(
       base_dir,
-      "coder",
+      "agentic-engineering.coder",
       {:skill, "model-release-intake", false},
       "never lands",
       "test"
@@ -12340,8 +12591,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply retry",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -12351,12 +12602,12 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-retry", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
 
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "retried served skill",
         "test"
@@ -12417,8 +12668,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply retired",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -12428,13 +12679,13 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-retired", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
     skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
     old_body = File.read!(skill)
 
     identity_edit!(
       base_dir,
-      "coder",
+      "agentic-engineering.coder",
       {:skill, "model-release-intake", false},
       "not for the retired",
       "test"
@@ -12470,8 +12721,8 @@ defmodule Tightbeam.GatewayTest do
           display_name: key,
           owner_user_id: "flynn",
           origin: "user:flynn",
-          archetype: "coder",
-          identity_name: "coder",
+          archetype: "agentic-engineering.coder",
+          identity_name: "agentic-engineering.coder",
           identity_revision: revision,
           order_index: order,
           host: "testhost",
@@ -12482,7 +12733,7 @@ defmodule Tightbeam.GatewayTest do
 
       Org.append_pointer(ctx.db, key, "thread-#{order}", "created")
       cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-      Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+      Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
       {session, Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")}
     end
 
@@ -12494,7 +12745,7 @@ defmodule Tightbeam.GatewayTest do
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "mid-pass guidance",
         "test"
@@ -12546,8 +12797,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply newer revision",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: original,
         host: "testhost",
         harness: "codex",
@@ -12557,13 +12808,13 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-newer-revision", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, original, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, original, "agentic-engineering.coder", :codex, cwd)
     skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
 
     captured =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "captured revision",
         "test"
@@ -12580,7 +12831,7 @@ defmodule Tightbeam.GatewayTest do
         {:newer,
          identity_edit!(
            base_dir,
-           "coder",
+           "agentic-engineering.coder",
            {:skill, "model-release-intake", false},
            "newer published revision",
            "test"
@@ -12654,8 +12905,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply partial",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -12665,7 +12916,7 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-partial", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
 
     skills = Path.join(cwd, ".codex/skills")
     alpha = Path.join(skills, "tightbeam__human-communication/SKILL.md")
@@ -12675,7 +12926,7 @@ defmodule Tightbeam.GatewayTest do
 
     identity_edit!(
       base_dir,
-      "coder",
+      "agentic-engineering.coder",
       {:skill, "human-communication", false},
       "alpha next",
       "test"
@@ -12683,7 +12934,7 @@ defmodule Tightbeam.GatewayTest do
 
     identity_edit!(
       base_dir,
-      "coder",
+      "agentic-engineering.coder",
       {:skill, "model-release-intake", false},
       "beta next",
       "test"
@@ -12748,8 +12999,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply stamp fail",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -12759,13 +13010,13 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-stamp-fail", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
     skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
 
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "stamp-fail served skill",
         "test"
@@ -12839,8 +13090,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply nudge fail",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -12850,13 +13101,13 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-nudge-fail", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
     skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
 
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "nudge-fail served skill",
         "test"
@@ -12924,8 +13175,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply lost response",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -12935,13 +13186,13 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-lost-response", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
     skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
 
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "lost-response served skill",
         "test"
@@ -13008,8 +13259,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply scheduler delay",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -13019,12 +13270,12 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-scheduler-delay", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
 
     next =
       identity_edit!(
         base_dir,
-        "coder",
+        "agentic-engineering.coder",
         {:skill, "model-release-intake", false},
         "scheduler recovery skill",
         "test"
@@ -13151,8 +13402,8 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Identity apply forbidden",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
+        archetype: "agentic-engineering.coder",
+        identity_name: "agentic-engineering.coder",
         identity_revision: revision,
         host: "testhost",
         harness: "codex",
@@ -13162,13 +13413,13 @@ defmodule Tightbeam.GatewayTest do
 
     Org.append_pointer(ctx.db, session.session_key, "thread-forbidden", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
     skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
     body = File.read!(skill)
 
     identity_edit!(
       base_dir,
-      "coder",
+      "agentic-engineering.coder",
       {:skill, "model-release-intake", false},
       "must not reach an outsider's apply",
       "test"
@@ -14698,7 +14949,17 @@ defmodule Tightbeam.GatewayTest do
   defp learn_engineering_identity!(base_dir) do
     learn_engineering_identity_without_apply_fixture_skills!(base_dir)
 
-    manifest_path = Path.join([base_dir, "identity", "archetypes", "coder.toml"])
+    receipt =
+      Tightbeam.Identity.Provenance.receipts(base_dir)
+      |> Enum.find(&(&1.name == "agentic-engineering"))
+
+    manifest_relative = Enum.find(receipt.paths, &String.ends_with?(&1, "archetypes/coder.toml"))
+    assert manifest_relative
+
+    assert {:kungfu, "agentic-engineering"} =
+             Tightbeam.Identity.Provenance.owner_for_path(base_dir, manifest_relative)
+
+    manifest_path = Path.join([base_dir, "identity", manifest_relative])
     manifest = File.read!(manifest_path)
 
     skills_line =
@@ -14724,7 +14985,7 @@ defmodule Tightbeam.GatewayTest do
         global: false
       )
 
-    identity_edit!(base_dir, "coder", :manifest, fixture_manifest, "test")
+    identity_edit!(base_dir, "agentic-engineering.coder", :manifest, fixture_manifest, "test")
     Archetypes.load!(base_dir)
   end
 
@@ -14861,8 +15122,8 @@ defmodule Tightbeam.GatewayTest do
       display_name: key,
       owner_user_id: "flynn",
       origin: "user:flynn",
-      archetype: "coder",
-      identity_name: "coder",
+      archetype: "agentic-engineering.coder",
+      identity_name: "agentic-engineering.coder",
       identity_revision: revision,
       host: "testhost",
       harness: "codex",

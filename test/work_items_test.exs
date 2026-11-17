@@ -1924,6 +1924,7 @@ defmodule Tightbeam.WorkItemsTest do
 
     File.write!(Path.join(base, "identity/rules/deny.toml"), """
     [[rule]]
+    archetypes = ["*"]
     name = "deny-work-item-create"
     verb = "work-item-create"
     text = "create denied"

@@ -32,6 +32,9 @@ manifest = fn where ->
   """
 end
 
+qualified_coder = "agentic-engineering.coder"
+bundle_coder_path = "kungfu/agentic-engineering/archetypes/coder.toml"
+
 if phase == "conflict" do
   false = File.exists?(base)
   File.mkdir_p!(Path.join(source, "archetypes"))
@@ -120,7 +123,7 @@ call = fn args -> cli.(args, "recovery-admin") end
 edit = fn target, bytes ->
   path = Path.join(root, "edit-input")
   File.write!(path, bytes)
-  call.(["identity", "edit", "coder"] ++ target ++ ["--file", path])
+  call.(["identity", "edit", qualified_coder] ++ target ++ ["--file", path])
 end
 
 snapshot = fn ->
@@ -129,7 +132,7 @@ snapshot = fn ->
     "main" => git.(["rev-parse", "main"]),
     "merge" => File.read!(Path.join(dir, ".git/MERGE_HEAD")),
     "index" => git.(["ls-files", "--stage"]),
-    "manifest" => File.read!(Path.join(dir, "archetypes/coder.toml")),
+    "manifest" => File.read!(Path.join(dir, bundle_coder_path)),
     "guidance" => File.read!(Path.join(dir, "guidance/coder.md"))
   }
 end
@@ -144,18 +147,21 @@ case phase do
     File.write!(Path.join(source, "guidance/coder.md"), "incoming guidance\n")
     result = call.(["identity", "relearn"])
     assert result["state"] == "relearn-conflicted"
-    assert Enum.sort(result["conflictingPaths"]) == ["archetypes/coder.toml", "guidance/coder.md"]
+
+    assert Enum.sort(result["conflictingPaths"]) ==
+             Enum.sort([bundle_coder_path, "guidance/coder.md"])
+
     assert Identity.live_revision!(base) == File.read!(Path.join(root, "stable"))
     File.write!(Path.join(root, "pending.json"), JSON.encode!(snapshot.()))
 
   recovery when recovery in ["abort", "resolve"] ->
     assert snapshot.() == JSON.decode!(before)
-    assert Archetypes.get("coder").where == ["local"]
+    assert Archetypes.get(qualified_coder).where == ["local"]
 
-    assert Archetypes.guidance(Archetypes.get("coder"), Archetypes.fragments()) =~
+    assert Archetypes.guidance(Archetypes.get(qualified_coder), Archetypes.fragments()) =~
              "local customization"
 
-    refute Archetypes.guidance(Archetypes.get("coder"), Archetypes.fragments()) =~
+    refute Archetypes.guidance(Archetypes.get(qualified_coder), Archetypes.fragments()) =~
              "incoming guidance"
 
     {denial, status} =
@@ -172,7 +178,7 @@ case phase do
     if recovery == "abort" do
       assert call.(["identity", "relearn", "--abort"])["state"] == "aborted"
       assert Identity.live_revision!(base) == File.read!(Path.join(root, "stable"))
-      assert File.read!(Path.join(dir, "archetypes/coder.toml")) == manifest.("local")
+      assert File.read!(Path.join(dir, bundle_coder_path)) == manifest.("local")
       assert File.read!(Path.join(dir, "guidance/coder.md")) == "local customization\n"
       assert git.(["status", "--porcelain"]) == ""
       refute File.exists?(Path.join(dir, ".git/MERGE_HEAD"))
@@ -180,19 +186,19 @@ case phase do
       File.write!(Path.join(root, "pending.json"), JSON.encode!(snapshot.()))
     else
       # Explicit operator resolution via the documented working-tree seam.
-      File.write!(Path.join(dir, "archetypes/coder.toml"), manifest.("resolved"))
+      File.write!(Path.join(dir, bundle_coder_path), manifest.("resolved"))
       File.write!(Path.join(dir, "guidance/coder.md"), "resolved customization\n")
-      git.(["add", "archetypes/coder.toml", "guidance/coder.md"])
+      git.(["add", bundle_coder_path, "guidance/coder.md"])
       assert call.(["identity", "relearn", "--resolve"])["state"] == "published"
       assert Identity.live_revision!(base) != File.read!(Path.join(root, "stable"))
-      assert Archetypes.get("coder").where == ["resolved"]
+      assert Archetypes.get(qualified_coder).where == ["resolved"]
       assert git.(["status", "--porcelain"]) == ""
     end
 
   "normal" ->
-    assert Archetypes.get("coder").where == ["resolved"]
+    assert Archetypes.get(qualified_coder).where == ["resolved"]
     assert call.(["identity", "relearn"])["state"] == "published"
-    assert Archetypes.get("coder").where == ["resolved"]
+    assert Archetypes.get(qualified_coder).where == ["resolved"]
     assert File.read!(Path.join(dir, "guidance/coder.md")) == "resolved customization\n"
 end
 
