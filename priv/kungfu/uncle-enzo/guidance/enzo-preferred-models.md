@@ -31,3 +31,15 @@ For review, use a qualified independent reviewer who did not author the work. Pr
 - Use xhigh/max when results justify it; security review is the exception here. Ultra modes also change orchestration.
 - Compare cost per accepted result, including retries and reasoning. Haiku input above 100K raises its token rates fivefold.
 - Exploit research needs a separate choice: Mythos and GPT-6 Cyber require access. Do not treat application-review results as exploit capability.
+
+## Changing models mid-work
+
+If the nature of the work changes, the exec should feel free to change a deliverator's model (tightbeam tune) as necessary.
+
+## Model character
+
+Each model has a character. Use these tendencies to your advantage, and mitigate them with review.
+
+- Opus 5.5 (medium and high): the teacher's pet. Not the smartest in the class, but more detail-oriented, even when that detail is over-analysis. Eager to please, but also paranoid that it will make a mistake, so it errs heavily on the side of safety at the cost of pragmatism and quick delivery.
+- Fable 5.2: the smartest student in the class. It smokes entirely too much pot, but if you call on it, it delivers a nuanced, correct answer. It is more pragmatic about what it lets slide. When something needs to get out the door, rely on Fable.
+- Astra and Sol: sticklers like Opus, probably even more so. They tend to over-engineer, and to add unasked-for security, unwarranted arbitrary limits and thresholds, and code that stops a workflow on a technicality (brittle code), instead of resilient code that continues where it can when an error is encountered.

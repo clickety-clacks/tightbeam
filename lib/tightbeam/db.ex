@@ -353,6 +353,38 @@ defmodule Tightbeam.DB do
   end
 
   @doc """
+  `read_transaction/2` for a request path: the callback's result, or a raised
+  error. A read that runs out of time on its read connection raises the same
+  sanitized `Timeout` a caller's wait for the owner does, so a client is told
+  to retry rather than handed a server error.
+  """
+  @spec read_transaction!(server(), (Tightbeam.DB.Txn.t() -> result)) :: result
+        when result: term()
+  def read_transaction!(server \\ __MODULE__, fun) when is_function(fun, 1) do
+    case read_transaction(server, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise_read_error!(error)
+    end
+  end
+
+  @doc """
+  Raise the error a failed `read_transaction/2` returned. A read that ran out
+  of time on its read connection becomes the sanitized `Timeout`.
+  """
+  @spec raise_read_error!(Exception.t() | term()) :: no_return()
+  def raise_read_error!(%DeadlineExceeded{}) do
+    raise Timeout,
+      request_id: Tightbeam.RequestContext.capture().request_id,
+      operation: "db.read_transaction",
+      effect_kind: "read",
+      budget_ms: call_timeout(),
+      timeout_source: "reader_deadline",
+      effect_state: "none"
+  end
+
+  def raise_read_error!(error), do: raise(error)
+
+  @doc """
   Commit one transaction, then run a publication callback after the owner has replied.
 
   An arity-one callback receives the prepared result in the caller process. Keeping arbitrary

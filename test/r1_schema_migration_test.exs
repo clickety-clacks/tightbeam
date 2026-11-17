@@ -76,7 +76,15 @@ defmodule Tightbeam.R1SchemaMigrationTest do
 
     assignments = rows(db, "SELECT * FROM assignments")
     facts = rows(db, "SELECT * FROM condition_facts")
+    before = snapshot(db)
     assert_raise DB.Error, fn -> Schema.ensure_all(db) end
+    assert snapshot(db) == before
+
+    assert rows(
+             db,
+             "SELECT name FROM sqlite_master WHERE name LIKE 'harness_switch_context%' ORDER BY name"
+           ) == []
+
     assert rows(db, "SELECT * FROM assignments") == assignments
     assert rows(db, "SELECT * FROM condition_facts") == facts
     assert shape(db) == [["row-driven-o2-v1-019"]]
@@ -85,6 +93,16 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     :ok = DB.execute(db, "DROP TRIGGER refuse_r1")
     assert :ok = Schema.ensure_all(db)
     assert_columns(db)
+
+    assert rows(
+             db,
+             "SELECT name FROM sqlite_master WHERE name LIKE 'harness_switch_context%' ORDER BY name"
+           ) ==
+             [
+               ["harness_switch_context_message"],
+               ["harness_switch_context_pending"],
+               ["harness_switch_contexts"]
+             ]
   end
 
   test "unknown shape refuses without changing rows or adopting R1", %{db: db} do
