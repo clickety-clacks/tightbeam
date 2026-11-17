@@ -59,6 +59,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Assignments,
     Tightbeam.CommandExecutions,
     Tightbeam.AssignmentCommitRefCorrections,
+    Tightbeam.OperationalReceipts,
     Tightbeam.DeliveryResponsibilities,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
@@ -5554,6 +5555,10 @@ defmodule Tightbeam.Schema do
   # of the bootstrap pass so a refused migration preserves the exact
   # predecessor snapshot; the final schema pass installs it after migrations.
   defp bootstrap_module(_db, Tightbeam.AssignmentCommitRefCorrections, _current?), do: :ok
+
+  # Attest receipts are additive current-build storage, installed after every
+  # exact predecessor migration like the correction table above.
+  defp bootstrap_module(_db, Tightbeam.OperationalReceipts, _current?), do: :ok
 
   # Delivery responsibility is additive current-build storage. Do not write it
   # until every exact predecessor migration has succeeded.

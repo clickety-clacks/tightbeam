@@ -1380,6 +1380,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             verdict,
             note,
             commit_refs,
+            receipts,
             artifact_id,
             content_sha256,
             wait_id,
@@ -1401,6 +1402,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params.push(format!(
                     "\"commitRefs\":{}",
                     serde_json::to_string(value).expect("commit refs are JSON serializable")
+                ));
+            }
+            if !receipts.is_empty() {
+                params.push(format!(
+                    "\"receipts\":{}",
+                    serde_json::to_string(receipts).expect("receipts are JSON serializable")
                 ));
             }
             if let Some(value) = artifact_id {
@@ -5419,6 +5426,65 @@ mod tests {
             ]),
             r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","commitRefs":[{"commit":"abc123","repo":"lab1:/src/repo"}]}}"#
         );
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "verified",
+                "--receipt",
+                "art_b:bbbb",
+                "--receipt",
+                "art_a:aaaa",
+                "--as",
+                "builder",
+            ]),
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"verdict","verdictKind":"verified","receipts":["art_b:bbbb","art_a:aaaa"]}}"#
+        );
+        for (args, message) in [
+            (
+                &[
+                    "attest",
+                    "asg_1",
+                    "--kind",
+                    "progress",
+                    "--receipt",
+                    "art_a:aaaa",
+                ][..],
+                "--receipt is only valid with --kind verdict --verdict verified",
+            ),
+            (
+                &[
+                    "attest",
+                    "asg_1",
+                    "--kind",
+                    "verdict",
+                    "--verdict",
+                    "approved",
+                    "--receipt",
+                    "art_a:aaaa",
+                ][..],
+                "--receipt is only valid with --kind verdict --verdict verified",
+            ),
+            (
+                &[
+                    "attest",
+                    "asg_1",
+                    "--kind",
+                    "verdict",
+                    "--verdict",
+                    "verified",
+                    "--receipt",
+                    "",
+                ][..],
+                "--receipt requires <artifactId>:<sha256>",
+            ),
+        ] {
+            let args = args.iter().map(|arg| (*arg).to_owned()).collect();
+            assert_eq!(args::parse(args).err().as_deref(), Some(message));
+        }
     }
 
     #[test]

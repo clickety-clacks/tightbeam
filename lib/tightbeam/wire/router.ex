@@ -4331,7 +4331,7 @@ defmodule Tightbeam.Wire.Router do
     "assignments" => ~w(role session_key state)a,
     "attend" => ~w(high)a,
     "attest" =>
-      ~w(artifact_id assignment_id commit_refs content_sha256 kind mementos note release_fact_kind release_fact_principal_ref release_fact_scope verdict_kind wait_id)a,
+      ~w(artifact_id assignment_id commit_refs content_sha256 kind mementos note receipts release_fact_kind release_fact_principal_ref release_fact_scope verdict_kind wait_id)a,
     "attests" => ~w(assignment_id)a,
     "breathing" => ~w(target_id target_kind)a,
     "cancel" => ~w(assignment_id reason)a,
