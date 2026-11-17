@@ -1030,14 +1030,14 @@ defmodule Tightbeam.WorkItems do
   def arm_slate_in_txn(%Txn{} = txn, work_item_id) when is_binary(work_item_id) do
     case Txn.q(
            txn,
-           "SELECT state, ownerUserId FROM work_items WHERE id = ?1",
+           "SELECT state, ownerUserId, deliveryOwnerSessionKey FROM work_items WHERE id = ?1",
            [work_item_id]
          ) do
-      [["open", owner]] ->
+      [["open", owner, delivery_owner]] ->
         if not open_assignments?(txn, work_item_id) do
           wake =
             Wakes.schedule_in_txn(txn, %{
-              session_key: Org.personal_session_key(owner),
+              session_key: delivery_owner || Org.personal_session_key(owner),
               origin: @origin,
               prompt:
                 Tightbeam.Reminders.render(txn, "work-item-slate", %{work_item_id: work_item_id}),
@@ -1071,10 +1071,10 @@ defmodule Tightbeam.WorkItems do
       when is_binary(item_id) and is_binary(wake_id) do
     case Txn.q(
            txn,
-           "SELECT state, ownerUserId, title, routingWakeId, slateWakeId FROM work_items WHERE id = ?1",
+           "SELECT state, ownerUserId, deliveryOwnerSessionKey, title, routingWakeId, slateWakeId FROM work_items WHERE id = ?1",
            [item_id]
          ) do
-      [[state, owner, title, routing, slate]] ->
+      [[state, owner, delivery_owner, title, routing, slate]] ->
         cond do
           state == "open" and routing == wake_id ->
             arm_routing_in_txn(txn, item_id, owner, title)
@@ -1082,7 +1082,7 @@ defmodule Tightbeam.WorkItems do
           state == "open" and slate == wake_id and not open_assignments?(txn, item_id) ->
             replacement =
               Wakes.schedule_in_txn(txn, %{
-                session_key: Org.personal_session_key(owner),
+                session_key: delivery_owner || Org.personal_session_key(owner),
                 origin: @origin,
                 prompt:
                   Tightbeam.Reminders.render(txn, "work-item-slate", %{work_item_id: item_id}),

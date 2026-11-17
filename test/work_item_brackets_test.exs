@@ -747,6 +747,46 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert Wakes.get(ctx.db, new).state == "pending"
   end
 
+  test "slate notices use the recorded delivery owner when scheduled and re-armed", ctx do
+    delivery_owner = ctx.dsession.session_key
+    item = create(ctx, {:user, ctx.holder.owner_user_id}, %{title: "Slate delivery owner"})
+
+    assert %{deliveryOwnerSessionKey: ^delivery_owner} =
+             update(ctx, item.id, %{delivery_owner_session_key: delivery_owner})
+
+    {:ok, assignment} =
+      disp_assign(ctx, {:user, ctx.holder.owner_user_id}, "holder", "w", item.id)
+
+    complete(ctx, "holder", assignment.id)
+
+    slate = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+    assert slate.session_key == delivery_owner
+
+    deliver_bracket_wake(ctx.db, slate)
+
+    rearmed = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+    assert rearmed.session_key == delivery_owner
+  end
+
+  test "slate notices fall back to the owner personal session when no delivery owner is recorded",
+       ctx do
+    owner_session = Org.personal_session_key(ctx.holder.owner_user_id)
+    item = create(ctx, {:user, ctx.holder.owner_user_id}, %{title: "Slate owner fallback"})
+
+    {:ok, assignment} =
+      disp_assign(ctx, {:user, ctx.holder.owner_user_id}, "holder", "w", item.id)
+
+    complete(ctx, "holder", assignment.id)
+
+    slate = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+    assert slate.session_key == owner_session
+
+    deliver_bracket_wake(ctx.db, slate)
+
+    rearmed = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+    assert rearmed.session_key == owner_session
+  end
+
   ## Proof 18 — a non-admin owner sees its own UNASSIGNED item through the owner path.
 
   test "Proof 18: a non-admin owner lists and details its own unassigned item", ctx do
