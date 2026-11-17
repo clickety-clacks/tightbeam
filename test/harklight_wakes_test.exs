@@ -3446,12 +3446,20 @@ defmodule Tightbeam.HarklightWakesTest do
 
     # A saved change operation from an earlier release has a list-shaped request.
     # Main no longer creates one, but retry must still read its persisted state.
-    assert %{state: "pending"} =
-             HarklightWakes.prepare_send(
+    assert {:ok, _} =
+             DB.query(
                db,
-               call,
-               Tightbeam.Id.uuid4(),
-               JSON.encode!(%{"operation_kind" => "change", "request" => ["--message", "request"]})
+               "INSERT INTO harklight_send_operations(opId,sessionKey,host,payload,state,createdAt,updatedAt) VALUES(?1,?2,?3,?4,?5,1,1)",
+               [
+                 Tightbeam.Id.uuid4(),
+                 call.session_key,
+                 Placement.local_host_name(),
+                 JSON.encode!(%{
+                   "operation_kind" => "change",
+                   "request" => ["--message", "request"]
+                 }),
+                 "pending"
+               ]
              )
 
     runner = fn ["status", "--session", @handle] ->
