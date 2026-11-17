@@ -7118,6 +7118,299 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  test "code completion uses a verified correction on the closed clean review", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    work_item = create_work_item(ctx, "verified review correction completion")
+    commit = String.duplicate("a", 40)
+    producer_refs = [%{"repo" => "testhost:/tmp/producer", "commit" => commit}]
+
+    producer =
+      assign_call({:user, "flynn"}, "producer", nil, work_item.id)
+      |> put_in([:params, :effect_kind], "code")
+      |> then(&handle(ctx, "assign", &1))
+
+    review =
+      assign_call({:user, "flynn"}, "review", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{kind: "completion"}, assignment: %{state: "closed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "other-session"}, review.id, "completion")
+             )
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    artifact_id = "art_review_correction_#{System.unique_integer([:positive])}"
+    correction_id = "crc_review_correction_#{System.unique_integer([:positive])}"
+    created_at = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, createdBySession, workItemId,
+                  producedByAssignmentId, originPath, contentSha256, state, createdAt, updatedAt)
+               VALUES (?1, 'report', 'review evidence', 'other-session', ?2,
+                       ?3, '/tmp/review-evidence.md', ?4, 'in-workspace', ?5, ?5)
+               """,
+               [artifact_id, work_item.id, review.id, String.duplicate("b", 64), created_at]
+             )
+
+    correction_refs = [
+      %{
+        "repo" => "testhost:/tmp/reviewer",
+        "remote" => "origin",
+        "ref" => "refs/heads/main",
+        "commit" => commit,
+        "verifiedRefCommit" => commit
+      }
+    ]
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_commit_ref_corrections
+                 (id, assignmentId, commitRefs, reason, evidenceArtifactId,
+                  actorKind, actorRef, cause, idempotencyKey, requestFingerprint,
+                  verifiedAt, createdAt)
+               VALUES (?1, ?2, ?3, 'verified review coverage', ?4, 'session',
+                       'other-session', 'historical_canonical_commitref_correction',
+                       ?5, ?6, NULL, ?7)
+               """,
+               [
+                 correction_id,
+                 review.id,
+                 JSON.encode!(correction_refs),
+                 artifact_id,
+                 correction_id,
+                 String.duplicate("c", 64),
+                 created_at
+               ]
+             )
+
+    completion = attest_call({:session, "holder"}, producer.id, "completion")
+
+    assert %{code: "inapplicable_code_evidence", message: message} =
+             handle(ctx, "attest", completion)
+
+    assert message =~ "latest independent clean review is missing verified producer commits"
+    assert message =~ commit
+
+    verified_at = created_at + 1
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignment_commit_ref_corrections SET verifiedAt=?1 WHERE id=?2",
+               [verified_at, correction_id]
+             )
+
+    assert %{attest: %{kind: "completion"}} =
+             result =
+             handle(ctx, "attest", completion)
+
+    assert result.assignment.state == "closed"
+    assert result.assignment.outcome == "completed"
+
+    assert {:ok, [[nil, "reviewed-clean"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT commitRefs,verdictKind
+               FROM attests
+               WHERE assignmentId=?1 AND kind='verdict'
+               """,
+               [review.id]
+             )
+
+    assert {:ok, [correction_row]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,commitRefs,verifiedAt,actorRef " <>
+                 "FROM assignment_commit_ref_corrections WHERE id=?1",
+               [correction_id]
+             )
+
+    assert correction_row == [
+             correction_id,
+             JSON.encode!(correction_refs),
+             verified_at,
+             "other-session"
+           ]
+  end
+
+  test "code completion ignores a verified correction authored by the producer", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    work_item = create_work_item(ctx, "producer correction cannot supply review coverage")
+    commit = String.duplicate("a", 40)
+    producer_refs = [%{"repo" => "testhost:/tmp/producer", "commit" => commit}]
+
+    producer =
+      assign_call({:user, "flynn"}, "producer", nil, work_item.id)
+      |> put_in([:params, :effect_kind], "code")
+      |> then(&handle(ctx, "assign", &1))
+
+    review =
+      assign_call({:user, "flynn"}, "review", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{kind: "completion"}, assignment: %{state: "closed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "other-session"}, review.id, "completion")
+             )
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    artifact_id = "art_producer_correction_#{System.unique_integer([:positive])}"
+    correction_id = "crc_producer_correction_#{System.unique_integer([:positive])}"
+    created_at = System.system_time(:millisecond)
+    verified_at = created_at + 1
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, createdBySession, workItemId,
+                  producedByAssignmentId, originPath, contentSha256, state, createdAt, updatedAt)
+               VALUES (?1, 'report', 'review evidence', 'other-session', ?2,
+                       ?3, '/tmp/review-evidence.md', ?4, 'in-workspace', ?5, ?5)
+               """,
+               [artifact_id, work_item.id, review.id, String.duplicate("b", 64), created_at]
+             )
+
+    correction_refs = [
+      %{
+        "repo" => "testhost:/tmp/producer",
+        "remote" => "origin",
+        "ref" => "refs/heads/main",
+        "commit" => commit,
+        "verifiedRefCommit" => commit
+      }
+    ]
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_commit_ref_corrections
+                 (id, assignmentId, commitRefs, reason, evidenceArtifactId,
+                  actorKind, actorRef, cause, idempotencyKey, requestFingerprint,
+                  verifiedAt, createdAt)
+               VALUES (?1, ?2, ?3, 'verified review coverage', ?4, 'session',
+                       ?5, 'historical_canonical_commitref_correction', ?6, ?7, ?8, ?9)
+               """,
+               [
+                 correction_id,
+                 review.id,
+                 JSON.encode!(correction_refs),
+                 artifact_id,
+                 producer.holderKey,
+                 correction_id,
+                 String.duplicate("c", 64),
+                 verified_at,
+                 created_at
+               ]
+             )
+
+    completion = attest_call({:session, "holder"}, producer.id, "completion")
+
+    assert %{code: "inapplicable_code_evidence", message: message} =
+             handle(ctx, "attest", completion)
+
+    assert message =~ "latest independent clean review is missing verified producer commits"
+    assert message =~ commit
+
+    assert %{state: "open", closingAttestId: nil} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, producer.id)
+             )
+
+    assert {:ok, [[nil, "reviewed-clean"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT commitRefs,verdictKind FROM attests WHERE assignmentId=?1 AND kind='verdict'",
+               [review.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+               [producer.id]
+             )
+
+    assert {:ok, [correction_row]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,commitRefs,verifiedAt,actorKind,actorRef " <>
+                 "FROM assignment_commit_ref_corrections WHERE id=?1",
+               [correction_id]
+             )
+
+    assert correction_row == [
+             correction_id,
+             JSON.encode!(correction_refs),
+             verified_at,
+             "session",
+             producer.holderKey
+           ]
+  end
+
   test "code completion refuses a linked clean review recorded for a different commit", ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
