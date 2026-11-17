@@ -4961,6 +4961,17 @@ defmodule Tightbeam.Assignments do
                      {:halt, :error}
                    end
 
+                 {["commit", "ref", "remote", "repo"], repo, commit}
+                 when is_binary(repo) and is_binary(commit) and
+                        byte_size(commit) in [40, 64] ->
+                   if is_binary(ref["remote"]) and ref["remote"] != "" and
+                        is_binary(ref["ref"]) and ref["ref"] != "" and
+                        Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit) do
+                     {:cont, {:ok, [Map.put(ref, "commit", String.downcase(commit)) | acc]}}
+                   else
+                     {:halt, :error}
+                   end
+
                  _ ->
                    {:halt, :error}
                end
