@@ -120,7 +120,12 @@ defmodule Tightbeam.Wire.SocketTest do
       start: {LaneDoorbell, :start_link, [{self(), Tightbeam.LaneManager}]}
     })
 
-    config = %{db: ctx.db, base_dir: System.tmp_dir!(), port: 0}
+    base_dir =
+      Path.join(System.tmp_dir!(), "socket-chat-assets-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+    config = %{db: ctx.db, base_dir: base_dir, port: 0}
     handlers = Gateway.handlers(config)
     Rules.load!(Path.join(System.tmp_dir!(), "missing-socket-e2e-rules"), Map.keys(handlers))
 
@@ -238,10 +243,18 @@ defmodule Tightbeam.Wire.SocketTest do
                )
     end
 
-    canonical_attachments = [
-      %{"assetId" => "a_one", "mimeType" => "image/png", "filename" => "one.png", "size" => 3},
-      %{"assetId" => "a_two", "mimeType" => "image/jpeg", "filename" => "two.jpg", "size" => 5}
-    ]
+    canonical_attachments =
+      for {mime_type, filename, bytes} <-
+            [{"image/png", "one.png", "one"}, {"image/jpeg", "two.jpg", "two!!"}] do
+        asset = Tightbeam.Assets.put(ctx.db, base_dir, device.user_id, mime_type, filename, bytes)
+
+        %{
+          "assetId" => asset.asset_id,
+          "mimeType" => asset.mime_type,
+          "filename" => asset.filename,
+          "size" => asset.size
+        }
+      end
 
     for {id, attachments} <- [{"c_null_attachments", nil}, {"c_empty_attachments", []}] do
       {:push, {:text, ack}, live} =
