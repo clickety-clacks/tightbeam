@@ -4369,6 +4369,9 @@ defmodule Tightbeam.GatewayTest do
     assert HarnessProcess.parked?(ctx.db, adapter_key)
     assert HarnessHealth.get(ctx.db, incident.id).state == "open"
 
+    assert {:ok, _released} = Tightbeam.HarnessProcess.reconcile_failed_parks(ctx.db)
+    assert HarnessProcess.parked?(ctx.db, adapter_key)
+
     assert {:resolved, resolved} =
              HarnessHealth.resolve(ctx.db, %{
                correlation_id: "rate-reconcile-race-normal-success",
