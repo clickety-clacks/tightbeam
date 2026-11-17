@@ -400,6 +400,11 @@ pub enum Command {
         assignment_id: String,
         reason: String,
     },
+    AssignmentOpenerAccept {
+        identity: Identity,
+        assignment_id: String,
+        to_session_key: Option<String>,
+    },
     ReopenAssignment {
         identity: Identity,
         assignment_id: String,
@@ -1149,6 +1154,9 @@ COMMANDS:
   revoke-assignment <assignmentId> --reason "..."
       Revoke when the assignment handler already authorizes your principal.
       A non-owner caller receives a warning naming the work owner; revocation proceeds.
+  assignment-opener-accept <assignmentId> [--to <sessionKey>]
+      Accept opener duty for one open assignment whose opener retired.
+      The assignment stays open. The successor is you, or the named session.
   reopen-assignment <assignmentId> --reason <reason>
       Reopen an authorized closed assignment and record the reason.
       A non-owner caller receives a warning naming the work owner; reopening proceeds.
@@ -3282,6 +3290,22 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 assignment_id: parsed.positional[1].clone(),
                 reason,
+            })
+        }
+        "assignment-opener-accept" => {
+            let usage =
+                "usage: tightbeam assignment-opener-accept <assignmentId> [--to <sessionKey>]";
+            if parsed.positional.len() != 2
+                || parsed.duplicates.contains("to")
+                || nonempty(flags, "role").is_some()
+                || nonempty(flags, "user").is_some()
+            {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::AssignmentOpenerAccept {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                to_session_key: nonempty(flags, "to"),
             })
         }
         "reopen-assignment" => {
@@ -6620,6 +6644,7 @@ mod tests {
                 "assimilate",
                 "assign",
                 "assignment-get",
+                "assignment-opener-accept",
                 "assignments",
                 "artifact-record",
                 "artifact-content-fetch",

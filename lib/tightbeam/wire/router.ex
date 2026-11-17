@@ -80,6 +80,7 @@ defmodule Tightbeam.Wire.Router do
                  [
                    "assess_attachments",
                    "session-custody-transfer",
+                   "assignment-opener-accept",
                    "fact-demand",
                    "sentinel-demand",
                    "fact-producer-claim",
@@ -4666,6 +4667,7 @@ defmodule Tightbeam.Wire.Router do
     "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
     "session-custody-transfer" =>
       ~w(from_session_key idempotency_key parent_session_key to_session_key)a,
+    "assignment-opener-accept" => ~w(assignment_id to_session_key)a,
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
     "spawn" =>
       ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id owner_user_id)a,
