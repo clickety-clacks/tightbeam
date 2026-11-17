@@ -1125,6 +1125,17 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::HarklightBriefing {
+            identity,
+            request_id,
+            rearm_to_session,
+        } => {
+            let mut params = vec![string_field("requestId", request_id)];
+            if let Some(session) = rearm_to_session {
+                params.push(string_field("rearmToSession", session));
+            }
+            Ok(request(identity, "harklight-briefing", vec![], params))
+        }
         Command::DecisionRequest {
             identity,
             request_id,
@@ -4099,9 +4110,10 @@ fn local_harklight_identity_refusal(
             Some("harklight-send requires the authenticated session or one of its roles")
         }
         Command::HarklightBriefingsCatchup { identity, .. }
+        | Command::HarklightBriefing { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
         {
-            Some("harklight-briefings-catchup requires an active admin-owned session")
+            Some("Harklight briefing commands require an active admin-owned session")
         }
         Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
@@ -4135,6 +4147,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
         | Command::HarklightBriefingsCatchup { identity, .. }
+        | Command::HarklightBriefing { identity, .. }
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
@@ -5000,6 +5013,23 @@ mod tests {
 
         let explicit_user = parse(&["add-user", "guest", "--as-user", "flynn"]);
         assert!(!requires_session_discovery(&explicit_user));
+    }
+
+    #[test]
+    fn exact_harklight_briefing_maps_only_the_named_request_and_target() {
+        let request = "dr_12345678-1234-4123-8123-123456789abc";
+        assert_eq!(
+            body(&[
+                "harklight-briefing",
+                "--request",
+                request,
+                "--rearm-to-session",
+                "agent:owner",
+            ]),
+            format!(
+                r#"{{"verb":"harklight-briefing","params":{{"requestId":"{request}","rearmToSession":"agent:owner"}}}}"#
+            )
+        );
     }
 
     #[test]

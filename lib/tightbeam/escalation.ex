@@ -2726,7 +2726,7 @@ defmodule Tightbeam.Escalation do
            payload: payload
          }) do
       %{fact_id: _} ->
-        :ok
+        Tightbeam.HarklightBriefings.filed_request_in_txn(txn, request)
 
       {:error, reason} ->
         raise DB.Error, message: "decision request filing fact refused: #{inspect(reason)}"

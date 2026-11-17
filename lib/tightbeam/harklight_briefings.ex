@@ -36,6 +36,198 @@ defmodule Tightbeam.HarklightBriefings do
 
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
+  @doc false
+  def filed_request_in_txn(%Txn{} = txn, request) do
+    owner = request.owner_user_id
+
+    if addressed_principal(request) == "user:" <> owner and is_nil(briefing_rule(owner)) do
+      session_key = Org.personal_session_key(owner)
+      wake_id = wake_id(request.id)
+
+      if Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2", [
+           session_key,
+           owner
+         ]) == [["active"]] and is_nil(wake_in_txn(txn, wake_id)) do
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: wake_id,
+          session_key: session_key,
+          origin: @wake_origin,
+          prompt:
+            "Investigate the exact open decision request #{request.id} for its addressed owner. Read the request and supporting records, then brief the owner in plain language with its options and your recommendation through `tightbeam harklight-send --session new --type request --reply --decision-request-id #{request.id} ...`. Reread its status before sending or ruling; do not present a closed request or create a replacement decision. Keep replies in the originating Harklight conversation and reconcile an uncertain send before retrying.",
+          due_at: System.system_time(:millisecond),
+          summon: true
+        })
+      end
+    end
+
+    :ok
+  end
+
+  @doc "Read the exact request's briefing wake and bound send, or admit its stable wake to one named session."
+  def exact(db, call, opts \\ []) do
+    request_id = call.params[:request_id]
+    target_session = call.params[:rearm_to_session]
+
+    with true <- is_binary(request_id) and Regex.match?(@request_id, request_id),
+         :ok <- active_admin_origin(db, call, Keyword.get(opts, :authorized, false)),
+         {:ok, owner} <- owner_user_id(db, call),
+         :ok <- maybe_rearm(db, call, request_id, owner, target_session) do
+      exact_readback(db, request_id, owner, call.session_key)
+    else
+      false -> failure("invalid_harklight_decision_request", "decision request ID is invalid")
+      {:error, code, message} -> failure(code, message)
+    end
+  end
+
+  defp maybe_rearm(_db, _call, _request_id, _owner, nil), do: :ok
+
+  defp maybe_rearm(db, call, request_id, owner, target_session)
+       when is_binary(target_session) and target_session != "" do
+    now = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           request = Escalation.raw_by_id_in_txn(txn, request_id)
+           existing = progress_in_txn(txn, request_id)
+           wake_id = wake_id(request_id)
+           wake = wake_in_txn(txn, wake_id)
+
+           cond do
+             request == nil or request.owner_user_id != owner ->
+               {:error, "decision_request_not_found",
+                "decision request is not visible to this owner"}
+
+             request.status != "open" ->
+               {:error, "decision_request_not_open", "decision request is no longer open"}
+
+             addressed_principal(request) != "user:" <> owner ->
+               {:error, "decision_request_address_mismatch",
+                "decision request is not addressed to this owner"}
+
+             Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2", [
+               target_session,
+               owner
+             ]) != [["active"]] ->
+               {:error, "harklight_briefing_target_unavailable",
+                "target must be an active session of this owner"}
+
+             existing && existing.send_op_id && existing.session_key != target_session ->
+               {:error, "harklight_briefing_origin_mismatch",
+                "an existing send belongs to another session"}
+
+             existing && existing.state in ["unresolved", "excluded"] ->
+               {:error, "harklight_briefing_association_unresolved", existing.disposition}
+
+             wake &&
+                 (wake.origin != @wake_origin or wake.session_key != target_session or
+                    wake.state == "canceled") ->
+               {:error, "harklight_briefing_wake_conflict",
+                "the original request wake cannot be moved or revived"}
+
+             true ->
+               unless wake do
+                 Wakes.schedule_in_txn(txn, %{
+                   wake_id: wake_id,
+                   session_key: target_session,
+                   origin: @wake_origin,
+                   prompt:
+                     "Investigate the exact open decision request #{request_id}, its cause and supporting evidence. Brief the owner in plain language through `tightbeam harklight-send --session new --type request --reply --decision-request-id #{request_id} ...`. Keep the originating session and thread for replies; reread the request before any ruling. Do not create a replacement decision.",
+                   due_at: now,
+                   creator_session_key: call.session_key,
+                   summon: true
+                 })
+
+                 Tightbeam.EventLog.lifecycle_in_txn(
+                   txn,
+                   "harklight_briefing_exact_rearmed",
+                   request_id,
+                   JSON.encode!(%{
+                     wake_id: wake_id,
+                     target_session: target_session,
+                     actor: call.origin
+                   })
+                 )
+               end
+
+               if is_nil(existing) or existing.state in ["staged", "reuse_staged", "admitted"] do
+                 persist_in_txn(
+                   txn,
+                   request_id,
+                   owner,
+                   "admitted",
+                   if(wake,
+                     do: "original request wake reused",
+                     else: "original request wake rearmed to named session"
+                   ),
+                   call.session_key,
+                   target_session,
+                   wake_id,
+                   existing && existing.send_op_id,
+                   existing && existing.handle,
+                   existing && existing.sender_id,
+                   existing && existing.message_id,
+                   now
+                 )
+               end
+
+               :ok
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:ok, {:error, code, message}} -> {:error, code, message}
+      {:error, reason} -> {:error, "harklight_briefing_rearm_unavailable", inspect(reason)}
+    end
+  end
+
+  defp maybe_rearm(_db, _call, _request_id, _owner, _target),
+    do: {:error, "invalid_harklight_briefing_target", "target session is invalid"}
+
+  defp exact_readback(db, request_id, owner, actor_session) do
+    case DB.query(db, "SELECT status FROM decision_requests WHERE id=?1 AND ownerUserId=?2", [
+           request_id,
+           owner
+         ]) do
+      {:ok, [[request_status]]} ->
+        progress = progress(db, request_id)
+        wake_id = wake_id(request_id)
+        wake = wake(db, wake_id)
+        operation = operation_by_id(db, progress && progress.send_op_id)
+
+        bound? =
+          progress && wake && wake.state == "fired" && operation && operation.state == "bound" &&
+            operation.session_key == wake.session_key &&
+            decision_request_id(operation.payload) == request_id &&
+            progress.handle == operation.handle &&
+            progress.sender_id == operation.sender_id &&
+            progress.message_id == operation.message_id &&
+            DB.query(
+              db,
+              "SELECT handle FROM harklight_wake_requests WHERE senderId=?1 AND messageId=?2",
+              [operation.sender_id, operation.message_id]
+            ) == {:ok, [[operation.handle]]}
+
+        %{
+          ok: true,
+          request_id: request_id,
+          request_status: request_status,
+          actor_session_key: actor_session,
+          wake_id: wake_id,
+          wake_state: wake && wake.state,
+          wake_session_key: wake && wake.session_key,
+          wake_origin: wake && wake.origin,
+          briefing_state: progress && progress.state,
+          send_op_id: progress && progress.send_op_id,
+          send_state: operation && operation.state,
+          handle: progress && progress.handle,
+          sender_id: progress && progress.sender_id,
+          message_id: progress && progress.message_id,
+          associated_presentation: !!bound?
+        }
+
+      _ ->
+        failure("decision_request_not_found", "decision request is not visible to this owner")
+    end
+  end
+
   @doc "Stage every visible request for the authenticated owner and admit at most `limit` new wakes."
   def catchup(db, call, opts \\ []) do
     limit = call.params[:limit] || 0

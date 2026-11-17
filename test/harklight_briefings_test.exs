@@ -50,6 +50,7 @@ defmodule Tightbeam.HarklightBriefingsTest do
 
   test "catchup stages every open request and admits only the requested number once", ctx do
     requests = Enum.map(1..3, fn n -> open_request(ctx, "Question #{n}?") end)
+    remove_automatic_wakes(ctx)
     load_briefing_rule(ctx, ctx.consumer.session_key)
 
     assert %{ok: true, listed: 3, admitted: 1, staged: 2, requests: first} =
@@ -152,6 +153,29 @@ defmodule Tightbeam.HarklightBriefingsTest do
                handle,
                "briefing-sender",
                message_id
+             )
+
+    assert %{ok: true, wake_id: wake_id, send_state: "bound", associated_presentation: false} =
+             HarklightBriefings.exact(ctx.db, %{ctx.call | params: %{request_id: request.id}},
+               authorized: true
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE wakes SET state='fired',firedAt=1 WHERE wakeId=?1",
+               [wake_id]
+             )
+
+    assert %{
+             ok: true,
+             send_state: "bound",
+             associated_presentation: true,
+             handle: ^handle,
+             message_id: ^message_id
+           } =
+             HarklightBriefings.exact(ctx.db, %{ctx.call | params: %{request_id: request.id}},
+               authorized: true
              )
 
     assert {:ok, %{action: :existing, op_id: ^first_op, message_id: ^message_id}} =
@@ -258,6 +282,7 @@ defmodule Tightbeam.HarklightBriefingsTest do
     assert %{status: "ruled", decision: "accept"} =
              Escalation.operator_rule(ctx.db, rule_call, authorized: true)
 
+    remove_automatic_wakes(ctx)
     load_briefing_rule(ctx, ctx.consumer.session_key)
 
     assert %{ok: true, listed: 2, admitted: 1, excluded: 1, requests: entries} = catchup(ctx, 5)
@@ -279,6 +304,147 @@ defmodule Tightbeam.HarklightBriefingsTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM harklight_decision_briefings")
   end
 
+  test "exact rearm admits only the named open request without a configured rule", ctx do
+    first = open_request(ctx, "First choice?")
+    second = open_request(ctx, "Second choice?")
+    remove_automatic_wakes(ctx)
+
+    assert {:ok, [[question, options]]} =
+             DB.query(ctx.db, "SELECT question,options FROM decision_requests WHERE id=?1", [
+               first.id
+             ])
+
+    call = %{
+      ctx.call
+      | params: %{request_id: first.id, rearm_to_session: ctx.consumer.session_key}
+    }
+
+    assert %{
+             ok: true,
+             request_id: id,
+             wake_state: "pending",
+             wake_session_key: target,
+             associated_presentation: false
+           } =
+             HarklightBriefings.exact(ctx.db, call, authorized: true)
+
+    assert id == first.id
+    assert target == ctx.consumer.session_key
+    assert briefing_wake_count(ctx.db) == 1
+
+    assert {:ok, [[^question, ^options]]} =
+             DB.query(ctx.db, "SELECT question,options FROM decision_requests WHERE id=?1", [
+               first.id
+             ])
+
+    assert %{ok: true, wake_id: wake_id} =
+             HarklightBriefings.exact(ctx.db, call, authorized: true)
+
+    assert briefing_wake_count(ctx.db) == 1
+
+    assert %{ok: true, wake_state: nil, send_op_id: nil} =
+             HarklightBriefings.exact(ctx.db, %{ctx.call | params: %{request_id: second.id}},
+               authorized: true
+             )
+
+    assert {:ok, [[^target, "remedy:harklight-decision-request-briefing"]]} =
+             DB.query(ctx.db, "SELECT sessionKey,origin FROM wakes WHERE wakeId=?1", [wake_id])
+
+    assert {:error, "harklight_briefing_route_unavailable", _} =
+             HarklightBriefings.reserve_send(ctx.db, %{ctx.call | params: %{}}, second.id)
+
+    assert {:ok, %{action: :start}} =
+             HarklightBriefings.reserve_send(
+               ctx.db,
+               %{session_call(ctx.consumer.session_key) | params: %{}},
+               first.id
+             )
+  end
+
+  test "exact rearm refuses a target change for an existing request wake", ctx do
+    request = open_request(ctx, "Which route?")
+    remove_automatic_wakes(ctx)
+
+    first = %{
+      ctx.call
+      | params: %{request_id: request.id, rearm_to_session: ctx.consumer.session_key}
+    }
+
+    assert %{ok: true} = HarklightBriefings.exact(ctx.db, first, authorized: true)
+
+    second = %{
+      ctx.call
+      | params: %{request_id: request.id, rearm_to_session: ctx.compiler.session_key}
+    }
+
+    assert %{ok: false, code: "harklight_briefing_wake_conflict"} =
+             HarklightBriefings.exact(ctx.db, second, authorized: true)
+
+    assert briefing_wake_count(ctx.db) == 1
+  end
+
+  test "exact rearm plainly refuses a closed request without creating a wake", ctx do
+    request = open_request(ctx, "Already decided?")
+    remove_automatic_wakes(ctx)
+
+    assert %{status: "ruled"} =
+             Escalation.operator_rule(
+               ctx.db,
+               %{
+                 verb: "operator-rule",
+                 origin: "user:#{@owner}",
+                 principal: {:user, @owner},
+                 params: %{request_id: request.id, decision: "accept", rationale: "Chosen"}
+               },
+               authorized: true
+             )
+
+    assert %{ok: false, code: "decision_request_not_open"} =
+             HarklightBriefings.exact(
+               ctx.db,
+               %{
+                 ctx.call
+                 | params: %{request_id: request.id, rearm_to_session: ctx.consumer.session_key}
+               },
+               authorized: true
+             )
+
+    assert briefing_wake_count(ctx.db) == 0
+  end
+
+  test "filing automatically binds the briefing wake to the addressed owner", ctx do
+    request = open_request(ctx, "Which option should we take?")
+
+    assert {:ok, [[session_key, origin]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,origin FROM wakes WHERE wakeId=?1",
+               [briefing_wake_id(request.id)]
+             )
+
+    assert session_key == ctx.main.session_key
+    assert session_key != ctx.compiler.session_key
+    assert origin == "remedy:harklight-decision-request-briefing"
+    assert briefing_wake_count(ctx.db) == 1
+
+    assert {:ok, %{action: :start}} =
+             HarklightBriefings.reserve_send(
+               ctx.db,
+               %{session_call(ctx.main.session_key) | params: %{}},
+               request.id
+             )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               ctx.compiler.session_key
+             ])
+
+    assert {:ok, [[^session_key]]} =
+             DB.query(ctx.db, "SELECT sessionKey FROM wakes WHERE wakeId=?1", [
+               briefing_wake_id(request.id)
+             ])
+  end
+
   defp catchup(ctx, limit) do
     HarklightBriefings.catchup(ctx.db, Map.put(ctx.call, :params, %{limit: limit}),
       authorized: true
@@ -291,6 +457,22 @@ defmodule Tightbeam.HarklightBriefingsTest do
       | verb: "operator-ask",
         params: %{question: question}
     })
+  end
+
+  defp remove_automatic_wakes(ctx) do
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM wakes WHERE origin='remedy:harklight-decision-request-briefing'"
+             )
+  end
+
+  defp briefing_wake_id(request_id) do
+    digest =
+      :crypto.hash(:sha256, "harklight-decision-request-briefing" <> <<0>> <> request_id)
+      |> Base.encode16(case: :lower)
+
+    "w_rule_" <> digest
   end
 
   defp load_briefing_rule(ctx, target) do

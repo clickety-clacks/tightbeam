@@ -1064,6 +1064,9 @@ defmodule Tightbeam.Gateway do
       {"harklight-briefings-catchup", []} => fn call ->
         Tightbeam.HarklightBriefings.catchup(db, call, authorized: admin_caller?(db, call))
       end,
+      {"harklight-briefing", []} => fn call ->
+        Tightbeam.HarklightBriefings.exact(db, call, authorized: admin_caller?(db, call))
+      end,
       {"harklight-retry", []} => fn call ->
         Tightbeam.HarklightWakes.retry_command(db, call)
       end,
