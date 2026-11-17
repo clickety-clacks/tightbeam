@@ -13142,6 +13142,7 @@ defmodule Tightbeam.GatewayTest do
       rest_post(ctx, "tbc_test", put_in(body, [:params, :content], "different text"))
 
     assert conflict.status == 409
+
     assert JSON.decode!(conflict.resp_body) == %{
              "error" => %{"code" => "client_message_conflict"}
            }
