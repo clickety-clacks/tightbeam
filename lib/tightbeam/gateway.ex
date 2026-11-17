@@ -372,6 +372,7 @@ defmodule Tightbeam.Gateway do
           db: db,
           name: Tightbeam.AdapterCoordinator},
          {Tightbeam.Productions.BubbleSweeper, db: db},
+         {Tightbeam.PathNotes, db: db, stat_config: Map.take(config, [:sh, :file_stat])},
          {Tightbeam.LaneManager,
           db: db,
           lane_sup: Tightbeam.LaneSupervisor,
@@ -4316,6 +4317,9 @@ defmodule Tightbeam.Gateway do
 
     runner = fn turn ->
       session = Org.get(db, turn.session_key)
+      # Path checks start before anything else so they have the most time to
+      # return; the prompt below never waits for them.
+      path_plan = Tightbeam.PathNotes.claimed(db, turn)
       echo = Projection.get(db, turn.message_id)
       correlation = (echo && echo.client_message_id) || turn.message_id
       publish_turn_state(db, turn.session_key, correlation, "running", nil)
@@ -4403,12 +4407,13 @@ defmodule Tightbeam.Gateway do
                    db,
                    prompt_adapter,
                    harness_session_id,
-                   prepare_turn_prompt_content(
-                     db,
+                   db
+                   |> prepare_turn_prompt_content(
                      assignment_identity_refresh_brief(turn, identity_refresh_revision),
                      active_session,
                      config
-                   ),
+                   )
+                   |> Tightbeam.PathNotes.annotate(path_plan),
                    trace_dispatch: fn request_id ->
                      case Tightbeam.TurnLifecycle.append(db, turn.seq, %{
                             event_key: "prompt:dispatched",

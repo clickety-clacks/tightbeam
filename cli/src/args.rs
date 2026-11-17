@@ -1194,7 +1194,8 @@ COMMANDS:
   attests <assignmentId>
       List every attest filed against an assignment.
   check-attest <attestId>
-      Check the files recorded on an attest's assignment and attached artifact.
+      Check the files recorded on an attest's assignment and attached artifact,
+      and the absolute paths written in its note.
   assignment-get <assignmentId> [--fact-id <id>]
       Read the assignment's current cannot-proceed release tuple and state. When
       --fact-id is supplied, also read that existing fact and report the stored

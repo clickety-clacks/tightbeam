@@ -11198,6 +11198,16 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  @tag timeout: 180_000
+  @tag cold_gateway: true, gateway_path_notes: true, tmp_dir: true
+  test "delivered turns carry one presence note per handed-on path", ctx do
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_path_notes.exs",
+      "guarded-gateway-path-notes: ok"
+    )
+  end
+
   # The provisioning seam, beyond deliver_home: a real turn that
   # provisions a fresh harness session must pin the shared home to the SESSION'S
   # selected model (not the org default), so the adapter offers+accepts it at
