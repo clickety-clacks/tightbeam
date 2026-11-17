@@ -1,3 +1,8 @@
+defmodule Tightbeam.Org.DisplayNameError do
+  @moduledoc false
+  defexception [:code, :message]
+end
+
 defmodule Tightbeam.Org do
   @moduledoc """
   Session registry for wire identity, organization identity, model provenance,
@@ -573,6 +578,7 @@ defmodule Tightbeam.Org do
   @spec create_in_txn(Txn.t(), map()) :: session()
   def create_in_txn(%Txn{} = txn, input) do
     Txn.assert_archetype_available!(txn, Map.fetch!(input, :archetype))
+    validate_display_name!(txn, Map.fetch!(input, :display_name))
 
     session_key =
       Map.get(input, :session_key) || custom_session_key(Map.fetch!(input, :owner_user_id))
@@ -627,7 +633,31 @@ defmodule Tightbeam.Org do
     end
 
     publish_session_in_txn(txn, "session.spawned", session)
+
+    if session.kind == "main" do
+      Tightbeam.HarnessRecoveryNotice.retry_owner_in_txn(txn, owner_user_id, now)
+    end
+
     session
+  end
+
+  @doc false
+  @spec initial_display_name_in_txn(Txn.t(), String.t()) :: String.t()
+  def initial_display_name_in_txn(%Txn{} = txn, base_name) when is_binary(base_name) do
+    available_initial_display_name!(txn, base_name, 1)
+  end
+
+  defp available_initial_display_name!(txn, base_name, suffix) do
+    candidate = if suffix == 1, do: base_name, else: "#{base_name} (#{suffix})"
+    validate_display_name!(txn, candidate)
+    candidate
+  rescue
+    error in Tightbeam.Org.DisplayNameError ->
+      if error.code == "display_name_taken" do
+        available_initial_display_name!(txn, base_name, suffix + 1)
+      else
+        reraise error, __STACKTRACE__
+      end
   end
 
   # Main may be virtual until its first connection. Only an explicitly supplied
@@ -660,6 +690,56 @@ defmodule Tightbeam.Org do
             raise ArgumentError, "invalid organizational parent"
         end
     end
+  end
+
+  defp validate_display_name!(
+         txn,
+         display_name,
+         excluding_session_key \\ nil,
+         unchanged? \\ false
+       )
+
+  defp validate_display_name!(txn, display_name, excluding_session_key, unchanged?)
+       when is_binary(display_name) do
+    if String.trim(display_name) == "" do
+      raise Tightbeam.Org.DisplayNameError,
+        code: "display_name_empty",
+        message: "display name must not be empty"
+    end
+
+    unless unchanged? do
+      normalized = normalized_display_name(display_name)
+
+      collision? =
+        txn
+        |> Txn.q("SELECT sessionKey, displayName FROM sessions ORDER BY sessionKey", [])
+        |> Enum.any?(fn [session_key, existing_name] ->
+          session_key != excluding_session_key and
+            normalized_display_name(existing_name) == normalized
+        end)
+
+      if collision? do
+        raise Tightbeam.Org.DisplayNameError,
+          code: "display_name_taken",
+          message: "display name is already in use"
+      end
+    end
+
+    :ok
+  end
+
+  defp validate_display_name!(_txn, _display_name, _excluding_session_key, _unchanged?) do
+    raise Tightbeam.Org.DisplayNameError,
+      code: "display_name_invalid",
+      message: "display name must be text"
+  end
+
+  defp normalized_display_name(display_name) do
+    display_name
+    |> String.trim()
+    |> String.to_charlist()
+    |> :string.casefold()
+    |> List.to_string()
   end
 
   defp validate_topology_ancestry!(txn, key, owner, seen) do
@@ -866,7 +946,18 @@ defmodule Tightbeam.Org do
   @doc "Rename a session (raises if unknown). Returns the updated session."
   @spec rename(db(), String.t(), String.t()) :: session()
   def rename(db \\ Tightbeam.DB, session_key, display_name) do
-    update(db, session_key, "displayName = ?2", [display_name])
+    transaction!(db, fn txn ->
+      current = must_get(txn, session_key)
+
+      validate_display_name!(
+        txn,
+        display_name,
+        session_key,
+        display_name == current.display_name
+      )
+
+      update_in_txn(txn, session_key, "displayName = ?2", [display_name])
+    end)
   end
 
   @doc """
@@ -1117,23 +1208,36 @@ defmodule Tightbeam.Org do
   @spec retire_in_txn(Txn.t(), String.t(), String.t()) :: session()
   def retire_in_txn(%Txn{} = txn, session_key, principal)
       when is_binary(principal) and principal != "" do
+    retire_in_txn(txn, session_key, principal, [])
+  end
+
+  @spec retire_in_txn(Txn.t(), String.t(), String.t(), keyword()) :: session()
+  def retire_in_txn(%Txn{} = txn, session_key, principal, opts)
+      when is_binary(principal) and principal != "" and is_list(opts) do
     case must_get(txn, session_key) do
       %{state: "retired"} = session ->
         session
 
       %{state: "active"} ->
-        retire_active_in_txn(txn, session_key, principal)
+        retire_active_in_txn(txn, session_key, principal, opts)
     end
   end
 
-  def retire_in_txn(%Txn{} = txn, session_key, principal, _legacy_supervision_interval_ms),
-    do: retire_in_txn(txn, session_key, principal)
+  # Keep accepting the former interval argument for callers on the preceding
+  # source line; current callers that defer handoff pass options directly.
+  def retire_in_txn(%Txn{} = txn, session_key, principal, _legacy_supervision_interval_ms)
+      when is_binary(principal) and principal != "",
+      do: retire_in_txn(txn, session_key, principal)
 
   def retire_in_txn(%Txn{}, _session_key, _principal) do
     raise ArgumentError, "retirement requires a non-empty principal"
   end
 
-  defp retire_active_in_txn(txn, session_key, _principal) do
+  def retire_in_txn(%Txn{}, _session_key, _principal, _opts) do
+    raise ArgumentError, "retirement requires a non-empty principal"
+  end
+
+  defp retire_active_in_txn(txn, session_key, _principal, opts) do
     retirement_epoch = now()
     Tightbeam.Retirements.retiring_in_txn(txn, [session_key])
 
@@ -1155,11 +1259,13 @@ defmodule Tightbeam.Org do
     if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
     Tightbeam.Retirements.session_retired_in_txn(txn, session_key)
 
-    Txn.handoff(
-      txn,
-      Tightbeam.HarklightWakes,
-      Tightbeam.HarklightWakes.retirement_handoff_in_txn(txn, session_key)
-    )
+    unless Keyword.get(opts, :defer_harklight, false) do
+      Txn.handoff(
+        txn,
+        Tightbeam.HarklightWakes,
+        Tightbeam.HarklightWakes.retirement_handoff_in_txn(txn, session_key)
+      )
+    end
 
     Tightbeam.SentinelSubscriptions.end_session_in_txn(txn, session_key)
 
@@ -1190,6 +1296,11 @@ defmodule Tightbeam.Org do
         )
         AND NOT EXISTS (
           SELECT 1 FROM harklight_wake_deliveries d WHERE d.wakeId=w.wakeId
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM wake_retry_attempts retry
+          JOIN harklight_wake_deliveries d ON d.wakeId=retry.rootWakeId
+          WHERE retry.wakeId=w.wakeId
         )
       ORDER BY w.createdAt,w.wakeId
       """,

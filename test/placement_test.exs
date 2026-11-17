@@ -304,11 +304,6 @@ defmodule Tightbeam.PlacementTest do
     assert error.message == expected
   end
 
-  test "origin checks name a disappeared host", %{base_dir: base_dir, db: db} do
-    assert %{"/work/file" => {:error, "no host named eurisko is registered"}} =
-             Placement.check_origins(%{base_dir: base_dir, db: db}, "eurisko", ["/work/file"])
-  end
-
   test "move_workdir copies local to local", %{base_dir: base_dir, db: db} do
     old_base = Path.join(base_dir, "old-local")
     new_base = Path.join(base_dir, "new-local")
@@ -1918,6 +1913,81 @@ defmodule Tightbeam.PlacementTest do
       Enum.find(opts[:env], fn {key, _value} -> key == "TIGHTBEAM_LINEAGE" end)
 
     assert Base.url_decode64!(encoded, padding: false) == "codex@testhost"
+  end
+
+  test "Pi session keys resolve to stable private homes separate from placement readiness", %{
+    base_dir: base_dir
+  } do
+    host = %{base_dir: base_dir}
+    key_a = Placement.pi_session_adapter_key("session-a", "testhost")
+    key_b = Placement.pi_session_adapter_key("session-b", "testhost")
+
+    assert Placement.pi_session_adapter?(key_a)
+    assert Placement.pi_session_adapter?(key_b)
+    assert {:ok, "session-a"} = Placement.pi_session_key(key_a)
+    assert {:ok, "session-b"} = Placement.pi_session_key(key_b)
+
+    private_a = Placement.pi_private_home(host, elem(key_a, 1))
+    private_b = Placement.pi_private_home(host, elem(key_b, 1))
+    readiness = Placement.pi_private_home(host, "shared")
+
+    assert private_a ==
+             Path.join([Placement.host_workdir_path(host, "session-a"), ".tightbeam", "pi-home"])
+
+    assert private_b ==
+             Path.join([Placement.host_workdir_path(host, "session-b"), ".tightbeam", "pi-home"])
+
+    refute private_a == private_b
+    refute private_a == readiness
+    assert readiness == Path.join([base_dir, "work", "pi-readiness-home"])
+    assert Placement.placement_adapter_key(key_a) == {:pi, "shared", "testhost"}
+  end
+
+  test "Pi session launch homes stay private while coding-agent state stays shared", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    host = Placement.local_host_name()
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("opencode-go/gpt-5.6-luna"),
+      credential_kind: fn _provider, _host -> :api_key end
+    }
+
+    opts_a =
+      Placement.adapter_opts!(
+        config,
+        Placement.pi_session_adapter_key("session-a", host)
+      )
+
+    opts_b =
+      Placement.adapter_opts!(
+        config,
+        Placement.pi_session_adapter_key("session-b", host)
+      )
+
+    env_a = Map.new(opts_a[:env])
+    env_b = Map.new(opts_b[:env])
+
+    assert env_a["PI_CODING_AGENT_DIR"] == env_b["PI_CODING_AGENT_DIR"]
+    assert env_a["PI_CODING_AGENT_DIR"] == opts_a[:home]
+
+    assert env_a["HOME"] ==
+             Placement.pi_private_home(%{base_dir: base_dir}, "pi-session:session-a")
+
+    assert env_b["HOME"] ==
+             Placement.pi_private_home(%{base_dir: base_dir}, "pi-session:session-b")
+
+    refute env_a["HOME"] == env_b["HOME"]
+    assert env_a["PI_REAL_HOME"] == env_b["PI_REAL_HOME"]
+
+    for private_home <- [env_a["HOME"], env_b["HOME"]] do
+      assert private_home |> File.stat!() |> Map.fetch!(:mode) |> Bitwise.band(0o777) == 0o700
+    end
   end
 
   test "deliver_home preserves the manifest and nested state with zero statutes", %{

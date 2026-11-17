@@ -4,7 +4,18 @@ defmodule Tightbeam.ToolCallsTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{Archetypes, DB, Devices, Identity, Ledger, Org, Projection, StateResources}
+  alias Tightbeam.{
+    Archetypes,
+    DB,
+    Devices,
+    Identity,
+    Ledger,
+    Org,
+    Projection,
+    StateResources,
+    TurnEvents
+  }
+
   alias Tightbeam.Firehose.{Hub, Publisher}
   alias Tightbeam.ToolCalls
   alias Tightbeam.Wire.Router
@@ -274,6 +285,203 @@ defmodule Tightbeam.ToolCallsTest do
     assert String.starts_with?(transition["payload"]["content"], "[context compacted]")
   end
 
+  test "turn events retain received interleaving across REST pages and Firehose rebuild", ctx do
+    :ok =
+      subscribe(ctx, "turn-event-order", ["message.segment_recorded", "tool_call.event_recorded"])
+
+    message_id = "s_" <> Tightbeam.Id.uuid4()
+    first_content = %{"type" => "text", "text" => "A"}
+    second_content = %{"type" => "text", "text" => "B"}
+    third_content = %{"type" => "text", "text" => "C"}
+
+    assert {:ok, first} =
+             TurnEvents.append_assistant_segment(
+               ctx.db,
+               ctx.session_key,
+               ctx.turn_seq,
+               message_id,
+               first_content
+             )
+
+    first_notice = receive_notice("message.segment_recorded")
+    first_item = StateResources.turn_event(first)
+    first_bytes = StateResources.encode_item("turn events", first_item)
+    assert first.turn_event_seq == 1
+    assert first.message_id == message_id
+    assert first_notice["refs"]["turnEventId"] == first.id
+    assert first_notice["refs"]["messageId"] == message_id
+    assert first_notice["payload"] == first_item
+
+    assert {:ok, rebuilt_first} =
+             Tightbeam.Firehose.Rebuild.fetch(
+               ctx.db,
+               first_notice["class"],
+               first_notice["refs"],
+               "tool-call-owner",
+               false
+             )
+
+    assert rebuilt_first == first_item
+
+    assert String.contains?(
+             Publisher.encode_wire_notice(first_notice),
+             "\"payload\":" <> first_bytes
+           )
+
+    start =
+      ToolCalls.normalize_notification(%{
+        "title" => "Run command",
+        "kind" => "execute",
+        "status" => "in_progress",
+        "rawInput" => %{"command" => "printf done"}
+      })
+
+    assert {:ok, :started} =
+             ToolCalls.observe(
+               ctx.db,
+               ctx.session_key,
+               ctx.turn_seq,
+               "turn-order-call",
+               start,
+               %{},
+               nil
+             )
+
+    start_notice = receive_notice("tool_call.event_recorded")
+    start_item = start_notice["payload"]
+    assert start_item["turnEventSeq"] == 2
+    assert start_item["kind"] == "tool.started"
+    assert start_item["toolCall"]["rowVersion"] == 1
+    assert start_item["toolCall"]["status"] == "in_progress"
+
+    assert {:ok, second} =
+             TurnEvents.append_assistant_segment(
+               ctx.db,
+               ctx.session_key,
+               ctx.turn_seq,
+               message_id,
+               second_content
+             )
+
+    second_notice = receive_notice("message.segment_recorded")
+    assert second.turn_event_seq == 3
+    assert second.message_id == message_id
+    assert second_notice["payload"]["id"] == second.id
+    assert second_notice["payload"]["content"] == second_content
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE sessions SET clearedThroughSeq=?1 WHERE sessionKey=?2",
+                 [ctx.anchor + 100, ctx.session_key]
+               )
+
+               :ok
+             end)
+
+    terminal =
+      ToolCalls.normalize_notification(%{
+        "status" => "completed",
+        "rawOutput" => %{"stdout" => "done"}
+      })
+
+    assert {:ok, :ended} =
+             ToolCalls.observe(
+               ctx.db,
+               ctx.session_key,
+               ctx.turn_seq,
+               "turn-order-call",
+               terminal,
+               %{},
+               nil
+             )
+
+    end_notice = receive_notice("tool_call.event_recorded")
+    end_item = end_notice["payload"]
+    assert end_item["turnEventSeq"] == 4
+    assert end_item["kind"] == "tool.ended"
+    assert end_item["toolCall"]["rowVersion"] == 2
+    assert end_item["toolCall"]["status"] == "completed"
+
+    assert {:ok, rebuilt_end} =
+             Tightbeam.Firehose.Rebuild.fetch(
+               ctx.db,
+               end_notice["class"],
+               end_notice["refs"],
+               "tool-call-owner",
+               false
+             )
+
+    assert rebuilt_end == end_item
+
+    assert {:ok, third} =
+             TurnEvents.append_assistant_segment(
+               ctx.db,
+               ctx.session_key,
+               ctx.turn_seq,
+               message_id,
+               third_content
+             )
+
+    third_notice = receive_notice("message.segment_recorded")
+    assert third.turn_event_seq == 5
+    assert third.message_id == message_id
+    assert third_notice["payload"]["id"] == third.id
+
+    {:appended, whole_message} =
+      Projection.append(ctx.db, %{
+        id: message_id,
+        session_key: ctx.session_key,
+        role: "assistant",
+        content: "ABC"
+      })
+
+    assert whole_message.id == message_id
+
+    detail = get(ctx, "/api/sessions/#{ctx.session_key}/turn-events/#{first.id}")
+    assert detail.status == 200, detail.resp_body
+    assert JSON.decode!(detail.resp_body)["item"] == first_item
+    assert String.contains?(detail.resp_body, "\"item\":" <> first_bytes)
+
+    latest =
+      get(ctx, "/api/sessions/#{ctx.session_key}/turn-events?turnSeq=#{ctx.turn_seq}&limit=2")
+
+    assert latest.status == 200, latest.resp_body
+    latest_page = JSON.decode!(latest.resp_body)
+    assert Enum.map(latest_page["items"], & &1["turnEventSeq"]) == [4, 5]
+    assert latest_page["page"]["hasMoreBefore"]
+
+    prior =
+      get(
+        ctx,
+        "/api/sessions/#{ctx.session_key}/turn-events?turnSeq=#{ctx.turn_seq}&limit=2&before=" <>
+          URI.encode_www_form(latest_page["page"]["oldestCursor"])
+      )
+
+    assert prior.status == 200, prior.resp_body
+    prior_page = JSON.decode!(prior.resp_body)
+    assert Enum.map(prior_page["items"], & &1["turnEventSeq"]) == [2, 3]
+    assert prior_page["page"]["hasMoreBefore"]
+
+    oldest =
+      get(
+        ctx,
+        "/api/sessions/#{ctx.session_key}/turn-events?turnSeq=#{ctx.turn_seq}&limit=2&before=" <>
+          URI.encode_www_form(prior_page["page"]["oldestCursor"])
+      )
+
+    assert oldest.status == 200, oldest.resp_body
+    oldest_page = JSON.decode!(oldest.resp_body)
+    assert Enum.map(oldest_page["items"], & &1["turnEventSeq"]) == [1]
+    refute oldest_page["page"]["hasMoreBefore"]
+
+    assert Enum.map(
+             oldest_page["items"] ++ prior_page["items"] ++ latest_page["items"],
+             & &1["turnEventSeq"]
+           ) == [1, 2, 3, 4, 5]
+  end
+
   test "bounds each canonical JSON field and reports the original byte lengths", ctx do
     input = %{"v" => String.duplicate("🙂", 17_000)}
     output = %{"result" => String.duplicate("x", 70_000)}
@@ -476,7 +684,7 @@ defmodule Tightbeam.ToolCallsTest do
 
   test "fresh setup applies the feature-local migration without changing the root stamp", ctx do
     {:ok, [[root_shape]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp", [])
-    assert root_shape == "session-custody-v1-0116"
+    assert root_shape == "session-custody-artifact-process-attribution-v1-0117"
 
     {:ok, [[0, "tool-call-transition-v1-011"]]} =
       DB.query(ctx.db, "SELECT id, shape FROM tool_call_transition_migration", [])
@@ -503,6 +711,16 @@ defmodule Tightbeam.ToolCallsTest do
         "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='tool_calls_session_anchor'",
         []
       )
+
+    assert {:ok, [[0, "turn-event-order-v1"]]} =
+             DB.query(ctx.db, "SELECT id, shape FROM turn_event_migration", [])
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='turn_events_session_order'",
+               []
+             )
   end
 
   @tag :historical_messages
@@ -551,18 +769,18 @@ defmodule Tightbeam.ToolCallsTest do
         prompt: "Repair this recorded human sender before the message rebuild."
       })
 
-    message_columns = ~w(
+    message_columns_before = ~w(
       seq id sessionKey role content timestamp sender deviceId clientMessageId
       replyToMessageId replyToClientMessageId llmVisibleMessageId attachments
       attentionTier messageType markerKind markerFrom markerTo
     )
 
-    message_rows_sql =
-      "SELECT " <> Enum.join(message_columns, ", ") <> " FROM messages ORDER BY seq"
+    message_rows_sql_before =
+      "SELECT " <> Enum.join(message_columns_before, ", ") <> " FROM messages ORDER BY seq"
 
-    {:ok, message_rows_before} = DB.query(ctx.db, message_rows_sql, [])
+    {:ok, message_rows_before} = DB.query(ctx.db, message_rows_sql_before, [])
 
-    sender_index = Enum.find_index(message_columns, &(&1 == "sender"))
+    sender_index = Enum.find_index(message_columns_before, &(&1 == "sender"))
 
     {:ok, root_stamp_before} =
       DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
@@ -596,7 +814,12 @@ defmodule Tightbeam.ToolCallsTest do
     :ok = Tightbeam.Schema.ensure_all(ctx.db)
     assert :ok = ToolCalls.ensure_schema(ctx.db)
 
-    assert {:ok, [["session-custody-v1-0116", _]]} =
+    message_columns = message_columns_before ++ ["recordEventIds"]
+
+    message_rows_sql =
+      "SELECT " <> Enum.join(message_columns, ", ") <> " FROM messages ORDER BY seq"
+
+    assert {:ok, [["session-custody-artifact-process-attribution-v1-0117", _]]} =
              DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
 
     {:ok, [[message_high_water_after]]} =
@@ -608,6 +831,8 @@ defmodule Tightbeam.ToolCallsTest do
 
     expected_message_rows =
       Enum.map(message_rows_before, fn row ->
+        row = row ++ [nil]
+
         if Enum.at(row, 1) == repair_message.id do
           List.replace_at(row, sender_index, "user:recorded-before-rebuild")
         else
@@ -632,7 +857,12 @@ defmodule Tightbeam.ToolCallsTest do
         []
       )
 
-    assert index_names == [["messages_client_dedupe"], ["messages_session"]]
+    assert index_names == [
+             ["messages_client_dedupe"],
+             ["messages_record_event_ids"],
+             ["messages_record_event_reply"],
+             ["messages_session"]
+           ]
 
     {:ok, session_index_columns} = DB.query(ctx.db, "PRAGMA index_info(messages_session)", [])
 

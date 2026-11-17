@@ -158,7 +158,27 @@ defmodule Tightbeam.EffortCheckinTest do
            ) == 0
   end
 
-  test "an existing effort request remains answerable and answering it arms nothing", ctx do
+  test "retired effort process cannot issue a new wake cancellation", ctx do
+    assignment = assign(ctx.db)
+    due_at = System.system_time(:millisecond) + 60_000
+    original = old_wake(ctx.db, assignment.id, "effort_probe", due_at)
+    replacement = old_wake(ctx.db, assignment.id, "effort_probe", due_at)
+
+    assert {:ok, false} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.cancel_in_txn(txn, %{
+                 wake_id: original.wake_id,
+                 requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                 reason_kind: "superseded",
+                 causal_source: %{kind: "wake", id: replacement.wake_id},
+                 outcome: %{kind: "replacement", replacement_wake_id: replacement.wake_id}
+               })
+             end)
+
+    assert %{state: "pending"} = Wakes.get(ctx.db, original.wake_id)
+  end
+
+  test "an existing effort request remains readable without restoring its retired rule", ctx do
     assignment = assign(ctx.db)
 
     deadline =
@@ -202,41 +222,13 @@ defmodule Tightbeam.EffortCheckinTest do
                params: %{request_id: request_id}
              })
 
-    result =
-      handlers["effort-rule"].(%{
-        verb: "effort-rule",
-        origin: "agent:parent",
-        principal: {:session, "parent"},
-        params: %{request_id: request_id, action: "continue"}
-      })
-
-    assert %{status: "ruled", decision: "continue"} = result
-    assert %{state: "canceled"} = Wakes.get(ctx.db, deadline.wake_id)
-
-    assert %{decision_request: %{id: ^request_id, status: "ruled", decision: "continue"}} =
-             handlers["decision-request"].(%{
-               verb: "decision-request",
-               origin: "agent:parent",
-               principal: {:session, "parent"},
-               params: %{request_id: request_id}
-             })
-
-    assert count(
-             ctx.db,
-             "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
-             [
-               assignment.id
-             ]
-           ) == 0
-
-    assert count(
-             ctx.db,
-             "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='effort_probe' AND state='pending'",
-             [assignment.id]
-           ) == 0
+    refute Map.has_key?(handlers, "effort-rule")
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
+    assert %{state: "pending"} = Wakes.get(ctx.db, deadline.wake_id)
   end
 
-  test "effort wake cancellation uses an open child assignment as work-item liveness", ctx do
+  test "retired effort wake drains while an open child keeps the work item live", ctx do
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
         verb: "work-item-create",
@@ -245,76 +237,32 @@ defmodule Tightbeam.EffortCheckinTest do
         params: %{title: "parent remains live through child"}
       })
 
-    parent = assign(ctx.db, item.id, "parent assignment", "coordination")
+    assign(ctx.db, item.id, "parent assignment", "coordination")
     child = assign(ctx.db, item.id, "open child assignment", "coordination")
-
-    %{assignment: %{state: "closed", outcome: "completed"}} =
-      Assignments.__handle__(ctx.db, "attest", %{
-        verb: "attest",
-        origin: "agent:holder",
-        principal: {:session, "holder"},
-        session_key: "holder",
-        params: %{assignment_id: parent.id, kind: "completion", note: "parent work finished"}
-      })
 
     deadline =
       old_wake(
         ctx.db,
-        parent.id,
+        child.id,
         "effort_deadline",
         System.system_time(:millisecond) + 60_000
       )
 
-    request_id = "dr_child_live_effort"
-    now = System.system_time(:millisecond)
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         name: :effort_retired_child_scheduler,
+         tick_ms: 60_000,
+         deliver: fn _wake -> :ok end}
+      )
 
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO decision_requests
-                 (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
-                  effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,options,context,status)
-               VALUES (?1,'effort','process:tightbeam','owner',?2,'parent',0,1,?3,?4,?5,
-                       'Continue or dismiss?',?6,'{}','open')
-               """,
-               [
-                 request_id,
-                 parent.id,
-                 deadline.wake_id,
-                 now,
-                 now + 86_400_000,
-                 JSON.encode!(["continue", "dismiss"])
-               ]
-             )
-
-    handlers = Gateway.handlers(%{db: ctx.db})
-
-    assert %{status: "ruled", decision: "continue"} =
-             handlers["effort-rule"].(%{
-               verb: "effort-rule",
-               origin: "agent:parent",
-               principal: {:session, "parent"},
-               params: %{request_id: request_id, action: "continue"}
-             })
+    due!(ctx.db, deadline.wake_id)
+    assert :ok = Wakes.fire_due(scheduler)
 
     assert %{state: "canceled"} = Wakes.get(ctx.db, deadline.wake_id)
 
-    assert [["supervision_entitlement", child_id, 1]] =
-             rows(
-               ctx.db,
-               "SELECT livenessTriggerKind,livenessTriggerId,actionNeeded FROM wake_cancellations WHERE wakeId=?1",
-               [deadline.wake_id]
-             )
-
-    assert child_id == child.id
-
-    assert [["open", "owner"]] =
-             rows(
-               ctx.db,
-               "SELECT state,ownerUserId FROM work_items WHERE id=?1",
-               [item.id]
-             )
+    assert [["open"]] = rows(ctx.db, "SELECT state FROM work_items WHERE id=?1", [item.id])
 
     item_id = item.id
 

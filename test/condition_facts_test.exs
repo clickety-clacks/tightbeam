@@ -1111,7 +1111,7 @@ defmodule Tightbeam.ConditionFactsTest do
               |> Map.take([:archetype, :host, :harness, :provider, :model, :owner_user_id])
               |> Map.merge(%{
                 session_key: verifier_key,
-                display_name: "Condition verifier",
+                display_name: "Condition verifier for #{target.session_key}",
                 origin: "user:" <> target.owner_user_id
               })
             )

@@ -6,114 +6,74 @@ defmodule Tightbeam.HarnessPiTest do
 
   alias Tightbeam.Harness.Pi
 
-  @close_only_close_session """
-    async closeSession(params) {
-      this.sessions.close(params.sessionId);
-      return {};
+  test "local stock adapter readiness is version-pinned and idempotent" do
+    root = tmp_dir!("pi-stock-local-readiness")
+    {target, bundle, package_json} = adapter_fixture(root)
+    stock_bytes = File.read!(bundle)
+    stock_hash = :crypto.hash(:sha256, stock_bytes)
+
+    assert {:ok, "adapters present"} = Pi.ensure_adapter(target)
+    assert {:ok, "adapters present"} = Pi.ensure_adapter(target)
+    assert JSON.decode!(File.read!(package_json))["version"] == "0.0.34"
+    assert File.read!(bundle) == stock_bytes
+    assert :crypto.hash(:sha256, File.read!(bundle)) == stock_hash
+  end
+
+  test "local readiness replaces a Pi package outside the stock version pin" do
+    root = tmp_dir!("pi-stock-version-repair")
+    {target, _bundle, package_json} = adapter_fixture(root, "0.0.33")
+    owner = self()
+
+    target =
+      Map.put(target, :sh, fn command ->
+        send(owner, {:pi_install_command, command})
+        File.write!(package_json, JSON.encode!(%{"version" => "0.0.34"}))
+        {"", 0}
+      end)
+
+    assert {:ok, "deployed adapters"} = Pi.ensure_adapter(target)
+    assert_receive {:pi_install_command, ["/bin/sh", "-c", script]}
+    assert script =~ "pi-acp@0.0.34"
+    assert JSON.decode!(File.read!(package_json))["version"] == "0.0.34"
+  end
+
+  test "remote stock adapter readiness checks the package pin without rewriting its bundle" do
+    owner = self()
+    adapter = "/remote/base/adapters/node_modules/.bin/pi-acp"
+    expected_package = "/remote/base/adapters/node_modules/pi-acp/package.json"
+
+    target = %{
+      adapter_binary: adapter,
+      base_dir: "/local/base",
+      host_name: "vector",
+      host_config: %{base_dir: "/remote/base", ssh: "vector@remote"},
+      sh: fn command ->
+        send(owner, {:remote_readiness_command, command})
+        joined = Enum.join(command, " ")
+
+        if String.contains?(joined, "cat "),
+          do: {~s({"version":"0.0.34"}), 0},
+          else: {"", 0}
+      end
     }
-  """
 
-  # Negative control for blocker 1: the pre-fix sequential await-then-close body.
-  # When cancellation rejects, the await throws before close runs, so the session
-  # is retained and close is never called. Reverting the pi.ex fix reproduces this
-  # body and turns the positive rejection test below red.
-  @sequential_close_session """
-    async closeSession(params) {
-      const session = this.sessions.maybeGet(params.sessionId);
-      if (session) await session.cancel();
-      this.sessions.close(params.sessionId);
-      return {};
-    }
-  """
+    assert {:ok, "adapters present"} = Pi.ensure_adapter(target)
+    assert {:ok, "adapters present"} = Pi.ensure_adapter(target)
 
-  test "adapter patch adds abort-on-close lifecycle and preserves concurrent sessions idempotently" do
-    patched = Pi.patch_adapter_source(pristine_adapter_fixture())
+    commands =
+      for _ <- 1..4 do
+        assert_receive {:remote_readiness_command, command}
+        Enum.join(command, " ")
+      end
 
-    assert patched =~ "          close: {}"
-    assert patched =~ "  async closeSession(params) {"
-    assert patched =~ "    if (session) await session.cancel();"
-    assert patched =~ "    this.sessions.close(params.sessionId);"
-    refute patched =~ "closeAllExcept"
-    assert Pi.patch_adapter_source(patched) == patched
-  end
+    assert Enum.count(commands, &String.contains?(&1, "test -x")) == 2
 
-  test "adapter patch upgrades the prior close-only handler to abort-on-close idempotently" do
-    source =
-      pristine_adapter_fixture()
-      |> Pi.patch_adapter_source()
-      |> String.replace(
-        "    const session = this.sessions.maybeGet(params.sessionId);\n    try {\n      if (session) await session.cancel();\n    } finally {\n      this.sessions.close(params.sessionId);\n    }",
-        "    this.sessions.close(params.sessionId);",
-        global: false
-      )
+    assert Enum.count(commands, fn command ->
+             String.contains?(command, "cat ") and String.contains?(command, expected_package)
+           end) == 2
 
-    upgraded = Pi.patch_adapter_source(source)
-
-    assert upgraded =~ "    if (session) await session.cancel();"
-    assert Pi.patch_adapter_source(upgraded) == upgraded
-  end
-
-  test "patched closeSession sends abort and settles an interrupted turn as cancelled" do
-    patched_close_session =
-      pristine_adapter_fixture()
-      |> Pi.patch_adapter_source()
-      |> close_session_source()
-
-    assert close_contract(patched_close_session) == %{
-             "abortRequests" => [%{"type" => "abort"}],
-             "release" => %{
-               "bundleSha256" =>
-                 "24ff73fda6e3c76ddce2d359a79f5c4b8f292eb290e4d2ab85aac94676b2c2dc",
-               "package" => "pi-acp",
-               "version" => "0.0.33"
-             },
-             "settlements" => ["cancelled"],
-             "sessionClosed" => true,
-             "stopReason" => "cancelled",
-             "trace" => ["request:abort", "dispose"]
-           }
-  end
-
-  test "close-only handler leaves an interrupted turn to complete as end_turn without abort" do
-    assert close_contract(@close_only_close_session) == %{
-             "abortRequests" => [],
-             "release" => %{
-               "bundleSha256" =>
-                 "24ff73fda6e3c76ddce2d359a79f5c4b8f292eb290e4d2ab85aac94676b2c2dc",
-               "package" => "pi-acp",
-               "version" => "0.0.33"
-             },
-             "settlements" => ["end_turn"],
-             "sessionClosed" => true,
-             "stopReason" => "end_turn",
-             "trace" => ["dispose"]
-           }
-  end
-
-  test "patched closeSession closes the session in finally even when cancellation rejects" do
-    patched_close_session =
-      pristine_adapter_fixture()
-      |> Pi.patch_adapter_source()
-      |> close_session_source()
-
-    result = cancel_rejection_contract(patched_close_session)
-
-    # Close runs exactly once in the finally path, so the session is gone...
-    assert result["closeCalls"] == 1
-    assert result["sessionClosed"] == true
-    # ...and the cancellation failure is still observable, not a false success.
-    assert result["cancelRejected"] == true
-    assert result["cancelError"] =~ "injected abort failure"
-  end
-
-  test "sequential await-then-close body strands the session when cancellation rejects" do
-    result = cancel_rejection_contract(@sequential_close_session)
-
-    # Negative control: the await throws before close, so close never runs and the
-    # session is retained. This is the failure the finally-based fix eliminates.
-    assert result["closeCalls"] == 0
-    assert result["sessionClosed"] == false
-    assert result["cancelRejected"] == true
+    refute Enum.any?(commands, &String.contains?(&1, "node -e"))
+    refute Enum.any?(commands, &String.contains?(&1, "npm install"))
   end
 
   test "isolated engine launcher inventories workspace inputs without personal discovery" do
@@ -128,8 +88,10 @@ defmodule Tightbeam.HarnessPiTest do
 
     cwd = Path.join(root, "workspace")
     home = Path.join(root, "owned")
+    private_home = Path.join(root, "private-home")
+    real_home = Path.join(root, "real-home")
     bin = Path.join(root, "bin")
-    for dir <- [cwd, home, bin], do: File.mkdir_p!(dir)
+    for dir <- [cwd, home, private_home, real_home, bin], do: File.mkdir_p!(dir)
 
     write = fn file ->
       File.mkdir_p!(Path.dirname(file))
@@ -158,11 +120,17 @@ defmodule Tightbeam.HarnessPiTest do
 
     File.write!(
       fake,
-      "#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify(process.argv.slice(2)));\n"
+      "#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({args:process.argv.slice(2),home:process.env.HOME,piHome:process.env.PI_CODING_AGENT_DIR,hasPrivateHomeMarker:Object.hasOwn(process.env,'PI_REAL_HOME')}));\n"
     )
 
     File.chmod!(fake, 0o755)
-    env = [{"PI_CODING_AGENT_DIR", home}, {"PATH", bin <> ":" <> System.fetch_env!("PATH")}]
+
+    env = [
+      {"PI_CODING_AGENT_DIR", home},
+      {"PI_REAL_HOME", real_home},
+      {"HOME", private_home},
+      {"PATH", bin <> ":" <> System.fetch_env!("PATH")}
+    ]
 
     run = fn ->
       System.cmd("node", [launcher, "--mode", "rpc", "--no-themes"],
@@ -173,7 +141,12 @@ defmodule Tightbeam.HarnessPiTest do
     end
 
     {output, 0} = run.()
-    args = JSON.decode!(output)
+    child = JSON.decode!(output)
+    args = child["args"]
+
+    assert child["home"] == real_home
+    assert child["piHome"] == home
+    refute child["hasPrivateHomeMarker"]
     assert Enum.take(args, 5) == ["-nc", "-ns", "-ne", "-e", extension]
     assert Enum.take(args, -3) == ["--mode", "rpc", "--no-themes"]
     assert convention in args and nested in args
@@ -184,7 +157,7 @@ defmodule Tightbeam.HarnessPiTest do
     refute Path.join(home, "skills/unowned/SKILL.md") in args
     later = write.(Path.join(cwd, ".pi/skills/later/SKILL.md"))
     {output, 0} = run.()
-    assert later in JSON.decode!(output)
+    assert later in JSON.decode!(output)["args"]
     File.write!(fake, "#!/bin/sh\nexit 2\n")
     assert {_, 2} = run.()
     File.rm!(extension)
@@ -195,7 +168,7 @@ defmodule Tightbeam.HarnessPiTest do
   test "launch refuses overrides of its isolated engine command and home" do
     target = %{host_config: %{base_dir: "/fixture", ssh: nil}}
 
-    for name <- ["PI_ACP_PI_COMMAND", "PI_CODING_AGENT_DIR"] do
+    for name <- ["HOME", "PI_REAL_HOME", "PI_ACP_PI_COMMAND", "PI_CODING_AGENT_DIR"] do
       assert_raise ArgumentError, "Pi isolation environment cannot be overridden", fn ->
         Pi.prepare_launch(target, "/owned", common_env: [{name, "/outside"}], remote_env: [])
       end
@@ -392,107 +365,27 @@ defmodule Tightbeam.HarnessPiTest do
     assert Pi.extension_source(%{"hooks" => %{}}) =~ ~s(spawnSync("/bin/sh")
   end
 
-  test "remote adapter rejects relative node candidates before probing them" do
-    owner = self()
-    adapter = "/remote/base/adapters/node_modules/.bin/pi-acp"
+  defp adapter_fixture(base, version \\ "0.0.34") do
+    adapter = Path.join([base, "adapters", "node_modules", ".bin", "pi-acp"])
+    package_dir = Path.join([base, "adapters", "node_modules", "pi-acp"])
+    package_json = Path.join(package_dir, "package.json")
+    bundle = Path.join([package_dir, "dist", "index.js"])
+    File.mkdir_p!(Path.dirname(adapter))
+    File.mkdir_p!(Path.dirname(bundle))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    File.write!(package_json, JSON.encode!(%{"version" => version}))
+    File.write!(bundle, "stock package fixture bytes\n")
 
-    target = fn toolchain_dirs, label ->
-      %{
-        adapter_binary: adapter,
-        base_dir: "/local/base",
-        find_executable: fn "ssh" -> "/usr/bin/ssh" end,
-        host_name: "worker",
-        host_config: %{
-          base_dir: "/remote/base",
-          ssh: "fixture@worker",
-          toolchain_dirs: toolchain_dirs
-        },
-        sh: fn command ->
-          send(owner, {label, command})
-          {"", 0}
-        end
-      }
-    end
+    target = %{
+      adapter_binary: adapter,
+      base_dir: base,
+      host_name: "vector",
+      host_config: %{base_dir: base, ssh: nil},
+      sh: fn command -> raise "unexpected Pi adapter install command: #{inspect(command)}" end
+    }
 
-    assert {:error, %{code: "host_unready", message: "remote node executable not found"}} =
-             target.(["relative-bin"], :relative) |> Pi.ensure_adapter()
-
-    assert_receive {:relative, _adapter_presence_check}
-    refute_receive {:relative, _node_command}
-
-    assert {:ok, "adapters present; pi adapter patched"} =
-             target.(["/opt/toolchain"], :absolute) |> Pi.ensure_adapter()
-
-    assert_receive {:absolute, _adapter_presence_check}
-
-    assert_receive {:absolute,
-                    ["/usr/bin/ssh" | [_, _, _, _, "fixture@worker", "/bin/test", "-x", node]]}
-
-    assert node == "/opt/toolchain/node"
-
-    assert_receive {:absolute,
-                    ["/usr/bin/ssh" | [_, _, _, _, "fixture@worker", ^node, "-e", script]]}
-
-    assert script =~ "/remote/base/adapters/node_modules/pi-acp/package.json"
-    assert script =~ "unsupported pi adapter version"
-    assert script =~ "0.0.33"
-    assert script =~ "const rs=JSON.parse"
-  end
-
-  defp pristine_adapter_fixture do
-    [
-      "          list: {},\n          delete: {}",
-      "    this.sessions.closeAllExcept?.(session.sessionId);\n    const response = {",
-      "    const fileCommands = loadSlashCommands(params.cwd);\n    this.sessions.closeAllExcept?.(session.sessionId);\n    this.store.upsert({",
-      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {"
-    ]
-    |> Enum.join("\n")
-  end
-
-  defp close_contract(close_session_source) do
-    root = tmp_dir!("pi-close-contract")
-    runner = Path.join(root, "runner.mjs")
-    fixture = Path.expand("fixtures/pi_acp/0.0.33-close-contract.mjs", __DIR__)
-
-    File.write!(
-      runner,
-      """
-      import { runCloseContract } from #{JSON.encode!(fixture)};
-      const result = await runCloseContract(#{JSON.encode!(close_session_source)});
-      process.stdout.write(JSON.stringify(result));
-      """
-    )
-
-    {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
-    JSON.decode!(output)
-  end
-
-  defp cancel_rejection_contract(close_session_source) do
-    root = tmp_dir!("pi-cancel-rejection")
-    runner = Path.join(root, "runner.mjs")
-    fixture = Path.expand("fixtures/pi_acp/0.0.33-close-contract.mjs", __DIR__)
-
-    File.write!(
-      runner,
-      """
-      import { runCancelRejectionContract } from #{JSON.encode!(fixture)};
-      const result = await runCancelRejectionContract(#{JSON.encode!(close_session_source)});
-      process.stdout.write(JSON.stringify(result));
-      """
-    )
-
-    {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
-    JSON.decode!(output)
-  end
-
-  defp close_session_source(source) do
-    [_, close_session] =
-      Regex.run(
-        ~r/(  async closeSession\(params\) \{.*?\n  \})\n  async listSessions\(params\)/s,
-        source
-      )
-
-    close_session
+    {target, bundle, package_json}
   end
 
   defp tmp_dir!(label) do

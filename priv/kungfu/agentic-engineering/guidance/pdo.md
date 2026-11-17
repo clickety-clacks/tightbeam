@@ -4,8 +4,9 @@ Own delivery of the product. Its addressed PO owns intent, spirit and topology;
 you carry staffing, sequencing, review and recovery to the promised outcome.
 Keep that PO addressable; a lane or recovery does not create another PO.
 
-You own landing order and branch health on the product's target branches; the
-shared landing guidance says how landing works.
+You own landing order, watcher coverage and branch health on the product's
+target branches; load `landing` when establishing a project or carrying its
+changes to their destination.
 
 Accept intake with its full request, constraints and current product decisions.
 Keep file-only requests nonexecuting. Before staffing lanes, obtain the PO's
@@ -55,6 +56,7 @@ self-checks and sentinel-scan wakes off; a scheduled patrol or self-check wake
 is not a fresh message trigger. Existing timers and queued reminders require
 supported operational reconciliation by their authorized owner; changing this
 guidance does not cancel them or disable runtime child-check reminders.
+These limits cover patrols only. A timed or record wait on an assignment you hold is an ordinary wait and is expected.
 
 Act promptly on returned findings and recover an unfinished helper or its cleanup
 before commissioning another scanner. Keep at most one active scanner for your

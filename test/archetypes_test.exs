@@ -92,7 +92,10 @@ defmodule Tightbeam.ArchetypesTest do
     refute File.exists?(Path.join(identity_dir, "rails"))
 
     assert Path.wildcard(Path.join(identity_dir, "rules/*.toml")) ==
-             [Path.join(identity_dir, "rules/harness-health-recovery.toml")]
+             [
+               Path.join(identity_dir, "rules/harness-health-recovery.toml"),
+               Path.join(identity_dir, "rules/harness-recovery-main-wake.toml")
+             ]
 
     assert File.read!(Path.join(identity_dir, "rules/harness-health-recovery.toml")) ==
              File.read!(
@@ -292,7 +295,7 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     assert role_guidance.("product-owner") =~ "have delivery ownership commission its\nbytes"
-    assert role_guidance.("pdo") =~ "You own landing order and branch health"
+    assert role_guidance.("pdo") =~ "You own landing order, watcher coverage and branch health"
 
     for role <- ~w(product-owner orchestrator) do
       refute role_guidance.(role) =~ heading
@@ -416,7 +419,14 @@ defmodule Tightbeam.ArchetypesTest do
       snapshot =
         Identity.snapshot_at!(ctx.base_dir, Identity.live_revision!(ctx.base_dir), role, :codex)
 
-      assert Map.keys(snapshot.skills) == ["repository-retirement"]
+      expected_skill_keys =
+        if role == "integrator" do
+          ["landing", "repository-retirement"]
+        else
+          ["repository-retirement"]
+        end
+
+      assert Map.keys(snapshot.skills) == expected_skill_keys
       assert snapshot.guidance =~ "# How Tightbeam works"
       refute Regex.match?(~r/^#include/m, snapshot.guidance)
     end

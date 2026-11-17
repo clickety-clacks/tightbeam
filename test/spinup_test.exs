@@ -431,9 +431,12 @@ defmodule Tightbeam.SpinupTest do
 
   defp stage_pi!(base_dir) do
     path = Path.join([base_dir, "adapters", "node_modules", ".bin", "pi-acp"])
+    package_json = Path.join([base_dir, "adapters", "node_modules", "pi-acp", "package.json"])
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "#!/bin/sh\nexit 0\n")
     File.chmod!(path, 0o755)
+    File.mkdir_p!(Path.dirname(package_json))
+    File.write!(package_json, JSON.encode!(%{"version" => "0.0.34"}))
     path
   end
 

@@ -98,7 +98,7 @@ defmodule Tightbeam.IdentityTest do
     refute_receive {:firehose_notice, _}
   end
 
-  test "neutral seed creates the exact three refs and neutral seed files", ctx do
+  test "neutral seed creates the exact three refs and all seed files", ctx do
     assert :initialized = Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")
     refs = git!(dir, ["branch", "--format=%(refname:short)"])
@@ -114,7 +114,8 @@ defmodule Tightbeam.IdentityTest do
              [
                "archetypes/default.toml",
                "guidance/operating-model.md",
-               "rules/harness-health-recovery.toml"
+               "rules/harness-health-recovery.toml",
+               "rules/harness-recovery-main-wake.toml"
              ]
 
     assert git!(dir, ["show", "main:rules/harness-health-recovery.toml"]) ==
@@ -143,6 +144,13 @@ defmodule Tightbeam.IdentityTest do
                  "The same bug keeps coming back and nobody finds the cause.",
                  "I want to know a change was actually tested, not just claimed."
                ],
+               root_archetype: "orchestrator"
+             },
+             %{
+               name: "harklight-decision-briefings",
+               purpose:
+                 "Route decision requests through a configurable investigator, preserve its Harklight conversation, and reconcile staged catchup without duplicate briefings.",
+               phrases: [],
                root_archetype: "orchestrator"
              },
              %{

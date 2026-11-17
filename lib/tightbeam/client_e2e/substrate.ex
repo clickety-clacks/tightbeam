@@ -93,7 +93,8 @@ defmodule Tightbeam.ClientE2E.Substrate do
   @spec turns_for_session(base_dir(), String.t()) :: [map()]
   def turns_for_session(base_dir, session_key) do
     query(base_dir, """
-    SELECT t.seq, t.status, t.prompt, m.clientMessageId AS clientMessageId
+    SELECT t.seq, t.status, t.prompt, t.createdAt, t.endedAt,
+           m.clientMessageId AS clientMessageId
     FROM turns t LEFT JOIN messages m ON m.id = t.messageId
     WHERE t.sessionKey = #{quote_string(session_key)}
     ORDER BY t.seq
@@ -134,8 +135,43 @@ defmodule Tightbeam.ClientE2E.Substrate do
   @spec messages(base_dir(), String.t()) :: [map()]
   def messages(base_dir, session_key) do
     query(base_dir, """
-    SELECT seq, id, role, content, sender, clientMessageId, replyToClientMessageId, timestamp
+    SELECT seq, id, role, content, sender, deviceId, clientMessageId,
+           replyToClientMessageId, timestamp
     FROM messages WHERE sessionKey = #{quote_string(session_key)} ORDER BY seq
+    """)
+  end
+
+  @doc "The identified human source and its persisted batch/carrier provenance."
+  @spec human_post_delivery_rows(base_dir(), String.t(), String.t()) :: [map()]
+  def human_post_delivery_rows(base_dir, session_key, client_message_id) do
+    query(base_dir, """
+    SELECT m.id AS messageId, m.seq AS messageSeq, m.deviceId AS deviceId,
+           m.clientMessageId AS clientMessageId, m.timestamp AS timestamp,
+           source.wakeId AS sourceWakeId,
+           source.deliveredTurnSeq AS sourceTurnSeq,
+           member.memberId AS memberId,
+           member.publicationSeq AS publicationSeq,
+           member.state AS memberState,
+           batch.deliveryWakeId AS deliveryWakeId,
+           batch.state AS batchState,
+           carrier.wakeId AS carrierWakeId,
+           turn.seq AS carrierTurnSeq,
+           turn.status AS carrierStatus,
+           carrier_message.id AS carrierMessageId
+    FROM messages m
+    LEFT JOIN wakes source
+      ON source.sessionKey=m.sessionKey AND source.consumer='prompt' AND source.digest=0
+     AND json_extract(source.sourceClientIdentity,'$.deviceId')=m.deviceId
+     AND json_extract(source.sourceClientIdentity,'$.clientMessageId')=m.clientMessageId
+    LEFT JOIN notice_batch_members member ON member.sourceWakeId=source.wakeId
+    LEFT JOIN notice_batches batch ON batch.batchId=member.batchId
+    LEFT JOIN wakes carrier ON carrier.wakeId=batch.deliveryWakeId
+    LEFT JOIN turns turn ON turn.wakeId=batch.deliveryWakeId
+    LEFT JOIN messages carrier_message ON carrier_message.id=turn.messageId
+    WHERE m.sessionKey=#{quote_string(session_key)}
+      AND m.clientMessageId=#{quote_string(client_message_id)}
+      AND m.role='user'
+    ORDER BY member.publicationSeq, turn.seq
     """)
   end
 

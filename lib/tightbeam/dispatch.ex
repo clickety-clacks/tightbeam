@@ -67,7 +67,7 @@ defmodule Tightbeam.Dispatch do
   @read_verbs ~w(facts-read fact-demand fact-producers artifact-content-fetch artifact-get artifacts mementos decision-requests
     decision-request host-env-list sentinel-list sentinel-events sentinel-subscriptions identity-status kungfu-list harness-processes
     role-list breathing work-item-get work-item-trace transcript execution-map execution-map-select
-    toplines topline topline-placement-list work-item-list attests assignment-get assignments inspect
+    toplines topline topline-placement-list work-item-list attests check-attest assignment-get assignments inspect
     harness-health-evidence-other)
 
   @db_transaction_diagnostic_fields ~w(

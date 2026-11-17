@@ -54,6 +54,7 @@ defmodule Tightbeam.Projection do
           submitter: map() | nil,
           attention_tier: integer(),
           message_type: String.t() | nil,
+          record_event_ids: [String.t()] | nil,
           marker: %{kind: String.t(), from: String.t(), to: String.t()} | nil
         }
 
@@ -143,20 +144,23 @@ defmodule Tightbeam.Projection do
         conflict
 
       :new ->
-        id = "s_" <> Tightbeam.Id.uuid4()
+        id = Map.get(input, :id) || "s_" <> Tightbeam.Id.uuid4()
         client_message_id = Map.get(input, :client_message_id)
         message_type = message_type(input)
 
         {marker_kind, marker_from, marker_to} =
           marker_columns(Map.get(input, :marker), message_type)
 
+        record_event_ids = encode_record_event_ids(Map.get(input, :record_event_ids))
+
         Txn.q(
           txn,
           """
             INSERT INTO messages (id, sessionKey, role, content, timestamp, sender, deviceId,
               clientMessageId, replyToMessageId, replyToClientMessageId, llmVisibleMessageId, attachments,
-              attentionTier, messageType, markerKind, markerFrom, markerTo, submitter)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+              attentionTier, messageType, markerKind, markerFrom, markerTo, submitter,
+              recordEventIds)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
           """,
           [
             id,
@@ -176,7 +180,8 @@ defmodule Tightbeam.Projection do
             marker_kind,
             marker_from,
             marker_to,
-            if(input[:submitter], do: JSON.encode!(input[:submitter]))
+            if(input[:submitter], do: JSON.encode!(input[:submitter])),
+            record_event_ids
           ]
         )
 
@@ -286,7 +291,7 @@ defmodule Tightbeam.Projection do
               SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                      clientMessageId, replyToMessageId, replyToClientMessageId,
                      llmVisibleMessageId, attachments, attentionTier,
-                     messageType, markerKind, markerFrom, markerTo, submitter
+                     recordEventIds, messageType, markerKind, markerFrom, markerTo, submitter
               FROM messages
               WHERE sessionKey = ?1 AND deviceId = ?2 AND clientMessageId = ?3
             """,
@@ -353,16 +358,29 @@ defmodule Tightbeam.Projection do
   Notices are records, not structural boundaries. Their readable content is
   caller-authored, while their class comes from the process origin.
   """
-  @spec append_substrate_in_txn(Txn.t(), String.t(), String.t(), attention()) ::
+  @spec append_substrate_in_txn(
+          Txn.t(),
+          String.t(),
+          String.t(),
+          attention(),
+          [String.t()] | nil
+        ) ::
           {:appended, message()}
-  def append_substrate_in_txn(%Txn{} = txn, session_key, content, attention \\ :normal) do
+  def append_substrate_in_txn(
+        %Txn{} = txn,
+        session_key,
+        content,
+        attention \\ :normal,
+        record_event_ids \\ nil
+      ) do
     case append_in_txn(txn, %{
            session_key: session_key,
            role: "assistant",
            content: content,
            sender: "process:tightbeam",
            message_type: "substrate",
-           attention_tier: attention_tier(attention)
+           attention_tier: attention_tier(attention),
+           record_event_ids: record_event_ids
          }) do
       {:appended, message} = appended ->
         Publisher.message_in_txn(txn, session_key, message)
@@ -374,9 +392,13 @@ defmodule Tightbeam.Projection do
   end
 
   @doc "Append a substrate notice and queue its post-commit message notice."
-  @spec append_substrate(db(), String.t(), String.t(), attention()) :: {:appended, message()}
-  def append_substrate(db, session_key, content, attention \\ :normal) do
-    transaction!(db, &append_substrate_in_txn(&1, session_key, content, attention))
+  @spec append_substrate(db(), String.t(), String.t(), attention(), [String.t()] | nil) ::
+          {:appended, message()}
+  def append_substrate(db, session_key, content, attention \\ :normal, record_event_ids \\ nil) do
+    transaction!(
+      db,
+      &append_substrate_in_txn(&1, session_key, content, attention, record_event_ids)
+    )
   end
 
   @doc """
@@ -453,7 +475,7 @@ defmodule Tightbeam.Projection do
           SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
                  llmVisibleMessageId, attachments, attentionTier,
-                 messageType, markerKind, markerFrom, markerTo, submitter
+                 recordEventIds, messageType, markerKind, markerFrom, markerTo, submitter
           FROM messages WHERE id = ?1
         """,
         [id]
@@ -489,7 +511,7 @@ defmodule Tightbeam.Projection do
           SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
                  llmVisibleMessageId, attachments, attentionTier,
-                 messageType, markerKind, markerFrom, markerTo, submitter
+                 recordEventIds, messageType, markerKind, markerFrom, markerTo, submitter
           FROM messages WHERE sessionKey = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3
         """,
         [session_key, after_seq, limit]
@@ -552,7 +574,7 @@ defmodule Tightbeam.Projection do
       """
         SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                clientMessageId, replyToMessageId, replyToClientMessageId,
-               llmVisibleMessageId, attachments, attentionTier,
+               llmVisibleMessageId, attachments, attentionTier, recordEventIds,
                messageType, markerKind, markerFrom, markerTo, submitter
         FROM messages WHERE id = ?1
       """,
@@ -575,6 +597,7 @@ defmodule Tightbeam.Projection do
          llm_visible_message_id,
          attachments,
          attention_tier,
+         record_event_ids,
          message_type,
          marker_kind,
          marker_from,
@@ -597,10 +620,27 @@ defmodule Tightbeam.Projection do
       attachments: JSON.decode!(attachments),
       submitter: if(submitter, do: JSON.decode!(submitter)),
       attention_tier: attention_tier,
+      record_event_ids: decode_record_event_ids(record_event_ids),
       message_type: message_type,
       marker: marker(marker_kind, marker_from, marker_to)
     }
   end
+
+  defp encode_record_event_ids(nil), do: nil
+
+  defp encode_record_event_ids(ids) when is_list(ids) do
+    if Enum.all?(ids, &(is_binary(&1) and &1 != "")) do
+      JSON.encode!(Enum.uniq(ids))
+    else
+      raise ArgumentError, "record_event_ids must contain non-empty strings"
+    end
+  end
+
+  defp encode_record_event_ids(value),
+    do: raise(ArgumentError, "record_event_ids must be a list or nil, got: #{inspect(value)}")
+
+  defp decode_record_event_ids(nil), do: nil
+  defp decode_record_event_ids(value), do: JSON.decode!(value)
 
   defp message_type(input) do
     case Map.fetch(input, :message_type) do
