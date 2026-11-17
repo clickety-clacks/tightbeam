@@ -14,6 +14,7 @@ mod github_auth;
 mod harklight_child;
 mod harness_process;
 mod harnesses;
+mod identity_apply;
 mod lease;
 mod onboard_emit;
 mod preflight;

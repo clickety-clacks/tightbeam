@@ -11878,6 +11878,368 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, last.session_key).identity_revision == next
   end
 
+  # wi_47c7e2eb: `--all` is a sequence of bounded steps. Each step is durable
+  # on its own and the cursor resumes the fixed visiting order.
+  test "identity apply --all proceeds in bounded steps that resume from the cursor", ctx do
+    base_dir = role_test_base("identity-apply-steps")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+    keys = for n <- 1..3, do: identity_apply_step_session(ctx.db, "steps-#{n}", revision)
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "stepped guidance",
+        "test"
+      )
+
+    ensure_global_registry()
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    ordered = identity_apply_visiting_order(ctx.db)
+    total = length(ordered)
+    assert Enum.all?(keys, &(&1 in ordered))
+
+    first = apply.(%{origin: "user:flynn", params: %{all: true, limit: 2}})
+
+    assert %{status: "complete", identity_revision: ^next, total: ^total} = first
+    assert first.remaining == total - 2
+    assert first.target_session_keys == Enum.take(ordered, 2)
+    assert first.applied == Enum.take(ordered, 2)
+    assert is_binary(first.cursor)
+
+    # The step stopped where it said it did: nothing after it is touched.
+    for key <- Enum.drop(ordered, 2), key in keys do
+      assert Org.get(ctx.db, key).identity_revision == revision
+      assert Tightbeam.Wakes.list_for_session(ctx.db, key) == []
+    end
+
+    second =
+      apply.(%{origin: "user:flynn", params: %{all: true, limit: 200, cursor: first.cursor}})
+
+    assert %{status: "complete", identity_revision: ^next, total: ^total, remaining: 0} = second
+    assert second.cursor == nil
+    assert second.target_session_keys == Enum.drop(ordered, 2)
+    for key <- ordered, do: assert(Org.get(ctx.db, key).identity_revision == next)
+
+    # A repeated run passes over current sessions and records nothing new.
+    {:ok, [[wakes]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+    again = apply.(%{origin: "user:flynn", params: %{all: true, limit: 200}})
+
+    assert %{status: "complete", total: ^total, remaining: 0, cursor: nil, applied: ^ordered} =
+             again
+
+    for result <- again.results do
+      assert %{files: "already_current", stamp: "committed"} = result
+      if result.session_key in keys, do: assert(result.prompt_enqueue == "already_pending")
+    end
+
+    assert {:ok, [[^wakes]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    for params <- [
+          %{all: true, limit: 0},
+          %{all: true, limit: "2"},
+          %{all: true, limit: 2, cursor: "not-a-cursor"}
+        ] do
+      assert %{code: "invalid"} = apply.(%{origin: "user:flynn", params: params})
+    end
+  end
+
+  # The wake scheduler re-resolves every due prompt in the org whenever any
+  # recipient becomes ready. Hundreds of reread prompts falling due together
+  # held up all other delivery, so a run spaces them, across its steps too.
+  test "identity apply --all spaces the reread prompts it schedules", ctx do
+    base_dir = role_test_base("identity-apply-spacing")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+    keys = for n <- 1..3, do: identity_apply_step_session(ctx.db, "spacing-#{n}", revision)
+
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "model-release-intake", false},
+      "spaced guidance",
+      "test"
+    )
+
+    ensure_global_registry()
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    started = System.system_time(:millisecond)
+
+    first = apply.(%{origin: "user:flynn", params: %{all: true, limit: 2}})
+    rest = apply.(%{origin: "user:flynn", params: %{all: true, limit: 200, cursor: first.cursor}})
+    finished = System.system_time(:millisecond)
+    assert %{status: "complete", cursor: nil} = rest
+
+    due =
+      for key <- identity_apply_visiting_order(ctx.db), key in keys do
+        assert {:ok, [[due_at]]} =
+                 DB.query(ctx.db, "SELECT dueAt FROM wakes WHERE sessionKey=?1", [key])
+
+        due_at
+      end
+
+    # The first falls due at once; each later one a second after the one before,
+    # and the second step continues where the first stopped.
+    assert [first_due, second_due, third_due] = due
+    assert first_due in started..finished
+    assert second_due - first_due >= 1_000
+    assert third_due - second_due >= 1_000
+    assert third_due <= finished + 2_000
+  end
+
+  # A step also ends on time, so one slow target cannot stretch a request.
+  test "identity apply --all ends a step once its time budget is spent", ctx do
+    base_dir = role_test_base("identity-apply-budget")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+    for n <- 1..3, do: identity_apply_step_session(ctx.db, "budget-#{n}", revision)
+
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "model-release-intake", false},
+      "budgeted guidance",
+      "test"
+    )
+
+    ensure_global_registry()
+
+    apply =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:identity_apply_step_budget_ms, 0)
+      |> Gateway.handlers()
+      |> Map.fetch!("identity-apply")
+
+    ordered = identity_apply_visiting_order(ctx.db)
+    step = apply.(%{origin: "user:flynn", params: %{all: true, limit: 10}})
+
+    # With no time left a step still makes progress, one session at a time.
+    assert step.total == length(ordered)
+    assert step.remaining == length(ordered) - 1
+    assert step.target_session_keys == [hd(ordered)]
+    assert is_binary(step.cursor)
+  end
+
+  test "identity apply reports a busy session and passes over it without waiting", ctx do
+    base_dir = role_test_base("identity-apply-busy")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+    busy = identity_apply_step_session(ctx.db, "busy-1", revision)
+    free = identity_apply_step_session(ctx.db, "busy-2", revision)
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "busy pass guidance",
+        "test"
+      )
+
+    ensure_global_registry()
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    # A turn being set up holds this lock for as long as its adapter call takes.
+    hold = fn key ->
+      parent = self()
+
+      holder =
+        spawn_link(fn ->
+          lock = {{Tightbeam.Gateway, :session_mutation, key}, self()}
+          true = :global.set_lock(lock)
+          send(parent, {:held, key})
+
+          receive do
+            :release -> :global.del_lock(lock)
+          end
+
+          send(parent, {:released, key})
+        end)
+
+      assert_receive {:held, ^key}
+      holder
+    end
+
+    busy_holder = hold.(busy)
+    pass = Task.async(fn -> apply.(%{origin: "user:flynn", params: %{all: true}}) end)
+
+    assert {:ok, result} = Task.yield(pass, 10_000) || Task.shutdown(pass, :brutal_kill)
+    assert %{status: "partial", complete: false} = result
+    assert free in result.applied
+    refute busy in result.applied
+
+    assert %{
+             outcome: "busy",
+             files: "not_started",
+             stamp: "not_committed",
+             prompt_enqueue: "not_attempted",
+             reason: reason
+           } = Enum.find(result.results, &(&1.session_key == busy))
+
+    assert reason =~ "apply it again"
+    assert Org.get(ctx.db, busy).identity_revision == revision
+    assert Org.get(ctx.db, free).identity_revision == next
+    assert Tightbeam.Wakes.list_for_session(ctx.db, busy) == []
+
+    # A session that is already current needs no lock, so a busy one is passed
+    # as current rather than reported busy.
+    free_holder = hold.(free)
+
+    assert %{outcome: "applied", files: "already_current"} =
+             apply.(%{origin: "user:flynn", params: %{session_key: free}}).results |> hd()
+
+    send(free_holder, :release)
+    assert_receive {:released, ^free}
+    send(busy_holder, :release)
+    assert_receive {:released, ^busy}
+
+    # Once the session is free the same command picks it up.
+    assert %{status: "complete", applied: [^busy]} =
+             apply.(%{origin: "user:flynn", params: %{session_key: busy}})
+
+    assert Org.get(ctx.db, busy).identity_revision == next
+  end
+
+  test "identity apply --all marks the rest superseded when a revision is published mid-run",
+       ctx do
+    base_dir = role_test_base("identity-apply-superseded")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+    [first, second] = for n <- 1..2, do: identity_apply_step_session(ctx.db, "sup-#{n}", revision)
+
+    second_cwd =
+      Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), Org.get(ctx.db, second))
+
+    Identity.provision_at!(base_dir, revision, "coder", :codex, second_cwd)
+    second_skill = Path.join(second_cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+    second_body = File.read!(second_skill)
+
+    started =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "run revision",
+        "test"
+      )
+
+    ensure_global_registry()
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert [^first, ^second | _] = identity_apply_visiting_order(ctx.db)
+    step = apply.(%{origin: "user:flynn", params: %{all: true, limit: 1}})
+    assert %{identity_revision: ^started, applied: [^first]} = step
+
+    published =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "newer revision",
+        "test"
+      )
+
+    rest = apply.(%{origin: "user:flynn", params: %{all: true, limit: 200, cursor: step.cursor}})
+
+    # The run keeps its own revision and says the remainder was overtaken.
+    assert %{status: "partial", identity_revision: ^started, applied: [], cursor: nil} = rest
+
+    assert [%{session_key: ^second} | _] = rest.results
+
+    for result <- rest.results do
+      assert %{
+               outcome: "superseded",
+               files: "not_started",
+               stamp: "not_committed",
+               prompt_enqueue: "not_attempted",
+               current_identity_revision: ^published
+             } = result
+    end
+
+    # Nothing of the overtaken revision reached the session: not its files,
+    # not its stamp, not a prompt.
+    assert File.read!(second_skill) == second_body
+    assert Org.get(ctx.db, second).identity_revision == revision
+    assert Tightbeam.Wakes.list_for_session(ctx.db, second) == []
+  end
+
+  # The archetype's composed guidance and skills cost one git process per
+  # guidance file. A pass reads them once per archetype and harness.
+  test "identity apply and status read an archetype snapshot once per pass", ctx do
+    base_dir = role_test_base("identity-apply-snapshot-once")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+    for n <- 1..3, do: identity_apply_step_session(ctx.db, "once-#{n}", revision)
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "read once guidance",
+        "test"
+      )
+
+    ensure_global_registry()
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    :erlang.trace_pattern({Identity, :snapshot_at!, 4}, true, [:local])
+    on_exit(fn -> :erlang.trace_pattern({Identity, :snapshot_at!, 4}, false, [:local]) end)
+
+    snapshot_reads = fn verb, params ->
+      parent = self()
+
+      worker =
+        spawn_link(fn ->
+          receive do
+            :go ->
+              send(parent, {:handled, handlers[verb].(%{origin: "user:flynn", params: params})})
+          end
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      :erlang.trace(worker, true, [:call])
+      send(worker, :go)
+      assert_receive {:handled, result}, 30_000
+      barrier = :erlang.trace_delivered(worker)
+      assert_receive {:trace_delivered, ^worker, ^barrier}
+      send(worker, :stop)
+
+      reads =
+        Stream.repeatedly(fn ->
+          receive do
+            {:trace, ^worker, :call,
+             {Identity, :snapshot_at!, [_, read_revision, archetype, harness]}} ->
+              {read_revision, archetype, harness}
+          after
+            0 -> nil
+          end
+        end)
+        |> Enum.take_while(&(&1 != nil))
+
+      {result, reads}
+    end
+
+    # Three coder sessions on one harness: one read, not three. No pair is
+    # read twice.
+    assert {%{status: "complete", applied: applied}, reads} =
+             snapshot_reads.("identity-apply", %{all: true})
+
+    assert length(applied) >= 3
+    assert Enum.count(reads, &(&1 == {next, "coder", :codex})) == 1
+    assert reads == Enum.uniq(reads)
+
+    assert {%{sessions: sessions}, reads} = snapshot_reads.("identity-status", %{})
+    assert length(sessions) >= 3
+    assert Enum.count(reads, &(&1 == {next, "coder", :codex})) == 1
+    assert reads == Enum.uniq(reads)
+  end
+
   # The materializer can fail after touching an unknown subset of files. Report
   # the target and that uncertainty without claiming the stamp or prompt landed.
   test "a writer failure reports the target and leaves the prior stamp", ctx do
@@ -12163,7 +12525,11 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, first.session_key).identity_revision == next
   end
 
-  test "identity apply does not write a captured revision after a newer revision publishes",
+  # A run that started on one revision never stamps it once a newer one is
+  # live. Files are written outside the org-wide lock, so the last check sits
+  # between the file write and the stamp; a run whose revision is overtaken
+  # before it reaches a session writes nothing there (see the stepped test).
+  test "identity apply does not stamp a captured revision after a newer revision publishes",
        ctx do
     base_dir = role_test_base("identity-apply-newer-revision")
     learn_engineering_identity!(base_dir)
@@ -12188,7 +12554,6 @@ defmodule Tightbeam.GatewayTest do
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, original, "coder", :codex, cwd)
     skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
-    original_body = File.read!(skill)
 
     captured =
       identity_edit!(
@@ -12200,62 +12565,35 @@ defmodule Tightbeam.GatewayTest do
       )
 
     ensure_global_registry()
-    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
     parent = self()
 
-    lock =
-      Task.async(fn ->
-        :global.trans({{Gateway, :session_mutation, session.session_key}, self()}, fn ->
-          send(parent, :identity_apply_session_lock_held)
-
-          receive do
-            :release_identity_apply_session_lock -> :released
-          end
-        end)
-      end)
-
-    assert_receive :identity_apply_session_lock_held
-
-    apply_task =
-      Task.async(fn ->
-        apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
-      end)
-
-    waiting_for_session_lock? =
-      Enum.reduce_while(1..100, false, fn _, _ ->
-        {:current_stacktrace, stacktrace} = Process.info(apply_task.pid, :current_stacktrace)
-
-        waiting? =
-          Enum.any?(stacktrace, fn
-            {:global, function, _arity, _location} when function in [:set_lock, :random_sleep] ->
-              true
-
-            _ ->
-              false
-          end)
-
-        if waiting? do
-          {:halt, true}
-        else
-          Process.sleep(10)
-          {:cont, false}
-        end
-      end)
-
-    assert waiting_for_session_lock?,
-           "expected apply to wait on the held session lock, observed #{inspect(Process.info(apply_task.pid, [:status, :current_function, :current_stacktrace]))}"
-
-    newer =
-      identity_edit!(
-        base_dir,
-        "coder",
-        {:skill, "model-release-intake", false},
-        "newer published revision",
-        "test"
+    # The injection: a newer revision is published after this session's files
+    # are written and before its stamp.
+    publish_newer = fn ->
+      send(
+        parent,
+        {:newer,
+         identity_edit!(
+           base_dir,
+           "coder",
+           {:skill, "model-release-intake", false},
+           "newer published revision",
+           "test"
+         )}
       )
+    end
 
-    send(lock.pid, :release_identity_apply_session_lock)
-    assert {:ok, :released} = Task.yield(lock, 5_000)
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    racing_apply =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:on_identity_apply_files, publish_newer)
+      |> Gateway.handlers()
+      |> Map.fetch!("identity-apply")
+
+    result = racing_apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+    assert_received {:newer, newer}
 
     assert %{
              status: "partial",
@@ -12266,17 +12604,21 @@ defmodule Tightbeam.GatewayTest do
              results: [
                %{
                  outcome: "superseded",
-                 files: "not_started",
+                 files: "materialized",
                  stamp: "not_committed",
                  prompt_enqueue: "not_attempted",
                  current_identity_revision: ^newer
                }
              ]
-           } = Task.await(apply_task, 10_000)
+           } = result
 
     assert session_key == session.session_key
     assert Identity.live_revision!(base_dir) == newer
-    assert File.read!(skill) == original_body
+
+    # The files of the run's revision were already written when the newer one
+    # was published; the stamp still names the revision before the run, so the
+    # session reads as behind and the next apply rewrites the files.
+    assert File.read!(skill) == "captured revision"
     assert Org.get(ctx.db, session.session_key).identity_revision == original
     assert Tightbeam.Wakes.list_for_session(ctx.db, session.session_key) == []
 
@@ -14503,6 +14845,36 @@ defmodule Tightbeam.GatewayTest do
       })
 
     {seq, message}
+  end
+
+  # A started coder session on the Codex harness, stamped at `revision`.
+  defp identity_apply_step_session(db, suffix, revision) do
+    key = "agent:apply-#{suffix}"
+
+    Org.create(db, %{
+      session_key: key,
+      display_name: key,
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "coder",
+      identity_name: "coder",
+      identity_revision: revision,
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("gpt-5.6-sol", effort: "medium")
+    })
+
+    Org.append_pointer(db, key, "thread-#{suffix}", "created")
+    key
+  end
+
+  # The fixed order `--all` steps visit sessions in.
+  defp identity_apply_visiting_order(db) do
+    db
+    |> Org.list_for_user("", true)
+    |> Enum.sort_by(&[&1.archetype, &1.harness, &1.session_key])
+    |> Enum.map(& &1.session_key)
   end
 
   defp ensure_global_registry do
