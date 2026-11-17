@@ -3018,7 +3018,11 @@ defmodule Tightbeam.RulesTest do
       ])
 
     File.mkdir_p!(Path.dirname(manifest))
-    File.write!(manifest, JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()}))
+
+    File.write!(
+      manifest,
+      JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()})
+    )
 
     auth_dir = Tightbeam.Homes.home_path(ctx.base_dir, "testhost", :claude)
     File.mkdir_p!(auth_dir)

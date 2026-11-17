@@ -87,7 +87,10 @@ defmodule GuardRemoteUrl do
                 Enum.any?(command, &String.contains?(&1, "cat")) ->
               {"", 42}
 
-            Enum.any?(command, &String.contains?(&1, "/@agentclientprotocol/claude-agent-acp/package.json")) ->
+            Enum.any?(
+              command,
+              &String.contains?(&1, "/@agentclientprotocol/claude-agent-acp/package.json")
+            ) ->
               {JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()}), 0}
 
             true ->
@@ -103,7 +106,10 @@ defmodule GuardRemoteUrl do
                 Enum.any?(command, &String.contains?(&1, "cat")) ->
               {"", 42}
 
-            Enum.any?(command, &String.contains?(&1, "/@agentclientprotocol/claude-agent-acp/package.json")) ->
+            Enum.any?(
+              command,
+              &String.contains?(&1, "/@agentclientprotocol/claude-agent-acp/package.json")
+            ) ->
               {JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()}), 0}
 
             true ->

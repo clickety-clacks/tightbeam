@@ -7206,6 +7206,7 @@ defmodule Tightbeam.GatewayTest do
   test "explicit spawn and tune do not gate model names on either host catalog", ctx do
     base_dir = move_test_base(ctx.db, "per-host-validate", "worker")
     parent = self()
+
     sh = fn command ->
       send(parent, {:spinup_command, command})
       successful_readiness_probe(command)
@@ -7293,6 +7294,7 @@ defmodule Tightbeam.GatewayTest do
   test "a harness with no GATEWAY credential still spawns on a satellite that has one", ctx do
     base_dir = move_test_base(ctx.db, "satellite-only-harness", "worker")
     parent = self()
+
     sh = fn command ->
       send(parent, {:spinup_command, command})
       successful_readiness_probe(command)
@@ -9739,7 +9741,9 @@ defmodule Tightbeam.GatewayTest do
     File.write!(Path.join(source, "memory.md"), "keep")
 
     sh = fn command ->
-      if hd(command) == "rsync", do: {"copy failed", 23}, else: successful_readiness_probe(command)
+      if hd(command) == "rsync",
+        do: {"copy failed", 23},
+        else: successful_readiness_probe(command)
     end
 
     tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
@@ -15633,7 +15637,16 @@ defmodule Tightbeam.GatewayTest do
           {"codex-acp", Tightbeam.Harness.Codex}
         ] do
       adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", bin])
-      manifest = Path.join([base_dir, "adapters", "node_modules", module.install_package(), "package.json"])
+
+      manifest =
+        Path.join([
+          base_dir,
+          "adapters",
+          "node_modules",
+          module.install_package(),
+          "package.json"
+        ])
+
       File.mkdir_p!(Path.dirname(manifest))
       File.write!(manifest, JSON.encode!(%{"version" => module.adapter_version()}))
       File.mkdir_p!(Path.dirname(adapter))
