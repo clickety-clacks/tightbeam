@@ -13043,6 +13043,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "REST post carries submitter through the parser into history and the model prompt", ctx do
+    ensure_global_registry()
     owner = ctx.device.user_id
     submitter = %{"identity" => nil, "displayName" => "Avery"}
 
