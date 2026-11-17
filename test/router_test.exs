@@ -1872,10 +1872,11 @@ defmodule Tightbeam.Wire.RouterTest do
       ConditionFacts.standing?(ctx.db, "cli-incompatible", session.session_key)
     end
 
-    # Nothing changed: the command runs.
-    ok = call.(overloaded, required)
+    # Nothing changed: the command runs, and nothing asked the writer.
+    {ok, log} = ExUnit.CaptureLog.with_log(fn -> call.(overloaded, required) end)
     assert ok.status == 200, ok.resp_body
     assert_receive {:call, %{verb: "inspect"}}
+    refute log =~ "not recorded"
 
     # A mismatch that cannot be recorded: the caller still gets the real refusal.
     {refused, log} = ExUnit.CaptureLog.with_log(fn -> call.(overloaded, "0.2.0") end)
