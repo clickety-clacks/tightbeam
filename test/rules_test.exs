@@ -3757,7 +3757,7 @@ defmodule Tightbeam.RulesTest do
     agent = engineering_session(ctx.db, "below-backlog", "scope-test-owner", archetype: "coder")
     load_ac6a_rules(ctx)
     db_pid = Process.whereis(ctx.db)
-    assert 1 == :erlang.trace_pattern({Rules, :notice_bindings, 2}, true, [:local])
+    assert 1 == :erlang.trace_pattern({Rules, :notice_bindings, 3}, true, [:local])
     assert 1 == :erlang.trace(db_pid, true, [:call, {:tracer, self()}])
 
     try do
@@ -3774,7 +3774,7 @@ defmodule Tightbeam.RulesTest do
       refute_received {:trace, ^db_pid, :call, {Rules, :notice_bindings, _}}
     after
       :erlang.trace(db_pid, false, [:call])
-      :erlang.trace_pattern({Rules, :notice_bindings, 2}, false, [:local])
+      :erlang.trace_pattern({Rules, :notice_bindings, 3}, false, [:local])
     end
   end
 
