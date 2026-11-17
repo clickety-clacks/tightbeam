@@ -778,6 +778,8 @@ defmodule Tightbeam.Gateway do
 
         case canonical_post_attachments(Map.get(p, :attachments)) do
           {:ok, attachments} ->
+            rest_send? = call[:transport] == :rest
+
             outcome =
               deliver_prompt(call.session_key, call.origin, p.content,
                 db: db,
@@ -785,12 +787,38 @@ defmodule Tightbeam.Gateway do
                 client_message_id: p.client_message_id,
                 attachments: attachments,
                 creator_session_key: call.session_key,
-                queue_when_busy: true
+                queue_when_busy: true,
+                conn_registry: config[:conn_registry] || Tightbeam.ConnRegistry,
+                lane_manager: config[:lane_manager] || Tightbeam.LaneManager,
+                return_receipt: rest_send?
               )
 
-            if outcome in [:appended, :queued],
-              do: %{ack: p.client_message_id},
-              else: %{dedupe: to_string(outcome)}
+            case outcome do
+              {kind, message_id, turn_seq} when kind in [:recorded, :duplicate] ->
+                %{
+                  outcome: to_string(kind),
+                  sessionKey: call.session_key,
+                  deviceId: p.device_id,
+                  clientMessageId: p.client_message_id,
+                  messageId: message_id,
+                  turnSeq: turn_seq
+                }
+
+              status when status in [:appended, :queued] ->
+                %{ack: p.client_message_id}
+
+              :conflict when rest_send? ->
+                %{
+                  code: "invalid_message",
+                  message: "clientMessageId reused with different content"
+                }
+
+              :skipped when rest_send? ->
+                %{code: "not_deliverable"}
+
+              status ->
+                %{dedupe: to_string(status)}
+            end
 
           :error ->
             %{
@@ -961,6 +989,9 @@ defmodule Tightbeam.Gateway do
       end,
       {"harklight-briefings-catchup", []} => fn call ->
         Tightbeam.HarklightBriefings.catchup(db, call, authorized: admin_caller?(db, call))
+      end,
+      {"harklight-retry", []} => fn call ->
+        Tightbeam.HarklightWakes.retry_command(db, call)
       end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
@@ -2190,6 +2221,7 @@ defmodule Tightbeam.Gateway do
           | :duplicate
           | :conflict
           | :skipped
+          | {:recorded | :duplicate, String.t(), pos_integer() | nil}
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -2205,10 +2237,13 @@ defmodule Tightbeam.Gateway do
 
     case result do
       {:ok, {:staged, _wake}} ->
-        :queued
+        if opts[:return_receipt],
+          do: staged_delivery_receipt(db, session_key, opts),
+          else: :queued
 
       {:ok, delivery} ->
-        complete_delivery(db, delivery)
+        status = complete_delivery(db, delivery)
+        if opts[:return_receipt], do: delivery_receipt(db, delivery, status), else: status
 
       {:error, %{message: message}} when is_binary(message) ->
         if String.contains?(message, "UNIQUE"),
@@ -2217,6 +2252,107 @@ defmodule Tightbeam.Gateway do
 
       {:error, error} ->
         raise error
+    end
+  end
+
+  defp delivery_receipt(db, delivery, status) when status in [:appended, :duplicate] do
+    kind = if status == :appended, do: :recorded, else: :duplicate
+
+    message =
+      case delivery do
+        {:appended, _target, message, _opts} -> message
+        {:duplicate, message} -> message
+      end
+
+    case DB.query(db, "SELECT seq FROM turns WHERE messageId = ?1 ORDER BY seq ASC LIMIT 1", [
+           message.id
+         ]) do
+      {:ok, [[turn_seq]]} ->
+        {kind, message.id, turn_seq}
+
+      {:ok, []} ->
+        case human_post_delivery_turn_seq(db, message) do
+          turn_seq when is_integer(turn_seq) ->
+            {kind, message.id, turn_seq}
+
+          _ ->
+            if staged_human_post?(db, message) do
+              {kind, message.id, nil}
+            else
+              :skipped
+            end
+        end
+    end
+  end
+
+  defp delivery_receipt(_db, _delivery, status), do: status
+
+  defp staged_delivery_receipt(db, session_key, opts) do
+    case DB.query(
+           db,
+           "SELECT id FROM messages WHERE sessionKey=?1 AND deviceId=?2 AND clientMessageId=?3",
+           [session_key, opts[:device_id], opts[:client_message_id]]
+         ) do
+      {:ok, [[message_id]]} ->
+        case DB.query(
+               db,
+               "SELECT seq FROM turns WHERE messageId=?1 ORDER BY seq ASC LIMIT 1",
+               [message_id]
+             ) do
+          {:ok, [[turn_seq]]} ->
+            {:recorded, message_id, turn_seq}
+
+          {:ok, []} ->
+            {:recorded, message_id, nil}
+
+          {:error, error} ->
+            raise error
+        end
+
+      {:ok, []} ->
+        :skipped
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
+  defp human_post_delivery_turn_seq(db, message) do
+    case DB.query(
+           db,
+           """
+           SELECT deliveredTurnSeq FROM wakes
+           WHERE sessionKey=?1 AND consumer='prompt' AND digest=0
+             AND sourceClientIdentity IS NOT NULL
+             AND json_extract(sourceClientIdentity,'$.targetSessionKey')=?1
+             AND json_extract(sourceClientIdentity,'$.deviceId')=?2
+             AND json_extract(sourceClientIdentity,'$.clientMessageId')=?3
+           LIMIT 1
+           """,
+           [message.session_key, message.device_id, message.client_message_id]
+         ) do
+      {:ok, [[turn_seq]]} -> turn_seq
+      {:ok, []} -> nil
+      {:error, error} -> raise error
+    end
+  end
+
+  defp staged_human_post?(db, message) do
+    case DB.query(
+           db,
+           """
+           SELECT 1 FROM wakes
+           WHERE sessionKey=?1 AND consumer='prompt' AND digest=0
+             AND state IN ('pending','fired') AND deliveredTurnSeq IS NULL
+             AND json_extract(sourceClientIdentity,'$.deviceId')=?2
+             AND json_extract(sourceClientIdentity,'$.clientMessageId')=?3
+           LIMIT 1
+           """,
+           [message.session_key, message.device_id, message.client_message_id]
+         ) do
+      {:ok, [[1]]} -> true
+      {:ok, []} -> false
+      {:error, error} -> raise error
     end
   end
 
@@ -2301,31 +2437,46 @@ defmodule Tightbeam.Gateway do
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
-        record_undeliverable_in_txn(txn, session_key, origin, opts, "no_delivery_target")
-        :skipped
+        message_result =
+          if queued_human_post_delivery? or not is_nil(opts[:target_gate]) do
+            :new
+          else
+            prompt_identity_result(txn, session_key, stamped, prompt, opts)
+          end
+
+        case message_result do
+          {:duplicate, _message} = duplicate ->
+            duplicate
+
+          {:conflict, _message} = conflict ->
+            conflict
+
+          :new ->
+            record_undeliverable_in_txn(txn, session_key, origin, opts, "no_delivery_target")
+            :skipped
+        end
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
-        if Ledger.enqueueable_in_txn?(txn, target) do
-          message_result =
-            if queued_human_post_delivery? do
-              # The staged source's own sidecar is the identity being materialized.
-              # Its wake id and the message table's unique client identity guard
-              # replay; querying the sidecar here would mistake the source itself
-              # for an earlier post.
-              :new
-            else
-              Projection.prompt_message_result_in_txn(txn, %{
-                session_key: target,
-                role: "user",
-                content: stamped,
-                raw_content: prompt,
-                device_id: opts[:device_id],
-                client_message_id: opts[:client_message_id]
-              })
-            end
+        message_result =
+          if queued_human_post_delivery? do
+            # The staged source's own sidecar is the identity being materialized.
+            # Its wake id and the message table's unique client identity guard
+            # replay; querying the sidecar here would mistake the source itself
+            # for an earlier post.
+            :new
+          else
+            prompt_identity_result(txn, target, stamped, prompt, opts)
+          end
 
-          case message_result do
-            :new ->
+        case message_result do
+          {:duplicate, _message} = duplicate ->
+            duplicate
+
+          {:conflict, _message} = conflict ->
+            conflict
+
+          :new ->
+            if Ledger.enqueueable_in_txn?(txn, target) do
               if not queued_human_post_delivery? and stage_for_queue?(txn, target, opts) do
                 stage_prompt_in_txn(
                   txn,
@@ -2346,15 +2497,23 @@ defmodule Tightbeam.Gateway do
                   opts
                 )
               end
-
-            duplicate_or_conflict ->
-              duplicate_or_conflict
-          end
-        else
-          # Ask before the echo: a message with no turn is history nobody can answer.
-          refuse_undeliverable_turn(txn, target, origin, opts)
+            else
+              # Ask before the echo: a message with no turn is history nobody can answer.
+              refuse_undeliverable_turn(txn, target, origin, opts)
+            end
         end
     end
+  end
+
+  defp prompt_identity_result(txn, target, stamped, prompt, opts) do
+    Projection.prompt_message_result_in_txn(txn, %{
+      session_key: target,
+      role: "user",
+      content: stamped,
+      raw_content: prompt,
+      device_id: opts[:device_id],
+      client_message_id: opts[:client_message_id]
+    })
   end
 
   defp stage_for_queue?(txn, target, opts) do
@@ -11167,6 +11326,16 @@ defmodule Tightbeam.Gateway do
           %{session_key: member.session_key, assignments: assignments}
         end)
 
+      # Resolve receivers only after the whole retiring set is inactive. A
+      # parent retiring in this transaction cannot take its child's conversation.
+      Enum.each(retired, fn member ->
+        Txn.handoff(
+          txn,
+          Tightbeam.HarklightWakes,
+          Tightbeam.HarklightWakes.retirement_handoff_in_txn(txn, member.session_key)
+        )
+      end)
+
       retired
       |> Enum.flat_map(& &1.assignments)
       |> Enum.map(& &1.work_item_id)
@@ -11271,7 +11440,7 @@ defmodule Tightbeam.Gateway do
          drain_reason
        ) do
     assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
-    Org.retire_in_txn(txn, session_key, principal)
+    Org.retire_in_txn(txn, session_key, principal, defer_harklight: true)
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
     assignments
   end

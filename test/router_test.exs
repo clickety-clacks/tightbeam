@@ -906,6 +906,30 @@ defmodule Tightbeam.Wire.RouterTest do
     assert agent_verbs -- handler_keys == []
   end
 
+  test "existing sentinel unsubscribe remains available through agent dispatch", ctx do
+    session = create_session(ctx.db, "sentinel-unsubscribe-wire", ctx.device.user_id)
+    subscription_id = "sub_router_allowlist"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO sentinel_subscriptions(subscriptionId,sessionKey,event,filter,createdAt) VALUES(?1,?2,?3,?4,?5)",
+               [subscription_id, session.session_key, "example/event", "[]", 1]
+             )
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    response =
+      dispatch_cli(ctx, session.cli_token, %{
+        verb: "sentinel-unsubscribe",
+        params: %{subscriptionId: subscription_id}
+      })
+
+    assert response.status == 200, response.resp_body
+    assert JSON.decode!(response.resp_body)["result"] == %{"unsubscribed" => subscription_id}
+  end
+
   test "fact producer verbs cross agent dispatch for sessions, users and processes", ctx do
     session = create_session(ctx.db, "fact-wire-reader", ctx.device.user_id)
     handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
@@ -2790,15 +2814,14 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call,
                     %{verb: "wake", origin: "agent:orchestrator:demo", session_key: "orch"}}
 
-    # `post` remains an internal handler-backed verb: the public wire must
-    # reject it before the handler can append a message or enqueue a turn.
+    # An unknown verb is refused before a handler can append a message or turn.
     {:ok, [[before_events]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
     {:ok, [[before_messages]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     {:ok, [[before_turns]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
     disallowed =
       dispatch_cli(ctx, "tbc_test", %{
-        verb: "post",
+        verb: "not-a-verb",
         asUser: "flynn",
         params: %{content: "must not be delivered", clientMessageId: "internal-post-negative"}
       })
@@ -2808,7 +2831,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(disallowed.resp_body) == %{
              "error" => %{
                "code" => "invalid_message",
-               "message" => "verb not allowed: post"
+               "message" => "verb not allowed: not-a-verb"
              }
            }
 

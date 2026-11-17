@@ -1208,23 +1208,36 @@ defmodule Tightbeam.Org do
   @spec retire_in_txn(Txn.t(), String.t(), String.t()) :: session()
   def retire_in_txn(%Txn{} = txn, session_key, principal)
       when is_binary(principal) and principal != "" do
+    retire_in_txn(txn, session_key, principal, [])
+  end
+
+  @spec retire_in_txn(Txn.t(), String.t(), String.t(), keyword()) :: session()
+  def retire_in_txn(%Txn{} = txn, session_key, principal, opts)
+      when is_binary(principal) and principal != "" and is_list(opts) do
     case must_get(txn, session_key) do
       %{state: "retired"} = session ->
         session
 
       %{state: "active"} ->
-        retire_active_in_txn(txn, session_key, principal)
+        retire_active_in_txn(txn, session_key, principal, opts)
     end
   end
 
-  def retire_in_txn(%Txn{} = txn, session_key, principal, _legacy_supervision_interval_ms),
-    do: retire_in_txn(txn, session_key, principal)
+  # Keep accepting the former interval argument for callers on the preceding
+  # source line; current callers that defer handoff pass options directly.
+  def retire_in_txn(%Txn{} = txn, session_key, principal, _legacy_supervision_interval_ms)
+      when is_binary(principal) and principal != "",
+      do: retire_in_txn(txn, session_key, principal)
 
   def retire_in_txn(%Txn{}, _session_key, _principal) do
     raise ArgumentError, "retirement requires a non-empty principal"
   end
 
-  defp retire_active_in_txn(txn, session_key, _principal) do
+  def retire_in_txn(%Txn{}, _session_key, _principal, _opts) do
+    raise ArgumentError, "retirement requires a non-empty principal"
+  end
+
+  defp retire_active_in_txn(txn, session_key, _principal, opts) do
     retirement_epoch = now()
     Tightbeam.Retirements.retiring_in_txn(txn, [session_key])
 
@@ -1246,11 +1259,13 @@ defmodule Tightbeam.Org do
     if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
     Tightbeam.Retirements.session_retired_in_txn(txn, session_key)
 
-    Txn.handoff(
-      txn,
-      Tightbeam.HarklightWakes,
-      Tightbeam.HarklightWakes.retirement_handoff_in_txn(txn, session_key)
-    )
+    unless Keyword.get(opts, :defer_harklight, false) do
+      Txn.handoff(
+        txn,
+        Tightbeam.HarklightWakes,
+        Tightbeam.HarklightWakes.retirement_handoff_in_txn(txn, session_key)
+      )
+    end
 
     Tightbeam.SentinelSubscriptions.end_session_in_txn(txn, session_key)
 
@@ -1281,6 +1296,11 @@ defmodule Tightbeam.Org do
         )
         AND NOT EXISTS (
           SELECT 1 FROM harklight_wake_deliveries d WHERE d.wakeId=w.wakeId
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM wake_retry_attempts retry
+          JOIN harklight_wake_deliveries d ON d.wakeId=retry.rootWakeId
+          WHERE retry.wakeId=w.wakeId
         )
       ORDER BY w.createdAt,w.wakeId
       """,

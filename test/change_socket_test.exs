@@ -1233,7 +1233,12 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert function_exported?(Tightbeam.Artifacts, :archive_session, 4)
     assert function_exported?(Tightbeam.Artifacts, :release, 2)
 
-    declared = Enum.sort(Gateway.emitted_state_classes(handler_effects))
+    # TurnEvents commits these event rows outside the executable Gateway handlers.
+    declared =
+      Enum.sort(
+        Gateway.emitted_state_classes(handler_effects) ++
+          ~w(message.segment_recorded tool_call.event_recorded)
+      )
 
     registered =
       rows

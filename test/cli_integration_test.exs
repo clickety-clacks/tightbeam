@@ -3375,6 +3375,61 @@ defmodule Tightbeam.CliIntegrationTest do
     end
   end
 
+  test "real CLI dispatches Harklight retry for authenticated identities", ctx do
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO users (userId,isAdmin,createdAt) VALUES('fixture-user',0,1)"
+             )
+
+    File.write!(
+      Path.join(ctx.base_dir, "gateway.json"),
+      JSON.encode!(%{port: ctx.port, cliToken: "tbc_cli_integration"})
+    )
+
+    calls = [
+      {ctx.workdir, [], "agent:cli-holder", {:session, "cli-holder"}},
+      {ctx.outside, ["--as-user", "fixture-user"], "user:fixture-user", {:user, "fixture-user"}},
+      {ctx.outside, ["--as-process", "fixture-process"], "process:fixture-process",
+       {:process, "fixture-process"}}
+    ]
+
+    for {cwd, flags, origin, principal} <- calls do
+      {output, 0} =
+        System.cmd(
+          ctx.binary,
+          ["harklight-retry", "--all"] ++ flags,
+          cd: cwd,
+          env: [
+            {"TIGHTBEAM_BASE_DIR", ctx.base_dir},
+            {"TIGHTBEAM_URL", nil},
+            {"TIGHTBEAM_TOKEN", nil}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert JSON.decode!(output) == %{
+               "selector" => "all",
+               "results" => [],
+               "counts" => %{
+                 "inProgress" => 0,
+                 "notFailed" => 0,
+                 "skippedClosed" => 0,
+                 "listening" => 0,
+                 "failed" => 0
+               }
+             }
+
+      assert_receive {:cli_call,
+                      %{
+                        verb: "harklight-retry",
+                        origin: ^origin,
+                        principal: ^principal,
+                        params: %{all: true}
+                      }}
+    end
+  end
+
   test "real CLI keeps explicit Harklight identities local with session credentials",
        ctx do
     commands = [

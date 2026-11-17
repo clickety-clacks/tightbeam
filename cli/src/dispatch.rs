@@ -634,6 +634,20 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 vec![selector],
             ))
         }
+        Command::HarklightRetry {
+            identity,
+            all,
+            message,
+            handle,
+        } => {
+            let params = match (all, message, handle) {
+                (true, None, None) => vec!["\"all\":true".to_owned()],
+                (false, Some(message), None) => vec![string_field("messageId", message)],
+                (false, None, Some(handle)) => vec![string_field("handle", handle)],
+                _ => unreachable!("the parser requires exactly one Harklight retry selector"),
+            };
+            Ok(request(identity, "harklight-retry", vec![], params))
+        }
         // Not a verb and not on /agent/dispatch: it changes no domain state, it
         // tells the gateway to look at this session's running turn NOW, while the
         // command it observed has not run yet.
@@ -3896,6 +3910,7 @@ where
                 }
             }
             let request = build_request(&command)?;
+            let mut command_failure = None;
             if let Some(result) = send_request(&endpoint, &request, None)? {
                 if matches!(command, Command::Wake { .. }) {
                     if let Some(warnings) = result.get("warnings").and_then(Value::as_array) {
@@ -3906,12 +3921,24 @@ where
                         }
                     }
                 }
+                if matches!(command, Command::HarklightRetry { .. })
+                    && result
+                        .pointer("/counts/failed")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|failed| failed > 0)
+                {
+                    command_failure =
+                        Some("harklight-retry: one or more selected handles remain unavailable");
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).expect("JSON value serializes")
                 );
             }
-            Ok(())
+            match command_failure {
+                Some(message) => Err(message.to_owned()),
+                None => Ok(()),
+            }
         }
     }
 }
@@ -4038,6 +4065,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
+        | Command::HarklightRetry { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::RoleBind { identity, .. }
@@ -4304,6 +4332,9 @@ mod tests {
                 vec!["harklight-follow", "--handle", "h"],
                 "harklight-follow",
             ),
+            (vec!["harklight-retry", "--all"], "harklight-retry"),
+            (vec!["harklight-retry", "--message", "m"], "harklight-retry"),
+            (vec!["harklight-retry", "--session", "h"], "harklight-retry"),
         ];
         for (args, verb) in commands {
             let command =
@@ -4326,6 +4357,14 @@ mod tests {
                 assert_eq!(body["params"]["handle"], "h");
             } else if verb == "harklight-listener-restore" {
                 assert_eq!(body["params"]["handle"], "h");
+            } else if verb == "harklight-retry" {
+                if body["params"].get("all").is_some() {
+                    assert_eq!(body["params"]["all"], true);
+                } else if body["params"].get("messageId").is_some() {
+                    assert_eq!(body["params"]["messageId"], "m");
+                } else {
+                    assert_eq!(body["params"]["handle"], "h");
+                }
             } else {
                 assert_eq!(body["params"]["messageId"], "m");
             }
@@ -4816,8 +4855,34 @@ mod tests {
         let ordinary_session_call = parse(&["work-item-get", "wi_1"]);
         assert!(requires_session_discovery(&ordinary_session_call));
 
+        let retry_call = parse(&["harklight-retry", "--all"]);
+        assert!(requires_session_discovery(&retry_call));
+
         let explicit_user = parse(&["add-user", "guest", "--as-user", "flynn"]);
         assert!(!requires_session_discovery(&explicit_user));
+    }
+
+    #[test]
+    fn harklight_retry_preserves_existing_authenticated_identities() {
+        let endpoint = Endpoint {
+            base: "http://gateway.example:11373".to_owned(),
+            token: "fixture-token".to_owned(),
+            origin: Origin::Session(PathBuf::from("/work/.tightbeam-session")),
+        };
+
+        for identity in [
+            Identity::User("owner".to_owned()),
+            Identity::Process("worker".to_owned()),
+        ] {
+            let command = Command::HarklightRetry {
+                identity,
+                all: true,
+                message: None,
+                handle: None,
+            };
+
+            assert_eq!(local_harklight_identity_refusal(&command, &endpoint), None);
+        }
     }
 
     /// The case the value comparison could not see.

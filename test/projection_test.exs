@@ -7,6 +7,7 @@ defmodule Tightbeam.ProjectionTest do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     :ok = Projection.ensure_schema(name)
+    :ok = DB.execute(name, "ALTER TABLE messages ADD COLUMN recordEventIds TEXT")
 
     :ok =
       DB.execute(name, """
@@ -58,15 +59,24 @@ defmodule Tightbeam.ProjectionTest do
       role: "user",
       content: "hi",
       device_id: "d",
-      client_message_id: "c_1"
+      client_message_id: "c_1",
+      record_event_ids: ["work_item.filed:wi_1"]
     }
 
     assert {:appended, first} = Projection.append(db, input)
+    assert first.record_event_ids == ["work_item.filed:wi_1"]
+    assert Projection.get(db, first.id).record_event_ids == first.record_event_ids
+
+    assert [listed] = Projection.list_after(db, "k1", nil, 10)
+    assert listed.record_event_ids == first.record_event_ids
+
     assert {:duplicate, duplicate} = Projection.append(db, input)
     assert duplicate.id == first.id
+    assert duplicate.record_event_ids == first.record_event_ids
 
     assert {:conflict, existing} = Projection.append(db, %{input | content: "DIFFERENT"})
     assert existing.id == first.id
+    assert existing.record_event_ids == first.record_event_ids
 
     {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM messages")
     assert count == 1

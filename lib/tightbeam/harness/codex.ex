@@ -266,6 +266,12 @@ defmodule Tightbeam.Harness.Codex do
   end
 
   @impl true
+  def session_load_meta(session, guidance) do
+    session_config(session, guidance).meta
+    |> Map.put("developerInstructions", guidance)
+  end
+
+  @impl true
   def owned_home_entries,
     do: Support.owned_home_entries("hooks.json")
 

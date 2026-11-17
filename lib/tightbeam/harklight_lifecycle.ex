@@ -693,31 +693,99 @@ defmodule Tightbeam.HarklightLifecycle do
   # Recheck local evidence after status so a registered request or pending send
   # cannot be skipped using an earlier snapshot.
   def closed_for_start?(db, handle, opts \\ []) do
-    with {:ok, initial} <- completion_snapshot(db, handle),
-         true <- initial.requests != [] and initial.pending_sends == [],
-         {:ok, runner} <- read_runner(opts),
-         {:ok, output} <- run_status(runner, handle),
-         {:ok, status} when is_map(status) <- JSON.decode(output),
-         true <- status["session_handle"] == handle,
-         0 <- status["open_requests"],
-         0 <- status["pending_undelivered"],
-         {:ok, true} <-
-           DB.transaction(db, fn txn ->
-             with {:ok, current} <- completion_snapshot_in_txn(txn, handle),
-                  true <- current.requests == initial.requests,
-                  true <- current.pending_sends == [],
-                  true <- current.entries == initial.entries do
-               locally_delivered_and_unheld?(txn, handle, current.entries, current.session_key)
-             else
-               _ -> false
-             end
-           end) do
-      true
-    else
-      _ -> false
-    end
+    match?({:closed, _}, listener_start_decision(db, handle, opts))
   rescue
     _ -> false
+  end
+
+  @doc false
+  def listener_start_decision(db, handle, opts \\ []) do
+    case completion_snapshot(db, handle) do
+      {:ok, initial} ->
+        cond do
+          initial.requests == [] ->
+            {:start, %{eligibility_undecidable: true, reason: "no_tightbeam_request_record"}}
+
+          initial.pending_sends != [] ->
+            {:start, %{pending_send_count: length(initial.pending_sends)}}
+
+          true ->
+            with {:ok, runner} <- read_runner(opts),
+                 {:ok, output} <- run_status(runner, handle),
+                 {:ok, status} when is_map(status) <- JSON.decode(output),
+                 true <- status["session_handle"] == handle,
+                 open_requests when is_integer(open_requests) and open_requests >= 0 <-
+                   status["open_requests"],
+                 pending_undelivered
+                 when is_integer(pending_undelivered) and pending_undelivered >= 0 <-
+                   status["pending_undelivered"] do
+              status_evidence = %{
+                open_requests: open_requests,
+                pending_undelivered: pending_undelivered
+              }
+
+              cond do
+                open_requests > 0 or pending_undelivered > 0 ->
+                  {:start, status_evidence}
+
+                true ->
+                  case DB.transaction(db, fn txn ->
+                         case completion_snapshot_in_txn(txn, handle) do
+                           {:ok, current} ->
+                             cond do
+                               current.session_key != initial.session_key ->
+                                 :changed
+
+                               current.requests != initial.requests ->
+                                 :changed
+
+                               current.pending_sends != [] ->
+                                 :changed
+
+                               current.entries != initial.entries ->
+                                 :changed
+
+                               locally_delivered_and_unheld?(
+                                 txn,
+                                 handle,
+                                 current.entries,
+                                 current.session_key
+                               ) ->
+                                 :closed
+
+                               true ->
+                                 :undelivered_work
+                             end
+
+                           _ ->
+                             :changed
+                         end
+                       end) do
+                    {:ok, :closed} ->
+                      {:closed, status_evidence}
+
+                    {:ok, :undelivered_work} ->
+                      {:start, %{undelivered_work: true}}
+
+                    _ ->
+                      {:start,
+                       %{
+                         eligibility_undecidable: true,
+                         reason: "local_state_changed_during_check"
+                       }}
+                  end
+              end
+            else
+              _ ->
+                {:start, %{eligibility_undecidable: true, reason: "harklight_status_unavailable"}}
+            end
+        end
+
+      _ ->
+        {:start, %{eligibility_undecidable: true, reason: "tightbeam_state_unavailable"}}
+    end
+  rescue
+    _ -> {:start, %{eligibility_undecidable: true, reason: "start_decision_failed"}}
   end
 
   def completion_evidence(db, handle, opts \\ []) do

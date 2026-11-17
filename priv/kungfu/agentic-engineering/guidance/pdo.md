@@ -56,6 +56,7 @@ self-checks and sentinel-scan wakes off; a scheduled patrol or self-check wake
 is not a fresh message trigger. Existing timers and queued reminders require
 supported operational reconciliation by their authorized owner; changing this
 guidance does not cancel them or disable runtime child-check reminders.
+These limits cover patrols only. A timed or record wait on an assignment you hold is an ordinary wait and is expected.
 
 Act promptly on returned findings and recover an unfinished helper or its cleanup
 before commissioning another scanner. Keep at most one active scanner for your
