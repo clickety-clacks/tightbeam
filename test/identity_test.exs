@@ -293,6 +293,62 @@ defmodule Tightbeam.IdentityTest do
     assert {:noop, ^revision} = learn!(ctx.base, "agentic-engineering", "operator")
   end
 
+  test "missing installed kungfu rules are reported without changing live identity", ctx do
+    Application.put_env(
+      :tightbeam,
+      :identity_source_dir,
+      Path.expand("../priv/kungfu/agentic-engineering", __DIR__)
+    )
+
+    assert :initialized = Identity.init!(ctx.base)
+    assert {:ok, complete} = learn!(ctx.base, "agentic-engineering", "operator")
+    assert Identity.status(ctx.base).missing_installed_kungfu == []
+    assert Identity.status(ctx.base).missing_installed_kungfu_notice == nil
+
+    assert capture_log(fn ->
+             assert :ok = Tightbeam.Gateway.warn_missing_installed_kungfu(ctx.base)
+           end) == ""
+
+    dir = Path.join(ctx.base, "identity")
+    path = "rules/row-reaction-handoff.toml"
+    full = Path.join(dir, path)
+    shipped = File.read!(full)
+
+    File.write!(
+      full,
+      String.replace(
+        shipped,
+        ~s(name = "assignment-terminal-handoff"),
+        ~s(name = "other-handoff")
+      )
+    )
+
+    git!(dir, ["add", path])
+    git!(dir, ["commit", "-m", "simulate missing installed reaction"], "operator")
+    missing = git!(dir, ["rev-parse", "HEAD"])
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", missing])
+
+    status = Identity.status(ctx.base)
+    assert status.missing_installed_kungfu == ["#{path} (reaction assignment-terminal-handoff)"]
+    assert status.missing_installed_kungfu_notice =~ path
+    assert status.missing_installed_kungfu_notice =~ "tightbeam identity relearn"
+
+    assert capture_log(fn ->
+             assert :ok = Tightbeam.Gateway.warn_missing_installed_kungfu(ctx.base)
+           end) =~ path
+
+    assert Identity.live_revision!(ctx.base) == missing
+    refute complete == missing
+
+    File.rm!(full)
+    git!(dir, ["add", path])
+    git!(dir, ["commit", "-m", "simulate missing installed file"], "operator")
+    absent = git!(dir, ["rev-parse", "HEAD"])
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", absent])
+    assert Identity.status(ctx.base).missing_installed_kungfu == [path]
+    assert Identity.status(ctx.base).missing_installed_kungfu_notice =~ path
+  end
+
   test "shipped engineering bundle keeps completion review without receipt admission",
        ctx do
     shipped = Path.expand("priv/kungfu/agentic-engineering")

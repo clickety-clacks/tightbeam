@@ -168,6 +168,7 @@ defmodule Tightbeam.Gateway do
     db = Map.get(config, :db, Tightbeam.DB)
     :ok = DB.assert_base_admitted!(db, config.base_dir)
     Identity.init_after_admission!(config.base_dir, db)
+    warn_missing_installed_kungfu(config.base_dir)
     load_law!(config)
     prod_limit = Map.get(config, :prod_limit, 3)
 
@@ -6083,6 +6084,15 @@ defmodule Tightbeam.Gateway do
     identity
     |> Map.put(:sessions, sessions)
     |> maybe_put_guidance(guidance)
+  end
+
+  @doc false
+  def warn_missing_installed_kungfu(base_dir) do
+    if notice = Identity.missing_installed_kungfu_notice(base_dir) do
+      Logger.warning(notice)
+    end
+
+    :ok
   end
 
   defp maybe_put_guidance(status, nil), do: status
