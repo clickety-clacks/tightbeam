@@ -3627,6 +3627,59 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  test "a clean review does not reclose a reopened assignment with its earlier completion",
+       ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    producer =
+      assign_call({:user, "flynn"}, "reopened producer")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    review =
+      assign_call({:user, "flynn"}, "producer review")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> Map.put(:session_key, "other-session")
+      |> then(&handle(ctx, "assign", &1))
+
+    first = handle(ctx, "attest", attest_call({:session, "holder"}, producer.id, "completion"))
+    assert first.assignment.state == "closed"
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, producer.id, "verify the recorded evidence")
+             )
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    readback = handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, producer.id))
+    assert readback.state == "open"
+    assert readback.outcome == nil
+    assert readback.closedAt == nil
+    assert readback.closingAttestId == nil
+    assert [%{priorClosingAttestId: prior}] = readback.reopenings
+    assert prior == first.attest.id
+
+    second =
+      attest_call({:session, "holder"}, producer.id, "completion")
+      |> Map.put(:review_pending, true)
+      |> then(&handle(ctx, "attest", &1))
+
+    assert {:ok, [["closed", "completed", closing]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
+               [producer.id]
+             )
+
+    assert closing == second.attest.id
+  end
+
   test "opener revocation settles a standing cannot-proceed and its decision request", ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 
