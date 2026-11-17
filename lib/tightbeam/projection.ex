@@ -74,7 +74,6 @@ defmodule Tightbeam.Projection do
     replyToClientMessageId TEXT,
     llmVisibleMessageId    TEXT NOT NULL,
     attachments            TEXT NOT NULL DEFAULT '[]',
-    submitter              TEXT,
     attentionTier          INTEGER NOT NULL DEFAULT 0,
     messageType            TEXT,
     markerKind             TEXT CHECK (
@@ -104,6 +103,10 @@ defmodule Tightbeam.Projection do
   def ensure_schema(db \\ Tightbeam.DB) do
     :ok = DB.execute(db, @ddl)
     :ok = AttachmentDelivery.ensure_schema(db)
+  end
+
+  @doc false
+  def ensure_submitter_column(db \\ Tightbeam.DB) do
     {:ok, columns} = DB.query(db, "PRAGMA table_info(messages)")
 
     unless Enum.any?(columns, fn row -> Enum.at(row, 1) == "submitter" end) do

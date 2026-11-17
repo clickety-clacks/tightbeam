@@ -250,7 +250,22 @@ defmodule Tightbeam.ToolCalls do
              [type, name]
            ) do
         [[sql]] ->
-          unless normalize_schema_sql(sql) == normalize_schema_sql(expected_sql) do
+          matches_expected? = normalize_schema_sql(sql) == normalize_schema_sql(expected_sql)
+
+          # Projection adds submitter after this historical migration. SQLite places
+          # an added column immediately before the table-level CHECK constraint.
+          actual_sql = normalize_schema_sql(sql)
+          submitter_column = "markerTo TEXT, submitter TEXT, CHECK"
+
+          matches_submitter? =
+            name == "messages" and String.contains?(actual_sql, submitter_column) and
+              String.replace(
+                actual_sql,
+                submitter_column,
+                "markerTo TEXT, CHECK"
+              ) == normalize_schema_sql(expected_sql)
+
+          unless matches_expected? or matches_submitter? do
             raise Tightbeam.Schema.ShapeError,
               message:
                 "incompatible_tool_call_transition_schema_object: #{inspect({type, name, sql})}"

@@ -7,6 +7,7 @@ defmodule Tightbeam.ProjectionTest do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     :ok = Projection.ensure_schema(name)
+    :ok = Projection.ensure_submitter_column(name)
 
     :ok =
       DB.execute(name, """
