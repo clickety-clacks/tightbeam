@@ -10990,6 +10990,88 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[3]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
+  # wi_47c7e2eb: this count runs in the database writer at every turn end. It
+  # reads one turn per late session, the newest started one, however long the
+  # session's history is. Before, it read every turn of every late session, and
+  # a publication on a large org stalled the writer for seconds per turn end.
+  test "identity staleness alarm decides each session by its newest started turn alone", ctx do
+    base_dir = role_test_base("identity-staleness-bounded")
+    assert :initialized = Identity.init!(base_dir)
+    :ok = Tightbeam.AdminProjection.bootstrap_served(ctx.db, base_dir)
+    ensure_main_session(ctx.db, "flynn")
+    ensure_global_registry()
+
+    {:ok, [[item, published_at]]} =
+      DB.query(
+        ctx.db,
+        "SELECT item, updatedAt FROM admin_projection_versions " <>
+          "WHERE resource = 'identity' AND primaryKey = 'served'"
+      )
+
+    %{"liveRevision" => revision} = JSON.decode!(item)
+    now = System.system_time(:millisecond)
+
+    turn = fn session, status, started_at ->
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: session.session_key,
+          message_id: "identity-staleness-bounded-#{System.unique_integer([:positive])}",
+          origin: "user:flynn",
+          prompt: "fixture"
+        })
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE turns SET status = ?2, startedAt = ?3, endedAt = ?3 WHERE seq = ?1",
+          [seq, status, started_at]
+        )
+    end
+
+    behind = fn key ->
+      session = create_session(ctx.db, key, "flynn")
+      Org.set_identity_revision(ctx.db, key, "older-revision")
+      session
+    end
+
+    # A long history before the publication, then one turn after it: late.
+    late = behind.("agent:identity-bounded-late")
+    for offset <- 50..1//-1, do: turn.(late, "delivered", published_at - offset)
+    turn.(late, "delivered", published_at + 1)
+
+    # Late, with turns still waiting behind the one that ran.
+    queued_behind = behind.("agent:identity-bounded-queued")
+    turn.(queued_behind, "delivered", published_at + 1)
+    turn.(queued_behind, "queued", nil)
+    turn.(queued_behind, "queued", nil)
+
+    # Only history from before the publication, however much: not late.
+    quiet = behind.("agent:identity-bounded-quiet")
+    for offset <- 50..1//-1, do: turn.(quiet, "delivered", published_at - offset)
+
+    # Never started a turn at all: not late.
+    idle = behind.("agent:identity-bounded-idle")
+    turn.(idle, "queued", nil)
+
+    # The newest started turn decides. Turns of one session start in `seq`
+    # order, so an older turn carrying a later start time is not a state the
+    # ledger produces; this row exists to show the count does not look past
+    # the newest started turn into the session's history.
+    newest_decides = behind.("agent:identity-bounded-newest")
+    turn.(newest_decides, "delivered", published_at + 1)
+    turn.(newest_decides, "delivered", published_at - 1)
+
+    assert {:scheduled, 2, ^revision} = Gateway.identity_staleness_alarm_for_test(ctx.db, now)
+
+    assert {:ok, [[prompt]]} = DB.query(ctx.db, "SELECT prompt FROM wakes")
+
+    assert prompt ==
+             "Identity staleness: active sessions late for published revision #{revision}: 2."
+
+    for session <- [late, queued_behind, quiet, idle, newest_decides],
+        do: refute(prompt =~ session.session_key)
+  end
+
   test "learn and unlearn reload all law and unlearn names durable references", ctx do
     case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
       {:ok, _pid} -> :ok
