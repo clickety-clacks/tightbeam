@@ -4,6 +4,8 @@
 # and use the supported ruling seam for the request kind.
 [[rule]]
 name = "harklight-decision-request-briefing"
+# A substrate rule: it observes decision requests filed by any agent.
+archetypes = ["*"]
 verb = "condition"
 edges = ["row-commit"]
 effect = "notice"
