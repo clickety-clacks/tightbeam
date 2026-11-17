@@ -9696,9 +9696,11 @@ defmodule Tightbeam.Gateway do
              revision = session.identity_revision || Identity.live_revision!(config.base_dir),
              snapshot = served_snapshot(config, destination, harness_atom, revision),
              guidance =
-               if context_enabled?,
-                 do: snapshot.guidance,
-                 else: append_durable_session_handoff(snapshot.guidance, handoff.records),
+               if context_enabled? do
+                 snapshot.guidance
+               else
+                 append_durable_session_handoff(snapshot.guidance, handoff.records)
+               end,
              mcp_servers = mcp_servers_for_archetype(session.archetype),
              cwd = Placement.holder_workdir(config, session) do
           destination_payload_evidence =
