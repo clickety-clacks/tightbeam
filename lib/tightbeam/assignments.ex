@@ -14,7 +14,6 @@ defmodule Tightbeam.Assignments do
     EventLog,
     Mementos,
     Org,
-    Placement,
     Projection,
     RailRemedy,
     Rules,

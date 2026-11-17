@@ -85,8 +85,12 @@ defmodule Tightbeam.AttestFileCheck do
     case runner.(["ssh", "-o", "BatchMode=yes", destination, command]) do
       {output, 0} ->
         case JSON.decode(output) do
-          {:ok, %{"status" => "present"}} -> %{status: "present"}
-          {:ok, %{"status" => "absent"}} -> %{status: "absent"}
+          {:ok, %{"status" => "present"}} ->
+            %{status: "present"}
+
+          {:ok, %{"status" => "absent"}} ->
+            %{status: "absent"}
+
           {:ok, %{"status" => "could_not_access", "error" => error}} ->
             %{status: "could_not_access", error: error}
 

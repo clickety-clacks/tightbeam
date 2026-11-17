@@ -223,8 +223,10 @@ defmodule Tightbeam.EffortCheckinTest do
              })
 
     refute Map.has_key?(handlers, "effort-rule")
+
     assert {:ok, [["open"]]} =
              DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
+
     assert %{state: "pending"} = Wakes.get(ctx.db, deadline.wake_id)
   end
 

@@ -1045,7 +1045,6 @@ defmodule Tightbeam.Gateway do
       {"harklight-cover", []} => fn call ->
         Tightbeam.HarklightOriginListener.cover(call)
       end,
-
       {"harklight-listener-restore", []} => fn call ->
         HarklightWakes.restore_listener(db, call, call.params[:handle])
       end,

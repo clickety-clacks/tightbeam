@@ -7557,7 +7557,8 @@ defmodule Tightbeam.AssignmentsTest do
           {"art_present", assignment.id, "lab1:/files/present", "in-workspace", nil},
           {"art_missing", assignment.id, "lab1:/files/missing", "in-workspace", nil},
           {"art_unreachable", assignment.id, "lab1:/files/unreachable", "in-workspace", nil},
-          {"art_disappeared_host", assignment.id, "missinghost:/files/unknown", "in-workspace", nil},
+          {"art_disappeared_host", assignment.id, "missinghost:/files/unknown", "in-workspace",
+           nil},
           {"art_archived", assignment.id, "lab1:/files/old", "archived", "/files/archive"},
           {"art_unrelated", nil, "lab1:/files/unrelated", "in-workspace", nil}
         ] do
@@ -7570,7 +7571,10 @@ defmodule Tightbeam.AssignmentsTest do
       Gateway.handlers(%{
         db: ctx.db,
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
-        sh: fn _ -> send(parent, :attest_probe); {"", 0} end,
+        sh: fn _ ->
+          send(parent, :attest_probe)
+          {"", 0}
+        end,
         file_stat: fn path ->
           send(parent, {:checked, path})
 
@@ -7623,6 +7627,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert result.summary ==
              "absent: lab1:/files/missing; could not access: missinghost:/files/unknown, lab1:/files/unreachable"
+
     assert_received {:checked, "/files/archive"}
     refute_received {:checked, "/files/old"}
     refute_received {:checked, "/files/unrelated"}
@@ -7642,6 +7647,7 @@ defmodule Tightbeam.AssignmentsTest do
         base_dir: Application.fetch_env!(:tightbeam, :base_dir),
         file_stat: fn _path ->
           send(parent, {:check_entered, self()})
+
           receive do
             :release_check -> {:ok, %{}}
           end
@@ -7667,6 +7673,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{attest: %{kind: "progress"}} = Task.await(another, 10_000)
     send(check.pid, :release_check)
+
     assert {:ok, %{files: [%{status: "present"}], summary: "All 1 files are present on disk."}} =
              Task.await(check, 10_000)
   end
@@ -7890,7 +7897,15 @@ defmodule Tightbeam.AssignmentsTest do
     assert snapshot.() == before_settled_reads
   end
 
-  defp seed_file_artifact(db, work_item_id, id, producer, origin, state \\ "in-workspace", home \\ nil) do
+  defp seed_file_artifact(
+         db,
+         work_item_id,
+         id,
+         producer,
+         origin,
+         state \\ "in-workspace",
+         home \\ nil
+       ) do
     {:ok, _} =
       DB.query(
         db,

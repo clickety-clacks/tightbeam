@@ -2164,41 +2164,6 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-
-  def handle_call({:retry_handle, handle}, from, state) do
-    cond do
-      listener_start_in_flight?(state, handle) ->
-        {:reply, :in_progress, state}
-
-      true ->
-        case DB.query(
-               state.db,
-               "SELECT state FROM harklight_wake_handles WHERE handle=?1",
-               [handle]
-             ) do
-          {:ok, [[state_value]]} when state_value in ["active", "complete"] ->
-            {:reply, {:not_failed, state_value}, state}
-
-          {:ok, [["unavailable"]]} ->
-            state = %{
-              state
-              | retry_waiters:
-                  Map.put(state.retry_waiters, handle, %{from: from, started_for: %{}})
-            }
-
-            {:noreply, start_worker(state, handle, :retry)}
-
-          {:ok, []} ->
-            {:reply, {:failed, "handle no longer exists", %{eligibility_undecidable: true}},
-             state}
-
-          _ ->
-            {:reply, {:failed, "handle state unavailable", %{eligibility_undecidable: true}},
-             state}
-        end
-    end
-  end
-
   @impl true
   def handle_call({:capture, handle, line}, from, state) do
     result =

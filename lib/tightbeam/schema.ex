@@ -6149,6 +6149,7 @@ defmodule Tightbeam.Schema do
            ] ->
         :ok = check_work_item_owner_link_shape(db)
         :ok = check_decision_request_row_schema_shape(db)
+
         if shape in [@session_custody_shape, @session_custody_artifact_process_shape],
           do: check_session_custody_shape(db),
           else: :ok

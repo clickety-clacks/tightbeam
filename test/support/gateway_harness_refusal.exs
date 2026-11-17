@@ -122,6 +122,7 @@ defmodule GatewayHarnessRefusal do
 
       assert prompt == "[from You]\n\n" <> content
       assert byte_size(prompt) == 65_549
+
       assert {:ok, [[^content, 65_537]]} =
                Tightbeam.DB.query(
                  db,
