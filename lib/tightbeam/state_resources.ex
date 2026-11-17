@@ -114,7 +114,7 @@ defmodule Tightbeam.StateResources do
            ), ''),
            'user:' || session_owner.ownerUserId
          ) ELSE m.sender END,
-         m.deviceId, m.clientMessageId,
+         m.submitter, m.deviceId, m.clientMessageId,
          m.replyToMessageId, m.replyToClientMessageId, m.llmVisibleMessageId,
          m.attachments, m.attentionTier,
          t.seq, t.assignmentId, t.jobRef, t.harness, t.model,
@@ -164,7 +164,24 @@ defmodule Tightbeam.StateResources do
            ) THEN NULL
            WHEN t.origin LIKE 'agent:%' OR t.origin LIKE 'process:%' THEN 0
            ELSE NULL
-         END
+         END,
+         COALESCE((
+           SELECT json_group_array(json_object(
+             'assetId', latest.assetId,
+             'outcome', latest.outcome,
+             'reason', json(latest.reason)
+           ))
+           FROM message_attachment_delivery_results AS latest
+           WHERE latest.messageId=m.id
+             AND latest.seq=(
+               SELECT MAX(previous.seq)
+               FROM message_attachment_delivery_results AS previous
+               WHERE previous.messageId=latest.messageId
+                 AND previous.assetId=latest.assetId
+             )
+         ), '[]'),
+         (SELECT COUNT(*) FROM message_attachment_delivery_results AS delivery_count
+           WHERE delivery_count.messageId=m.id)
   FROM messages AS m
   LEFT JOIN turns AS t
     ON t.seq IN (
@@ -244,7 +261,7 @@ defmodule Tightbeam.StateResources do
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
     "transcript messages" =>
-      ~w(id seq sessionKey role messageType marker content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq turnIncludesHuman isBatchCarrier assignmentId jobRef harness provider model effort context rowVersion),
+      ~w(id seq sessionKey role messageType marker content at sender submitter deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq turnIncludesHuman isBatchCarrier assignmentId jobRef harness provider model effort context rowVersion),
     "tool calls" =>
       ~w(id seq sessionKey turnSeq afterMessageSeq harnessToolCallId title kind toolName status rawInput rawOutput content truncated startedAt endedAt rowVersion),
     "condition facts" => ~w(id ts kind scope origin rowVersion),
@@ -439,6 +456,7 @@ defmodule Tightbeam.StateResources do
     {"read markers", "marker"} => :read_marker,
     {"transcript messages", "attachments"} => {:array, :attachment, :preserve},
     {"transcript messages", "marker"} => :transition_marker,
+    {"transcript messages", "submitter"} => :submitter,
     {"transcript messages", "context"} => :json,
     {"tool calls", "rawInput"} => :json,
     {"tool calls", "rawOutput"} => :json,
@@ -2084,6 +2102,7 @@ defmodule Tightbeam.StateResources do
       "content" => required_wire_string!(value(row, :content), "content"),
       "at" => message_at!(row),
       "sender" => message_sender!(row, stored_type),
+      "submitter" => value(row, :submitter),
       "deviceId" => nullable_string!(value(row, :device_id), "deviceId"),
       "clientMessageId" => nullable_string!(value(row, :client_message_id), "clientMessageId"),
       "replyToMessageId" =>
@@ -2111,6 +2130,7 @@ defmodule Tightbeam.StateResources do
       end
 
     item = if is_nil(message_type), do: Map.delete(item, "messageType"), else: item
+    item = if is_nil(item["submitter"]), do: Map.delete(item, "submitter"), else: item
 
     item =
       if value(row, :is_batch_carrier) == true,
@@ -2427,6 +2447,9 @@ defmodule Tightbeam.StateResources do
 
     fields = if Map.has_key?(item, "marker"), do: fields, else: List.delete(fields, "marker")
 
+    fields =
+      if Map.has_key?(item, "submitter"), do: fields, else: List.delete(fields, "submitter")
+
     case Map.fetch(item, "messageType") do
       {:ok, value} when is_binary(value) ->
         fields
@@ -2572,13 +2595,33 @@ defmodule Tightbeam.StateResources do
     )
   end
 
-  defp validate_wire_value!(value, :attachment, label) do
-    validate_closed_wire_object!(
-      value,
-      %{"assetId" => :string, "mimeType" => :string, "filename" => :string, "size" => :integer},
-      label
-    )
+  defp validate_wire_value!(value, :attachment, label) when is_map(value) do
+    base_types = %{
+      "assetId" => :string,
+      "mimeType" => :string,
+      "filename" => :string,
+      "size" => :integer
+    }
+
+    fields = Enum.sort(Map.keys(value))
+    base_fields = Enum.sort(Map.keys(base_types))
+    delivery_fields = Enum.sort(Map.keys(base_types) ++ ["delivery"])
+
+    cond do
+      fields == base_fields ->
+        validate_closed_wire_object!(value, base_types, label)
+
+      fields == delivery_fields ->
+        validate_closed_wire_object!(value, Map.put(base_types, "delivery", :json), label)
+        :ok = encode_delivery!(Map.fetch!(value, "delivery"))
+
+      true ->
+        raise ArgumentError, "#{label} has an extra or missing field"
+    end
   end
+
+  defp validate_wire_value!(_value, :attachment, label),
+    do: raise(ArgumentError, "#{label} must be an object")
 
   defp validate_wire_value!(value, :transition_marker, label) do
     validate_closed_wire_object!(
@@ -2606,6 +2649,14 @@ defmodule Tightbeam.StateResources do
 
   defp validate_wire_value!(value, :commit_ref, label) do
     validate_closed_wire_object!(value, %{"repo" => :string, "commit" => :string}, label)
+  end
+
+  defp validate_wire_value!(value, :submitter, label) do
+    validate_closed_wire_object!(
+      value,
+      %{"identity" => {:nullable, :string}, "displayName" => {:nullable, :string}},
+      label
+    )
   end
 
   defp validate_wire_value!(value, :decision_option, label) do
@@ -2807,15 +2858,18 @@ defmodule Tightbeam.StateResources do
   end
 
   defp encode_item_field("transcript messages", "attachments", value) do
-    encode_closed_list!(
-      value,
-      ~w(assetId mimeType filename size),
-      "transcript messages.attachments"
-    )
+    unless is_list(value),
+      do: raise(ArgumentError, "transcript messages.attachments must be an array")
+
+    encoded = Enum.map_join(value, ",", &encode_message_attachment!/1)
+    "[" <> encoded <> "]"
   end
 
   defp encode_item_field("transcript messages", "marker", value),
     do: encode_closed_object!(value, ~w(kind from to), "transcript messages.marker")
+
+  defp encode_item_field("transcript messages", "submitter", value),
+    do: encode_closed_object!(value, ~w(identity displayName), "transcript messages.submitter")
 
   defp encode_item_field("transcript messages", "context", value), do: encode_j!(value)
 
@@ -2905,6 +2959,64 @@ defmodule Tightbeam.StateResources do
 
   defp encode_closed_object!(_value, _fields, label),
     do: raise(ArgumentError, "#{label} must be an object")
+
+  defp encode_message_attachment!(attachment) when is_map(attachment) do
+    base_fields = ~w(assetId mimeType filename size)
+
+    fields = Enum.sort(Map.keys(attachment))
+
+    cond do
+      fields == Enum.sort(base_fields) ->
+        encode_closed_object!(attachment, base_fields, "transcript messages.attachments")
+
+      fields == Enum.sort(base_fields ++ ["delivery"]) ->
+        :ok = encode_delivery!(Map.fetch!(attachment, "delivery"))
+
+        encode_closed_object!(
+          attachment,
+          base_fields ++ ["delivery"],
+          "transcript messages.attachments"
+        )
+
+      true ->
+        raise ArgumentError, "transcript messages.attachments has an extra or missing field"
+    end
+  end
+
+  defp encode_message_attachment!(_attachment),
+    do: raise(ArgumentError, "transcript messages.attachments must contain objects")
+
+  defp encode_delivery!(%{"outcome" => outcome, "reason" => reason} = delivery)
+       when outcome in ["pending", "delivered", "not-delivered", "unknown"] do
+    encode_closed_object!(
+      delivery,
+      ~w(outcome reason),
+      "transcript messages.attachments.delivery"
+    )
+
+    case {outcome, reason} do
+      {outcome, nil} when outcome in ["pending", "delivered"] ->
+        :ok
+
+      {outcome, %{"code" => code, "message" => message} = value}
+      when outcome in ["not-delivered", "unknown"] and is_binary(code) and code != "" and
+             is_binary(message) and message != "" ->
+        encode_closed_object!(
+          value,
+          ~w(code message),
+          "transcript messages.attachments.delivery.reason"
+        )
+
+        :ok
+
+      _ ->
+        raise ArgumentError,
+              "transcript messages.attachments.delivery has an invalid outcome or reason"
+    end
+  end
+
+  defp encode_delivery!(_delivery),
+    do: raise(ArgumentError, "transcript messages.attachments.delivery must be an object")
 
   defp encode_j!(value) when is_map(value) do
     unless Enum.all?(Map.keys(value), &is_binary/1) do
@@ -3016,6 +3128,7 @@ defmodule Tightbeam.StateResources do
          marker_to,
          at,
          sender,
+         submitter,
          device_id,
          client_message_id,
          reply_to_message_id,
@@ -3031,7 +3144,9 @@ defmodule Tightbeam.StateResources do
          effort,
          context,
          is_batch_carrier,
-         turn_includes_human
+         turn_includes_human,
+         delivery_results,
+         delivery_result_count
        ]) do
     {harness, model, effort, context} =
       if role == "assistant",
@@ -3050,12 +3165,13 @@ defmodule Tightbeam.StateResources do
       content: content,
       at: at,
       sender: sender,
+      submitter: if(submitter, do: JSON.decode!(submitter)),
       device_id: device_id,
       client_message_id: client_message_id,
       reply_to_message_id: reply_to_message_id,
       reply_to_client_message_id: reply_to_client_message_id,
       llm_visible_message_id: llm_visible_message_id,
-      attachments: JSON.decode!(attachments),
+      attachments: project_attachment_delivery(JSON.decode!(attachments), delivery_results),
       attention_tier: attention_tier,
       turn_seq: turn_seq,
       is_batch_carrier: is_batch_carrier == 1,
@@ -3074,8 +3190,25 @@ defmodule Tightbeam.StateResources do
       # A staged human row gains its turn association when it is delivered.
       # Include that sequence so publishing the updated projection advances
       # rowVersion even when the message timestamp is unchanged.
-      row_version: max(seq, at) + if(is_integer(turn_seq), do: turn_seq, else: 0)
+      row_version:
+        max(seq, at) + if(is_integer(turn_seq), do: turn_seq, else: 0) + delivery_result_count
     }
+  end
+
+  defp project_attachment_delivery(attachments, encoded_results) do
+    deliveries =
+      encoded_results
+      |> JSON.decode!()
+      |> Map.new(fn result ->
+        {result["assetId"], %{"outcome" => result["outcome"], "reason" => result["reason"]}}
+      end)
+
+    Enum.map(attachments, fn attachment ->
+      case Map.fetch(deliveries, attachment["assetId"]) do
+        {:ok, delivery} -> Map.put(attachment, "delivery", delivery)
+        :error -> attachment
+      end
+    end)
   end
 
   defp message_sender!(row, message_type) do
