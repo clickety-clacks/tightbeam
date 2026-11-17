@@ -219,7 +219,7 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
            )
          end) do
       {:ok, {:released, release}} ->
-        harness = Harness.parse!(release.harness)
+        harness = Harness.parse!(release.harness).id()
 
         Tightbeam.AdapterCoordinator.release_recovered_circuit(
           Tightbeam.AdapterCoordinator,
