@@ -13022,6 +13022,7 @@ defmodule Tightbeam.GatewayTest do
 
     response = rest_post(ctx, "tbc_test", body)
     assert response.status == 200
+
     assert %{
              "result" => %{
                "ack" => "c_rest_attachment",
@@ -13146,6 +13147,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     assert response.status == 200
+
     assert %{
              "result" => %{
                "ack" => "c_rest_queued_receipt",
