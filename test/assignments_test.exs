@@ -3,7 +3,7 @@ defmodule Tightbeam.AssignmentsTest do
   alias Tightbeam.Model
 
   @session_identity_shape "session-identity-v1-0114"
-  @current_shape "session-custody-artifact-process-attribution-v1-0117"
+  @current_shape "attest-lifecycle-actor-v1-0117"
 
   alias Tightbeam.{
     Assignments,
@@ -6243,20 +6243,27 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "attest lifecycle, authorization precedence, and terminal race are atomic", ctx do
+  test "attest lifecycle, principals other than the holder, and terminal race are atomic",
+       ctx do
     assignment =
       assign_call({:session, "holder"}, "work")
       |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
-    assert %{code: "not_holder"} =
-             handle(ctx, "attest", attest_call({:process, "cron"}, assignment.id, "progress"))
+    # Automation and users record progress too; the row names who filed it.
+    process_progress =
+      handle(ctx, "attest", attest_call({:process, "cron"}, assignment.id, "progress"))
+
+    assert %{kind: "progress", bySession: nil, byUser: nil} = process_progress.attest
+    assert process_progress.assignment.state == "open"
 
     assert %{code: "principal_required"} =
              handle(ctx, "attest", attest_call(nil, assignment.id, "progress"))
 
-    assert %{code: "not_holder"} =
-             handle(ctx, "attest", attest_call({:user, "flynn"}, assignment.id, "progress"))
+    user_progress =
+      handle(ctx, "attest", attest_call({:user, "flynn"}, assignment.id, "progress"))
+
+    assert %{kind: "progress", bySession: nil, byUser: "flynn"} = user_progress.attest
 
     third_party_progress =
       handle(
@@ -6942,28 +6949,84 @@ defmodule Tightbeam.AssignmentsTest do
     refute message =~ String.duplicate("c", 40)
   end
 
-  test "non-session commit-ref attestations remain refused", ctx do
-    assignment =
-      assign_call({:user, "flynn"}, "non-session evidence")
-      |> put_in([:params, :effect_kind], "code")
-      |> then(&handle(ctx, "assign", &1))
+  test "a user records commit-ref evidence and completes reviewed code for its holder", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
 
     refs = [
-      %{"repo" => "testhost:/tmp/non-session-evidence", "commit" => String.duplicate("a", 40)}
+      %{"repo" => "testhost:/tmp/user-evidence", "commit" => String.duplicate("a", 40)}
     ]
 
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "user-completed producer"))
+
+    # A user's verification is recorded under the user; it is not the holder's.
+    assert %{attest: %{verdictKind: "verified", byUser: "flynn", bySession: nil}} =
+             attest_call({:user, "flynn"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    review =
+      assign_call({:user, "flynn"}, "user-completed review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], refs)
+             |> then(&handle(ctx, "attest", &1))
+
     completion =
-      attest_call({:user, "flynn"}, assignment.id, "completion")
+      attest_call({:user, "flynn"}, producer.id, "completion")
       |> put_in([:params, :commit_refs], refs)
 
-    assert %{code: "not_holder"} = handle(ctx, "attest", completion)
+    assert %{attest: %{kind: "completion", byUser: "flynn", bySession: nil}, assignment: closed} =
+             handle(ctx, "attest", completion)
 
-    verification =
-      attest_call({:user, "flynn"}, assignment.id, "verdict")
-      |> put_in([:params, :verdict_kind], "verified")
-      |> put_in([:params, :commit_refs], refs)
+    assert %{state: "closed", outcome: "completed", closedByUser: "flynn", closedBySession: nil} =
+             closed
+  end
 
-    assert %{code: "not_holder"} = handle(ctx, "attest", verification)
+  test "automation completes an assignment and the closed row can be reopened", ctx do
+    assignment =
+      assign_call({:user, "flynn"}, "automation-completed")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{kind: "completion", bySession: nil, byUser: nil}, assignment: closed} =
+             handle(ctx, "attest", attest_call({:process, "ci"}, assignment.id, "completion"))
+
+    assert %{
+             state: "closed",
+             outcome: "completed",
+             closedByUser: nil,
+             closedBySession: nil,
+             closedByProcess: nil
+           } = closed
+
+    assert %{assignment: %{state: "open"}} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "more to do")
+             )
   end
 
   test "review attest accepts the canonical remote and ref commit shape", ctx do
