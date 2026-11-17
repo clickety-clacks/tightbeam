@@ -284,12 +284,8 @@ defmodule Tightbeam.Identity do
            cd: identity_dir,
            stderr_to_stdout: true
          ) do
-      {_output, 0} ->
-        true
-
-      {_output, 1} ->
-        false
-
+      {_output, 0} -> true
+      {_output, 1} -> false
       {output, status} -> raise "git rev-parse failed (#{status}): #{String.trim(output)}"
     end
   end
@@ -1541,8 +1537,12 @@ defmodule Tightbeam.Identity do
            cd: dir,
            stderr_to_stdout: true
          ) do
-      {_output, 0} -> true
-      {_output, 1} -> false
+      {_output, 0} ->
+        true
+
+      {_output, 1} ->
+        false
+
       {output, 128} ->
         if String.trim_trailing(output) ==
              "fatal: path '#{path}' does not exist in '#{revision}'" do
