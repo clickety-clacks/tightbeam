@@ -481,7 +481,7 @@ defmodule Tightbeam.CredentialsTest do
     Process.sleep(5_100)
     send(server, :release_gate)
     assert {:ok, _staging, _lease_id} = Task.await(lifecycle, 1_000)
-    assert {:needs_onboarding, :in_progress} = Task.await(caller, 6_000)
+    assert {:pending, nil} = Task.await(caller, 6_000)
     assert :sys.get_state(server).status_reads == %{}
   end
 
