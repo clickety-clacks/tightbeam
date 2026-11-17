@@ -10,6 +10,7 @@ defmodule Tightbeam.Projection do
   older ever wrote a -1, and nothing older reads this table.
   """
 
+  alias Tightbeam.AttachmentDelivery
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
@@ -102,6 +103,7 @@ defmodule Tightbeam.Projection do
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
     :ok = DB.execute(db, @ddl)
+    :ok = AttachmentDelivery.ensure_schema(db)
     {:ok, columns} = DB.query(db, "PRAGMA table_info(messages)")
 
     unless Enum.any?(columns, fn row -> Enum.at(row, 1) == "submitter" end) do
@@ -173,6 +175,17 @@ defmodule Tightbeam.Projection do
             if(input[:submitter], do: JSON.encode!(input[:submitter]))
           ]
         )
+
+        if Map.get(input, :role) == "user" do
+          :ok =
+            AttachmentDelivery.append_pending_in_txn(
+              txn,
+              id,
+              Map.fetch!(input, :session_key),
+              client_message_id,
+              Map.get(input, :attachments, [])
+            )
+        end
 
         [row] = select_by_id(txn, id)
         {:appended, to_message(row)}

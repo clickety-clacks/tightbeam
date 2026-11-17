@@ -52,6 +52,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.NoticeBatcher,
     Tightbeam.AdminProjection,
     Tightbeam.Projection,
+    Tightbeam.AttachmentDelivery,
     Tightbeam.Org,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
