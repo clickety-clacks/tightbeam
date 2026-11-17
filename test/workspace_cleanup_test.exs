@@ -503,6 +503,106 @@ defmodule Tightbeam.WorkspaceCleanupTest do
              "/remote/base/archive"
   end
 
+  test "absent archives repoint records once without claiming recovered files", ctx do
+    kept = Path.join(ctx.workspace, "kept")
+    File.write!(kept, "archive")
+    artifact = artifact(ctx, kept)
+    retire(ctx)
+
+    assert %{status: "completed"} =
+             WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+    old = Artifacts.get(ctx.db, artifact.artifact_id)
+    File.rm_rf!(Path.dirname(old.home))
+    destination = Path.join(ctx.base, "destination")
+    Application.put_env(:tightbeam, :archive_dir, destination)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(worker, :drain)
+        :sys.get_state(worker)
+      end)
+
+    moved = Artifacts.get(ctx.db, artifact.artifact_id)
+    assert moved.state == "archived"
+
+    assert moved.home ==
+             String.replace_prefix(old.home, Path.join(ctx.base, "archive"), destination)
+
+    assert log =~ Path.dirname(old.home)
+    assert log =~ "are missing"
+    refute File.exists?(moved.home)
+
+    assert {:ok, [[archive_path]]} =
+             DB.query(
+               ctx.db,
+               "SELECT archivePath FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [ctx.session.session_key]
+             )
+
+    assert archive_path == Path.dirname(moved.home)
+    send(worker, :drain)
+    state = :sys.get_state(worker)
+    assert state.relocation_failures == %{}
+    assert state.timer == nil
+    assert Artifacts.get(ctx.db, artifact.artifact_id).updated_at == moved.updated_at
+  end
+
+  test "relocation failures grow the sweep delay across different entries and cap it", ctx do
+    source = Path.join(ctx.base, "archive")
+    destination = Path.join(ctx.base, "destination")
+    File.mkdir_p!(source)
+    for n <- 1..12, do: File.write!(Path.join(source, "blocked-#{n}"), "not a directory")
+    Application.put_env(:tightbeam, :archive_dir, destination)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+
+    for expected <- [
+          2_000,
+          4_000,
+          8_000,
+          16_000,
+          32_000,
+          64_000,
+          128_000,
+          256_000,
+          300_000,
+          300_000
+        ] do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          send(worker, :drain)
+          state = :sys.get_state(worker)
+          assert Process.read_timer(state.timer) > expected - 1_000
+          assert Process.read_timer(state.timer) <= expected
+        end)
+
+      assert log =~ "exited with status 1"
+    end
+
+    File.mkdir_p!(Path.join(source, "aaa-good"))
+    send(worker, :drain)
+    state = :sys.get_state(worker)
+    assert Process.read_timer(state.timer) <= 1_000
+    assert File.dir?(Path.join(destination, "aaa-good"))
+  end
+
+  test "archive roots that alias the same directory preserve their contents", ctx do
+    source = Path.join(ctx.base, "archive")
+    destination = Path.join(ctx.base, "destination")
+    File.mkdir_p!(Path.join(source, "entry"))
+    File.write!(Path.join([source, "entry", "kept"]), "preserve")
+    File.ln_s!(source, destination)
+    Application.put_env(:tightbeam, :archive_dir, destination)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+    send(worker, :drain)
+    :sys.get_state(worker)
+    assert File.read!(Path.join([destination, "entry", "kept"])) == "preserve"
+  end
+
   test "each drain relocates only one existing archive entry", ctx do
     source = Path.join(ctx.base, "archive")
     destination = Path.join(ctx.base, "destination")
