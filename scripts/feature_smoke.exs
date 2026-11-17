@@ -47,7 +47,8 @@
 #
 # Both groups additionally need the org's identity/rules to carry the shipped
 # verification statutes (completion-requires-verification,
-# completion-requires-results-artifact) AND a `coder` archetype that admits this
+# completion-requires-results-artifact) AND an `agentic-engineering.coder`
+# archetype that admits this
 # host. Rules load once at gateway BOOT, so an org whose law changed under a
 # running gateway must be rebooted before the run. On the test host that means the
 # eb0ea2b org-law workaround must be REVERTED first: with it installed the
@@ -381,7 +382,7 @@ defmodule FeatureSmoke do
 
     session =
       ok!(state, "spawn", %{
-        "archetype" => "reviewer-code",
+        "archetype" => "agentic-engineering.reviewer-code",
         "workItemId" => wi_id,
         "displayName" => "smoke-local-deploy-#{unique()}",
         "idempotencyKey" => "local-deploy-#{unique()}"
@@ -407,7 +408,8 @@ defmodule FeatureSmoke do
         error in RuntimeError -> fail(state, Exception.message(error))
       end
 
-      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer-code", harness)
+      snapshot =
+        Tightbeam.Identity.snapshot!(state.base_dir, "agentic-engineering.reviewer-code", harness)
 
       assert(
         state,
@@ -613,7 +615,7 @@ defmodule FeatureSmoke do
     # session instead of whatever retired one a previous group left behind.
     reviewer =
       ok!(%{state | leg: reviewer_leg}, "spawn", %{
-        "archetype" => "reviewer-code",
+        "archetype" => "agentic-engineering.reviewer-code",
         "workItemId" => wi_id,
         "displayName" => "smoke-gate-reviewer-#{u}",
         "idempotencyKey" => "grv-#{u}"
@@ -1178,14 +1180,16 @@ defmodule FeatureSmoke do
   # A host-pinned coder holding grounded work. Both halves need exactly this, and the
   # pieces are load-bearing in ways worth keeping together rather than duplicating.
   #
-  # `holder_archetype in ["coder"]` is a deny_when condition on both verification statutes,
-  # so a default-archetype holder would walk straight past them and prove nothing.
+  # `holder_archetype in ["agentic-engineering.coder"]` is a deny_when condition
+  # on both verification statutes, so a default-archetype holder would walk
+  # straight past them and prove nothing.
   #
   # THE HOST IS PINNED, and the seed depends on it. `Placement.resolve/3` reads a nil host
-  # as "first of archetype.where" unless the archetype grants `["*"]`, and the shipped coder
-  # archetype is a restricted `where` list — so an unpinned spawn on any other gateway
+  # as "first of archetype.where" unless the archetype grants `["*"]`, and the shipped
+  # `agentic-engineering.coder` archetype has a restricted `where` list — so an unpinned spawn
+  # on any other gateway
   # places the holder on a DIFFERENT machine while the seed is written locally. Where an
-  # org's coder archetype does not admit this host the spawn is refused `host_not_allowed`
+  # org's `agentic-engineering.coder` archetype does not admit this host the spawn is refused `host_not_allowed`
   # by name, which is the right failure: about the org's law, not about a file that
   # mysteriously is not there.
   defp open_grounded_assignment!(state, u, wi_id, subject, tag) do
@@ -1198,7 +1202,7 @@ defmodule FeatureSmoke do
 
     session =
       ok!(state, "spawn", %{
-        "archetype" => "coder",
+        "archetype" => "agentic-engineering.coder",
         "host" => Tightbeam.Placement.local_host_name(),
         "displayName" => "smoke-#{tag}-coder-#{u}",
         "workItemId" => wi_id,
@@ -1908,13 +1912,17 @@ defmodule FeatureSmoke do
         ok!(state, "config", %{
           "action" => "set",
           "setting" => "default-archetype",
-          "value" => "reviewer-code"
+          "value" => "agentic-engineering.reviewer-code"
         })
 
         got =
           ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
 
-        assert(state, got == "reviewer-code", "config: set did not persist (#{inspect(got)})")
+        assert(
+          state,
+          got == "agentic-engineering.reviewer-code",
+          "config: set did not persist (#{inspect(got)})"
+        )
 
         wi = ok!(state, "work-item-create", %{"title" => "smoke default archetype #{unique()}"})
         wi_id = wi["workItemId"] || wi["id"]
@@ -1940,7 +1948,11 @@ defmodule FeatureSmoke do
 
         retire(state, spawn)
         retire(state, topology)
-        assert(state, arch == "reviewer-code", "config: spawn archetype was #{inspect(arch)}")
+        assert(
+          state,
+          arch == "agentic-engineering.reviewer-code",
+          "config: spawn archetype was #{inspect(arch)}"
+        )
       end
     )
 
@@ -2399,11 +2411,11 @@ defmodule FeatureSmoke do
     u = unique()
 
     # Ownerless intake uses the office spawn path, then opens a same-item
-    # coordination card. Supplying workItemId to spawn would request production
-    # staffing before this item's first delivery owner exists.
+    # coordination card. Supplying workItemId here would request production
+    # staffing before the item's first delivery owner exists.
     coordinator =
       ok!(state, "spawn", %{
-        "archetype" => "product-owner",
+        "archetype" => "agentic-engineering.product-owner",
         "displayName" => "smoke-topology-#{u}",
         "idempotencyKey" => "topology-#{u}"
       })

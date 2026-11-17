@@ -5,6 +5,20 @@
 # substrate records an accountable notice, keeps the completion pending, and releases it after
 # the matching review lands. The accountable owner directs staffing.
 [[rule]]
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 name = "completion-requires-review"
 verb = "attest"
 text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards, to be reviewed-clean on a card held by a different session; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
@@ -29,6 +43,20 @@ prompt = "Coordinate independent review of assignment {assignment_id}; preserve 
 # recon. The recon archetype elects bug-provenance; its diagnosed verdict releases
 # the work-item-grain remedy episode and permits the re-fix dispatch.
 [[rule]]
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 name = "refix-requires-diagnosis"
 verb = "dispatch"
 text = "a repeated bug fix requires a diagnosed verdict on its work item"
@@ -50,6 +78,20 @@ reviews = "{assignment_id}"
 work_item = "{work_item_id}"
 
 [[rule]]
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 name = "code-review-requires-passing-tests"
 verb = "assign"
 text = "code review needs the code author's passing-test receipt: the assignment holder must file a tests-passed verdict with the tested repository, commit, command or suite, and passing result"
@@ -58,7 +100,7 @@ effect = "deny"
 deny_when = [
   { fact = "assignment.is_producing_card", op = "eq", value = true },
   { fact = "assignment.state", op = "eq", value = "open" },
-  { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
+  { fact = "assignment.holder_archetype", op = "eq", value = "agentic-engineering.coder" },
   { fact = "assignment.holder_noted_verdict_kinds", op = "not_in", value = ["tests-passed"] },
 ]
 
@@ -73,6 +115,20 @@ deny_when = [
 # Born from the adjudication postmortem: an 11-round spec pipeline ran
 # spec->review->implementation with no product-owner edge to cross.
 [[rule]]
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 name = "spec-dispatch-requires-spirit"
 verb = "dispatch"
 text = "spec-backed work needs a product-owner spirit verdict first: assign your product-owner a spirit review of this work item; a spirit-approved verdict releases this dispatch"
@@ -99,6 +155,7 @@ deny_when = [
 # `target.archetype` names the session about to hold the card; the assignment
 # facts describe the reviewed or prior card, never the one being opened.
 [[rule]]
+archetypes = ["agentic-engineering.coder"]
 name = "implementation-requires-posture"
 verb = "assign"
 text = "implementation needs a posture ruling first: file posture-light or posture-heavy as a verdict on a card on this work item, with the reasoning, then assign"
@@ -106,11 +163,12 @@ external_producer = true
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "target.archetype", op = "eq", value = "coder" },
+  { fact = "target.archetype", op = "eq", value = "agentic-engineering.coder" },
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["posture-light", "posture-heavy"] },
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder"]
 name = "implementation-dispatch-requires-posture"
 verb = "dispatch"
 text = "implementation needs a posture ruling first: file posture-light or posture-heavy as a verdict on a card on this work item, with the reasoning, then dispatch"
@@ -118,7 +176,7 @@ external_producer = true
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "target.archetype", op = "eq", value = "coder" },
+  { fact = "target.archetype", op = "eq", value = "agentic-engineering.coder" },
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["posture-light", "posture-heavy"] },
 ]
 

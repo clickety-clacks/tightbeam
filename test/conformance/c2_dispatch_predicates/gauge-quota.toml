@@ -8,6 +8,7 @@ source = "Substrate manual §identity; §6 gauge exemption"
 legibility = "event:denied(rule=gauge-quota)"
 
 [[fixture.rule]]
+archetypes = ["*"]
 name = "gauge-quota"
 verb = "spawn"
 text = "the caller has reached the live-session gauge"

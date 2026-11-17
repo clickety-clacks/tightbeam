@@ -29,22 +29,26 @@ defmodule Tightbeam.RulesTransportTest do
     [[rule]]
     name = "ws-denial"
     verb = "post"
+    archetypes = ["*"]
     text = "websocket denied"
     deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
 
     [[rule]]
     name = "rest-denial"
     verb = "spawn"
+    archetypes = ["*"]
     text = "rest denied"
     deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
 
     [[rule]]
     name = "agent-denial"
     verb = "inspect"
+    archetypes = ["*"]
     text = "agent denied"
     deny_when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
     """)
 
+    Tightbeam.Archetypes.load!(base_dir)
     Rules.load!(base_dir, ["post", "spawn", "inspect"])
     parent = self()
 
@@ -193,6 +197,7 @@ defmodule Tightbeam.RulesTransportTest do
     [[rule]]
     name = "control-denial"
     verb = "tune"
+    archetypes = ["*"]
     text = "control denied"
     deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
     """)

@@ -392,6 +392,19 @@ defmodule Tightbeam.HarnessPiTest do
     assert Pi.extension_source(%{"hooks" => %{}}) =~ ~s(spawnSync("/bin/sh")
   end
 
+  test "Pi rail hooks capture session cwd at session start and ignore tool cwd" do
+    source = Pi.extension_source(%{"hooks" => %{}})
+
+    assert source =~ "pi.on(\"session_start\", async (_event, ctx) =>"
+
+    assert source =~
+             "sessionWorkdir = typeof ctx?.cwd === \"string\" && ctx.cwd ? resolve(ctx.cwd) : \"\""
+
+    assert source =~ "cwd: sessionWorkdir || process.cwd()"
+    assert source =~ "TIGHTBEAM_SESSION_WORKDIR: sessionWorkdir"
+    refute source =~ "event?.cwd"
+  end
+
   test "remote adapter rejects relative node candidates before probing them" do
     owner = self()
     adapter = "/remote/base/adapters/node_modules/.bin/pi-acp"

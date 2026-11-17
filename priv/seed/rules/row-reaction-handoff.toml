@@ -1,6 +1,7 @@
 # Terminal policy is elected with the engineering bundle.
 [[reaction]]
 name = "assignment-terminal-handoff"
+archetypes = ["*"]
 family = "terminal-handoff"
 events = ["assignment"]
 when = { op = "and", args = [{ op = "or", args = [{ op = "and", args = [{ op = "eq", args = [{ ref = "event.before.id" }, { ref = "event.after.id" }] }, { op = "eq", args = [{ ref = "event.before.state" }, "open"] }] }, { op = "eq", args = [{ ref = "event.historical" }, true] }] }, { op = "eq", args = [{ ref = "event.after.state" }, "closed"] }, { op = "or", args = [{ op = "and", args = [{ op = "eq", args = [{ ref = "terminal.source_kind" }, "attest"] }, { op = "in", args = [{ ref = "terminal.outcome" }, ["completed", "surrendered"]] }] }, { op = "and", args = [{ op = "eq", args = [{ ref = "terminal.source_kind" }, "assignment_revocation"] }, { op = "eq", args = [{ ref = "terminal.outcome" }, "revoked"] }] }] }] }

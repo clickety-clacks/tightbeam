@@ -171,8 +171,6 @@ defmodule Tightbeam.Gateway do
     db = Map.get(config, :db, Tightbeam.DB)
     :ok = DB.assert_base_admitted!(db, config.base_dir)
     Identity.init_after_admission!(config.base_dir, db)
-    warn_missing_installed_kungfu(config.base_dir)
-    load_law!(config)
     prod_limit = Map.get(config, :prod_limit, 3)
 
     unless is_integer(prod_limit) and prod_limit >= 0 do
@@ -182,6 +180,9 @@ defmodule Tightbeam.Gateway do
     File.mkdir_p!(config.base_dir)
 
     :ok = Schema.ensure_all(db)
+    _ = Tightbeam.Identity.RailScopeMigration.run!(config.base_dir, db)
+    warn_missing_installed_kungfu(config.base_dir)
+    load_law!(config)
     :ok = AdminProjection.bootstrap_served(db, config.base_dir)
     :ok = TerminalCredentialFailure.reconcile_all(db)
 
@@ -6062,63 +6063,69 @@ defmodule Tightbeam.Gateway do
   end
 
   defp identity_repoint_result(config, db, call) do
-    archetype = call.params.archetype
+    with {:ok, resolved_archetype} <- Archetypes.resolve(call.params.archetype) do
+      archetype = resolved_archetype.name
 
-    result =
-      case Org.get(db, call.session_key) do
-        nil ->
-          {:error, :not_found}
+      result =
+        case Org.get(db, call.session_key) do
+          nil ->
+            {:error, :not_found}
 
-        %{state: "retired"} ->
-          repoint_session_record(db, call.session_key, archetype)
+          %{state: "retired"} ->
+            repoint_session_record(db, call.session_key, archetype)
 
-        %{kind: "main"} = session ->
-          repoint_main_session(config, db, session, archetype)
+          %{kind: "main"} = session ->
+            repoint_main_session(config, db, session, archetype)
 
-        %{is_built_in: true} = session ->
-          repoint_main_session(config, db, session, archetype)
+          %{is_built_in: true} = session ->
+            repoint_main_session(config, db, session, archetype)
 
-        _session ->
-          {:error, :not_repointable}
-      end
+          _session ->
+            {:error, :not_repointable}
+        end
 
-    case result do
-      {:ok, session} ->
-        %{
-          state: "repointed",
-          session_key: session.session_key,
-          archetype: session.archetype
-        }
-
-      {:error, :unknown_archetype} ->
-        %{code: "unknown_archetype", message: "unknown archetype: #{archetype}"}
-
-      {:error, :not_found} ->
-        %{code: "not_found", message: "unknown session: #{call.session_key}"}
-
-      {:error, :not_repointable} ->
-        %{
-          code: "session_not_retired",
-          message: "session #{call.session_key} must be retired before archetype repoint"
-        }
-
-      {:error, :turn_in_progress} ->
-        turn_in_progress([call.session_key])
-
-      {:error, :archetype_release_in_progress} ->
-        %{
-          code: "archetype_release_in_progress",
-          message: "cannot repoint to #{archetype} while it is being released"
-        }
-
-      {:error, reason} ->
-        ErrorDiagnostic.put(
+      case result do
+        {:ok, session} ->
           %{
-            code: "identity_repoint_failed",
-            message: "session #{call.session_key} could not change archetype: #{inspect(reason)}"
-          },
-          ErrorDiagnostic.for_reason(reason, operation: "repoint_archetype")
-        )
+            state: "repointed",
+            session_key: session.session_key,
+            archetype: session.archetype
+          }
+
+        {:error, %{code: code} = error}
+        when code in ["unknown_archetype", "qualified_archetype_required"] ->
+          error
+
+        {:error, :not_found} ->
+          %{code: "not_found", message: "unknown session: #{call.session_key}"}
+
+        {:error, :not_repointable} ->
+          %{
+            code: "session_not_retired",
+            message: "session #{call.session_key} must be retired before archetype repoint"
+          }
+
+        {:error, :turn_in_progress} ->
+          turn_in_progress([call.session_key])
+
+        {:error, :archetype_release_in_progress} ->
+          %{
+            code: "archetype_release_in_progress",
+            message: "cannot repoint to #{archetype} while it is being released"
+          }
+
+        {:error, reason} ->
+          ErrorDiagnostic.put(
+            %{
+              code: "identity_repoint_failed",
+              message:
+                "session #{call.session_key} could not change archetype: #{inspect(reason)}"
+            },
+            ErrorDiagnostic.for_reason(reason, operation: "repoint_archetype")
+          )
+      end
+    else
+      {:error, error} -> error
     end
   end
 
@@ -7649,45 +7656,44 @@ defmodule Tightbeam.Gateway do
            }
          } = call
        ) do
-    case DB.transaction(db, fn txn ->
-           if Archetypes.get(archetype_name) do
-             result = Org.put_setting_projected_in_txn(txn, "default-archetype", archetype_name)
+    case Archetypes.resolve(archetype_name) do
+      {:ok, archetype} ->
+        case DB.transaction(db, fn txn ->
+               result = Org.put_setting_projected_in_txn(txn, "default-archetype", archetype.name)
 
-             Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+               Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
 
-             if result.changed do
-               Tightbeam.Firehose.Publisher.committed_in_txn(
-                 txn,
-                 "config.updated",
-                 result.projection,
-                 %{"key" => "default-archetype"}
-               )
-             end
+               if result.changed do
+                 Tightbeam.Firehose.Publisher.committed_in_txn(
+                   txn,
+                   "config.updated",
+                   result.projection,
+                   %{"key" => "default-archetype"}
+                 )
+               end
 
-             {:ok, result}
-           else
-             {:error, :unknown_archetype}
-           end
-         end) do
-      {:ok, {:ok, result}} ->
-        %{
-          setting: "default-archetype",
-          value: archetype_name,
-          config: StateResources.config(result.projection),
-          changed: result.changed
-        }
+               result
+             end) do
+          {:ok, result} ->
+            %{
+              setting: "default-archetype",
+              value: archetype.name,
+              config: StateResources.config(result.projection),
+              changed: result.changed
+            }
 
-      {:ok, {:error, :unknown_archetype}} ->
-        %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
+          {:error, %DB.ReferenceFenceError{archetypes: names}} ->
+            %{
+              code: "archetype_release_in_progress",
+              message: "cannot set default-archetype while releasing #{Enum.join(names, ", ")}"
+            }
 
-      {:error, %DB.ReferenceFenceError{archetypes: names}} ->
-        %{
-          code: "archetype_release_in_progress",
-          message: "cannot set default-archetype while releasing #{Enum.join(names, ", ")}"
-        }
+          {:error, error} ->
+            raise error
+        end
 
       {:error, error} ->
-        raise error
+        error
     end
   end
 
@@ -8832,28 +8838,34 @@ defmodule Tightbeam.Gateway do
 
     # Identity must exist; placement is constitutional set membership
     # (spec §Placement) — Placement denies, we relay, nobody judges.
-    case Archetypes.get(archetype_name) do
-      nil ->
-        %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
+    case Archetypes.resolve(archetype_name) do
+      {:ok, archetype} ->
+        case archetype do
+          %{ephemeral: true} when is_nil(caller.caller_session) ->
+            %{
+              code: "ephemeral_requires_caller",
+              message: "ephemeral spawns require a calling agent"
+            }
 
-      %{ephemeral: true} when is_nil(caller.caller_session) ->
-        %{code: "ephemeral_requires_caller", message: "ephemeral spawns require a calling agent"}
+          %{ephemeral: true} when is_map_key(p, :work_item_id) ->
+            %{
+              code: "ephemeral_obligation",
+              message: "ephemeral spawns cannot bind work items"
+            }
 
-      %{ephemeral: true} when is_map_key(p, :work_item_id) ->
-        %{
-          code: "ephemeral_obligation",
-          message: "ephemeral spawns cannot bind work items"
-        }
+          %{ephemeral: true} ->
+            if Tightbeam.Ephemeral.available?(db) do
+              create_available_spawn(config, db, call, caller, archetype)
+            else
+              %{code: "ephemeral_unavailable", message: "ephemeral migration failed"}
+            end
 
-      %{ephemeral: true} = archetype ->
-        if Tightbeam.Ephemeral.available?(db) do
-          create_available_spawn(config, db, call, caller, archetype)
-        else
-          %{code: "ephemeral_unavailable", message: "ephemeral migration failed"}
+          _ ->
+            create_available_spawn(config, db, call, caller, archetype)
         end
 
-      archetype ->
-        create_available_spawn(config, db, call, caller, archetype)
+      {:error, error} ->
+        error
     end
   end
 
