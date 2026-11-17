@@ -3,12 +3,13 @@
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const USAGE =
   'usage: tightbeam-select stage --root ROOT --package FILE --checksums SHA256SUMS --provenance release-provenance.json\n' +
-  '       tightbeam-select select --root ROOT --build sha256-<package-digest>';
+  '       tightbeam-select select --root ROOT --build sha256-<package-digest> [--base-dir DIR]';
 
 function refuse(message) {
   throw new Error(message);
@@ -377,10 +378,143 @@ function currentBuild(root) {
   return match[1];
 }
 
+function hasSymlink(root) {
+  const stat = fs.lstatSync(root);
+  if (stat.isSymbolicLink()) return true;
+  if (!stat.isDirectory()) return false;
+  return fs.readdirSync(root).some((name) => hasSymlink(path.join(root, name)));
+}
+
+function makeReadOnly(root) {
+  const stat = fs.lstatSync(root);
+  if (stat.isDirectory()) {
+    for (const name of fs.readdirSync(root)) makeReadOnly(path.join(root, name));
+    fs.chmodSync(root, 0o555);
+    return;
+  }
+  if (!stat.isFile()) refuse(`identity copy contains a non-regular entry: ${root}`);
+  fs.chmodSync(root, stat.mode & 0o555);
+}
+
+function makeWritable(root) {
+  const stat = fs.lstatSync(root);
+  if (stat.isDirectory()) {
+    fs.chmodSync(root, 0o700);
+    for (const name of fs.readdirSync(root)) makeWritable(path.join(root, name));
+    return;
+  }
+  if (stat.isFile()) fs.chmodSync(root, 0o600);
+}
+
+function warning(message) {
+  process.stderr.write(`tightbeam-select: warning: ${message}\n`);
+}
+
+function rulePreflight(candidate, baseDir) {
+  let scratch;
+  try {
+    scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'tightbeam-rule-preflight-'));
+    const installedIdentity = path.join(baseDir, 'identity');
+    let identityStat;
+    try {
+      identityStat = fs.lstatSync(installedIdentity);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        warning(`rule check could not complete: installed identity is missing at ${installedIdentity}`);
+        return;
+      }
+      throw error;
+    }
+    if (!identityStat.isDirectory() || identityStat.isSymbolicLink()) {
+      warning(`rule check could not complete: installed identity is not a regular directory at ${installedIdentity}`);
+      return;
+    }
+    if (hasSymlink(installedIdentity)) {
+      warning('rule check could not complete: installed identity contains symbolic links');
+      return;
+    }
+
+    const identityCopy = path.join(scratch, 'identity');
+    fs.cpSync(installedIdentity, identityCopy, {
+      recursive: true,
+      errorOnExist: true,
+      force: false,
+      preserveTimestamps: true,
+    });
+    makeReadOnly(identityCopy);
+
+    const marker = 'TIGHTBEAM_RULE_PREFLIGHT_JSON:';
+    const expression = `IO.puts(${JSON.stringify(marker)} <> JSON.encode!(Tightbeam.RulePreflight.run()))`;
+    const env = { ...process.env };
+    for (const name of Object.keys(env)) {
+      if (/^(TIGHTBEAM_|RELEASE_|ERL_|ERTS_)/.test(name)) delete env[name];
+    }
+    env.TIGHTBEAM_BASE_DIR = scratch;
+    env.TIGHTBEAM_PORT = '0';
+    const result = spawnSync(
+      path.join(candidate.packageRoot, 'bin/tightbeam-gateway'),
+      ['eval', expression],
+      { encoding: 'utf8', env, maxBuffer: 4 * 1024 * 1024 },
+    );
+    const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+
+    if (result.error || result.status !== 0) {
+      const detail = (result.error?.message || output).trim();
+      warning(`rule check could not complete${detail ? `: ${detail}` : ''}`);
+      return;
+    }
+
+    const resultLines = output.split(/\r?\n/).filter((line) => line.startsWith(marker));
+    if (resultLines.length !== 1) {
+      warning('rule check could not complete: the target release returned no unique result');
+      return;
+    }
+
+    let report;
+    try {
+      report = JSON.parse(resultLines[0].slice(marker.length));
+    } catch (error) {
+      warning(`rule check could not complete: invalid result from target release: ${error.message}`);
+      return;
+    }
+
+    if (
+      !report ||
+      report.complete !== true ||
+      typeof report.recording_available !== 'boolean' ||
+      !Array.isArray(report.warnings) ||
+      !Array.isArray(report.unavailable_verbs) ||
+      !Array.isArray(report.skipped_policies)
+    ) {
+      warning('rule check could not complete: the target release returned an incomplete result');
+      return;
+    }
+
+    for (const message of report.warnings) {
+      if (typeof message === 'string' && message.length > 0) warning(message);
+    }
+  } catch (error) {
+    warning(`rule check could not complete: ${error.message}`);
+  } finally {
+    if (scratch) {
+      try {
+        makeWritable(scratch);
+        fs.rmSync(scratch, { recursive: true, force: true });
+      } catch (error) {
+        warning(`temporary rule-check files could not be removed: ${error.message}`);
+      }
+    }
+  }
+}
+
 function select(values) {
   const root = canonicalRoot(required(values, 'root'), false);
   const buildId = required(values, 'build');
   const candidate = readReceipt(root, buildId);
+  const baseDir = path.resolve(
+    values['base-dir'] || process.env.TIGHTBEAM_BASE_DIR || process.env.TIGHTBEAM_HOME || path.join(os.homedir(), '.tightbeam'),
+  );
+  rulePreflight(candidate, baseDir);
   const previousBuildId = currentBuild(root);
 
   if (previousBuildId) readReceipt(root, previousBuildId);

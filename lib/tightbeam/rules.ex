@@ -67,6 +67,7 @@ defmodule Tightbeam.Rules do
 
   @persist_key __MODULE__
   @policy_key {__MODULE__, :policies}
+  @diagnostics_key {__MODULE__, :diagnostics}
   @snapshot_key {__MODULE__, :effective_snapshot}
   @call_snapshot_key {__MODULE__, :call_snapshot}
   @rule_keys MapSet.new([
@@ -354,6 +355,7 @@ defmodule Tightbeam.Rules do
     declarations = Tightbeam.Mementos.read_declarations!(law_base, identity_manifest_sha)
 
     :persistent_term.put({__MODULE__, :unavailable_verbs}, %{})
+    :persistent_term.put(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
 
     entries =
       law_base
@@ -405,6 +407,15 @@ defmodule Tightbeam.Rules do
               Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
             )
 
+            Enum.each(affected, fn verb ->
+              record_unavailable_verb(%{
+                verb: verb,
+                file: diagnostic_file(path, law_base),
+                name: "<file>",
+                reason: Exception.message(error)
+              })
+            end)
+
             []
         end
       end)
@@ -449,6 +460,14 @@ defmodule Tightbeam.Rules do
         if duplicates[rule.name] > 1 do
           require Logger
           Logger.warning("rule #{rule.name} unavailable: duplicate name in #{rule.source}")
+
+          record_unavailable_verb(%{
+            verb: rule.verb,
+            file: diagnostic_file(rule.source, law_base),
+            name: rule.name,
+            reason: "duplicate name"
+          })
+
           unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
 
           :persistent_term.put(
@@ -472,6 +491,15 @@ defmodule Tightbeam.Rules do
             Enum.reduce(verbs, unavailable, &Map.put(&2, &1, policy.source))
           )
 
+          Enum.each(verbs, fn verb ->
+            record_unavailable_verb(%{
+              verb: verb,
+              file: diagnostic_file(policy.source, law_base),
+              name: policy.name,
+              reason: "duplicate policy name"
+            })
+          end)
+
           true
         else
           false
@@ -492,6 +520,14 @@ defmodule Tightbeam.Rules do
           error ->
             require Logger
             Logger.warning("rule #{rule.name} unavailable: #{Exception.message(error)}")
+
+            record_unavailable_verb(%{
+              verb: rule.verb,
+              file: diagnostic_file(rule.source, law_base),
+              name: rule.name,
+              reason: Exception.message(error)
+            })
+
             unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
 
             :persistent_term.put(
@@ -527,6 +563,26 @@ defmodule Tightbeam.Rules do
     })
 
     rules
+  end
+
+  @doc "Return the rule availability diagnostics from the most recent load."
+  def status do
+    diagnostics =
+      :persistent_term.get(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
+
+    unavailable =
+      diagnostics.unavailable_verbs
+      |> Enum.sort_by(&{&1.verb, &1.file, &1.name || ""})
+
+    skipped =
+      diagnostics.skipped_policies
+      |> Enum.sort_by(&{&1.file, &1.name})
+
+    %{
+      recording_available: unavailable == [],
+      unavailable_verbs: unavailable,
+      skipped_policies: skipped
+    }
   end
 
   @doc false
@@ -1448,6 +1504,15 @@ defmodule Tightbeam.Rules do
                   Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
                 )
 
+                Enum.each(affected, fn affected_verb ->
+                  record_unavailable_verb(%{
+                    verb: affected_verb,
+                    file: diagnostic_file(path, base_dir),
+                    name: if(is_map(rule), do: Map.get(rule, "name"), else: "##{ordinal}"),
+                    reason: Exception.message(error)
+                  })
+                end)
+
                 {:unavailable, path}
             end
           end)
@@ -1470,8 +1535,11 @@ defmodule Tightbeam.Rules do
             if retired_policy?(policy) do
               require Logger
 
-              Logger.warning(
-                "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose #{Map.get(policy, "purpose")} is retired"
+              record_skipped_policy(
+                path,
+                base_dir,
+                Map.get(policy, "name"),
+                "skipped: purpose #{Map.get(policy, "purpose")} is retired"
               )
 
               []
@@ -1479,8 +1547,11 @@ defmodule Tightbeam.Rules do
               if unsupported_policy_purpose?(policy) do
                 require Logger
 
-                Logger.warning(
-                  "#{path}: policy #{inspect(Map.get(policy, "name"))}: unsupported purpose: #{inspect(Map.get(policy, "purpose"))}"
+                record_skipped_policy(
+                  path,
+                  base_dir,
+                  Map.get(policy, "name"),
+                  "unsupported purpose: #{inspect(Map.get(policy, "purpose"))}"
                 )
 
                 []
@@ -1527,6 +1598,39 @@ defmodule Tightbeam.Rules do
   end
 
   defp unsupported_policy_purpose?(_policy), do: false
+
+  defp record_skipped_policy(path, base_dir, name, reason) do
+    file = diagnostic_file(path, base_dir)
+    separator = if String.starts_with?(reason, "skipped:"), do: " ", else: ": "
+    warning = "#{file}: policy #{inspect(name)}#{separator}#{reason}"
+    require Logger
+    Logger.warning("#{path}: policy #{inspect(name)}#{separator}#{reason}")
+    item = %{file: file, name: name, reason: reason, message: warning}
+
+    update_diagnostics(fn diagnostics ->
+      %{diagnostics | skipped_policies: [item | diagnostics.skipped_policies]}
+    end)
+  end
+
+  defp record_unavailable_verb(diagnostic) do
+    update_diagnostics(fn diagnostics ->
+      update_in(diagnostics.unavailable_verbs, &[diagnostic | &1])
+    end)
+  end
+
+  defp update_diagnostics(fun) do
+    current =
+      :persistent_term.get(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
+
+    :persistent_term.put(@diagnostics_key, fun.(current))
+  end
+
+  defp diagnostic_file(path, law_base) do
+    identity_root = Path.expand(Path.join(law_base, "identity"))
+    relative = Path.relative_to(Path.expand(path), identity_root)
+
+    if String.starts_with?(relative, "../"), do: Path.basename(path), else: relative
+  end
 
   defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
     raw_name = Map.get(policy, "name")
