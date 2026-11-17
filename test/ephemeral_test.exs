@@ -424,6 +424,89 @@ defmodule Tightbeam.EphemeralTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT id FROM ephemeral_migration")
   end
 
+  # wi_0b608f33: every turn's workdir lookup and identity apply's file step ask
+  # this question. It only reads, so it must not queue behind the database
+  # writer: while the writer is busy with something slow, the answer still comes.
+  test "R2.5 the ephemeral lookup answers while the database writer is busy" do
+    base_dir =
+      System.tmp_dir!()
+      |> Path.join("tightbeam-ephemeral-reader-#{System.unique_integer([:positive])}")
+      |> Tightbeam.LiveBaseAdmission.canonical!()
+
+    File.mkdir_p!(base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    payload_root = Path.join(base_dir, "payload")
+    File.mkdir_p!(Path.join(payload_root, "ebin"))
+    File.mkdir_p!(Path.join(payload_root, "priv"))
+    File.write!(Path.join(payload_root, "priv/ephemeral-reader-test"), "test payload")
+
+    {:ok, manifest} =
+      Tightbeam.LiveBaseGuard.generate_manifest(Tightbeam.LiveBasePayload.files!(payload_root))
+
+    File.write!(Path.join(payload_root, "build-manifest.json"), JSON.encode!(manifest))
+
+    db =
+      start_supervised!(
+        Supervisor.child_spec(
+          {DB,
+           path: Path.join(base_dir, "state.db"),
+           name: nil,
+           guard_inputs: [],
+           payload_root: payload_root},
+          id: {:ephemeral_reader, System.unique_integer([:positive])}
+        )
+      )
+
+    :ok = ensure_all_schemas(db)
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('owner',1,1)")
+
+    for key <- ["caller", "helper", "ordinary"] do
+      Org.create(db, %{
+        session_key: key,
+        display_name: key,
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+    end
+
+    assert {:ok, _} = DB.transaction(db, &Ephemeral.stamp_in_txn(&1, "helper", "caller"))
+
+    parent = self()
+
+    writer =
+      Task.async(fn ->
+        DB.transaction(db, fn _txn ->
+          send(parent, {:writer_held, self()})
+
+          receive do
+            :release -> :released
+          after
+            10_000 -> raise "writer was not released"
+          end
+        end)
+      end)
+
+    assert_receive {:writer_held, owner}, 5_000
+
+    lookups =
+      Task.async(fn ->
+        {Ephemeral.available?(db), Ephemeral.session?(db, "helper"),
+         Ephemeral.session?(db, "ordinary")}
+      end)
+
+    answered = Task.yield(lookups, 2_000)
+    send(owner, :release)
+
+    assert {:ok, {true, true, false}} = answered
+    assert {:ok, :released} = Task.await(writer, 5_000)
+  end
+
   test "R2.1-R2.5 migration and stamped elections survive restart", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     assert :ok = Schema.ensure_all(db)
