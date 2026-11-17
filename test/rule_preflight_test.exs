@@ -65,7 +65,9 @@ defmodule Tightbeam.RulePreflightTest do
     end)
   end
 
-  test "preflight retains receipt-owned scope validation and namespaced diagnostics", %{base: base} do
+  test "preflight retains receipt-owned scope validation and namespaced diagnostics", %{
+    base: base
+  } do
     root = Path.join([base, "identity", "kungfu", "preflight-scope"])
     archetype_path = Path.join(root, "archetypes/analyst.toml")
     rule_path = Path.join(root, "rules/owned.toml")
