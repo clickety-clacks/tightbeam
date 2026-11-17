@@ -31,6 +31,11 @@ defmodule Tightbeam.EscalationTest do
     end
   end
 
+  # Operator asks must name their product and the work they serve; tests that
+  # are not about attribution file against this fixture work item.
+  @fixture_work_item "wi-escalation-fixture"
+  @fixture_project "Fixture product"
+
   setup do
     db = :"escalation_db_#{System.unique_integer([:positive])}"
     scheduler = :"escalation_scheduler_#{System.unique_integer([:positive])}"
@@ -39,6 +44,7 @@ defmodule Tightbeam.EscalationTest do
     :ok = ensure_all_schemas(db)
 
     raiser = session(db, "raiser", "flynn")
+    insert_work_item!(db, @fixture_work_item, "flynn")
 
     _admin_device =
       Devices.pair(db, %{
@@ -3758,7 +3764,230 @@ defmodule Tightbeam.EscalationTest do
     }
   end
 
+  describe "operator requests name their project" do
+    test "the wire passes operator-ask links under the names rule facts read" do
+      assert Tightbeam.Wire.Router.atomize_params_for_test("operator-ask", %{
+               "question" => "q?",
+               "project" => "Tightbeam",
+               "assignment" => "asg_1",
+               "work_item" => "wi_1"
+             }) == %{
+               question: "q?",
+               project: "Tightbeam",
+               assignment_id: "asg_1",
+               work_item_id: "wi_1"
+             }
+    end
+
+    test "an ask naming no assignment or work item is refused with no effects", ctx do
+      before = operator_request_count(ctx.db)
+
+      assert %{code: "invalid", message: message} =
+               Escalation.operator_ask(
+                 ctx.db,
+                 bare_operator_call(ctx.raiser, %{question: "unlinked?", project: "Tightbeam"})
+               )
+
+      assert message =~ "--assignment or --work-item"
+
+      assert %{code: "invalid", message: project_message} =
+               Escalation.operator_ask(
+                 ctx.db,
+                 bare_operator_call(ctx.raiser, %{
+                   question: "no product?",
+                   work_item_id: @fixture_work_item,
+                   project: "  "
+                 })
+               )
+
+      assert project_message =~ "--project"
+      assert operator_request_count(ctx.db) == before
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed'"
+               )
+    end
+
+    test "a work-item ask records and lists its project", ctx do
+      request =
+        Escalation.operator_ask(
+          ctx.db,
+          bare_operator_call(ctx.raiser, %{
+            question: "ship it?",
+            project: " Tightbeam ",
+            work_item_id: @fixture_work_item
+          })
+        )
+
+      assert %{
+               project: "Tightbeam",
+               project_attribution: "recorded",
+               project_unresolved_reason: nil,
+               work_item_id: @fixture_work_item,
+               association_status: "work-item",
+               assignment_id: nil
+             } = listed(ctx, request.id, "open")
+
+      assert %{project: "Tightbeam", work_item_id: @fixture_work_item} =
+               Escalation.get(ctx.db, bare_operator_call(ctx.raiser, %{}), request.id)
+    end
+
+    test "an assignment ask records the assignment's work item and survives its removal", ctx do
+      insert_assignment!(ctx.db, "a-project", ctx.raiser.session_key, "open")
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE assignments SET workItemId=?1 WHERE id='a-project'", [
+          @fixture_work_item
+        ])
+
+      request =
+        Escalation.operator_ask(
+          ctx.db,
+          bare_operator_call(ctx.raiser, %{
+            question: "which window?",
+            project: "Tightbeam",
+            assignment: "a-project"
+          })
+        )
+
+      assert %{
+               project: "Tightbeam",
+               assignment_id: "a-project",
+               work_item_id: @fixture_work_item,
+               association_status: "assignment"
+             } = listed(ctx, request.id, "open")
+
+      count = length(Escalation.list(ctx.db, bare_operator_call(ctx.raiser, %{}), "all"))
+      {:ok, _} = DB.query(ctx.db, "DELETE FROM assignments WHERE id='a-project'", [])
+
+      assert %{
+               status: "open",
+               project: "Tightbeam",
+               project_attribution: "recorded",
+               assignment_id: "a-project",
+               work_item_id: @fixture_work_item,
+               association_status: "assignment-removed"
+             } = listed(ctx, request.id, "open")
+
+      assert length(Escalation.list(ctx.db, bare_operator_call(ctx.raiser, %{}), "all")) ==
+               count
+    end
+
+    test "dual references must agree and every reference must resolve", ctx do
+      insert_assignment!(ctx.db, "a-dual", ctx.raiser.session_key, "open")
+      insert_work_item!(ctx.db, "wi-other", "flynn")
+      insert_work_item!(ctx.db, "wi-foreign", "someone-else")
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE assignments SET workItemId=?1 WHERE id='a-dual'", [
+          @fixture_work_item
+        ])
+
+      before = operator_request_count(ctx.db)
+
+      ask = fn params ->
+        Escalation.operator_ask(
+          ctx.db,
+          bare_operator_call(
+            ctx.raiser,
+            Map.merge(%{question: "refs #{inspect(params)}?", project: "Tightbeam"}, params)
+          )
+        )
+      end
+
+      assert %{code: "invalid"} = ask.(%{assignment: "a-dual", work_item_id: "wi-other"})
+      assert %{code: "not_found"} = ask.(%{work_item_id: "wi-missing"})
+      assert %{code: "not_owner"} = ask.(%{work_item_id: "wi-foreign"})
+      assert %{code: "not_found"} = ask.(%{assignment_id: "a-missing"})
+      assert operator_request_count(ctx.db) == before
+
+      assert %{id: id} = ask.(%{assignment_id: "a-dual", work_item: @fixture_work_item})
+
+      assert %{work_item_id: @fixture_work_item, association_status: "assignment"} =
+               listed(ctx, id, "open")
+    end
+
+    test "legacy requests without a recorded project stay listed with a truthful reason", ctx do
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO decision_requests
+            (id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+             raisedAt, deadlineAt, actionKey, question, options, context, status, rowSchemaRevision)
+          VALUES ('dr_legacy', 'operator', 'agent:raiser', ?1, 'flynn', 'a-gone',
+                  1, 2, 'legacy-key', 'old question?', '[{"label":"accept"}]',
+                  '{"note":null,"supersedes":null}', 'open', 2)
+          """,
+          [ctx.raiser.session_key]
+        )
+
+      assert %{
+               id: "dr_legacy",
+               status: "open",
+               project: nil,
+               project_attribution: "unresolved",
+               project_unresolved_reason: reason,
+               assignment_id: "a-gone",
+               work_item_id: nil,
+               association_status: "assignment-removed"
+             } = listed(ctx, "dr_legacy", "open")
+
+      assert reason =~ "no project was recorded"
+      assert reason =~ "a-gone no longer exists"
+    end
+
+    test "every request kind carries project attribution", ctx do
+      target = session(ctx.db, "attribution-target", "flynn")
+
+      agent_request =
+        Escalation.ask(
+          ctx.db,
+          agent_call(ctx.raiser, %{question: "which route?"}, %{
+            verb: "ask",
+            session_key: target.session_key
+          })
+        )
+
+      {:decision_pending, statute_id} =
+        open(ctx, call(ctx.raiser, %{kind: "completion"}), statute())
+
+      for id <- [agent_request.id, statute_id] do
+        assert %{
+                 project: nil,
+                 project_attribution: "unresolved",
+                 project_unresolved_reason: reason,
+                 association_status: _
+               } =
+                 ctx.db
+                 |> Escalation.list(bare_operator_call(ctx.raiser, %{}), "all",
+                   owner_user_id: "flynn"
+                 )
+                 |> Enum.find(&(&1.id == id))
+
+        assert is_binary(reason) and reason != ""
+      end
+    end
+  end
+
   defp operator_call(session, params) do
+    linked? =
+      Enum.any?(
+        [:assignment, :assignment_id, :work_item, :work_item_id],
+        &Map.has_key?(params, &1)
+      )
+
+    params =
+      params
+      |> Map.put_new(:project, @fixture_project)
+      |> then(&if(linked?, do: &1, else: Map.put(&1, :work_item_id, @fixture_work_item)))
+
+    bare_operator_call(session, params)
+  end
+
+  defp bare_operator_call(session, params) do
     %{
       verb: "operator-ask",
       origin: "agent:raiser",
@@ -3766,6 +3995,28 @@ defmodule Tightbeam.EscalationTest do
       transport_session_key: session.session_key,
       params: params
     }
+  end
+
+  defp insert_work_item!(db, id, owner_user_id) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO work_items (id,title,ownerUserId,createdByUser,createdAt) VALUES (?1,'fixture work',?2,?2,1)",
+        [id, owner_user_id]
+      )
+  end
+
+  defp operator_request_count(db) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
+
+    count
+  end
+
+  defp listed(ctx, id, status \\ "all") do
+    ctx.db
+    |> Escalation.list(bare_operator_call(ctx.raiser, %{}), status)
+    |> Enum.find(&(&1.id == id))
   end
 
   defp start_gateway_scheduler(ctx, name \\ nil) do

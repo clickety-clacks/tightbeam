@@ -1045,7 +1045,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             question,
             note,
             options,
+            project,
             assignment_id,
+            work_item_id,
             deadline_ms,
             supersedes,
         } => {
@@ -1063,8 +1065,13 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     serde_json::to_string(&options).expect("operator option labels serialize")
                 ));
             }
+            params.push(string_field("project", project));
+            // assignment_id and work_item_id are the names rule facts read.
             if let Some(value) = assignment_id {
-                params.push(string_field("assignment", value));
+                params.push(string_field("assignment_id", value));
+            }
+            if let Some(value) = work_item_id {
+                params.push(string_field("work_item_id", value));
             }
             if let Some(value) = deadline_ms {
                 params.push(format!("\"deadline\":{value}"));
@@ -5707,6 +5714,8 @@ mod tests {
                 "release train",
                 "--options",
                 "accept,wait",
+                "--project",
+                "Tightbeam",
                 "--assignment",
                 "asg_1",
                 "--deadline",
@@ -5716,7 +5725,21 @@ mod tests {
                 "--as",
                 "parent",
             ]),
-            r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","note":"release train","options":[{"label":"accept"},{"label":"wait"}],"assignment":"asg_1","deadline":7200000,"supersedes":"dr_old"}}"#
+            r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","note":"release train","options":[{"label":"accept"},{"label":"wait"}],"project":"Tightbeam","assignment_id":"asg_1","deadline":7200000,"supersedes":"dr_old"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "operator-ask",
+                "--question",
+                "ship window?",
+                "--project",
+                "Tightbeam",
+                "--work-item",
+                "wi_1",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","project":"Tightbeam","work_item_id":"wi_1"}}"#
         );
         assert_eq!(
             body(&[

@@ -371,7 +371,9 @@ pub enum Command {
         question: String,
         note: Option<String>,
         options: Option<Vec<String>>,
+        project: String,
         assignment_id: Option<String>,
+        work_item_id: Option<String>,
         deadline_ms: Option<String>,
         supersedes: Option<String>,
     },
@@ -1147,9 +1149,10 @@ COMMANDS:
   ask (--session <key> | --role <name> | --user <id>) --question <text> [--about <assignment>]
   answer --request <dr_id> --answer <text>
   return --request <dr_id> --reason <text>
-  operator-ask --question <q> [--note <t>] [--options a,b,c]
-               [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]
-      File an owner-scoped operator decision request.
+  operator-ask --question <q> --project <product> (--assignment <asgId> | --work-item <wiId>)
+               [--note <t>] [--options a,b,c] [--deadline <dur>] [--supersedes <dr_id>]
+      File an owner-scoped operator decision request. --project names the product the
+      operator is deciding for; the assignment or work item names the work it serves.
   operator-rule <dr_id> (--decision <label> | --response <text>)
                 [--rationale <text>]
       Record the operator's resolution. A session that presented the request runs it
@@ -3209,10 +3212,21 @@ fn parse_with_optional_catalog(
         }
         "operator-ask" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam operator-ask --question <q> [--note <t>] [--options a,b,c] [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
+                return Err("usage: tightbeam operator-ask --question <q> --project <product> (--assignment <asgId> | --work-item <wiId>) [--note <t>] [--options a,b,c] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
             }
             let question =
                 nonempty(flags, "question").ok_or_else(|| "--question is required".to_owned())?;
+            let project = nonempty(flags, "project").ok_or_else(|| {
+                "--project is required: name the product this decision is about".to_owned()
+            })?;
+            let assignment_id = nonempty(flags, "assignment");
+            let work_item_id = nonempty(flags, "work-item");
+            if assignment_id.is_none() && work_item_id.is_none() {
+                return Err(
+                    "--assignment or --work-item is required: name the work this decision serves"
+                        .to_owned(),
+                );
+            }
             let options = flags
                 .get("options")
                 .map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>());
@@ -3225,7 +3239,9 @@ fn parse_with_optional_catalog(
                 question,
                 note: nonempty(flags, "note"),
                 options,
-                assignment_id: nonempty(flags, "assignment"),
+                project,
+                assignment_id,
+                work_item_id,
                 deadline_ms,
                 supersedes: nonempty(flags, "supersedes"),
             })
@@ -8037,6 +8053,8 @@ mod tests {
                 "release train",
                 "--options",
                 "accept,wait",
+                "--project",
+                "Tightbeam",
                 "--assignment",
                 "asg_1",
                 "--deadline",
@@ -8051,7 +8069,9 @@ mod tests {
                 question: "ship window?".to_owned(),
                 note: Some("release train".to_owned()),
                 options: Some(vec!["accept".to_owned(), "wait".to_owned()]),
+                project: "Tightbeam".to_owned(),
                 assignment_id: Some("asg_1".to_owned()),
+                work_item_id: None,
                 deadline_ms: Some("7200000".to_owned()),
                 supersedes: Some("dr_old".to_owned()),
             })
