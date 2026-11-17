@@ -206,7 +206,10 @@ defmodule Tightbeam.ArchetypesTest do
         "user's stated goal before any tool call."
 
     section = heading <> "\n\n" <> intro <> "\n\n" <> facts
-    boundary = section <> "\n# Served identity\n"
+    # The renderer trims the bundle section and joins the next section after a
+    # blank line, so the boundary holds whichever bundle sorts last, with or
+    # without phrases.
+    boundary = String.trim_trailing(section) <> "\n\n# Served identity\n"
 
     validate_facts = fn guidance ->
       assert length(:binary.matches(guidance, heading)) == 1
