@@ -6549,7 +6549,8 @@ defmodule Tightbeam.AssignmentsTest do
     assert after_verdict == before_verdict + 1
   end
 
-  test "code completion requires review coverage and allows additional reviewed refs", ctx do
+  test "code completion needs holder verification and independent review, not matching refs",
+       ctx do
     parent = self()
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
@@ -6635,7 +6636,7 @@ defmodule Tightbeam.AssignmentsTest do
                producer_refs
              )
 
-    assert [] ==
+    assert ["reviewed-clean"] ==
              Assignments.qualifying_review_verdict_kinds(
                ctx.db,
                producer.id,
