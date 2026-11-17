@@ -429,6 +429,79 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert is_integer(resolved_at)
   end
 
+  test "ordinary shutdown waits for a delayed park and settles it durably", ctx do
+    script = Path.join(ctx.test_dir, "shutdown_delayed_park.js")
+    File.write!(script, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), script],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             process_identity_dir: ctx.test_dir,
+             process_helper: @process_helper
+           ]
+         end,
+         db: ctx.db,
+         name: :shutdown_delayed_park_coordinator}
+      )
+
+    key = {:claude, "shared", "testhost"}
+    assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(fn ->
+             match?([%{state: "running"}], HarnessProcess.list(ctx.db))
+           end)
+
+    parent = self()
+    previous_runner = Application.get_env(:tightbeam, :harness_process_command_runner_for_test)
+
+    Application.put_env(:tightbeam, :harness_process_command_runner_for_test, fn executable,
+                                                                                 args,
+                                                                                 _timeout ->
+      if List.first(args) == "harness-group" do
+        send(parent, {:park_waiting, self()})
+
+        receive do
+          :finish_park -> :ok
+        end
+      end
+
+      System.cmd(executable, args, stderr_to_stdout: true)
+    end)
+
+    on_exit(fn ->
+      if previous_runner do
+        Application.put_env(:tightbeam, :harness_process_command_runner_for_test, previous_runner)
+      else
+        Application.delete_env(:tightbeam, :harness_process_command_runner_for_test)
+      end
+    end)
+
+    stopper = Task.async(fn -> GenServer.stop(coordinator, :shutdown, :infinity) end)
+    assert_receive {:park_waiting, park_task}, 10_000
+
+    try do
+      # The old ordinary shutdown budget was 30 seconds. The command remains
+      # gated past that boundary, so an elapsed-time cutoff cannot pass.
+      assert Task.yield(stopper, 31_000) == nil
+      assert [%{state: "park_requested", resolved_at: nil}] = HarnessProcess.list(ctx.db)
+    after
+      send(park_task, :finish_park)
+    end
+
+    assert :ok = Task.await(stopper, 30_000)
+    assert [%{state: "killed", resolved_at: resolved_at}] = HarnessProcess.list(ctx.db)
+    assert is_integer(resolved_at)
+    refute HarnessProcess.fenced?(ctx.db, key)
+  end
+
   test "supervisor shutdown runs Cursor group cleanup through the dedicated launcher", ctx do
     parent = self()
     name = :supervised_cursor_cleanup_coordinator
