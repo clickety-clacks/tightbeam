@@ -99,6 +99,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert Path.wildcard(Path.join(identity_dir, "rules/*.toml")) ==
              [
+               Path.join(identity_dir, "rules/harklight-decision-request-briefing.toml"),
                Path.join(identity_dir, "rules/harness-health-recovery.toml"),
                Path.join(identity_dir, "rules/harness-recovery-main-wake.toml"),
                Path.join(identity_dir, "rules/row-reaction-handoff.toml"),

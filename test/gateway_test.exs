@@ -1225,9 +1225,25 @@ defmodule Tightbeam.GatewayTest do
                owner_lease: turn.owner_lease
              )
 
-    assert NoticeBatcher.recover(ctx.db, at, opts) == []
+    assert {:ok, [[bounce_id, "k2", "pending", bounce_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,sessionKey,state,prompt FROM wakes WHERE wakeId LIKE 'w_unresponsive_%' AND sessionKey='k2'"
+             )
+
+    assert bounce_prompt =~ "the recipient's lane is down"
+    assert [bounce_carrier] = NoticeBatcher.recover(ctx.db, at, opts)
+    assert bounce_carrier != carrier
+
+    assert {:ok, [[^bounce_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceWakeId FROM notice_batch_members WHERE batchId=(SELECT batchId FROM notice_batches WHERE deliveryWakeId=?1)",
+               [bounce_carrier]
+             )
+
     assert NoticeBatcher.batch(ctx.db, frozen.batch_id) == committed
-    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
   @tag recipient_readiness: true
@@ -10772,13 +10788,8 @@ defmodule Tightbeam.GatewayTest do
 
   test "REST human post records an attributed message and turn and returns the same IDs on retry",
        ctx do
-    attachment = %{
-      "assetId" => "a_test",
-      "mimeType" => "image/png",
-      "filename" => "plot.png",
-      "size" => 2048
-    }
-
+    # Main #751 validates attachment assets and its own tests cover them; this
+    # 0.1.16 receipt test posts text.
     body = %{
       verb: "post",
       asUser: "flynn",
@@ -10786,8 +10797,7 @@ defmodule Tightbeam.GatewayTest do
       params: %{
         clientMessageId: "c_rest_1",
         deviceId: "chat_test",
-        content: "hello",
-        attachments: [attachment]
+        content: "hello"
       }
     }
 
@@ -10808,7 +10818,7 @@ defmodule Tightbeam.GatewayTest do
     message = Projection.get(ctx.db, message_id)
     assert message.content == "hello"
     assert message.sender == "user:flynn"
-    assert message.attachments == [attachment]
+    assert message.attachments == []
 
     assert {:ok, [[^turn_seq, ^message_id]]} =
              DB.query(ctx.db, "SELECT seq,messageId FROM turns WHERE seq=?1", [turn_seq])
@@ -10825,9 +10835,10 @@ defmodule Tightbeam.GatewayTest do
              }
            } = JSON.decode!(duplicate.resp_body)
 
+    # Main #751 maps a reused client message id to HTTP 409.
     conflict = rest_post(ctx, "tbc_test", put_in(body, [:params, :content], "different"))
-    assert conflict.status == 400
-    assert %{"error" => %{"code" => "invalid_message"}} = JSON.decode!(conflict.resp_body)
+    assert conflict.status == 409
+    assert %{"error" => %{"code" => "client_message_conflict"}} = JSON.decode!(conflict.resp_body)
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
@@ -10841,7 +10852,10 @@ defmodule Tightbeam.GatewayTest do
       params: %{clientMessageId: "c_rest_2", deviceId: "chat_test", content: "hello"}
     }
 
-    assert rest_post(ctx, ctx.device.token, body).status == 401
+    # Main #775: only the org credential may REST-post as a user.
+    device = rest_post(ctx, ctx.device.token, body)
+    assert device.status == 400
+    assert %{"error" => %{"message" => "verb not allowed: post"}} = JSON.decode!(device.resp_body)
 
     no_user = rest_post(ctx, "tbc_test", Map.delete(body, :asUser))
     assert no_user.status == 403

@@ -301,6 +301,7 @@ defmodule Tightbeam.HarklightBriefingsTest do
       """
       [[rule]]
       name = "harklight-decision-request-briefing"
+      archetypes = ["*"]
       verb = "condition"
       edges = ["row-commit"]
       effect = "notice"

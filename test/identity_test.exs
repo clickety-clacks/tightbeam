@@ -117,6 +117,7 @@ defmodule Tightbeam.IdentityTest do
                "guidance/operating-model.md",
                "rails/github-auth.toml",
                "rails/tightbeam-probe.toml",
+               "rules/harklight-decision-request-briefing.toml",
                "rules/harness-health-recovery.toml",
                "rules/harness-recovery-main-wake.toml",
                "rules/row-reaction-handoff.toml",
@@ -156,7 +157,7 @@ defmodule Tightbeam.IdentityTest do
                purpose:
                  "Route decision requests through a configurable investigator, preserve its Harklight conversation, and reconcile staged catchup without duplicate briefings.",
                phrases: [],
-               root_archetype: "orchestrator"
+               root_archetype: "harklight-decision-briefings.orchestrator"
              },
              %{
                name: "sentinels",

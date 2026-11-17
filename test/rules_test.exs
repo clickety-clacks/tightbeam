@@ -2194,7 +2194,12 @@ defmodule Tightbeam.RulesTest do
         operator_ask_call(raiser.session_key, %{question: "Choose a route?"})
       )
 
-    assert [wake] = Wakes.list_pending(ctx.db)
+    # Besides the routed notice, main's deadline-lapse reminder waits for Main.
+    {[deadline], [wake]} =
+      Wakes.list_pending(ctx.db)
+      |> Enum.split_with(&String.starts_with?(&1.prompt, "Operator decision #{request.id} passed"))
+
+    assert deadline.due_at == request.deadline_at
     assert wake.session_key == recipient.session_key
     assert wake.prompt == "Investigate decision #{request.id}"
     assert wake.origin == "remedy:filing-notice"
@@ -2220,7 +2225,11 @@ defmodule Tightbeam.RulesTest do
     }
 
     assert {:ok, :ok} = DB.transaction(ctx.db, &Wakes.row_commit_in_txn(&1, [transition]))
-    assert [same_wake] = Wakes.list_pending(ctx.db)
+    assert [same_wake] =
+             Enum.reject(
+               Wakes.list_pending(ctx.db),
+               &String.starts_with?(&1.prompt, "Operator decision ")
+             )
     assert same_wake.wake_id == wake.wake_id
 
     assert {:ok, :ok} =
@@ -2256,7 +2265,11 @@ defmodule Tightbeam.RulesTest do
                other_request.id
              ])
 
-    assert [same_wake] = Wakes.list_pending(ctx.db)
+    assert [same_wake] =
+             Enum.reject(
+               Wakes.list_pending(ctx.db),
+               &String.starts_with?(&1.prompt, "Operator decision ")
+             )
     assert same_wake.wake_id == wake.wake_id
   end
 
