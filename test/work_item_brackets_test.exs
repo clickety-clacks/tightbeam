@@ -765,6 +765,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     deliver_bracket_wake(ctx.db, slate)
 
     rearmed = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+    refute rearmed.wake_id == slate.wake_id
     assert rearmed.session_key == delivery_owner
   end
 
@@ -784,7 +785,42 @@ defmodule Tightbeam.WorkItemBracketsTest do
     deliver_bracket_wake(ctx.db, slate)
 
     rearmed = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+    refute rearmed.wake_id == slate.wake_id
     assert rearmed.session_key == owner_session
+  end
+
+  for retirement_time <- [:before_arm, :before_rearm] do
+    @retirement_time retirement_time
+    test "slate notices fall back after delivery owner retirement #{@retirement_time}", ctx do
+      delivery_owner = ctx.dsession.session_key
+      owner_session = Org.personal_session_key(ctx.holder.owner_user_id)
+      item = create(ctx, {:user, ctx.holder.owner_user_id}, %{title: "Retired delivery owner"})
+      update(ctx, item.id, %{delivery_owner_session_key: delivery_owner})
+
+      {:ok, assignment} =
+        disp_assign(ctx, {:user, ctx.holder.owner_user_id}, "holder", "w", item.id)
+
+      if @retirement_time == :before_arm do
+        assert %{state: "retired"} = Org.retire(ctx.db, delivery_owner, "test:retirement")
+      end
+
+      complete(ctx, "holder", assignment.id)
+      slate = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+
+      if @retirement_time == :before_arm do
+        assert slate.session_key == owner_session
+      else
+        assert slate.session_key == delivery_owner
+        assert %{state: "retired"} = Org.retire(ctx.db, delivery_owner, "test:retirement")
+      end
+
+      assert get(ctx, item.id).workItem.deliveryOwnerSessionKey == delivery_owner
+      deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, slate.wake_id))
+
+      rearmed = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+      refute rearmed.wake_id == slate.wake_id
+      assert rearmed.session_key == owner_session
+    end
   end
 
   ## Proof 18 — a non-admin owner sees its own UNASSIGNED item through the owner path.

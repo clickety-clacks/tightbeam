@@ -1037,7 +1037,7 @@ defmodule Tightbeam.WorkItems do
         if not open_assignments?(txn, work_item_id) do
           wake =
             Wakes.schedule_in_txn(txn, %{
-              session_key: delivery_owner || Org.personal_session_key(owner),
+              session_key: slate_recipient_in_txn(txn, delivery_owner, owner),
               origin: @origin,
               prompt:
                 Tightbeam.Reminders.render(txn, "work-item-slate", %{work_item_id: work_item_id}),
@@ -1082,7 +1082,7 @@ defmodule Tightbeam.WorkItems do
           state == "open" and slate == wake_id and not open_assignments?(txn, item_id) ->
             replacement =
               Wakes.schedule_in_txn(txn, %{
-                session_key: delivery_owner || Org.personal_session_key(owner),
+                session_key: slate_recipient_in_txn(txn, delivery_owner, owner),
                 origin: @origin,
                 prompt:
                   Tightbeam.Reminders.render(txn, "work-item-slate", %{work_item_id: item_id}),
@@ -1188,6 +1188,13 @@ defmodule Tightbeam.WorkItems do
         failures
     end)
     |> Enum.reverse()
+  end
+
+  defp slate_recipient_in_txn(txn, delivery_owner, owner) do
+    case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [delivery_owner]) do
+      [["active"]] -> delivery_owner
+      _ -> Org.personal_session_key(owner)
+    end
   end
 
   defp arm_routing_in_txn(txn, id, owner, title) do
