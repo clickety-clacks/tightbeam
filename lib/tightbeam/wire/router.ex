@@ -52,6 +52,8 @@ defmodule Tightbeam.Wire.Router do
 
   @websocket_read_timeout :infinity
 
+  require Logger
+
   alias Tightbeam.{
     Assets,
     AttachmentDelivery,
@@ -3498,17 +3500,33 @@ defmodule Tightbeam.Wire.Router do
            required,
            conn.request_path
          ) do
-      {:error, reason} ->
-        {:error, 503, "mismatch_state_unavailable", "CLI mismatch state could not be recorded",
-         ErrorDiagnostic.from_reason(reason,
-           operation: "observe_cli_compatibility",
-           origin: "gateway",
-           cli_state: state
-         )}
-
-      _ ->
-        :ok
+      {:error, reason} -> cli_compatibility_unrecorded(session, state, reason)
+      _ -> :ok
     end
+  rescue
+    error -> cli_compatibility_unrecorded(session, state, error)
+  catch
+    :exit, reason -> cli_compatibility_unrecorded(session, state, {:exit, reason})
+  end
+
+  # The observation is bookkeeping about the caller, not the command it asked
+  # for. When it cannot be recorded (the database writer is overloaded or slow)
+  # the command still runs and returns its own result; a real change is recorded
+  # by the next call that finds the writer available.
+  defp cli_compatibility_unrecorded(session, state, reason) do
+    node =
+      ErrorDiagnostic.from_reason(reason,
+        operation: "observe_cli_compatibility",
+        origin: "gateway",
+        cli_state: state
+      )
+
+    Logger.warning(
+      "CLI compatibility observation for #{session.session_key} not recorded; " <>
+        "continuing: " <> JSON.encode!(node)
+    )
+
+    :ok
   end
 
   defp cli_token_auth(conn) do
