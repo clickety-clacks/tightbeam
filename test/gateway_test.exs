@@ -13736,7 +13736,7 @@ defmodule Tightbeam.GatewayTest do
                })
              ]
 
-      page = StateResources.query_messages_for_session_page(ctx.db, "k1", nil, 100)
+      page = StateResources.query_messages_for_session_page(ctx.db, "k1", :latest, 100)
       page_message = Enum.find(page.rows, &(&1.id == message_id))
       assert StateResources.message(page_message)["attachments"] == delivered["attachments"]
 
