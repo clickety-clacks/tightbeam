@@ -65,7 +65,7 @@ defmodule Tightbeam.AssignmentOpenerAcceptanceTest do
     row
   end
 
-  defp standing_cannot_proceed(db, assignment_id, disposer) do
+  defp standing_cannot_proceed(db, assignment_id, disposer, suffix \\ "blocked") do
     {:ok, %{wake_id: wake_id}} =
       DB.transaction(db, fn txn ->
         Wakes.schedule_in_txn(txn, %{
@@ -86,17 +86,17 @@ defmodule Tightbeam.AssignmentOpenerAcceptanceTest do
         INSERT INTO decision_requests
           (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
            expecterSessionKey,expecterUserId,raisedAt,question,context,status)
-        VALUES ('dr_blocked','agent','session:holder','holder','owner',?1,
+        VALUES (?3,'agent','session:holder','holder','owner',?1,
                 ?2,'owner',3,'blocked','{}','open')
         """,
-        [assignment_id, disposer]
+        [assignment_id, disposer, "dr_" <> suffix]
       )
 
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES ('att_blocked',?1,'cannot-proceed','holder',3)",
-        [assignment_id]
+        "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES (?2,?1,'cannot-proceed','holder',3)",
+        [assignment_id, "att_" <> suffix]
       )
 
     {:ok, _} =
@@ -106,9 +106,16 @@ defmodule Tightbeam.AssignmentOpenerAcceptanceTest do
         INSERT INTO assignment_cannot_proceed
           (id,assignmentId,attestId,decisionRequestId,decisionWakeId,openerRef,
            disposerRef,reason,state,createdAt)
-        VALUES ('cp_blocked',?1,'att_blocked','dr_blocked',?2,?3,?3,'blocked','standing',3)
+        VALUES (?4,?1,?5,?6,?2,?3,?3,'blocked','standing',3)
         """,
-        [assignment_id, wake_id, "session:" <> disposer]
+        [
+          assignment_id,
+          wake_id,
+          "session:" <> disposer,
+          "cp_" <> suffix,
+          "att_" <> suffix,
+          "dr_" <> suffix
+        ]
       )
 
     wake_id
@@ -160,6 +167,33 @@ defmodule Tightbeam.AssignmentOpenerAcceptanceTest do
     again = accept(ctx.db, {:session, "delivery"}, %{assignment_id: "asg_one"})
     assert again["changed"] == false
     assert again["currentOpenerSessionKey"] == "delivery"
+  end
+
+  test "a block filed before the opener retired follows the accepted opener duty", ctx do
+    early_wake = standing_cannot_proceed(ctx.db, "asg_one", "opener", "early")
+    assert %{state: "retired"} = Org.retire(ctx.db, "opener", "user:owner")
+
+    # Retirement hands the block's pending notice to the retired opener's parent.
+    assert {:ok, [["lead", "pending"]]} =
+             DB.query(ctx.db, "SELECT sessionKey,state FROM wakes WHERE wakeId=?1", [early_wake])
+
+    result = accept(ctx.db, {:session, "delivery"}, %{assignment_id: "asg_one"})
+    assert result["currentOpenerSessionKey"] == "delivery"
+
+    assert {:ok, [["delivery", "pending"]]} =
+             DB.query(ctx.db, "SELECT sessionKey,state FROM wakes WHERE wakeId=?1", [early_wake])
+
+    assert {:ok, [["session:delivery"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id='cp_early'"
+             )
+
+    assert {:ok, [["delivery"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT currentExpecterSessionKey FROM decision_requests WHERE id='dr_early'"
+             )
   end
 
   test "a session with no accountability for the assignment is refused", ctx do

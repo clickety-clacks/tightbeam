@@ -4,9 +4,10 @@ defmodule Tightbeam.AssignmentOpenerAcceptance do
 
   The assignment stays open with its holder, attests and history. Only the
   current opener moves: `currentOpenerSessionKey` names the successor. A
-  standing cannot-proceed the retired opener had to dispose, an open question
-  on the assignment waiting on the retired opener, and its undelivered notices
-  about the assignment move to the successor. The original `openedBySession`
+  standing cannot-proceed the retired opener had to dispose, its undelivered
+  notice wherever retirement sent it, an open question on the assignment
+  waiting on the retired opener, and undelivered notices about the assignment
+  still addressed to the retired opener move to the successor. The original `openedBySession`
   and expecter are never rewritten.
 
   The successor is the caller, or the session named with `toSessionKey`. The
@@ -98,15 +99,20 @@ defmodule Tightbeam.AssignmentOpenerAcceptance do
       [assignment_id, to, from]
     )
 
-    # Undelivered notices about this assignment addressed to the retired opener
-    # go to the successor instead.
+    # Undelivered notices about this assignment go to the successor: those still
+    # addressed to the retired opener, and the notice of a standing block, which
+    # retirement may already have handed to the retired opener's parent.
     Txn.q(
       txn,
       """
       SELECT wakeId FROM wakes
-      WHERE assignmentId=?1 AND sessionKey=?2 AND targetRole IS NULL
+      WHERE assignmentId=?1 AND targetRole IS NULL
         AND consumer='prompt' AND reresolve IS NULL
         AND state='pending' AND deliveredTurnSeq IS NULL
+        AND (sessionKey=?2 OR wakeId IN (
+          SELECT decisionWakeId FROM assignment_cannot_proceed
+          WHERE assignmentId=?1 AND state='standing'
+        ))
       ORDER BY createdAt,wakeId
       """,
       [assignment_id, from]
