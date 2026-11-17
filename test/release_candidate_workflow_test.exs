@@ -299,13 +299,13 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
 
     package_name = "tightbeam-1.0.0-linux-x86_64-#{String.slice(fixture.f2, 0, 7)}.tgz"
     assert File.read!(Path.join(stage_root, package_name)) == File.read!(fixture.package)
-    provenance = Jason.decode!(File.read!(Path.join(stage_root, "release-provenance.json")))
+    provenance = JSON.decode!(File.read!(Path.join(stage_root, "release-provenance.json")))
     assert provenance["workflow"] == provenance["candidate"]["workflow"]
     assert provenance["candidate"]["workflow_sha"] == fixture.f2
     assert provenance["tag"] == tag
 
     example = Path.join(@root, "packaging/release-install/example-release.json")
-    input = Jason.decode!(File.read!(example))
+    input = JSON.decode!(File.read!(example))
     package_sha = file_sha256(Path.join(stage_root, package_name))
 
     release =
@@ -324,7 +324,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     input = Map.merge(input, %{"purpose" => "candidate-soak", "release" => release})
     input_path = Path.join(fixture.root, "candidate-install.json")
     output = Path.join(fixture.root, "candidate-install-bundle")
-    File.write!(input_path, Jason.encode!(input, pretty: true) <> "\n")
+    File.write!(input_path, JSON.encode!(input, pretty: true) <> "\n")
 
     assert {_, 0} = command("python3", [@renderer, input_path, stage_root, output], cd: @root)
     sheet = File.read!(Path.join(output, "install-sheet.md"))
