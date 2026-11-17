@@ -324,7 +324,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     input = Map.merge(input, %{"purpose" => "candidate-soak", "release" => release})
     input_path = Path.join(fixture.root, "candidate-install.json")
     output = Path.join(fixture.root, "candidate-install-bundle")
-    File.write!(input_path, JSON.encode!(input, pretty: true) <> "\n")
+    File.write!(input_path, JSON.encode!(input) <> "\n")
 
     assert {_, 0} = command("python3", [@renderer, input_path, stage_root, output], cd: @root)
     sheet = File.read!(Path.join(output, "install-sheet.md"))
