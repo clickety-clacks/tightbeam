@@ -12137,7 +12137,9 @@ defmodule Tightbeam.GatewayTest do
 
     assert Archetypes.get("agentic-engineering.coder") == nil
     refute Rails.statutes?()
-    assert :persistent_term.get(Rules, []) == []
+    # Only the substrate's inert briefing template rule remains after unlearn.
+    assert [%{name: "harklight-decision-request-briefing", owner: :substrate}] =
+             :persistent_term.get(Rules, [])
   end
 
   test "kungfu list reports shipped bundles and their offer metadata",
