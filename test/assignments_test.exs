@@ -270,6 +270,30 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert retired.retired_session_keys == ["holder"]
     assert Org.get(ctx.db, "holder").state == "retired"
+
+    assert {:ok, [["closed", "revoked"]]} =
+             DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [linked.id])
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM work_items WHERE id=?1", [item.id])
+
+    assert {:ok, [[canceled_notice]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT c.wakeId FROM wake_cancellations c JOIN wakes w ON w.wakeId=c.wakeId
+               WHERE w.assignmentId=?1 AND w.state='canceled'
+                 AND c.requesterId='tightbeam:retirement'
+                 AND c.reasonKind='obligation_disposed'
+                 AND c.causalSourceKind='assignment_transition' AND c.causalSourceId=?1
+                 AND c.outcomeKind='disposition'
+                 AND c.dispositionKind='assignment_transition' AND c.dispositionId=?1
+                 AND c.livenessTriggerKind IS NULL AND c.actionNeeded=0
+               """,
+               [linked.id]
+             )
+
+    assert is_binary(canceled_notice)
   end
 
   describe "attest notices to assignment openers" do
