@@ -45,9 +45,10 @@ defmodule Tightbeam.AdapterCoordinator do
   require Logger
   alias Tightbeam.ErrorDiagnostic
 
-  @adapter_readiness_timeout 185_000
-  @adapter_checkout_timeout 190_000
-  @shutdown_budget_ms 30_000
+  @adapter_readiness_timeout :infinity
+  @shutdown_budget_ms :infinity
+  # Finite shutdown budgets below remain for explicit callers and fault tests;
+  # ordinary shutdown waits for process-group parking and durable settlement.
   # Match the DB owner's busy timeout so a contended durable write still has
   # room to finish before the supervisor's outer shutdown deadline.
   @shutdown_settlement_budget_ms 5_000
@@ -100,15 +101,13 @@ defmodule Tightbeam.AdapterCoordinator do
       start: {__MODULE__, :start_link, [opts]},
       type: :worker,
       restart: :permanent,
-      # The normal worker default (5s) is shorter than identity recovery plus
-      # signal delivery. Let terminate/2 settle the durable process group:
-      # derived from the configured budget, not the attribute, so a caller
-      # raising shutdown_budget_ms is not killed before its own deadline, and
-      # widened by the margin (see @shutdown_supervisor_margin_ms) so the
-      # supervisor never reclaims time the callback's contract still owns.
+      # The normal worker default (5s) can cut off a durable park. Explicit
+      # finite budgets retain their supervisor margin for fault tests.
       shutdown:
-        Keyword.get(opts, :shutdown_budget_ms, @shutdown_budget_ms) +
-          @shutdown_supervisor_margin_ms
+        case Keyword.get(opts, :shutdown_budget_ms, @shutdown_budget_ms) do
+          :infinity -> :infinity
+          budget -> budget + @shutdown_supervisor_margin_ms
+        end
     }
   end
 
@@ -121,13 +120,13 @@ defmodule Tightbeam.AdapterCoordinator do
   """
   @spec adapter_for(GenServer.server(), adapter_key()) :: checkout()
   def adapter_for(server \\ __MODULE__, key) do
-    GenServer.call(server, {:adapter_for, key}, @adapter_checkout_timeout)
+    GenServer.call(server, {:adapter_for, key}, :infinity)
   end
 
   @doc "The adapter checkout used by a claimed turn; it has no elapsed-time failure."
   @spec adapter_for_turn(GenServer.server(), adapter_key()) :: checkout()
   def adapter_for_turn(server \\ __MODULE__, key) do
-    GenServer.call(server, {:adapter_for, key}, @adapter_checkout_timeout)
+    GenServer.call(server, {:adapter_for, key}, :infinity)
   end
 
   @doc """
@@ -139,7 +138,7 @@ defmodule Tightbeam.AdapterCoordinator do
   """
   @spec adapter_for(GenServer.server(), adapter_key(), keyword()) :: checkout()
   def adapter_for(server, key, context) do
-    GenServer.call(server, {:adapter_for, key, context}, @adapter_checkout_timeout)
+    GenServer.call(server, {:adapter_for, key, context}, :infinity)
   end
 
   @doc """
@@ -277,8 +276,8 @@ defmodule Tightbeam.AdapterCoordinator do
        ready_refs: MapSet.new(),
        load_active: %{},
        load_queue: %{},
-       # The production child spec supplies the 30-second default. The
-       # private overrides make deadline exhaustion deterministic in tests.
+       # Production waits for definitive park results; private finite overrides
+       # keep deadline exhaustion deterministic in fault tests.
        shutdown_budget_ms: Keyword.get(opts, :shutdown_budget_ms, @shutdown_budget_ms),
        shutdown_settlement_budget_ms:
          Keyword.get(opts, :shutdown_settlement_budget_ms, @shutdown_settlement_budget_ms),
@@ -293,6 +292,52 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def terminate(_reason, state) do
+    if state.shutdown_budget_ms == :infinity do
+      terminate_after_park(state)
+    else
+      terminate_with_budget(state)
+    end
+  end
+
+  defp terminate_after_park(state) do
+    keys = Map.keys(state.adapters)
+    state = Enum.reduce(keys, state, &cancel_pending_starts(&1, &2))
+
+    case Tightbeam.HarnessProcess.begin_park_many(state.db, keys) do
+      {:ok, pending} ->
+        results =
+          pending
+          |> start_shutdown_tasks(state.db)
+          |> Enum.map(fn {key, process_row, task} ->
+            result =
+              case Task.yield(task, :infinity) do
+                {:ok, outcome} -> outcome
+                {:exit, reason} -> {:error, {:shutdown_task_exit, reason}}
+              end
+
+            {key, process_row, result}
+          end)
+
+        Enum.reduce(keys, state, &retire_shutdown_adapter(&1, &2))
+        :ok = Tightbeam.HarnessProcess.settle_park_results(state.db, results)
+
+        Enum.each(results, fn {key, _row, result} ->
+          if result not in [:ok, :already_resolved],
+            do:
+              Logger.error(
+                "adapter shutdown cleanup failed for #{key_name(key)}: #{inspect(result)}"
+              )
+        end)
+
+      {:error, reason} ->
+        Logger.error("adapter shutdown preparation failed: #{inspect(reason)}")
+        Enum.reduce(keys, state, &retire_shutdown_adapter(&1, &2))
+    end
+
+    :ok
+  end
+
+  defp terminate_with_budget(state) do
     # One monotonic clock covers preparation, park attempts, durable settlement,
     # and nonblocking retirement. Reserve the final slice for settlement; if
     # either DB phase cannot finish, keep the outcome explicitly unresolved.
@@ -1285,11 +1330,15 @@ defmodule Tightbeam.AdapterCoordinator do
     token = make_ref()
 
     timer =
-      Process.send_after(
-        owner,
-        {:adapter_readiness_timeout, key, generation, token},
-        state.readiness_timeout_ms
-      )
+      if state.readiness_timeout_ms == :infinity do
+        nil
+      else
+        Process.send_after(
+          owner,
+          {:adapter_readiness_timeout, key, generation, token},
+          state.readiness_timeout_ms
+        )
+      end
 
     adapter_opts = state.adapter_opts
     adapter_context = state.adapter_context

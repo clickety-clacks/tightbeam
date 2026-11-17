@@ -43,7 +43,6 @@ defmodule Tightbeam.HarnessHealth do
   @prod_shape_consumers ["assignment_prodder"]
   @failure_evidence ~w(authoritative-provider terminal-failure)
   @evidence_window_ms 120_000
-  @other_max_validity_ms 900_000
   @harness_health_schema_stamp "harness-health-other-v1-019"
   # Schema.ensure_all invokes module bootstraps before the repository's final
   # stamp is installed. HarnessHealth must not migrate at any intermediate
@@ -893,7 +892,7 @@ defmodule Tightbeam.HarnessHealth do
   defp raise_schema_conflict!(message),
     do: raise(ArgumentError, "harness_health_other_schema_conflict: #{message}")
 
-  @doc "The fixed inference window established by the reviewed patrol design."
+  @doc "The inference window for distinct terminal failures."
   @spec evidence_window_ms() :: pos_integer()
   def evidence_window_ms, do: @evidence_window_ms
 
@@ -2547,7 +2546,7 @@ defmodule Tightbeam.HarnessHealth do
           AND evidenceKind='terminal-failure' AND incidentId IS NULL
           AND observedAt BETWEEN ?4 AND ?5
         """,
-        window_params(input)
+        inference_window_params(input)
       )
 
     count
@@ -2573,14 +2572,14 @@ defmodule Tightbeam.HarnessHealth do
           AND observedAt BETWEEN ?4 AND ?5
         ORDER BY observedAt,id
         """,
-        window_params(input)
+        inference_window_params(input)
       )
       |> List.flatten()
 
     Enum.uniq(authoritative ++ inferred)
   end
 
-  defp window_params(input) do
+  defp inference_window_params(input) do
     [
       input.harness,
       input.host,
@@ -2906,11 +2905,6 @@ defmodule Tightbeam.HarnessHealth do
     unless is_integer(valid_until) and valid_until > accepted_at,
       do: raise(ArgumentError, "invalid_other_evidence")
 
-    if valid_until > observed_at + @other_max_validity_ms do
-      raise ArgumentError,
-            "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
-    end
-
     unless evidence_mode in ~w(exact_error probe_digest),
       do: raise(ArgumentError, "invalid_other_evidence")
 
@@ -3020,9 +3014,6 @@ defmodule Tightbeam.HarnessHealth do
            do: raise(ArgumentError, "invalid_recovery_evidence")
 
     unless observed_at <= accepted_at,
-      do: raise(ArgumentError, "stale_recovery_evidence")
-
-    unless accepted_at - observed_at <= @evidence_window_ms,
       do: raise(ArgumentError, "stale_recovery_evidence")
 
     if credential_shaped?(Enum.join([observed_state, exact_probe, cause], "\n")),
@@ -3421,6 +3412,9 @@ defmodule Tightbeam.HarnessHealth do
       [row] ->
         incident = incident(row)
         opening = observation_by_id(txn, incident.openObservationId)
+
+        unless input.observed_at >= incident.openedAt,
+          do: raise(ArgumentError, "stale_recovery_evidence")
 
         if incident.expiresAt && input.observed_at >= incident.expiresAt do
           expire_other_incidents_in_txn(txn, input.harness, input.host, input.observed_at)

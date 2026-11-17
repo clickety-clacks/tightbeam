@@ -13067,6 +13067,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "REST post records a canonical attachment with its existing identity", ctx do
+    ensure_global_registry()
     owner = ctx.device.user_id
 
     asset =
@@ -13153,6 +13154,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "attachment assessment is ordered, selected-session scoped, and keeps uncertainty explicit",
        ctx do
+    ensure_global_registry()
     owner = ctx.device.user_id
 
     {:ok, {_name, zip_bytes}} =
@@ -13607,6 +13609,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "ZIP and both inclusive size boundaries reach the selected workspace byte-for-byte", ctx do
+    ensure_global_registry()
     owner = ctx.device.user_id
 
     start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
@@ -13759,6 +13762,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "the existing inline image path still sends the same bytes", ctx do
+    ensure_global_registry()
     owner = ctx.device.user_id
     image_bytes = <<137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4>>
 
