@@ -829,10 +829,10 @@ defmodule Tightbeam.Gateway do
                   attachments: attachments,
                   submitter: submitter,
                   human_post: true,
-                  conn_registry: config[:conn_registry] || Tightbeam.ConnRegistry,
-                  lane_manager: config[:lane_manager] || Tightbeam.LaneManager,
                   creator_session_key: call.session_key,
-                  queue_when_busy: true
+                  queue_when_busy: true,
+                  conn_registry: Map.get(config, :conn_registry) || Tightbeam.ConnRegistry,
+                  lane_manager: Map.get(config, :lane_manager) || Tightbeam.LaneManager
                 )
 
               if outcome in [:appended, :queued],
