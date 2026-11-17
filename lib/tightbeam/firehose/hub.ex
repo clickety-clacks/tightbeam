@@ -81,11 +81,16 @@ defmodule Tightbeam.Firehose.Hub do
 
   def publish(server \\ __MODULE__, notice), do: GenServer.cast(server, {:publish, notice})
 
+  @doc "Fan out several notices in order, with no other publication between them."
+  def publish_all(server, notices), do: GenServer.cast(server, {:publish_all, notices})
+
   def committed(server \\ __MODULE__, class, payload, refs),
     do: GenServer.cast(server, {:committed, class, payload, refs})
 
-  def accepted(server, db, call, result),
-    do: GenServer.cast(server, {:accepted, db, call, result})
+  # Builds notices from the committed result alone; callers that need a
+  # canonical database read use Publisher.accepted/3, which reads first.
+  def accepted(server, call, result),
+    do: GenServer.cast(server, {:accepted, call, result})
 
   def denied(server, call, error),
     do: GenServer.cast(server, {:denied, call, error})
@@ -241,6 +246,9 @@ defmodule Tightbeam.Firehose.Hub do
   def handle_cast({:publish, notice}, state),
     do: {:noreply, fanout(state, notice)}
 
+  def handle_cast({:publish_all, notices}, state),
+    do: {:noreply, Enum.reduce(notices, state, &fanout(&2, &1))}
+
   def handle_cast({:committed, _, _, _}, %{shutting_down: true} = state),
     do: {:noreply, state}
 
@@ -284,10 +292,10 @@ defmodule Tightbeam.Firehose.Hub do
   def handle_cast({:committed, class, payload, refs}, state),
     do: {:noreply, fanout(state, Publisher.committed_notice(class, payload, refs))}
 
-  def handle_cast({:accepted, db, call, result}, state),
+  def handle_cast({:accepted, call, result}, state),
     do:
       {:noreply,
-       Enum.reduce(Publisher.accepted_notices(db, call, result), state, &fanout(&2, &1))}
+       Enum.reduce(Publisher.accepted_notices(nil, call, result), state, &fanout(&2, &1))}
 
   def handle_cast({:denied, call, error}, state),
     do: {:noreply, Enum.reduce(Publisher.denied_notices(call, error), state, &fanout(&2, &1))}

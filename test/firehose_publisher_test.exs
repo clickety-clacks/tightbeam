@@ -1556,6 +1556,65 @@ defmodule Tightbeam.Firehose.PublisherTest do
     refute Map.has_key?(notice["payload"], "role")
   end
 
+  test "an accepted notice's database read cannot hold up the hub" do
+    db = :firehose_stalled_read_db
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      Tightbeam.DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
+
+    role = Tightbeam.Roles.create!(db, "worker", "flynn", nil)
+    _earlier = drain_notices()
+
+    call = %{
+      verb: "role-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{name: "worker"}
+    }
+
+    owner = GenServer.whereis(db)
+    :ok = :sys.suspend(owner)
+    publisher = Task.async(fn -> Publisher.accepted(db, call, role) end)
+
+    try do
+      # Wait until the canonical read is queued at the stalled database.
+      assert wait_until(fn ->
+               match?({:message_queue_len, n} when n > 0, Process.info(owner, :message_queue_len))
+             end)
+
+      # A socket heartbeat makes this call; it must answer while the read waits.
+      assert is_integer(GenServer.call(Hub, {:sequence, self()}, 1_000))
+      refute_receive {:firehose_notice, _notice}
+    after
+      :ok = :sys.resume(owner)
+    end
+
+    assert :ok = Task.await(publisher)
+    assert %{"class" => "verb.accepted"} = receive_notice()
+    assert %{"class" => "role.created", "payload" => payload} = receive_notice()
+
+    assert payload ==
+             Tightbeam.StateResources.role(Tightbeam.StateResources.query_role(db, "worker"))
+
+    refute_receive {:firehose_notice, _notice}
+  end
+
+  test "a failed canonical read still publishes the verb observation" do
+    call = %{
+      verb: "role-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{name: "worker"}
+    }
+
+    assert :ok = Publisher.accepted(:firehose_absent_db, call, %{name: "worker"})
+    assert %{"class" => "verb.accepted", "refs" => %{"origin" => "user:flynn"}} = receive_notice()
+    refute_receive {:firehose_notice, _notice}
+    assert Process.alive?(GenServer.whereis(Hub))
+  end
+
   test "a rail denial emits both observational classes" do
     call = %{
       verb: "attest",
@@ -1751,6 +1810,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
   defp observed_classes do
     drain_notices()
     |> Enum.map(& &1["class"])
+  end
+
+  defp wait_until(check, attempts \\ 200) do
+    cond do
+      check.() ->
+        true
+
+      attempts == 0 ->
+        false
+
+      true ->
+        Process.sleep(5)
+        wait_until(check, attempts - 1)
+    end
   end
 
   defp drain_notices(acc \\ []) do
