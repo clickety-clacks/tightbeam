@@ -93,7 +93,8 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
     assert [%{state: "launching", resolved_at: nil, last_error: nil}] =
              HarnessProcess.list(ctx.db)
 
-    refute HarnessProcess.fenced?(ctx.db, @key)
+    assert HarnessProcess.fenced?(ctx.db, @key)
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM harness_park_fences")
 
     terminal(row)
 

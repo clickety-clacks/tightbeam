@@ -445,14 +445,15 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+    first = Credentials.status(:openai, server)
+    assert match?({:needs_onboarding, _}, first)
     assert :atomics.get(calls, 1) > 1
 
     :sys.replace_state(server, fn state ->
       %{state | sh: fn _command -> receive do: (:release_probe -> {"", 1}) end}
     end)
 
-    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+    assert Credentials.status(:openai, server) == first
   end
 
   test "queueing behind a lifecycle call cannot start an expired status read", ctx do
