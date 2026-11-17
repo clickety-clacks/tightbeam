@@ -165,6 +165,43 @@ defmodule Tightbeam.RulesTest do
     assert :ok = Rules.evaluate(ctx.db, call())
   end
 
+  test "non-string and missing purposes skip only their policies", ctx do
+    path =
+      put_raw(
+        ctx,
+        rule("deny-post", "post", "caller.origin_class", "eq", "user") <>
+          rule("deny-wake", "wake", "caller.origin_class", "eq", "user") <>
+          """
+          [[policy]]
+          name = "supported-evidence"
+          purpose = "attest-operational-evidence"
+          when = [{ fact = "assignment.effect_kind", op = "eq", value = "evidence" }]
+
+          [[policy]]
+          name = "numeric-purpose"
+          purpose = 17
+          when = [{ fact = "unknown.fact", op = "eq", value = true }]
+
+          [[policy]]
+          name = "missing-purpose"
+          when = [{ fact = "unknown.fact", op = "eq", value = true }]
+          """
+      )
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        loaded = Rules.load!(ctx.base_dir, ["post", "wake", "status"])
+        assert Enum.map(loaded, & &1.name) == ["deny-post", "deny-wake"]
+        assert Enum.map(Rules.effective_snapshot().policies, & &1.name) == ["supported-evidence"]
+      end)
+
+    assert log =~ "#{path}: policy \"numeric-purpose\": unsupported purpose: 17"
+    assert log =~ "#{path}: policy \"missing-purpose\": unsupported purpose: nil"
+    assert {:deny, %{code: "rule_denied"}} = Rules.evaluate(ctx.db, call())
+    assert {:deny, %{code: "rule_denied"}} = Rules.evaluate(ctx.db, %{call() | verb: "wake"})
+    assert :ok = Rules.evaluate(ctx.db, %{call() | verb: "status"})
+  end
+
   test "a malformed rule leaves a healthy sibling rule active", ctx do
     put_raw(
       ctx,

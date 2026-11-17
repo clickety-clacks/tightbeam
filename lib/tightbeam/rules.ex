@@ -1513,7 +1513,7 @@ defmodule Tightbeam.Rules do
 
   defp unsupported_policy_purpose?(policy) when is_map(policy) do
     purpose = Map.get(policy, "purpose")
-    is_binary(purpose) and purpose not in @policy_purposes
+    purpose not in @policy_purposes
   end
 
   defp unsupported_policy_purpose?(_policy), do: false
