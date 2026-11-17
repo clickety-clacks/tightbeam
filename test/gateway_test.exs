@@ -56,7 +56,7 @@ defmodule Tightbeam.GatewayTest do
 
     expected =
       expected ++
-        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow)
+        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow)
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 
@@ -1347,14 +1347,19 @@ defmodule Tightbeam.GatewayTest do
         "sessionKey" => "k1"
       })
 
-    post = Gateway.handlers(%{db: ctx.db})["post"]
+    post = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["post"]
 
-    attachment = %{
-      "assetId" => "asset-post-1",
-      "mimeType" => "image/png",
-      "filename" => "diagram.png",
-      "size" => 123
-    }
+    asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        "flynn",
+        "image/png",
+        "diagram.png",
+        <<137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3>>
+      )
+
+    attachment = attachment_ref(asset, "diagram.png")
 
     call = %{
       session_key: "k1",

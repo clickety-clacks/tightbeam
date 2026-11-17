@@ -168,6 +168,7 @@ defmodule Tightbeam.Gateway do
     db = Map.get(config, :db, Tightbeam.DB)
     :ok = DB.assert_base_admitted!(db, config.base_dir)
     Identity.init_after_admission!(config.base_dir, db)
+    warn_missing_installed_kungfu(config.base_dir)
     load_law!(config)
     prod_limit = Map.get(config, :prod_limit, 3)
 
@@ -1039,6 +1040,9 @@ defmodule Tightbeam.Gateway do
           runner: Map.get(config, :harklight_send_runner)
         )
       end,
+      {"harklight-retry", []} => fn call ->
+        Tightbeam.HarklightWakes.retry_command(db, call)
+      end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,
@@ -1768,7 +1772,7 @@ defmodule Tightbeam.Gateway do
     |> compile_handler_specs!()
   end
 
-  @direct_state_classes ~w(message.created message.attachment_delivery.updated transition.recorded tool_call.started tool_call.ended wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated)
+  @direct_state_classes ~w(message.created transition.recorded tool_call.started tool_call.ended wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated)
 
   @doc false
   @spec compile_handler_specs!(map()) ::
@@ -6097,6 +6101,15 @@ defmodule Tightbeam.Gateway do
     identity
     |> Map.put(:sessions, sessions)
     |> maybe_put_guidance(guidance)
+  end
+
+  @doc false
+  def warn_missing_installed_kungfu(base_dir) do
+    if notice = Identity.missing_installed_kungfu_notice(base_dir) do
+      Logger.warning(notice)
+    end
+
+    :ok
   end
 
   defp maybe_put_guidance(status, nil), do: status
