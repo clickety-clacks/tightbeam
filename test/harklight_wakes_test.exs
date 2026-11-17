@@ -428,12 +428,35 @@ defmodule Tightbeam.HarklightWakesTest do
   end
 
   @tag :origin_consumer
-  test "aggregate capture preserves retirement fencing and deduplicates retained offers",
-       %{db: db, session: session} do
+  test "aggregate capture fences the retiree and delivers to its successor exactly once",
+       %{db: db, session: session, main: main} do
     assert {:ok, :started} =
              Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
 
     assert {:ok, _} = Tightbeam.HarklightOrigin.confirmed(db, @handle, true)
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+    line = event(1, "discussion", "shared origin after retirement")
+    assert :ok = HarklightWakes.capture_origin_line(db, line)
+    assert :ok = HarklightWakes.capture_origin_line(db, line)
+    successor = main.session_key
+
+    assert {:ok, [[^successor]]} =
+             DB.query(db, "SELECT sessionKey FROM harklight_wake_deliveries")
+
+    assert {:ok, [[^successor]]} = DB.query(db, "SELECT sessionKey FROM wakes")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM harklight_wake_entries")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT lastCursor FROM harklight_wake_handles")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM harklight_origin_offers")
+  end
+
+  @tag :origin_consumer
+  test "aggregate capture without an active successor fences retirement and deduplicates retained offers",
+       %{db: db, session: session, main: main} do
+    assert {:ok, :started} =
+             Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+
+    assert {:ok, _} = Tightbeam.HarklightOrigin.confirmed(db, @handle, true)
+    Org.retire(db, main.session_key, "user:owner", 60_000)
     Org.retire(db, session.session_key, "user:owner", 60_000)
     line = event(1, "discussion", "shared origin after retirement")
     assert :captured = HarklightWakes.capture_origin_line(db, line)
@@ -444,6 +467,48 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM harklight_wake_entries")
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
     assert {:ok, [[0]]} = DB.query(db, "SELECT lastCursor FROM harklight_wake_handles")
+  end
+
+  @tag :origin_consumer
+  test "explicit custody transfer wins over automatic retirement succession for aggregate delivery",
+       %{db: db, session: session, main: main} do
+    successor =
+      Org.create(db, %{
+        session_key: "agent:aggregate:successor",
+        display_name: "Successor",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        spawned_by: main.session_key,
+        archetype: "default",
+        host: Placement.local_host_name(),
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("fable")
+      })
+
+    assert {:ok, :started} =
+             Tightbeam.HarklightOrigin.begin_move(db, @handle, session.session_key)
+
+    assert {:ok, _} = Tightbeam.HarklightOrigin.confirmed(db, @handle, true)
+
+    assert %{"eventId" => _} =
+             SessionCustodyTransfer.handle(db, %{
+               principal: {:user, "owner"},
+               params: %{
+                 from_session_key: session.session_key,
+                 to_session_key: successor.session_key,
+                 idempotency_key: "aggregate-explicit-receiver"
+               }
+             })
+
+    Org.retire(db, session.session_key, "user:owner", 60_000)
+    line = event(1, "discussion", "explicit receiver after origin retirement")
+    assert :ok = HarklightWakes.capture_origin_line(db, line)
+    assert :ok = HarklightWakes.capture_origin_line(db, line)
+    receiver = successor.session_key
+    assert {:ok, [[^receiver]]} = DB.query(db, "SELECT sessionKey FROM harklight_wake_deliveries")
+    assert {:ok, [[^receiver]]} = DB.query(db, "SELECT sessionKey FROM wakes")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM harklight_origin_offers")
   end
 
   @tag :origin_consumer
