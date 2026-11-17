@@ -76,6 +76,7 @@ impl CommandContext {
             HarklightSettle { .. } => ("cli.harklight_settle", DispatchPath),
             HarklightFollow { .. } => ("cli.harklight_follow", DispatchPath),
             HarklightCover { .. } => ("cli.harklight_cover", DispatchPath),
+            HarklightRetry { .. } => ("cli.harklight_retry", DispatchPath),
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
             Artifacts { .. } => ("cli.artifacts", DispatchPath),
             ToolCallObserved => ("cli.tool_call_observed", Requests::ToolCallObserved),
@@ -459,6 +460,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HarklightSettle { .. }
         | HarklightFollow { .. }
         | HarklightCover { .. }
+        | HarklightRetry { .. }
         | ToolCallObserved
         | RoleBind { .. }
         | Tune { .. }
@@ -569,6 +571,29 @@ mod tests {
         assert!(!debug.contains("PRIVATE_USER"));
         assert!(!debug.contains("PRIVATE_ASSIGNMENT"));
         assert!(!debug.contains("PRIVATE_REASON"));
+    }
+
+    #[test]
+    fn harklight_retry_is_a_dispatch_write_without_retained_selector_data() {
+        let command = Command::HarklightRetry {
+            identity: Identity::Session,
+            all: false,
+            message: Some("PRIVATE_MESSAGE".into()),
+            handle: None,
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.harklight_retry"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        assert!(!format!("{context:?}").contains("PRIVATE_MESSAGE"));
     }
 
     #[test]
