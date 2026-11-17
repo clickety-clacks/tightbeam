@@ -625,6 +625,99 @@ defmodule Tightbeam.IdentityTest do
     assert Identity.live_revision!(ctx.base) == stable
   end
 
+  test "status says a commit on the identity source did not change live and names the publishing step",
+       ctx do
+    Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    live = Identity.live_revision!(ctx.base)
+    assert %{source_revision: ^live, source_notice: nil} = Identity.status(ctx.base)
+
+    File.write!(Path.join(dir, "guidance/coder.md"), "committed straight to main")
+    git!(dir, ["add", "-A"])
+    git!(dir, ["commit", "-m", "direct source commit"], "test")
+    source = git!(dir, ["rev-parse", "main"])
+
+    assert %{live_revision: ^live, source_revision: ^source, source_notice: notice} =
+             Identity.status(ctx.base)
+
+    assert notice =~ "nothing changed live"
+    assert notice =~ source
+    assert notice =~ "`tightbeam identity edit` publishes everything on main"
+    assert Identity.live_revision!(ctx.base) == live
+
+    published = edit!(ctx.base, "coder", :guidance, "published edit", "test")
+
+    assert %{live_revision: ^published, source_revision: ^published, source_notice: nil} =
+             Identity.status(ctx.base)
+
+    assert git!(dir, ["show", "#{published}~1:guidance/coder.md"]) ==
+             "committed straight to main"
+  end
+
+  test "status names the publishing step when main does not descend from live", ctx do
+    Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    live = Identity.live_revision!(ctx.base)
+
+    divergent =
+      git!(dir, [
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@tightbeam.invalid",
+        "commit-tree",
+        "#{live}^{tree}",
+        "-m",
+        "unrelated live"
+      ])
+
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", divergent, live])
+    File.write!(Path.join(dir, "guidance/coder.md"), "main commit")
+    git!(dir, ["add", "-A"])
+    git!(dir, ["commit", "-m", "main commit"], "test")
+
+    assert %{source_notice: notice} = Identity.status(ctx.base)
+    assert notice =~ "nothing changed live"
+    assert notice =~ "does not descend from live"
+    assert notice =~ "a successful `tightbeam identity edit` publishes everything on main"
+  end
+
+  test "a refused publication says the commit is not live and names the publishing step", ctx do
+    Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    candidate = Identity.edit!(ctx.base, "coder", :guidance, "unpublished", "test")
+
+    divergent =
+      git!(dir, [
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@tightbeam.invalid",
+        "commit-tree",
+        "#{candidate.expected_prior}^{tree}",
+        "-m",
+        "unrelated live"
+      ])
+
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", divergent, candidate.expected_prior])
+
+    assert {:error, %{code: "identity_publication_conflict", message: message}} =
+             Identity.publish_live!(ctx.base, candidate)
+
+    assert message =~ "live revision is unchanged (#{divergent})"
+    assert message =~ "nothing changed live"
+    assert message =~ "`tightbeam identity edit` publishes everything on main"
+
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", divergent])
+    stale = %{candidate | expected_prior: divergent}
+
+    assert {:error, %{code: "identity_publication_non_fast_forward", message: message}} =
+             Identity.publish_live!(ctx.base, stale)
+
+    assert message =~ "nothing changed live"
+    assert Identity.live_revision!(ctx.base) == divergent
+  end
+
   test "pending recovery loads published law and runs published checks without changing the merge",
        ctx do
     alias Tightbeam.{DB, Gateway, Rails, RailScript, Schema}
