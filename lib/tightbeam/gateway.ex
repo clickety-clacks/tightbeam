@@ -3980,7 +3980,7 @@ defmodule Tightbeam.Gateway do
          _model,
          _input
        ),
-       do: {:error, :timeout}
+    do: {:error, :timeout}
 
   defp compactor_result({:error, reason}, _close_result, _model, _input),
     do: {:error, {:prompt_failed, reason}}
@@ -9716,7 +9716,8 @@ defmodule Tightbeam.Gateway do
                  guidance
                ) do
             {:ok, sid} ->
-              {:ok, adapter, sid, if(handoff, do: handoff.through_seq), destination_payload_evidence}
+              {:ok, adapter, sid, if(handoff, do: handoff.through_seq),
+               destination_payload_evidence}
 
             {:error, {:session_prepare_failed, reason, sid, cleanup}} ->
               {:candidate_prepare_failed, reason, sid, cleanup}

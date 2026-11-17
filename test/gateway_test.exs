@@ -5376,7 +5376,10 @@ defmodule Tightbeam.GatewayTest do
     config =
       gateway_config(base_dir, ctx.db, 0)
       |> Map.put(:harness_switch_context_enabled, true)
-      |> Map.put(:harness_switch_context, Application.fetch_env!(:tightbeam, :harness_switch_context))
+      |> Map.put(
+        :harness_switch_context,
+        Application.fetch_env!(:tightbeam, :harness_switch_context)
+      )
 
     assert :ok =
              DB.execute(
@@ -5432,16 +5435,18 @@ defmodule Tightbeam.GatewayTest do
     assert after_switch.cleared_through_seq == before.cleared_through_seq
 
     assert {:ok,
-            [[
-              "claude",
-              "before-model",
-              "codex",
-              "gpt-5.6-sol",
-              processed_json,
-              "[]",
-              payload_evidence_json,
-              "pending"
-            ]]} =
+            [
+              [
+                "claude",
+                "before-model",
+                "codex",
+                "gpt-5.6-sol",
+                processed_json,
+                "[]",
+                payload_evidence_json,
+                "pending"
+              ]
+            ]} =
              DB.query(
                ctx.db,
                """
@@ -5460,8 +5465,7 @@ defmodule Tightbeam.GatewayTest do
       byte_size(guidance) +
         byte_size(
           JSON.encode!(%{
-            _meta:
-              Tightbeam.Harness.Codex.session_config(%{cwd: destination_cwd}, guidance).meta
+            _meta: Tightbeam.Harness.Codex.session_config(%{cwd: destination_cwd}, guidance).meta
           })
         )
 

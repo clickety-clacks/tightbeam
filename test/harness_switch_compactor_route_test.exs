@@ -96,7 +96,8 @@ defmodule Tightbeam.HarnessSwitchCompactorRouteTest do
   end
 
   test "a timed out compactor prompt closes its temporary session within the cleanup bound" do
-    adapter = start_supervised!({Adapter, owner: self(), prompt_result: {:error, :prompt_timeout}})
+    adapter =
+      start_supervised!({Adapter, owner: self(), prompt_result: {:error, :prompt_timeout}})
     coordinator = start_supervised!({Coordinator, adapter: adapter, owner: self()})
 
     assert {:error, :timeout} =

@@ -230,12 +230,17 @@ defmodule Tightbeam.HarnessSwitchContext do
   def prepare_turn(db, turn, session, echo, config) do
     {current_content, attachments} =
       case echo do
-        prompt when is_binary(prompt) -> {prompt, []}
+        prompt when is_binary(prompt) ->
+          {prompt, []}
+
         %{content: content} = prepared when is_binary(content) or is_list(content) ->
           {content, Map.get(prepared, :attachments, []) || []}
 
-        content when is_list(content) -> {content, []}
-        _ -> {turn.prompt, []}
+        content when is_list(content) ->
+          {content, []}
+
+        _ ->
+          {turn.prompt, []}
       end
 
     with {:ok, bound} <- bound_prompt_for_message(db, turn.session_key, turn.message_id) do
@@ -363,8 +368,7 @@ defmodule Tightbeam.HarnessSwitchContext do
         },
         estimator: @token_estimator,
         historical_context_bytes_upper: byte_size(minimal),
-        current_input_bytes_upper:
-          payload_bytes(compose_handoff_prompt("", current_content)),
+        current_input_bytes_upper: payload_bytes(compose_handoff_prompt("", current_content)),
         included_message_ids: [],
         omitted_message_ids: snapshot.processed_message_ids || Enum.map(entries, & &1.id),
         compactor_model: nil,
@@ -436,9 +440,14 @@ defmodule Tightbeam.HarnessSwitchContext do
           {:ok, %{prompt: prompt}}
         end
 
-      {:ok, []} -> {:ok, nil}
-      {:ok, _rows} -> {:error, :invalid_bound_context}
-      {:error, error} -> {:error, {:context_read_failed, Exception.message(error)}}
+      {:ok, []} ->
+        {:ok, nil}
+
+      {:ok, _rows} ->
+        {:error, :invalid_bound_context}
+
+      {:error, error} ->
+        {:error, {:context_read_failed, Exception.message(error)}}
     end
   end
 
@@ -1148,8 +1157,7 @@ defmodule Tightbeam.HarnessSwitchContext do
         context_tokens: capacity.context_tokens,
         identity_tokens_upper: identity_payload_bytes,
         tool_definition_tokens_upper: tool_definitions_bytes,
-        pending_input_tokens_upper:
-          payload_bytes(compose_handoff_prompt("", current_content)),
+        pending_input_tokens_upper: payload_bytes(compose_handoff_prompt("", current_content)),
         catalog_key: "#{session.host}|#{session.harness}|#{Model.to_ref(model)}",
         selected_context: model.context || "default",
         reserve_tokens: @handoff_reserve_tokens,
@@ -1190,7 +1198,8 @@ defmodule Tightbeam.HarnessSwitchContext do
         }
     end
   rescue
-    _error -> %{status: "unverified", reason: "destination session payload or catalog lookup failed"}
+    _error ->
+      %{status: "unverified", reason: "destination session payload or catalog lookup failed"}
   end
 
   defp catalog_entry(host, harness, model, model_catalog, config) do

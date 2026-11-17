@@ -6,6 +6,7 @@ config :tightbeam, :escalation_decision_deadline_ms, 86_400_000
 # ACP access for the source model and tier listed below. Its input capacity is
 # resolved from the exact host/harness/model catalog entry at switch time.
 config :tightbeam, :harness_switch_context_enabled, false
+
 config :tightbeam, :harness_switch_context, %{
   compactor: %{
     route: :codex_acp,
