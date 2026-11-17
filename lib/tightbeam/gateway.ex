@@ -828,7 +828,9 @@ defmodule Tightbeam.Gateway do
                     client_message_id: p.client_message_id,
                     attachments: attachments,
                     creator_session_key: call.session_key,
-                    queue_when_busy: true
+                    queue_when_busy: true,
+                    conn_registry: Map.get(config, :conn_registry) || Tightbeam.ConnRegistry,
+                    lane_manager: Map.get(config, :lane_manager) || Tightbeam.LaneManager
                   )
 
                 if outcome in [:appended, :queued],
