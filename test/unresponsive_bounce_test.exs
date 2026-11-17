@@ -185,7 +185,10 @@ defmodule Tightbeam.UnresponsiveBounceTest do
              )
 
     assert {:ok, [["queued"]]} =
-             DB.query(ctx.db, "SELECT status FROM turns WHERE wakeId='w_unresponsive_accepted_source'")
+             DB.query(
+               ctx.db,
+               "SELECT status FROM turns WHERE wakeId='w_unresponsive_accepted_source'"
+             )
 
     assert {:ok, []} = bounce_prompts(ctx.db)
   end
