@@ -58,6 +58,18 @@ defmodule Tightbeam.AssignmentsTest do
     %{db: db, holder: holder, other: other, handlers: handlers, law: law}
   end
 
+  test "non-owner revocation and reopening proceed with owner warning", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "warning disposition"))
+
+    revoked = handle(ctx, "revoke-assignment", revoke_call({:user, "other"}, assignment.id))
+    assert revoked.outcome == "revoked"
+    assert revoked.warning =~ "user:other acted on an assignment owned by flynn"
+
+    reopened = handle(ctx, "reopen-assignment", reopen_call({:user, "other"}, assignment.id, "repair"))
+    assert reopened.state == "open"
+    assert reopened.warning =~ "user:other acted on an assignment owned by flynn"
+  end
+
   test "upgrading assignments adds no parent links to existing rows", ctx do
     existing = ctx.handlers["assign"].(assign_call({:user, "flynn"}, "existing task"))
 
