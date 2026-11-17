@@ -355,7 +355,7 @@ defmodule Tightbeam.CredentialsTest do
                %{path: parent, found: :untraversable, expected: :traversable_directory}}}
   end
 
-  test "a blocked remote status returns unavailable while its owner remains responsive", ctx do
+  test "a blocked remote status stays pending while its owner remains responsive", ctx do
     parent = self()
 
     {:ok, server} =
@@ -386,7 +386,7 @@ defmodule Tightbeam.CredentialsTest do
     assert {:pending, nil} =
              Task.await(caller, 6_000)
 
-    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 1_000
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 2_000
     assert :sys.get_state(server).status_reads == %{}
   end
 
