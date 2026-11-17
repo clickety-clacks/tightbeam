@@ -334,9 +334,11 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["update-ref", "refs/heads/tightbeam/live", missing])
 
     status = Identity.status(ctx.base)
+
     assert status.missing_installed_kungfu == [
              "#{path} (rule engineering-spawn-staffing-needs-work-item)"
            ]
+
     assert status.missing_installed_kungfu_notice =~ path
     assert status.missing_installed_kungfu_notice =~ "tightbeam identity relearn"
 

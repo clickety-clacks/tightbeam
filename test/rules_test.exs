@@ -4264,6 +4264,7 @@ defmodule Tightbeam.RulesTest do
 
     holder =
       engineering_session(ctx.db, "scoped-backlog-holder", "scope-owner", archetype: "coder")
+
     load_ac6a_rules(ctx)
 
     for index <- 1..20 do
@@ -4301,6 +4302,7 @@ defmodule Tightbeam.RulesTest do
 
     holder =
       engineering_session(ctx.db, "scoped-opener-holder", "scope-owner", archetype: "coder")
+
     opened = assignment(ctx, holder.session_key, {:session, main.session_key})
     load_ac6a_rules(ctx)
 
@@ -4335,6 +4337,7 @@ defmodule Tightbeam.RulesTest do
 
     holder = engineering_session(ctx.db, "unavailable-backlog-holder", "scope-owner")
     [rule | _] = Enum.filter(load_ac6a_rules(ctx), &(&1.name == "ac6a-queue-backlog"))
+
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
                holder.session_key

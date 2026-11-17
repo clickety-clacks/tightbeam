@@ -1119,8 +1119,7 @@ defmodule Tightbeam.Rules do
                 if effect_scope_matches?(rule, rule.effect, txn, candidate_call) do
                   {:halt,
                    [
-                     {:notice, rule, candidate_call,
-                      evidence_facts(rule.conditions, cache)}
+                     {:notice, rule, candidate_call, evidence_facts(rule.conditions, cache)}
                    ]}
                 else
                   {:cont, []}

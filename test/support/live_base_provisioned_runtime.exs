@@ -32,6 +32,7 @@ try do
 after
   Application.delete_env(:tightbeam, :identity_seed_dir)
 end
+
 identity_revision = Tightbeam.Identity.live_revision!(template)
 File.mkdir_p!(Path.join(template, "homes/testhost"))
 File.write!(Path.join(template, "homes/testhost/synthetic.txt"), "no credentials\n")
