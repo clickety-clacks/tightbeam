@@ -71,11 +71,14 @@ defmodule Tightbeam.AttestEvidence do
             )
           end
 
-        _ ->
+        [[nil, nil]] ->
           RecordFyis.note(
             call,
-            "#{cited_pair(call)}; the producer has no verified verdict with an artifact"
+            "#{cited_pair(call)}; the producer's latest verified verdict has no artifact"
           )
+
+        [] ->
+          RecordFyis.note(call, "#{cited_pair(call)}; the producer has no verified verdict")
       end
     else
       call

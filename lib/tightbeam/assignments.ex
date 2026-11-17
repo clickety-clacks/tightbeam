@@ -1317,7 +1317,7 @@ defmodule Tightbeam.Assignments do
       limit,
       fn row -> [Enum.at(row, 12), hd(row)] end
     )
-    |> then(fn page -> %{page | rows: Enum.map(page.rows, &attest_collection_row/1)} end)
+    |> then(fn page -> %{page | rows: attest_collection_rows(txn, page.rows)} end)
   end
 
   def list_attests(%Txn{} = txn, %{
@@ -1358,7 +1358,7 @@ defmodule Tightbeam.Assignments do
       limit,
       fn row -> [Enum.at(row, 12), hd(row)] end
     )
-    |> then(fn page -> %{page | rows: Enum.map(page.rows, &attest_collection_row/1)} end)
+    |> then(fn page -> %{page | rows: attest_collection_rows(txn, page.rows)} end)
   end
 
   def list_attests(db, assignment_id) when is_binary(assignment_id) do
@@ -1403,6 +1403,13 @@ defmodule Tightbeam.Assignments do
       predicate = column <> " IN (" <> Enum.map_join(values, ", ", fn _ -> "?" end) <> ")"
       {"(" <> where <> ") AND " <> predicate, params ++ values}
     end)
+  end
+
+  # REST attest items always carry fyi: the stored FYI lines, or [].
+  defp attest_collection_rows(txn, rows) do
+    rows = Enum.map(rows, &attest_collection_row/1)
+    fyis = RecordFyis.list_many(txn, "attest", Enum.map(rows, & &1.id))
+    Enum.map(rows, &Map.put(&1, :fyi, Map.get(fyis, &1.id, [])))
   end
 
   defp attest_collection_row([

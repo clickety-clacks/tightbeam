@@ -7,7 +7,7 @@ defmodule Tightbeam.AttestFyiTest do
 
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ArtifactContent, DB, Gateway, Model, Org, Placement, Schema}
+  alias Tightbeam.{ArtifactContent, DB, Gateway, Model, Org, Placement, Rules, Schema}
 
   @suffix "; decide for yourself whether that is acceptable"
   @judgment_words ~w(must required requires should please invalid error forbidden refus denied violat cannot) ++
@@ -345,6 +345,47 @@ defmodule Tightbeam.AttestFyiTest do
                artifact_id: good.id,
                content_sha256: ""
              )
+  end
+
+  test "a review pair that differs from the producer's latest verified verdict names what that verdict carries",
+       ctx do
+    review_card = ctx.card.("asg_fyi_evidence_review", ctx.reviewer, "review", ctx.evidence)
+    artifact = capture(ctx, ctx.evidence, "operation result")
+
+    policy = %{
+      name: "evidence-operation",
+      purpose: "attest-operational-evidence",
+      source: "test-policy",
+      conditions: [%{fact: "assignment.effect_kind", op: "eq", value: "evidence"}]
+    }
+
+    snapshot = Rules.effective_snapshot() |> Map.put(:policies, [policy])
+
+    review = fn ->
+      Rules.with_snapshot(snapshot, fn ->
+        attest(ctx, ctx.reviewer, review_card, "verdict",
+          verdict_kind: "reviewed-clean",
+          artifact_id: artifact.id,
+          content_sha256: artifact.hash
+        )
+      end)
+    end
+
+    cited = "this review cites artifact #{artifact.id} sha256 #{artifact.hash}"
+
+    assert review.().fyi == [fyi(cited <> "; the producer has no verified verdict")]
+
+    assert %{attest: %{artifactId: _}} =
+             verified_with(ctx, ctx.evidence, artifact.id, artifact.hash)
+
+    refute Map.has_key?(review.(), :fyi)
+
+    later = attest(ctx, ctx.holder, ctx.evidence, "verdict", verdict_kind: "verified")
+    assert later.fyi == [fyi("this verified verdict carries no commit refs")]
+
+    lines = review.().fyi
+    assert lines == [fyi(cited <> "; the producer's latest verified verdict has no artifact")]
+    assert_neutral(lines)
   end
 
   test "an artifact outside the selected evidence route is recorded unchecked with an FYI", ctx do

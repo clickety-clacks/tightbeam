@@ -266,7 +266,7 @@ defmodule Tightbeam.StateResources do
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "attests" =>
-      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs ts rowVersion),
+      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs fyi ts rowVersion),
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
@@ -481,6 +481,7 @@ defmodule Tightbeam.StateResources do
     {"work items", "landings"} => {:array, :landing, :preserve},
     {"assignments", "files"} => {:array, :string, :preserve},
     {"attests", "commitRefs"} => {:array, :commit_ref, :preserve},
+    {"attests", "fyi"} => {:array, :string, :preserve},
     {"decision requests", "options"} => {:array, :decision_option, :preserve},
     {"decision requests", "context"} => :json,
     {"sessions", "overrides"} => :session_overrides,
@@ -1338,6 +1339,7 @@ defmodule Tightbeam.StateResources do
           by_harness: by_harness,
           by_provider: by_provider,
           commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
+          fyi: Map.get(Tightbeam.RecordFyis.list_many(db, "attest", [id]), id, []),
           ts: ts
         }
 
