@@ -3657,19 +3657,14 @@ defmodule Tightbeam.Wire.Router do
              params.attachments
            ) do
         :ok ->
-          dispatch_response(
-            conn,
-            %{
-              verb: "post",
-              origin: "user:#{user_id}",
-              principal: {:user, user_id},
-              session_key: session_key,
-              params: params,
-              transport: :rest
-            },
-            200,
-            &%{"result" => &1}
-          )
+          rest_post_dispatch_response(conn, %{
+            verb: "post",
+            origin: "user:#{user_id}",
+            principal: {:user, user_id},
+            session_key: session_key,
+            params: params,
+            transport: :rest
+          })
 
         {:error, :invalid_asset} ->
           error(conn, 400, "invalid_message", "attachment asset is unavailable")
@@ -3688,6 +3683,25 @@ defmodule Tightbeam.Wire.Router do
       end
     else
       {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  defp rest_post_dispatch_response(conn, call) do
+    case Dispatch.dispatch(db(conn), handlers(conn), call) do
+      {:ok, %{dedupe: "conflict"}} ->
+        error(conn, 409, "client_message_conflict")
+
+      {:ok, %{dedupe: "skipped"}} ->
+        error(conn, 409, "not_deliverable")
+
+      {:ok, result} ->
+        json(conn, 200, %{"result" => result})
+
+      {:error, result} ->
+        dispatch_error(conn, call, error_status(result[:code]), result)
+
+      {:decision_pending, decision_request_id} ->
+        decision_pending(conn, decision_request_id)
     end
   end
 

@@ -13118,6 +13118,70 @@ defmodule Tightbeam.GatewayTest do
              ])
   end
 
+  test "REST post conflict returns a known refusal without a success receipt", ctx do
+    ensure_global_registry()
+    owner = ctx.device.user_id
+
+    body = %{
+      verb: "post",
+      asUser: owner,
+      sessionKey: "k1",
+      params: %{
+        clientMessageId: "c_rest_conflict_receipt",
+        deviceId: "chat_test",
+        content: "original text",
+        attachments: []
+      }
+    }
+
+    recorded = rest_post(ctx, "tbc_test", body)
+    assert recorded.status == 200
+    assert_receive {:ensure_lane, "k1"}
+
+    conflict =
+      rest_post(ctx, "tbc_test", put_in(body, [:params, :content], "different text"))
+
+    assert conflict.status == 409
+    assert JSON.decode!(conflict.resp_body) == %{
+             "error" => %{"code" => "client_message_conflict"}
+           }
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId=?1", [
+               "c_rest_conflict_receipt"
+             ])
+  end
+
+  test "REST skipped post result returns not-deliverable without a success receipt", ctx do
+    owner = ctx.device.user_id
+
+    response =
+      rest_post_with_handlers(
+        ctx,
+        "tbc_test",
+        %{
+          verb: "post",
+          asUser: owner,
+          sessionKey: "k1",
+          params: %{
+            clientMessageId: "c_rest_skipped_receipt",
+            deviceId: "chat_test",
+            content: "known skipped post",
+            attachments: []
+          }
+        },
+        %{"post" => fn _call -> %{dedupe: "skipped"} end}
+      )
+
+    assert response.status == 409
+    assert JSON.decode!(response.resp_body) == %{"error" => %{"code" => "not_deliverable"}}
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId=?1", [
+               "c_rest_skipped_receipt"
+             ])
+  end
+
   @tag recipient_readiness: true
   test "REST post receipt leaves turnSeq null while the human post is queued", ctx do
     ensure_global_registry()
