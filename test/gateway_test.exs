@@ -6624,6 +6624,15 @@ defmodule Tightbeam.GatewayTest do
     assert Devices.user(ctx.db, "blocked") == nil
   end
 
+  test "duplicate add-user returns a typed conflict", ctx do
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["add-user"]
+    call = %{origin: "user:flynn", session_key: nil, params: %{user_id: "guest"}}
+
+    assert %{user: %{"userId" => "guest"}} = handler.(call)
+    assert %{code: "user_exists", message: "user already exists: guest"} = handler.(call)
+    assert Devices.user(ctx.db, "guest") != nil
+  end
+
   test "a crash-recovered turn warns that side effects are unknown, not undone", ctx do
     # Boot recovery terminalizes an interrupted turn as "outcome unknown". The
     # in-chat marker must tell the agent to VERIFY before repeating anything

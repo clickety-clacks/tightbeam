@@ -21,6 +21,18 @@ defmodule Tightbeam.ArtifactsTest do
 
   alias Tightbeam.StateResources
 
+  test "missing artifact title or origin path names the input shape", ctx do
+    for params <- [
+          %{kind: "report", origin_path: "lab1:/tmp/report"},
+          %{kind: "report", title: "Report"}
+        ] do
+      assert %{code: "invalid_artifact_record_shape", message: message} =
+               record(ctx.db, ctx.child.session_key, params)
+
+      assert message =~ "title and originPath"
+    end
+  end
+
   @tag artifact_delta: true
   test "canonical artifact projection rejects missing floors while hidden detail stays silent",
        ctx do

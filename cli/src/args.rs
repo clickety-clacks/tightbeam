@@ -1126,6 +1126,7 @@ COMMANDS:
                 [--rationale <text>]
       Record the operator's resolution. A session that presented the request runs it
       only on the operator's explicit delegation, quoted in --rationale.
+      A non-owner caller receives a warning naming the request owner; the ruling proceeds.
   operator-withdraw <dr_id> --reason <text>
       Withdraw an operator decision request as its owner or original asker.
   decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
@@ -1139,8 +1140,10 @@ COMMANDS:
       Stop a running turn in a session owned by that user.
   revoke-assignment <assignmentId> --reason "..."
       Revoke when the assignment handler already authorizes your principal.
+      A non-owner caller receives a warning naming the work owner; revocation proceeds.
   reopen-assignment <assignmentId> --reason <reason>
       Reopen an authorized closed assignment and record the reason.
+      A non-owner caller receives a warning naming the work owner; reopening proceeds.
   repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.

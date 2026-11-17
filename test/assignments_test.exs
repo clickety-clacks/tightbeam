@@ -58,6 +58,20 @@ defmodule Tightbeam.AssignmentsTest do
     %{db: db, holder: holder, other: other, handlers: handlers, law: law}
   end
 
+  test "non-owner revocation and reopening proceed with owner warning", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "warning disposition"))
+
+    revoked = handle(ctx, "revoke-assignment", revoke_call({:user, "other"}, assignment.id))
+    assert revoked.outcome == "revoked"
+    assert revoked.warning =~ "user:other acted on an assignment owned by flynn"
+
+    reopened =
+      handle(ctx, "reopen-assignment", reopen_call({:user, "other"}, assignment.id, "repair"))
+
+    assert reopened.state == "open"
+    assert reopened.warning =~ "user:other acted on an assignment owned by flynn"
+  end
+
   test "upgrading assignments adds no parent links to existing rows", ctx do
     existing = ctx.handlers["assign"].(assign_call({:user, "flynn"}, "existing task"))
 
@@ -6893,6 +6907,35 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :commit_refs], refs)
 
     assert %{code: "not_holder"} = handle(ctx, "attest", verification)
+  end
+
+  test "review attest accepts the canonical remote and ref commit shape", ctx do
+    producer =
+      assign_call({:user, "flynn"}, "canonical commit evidence")
+      |> then(&handle(ctx, "assign", &1))
+
+    review =
+      assign_call({:user, "flynn"}, "canonical commit review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    refs = [
+      %{
+        "repo" => "testhost:/tmp/canonical-evidence",
+        "remote" => "git@example.invalid:repo.git",
+        "ref" => "refs/heads/main",
+        "commit" => String.duplicate("A", 40)
+      }
+    ]
+
+    assert %{attest: %{commitRefs: [stored]}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert stored == Map.put(hd(refs), "commit", String.duplicate("a", 40))
   end
 
   test "a later review retraction before code completion defeats code completion", ctx do
