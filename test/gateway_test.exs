@@ -5494,6 +5494,7 @@ defmodule Tightbeam.GatewayTest do
              Ledger.claim_next(ctx.db, "swap-context", "destination-fixture")
 
     assert destination_turn.seq == destination_seq
+    destination_turn = Map.put(destination_turn, :session_key, "swap-context")
 
     destination_config =
       config
