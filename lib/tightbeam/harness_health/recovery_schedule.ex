@@ -218,30 +218,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
   end
 
   @doc "Recheck open usage-limit holds after the harness credential changes."
-  def credential_changed(db, provider, host)
-      when provider in [:anthropic, :openai] and is_binary(host) do
-    harness = if provider == :anthropic, do: "claude", else: "codex"
-
-    case DB.query(
-           db,
-           "SELECT id FROM harness_health_incidents WHERE harness=?1 AND host=?2 AND failureClass='rate-limit-dead' AND state='open'",
-           [harness, host]
-         ) do
-      {:ok, rows} ->
-        Enum.reduce_while(rows, :ok, fn [id], :ok ->
-          case retry_now(db, id) do
-            {:ok, _} -> {:cont, :ok}
-            {:already_running, _} -> {:cont, :ok}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
-
-      {:error, error} ->
-        {:error, error}
-    end
-  end
-
-  def credential_changed(_db, _provider, _host), do: :ok
+  defdelegate credential_changed(db, provider, host), to: Tightbeam.Harness.RecoveryProbe
 
   @doc false
   def operator_requested_in_txn?(txn, hold_id, cycle_id) do

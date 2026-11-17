@@ -98,7 +98,7 @@ defmodule Tightbeam.IdentityTest do
     refute_receive {:firehose_notice, _}
   end
 
-  test "neutral seed creates the exact three refs and only the two seed files", ctx do
+  test "neutral seed creates the exact three refs and neutral seed files", ctx do
     assert :initialized = Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")
     refs = git!(dir, ["branch", "--format=%(refname:short)"])
@@ -111,7 +111,18 @@ defmodule Tightbeam.IdentityTest do
 
     assert git!(dir, ["ls-tree", "-r", "--name-only", "main"])
            |> String.split("\n", trim: true) ==
-             ["archetypes/default.toml", "guidance/operating-model.md"]
+             [
+               "archetypes/default.toml",
+               "guidance/operating-model.md",
+               "rules/harness-health-recovery.toml"
+             ]
+
+    assert git!(dir, ["show", "main:rules/harness-health-recovery.toml"]) ==
+             String.trim(
+               File.read!(
+                 Application.app_dir(:tightbeam, "priv/seed/rules/harness-health-recovery.toml")
+               )
+             )
 
     snapshot = Identity.snapshot!(ctx.base, "default", :codex)
     assert snapshot.skills == %{}
