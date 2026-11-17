@@ -51,7 +51,10 @@ defmodule Tightbeam.LedgerTest do
     end
 
     enqueue!(db, "k1", "next")
-    assert {{:ok, turn}, claimed} = traced_queries(db, fn -> Ledger.claim_next(db, "k1", "lane") end)
+
+    assert {{:ok, turn}, claimed} =
+             traced_queries(db, fn -> Ledger.claim_next(db, "k1", "lane") end)
+
     assert {:busy, busy} = traced_queries(db, fn -> Ledger.claim_next(db, "k1", "lane") end)
     :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert {:none, empty} = traced_queries(db, fn -> Ledger.claim_next(db, "k1", "lane") end)
