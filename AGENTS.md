@@ -17,7 +17,9 @@ Before building a candidate, pass all three gates in
 on `main` or accounted for as an equivalent or an intentional removal ruled by
 the product owner; the proposed release boots and migrates from a database
 shaped like the previous release's on an isolated host; and every pull request
-to `main` runs and passes the full Linux and macOS test suites, not compile-only.
+to `main` runs the full Linux and macOS test suites. Both checks must pass
+before a candidate is built. Do not merge a pull request with either check red;
+at present, the checks report results but do not block merges automatically.
 A missing feature blocks the candidate; a **Breaking changes** entry does not
 replace release parity. Then CI builds a candidate and `SHA256SUMS` from the
 exact release commit without publishing a release. After the user separately
