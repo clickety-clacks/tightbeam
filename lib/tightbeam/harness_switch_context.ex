@@ -640,7 +640,6 @@ defmodule Tightbeam.HarnessSwitchContext do
            ) do
         [["pending", nil, nil]] ->
           assert_running_turn_for_binding(txn, turn)
-          update_turn_prompt(txn, turn, result.prompt)
 
           Txn.q(
             txn,
@@ -677,8 +676,8 @@ defmodule Tightbeam.HarnessSwitchContext do
 
         [["bound", message_id, prompt]]
         when message_id == turn.message_id and is_binary(prompt) ->
-          update_turn_prompt(txn, turn, prompt)
-          {:ok, prompt}
+          assert_running_turn_for_binding(txn, turn)
+          decode_bound_prompt(prompt)
 
         _ ->
           {:error, :context_no_longer_pending}
@@ -703,20 +702,6 @@ defmodule Tightbeam.HarnessSwitchContext do
 
       _ ->
         raise DB.Error, message: "running turn changed before context binding"
-    end
-  end
-
-  defp update_turn_prompt(txn, turn, prompt) do
-    Txn.q(
-      txn,
-      "UPDATE turns SET prompt=?1 WHERE seq=?2 AND sessionKey=?3 AND status='running' AND prompt=?4",
-      [prompt, turn.seq, turn.session_key, turn.prompt]
-    )
-
-    if Txn.changes(txn) == 1 do
-      :ok
-    else
-      raise DB.Error, message: "running turn prompt changed before context binding"
     end
   end
 

@@ -91,7 +91,9 @@ defmodule Tightbeam.HarnessSwitchCompactorRouteTest do
     assert_receive {:acp_new_session, %Model{family: "gpt-6-luna", effort: "low"},
                     "/tmp/compactor-cwd", [], ^instructions}
 
-    assert_receive {:acp_prompt, "compactor-acp-session", ^input, [timeout: 30_000]}
+    assert_receive {:acp_prompt, "compactor-acp-session", ^input, prompt_opts}
+    assert Keyword.get(prompt_opts, :timeout) == 30_000
+    assert Keyword.get(prompt_opts, :cancel_grace) == 5_000
     assert_receive {:acp_close, "compactor-acp-session", [request_timeout: 5_000]}
   end
 
@@ -116,7 +118,9 @@ defmodule Tightbeam.HarnessSwitchCompactorRouteTest do
                "compact without tools"
              )
 
-    assert_receive {:acp_prompt, "compactor-acp-session", "historical input", [timeout: 30_000]}
+    assert_receive {:acp_prompt, "compactor-acp-session", "historical input", prompt_opts}
+    assert Keyword.get(prompt_opts, :timeout) == 30_000
+    assert Keyword.get(prompt_opts, :cancel_grace) == 5_000
     assert_receive {:acp_close, "compactor-acp-session", [request_timeout: 5_000]}
   end
 

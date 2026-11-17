@@ -1,6 +1,7 @@
 defmodule Tightbeam.GatewayTest do
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.HarnessSwitchContext
   alias Tightbeam.Model
   alias Tightbeam.Wire.ChangeSocket
 
@@ -5517,6 +5518,11 @@ defmodule Tightbeam.GatewayTest do
              %{type: "text", text: historical_and_current},
              image_block
            ] = prepared.prompt
+
+    assert {:ok, [[persisted_turn_prompt]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE seq=?1", [destination_turn.seq])
+
+    assert persisted_turn_prompt == destination_turn.prompt
 
     assert historical_and_current =~ "## Historical working context"
     assert historical_and_current =~ "WID19B_CAPTURED=keep-once"
