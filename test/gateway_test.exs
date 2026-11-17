@@ -3971,6 +3971,153 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
+  # Turns queued behind a rate-limit park fence. Two assignments, both open and
+  # holding only a queued turn (nothing has run, nothing has failed):
+  #   * `asg_held_linked` was open when the incident opened, so the incident's
+  #     affected-work snapshot links it;
+  #   * `asg_held_after` is opened after the incident, so it is not linked.
+  defp held_behind_fence!(ctx) do
+    session = Org.get(ctx.db, "k1")
+    adapter_key = {:claude, "shared", "testhost"}
+
+    open_assignment = fn id, opened_at ->
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO assignments
+                   (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+                 VALUES (?1,'continue held work','k1','flynn',?2,'open',?3,?4)
+                 """,
+                 [id, opened_at, session.harness, session.provider]
+               )
+
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: "k1",
+          message_id: "m-#{id}",
+          origin: "agent:k1",
+          prompt: "held behind the fence",
+          assignment_id: id
+        })
+
+      seq
+    end
+
+    linked_seq = open_assignment.("asg_held_linked", 100)
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "held-fence-incident",
+               harness: session.harness,
+               host: session.host,
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               observed_at: 110,
+               cause: "usage limit",
+               principal: "process:tightbeam"
+             })
+
+    after_seq = open_assignment.("asg_held_after", 120)
+
+    # The fixture is only meaningful while the fence stands and the incident is
+    # open, and while neither turn has been started by anything.
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert HarnessHealth.get(ctx.db, incident.id).state == "open"
+
+    assert {:ok, [["asg_held_linked"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId FROM harness_health_assignments WHERE incidentId=?1",
+               [incident.id]
+             )
+
+    assert {:ok, [[^linked_seq, "queued"], [^after_seq, "queued"]]} =
+             DB.query(ctx.db, "SELECT seq,status FROM turns ORDER BY seq")
+
+    %{incident: incident, adapter_key: adapter_key, linked_seq: linked_seq, after_seq: after_seq}
+  end
+
+  defp held_repair_handler(ctx) do
+    {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
+
+    ctx.catalog_base
+    |> gateway_config(ctx.db, 0)
+    |> Map.put(:adapter_coordinator, coordinator)
+    |> Gateway.handlers()
+    |> Map.fetch!("repair-assignment")
+  end
+
+  defp held_repair_call(ctx, assignment_id, action) do
+    %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: ctx.lane,
+      params: %{
+        assignment_id: assignment_id,
+        action: action,
+        idempotency_key: "held-#{assignment_id}-#{action}"
+      }
+    }
+  end
+
+  # The four refusals a held turn gets today, pinned as they are.
+  test "repair of a turn queued behind a park fence is refused, with contradictory reasons",
+       ctx do
+    held = held_behind_fence!(ctx)
+    handler = held_repair_handler(ctx)
+
+    # Not linked to the incident: resume says no incident covers it while the
+    # incident is open and holding its turn; relaunch says it has launched
+    # because the queued turn counts as a turn.
+    assert %{ok: false, code: "no_open_incident"} =
+             handler.(held_repair_call(ctx, "asg_held_after", "resume"))
+
+    assert %{ok: false, code: "holder_launched"} =
+             handler.(held_repair_call(ctx, "asg_held_after", "relaunch"))
+
+    # Linked to the incident: relaunch says the incident wants resume; resume
+    # says there is no failed turn to rerun.
+    assert %{ok: false, code: "wrong_repair"} =
+             handler.(held_repair_call(ctx, "asg_held_linked", "relaunch"))
+
+    assert %{ok: false, code: "no_failed_turn"} =
+             handler.(held_repair_call(ctx, "asg_held_linked", "resume"))
+
+    assert HarnessHealth.get(ctx.db, held.incident.id).state == "open"
+  end
+
+  # A refused repair must have no effect. These two ask the same refused resume
+  # and fail if it reaches past the refusal.
+  test "a refused resume of a held turn does not close the shared adapter", ctx do
+    held = held_behind_fence!(ctx)
+    handler = held_repair_handler(ctx)
+
+    assert %{ok: false, code: "no_failed_turn"} =
+             handler.(held_repair_call(ctx, "asg_held_linked", "resume"))
+
+    refute_receive {:repair_close_adapter, _}, 100
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, held.adapter_key)
+  end
+
+  test "a refused resume of a held turn leaves the park fence standing", ctx do
+    held = held_behind_fence!(ctx)
+    handler = held_repair_handler(ctx)
+
+    assert %{ok: false, code: "no_failed_turn"} =
+             handler.(held_repair_call(ctx, "asg_held_linked", "resume"))
+
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, held.adapter_key)
+    assert HarnessHealth.get(ctx.db, held.incident.id).state == "open"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE status NOT IN ('queued')"
+             )
+  end
+
   defp failed_repair_route!(ctx, assignment_id, failure_class, observed_at) do
     session = Org.get(ctx.db, "k1")
 
