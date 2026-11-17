@@ -169,6 +169,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert incident.affectedAssignments == Enum.sort(Enum.map(ctx.sessions, & &1.assignment))
     refute ctx.outside_session in incident.affectedSessions
     refute "asg_health_outside" in incident.affectedAssignments
+
     assert Enum.map(incident.observations, & &1.correlation_id) == ["late", "failure-3"]
   end
 
@@ -265,9 +266,16 @@ defmodule Tightbeam.HarnessHealthTest do
       redaction_confirmed: true,
       cause: "normal turn 101 delivered",
       observed_at: recovery_at,
-      accepted_at: recovery_at,
+      accepted_at: recovery_at + 180_000,
       idempotency_key: "other-recovery-1"
     }
+
+    assert {:error, %{code: "stale_recovery_evidence"}} =
+             HarnessHealth.resolve_other(ctx.db, %{
+               recovery
+               | observed_at: at - 1,
+                 idempotency_key: "other-recovery-before-failure"
+             })
 
     assert {:resolved, resolved} = HarnessHealth.resolve_other(ctx.db, recovery)
     assert resolved.state == "resolved"
@@ -295,7 +303,7 @@ defmodule Tightbeam.HarnessHealthTest do
     refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "testhost", "other")
   end
 
-  test "other evidence validity accepts the 15-minute boundary and explains excess validity",
+  test "other evidence validity can exceed fifteen minutes",
        ctx do
     at = System.system_time(:millisecond)
     source_session = "agent:harness-health:validity-boundary"
@@ -326,26 +334,13 @@ defmodule Tightbeam.HarnessHealthTest do
       not_known_class_reason: "not one of the named failure classes",
       observed_at: at,
       accepted_at: at,
-      valid_until: at + 900_000,
+      valid_until: at + 3_600_000,
       world_status: "UNKNOWN",
       redaction_confirmed: true,
       idempotency_key: "other-validity-boundary"
     }
 
     assert {:opened, _opened} = HarnessHealth.observe_other(ctx.db, input)
-
-    assert {:error,
-            %{
-              code: "invalid_other_evidence",
-              message:
-                "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
-            }} =
-             HarnessHealth.observe_other(ctx.db, %{
-               input
-               | description: "unclassified evidence beyond validity limit",
-                 valid_until: at + 900_001,
-                 idempotency_key: "other-validity-over-limit"
-             })
   end
 
   test "public other opening deduplicates an owner main already present as an ancestor", ctx do
