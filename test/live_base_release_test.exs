@@ -567,7 +567,7 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     # The census must be allowed to become faster. Unbounded migration waits
     # are proved independently in DBCallTimeoutTest; this populated fixture
     # retains the guarded upgrade, integrity and restart assertions.
-    assert log =~ "migration call migration_transaction: finished elapsed_ms="
+    assert log =~ "database startup call migration_transaction: finished elapsed_ms="
     assert log =~ "terminal census begin"
     assert log =~ "stamp begin"
     assert log =~ "runtime checks restored"
