@@ -33,7 +33,7 @@ defmodule Tightbeam.RulePreflightTest do
     """)
 
     ExUnit.CaptureLog.capture_log(fn ->
-      Rules.load!(base, ["wake"])
+      Rules.load!(base, Map.keys(Gateway.handlers(%{base_dir: base})))
     end)
 
     status = Rules.status()
