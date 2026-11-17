@@ -4622,7 +4622,7 @@ defmodule Tightbeam.Wire.Router do
     "host-env-set" => ~w(harness host key name sentinel value)a,
     "host-env-unset" => ~w(harness host key name sentinel)a,
     "host-toolchain-set" => ~w(dirs host)a,
-    "identity-apply" => ~w(all session_key)a,
+    "identity-apply" => ~w(all cursor limit session_key)a,
     "identity-edit" =>
       ~w(archetype content expected_revision idempotency_key manifest name path remove skill)a,
     "identity-relearn" => ~w(action idempotency_key)a,

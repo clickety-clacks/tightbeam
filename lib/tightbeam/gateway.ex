@@ -5383,6 +5383,12 @@ defmodule Tightbeam.Gateway do
 
   defp complete_session_snapshot(config, session, harness, revision) do
     snapshot = Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)
+    complete_session_snapshot(config, session, snapshot)
+  end
+
+  # The session-specific part of a served snapshot, over an archetype snapshot
+  # the caller already holds.
+  defp complete_session_snapshot(config, session, snapshot) do
     guidance = append_transcript_self_inspection(snapshot.guidance, session.session_key)
 
     guidance =
@@ -6033,12 +6039,14 @@ defmodule Tightbeam.Gateway do
     identity = Identity.status(config.base_dir)
     live = identity.live_revision
 
-    sessions =
+    {sessions, _archetype_snapshots} =
       db
       |> Org.list_for_user("", true)
-      |> Enum.map(fn session ->
-        harness = Harness.parse!(session.harness).id()
-        expected = complete_session_snapshot(config, session, harness, live)
+      |> Enum.map_reduce(%{}, fn session, archetype_snapshots ->
+        {read, archetype_snapshots} =
+          archetype_snapshot_once(config, live, session, archetype_snapshots)
+
+        expected = complete_session_snapshot(config, session, archetype_snapshot!(read))
 
         reasons =
           [
@@ -6061,17 +6069,17 @@ defmodule Tightbeam.Gateway do
           ]
           |> Enum.reject(&is_nil/1)
 
-        %{
-          session_key: session.session_key,
-          identity_revision: session.identity_revision,
-          identity_render_contract: session.identity_render_contract,
-          identity_guidance_digest: session.identity_guidance_digest,
-          expected_identity_revision: live,
-          expected_render_contract: expected.render_contract,
-          expected_guidance_digest: expected.guidance_digest,
-          identity_stale: reasons != [],
-          identity_stale_reasons: reasons
-        }
+        {%{
+           session_key: session.session_key,
+           identity_revision: session.identity_revision,
+           identity_render_contract: session.identity_render_contract,
+           identity_guidance_digest: session.identity_guidance_digest,
+           expected_identity_revision: live,
+           expected_render_contract: expected.render_contract,
+           expected_guidance_digest: expected.guidance_digest,
+           identity_stale: reasons != [],
+           identity_stale_reasons: reasons
+         }, archetype_snapshots}
       end)
 
     guidance =
@@ -6094,10 +6102,57 @@ defmodule Tightbeam.Gateway do
   defp maybe_put_guidance(status, nil), do: status
   defp maybe_put_guidance(status, guidance), do: Map.put(status, :guidance, guidance)
 
-  defp identity_apply_result(config, db, %{params: %{all: true}}) do
-    revision = Identity.live_revision!(config.base_dir)
+  # The composed archetype guidance and skills depend only on the revision,
+  # the archetype and the harness, and reading them costs one git process per
+  # guidance file. A pass over many sessions reads each pair once. A failed
+  # read is kept too, so every session of that pair reports it without the
+  # work being repeated.
+  defp archetype_snapshot_once(config, revision, session, archetype_snapshots) do
+    key = {session.archetype, session.harness}
+
+    case archetype_snapshots do
+      %{^key => read} ->
+        {read, archetype_snapshots}
+
+      _ ->
+        read =
+          try do
+            harness = Harness.parse!(session.harness).id()
+            {:ok, Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)}
+          rescue
+            error -> {:raised, error, __STACKTRACE__}
+          end
+
+        {read, Map.put(archetype_snapshots, key, read)}
+    end
+  end
+
+  defp archetype_snapshot!({:ok, snapshot}), do: snapshot
+  defp archetype_snapshot!({:raised, error, stacktrace}), do: reraise(error, stacktrace)
+
+  # A step of `identity apply --all` takes at most this many sessions and stops
+  # taking new ones once it has run this long. The client asks for the next
+  # step with the returned cursor, so no single request spans the org.
+  @identity_apply_step_max 200
+  @identity_apply_step_budget_ms 5_000
+  # A stamp waits for the org-wide identity lock for a few seconds at most.
+  @identity_apply_live_lock_retries 5
+  # Reread prompts of one run fall due this far apart. The wake scheduler
+  # re-resolves every due prompt in the org each time any recipient becomes
+  # ready, so hundreds falling due at once would hold up all other delivery.
+  @identity_apply_reread_spacing_ms 1_000
+
+  defp identity_apply_result(config, db, %{params: %{all: true} = params}) do
     sessions = Org.list_for_user(db, "", true)
-    identity_apply_sessions(config, db, sessions, revision)
+
+    case params[:limit] do
+      nil ->
+        revision = Identity.live_revision!(config.base_dir)
+        identity_apply_sessions(config, db, sessions, revision)
+
+      limit ->
+        identity_apply_step(config, db, sessions, params[:cursor], limit)
+    end
   end
 
   # A retired session is not a target. `Org.get/2` returns retired rows — retiring
@@ -6120,8 +6175,109 @@ defmodule Tightbeam.Gateway do
     do: %{code: "not_found", message: "no matching session"}
 
   defp identity_apply_sessions(config, db, sessions, revision) do
-    results = Enum.map(sessions, &identity_apply_session_result(config, db, &1, revision))
+    {results, _pass} =
+      Enum.map_reduce(
+        sessions,
+        identity_apply_pass(revision, 0),
+        &identity_apply_session_result(config, db, &1, &2)
+      )
 
+    identity_apply_report(db, revision, results)
+  end
+
+  # What one request carries from session to session: the run's revision, the
+  # archetype snapshots read so far, and how many reread prompts the run has
+  # scheduled, which spaces the next one.
+  defp identity_apply_pass(revision, rereads),
+    do: %{revision: revision, archetype_snapshots: %{}, rereads: rereads}
+
+  # One bounded step of `--all`. Sessions are visited in a fixed order grouped
+  # by archetype and harness, so a step reads few archetype snapshots and the
+  # cursor names a position that later steps can resume from. The cursor also
+  # carries the revision the run started with: a publication during the run
+  # shows up as `superseded` results instead of a silent mix of revisions. It
+  # carries the count of reread prompts scheduled so far, so their spacing
+  # continues across steps.
+  defp identity_apply_step(config, db, sessions, cursor, limit) do
+    with {:ok, limit} <- identity_apply_step_limit(limit),
+         {:ok, position} <- identity_apply_position(cursor) do
+      ordered = Enum.sort_by(sessions, &identity_apply_order/1)
+
+      {revision, rereads, pending} =
+        case position do
+          nil ->
+            {Identity.live_revision!(config.base_dir), 0, ordered}
+
+          {revision, last, rereads} ->
+            {revision, rereads, Enum.drop_while(ordered, &(identity_apply_order(&1) <= last))}
+        end
+
+      if ordered == [] do
+        identity_apply_sessions(config, db, [], revision)
+      else
+        budget = Map.get(config, :identity_apply_step_budget_ms, @identity_apply_step_budget_ms)
+        deadline = System.monotonic_time(:millisecond) + budget
+
+        {results, pass} =
+          pending
+          |> Enum.take(limit)
+          |> Enum.reduce_while(
+            {[], identity_apply_pass(revision, rereads)},
+            fn session, {results, pass} ->
+              if results != [] and System.monotonic_time(:millisecond) >= deadline do
+                {:halt, {results, pass}}
+              else
+                {result, pass} = identity_apply_session_result(config, db, session, pass)
+                {:cont, {[result | results], pass}}
+              end
+            end
+          )
+
+        results = Enum.reverse(results)
+        handled = length(results)
+        remaining = length(pending) - handled
+
+        next =
+          if remaining > 0 do
+            last = pending |> Enum.at(handled - 1) |> identity_apply_order()
+            Base.url_encode64(JSON.encode!([revision, pass.rereads | last]), padding: false)
+          end
+
+        db
+        |> identity_apply_report(revision, results)
+        |> Map.merge(%{total: length(ordered), remaining: remaining, cursor: next})
+      end
+    else
+      {:error, message} -> %{code: "invalid", message: message}
+    end
+  end
+
+  defp identity_apply_order(session),
+    do: [session.archetype, session.harness, session.session_key]
+
+  defp identity_apply_step_limit(limit) when is_integer(limit) and limit > 0,
+    do: {:ok, min(limit, @identity_apply_step_max)}
+
+  defp identity_apply_step_limit(_limit), do: {:error, "limit must be a positive integer"}
+
+  defp identity_apply_position(nil), do: {:ok, nil}
+
+  defp identity_apply_position(cursor) when is_binary(cursor) do
+    with {:ok, encoded} <- Base.url_decode64(cursor, padding: false),
+         {:ok, [revision, rereads | [_archetype, _harness, _session_key] = last]} <-
+           JSON.decode(encoded),
+         true <- Enum.all?([revision | last], &is_binary/1),
+         true <- is_integer(rereads) and rereads >= 0 do
+      {:ok, {revision, last, rereads}}
+    else
+      _ -> {:error, "cursor is not one returned by identity apply"}
+    end
+  end
+
+  defp identity_apply_position(_cursor),
+    do: {:error, "cursor is not one returned by identity apply"}
+
+  defp identity_apply_report(db, revision, results) do
     results = Enum.map(results, &identity_apply_stream_update(db, &1))
 
     applied =
@@ -6138,75 +6294,213 @@ defmodule Tightbeam.Gateway do
       status: if(complete?, do: "complete", else: "partial"),
       complete: complete?,
       identity_revision: revision,
-      target_session_keys: Enum.map(sessions, & &1.session_key),
+      target_session_keys: Enum.map(results, & &1.session_key),
       applied: applied,
       results: results
     }
   end
 
-  defp identity_apply_session_result(config, db, session, revision) do
-    result =
-      with_session_mutation_lock(session.session_key, fn ->
-        Identity.with_live_revision_lock(config.base_dir, fn current_revision ->
-          if current_revision == revision do
-            identity_apply_session_at_revision(config, db, session, revision)
-          else
-            %{
-              session_key: session.session_key,
-              outcome: "superseded",
-              files: "not_started",
-              stamp: "not_committed",
-              prompt_enqueue: "not_attempted",
-              prompt_delivery: "not_started",
-              reread: "unconfirmed",
-              stream_update: "not_attempted",
-              current_identity_revision: current_revision
-            }
-          end
-        end)
-      end)
+  defp identity_apply_session_result(config, db, session, pass) do
+    {read, archetype_snapshots} =
+      archetype_snapshot_once(config, pass.revision, session, pass.archetype_snapshots)
 
-    if is_map(result),
-      do: result,
-      else:
-        identity_apply_failure_result(session, "session apply lock returned #{inspect(result)}")
-  rescue
-    error -> identity_apply_exception_result(session, error)
-  catch
-    :exit, reason -> identity_apply_failure_result(session, "exit: #{inspect(reason)}")
+    spacing =
+      Map.get(config, :identity_apply_reread_spacing_ms, @identity_apply_reread_spacing_ms)
+
+    reread_at = System.system_time(:millisecond) + pass.rereads * spacing
+
+    result =
+      try do
+        identity_apply_session(config, db, session, pass.revision, read, reread_at)
+      rescue
+        error -> identity_apply_exception_result(session, error)
+      catch
+        :exit, reason -> identity_apply_failure_result(session, "exit: #{inspect(reason)}")
+      end
+
+    rereads =
+      if result[:prompt_enqueue] == "recorded_pending",
+        do: pass.rereads + 1,
+        else: pass.rereads
+
+    {result, %{pass | archetype_snapshots: archetype_snapshots, rereads: rereads}}
   end
 
-  defp identity_apply_session_at_revision(config, db, session, revision) do
+  defp identity_apply_session(config, db, session, revision, read, reread_at) do
     case Org.get(db, session.session_key) do
       %{state: "active"} = current ->
-        harness = Harness.parse!(current.harness).id()
-        snapshot = complete_session_snapshot(config, current, harness, revision)
+        snapshot = identity_apply_snapshot(config, current, session, revision, read)
 
-        files =
-          if identity_stamp_matches?(current, snapshot) do
-            "already_current"
-          else
-            Placement.materialize_identity(config, current, snapshot)
-            "materialized"
-          end
-
-        identity_apply_persist_result(db, current, snapshot, revision, files)
+        case identity_apply_already_current(db, current, snapshot, revision) do
+          nil -> identity_apply_locked(config, db, session, revision, read, reread_at)
+          result -> result
+        end
 
       _retired_or_missing ->
+        identity_apply_skipped_result(session)
+    end
+  end
+
+  # The listed row chose which archetype snapshot was read. A session whose
+  # archetype or harness changed since the listing gets its own read.
+  defp identity_apply_snapshot(config, current, listed, revision, read) do
+    if current.archetype == listed.archetype and current.harness == listed.harness do
+      complete_session_snapshot(config, current, archetype_snapshot!(read))
+    else
+      harness = Harness.parse!(current.harness).id()
+      complete_session_snapshot(config, current, harness, revision)
+    end
+  end
+
+  # A session whose stamp already matches and whose reread prompt is already
+  # recorded needs no write. No lock is taken, and on a file-backed database
+  # these reads go to the reader pool, so a repeated pass over an applied org
+  # does not use the writer.
+  defp identity_apply_already_current(db, session, snapshot, revision) do
+    if identity_stamp_matches?(session, snapshot) do
+      prompt = identity_apply_prompt(revision)
+
+      {:ok, existing} =
+        DB.read_transaction(db, fn txn ->
+          case Org.current_pointer_snapshot_in_txn(txn, session.session_key) do
+            nil ->
+              %{enqueue: "not_required", delivery: "not_required", reread: "not_applicable"}
+
+            _pointer ->
+              identity_apply_existing_prompt_in_txn(txn, session.session_key, prompt)
+          end
+        end)
+
+      if existing do
         %{
           session_key: session.session_key,
-          outcome: "skipped",
-          files: "not_updated",
-          stamp: "not_attempted",
-          prompt_enqueue: "not_required",
-          prompt_delivery: "not_required",
-          reread: "not_applicable",
+          outcome: "applied",
+          files: "already_current",
+          stamp: "committed",
+          prompt_enqueue: existing.enqueue,
+          prompt_delivery: existing.delivery,
+          reread: existing.reread,
+          wake_id: existing[:wake_id],
           stream_update: "not_attempted"
+        }
+      end
+    end
+  end
+
+  # A turn being set up, a model change or a heal holds the session's lock for
+  # as long as its adapter call takes. Apply makes one attempt and reports the
+  # session as busy rather than wait behind it.
+  defp identity_apply_locked(config, db, session, revision, read, reread_at) do
+    case try_session_mutation_lock(session.session_key, fn ->
+           identity_apply_session_at_revision(config, db, session, revision, read, reread_at)
+         end) do
+      {:ok, result} when is_map(result) ->
+        result
+
+      {:ok, other} ->
+        identity_apply_failure_result(session, "session apply lock returned #{inspect(other)}")
+
+      :busy ->
+        %{
+          session_key: session.session_key,
+          outcome: "busy",
+          files: "not_started",
+          stamp: "not_committed",
+          prompt_enqueue: "not_attempted",
+          prompt_delivery: "not_started",
+          reread: "unconfirmed",
+          stream_update: "not_attempted",
+          reason: "a turn is being set up or the session is being changed; apply it again"
         }
     end
   end
 
-  defp identity_apply_persist_result(db, session, snapshot, revision, files) do
+  defp identity_apply_session_at_revision(config, db, session, revision, read, reread_at) do
+    case Org.get(db, session.session_key) do
+      %{state: "active"} = current ->
+        # Checked before any file is written: a run that started on an older
+        # revision must not put that revision's files over a newer apply.
+        case Identity.current_live_revision!(config.base_dir) do
+          ^revision ->
+            snapshot = identity_apply_snapshot(config, current, session, revision, read)
+
+            files =
+              if identity_stamp_matches?(current, snapshot) do
+                "already_current"
+              else
+                Placement.materialize_identity(config, current, snapshot)
+                "materialized"
+              end
+
+            case config[:on_identity_apply_files] do
+              callback when is_function(callback, 0) -> callback.()
+              _ -> :ok
+            end
+
+            identity_apply_stamp(config, db, current, snapshot, revision, files, reread_at)
+
+          live ->
+            identity_apply_superseded_result(session, live, "not_started")
+        end
+
+      _retired_or_missing ->
+        identity_apply_skipped_result(session)
+    end
+  end
+
+  # The files are already written when this lock is taken. It covers only the
+  # last live check and the stamp, so a publication and other sessions' applies
+  # never wait behind one session's file writes.
+  defp identity_apply_stamp(config, db, session, snapshot, revision, files, reread_at) do
+    case Identity.with_live_revision_lock(
+           config.base_dir,
+           @identity_apply_live_lock_retries,
+           fn
+             ^revision ->
+               identity_apply_persist_result(db, session, snapshot, revision, files, reread_at)
+
+             live ->
+               identity_apply_superseded_result(session, live, files)
+           end
+         ) do
+      :aborted ->
+        session
+        |> identity_apply_failure_result("the identity lock stayed busy; apply it again")
+        |> Map.put(:files, files)
+
+      result ->
+        result
+    end
+  end
+
+  defp identity_apply_superseded_result(session, live_revision, files) do
+    %{
+      session_key: session.session_key,
+      outcome: "superseded",
+      files: files,
+      stamp: "not_committed",
+      prompt_enqueue: "not_attempted",
+      prompt_delivery: "not_started",
+      reread: "unconfirmed",
+      stream_update: "not_attempted",
+      current_identity_revision: live_revision
+    }
+  end
+
+  defp identity_apply_skipped_result(session) do
+    %{
+      session_key: session.session_key,
+      outcome: "skipped",
+      files: "not_updated",
+      stamp: "not_attempted",
+      prompt_enqueue: "not_required",
+      prompt_delivery: "not_required",
+      reread: "not_applicable",
+      stream_update: "not_attempted"
+    }
+  end
+
+  defp identity_apply_persist_result(db, session, snapshot, revision, files, reread_at) do
     result =
       try do
         DB.transaction(db, fn txn ->
@@ -6233,7 +6527,12 @@ defmodule Tightbeam.Gateway do
 
                 _pointer ->
                   notification =
-                    identity_apply_prompt_record_in_txn(txn, session.session_key, revision)
+                    identity_apply_prompt_record_in_txn(
+                      txn,
+                      session.session_key,
+                      revision,
+                      reread_at
+                    )
 
                   Map.put(notification, :stamp, "committed")
               end
@@ -6311,9 +6610,40 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp identity_apply_prompt_record_in_txn(txn, session_key, revision) do
+  defp identity_apply_prompt_record_in_txn(txn, session_key, revision, reread_at) do
     prompt = identity_apply_prompt(revision)
 
+    case identity_apply_existing_prompt_in_txn(txn, session_key, prompt) do
+      nil ->
+        wake =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: session_key,
+            target_role: nil,
+            origin: "process:tightbeam",
+            prompt: prompt,
+            due_at: reread_at,
+            consumer: "prompt",
+            target_gate: 1
+          })
+
+        Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+
+        %{
+          stamp: "committed",
+          enqueue: "recorded_pending",
+          delivery: "pending",
+          reread: "unconfirmed",
+          wake_id: wake.wake_id
+        }
+
+      existing ->
+        existing
+    end
+  end
+
+  # The reread prompt this revision already has for the session, if any. Reads
+  # only, so it runs equally inside the stamp transaction and on a reader.
+  defp identity_apply_existing_prompt_in_txn(txn, session_key, prompt) do
     existing_wakes =
       DB.Txn.q(
         txn,
@@ -6360,26 +6690,7 @@ defmodule Tightbeam.Gateway do
         }
 
       true ->
-        wake =
-          Wakes.schedule_in_txn(txn, %{
-            session_key: session_key,
-            target_role: nil,
-            origin: "process:tightbeam",
-            prompt: prompt,
-            due_at: System.system_time(:millisecond),
-            consumer: "prompt",
-            target_gate: 1
-          })
-
-        Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
-
-        %{
-          stamp: "committed",
-          enqueue: "recorded_pending",
-          delivery: "pending",
-          reread: "unconfirmed",
-          wake_id: wake.wake_id
-        }
+        nil
     end
   end
 
@@ -9478,6 +9789,17 @@ defmodule Tightbeam.Gateway do
 
   defp with_session_mutation_lock(session_key, fun) do
     :global.trans({{__MODULE__, :session_mutation, session_key}, self()}, fun)
+  end
+
+  # One attempt and no wait. `:global` has no queue: a waiter sleeps for up to
+  # eight seconds between attempts, for as long as the holder keeps the lock.
+  defp try_session_mutation_lock(session_key, fun) do
+    lock = {{__MODULE__, :session_mutation, session_key}, self()}
+
+    case :global.trans(lock, fn -> {:ok, fun.()} end, [node() | Node.list()], 0) do
+      :aborted -> :busy
+      {:ok, _result} = locked -> locked
+    end
   end
 
   # Serialize the [re-pin the shared home -> session/new|load] window per ADAPTER

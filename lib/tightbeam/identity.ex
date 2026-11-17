@@ -313,9 +313,33 @@ defmodule Tightbeam.Identity do
     with_live_revision_lock_in_dir(identity_dir(base_dir), fun)
   end
 
-  # Apply holds this lock for one target's materialization and durable stamp.
-  # Live-ref writers take the same lock so an older projection cannot write
-  # after a newer revision becomes live.
+  @doc false
+  # For a caller that resolved the live revision earlier in the same pass and
+  # takes the lock once per session: the same lock without repeating the
+  # repository checks of `init!/1`, and with a bounded wait. Returns `:aborted`
+  # when the lock stayed held for all `retries` further attempts.
+  def with_live_revision_lock(base_dir, retries, fun)
+      when is_integer(retries) and retries >= 0 and is_function(fun, 1) do
+    identity_dir = identity_dir(base_dir)
+    lock = {{__MODULE__, :live_revision, Path.expand(identity_dir)}, self()}
+
+    :global.trans(
+      lock,
+      fn -> fun.(git_output!(identity_dir, ["rev-parse", @live])) end,
+      [node() | Node.list()],
+      retries
+    )
+  end
+
+  @doc false
+  # The publication pointer alone, for a caller that already ran
+  # `live_revision!/1` in the same pass.
+  def current_live_revision!(base_dir),
+    do: git_output!(identity_dir(base_dir), ["rev-parse", @live])
+
+  # A session's stamp is committed under this lock. Live-ref writers take the
+  # same lock so an older projection cannot write after a newer revision
+  # becomes live.
   defp with_live_revision_lock_in_dir(identity_dir, fun) do
     lock = {{__MODULE__, :live_revision, Path.expand(identity_dir)}, self()}
 
