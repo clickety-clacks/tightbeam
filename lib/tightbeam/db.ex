@@ -91,6 +91,20 @@ defmodule Tightbeam.DB do
   end
 
   @queue_limit 128
+
+  @doc false
+  # The refusal itself, or the strict match on a database result that it tripped.
+  def overload_error?(%Overloaded{}), do: true
+  def overload_error?(%MatchError{term: {:error, %Overloaded{}}}), do: true
+  def overload_error?(%CaseClauseError{term: {:error, %Overloaded{}}}), do: true
+  def overload_error?(_error), do: false
+
+  @doc false
+  # What a caller is told when its operation met the refusal: nothing is wrong
+  # with the request, and the same request can be sent again.
+  def overload_refusal,
+    do: %{code: "db_overloaded", message: "database overloaded; retry later"}
+
   @startup_progress_ms 5_000
   @deadline_key {__MODULE__, :deadline}
   @statement_cache_key {__MODULE__, :statement_cache}

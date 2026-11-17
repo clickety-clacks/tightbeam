@@ -1029,7 +1029,8 @@ defmodule Tightbeam.Wire.Router do
         state_error(conn, spec.resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
@@ -1154,7 +1155,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> state_error(conn, "read markers", status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       state_error(conn, "read markers", 500, "projection_invalid", nil)
   end
 
@@ -1319,7 +1321,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> state_error(conn, "sessions", status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       state_error(conn, "sessions", 500, "projection_invalid", nil)
   end
 
@@ -1712,7 +1715,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> state_error(conn, resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       state_error(conn, resource, 500, "projection_invalid", nil)
   end
 
@@ -1956,7 +1960,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> state_error(conn, resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       state_error(conn, "tool calls", 500, "projection_invalid", nil)
   end
 
@@ -2561,7 +2566,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       d1_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
@@ -2769,7 +2775,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       d1_error(conn, "execution map", 500, "projection_invalid", nil)
   end
 
@@ -2985,7 +2992,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> d1_error(conn, "attests", status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       d1_error(conn, "attests", 500, "projection_invalid", nil)
   end
 
@@ -3004,7 +3012,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       d1_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
@@ -3025,7 +3034,8 @@ defmodule Tightbeam.Wire.Router do
         d1_error(conn, "work-item trace", status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       d1_error(conn, "work-item trace", 500, "projection_invalid", nil)
   end
 
@@ -4408,6 +4418,12 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  # A read that met the overloaded database owner is not an invalid projection.
+  # Let the request boundary answer it as the retryable refusal it is.
+  defp reraise_overload(error, stacktrace) do
+    if DB.overload_error?(error), do: reraise(error, stacktrace), else: :ok
+  end
+
   defp error_status("forbidden"), do: 403
 
   defp error_status(code)
@@ -4419,6 +4435,7 @@ defmodule Tightbeam.Wire.Router do
   defp error_status("unknown_work_item"), do: 404
   defp error_status("server_error"), do: 500
   defp error_status("assessment-unavailable"), do: 503
+  defp error_status("db_overloaded"), do: 503
 
   defp error_status(code)
        when code in [
