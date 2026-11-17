@@ -2045,42 +2045,22 @@ defmodule Tightbeam.HarnessHealth do
   defp promotion_close_authorized?(txn, {kind, value}, promotion_id)
        when kind in [:user, :session] do
     case kind do
+      # Any user, or any active session, may close an existing promotion.
       :user ->
-        admin_user?(txn, value) or
-          Txn.q(
-            txn,
-            "SELECT 1 FROM harness_health_class_promotions p JOIN harness_health_incidents i ON i.id IN (p.firstIncidentId,p.secondIncidentId) JOIN harness_health_observations o ON o.id=i.openObservationId JOIN sessions s ON s.sessionKey=o.sessionKey WHERE p.id=?1 AND s.ownerUserId=?2",
-            [promotion_id, value]
-          ) != []
+        promotion_exists?(txn, promotion_id)
 
       :session ->
-        case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [value]) do
-          [["active"]] ->
-            Txn.q(
-              txn,
-              """
-              SELECT o.sessionKey,s.ownerUserId,r.custodian
-              FROM harness_health_class_promotions p
-              JOIN harness_health_incidents i ON i.id IN (p.firstIncidentId,p.secondIncidentId)
-              JOIN harness_health_observations o ON o.id=i.openObservationId
-              JOIN sessions s ON s.sessionKey=o.sessionKey
-              LEFT JOIN harness_health_other_reviews r ON r.incidentId=i.id
-              WHERE p.id=?1
-              """,
-              [promotion_id]
-            )
-            |> Enum.any?(fn [source, owner, custodian] ->
-              value == source or value == custodian or
-                session_owner_authorized?(txn, value, owner)
-            end)
-
-          _ ->
-            false
-        end
+        Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [value]) == [["active"]] and
+          promotion_exists?(txn, promotion_id)
     end
   end
 
   defp promotion_close_authorized?(_txn, {:process, _name}, _id), do: true
+
+  defp promotion_exists?(txn, promotion_id),
+    do:
+      Txn.q(txn, "SELECT 1 FROM harness_health_class_promotions WHERE id=?1", [promotion_id]) !=
+        []
 
   defp promotion_close_authorized?(_txn, _principal, _promotion_id), do: false
 
@@ -2101,19 +2081,11 @@ defmodule Tightbeam.HarnessHealth do
         [incident_id]
       )
 
+    # Any user or session may act on an existing incident, whoever owns it.
     case {rows, principal} do
-      {[[source, custodian, owner]], {:session, session}} ->
-        session == custodian or session == source or
-          session_owner_authorized?(txn, session, owner)
-
-      {[[_, _, owner]], {:user, user}} ->
-        user == owner or admin_user?(txn, user)
-
-      {[[_, _, owner]], "user:" <> user} ->
-        user == owner or admin_user?(txn, user)
-
-      _ ->
-        false
+      {[_row], {kind, _}} when kind in [:session, :user] -> true
+      {[_row], "user:" <> _user} -> true
+      _ -> false
     end
   end
 
@@ -2134,19 +2106,11 @@ defmodule Tightbeam.HarnessHealth do
         [incident_id]
       )
 
+    # Any user or session may act on an existing incident, whoever owns it.
     case {rows, principal} do
-      {[[source, owner, custodian]], {:session, session}} ->
-        session == source or session == custodian or
-          session_owner_authorized?(txn, session, owner)
-
-      {[[_, owner, _]], {:user, user}} ->
-        user == owner or admin_user?(txn, user)
-
-      {[[_, owner, _]], "user:" <> user} ->
-        user == owner or admin_user?(txn, user)
-
-      _ ->
-        false
+      {[_row], {kind, _}} when kind in [:session, :user] -> true
+      {[_row], "user:" <> _user} -> true
+      _ -> false
     end
   end
 
@@ -3059,14 +3023,9 @@ defmodule Tightbeam.HarnessHealth do
            "SELECT ownerUserId,state FROM sessions WHERE sessionKey=?1 AND harness=?2 AND host=?3",
            [input.source_session_key, input.harness, input.host]
          ) do
-      [[owner_user_id, "active"]] ->
-        unless other_source_authorized?(
-                 txn,
-                 input.principal_identity,
-                 input.source_session_key,
-                 owner_user_id
-               ),
-               do: raise(ArgumentError, "not_authorized")
+      [[_owner_user_id, "active"]] ->
+        unless other_source_authorized?(input.principal_identity),
+          do: raise(ArgumentError, "not_authorized")
 
       [[_, _]] ->
         raise(ArgumentError, "source_not_active")
@@ -3076,23 +3035,13 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
-  defp other_source_authorized?(txn, {:session, session_key}, source, owner),
-    do: session_key == source or session_owner_authorized?(txn, session_key, owner)
+  # Any user, session or automation may report a failure seen on any session.
+  defp other_source_authorized?({kind, _value}) when kind in [:session, :user, :process],
+    do: true
 
-  defp other_source_authorized?(txn, {:user, user}, _source, owner),
-    do: user == owner or admin_user?(txn, user)
-
-  defp other_source_authorized?(txn, user, source, owner) when is_binary(user) do
-    case user do
-      "session:" <> session -> other_source_authorized?(txn, {:session, session}, source, owner)
-      "user:" <> user_id -> other_source_authorized?(txn, {:user, user_id}, source, owner)
-      _ -> false
-    end
-  end
-
-  defp other_source_authorized?(_txn, {:process, _name}, _source, _owner), do: true
-
-  defp other_source_authorized?(_txn, _principal, _source, _owner), do: false
+  defp other_source_authorized?("session:" <> _session), do: true
+  defp other_source_authorized?("user:" <> _user), do: true
+  defp other_source_authorized?(_principal), do: false
 
   defp admin_user?(txn, user),
     do: Txn.q(txn, "SELECT 1 FROM users WHERE userId=?1 AND isAdmin=1", [user]) == [[1]]

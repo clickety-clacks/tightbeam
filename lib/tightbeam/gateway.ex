@@ -2070,28 +2070,13 @@ defmodule Tightbeam.Gateway do
   defp repair_assignment(_db, _assignment_id),
     do: {:error, "invalid_request", "repair-assignment requires assignmentId"}
 
-  defp repair_authorized(db, call, assignment) do
-    allowed =
-      case call.principal do
-        {:user, user} ->
-          assignment.opened_by_user == user or admin_caller?(db, call)
+  # Any user, session or automation may repair; the attempt records who asked.
+  defp repair_authorized(_db, %{principal: {kind, _}}, _assignment)
+       when kind in [:user, :session, :process],
+       do: :ok
 
-        {:session, session} ->
-          assignment.opened_by_session == session or
-            assignment.opened_by_user == principal_caller(db, call).owner_user_id or
-            admin_caller?(db, call)
-
-        {:process, _} ->
-          true
-
-        _ ->
-          false
-      end
-
-    if allowed,
-      do: :ok,
-      else: {:error, "not_authorized", "assignment repair requires its opener or an admin"}
-  end
+  defp repair_authorized(_db, _call, _assignment),
+    do: {:error, "principal_required", "assignment repair requires a user, session or process"}
 
   defp repair_holder(db, assignment) do
     case Org.get(db, assignment.holder) do

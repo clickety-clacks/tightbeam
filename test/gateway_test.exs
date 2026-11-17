@@ -3732,7 +3732,8 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  test "restart is authorized, executes once per key, and replays its terminal result", ctx do
+  test "restart by a caller other than the opener executes once per key and replays its result",
+       ctx do
     repair = failed_repair_route!(ctx, "asg_restart_repair", "adapter_unavailable", 30)
     {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
 
@@ -3743,28 +3744,10 @@ defmodule Tightbeam.GatewayTest do
       |> Gateway.handlers()
       |> Map.fetch!("repair-assignment")
 
-    unauthorized =
-      handler.(%{
-        origin: "user:zoe",
-        principal: {:user, "zoe"},
-        params: %{
-          assignment_id: repair.assignment_id,
-          action: "restart",
-          idempotency_key: "restart-unauthorized"
-        }
-      })
-
-    assert unauthorized == %{
-             ok: false,
-             code: "not_authorized",
-             message: "assignment repair requires its opener or an admin"
-           }
-
-    refute unauthorized.message =~ repair.incident.id
-
+    # zoe neither opened the assignment nor administers the organization.
     call = %{
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:zoe",
+      principal: {:user, "zoe"},
       lane_manager: ctx.lane,
       params: %{
         assignment_id: repair.assignment_id,
