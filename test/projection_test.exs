@@ -50,6 +50,29 @@ defmodule Tightbeam.ProjectionTest do
     assert JSON.decode!(encoded) == message.attachments
   end
 
+  test "submitter stays separate from sender and survives canonical replay", %{db: db} do
+    submitter = %{"identity" => nil, "displayName" => "Avery"}
+
+    assert {:appended, message} =
+             Projection.append(db, %{
+               session_key: "shared",
+               role: "user",
+               content: "hello",
+               sender: "user:deployment",
+               submitter: submitter
+             })
+
+    assert message.sender == "user:deployment"
+    assert message.submitter == submitter
+    assert [%{submitter: ^submitter}] = Projection.list_after(db, "shared", nil, 10)
+    assert Tightbeam.Wire.Payloads.server_message(message)["submitter"] == submitter
+
+    assert {:appended, older} =
+             Projection.append(db, %{session_key: "shared", role: "user", content: "old"})
+
+    refute Map.has_key?(Tightbeam.Wire.Payloads.server_message(older), "submitter")
+  end
+
   test "client dedupe is idempotent for same content and conflicts for different content", %{
     db: db
   } do

@@ -4298,6 +4298,7 @@ defmodule Tightbeam.Wire.Router do
   }
 
   @param_keys %{
+    "post" => ~w(content device_id client_message_id attachments submitter)a,
     "harklight-send" => ~w(
         harklight_session sender_id title message_type message_kind importance stake by_when reply
         body choices files vendor_session_id supersedes

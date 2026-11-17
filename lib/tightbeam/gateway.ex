@@ -782,26 +782,34 @@ defmodule Tightbeam.Gateway do
       {"post", ["message.created", "session.updated"]} => fn call ->
         p = call.params
 
-        case canonical_post_attachments(Map.get(p, :attachments)) do
-          {:ok, attachments} ->
-            outcome =
-              deliver_prompt(call.session_key, call.origin, p.content,
-                db: db,
-                device_id: p.device_id,
-                client_message_id: p.client_message_id,
-                attachments: attachments,
-                creator_session_key: call.session_key,
-                queue_when_busy: true
-              )
+        with {:ok, attachments} <- canonical_post_attachments(Map.get(p, :attachments)),
+             {:ok, submitter} <- canonical_submitter(Map.get(p, :submitter)) do
+          outcome =
+            deliver_prompt(call.session_key, call.origin, p.content,
+              db: db,
+              device_id: p.device_id,
+              client_message_id: p.client_message_id,
+              attachments: attachments,
+              submitter: submitter,
+              human_post: true,
+              creator_session_key: call.session_key,
+              queue_when_busy: true
+            )
 
-            if outcome in [:appended, :queued],
-              do: %{ack: p.client_message_id},
-              else: %{dedupe: to_string(outcome)}
-
+          if outcome in [:appended, :queued],
+            do: %{ack: p.client_message_id},
+            else: %{dedupe: to_string(outcome)}
+        else
           :error ->
             %{
               code: "invalid_message",
               message: "attachments must be canonical attachment references"
+            }
+
+          {:error, :submitter} ->
+            %{
+              code: "invalid_message",
+              message: "submitter must contain nullable identity and displayName strings"
             }
         end
       end,
@@ -2310,6 +2318,24 @@ defmodule Tightbeam.Gateway do
 
   def decorate_delivery_prompt(prompt, _sender), do: prompt
 
+  defp canonical_submitter(nil), do: {:ok, nil}
+
+  defp canonical_submitter(%{"identity" => identity, "displayName" => name} = value)
+       when (is_nil(identity) or is_binary(identity)) and (is_nil(name) or is_binary(name)) and
+              map_size(value) == 2 do
+    if is_nil(identity) and is_nil(name), do: {:ok, nil}, else: {:ok, value}
+  end
+
+  defp canonical_submitter(_), do: {:error, :submitter}
+
+  @doc false
+  def decorate_human_prompt(prompt, nil), do: "[from You]\n\n" <> prompt
+
+  def decorate_human_prompt(prompt, submitter) do
+    name = submitter["displayName"] || "You"
+    "[from #{name}]\n\n" <> prompt
+  end
+
   defp deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
     opts = delivery_attachments_in_txn(txn, opts)
     queued_human_post_delivery? = opts[:queued_human_post_delivery] == true
@@ -2317,7 +2343,11 @@ defmodule Tightbeam.Gateway do
     stamped =
       if queued_human_post_delivery?,
         do: prompt,
-        else: decorate_delivery_prompt(prompt, opts[:sender])
+        else:
+          if(opts[:human_post],
+            do: decorate_human_prompt(prompt, opts[:submitter]),
+            else: decorate_delivery_prompt(prompt, opts[:sender])
+          )
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
@@ -2501,6 +2531,7 @@ defmodule Tightbeam.Gateway do
         "clientMessageId" => client_message_id,
         "sourceWakeId" => wake.wake_id,
         "payloadSha256" => payload_sha256,
+        "submitter" => opts[:submitter],
         "createdAt" => wake.created_at
       }
 
@@ -2514,7 +2545,8 @@ defmodule Tightbeam.Gateway do
              sender: origin,
              device_id: device_id,
              client_message_id: client_message_id,
-             attachments: Keyword.get(opts, :attachments, []) || []
+             attachments: Keyword.get(opts, :attachments, []) || [],
+             submitter: opts[:submitter]
            }) do
         {:appended, message} ->
           Tightbeam.Firehose.Publisher.message_in_txn(txn, target, message)
@@ -2568,7 +2600,8 @@ defmodule Tightbeam.Gateway do
           sender: source.origin,
           device_id: source.device_id,
           client_message_id: source.client_message_id,
-          attachments: source.attachments
+          attachments: source.attachments,
+          submitter: source.submitter
         }
 
         case Projection.append_in_txn(txn, input) do
@@ -2591,7 +2624,8 @@ defmodule Tightbeam.Gateway do
       device_id: opts[:device_id],
       client_message_id: opts[:client_message_id],
       attachments: opts[:attachments] || [],
-      sender: opts[:sender] || origin
+      sender: opts[:sender] || origin,
+      submitter: opts[:submitter]
     }
 
     case Projection.append_in_txn(txn, input) do

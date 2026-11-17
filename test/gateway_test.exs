@@ -4,6 +4,35 @@ defmodule Tightbeam.GatewayTest do
   alias Tightbeam.Model
   alias Tightbeam.Wire.ChangeSocket
 
+  test "post rejects malformed submitter without changing post authority" do
+    post = Tightbeam.Gateway.handlers(%{db: :unused})["post"]
+
+    assert %{code: "invalid_message"} =
+             post.(%{params: %{attachments: [], submitter: %{"displayName" => "Avery"}}})
+
+    assert %{code: "invalid_message"} =
+             post.(%{
+               params: %{
+                 attachments: [],
+                 submitter: %{"identity" => nil, "displayName" => 17}
+               }
+             })
+  end
+
+  test "human prompt uses the submitted display name or generic You" do
+    assert Tightbeam.Gateway.decorate_human_prompt("hello", %{
+             "identity" => nil,
+             "displayName" => "Avery"
+           }) == "[from Avery]\n\nhello"
+
+    assert Tightbeam.Gateway.decorate_human_prompt("hello", %{
+             "identity" => "received-login",
+             "displayName" => nil
+           }) == "[from You]\n\nhello"
+
+    assert Tightbeam.Gateway.decorate_human_prompt("hello", nil) == "[from You]\n\nhello"
+  end
+
   # The committed packaging shim, for the writer→consumer seam test below.
   @shim Path.expand("../packaging/tightbeam-gateway", __DIR__)
 
@@ -918,7 +947,8 @@ defmodule Tightbeam.GatewayTest do
       params: %{
         content: "new direct post",
         device_id: "alias-post-device",
-        client_message_id: "alias-post-1"
+        client_message_id: "alias-post-1",
+        submitter: %{"identity" => nil, "displayName" => "Avery"}
       }
     }
 
@@ -969,7 +999,16 @@ defmodule Tightbeam.GatewayTest do
     refute carrier_message_id == human_message_id
     assert prompt =~ "urgent role source"
     assert prompt =~ "new direct post"
+    assert prompt =~ "[from Avery]\n\nnew direct post"
     assert prompt =~ ~r/urgent role source.*new direct post/s
+
+    assert %{submitter: %{"identity" => nil, "displayName" => "Avery"}} =
+             Tightbeam.Projection.get(ctx.db, human_message_id)
+
+    assert %{"submitter" => %{"identity" => nil, "displayName" => "Avery"}} =
+             ctx.db
+             |> StateResources.query_message(human_message_id)
+             |> StateResources.message()
 
     for wake_id <- [source.wake_id, post_wake_id] do
       assert [
@@ -2380,7 +2419,8 @@ defmodule Tightbeam.GatewayTest do
       params: %{
         content: "first immediate human message",
         device_id: "direct-post-device",
-        client_message_id: "direct-post-1"
+        client_message_id: "direct-post-1",
+        submitter: %{"identity" => nil, "displayName" => "Avery"}
       }
     }
 
@@ -2417,6 +2457,7 @@ defmodule Tightbeam.GatewayTest do
              DB.query(ctx.db, "SELECT seq,status FROM turns WHERE sessionKey='k1'")
 
     assert seq == turn.seq
+    assert turn.prompt == "[from Avery]\n\nfirst immediate human message"
 
     assert {:ok, [[0]]} =
              DB.query(

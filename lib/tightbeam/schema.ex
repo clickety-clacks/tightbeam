@@ -2115,6 +2115,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
     :ok = upgrade_session_custody_v1(db)
+    :ok = Tightbeam.Projection.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
