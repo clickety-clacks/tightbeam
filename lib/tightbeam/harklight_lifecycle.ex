@@ -829,7 +829,7 @@ defmodule Tightbeam.HarklightLifecycle do
         pending_send_rows =
           Txn.q(
             txn,
-            "SELECT opId,payload FROM harklight_send_operations WHERE sessionKey=?1 AND state='pending' ORDER BY opId",
+            "SELECT opId,payload FROM harklight_send_operations WHERE sessionKey=?1 AND state='pending' AND COALESCE(json_extract(payload,'$.operation_kind'),'send')<>'change' ORDER BY opId",
             [session_key]
           )
 

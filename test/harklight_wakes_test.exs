@@ -3893,6 +3893,78 @@ defmodule Tightbeam.HarklightWakesTest do
              )
   end
 
+  test "retry all skips an answered handle despite a legacy pending change", %{
+    db: db,
+    session: session
+  } do
+    parent = self()
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+    mark_completion_wakes_delivered(db, @handle)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_send_operations(opId,sessionKey,host,payload,state,createdAt,updatedAt) VALUES(?1,?2,?3,?4,'pending',1,1)",
+               [
+                 Tightbeam.Id.uuid4(),
+                 session.session_key,
+                 Placement.local_host_name(),
+                 JSON.encode!(%{
+                   "operation_kind" => "change",
+                   "request" => ["--message", "request"]
+                 })
+               ]
+             )
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1", [
+               @handle
+             ])
+
+    runner = fn ["status", "--session", @handle] ->
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 0,
+         "pending_undelivered" => 0,
+         "pending_delivered_unacted" => 0
+       }), 0}
+    end
+
+    listener = fn manager, handle, _vendor ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      send(parent, :unexpected_retry_listener)
+      receive do: (:hold -> :ok)
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: listener, send_runner: runner, retry_delays: []}
+      )
+
+    assert eventually(fn ->
+             Process.info(manager, :message_queue_len) == {:message_queue_len, 0}
+           end)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable',lastError='previous failure' WHERE handle=?1",
+               [@handle]
+             )
+
+    assert %{selector: "all", counts: %{skipped_closed: 1}, results: [result]} =
+             HarklightWakes.retry_command(db, %{params: %{all: true}})
+
+    assert result.outcome == "skipped_closed"
+    refute_receive :unexpected_retry_listener, 0
+
+    assert {:ok, [["unavailable", "previous failure"]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ])
+  end
+
   test "deferred existing starts skip while deferred new-request starts remain ungated", %{
     db: db,
     session: session
