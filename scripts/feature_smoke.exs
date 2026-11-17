@@ -4,10 +4,15 @@
 #
 #   TIGHTBEAM_BASE_DIR=/absolute/owned/test-base \
 #   TIGHTBEAM_SMOKE_OWNED_BASE=/absolute/owned/test-base \
+#   TIGHTBEAM_SMOKE_OWNER='<admin-user-id>' \
 #   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
 #   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
 #   TIGHTBEAM_SMOKE_MODEL_CURSOR='<catalog-listed-cursor-model>' \
 #   mix run --no-start scripts/feature_smoke.exs
+#
+# TIGHTBEAM_SMOKE_OWNER is required: the admin user id, present in the copied
+# org's state.db, that the smoke acts as. A run without it stops before its
+# first gateway request.
 #
 # Run only selected areas with TIGHTBEAM_SMOKE_AREAS=provider,work,decisions,
 # telemetry,artifacts. The default is all. Shared record journeys run once using
@@ -54,7 +59,6 @@ defmodule FeatureSmoke do
     defexception [:message]
   end
 
-  @owner System.get_env("TIGHTBEAM_SMOKE_OWNER") || "mike"
   @smoke_areas ~w(provider work decisions telemetry artifacts)
 
   # How long a remedy episode gets to reach a status. The transition rides the attest
@@ -68,11 +72,31 @@ defmodule FeatureSmoke do
   @lane_slack_ms 60_000
 
   def run do
+    # Before any gateway request, in either mode. Read at run time so that
+    # compiling this module never needs the variable.
+    owner!()
+
     Tightbeam.DeployReadiness.route!(
       System.get_env("TIGHTBEAM_SMOKE_MODE"),
       &run_readiness/0,
       &run_full/0
     )
+  end
+
+  # The user the smoke acts as. There is no default: a smoke needs an explicit admin.
+  defp owner! do
+    case System.get_env("TIGHTBEAM_SMOKE_OWNER") do
+      owner when owner in [nil, ""] ->
+        raise Failure,
+          message:
+            "feature-smoke needs an owner: set TIGHTBEAM_SMOKE_OWNER to an admin user id " <>
+              "present in the org under test's state.db " <>
+              "(for example TIGHTBEAM_SMOKE_OWNER=<admin-user-id> mix run --no-start " <>
+              "scripts/feature_smoke.exs)"
+
+      owner ->
+        owner
+    end
   end
 
   # Both modes create, bind and retire records in the base they are pointed at, so
@@ -2447,7 +2471,7 @@ defmodule FeatureSmoke do
           # Session-authenticated: the session's own bearer token IS the principal.
           Map.get(state, :as_session) -> b
           as_key -> Map.put(b, "asSession", as_key)
-          true -> Map.put(b, "asUser", @owner)
+          true -> Map.put(b, "asUser", owner!())
         end
       end)
 
