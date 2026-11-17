@@ -979,24 +979,33 @@ defmodule Tightbeam.Escalation do
       {:ok, [[owner]]} ->
         caller_owner =
           case call.principal do
-            {:user, user} -> user
+            {:user, user} ->
+              user
+
             {:session, session} ->
-              case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session]) do
+              case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [
+                     session
+                   ]) do
                 {:ok, [[user]]} -> user
                 _ -> nil
               end
-            _ -> owner
+
+            _ ->
+              owner
           end
 
         if caller_owner != owner do
-          warning = "#{principal_id(call)} ruled a request owned by #{owner}; the action proceeded."
+          warning =
+            "#{principal_id(call)} ruled a request owned by #{owner}; the action proceeded."
+
           Logger.warning(warning)
           Map.put(result, :warning, warning)
         else
           result
         end
 
-      _ -> result
+      _ ->
+        result
     end
   end
 

@@ -2303,34 +2303,47 @@ defmodule Tightbeam.Assignments do
 
   defp warn_non_owner_assignment(result, db, %{principal: principal, params: params})
        when is_map(result) do
-    case DB.query(db, """
-         SELECT COALESCE(w.ownerUserId, a.openedByUser, s.ownerUserId)
-         FROM assignments a
-         LEFT JOIN work_items w ON w.id = a.workItemId
-         LEFT JOIN sessions s ON s.sessionKey = COALESCE(a.currentOpenerSessionKey, a.openedBySession)
-         WHERE a.id = ?1
-         """, [params[:assignment_id]]) do
+    case DB.query(
+           db,
+           """
+           SELECT COALESCE(w.ownerUserId, a.openedByUser, s.ownerUserId)
+           FROM assignments a
+           LEFT JOIN work_items w ON w.id = a.workItemId
+           LEFT JOIN sessions s ON s.sessionKey = COALESCE(a.currentOpenerSessionKey, a.openedBySession)
+           WHERE a.id = ?1
+           """,
+           [params[:assignment_id]]
+         ) do
       {:ok, [[owner]]} ->
         caller_owner =
           case principal do
-            {:user, user} -> user
+            {:user, user} ->
+              user
+
             {:session, session} ->
-              case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session]) do
+              case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [
+                     session
+                   ]) do
                 {:ok, [[user]]} -> user
                 _ -> nil
               end
-            _ -> owner
+
+            _ ->
+              owner
           end
 
         if caller_owner != owner do
-          warning = "#{principal_id(principal)} acted on an assignment owned by #{owner}; the action proceeded."
+          warning =
+            "#{principal_id(principal)} acted on an assignment owned by #{owner}; the action proceeded."
+
           Logger.warning(warning)
           Map.put(result, :warning, warning)
         else
           result
         end
 
-      _ -> result
+      _ ->
+        result
     end
   end
 

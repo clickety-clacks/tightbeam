@@ -65,7 +65,9 @@ defmodule Tightbeam.AssignmentsTest do
     assert revoked.outcome == "revoked"
     assert revoked.warning =~ "user:other acted on an assignment owned by flynn"
 
-    reopened = handle(ctx, "reopen-assignment", reopen_call({:user, "other"}, assignment.id, "repair"))
+    reopened =
+      handle(ctx, "reopen-assignment", reopen_call({:user, "other"}, assignment.id, "repair"))
+
     assert reopened.state == "open"
     assert reopened.warning =~ "user:other acted on an assignment owned by flynn"
   end
