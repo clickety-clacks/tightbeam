@@ -28,6 +28,7 @@ defmodule Tightbeam.IdentityTest do
   test "an unlearned bundle probe does not emit expected git fatal stderr", ctx do
     assert :initialized = Identity.init!(ctx.base)
     probe = "Tightbeam.Identity.public_kungfu(#{inspect(ctx.base)}, \"unlearned-bundle\")"
+
     run_probe = fn ->
       System.cmd("elixir", ["-S", "mix", "run", "--no-start", "-e", probe],
         stderr_to_stdout: true
