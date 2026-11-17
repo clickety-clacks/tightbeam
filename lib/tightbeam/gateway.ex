@@ -9973,7 +9973,8 @@ defmodule Tightbeam.Gateway do
         {:error,
          %{
            code: "credential_status_pending",
-           message: "Credential status has not answered yet for #{provider} on #{machine}; retry later"
+           message:
+             "Credential status has not answered yet for #{provider} on #{machine}; retry later"
          }}
     end
   end
