@@ -124,6 +124,7 @@ defmodule Tightbeam.Wire.Payloads do
     |> put_if_present("deviceId", Map.get(m, :device_id))
     |> put_if_present("clientMessageId", Map.get(m, :client_message_id))
     |> put_if_present("sender", Map.get(m, :sender))
+    |> put_if_present("submitter", Map.get(m, :submitter))
     |> put_if_present("replyToMessageId", Map.get(m, :reply_to_message_id))
     |> put_if_present("replyToClientMessageId", Map.get(m, :reply_to_client_message_id))
     |> put_if_present("messageType", Map.get(m, :message_type))

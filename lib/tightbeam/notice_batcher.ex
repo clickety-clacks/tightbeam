@@ -886,7 +886,7 @@ defmodule Tightbeam.NoticeBatcher do
 
       source =
         if source,
-          do: Map.put(source, :delivery_prompt, Wakes.delivery_prompt_in_txn(txn, wake_id))
+          do: Map.put(source, :delivery_prompt, human_delivery_prompt_in_txn(txn, wake_id))
 
       :ok = Txn.exec(txn, "RELEASE notice_source_prepare")
       source
@@ -920,6 +920,21 @@ defmodule Tightbeam.NoticeBatcher do
 
       _ ->
         nil
+    end
+  end
+
+  defp human_delivery_prompt_in_txn(txn, wake_id) do
+    prompt = Wakes.delivery_prompt_in_txn(txn, wake_id)
+
+    case source_client_identity_in_txn(txn, wake_id) do
+      %{"submitter" => %{"displayName" => name}} when is_binary(name) ->
+        "[from #{name}]\n\n" <> prompt
+
+      %{"deviceId" => _} ->
+        "[from You]\n\n" <> prompt
+
+      _ ->
+        prompt
     end
   end
 
@@ -1543,6 +1558,7 @@ defmodule Tightbeam.NoticeBatcher do
                 timestamp: created_at,
                 device_id: Map.fetch!(identity, "deviceId"),
                 client_message_id: Map.fetch!(identity, "clientMessageId"),
+                submitter: identity["submitter"],
                 attachments: delivery_attachments_in_txn(txn, source_wake_id)
               }
             ]

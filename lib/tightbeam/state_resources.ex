@@ -114,7 +114,7 @@ defmodule Tightbeam.StateResources do
            ), ''),
            'user:' || session_owner.ownerUserId
          ) ELSE m.sender END,
-         m.deviceId, m.clientMessageId,
+         m.submitter, m.deviceId, m.clientMessageId,
          m.replyToMessageId, m.replyToClientMessageId, m.llmVisibleMessageId,
          m.attachments, m.attentionTier,
          t.seq, t.assignmentId, t.jobRef, t.harness, t.model,
@@ -261,7 +261,7 @@ defmodule Tightbeam.StateResources do
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
     "transcript messages" =>
-      ~w(id seq sessionKey role messageType marker content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq turnIncludesHuman isBatchCarrier assignmentId jobRef harness provider model effort context rowVersion),
+      ~w(id seq sessionKey role messageType marker content at sender submitter deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq turnIncludesHuman isBatchCarrier assignmentId jobRef harness provider model effort context rowVersion),
     "tool calls" =>
       ~w(id seq sessionKey turnSeq afterMessageSeq harnessToolCallId title kind toolName status rawInput rawOutput content truncated startedAt endedAt rowVersion),
     "condition facts" => ~w(id ts kind scope origin rowVersion),
@@ -456,6 +456,7 @@ defmodule Tightbeam.StateResources do
     {"read markers", "marker"} => :read_marker,
     {"transcript messages", "attachments"} => {:array, :attachment, :preserve},
     {"transcript messages", "marker"} => :transition_marker,
+    {"transcript messages", "submitter"} => :submitter,
     {"transcript messages", "context"} => :json,
     {"tool calls", "rawInput"} => :json,
     {"tool calls", "rawOutput"} => :json,
@@ -2101,6 +2102,7 @@ defmodule Tightbeam.StateResources do
       "content" => required_wire_string!(value(row, :content), "content"),
       "at" => message_at!(row),
       "sender" => message_sender!(row, stored_type),
+      "submitter" => value(row, :submitter),
       "deviceId" => nullable_string!(value(row, :device_id), "deviceId"),
       "clientMessageId" => nullable_string!(value(row, :client_message_id), "clientMessageId"),
       "replyToMessageId" =>
@@ -2128,6 +2130,7 @@ defmodule Tightbeam.StateResources do
       end
 
     item = if is_nil(message_type), do: Map.delete(item, "messageType"), else: item
+    item = if is_nil(item["submitter"]), do: Map.delete(item, "submitter"), else: item
 
     item =
       if value(row, :is_batch_carrier) == true,
@@ -2444,6 +2447,9 @@ defmodule Tightbeam.StateResources do
 
     fields = if Map.has_key?(item, "marker"), do: fields, else: List.delete(fields, "marker")
 
+    fields =
+      if Map.has_key?(item, "submitter"), do: fields, else: List.delete(fields, "submitter")
+
     case Map.fetch(item, "messageType") do
       {:ok, value} when is_binary(value) ->
         fields
@@ -2643,6 +2649,14 @@ defmodule Tightbeam.StateResources do
 
   defp validate_wire_value!(value, :commit_ref, label) do
     validate_closed_wire_object!(value, %{"repo" => :string, "commit" => :string}, label)
+  end
+
+  defp validate_wire_value!(value, :submitter, label) do
+    validate_closed_wire_object!(
+      value,
+      %{"identity" => {:nullable, :string}, "displayName" => {:nullable, :string}},
+      label
+    )
   end
 
   defp validate_wire_value!(value, :decision_option, label) do
@@ -2853,6 +2867,9 @@ defmodule Tightbeam.StateResources do
 
   defp encode_item_field("transcript messages", "marker", value),
     do: encode_closed_object!(value, ~w(kind from to), "transcript messages.marker")
+
+  defp encode_item_field("transcript messages", "submitter", value),
+    do: encode_closed_object!(value, ~w(identity displayName), "transcript messages.submitter")
 
   defp encode_item_field("transcript messages", "context", value), do: encode_j!(value)
 
@@ -3111,6 +3128,7 @@ defmodule Tightbeam.StateResources do
          marker_to,
          at,
          sender,
+         submitter,
          device_id,
          client_message_id,
          reply_to_message_id,
@@ -3147,6 +3165,7 @@ defmodule Tightbeam.StateResources do
       content: content,
       at: at,
       sender: sender,
+      submitter: if(submitter, do: JSON.decode!(submitter)),
       device_id: device_id,
       client_message_id: client_message_id,
       reply_to_message_id: reply_to_message_id,

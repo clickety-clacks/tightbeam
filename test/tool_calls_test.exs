@@ -64,12 +64,24 @@ defmodule Tightbeam.ToolCallsTest do
         ensure_main_session(db, "tool-call-owner")
       end
 
-    {:appended, prompt_message} =
-      Projection.append(db, %{
-        session_key: session.session_key,
-        role: "user",
-        content: "Record the prompt before the tool call."
-      })
+    prompt_message =
+      if context[:historical_messages] do
+        insert_historical_message(
+          db,
+          session.session_key,
+          "user",
+          "Record the prompt before the tool call."
+        )
+      else
+        {:appended, message} =
+          Projection.append(db, %{
+            session_key: session.session_key,
+            role: "user",
+            content: "Record the prompt before the tool call."
+          })
+
+        message
+      end
 
     turn_attrs = %{
       session_key: session.session_key,
@@ -514,19 +526,22 @@ defmodule Tightbeam.ToolCallsTest do
         :ok
       end)
 
-    {:appended, marker} =
-      Projection.append_marker(ctx.db, ctx.session_key, %{
-        kind: "model-retune",
-        from: "claude-sonnet-4-6",
-        to: "claude-opus-5-5"
-      })
+    marker =
+      insert_historical_message(ctx.db, ctx.session_key, "assistant", "Model retuned",
+        sender: "process:tightbeam",
+        message_type: "marker",
+        marker_kind: "model-retune",
+        marker_from: "claude-sonnet-4-6",
+        marker_to: "claude-opus-5-5"
+      )
 
-    {:appended, repair_message} =
-      Projection.append(ctx.db, %{
-        session_key: ctx.session_key,
-        role: "user",
-        content: "Repair this recorded human sender before the message rebuild."
-      })
+    repair_message =
+      insert_historical_message(
+        ctx.db,
+        ctx.session_key,
+        "user",
+        "Repair this recorded human sender before the message rebuild."
+      )
 
     {:ok, _repair_turn_seq} =
       insert_historical_turn(ctx.db, %{
@@ -606,7 +621,9 @@ defmodule Tightbeam.ToolCallsTest do
              DB.query(ctx.db, "SELECT sender FROM messages WHERE id=?1", [repair_message.id])
 
     {:ok, columns_after} = DB.query(ctx.db, "PRAGMA table_info(messages)", [])
-    assert Enum.map(columns_after, fn [_cid, name | _rest] -> name end) == message_columns
+
+    assert Enum.map(columns_after, fn [_cid, name | _rest] -> name end) ==
+             message_columns ++ ["submitter"]
 
     {:ok, index_names} =
       DB.query(
@@ -679,6 +696,37 @@ defmodule Tightbeam.ToolCallsTest do
       )
 
     ToolCalls.query_by_id(db, id)
+  end
+
+  # The predecessor fixture predates submitter; current Projection writes the
+  # upgraded shape, so seed historical rows through its exact DML instead.
+  defp insert_historical_message(db, session_key, role, content, opts \\ []) do
+    id = "s_" <> Tightbeam.Id.uuid4()
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO messages
+          (id, sessionKey, role, content, timestamp, sender, llmVisibleMessageId,
+           attachments, messageType, markerKind, markerFrom, markerTo)
+        VALUES (?1, ?2, ?3, ?4, 1, ?5, ?1, '[]', ?6, ?7, ?8, ?9)
+        """,
+        [
+          id,
+          session_key,
+          role,
+          content,
+          Keyword.get(opts, :sender),
+          Keyword.get(opts, :message_type),
+          Keyword.get(opts, :marker_kind),
+          Keyword.get(opts, :marker_from),
+          Keyword.get(opts, :marker_to)
+        ]
+      )
+
+    {:ok, [[seq]]} = DB.query(db, "SELECT seq FROM messages WHERE id=?1", [id])
+    %{id: id, seq: seq, content: content}
   end
 
   defp subscribe(ctx, id, classes) do
