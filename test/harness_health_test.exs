@@ -536,6 +536,7 @@ defmodule Tightbeam.HarnessHealthTest do
   test "a busy other-route recipient keeps the recovery notice as a source until ready", ctx do
     registry = :"health_batch_registry_#{System.unique_integer([:positive])}"
     lane = :"health_batch_lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
     start_supervised!({Tightbeam.ConnRegistry, name: registry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
 
