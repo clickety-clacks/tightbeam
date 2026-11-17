@@ -3890,7 +3890,7 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     refute next_cycle_id == cycle_id
-    assert next_due_at == revised_due_at + 600_000
+    assert next_due_at == revised_due_at + 2_400_000
     assert next_due_at > revised_due_at + 1_000
   end
 
