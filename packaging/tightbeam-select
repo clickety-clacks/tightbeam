@@ -451,15 +451,26 @@ function rulePreflight(candidate, baseDir) {
     }
     env.TIGHTBEAM_BASE_DIR = scratch;
     env.TIGHTBEAM_PORT = '0';
+    const timeoutMs = 10_000;
     const result = spawnSync(
       path.join(candidate.packageRoot, 'bin/tightbeam-gateway'),
       ['eval', expression],
-      { encoding: 'utf8', env, maxBuffer: 4 * 1024 * 1024 },
+      {
+        encoding: 'utf8',
+        env,
+        maxBuffer: 4 * 1024 * 1024,
+        // Report-only checks cannot hold selection behind a stuck candidate.
+        // SIGTERM can be ignored; use a signal that ends the timed-out child.
+        timeout: timeoutMs,
+        killSignal: 'SIGKILL',
+      },
     );
     const output = `${result.stdout || ''}\n${result.stderr || ''}`;
 
     if (result.error || result.status !== 0) {
-      const detail = (result.error?.message || output).trim();
+      const detail = result.error?.code === 'ETIMEDOUT'
+        ? `timed out after ${timeoutMs} ms`
+        : (result.error?.message || output).trim();
       warning(`rule check could not complete${detail ? `: ${detail}` : ''}`);
       return;
     }

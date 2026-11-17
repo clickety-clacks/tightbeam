@@ -199,6 +199,37 @@ defmodule Tightbeam.PackagingActivationTest do
     assert selected_link(install_root) == "builds/#{fallback_stage["buildId"]}"
   end
 
+  test "a checker that ignores termination times out without blocking selection" do
+    root = fixture_root()
+    install_root = Path.join(root, "installation")
+    previous = package_fixture(root, "0.1.9", String.duplicate("3", 40))
+    previous_stage = stage!(previous, install_root)
+    select!(install_root, previous_stage["buildId"])
+
+    candidate = package_fixture(root, "0.1.10", String.duplicate("4", 40))
+    candidate_stage = stage!(candidate, install_root)
+    pid_file = Path.join(install_root, "preflight.pid")
+    kill = System.find_executable("kill") || flunk("kill is required for checker cleanup")
+    checker = Task.async(fn -> select(install_root, candidate_stage["buildId"], "hang") end)
+
+    try do
+      assert {:ok, {output, 0}} = Task.yield(checker, 20_000)
+      assert output =~ "rule check could not complete: timed out after 10000 ms"
+      assert selected_link(install_root) == "builds/#{candidate_stage["buildId"]}"
+      pid = File.read!(pid_file) |> String.trim()
+      assert {_, status} = System.cmd(kill, ["-0", pid], stderr_to_stdout: true)
+      assert status != 0
+
+      rule_file =
+        Path.join([install_root, "installed-base", "identity", "rules", "preflight.toml"])
+
+      assert File.read!(rule_file) == "[[rule]]\nname = \"preflight-sample\"\n"
+    after
+      if File.exists?(pid_file), do: kill_pid(kill, File.read!(pid_file) |> String.trim())
+      Task.shutdown(checker, :brutal_kill)
+    end
+  end
+
   defp fixture_root do
     name = "tightbeam-package-activation-#{System.unique_integer([:positive, :monotonic])}"
     root = Path.join(System.tmp_dir!(), name)
@@ -234,6 +265,7 @@ defmodule Tightbeam.PackagingActivationTest do
         "  case \"${TB_RULE_PREFLIGHT_MODE:-ok}\" in\n" <>
         "    fail) printf '%s\\n' 'checker failed' >&2; exit 42 ;;\n" <>
         "    silent) exit 0 ;;\n" <>
+        "    hang) exec node -e 'process.on(\"SIGTERM\", () => {}); require(\"node:fs\").writeFileSync(process.env.TB_RULE_PREFLIGHT_PID_FILE, String(process.pid)); setInterval(() => {}, 1000);' ;;\n" <>
         "    *)\n" <>
         "      case \"$2\" in *Tightbeam.RulePreflight.run*) ;; *) exit 43 ;; esac\n" <>
         "      [ -r \"$TIGHTBEAM_BASE_DIR/identity/rules/preflight.toml\" ] || exit 44\n" <>
@@ -345,7 +377,10 @@ defmodule Tightbeam.PackagingActivationTest do
         "--base-dir",
         base_dir
       ],
-      env: [{"TB_RULE_PREFLIGHT_MODE", mode}],
+      env: [
+        {"TB_RULE_PREFLIGHT_MODE", mode},
+        {"TB_RULE_PREFLIGHT_PID_FILE", Path.join(install_root, "preflight.pid")}
+      ],
       stderr_to_stdout: true
     )
   end
