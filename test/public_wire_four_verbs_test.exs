@@ -67,7 +67,8 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert Enum.all?(@verbs, &(&1 in agent_verbs))
     assert Enum.all?(@verbs, &Map.has_key?(handlers, &1))
     assert "repair-assignment" in agent_verbs
-    assert "post" in agent_verbs
+    # Main #775 keeps post out of the agent verbs (ruling dr_69a50f69 pending).
+    refute "post" in agent_verbs
     assert Map.has_key?(handlers, "post")
 
     for verb <- @verbs do

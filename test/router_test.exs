@@ -2866,7 +2866,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(disallowed.resp_body) == %{
              "error" => %{
                "code" => "invalid_message",
-               "message" => "verb not allowed: not-a-verb"
+               "message" => "verb not allowed: post"
              }
            }
 
