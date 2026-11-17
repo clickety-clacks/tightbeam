@@ -1533,26 +1533,15 @@ defmodule Tightbeam.Identity do
   end
 
   defp path_exists_at?(dir, revision, path) do
-    case System.cmd("git", ["cat-file", "-e", "#{revision}:#{path}"],
+    case System.cmd("git", ["ls-tree", "-r", "--name-only", revision, "--", path],
            cd: dir,
            stderr_to_stdout: true
          ) do
-      {_output, 0} ->
-        true
-
-      {_output, 1} ->
-        false
-
-      {output, 128} ->
-        if String.trim_trailing(output) ==
-             "fatal: path '#{path}' does not exist in '#{revision}'" do
-          false
-        else
-          raise "git cat-file failed (128): #{output}"
-        end
+      {output, 0} ->
+        output |> String.split("\n", trim: true) |> Enum.member?(path)
 
       {output, status} ->
-        raise "git cat-file failed (#{status}): #{output}"
+        raise "git ls-tree failed (#{status}): #{output}"
     end
   end
 

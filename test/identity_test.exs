@@ -27,10 +27,31 @@ defmodule Tightbeam.IdentityTest do
 
   test "an unlearned bundle probe does not emit expected git fatal stderr", ctx do
     assert :initialized = Identity.init!(ctx.base)
+    probe = "Tightbeam.Identity.public_kungfu(#{inspect(ctx.base)}, \"unlearned-bundle\")"
+    run_probe = fn ->
+      System.cmd("elixir", ["-S", "mix", "run", "--no-start", "-e", probe],
+        stderr_to_stdout: true
+      )
+    end
 
-    assert ExUnit.CaptureIO.capture_io(:stderr, fn ->
-             assert Identity.public_kungfu(ctx.base, "unlearned-bundle") == nil
-           end) == ""
+    assert {output, 0} = run_probe.()
+    refute output =~ "fatal: path"
+
+    # Git has a different missing-path message when the file is on disk but
+    # absent from the revision being inspected.
+    manifest = Path.join(ctx.base, "identity/kungfu/unlearned-bundle/manifest.toml")
+    File.mkdir_p!(Path.dirname(manifest))
+    File.write!(manifest, "")
+    assert Identity.public_kungfu(ctx.base, "unlearned-bundle") == nil
+    assert {output, 0} = run_probe.()
+    refute output =~ "fatal: path"
+
+    dir = Path.join(ctx.base, "identity")
+    git!(dir, ["update-ref", "-d", "refs/heads/tightbeam/live"])
+
+    assert_raise RuntimeError, ~r/git ls-tree failed/, fn ->
+      Identity.public_kungfu(ctx.base, "unlearned-bundle")
+    end
   end
 
   test "served bootstrap seeds exact identity and raw kungfu without notices", ctx do
