@@ -17,6 +17,30 @@ defmodule Tightbeam.HarklightWakesTest do
     Wakes
   }
 
+  # Refuses the listener's active-state write as an overloaded database would,
+  # a given number of times, and forwards everything else to the real owner.
+  defmodule AttachmentStateOverloadDB do
+    use GenServer
+
+    def start_link({db, parent, refusals}),
+      do: GenServer.start_link(__MODULE__, %{db: db, parent: parent, refusals: refusals})
+
+    def init(state), do: {:ok, state}
+
+    def handle_call(
+          {:query, "UPDATE harklight_wake_handles SET state='active'" <> _, _},
+          _from,
+          %{refusals: refusals} = state
+        )
+        when refusals > 0 do
+      send(state.parent, :attachment_state_refused)
+      {:reply, {:error, %DB.Overloaded{}}, %{state | refusals: refusals - 1}}
+    end
+
+    def handle_call(request, _from, state),
+      do: {:reply, GenServer.call(state.db, request, :infinity), state}
+  end
+
   @handle "7d737f62-bbd7-4c51-978d-f6ff5b4d8146"
   @send_op "0bdb87a0-3a09-4f61-bff4-9a4a704324c8"
   @payload ~s({"type":"send","message":{"sender_id":"sender","message_id":"request"}})
@@ -3643,8 +3667,114 @@ defmodule Tightbeam.HarklightWakesTest do
     refute_receive :unexpected_harklight_contact, 0
   end
 
-  test "retry reports an active handle as not failed without another start", %{db: db} do
+  test "retry reports a listening or complete handle as not failed without another start", %{
+    db: db
+  } do
     parent = self()
+
+    runner = fn ["status", "--session", @handle] ->
+      send(parent, :retry_status_read)
+
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 1,
+         "pending_undelivered" => 0
+       }), 0}
+    end
+
+    listener = fn manager, handle, _vendor ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      send(parent, {:listening, self()})
+      receive do: (:hold -> :ok)
+    end
+
+    manager = start_supervised!({HarklightWakes, db: db, listener: listener, send_runner: runner})
+    assert_receive :retry_status_read
+    assert_receive {:listening, listener_pid}
+
+    assert eventually(fn ->
+             Process.info(manager, :message_queue_len) == {:message_queue_len, 0}
+           end)
+
+    assert %{counts: %{not_failed: 1}, results: [%{outcome: "not_failed", state: "active"}]} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+    assert %{selector: "all", results: []} =
+             HarklightWakes.retry_command(db, %{params: %{all: true}})
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1", [
+               @handle
+             ])
+
+    assert %{counts: %{not_failed: 1}, results: [%{outcome: "not_failed", state: "complete"}]} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+    refute_receive :retry_status_read, 0
+    refute_receive {:listening, _}, 0
+    assert :sys.get_state(manager).workers == %{@handle => listener_pid}
+  end
+
+  test "retry restarts an active handle that has no listener", %{db: db} do
+    parent = self()
+
+    runner = fn ["status", "--session", @handle] ->
+      send(parent, :retry_status_read)
+
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 1,
+         "pending_undelivered" => 0
+       }), 0}
+    end
+
+    listener = fn manager, handle, _vendor ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      send(parent, {:listening, self()})
+      receive do: (:hold -> :ok)
+    end
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1", [
+               @handle
+             ])
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: listener, send_runner: runner, retry_delays: []}
+      )
+
+    assert eventually(fn ->
+             Process.info(manager, :message_queue_len) == {:message_queue_len, 0}
+           end)
+
+    # The row looks healthy, but its listener ended before recording a failure.
+    assert {:ok, _} =
+             DB.query(db, "UPDATE harklight_wake_handles SET state='active' WHERE handle=?1", [
+               @handle
+             ])
+
+    assert :sys.get_state(manager).workers == %{}
+
+    assert %{selector: "all", counts: %{listening: 1}, results: [%{outcome: "listening"}]} =
+             HarklightWakes.retry_command(db, %{params: %{all: true}})
+
+    assert_receive :retry_status_read
+    assert_receive {:listening, listener_pid}
+    assert :sys.get_state(manager).workers == %{@handle => listener_pid}
+
+    assert %{counts: %{not_failed: 1}, results: [%{outcome: "not_failed", state: "active"}]} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+    refute_receive {:listening, _}, 50
+    refute_receive :retry_status_read, 0
+  end
+
+  test "retry leaves a closed active handle without a listener closed", %{db: db} do
+    parent = self()
+    answer = completion_event(@handle, 1, "request", "terminal", "person")
+    assert :ok = HarklightWakes.capture_line(db, @handle, JSON.encode!(answer))
+    mark_completion_wakes_delivered(db, @handle)
 
     assert {:ok, _} =
              DB.query(db, "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1", [
@@ -3652,11 +3782,24 @@ defmodule Tightbeam.HarklightWakesTest do
              ])
 
     runner = fn ["status", "--session", @handle] ->
-      send(parent, :retry_status_read)
-      {"{}", 0}
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 0,
+         "pending_undelivered" => 0,
+         "pending_delivered_unacted" => 0
+       }), 0}
     end
 
-    manager = start_supervised!({HarklightWakes, db: db, send_runner: runner})
+    listener = fn manager, handle, _vendor ->
+      :ok = GenServer.call(manager, {:attached, handle})
+      send(parent, :unexpected_retry_listener)
+      receive do: (:hold -> :ok)
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: listener, send_runner: runner, retry_delays: []}
+      )
 
     assert eventually(fn ->
              Process.info(manager, :message_queue_len) == {:message_queue_len, 0}
@@ -3667,11 +3810,67 @@ defmodule Tightbeam.HarklightWakesTest do
                @handle
              ])
 
-    assert %{counts: %{not_failed: 1}, results: [%{outcome: "not_failed", state: "active"}]} =
+    assert %{counts: %{skipped_closed: 1}, results: [%{outcome: "skipped_closed"}]} =
              HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
 
-    refute_receive :retry_status_read, 0
-    assert :sys.get_state(manager).workers == %{}
+    refute_receive :unexpected_retry_listener, 50
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+
+    assert {:ok, [["active"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+  end
+
+  test "an overloaded listener-state write keeps the attachment and delivers the waiting entry once",
+       %{db: db, session: session} do
+    path = Path.join(System.tmp_dir!(), "state-write-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm(path) end)
+    waiting = event(1, "discussion", "waiting reply")
+
+    fake_harklight_agent!("""
+    printf '%s\\n' "$*" >> '#{path}'
+    if [ "$1" = attach ]; then
+      printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+    elif [ "$1" = listen ]; then
+      printf '%s\\n' '#{waiting}'
+      exec sleep 300
+    fi
+    """)
+
+    proxy = start_supervised!({AttachmentStateOverloadDB, {db, self(), 3}})
+
+    manager =
+      start_supervised!({HarklightWakes, db: proxy, attachment_state_retry_delays: [10, 20]})
+
+    for _ <- 1..3, do: assert_receive(:attachment_state_refused, 2_000)
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT COUNT(*) FROM harklight_wake_deliveries") == {:ok, [[1]]}
+           end)
+
+    assert {:ok, [[@handle, "1", session_key]]} =
+             DB.query(db, "SELECT handle,eventId,sessionKey FROM harklight_wake_deliveries")
+
+    assert session_key == session.session_key
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+
+    assert {:ok, [["active", nil]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
+             ])
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT wakeId FROM wakes WHERE wakeId=?1", [
+               "w_harklight_notice_recovery_" <> @handle
+             ])
+
+    calls = File.read!(path) |> String.split("\n", trim: true)
+    assert Enum.count(calls, &String.starts_with?(&1, "attach ")) == 1
+    assert Enum.count(calls, &String.starts_with?(&1, "listen ")) == 1
+
+    state = :sys.get_state(manager)
+    assert Map.has_key?(state.workers, @handle)
+    refute Map.has_key?(state.failures, @handle)
+    assert is_port(state.ports[@handle])
   end
 
   test "manual retry reports an in-flight startup without starting a second listener", %{db: db} do
