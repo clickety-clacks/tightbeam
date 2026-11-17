@@ -6993,6 +6993,10 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  # A recipient-specific pass reads only the waits that can resolve to that
+  # recipient (resolved_recipient/2): session-addressed waits stored for it and
+  # waits for a role bound to it. Waits addressed to other sessions never match
+  # and would only cost a write transaction each at every turn end.
   defp deliver_eligible_waits(db, delivery_opts, recipient \\ nil) do
     {:ok, rows} =
       DB.query(
@@ -7000,7 +7004,9 @@ defmodule Tightbeam.Wakes do
         """
         SELECT wakeId FROM wakes
         WHERE state='pending' AND waitMode IS NOT NULL AND recognitionAt IS NOT NULL
-          AND firedAt IS NULL AND (?1 IS NULL OR sessionKey=?1 OR targetRole IS NOT NULL OR targetGate<>0)
+          AND firedAt IS NULL AND (?1 IS NULL
+            OR (targetRole IS NULL AND sessionKey=?1)
+            OR targetRole IN (SELECT name FROM roles WHERE boundSessionKey=?1))
         ORDER BY recognitionAt,wakeId
         """,
         [recipient]
