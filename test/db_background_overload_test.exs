@@ -31,6 +31,11 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
     end
   end
 
+  test "optional review audit does not join a saturated owner queue", %{db: db} do
+    assert :ok = Tightbeam.Assignments.audit_review_item_conflicts(db)
+    assert {:message_queue_len, 128} = Process.info(db, :message_queue_len)
+  end
+
   test "notice drain skips its pass under overload", %{db: db} do
     assert Tightbeam.NoticeBatcher.recover(db) == []
   end

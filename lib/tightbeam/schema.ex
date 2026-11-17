@@ -52,6 +52,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.NoticeBatcher,
     Tightbeam.AdminProjection,
     Tightbeam.Projection,
+    Tightbeam.AttachmentDelivery,
     Tightbeam.Org,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
@@ -2115,9 +2116,10 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
     :ok = upgrade_session_custody_v1(db)
+    :ok = Tightbeam.Projection.ensure_submitter_column(db)
 
     case DB.finish_schema(db) do
-      :ok -> Tightbeam.Recognition.activate(db)
+      :ok -> :ok
       {:error, error} -> raise error
     end
   end
@@ -6460,6 +6462,10 @@ defmodule Tightbeam.Schema do
   # Delivery responsibility is additive current-build storage. Do not write it
   # until every exact predecessor migration has succeeded.
   defp bootstrap_module(_db, Tightbeam.DeliveryResponsibilities, _current?), do: :ok
+
+  # Attachment delivery outcomes are additive current-build storage. Delay
+  # their DDL until the exact predecessor migrations, including R1, succeed.
+  defp bootstrap_module(_db, Tightbeam.AttachmentDelivery, _current?), do: :ok
 
   defp bootstrap_module(db, Tightbeam.AdminProjection, _current?),
     do: Tightbeam.AdminProjection.ensure_storage(db)

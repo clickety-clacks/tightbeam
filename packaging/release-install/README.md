@@ -1,28 +1,34 @@
 # Release installation bundle
 
 Every native Tightbeam package carries this directory. It is a template, not
-permission to install a package. Render a fresh bundle for each tagged release
-and its exact supported installed predecessor.
+permission to install a package. Render a fresh bundle for each candidate or
+published release and its exact supported installed predecessor.
 
-The normal release workflow builds and checks a tagged candidate at its exact
-source commit. Before a production soak, confirm the tagged GitHub Release is
-marked prerelease and is not the latest release. Its
-package, `SHA256SUMS` and `release-provenance.json` are the inputs to this
-renderer and to the existing selector. Candidate installation needs a separate
-exact whole-action yes. After a healthy soak, promote the same release with
-identical package bytes; do not rebuild it. A later install needs another exact
-whole-action yes. The release metadata proves source and package identity;
-approval, soak outcome and release-list status must be established separately.
+For the first install, use the successful main candidate run's
+`release-candidate-stage-<sha>` artifact. It contains selector-ready package
+files, the canonical `release-candidate-manifest.json`, unpublished candidate
+`release-provenance.json`, and `SHA256SUMS`. The candidate provenance names the
+workflow at top level and records the candidate run, workflow SHA and proof
+manifest hash. Its tag is planned metadata only: no Git tag or GitHub Release
+exists before the soak. The renderer verifies the package against the proof
+manifest and the selector's package checksum before producing an install
+bundle. A candidate install requires separate exact whole-action approval. Publish those
+identical package bytes only after a healthy soak; do not rebuild them. A later
+install requires another exact approval. The release metadata proves source
+and package identity; approval and soak outcome must be established separately.
 
 1. Fill in `example-release.json` with the exact predecessor build ID, source
    prefix and schema stamp; the new tag, full source commit, package and asset
    digests; the required paths and service properties; and the expected new
    schema stamp and first-start effects. Record any base-directory files that
    this upgrade changes in `preflight_files` with their installed SHA-256.
-2. Set `purpose` to `prerelease-soak` for the first install or
-   `release-install` for a later install. Supply the tagged Linux package,
-   `SHA256SUMS` and `release-provenance.json` together. The renderer checks
-   their exact hashes, tag, source commit, workflow and package identity.
+2. Set `purpose` to `candidate-soak` for the first install or
+   `release-install` for a later install. For a candidate, supply the Linux
+   package, `SHA256SUMS`, `release-provenance.json` and
+   `release-candidate-manifest.json` from the same candidate-stage artifact.
+   The renderer checks their exact hashes, planned tag, source commit, workflow
+   run, proof manifest and package identity. For a later install, supply the
+   published package, checksums, provenance and candidate manifest together.
 3. Rehearse the exact package, generated job and launcher on an isolated
    synthetic store at the supported database, WAL, archive, schema/index and
    writer scale. Measure the whole maintenance action and outage. Exercise
@@ -30,8 +36,9 @@ approval, soak outcome and release-list status must be established separately.
    bytes change. Put measured times and limits in the manifest's `rehearsal`
    object; retain the nonsecret, hash-bound run record alongside the bundle.
    A missing or failed full-size run holds the installation request. Before
-   the candidate install, also verify the prerelease is not latest; before a
-   later install, verify the recorded healthy soak and unchanged package SHA.
+   candidate installation, verify the approval names the exact candidate SHA
+   and package; before a later install, verify the recorded healthy soak and
+   unchanged package SHA.
 4. Render into a new directory:
 
    ```sh
@@ -43,8 +50,14 @@ approval, soak outcome and release-list status must be established separately.
    changed after the measured run. Review the bundle and its evidence before
    preparing the exact whole-action approval request.
 
-The launcher verifies the package and installed predecessor before service
-control. After a separate approval, its one command uses one sudo password;
+The launcher verifies the package, candidate proof when present, and installed
+predecessor before service control. After a separate approval, its one command uses one sudo password;
 there is no additional `RUN` prompt. The install sheet names the paths,
 database effect, measured outage, backup and rollback limits. A mismatch or
 uncertain terminal result is a stop, not a reason to retry the action.
+
+A failed candidate or unhealthy soak remains unpublished. Fix the source in a
+reviewed change to `main` and build a fresh candidate. If a release is already
+published and later proves defective, keep it available with a do-not-install
+warning naming the failure and safe replacement, and mark it prerelease so it
+cannot be latest.

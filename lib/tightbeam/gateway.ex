@@ -62,6 +62,7 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.{
     AdapterCoordinator,
+    AttachmentDelivery,
     AdminProjection,
     Archetypes,
     Assets,
@@ -160,10 +161,14 @@ defmodule Tightbeam.Gateway do
 
   @doc false
   @spec children_after_preflight(config()) :: [Supervisor.child_spec() | {module(), term()}]
-  def children_after_preflight(config) do
+  def children_after_preflight(config),
+    do: DB.startup_wait(fn -> build_children_after_preflight(config) end)
+
+  defp build_children_after_preflight(config) do
     db = Map.get(config, :db, Tightbeam.DB)
     :ok = DB.assert_base_admitted!(db, config.base_dir)
     Identity.init_after_admission!(config.base_dir, db)
+    warn_missing_installed_kungfu(config.base_dir)
     load_law!(config)
     prod_limit = Map.get(config, :prod_limit, 3)
 
@@ -305,6 +310,10 @@ defmodule Tightbeam.Gateway do
         ] ++ delivery_config
       )
     end
+
+    # The schema pass is only the first part of boot. Keep durable recognition
+    # dormant through the remaining migrations and reconciliations above.
+    :ok = Tightbeam.Recognition.activate(db)
 
     (credential_children(config, db) ++
        [
@@ -783,29 +792,102 @@ defmodule Tightbeam.Gateway do
     item_change = fn work_item_id, kind -> emit_item_change(db, work_item_id, kind) end
 
     %{
+      {"assess_attachments", []} => fn call ->
+        case {call[:principal], Org.get(db, call.session_key)} do
+          {{:user, user_id}, %{} = session} ->
+            client_message_id =
+              Map.get(call.params, :client_message_id, call.params["clientMessageId"])
+
+            asset_ids = Map.get(call.params, :asset_ids, call.params["assetIds"])
+
+            if is_binary(client_message_id) and is_list(asset_ids) do
+              case AttachmentDelivery.assess(
+                     db,
+                     config.base_dir,
+                     user_id,
+                     session,
+                     client_message_id,
+                     asset_ids
+                   ) do
+                {:ok, result} -> result
+                {:error, result} -> result
+              end
+            else
+              %{
+                code: "invalid_message",
+                message: "attachment assessment requires a message ID and asset IDs"
+              }
+            end
+
+          _ ->
+            %{
+              code: "assessment-unavailable",
+              message: AttachmentDelivery.assessment_unavailable_message()
+            }
+        end
+      end,
       {"post", ["message.created", "session.updated"]} => fn call ->
         p = call.params
 
-        case canonical_post_attachments(Map.get(p, :attachments)) do
-          {:ok, attachments} ->
-            outcome =
-              deliver_prompt(call.session_key, call.origin, p.content,
-                db: db,
-                device_id: p.device_id,
-                client_message_id: p.client_message_id,
-                attachments: attachments,
-                creator_session_key: call.session_key,
-                queue_when_busy: true
-              )
+        with {:ok, attachments} <- canonical_post_attachments(Map.get(p, :attachments)),
+             {:ok, submitter} <- canonical_submitter(Map.get(p, :submitter)) do
+          case validate_post_attachments(db, config, call, attachments) do
+            :ok ->
+              outcome =
+                deliver_prompt(call.session_key, call.origin, p.content,
+                  db: db,
+                  device_id: p.device_id,
+                  client_message_id: p.client_message_id,
+                  attachments: attachments,
+                  submitter: submitter,
+                  human_post: true,
+                  creator_session_key: call.session_key,
+                  queue_when_busy: true
+                )
 
-            if outcome in [:appended, :queued],
-              do: %{ack: p.client_message_id},
-              else: %{dedupe: to_string(outcome)}
+              if outcome in [:appended, :queued, :duplicate] do
+                receipt =
+                  human_post_receipt(db, call.session_key, p.device_id, p.client_message_id)
 
+                legacy_result =
+                  if outcome in [:appended, :queued],
+                    do: %{ack: p.client_message_id},
+                    else: %{dedupe: "duplicate"}
+
+                Map.merge(legacy_result, %{
+                  outcome: if(outcome == :duplicate, do: "duplicate", else: "recorded"),
+                  session_key: call.session_key,
+                  device_id: p.device_id,
+                  client_message_id: p.client_message_id,
+                  message_id: receipt.message_id,
+                  turn_seq: receipt.turn_seq
+                })
+              else
+                %{dedupe: to_string(outcome)}
+              end
+
+            {:error, :invalid_asset} ->
+              %{code: "invalid_message", message: "attachment asset is unavailable"}
+
+            {:over_limit, offending_asset_ids} ->
+              %{
+                code: "attachment_over_limit",
+                message: "This file exceeds the delivery limit.",
+                max_deliverable_attachment_bytes: AttachmentDelivery.max_deliverable_bytes(),
+                offending_asset_ids: offending_asset_ids
+              }
+          end
+        else
           :error ->
             %{
               code: "invalid_message",
               message: "attachments must be canonical attachment references"
+            }
+
+          {:error, :submitter} ->
+            %{
+              code: "invalid_message",
+              message: "submitter must contain nullable identity and displayName strings"
             }
         end
       end,
@@ -968,6 +1050,9 @@ defmodule Tightbeam.Gateway do
         Tightbeam.HarklightFollows.follow(db, call,
           runner: Map.get(config, :harklight_send_runner)
         )
+      end,
+      {"harklight-retry", []} => fn call ->
+        Tightbeam.HarklightWakes.retry_command(db, call)
       end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
@@ -1398,16 +1483,10 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call ->
           p = call.params
 
-          %{
-            user:
-              db
-              |> Devices.add_user_with_firehose(
-                p.user_id,
-                Map.get(p, :is_admin, false),
-                call
-              )
-              |> StateResources.user()
-          }
+          case Devices.add_user_with_firehose(db, p.user_id, Map.get(p, :is_admin, false), call) do
+            %{code: "user_exists"} = refusal -> refusal
+            user -> %{user: StateResources.user(user)}
+          end
         end),
       {"read-marker-set", ["read_marker.updated"]} => fn call ->
         read_marker_result(db, call, :set)
@@ -1743,11 +1822,59 @@ defmodule Tightbeam.Gateway do
 
   defp canonical_post_attachments(nil), do: {:ok, []}
 
+  defp validate_post_attachments(_db, _config, _call, []), do: :ok
+
+  defp validate_post_attachments(db, config, call, attachments) do
+    user_id =
+      case Map.get(call, :principal) do
+        {:user, id} when is_binary(id) ->
+          id
+
+        _ ->
+          case Map.get(call, :origin) do
+            "user:" <> id when id != "" -> id
+            _ -> nil
+          end
+      end
+
+    if is_binary(user_id) do
+      AttachmentDelivery.validate_post(db, config.base_dir, user_id, attachments)
+    else
+      {:error, :invalid_asset}
+    end
+  end
+
   defp canonical_post_attachments(attachments) when is_list(attachments) do
     if Enum.all?(attachments, &canonical_attachment?/1), do: {:ok, attachments}, else: :error
   end
 
   defp canonical_post_attachments(_attachments), do: :error
+
+  defp human_post_receipt(db, session_key, device_id, client_message_id) do
+    case DB.query(
+           db,
+           """
+           SELECT m.id,
+             (SELECT t.seq FROM turns t
+              WHERE t.sessionKey=m.sessionKey AND t.messageId=m.id
+              ORDER BY t.seq LIMIT 1)
+           FROM messages m
+           WHERE m.sessionKey=?1 AND m.deviceId=?2 AND m.clientMessageId=?3
+           ORDER BY m.seq DESC LIMIT 1
+           """,
+           [session_key, device_id, client_message_id]
+         ) do
+      {:ok, [[message_id, turn_seq]]} ->
+        %{message_id: message_id, turn_seq: turn_seq}
+
+      {:ok, []} ->
+        raise DB.Error,
+          message: "persisted human post is missing its canonical message receipt"
+
+      {:error, error} ->
+        raise error
+    end
+  end
 
   defp canonical_attachment?(attachment) when is_map(attachment) do
     Enum.sort(Map.keys(attachment)) == ~w(assetId filename mimeType size) and
@@ -2314,6 +2441,24 @@ defmodule Tightbeam.Gateway do
 
   def decorate_delivery_prompt(prompt, _sender), do: prompt
 
+  defp canonical_submitter(nil), do: {:ok, nil}
+
+  defp canonical_submitter(%{"identity" => identity, "displayName" => name} = value)
+       when (is_nil(identity) or is_binary(identity)) and (is_nil(name) or is_binary(name)) and
+              map_size(value) == 2 do
+    if is_nil(identity) and is_nil(name), do: {:ok, nil}, else: {:ok, value}
+  end
+
+  defp canonical_submitter(_), do: {:error, :submitter}
+
+  @doc false
+  def decorate_human_prompt(prompt, nil), do: "[from You]\n\n" <> prompt
+
+  def decorate_human_prompt(prompt, submitter) do
+    name = submitter["displayName"] || "You"
+    "[from #{name}]\n\n" <> prompt
+  end
+
   defp deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
     opts = delivery_attachments_in_txn(txn, opts)
     queued_human_post_delivery? = opts[:queued_human_post_delivery] == true
@@ -2321,7 +2466,11 @@ defmodule Tightbeam.Gateway do
     stamped =
       if queued_human_post_delivery?,
         do: prompt,
-        else: decorate_delivery_prompt(prompt, opts[:sender])
+        else:
+          if(opts[:human_post],
+            do: decorate_human_prompt(prompt, opts[:submitter]),
+            else: decorate_delivery_prompt(prompt, opts[:sender])
+          )
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
@@ -2367,6 +2516,7 @@ defmodule Tightbeam.Gateway do
                   role_fallback,
                   origin,
                   stamped,
+                  prompt,
                   opts
                 )
               end
@@ -2490,6 +2640,8 @@ defmodule Tightbeam.Gateway do
 
     wake = Wakes.schedule_in_txn(txn, wake_input)
 
+    maybe_bounce_unresponsive_in_txn(txn, target, [wake.wake_id], origin, nil)
+
     NoticeBatcher.persist_source_attachments_in_txn(
       txn,
       wake.wake_id,
@@ -2505,6 +2657,7 @@ defmodule Tightbeam.Gateway do
         "clientMessageId" => client_message_id,
         "sourceWakeId" => wake.wake_id,
         "payloadSha256" => payload_sha256,
+        "submitter" => opts[:submitter],
         "createdAt" => wake.created_at
       }
 
@@ -2518,7 +2671,8 @@ defmodule Tightbeam.Gateway do
              sender: origin,
              device_id: device_id,
              client_message_id: client_message_id,
-             attachments: Keyword.get(opts, :attachments, []) || []
+             attachments: Keyword.get(opts, :attachments, []) || [],
+             submitter: opts[:submitter]
            }) do
         {:appended, message} ->
           Tightbeam.Firehose.Publisher.message_in_txn(txn, target, message)
@@ -2551,7 +2705,16 @@ defmodule Tightbeam.Gateway do
 
   defp staged_prompt_target_gate(_target_gate), do: 1
 
-  defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
+  defp append_and_enqueue_in_txn(
+         txn,
+         target,
+         role_ref,
+         role_fallback,
+         origin,
+         stamped,
+         raw_prompt,
+         opts
+       ) do
     queued_human_post_delivery? = opts[:queued_human_post_delivery] == true
 
     human_source_messages =
@@ -2572,7 +2735,8 @@ defmodule Tightbeam.Gateway do
           sender: source.origin,
           device_id: source.device_id,
           client_message_id: source.client_message_id,
-          attachments: source.attachments
+          attachments: source.attachments,
+          submitter: source.submitter
         }
 
         case Projection.append_in_txn(txn, input) do
@@ -2591,11 +2755,12 @@ defmodule Tightbeam.Gateway do
     input = %{
       session_key: target,
       role: "user",
-      content: stamped,
+      content: if(opts[:human_post], do: raw_prompt, else: stamped),
       device_id: opts[:device_id],
       client_message_id: opts[:client_message_id],
       attachments: opts[:attachments] || [],
-      sender: opts[:sender] || origin
+      sender: opts[:sender] || origin,
+      submitter: opts[:submitter]
     }
 
     case Projection.append_in_txn(txn, input) do
@@ -2684,6 +2849,20 @@ defmodule Tightbeam.Gateway do
 
     case enqueued do
       {:ok, seq} ->
+        source_ids =
+          case opts[:wake_id] do
+            wake_id when is_binary(wake_id) ->
+              case NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id) do
+                [] -> [wake_id]
+                ids -> ids
+              end
+
+            _ ->
+              []
+          end
+
+        maybe_bounce_unresponsive_in_txn(txn, target, source_ids, origin, message.id)
+
         if is_binary(opts[:wake_id]) do
           source_ids = NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
           source_ids = if source_ids == [], do: [opts[:wake_id]], else: source_ids
@@ -2713,6 +2892,85 @@ defmodule Tightbeam.Gateway do
         refuse_undeliverable_turn(txn, target, origin, opts)
     end
   end
+
+  defp maybe_bounce_unresponsive_in_txn(txn, target, source_ids, origin, message_id) do
+    case unresponsive_reason_in_txn(txn, target) do
+      nil -> :ok
+      reason -> bounce_unresponsive_in_txn(txn, target, source_ids, origin, message_id, reason)
+    end
+  end
+
+  defp unresponsive_reason_in_txn(txn, target) do
+    case DB.Txn.q(txn, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [target]) do
+      [[harness, host]] ->
+        parked? =
+          HarnessProcess.parked_in_txn?(txn, {Harness.parse!(harness).id(), "shared", host})
+
+        # Incident membership is a snapshot of affected sessions, not a hold.
+        # A rate-limit incident establishes the adapter park fence that stops turns.
+        incident_hold? =
+          parked? and
+            DB.Txn.q(
+              txn,
+              "SELECT 1 FROM harness_health_incidents WHERE harness=?1 AND host=?2 AND failureClass='rate-limit-dead' AND state='open' LIMIT 1",
+              [harness, host]
+            ) != []
+
+        cond do
+          incident_hold? ->
+            "the recipient is held by a harness incident"
+
+          parked? ->
+            "the recipient's harness is parked"
+
+          Tightbeam.Application.draining?() ->
+            "the recipient is not admitting turns"
+
+          true ->
+            nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp bounce_unresponsive_in_txn(txn, target, source_ids, origin, message_id, reason) do
+    keys = if source_ids == [], do: [message_id], else: source_ids
+
+    Enum.each(keys, fn key ->
+      {creator, source_origin} =
+        case DB.Txn.q(txn, "SELECT creatorSessionKey,origin FROM wakes WHERE wakeId=?1", [key]) do
+          [[creator, source_origin]] -> {creator, source_origin}
+          _ -> {nil, origin}
+        end
+
+      sender = bounce_sender(creator, source_origin)
+      bounce_id = "w_unresponsive_" <> (:crypto.hash(:sha256, key) |> Base.encode16(case: :lower))
+
+      if is_binary(sender) and
+           DB.Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [bounce_id]) == [] do
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: bounce_id,
+          session_key: sender,
+          origin: "process:tightbeam",
+          prompt:
+            "Message #{key} to #{target} has not been read yet because #{reason}. " <>
+              "The original message remains queued.",
+          due_at: System.system_time(:millisecond),
+          target_gate: 1
+        })
+      end
+    end)
+
+    :ok
+  end
+
+  defp bounce_sender(_creator, "process:" <> _), do: nil
+  defp bounce_sender(creator, _origin) when is_binary(creator), do: creator
+  defp bounce_sender(nil, "user:" <> user), do: Org.personal_session_key(user)
+  defp bounce_sender(nil, "session:" <> session), do: session
+  defp bounce_sender(_, _), do: nil
 
   # The wake is still CONSUMED — leaving it pending would redeliver the same
   # undeliverable notice every tick — and the loss is named rather than left as
@@ -2825,7 +3083,37 @@ defmodule Tightbeam.Gateway do
       Wakes.delivery_outcome_committed(db, actual_session_key, opts[:wake_id])
     end
 
-    nudge_lane(Keyword.get(opts, :lane_manager, Tightbeam.LaneManager), actual_session_key)
+    if nudge_lane(Keyword.get(opts, :lane_manager, Tightbeam.LaneManager), actual_session_key) ==
+         :lane_down do
+      DB.transaction(db, fn txn ->
+        if DB.Txn.q(
+             txn,
+             "SELECT 1 FROM turns WHERE sessionKey=?1 AND messageId=?2 AND status='queued'",
+             [actual_session_key, message.id]
+           ) != [] do
+          source_ids =
+            case opts[:wake_id] do
+              wake_id when is_binary(wake_id) ->
+                case NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id) do
+                  [] -> [wake_id]
+                  ids -> ids
+                end
+
+              _ ->
+                []
+            end
+
+          bounce_unresponsive_in_txn(
+            txn,
+            actual_session_key,
+            source_ids,
+            message.sender,
+            message.id,
+            "the recipient's lane is down"
+          )
+        end
+      end)
+    end
 
     :appended
   end
@@ -2843,6 +3131,11 @@ defmodule Tightbeam.Gateway do
   # after it is up again starts the lane.
   defp nudge_lane(lane_manager, session_key) do
     LaneManager.ensure_lane(lane_manager, session_key)
+
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> if Process.alive?(pid), do: :ok, else: :lane_down
+      [] -> :lane_down
+    end
   catch
     :exit, reason ->
       Logger.warning(
@@ -2850,7 +3143,7 @@ defmodule Tightbeam.Gateway do
           "the lane manager's next reconcile starts it: #{inspect(reason)}"
       )
 
-      :ok
+      :lane_down
   end
 
   @doc false
@@ -3499,31 +3792,74 @@ defmodule Tightbeam.Gateway do
 
   @doc false
   def turn_prompt_content(db, turn, session_key, harness, base_dir) do
-    messages = turn_human_messages(db, turn, session_key)
+    case Org.get(db, session_key) do
+      %{} = session ->
+        session = Map.put(session, :harness, harness)
 
-    entries =
-      Enum.flat_map(messages, fn message ->
+        prepare_turn_prompt_content(db, turn, session, %{db: db, base_dir: base_dir}).content
+
+      _ ->
+        turn.prompt
+    end
+  end
+
+  @doc false
+  def prepare_turn_prompt_content(db, turn, session, config) do
+    prepared =
+      Enum.flat_map(turn_human_messages(db, turn, session.session_key), fn message ->
         message.attachments
         |> Enum.with_index(1)
         |> Enum.map(fn {attachment, index} ->
-          turn_attachment_entry(
-            db,
-            base_dir,
-            message,
-            attachment,
-            index,
-            Harness.inline_attachments?(harness)
-          )
+          prepare_turn_attachment(db, config, session, message, attachment, index)
         end)
       end)
 
-    case entries do
-      [] ->
-        turn.prompt
+    entries = Enum.map(prepared, fn item -> {item.label, item.block} end)
 
-      _entries ->
-        append_turn_attachment_labels(turn.prompt, entries)
+    attempts =
+      prepared
+      |> Enum.map(& &1.attempt)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(&Map.put(&1, :session_key, session.session_key))
+
+    %{
+      content:
+        if(entries == [],
+          do: turn.prompt,
+          else: append_turn_attachment_labels(turn.prompt, entries)
+        ),
+      attempts: attempts
+    }
+  end
+
+  defp prompt_with_attachment_outcomes(db, adapter, harness_session_id, prepared, opts) do
+    try do
+      result = Adapter.prompt(adapter, harness_session_id, prepared.content, opts)
+      outcome = if match?({:ok, _}, result), do: :accepted, else: :unknown
+      persist_attachment_attempts(db, prepared.attempts, outcome)
+      result
+    rescue
+      error ->
+        persist_attachment_attempts(db, prepared.attempts, :unknown)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        persist_attachment_attempts(db, prepared.attempts, :unknown)
+        :erlang.raise(kind, reason, __STACKTRACE__)
     end
+  end
+
+  defp persist_attachment_attempts(_db, [], _outcome), do: :ok
+
+  defp persist_attachment_attempts(db, attempts, outcome) do
+    AttachmentDelivery.record_attempts(db, attempts, outcome)
+  rescue
+    error ->
+      Logger.error(
+        "attachment delivery outcome could not be persisted: #{Exception.message(error)}"
+      )
+
+      :ok
   end
 
   defp turn_human_messages(db, turn, session_key) do
@@ -3531,7 +3867,7 @@ defmodule Tightbeam.Gateway do
       case DB.query(
              db,
              """
-             SELECT message.seq,message.attachments,member.publicationSeq
+             SELECT message.id,message.seq,message.clientMessageId,message.attachments,member.publicationSeq
              FROM wakes AS source
              JOIN messages AS message
                ON message.sessionKey=?2
@@ -3553,16 +3889,25 @@ defmodule Tightbeam.Gateway do
       [] ->
         case Projection.get(db, turn.message_id) do
           %{role: "user"} = message ->
-            [%{seq: message.seq, attachments: message.attachments}]
+            [
+              %{
+                id: message.id,
+                seq: message.seq,
+                client_message_id: message.client_message_id,
+                attachments: message.attachments
+              }
+            ]
 
           _ ->
             []
         end
 
       rows ->
-        Enum.map(rows, fn [seq, encoded_attachments, publication_seq] ->
+        Enum.map(rows, fn [id, seq, client_message_id, encoded_attachments, publication_seq] ->
           %{
+            id: id,
             seq: seq,
+            client_message_id: client_message_id,
             attachments: JSON.decode!(encoded_attachments),
             publication_seq: publication_seq
           }
@@ -3570,46 +3915,245 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp turn_attachment_entry(db, base_dir, message, attachment, index, covered_harness?) do
+  defp prepare_turn_attachment(db, config, session, message, attachment, index) do
     marker =
       case Map.get(message, :publication_seq) do
         publication_seq when is_integer(publication_seq) -> "[#{publication_seq}]"
         _ -> "message [#{message.seq}]"
       end
 
-    label =
-      "#{marker} attachment #{index} #{inspect(attachment["filename"])} " <>
-        "(#{attachment["mimeType"]}, #{attachment["size"]} bytes): "
-
+    filename = attachment["filename"]
     mime_type = attachment["mimeType"]
     asset_id = attachment["assetId"]
+    base_label = "#{marker} attachment #{index} #{inspect(filename)}"
 
+    with %{} = asset <- Assets.get(db, asset_id) do
+      label = "#{base_label} (#{mime_type}, #{asset.size} bytes): "
+
+      if mime_type in ["image/jpeg", "image/png"] do
+        prepare_inline_image(config, session, message, label, asset, mime_type, asset_id)
+      else
+        prepare_original_file(config, session, message, label, asset, filename, asset_id, index)
+      end
+    else
+      nil ->
+        attachment_entry(
+          message,
+          base_label <>
+            " (#{mime_type}, size unknown): unavailable: the stored attachment could not be found.",
+          nil,
+          asset_id,
+          "not-delivered",
+          %{
+            code: "attachment-unavailable",
+            message: "The stored attachment metadata is unavailable."
+          }
+        )
+    end
+  end
+
+  defp prepare_inline_image(config, session, message, label, asset, mime_type, asset_id) do
     cond do
-      mime_type not in ["image/jpeg", "image/png"] ->
-        {label <>
-           "original-file delivery is not included in this Gateway release; bytes were not sent.",
-         nil}
-
-      not covered_harness? ->
-        {label <>
-           "image content blocks are not enabled for this harness; bytes were not sent.", nil}
+      not Harness.inline_attachments?(session.harness) ->
+        attachment_entry(
+          message,
+          label <> "image content blocks are not enabled for this harness; bytes were not sent.",
+          nil,
+          asset_id,
+          "not-delivered",
+          %{code: "unsupported-delivery", message: "This file will not reach the agent."}
+        )
 
       true ->
-        case Assets.get(db, asset_id) do
-          nil ->
-            {label <> "unavailable: the stored attachment could not be found.", nil}
+        source = Assets.file_path(config.base_dir, asset_id)
+        limit = AttachmentDelivery.max_deliverable_bytes()
 
-          _asset ->
-            case File.read(Assets.file_path(base_dir, asset_id)) do
-              {:ok, bytes} ->
-                {label <> "included inline.",
-                 %{type: "image", data: Base.encode64(bytes), mimeType: mime_type}}
+        case File.stat(source) do
+          {:ok, %{size: size}} when size > limit ->
+            attachment_entry(
+              message,
+              label <> "unavailable: this file exceeds the delivery limit.",
+              nil,
+              asset_id,
+              "not-delivered",
+              %{code: "over-limit", message: "This file exceeds the delivery limit."}
+            )
 
-              {:error, _reason} ->
-                {label <> "unavailable: the stored attachment bytes could not be read.", nil}
+          {:ok, %{size: size}} when size != asset.size ->
+            attachment_entry(
+              message,
+              label <> "unavailable: the stored attachment bytes could not be verified.",
+              nil,
+              asset_id,
+              "unknown",
+              %{
+                code: "assessment-unavailable",
+                message: AttachmentDelivery.assessment_unavailable_message()
+              }
+            )
+
+          {:ok, %{size: size}} ->
+            case File.read(source) do
+              {:ok, bytes} when byte_size(bytes) == size ->
+                attachment_entry(
+                  message,
+                  label <> "included inline.",
+                  %{type: "image", data: Base.encode64(bytes), mimeType: mime_type},
+                  asset_id,
+                  "delivered",
+                  nil
+                )
+
+              _ ->
+                attachment_entry(
+                  message,
+                  label <> "unavailable: the stored attachment bytes could not be verified.",
+                  nil,
+                  asset_id,
+                  "unknown",
+                  %{
+                    code: "assessment-unavailable",
+                    message: AttachmentDelivery.assessment_unavailable_message()
+                  }
+                )
             end
+
+          {:error, :enoent} ->
+            attachment_entry(
+              message,
+              label <> "unavailable: the stored attachment bytes could not be read.",
+              nil,
+              asset_id,
+              "not-delivered",
+              %{
+                code: "attachment-unavailable",
+                message: "The stored attachment bytes are unavailable."
+              }
+            )
+
+          {:error, _reason} ->
+            attachment_entry(
+              message,
+              label <> "unavailable: the stored attachment bytes could not be read.",
+              nil,
+              asset_id,
+              "unknown",
+              %{
+                code: "assessment-unavailable",
+                message: AttachmentDelivery.assessment_unavailable_message()
+              }
+            )
         end
     end
+  end
+
+  defp prepare_original_file(config, session, message, label, asset, filename, asset_id, index) do
+    source = Assets.file_path(config.base_dir, asset_id)
+    limit = AttachmentDelivery.max_deliverable_bytes()
+
+    case {Harness.original_file_attachments?(session.harness), File.stat(source)} do
+      {false, _stat} ->
+        attachment_entry(
+          message,
+          label <> "original-file delivery is not enabled for this harness; bytes were not sent.",
+          nil,
+          asset_id,
+          "not-delivered",
+          %{code: "unsupported-delivery", message: "This file will not reach the agent."}
+        )
+
+      {true, {:ok, %{size: size}}} when size <= limit and size == asset.size ->
+        case Placement.deliver_attachment(config, session, message.id, source, index, filename) do
+          {:ok, agent_path, _sha256} ->
+            attachment_entry(
+              message,
+              label <> "original file bytes are available at #{agent_path}.",
+              nil,
+              asset_id,
+              "delivered",
+              nil
+            )
+
+          {:error, _reason} ->
+            attachment_entry(
+              message,
+              label <>
+                "unavailable: the original file could not be transferred to the agent workspace.",
+              nil,
+              asset_id,
+              "not-delivered",
+              %{
+                code: "transfer-failed",
+                message: "This file could not be delivered to the agent."
+              }
+            )
+        end
+
+      {true, {:ok, %{size: size}}} when size > limit ->
+        attachment_entry(
+          message,
+          label <> "unavailable: this file exceeds the delivery limit.",
+          nil,
+          asset_id,
+          "not-delivered",
+          %{code: "over-limit", message: "This file exceeds the delivery limit."}
+        )
+
+      {true, {:ok, _stat}} ->
+        attachment_entry(
+          message,
+          label <> "unavailable: the stored attachment bytes could not be verified.",
+          nil,
+          asset_id,
+          "unknown",
+          %{
+            code: "assessment-unavailable",
+            message: AttachmentDelivery.assessment_unavailable_message()
+          }
+        )
+
+      {true, {:error, :enoent}} ->
+        attachment_entry(
+          message,
+          label <> "unavailable: the stored attachment bytes could not be read.",
+          nil,
+          asset_id,
+          "not-delivered",
+          %{
+            code: "attachment-unavailable",
+            message: "The stored attachment bytes are unavailable."
+          }
+        )
+
+      {true, {:error, _reason}} ->
+        attachment_entry(
+          message,
+          label <> "unavailable: the stored attachment bytes could not be read.",
+          nil,
+          asset_id,
+          "unknown",
+          %{
+            code: "assessment-unavailable",
+            message: AttachmentDelivery.assessment_unavailable_message()
+          }
+        )
+    end
+  end
+
+  defp attachment_entry(message, label, block, asset_id, outcome, reason) do
+    attempt =
+      if is_binary(Map.get(message, :id)) and is_binary(Map.get(message, :client_message_id)) do
+        %{
+          message_id: message.id,
+          session_key: message[:session_key],
+          client_message_id: message.client_message_id,
+          asset_id: asset_id,
+          outcome: outcome,
+          reason: reason
+        }
+      end
+
+    %{label: label, block: block, attempt: attempt}
   end
 
   defp append_turn_attachment_labels(prompt, entries) do
@@ -3803,15 +4347,15 @@ defmodule Tightbeam.Gateway do
              {:ok, result} <-
                stage_with_session(
                  :prompt,
-                 Adapter.prompt(
+                 prompt_with_attachment_outcomes(
+                   db,
                    prompt_adapter,
                    harness_session_id,
-                   turn_prompt_content(
+                   prepare_turn_prompt_content(
                      db,
                      assignment_identity_refresh_brief(turn, identity_refresh_revision),
-                     active_session.session_key,
-                     active_session.harness,
-                     config.base_dir
+                     active_session,
+                     config
                    ),
                    trace_dispatch: fn request_id ->
                      case Tightbeam.TurnLifecycle.append(db, turn.seq, %{
@@ -4184,6 +4728,13 @@ defmodule Tightbeam.Gateway do
       [[item, published_at]] ->
         %{"liveRevision" => revision} = JSON.decode!(item)
 
+        # This runs in the database writer at every turn end, so its cost must
+        # not grow with turn history. A session's turns start in `seq` order, so
+        # its newest started turn alone decides whether it ran after the
+        # publication: one index step per session. Asking instead whether ANY
+        # turn started after the publication reads every turn row of every
+        # session that is behind, which on a large org held the writer for
+        # seconds per turn end from the moment a revision was published.
         [[late_count]] =
           Txn.q(
             txn,
@@ -4192,11 +4743,13 @@ defmodule Tightbeam.Gateway do
             FROM sessions AS session
             WHERE session.state = 'active'
               AND session.identityRevision IS NOT ?1
-              AND EXISTS (
-                SELECT 1 FROM turns AS turn
+              AND (
+                SELECT turn.startedAt FROM turns AS turn
                 WHERE turn.sessionKey = session.sessionKey
-                  AND turn.startedAt >= ?2
-              )
+                  AND turn.startedAt IS NOT NULL
+                ORDER BY turn.seq DESC
+                LIMIT 1
+              ) >= ?2
             """,
             [revision, published_at]
           )
@@ -4839,6 +5392,12 @@ defmodule Tightbeam.Gateway do
 
   defp complete_session_snapshot(config, session, harness, revision) do
     snapshot = Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)
+    complete_session_snapshot(config, session, snapshot)
+  end
+
+  # The session-specific part of a served snapshot, over an archetype snapshot
+  # the caller already holds.
+  defp complete_session_snapshot(config, session, snapshot) do
     guidance = append_transcript_self_inspection(snapshot.guidance, session.session_key)
 
     guidance =
@@ -5489,12 +6048,14 @@ defmodule Tightbeam.Gateway do
     identity = Identity.status(config.base_dir)
     live = identity.live_revision
 
-    sessions =
+    {sessions, _archetype_snapshots} =
       db
       |> Org.list_for_user("", true)
-      |> Enum.map(fn session ->
-        harness = Harness.parse!(session.harness).id()
-        expected = complete_session_snapshot(config, session, harness, live)
+      |> Enum.map_reduce(%{}, fn session, archetype_snapshots ->
+        {read, archetype_snapshots} =
+          archetype_snapshot_once(config, live, session, archetype_snapshots)
+
+        expected = complete_session_snapshot(config, session, archetype_snapshot!(read))
 
         reasons =
           [
@@ -5517,17 +6078,17 @@ defmodule Tightbeam.Gateway do
           ]
           |> Enum.reject(&is_nil/1)
 
-        %{
-          session_key: session.session_key,
-          identity_revision: session.identity_revision,
-          identity_render_contract: session.identity_render_contract,
-          identity_guidance_digest: session.identity_guidance_digest,
-          expected_identity_revision: live,
-          expected_render_contract: expected.render_contract,
-          expected_guidance_digest: expected.guidance_digest,
-          identity_stale: reasons != [],
-          identity_stale_reasons: reasons
-        }
+        {%{
+           session_key: session.session_key,
+           identity_revision: session.identity_revision,
+           identity_render_contract: session.identity_render_contract,
+           identity_guidance_digest: session.identity_guidance_digest,
+           expected_identity_revision: live,
+           expected_render_contract: expected.render_contract,
+           expected_guidance_digest: expected.guidance_digest,
+           identity_stale: reasons != [],
+           identity_stale_reasons: reasons
+         }, archetype_snapshots}
       end)
 
     guidance =
@@ -5547,13 +6108,69 @@ defmodule Tightbeam.Gateway do
     |> maybe_put_guidance(guidance)
   end
 
+  @doc false
+  def warn_missing_installed_kungfu(base_dir) do
+    if notice = Identity.missing_installed_kungfu_notice(base_dir) do
+      Logger.warning(notice)
+    end
+
+    :ok
+  end
+
   defp maybe_put_guidance(status, nil), do: status
   defp maybe_put_guidance(status, guidance), do: Map.put(status, :guidance, guidance)
 
-  defp identity_apply_result(config, db, %{params: %{all: true}}) do
-    revision = Identity.live_revision!(config.base_dir)
+  # The composed archetype guidance and skills depend only on the revision,
+  # the archetype and the harness, and reading them costs one git process per
+  # guidance file. A pass over many sessions reads each pair once. A failed
+  # read is kept too, so every session of that pair reports it without the
+  # work being repeated.
+  defp archetype_snapshot_once(config, revision, session, archetype_snapshots) do
+    key = {session.archetype, session.harness}
+
+    case archetype_snapshots do
+      %{^key => read} ->
+        {read, archetype_snapshots}
+
+      _ ->
+        read =
+          try do
+            harness = Harness.parse!(session.harness).id()
+            {:ok, Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)}
+          rescue
+            error -> {:raised, error, __STACKTRACE__}
+          end
+
+        {read, Map.put(archetype_snapshots, key, read)}
+    end
+  end
+
+  defp archetype_snapshot!({:ok, snapshot}), do: snapshot
+  defp archetype_snapshot!({:raised, error, stacktrace}), do: reraise(error, stacktrace)
+
+  # A step of `identity apply --all` takes at most this many sessions and stops
+  # taking new ones once it has run this long. The client asks for the next
+  # step with the returned cursor, so no single request spans the org.
+  @identity_apply_step_max 200
+  @identity_apply_step_budget_ms 5_000
+  # A stamp waits for the org-wide identity lock for a few seconds at most.
+  @identity_apply_live_lock_retries 5
+  # Reread prompts of one run fall due this far apart. The wake scheduler
+  # re-resolves every due prompt in the org each time any recipient becomes
+  # ready, so hundreds falling due at once would hold up all other delivery.
+  @identity_apply_reread_spacing_ms 1_000
+
+  defp identity_apply_result(config, db, %{params: %{all: true} = params}) do
     sessions = Org.list_for_user(db, "", true)
-    identity_apply_sessions(config, db, sessions, revision)
+
+    case params[:limit] do
+      nil ->
+        revision = Identity.live_revision!(config.base_dir)
+        identity_apply_sessions(config, db, sessions, revision)
+
+      limit ->
+        identity_apply_step(config, db, sessions, params[:cursor], limit)
+    end
   end
 
   # A retired session is not a target. `Org.get/2` returns retired rows — retiring
@@ -5576,8 +6193,109 @@ defmodule Tightbeam.Gateway do
     do: %{code: "not_found", message: "no matching session"}
 
   defp identity_apply_sessions(config, db, sessions, revision) do
-    results = Enum.map(sessions, &identity_apply_session_result(config, db, &1, revision))
+    {results, _pass} =
+      Enum.map_reduce(
+        sessions,
+        identity_apply_pass(revision, 0),
+        &identity_apply_session_result(config, db, &1, &2)
+      )
 
+    identity_apply_report(db, revision, results)
+  end
+
+  # What one request carries from session to session: the run's revision, the
+  # archetype snapshots read so far, and how many reread prompts the run has
+  # scheduled, which spaces the next one.
+  defp identity_apply_pass(revision, rereads),
+    do: %{revision: revision, archetype_snapshots: %{}, rereads: rereads}
+
+  # One bounded step of `--all`. Sessions are visited in a fixed order grouped
+  # by archetype and harness, so a step reads few archetype snapshots and the
+  # cursor names a position that later steps can resume from. The cursor also
+  # carries the revision the run started with: a publication during the run
+  # shows up as `superseded` results instead of a silent mix of revisions. It
+  # carries the count of reread prompts scheduled so far, so their spacing
+  # continues across steps.
+  defp identity_apply_step(config, db, sessions, cursor, limit) do
+    with {:ok, limit} <- identity_apply_step_limit(limit),
+         {:ok, position} <- identity_apply_position(cursor) do
+      ordered = Enum.sort_by(sessions, &identity_apply_order/1)
+
+      {revision, rereads, pending} =
+        case position do
+          nil ->
+            {Identity.live_revision!(config.base_dir), 0, ordered}
+
+          {revision, last, rereads} ->
+            {revision, rereads, Enum.drop_while(ordered, &(identity_apply_order(&1) <= last))}
+        end
+
+      if ordered == [] do
+        identity_apply_sessions(config, db, [], revision)
+      else
+        budget = Map.get(config, :identity_apply_step_budget_ms, @identity_apply_step_budget_ms)
+        deadline = System.monotonic_time(:millisecond) + budget
+
+        {results, pass} =
+          pending
+          |> Enum.take(limit)
+          |> Enum.reduce_while(
+            {[], identity_apply_pass(revision, rereads)},
+            fn session, {results, pass} ->
+              if results != [] and System.monotonic_time(:millisecond) >= deadline do
+                {:halt, {results, pass}}
+              else
+                {result, pass} = identity_apply_session_result(config, db, session, pass)
+                {:cont, {[result | results], pass}}
+              end
+            end
+          )
+
+        results = Enum.reverse(results)
+        handled = length(results)
+        remaining = length(pending) - handled
+
+        next =
+          if remaining > 0 do
+            last = pending |> Enum.at(handled - 1) |> identity_apply_order()
+            Base.url_encode64(JSON.encode!([revision, pass.rereads | last]), padding: false)
+          end
+
+        db
+        |> identity_apply_report(revision, results)
+        |> Map.merge(%{total: length(ordered), remaining: remaining, cursor: next})
+      end
+    else
+      {:error, message} -> %{code: "invalid", message: message}
+    end
+  end
+
+  defp identity_apply_order(session),
+    do: [session.archetype, session.harness, session.session_key]
+
+  defp identity_apply_step_limit(limit) when is_integer(limit) and limit > 0,
+    do: {:ok, min(limit, @identity_apply_step_max)}
+
+  defp identity_apply_step_limit(_limit), do: {:error, "limit must be a positive integer"}
+
+  defp identity_apply_position(nil), do: {:ok, nil}
+
+  defp identity_apply_position(cursor) when is_binary(cursor) do
+    with {:ok, encoded} <- Base.url_decode64(cursor, padding: false),
+         {:ok, [revision, rereads | [_archetype, _harness, _session_key] = last]} <-
+           JSON.decode(encoded),
+         true <- Enum.all?([revision | last], &is_binary/1),
+         true <- is_integer(rereads) and rereads >= 0 do
+      {:ok, {revision, last, rereads}}
+    else
+      _ -> {:error, "cursor is not one returned by identity apply"}
+    end
+  end
+
+  defp identity_apply_position(_cursor),
+    do: {:error, "cursor is not one returned by identity apply"}
+
+  defp identity_apply_report(db, revision, results) do
     results = Enum.map(results, &identity_apply_stream_update(db, &1))
 
     applied =
@@ -5594,75 +6312,213 @@ defmodule Tightbeam.Gateway do
       status: if(complete?, do: "complete", else: "partial"),
       complete: complete?,
       identity_revision: revision,
-      target_session_keys: Enum.map(sessions, & &1.session_key),
+      target_session_keys: Enum.map(results, & &1.session_key),
       applied: applied,
       results: results
     }
   end
 
-  defp identity_apply_session_result(config, db, session, revision) do
-    result =
-      with_session_mutation_lock(session.session_key, fn ->
-        Identity.with_live_revision_lock(config.base_dir, fn current_revision ->
-          if current_revision == revision do
-            identity_apply_session_at_revision(config, db, session, revision)
-          else
-            %{
-              session_key: session.session_key,
-              outcome: "superseded",
-              files: "not_started",
-              stamp: "not_committed",
-              prompt_enqueue: "not_attempted",
-              prompt_delivery: "not_started",
-              reread: "unconfirmed",
-              stream_update: "not_attempted",
-              current_identity_revision: current_revision
-            }
-          end
-        end)
-      end)
+  defp identity_apply_session_result(config, db, session, pass) do
+    {read, archetype_snapshots} =
+      archetype_snapshot_once(config, pass.revision, session, pass.archetype_snapshots)
 
-    if is_map(result),
-      do: result,
-      else:
-        identity_apply_failure_result(session, "session apply lock returned #{inspect(result)}")
-  rescue
-    error -> identity_apply_exception_result(session, error)
-  catch
-    :exit, reason -> identity_apply_failure_result(session, "exit: #{inspect(reason)}")
+    spacing =
+      Map.get(config, :identity_apply_reread_spacing_ms, @identity_apply_reread_spacing_ms)
+
+    reread_at = System.system_time(:millisecond) + pass.rereads * spacing
+
+    result =
+      try do
+        identity_apply_session(config, db, session, pass.revision, read, reread_at)
+      rescue
+        error -> identity_apply_exception_result(session, error)
+      catch
+        :exit, reason -> identity_apply_failure_result(session, "exit: #{inspect(reason)}")
+      end
+
+    rereads =
+      if result[:prompt_enqueue] == "recorded_pending",
+        do: pass.rereads + 1,
+        else: pass.rereads
+
+    {result, %{pass | archetype_snapshots: archetype_snapshots, rereads: rereads}}
   end
 
-  defp identity_apply_session_at_revision(config, db, session, revision) do
+  defp identity_apply_session(config, db, session, revision, read, reread_at) do
     case Org.get(db, session.session_key) do
       %{state: "active"} = current ->
-        harness = Harness.parse!(current.harness).id()
-        snapshot = complete_session_snapshot(config, current, harness, revision)
+        snapshot = identity_apply_snapshot(config, current, session, revision, read)
 
-        files =
-          if identity_stamp_matches?(current, snapshot) do
-            "already_current"
-          else
-            Placement.materialize_identity(config, current, snapshot)
-            "materialized"
-          end
-
-        identity_apply_persist_result(db, current, snapshot, revision, files)
+        case identity_apply_already_current(db, current, snapshot, revision) do
+          nil -> identity_apply_locked(config, db, session, revision, read, reread_at)
+          result -> result
+        end
 
       _retired_or_missing ->
+        identity_apply_skipped_result(session)
+    end
+  end
+
+  # The listed row chose which archetype snapshot was read. A session whose
+  # archetype or harness changed since the listing gets its own read.
+  defp identity_apply_snapshot(config, current, listed, revision, read) do
+    if current.archetype == listed.archetype and current.harness == listed.harness do
+      complete_session_snapshot(config, current, archetype_snapshot!(read))
+    else
+      harness = Harness.parse!(current.harness).id()
+      complete_session_snapshot(config, current, harness, revision)
+    end
+  end
+
+  # A session whose stamp already matches and whose reread prompt is already
+  # recorded needs no write. No lock is taken, and on a file-backed database
+  # these reads go to the reader pool, so a repeated pass over an applied org
+  # does not use the writer.
+  defp identity_apply_already_current(db, session, snapshot, revision) do
+    if identity_stamp_matches?(session, snapshot) do
+      prompt = identity_apply_prompt(revision)
+
+      {:ok, existing} =
+        DB.read_transaction(db, fn txn ->
+          case Org.current_pointer_snapshot_in_txn(txn, session.session_key) do
+            nil ->
+              %{enqueue: "not_required", delivery: "not_required", reread: "not_applicable"}
+
+            _pointer ->
+              identity_apply_existing_prompt_in_txn(txn, session.session_key, prompt)
+          end
+        end)
+
+      if existing do
         %{
           session_key: session.session_key,
-          outcome: "skipped",
-          files: "not_updated",
-          stamp: "not_attempted",
-          prompt_enqueue: "not_required",
-          prompt_delivery: "not_required",
-          reread: "not_applicable",
+          outcome: "applied",
+          files: "already_current",
+          stamp: "committed",
+          prompt_enqueue: existing.enqueue,
+          prompt_delivery: existing.delivery,
+          reread: existing.reread,
+          wake_id: existing[:wake_id],
           stream_update: "not_attempted"
+        }
+      end
+    end
+  end
+
+  # A turn being set up, a model change or a heal holds the session's lock for
+  # as long as its adapter call takes. Apply makes one attempt and reports the
+  # session as busy rather than wait behind it.
+  defp identity_apply_locked(config, db, session, revision, read, reread_at) do
+    case try_session_mutation_lock(session.session_key, fn ->
+           identity_apply_session_at_revision(config, db, session, revision, read, reread_at)
+         end) do
+      {:ok, result} when is_map(result) ->
+        result
+
+      {:ok, other} ->
+        identity_apply_failure_result(session, "session apply lock returned #{inspect(other)}")
+
+      :busy ->
+        %{
+          session_key: session.session_key,
+          outcome: "busy",
+          files: "not_started",
+          stamp: "not_committed",
+          prompt_enqueue: "not_attempted",
+          prompt_delivery: "not_started",
+          reread: "unconfirmed",
+          stream_update: "not_attempted",
+          reason: "a turn is being set up or the session is being changed; apply it again"
         }
     end
   end
 
-  defp identity_apply_persist_result(db, session, snapshot, revision, files) do
+  defp identity_apply_session_at_revision(config, db, session, revision, read, reread_at) do
+    case Org.get(db, session.session_key) do
+      %{state: "active"} = current ->
+        # Checked before any file is written: a run that started on an older
+        # revision must not put that revision's files over a newer apply.
+        case Identity.current_live_revision!(config.base_dir) do
+          ^revision ->
+            snapshot = identity_apply_snapshot(config, current, session, revision, read)
+
+            files =
+              if identity_stamp_matches?(current, snapshot) do
+                "already_current"
+              else
+                Placement.materialize_identity(config, current, snapshot)
+                "materialized"
+              end
+
+            case config[:on_identity_apply_files] do
+              callback when is_function(callback, 0) -> callback.()
+              _ -> :ok
+            end
+
+            identity_apply_stamp(config, db, current, snapshot, revision, files, reread_at)
+
+          live ->
+            identity_apply_superseded_result(session, live, "not_started")
+        end
+
+      _retired_or_missing ->
+        identity_apply_skipped_result(session)
+    end
+  end
+
+  # The files are already written when this lock is taken. It covers only the
+  # last live check and the stamp, so a publication and other sessions' applies
+  # never wait behind one session's file writes.
+  defp identity_apply_stamp(config, db, session, snapshot, revision, files, reread_at) do
+    case Identity.with_live_revision_lock(
+           config.base_dir,
+           @identity_apply_live_lock_retries,
+           fn
+             ^revision ->
+               identity_apply_persist_result(db, session, snapshot, revision, files, reread_at)
+
+             live ->
+               identity_apply_superseded_result(session, live, files)
+           end
+         ) do
+      :aborted ->
+        session
+        |> identity_apply_failure_result("the identity lock stayed busy; apply it again")
+        |> Map.put(:files, files)
+
+      result ->
+        result
+    end
+  end
+
+  defp identity_apply_superseded_result(session, live_revision, files) do
+    %{
+      session_key: session.session_key,
+      outcome: "superseded",
+      files: files,
+      stamp: "not_committed",
+      prompt_enqueue: "not_attempted",
+      prompt_delivery: "not_started",
+      reread: "unconfirmed",
+      stream_update: "not_attempted",
+      current_identity_revision: live_revision
+    }
+  end
+
+  defp identity_apply_skipped_result(session) do
+    %{
+      session_key: session.session_key,
+      outcome: "skipped",
+      files: "not_updated",
+      stamp: "not_attempted",
+      prompt_enqueue: "not_required",
+      prompt_delivery: "not_required",
+      reread: "not_applicable",
+      stream_update: "not_attempted"
+    }
+  end
+
+  defp identity_apply_persist_result(db, session, snapshot, revision, files, reread_at) do
     result =
       try do
         DB.transaction(db, fn txn ->
@@ -5689,7 +6545,12 @@ defmodule Tightbeam.Gateway do
 
                 _pointer ->
                   notification =
-                    identity_apply_prompt_record_in_txn(txn, session.session_key, revision)
+                    identity_apply_prompt_record_in_txn(
+                      txn,
+                      session.session_key,
+                      revision,
+                      reread_at
+                    )
 
                   Map.put(notification, :stamp, "committed")
               end
@@ -5767,9 +6628,40 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp identity_apply_prompt_record_in_txn(txn, session_key, revision) do
+  defp identity_apply_prompt_record_in_txn(txn, session_key, revision, reread_at) do
     prompt = identity_apply_prompt(revision)
 
+    case identity_apply_existing_prompt_in_txn(txn, session_key, prompt) do
+      nil ->
+        wake =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: session_key,
+            target_role: nil,
+            origin: "process:tightbeam",
+            prompt: prompt,
+            due_at: reread_at,
+            consumer: "prompt",
+            target_gate: 1
+          })
+
+        Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+
+        %{
+          stamp: "committed",
+          enqueue: "recorded_pending",
+          delivery: "pending",
+          reread: "unconfirmed",
+          wake_id: wake.wake_id
+        }
+
+      existing ->
+        existing
+    end
+  end
+
+  # The reread prompt this revision already has for the session, if any. Reads
+  # only, so it runs equally inside the stamp transaction and on a reader.
+  defp identity_apply_existing_prompt_in_txn(txn, session_key, prompt) do
     existing_wakes =
       DB.Txn.q(
         txn,
@@ -5816,26 +6708,7 @@ defmodule Tightbeam.Gateway do
         }
 
       true ->
-        wake =
-          Wakes.schedule_in_txn(txn, %{
-            session_key: session_key,
-            target_role: nil,
-            origin: "process:tightbeam",
-            prompt: prompt,
-            due_at: System.system_time(:millisecond),
-            consumer: "prompt",
-            target_gate: 1
-          })
-
-        Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
-
-        %{
-          stamp: "committed",
-          enqueue: "recorded_pending",
-          delivery: "pending",
-          reread: "unconfirmed",
-          wake_id: wake.wake_id
-        }
+        nil
     end
   end
 
@@ -5995,6 +6868,7 @@ defmodule Tightbeam.Gateway do
         params[:reason],
         source
       )
+      |> recheck_rate_limit_after_onboard(config, provider_atom(provider), machine)
       |> finish_oauth_recovery_wake(config, call, provider_atom(provider), machine, phase, kind)
       |> with_owner_user_id(phase, gateway_db(config), call)
     else
@@ -6040,6 +6914,31 @@ defmodule Tightbeam.Gateway do
   defp onboard_result(_config, %{params: %{provider: _provider}}) do
     %{code: "invalid_message", message: "unsupported onboarding provider"}
   end
+
+  defp recheck_rate_limit_after_onboard(
+         %{status: "onboarded"} = result,
+         config,
+         provider,
+         machine
+       ) do
+    case Tightbeam.HarnessHealth.RecoverySchedule.credential_changed(
+           gateway_db(config),
+           provider,
+           machine
+         ) do
+      :ok ->
+        result
+
+      {:error, reason} ->
+        Logger.warning(
+          "rate-limit recovery recheck after credential change failed: #{inspect(reason)}"
+        )
+
+        result
+    end
+  end
+
+  defp recheck_rate_limit_after_onboard(result, _config, _provider, _machine), do: result
 
   defp onboard_phase(
          config,
@@ -7383,7 +8282,8 @@ defmodule Tightbeam.Gateway do
              :condition_kind,
              :predicate,
              :after_turn,
-             :replace_queued
+             :replace_queued,
+             :prod_id
            ],
            &is_nil(p[&1])
          ))
@@ -7396,6 +8296,7 @@ defmodule Tightbeam.Gateway do
     after_turn? = p[:after_turn] == true
     replace_present? = Map.has_key?(p, :replace_queued)
     replace_queued? = p[:replace_queued] == true
+    prod_id = p[:prod_id]
     wait? = predicate? or after_turn?
 
     cond do
@@ -7406,6 +8307,14 @@ defmodule Tightbeam.Gateway do
         false
 
       replace_present? and p[:replace_queued] not in [true, false] ->
+        false
+
+      Map.has_key?(p, :prod_id) and
+          (not is_binary(prod_id) or String.trim(prod_id) == "") ->
+        false
+
+      is_binary(prod_id) and
+          (wait? or is_binary(p[:condition_kind]) or is_binary(p[:cron]) or replace_queued?) ->
         false
 
       predicate? and after_turn? ->
@@ -7544,6 +8453,8 @@ defmodule Tightbeam.Gateway do
         # Typed waits validate the assignment through register_wait_in_txn/2.
         # Internal process and bound remedy wakes continue to use their carriers.
         assignment_id: assignment_id,
+        prod_id: p[:prod_id],
+        prod_sender: prod_sender(call[:principal]),
         activity_assignment_id: activity_assignment_id
       })
 
@@ -7609,6 +8520,11 @@ defmodule Tightbeam.Gateway do
        do: scheduled_wake_assignment_id(params) || immediate_wake_assignment_id(params)
 
   defp wake_assignment_id_in_txn(_txn, _call), do: nil
+
+  defp prod_sender({kind, id}) when kind in [:session, :user, :process] and is_binary(id),
+    do: %{kind: Atom.to_string(kind), id: id}
+
+  defp prod_sender(_), do: nil
 
   defp scheduled_wake_assignment_id(params) do
     if is_number(params[:after_ms]) or is_number(params[:at]) or
@@ -8893,6 +9809,17 @@ defmodule Tightbeam.Gateway do
     :global.trans({{__MODULE__, :session_mutation, session_key}, self()}, fun)
   end
 
+  # One attempt and no wait. `:global` has no queue: a waiter sleeps for up to
+  # eight seconds between attempts, for as long as the holder keeps the lock.
+  defp try_session_mutation_lock(session_key, fun) do
+    lock = {{__MODULE__, :session_mutation, session_key}, self()}
+
+    case :global.trans(lock, fn -> {:ok, fun.()} end, [node() | Node.list()], 0) do
+      :aborted -> :busy
+      {:ok, _result} = locked -> locked
+    end
+  end
+
   # Serialize the [re-pin the shared home -> session/new|load] window per ADAPTER
   # ({harness, host}). The adapter binds its offered model set by re-reading the
   # shared home at session/new|load, and the pin is now session-varying, so
@@ -9929,6 +10856,14 @@ defmodule Tightbeam.Gateway do
          |> ErrorDiagnostic.put(
            ErrorDiagnostic.from_reason(reason, operation: "credential_status", provider: provider)
          )}
+
+      {:pending, nil} ->
+        {:error,
+         %{
+           code: "credential_status_pending",
+           message:
+             "Credential status has not answered yet for #{provider} on #{machine}; retry later"
+         }}
     end
   end
 

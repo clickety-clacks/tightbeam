@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "purpose": "prerelease-soak",
+  "purpose": "candidate-soak",
   "predecessor": {
     "version": "0.0.1",
     "build": 1,

@@ -72,6 +72,7 @@ pub enum Command {
         assignment_id: Option<String>,
         after_turn: bool,
         replace_queued: bool,
+        prod_id: Option<String>,
         idempotency_key: Option<String>,
         /// Sender-elected delivery class. The vocabulary is extensible, so the
         /// CLI validates only that a supplied name is non-empty.
@@ -222,6 +223,12 @@ pub enum Command {
     },
     HarklightFollow {
         identity: Identity,
+        message: Option<String>,
+        handle: Option<String>,
+    },
+    HarklightRetry {
+        identity: Identity,
+        all: bool,
         message: Option<String>,
         handle: Option<String>,
     },
@@ -823,6 +830,7 @@ COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
        [--after 30s|5m|2h] [--at <epochMs>] [--cron "<schedule>"] [--assignment <id>] [--replace-queued]
        [--class fyi|status-query|input-needed|blocker|algedonic]
+       [--prod-id <id>]
       Condition wake:
         tightbeam wake (--session <key> | --role <name> | --user <id>)
           --when-fact <kind> [--when-scope <scope>]
@@ -847,6 +855,8 @@ COMMANDS:
       It never resumes or replays prior work. The fact stamp reports why the prompt arrived.
       --replace-queued requires --assignment and asks delivery to cancel only your own
       eligible queued messages to that assignment's holder.
+      --prod-id replaces your older queued, undelivered prod with the same id to
+      the same session; the newest prompt and delivery time win.
       The accountable agent re-reads durable state and decides the next action.
       The fallback timer detects silence only; it does not select an action.
       A dependency predicate names conditions, optional bindings, and resolverRef.
@@ -932,6 +942,8 @@ COMMANDS:
       Explicitly move your conversation to the shared origin listener.
   harklight-follow (--message <id> | --handle <handle>)
       Follow a message or conversation sent through Tightbeam.
+  harklight-retry (--all | --message <id> | --session <handle>)
+      Retry the bounded listener start for unavailable unanswered conversations.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
       --type fyi|request [--kind blocker|success]
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
@@ -1122,6 +1134,7 @@ COMMANDS:
                 [--rationale <text>]
       Record the operator's resolution. A session that presented the request runs it
       only on the operator's explicit delegation, quoted in --rationale.
+      A non-owner caller receives a warning naming the request owner; the ruling proceeds.
   operator-withdraw <dr_id> --reason <text>
       Withdraw an operator decision request as its owner or original asker.
   decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
@@ -1135,8 +1148,10 @@ COMMANDS:
       Stop a running turn in a session owned by that user.
   revoke-assignment <assignmentId> --reason "..."
       Revoke when the assignment handler already authorizes your principal.
+      A non-owner caller receives a warning naming the work owner; revocation proceeds.
   reopen-assignment <assignmentId> --reason <reason>
       Reopen an authorized closed assignment and record the reason.
+      A non-owner caller receives a warning naming the work owner; reopening proceeds.
   repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.
@@ -1250,7 +1265,11 @@ COMMANDS:
       Best-effort update of the selected sessions' Tightbeam-owned skill files
       to the current live identity revision, followed by an ordinary prompt
       asking each started session to re-read them. It cannot confirm that a
-      session did, and it does not reload any running model context.
+      session did, and it does not reload any running model context. --all
+      proceeds in short steps and prints a progress line for each on stderr;
+      what a step applied is kept if the run is interrupted. A busy session is
+      reported and passed over. Run it again to continue or to pick those up;
+      sessions that are already current are passed quickly.
   onboard openai|anthropic [--api-key] [--owner <user>]
       Run this machine's model-provider credential onboarding flow. Without
       --api-key this is the interactive subscription ceremony. With it the flow is
@@ -2179,6 +2198,7 @@ fn parse_with_optional_catalog(
             let assignment_id = nonempty(flags, "assignment");
             let after_turn = flags.contains_key("after-turn");
             let replace_queued = flags.contains_key("replace-queued");
+            let prod_id = nonempty(flags, "prod-id");
             let wait = predicate.is_some() || after_turn;
 
             if condition_scope.is_some() && condition_kind.is_none() {
@@ -2216,6 +2236,14 @@ fn parse_with_optional_catalog(
                         .to_owned(),
                 );
             }
+            if flags.get("prod-id").is_some_and(|id| id.trim().is_empty()) {
+                return Err("--prod-id requires a non-empty id".to_owned());
+            }
+            if prod_id.is_some()
+                && (wait || condition_kind.is_some() || cron.is_some() || replace_queued)
+            {
+                return Err("--prod-id requires an ordinary prompt wake".to_owned());
+            }
             if predicate.is_some() && fallback_after_ms.is_none() && at.is_none() {
                 return Err(
                     "a predicate wake requires a fallback (--fallback-after / --at)".to_owned(),
@@ -2250,6 +2278,7 @@ fn parse_with_optional_catalog(
                 assignment_id,
                 after_turn,
                 replace_queued,
+                prod_id,
                 idempotency_key,
                 class: nonempty(flags, "class"),
             })
@@ -2770,6 +2799,44 @@ fn parse_with_optional_catalog(
 
             Ok(Command::HarklightFollow {
                 identity: identity(flags)?,
+                message,
+                handle,
+            })
+        }
+        "harklight-retry" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "as" | "as-user" | "as-process" | "all" | "message" | "session"
+                    )
+                })
+            {
+                return Err(
+                    "usage: tightbeam harklight-retry (--all | --message <id> | --session <handle>)"
+                        .to_owned(),
+                );
+            }
+
+            let all = flags.contains_key("all");
+            let message = nonempty(flags, "message");
+            let handle = nonempty(flags, "session");
+
+            if [all, message.is_some(), handle.is_some()]
+                .into_iter()
+                .filter(|selected| *selected)
+                .count()
+                != 1
+            {
+                return Err(
+                    "usage: tightbeam harklight-retry (--all | --message <id> | --session <handle>)"
+                        .to_owned(),
+                );
+            }
+
+            Ok(Command::HarklightRetry {
+                identity: identity(flags)?,
+                all,
                 message,
                 handle,
             })
@@ -4011,7 +4078,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -4943,6 +5010,57 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn harklight_retry_requires_exactly_one_selector() {
+        assert_eq!(
+            parse(strings(&["harklight-retry", "--all"])),
+            Ok(Command::HarklightRetry {
+                identity: Identity::Session,
+                all: true,
+                message: None,
+                handle: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "harklight-retry",
+                "--message",
+                "message-example"
+            ])),
+            Ok(Command::HarklightRetry {
+                identity: Identity::Session,
+                all: false,
+                message: Some("message-example".to_owned()),
+                handle: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["harklight-retry", "--session", "handle-example"])),
+            Ok(Command::HarklightRetry {
+                identity: Identity::Session,
+                all: false,
+                message: None,
+                handle: Some("handle-example".to_owned()),
+            })
+        );
+
+        for args in [
+            vec!["harklight-retry"],
+            vec!["harklight-retry", "--all", "--session", "handle-example"],
+            vec!["harklight-retry", "unexpected", "--all"],
+            vec![
+                "harklight-retry",
+                "--message",
+                "message-example",
+                "--session",
+                "handle-example",
+            ],
+            vec!["harklight-retry", "--unknown"],
+        ] {
+            assert!(parse(strings(&args)).is_err(), "accepted {args:?}");
+        }
     }
 
     #[test]
@@ -6529,6 +6647,7 @@ mod tests {
                 "harklight-settle",
                 "harklight-follow",
                 "harklight-cover",
+                "harklight-retry",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",
@@ -7053,6 +7172,7 @@ mod tests {
                 assignment_id: None,
                 after_turn: false,
                 replace_queued: false,
+                prod_id: None,
                 idempotency_key: Some("wake-1".to_owned()),
                 class: None,
             })
@@ -7084,6 +7204,7 @@ mod tests {
                 assignment_id: None,
                 after_turn: false,
                 replace_queued: false,
+                prod_id: None,
                 idempotency_key: None,
                 class: None,
             })
@@ -7181,6 +7302,7 @@ mod tests {
             Ok(Command::Wake {
                 assignment_id: Some(id),
                 replace_queued: true,
+            prod_id: None,
                 ..
             }) if id == "asg_a"
         ));
@@ -7210,6 +7332,58 @@ mod tests {
                 "continue",
             ])),
             Err("--replace-queued cannot be combined with --predicate or --after-turn".to_owned())
+        );
+    }
+
+    #[test]
+    fn prod_id_is_a_sender_elected_prompt_scope() {
+        assert!(matches!(
+            parse(strings(&[
+                "wake", "--session", "agent:holder", "--prod-id", "page",
+                "--after", "1m", "--prompt", "revised"
+            ])),
+            Ok(Command::Wake { prod_id: Some(id), prompt, .. })
+                if id == "page" && prompt == "revised"
+        ));
+        assert!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--prod-id",
+                "",
+                "--prompt",
+                "missing id"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--prod-id",
+                "   ",
+                "--prompt",
+                "blank id"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--prod-id",
+                "page",
+                "--when-fact",
+                "done",
+                "--fallback-after",
+                "1h",
+                "--prompt",
+                "protected"
+            ]))
+            .is_err()
         );
     }
 
@@ -7246,6 +7420,7 @@ mod tests {
                 assignment_id: Some("asg_a".to_owned()),
                 after_turn: false,
                 replace_queued: false,
+                prod_id: None,
                 idempotency_key: None,
                 class: None,
             })
@@ -7277,6 +7452,7 @@ mod tests {
                 assignment_id: Some("asg_a".to_owned()),
                 after_turn: true,
                 replace_queued: false,
+                prod_id: None,
                 idempotency_key: None,
                 class: None,
             })
@@ -7689,7 +7865,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -8326,6 +8502,7 @@ mod tests {
                     assignment_id: None,
                     after_turn: false,
                     replace_queued: false,
+                    prod_id: None,
                     idempotency_key: None,
                     class: None,
                 },

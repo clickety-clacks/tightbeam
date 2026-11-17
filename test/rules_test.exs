@@ -120,6 +120,88 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
+  test "unsupported purpose skips only its policy while sibling policy and verbs continue", ctx do
+    path =
+      put_raw(
+        ctx,
+        rule("deny-post", "post", "caller.origin_class", "eq", "user") <>
+          rule("deny-wake", "wake", "caller.origin_class", "eq", "user") <>
+          """
+          [[policy]]
+          name = "supported-evidence"
+          purpose = "attest-operational-evidence"
+          when = [{ fact = "assignment.effect_kind", op = "eq", value = "evidence" }]
+
+          [[policy]]
+          name = "unknown-purpose"
+          purpose = "wait-unknown-x"
+          when = [{ fact = "unknown.fact", op = "eq", value = true }]
+          """
+      )
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        loaded = Rules.load!(ctx.base_dir, ["post", "wake", "status"])
+        assert Enum.map(loaded, & &1.name) == ["deny-post", "deny-wake"]
+        assert Enum.map(Rules.effective_snapshot().policies, & &1.name) == ["supported-evidence"]
+      end)
+
+    assert log =~ "#{path}: policy \"unknown-purpose\": unsupported purpose: \"wait-unknown-x\""
+    assert {:deny, %{code: "rule_denied"}} = Rules.evaluate(ctx.db, call())
+    assert {:deny, %{code: "rule_denied"}} = Rules.evaluate(ctx.db, %{call() | verb: "wake"})
+    assert :ok = Rules.evaluate(ctx.db, %{call() | verb: "status"})
+  end
+
+  test "a file with only an unsupported-purpose policy leaves verbs available", ctx do
+    path =
+      put_raw(ctx, "[[policy]]\nname = 'unknown-purpose'\npurpose = 'wait-unknown-x'\n")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert [] = Rules.load!(ctx.base_dir, ["post"])
+      end)
+
+    assert log =~ "#{path}: policy \"unknown-purpose\": unsupported purpose: \"wait-unknown-x\""
+    assert :ok = Rules.evaluate(ctx.db, call())
+  end
+
+  test "non-string and missing purposes skip only their policies", ctx do
+    path =
+      put_raw(
+        ctx,
+        rule("deny-post", "post", "caller.origin_class", "eq", "user") <>
+          rule("deny-wake", "wake", "caller.origin_class", "eq", "user") <>
+          """
+          [[policy]]
+          name = "supported-evidence"
+          purpose = "attest-operational-evidence"
+          when = [{ fact = "assignment.effect_kind", op = "eq", value = "evidence" }]
+
+          [[policy]]
+          name = "numeric-purpose"
+          purpose = 17
+          when = [{ fact = "unknown.fact", op = "eq", value = true }]
+
+          [[policy]]
+          name = "missing-purpose"
+          when = [{ fact = "unknown.fact", op = "eq", value = true }]
+          """
+      )
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        loaded = Rules.load!(ctx.base_dir, ["post", "wake", "status"])
+        assert Enum.map(loaded, & &1.name) == ["deny-post", "deny-wake"]
+        assert Enum.map(Rules.effective_snapshot().policies, & &1.name) == ["supported-evidence"]
+      end)
+
+    assert log =~ "#{path}: policy \"numeric-purpose\": unsupported purpose: 17"
+    assert log =~ "#{path}: policy \"missing-purpose\": unsupported purpose: nil"
+    assert {:deny, %{code: "rule_denied"}} = Rules.evaluate(ctx.db, call())
+    assert {:deny, %{code: "rule_denied"}} = Rules.evaluate(ctx.db, %{call() | verb: "wake"})
+    assert :ok = Rules.evaluate(ctx.db, %{call() | verb: "status"})
+  end
+
   test "a malformed rule leaves a healthy sibling rule active", ctx do
     put_raw(
       ctx,
@@ -4007,7 +4089,38 @@ defmodule Tightbeam.RulesTest do
                [no_context.session_key]
              )
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[no_context_target]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:ac6a-queue-backlog' AND sessionKey=?1",
+               [no_context.session_key]
+             )
+
+    assert no_context_target == no_context.session_key
+
+    main = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    other_no_context = session(ctx.db, "ac6a-owner-main-fallback-holder", "flynn")
+
+    for index <- 1..20 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: other_no_context.session_key,
+                 message_id: "ac6a-owner-main-fallback-#{index}",
+                 origin: "process:seed",
+                 prompt: "no assignment or work item, with an owner Main"
+               })
+    end
+
+    assert {:ok, [[main_target]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:ac6a-queue-backlog' AND sessionKey=?1",
+               [main.session_key]
+             )
+
+    assert main_target == main.session_key
+
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed' AND subject='ac6a-queue-backlog'"

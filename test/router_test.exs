@@ -40,6 +40,15 @@ defmodule Tightbeam.Wire.RouterTest do
     def handle_call({:fire_matching, _fact_id}, _from, state), do: {:reply, :ok, state}
   end
 
+  @tag prod_id_replacement: true
+  test "wake prod id crosses the wire parameter boundary" do
+    assert %{prod_id: "page", prompt: "revised"} =
+             Router.atomize_params_for_test("wake", %{
+               "prodId" => "page",
+               "prompt" => "revised"
+             })
+  end
+
   test "unknown keys cannot create atoms or borrow another verb's parameters" do
     key = "unrecognized_wire_key_#{System.unique_integer([:positive])}"
     assert_raise ArgumentError, fn -> String.to_existing_atom(key) end
@@ -907,6 +916,30 @@ defmodule Tightbeam.Wire.RouterTest do
     handler_keys = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir}) |> Map.keys()
 
     assert agent_verbs -- handler_keys == []
+  end
+
+  test "existing sentinel unsubscribe remains available through agent dispatch", ctx do
+    session = create_session(ctx.db, "sentinel-unsubscribe-wire", ctx.device.user_id)
+    subscription_id = "sub_router_allowlist"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO sentinel_subscriptions(subscriptionId,sessionKey,event,filter,createdAt) VALUES(?1,?2,?3,?4,?5)",
+               [subscription_id, session.session_key, "example/event", "[]", 1]
+             )
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    response =
+      dispatch_cli(ctx, session.cli_token, %{
+        verb: "sentinel-unsubscribe",
+        params: %{subscriptionId: subscription_id}
+      })
+
+    assert response.status == 200, response.resp_body
+    assert JSON.decode!(response.resp_body)["result"] == %{"unsubscribed" => subscription_id}
   end
 
   test "fact producer verbs cross agent dispatch for sessions, users and processes", ctx do
@@ -2304,7 +2337,15 @@ defmodule Tightbeam.Wire.RouterTest do
     for {verb, params} <- [
           {"work-item-create", %{title: "Create"}},
           {"work-item-handoff",
-           %{workItemId: "wi_test", deliveryOwnerSessionKey: "pdo-a", brief: "Take delivery."}},
+           %{
+             workItemId: "wi_test",
+             deliveryOwnerSessionKey: "pdo-a",
+             brief: "Take delivery.",
+             specRefName: "agreed-spec",
+             specRefSha256: String.duplicate("a", 64),
+             isBug: true,
+             priority: 2
+           }},
           {"work-item-get", %{workItemId: "wi_test"}},
           {"work-item-trace", %{workItemId: "wi_test"}},
           {"work-item-list", %{}},
@@ -2327,7 +2368,11 @@ defmodule Tightbeam.Wire.RouterTest do
         assert received_params == %{
                  work_item_id: "wi_test",
                  delivery_owner_session_key: "pdo-a",
-                 brief: "Take delivery."
+                 brief: "Take delivery.",
+                 spec_ref_name: "agreed-spec",
+                 spec_ref_sha256: String.duplicate("a", 64),
+                 is_bug: true,
+                 priority: 2
                }
       end
     end
@@ -2793,17 +2838,30 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call,
                     %{verb: "wake", origin: "agent:orchestrator:demo", session_key: "orch"}}
 
-    # `post` remains an internal handler-backed verb: the public wire must
-    # reject it before the handler can append a message or enqueue a turn.
+    # Human Chat sends use the org credential. An agent session's own CLI
+    # token must not let it post as its owning user.
     {:ok, [[before_events]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
     {:ok, [[before_messages]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     {:ok, [[before_turns]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
+    session_cli_token = "tbc_orchestrator_session"
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE sessions SET cliToken='tbc_orchestrator_session' WHERE sessionKey='orch'"
+      )
+
     disallowed =
-      dispatch_cli(ctx, "tbc_test", %{
+      dispatch_cli(ctx, session_cli_token, %{
         verb: "post",
+        sessionKey: actor.session_key,
         asUser: "flynn",
-        params: %{content: "must not be delivered", clientMessageId: "internal-post-negative"}
+        params: %{
+          content: "must not be delivered",
+          clientMessageId: "c_internal-post-negative",
+          deviceId: ctx.device.device_id
+        }
       })
 
     assert disallowed.status == 400

@@ -20,6 +20,7 @@ defmodule Tightbeam.DB do
 
   @typedoc "The DB owner, or its explicit boot-only migration context."
   @type server :: GenServer.server() | Migration.t()
+  @startup_wait_key {__MODULE__, :startup_wait}
 
   @doc """
   Give schema bootstrap an explicit unbounded client context. Pass this value
@@ -30,6 +31,21 @@ defmodule Tightbeam.DB do
   @spec migration_context(server()) :: Migration.t()
   def migration_context(%Migration{} = context), do: context
   def migration_context(server), do: %Migration{server: server}
+
+  @doc "Wait for startup database steps in this process without changing runtime callers."
+  @spec startup_wait((-> result)) :: result when result: term()
+  def startup_wait(fun) when is_function(fun, 0) do
+    previous = Process.get(@startup_wait_key)
+    Process.put(@startup_wait_key, true)
+
+    try do
+      fun.()
+    after
+      if previous == nil,
+        do: Process.delete(@startup_wait_key),
+        else: Process.put(@startup_wait_key, previous)
+    end
+  end
 
   @typedoc "One result row, positional (SELECT column order)."
   @type row :: [term()]
@@ -75,6 +91,7 @@ defmodule Tightbeam.DB do
   end
 
   @queue_limit 128
+  @startup_progress_ms 5_000
   @deadline_key {__MODULE__, :deadline}
   @statement_cache_key {__MODULE__, :statement_cache}
   # Bound per-connection statement memory while letting recent hot queries stay cached.
@@ -82,6 +99,8 @@ defmodule Tightbeam.DB do
 
   @doc false
   def overloaded?(server) do
+    server = if match?(%Migration{}, server), do: server.server, else: server
+
     case GenServer.whereis(server) do
       pid when is_pid(pid) ->
         case Process.info(pid, :message_queue_len) do
@@ -319,13 +338,17 @@ defmodule Tightbeam.DB do
           {:ok, result} | {:error, Exception.t()}
         when result: term()
   def read_transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
-    case reader(server, "SELECT 1") do
-      reader when is_pid(reader) ->
-        Tightbeam.DB.Reader.read_transaction(reader, fun, call_timeout())
+    if match?(%Migration{}, server) or Process.get(@startup_wait_key) do
+      transaction(migration_context(server), fun)
+    else
+      case reader(server, "SELECT 1") do
+        reader when is_pid(reader) ->
+          Tightbeam.DB.Reader.read_transaction(reader, fun, call_timeout())
 
-      _ ->
-        # Private in-memory databases have no separate connection pool.
-        transaction(server, fun)
+        _ ->
+          # Private in-memory databases have no separate connection pool.
+          transaction(server, fun)
+      end
     end
   end
 
@@ -349,9 +372,10 @@ defmodule Tightbeam.DB do
   @doc false
   def transaction_then(server, prepare, after_commit, opts)
       when is_function(prepare, 1) and is_function(after_commit) do
-    deadline = System.monotonic_time(:millisecond) + call_timeout()
+    startup? = match?(%Migration{}, server) or Process.get(@startup_wait_key)
+    deadline = if startup?, do: nil, else: System.monotonic_time(:millisecond) + call_timeout()
 
-    case DBObservation.call(
+    case observed_call(
            server,
            if(opts == [],
              do: {:transaction_then, prepare, after_commit},
@@ -558,12 +582,28 @@ defmodule Tightbeam.DB do
   defp call(%Migration{server: server}, request) do
     operation = if is_tuple(request), do: elem(request, 0), else: request
     started = System.monotonic_time(:millisecond)
-    Logger.info("database migration call #{operation}: begin")
-    result = GenServer.call(server, request, :infinity)
+    Logger.info("database startup call #{operation}: begin")
+    request_id = :gen_server.send_request(server, request)
+    result = await_startup_reply(request_id, operation, started)
     elapsed = System.monotonic_time(:millisecond) - started
     outcome = if match?({:error, _}, result), do: "failed", else: "finished"
-    Logger.info("database migration call #{operation}: #{outcome} elapsed_ms=#{elapsed}")
+    Logger.info("database startup call #{operation}: #{outcome} elapsed_ms=#{elapsed}")
     result
+  end
+
+  defp await_startup_reply(request_id, operation, started) do
+    case :gen_server.wait_response(request_id, @startup_progress_ms) do
+      {:reply, reply} ->
+        reply
+
+      :timeout ->
+        elapsed = System.monotonic_time(:millisecond) - started
+        Logger.info("database startup call #{operation}: still waiting elapsed_ms=#{elapsed}")
+        await_startup_reply(request_id, operation, started)
+
+      {:error, {reason, server}} ->
+        exit({reason, {:gen_server, :call, [server, :redacted, :infinity]}})
+    end
   end
 
   defp call(server, request), do: GenServer.call(server, request, call_timeout())
@@ -571,11 +611,17 @@ defmodule Tightbeam.DB do
   # Current 0.1.9 schema bootstrap passes this explicit context through query,
   # DDL, and schema calls. Preserve its unbounded migration wait and logging;
   # only ordinary runtime owner calls use the diagnostic envelope.
-  defp observed_call(%Migration{} = context, request, _operation, _budget),
-    do: call(context, request)
+  defp observed_call(server, request, _operation, _budget)
+       when is_struct(server, Migration),
+       do: call(server, request)
 
-  defp observed_call(server, request, operation, budget),
-    do: DBObservation.call(server, request, operation, budget)
+  defp observed_call(server, request, operation, budget) do
+    if Process.get(@startup_wait_key) do
+      call(migration_context(server), request)
+    else
+      DBObservation.call(server, request, operation, budget)
+    end
+  end
 
   @doc """
   Run a schema migration in the DB owner without the runtime client deadline.
@@ -608,7 +654,7 @@ defmodule Tightbeam.DB do
 
   @doc false
   def assert_base_admitted!(server, base) do
-    case DBObservation.call(
+    case observed_call(
            server,
            {:assert_base_admitted, base},
            "schema.ensure",

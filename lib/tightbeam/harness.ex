@@ -288,6 +288,12 @@ defmodule Tightbeam.Harness do
   @doc "Whether the registered harness accepts inline image attachments in turn prompts."
   @spec inline_attachments?(atom() | binary()) :: boolean()
   def inline_attachments?(harness) do
+    original_file_attachments?(harness)
+  end
+
+  @doc "Whether the existing original-file workspace route is covered for this harness."
+  @spec original_file_attachments?(atom() | binary()) :: boolean()
+  def original_file_attachments?(harness) do
     Enum.any?(known(), fn module ->
       module in [Tightbeam.Harness.Claude, Tightbeam.Harness.Codex] and
         harness in [module, module.id(), module.wire_name()]

@@ -610,6 +610,27 @@ defmodule Tightbeam.Placement do
     end
   end
 
+  @doc false
+  def deliver_attachment(config, holder_session, message_id, source_path, index, filename) do
+    host = fetch_session_host!(config, holder_session)
+    workdir = attachment_workdir(config, host, holder_session)
+    safe_name = safe_attachment_name(filename)
+    relative_path = Path.join([".tightbeam", "attachments", message_id, "#{index}-#{safe_name}"])
+    destination = Path.join(workdir, relative_path)
+
+    with {:ok, source_hash} <- file_sha256(source_path),
+         :ok <- deliver_attachment_file(config, host, source_path, destination),
+         {:ok, destination_hash} <- holder_file_sha256(config, host, destination),
+         true <- source_hash == destination_hash do
+      {:ok, destination, source_hash}
+    else
+      false -> {:error, :digest_mismatch}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _error -> {:error, :transfer_failed}
+  end
+
   def with_turn_directory(config, session, fun) do
     if Tightbeam.Ephemeral.session?(config.db, session.session_key) do
       host = fetch_session_host!(config, session)
@@ -2177,6 +2198,73 @@ defmodule Tightbeam.Placement do
 
   defp system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
   defp system_cmd_out([command | args]), do: System.cmd(command, args)
+
+  defp safe_attachment_name(filename) when is_binary(filename) do
+    name =
+      filename
+      |> String.replace("\\", "/")
+      |> Path.basename()
+      |> String.replace(~r/[\x00-\x1F\x7F]/u, "_")
+
+    if name in ["", ".", ".."], do: "attachment", else: name
+  end
+
+  defp attachment_workdir(config, host, holder_session) do
+    if config[:db] && Tightbeam.Ephemeral.session?(config.db, holder_session.session_key) do
+      Process.get({__MODULE__, :turn_directory}) ||
+        raise("ephemeral attachments require a turn directory")
+    else
+      host_workdir_path(host, holder_session.session_key)
+    end
+  end
+
+  defp deliver_attachment_file(_config, %{ssh: nil}, source_path, destination) do
+    File.mkdir_p!(Path.dirname(destination))
+    File.cp!(source_path, destination)
+    :ok
+  end
+
+  defp deliver_attachment_file(config, %{ssh: host}, source_path, destination) do
+    sh = Map.get(config, :sh, &system_cmd/1)
+    parent = Path.dirname(destination)
+    remote_script = "mkdir -p -- #{shell_quote(parent)}"
+    run!(sh, ["ssh" | @ssh_opts] ++ [host, "sh", "-c", shell_quote(remote_script)])
+
+    run!(sh, [
+      "rsync",
+      "-a",
+      "-e",
+      Enum.join(["ssh" | @ssh_opts], " "),
+      source_path,
+      "#{host}:#{destination}"
+    ])
+
+    :ok
+  end
+
+  defp holder_file_sha256(_config, %{ssh: nil}, path), do: file_sha256(path)
+
+  defp holder_file_sha256(config, %{ssh: host}, path) do
+    sh_out = Map.get(config, :sh_out, &system_cmd_out/1)
+    script = "cat #{shell_quote(path)}"
+
+    case sh_out.(["ssh" | @ssh_opts] ++ [host, "sh", "-c", shell_quote(script)]) do
+      {bytes, 0} ->
+        {:ok, sha256(bytes)}
+
+      _ ->
+        {:error, :destination_unreadable}
+    end
+  end
+
+  defp file_sha256(path) do
+    case File.read(path) do
+      {:ok, bytes} -> {:ok, sha256(bytes)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 
   defp run!(sh, command) do
     case sh.(command) do
