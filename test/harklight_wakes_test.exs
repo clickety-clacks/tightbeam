@@ -3826,6 +3826,106 @@ defmodule Tightbeam.HarklightWakesTest do
     assert Process.alive?(listener_pid)
   end
 
+  test "manual retry reads saved sends after a listener restart with a pending change", %{
+    db: db,
+    call: call,
+    session: session
+  } do
+    parent = self()
+    {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+    assert %{state: "pending"} =
+             HarklightWakes.prepare_change(
+               db,
+               call,
+               Tightbeam.Id.uuid4(),
+               "request",
+               "revise",
+               ["--message", "request"]
+             )
+
+    runner = fn ["status", "--session", @handle] ->
+      {JSON.encode!(%{
+         "session_handle" => @handle,
+         "open_requests" => 1,
+         "pending_undelivered" => 0,
+         "pending_delivered_unacted" => 0
+       }), 0}
+    end
+
+    listener = fn manager, handle, _vendor ->
+      attempt = Agent.get_and_update(attempts, fn count -> {count + 1, count + 1} end)
+
+      case attempt do
+        2 ->
+          :ok = GenServer.call(manager, {:finished, handle, "scripted_attach_failure"})
+          send(parent, :restart_attach_failed)
+
+        _ ->
+          :ok = GenServer.call(manager, {:attached, handle})
+          send(parent, {:listener_started, attempt, self()})
+          receive do: (:hold -> :ok)
+      end
+    end
+
+    opts = [
+      db: db,
+      listener: listener,
+      send_runner: runner,
+      retry_delays: [],
+      attach_retry_delays: []
+    ]
+
+    start_supervised!({HarklightWakes, opts})
+    assert_receive {:listener_started, 1, first_listener}
+    first_ref = Process.monitor(first_listener)
+    :ok = stop_supervised(HarklightWakes)
+    assert_receive {:DOWN, ^first_ref, :process, ^first_listener, :shutdown}
+
+    start_supervised!({HarklightWakes, opts})
+    assert_receive :restart_attach_failed
+
+    assert {:ok, [["unavailable"]]} =
+             DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+
+    assert %{counts: %{listening: 1}, results: [%{outcome: "listening"}]} =
+             HarklightWakes.retry_command(db, %{params: %{message_id: "request"}})
+
+    assert_receive {:listener_started, 3, _retry_listener}
+    reply = event(1, "discussion", "same-origin reply after retry")
+    assert :ok = HarklightWakes.capture_line(db, @handle, reply)
+    assert :ok = HarklightWakes.capture_line(db, @handle, reply)
+    origin = session.session_key
+
+    assert {:ok, [[^origin, prompt]]} =
+             DB.query(
+               db,
+               "SELECT d.sessionKey,w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId WHERE d.handle=?1 AND d.eventId='1'",
+               [@handle]
+             )
+
+    assert prompt =~ "same-origin reply after retry"
+  end
+
+  test "retry state-read failure names the handle, read, and database reason", %{
+    db: db,
+    session: session
+  } do
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO harklight_send_operations(opId,sessionKey,host,payload,state,createdAt,updatedAt) VALUES(?1,?2,?3,'not-json','pending',1,1)",
+               [Tightbeam.Id.uuid4(), session.session_key, Placement.local_host_name()]
+             )
+
+    assert %{code: "harklight_retry_state_unavailable", message: message} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+    assert message =~ @handle
+    assert message =~ "pending sends"
+    assert message =~ "malformed JSON"
+  end
+
   test "manual retry leaves a scheduled automatic recovery in flight", %{db: db} do
     parent = self()
     {:ok, attempts} = Agent.start_link(fn -> 0 end)

@@ -941,7 +941,6 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-
   def retry_command(db, call) do
     params = Map.get(call, :params, %{})
 
@@ -1106,10 +1105,10 @@ defmodule Tightbeam.HarklightWakes do
 
           {:cont, {:ok, [target | gathered]}}
 
-        _ ->
+        {:error, stage, reason} ->
           {:halt,
            {:error, "harklight_retry_state_unavailable",
-            "could not read message states for a selected handle"}}
+            "could not read #{stage} for handle #{target.handle}: #{reason}"}}
       end
     end)
     |> case do
@@ -1120,25 +1119,29 @@ defmodule Tightbeam.HarklightWakes do
 
   defp retry_messages(db, handle, origin_session) do
     with {:ok, requests} <-
-           DB.query(
+           retry_message_rows(
+             "saved requests",
              db,
              "SELECT senderId,messageId FROM harklight_wake_requests WHERE handle=?1 ORDER BY senderId,messageId",
              [handle]
            ),
          {:ok, bound_sends} <-
-           DB.query(
+           retry_message_rows(
+             "bound sends",
              db,
              "SELECT senderId,messageId FROM harklight_send_operations WHERE handle=?1 AND state='bound' ORDER BY senderId,messageId",
              [handle]
            ),
          {:ok, pending_sends} <-
-           DB.query(
+           retry_message_rows(
+             "pending sends",
              db,
-             "SELECT payload FROM harklight_send_operations WHERE sessionKey=?1 AND state='pending' ORDER BY opId",
+             "SELECT payload FROM harklight_send_operations WHERE sessionKey=?1 AND state='pending' AND COALESCE(json_extract(payload,'$.operation_kind'),'send')<>'change' ORDER BY opId",
              [origin_session]
            ),
          {:ok, terminals} <-
-           DB.query(
+           retry_message_rows(
+             "terminal entries",
              db,
              "SELECT senderId,messageId,rawLine FROM harklight_wake_entries WHERE handle=?1 AND entryKind='terminal' ORDER BY feedCursor",
              [handle]
@@ -1164,10 +1167,20 @@ defmodule Tightbeam.HarklightWakes do
          }
        end)}
     else
-      _ -> :error
+      {:error, stage, reason} -> {:error, stage, reason}
+      :error -> {:error, "pending send payload", "invalid persisted send payload"}
     end
   rescue
-    _ -> :error
+    error -> {:error, "message-state conversion", Exception.message(error)}
+  end
+
+  defp retry_message_rows(stage, db, sql, params) do
+    case DB.query(db, sql, params) do
+      {:ok, rows} -> {:ok, rows}
+      {:error, reason} -> {:error, stage, Exception.message(reason)}
+    end
+  rescue
+    error -> {:error, stage, Exception.message(error)}
   end
 
   defp pending_retry_messages(rows, handle) do
@@ -2012,7 +2025,6 @@ defmodule Tightbeam.HarklightWakes do
         {:reply, {:error, "harklight_listener_unavailable"}, state}
     end
   end
-
 
   def handle_call({:retry_handle, handle}, from, state) do
     cond do
