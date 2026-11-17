@@ -49,6 +49,7 @@ defmodule Tightbeam.EscalationTest do
       })
 
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
     start_supervised!({LaneDoorbell, self()})
 
     start_supervised!(

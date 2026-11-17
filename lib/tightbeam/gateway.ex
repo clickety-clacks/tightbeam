@@ -3127,15 +3127,9 @@ defmodule Tightbeam.Gateway do
   defp nudge_lane(lane_manager, session_key) do
     LaneManager.ensure_lane(lane_manager, session_key)
 
-    case Process.whereis(Tightbeam.LaneRegistry) do
-      nil ->
-        :lane_down
-
-      _ ->
-        case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-          [{pid, _}] -> if Process.alive?(pid), do: :ok, else: :lane_down
-          [] -> :lane_down
-        end
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> if Process.alive?(pid), do: :ok, else: :lane_down
+      [] -> :lane_down
     end
   catch
     :exit, reason ->
