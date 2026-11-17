@@ -93,6 +93,31 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
             |> String.replace("disposerRef TEXT NOT NULL", "disposerRef TEXT")
           ]
 
+        # PR #737 intentionally rebuilds the idempotency table for custody transfer.
+        [type, "wire_idempotency", _sql] ->
+          [
+            type,
+            "wire_idempotency",
+            String.trim_trailing("""
+            CREATE TABLE "wire_idempotency" (
+              ownerUserId TEXT NOT NULL,
+              operation TEXT NOT NULL CHECK (operation IN
+                ('spawn','retire','wake','assign','condition','work-item-create',
+                 'session-reparent','session-po-set','settle-turn','session-custody-transfer')),
+              idempotencyKey TEXT NOT NULL,
+              sessionKey TEXT NOT NULL,
+              requestFingerprint TEXT,
+              canonicalResponse TEXT,
+              responseJson TEXT,
+              PRIMARY KEY(ownerUserId,operation,idempotencyKey),
+              CHECK (operation NOT IN ('session-reparent','session-po-set','session-custody-transfer') OR
+                (requestFingerprint IS NOT NULL AND canonicalResponse IS NOT NULL)),
+              CHECK (operation != 'settle-turn' OR
+                (requestFingerprint IS NOT NULL AND responseJson IS NOT NULL))
+            )
+            """)
+          ]
+
         object ->
           object
       end)
@@ -109,6 +134,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
     assert [
              @successor,
+             "closed-assignment-cannot-proceed-reconciliation-v1-015",
              "session-identity-v1-0114",
              "launch-preparation-evidence-v1-0112",
              "launch-preparation-boot-v1-0110",

@@ -1209,9 +1209,25 @@ defmodule Tightbeam.GatewayTest do
                owner_lease: turn.owner_lease
              )
 
-    assert NoticeBatcher.recover(ctx.db, at, opts) == []
+    assert {:ok, [[bounce_id, "k2", "pending", bounce_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,sessionKey,state,prompt FROM wakes WHERE wakeId LIKE 'w_unresponsive_%' AND sessionKey='k2'"
+             )
+
+    assert bounce_prompt =~ "the recipient's lane is down"
+    assert [bounce_carrier] = NoticeBatcher.recover(ctx.db, at, opts)
+    assert bounce_carrier != carrier
+
+    assert {:ok, [[^bounce_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceWakeId FROM notice_batch_members WHERE batchId=(SELECT batchId FROM notice_batches WHERE deliveryWakeId=?1)",
+               [bounce_carrier]
+             )
+
     assert NoticeBatcher.batch(ctx.db, frozen.batch_id) == committed
-    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
   @tag recipient_readiness: true
