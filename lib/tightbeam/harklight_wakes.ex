@@ -269,9 +269,16 @@ defmodule Tightbeam.HarklightWakes do
           [handle, session_key]
         ) != []
 
-      if origin == session_key or
+      [[receiver]] =
+        Txn.q(
+          txn,
+          "SELECT COALESCE(currentReceiverSessionKey,sessionKey) FROM harklight_wake_handles WHERE handle=?1",
+          [handle]
+        )
+
+      if receiver == session_key or
            (follows_conversation and
-              match?(%{state: "retired"}, Org.get_in_txn(txn, origin)) and
+              match?(%{state: "retired"}, Org.get_in_txn(txn, receiver)) and
               not actual_receiver_eligible_in_txn?(txn, handle, origin, host)) do
         case successor_in_txn(txn, session_key) do
           %{session_key: successor, host: ^host} ->
