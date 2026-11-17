@@ -18,11 +18,13 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
     ]
 
     for route <- [:local, :remote, :remote_macos],
-        {label, initial, unchanged?} <- cases do
+        {_label, initial, unchanged?} <- cases do
+      # The fake SSH target reconstructs the remote shell command, so keep the
+      # generated fixture path free of spaces instead of embedding case labels.
       root =
         Path.join(
           System.tmp_dir!(),
-          "tb-codex-guardian-#{route}-#{label}-#{System.unique_integer([:positive])}"
+          "tb-codex-guardian-#{route}-#{System.unique_integer([:positive])}"
         )
 
       on_exit(fn -> File.rm_rf!(root) end)
