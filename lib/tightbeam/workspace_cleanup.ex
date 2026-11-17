@@ -35,7 +35,8 @@ defmodule Tightbeam.WorkspaceCleanup do
        db: Map.get(config, :db, DB),
        timer: timer,
        relocation_failures: %{},
-       relocation_backoff: 1_000
+       relocation_backoff: 1_000,
+       relocation_next_at: nil
      }}
   end
 
@@ -73,13 +74,31 @@ defmodule Tightbeam.WorkspaceCleanup do
           60_000
       end
 
+    now = System.monotonic_time(:millisecond)
+
     {relocation_delay, relocation_failures, backoff} =
-      relocate_archive(
-        state.config,
-        state.db,
-        state.relocation_failures,
-        state.relocation_backoff
-      )
+      if state.relocation_next_at && state.relocation_next_at > now do
+        {state.relocation_next_at - now, state.relocation_failures, state.relocation_backoff}
+      else
+        relocate_archive(
+          state.config,
+          state.db,
+          state.relocation_failures,
+          state.relocation_backoff
+        )
+      end
+
+    next_at =
+      cond do
+        state.relocation_next_at && state.relocation_next_at > now ->
+          state.relocation_next_at
+
+        relocation_delay && backoff > 1_000 ->
+          System.monotonic_time(:millisecond) + relocation_delay
+
+        true ->
+          nil
+      end
 
     delay = if relocation_delay, do: min(delay || relocation_delay, relocation_delay), else: delay
     timer = if delay, do: Process.send_after(self(), :drain, delay)
@@ -89,7 +108,8 @@ defmodule Tightbeam.WorkspaceCleanup do
        state
        | timer: timer,
          relocation_failures: relocation_failures,
-         relocation_backoff: backoff
+         relocation_backoff: backoff,
+         relocation_next_at: next_at
      }}
   end
 
@@ -194,7 +214,13 @@ defmodule Tightbeam.WorkspaceCleanup do
       {_, 3} ->
         throw({:archive_missing, old, target})
 
-      {output, status} ->
+      {:runner_timeout, timeout_ms} ->
+        raise "archive move timed out after #{timeout_ms}ms"
+
+      {:runner_exception, detail} ->
+        raise "archive move runner failed: #{detail}"
+
+      {output, status} when is_binary(output) and is_integer(status) ->
         raise "archive move exited with status #{status}: #{String.trim(output)}"
     end
 
