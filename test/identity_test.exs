@@ -373,6 +373,25 @@ defmodule Tightbeam.IdentityTest do
              ["#{path} (live rule entries could not be inspected)"]
 
     assert Identity.live_revision!(ctx.base) == malformed_table
+
+    File.write!(full, shipped)
+    rails_path = "rails/engineering.toml"
+    File.write!(Path.join(dir, rails_path), "[[statute]\nname = broken")
+    git!(dir, ["add", path, rails_path])
+    git!(dir, ["commit", "-m", "simulate malformed live rails file"], "operator")
+    malformed_rails = git!(dir, ["rev-parse", "HEAD"])
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", malformed_rails])
+
+    assert Identity.status(ctx.base).missing_installed_kungfu ==
+             ["#{rails_path} (live rule entries could not be inspected)"]
+
+    assert Identity.live_revision!(ctx.base) == malformed_rails
+
+    assert Identity.missing_installed_kungfu(ctx.base, "missing-git-revision") ==
+             ["installed kungfu comparison unavailable"]
+
+    assert Identity.missing_installed_kungfu_notice(ctx.base, "missing-git-revision") =~
+             "comparison unavailable"
   end
 
   test "shipped engineering bundle keeps completion review without receipt admission",
