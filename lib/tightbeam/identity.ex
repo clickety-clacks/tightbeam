@@ -1228,7 +1228,9 @@ defmodule Tightbeam.Identity do
     head = "Identity source (main, #{source}) is not the live revision (#{live}): " <> @not_live
 
     case System.cmd("git", ["merge-base", "--is-ancestor", live, source], cd: dir) do
-      {_output, 0} -> head <> " " <> @publish_step
+      {_output, 0} ->
+        head <> " " <> @publish_step
+
       _ ->
         head <>
           " Main does not descend from live, so publication is refused until it does. " <>
