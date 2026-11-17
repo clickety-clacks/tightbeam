@@ -1,7 +1,7 @@
 defmodule Tightbeam.AttestEvidence do
   @moduledoc false
 
-  alias Tightbeam.{FileEffectEvidence, Mementos, OperationalEvidence, Rules}
+  alias Tightbeam.{FileEffectEvidence, Mementos, OperationalEvidence, RecordFyis, Rules}
   alias Tightbeam.DB.Txn
 
   # This is called with the dispatch snapshot pinned in the transaction owner.
@@ -59,26 +59,33 @@ defmodule Tightbeam.AttestEvidence do
              """,
              [source_id]
            ) do
-        [[artifact_id, digest]] ->
+        [[artifact_id, digest]] when is_binary(artifact_id) ->
           if artifact_id == call.params[:artifact_id] and digest == call.params[:content_sha256] do
             Map.put(call, :validated_review_evidence, %{artifact_id: artifact_id, sha256: digest})
           else
-            refuse!(
-              "operational_evidence_invalid",
-              "review evidence must match the producer's verified artifact and contentSha256"
+            # Spec row A10: a different pair is recorded with an FYI.
+            RecordFyis.note(
+              call,
+              "#{cited_pair(call)}; the producer's latest verified verdict cites " <>
+                "artifact #{artifact_id} sha256 #{digest}"
             )
           end
 
         _ ->
-          refuse!(
-            "operational_evidence_invalid",
-            "review evidence must match the producer's verified artifact and contentSha256"
+          RecordFyis.note(
+            call,
+            "#{cited_pair(call)}; the producer has no verified verdict with an artifact"
           )
       end
     else
       call
     end
   end
+
+  defp cited_pair(call),
+    do:
+      "this review cites artifact #{call.params[:artifact_id]} " <>
+        "sha256 #{call.params[:content_sha256]}"
 
   defp producing_assignment(txn, id) do
     case Txn.q(
@@ -122,12 +129,11 @@ defmodule Tightbeam.AttestEvidence do
       phase == "legacy" and assignment.effect_kind == "code" and not file_manifest_supplied? ->
         call
 
+      # Spec row A12: when the artifact does not fit the selected evidence
+      # route, the pair is recorded without route validation and an FYI says so.
       assignment.files_present and artifact_supplied? and
         match?({:ok, _}, operational_policy) and not file_manifest_supplied? ->
-        refuse!(
-          "non_file_operational_evidence_policy_inactive",
-          "operational evidence does not cover an assignment with declared files"
-        )
+        unchecked_route(call, "operational", "declared files are present")
 
       assignment.files_present and phase == "replacement" ->
         case file_policy do
@@ -145,39 +151,54 @@ defmodule Tightbeam.AttestEvidence do
             |> Map.put(:file_effect_manifest, %{valid: true})
             |> Map.put(:memento_comparison_value, result.comparison_value)
 
+          :none when artifact_supplied? ->
+            unchecked_route(call, "operational", "declared files are present")
+
           :none ->
-            refuse!("file_effect_evidence_policy_inactive", "no file evidence policy selected")
+            call
         end
 
       assignment.files_present and artifact_supplied? ->
-        refuse!(
-          "file_effect_evidence_policy_inactive",
-          "file evidence requires replacement policy"
-        )
+        unchecked_route(call, "operational", "declared files are present")
 
       not assignment.files_present and
         not (phase == "legacy" and assignment.effect_kind == "code") and
           match?({:ok, _}, operational_policy) ->
         require_pair!(call)
-        Map.put(call, :validated_operational_evidence, OperationalEvidence.validate!(txn, call))
+        validated_operational_evidence(txn, call)
 
       not assignment.files_present and assignment.effect_kind != "code" and artifact_supplied? ->
         # A captured artifact can substantiate non-code work even when no
         # operational evidence policy is selected. Keep validating its bytes
         # and attribution, and leave code verification on its commit-ref path.
         require_pair!(call)
-        Map.put(call, :validated_operational_evidence, OperationalEvidence.validate!(txn, call))
+        validated_operational_evidence(txn, call)
 
       not assignment.files_present and artifact_supplied? ->
-        refuse!(
-          "non_file_operational_evidence_policy_inactive",
-          "no operational evidence policy selected for this assignment"
-        )
+        unchecked_route(call, "operational", "no operational evidence policy is selected")
 
       true ->
         call
     end
   end
+
+  # Mismatches the operational evidence check finds are recorded as FYIs with
+  # the verdict (spec rows A13 to A15).
+  defp validated_operational_evidence(txn, call) do
+    {validated, facts} = OperationalEvidence.validate!(txn, call)
+
+    facts
+    |> Enum.reduce(call, &RecordFyis.note(&2, &1))
+    |> Map.put(:validated_operational_evidence, validated)
+  end
+
+  defp unchecked_route(call, route, reason),
+    do:
+      RecordFyis.note(
+        call,
+        "the artifact on this verdict was not checked as #{route} evidence because " <>
+          "#{reason} for this assignment"
+      )
 
   defp require_pair!(call) do
     unless is_binary(call.params[:artifact_id]) and call.params[:artifact_id] != "" and

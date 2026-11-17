@@ -16,6 +16,7 @@ defmodule Tightbeam.Assignments do
     Org,
     Projection,
     RailRemedy,
+    RecordFyis,
     Rules,
     Supervision,
     Wakes,
@@ -719,7 +720,7 @@ defmodule Tightbeam.Assignments do
     case Txn.q(
            txn,
            """
-           SELECT verdictKind
+           SELECT verdictKind, id
            FROM attests
            WHERE assignmentId=?1 AND kind='verdict' AND verdictKind IN (?2, ?3, ?4)
            ORDER BY ts DESC, rowid DESC
@@ -727,7 +728,7 @@ defmodule Tightbeam.Assignments do
            """,
            [assignment_id | @completion_state_verdict_kinds]
          ) do
-      [[kind]] when kind in @completion_blocking_verdict_kinds -> kind
+      [[kind, attest_id]] when kind in @completion_blocking_verdict_kinds -> {kind, attest_id}
       _ -> nil
     end
   end
@@ -1368,7 +1369,17 @@ defmodule Tightbeam.Assignments do
         [assignment_id]
       )
 
-    Enum.map(rows, fn row -> attest(row) |> then(&Mementos.attach(db, "attest", &1)) end)
+    attests =
+      Enum.map(rows, fn row -> attest(row) |> then(&Mementos.attach(db, "attest", &1)) end)
+
+    fyis = RecordFyis.list_many(db, "attest", Enum.map(attests, & &1.id))
+
+    Enum.map(attests, fn attest ->
+      case Map.get(fyis, attest.id) do
+        nil -> attest
+        fyi -> Map.put(attest, :fyi, fyi)
+      end
+    end)
   end
 
   defp attest_collection_where(assignment_id, filters) do
@@ -1977,7 +1988,7 @@ defmodule Tightbeam.Assignments do
 
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
-         :ok <- commit_ref_filing_allowed(db, call),
+         {:ok, call} <- commit_ref_filing_allowed(db, call),
          {:ok, call} <- prepare_attest_commit_refs(db, call) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
@@ -2786,11 +2797,21 @@ defmodule Tightbeam.Assignments do
     prepared = AttestEvidence.prepare_in_txn!(txn, Map.put_new(call, :verb, "attest"))
 
     result =
-      with :ok <- require_producer_commit_refs_after_evidence(txn, prepared),
-           :ok <- validate_revision_binding_in_txn(txn, prepared) do
+      with {:ok, prepared} <- require_producer_commit_refs_after_evidence(txn, prepared),
+           {:ok, prepared} <- validate_revision_binding_in_txn(txn, prepared) do
         if prepared.params[:kind] == "verdict",
           do: verdict_in_txn(txn, prepared),
           else: lifecycle_attest_in_txn(txn, prepared)
+      end
+
+    # FYI lines stored with the attest are also returned at the top level.
+    result =
+      case result do
+        %{attest: %{fyi: [_ | _] = fyi}} = accepted when not is_map_key(accepted, :code) ->
+          Map.put(accepted, :fyi, fyi)
+
+        other ->
+          other
       end
 
     if prepared.params[:kind] == "verdict" and prepared.params[:verdict_kind] == "verified" and
@@ -2806,8 +2827,8 @@ defmodule Tightbeam.Assignments do
     result
   end
 
-  # Producer verification requires commit refs unless the selected operational
-  # evidence route has validated the evidence for this call.
+  # A holder verification with neither commit refs nor validated operational
+  # evidence is recorded with an FYI (spec row A5).
   defp require_producer_commit_refs_after_evidence(txn, call) do
     if call.params[:kind] == "verdict" and call.params[:verdict_kind] == "verified" and
          call.params[:commit_refs] in [nil, []] and
@@ -2816,13 +2837,13 @@ defmodule Tightbeam.Assignments do
              call.params[:assignment_id]
            ]) do
         [[holder, nil]] when call.principal == {:session, holder} ->
-          error("invalid_commit_refs", "producer verification requires immutable commitRefs")
+          {:ok, RecordFyis.note(call, "this verified verdict carries no commit refs")}
 
         _ ->
-          :ok
+          {:ok, call}
       end
     else
-      :ok
+      {:ok, call}
     end
   end
 
@@ -2832,7 +2853,7 @@ defmodule Tightbeam.Assignments do
 
     cond do
       is_nil(artifact_id) and is_nil(hash) ->
-        :ok
+        {:ok, call}
 
       is_nil(artifact_id) or is_nil(hash) ->
         error("invalid_revision_binding", "artifact and sha256 must be supplied together")
@@ -2847,60 +2868,154 @@ defmodule Tightbeam.Assignments do
         error("invalid_revision_binding", "artifact and sha256 must be nonblank text")
 
       call[:validated_operational_evidence] != nil ->
-        :ok
+        {:ok, call}
 
       true ->
-        producer_session =
-          case call.principal do
-            {:session, session} -> session
-            _ -> nil
-          end
-
-        case Txn.q(
-               txn,
-               """
-               SELECT art.contentSha256
-               FROM assignments review
-               JOIN artifacts art ON art.artifactId=?2
-               JOIN assignments producer ON producer.id=art.producedByAssignmentId
-               JOIN work_items wi ON wi.id=art.workItemId
-               JOIN sessions rs ON rs.sessionKey=review.holderKey
-               JOIN sessions ps ON ps.sessionKey=producer.holderKey
-               WHERE review.id=?1
-                 AND (review.reviewsAssignmentId=art.producedByAssignmentId
-                      OR (review.reviewsAssignmentId IS NULL
-                          AND review.id=art.producedByAssignmentId
-                          AND review.workItemId=art.workItemId
-                          AND review.holderKey=?4
-                          AND ?3='verified'))
-                 AND rs.ownerUserId=wi.ownerUserId
-                 AND ps.ownerUserId=wi.ownerUserId
-               """,
-               [
-                 call.params[:assignment_id],
-                 artifact_id,
-                 call.params[:verdict_kind],
-                 producer_session
-               ]
-             ) do
-          [[^hash]] ->
-            :ok
-
-          [[expected_hash]] ->
-            error(
-              "invalid_revision_binding",
-              "artifact #{artifact_id} revision mismatch: expected sha256 #{expected_hash}"
-            )
-
-          [] ->
-            error(
-              "invalid_revision_binding",
-              "expected an artifact produced by this assignment for holder verification, " <>
-                "or by the assignment reviewed by this review card"
-            )
-        end
+        revision_binding_facts_in_txn(txn, call, artifact_id, hash)
     end
   end
+
+  # Spec rows A7 and A8. A missing artifact or one owned by another user stays
+  # a refusal; a binding to another producer or another recorded hash is
+  # recorded with FYIs naming both sides.
+  defp revision_binding_facts_in_txn(txn, call, artifact_id, hash) do
+    card_id = call.params[:assignment_id]
+
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT art.contentSha256, art.producedByAssignmentId, art.workItemId,
+               COALESCE(wi.ownerUserId, creator.ownerUserId),
+               card.reviewsAssignmentId, card.workItemId, card.holderKey, holder.ownerUserId
+        FROM artifacts art
+        JOIN assignments card ON card.id=?1
+        JOIN sessions holder ON holder.sessionKey=card.holderKey
+        LEFT JOIN work_items wi ON wi.id=art.workItemId
+        LEFT JOIN sessions creator ON creator.sessionKey=art.createdBySession
+        WHERE art.artifactId=?2
+        """,
+        [card_id, artifact_id]
+      )
+
+    case rows do
+      [
+        [
+          recorded_hash,
+          producer_id,
+          artifact_item,
+          artifact_owner,
+          reviews_id,
+          card_item,
+          holder,
+          holder_owner
+        ]
+      ]
+      when is_binary(artifact_owner) and artifact_owner == holder_owner ->
+        producer_owner =
+          case producer_id &&
+                 Txn.q(
+                   txn,
+                   """
+                   SELECT s.ownerUserId FROM assignments p
+                   JOIN sessions s ON s.sessionKey=p.holderKey WHERE p.id=?1
+                   """,
+                   [producer_id]
+                 ) do
+            [[owner]] -> owner
+            _ -> artifact_owner
+          end
+
+        if producer_owner != artifact_owner do
+          revision_binding_unavailable()
+        else
+          by =
+            case call.principal do
+              {:session, session} -> session
+              {:user, user} -> user
+              _ -> nil
+            end
+
+          call =
+            cond do
+              not is_nil(reviews_id) and producer_id == reviews_id ->
+                call
+
+              not is_nil(reviews_id) and producer_id == card_id ->
+                RecordFyis.note(
+                  call,
+                  "artifact #{artifact_id} was produced by this review card, " <>
+                    "not by assignment #{reviews_id} that it reviews"
+                )
+
+              not is_nil(reviews_id) ->
+                RecordFyis.note(
+                  call,
+                  "artifact #{artifact_id} was produced by #{producer_text(producer_id)}, " <>
+                    "not by this assignment or the assignment this card reviews"
+                )
+
+              producer_id != card_id ->
+                RecordFyis.note(
+                  call,
+                  "artifact #{artifact_id} was produced by #{producer_text(producer_id)}, " <>
+                    "not by this assignment or the assignment this card reviews"
+                )
+
+              artifact_item != card_item ->
+                RecordFyis.note(
+                  call,
+                  "artifact #{artifact_id} is on work item #{artifact_item || "none"}; " <>
+                    "this assignment is on work item #{card_item || "none"}"
+                )
+
+              by != holder ->
+                RecordFyis.note(
+                  call,
+                  "artifact #{artifact_id} was produced by this assignment; " <>
+                    "this verdict is filed by #{by}, not its holder #{holder}"
+                )
+
+              call.params[:verdict_kind] != "verified" ->
+                RecordFyis.note(
+                  call,
+                  "artifact #{artifact_id} was produced by this assignment; " <>
+                    "it is bound here to a #{call.params[:verdict_kind]} verdict, " <>
+                    "not a holder verified verdict"
+                )
+
+              true ->
+                call
+            end
+
+          call =
+            if recorded_hash == hash,
+              do: call,
+              else:
+                RecordFyis.note(
+                  call,
+                  "artifact #{artifact_id} is recorded with sha256 #{recorded_hash || "none"}; " <>
+                    "this verdict cites sha256 #{hash}"
+                )
+
+          {:ok, call}
+        end
+
+      _ ->
+        revision_binding_unavailable()
+    end
+  end
+
+  defp producer_text(nil), do: "no recorded assignment"
+  defp producer_text(producer_id), do: "assignment #{producer_id}"
+
+  defp revision_binding_unavailable,
+    do:
+      error(
+        "invalid_revision_binding",
+        "expected an artifact produced by this assignment for holder verification, " <>
+          "or by the assignment reviewed by this review card"
+      )
 
   defp lifecycle_attest_in_txn(txn, call) do
     assignment_id = call.params[:assignment_id]
@@ -2926,7 +3041,7 @@ defmodule Tightbeam.Assignments do
                  :ok <- valid_cannot_proceed_reason(call.params),
                  :ok <- absent_verdict_kind(call.params[:verdict_kind]),
                  :ok <- valid_release_tuple_for_kind(call.params),
-                 :ok <- applicable_code_completion_in_txn(txn, assignment, call) do
+                 {:ok, call} <- applicable_code_completion_in_txn(txn, assignment, call) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
@@ -2962,13 +3077,16 @@ defmodule Tightbeam.Assignments do
                         nil ->
                           insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
 
-                        blocking_verdict ->
-                          error(
-                            "completion_blocked",
-                            "assignment completion is blocked by its latest #{blocking_verdict} verdict; " <>
-                              "file cannot-proceed to route the dependency to the parent as a decision, or, " <>
-                              "after it actually clears, file verdictKind=cleared on this assignment before completing"
-                          )
+                        {blocking_kind, blocking_attest_id} ->
+                          # Spec row A3: the completion is recorded with an FYI.
+                          call =
+                            RecordFyis.note(
+                              call,
+                              "the latest state verdict on this assignment is #{blocking_kind} " <>
+                                "(#{blocking_attest_id}) with no later cleared verdict"
+                            )
+
+                          insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
                       end
 
                     _standing ->
@@ -3473,10 +3591,18 @@ defmodule Tightbeam.Assignments do
   end
 
   defp settle_completed_assignment_after_review_in_txn(txn, call, producer, completion) do
-    completion_call = Map.put(call, :params, %{assignment_id: producer.id, kind: "completion"})
+    completion_call =
+      call
+      |> Map.delete(:fyi)
+      |> Map.put(:params, %{assignment_id: producer.id, kind: "completion"})
 
+    # The automatic close after a clean review keeps its strict condition: it
+    # happens only when the completion checks find nothing to report.
     if producer.state == "open" and
-         applicable_code_completion_in_txn(txn, producer, completion_call) == :ok do
+         match?(
+           {:ok, checked} when not is_map_key(checked, :fyi),
+           applicable_code_completion_in_txn(txn, producer, completion_call)
+         ) do
       close_completed_assignment_in_txn(txn, call, producer, completion)
     end
 
@@ -4521,23 +4647,33 @@ defmodule Tightbeam.Assignments do
     {by_user, by_session} = opener(call.principal)
     {by_harness, by_provider} = verdict_author_family(txn, call.params.kind, by_session)
 
-    insert_attest_row(txn, %{
-      assignment_id: assignment_id,
-      kind: call.params.kind,
-      verdict_kind: call.params[:verdict_kind],
-      note: call.params[:note],
-      by_session: by_session,
-      by_user: by_user,
-      producer: nil,
-      producer_command: nil,
-      by_harness: by_harness,
-      by_provider: by_provider,
-      commit_refs: call.params[:commit_refs],
-      allow_closed: allow_closed,
-      artifact_id: call.params[:artifact_id],
-      content_sha256: call.params[:content_sha256],
-      wait_id: call.params[:wait_id]
-    })
+    attest =
+      insert_attest_row(txn, %{
+        assignment_id: assignment_id,
+        kind: call.params.kind,
+        verdict_kind: call.params[:verdict_kind],
+        note: call.params[:note],
+        by_session: by_session,
+        by_user: by_user,
+        producer: nil,
+        producer_command: nil,
+        by_harness: by_harness,
+        by_provider: by_provider,
+        commit_refs: call.params[:commit_refs],
+        allow_closed: allow_closed,
+        artifact_id: call.params[:artifact_id],
+        content_sha256: call.params[:content_sha256],
+        wait_id: call.params[:wait_id]
+      })
+
+    case call[:fyi] do
+      [_ | _] = fyi ->
+        :ok = RecordFyis.put_in_txn(txn, "attest", attest.id, fyi)
+        Map.put(attest, :fyi, Enum.uniq(fyi))
+
+      _ ->
+        attest
+    end
   end
 
   defp insert_attest_row(txn, attrs) do
@@ -4712,12 +4848,12 @@ defmodule Tightbeam.Assignments do
   defp valid_commit_refs(_db, kind, _refs) when kind in ["completion", "verdict"],
     do: error("invalid_commit_refs", "commitRefs must be an array")
 
+  # Refs on another attest kind are recorded as filed; the result states which
+  # readers use them (spec row A6). Their shape is still checked below.
+  defp valid_commit_refs(_db, _kind, refs) when is_list(refs), do: :ok
+
   defp valid_commit_refs(_db, _kind, _refs),
-    do:
-      error(
-        "invalid_commit_refs",
-        "commitRefs are only valid on producing completion or review-link verdict attests"
-      )
+    do: error("invalid_commit_refs", "commitRefs must be an array")
 
   defp prepare_attest_commit_refs(db, call) do
     refs = call.params[:commit_refs]
@@ -4726,6 +4862,11 @@ defmodule Tightbeam.Assignments do
       :ok ->
         case canonical_commit_refs(refs) do
           {:ok, canonical} ->
+            call =
+              if is_list(refs) and call.params[:kind] not in ["completion", "verdict"],
+                do: RecordFyis.note(call, unread_commit_refs_fact(call.params[:kind], false)),
+                else: call
+
             {:ok, put_in(call, [:params, :commit_refs], canonical)}
 
           :error ->
@@ -4743,41 +4884,24 @@ defmodule Tightbeam.Assignments do
 
   defp commit_ref_filing_allowed(db, call) do
     if late_ruling_receipt?(call.params) do
-      :ok
+      {:ok, call}
     else
       commit_ref_filing_allowed_regular(db, call)
     end
   end
 
+  # A holder verification without commit refs is stated as an FYI inside the
+  # attest transaction (spec row A5), for every producing card.
   defp commit_ref_filing_allowed_regular(db, call) do
     case {call.params[:kind], call.params[:commit_refs], call.params[:verdict_kind]} do
-      {"verdict", nil, "verified"} ->
-        if revision_evidence_supplied?(call) do
-          :ok
-        else
-          case DB.query(
-                 db,
-                 "SELECT a.holderKey,a.reviewsAssignmentId,COALESCE(e.effectKind,'code') " <>
-                   "FROM assignments a LEFT JOIN assignment_effects e ON e.assignmentId=a.id " <>
-                   "WHERE a.id=?1",
-                 [call.params[:assignment_id]]
-               ) do
-            {:ok, [[holder, nil, "code"]]} when call.principal == {:session, holder} ->
-              error("invalid_commit_refs", "producer verification requires immutable commitRefs")
-
-            _ ->
-              :ok
-          end
-        end
-
       {_kind, nil, _verdict_kind} ->
-        :ok
+        {:ok, call}
 
       {kind, _refs, _verdict_kind} when kind in ["completion", "verdict"] ->
         commit_ref_filing_allowed_for_assignment(db, call, kind)
 
       {_kind, _refs, _verdict_kind} ->
-        :ok
+        {:ok, call}
     end
   end
 
@@ -4807,14 +4931,11 @@ defmodule Tightbeam.Assignments do
           state != "open" ->
             assignment_closed()
 
-          not is_nil(reviews_assignment_id) ->
-            error(
-              "invalid_commit_refs",
-              "commitRefs are not allowed on non-producing completion attests"
-            )
+          not is_nil(reviews_assignment_id) and is_list(call.params[:commit_refs]) ->
+            {:ok, RecordFyis.note(call, unread_commit_refs_fact("completion", true))}
 
           true ->
-            :ok
+            {:ok, call}
         end
 
       {:ok, [[holder, state, nil, effect_kind]]} when kind == "verdict" ->
@@ -4824,32 +4945,41 @@ defmodule Tightbeam.Assignments do
 
           effect_kind == "review" and
               call.params[:verdict_kind] in @review_conclusion_verdict_kinds ->
-            if state == "open", do: :ok, else: assignment_closed()
-
-          call.params[:verdict_kind] not in ["verified", "verification-failed"] ->
-            error(
-              "invalid_commit_refs",
-              "commitRefs on producing verdicts require verified or verification-failed"
-            )
+            if state == "open", do: {:ok, call}, else: assignment_closed()
 
           state != "open" ->
             assignment_closed()
 
-          effect_kind == "code" and call.params[:verdict_kind] == "verified" and
-            call.params[:commit_refs] == [] and not revision_evidence_supplied?(call) ->
-            error("invalid_commit_refs", "producer verification requires immutable commitRefs")
+          call.params[:verdict_kind] not in ["verified", "verification-failed"] and
+              is_list(call.params[:commit_refs]) ->
+            {:ok,
+             RecordFyis.note(
+               call,
+               unread_commit_refs_fact("#{call.params[:verdict_kind]} verdict", false)
+             )}
 
           true ->
-            :ok
+            {:ok, call}
         end
 
       {:ok, [[_holder, _state, _reviews_assignment_id, _effect_kind]]} ->
-        :ok
+        {:ok, call}
     end
   end
 
-  defp revision_evidence_supplied?(call),
-    do: not is_nil(call.params[:artifact_id]) or not is_nil(call.params[:content_sha256])
+  # Spec row A6. Completion and review-coverage checks read refs only from
+  # holder verified verdicts and review conclusions; the work item's commit-ref
+  # summary reads every attest's refs, and the execution map reads the closing
+  # completion's refs.
+  defp unread_commit_refs_fact(kind, closing?) do
+    readers =
+      if closing?,
+        do: "the work item's commit refs and this assignment's closing commit refs include them",
+        else: "the work item's commit refs include them"
+
+    "commit refs are recorded on this #{kind} attest; Tightbeam's completion and " <>
+      "review-coverage checks do not read them, and #{readers}"
+  end
 
   defp canonical_commit_refs(nil), do: {:ok, nil}
 
@@ -4895,10 +5025,13 @@ defmodule Tightbeam.Assignments do
 
   defp canonical_commit_refs(_), do: :error
 
-  defp applicable_code_completion_in_txn(_txn, _assignment, %{params: %{kind: kind}})
+  defp applicable_code_completion_in_txn(_txn, _assignment, %{params: %{kind: kind}} = call)
        when kind != "completion",
-       do: :ok
+       do: {:ok, call}
 
+  # Spec rows A1 and A2: a code completion without a holder verification, an
+  # independent clean review, or review coverage of the verified commits is
+  # recorded with one FYI per missing fact.
   defp applicable_code_completion_in_txn(txn, %{effectKind: "code"} = assignment, call) do
     review = latest_review_conclusion_in_txn(txn, assignment.id)
     verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
@@ -4939,27 +5072,51 @@ defmodule Tightbeam.Assignments do
             verification && verification.commit_refs
           )
 
-        error(
-          "inapplicable_code_evidence",
-          "latest independent clean review is missing verified producer commits: #{Enum.join(uncovered_commits, ", ")}"
-        )
+        noun = if length(uncovered_commits) == 1, do: "commit", else: "commits"
+
+        {:ok,
+         RecordFyis.note(
+           call,
+           "the latest independent clean review does not list verified #{noun} " <>
+             Enum.join(uncovered_commits, ", ")
+         )}
 
       verification_qualifies? and independent_clean_review? ->
         if match?(%{linked?: false}, review) do
           Logger.warning("completion_review_missing_link accepted assignmentId=#{assignment.id}")
         end
 
-        :ok
+        {:ok, call}
 
       true ->
-        error(
-          "inapplicable_code_evidence",
-          "code completion requires a holder verification and the latest independent clean review, unless review is pending"
-        )
+        call =
+          if verification_qualifies?,
+            do: call,
+            else: RecordFyis.note(call, missing_verification_fact(verification))
+
+        call =
+          if independent_clean_review?,
+            do: call,
+            else: RecordFyis.note(call, missing_review_fact(review))
+
+        {:ok, call}
     end
   end
 
-  defp applicable_code_completion_in_txn(_txn, _assignment, _call), do: :ok
+  defp applicable_code_completion_in_txn(_txn, _assignment, call), do: {:ok, call}
+
+  defp missing_verification_fact(%{kind: kind}) when kind != "verified",
+    do: "the holder's latest verification verdict on this code assignment is #{kind}"
+
+  defp missing_verification_fact(_verification),
+    do: "this code assignment has no verified verdict from its holder"
+
+  defp missing_review_fact(nil), do: "this code assignment has no review conclusion"
+
+  defp missing_review_fact(%{kind: kind, holder: holder}),
+    do:
+      "the latest review conclusion on this assignment is #{kind} from #{holder}, " <>
+        "not an independent reviewed-clean"
 
   defp latest_review_conclusion_in_txn(txn, assignment_id) do
     case Txn.q(
