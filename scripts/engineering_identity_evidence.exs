@@ -125,7 +125,7 @@ defmodule Tightbeam.EngineeringIdentityEvidence do
 
     for expected <- [
           "| Product delivery orchestration | gpt-6-sol[low] |",
-          "| Executive or delegated lane orchestration | gpt-6-sol[low] |",
+          "| Organization-level or delegated lane orchestration | gpt-6-sol[low] |",
           "| Well-scoped or sustained implementation under an understood architecture | gpt-6-luna[max] |",
           "| Specification under product rulings | claude-opus-5-5[high] |",
           "Codex producer: claude-opus-5-5[high]; Claude producer: gpt-6-astra[high]"

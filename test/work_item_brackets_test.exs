@@ -578,6 +578,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     [[rule]]
     name = "deny-assign"
     verb = "assign"
+    archetypes = ["*"]
     text = "assign denied"
     [[rule.deny_when]]
     fact = "caller.origin_class"
