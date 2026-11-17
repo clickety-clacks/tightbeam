@@ -84,6 +84,57 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
     end
   end
 
+  test "unanswered identity stays pending without replacing durable launch state", ctx do
+    {row, _} = prepare(ctx)
+
+    assert {:pending, :identity_not_answered} =
+             HarnessProcess.capture_identity(ctx.db, row.launch_id, 30)
+
+    assert [%{state: "launching", resolved_at: nil, last_error: nil}] =
+             HarnessProcess.list(ctx.db)
+
+    assert HarnessProcess.fenced?(ctx.db, @key)
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM harness_park_fences")
+
+    terminal(row)
+
+    assert {:error, {:launch_identity_failed, _, {:launcher_failed, _}}} =
+             HarnessProcess.capture_identity(ctx.db, row.launch_id, 30)
+
+    assert HarnessProcess.fenced?(ctx.db, @key)
+  end
+
+  test "remote identity and terminal-record timeouts stay pending", ctx do
+    {row, _} = prepare(ctx)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE harness_processes SET ssh = 'fixture' WHERE launchId = ?1", [
+        row.launch_id
+      ])
+
+    Application.put_env(:tightbeam, :harness_process_command_runner_for_test, fn _exe,
+                                                                                 _args,
+                                                                                 _timeout ->
+      {:error, :timeout}
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:tightbeam, :harness_process_command_runner_for_test)
+    end)
+
+    assert {:pending, :identity_read_timeout} =
+             HarnessProcess.capture_identity(ctx.db, row.launch_id, 30)
+
+    [unchanged] = HarnessProcess.list(ctx.db)
+    assert unchanged.state == "launching"
+    assert unchanged.last_error == nil
+
+    assert {:pending, :identity_read_timeout} =
+             HarnessProcess.Recovery.terminal_record(unchanged)
+
+    assert {:error, _} = settle(ctx, unchanged)
+  end
+
   test "exact connection exit is attributed before the identity deadline", ctx do
     {row, _} = prepare(ctx)
     File.write!(row.identity_path, "")
