@@ -442,7 +442,11 @@ defmodule Tightbeam.GatewayTest do
           {parent, opts} = state
         ) do
       send(parent, {:tune_config_applied, sid, model})
-      {:reply, Keyword.get(opts, :apply_result, {:ok, model}), state}
+
+      case Keyword.get(opts, :apply_result, {:ok, model}) do
+        :exit -> {:stop, :deliberate_adapter_exit, state}
+        result -> {:reply, result, state}
+      end
     end
 
     def handle_call({:current_model, _sid}, _from, {_parent, opts} = state),
@@ -7703,6 +7707,53 @@ defmodule Tightbeam.GatewayTest do
     assert Ledger.running?(ctx.db, "k1")
     refute_received {:tune_session_closed, _}
     send(worker, :finish)
+  end
+
+  test "running configuration reports an adapter exit as an unknown runtime outcome", ctx do
+    base_dir = role_test_base("running-config-adapter-exit")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    host = Placement.local_host_name()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    Org.set_host(ctx.db, "k1", host)
+    Org.append_pointer(ctx.db, "k1", "running-session", "created")
+    put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+    before = Org.get(ctx.db, "k1").model
+
+    adapter = start_supervised!({TuneAdapterStub, {self(), resident: true, apply_result: :exit}})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    {seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "keep running")
+    parent = self()
+
+    start_lane!(ctx.db, "k1", fn _ ->
+      send(parent, {:exit_runner, self()})
+
+      receive do
+        :finish -> {:ok, %{}}
+      end
+    end)
+
+    assert_receive {:exit_runner, worker}
+
+    assert %{ok: false, code: "runtime_config_unknown", diagnostic: %{}} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: origin,
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6", effort: "high"}
+             })
+
+    assert_received {:tune_config_applied, "running-session", _model}
+    assert Org.get(ctx.db, "k1").model == before
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "running-session"
+    assert Ledger.running?(ctx.db, "k1")
+    send(worker, :finish)
+
+    # The refusal must not take the session lane down with it: the running
+    # turn still reaches its own terminal result.
+    assert eventually(fn ->
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+               {:ok, [["delivered"]]}
+           end)
   end
 
   describe "session status reports its host's credential kind" do

@@ -274,6 +274,11 @@ defmodule Tightbeam.Acp.Adapter do
       {:apply_model_strict, session_id, model, prior_model, deadline},
       @strict_model_call_timeout
     )
+  catch
+    # The configuration request may already have reached the harness, so its
+    # effect is unknown. An uncaught exit would reach the wire as an empty 500.
+    :exit, reason ->
+      {:error, {:runtime_config_unknown, {:adapter_unavailable, unavailable_reason(reason)}}}
   end
 
   @doc "The adapter's cached model value. This does not query the harness owner."
