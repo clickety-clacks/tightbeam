@@ -14,7 +14,23 @@ defmodule Tightbeam.TerminalReactionFixture do
 
     for {name, directory} <- rule_sources do
       source = Path.join([:code.priv_dir(:tightbeam), directory, name])
-      File.cp!(source, Path.join(rules, name))
+      contents = File.read!(source)
+
+      contents =
+        if name == "row-reaction-attest-notice.toml" do
+          # Synthetic sessions use the default archetype; production lists its bundle roles.
+          contents
+          |> String.replace(~r/^archetypes = .*\n/m, "")
+          |> String.replace(
+            "[[reaction]]\n",
+            "[[reaction]]\narchetypes = [\"*\"]\n",
+            global: false
+          )
+        else
+          contents
+        end
+
+      File.write!(Path.join(rules, name), contents)
     end
 
     Tightbeam.Rules.load!(law, verbs)

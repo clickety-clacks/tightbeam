@@ -1,5 +1,6 @@
 # Attest and first-start notices are elected by the engineering bundle.
 [[reaction]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "r01-attest-notice"
 family = "r01-attest-notice"
 events = ["assignment_attest", "assignment_start"]

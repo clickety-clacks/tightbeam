@@ -1,7 +1,8 @@
 The engineering bundle elects three row reactions. Loading the runtime alone
 elects none. Their source events and pending actions are stored in the same
 transaction as the writes they observe. Rule identity and revision are recorded
-with the action; the recipient and prompt do not define its identity.
+with the action; the recipient and prompt do not define its identity. The R01
+reaction applies to the archetypes declared by the engineering bundle.
 
 `r01-attest-notice` in `row-reaction-attest-notice.toml` means: tell the opener
 once when the holder's first turn delivered for an assignment actually starts.
