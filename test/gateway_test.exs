@@ -1218,6 +1218,7 @@ defmodule Tightbeam.GatewayTest do
     assert bounce_prompt =~ "the recipient's lane is down"
     assert [bounce_carrier] = NoticeBatcher.recover(ctx.db, at, opts)
     assert bounce_carrier != carrier
+
     assert {:ok, [[^bounce_id]]} =
              DB.query(
                ctx.db,
