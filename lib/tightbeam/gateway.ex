@@ -2466,6 +2466,7 @@ defmodule Tightbeam.Gateway do
                   role_fallback,
                   origin,
                   stamped,
+                  prompt,
                   opts
                 )
               end
@@ -2652,7 +2653,16 @@ defmodule Tightbeam.Gateway do
 
   defp staged_prompt_target_gate(_target_gate), do: 1
 
-  defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
+  defp append_and_enqueue_in_txn(
+         txn,
+         target,
+         role_ref,
+         role_fallback,
+         origin,
+         stamped,
+         raw_prompt,
+         opts
+       ) do
     queued_human_post_delivery? = opts[:queued_human_post_delivery] == true
 
     human_source_messages =
@@ -2693,7 +2703,7 @@ defmodule Tightbeam.Gateway do
     input = %{
       session_key: target,
       role: "user",
-      content: stamped,
+      content: if(opts[:human_post], do: raw_prompt, else: stamped),
       device_id: opts[:device_id],
       client_message_id: opts[:client_message_id],
       attachments: opts[:attachments] || [],

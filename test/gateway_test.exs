@@ -13056,7 +13056,7 @@ defmodule Tightbeam.GatewayTest do
 
     message_id = rest_post_message_id!(ctx.db, "k1", "chat_submitter", "c_rest_submitter")
 
-    assert %{submitter: ^submitter, sender: "user:" <> ^owner} =
+    assert %{content: "hello", submitter: ^submitter, sender: "user:" <> ^owner} =
              Projection.get(ctx.db, message_id)
 
     assert %{"submitter" => ^submitter} =
@@ -13686,10 +13686,11 @@ defmodule Tightbeam.GatewayTest do
         })
 
       assert response.status == 200
-      assert_receive {:ensure_lane, "k1"}
       message_id = rest_post_message_id!(ctx.db, "k1", "chat_test", client_message_id)
 
       raw = Projection.get(ctx.db, message_id)
+      assert raw.session_key == "k1"
+      assert raw.content == "open #{filename}"
       assert raw.attachments == [attachment_ref(asset, filename)]
 
       pending = StateResources.message(StateResources.query_message(ctx.db, message_id))
