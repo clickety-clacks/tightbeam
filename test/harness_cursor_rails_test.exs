@@ -1,5 +1,5 @@
 defmodule Tightbeam.Harness.CursorRailsTest do
-  use ExUnit.Case, async: true
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Harness.CursorRails
   alias Tightbeam.Harness.CursorRails.UnmappableRailError
@@ -9,10 +9,18 @@ defmodule Tightbeam.Harness.CursorRailsTest do
   # with the hook payload on stdin. The Tightbeam command's own stderr is captured
   # INSIDE the wrapper, so the process stdout is only the permission verdict.
   # stdin rides in an env var so no fixture quoting can leak into the script.
-  defp run_hook(%{"command" => command}, stdin_json) do
+  defp run_hook(%{"command" => command}, stdin_json, cursor_project_dir \\ "") do
+    cwd = stdin_json |> JSON.decode!() |> Map.fetch!("cwd")
+    cli_dir = Path.expand("../cli/target/release", __DIR__)
+
     {out, 0} =
       System.cmd("sh", ["-c", "printf '%s' \"$HOOK_STDIN\" | ( #{command} )"],
-        env: [{"HOOK_STDIN", stdin_json}],
+        cd: cwd,
+        env: [
+          {"HOOK_STDIN", stdin_json},
+          {"PATH", cli_dir <> ":" <> System.get_env("PATH", "")},
+          {"CURSOR_PROJECT_DIR", cursor_project_dir}
+        ],
         stderr_to_stdout: false
       )
 
@@ -33,13 +41,33 @@ defmodule Tightbeam.Harness.CursorRailsTest do
   # the generated wrapper emits cursor's real verdict shape for a real input shape,
   # but NOT that a live cursor-agent turn accepts it end-to-end. That authenticated
   # rails RE-CAPTURE is the coordinator-owned follow-on, gated on George's key.
-  defp shell_stdin(command) do
+  defp shell_stdin(command, cwd \\ "/tmp") do
     JSON.encode!(%{
       "hook_event_name" => "beforeShellExecution",
       "command" => command,
-      "cwd" => "/tmp",
+      "cwd" => cwd,
       "sandbox" => false
     })
+  end
+
+  defp probe_entry?(entry) do
+    [%{"command" => command}] = entry["hooks"]
+    String.contains?(command, "[gate: tightbeam-probe]")
+  end
+
+  defp run_shell_entry(entry, input) do
+    [%{"command" => command}] = entry["hooks"]
+    cwd = input |> JSON.decode!() |> Map.fetch!("cwd")
+    cli_dir = Path.expand("../cli/target/release", __DIR__)
+
+    System.cmd("sh", ["-c", "printf '%s' \"$HOOK_STDIN\" | " <> command],
+      cd: cwd,
+      env: [
+        {"HOOK_STDIN", input},
+        {"PATH", cli_dir <> ":" <> System.get_env("PATH", "")}
+      ],
+      stderr_to_stdout: true
+    )
   end
 
   describe "compile/1 shape and routing" do
@@ -138,6 +166,8 @@ defmodule Tightbeam.Harness.CursorRailsTest do
       # The wrap is applied, not a passthrough of the raw command.
       assert shell_cmd =~ "permission"
       refute shell_cmd == "true"
+      assert shell_cmd =~ "TIGHTBEAM_SESSION_WORKDIR=\"${CURSOR_PROJECT_DIR:-}\""
+      refute shell_cmd =~ "tool_input.cwd"
     end
 
     test "multiple Bash entries accumulate under one event, order preserved" do
@@ -195,32 +225,193 @@ defmodule Tightbeam.Harness.CursorRailsTest do
     end
   end
 
-  describe "real deny protocol — Rails.probe_entry/0 executed as Cursor runs it" do
+  describe "TOML wiring-check statute remains Codex/Pi-only" do
     setup do
-      # probe_entry is a single PreToolUse entry; wrap it in the hook_settings map shape.
-      pre = %{"hooks" => %{"PreToolUse" => [Rails.probe_entry()]}}
-      %{"hooks" => %{"beforeShellExecution" => [hook]}} = CursorRails.compile(pre)
-      %{hook: hook}
+      base =
+        Path.join(
+          System.tmp_dir!(),
+          "tb-cursor-probe-#{System.unique_integer([:positive])}"
+        )
+
+      rails_dir = Path.join([base, "identity", "rails"])
+      File.mkdir_p!(rails_dir)
+
+      File.cp!(
+        Path.expand("../priv/seed/rails/tightbeam-probe.toml", __DIR__),
+        Path.join(rails_dir, "tightbeam-probe.toml")
+      )
+
+      Rails.load!(base)
+
+      File.write!(
+        Path.join(base, Rails.session_scope_filename()),
+        Rails.session_scope_content("agentic-engineering.coder")
+      )
+
+      on_exit(fn ->
+        File.rm_rf!(base)
+        :persistent_term.erase(Rails)
+      end)
+
+      codex = get_in(Rails.hook_settings(:codex), ["hooks", "PreToolUse"])
+      pi = get_in(Rails.hook_settings(:pi), ["hooks", "PreToolUse"])
+      claude = get_in(Rails.hook_settings(:claude), ["hooks", "PreToolUse"])
+      cursor = get_in(Rails.hook_settings(:cursor), ["hooks", "PreToolUse"])
+      probe = Enum.find(codex, &probe_entry?/1)
+
+      %{
+        probe: probe,
+        pi_probe: Enum.find(pi, &probe_entry?/1),
+        claude: claude,
+        cursor: cursor,
+        scope_cwd: base
+      }
     end
 
-    test "denies with the gate reason when the probe pattern matches", %{hook: hook} do
-      # The probe statute's pattern is "tightbeam-gate-probe".
-      verdict = run_hook(hook, shell_stdin("run tightbeam-gate-probe now"))
+    test "Codex and Pi deny the same raw marker without gateway access", %{
+      probe: probe,
+      pi_probe: pi_probe
+    } do
+      assert probe == pi_probe
 
-      assert verdict["permission"] == "deny"
-      assert verdict["user_message"] =~ "[gate: tightbeam-probe]"
+      expected =
+        "[gate: tightbeam-probe] Spawn wiring-check probe command; always refused by design.\n"
+
+      probe_cwd =
+        Path.join(
+          System.tmp_dir!(),
+          "tb-cursor-probe-without-sidecar-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(probe_cwd)
+      on_exit(fn -> File.rm_rf!(probe_cwd) end)
+
+      for input <- [
+            shell_stdin("run tightbeam-gate-probe now", probe_cwd),
+            shell_stdin("grep -rn tightbeam-gate-probe lib", probe_cwd),
+            shell_stdin(
+              "tightbeam attest asg_1 --kind progress --note 'tightbeam-gate-probe'",
+              probe_cwd
+            )
+          ] do
+        assert run_shell_entry(probe, input) == {expected, 2}
+      end
     end
 
-    test "allows when the probe pattern does not match", %{hook: hook} do
-      verdict = run_hook(hook, shell_stdin("ls -la"))
-      assert verdict == %{"permission" => "allow"}
+    test "Claude and Cursor do not get a probe entry", %{
+      claude: claude,
+      cursor: cursor,
+      scope_cwd: scope_cwd
+    } do
+      refute Enum.any?(claude, &probe_entry?/1)
+      refute Enum.any?(cursor, &probe_entry?/1)
+
+      %{"hooks" => %{"beforeShellExecution" => cursor_hooks}} =
+        CursorRails.compile(%{"hooks" => %{"PreToolUse" => cursor}})
+
+      for command <- [
+            "run tightbeam-gate-probe now",
+            "grep -rn tightbeam-gate-probe lib",
+            "tightbeam attest asg_1 --kind progress --note 'tightbeam-gate-probe'"
+          ],
+          hook <- cursor_hooks do
+        assert run_hook(hook, shell_stdin(command, scope_cwd)) == %{"permission" => "allow"}
+      end
+    end
+  end
+
+  test "packaged Cursor helper applies compiled scope and preserves 0.1.16 pattern misses" do
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "tb-cursor-scoped-#{System.unique_integer([:positive])}"
+      )
+
+    identity = Path.join(base, "identity")
+    bundle = Path.join(identity, "kungfu/agentic-engineering")
+    rails_dir = Path.join(bundle, "rails")
+    File.mkdir_p!(rails_dir)
+
+    File.write!(Path.join(bundle, "installed.toml"), """
+    name = "agentic-engineering"
+    paths = [
+      "kungfu/agentic-engineering/archetypes/coder.toml",
+      "kungfu/agentic-engineering/rails/engineering.toml",
+    ]
+    """)
+
+    File.write!(Path.join(rails_dir, "engineering.toml"), """
+    [[statute]]
+    name = "no-git-stash"
+    on = "tool-call"
+    archetypes = ["agentic-engineering.coder"]
+    tool = "Bash"
+    pattern = "git stash"
+    text = "Do not stash this worktree."
+    """)
+
+    try do
+      assert [statute] = Rails.load!(base)
+      assert statute.name == "agentic-engineering.no-git-stash"
+
+      scope_file = Path.join(base, Rails.session_scope_filename())
+      File.write!(Path.join(base, ".tightbeam-session"), "fixture-session")
+      File.write!(scope_file, Rails.session_scope_content("agentic-engineering.coder"))
+      caller_project = Path.join(base, "repo/src")
+      outside = Path.join(base, "outside-workdir/repo")
+      File.mkdir_p!(caller_project)
+      File.mkdir_p!(outside)
+      outside_workdir = Path.join(base, "outside-workdir")
+      File.write!(Path.join(outside_workdir, ".tightbeam-session"), "other-fixture-session")
+      outside_scope = Path.join(outside_workdir, Rails.session_scope_filename())
+      File.write!(outside_scope, Rails.session_scope_content("agentic-engineering.non-member"))
+
+      %{"hooks" => %{"beforeShellExecution" => [hook, _observation_hook]}} =
+        Rails.hook_settings(:cursor)
+        |> CursorRails.compile()
+
+      assert run_hook(hook, shell_stdin("git stash push", base), caller_project) == %{
+               "permission" => "deny",
+               "user_message" =>
+                 "[gate: agentic-engineering.no-git-stash] Do not stash this worktree."
+             }
+
+      # The caller's project directory may be nested inside its session, while
+      # Cursor runs this event from a different session workdir. The caller's
+      # compiled scope still controls the matched rail.
+      assert run_hook(hook, shell_stdin("git stash push", outside), caller_project) == %{
+               "permission" => "deny",
+               "user_message" =>
+                 "[gate: agentic-engineering.no-git-stash] Do not stash this worktree."
+             }
+
+      File.write!(scope_file, Rails.session_scope_content("agentic-engineering.non-member"))
+      File.write!(outside_scope, Rails.session_scope_content("agentic-engineering.coder"))
+
+      assert run_hook(hook, shell_stdin("git stash push", outside), caller_project) == %{
+               "permission" => "allow"
+             }
+
+      File.rm!(scope_file)
+
+      assert %{"permission" => "deny", "user_message" => scope_error} =
+               run_hook(hook, shell_stdin("git stash push", outside), caller_project)
+
+      assert scope_error =~ "archetype scope check failed"
+
+      assert run_hook(hook, shell_stdin("git status", outside), caller_project) == %{
+               "permission" => "allow"
+             }
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rails)
     end
   end
 
   describe "real observation entry — observes, never blocks" do
     test "an artifact-record command is allowed, not denied" do
       # observation_entry rides in hook_settings; isolate it by matcher/shape.
-      %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings()
+      %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings(:cursor)
       # Every reserved entry is matcher "Bash"; compile the whole set and run each
       # against an artifact-record command — none may DENY it (observation is exit 0).
       %{"hooks" => %{"beforeShellExecution" => hooks}} =

@@ -1,2 +1,2 @@
-root_archetype = "<name>-role"
+root_archetype = "<name>.<name>-role"
 purpose = <purpose>

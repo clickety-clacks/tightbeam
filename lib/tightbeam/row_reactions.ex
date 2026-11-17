@@ -171,7 +171,7 @@ defmodule Tightbeam.RowReactions do
   end
 
   def admit(txn, event) do
-    facts = Snapshot.current(txn, event, %{})
+    facts = event_scope_facts(event, Snapshot.current(txn, event, %{}))
     actions = Store.admit(txn, event, facts)
     Enum.each(actions, &execute_action(txn, event, &1, event["at"]))
     Store.actions(txn, event["org"], event["id"])
@@ -290,7 +290,7 @@ defmodule Tightbeam.RowReactions do
     {_event, original} = Store.event(txn, event["org"], event["id"])
 
     facts =
-      Snapshot.current(txn, event, original)
+      event_scope_facts(event, Snapshot.current(txn, event, original))
       |> Map.put("transition", transition)
       |> Map.put(
         "reaction_actions",
@@ -475,6 +475,44 @@ defmodule Tightbeam.RowReactions do
       row["closedByUser"] -> %{"kind" => "user", "id" => row["closedByUser"]}
       true -> %{"kind" => "process", "id" => row["closedByProcess"]}
     end
+  end
+
+  defp event_scope_facts(event, facts) do
+    record_keys =
+      case event["kind"] do
+        "assignment" ->
+          after_row = event["after"] || %{}
+          Enum.filter([after_row["openedBySession"], after_row["holderKey"]], &is_binary/1)
+
+        "wake_delivery" ->
+          after_row = event["after"] || %{}
+          Enum.filter([after_row["creatorSessionKey"]], &is_binary/1)
+
+        _ ->
+          []
+      end
+
+    record_groups = if record_keys == [], do: [[]], else: [record_keys]
+
+    caller_key =
+      if get_in(event, ["principal", "kind"]) == "session",
+        do: get_in(event, ["principal", "id"])
+
+    delivery_key = get_in(event, ["delivery", "sessionKey"])
+
+    participant_keys = [caller_key, delivery_key] |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+    participant_archetypes =
+      Enum.map(participant_keys, fn key ->
+        case Enum.find(facts["sessions"] || [], &(&1["sessionKey"] == key)) do
+          %{"archetype" => archetype} -> archetype
+          _ -> nil
+        end
+      end)
+
+    facts
+    |> Map.put("scope_participant_archetypes", participant_archetypes)
+    |> Map.put("scope_record_session_groups", record_groups)
   end
 
   defp stringify(map), do: Map.new(map, fn {key, value} -> {Atom.to_string(key), value} end)

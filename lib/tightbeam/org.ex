@@ -337,6 +337,11 @@ defmodule Tightbeam.Org do
     value     TEXT NOT NULL,
     updatedAt INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS rail_scope_migrations (
+    migrationId TEXT PRIMARY KEY,
+    reportJson  TEXT NOT NULL,
+    completedAt INTEGER NOT NULL
+  );
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}

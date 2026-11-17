@@ -38,6 +38,13 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that pull request's older run, so the
+# runners only spend time on the head under review. Every other event gets a
+# group of its own and is never cancelled.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name != 'workflow_dispatch' && github.sha || inputs.candidate_sha }}
 
@@ -48,19 +55,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Pinned: ubuntu-latest moved to 26.04, where the Codex home
-          # reconciliation fixture fails; 0.1.15 was proved on 24.04.
+          # Pinned: the release line was proved on 24.04, and the release
+          # packages are built on 24.04 hosts.
           - os: ubuntu-24.04
             name: linux
           - os: macos-latest
             name: macos
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.name == 'macos' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","tb-macos"]') || matrix.os }}
-    # Pull requests and the merge queue run source checks, the gate scripts,
-    # and a compile. Every trusted push and manual run also executes the full
-    # Mix and Cargo suites on both platforms before release packaging.
-    env:
-      FULL_SUITE: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+    # Every event runs the full mix and cargo suites on both platforms: pull
+    # requests, the merge queue, branch and tag pushes, and manual runs. No
+    # event, path or label turns them into a compile-only check; a failure of
+    # either suite fails the check.
+    #
+    # Pull requests, the merge queue and manual runs use GitHub-hosted
+    # runners. The few self-hosted runners carry release work: release-line
+    # pushes, release candidates and packaging. Pull request suites there
+    # would queue release work behind them.
+    runs-on: ${{ matrix.name == 'macos' && github.event_name == 'push' && fromJSON('["self-hosted", "tb-macos"]') || matrix.os }}
     steps:
       - name: Validate exact source SHA
         shell: bash
@@ -92,6 +103,22 @@ jobs:
       - name: Public rule facts never shrink
         run: python3 scripts/verify_public_rule_facts.py
 
+      # The self-hosted Macs are shared machines. A full suite writes several GB
+      # (its own tmp/ tree plus build output); one run on a nearly full disk
+      # failed mid-suite with "no space left on device". Stop at once with a
+      # plain message instead.
+      - name: Require free disk space on the self-hosted macOS runner
+        if: runner.os == 'macOS' && runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          floor_gib=15
+          avail_gib=$(( $(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}') / 1048576 ))
+          if [ "$avail_gib" -lt "$floor_gib" ]; then
+            echo "::error::This runner has ${avail_gib} GiB free; a full macOS suite needs at least ${floor_gib} GiB. Free space on the runner's disk, then re-run."
+            exit 1
+          fi
+          echo "free disk: ${avail_gib} GiB (floor ${floor_gib} GiB)"
+
       - name: Set setup-beam target for the self-hosted macOS runner
         if: matrix.name == 'macos' && runner.environment == 'self-hosted'
         run: echo "ImageOS=macos26" >> "$GITHUB_ENV"
@@ -117,7 +144,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Toolchain versions (the parity record)
-        if: env.FULL_SUITE == 'true'
         run: |
           elixir --version
           rustc --version
@@ -135,7 +161,6 @@ jobs:
       # registered harness in the test registry (config/test.exs) and this is its
       # own CLI: nothing here imitates another harness's behaviour.
       - name: Put the in-repo harness CLI on PATH (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
         run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
 
       # The undeclared dependency that lied loudest: the identity suite commits
@@ -146,7 +171,6 @@ jobs:
       # nothing to resolve. Every dev mac has a global identity; the test host and the
       # runners have none, which is the whole 2-failure IdentityTest delta.
       - name: Declare a git identity (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
         run: |
           git config --global user.name "tightbeam ci"
           git config --global user.email "ci@tightbeam.invalid"
@@ -167,12 +191,10 @@ jobs:
           key: cargo-registry-${{ matrix.name }}-${{ hashFiles('cli/Cargo.lock') }}
 
       - name: cargo build --release (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
         working-directory: cli
         run: cargo build --release
 
       - name: Put the source-built Tightbeam CLI on PATH (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
         run: echo "$GITHUB_WORKSPACE/cli/target/release" >> "$GITHUB_PATH"
 
       # Make the runner's containment environment VISIBLE. Three fleet hosts at one
@@ -182,7 +204,7 @@ jobs:
       # node — so the cause is read from the runner's own output, not guessed from a
       # kernel number. Never fails the job; it only reports.
       - name: Containment environment (diagnostic)
-        if: env.FULL_SUITE == 'true' && matrix.name == 'linux'
+        if: matrix.name == 'linux'
         run: |
           uname -a
           echo "--- /dev/null as the shell sees it ---"
@@ -206,18 +228,26 @@ jobs:
         run: mix compile
 
       - name: mix test
-        if: env.FULL_SUITE == 'true'
         run: scripts/verify_mix.sh
 
       - name: cargo test
-        if: env.FULL_SUITE == 'true'
         working-directory: cli
         run: cargo test
 
-  # THE DEPLOY ARTIFACT IS BUILT HERE from the exact pushed SHA, only after the
-  # same-platform test suite passes. The dedicated CI account starts from a
-  # clean checkout, so packaging never uses a developer working tree or leftovers
-  # from an earlier job. Both matrix entries are supported native build targets.
+      # Records what a full suite leaves on disk, to size the floor above.
+      - name: Disk used by the suite (diagnostic)
+        if: always()
+        shell: bash
+        run: |
+          du -sh tmp _build deps cli/target 2>/dev/null || true
+          df -h "$GITHUB_WORKSPACE"
+
+  # THE DEPLOY ARTIFACT IS BUILT HERE, from the pushed SHA, by a machine nobody
+  # develops or smoke-tests on. Building it from a dev tree conflates "what I
+  # have" with "what was reviewed"; building it on the smoke host conflates the
+  # gate with the artifact. The runners are exactly the two supported
+  # platforms — ubuntu x86_64 and macOS arm64 — so `assemble.sh`'s refusal of
+  # anything else composes with this matrix rather than fighting it.
   #
   # Gated on the test matrix: an artifact never exists for a SHA the suite did
   # not pass on that platform.
@@ -232,7 +262,7 @@ jobs:
           - os: macos-latest
             name: darwin-aarch64
     name: release ${{ matrix.name }}
-    runs-on: ${{ matrix.name == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || matrix.name == 'darwin-aarch64' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "tb-macos"]') || matrix.os }}
+    runs-on: ${{ matrix.name == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || fromJSON('["self-hosted", "tb-macos"]') }}
     steps:
       - name: Validate exact source SHA
         shell: bash

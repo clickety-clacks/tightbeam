@@ -26,13 +26,13 @@ def evaluate(expression, context):
         raise ValueError('unsupported expression: ' + expression)
     words = {'&&': ' and ', '||': ' or ', '!=': ' != ', '==': ' == ',
              '(': '(', ')': ')', ',': ',', 'startsWith': '_starts',
-             'fromJSON': '_json'}
+             'format': '_format', 'fromJSON': '_json'}
     code = ''.join(
         words.get(token) or (repr(token[1:-1]) if token.startswith("'")
                              else repr(context[token]))
         for token in tokens)
     return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p),
-                       '_json': json.loads})
+                       '_format': lambda f, *a: f.format(*a), '_json': json.loads})
 
 
 class ExactHeadCI(unittest.TestCase):
@@ -62,66 +62,6 @@ class ExactHeadCI(unittest.TestCase):
                        'github.event.pull_request.head.sha': 'a' * 40,
                        'inputs.candidate_sha': 'c' * 40}
             self.assertEqual(evaluate(source, context), expected, event)
-
-    def test_macos_uses_pool_for_trusted_ci_and_linux_stays_hosted(self):
-        source = re.search(
-            r'(?m)^    runs-on: \$\{\{ (.*?) \}\}$', self.jobs['test']).group(1)
-        pool = ['self-hosted', 'tb-macos']
-        cases = [
-            ('macos', 'pull_request', 'clickety-clacks/tightbeam', pool),
-            ('macos', 'pull_request', 'contributor/project', 'macos-latest'),
-            ('macos', 'push', '', pool),
-            ('macos', 'merge_group', '', pool),
-            ('macos', 'workflow_dispatch', '', pool),
-            ('linux', 'pull_request', 'clickety-clacks/tightbeam', 'ubuntu-latest'),
-            ('linux', 'pull_request', 'contributor/project', 'ubuntu-latest'),
-            ('linux', 'push', '', 'ubuntu-latest'),
-        ]
-        for name, event, head_repo, expected in cases:
-            context = {
-                'matrix.name': name,
-                'matrix.os': 'ubuntu-latest' if name == 'linux' else 'macos-latest',
-                'github.event_name': event,
-                'github.event.pull_request.head.repo.full_name': head_repo,
-                'github.repository': 'clickety-clacks/tightbeam',
-            }
-            self.assertEqual(evaluate(source, context), expected, (name, event, head_repo))
-
-    def test_release_macos_uses_pool_for_trusted_release_events_only(self):
-        source = re.search(
-            r'(?m)^    runs-on: \$\{\{ (.*?) \}\}$', self.jobs['release']).group(1)
-        release_condition = re.search(
-            r'(?m)^    if: (.*)$', self.jobs['release']).group(1)
-        pool = ['self-hosted', 'tb-macos']
-        cases = [
-            ('push', 'refs/heads/0.1.16', '', pool),
-            ('push', 'refs/tags/v0.1.16', '', pool),
-            ('workflow_dispatch', 'refs/heads/0.1.16', '', pool),
-            ('pull_request', 'refs/pull/12/merge', 'contributor/project', 'macos-latest'),
-        ]
-        for event, ref, head_repo, expected in cases:
-            context = {
-                'matrix.name': 'darwin-aarch64',
-                'matrix.os': 'macos-latest',
-                'github.event_name': event,
-                'github.event.pull_request.head.repo.full_name': head_repo,
-                'github.repository': 'clickety-clacks/tightbeam',
-                'github.ref': ref,
-            }
-            self.assertEqual(evaluate(source, context), expected, (event, ref, head_repo))
-            self.assertEqual(evaluate(release_condition, context), event != 'pull_request')
-
-        linux = {
-            'matrix.name': 'linux-x86_64',
-            'matrix.os': 'ubuntu-latest',
-            'github.event_name': 'push',
-            'github.event.pull_request.head.repo.full_name': '',
-            'github.repository': 'clickety-clacks/tightbeam',
-            'github.ref': 'refs/heads/0.1.16',
-        }
-        self.assertEqual(evaluate(source, linux), ['self-hosted', 'tb-linux'])
-        self.assertIn('clean: true', self.jobs['release'])
-        self.assertIn('ImageOS=macos26', self.jobs['release'])
 
     def test_both_jobs_validate_before_exact_checkout(self):
         for name in ('test', 'release'):
@@ -236,28 +176,6 @@ class ExactHeadCI(unittest.TestCase):
                 'github.event_name': 'workflow_dispatch',
                 'inputs.docs_validation': mode}), expected)
 
-    def test_full_suite_runs_before_trusted_branch_push_packaging(self):
-        source = re.search(
-            r'(?m)^      FULL_SUITE: \$\{\{ (.*?) \}\}$', self.jobs['test']).group(1)
-        cases = [
-            ('push', 'refs/heads/0.1.16', True),
-            ('push', 'refs/tags/v0.1.16', True),
-            ('workflow_dispatch', 'refs/heads/0.1.16', True),
-            ('pull_request', 'refs/pull/12/merge', False),
-            ('merge_group', 'refs/heads/gh-readonly-queue/0.1.16/pr-12-abc', False),
-        ]
-        for event, ref, expected in cases:
-            self.assertEqual(evaluate(source, {
-                'github.event_name': event,
-                'github.ref': ref,
-            }), expected, (event, ref))
-
-        test_job = self.jobs['test']
-        release_job = self.jobs['release']
-        self.assertIn("if: env.FULL_SUITE == 'true'\n        run: scripts/verify_mix.sh", test_job)
-        self.assertIn("if: env.FULL_SUITE == 'true'\n        working-directory: cli\n        run: cargo test", test_job)
-        self.assertIn('    needs: test', release_job)
-
     def test_docs_dispatch_is_hosted_read_only_and_subject_bound(self):
         job = self.text.split('\n  docs-validation:\n', 1)[1]
         condition = re.search(r'(?m)^    if: (.*)$', job).group(1)
@@ -297,6 +215,51 @@ class ExactHeadCI(unittest.TestCase):
         self.assertNotIn('merge_group:', publish)
         self.assertNotIn('on:\n  push:', publish)
 
+
+    def test_full_suites_run_on_every_event(self):
+        # The suites are the gate on pull requests too: no event switch may
+        # turn the test job back into a compile-only check.
+        self.assertNotIn('FULL_SUITE', self.text)
+        job = self.jobs['test']
+        steps = job.split('\n      - ')
+        for command in ('run: cargo build --release', 'run: scripts/verify_mix.sh',
+                        'run: cargo test'):
+            matching = [step for step in steps if command in step]
+            self.assertEqual(len(matching), 1, command)
+            self.assertNotRegex(matching[0], r'(?m)^        if:', command)
+        condition = re.search(r'(?m)^    if: (.*)$', job).group(1)
+        for event in ('pull_request', 'merge_group', 'push', 'workflow_dispatch'):
+            self.assertTrue(evaluate(condition, {
+                'github.event_name': event, 'inputs.docs_validation': 'off'}), event)
+
+    def test_pull_request_suites_stay_off_the_release_pools(self):
+        # The few self-hosted runners carry release work; pull request,
+        # merge-queue and manual suites run on hosted runners beside them.
+        job = self.jobs['test']
+        self.assertIn(
+            "    runs-on: ${{ matrix.name == 'macos' && github.event_name == 'push' && "
+            "fromJSON('[\"self-hosted\", \"tb-macos\"]') || matrix.os }}", job)
+        self.assertEqual(re.findall(r'(?m)^          - os: (\S+)$', job),
+                         ['ubuntu-24.04', 'macos-latest'])
+
+    def test_self_hosted_mac_checks_disk_before_the_suite(self):
+        job = self.jobs['test']
+        self.assertLess(
+            job.index('name: Require free disk space on the self-hosted macOS runner'),
+            job.index('run: scripts/verify_mix.sh'))
+        self.assertIn("if: runner.os == 'macOS' && runner.environment == 'self-hosted'", job)
+
+    def test_only_a_superseded_pull_request_run_is_cancelled(self):
+        group = re.search(r'(?m)^  group: \$\{\{ (.*) \}\}$', self.text).group(1)
+        cancel = re.search(r'(?m)^  cancel-in-progress: \$\{\{ (.*) \}\}$', self.text).group(1)
+        base = {'github.event.pull_request.number': 12, 'github.run_id': 99}
+        self.assertEqual(
+            evaluate(group, {**base, 'github.event_name': 'pull_request'}), 'ci-pr-12')
+        self.assertTrue(evaluate(cancel, {'github.event_name': 'pull_request'}))
+        for event in ('push', 'merge_group', 'workflow_dispatch'):
+            self.assertEqual(
+                evaluate(group, {**base, 'github.event_name': event}), 'ci-run-99', event)
+            self.assertFalse(evaluate(cancel, {'github.event_name': event}), event)
 
     def test_no_retired_branch_dependency(self):
         self.assertNotIn('release-candidate/', self.text)

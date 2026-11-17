@@ -17,7 +17,9 @@ Before building a candidate, pass all three gates in
 on `main` or accounted for as an equivalent or an intentional removal ruled by
 the product owner; the proposed release boots and migrates from a database
 shaped like the previous release's on an isolated host; and every pull request
-to `main` runs and passes the full Linux and macOS test suites, not compile-only.
+to `main` runs the full Linux and macOS test suites. Both checks must pass
+before a candidate is built. Do not merge a pull request with either check red;
+at present, the checks report results but do not block merges automatically.
 A missing feature blocks the candidate; a **Breaking changes** entry does not
 replace release parity. Then CI builds a candidate and `SHA256SUMS` from the
 exact release commit without publishing a release. After the user separately
@@ -29,6 +31,12 @@ candidate. Record the candidate hash, soak outcome and publication identity.
 Every candidate or release installation needs the user's exact approval. If
 the release tooling cannot support this flow, report the gap rather than
 substitute a rebuild or publish before the soak.
+
+The fourth release gate requires a recorded health check with a `healthy`
+result for the exact candidate running on the maintainers' production
+deployment under real load, with its installed acceptance closed, before
+publishing or promoting. It does not prevent installing an unpublished
+candidate for testing; the exact-install approval still applies.
 
 Keep a broken published release available. Put a clear do-not-install warning at
 the top of its notes naming the failure and safe replacement, and mark it

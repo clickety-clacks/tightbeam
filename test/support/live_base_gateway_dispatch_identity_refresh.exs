@@ -25,7 +25,7 @@ defmodule GuardDispatchIdentityRefresh do
           display_name: "Assignment target",
           owner_user_id: "test-owner",
           origin: "user:test-owner",
-          archetype: "coder",
+          archetype: "agentic-engineering.coder",
           host: "testhost",
           harness: "claude",
           provider: "anthropic",
@@ -51,7 +51,7 @@ defmodule GuardDispatchIdentityRefresh do
         runner = Keyword.fetch!(lane_opts, :runner)
         old = Identity.live_revision!(base)
         cwd = Placement.holder_workdir(config, session)
-        snapshot = Identity.provision_at!(base, old, "coder", :claude, cwd)
+        snapshot = Identity.provision_at!(base, old, "agentic-engineering.coder", :claude, cwd)
 
         Org.set_identity_stamp(
           db,
@@ -164,7 +164,13 @@ defmodule GuardDispatchIdentityRefresh do
 
   defp publish_skill!(base, text) do
     candidate =
-      Identity.edit!(base, "coder", {:skill, "repository-retirement", false}, text, "test")
+      Identity.edit!(
+        base,
+        "agentic-engineering.coder",
+        {:skill, "repository-retirement", false},
+        text,
+        "test"
+      )
 
     assert {:ok, revision} = Identity.publish_live!(base, candidate)
     revision
