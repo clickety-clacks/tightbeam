@@ -3,9 +3,11 @@ defmodule Tightbeam.AssignmentOpenerAcceptance do
   Accept opener accountability for one open assignment whose opener retired.
 
   The assignment stays open with its holder, attests and history. Only the
-  current opener moves: `currentOpenerSessionKey` names the successor, and a
-  standing cannot-proceed the retired opener had to dispose now waits on the
-  successor. The original `openedBySession` is never rewritten.
+  current opener moves: `currentOpenerSessionKey` names the successor. A
+  standing cannot-proceed the retired opener had to dispose, an open question
+  on the assignment waiting on the retired opener, and its undelivered notices
+  about the assignment move to the successor. The original `openedBySession`
+  and expecter are never rewritten.
 
   The successor is the caller, or the session named with `toSessionKey`. The
   caller must be accountable for the assignment: the work item's delivery
@@ -45,14 +47,16 @@ defmodule Tightbeam.AssignmentOpenerAcceptance do
     assignment = fetch!(txn, assignment_id)
     opener = current_opener!(assignment)
     successor = successor!(principal, to)
-    item = work_item(txn, assignment.work_item_id)
-    owner = owner_user_id(txn, assignment, item)
-    accountable!(txn, principal, assignment, opener, item, owner)
-    active_successor!(txn, successor)
-
+    # A repeat of an acceptance that already took effect is a readback. It is
+    # recognized first: after the move, the parent of the new opener is not the
+    # parent that was accountable for the retired one.
     if successor == opener.session_key do
       response(txn, assignment_id, opener.original, nil, successor, principal, nil)
     else
+      item = work_item(txn, assignment.work_item_id)
+      owner = owner_user_id(txn, assignment, item)
+      accountable!(txn, principal, assignment, opener, item, owner)
+      active_successor!(txn, successor)
       retired_opener!(txn, opener.session_key)
       move!(txn, assignment_id, opener.session_key, successor, principal, item)
     end
@@ -80,6 +84,42 @@ defmodule Tightbeam.AssignmentOpenerAcceptance do
       """,
       [assignment_id, "session:" <> to, "session:" <> from]
     )
+
+    # Open questions on this assignment that were waiting on the retired opener
+    # now wait on the successor. The original expecter stays on the row.
+    Txn.q(
+      txn,
+      """
+      UPDATE decision_requests
+      SET currentExpecterSessionKey=?2,rowVersion=rowVersion+1
+      WHERE assignmentId=?1 AND status='open'
+        AND COALESCE(currentExpecterSessionKey,expecterSessionKey)=?3
+      """,
+      [assignment_id, to, from]
+    )
+
+    # Undelivered notices about this assignment addressed to the retired opener
+    # go to the successor instead.
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId FROM wakes
+      WHERE assignmentId=?1 AND sessionKey=?2 AND targetRole IS NULL
+        AND consumer='prompt' AND reresolve IS NULL
+        AND state='pending' AND deliveredTurnSeq IS NULL
+      ORDER BY createdAt,wakeId
+      """,
+      [assignment_id, from]
+    )
+    |> Enum.each(fn [wake_id] ->
+      case Wakes.readdress_pending_in_txn(txn, wake_id, to) do
+        {:ok, _wake} ->
+          :ok
+
+        {:error, reason} ->
+          raise Refusal, code: "wake_readdress_failed", message: inspect(reason)
+      end
+    end)
 
     event = "aoa_" <> Tightbeam.Id.uuid4()
 

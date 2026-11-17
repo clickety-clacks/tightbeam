@@ -66,7 +66,7 @@ defmodule Tightbeam.AssignmentOpenerAcceptanceTest do
   end
 
   defp standing_cannot_proceed(db, assignment_id, disposer) do
-    {:ok, wake} =
+    {:ok, %{wake_id: wake_id}} =
       DB.transaction(db, fn txn ->
         Wakes.schedule_in_txn(txn, %{
           session_key: disposer,
@@ -108,14 +108,17 @@ defmodule Tightbeam.AssignmentOpenerAcceptanceTest do
            disposerRef,reason,state,createdAt)
         VALUES ('cp_blocked',?1,'att_blocked','dr_blocked',?2,?3,?3,'blocked','standing',3)
         """,
-        [assignment_id, wake.wake_id, "session:" <> disposer]
+        [assignment_id, wake_id, "session:" <> disposer]
       )
+
+    wake_id
   end
 
   test "the delivery owner accepts opener duty for one assignment after the opener retires",
        ctx do
-    standing_cannot_proceed(ctx.db, "asg_one", "opener")
     assert %{state: "retired"} = Org.retire(ctx.db, "opener", "user:owner")
+    # The holder reports a block that still names the retired opener.
+    blocked_wake = standing_cannot_proceed(ctx.db, "asg_one", "opener")
 
     result = accept(ctx.db, {:session, "delivery"}, %{assignment_id: "asg_one"})
 
@@ -131,9 +134,19 @@ defmodule Tightbeam.AssignmentOpenerAcceptanceTest do
     assert opener_row(ctx.db, "asg_one") == ["open", "holder", "opener", "delivery"]
     assert opener_row(ctx.db, "asg_two") == ["open", "holder", "opener", nil]
 
-    # The holder's standing block now waits on the successor.
+    # The holder's standing block, its open question and its undelivered notice
+    # now wait on the successor; the original expecter stays on record.
     assert {:ok, [["session:delivery", "standing"]]} =
              DB.query(ctx.db, "SELECT disposerRef,state FROM assignment_cannot_proceed")
+
+    assert {:ok, [["opener", "delivery", "open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT expecterSessionKey,currentExpecterSessionKey,status FROM decision_requests WHERE id='dr_blocked'"
+             )
+
+    assert {:ok, [["delivery", "pending"]]} =
+             DB.query(ctx.db, "SELECT sessionKey,state FROM wakes WHERE wakeId=?1", [blocked_wake])
 
     assert {:ok, [[detail]]} =
              DB.query(
@@ -171,6 +184,14 @@ defmodule Tightbeam.AssignmentOpenerAcceptanceTest do
       accept(ctx.db, {:session, "lead"}, %{assignment_id: "asg_one", to_session_key: "named"})
 
     assert by_parent["currentOpenerSessionKey"] == "named"
+    assert by_parent["changed"] == true
+
+    # The parent's retry reads back, although the new opener is not its child.
+    parent_repeat =
+      accept(ctx.db, {:session, "lead"}, %{assignment_id: "asg_one", to_session_key: "named"})
+
+    assert parent_repeat["changed"] == false
+    assert parent_repeat["currentOpenerSessionKey"] == "named"
 
     by_owner =
       accept(ctx.db, {:user, "owner"}, %{assignment_id: "asg_two", to_session_key: "named"})
@@ -180,6 +201,19 @@ defmodule Tightbeam.AssignmentOpenerAcceptanceTest do
 
     assert %{ok: false, code: "invalid_message"} =
              accept(ctx.db, {:user, "owner"}, %{assignment_id: "asg_two"})
+  end
+
+  test "the retired opener's parent may take the duty itself and repeat the acceptance", ctx do
+    assert %{state: "retired"} = Org.retire(ctx.db, "opener", "user:owner")
+
+    first = accept(ctx.db, {:session, "lead"}, %{assignment_id: "asg_one"})
+    assert first["changed"] == true
+    assert first["currentOpenerSessionKey"] == "lead"
+
+    again = accept(ctx.db, {:session, "lead"}, %{assignment_id: "asg_one"})
+    assert again["changed"] == false
+    assert again["currentOpenerSessionKey"] == "lead"
+    assert opener_row(ctx.db, "asg_one") == ["open", "holder", "opener", "lead"]
   end
 
   test "an active opener keeps its duty and a closed assignment is not reopened", ctx do
