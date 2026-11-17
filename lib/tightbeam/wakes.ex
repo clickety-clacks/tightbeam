@@ -45,6 +45,7 @@ defmodule Tightbeam.Wakes do
   @miss_lateness_ms 60_000
   @decision_request_notice_marker "decision-request-notice:"
   @sentinel_stop_notice_marker "sentinel-stop-notice:"
+  @sentinel_restart_notice_marker "sentinel-restart-notice:"
 
   @type db :: GenServer.server()
 
@@ -4047,6 +4048,10 @@ defmodule Tightbeam.Wakes do
   @doc false
   def sentinel_stop_notice_ref(host, qualified) when is_binary(host) and is_binary(qualified),
     do: @sentinel_stop_notice_marker <> JSON.encode!([host, qualified])
+
+  @doc false
+  def sentinel_restart_notice_ref(host, qualified) when is_binary(host) and is_binary(qualified),
+    do: @sentinel_restart_notice_marker <> JSON.encode!([host, qualified])
 
   @doc false
   def clear_decision_request_notice_in_txn(%Txn{} = txn, request_id)
