@@ -3124,9 +3124,15 @@ defmodule Tightbeam.Gateway do
   defp nudge_lane(lane_manager, session_key) do
     LaneManager.ensure_lane(lane_manager, session_key)
 
-    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{pid, _}] -> if Process.alive?(pid), do: :ok, else: :lane_down
-      [] -> :lane_down
+    if Process.whereis(Tightbeam.LaneRegistry) do
+      case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+        [{pid, _}] -> if Process.alive?(pid), do: :ok, else: :lane_down
+        [] -> :lane_down
+      end
+    else
+      # The manager accepted the nudge; without a registry there is no lane
+      # state to inspect (for example, a manager supplied by a caller).
+      :ok
     end
   catch
     :exit, reason ->
