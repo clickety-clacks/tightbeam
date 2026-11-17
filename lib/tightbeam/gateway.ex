@@ -9630,25 +9630,27 @@ defmodule Tightbeam.Gateway do
 
       {boundary, applies} =
         model_change_boundary(config, db, session, allow_queued, fn running? ->
-          run_session_mutation(session.session_key, fn ->
-            if running? do
-              apply_running_model(
-                config,
-                db,
-                Org.get(db, session.session_key),
-                new_ref,
-                routed.provider
-              )
-            else
-              apply_tuned_model(
-                config,
-                db,
-                session,
-                new_ref,
-                routed.provider,
-                call[:principal] || call.origin
-              )
-            end
+          contain_model_change_failure(fn ->
+            run_session_mutation(session.session_key, fn ->
+              if running? do
+                apply_running_model(
+                  config,
+                  db,
+                  Org.get(db, session.session_key),
+                  new_ref,
+                  routed.provider
+                )
+              else
+                apply_tuned_model(
+                  config,
+                  db,
+                  session,
+                  new_ref,
+                  routed.provider,
+                  call[:principal] || call.origin
+                )
+              end
+            end)
           end)
         end)
 
@@ -9753,6 +9755,18 @@ defmodule Tightbeam.Gateway do
     else
       {:error, denial} -> normalize_tune_denial(denial)
     end
+  end
+
+  # The change runs inside the session's lane, where an escaping exit would
+  # stop the lane, kill its running turn and reach the client as an empty 500.
+  # The request may already have reached the harness, so the outcome is
+  # reported as unknown rather than refused.
+  defp contain_model_change_failure(fun) do
+    fun.()
+  catch
+    kind, reason ->
+      {:error,
+       {:runtime_config_unknown, {:change_failed, Exception.format_banner(kind, reason)}}}
   end
 
   defp runtime_actual(%Model{} = model) do

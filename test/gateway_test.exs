@@ -7756,6 +7756,57 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
+  test "running configuration reports an adapter checkout exit without stopping the lane", ctx do
+    base_dir = role_test_base("running-config-checkout-exit")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    host = Placement.local_host_name()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    Org.set_host(ctx.db, "k1", host)
+    Org.append_pointer(ctx.db, "k1", "running-session", "created")
+    put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+    before = Org.get(ctx.db, "k1").model
+
+    # The adapter checkout runs inside the lane ahead of any adapter call; an
+    # exit there (a coordinator that is busy past its checkout timeout, or
+    # gone) must reach the caller as a decodable refusal too.
+    start_supervised!(
+      {CoordinatorStub, {fn _key -> exit(:deliberate_checkout_exit) end, self()}}
+    )
+    {seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "keep running")
+    parent = self()
+
+    lane =
+      start_lane!(ctx.db, "k1", fn _ ->
+        send(parent, {:residency_exit_runner, self()})
+
+        receive do
+          :finish -> {:ok, %{}}
+        end
+      end)
+
+    assert_receive {:residency_exit_runner, worker}
+
+    assert %{ok: false, code: "runtime_config_unknown", diagnostic: %{}} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: origin,
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6", effort: "high"}
+             })
+
+    assert_received {:adapter_key, _key}
+    refute_received {:tune_config_applied, _, _}
+    assert Org.get(ctx.db, "k1").model == before
+    assert Process.alive?(lane)
+    assert Ledger.running?(ctx.db, "k1")
+    send(worker, :finish)
+
+    assert eventually(fn ->
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+               {:ok, [["delivered"]]}
+           end)
+  end
+
   describe "session status reports its host's credential kind" do
     setup ctx do
       base =
