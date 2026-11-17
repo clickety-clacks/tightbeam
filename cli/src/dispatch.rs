@@ -156,6 +156,19 @@ fn request(
     }
 }
 
+/// One step of `identity apply --all`: a bounded number of sessions, resumed
+/// from the cursor the previous step returned.
+fn build_identity_apply_step_request(identity: &Identity, cursor: Option<&str>) -> RequestSpec {
+    let mut params = vec![
+        "\"all\":true".to_owned(),
+        format!("\"limit\":{}", crate::identity_apply::STEP_LIMIT),
+    ];
+    if let Some(cursor) = cursor {
+        params.push(string_field("cursor", cursor));
+    }
+    request(identity, "identity-apply", vec![], params)
+}
+
 /// Build the dispatch request without performing discovery or network I/O.
 pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     let context = CommandContext::for_command(command);
@@ -3872,6 +3885,23 @@ where
                 load_harnesses,
             )
         }
+        Command::IdentityApply {
+            identity,
+            session_key: None,
+            all: true,
+        } => {
+            let endpoint = discover_endpoint()?;
+            require_session_endpoint(&identity, &endpoint)?;
+            crate::identity_apply::run_all(
+                |cursor| {
+                    let request = build_identity_apply_step_request(&identity, cursor)
+                        .with_attempt_context(attempt_context.clone());
+                    send_request(&endpoint, &request, None)
+                },
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )
+        }
         command => {
             let endpoint = discover_endpoint()?;
             if let Some(reason) = local_harklight_identity_refusal(&command, &endpoint) {
@@ -6826,6 +6856,56 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_apply_all_asks_for_bounded_steps_and_resumes_from_the_cursor() {
+        use std::cell::RefCell;
+
+        let bodies = RefCell::new(Vec::new());
+        run_with(
+            Command::IdentityApply {
+                identity: Identity::User("flynn".to_owned()),
+                session_key: None,
+                all: true,
+            },
+            || {
+                Ok(Endpoint {
+                    base: "https://gateway.test".to_owned(),
+                    token: "tbc_test".to_owned(),
+                    origin: Origin::Provisioned,
+                })
+            },
+            |_endpoint, request, deadline| {
+                assert_eq!(deadline, None);
+                bodies.borrow_mut().push(request.body_json.clone());
+                let cursor = if bodies.borrow().len() == 1 {
+                    serde_json::json!("next-step")
+                } else {
+                    Value::Null
+                };
+                Ok(Some(serde_json::json!({
+                    "status": "complete",
+                    "complete": true,
+                    "identityRevision": "rev-1",
+                    "targetSessionKeys": [],
+                    "applied": [],
+                    "results": [],
+                    "total": 0,
+                    "cursor": cursor,
+                })))
+            },
+            |_, _| panic!("harness loader must not be called"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *bodies.borrow(),
+            vec![
+                r#"{"asUser":"flynn","verb":"identity-apply","params":{"all":true,"limit":100}}"#,
+                r#"{"asUser":"flynn","verb":"identity-apply","params":{"all":true,"limit":100,"cursor":"next-step"}}"#,
+            ]
+        );
     }
 
     #[test]
