@@ -31,7 +31,8 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     %{base_dir: base_dir}
   end
 
-  @briefing_source "kungfu/harklight-decision-briefings/rules/briefings.toml"
+  @briefing_source "rules/briefings.toml"
+  @briefing_namespaced_source "kungfu/harklight-decision-briefings/rules/briefings.toml"
   @briefing_destination "rules/harklight-decision-request-briefing.toml"
 
   test "configured 0.1.16 briefings keep their owner and route across upgrade", ctx do
@@ -61,6 +62,7 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     # Scope insertion is the only byte change, including the configured fields.
     assert String.replace(migrated, "archetypes = [\"*\"]\n", "") == original
     refute File.exists?(Path.join(identity_dir, @briefing_source))
+    refute File.exists?(Path.join(identity_dir, @briefing_namespaced_source))
 
     receipt =
       Toml.decode!(
@@ -111,6 +113,37 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     refute File.exists?(source)
   end
 
+  test "an already namespaced learned briefing also relocates", ctx do
+    init_briefing_fixture!(ctx.base_dir, true)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    source = Path.join(identity_dir, @briefing_source)
+    bytes = File.read!(source)
+    File.mkdir_p!(Path.dirname(Path.join(identity_dir, @briefing_namespaced_source)))
+    File.rename!(source, Path.join(identity_dir, @briefing_namespaced_source))
+    receipt = Path.join(identity_dir, "kungfu/harklight-decision-briefings/installed.toml")
+
+    File.write!(
+      receipt,
+      String.replace(File.read!(receipt), @briefing_source, @briefing_namespaced_source)
+    )
+
+    commit_fixture!(identity_dir, "fixture: namespaced learned briefing")
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
+    migrated = File.read!(Path.join(identity_dir, @briefing_destination))
+    assert String.replace(migrated, "archetypes = [\"*\"]\n", "") == bytes
+    refute File.exists?(Path.join(identity_dir, @briefing_namespaced_source))
+  end
+
+  test "an organization-owned flat briefing remains substrate law", ctx do
+    init_briefing_fixture!(ctx.base_dir, true)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    File.rm!(Path.join(identity_dir, "kungfu/harklight-decision-briefings/installed.toml"))
+    commit_fixture!(identity_dir, "fixture: organization-owned flat briefing")
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
+    assert File.exists?(Path.join(identity_dir, @briefing_source))
+    refute File.exists?(Path.join(identity_dir, @briefing_destination))
+  end
+
   test "unconfigured learned briefings migrate without error", ctx do
     init_briefing_fixture!(ctx.base_dir, false)
     assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
@@ -122,6 +155,10 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
 
   test "never-learned briefings migrate without error", ctx do
     Identity.init!(ctx.base_dir)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    File.rm!(Path.join(identity_dir, @briefing_destination))
+    commit_fixture!(identity_dir, "fixture: before briefing substrate seed existed")
+    git!(identity_dir, ["update-ref", "refs/heads/tightbeam/upstream", "main"])
     assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
     refute File.exists?(Path.join([ctx.base_dir, "identity", @briefing_source]))
   end
@@ -139,30 +176,20 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     commit_fixture!(identity_dir, "fixture: existing substrate briefing")
     assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
     assert File.read!(Path.join(identity_dir, @briefing_destination)) == existing
-    assert File.read!(Path.join(identity_dir, @briefing_source)) =~ "briefing-consumer"
+    assert File.read!(Path.join(identity_dir, @briefing_namespaced_source)) =~ "briefing-consumer"
   end
 
   defp init_briefing_fixture!(base_dir, configured?) do
     Identity.init!(base_dir)
     identity_dir = Path.join(base_dir, "identity")
-    seed = File.read!("priv/seed/rules/harklight-decision-request-briefing.toml")
-    legacy = String.replace(seed, "archetypes = [\"*\"]\n", "")
-
-    legacy =
-      if configured? do
-        legacy
-        |> String.replace("user:CONFIGURE_OWNER_ID", "user:briefing-test-owner")
-        |> String.replace(
-          "target_role = \"CONFIGURE_DECISION_BRIEFING_ROLE\"",
-          "target_session = \"briefing-consumer\""
-        )
-      else
-        legacy
-      end
+    # Released 0.1.16 learns rules flat; its receipt supplies bundle ownership.
+    legacy = File.read!(Path.join(__DIR__, "fixtures/rail-scope-migration/legacy-briefings.toml"))
 
     File.rm!(Path.join(identity_dir, @briefing_destination))
     File.mkdir_p!(Path.dirname(Path.join(identity_dir, @briefing_source)))
     File.write!(Path.join(identity_dir, @briefing_source), legacy)
+
+    File.mkdir_p!(Path.join(identity_dir, "kungfu/harklight-decision-briefings"))
 
     File.write!(
       Path.join(identity_dir, "kungfu/harklight-decision-briefings/installed.toml"),
@@ -170,6 +197,22 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     )
 
     commit_fixture!(identity_dir, "fixture: learned 0.1.16 briefing rule")
+    # Released learn imports the unconfigured bundle into upstream before the
+    # organization configures its main branch. Both refs have the flat path.
+    git!(identity_dir, ["update-ref", "refs/heads/tightbeam/upstream", "main"])
+
+    if configured? do
+      configured =
+        legacy
+        |> String.replace("user:CONFIGURE_OWNER_ID", "user:briefing-test-owner")
+        |> String.replace(
+          "target_role = \"CONFIGURE_DECISION_BRIEFING_ROLE\"",
+          "target_session = \"briefing-consumer\""
+        )
+
+      File.write!(Path.join(identity_dir, @briefing_source), configured)
+      commit_fixture!(identity_dir, "fixture: configure learned briefing on main")
+    end
   end
 
   test "receipt-owned files migrate once and preserve later agentless rails", ctx do

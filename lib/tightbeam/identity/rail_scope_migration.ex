@@ -300,10 +300,18 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   # 0.1.16 shipped this org-wide rule in an optional bundle. Preserve its
   # configured bytes as substrate law before applying kungfu scope isolation.
   defp plan_decision_briefing(plan) do
-    source = "kungfu/harklight-decision-briefings/rules/briefings.toml"
+    bundle = "harklight-decision-briefings"
+
+    source =
+      Enum.find(
+        ["rules/briefings.toml", "kungfu/#{bundle}/rules/briefings.toml"],
+        &(Map.has_key?(plan.entries, &1) and
+            Map.get(plan.owner_by_path, &1) == {:kungfu, bundle})
+      )
+
     destination = "rules/harklight-decision-request-briefing.toml"
 
-    if Map.has_key?(plan.entries, source) and not Map.has_key?(plan.entries, destination) do
+    if source && not Map.has_key?(plan.entries, destination) do
       bytes = Map.fetch!(plan.entries, source)
 
       %{
