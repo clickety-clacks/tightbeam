@@ -291,7 +291,10 @@ defmodule Tightbeam.Artifacts do
        do: :ok
 
   defp valid_record_shape(_),
-    do: %{code: "invalid_artifact_record_shape", message: "artifact-record requires title and originPath"}
+    do: %{
+      code: "invalid_artifact_record_shape",
+      message: "artifact-record requires title and originPath"
+    }
 
   defp record_with_content(db, call, digest, captured_bytes) do
     case {call[:principal], call[:session_key], call[:params][:work_item_id]} do
