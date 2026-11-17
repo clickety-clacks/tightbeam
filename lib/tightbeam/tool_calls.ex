@@ -823,10 +823,6 @@ defmodule Tightbeam.ToolCalls do
 
   defp with_read_transaction(%Txn{} = txn, fun), do: fun.(txn)
 
-  defp with_read_transaction(db, fun) do
-    case DB.transaction(db, fun) do
-      {:ok, result} -> result
-      {:error, error} -> raise error
-    end
-  end
+  # A read: it runs on a read connection, never in the database writer.
+  defp with_read_transaction(db, fun), do: DB.read_transaction!(db, fun)
 end
