@@ -10,6 +10,7 @@ defmodule Tightbeam.Projection do
   older ever wrote a -1, and nothing older reads this table.
   """
 
+  alias Tightbeam.AttachmentDelivery
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
