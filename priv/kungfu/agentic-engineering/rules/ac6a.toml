@@ -1,6 +1,7 @@
 # Event-driven supervision findings. These rules observe committed rows only;
 # the measured queue/assignment state is recomputed for each transition.
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "ac6a-queue-backlog"
 verb = "post"
 verbs = ["post", "wake"]
@@ -18,6 +19,7 @@ prompt = "Agent {session_key} has 20 or more queued turns or a queued turn at le
 idempotency_key = "backlog:{turn_backlog_episode_id}"
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "ac6a-sender-flood"
 verb = "post"
 verbs = ["post", "wake"]
@@ -36,6 +38,7 @@ prompt = "Your messages now account for at least three queued turns to already-b
 idempotency_key = "flood:{turn_backlog_episode_id}:{turn_caller_threshold_seq}"
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "ac6a-fourth-review-or-fix-round"
 verb = "attest"
 verbs = ["attest", "assign", "dispatch"]
@@ -52,6 +55,7 @@ prompt = "Work item {work_item_id} has reached its fourth {work_item_fourth_roun
 idempotency_key = "fourth-round:{work_item_id}:{work_item_fourth_round_kind}"
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "ac6a-unassigned-agent-turn"
 verb = "post"
 verbs = ["post", "wake"]
@@ -69,6 +73,7 @@ prompt = "Agent {session_key} started a turn without an open assignment. Review 
 idempotency_key = "unassigned:{session_unassigned_stretch_id}"
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "ac6a-third-review-rejection"
 verb = "attest"
 verbs = ["attest"]

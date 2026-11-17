@@ -539,7 +539,35 @@ defmodule Tightbeam.CheckTierTest do
   end
 
   defp put_rules(ctx, contents) do
+    # These are substrate rules in a shared test fixture.
+    contents = wildcard_scopes(contents)
     File.write!(Path.join(ctx.base_dir, "identity/rules/check.toml"), contents)
+  end
+
+  defp wildcard_scopes(contents) do
+    {lines, state} =
+      contents
+      |> String.split("\n", trim: false)
+      |> Enum.reduce({[], :outside}, fn line, {acc, state} ->
+        cond do
+          line in ["[[rule]]", "[[policy]]"] ->
+            acc = if state == :unscoped, do: ["archetypes = [\"*\"]" | acc], else: acc
+            {[line | acc], :unscoped}
+
+          String.starts_with?(line, "[") ->
+            acc = if state == :unscoped, do: ["archetypes = [\"*\"]" | acc], else: acc
+            {[line | acc], :outside}
+
+          state == :unscoped and String.starts_with?(line, "archetypes =") ->
+            {[line | acc], :scoped}
+
+          true ->
+            {[line | acc], state}
+        end
+      end)
+
+    lines = if state == :unscoped, do: ["archetypes = [\"*\"]" | lines], else: lines
+    lines |> Enum.reverse() |> Enum.join("\n")
   end
 
   defp rule(name, fact, op, value, verb \\ "attest") do
@@ -555,6 +583,7 @@ defmodule Tightbeam.CheckTierTest do
 
     """
     [[rule]]
+    archetypes = ["*"]
     name = "#{name}"
     verb = "#{verb}"
     text = "denied"

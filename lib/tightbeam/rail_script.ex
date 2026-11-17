@@ -95,6 +95,9 @@ defmodule Tightbeam.RailScript do
     path
   end
 
+  defp check_script!(base_dir, _scratch, %{identity_path: relative}),
+    do: Path.join([base_dir, "identity", relative])
+
   defp check_script!(base_dir, _scratch, check),
     do: Path.join([base_dir, "identity", "rails", "scripts", check.script])
 

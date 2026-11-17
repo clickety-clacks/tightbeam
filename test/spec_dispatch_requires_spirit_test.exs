@@ -32,10 +32,10 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
-    holder = session(db, "impl-holder", "coder")
-    owner = session(db, "po-holder", "product-owner")
-    pdo = session(db, "delivery-owner", "pdo")
-    reviewer = session(db, "review-holder", "reviewer")
+    holder = session(db, "impl-holder", "agentic-engineering.coder")
+    owner = session(db, "po-holder", "agentic-engineering.product-owner")
+    pdo = session(db, "delivery-owner", "agentic-engineering.pdo")
+    reviewer = session(db, "review-holder", "agentic-engineering.reviewer-spec")
 
     Roles.create!(db, "product-owner:spirit", "flynn", owner.session_key)
 
@@ -101,7 +101,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
   test "policy dispatch to an existing spec author opens each assignment with a rumination warning",
        ctx do
     item = work_item(ctx)
-    spec_author = session(ctx.db, "spec-author", "spec-writer")
+    spec_author = session(ctx.db, "spec-author", "agentic-engineering.spec-writer")
 
     call =
       dispatch_call(
@@ -186,6 +186,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
 
     File.write!(Path.join(rules_dir, "round-count-probe.toml"), """
     [[rule]]
+    archetypes = ["*"]
     name = "round-count-probe"
     verb = "attest"
     text = "synthetic fact probe: refuse after two recorded conclusions"

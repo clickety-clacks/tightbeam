@@ -2,6 +2,20 @@
 name = "no-git-stash"
 on = "tool-call"
 mode = "gate"
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 tool = "Bash"
 action = "git-stash"
 text = "You ran a mutating git stash; destructive git is forbidden on any worktree because it silently hides another agent's uncommitted work."
@@ -10,6 +24,20 @@ text = "You ran a mutating git stash; destructive git is forbidden on any worktr
 name = "no-git-reset-hard"
 on = "tool-call"
 mode = "gate"
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 tool = "Bash"
 action = "git-reset-hard"
 text = "You ran git reset --hard; destructive git is forbidden on any worktree because it discards another agent's uncommitted work."
@@ -18,6 +46,20 @@ text = "You ran git reset --hard; destructive git is forbidden on any worktree b
 name = "no-git-clean-force"
 on = "tool-call"
 mode = "gate"
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 tool = "Bash"
 action = "git-clean-force"
 text = "You ran a forced git clean; destructive git is forbidden on any worktree because it deletes another agent's untracked work."
@@ -26,6 +68,20 @@ text = "You ran a forced git clean; destructive git is forbidden on any worktree
 name = "no-git-checkout-discard"
 on = "tool-call"
 mode = "gate"
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 tool = "Bash"
 action = "git-checkout-discard"
 text = "You ran git checkout -- to discard paths; destructive git is forbidden on any worktree because it overwrites another agent's uncommitted work."
@@ -36,6 +92,20 @@ text = "You ran git checkout -- to discard paths; destructive git is forbidden o
 name = "no-git-restore"
 on = "tool-call"
 mode = "gate"
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 tool = "Bash"
 action = "git-restore"
 text = "You ran git restore; destructive git is forbidden on any worktree because it discards another agent's uncommitted work."

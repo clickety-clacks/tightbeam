@@ -1,5 +1,19 @@
 # rules/verification.toml — the engineering school's completion papertrail
 [[rule]]
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 name = "completion-requires-verification"
 verb = "attest"
 edges = ["verb"]
@@ -7,7 +21,7 @@ effect = "remedy"
 text = "completion requires a verification verdict on the assignment"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.holder_archetype", op = "in", value = ["coder"] },
+  { fact = "assignment.holder_archetype", op = "in", value = ["agentic-engineering.coder"] },
   { fact = "assignment.verdicts", op = "not_in", value = ["verified"] },
 ]
 [rule.remedy]
@@ -47,6 +61,20 @@ prompt = "Your completion of {assignment_id} is blocked: no verification verdict
 # ACTUALLY recorded; this asks whether the work left a record at all, never which
 # sort of record the archetype should have chosen.
 [[rule]]
+archetypes = [
+  "agentic-engineering.coder",
+  "agentic-engineering.guidance-reviewer",
+  "agentic-engineering.guidance-writer",
+  "agentic-engineering.integrator",
+  "agentic-engineering.orchestrator",
+  "agentic-engineering.pdo",
+  "agentic-engineering.product-owner",
+  "agentic-engineering.recon",
+  "agentic-engineering.reviewer-code",
+  "agentic-engineering.reviewer-spec",
+  "agentic-engineering.spec-writer",
+  "agentic-engineering.team-planner",
+]
 name = "completion-requires-results-artifact"
 verb = "attest"
 edges = ["verb"]
@@ -54,7 +82,7 @@ effect = "remedy"
 text = "completion requires a recorded results artifact from the holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.holder_archetype", op = "in", value = ["coder", "reviewer-code", "reviewer-spec", "spec-writer", "recon"] },
+  { fact = "assignment.holder_archetype", op = "in", value = ["agentic-engineering.coder", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.recon"] },
   { fact = "assignment.artifact_kinds", op = "not_in", value = ["report", "spec", "doc", "data", "other"] },
 ]
 [rule.remedy]

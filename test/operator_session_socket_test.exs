@@ -423,6 +423,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
 
     File.write!(Path.join(rules_dir, "post.toml"), """
     [[rule]]
+    archetypes = ["*"]
     name = "post-disabled"
     verb = "post"
     deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
@@ -447,6 +448,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
 
     File.write!(Path.join(rules_dir, "post.toml"), """
     [[rule]]
+    archetypes = ["*"]
     name = "post-decision"
     verb = "post"
     effect = "escalate"
