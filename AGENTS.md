@@ -32,6 +32,12 @@ Every candidate or release installation needs the user's exact approval. If
 the release tooling cannot support this flow, report the gap rather than
 substitute a rebuild or publish before the soak.
 
+The fourth release gate requires a recorded health check with a `healthy`
+result for the exact candidate running on the maintainers' production
+deployment under real load, with its installed acceptance closed, before
+publishing or promoting. It does not prevent installing an unpublished
+candidate for testing; the exact-install approval still applies.
+
 Keep a broken published release available. Put a clear do-not-install warning at
 the top of its notes naming the failure and safe replacement, and mark it
 prerelease so it cannot be latest. Delete a release only for a leaked secret or

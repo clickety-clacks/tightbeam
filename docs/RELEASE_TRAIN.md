@@ -79,6 +79,18 @@ If the soak fails or finds a defect, do not publish the candidate. Fix the
 source through a reviewed change to `main` and build a fresh candidate. The
 failed candidate remains unpublished.
 
+## Fourth release gate: production health
+
+Before publishing or promoting a release, record a health check with a
+`healthy` result for the exact candidate build running on the maintainers'
+production deployment under real load, and close the installed acceptance for
+that build. Do not publish or promote until the check is recorded and the
+acceptance is closed.
+
+This gate applies to publishing or promoting a release, not installing an
+unpublished candidate for testing. The separate exact-install approval still
+applies.
+
 ## Publish the same bytes
 
 After a `healthy` soak, manually dispatch `.github/workflows/publish-release.yml`
