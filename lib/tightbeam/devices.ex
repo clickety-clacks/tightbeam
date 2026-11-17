@@ -297,11 +297,15 @@ defmodule Tightbeam.Devices do
   @doc false
   def add_user_with_firehose(db, user_id, is_admin, call) do
     transaction!(db, fn txn ->
-      insert_user(txn, user_id, is_admin)
-      user = StateResources.query_user(txn, user_id)
-      :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
-      Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
-      user
+      if Txn.q(txn, "SELECT 1 FROM users WHERE userId = ?1", [user_id]) != [] do
+        %{code: "user_exists", message: "user already exists: #{user_id}"}
+      else
+        insert_user(txn, user_id, is_admin)
+        user = StateResources.query_user(txn, user_id)
+        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+        Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
+        user
+      end
     end)
   end
 

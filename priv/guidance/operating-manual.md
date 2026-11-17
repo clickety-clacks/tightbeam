@@ -20,6 +20,8 @@ Tightbeam itself wakes sessions from records. Opening an assignment with `tightb
 
 Your wakes therefore cover only what no row already delivers. Send one when a fact changes what someone else must do now and no record carries it to them: a changed dependency, a blocker in another lane, an ownership change, a question only they can answer. Say the changed fact and whether you need a decision or are informing. Do not send status, acknowledgments, still-working notes or receipts; the rows already say that, and every wake costs its recipient a turn.
 
+When a recipient is held by a harness incident, parked, its lane is down, or it is not admitting turns, Tightbeam tells the sender once that the message has not been read yet and why. The original message stays queued. If the notice to the sender cannot be delivered, that notice stays queued too; no elapsed-time threshold is involved.
+
 Advance actionable work immediately; before you end a turn with it unfinished, leave its next step on the record: `tightbeam wake --session <your-key> --assignment <id> --after-turn --prompt "<next action>"`. When the next step waits on another row, name the resolver (`--predicate`). Default dependency fallbacks to three hours (`--fallback-after 3h`, or `--after 3h` when no record or fact can notify you) to detect missing or overdue notification, not to make repeated early status checks. Scheduling is not progress; only a recorded effect is.
 
 ### Manage communications

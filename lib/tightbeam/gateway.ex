@@ -1394,16 +1394,10 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call ->
           p = call.params
 
-          %{
-            user:
-              db
-              |> Devices.add_user_with_firehose(
-                p.user_id,
-                Map.get(p, :is_admin, false),
-                call
-              )
-              |> StateResources.user()
-          }
+          case Devices.add_user_with_firehose(db, p.user_id, Map.get(p, :is_admin, false), call) do
+            %{code: "user_exists"} = refusal -> refusal
+            user -> %{user: StateResources.user(user)}
+          end
         end),
       {"read-marker-set", ["read_marker.updated"]} => fn call ->
         read_marker_result(db, call, :set)
@@ -2486,6 +2480,8 @@ defmodule Tightbeam.Gateway do
 
     wake = Wakes.schedule_in_txn(txn, wake_input)
 
+    maybe_bounce_unresponsive_in_txn(txn, target, [wake.wake_id], origin, nil)
+
     NoticeBatcher.persist_source_attachments_in_txn(
       txn,
       wake.wake_id,
@@ -2680,6 +2676,20 @@ defmodule Tightbeam.Gateway do
 
     case enqueued do
       {:ok, seq} ->
+        source_ids =
+          case opts[:wake_id] do
+            wake_id when is_binary(wake_id) ->
+              case NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id) do
+                [] -> [wake_id]
+                ids -> ids
+              end
+
+            _ ->
+              []
+          end
+
+        maybe_bounce_unresponsive_in_txn(txn, target, source_ids, origin, message.id)
+
         if is_binary(opts[:wake_id]) do
           source_ids = NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
           source_ids = if source_ids == [], do: [opts[:wake_id]], else: source_ids
@@ -2709,6 +2719,85 @@ defmodule Tightbeam.Gateway do
         refuse_undeliverable_turn(txn, target, origin, opts)
     end
   end
+
+  defp maybe_bounce_unresponsive_in_txn(txn, target, source_ids, origin, message_id) do
+    case unresponsive_reason_in_txn(txn, target) do
+      nil -> :ok
+      reason -> bounce_unresponsive_in_txn(txn, target, source_ids, origin, message_id, reason)
+    end
+  end
+
+  defp unresponsive_reason_in_txn(txn, target) do
+    case DB.Txn.q(txn, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [target]) do
+      [[harness, host]] ->
+        parked? =
+          HarnessProcess.parked_in_txn?(txn, {Harness.parse!(harness).id(), "shared", host})
+
+        # Incident membership is a snapshot of affected sessions, not a hold.
+        # A rate-limit incident establishes the adapter park fence that stops turns.
+        incident_hold? =
+          parked? and
+            DB.Txn.q(
+              txn,
+              "SELECT 1 FROM harness_health_incidents WHERE harness=?1 AND host=?2 AND failureClass='rate-limit-dead' AND state='open' LIMIT 1",
+              [harness, host]
+            ) != []
+
+        cond do
+          incident_hold? ->
+            "the recipient is held by a harness incident"
+
+          parked? ->
+            "the recipient's harness is parked"
+
+          Tightbeam.Application.draining?() ->
+            "the recipient is not admitting turns"
+
+          true ->
+            nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp bounce_unresponsive_in_txn(txn, target, source_ids, origin, message_id, reason) do
+    keys = if source_ids == [], do: [message_id], else: source_ids
+
+    Enum.each(keys, fn key ->
+      {creator, source_origin} =
+        case DB.Txn.q(txn, "SELECT creatorSessionKey,origin FROM wakes WHERE wakeId=?1", [key]) do
+          [[creator, source_origin]] -> {creator, source_origin}
+          _ -> {nil, origin}
+        end
+
+      sender = bounce_sender(creator, source_origin)
+      bounce_id = "w_unresponsive_" <> (:crypto.hash(:sha256, key) |> Base.encode16(case: :lower))
+
+      if is_binary(sender) and
+           DB.Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [bounce_id]) == [] do
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: bounce_id,
+          session_key: sender,
+          origin: "process:tightbeam",
+          prompt:
+            "Message #{key} to #{target} has not been read yet because #{reason}. " <>
+              "The original message remains queued.",
+          due_at: System.system_time(:millisecond),
+          target_gate: 1
+        })
+      end
+    end)
+
+    :ok
+  end
+
+  defp bounce_sender(_creator, "process:" <> _), do: nil
+  defp bounce_sender(creator, _origin) when is_binary(creator), do: creator
+  defp bounce_sender(nil, "user:" <> user), do: Org.personal_session_key(user)
+  defp bounce_sender(nil, "session:" <> session), do: session
+  defp bounce_sender(_, _), do: nil
 
   # The wake is still CONSUMED — leaving it pending would redeliver the same
   # undeliverable notice every tick — and the loss is named rather than left as
@@ -2821,7 +2910,37 @@ defmodule Tightbeam.Gateway do
       Wakes.delivery_outcome_committed(db, actual_session_key, opts[:wake_id])
     end
 
-    nudge_lane(Keyword.get(opts, :lane_manager, Tightbeam.LaneManager), actual_session_key)
+    if nudge_lane(Keyword.get(opts, :lane_manager, Tightbeam.LaneManager), actual_session_key) ==
+         :lane_down do
+      DB.transaction(db, fn txn ->
+        if DB.Txn.q(
+             txn,
+             "SELECT 1 FROM turns WHERE sessionKey=?1 AND messageId=?2 AND status='queued'",
+             [actual_session_key, message.id]
+           ) != [] do
+          source_ids =
+            case opts[:wake_id] do
+              wake_id when is_binary(wake_id) ->
+                case NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id) do
+                  [] -> [wake_id]
+                  ids -> ids
+                end
+
+              _ ->
+                []
+            end
+
+          bounce_unresponsive_in_txn(
+            txn,
+            actual_session_key,
+            source_ids,
+            message.sender,
+            message.id,
+            "the recipient's lane is down"
+          )
+        end
+      end)
+    end
 
     :appended
   end
@@ -2839,6 +2958,11 @@ defmodule Tightbeam.Gateway do
   # after it is up again starts the lane.
   defp nudge_lane(lane_manager, session_key) do
     LaneManager.ensure_lane(lane_manager, session_key)
+
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> if Process.alive?(pid), do: :ok, else: :lane_down
+      [] -> :lane_down
+    end
   catch
     :exit, reason ->
       Logger.warning(
@@ -2846,7 +2970,7 @@ defmodule Tightbeam.Gateway do
           "the lane manager's next reconcile starts it: #{inspect(reason)}"
       )
 
-      :ok
+      :lane_down
   end
 
   @doc false

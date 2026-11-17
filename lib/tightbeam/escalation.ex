@@ -962,13 +962,50 @@ defmodule Tightbeam.Escalation do
           )
 
           nudge(opts, result[:ruling_fact_id] && [result.ruling_fact_id])
-          result
+          warn_non_owner_ruling(result, db, call, request_id)
 
         {:error, error} ->
           raise error
       end
     else
       {:error, reason} -> reason
+    end
+  end
+
+  defp warn_non_owner_ruling(%{code: _} = result, _db, _call, _request_id), do: result
+
+  defp warn_non_owner_ruling(result, db, call, request_id) when is_map(result) do
+    case DB.query(db, "SELECT ownerUserId FROM decision_requests WHERE id = ?1", [request_id]) do
+      {:ok, [[owner]]} ->
+        caller_owner =
+          case call.principal do
+            {:user, user} ->
+              user
+
+            {:session, session} ->
+              case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [
+                     session
+                   ]) do
+                {:ok, [[user]]} -> user
+                _ -> nil
+              end
+
+            _ ->
+              owner
+          end
+
+        if caller_owner != owner do
+          warning =
+            "#{principal_id(call)} ruled a request owned by #{owner}; the action proceeded."
+
+          Logger.warning(warning)
+          Map.put(result, :warning, warning)
+        else
+          result
+        end
+
+      _ ->
+        result
     end
   end
 
