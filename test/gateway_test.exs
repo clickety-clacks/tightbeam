@@ -5418,7 +5418,7 @@ defmodule Tightbeam.GatewayTest do
       display_name: "Context switch",
       owner_user_id: "context-owner",
       origin: "user:context-owner",
-      archetype: "coder",
+      archetype: "agentic-engineering.coder",
       host: host,
       harness: "claude",
       provider: "anthropic",
