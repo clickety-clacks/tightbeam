@@ -1243,6 +1243,8 @@ defmodule Tightbeam.Identity do
     end)
     |> Enum.uniq()
     |> Enum.sort()
+  rescue
+    _error -> ["installed kungfu comparison unavailable"]
   end
 
   @doc false
@@ -1256,7 +1258,7 @@ defmodule Tightbeam.Identity do
         nil
 
       paths ->
-        "Installed kungfu is missing from the live identity: " <>
+        "Installed kungfu is missing or unreadable in the live identity: " <>
           Enum.join(paths, ", ") <> ". Run `tightbeam identity relearn` to install it."
     end
   end
@@ -1275,6 +1277,8 @@ defmodule Tightbeam.Identity do
     else
       []
     end
+  rescue
+    _error -> ["#{path} (live rule entries could not be inspected)"]
   end
 
   # A commit on the identity source (main) is not live until it is published.

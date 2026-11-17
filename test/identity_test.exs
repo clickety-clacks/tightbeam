@@ -347,6 +347,32 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["update-ref", "refs/heads/tightbeam/live", absent])
     assert Identity.status(ctx.base).missing_installed_kungfu == [path]
     assert Identity.status(ctx.base).missing_installed_kungfu_notice =~ path
+
+    File.write!(full, "[[reaction]\nname = broken")
+    git!(dir, ["add", path])
+    git!(dir, ["commit", "-m", "simulate malformed live rule file"], "operator")
+    malformed = git!(dir, ["rev-parse", "HEAD"])
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", malformed])
+
+    assert Identity.status(ctx.base).missing_installed_kungfu ==
+             ["#{path} (live rule entries could not be inspected)"]
+
+    assert capture_log(fn ->
+             assert :ok = Tightbeam.Gateway.warn_missing_installed_kungfu(ctx.base)
+           end) =~ path
+
+    assert Identity.live_revision!(ctx.base) == malformed
+
+    File.write!(full, "[reaction]\nname = \"not-a-list\"\n")
+    git!(dir, ["add", path])
+    git!(dir, ["commit", "-m", "simulate table-shaped live reaction"], "operator")
+    malformed_table = git!(dir, ["rev-parse", "HEAD"])
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", malformed_table])
+
+    assert Identity.status(ctx.base).missing_installed_kungfu ==
+             ["#{path} (live rule entries could not be inspected)"]
+
+    assert Identity.live_revision!(ctx.base) == malformed_table
   end
 
   test "shipped engineering bundle keeps completion review without receipt admission",
