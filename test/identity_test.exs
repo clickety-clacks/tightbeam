@@ -50,9 +50,12 @@ defmodule Tightbeam.IdentityTest do
     dir = Path.join(ctx.base, "identity")
     git!(dir, ["update-ref", "-d", "refs/heads/tightbeam/live"])
 
-    assert_raise RuntimeError, ~r/git ls-tree failed/, fn ->
-      Identity.public_kungfu(ctx.base, "unlearned-bundle")
-    end
+    log =
+      capture_log(fn ->
+        assert Identity.public_kungfu(ctx.base, "unlearned-bundle") == nil
+      end)
+
+    assert log =~ "git ls-tree failed (128)"
   end
 
   test "served bootstrap seeds exact identity and raw kungfu without notices", ctx do

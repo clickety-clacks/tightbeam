@@ -1541,7 +1541,8 @@ defmodule Tightbeam.Identity do
         output |> String.split("\n", trim: true) |> Enum.member?(path)
 
       {output, status} ->
-        raise "git ls-tree failed (#{status}): #{output}"
+        Logger.warning("git ls-tree failed (#{status}): #{String.trim(output)}")
+        false
     end
   end
 
