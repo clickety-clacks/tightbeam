@@ -2117,7 +2117,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_session_custody_v1(db)
 
     case DB.finish_schema(db) do
-      :ok -> Tightbeam.Recognition.activate(db)
+      :ok -> :ok
       {:error, error} -> raise error
     end
   end

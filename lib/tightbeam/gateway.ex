@@ -309,6 +309,10 @@ defmodule Tightbeam.Gateway do
       )
     end
 
+    # The schema pass is only the first part of boot. Keep durable recognition
+    # dormant through the remaining migrations and reconciliations above.
+    :ok = Tightbeam.Recognition.activate(db)
+
     (credential_children(config, db) ++
        [
          {ModelCatalog, base_dir: config.base_dir, db: db},
