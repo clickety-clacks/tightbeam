@@ -22,6 +22,7 @@ defmodule Tightbeam.Identity do
   @reserved_prefix "tightbeam__"
   @not_live "nothing changed live, and sessions keep being served the live revision."
   @publish_step "A successful `tightbeam identity edit` publishes everything on main."
+  @publish_step_later "Once it does, a successful `tightbeam identity edit` publishes everything on main."
   @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
   @bundle_setup_path "setup.md"
@@ -1228,15 +1229,17 @@ defmodule Tightbeam.Identity do
 
     case System.cmd("git", ["merge-base", "--is-ancestor", live, source], cd: dir) do
       {_output, 0} -> head <> " " <> @publish_step
-      _ -> head <> " Main does not descend from live, so publication is refused until it does."
+      _ ->
+        head <>
+          " Main does not descend from live, so publication is refused until it does. " <>
+          @publish_step_later
     end
   end
 
   defp unpublished_message(live) do
     "Not published: the live revision is unchanged (#{live}); nothing changed live. " <>
       "The commit exists on the identity source (main) only, and publication needs main " <>
-      "to descend from live; `tightbeam identity status` compares them. Once it does, " <>
-      String.replace_prefix(@publish_step, "A successful", "a successful")
+      "to descend from live; `tightbeam identity status` compares them. " <> @publish_step_later
   end
 
   defp identity_dir(base_dir), do: Path.join(base_dir, "identity")

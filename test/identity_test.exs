@@ -654,6 +654,34 @@ defmodule Tightbeam.IdentityTest do
              "committed straight to main"
   end
 
+  test "status names the publishing step when main does not descend from live", ctx do
+    Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+    live = Identity.live_revision!(ctx.base)
+
+    divergent =
+      git!(dir, [
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@tightbeam.invalid",
+        "commit-tree",
+        "#{live}^{tree}",
+        "-m",
+        "unrelated live"
+      ])
+
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", divergent, live])
+    File.write!(Path.join(dir, "guidance/coder.md"), "main commit")
+    git!(dir, ["add", "-A"])
+    git!(dir, ["commit", "-m", "main commit"], "test")
+
+    assert %{source_notice: notice} = Identity.status(ctx.base)
+    assert notice =~ "nothing changed live"
+    assert notice =~ "does not descend from live"
+    assert notice =~ "a successful `tightbeam identity edit` publishes everything on main"
+  end
+
   test "a refused publication says the commit is not live and names the publishing step", ctx do
     Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")
