@@ -23,8 +23,9 @@ defmodule Tightbeam.Wire.Router do
   (the real client and the black-box drivers speak these; never rename):
   - GET  /version              — no auth; protocolVersion + health numbers.
   - POST /agent/dispatch       — cliToken auth; body {verb, target?, params,
-    as|asUser} → origin resolution; verb must be in the closed AGENT_VERBS
-    set (post excluded on purpose: an agent DM IS a wake-with-prompt).
+    as|asUser} → origin resolution; agent verbs use the closed AGENT_VERBS set.
+    The Chat service's human `post` path uses the org credential; session
+    credentials cannot invoke it.
   - POST /agent/tool-call-observed — SESSION token only; no body. The
     substrate-reserved PreToolUse hook reporting that this session is about to
     run `tightbeam artifact-record`. Not a verb: it writes no domain state, only
@@ -78,7 +79,6 @@ defmodule Tightbeam.Wire.Router do
   @agent_verbs @agent_verbs ++
                  [
                    "assess_attachments",
-                   "post",
                    "session-custody-transfer",
                    "fact-demand",
                    "sentinel-demand",
@@ -333,12 +333,11 @@ defmodule Tightbeam.Wire.Router do
     with {:ok, auth} <- agent_dispatch_auth(conn) do
       with_json(conn, fn body, conn ->
         cond do
+          body["verb"] == "post" and auth == :org ->
+            dispatch_rest_post(conn, auth, body)
+
           body["verb"] == "post" ->
-            with :ok <- allowed_agent_verb("post", auth) do
-              dispatch_rest_post(conn, auth, body)
-            else
-              {:error, status, code, message} -> error(conn, status, code, message)
-            end
+            error(conn, 400, "invalid_message", "verb not allowed: post")
 
           body["verb"] == "assess_attachments" ->
             with :ok <- allowed_agent_verb("assess_attachments", auth) do

@@ -2814,17 +2814,30 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call,
                     %{verb: "wake", origin: "agent:orchestrator:demo", session_key: "orch"}}
 
-    # `post` remains an internal handler-backed verb: the public wire must
-    # reject it before the handler can append a message or enqueue a turn.
+    # Human Chat sends use the org credential. An agent session's own CLI
+    # token must not let it post as its owning user.
     {:ok, [[before_events]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
     {:ok, [[before_messages]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     {:ok, [[before_turns]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
+    session_cli_token = "tbc_orchestrator_session"
+
+    :ok =
+      DB.execute(ctx.db, "UPDATE sessions SET cliToken=?1 WHERE sessionKey=?2", [
+        session_cli_token,
+        actor.session_key
+      ])
+
     disallowed =
-      dispatch_cli(ctx, "tbc_test", %{
+      dispatch_cli(ctx, session_cli_token, %{
         verb: "post",
+        sessionKey: actor.session_key,
         asUser: "flynn",
-        params: %{content: "must not be delivered", clientMessageId: "internal-post-negative"}
+        params: %{
+          content: "must not be delivered",
+          clientMessageId: "c_internal-post-negative",
+          deviceId: ctx.device.device_id
+        }
       })
 
     assert disallowed.status == 400
