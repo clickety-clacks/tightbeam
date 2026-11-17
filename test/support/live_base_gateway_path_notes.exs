@@ -179,8 +179,12 @@ defmodule GuardPathNotes do
                    "\n\ncould not check #{hanging}: check still running; check before relying on it" <>
                    "\nverified present at #{present}"
 
-        assert Process.alive?(check_pid)
-        send(check_pid, :release)
+        # Once the turn's notes are read the unfinished check is ended, not
+        # left running. The forget is cast before the adapter saw the prompt,
+        # so this call is ordered after it.
+        _ = :sys.get_state(PathNotes)
+        refute Process.alive?(check_pid)
+        assert :ets.lookup(PathNotes, {hung.seq, "testhost", hanging}) == []
 
         # A batched delivery carries notes for paths across its members.
         a = Path.join(dir, "a.md")

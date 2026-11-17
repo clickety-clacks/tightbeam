@@ -1546,6 +1546,7 @@ defmodule Tightbeam.Ledger do
       end
 
     Tightbeam.Ephemeral.retire_turn_in_txn(txn, seq)
+    Tightbeam.PathNotes.terminal_in_txn(txn, seq)
 
     TurnLifecycle.append_in_txn(txn, seq, %{
       event_key: "terminal:committed",

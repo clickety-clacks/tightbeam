@@ -1,7 +1,7 @@
 defmodule Tightbeam.PathNotesTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, PathNotes, Placement, Schema, Wakes}
+  alias Tightbeam.{DB, Ledger, PathNotes, Placement, Schema, Wakes}
 
   @hosts ["lab1", "lab2"]
 
@@ -70,13 +70,21 @@ defmodule Tightbeam.PathNotesTest do
                "could not check lab1:/x: check still running; check before relying on it"
     end
 
-    test "a multi-line system error stays on the note's one line" do
+    test "a single-line system error passes through unchanged" do
+      assert PathNotes.note("/x", %{status: "could_not_access", error: "  Permission denied "}) ==
+               "could not check /x:   Permission denied ; check before relying on it"
+    end
+
+    test "line breaks in a system error become spaces so the note stays one line" do
       assert PathNotes.note("/x", %{
                status: "could_not_access",
                error: "ssh: connect to host lab1 port 22: Connection refused\r\n"
              }) ==
                "could not check /x: ssh: connect to host lab1 port 22: Connection refused; " <>
                  "check before relying on it"
+
+      assert PathNotes.note("/x", %{status: "could_not_access", error: " first \nsecond\r\n\n"}) ==
+               "could not check /x:  first  second; check before relying on it"
     end
 
     test "notes follow the delivered text after a blank line" do
@@ -201,6 +209,155 @@ defmodule Tightbeam.PathNotesTest do
         })
 
       assert Enum.map(plan.paths, & &1.display) == ["/w/agent.md"]
+    end
+  end
+
+  describe "check lifecycle" do
+    setup do
+      db = start_supervised!({DB, path: ":memory:", name: :path_notes_lifecycle_db})
+      :ok = Schema.ensure_all(db)
+      register_hosts(db, %{"lab2" => %{ssh: "lab2.test", base_dir: "/b", cli_bin: nil}})
+
+      :ok =
+        DB.execute(db, """
+        INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,createdAt,updatedAt)
+        VALUES ('receiver','receiver','fixture','user:fixture','coder','fixture','fixture_provider','fixture-model','lab2',1,1);
+        """)
+
+      # A stand-in for ssh whose remote check never returns: it records its
+      # process id and waits.
+      dir = Path.join(System.tmp_dir!(), "path-notes-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      pids = Path.join(dir, "pids")
+      ssh = Path.join(dir, "ssh")
+      File.write!(ssh, "#!/bin/sh\necho $$ >> '#{pids}'\nexec sleep 600\n")
+      File.chmod!(ssh, 0o755)
+      parent = self()
+
+      file_stat = fn _path ->
+        send(parent, {:local_check, self()})
+        receive do: (:never -> {:ok, %{}})
+      end
+
+      start_supervised!(
+        {PathNotes, db: db, stat_config: %{ssh_executable: ssh, file_stat: file_stat}}
+      )
+
+      %{db: db, pids: pids}
+    end
+
+    test "a remote check still running when its notes are read is ended with its ssh process",
+         ctx do
+      turn = %{
+        seq: 41,
+        session_key: "receiver",
+        message_id: "m_41",
+        prompt: "read /w/hung.md",
+        wake_id: nil
+      }
+
+      plan = PathNotes.claimed(ctx.db, turn)
+      [os_pid] = await_pids(ctx.pids, 1)
+      assert os_alive?(os_pid)
+
+      assert PathNotes.notes(plan) == [
+               "could not check /w/hung.md: check still running; check before relying on it"
+             ]
+
+      assert :sys.get_state(PathNotes).tracked == %{}
+      assert :ets.tab2list(PathNotes) == []
+      await_gone(os_pid)
+    end
+
+    test "a local check still running when its notes are read is ended", ctx do
+      local = Placement.local_host_name()
+
+      turn = %{
+        seq: 42,
+        session_key: "receiver",
+        message_id: "m_42",
+        prompt: "read #{local}:/w/hung.md",
+        wake_id: nil
+      }
+
+      plan = PathNotes.claimed(ctx.db, turn)
+      assert_receive {:local_check, worker}
+      assert [_note] = PathNotes.notes(plan)
+      assert :sys.get_state(PathNotes).tracked == %{}
+      refute Process.alive?(worker)
+    end
+
+    test "checks for a turn that ends undelivered are ended with it", ctx do
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: "receiver",
+          message_id: "m_cancel",
+          origin: "agent:sender",
+          prompt: "read /w/hung.md"
+        })
+
+      # The enqueue started the check.
+      [os_pid] = await_pids(ctx.pids, 1)
+      assert %{^seq => _} = :sys.get_state(PathNotes).tracked
+
+      {:ok, true} =
+        DB.transaction(ctx.db, fn txn -> Ledger.cancel_queued_in_txn(txn, seq, "test") end)
+
+      # The terminal transition hands the forget to the server after commit.
+      await(fn -> :sys.get_state(PathNotes).tracked == %{} end)
+      assert :ets.tab2list(PathNotes) == []
+      await_gone(os_pid)
+    end
+
+    test "stopping the check server ends its checks", ctx do
+      PathNotes.claimed(ctx.db, %{
+        seq: 43,
+        session_key: "receiver",
+        message_id: "m_43",
+        prompt: "read /w/hung.md",
+        wake_id: nil
+      })
+
+      [os_pid] = await_pids(ctx.pids, 1)
+      # The server learns the process id from the check; wait for that.
+      await(fn ->
+        match?(%{43 => %{} = w} when map_size(w) == 1, :sys.get_state(PathNotes).tracked) and
+          Enum.all?(Map.values(:sys.get_state(PathNotes).tracked[43]), & &1.os_pid)
+      end)
+
+      stop_supervised!(PathNotes)
+      await_gone(os_pid)
+    end
+  end
+
+  defp await_pids(file, count) do
+    await(fn ->
+      case File.read(file) do
+        {:ok, text} -> length(String.split(text, "\n", trim: true)) == count
+        _ -> false
+      end
+    end)
+
+    file |> File.read!() |> String.split("\n", trim: true)
+  end
+
+  defp os_alive?(os_pid),
+    do: match?({_, 0}, System.cmd("kill", ["-0", os_pid], stderr_to_stdout: true))
+
+  defp await_gone(os_pid), do: await(fn -> not os_alive?(os_pid) end)
+
+  defp await(condition, attempts \\ 400) do
+    cond do
+      condition.() ->
+        :ok
+
+      attempts == 0 ->
+        flunk("condition not reached")
+
+      true ->
+        Process.sleep(5)
+        await(condition, attempts - 1)
     end
   end
 end

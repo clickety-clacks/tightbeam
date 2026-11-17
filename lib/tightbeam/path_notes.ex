@@ -151,15 +151,20 @@ defmodule Tightbeam.PathNotes do
   def note(display, :running),
     do: "could not check #{display}: check still running; check before relying on it"
 
-  # A note is one line. The system error is passed through as reported; only
-  # its surrounding whitespace and line breaks are flattened.
+  # The system error is passed through as reported. A note is one line, so an
+  # error that itself contains line breaks has each break replaced by one space
+  # and trailing breaks dropped; no other character changes. (The multi-line
+  # rule is pending the delivery owner's ruling on R6.)
   defp one_line(error) do
-    error
-    |> to_string()
-    |> String.split(~r/\R/, trim: true)
-    |> Enum.map(&String.trim/1)
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.join(" ")
+    error = to_string(error)
+
+    if String.contains?(error, ["\r", "\n"]) do
+      error
+      |> String.replace(~r/(\r\n|\r|\n)+\z/, "")
+      |> String.replace(~r/\r\n|\r|\n/, " ")
+    else
+      error
+    end
   end
 
   @doc "Add notes after delivered content, separated by a blank line."
@@ -244,12 +249,22 @@ defmodule Tightbeam.PathNotes do
   that runs only if the enqueue commits; the enqueue itself does no extra work.
   """
   @spec enqueued_in_txn(Txn.t(), integer()) :: :ok
-  def enqueued_in_txn(%Txn{outbox: token, outbox_owner: owner} = txn, seq)
-      when is_reference(token) and owner == self() do
-    Txn.handoff(txn, __MODULE__, {:enqueued, seq})
-  end
+  def enqueued_in_txn(txn, seq), do: handoff_in_txn(txn, {:enqueued, seq})
 
-  def enqueued_in_txn(%Txn{}, _seq), do: :ok
+  @doc """
+  A turn reached a terminal state: nothing will read its notes, so end any
+  check still running for it and drop its results. Runs after commit.
+  """
+  @spec terminal_in_txn(Txn.t(), integer()) :: :ok
+  def terminal_in_txn(txn, seq), do: handoff_in_txn(txn, {:forget, seq})
+
+  # Migration and other ownerless transactions have no post-commit outbox;
+  # they deliver nothing, so there is nothing to check.
+  defp handoff_in_txn(%Txn{outbox: token, outbox_owner: owner} = txn, message)
+       when is_reference(token) and owner == self(),
+       do: Txn.handoff(txn, __MODULE__, message)
+
+  defp handoff_in_txn(%Txn{}, _message), do: :ok
 
   @doc false
   def plan(q, turn) do
@@ -374,7 +389,12 @@ defmodule Tightbeam.PathNotes do
   defp check_key(plan, entry), do: {plan.seq, entry.checked_host, entry.path}
 
   # ---------------------------------------------------------------------------
-  # Check server: owns the results table and the check processes.
+  # Check server: owns the results table and every check process. A check
+  # runs until it returns or until nothing can use its result any more: its
+  # turn's notes were read, or its turn reached a terminal state. Then the
+  # server ends it, including the ssh process a remote check started. There
+  # is no timeout: a check is never ended for taking long, only for being
+  # unwanted.
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -382,12 +402,16 @@ defmodule Tightbeam.PathNotes do
 
   @impl true
   def init(opts) do
+    # Shutdown ends the checks this server owns.
+    Process.flag(:trap_exit, true)
     :ets.new(@table, [:named_table, :protected, :set, read_concurrency: true])
 
     {:ok,
      %{
        db: Keyword.fetch!(opts, :db),
        stat_config: Keyword.get(opts, :stat_config, %{}),
+       # seq => %{check key => %{pid: worker, os_pid: external command or nil}}
+       # for the checks of that turn still running.
        tracked: %{}
      }}
   end
@@ -426,54 +450,123 @@ defmodule Tightbeam.PathNotes do
       {:noreply, state}
   end
 
-  def handle_cast({:start, plan, :claimed}, state) do
-    # A session runs one turn at a time in seq order, so once a later turn is
-    # claimed no earlier turn of that session will read its notes.
-    stale =
-      for {seq, session_key} <- state.tracked,
-          session_key == plan.session_key and seq < plan.seq,
-          do: seq
-
-    state = Enum.reduce(stale, state, &forget(&2, &1))
-    {:noreply, start(state, plan)}
-  end
-
+  def handle_cast({:start, plan, :claimed}, state), do: {:noreply, start(state, plan)}
   def handle_cast({:forget, seq}, state), do: {:noreply, forget(state, seq)}
 
   @impl true
+  def handle_info({:started, {seq, _host, _path} = key, os_pid}, state) do
+    case state.tracked do
+      %{^seq => %{^key => worker} = workers} ->
+        workers = Map.put(workers, key, %{worker | os_pid: os_pid})
+        {:noreply, put_in(state.tracked[seq], workers)}
+
+      _ ->
+        # Its turn was forgotten before the command reported its process.
+        kill_os_process(os_pid)
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:checked, {seq, _host, _path} = key, result}, state) do
-    if Map.has_key?(state.tracked, seq), do: :ets.insert(@table, {key, {:done, result}})
-    {:noreply, state}
+    case state.tracked do
+      %{^seq => workers} ->
+        :ets.insert(@table, {key, {:done, result}})
+        {:noreply, put_in(state.tracked[seq], Map.delete(workers, key))}
+
+      _ ->
+        {:noreply, state}
+    end
   end
 
   def handle_info(_message, state), do: {:noreply, state}
 
-  defp start(state, plan) do
-    server = self()
-
-    Enum.each(plan.paths, fn entry ->
-      key = check_key(plan, entry)
-
-      if :ets.insert_new(@table, {key, :running}) do
-        stat_config = state.stat_config
-        spawn(fn -> send(server, {:checked, key, check(entry, stat_config)}) end)
-      end
-    end)
-
-    %{state | tracked: Map.put(state.tracked, plan.seq, plan.session_key)}
+  @impl true
+  def terminate(_reason, state) do
+    Enum.each(state.tracked, fn {_seq, workers} -> stop_workers(workers) end)
   end
 
-  defp check(%{route: {:error, reason}}, _config),
+  defp start(state, plan) do
+    server = self()
+    stat_config = state.stat_config
+
+    workers =
+      Enum.reduce(plan.paths, Map.get(state.tracked, plan.seq, %{}), fn entry, workers ->
+        key = check_key(plan, entry)
+
+        if :ets.insert_new(@table, {key, :running}) do
+          pid =
+            spawn_link(fn ->
+              send(server, {:checked, key, check(entry, stat_config, server, key)})
+            end)
+
+          Map.put(workers, key, %{pid: pid, os_pid: nil})
+        else
+          workers
+        end
+      end)
+
+    put_in(state.tracked[plan.seq], workers)
+  end
+
+  defp check(%{route: {:error, reason}}, _config, _server, _key),
     do: %{status: "could_not_access", error: reason}
 
-  defp check(%{route: {:ok, route}, path: path}, config) do
+  defp check(%{route: {:ok, %{ssh: destination}}, path: path}, config, server, key)
+       when is_binary(destination) do
+    case Map.get(config, :ssh_executable) || System.find_executable("ssh") do
+      nil ->
+        %{status: "could_not_access", error: "ssh executable not found"}
+
+      ssh ->
+        port =
+          Port.open({:spawn_executable, ssh}, [
+            :binary,
+            :exit_status,
+            :stderr_to_stdout,
+            :hide,
+            args: ["-o", "BatchMode=yes", destination, AttestFileCheck.remote_command(path)]
+          ])
+
+        {:os_pid, os_pid} = Port.info(port, :os_pid)
+        send(server, {:started, key, os_pid})
+        {output, status} = collect(port, [])
+        AttestFileCheck.remote_result(output, status)
+    end
+  rescue
+    error -> %{status: "could_not_access", error: Exception.message(error)}
+  end
+
+  defp check(%{route: {:ok, route}, path: path}, config, _server, _key) do
     AttestFileCheck.stat(route, path, config)
   rescue
     error -> %{status: "could_not_access", error: Exception.message(error)}
   end
 
+  defp collect(port, output) do
+    receive do
+      {^port, {:data, data}} -> collect(port, [output, data])
+      {^port, {:exit_status, status}} -> {IO.iodata_to_binary(output), status}
+    end
+  end
+
   defp forget(state, seq) do
+    stop_workers(Map.get(state.tracked, seq, %{}))
     :ets.match_delete(@table, {{seq, :_, :_}, :_})
     %{state | tracked: Map.delete(state.tracked, seq)}
+  end
+
+  defp stop_workers(workers) do
+    Enum.each(workers, fn {_key, %{pid: pid, os_pid: os_pid}} ->
+      if os_pid, do: kill_os_process(os_pid)
+      Process.unlink(pid)
+      Process.exit(pid, :kill)
+    end)
+  end
+
+  defp kill_os_process(os_pid) do
+    System.cmd("kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    :ok
+  rescue
+    _ -> :ok
   end
 end

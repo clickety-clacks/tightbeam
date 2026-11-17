@@ -118,6 +118,15 @@ defmodule Tightbeam.AttestFileCheck do
   end
 
   defp remote_file_result(destination, path, config) do
+    runner = Map.get(config, :sh, &system_cmd/1)
+    {output, status} = runner.(["ssh", "-o", "BatchMode=yes", destination, remote_command(path)])
+    remote_result(output, status)
+  rescue
+    error in ErlangError -> %{status: "could_not_access", error: Exception.message(error)}
+  end
+
+  @doc "The remote shell command that stats `path` and prints the outcome as JSON."
+  def remote_command(path) do
     script = """
     import errno, json, os, sys
     try:
@@ -128,31 +137,27 @@ defmodule Tightbeam.AttestFileCheck do
         print(json.dumps({"status": status, "error": error.strerror, "errno": error.errno}))
     """
 
-    command = "python3 -c #{quote_shell(script)} #{quote_shell(path)}"
-    runner = Map.get(config, :sh, &system_cmd/1)
+    "python3 -c #{quote_shell(script)} #{quote_shell(path)}"
+  end
 
-    case runner.(["ssh", "-o", "BatchMode=yes", destination, command]) do
-      {output, 0} ->
-        case JSON.decode(output) do
-          {:ok, %{"status" => "present"}} ->
-            %{status: "present"}
+  @doc "Read the result of `remote_command/1` from the ssh output and exit status."
+  def remote_result(output, 0) do
+    case JSON.decode(output) do
+      {:ok, %{"status" => "present"}} ->
+        %{status: "present"}
 
-          {:ok, %{"status" => "absent"}} ->
-            %{status: "absent"}
+      {:ok, %{"status" => "absent"}} ->
+        %{status: "absent"}
 
-          {:ok, %{"status" => "could_not_access", "error" => error}} ->
-            %{status: "could_not_access", error: error}
+      {:ok, %{"status" => "could_not_access", "error" => error}} ->
+        %{status: "could_not_access", error: error}
 
-          _ ->
-            %{status: "could_not_access", error: output}
-        end
-
-      {output, _status} ->
+      _ ->
         %{status: "could_not_access", error: output}
     end
-  rescue
-    error in ErlangError -> %{status: "could_not_access", error: Exception.message(error)}
   end
+
+  def remote_result(output, _status), do: %{status: "could_not_access", error: output}
 
   defp system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
   defp quote_shell(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
