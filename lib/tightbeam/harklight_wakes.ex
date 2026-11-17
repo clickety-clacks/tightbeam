@@ -2130,9 +2130,11 @@ defmodule Tightbeam.HarklightWakes do
 
   @impl true
   def handle_call({:restore_listener, session_key, handle}, _from, state) do
+    # The conversation belongs to its current receiver: a custody transfer or
+    # retirement handoff moves it off the session that first opened it.
     case DB.query(
            state.db,
-           "SELECT sessionKey,host,state FROM harklight_wake_handles WHERE handle=?1",
+           "SELECT COALESCE(currentReceiverSessionKey,sessionKey),host,state FROM harklight_wake_handles WHERE handle=?1",
            [handle]
          ) do
       {:ok, [[^session_key, host, handle_state]]}

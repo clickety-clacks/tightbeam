@@ -2397,6 +2397,77 @@ defmodule Tightbeam.HarklightWakesTest do
     assert prompt =~ "same-session reply"
   end
 
+  test "Gateway listener restoration follows the conversation's current receiver", %{
+    db: db,
+    call: call,
+    session: session,
+    main: main
+  } do
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='complete' WHERE handle=?1",
+               [@handle]
+             )
+
+    parent = self()
+
+    listener = fn manager, handle, vendor_id ->
+      send(parent, {:listener_started, handle, vendor_id})
+      :ok = GenServer.call(manager, {:attached, handle})
+
+      receive do
+        :stop -> :ok
+      end
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes, db: db, listener: listener, send_runner: lifecycle_runner(db)}
+      )
+
+    assert :sys.get_state(manager).workers == %{}
+
+    # Custody moved the conversation from its origin session to Main.
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE harklight_wake_handles SET state='unavailable',lastError='listener_stopped',currentReceiverSessionKey=?2 WHERE handle=?1",
+               [@handle, main.session_key]
+             )
+
+    receiver_call = %{
+      call
+      | session_key: main.session_key,
+        principal: {:session, main.session_key},
+        transport_session_key: main.session_key
+    }
+
+    assert %{code: "harklight_origin_mismatch", outcome: "refused"} =
+             HarklightWakes.restore_listener(db, call, @handle)
+
+    refute_receive {:listener_started, @handle, _vendor_id}
+
+    # The origin session then retires; the receiver still owns the conversation.
+    assert {:ok, _} =
+             DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               session.session_key
+             ])
+
+    assert %{outcome: "refused"} = HarklightWakes.restore_listener(db, call, @handle)
+
+    assert %{
+             command: "listener-restore",
+             outcome: "requested",
+             listener_state: "restoring",
+             handle: @handle,
+             session_key: receiver_key
+           } = HarklightWakes.restore_listener(db, receiver_call, @handle)
+
+    assert receiver_key == main.session_key
+    assert_receive {:listener_started, @handle, _vendor_id}
+  end
+
   for saved_error <- ["listener_stopped", "attachment_refused"] do
     @saved_error saved_error
     test "restart restores an existing #{@saved_error} handle without changing captured state", %{
