@@ -370,7 +370,15 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    caller = Task.async(fn -> GenServer.call(server, {:status, :openai, System.monotonic_time(:millisecond) + 5_000}, 6_000) end)
+    caller =
+      Task.async(fn ->
+        GenServer.call(
+          server,
+          {:status, :openai, System.monotonic_time(:millisecond) + 5_000},
+          6_000
+        )
+      end)
+
     assert_receive {:status_probe_started, worker}
     monitor = Process.monitor(worker)
     assert map_size(:sys.get_state(server).status_reads) == 1
@@ -397,7 +405,14 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    caller = Task.async(fn -> GenServer.call(server, {:status, :openai, System.monotonic_time(:millisecond) + 5_000}, 6_000) end)
+    caller =
+      Task.async(fn ->
+        GenServer.call(
+          server,
+          {:status, :openai, System.monotonic_time(:millisecond) + 5_000},
+          6_000
+        )
+      end)
 
     for _ <- 1..3 do
       assert_receive {:status_command, worker, _command}
@@ -503,13 +518,18 @@ defmodule Tightbeam.CredentialsTest do
     kind = Task.async(fn -> GenServer.call(server_name, {:kind, :openai}, :infinity) end)
     assert_receive {:kind_probe_started, worker}
 
-    caller = Task.async(fn ->
-      try do
-        GenServer.call(server_name, {:status, :openai, System.monotonic_time(:millisecond) + 5_000}, 5_000)
-      catch
-        :exit, {:timeout, _} -> :timed_out
-      end
-    end)
+    caller =
+      Task.async(fn ->
+        try do
+          GenServer.call(
+            server_name,
+            {:status, :openai, System.monotonic_time(:millisecond) + 5_000},
+            5_000
+          )
+        catch
+          :exit, {:timeout, _} -> :timed_out
+        end
+      end)
 
     assert :timed_out = Task.await(caller, 6_000)
 
@@ -707,7 +727,15 @@ defmodule Tightbeam.CredentialsTest do
         ssh_bin: script
       )
 
-    caller = Task.async(fn -> GenServer.call(server, {:status, :openai, System.monotonic_time(:millisecond) + 5_000}, 6_000) end)
+    caller =
+      Task.async(fn ->
+        GenServer.call(
+          server,
+          {:status, :openai, System.monotonic_time(:millisecond) + 5_000},
+          6_000
+        )
+      end)
+
     read = await_status_read(server)
     monitor = Process.monitor(read.pid)
 

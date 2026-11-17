@@ -872,11 +872,12 @@ defmodule Tightbeam.Credentials do
         answer =
           if System.monotonic_time(:millisecond) < read.deadline and
                not match?({:unavailable, %{reason: :timeout}}, result),
-            do: result,
-            else: unanswered(state, read.provider)
+             do: result,
+             else: unanswered(state, read.provider)
 
         GenServer.reply(read.from, answer)
         state = %{state | status_reads: reads}
+
         state =
           if match?(:onboarded, answer) or match?({:needs_onboarding, _}, answer),
             do: put_in(state.last_status[read.provider], answer),
