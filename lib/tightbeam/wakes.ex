@@ -5095,10 +5095,13 @@ defmodule Tightbeam.Wakes do
 
   defp retirement_no_replacement_without_liveness?(_command, _outcome), do: false
 
+  # Retirement closes assignments in the same transaction before disposing their
+  # notices. That closed assignment is the disposition proof even when its
+  # parent work item stays open without a pending routing or inactivity wake.
   defp completed_assignment_without_liveness?(
          txn,
          %{
-           requester: %{kind: "process", id: "tightbeam:assignments"},
+           requester: %{kind: "process", id: requester_id},
            reason_kind: "obligation_disposed",
            causal_source: %{kind: "assignment_transition", id: assignment_id}
          },
@@ -5109,7 +5112,8 @@ defmodule Tightbeam.Wakes do
          },
          %{assignment_id: assignment_id},
          %{kind: "work_item", id: work_item_id, impact: "linked_work_open"}
-       ) do
+       )
+       when requester_id in ["tightbeam:assignments", "tightbeam:retirement"] do
     case Txn.q(
            txn,
            "SELECT 1 FROM assignments WHERE id=?1 AND workItemId=?2 AND state='closed'",
