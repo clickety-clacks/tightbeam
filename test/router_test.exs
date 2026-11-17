@@ -2823,10 +2823,10 @@ defmodule Tightbeam.Wire.RouterTest do
     session_cli_token = "tbc_orchestrator_session"
 
     :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET cliToken=?1 WHERE sessionKey=?2", [
-        session_cli_token,
-        actor.session_key
-      ])
+      DB.execute(
+        ctx.db,
+        "UPDATE sessions SET cliToken='tbc_orchestrator_session' WHERE sessionKey='orch'"
+      )
 
     disallowed =
       dispatch_cli(ctx, session_cli_token, %{
