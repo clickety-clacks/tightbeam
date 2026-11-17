@@ -1040,6 +1040,10 @@ defmodule Tightbeam.GatewayTest do
        ctx do
     alias Tightbeam.{Roles, Wakes}
 
+    # This test owns the ledger claim below. Keep its recipient present in the
+    # lane registry so delivery does not create an unrelated lane-down bounce.
+    {:ok, _} = Registry.register(Tightbeam.LaneRegistry, "k1", nil)
+
     Org.create(ctx.db, %{
       session_key: "k2",
       display_name: "Second",
