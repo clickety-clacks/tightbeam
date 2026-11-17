@@ -271,31 +271,7 @@ defmodule Tightbeam.OperationalReceiptsTest do
     end
 
     test "7: an identity declaring attest-operational-evidence loads and changes nothing", ctx do
-      rules = Path.join([ctx.base_dir, "identity", "rules", "engineering.toml"])
-      shipped = File.read!(rules)
-      refute shipped =~ "attest-operational-evidence"
-
-      File.write!(rules, """
-      [[policy]]
-      name = "operational-evidence-for-unfiled-live-effects"
-      purpose = "attest-operational-evidence"
-      when = [
-        { fact = "assignment.effect_kind", op = "eq", value = "live_mutation" },
-        { fact = "assignment.declared_files_present", op = "eq", value = false },
-      ]
-
-      #{shipped}
-      """)
-
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-          assert Enum.any?(loaded, &(&1.name == "completion-requires-review"))
-        end)
-
-      assert log =~
-               "policy \"operational-evidence-for-unfiled-live-effects\" skipped: " <>
-                 "purpose attest-operational-evidence is retired"
+      declare_operational_policy!(ctx)
 
       evidence_card_completes(ctx)
       receipt_failures_refuse(ctx)
@@ -355,6 +331,258 @@ defmodule Tightbeam.OperationalReceiptsTest do
     end
   end
 
+  # Amendment A2 r2 (art_567d7cbf): policy cards join the receipt route; code,
+  # coordination, release and review cards keep their gates.
+  describe "A2: policy cards verify from receipts" do
+    test "T-P1: a receipt-verified policy card still needs its review to complete", ctx do
+      item = item(ctx)
+      card = card(ctx, item.id, "policy")
+      receipt = receipt(ctx, item.id)
+
+      # Unverified and unreviewed, the shipped review rule answers first; T-U5
+      # shows completion-requires-verification refusing once the review exists.
+      assert {:error, %{reason: "remedy_fired", rule: "completion-requires-review"}} =
+               complete(ctx, card)
+
+      refute Map.has_key?(get(ctx, card), :operationalVerification)
+
+      assert {:ok, %{attest: %{verdictKind: "verified", commitRefs: nil} = verified}} =
+               verify(ctx, card, [receipt])
+
+      assert {:error, refusal} = complete(ctx, card)
+      assert %{reason: "remedy_fired", rule: "completion-requires-review"} = refusal
+      refute inspect(refusal) =~ "operational_receipt"
+      assert rule_text("completion-requires-review") =~ "policy"
+
+      review = card(ctx, item.id, "review", holder: ctx.reviewer, reviews: card.id)
+
+      assert {:ok, %{attest: clean}} =
+               attest(ctx, ctx.reviewer, %{
+                 assignment_id: review.id,
+                 kind: "verdict",
+                 verdict_kind: "reviewed-clean"
+               })
+
+      assert {:ok, %{operationalVerification: shown}} = complete(ctx, card)
+
+      assert shown == %{
+               verifiedAttestId: verified.id,
+               receipts: [%{artifactId: receipt.id, sha256: receipt.hash}],
+               review: %{
+                 attestId: clean.id,
+                 assignmentId: review.id,
+                 holderKey: ctx.reviewer,
+                 linked: true
+               }
+             }
+    end
+
+    test "T-P2: a policy card needs commits or receipts; only an artifact pair gets a hint",
+         ctx do
+      policy_card_requires_receipts(ctx)
+    end
+
+    test "T-P3: every receipt failure on a policy card is named and nothing is written", ctx do
+      receipt_failures_refuse(ctx, "policy")
+
+      item = item(ctx)
+      card = card(ctx, item.id, "policy")
+      receipt = receipt(ctx, item.id)
+
+      assert %{code: "operational_receipt_malformed", message: message} =
+               refused(verify(ctx, card, [receipt, receipt]))
+
+      assert message =~ "duplicate receipt"
+      assert attests(ctx, card) == []
+    end
+
+    test "T-P4: commitRefs alone still verify a policy card", ctx do
+      item = item(ctx)
+      card = card(ctx, item.id, "policy")
+
+      assert {:ok, %{attest: %{commitRefs: [_]} = committed}} =
+               attest(ctx, ctx.holder, Map.put(verified_params(card, []), :commit_refs, refs()))
+
+      refute Map.has_key?(committed, :receipts)
+    end
+
+    test "T-P5: a policy card with declared files verifies from receipts; file outcomes hold",
+         ctx do
+      item = item(ctx)
+      filed = card(ctx, item.id, "policy", files: ["guidance/note.md"])
+      receipt = receipt(ctx, item.id)
+
+      for contract <- [nil, @replacement] do
+        with_contract(contract, fn ->
+          assert %{code: without_receipts} = refused(verify(ctx, filed, []))
+
+          assert without_receipts ==
+                   if(contract,
+                     do: "file_effect_evidence_policy_inactive",
+                     else: "invalid_commit_refs"
+                   )
+
+          assert %{code: "file_effect_evidence_policy_inactive"} =
+                   refused(attest(ctx, ctx.holder, artifact_pair(filed, receipt)))
+        end)
+      end
+
+      assert attests(ctx, filed) == []
+      assert {:ok, %{attest: %{receipts: [_]}}} = verify(ctx, filed, [receipt])
+    end
+
+    test "T-P (R8): policy outcomes hold in the replacement admission phase", ctx do
+      with_contract(@replacement, fn ->
+        receipts_prepare(ctx, "policy")
+        policy_card_requires_receipts(ctx)
+        receipt_failures_refuse(ctx, "policy")
+      end)
+    end
+
+    test "T-P (R8): a declared attest-operational-evidence policy changes no policy outcome",
+         ctx do
+      declare_operational_policy!(ctx)
+
+      for contract <- [nil, @replacement] do
+        with_contract(contract, fn ->
+          receipts_prepare(ctx, "policy")
+          policy_card_requires_receipts(ctx)
+          receipt_failures_refuse(ctx, "policy")
+        end)
+      end
+    end
+
+    test "T-U4: coordination and release cards keep their gates", ctx do
+      for effect_kind <- ["coordination", "release"] do
+        item = item(ctx)
+        card = card(ctx, item.id, effect_kind)
+        receipt = receipt(ctx, item.id)
+
+        assert %{code: "operational_receipts_not_applicable", message: message} =
+                 refused(verify(ctx, card, [receipt]))
+
+        assert message =~ "effect kind #{effect_kind} is not operational"
+
+        for contract <- [nil, @replacement] do
+          with_contract(contract, fn ->
+            assert %{code: "invalid_commit_refs"} = refused(verify(ctx, card, []))
+
+            assert %{code: "invalid_commit_refs"} =
+                     refused(attest(ctx, ctx.holder, artifact_pair(card, receipt)))
+          end)
+        end
+
+        assert attests(ctx, card) == []
+
+        assert {:ok, %{attest: %{verdictKind: "verified", commitRefs: [_]}}} =
+                 attest(
+                   ctx,
+                   ctx.holder,
+                   Map.put(verified_params(card, []), :commit_refs, refs())
+                 )
+
+        case effect_kind do
+          "coordination" ->
+            assert {:ok, %{assignment: %{state: "closed"}} = completed} = complete(ctx, card)
+            refute Map.has_key?(completed, :operationalVerification)
+
+          "release" ->
+            assert {:error, %{reason: "remedy_fired", rule: "completion-requires-review"}} =
+                     complete(ctx, card)
+        end
+      end
+    end
+
+    test "T-U5: a review alone does not verify a policy card", ctx do
+      item = item(ctx)
+      card = card(ctx, item.id, "policy")
+      review = card(ctx, item.id, "review", holder: ctx.reviewer, reviews: card.id)
+
+      assert {:ok, _} =
+               attest(ctx, ctx.reviewer, %{
+                 assignment_id: review.id,
+                 kind: "verdict",
+                 verdict_kind: "reviewed-clean"
+               })
+
+      assert {:error, %{reason: "remedy_fired", rule: "completion-requires-verification"}} =
+               complete(ctx, card)
+
+      assert Enum.all?(attests(ctx, card), &(&1.verdictKind != "verified"))
+    end
+
+    test "T-U6: the refusal and the served manual name exactly the three kinds", ctx do
+      assert Tightbeam.OperationalReceipts.operational_kinds() ==
+               ~w(live_mutation evidence policy)
+
+      item = item(ctx)
+      code = card(ctx, item.id, "code")
+
+      assert %{code: "operational_receipts_not_applicable", message: message} =
+               refused(verify(ctx, code, [receipt(ctx, item.id)]))
+
+      assert message =~ "receipts verify live_mutation, evidence and policy assignments"
+
+      manual =
+        Path.expand("../priv/skills/tightbeam-operating-manual/SKILL.md", __DIR__)
+        |> File.read!()
+        |> String.replace(~r/\s+/, " ")
+
+      assert manual =~ "`--effect-kind live_mutation`, `evidence` or `policy`"
+    end
+  end
+
+  # A2 T-P2, reused by its R8 variants under each policy and phase variant.
+  defp policy_card_requires_receipts(ctx) do
+    item = item(ctx)
+    card = card(ctx, item.id, "policy")
+    receipt = receipt(ctx, item.id)
+
+    assert %{code: "operational_receipts_required", message: bare} =
+             refused(verify(ctx, card, []))
+
+    assert bare =~ "--receipt <artifactId>:<sha256>"
+    assert bare =~ "--commit-refs"
+    refute bare =~ "To verify from that artifact"
+    refute bare =~ "--receipt #{receipt.id}"
+    refute bare =~ "policy"
+
+    assert %{code: "operational_receipts_required", message: hinted} =
+             refused(attest(ctx, ctx.holder, artifact_pair(card, receipt)))
+
+    assert hinted =~ "--receipt #{receipt.id}:#{receipt.hash}"
+    refute inspect({bare, hinted}) =~ "non_file_operational_evidence_policy_inactive"
+    assert attests(ctx, card) == []
+  end
+
+  defp declare_operational_policy!(ctx) do
+    rules = Path.join([ctx.base_dir, "identity", "rules", "engineering.toml"])
+    shipped = File.read!(rules)
+    refute shipped =~ "attest-operational-evidence"
+
+    File.write!(rules, """
+    [[policy]]
+    name = "operational-evidence-for-unfiled-live-effects"
+    purpose = "attest-operational-evidence"
+    when = [
+      { fact = "assignment.effect_kind", op = "eq", value = "live_mutation" },
+      { fact = "assignment.declared_files_present", op = "eq", value = false },
+    ]
+
+    #{shipped}
+    """)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+        assert Enum.any?(loaded, &(&1.name == "completion-requires-review"))
+      end)
+
+    assert log =~
+             "policy \"operational-evidence-for-unfiled-live-effects\" skipped: " <>
+               "purpose attest-operational-evidence is retired"
+  end
+
   # Test 1, reused by test 7 under each policy and phase variant.
   defp evidence_card_completes(ctx) do
     item = item(ctx)
@@ -379,9 +607,9 @@ defmodule Tightbeam.OperationalReceiptsTest do
     assert {:ok, %{operationalVerification: ^shown}} = complete(ctx, card)
   end
 
-  defp receipts_prepare(ctx) do
+  defp receipts_prepare(ctx, effect_kind \\ "evidence") do
     item = item(ctx)
-    card = card(ctx, item.id, "evidence")
+    card = card(ctx, item.id, effect_kind)
     receipt = receipt(ctx, item.id)
 
     call = %{
@@ -398,10 +626,10 @@ defmodule Tightbeam.OperationalReceiptsTest do
   end
 
   # Test 4, reused by test 7 under each policy and phase variant.
-  defp receipt_failures_refuse(ctx) do
+  defp receipt_failures_refuse(ctx, effect_kind \\ "live_mutation") do
     item = item(ctx)
     other_item = item(ctx)
-    card = card(ctx, item.id, "live_mutation")
+    card = card(ctx, item.id, effect_kind)
     good = receipt(ctx, item.id)
     other = receipt(ctx, other_item.id)
 
@@ -459,7 +687,7 @@ defmodule Tightbeam.OperationalReceiptsTest do
                )
     end
 
-    unlinked_card = card(ctx, nil, "live_mutation")
+    unlinked_card = card(ctx, nil, effect_kind)
 
     assert %{code: "operational_receipt_unlinked", message: message} =
              refused(verify(ctx, unlinked_card, [good]))

@@ -38,9 +38,10 @@ Do not file completion for unfulfilled work or treat a wake as the release.
 
 ## Verifying operational work from receipts
 
-An assignment whose opener recorded `--effect-kind live_mutation` or `evidence`
-did its work outside a repository. Its holder verifies it with `attest <id> --kind
-verdict --verdict verified --receipt <artifactId>:<sha256>`, repeatable, citing
+An assignment whose opener recorded `--effect-kind live_mutation`, `evidence` or
+`policy` delivered an operation or a document rather than commits. Its holder may
+verify it with `attest <id> --kind verdict --verdict verified --receipt
+<artifactId>:<sha256>`, repeatable, citing
 artifacts recorded on the assignment's work item by their recorded hash. Every
 receipt must pass or nothing is written: `operational_receipt_missing` (no row, or
 released), `operational_receipt_unlinked` (another work item, or none),
