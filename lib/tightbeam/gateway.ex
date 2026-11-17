@@ -4719,6 +4719,13 @@ defmodule Tightbeam.Gateway do
       [[item, published_at]] ->
         %{"liveRevision" => revision} = JSON.decode!(item)
 
+        # This runs in the database writer at every turn end, so its cost must
+        # not grow with turn history. A session's turns start in `seq` order, so
+        # its newest started turn alone decides whether it ran after the
+        # publication: one index step per session. Asking instead whether ANY
+        # turn started after the publication reads every turn row of every
+        # session that is behind, which on a large org held the writer for
+        # seconds per turn end from the moment a revision was published.
         [[late_count]] =
           Txn.q(
             txn,
@@ -4727,11 +4734,13 @@ defmodule Tightbeam.Gateway do
             FROM sessions AS session
             WHERE session.state = 'active'
               AND session.identityRevision IS NOT ?1
-              AND EXISTS (
-                SELECT 1 FROM turns AS turn
+              AND (
+                SELECT turn.startedAt FROM turns AS turn
                 WHERE turn.sessionKey = session.sessionKey
-                  AND turn.startedAt >= ?2
-              )
+                  AND turn.startedAt IS NOT NULL
+                ORDER BY turn.seq DESC
+                LIMIT 1
+              ) >= ?2
             """,
             [revision, published_at]
           )
@@ -10507,6 +10516,14 @@ defmodule Tightbeam.Gateway do
          |> ErrorDiagnostic.put(
            ErrorDiagnostic.from_reason(reason, operation: "credential_status", provider: provider)
          )}
+
+      {:pending, nil} ->
+        {:error,
+         %{
+           code: "credential_status_pending",
+           message:
+             "Credential status has not answered yet for #{provider} on #{machine}; retry later"
+         }}
     end
   end
 
