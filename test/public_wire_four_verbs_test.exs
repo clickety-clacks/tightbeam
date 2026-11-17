@@ -273,7 +273,8 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert cross_owner_observer.status == 200, cross_owner_observer.resp_body
     assert other_incident_count(ctx.db) == 1
 
-    # A session may report a failure seen on another user's session.
+    # A session may report the same failure seen on another user's session; it
+    # attaches to the open incident.
     cross_owner_target =
       dispatch_cli(ctx, source.cli_token, %{
         observe_body
@@ -285,8 +286,8 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
       })
 
     assert cross_owner_target.status == 200, cross_owner_target.resp_body
-    assert JSON.decode!(cross_owner_target.resp_body)["result"]["status"] == "opened"
-    assert other_incident_count(ctx.db) == 2
+    assert JSON.decode!(cross_owner_target.resp_body)["result"]["status"] == "attached"
+    assert other_incident_count(ctx.db) == 1
 
     recovery_condition = "a normal provider turn completes"
 
