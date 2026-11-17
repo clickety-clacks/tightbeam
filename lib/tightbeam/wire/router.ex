@@ -272,11 +272,7 @@ defmodule Tightbeam.Wire.Router do
 
   get "/version" do
     coordinator = deps(conn)[:adapter_coordinator] || Tightbeam.AdapterCoordinator
-
-    health =
-      if Process.whereis(coordinator),
-        do: Tightbeam.AdapterCoordinator.health(coordinator),
-        else: %{}
+    snapshot = Tightbeam.AdapterHealthSnapshot.read(coordinator)
 
     # builds-identify-bytes: a running gateway states which bytes it is. version is
     # the release version (single home: the CLI-compat policy); build/sha are the
@@ -288,7 +284,8 @@ defmodule Tightbeam.Wire.Router do
       "build" => Tightbeam.BuildStamp.build(),
       "sha" => Tightbeam.BuildStamp.sha(),
       "features" => ["stale-turn-settlement-v1"],
-      "adapters" => health,
+      "adapters" => snapshot.adapters,
+      "adaptersAsOf" => snapshot.as_of,
       "diagnostics" => diagnostic_health(),
       "schedulerMisses" => Tightbeam.SchedulerMisses.count(),
       "eventPaths" => Tightbeam.SchedulerMisses.health()
