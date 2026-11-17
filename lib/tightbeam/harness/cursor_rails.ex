@@ -2,8 +2,8 @@ defmodule Tightbeam.Harness.CursorRails do
   @moduledoc """
   Compile Tightbeam rails into Cursor's hooks config.
 
-  Tightbeam rails are authored once, in the Claude/codex `PreToolUse` shape that
-  `Tightbeam.Rails.hook_settings/0` and `Tightbeam.Rails.probe_entry/0` emit:
+  Tightbeam rails are authored once, in the `PreToolUse` shape that
+  `Tightbeam.Rails.hook_settings/1` compiles for the selected harness:
 
       %{"hooks" => %{"PreToolUse" => [
         %{"matcher" => "Bash",
@@ -72,9 +72,8 @@ defmodule Tightbeam.Harness.CursorRails do
   # Tightbeam PreToolUse `matcher` -> Cursor before-execution hook event.
   #
   # ONLY matchers with a genuine, MATCHER-FAITHFUL BEFORE-execution gate belong
-  # here. Today that is exactly "Bash" -> beforeShellExecution: the reserved
-  # Tightbeam entries (probe, observation, github-auth) and every shipped statute
-  # use "Bash".
+  # here. Today that is exactly "Bash" -> beforeShellExecution: the TOML-backed
+  # checks, artifact observation and every shipped statute use "Bash".
   #
   # MCP is deliberately NOT mapped. A Tightbeam "mcp__<server>__<tool>" matcher
   # gates ONE specific tool, but Cursor's beforeMCPExecution fires for EVERY MCP
@@ -94,10 +93,10 @@ defmodule Tightbeam.Harness.CursorRails do
 
   ## Options
 
-    * `:path` — the PATH the wrapped command runs with. Reserved Tightbeam
-      rails (`github-auth-check`, `tool-call-observed`) invoke the `tightbeam`
-      helper by bare name, and `github-auth-check` in turn needs `gh`; both rely
-      on the harness PATH. Claude and codex inherit it from `common_env`; Cursor
+    * `:path` — the PATH the wrapped command runs with. The GitHub statute check
+      (`github-auth-check`) and artifact observation (`tool-call-observed`)
+      invoke the `tightbeam` helper by bare name, and the GitHub check in turn
+      needs `gh`; both rely on the harness PATH. Claude and codex inherit it from `common_env`; Cursor
       runs under the dedicated execution identity whose launcher sets a FIXED
       system PATH (deliberately — an inherited PATH was a code-execution hole
       into uid 503). So the Cursor wrapper itself sets PATH before running the
@@ -162,7 +161,8 @@ defmodule Tightbeam.Harness.CursorRails do
 
     path_prefix(path) <>
       "in=$(cat); " <>
-      "msg=$(printf '%s' \"$in\" | sh -c \"$(printf '%s' '#{b64}' | base64 -d)\" 2>&1 1>/dev/null); " <>
+      "msg=$(printf '%s' \"$in\" | TIGHTBEAM_SESSION_WORKDIR=\"${CURSOR_PROJECT_DIR:-}\" " <>
+      "sh -c \"$(printf '%s' '#{b64}' | base64 -d)\" 2>&1 1>/dev/null); " <>
       "rc=$?; " <>
       "if [ \"$rc\" = 2 ]; then " <>
       "esc=$(printf '%s' \"$msg\" | #{@json_encode_reason}); " <>

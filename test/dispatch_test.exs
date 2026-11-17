@@ -509,6 +509,8 @@ defmodule Tightbeam.DispatchTest do
 
     rule = %{
       name: "cas-rule",
+      owner: :substrate,
+      archetypes: ["*"],
       verb: "post",
       verbs: ["post"],
       text: "owner approval required",

@@ -197,6 +197,8 @@ defmodule Tightbeam.EphemeralTest do
   test "R2.3 read rules still deny without escalating the helper", %{db: db} do
     rule = %{
       name: "read-approval",
+      owner: :substrate,
+      archetypes: ["*"],
       verb: "inspect",
       verbs: ["inspect"],
       text: "approval required",
@@ -250,7 +252,7 @@ defmodule Tightbeam.EphemeralTest do
       Placement.with_turn_directory(config, helper, fn ->
         path = Placement.holder_workdir(config, helper)
         assert path != "/"
-        assert File.ls!(path) == []
+        assert File.ls!(path) == [".tightbeam-rail-scope.json"]
         File.write!(Path.join(path, "scratch"), "discard")
         path
       end)
@@ -262,7 +264,7 @@ defmodule Tightbeam.EphemeralTest do
       Placement.with_turn_directory(config, helper, fn ->
         next = Placement.holder_workdir(config, helper)
         refute next == path
-        assert File.ls!(next) == []
+        assert File.ls!(next) == [".tightbeam-rail-scope.json"]
         next
       end)
 

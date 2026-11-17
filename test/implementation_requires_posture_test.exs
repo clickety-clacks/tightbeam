@@ -32,10 +32,10 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
-    coder = session(db, "proportionate-coder", "coder")
-    orchestrator = session(db, "proportionate-orchestrator", "orchestrator")
-    reviewer = session(db, "proportionate-reviewer", "reviewer-spec")
-    po = session(db, "proportionate-po", "product-owner")
+    coder = session(db, "proportionate-coder", "agentic-engineering.coder")
+    orchestrator = session(db, "proportionate-orchestrator", "agentic-engineering.orchestrator")
+    reviewer = session(db, "proportionate-reviewer", "agentic-engineering.reviewer-spec")
+    po = session(db, "proportionate-po", "agentic-engineering.product-owner")
 
     Roles.create!(db, "product-owner:posture", "flynn", po.session_key)
 
@@ -85,8 +85,8 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
   # non-coder card on the same item is never gated.
   test "both posture rails load from the shipped bundle", ctx do
     names = Enum.map(ctx.rules, & &1.name)
-    assert "implementation-requires-posture" in names
-    assert "implementation-dispatch-requires-posture" in names
+    assert "agentic-engineering.implementation-requires-posture" in names
+    assert "agentic-engineering.implementation-dispatch-requires-posture" in names
   end
 
   test "a coder card on an unpostured work item is refused on assign and on dispatch",
@@ -94,7 +94,11 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     item = work_item(ctx)
 
     assert {:error,
-            %{code: "rule_denied", rule: "implementation-requires-posture", message: message}} =
+            %{
+              code: "rule_denied",
+              rule: "agentic-engineering.implementation-requires-posture",
+              message: message
+            }} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
@@ -111,7 +115,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     assert {:error,
             %{
               code: "rule_denied",
-              rule: "implementation-dispatch-requires-posture",
+              rule: "agentic-engineering.implementation-dispatch-requires-posture",
               message: dispatch_message
             }} =
              Dispatch.dispatch(
@@ -247,7 +251,8 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
                verdict_call(ctx.orchestrator.session_key, slice.id, "posture-light")
              )
 
-    assert {:error, %{code: "rule_denied", rule: "implementation-requires-posture"}} =
+    assert {:error,
+            %{code: "rule_denied", rule: "agentic-engineering.implementation-requires-posture"}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,

@@ -213,6 +213,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     policy = %{
       name: "operation-evidence",
+      archetypes: ["*"],
       purpose: "attest-operational-evidence",
       source: "test-policy",
       conditions: [
@@ -265,6 +266,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     file_policy = %{
       name: "file-evidence",
+      archetypes: ["*"],
       purpose: "attest-file-effect-evidence",
       source: "test-policy",
       evidence_memento: "example/evidence",
@@ -316,6 +318,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     policy = %{
       name: "a-file",
+      archetypes: ["*"],
       purpose: "attest-file-effect-evidence",
       source: "test-policy",
       evidence_memento: "example/evidence",
@@ -417,6 +420,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     policy = %{
       name: "overbroad-operational",
+      archetypes: ["*"],
       purpose: "attest-operational-evidence",
       source: "test-policy",
       conditions: [%{fact: "assignment.effect_kind", op: "eq", value: "code"}]
@@ -503,6 +507,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     policy = %{
       name: "operation-evidence",
+      archetypes: ["*"],
       purpose: "attest-operational-evidence",
       source: "test-policy",
       conditions: [
@@ -587,6 +592,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     policy = %{
       name: "operation-evidence",
+      archetypes: ["*"],
       purpose: "attest-operational-evidence",
       source: "test-policy",
       conditions: [

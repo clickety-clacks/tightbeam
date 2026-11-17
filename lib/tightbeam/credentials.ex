@@ -1438,7 +1438,7 @@ defmodule Tightbeam.Credentials do
       desired = %{
         harness: module.id(),
         machine: state.machine,
-        rails: Rails.hook_settings(),
+        rails: Rails.hook_settings(module.id()),
         credential_home: home
       }
 
