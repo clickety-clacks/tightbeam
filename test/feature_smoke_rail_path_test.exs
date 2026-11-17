@@ -46,7 +46,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
   # The smoke acts as the user named by TIGHTBEAM_SMOKE_OWNER and has no default.
   setup do
     previous = System.get_env("TIGHTBEAM_SMOKE_OWNER")
-    System.put_env("TIGHTBEAM_SMOKE_OWNER", "mike")
+    System.put_env("TIGHTBEAM_SMOKE_OWNER", "smoke-owner")
 
     on_exit(fn ->
       if previous,
@@ -87,14 +87,16 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     # this fixture has no provider lane, but must own that local doorbell.
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
     register_hosts(db, %{"testhost" => %{ssh: nil, base_dir: base, cli_bin: nil}})
-    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('mike',1,1)")
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('smoke-owner',1,1)")
 
     Org.create(db, %{
-      session_key: Org.personal_session_key("mike"),
+      session_key: Org.personal_session_key("smoke-owner"),
       display_name: "main",
       kind: "main",
-      owner_user_id: "mike",
-      origin: "user:mike",
+      owner_user_id: "smoke-owner",
+      origin: "user:smoke-owner",
       host: "testhost",
       archetype: "default",
       harness: "fixture",
@@ -192,7 +194,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     }
 
     state = %{
-      user_id: Org.get(db, Org.personal_session_key("mike")).owner_user_id,
+      user_id: Org.get(db, Org.personal_session_key("smoke-owner")).owner_user_id,
       port: port,
       token: "tbc_fixture",
       base_dir: base,
@@ -522,7 +524,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
         })
 
       key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-      Roles.create!(ctx.db, "reviewer-code", "mike", key)
+      Roles.create!(ctx.db, "reviewer-code", "smoke-owner", key)
 
       ExUnit.CaptureIO.capture_io(fn ->
         Driver.gate_chain_enforced(
