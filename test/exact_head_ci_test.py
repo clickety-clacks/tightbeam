@@ -219,10 +219,12 @@ class ExactHeadCI(unittest.TestCase):
                 'github.event_name': event, 'inputs.docs_validation': 'off'}), event)
 
     def test_pull_request_suites_stay_off_the_release_pools(self):
-        # Release-candidate and release packaging use the few self-hosted
-        # runners; pull request suites run on hosted runners beside them.
+        # The few self-hosted runners carry release work; pull request,
+        # merge-queue and manual suites run on hosted runners beside them.
         job = self.jobs['test']
-        self.assertIn('    runs-on: ${{ matrix.os }}', job)
+        self.assertIn(
+            "    runs-on: ${{ matrix.name == 'macos' && github.event_name == 'push' && "
+            "fromJSON('[\"self-hosted\", \"tb-macos\"]') || matrix.os }}", job)
         self.assertEqual(re.findall(r'(?m)^          - os: (\S+)$', job),
                          ['ubuntu-24.04', 'macos-latest'])
 

@@ -103,7 +103,10 @@ jobs:
           - os: macos-latest
             platform: darwin-aarch64
     name: test ${{ matrix.platform }}
-    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || matrix.os }}
+    # Candidate jobs run on the self-hosted pools, which carry only release
+    # work, so a candidate never waits behind pull request suites on the
+    # shared hosted macOS runners.
+    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || fromJSON('["self-hosted", "tb-macos"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -121,6 +124,10 @@ jobs:
       - name: Set setup-beam target for the self-hosted Linux runner
         if: matrix.platform == 'linux-x86_64' && runner.environment == 'self-hosted'
         run: echo "ImageOS=ubuntu24" >> "$GITHUB_ENV"
+
+      - name: Set setup-beam target for the self-hosted macOS runner
+        if: matrix.platform == 'darwin-aarch64' && runner.environment == 'self-hosted'
+        run: echo "ImageOS=macos26" >> "$GITHUB_ENV"
 
       - uses: erlef/setup-beam@v1
         with:
@@ -275,7 +282,7 @@ jobs:
           - os: macos-latest
             platform: darwin-aarch64
     name: package ${{ matrix.platform }}
-    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || matrix.os }}
+    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || fromJSON('["self-hosted", "tb-macos"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -290,6 +297,10 @@ jobs:
       - name: Set setup-beam target for the self-hosted Linux runner
         if: matrix.platform == 'linux-x86_64' && runner.environment == 'self-hosted'
         run: echo "ImageOS=ubuntu24" >> "$GITHUB_ENV"
+
+      - name: Set setup-beam target for the self-hosted macOS runner
+        if: matrix.platform == 'darwin-aarch64' && runner.environment == 'self-hosted'
+        run: echo "ImageOS=macos26" >> "$GITHUB_ENV"
 
       - uses: erlef/setup-beam@v1
         with:
