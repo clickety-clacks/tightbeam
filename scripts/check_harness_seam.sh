@@ -37,7 +37,18 @@ fi
 # are named per harness by definition).
 if grep -RnE "$identity" lib config \
   --exclude-dir=harness \
-  --exclude=credentials.ex
+  --exclude=credentials.ex \
+  --exclude=rails.ex
+then
+  echo "harness identity dispatch or list escaped the registry" >&2
+  exit 1
+fi
+
+# R6.7 requires this inline Codex/Pi spawn-probe guard. Exempt only that exact
+# clause from the registry scan; any other harness literal in rails.ex remains
+# visible and fails the same check.
+if perl -0777 -pe 's{defp enabled_for_harness\?\(\%\{check: "spawn-probe"\}, harness\)\s+when harness in \[:codex, :pi, "codex", "pi"\],\s+do: true}{}' \
+  lib/tightbeam/rails.ex | grep -nE "$identity"
 then
   echo "harness identity dispatch or list escaped the registry" >&2
   exit 1

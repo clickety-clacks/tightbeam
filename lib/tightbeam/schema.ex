@@ -55,6 +55,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Projection,
     Tightbeam.AttachmentDelivery,
     Tightbeam.Org,
+    Tightbeam.HarnessSwitchContext,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
     Tightbeam.WorkItems,
@@ -6512,6 +6513,10 @@ defmodule Tightbeam.Schema do
   # Harklight storage is additive and has no historical predecessor. A refused
   # migration must leave the predecessor schema untouched.
   defp bootstrap_module(_db, Tightbeam.HarklightWakes, _current?), do: :ok
+
+  # Switch-context storage has no historical predecessor. Install it in the
+  # later schema pass so a refused R1 stamp leaves the old schema untouched.
+  defp bootstrap_module(_db, Tightbeam.HarnessSwitchContext, _current?), do: :ok
 
   defp bootstrap_module(_db, Tightbeam.NoticeBatcher, _current?), do: :ok
 

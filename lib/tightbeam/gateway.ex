@@ -83,6 +83,7 @@ defmodule Tightbeam.Gateway do
     Harness,
     HarnessHealth,
     HarnessProcess,
+    HarnessSwitchContext,
     HarklightSend,
     HarklightWakes,
     Identity,
@@ -126,6 +127,8 @@ defmodule Tightbeam.Gateway do
   @harness_handoff_content_limit 1_200
   @harness_handoff_attachment_limit 4
   @harness_handoff_metadata_limit 120
+  @harness_switch_compactor_timeout_ms 30_000
+  @harness_switch_compactor_close_timeout_ms 5_000
 
   defmodule EffortRearmRace do
     @moduledoc false
@@ -173,8 +176,6 @@ defmodule Tightbeam.Gateway do
     config = Map.put(config, :db, db)
     :ok = DB.assert_base_admitted!(db, config.base_dir)
     Identity.init_after_admission!(config.base_dir, db)
-    warn_missing_installed_kungfu(config.base_dir)
-    load_law!(config)
     prod_limit = Map.get(config, :prod_limit, 3)
 
     unless is_integer(prod_limit) and prod_limit >= 0 do
@@ -184,6 +185,9 @@ defmodule Tightbeam.Gateway do
     File.mkdir_p!(config.base_dir)
 
     :ok = Schema.ensure_all(db)
+    _ = Tightbeam.Identity.RailScopeMigration.run!(config.base_dir, db)
+    warn_missing_installed_kungfu(config.base_dir)
+    load_law!(config)
     :ok = AdminProjection.bootstrap_served(db, config.base_dir)
     :ok = TerminalCredentialFailure.reconcile_all(db)
 
@@ -3183,9 +3187,15 @@ defmodule Tightbeam.Gateway do
   defp nudge_lane(lane_manager, session_key) do
     LaneManager.ensure_lane(lane_manager, session_key)
 
-    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{pid, _}] -> if Process.alive?(pid), do: :ok, else: :lane_down
-      [] -> :lane_down
+    if Process.whereis(Tightbeam.LaneRegistry) do
+      case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+        [{pid, _}] -> if Process.alive?(pid), do: :ok, else: :lane_down
+        [] -> :lane_down
+      end
+    else
+      # The manager accepted the nudge; without a registry there is no lane
+      # state to inspect (for example, a manager supplied by a caller).
+      :ok
     end
   catch
     :exit, reason ->
@@ -3914,6 +3924,153 @@ defmodule Tightbeam.Gateway do
       :ok
   end
 
+  defp prepare_turn_with_switch_context(
+         db,
+         turn,
+         session,
+         identity_refresh_revision,
+         config
+       ) do
+    prepared =
+      prepare_turn_prompt_content(
+        db,
+        assignment_identity_refresh_brief(turn, identity_refresh_revision),
+        session,
+        config
+      )
+
+    prepare_switch_context(db, turn, session, prepared, config)
+  end
+
+  defp prepare_switch_context(db, turn, session, prepared, config) do
+    if Map.get(config, :harness_switch_context_enabled, false) do
+      coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
+      host = session.host
+      cwd = Placement.holder_workdir(config, session)
+
+      compactor_call = fn compactor, input, instructions ->
+        harness_switch_compactor_call(coordinator, host, cwd, compactor, input, instructions)
+      end
+
+      config =
+        config
+        |> Map.put_new(
+          :harness_switch_context,
+          Application.get_env(:tightbeam, :harness_switch_context, %{})
+        )
+        |> Map.put(:harness_switch_compactor_call, compactor_call)
+
+      case HarnessSwitchContext.prepare_turn(db, turn, session, prepared, config) do
+        {:ok, prepared_turn} ->
+          {:ok, Map.put(prepared, :content, prepared_turn.prompt)}
+
+        {:error, reason} ->
+          {:error, {:context, reason}}
+      end
+    else
+      {:ok, prepared}
+    end
+  end
+
+  @doc false
+  def harness_switch_compactor_call(coordinator, host, cwd, compactor, input, instructions) do
+    with :codex_acp <- Map.get(compactor, :route),
+         harness_module when is_atom(harness_module) <- Map.get(compactor, :harness),
+         harness <- Harness.module!(harness_module),
+         model when is_binary(model) <- Map.get(compactor, :model),
+         {:ok, adapter, _generation} <-
+           AdapterCoordinator.adapter_for_turn(coordinator, {harness.id(), "shared", host}) do
+      selected_model =
+        Model.new(model,
+          effort: Map.get(compactor, :effort),
+          context: Map.get(compactor, :context)
+        )
+
+      case Adapter.new_session(adapter, selected_model, cwd, [], instructions) do
+        {:ok, acp_session_id} ->
+          prompt_result =
+            compactor_adapter_call(fn ->
+              Adapter.prompt(adapter, acp_session_id, input,
+                timeout: @harness_switch_compactor_timeout_ms
+              )
+            end)
+
+          close_result =
+            compactor_adapter_call(fn ->
+              Adapter.close_session(adapter, acp_session_id,
+                request_timeout: @harness_switch_compactor_close_timeout_ms
+              )
+            end)
+
+          compactor_result(prompt_result, close_result, selected_model, input)
+
+        {:error, reason} ->
+          {:error, {:session_create_failed, reason}}
+      end
+    else
+      _ -> {:error, :route_unavailable}
+    end
+  rescue
+    _error -> {:error, :route_unavailable}
+  catch
+    :exit, _reason -> {:error, :route_unavailable}
+  end
+
+  defp compactor_adapter_call(fun) do
+    fun.()
+  rescue
+    _error -> {:error, :route_unavailable}
+  catch
+    :exit, _reason -> {:error, :route_unavailable}
+  end
+
+  defp compactor_result(
+         {:ok, %{stop_reason: "end_turn", text: text}},
+         :ok,
+         selected_model,
+         input
+       )
+       when is_binary(text) and byte_size(text) > 0 do
+    {:ok, text,
+     %{
+       route: "codex_acp",
+       model: Model.to_ref(selected_model),
+       input_bytes: byte_size(input),
+       output_bytes: byte_size(text)
+     }}
+  end
+
+  defp compactor_result(prompt_result, _close_result, _model, _input)
+       when prompt_result in [
+              {:error, :timeout},
+              {:error, :prompt_timeout},
+              {:error, {:acp_request_not_dispatched, :prompt_timeout}}
+            ],
+       do: {:error, :timeout}
+
+  defp compactor_result(
+         {:error, {:prompt_interrupted, {:cancel_unacknowledged, _session_id}}},
+         _close_result,
+         _model,
+         _input
+       ),
+       do: {:error, :timeout}
+
+  defp compactor_result({:error, reason}, _close_result, _model, _input),
+    do: {:error, {:prompt_failed, reason}}
+
+  defp compactor_result(
+         {:ok, %{stop_reason: "end_turn", text: text}},
+         {:error, reason},
+         _model,
+         _input
+       )
+       when is_binary(text) and byte_size(text) > 0,
+       do: {:error, {:session_close_failed, reason}}
+
+  defp compactor_result(_prompt_result, _close_result, _model, _input),
+    do: {:error, :incomplete_or_unusable_response}
+
   defp turn_human_messages(db, turn, session_key) do
     rows =
       case DB.query(
@@ -4396,6 +4553,17 @@ defmodule Tightbeam.Gateway do
                    end
                  end)
                ),
+             {:ok, prepared_prompt} <-
+               stage(
+                 :context,
+                 prepare_turn_with_switch_context(
+                   db,
+                   turn,
+                   active_session,
+                   identity_refresh_revision,
+                   config
+                 )
+               ),
              {:ok, result} <-
                stage_with_session(
                  :prompt,
@@ -4403,12 +4571,7 @@ defmodule Tightbeam.Gateway do
                    db,
                    prompt_adapter,
                    harness_session_id,
-                   prepare_turn_prompt_content(
-                     db,
-                     assignment_identity_refresh_brief(turn, identity_refresh_revision),
-                     active_session,
-                     config
-                   ),
+                   prepared_prompt,
                    trace_dispatch: fn request_id ->
                      case Tightbeam.TurnLifecycle.append(db, turn.seq, %{
                             event_key: "prompt:dispatched",
@@ -6011,63 +6174,69 @@ defmodule Tightbeam.Gateway do
   end
 
   defp identity_repoint_result(config, db, call) do
-    archetype = call.params.archetype
+    with {:ok, resolved_archetype} <- Archetypes.resolve(call.params.archetype) do
+      archetype = resolved_archetype.name
 
-    result =
-      case Org.get(db, call.session_key) do
-        nil ->
-          {:error, :not_found}
+      result =
+        case Org.get(db, call.session_key) do
+          nil ->
+            {:error, :not_found}
 
-        %{state: "retired"} ->
-          repoint_session_record(db, call.session_key, archetype)
+          %{state: "retired"} ->
+            repoint_session_record(db, call.session_key, archetype)
 
-        %{kind: "main"} = session ->
-          repoint_main_session(config, db, session, archetype)
+          %{kind: "main"} = session ->
+            repoint_main_session(config, db, session, archetype)
 
-        %{is_built_in: true} = session ->
-          repoint_main_session(config, db, session, archetype)
+          %{is_built_in: true} = session ->
+            repoint_main_session(config, db, session, archetype)
 
-        _session ->
-          {:error, :not_repointable}
-      end
+          _session ->
+            {:error, :not_repointable}
+        end
 
-    case result do
-      {:ok, session} ->
-        %{
-          state: "repointed",
-          session_key: session.session_key,
-          archetype: session.archetype
-        }
-
-      {:error, :unknown_archetype} ->
-        %{code: "unknown_archetype", message: "unknown archetype: #{archetype}"}
-
-      {:error, :not_found} ->
-        %{code: "not_found", message: "unknown session: #{call.session_key}"}
-
-      {:error, :not_repointable} ->
-        %{
-          code: "session_not_retired",
-          message: "session #{call.session_key} must be retired before archetype repoint"
-        }
-
-      {:error, :turn_in_progress} ->
-        turn_in_progress([call.session_key])
-
-      {:error, :archetype_release_in_progress} ->
-        %{
-          code: "archetype_release_in_progress",
-          message: "cannot repoint to #{archetype} while it is being released"
-        }
-
-      {:error, reason} ->
-        ErrorDiagnostic.put(
+      case result do
+        {:ok, session} ->
           %{
-            code: "identity_repoint_failed",
-            message: "session #{call.session_key} could not change archetype: #{inspect(reason)}"
-          },
-          ErrorDiagnostic.for_reason(reason, operation: "repoint_archetype")
-        )
+            state: "repointed",
+            session_key: session.session_key,
+            archetype: session.archetype
+          }
+
+        {:error, %{code: code} = error}
+        when code in ["unknown_archetype", "qualified_archetype_required"] ->
+          error
+
+        {:error, :not_found} ->
+          %{code: "not_found", message: "unknown session: #{call.session_key}"}
+
+        {:error, :not_repointable} ->
+          %{
+            code: "session_not_retired",
+            message: "session #{call.session_key} must be retired before archetype repoint"
+          }
+
+        {:error, :turn_in_progress} ->
+          turn_in_progress([call.session_key])
+
+        {:error, :archetype_release_in_progress} ->
+          %{
+            code: "archetype_release_in_progress",
+            message: "cannot repoint to #{archetype} while it is being released"
+          }
+
+        {:error, reason} ->
+          ErrorDiagnostic.put(
+            %{
+              code: "identity_repoint_failed",
+              message:
+                "session #{call.session_key} could not change archetype: #{inspect(reason)}"
+            },
+            ErrorDiagnostic.for_reason(reason, operation: "repoint_archetype")
+          )
+      end
+    else
+      {:error, error} -> error
     end
   end
 
@@ -7603,45 +7772,44 @@ defmodule Tightbeam.Gateway do
            }
          } = call
        ) do
-    case DB.transaction(db, fn txn ->
-           if Archetypes.get(archetype_name) do
-             result = Org.put_setting_projected_in_txn(txn, "default-archetype", archetype_name)
+    case Archetypes.resolve(archetype_name) do
+      {:ok, archetype} ->
+        case DB.transaction(db, fn txn ->
+               result = Org.put_setting_projected_in_txn(txn, "default-archetype", archetype.name)
 
-             Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+               Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
 
-             if result.changed do
-               Tightbeam.Firehose.Publisher.committed_in_txn(
-                 txn,
-                 "config.updated",
-                 result.projection,
-                 %{"key" => "default-archetype"}
-               )
-             end
+               if result.changed do
+                 Tightbeam.Firehose.Publisher.committed_in_txn(
+                   txn,
+                   "config.updated",
+                   result.projection,
+                   %{"key" => "default-archetype"}
+                 )
+               end
 
-             {:ok, result}
-           else
-             {:error, :unknown_archetype}
-           end
-         end) do
-      {:ok, {:ok, result}} ->
-        %{
-          setting: "default-archetype",
-          value: archetype_name,
-          config: StateResources.config(result.projection),
-          changed: result.changed
-        }
+               result
+             end) do
+          {:ok, result} ->
+            %{
+              setting: "default-archetype",
+              value: archetype.name,
+              config: StateResources.config(result.projection),
+              changed: result.changed
+            }
 
-      {:ok, {:error, :unknown_archetype}} ->
-        %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
+          {:error, %DB.ReferenceFenceError{archetypes: names}} ->
+            %{
+              code: "archetype_release_in_progress",
+              message: "cannot set default-archetype while releasing #{Enum.join(names, ", ")}"
+            }
 
-      {:error, %DB.ReferenceFenceError{archetypes: names}} ->
-        %{
-          code: "archetype_release_in_progress",
-          message: "cannot set default-archetype while releasing #{Enum.join(names, ", ")}"
-        }
+          {:error, error} ->
+            raise error
+        end
 
       {:error, error} ->
-        raise error
+        error
     end
   end
 
@@ -8786,28 +8954,34 @@ defmodule Tightbeam.Gateway do
 
     # Identity must exist; placement is constitutional set membership
     # (spec §Placement) — Placement denies, we relay, nobody judges.
-    case Archetypes.get(archetype_name) do
-      nil ->
-        %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
+    case Archetypes.resolve(archetype_name) do
+      {:ok, archetype} ->
+        case archetype do
+          %{ephemeral: true} when is_nil(caller.caller_session) ->
+            %{
+              code: "ephemeral_requires_caller",
+              message: "ephemeral spawns require a calling agent"
+            }
 
-      %{ephemeral: true} when is_nil(caller.caller_session) ->
-        %{code: "ephemeral_requires_caller", message: "ephemeral spawns require a calling agent"}
+          %{ephemeral: true} when is_map_key(p, :work_item_id) ->
+            %{
+              code: "ephemeral_obligation",
+              message: "ephemeral spawns cannot bind work items"
+            }
 
-      %{ephemeral: true} when is_map_key(p, :work_item_id) ->
-        %{
-          code: "ephemeral_obligation",
-          message: "ephemeral spawns cannot bind work items"
-        }
+          %{ephemeral: true} ->
+            if Tightbeam.Ephemeral.available?(db) do
+              create_available_spawn(config, db, call, caller, archetype)
+            else
+              %{code: "ephemeral_unavailable", message: "ephemeral migration failed"}
+            end
 
-      %{ephemeral: true} = archetype ->
-        if Tightbeam.Ephemeral.available?(db) do
-          create_available_spawn(config, db, call, caller, archetype)
-        else
-          %{code: "ephemeral_unavailable", message: "ephemeral migration failed"}
+          _ ->
+            create_available_spawn(config, db, call, caller, archetype)
         end
 
-      archetype ->
-        create_available_spawn(config, db, call, caller, archetype)
+      {:error, error} ->
+        error
     end
   end
 
@@ -10122,7 +10296,8 @@ defmodule Tightbeam.Gateway do
          model,
          provider
        ) do
-    handoff = durable_session_handoff(db, session.session_key)
+    context_enabled? = Map.get(config, :harness_switch_context_enabled, false)
+    handoff = if context_enabled?, do: nil, else: durable_session_handoff(db, session.session_key)
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
     destination = %{session | harness: harness, model: model, provider: provider}
 
@@ -10137,17 +10312,29 @@ defmodule Tightbeam.Gateway do
         with {:ok, adapter, _generation} <- resident_adapter(destination),
              revision = session.identity_revision || Identity.live_revision!(config.base_dir),
              snapshot = served_snapshot(config, destination, harness_atom, revision),
-             guidance = append_durable_session_handoff(snapshot.guidance, handoff.records),
+             guidance =
+               if(
+                 context_enabled?,
+                 do: snapshot.guidance,
+                 else: append_durable_session_handoff(snapshot.guidance, handoff.records)
+               ),
+             mcp_servers = mcp_servers_for_archetype(session.archetype),
              cwd = Placement.holder_workdir(config, session) do
+          destination_payload_evidence =
+            if context_enabled? do
+              harness_switch_payload_evidence(harness_atom, cwd, guidance, mcp_servers)
+            end
+
           case Adapter.new_candidate_session(
                  adapter,
                  model,
                  cwd,
-                 mcp_servers_for_archetype(session.archetype),
+                 mcp_servers,
                  guidance
                ) do
             {:ok, sid} ->
-              {:ok, adapter, sid, handoff.through_seq}
+              {:ok, adapter, sid, if(handoff, do: handoff.through_seq),
+               destination_payload_evidence}
 
             {:error, {:session_prepare_failed, reason, sid, cleanup}} ->
               {:candidate_prepare_failed, adapter, reason, sid, cleanup}
@@ -10159,19 +10346,24 @@ defmodule Tightbeam.Gateway do
       end)
 
     case prepared do
-      {:ok, destination_adapter, destination_sid, handoff_through_seq} ->
+      {:ok, destination_adapter, destination_sid, handoff_through_seq,
+       destination_payload_evidence} ->
         source_pointer = Org.current_pointer(db, session.session_key)
 
         committed =
           DB.transaction(db, fn txn ->
+            source_session = Org.get_in_txn(txn, session.session_key)
             {record_model, record_harness} = read_recorded_model(txn, session.session_key)
+
+            swap_options =
+              if context_enabled?, do: [], else: [cleared_through: handoff_through_seq]
 
             case Org.swap_model_in_txn(
                    txn,
                    session.session_key,
                    {record_model, record_harness},
                    {model, harness, provider},
-                   cleared_through: handoff_through_seq
+                   swap_options
                  ) do
               {:ok, _} -> :ok
               {:duplicate, _} -> raise "harness changed before staged swap commit"
@@ -10181,6 +10373,17 @@ defmodule Tightbeam.Gateway do
             case Map.get(call, :on_swap_interlock) do
               fun when is_function(fun, 1) -> fun.(txn)
               _ -> :ok
+            end
+
+            if context_enabled? do
+              {:ok, _context_id} =
+                HarnessSwitchContext.capture_switch_in_txn(
+                  txn,
+                  source_session,
+                  harness,
+                  model,
+                  destination_payload_evidence
+                )
             end
 
             {:appended, marker} =
@@ -10203,11 +10406,13 @@ defmodule Tightbeam.Gateway do
 
         case committed do
           {:ok, marker} ->
-            broadcast(
-              db,
-              session.owner_user_id,
-              Payloads.stream_history_cleared(call.session_key)
-            )
+            unless context_enabled? do
+              broadcast(
+                db,
+                session.owner_user_id,
+                Payloads.stream_history_cleared(call.session_key)
+              )
+            end
 
             publish_stored_message(db, call.session_key, marker)
 
@@ -10291,6 +10496,22 @@ defmodule Tightbeam.Gateway do
         )
         |> with_selection_options(reason)
     end
+  end
+
+  defp harness_switch_payload_evidence(harness, cwd, guidance, mcp_servers) do
+    session_meta = Harness.module!(harness).session_config(%{cwd: cwd}, guidance).meta
+
+    %{
+      identity_tokens_upper:
+        byte_size(guidance) + byte_size(JSON.encode!(%{_meta: session_meta})),
+      tool_definition_tokens_upper: byte_size(JSON.encode!(mcp_servers)),
+      component_sources: %{
+        identity_tokens_upper:
+          "UTF-8 bytes of the exact destination guidance plus serialized session metadata",
+        tool_definition_tokens_upper:
+          "UTF-8 bytes of the exact destination session/new MCP definitions"
+      }
+    }
   end
 
   defp durable_session_handoff(db, session_key) do

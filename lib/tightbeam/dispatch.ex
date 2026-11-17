@@ -235,7 +235,10 @@ defmodule Tightbeam.Dispatch do
       {:remedy, statute, ref, error} ->
         outcome = RailRemedy.fire(db, handlers, statute, ref, call)
 
-        if statute.name == "completion-requires-review" and verb == "attest" and
+        if statute.name in [
+             "completion-requires-review",
+             "agentic-engineering.completion-requires-review"
+           ] and verb == "attest" and
              call.params[:kind] == "completion" and review_notice_routed?(outcome) do
           # A missing review keeps the assignment open, but it does not erase
           # the holder's completion report. The remedy's notice is stored

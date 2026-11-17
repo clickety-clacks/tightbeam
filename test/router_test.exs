@@ -25,7 +25,8 @@ defmodule Tightbeam.Wire.RouterTest do
   alias Tightbeam.TestSupport.DBFailureReportingFixture
 
   @nonterminal_operator_detail_keys ~w(
-    actionKey assignmentId consumedAt context deadlineAt deadlineWakeId decision
+    actionKey assignmentId consumedAt context currentExpecterSessionKey currentRaiserSessionKey
+    deadlineAt deadlineWakeId decision
     effortGeneration expecterSessionKey expecterUserId id kind lineageRung options
     ownerUserId parkWakeId question raiserId raiserSessionKey raisedAt rationale
     ruledAt ruledBy ruledViaSessionKey rulingFactId statuteName status withdrawnAt
@@ -1255,6 +1256,8 @@ defmodule Tightbeam.Wire.RouterTest do
     assert open_detail.status == 200
     open_row = JSON.decode!(open_detail.resp_body)["result"]["decisionRequest"]
     assert Enum.sort(Map.keys(open_row)) == Enum.sort(@nonterminal_operator_detail_keys)
+    assert open_row["currentRaiserSessionKey"] == raiser.session_key
+    assert open_row["currentExpecterSessionKey"] == open_row["expecterSessionKey"]
     refute Map.has_key?(open_row, "ruledViaPrincipal")
     refute Map.has_key?(open_row, "ruledViaSessionState")
     refute Map.has_key?(open_row, "rulingAttribution")
@@ -2866,7 +2869,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(disallowed.resp_body) == %{
              "error" => %{
                "code" => "invalid_message",
-               "message" => "verb not allowed: not-a-verb"
+               "message" => "verb not allowed: post"
              }
            }
 

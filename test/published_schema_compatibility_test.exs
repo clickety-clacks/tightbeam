@@ -61,7 +61,7 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
     db = start_supervised!({DB, path: ":memory:", name: :published_0_1_16_compatibility})
 
     assert Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) ==
-             "dcad069f1b8afd34e5fd48232217c6ee3b72d267b68889b25c918db6e3e09f79"
+             "87c94a39c84f25b7c9039f51ee135640e1dad0092fda229c509f98043df82eff"
 
     # In-memory owners create these empty retry tables before schema activation.
     assert :ok = DB.execute(db, "DROP TABLE pending_recognition_waits")
@@ -84,8 +84,8 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
                ["art_seedproc", nil, "process:ci"],
                ["art_seedsess", "agent:seed-one", nil]
              ],
-             briefings: [["dr_seed_briefing", "flynn", "staged"]],
-             recovery_notices: [["hh_seed", "flynn", "awaiting_main"]]
+             briefings: [["dr_seed_briefing", "fixture-owner", "staged"]],
+             recovery_notices: [["hh_seed", "fixture-owner", "awaiting_main"]]
            }
 
     assert :ok = Schema.ensure_all(db)

@@ -277,7 +277,7 @@ defmodule Tightbeam.SentinelsTest do
       candidate =
         Identity.edit!(
           ctx.base,
-          "alpha-bundle-role",
+          "alpha-bundle.alpha-bundle-role",
           :guidance,
           "Organization's local guidance.\n",
           "user:flynn"

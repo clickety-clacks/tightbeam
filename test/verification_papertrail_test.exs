@@ -20,6 +20,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
     Ledger,
     NoticeBatcher,
     Org,
+    Identity.Provenance,
     RailRemedy,
     Roles,
     Rules,
@@ -27,8 +28,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
     WorkItems
   }
 
-  @verification_rule "completion-requires-verification"
-  @artifact_rule "completion-requires-results-artifact"
+  @verification_rule "agentic-engineering.completion-requires-verification"
+  @artifact_rule "agentic-engineering.completion-requires-results-artifact"
 
   setup do
     db = :"verification_papertrail_db_#{System.unique_integer([:positive])}"
@@ -39,8 +40,11 @@ defmodule Tightbeam.VerificationPapertrailTest do
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
-    holder = session(db, "vp-coder", "coder", "claude", "anthropic")
-    reviewer = session(db, "vp-reviewer", "reviewer-code", "codex", "openai")
+    holder = session(db, "vp-coder", "agentic-engineering.coder", "claude", "anthropic")
+
+    reviewer =
+      session(db, "vp-reviewer", "agentic-engineering.reviewer-code", "codex", "openai")
+
     Roles.create!(db, "reviewer-code", "flynn", reviewer.session_key)
 
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
@@ -86,11 +90,25 @@ defmodule Tightbeam.VerificationPapertrailTest do
              Identity.learn!(ctx.base_dir, "agentic-engineering", "flynn")
 
     for file <- ["engineering.toml", "verification.toml"] do
-      assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
+      path = delivered_rule_path!(ctx.base_dir, "rules/#{file}")
+
+      assert File.exists?(path),
              "learn did not deliver rules/#{file} into the org's identity tree"
     end
 
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+  end
+
+  defp delivered_rule_path!(base_dir, suffix) do
+    receipt =
+      Provenance.receipts(base_dir)
+      |> Enum.find(&(&1.name == "agentic-engineering"))
+
+    assert receipt
+    relative = Enum.find(receipt.paths, &String.ends_with?(&1, suffix))
+    assert relative
+    assert {:kungfu, "agentic-engineering"} = Provenance.owner_for_path(base_dir, relative)
+    Path.join([base_dir, "identity", relative])
   end
 
   defp reviewed_clean_assignment(ctx) do
@@ -358,6 +376,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
       Path.join([escalate_dir, "identity", "rules", "escalate.toml"]),
       """
       [[rule]]
+      archetypes = ["*"]
       name = "verification-escalates"
       verb = "attest"
       external_producer = true
@@ -365,7 +384,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
       text = "completion without verification escalates to the owning human"
       deny_when = [
         { fact = "attest.kind", op = "eq", value = "completion" },
-        { fact = "assignment.holder_archetype", op = "in", value = ["coder"] },
+        { fact = "assignment.holder_archetype", op = "in", value = ["agentic-engineering.coder"] },
         { fact = "assignment.verdicts", op = "not_in", value = ["verified"] },
       ]
       """
@@ -447,9 +466,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
   test "learn delivers the verification statutes and they load beside engineering's (§7)", ctx do
     shipped = File.read!("priv/kungfu/agentic-engineering/rules/verification.toml")
-    delivered = Path.join([ctx.base_dir, "identity", "rules", "verification.toml"])
-
     learn_engineering_rules!(ctx)
+    delivered = delivered_rule_path!(ctx.base_dir, "rules/verification.toml")
 
     assert File.read!(delivered) == shipped
 
@@ -458,7 +476,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
     refute Enum.any?(loaded, &(&1.name == "wake-obligation-registration-authority"))
 
     expected = [
-      "completion-requires-review",
+      "agentic-engineering.completion-requires-review",
       @verification_rule,
       @artifact_rule
     ]

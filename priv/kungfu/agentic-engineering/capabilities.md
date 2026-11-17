@@ -1,8 +1,9 @@
 # Engineering kungfu capabilities
 
-Root archetype: orchestrator. Adopting this bundle supplies executive coordination
-and the engineering role roster. Intake establishes or reuses each product's
-accountable PDO and addressed PO; delivery runs through lane orchestrators.
+Root archetype: `agentic-engineering.orchestrator`. Adopting this bundle supplies
+organization-level coordination and the engineering role roster. Intake establishes
+or reuses each product's accountable PDO and addressed PO; delivery runs through
+lane orchestrators.
 
 - Adaptive teams: obtain the PO's plan and staff the smallest useful arrangement of
   specialists and delivery lanes. Use bounded planning advice when it earns its cost.
