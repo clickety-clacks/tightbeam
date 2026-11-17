@@ -13037,7 +13037,7 @@ defmodule Tightbeam.GatewayTest do
            ]
   end
 
-  test "shared post handler rechecks attachment size before accepting a socket send", ctx do
+  test "shared post handler rechecks attachment size before accepting dispatch", ctx do
     owner = ctx.device.user_id
 
     asset =
