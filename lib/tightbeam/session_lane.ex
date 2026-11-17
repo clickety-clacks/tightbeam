@@ -40,7 +40,11 @@ defmodule Tightbeam.SessionLane do
     reservation_owner_ref: nil,
     settlement_waiters: [],
     settlement_rechecking: false,
-    deferred_drain: false
+    deferred_drain: false,
+    # Set when the last start attempt found a standing park fence, so a
+    # diagnostic read can say why a queued turn is not starting. Cleared on a
+    # start attempt that finds none.
+    held: nil
   ]
 
   @doc """
@@ -241,6 +245,7 @@ defmodule Tightbeam.SessionLane do
        reservationPresent: not is_nil(state.reservation_token),
        settlementRechecking: state.settlement_rechecking,
        deferredDrain: state.deferred_drain,
+       held: state.held,
        taskPresent: not is_nil(state.task_ref),
        taskAlive: is_pid(state.task_pid) and Process.alive?(state.task_pid)
      }, state}
@@ -665,9 +670,21 @@ defmodule Tightbeam.SessionLane do
 
   defp claim_and_start(state) do
     if harness_parked?(state) do
-      state
+      %{state | held: held_by_fence(state)}
     else
-      claim_next(state)
+      claim_next(%{state | held: nil})
+    end
+  end
+
+  defp held_by_fence(state) do
+    with {:ok, [[harness, host]]} <-
+           DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [
+             state.session_key
+           ]),
+         %{} = hold <- Tightbeam.HarnessHealth.Hold.for_host(state.db, harness, host) do
+      Map.take(hold, [:incident_id, :failure_class, :since, :release])
+    else
+      _ -> %{incident_id: nil, failure_class: nil, since: nil, release: nil}
     end
   end
 

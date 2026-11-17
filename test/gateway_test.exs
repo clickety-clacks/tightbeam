@@ -4062,30 +4062,59 @@ defmodule Tightbeam.GatewayTest do
     }
   end
 
-  # The four refusals a held turn gets today, pinned as they are.
-  test "repair of a turn queued behind a park fence is refused, with contradictory reasons",
-       ctx do
+  # Whatever the action, and whether or not the incident links the assignment,
+  # a turn queued behind a park fence gets one answer: it is held, not stuck.
+  test "repair of a turn queued behind a park fence is refused as held, for every action", ctx do
     held = held_behind_fence!(ctx)
     handler = held_repair_handler(ctx)
 
-    # Not linked to the incident: resume says no incident covers it while the
-    # incident is open and holding its turn; relaunch says it has launched
-    # because the queued turn counts as a turn.
-    assert %{ok: false, code: "no_open_incident"} =
-             handler.(held_repair_call(ctx, "asg_held_after", "resume"))
+    for assignment_id <- ["asg_held_after", "asg_held_linked"],
+        action <- ["resume", "relaunch", "restart", "rerun", "tune"] do
+      assert %{ok: false, code: "held_behind_incident", message: message} =
+               handler.(held_repair_call(ctx, assignment_id, action))
 
-    assert %{ok: false, code: "holder_launched"} =
-             handler.(held_repair_call(ctx, "asg_held_after", "relaunch"))
-
-    # Linked to the incident: relaunch says the incident wants resume; resume
-    # says there is no failed turn to rerun.
-    assert %{ok: false, code: "wrong_repair"} =
-             handler.(held_repair_call(ctx, "asg_held_linked", "relaunch"))
-
-    assert %{ok: false, code: "no_failed_turn"} =
-             handler.(held_repair_call(ctx, "asg_held_linked", "resume"))
+      assert message =~ held.incident.id
+      assert message =~ "rate-limit incident"
+      assert message =~ "harness-health-retry #{held.incident.id}"
+    end
 
     assert HarnessHealth.get(ctx.db, held.incident.id).state == "open"
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, held.adapter_key)
+  end
+
+  test "the held refusal names the assignment whose failure opened the incident", ctx do
+    failed = failed_repair_route!(ctx, "asg_held_source", "rate-limit-dead", 60)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+               VALUES ('asg_held_behind','later work','k1','flynn',70,'open','claude','anthropic')
+               """
+             )
+
+    {:ok, _} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-asg_held_behind",
+        origin: "agent:k1",
+        prompt: "later work",
+        assignment_id: "asg_held_behind"
+      })
+
+    handler = held_repair_handler(ctx)
+
+    assert %{ok: false, code: "held_behind_incident", message: message} =
+             handler.(held_repair_call(ctx, "asg_held_behind", "resume"))
+
+    assert message =~ failed.incident.id
+    assert message =~ "opened the incident is asg_held_source"
+
+    # The failing assignment itself still repairs through its failed turn.
+    assert %{ok: true, action: "resume"} =
+             handler.(held_repair_call(ctx, "asg_held_source", "resume"))
   end
 
   # A refused repair must have no effect. These two ask the same refused resume
@@ -4094,7 +4123,7 @@ defmodule Tightbeam.GatewayTest do
     held = held_behind_fence!(ctx)
     handler = held_repair_handler(ctx)
 
-    assert %{ok: false, code: "no_failed_turn"} =
+    assert %{ok: false, code: "held_behind_incident"} =
              handler.(held_repair_call(ctx, "asg_held_linked", "resume"))
 
     refute_receive {:repair_close_adapter, _}, 100
@@ -4105,7 +4134,7 @@ defmodule Tightbeam.GatewayTest do
     held = held_behind_fence!(ctx)
     handler = held_repair_handler(ctx)
 
-    assert %{ok: false, code: "no_failed_turn"} =
+    assert %{ok: false, code: "held_behind_incident"} =
              handler.(held_repair_call(ctx, "asg_held_linked", "resume"))
 
     assert Tightbeam.HarnessProcess.parked?(ctx.db, held.adapter_key)
@@ -4116,6 +4145,177 @@ defmodule Tightbeam.GatewayTest do
                ctx.db,
                "SELECT COUNT(*) FROM turns WHERE status NOT IN ('queued')"
              )
+  end
+
+  # Not held (no fence), linked to the incident, only a queued turn: the repair
+  # has no failed turn to rerun and must refuse before it touches anything.
+  defp linked_without_failed_turn!(ctx, assignment_id, failure_class, observed_at) do
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+               VALUES (?1,'queued only','k1','flynn',?2,'open',?3,?4)
+               """,
+               [assignment_id, observed_at, session.harness, session.provider]
+             )
+
+    {:ok, _seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-#{assignment_id}",
+        origin: "agent:k1",
+        prompt: "queued only",
+        assignment_id: assignment_id
+      })
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "linked-#{assignment_id}",
+               harness: session.harness,
+               host: session.host,
+               failure_class: failure_class,
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               observed_at: observed_at + 1,
+               cause: failure_class,
+               principal: "process:tightbeam"
+             })
+
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
+    incident
+  end
+
+  test "a refused restart with no failed turn does not close the shared adapter", ctx do
+    linked_without_failed_turn!(ctx, "asg_restart_nofail", "adapter_unavailable", 200)
+    handler = held_repair_handler(ctx)
+
+    assert %{ok: false, code: "no_failed_turn"} =
+             handler.(held_repair_call(ctx, "asg_restart_nofail", "restart"))
+
+    refute_receive {:repair_close_adapter, _}, 100
+  end
+
+  test "a refused tune with no failed turn does not retune the session", ctx do
+    linked_without_failed_turn!(ctx, "asg_tune_nofail", "model_unavailable", 300)
+    handler = held_repair_handler(ctx)
+    before = Org.get(ctx.db, "k1").model
+
+    call = held_repair_call(ctx, "asg_tune_nofail", "tune")
+    call = put_in(call, [:params, :model], "claude-sonnet-4-6")
+
+    assert %{ok: false, code: "no_failed_turn"} = handler.(call)
+    assert Org.get(ctx.db, "k1").model == before
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE content LIKE '%model retune%'")
+  end
+
+  # ---- the hold is readable, on every surface ----
+
+  test "a queued turn behind a park fence reads as held on the turn, and others do not", ctx do
+    held = held_behind_fence!(ctx)
+
+    turn = StateResources.query_turn_by_seq(ctx.db, held.linked_seq) |> StateResources.turn()
+    assert turn["status"] == "queued"
+    assert turn["holdIncidentId"] == held.incident.id
+    assert turn["holdFailureClass"] == "rate-limit-dead"
+    assert is_integer(turn["holdSince"])
+    assert turn["holdRelease"] =~ "harness-health-retry #{held.incident.id}"
+
+    # Once the fence lifts the same turn reads as an ordinary queued turn.
+    :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, held.adapter_key)
+    turn = StateResources.query_turn_by_seq(ctx.db, held.linked_seq) |> StateResources.turn()
+    assert turn["status"] == "queued"
+    refute Map.has_key?(turn, "holdSince")
+    refute Map.has_key?(turn, "holdIncidentId")
+  end
+
+  test "a fence with no open incident still reads as held, with no incident named", ctx do
+    session = Org.get(ctx.db, "k1")
+    adapter_key = {:claude, "shared", "testhost"}
+    {:ok, _} = Tightbeam.HarnessProcess.begin_park(ctx.db, adapter_key)
+
+    {:ok, seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-fence-only",
+        origin: "agent:k1",
+        prompt: "behind a bare fence"
+      })
+
+    turn = StateResources.query_turn_by_seq(ctx.db, seq) |> StateResources.turn()
+    assert turn["holdIncidentId"] == nil
+    assert turn["holdFailureClass"] == nil
+    assert turn["holdRelease"] =~ "no open harness-health incident"
+
+    hold = Tightbeam.HarnessHealth.Hold.for_host(ctx.db, session.harness, session.host)
+    assert hold.incident_id == nil
+    assert hold.since == turn["holdSince"]
+  end
+
+  test "the turn read and the host read agree about the same hold", ctx do
+    held = held_behind_fence!(ctx)
+    session = Org.get(ctx.db, "k1")
+
+    hold = Tightbeam.HarnessHealth.Hold.for_host(ctx.db, session.harness, session.host)
+    turn = StateResources.query_turn_by_seq(ctx.db, held.after_seq) |> StateResources.turn()
+
+    assert {hold.incident_id, hold.failure_class, hold.since, hold.release} ==
+             {turn["holdIncidentId"], turn["holdFailureClass"], turn["holdSince"],
+              turn["holdRelease"]}
+  end
+
+  test "assignment-get names the hold on a held assignment only", ctx do
+    held = held_behind_fence!(ctx)
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Gateway.handlers()
+      |> Map.fetch!("assignment-get")
+
+    read = fn id ->
+      handler.(%{origin: "user:flynn", principal: {:user, "flynn"}, params: %{assignment_id: id}})
+    end
+
+    for id <- ["asg_held_linked", "asg_held_after"] do
+      assert %{heldBehind: behind} = read.(id)
+      assert behind.incidentId == held.incident.id
+      assert behind.failureClass == "rate-limit-dead"
+      assert behind.release =~ "harness-health-retry #{held.incident.id}"
+    end
+
+    :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, held.adapter_key)
+    refute Map.has_key?(read.("asg_held_linked"), :heldBehind)
+  end
+
+  test "a lane that declines to start behind a fence records why for session-diagnose", ctx do
+    held = held_behind_fence!(ctx)
+
+    pid =
+      start_supervised!(
+        {SessionLane,
+         session_key: "k1",
+         db: ctx.db,
+         task_sup: Tightbeam.TurnTaskSupervisor,
+         runner: fn _turn -> flunk("a held turn must not start") end}
+      )
+
+    assert :ok = SessionLane.nudge("k1")
+    refute_receive {:never, _}, 100
+
+    assert %{held: %{incident_id: incident_id, failure_class: "rate-limit-dead"}} =
+             GenServer.call(pid, :diagnostic_snapshot)
+
+    assert incident_id == held.incident.id
+
+    snapshot = Tightbeam.SessionDiagnose.snapshot("k1", %{db: ctx.db})
+    assert %{status: "fenced", incidentId: ^incident_id} = snapshot.parkGate
+    assert snapshot.parkGate.release =~ held.incident.id
   end
 
   defp failed_repair_route!(ctx, assignment_id, failure_class, observed_at) do

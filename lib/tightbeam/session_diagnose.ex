@@ -169,11 +169,27 @@ defmodule Tightbeam.SessionDiagnose do
       ledgerCounts: "unavailable_without_db_query",
       reservationGate:
         Map.get(recorded, :reservationPresent, "unavailable_without_lane_snapshot"),
-      parkGate: "unavailable_without_db_query",
+      parkGate: park_gate(recorded),
       claimError: "unavailable_not_recorded",
       scanAttemptAt: "unavailable_not_recorded"
     }
   end
+
+  # What the lane itself recorded at its last start attempt; this endpoint
+  # never queries the database. "fenced" means a park fence stood then, so a
+  # queued turn waits for it rather than being stuck.
+  defp park_gate(%{status: "available", held: %{} = held}) do
+    %{
+      status: "fenced",
+      incidentId: held.incident_id,
+      failureClass: held.failure_class,
+      since: held.since,
+      release: held.release
+    }
+  end
+
+  defp park_gate(%{status: "available"}), do: %{status: "not_fenced_at_last_start_attempt"}
+  defp park_gate(_), do: "unavailable_without_lane_snapshot"
 
   defp lane_record(nil), do: %{status: "absent"}
 
@@ -186,7 +202,7 @@ defmodule Tightbeam.SessionDiagnose do
         reservationPresent: reserved,
         settlementRechecking: rechecking,
         deferredDrain: deferred
-      }
+      } = snapshot
       when (is_nil(seq) or is_integer(seq)) and is_boolean(present) and is_boolean(alive) and
              is_boolean(reserved) and is_boolean(rechecking) and is_boolean(deferred) ->
         %{
@@ -198,6 +214,9 @@ defmodule Tightbeam.SessionDiagnose do
           settlementRechecking: rechecking,
           deferredDrain: deferred
         }
+        |> then(fn record ->
+          if is_map(snapshot[:held]), do: Map.put(record, :held, snapshot.held), else: record
+        end)
 
       _ ->
         %{status: "unavailable"}

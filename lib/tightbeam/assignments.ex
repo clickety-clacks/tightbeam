@@ -2380,6 +2380,21 @@ defmodule Tightbeam.Assignments do
               do: Map.put(result, :cannotProceed, cannot_proceed),
               else: result
 
+          result =
+            case Tightbeam.HarnessHealth.Hold.for_assignment(db, assignment_id) do
+              nil ->
+                result
+
+              hold ->
+                Map.put(result, :heldBehind, %{
+                  incidentId: hold.incident_id,
+                  failureClass: hold.failure_class,
+                  since: hold.since,
+                  openedByAssignmentId: hold.opened_by_assignment_id,
+                  release: hold.release
+                })
+            end
+
           case call.params[:fact_id] do
             nil ->
               result
