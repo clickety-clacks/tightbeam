@@ -102,20 +102,6 @@ defmodule Tightbeam.DB do
   @statement_cache_limit 64
 
   @doc false
-  # The refusal itself, or the strict match on a database result that it tripped.
-  def overload_error?(%Overloaded{}), do: true
-  def overload_error?(%MatchError{term: {:error, %Overloaded{}}}), do: true
-  def overload_error?(%CaseClauseError{term: {:error, %Overloaded{}}}), do: true
-  def overload_error?(_error), do: false
-
-  @doc false
-  # What a caller is told when its operation met the refusal: nothing is wrong
-  # with the request, and the same request can be sent again.
-  def overload_refusal,
-    do: %{code: "db_overloaded", message: "database overloaded; retry later"}
-
-
-  @doc false
   def overloaded?(server) do
     server = if match?(%Migration{}, server), do: server.server, else: server
 
@@ -249,6 +235,19 @@ defmodule Tightbeam.DB do
         reraise error, __STACKTRACE__
       end
   end
+
+  @doc false
+  # The refusal itself, or the strict match on a database result that it tripped.
+  def overload_error?(%Overloaded{}), do: true
+  def overload_error?(%MatchError{term: {:error, %Overloaded{}}}), do: true
+  def overload_error?(%CaseClauseError{term: {:error, %Overloaded{}}}), do: true
+  def overload_error?(_error), do: false
+
+  @doc false
+  # What a caller is told when its operation met the refusal: nothing is wrong
+  # with the request, and the same request can be sent again.
+  def overload_refusal,
+    do: %{code: "db_overloaded", message: "database overloaded; retry later"}
 
   @doc false
   def reader(server, sql) do
