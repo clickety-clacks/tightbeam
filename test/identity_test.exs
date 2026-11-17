@@ -357,7 +357,7 @@ defmodule Tightbeam.IdentityTest do
     assert Identity.status(ctx.base).missing_installed_kungfu == [path]
     assert Identity.status(ctx.base).missing_installed_kungfu_notice =~ path
 
-    File.write!(full, "[[reaction]\nname = broken")
+    File.write!(full, "[[rule]\nname = broken")
     git!(dir, ["add", path])
     git!(dir, ["commit", "-m", "simulate malformed live rule file"], "operator")
     malformed = git!(dir, ["rev-parse", "HEAD"])
@@ -372,9 +372,9 @@ defmodule Tightbeam.IdentityTest do
 
     assert Identity.live_revision!(ctx.base) == malformed
 
-    File.write!(full, "[reaction]\nname = \"not-a-list\"\n")
+    File.write!(full, "[rule]\nname = \"not-a-list\"\n")
     git!(dir, ["add", path])
-    git!(dir, ["commit", "-m", "simulate table-shaped live reaction"], "operator")
+    git!(dir, ["commit", "-m", "simulate table-shaped live rule"], "operator")
     malformed_table = git!(dir, ["rev-parse", "HEAD"])
     git!(dir, ["update-ref", "refs/heads/tightbeam/live", malformed_table])
 
@@ -384,7 +384,7 @@ defmodule Tightbeam.IdentityTest do
     assert Identity.live_revision!(ctx.base) == malformed_table
 
     File.write!(full, shipped)
-    rails_path = "rails/engineering.toml"
+    rails_path = "kungfu/agentic-engineering/rails/engineering.toml"
     File.write!(Path.join(dir, rails_path), "[[statute]\nname = broken")
     git!(dir, ["add", path, rails_path])
     git!(dir, ["commit", "-m", "simulate malformed live rails file"], "operator")
