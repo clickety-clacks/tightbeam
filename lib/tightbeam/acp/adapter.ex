@@ -475,7 +475,7 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, launch_id} ->
         db = Keyword.get(opts, :db, Tightbeam.DB)
 
-        case Tightbeam.HarnessProcess.capture_identity(db, launch_id, 5_000, conn) do
+        case capture_launch_identity(db, launch_id, conn, 250) do
           :ok ->
             :ok
 
@@ -539,6 +539,17 @@ defmodule Tightbeam.Acp.Adapter do
            offset,
            Keyword.get(opts, :harness_process_satellite_host)
          ), state}
+    end
+  end
+
+  defp capture_launch_identity(db, launch_id, conn, delay_ms) do
+    case Tightbeam.HarnessProcess.capture_identity(db, launch_id, 5_000, conn) do
+      {:pending, _reason} ->
+        Process.sleep(delay_ms)
+        capture_launch_identity(db, launch_id, conn, min(delay_ms * 2, 5_000))
+
+      answer ->
+        answer
     end
   end
 

@@ -10510,6 +10510,14 @@ defmodule Tightbeam.Gateway do
          |> ErrorDiagnostic.put(
            ErrorDiagnostic.from_reason(reason, operation: "credential_status", provider: provider)
          )}
+
+      {:pending, nil} ->
+        {:error,
+         %{
+           code: "credential_status_pending",
+           message:
+             "Credential status has not answered yet for #{provider} on #{machine}; retry later"
+         }}
     end
   end
 

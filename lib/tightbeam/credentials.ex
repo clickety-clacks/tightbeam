@@ -41,6 +41,7 @@ defmodule Tightbeam.Credentials do
           :onboarded
           | {:needs_onboarding, term()}
           | {:unavailable, %{host: String.t(), provider: provider(), reason: term()}}
+          | {:pending, status() | nil}
 
   @doc "Start one lifecycle owner for this machine."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -70,18 +71,20 @@ defmodule Tightbeam.Credentials do
     deadline = System.monotonic_time(:millisecond) + @status_budget_ms
 
     try do
-      GenServer.call(server, {:status, provider, deadline}, @status_budget_ms)
+      case GenServer.call(server, {:status, provider, deadline}, @status_budget_ms) do
+        {:pending, nil} = pending -> pending
+        {:pending, last} -> last
+        other -> other
+      end
     catch
-      :exit, {:timeout, _} ->
-        unavailable(status_host(server), provider, :timeout)
+      :exit, {:timeout, _} -> {:pending, nil}
     end
   end
 
-  defp status_host({:global, {__MODULE__, machine}}), do: machine
-  defp status_host(_server), do: Tightbeam.Placement.local_host_name()
-
   defp unavailable(host, provider, reason),
     do: {:unavailable, %{host: host, provider: provider, reason: reason}}
+
+  defp unanswered(state, provider), do: {:pending, state.last_status[provider]}
 
   @doc """
   The KIND of credential this machine holds for a provider, or `:none`.
@@ -561,22 +564,26 @@ defmodule Tightbeam.Credentials do
        onboarding_lease_ms: Keyword.get(opts, :onboarding_lease_ms, 1_800_000),
        present_but_unverified: %{},
        pending: %{},
-       status_reads: %{}
+       status_reads: %{},
+       last_status: %{}
      }}
   end
 
   @impl true
   def handle_call({:status, provider, deadline}, from, state) do
     if System.monotonic_time(:millisecond) >= deadline - @status_cleanup_ms do
-      {:reply, unavailable(state.machine, provider, :timeout), state}
+      {:reply, unanswered(state, provider), state}
     else
       case expire_status_lease(state, provider, deadline) do
+        {:unavailable, :timeout} ->
+          {:reply, unanswered(state, provider), state}
+
         {:unavailable, reason} ->
           {:reply, unavailable(state.machine, provider, reason), state}
 
         state ->
           if System.monotonic_time(:millisecond) >= deadline - @status_cleanup_ms do
-            {:reply, unavailable(state.machine, provider, :timeout), state}
+            {:reply, unanswered(state, provider), state}
           else
             owner = self()
             ref = make_ref()
@@ -850,12 +857,20 @@ defmodule Tightbeam.Credentials do
         Process.demonitor(read.monitor, [:flush])
 
         answer =
-          if System.monotonic_time(:millisecond) < read.deadline,
-            do: result,
-            else: unavailable(state.machine, read.provider, :timeout)
+          if System.monotonic_time(:millisecond) < read.deadline and
+               not match?({:unavailable, %{reason: :timeout}}, result),
+             do: result,
+             else: unanswered(state, read.provider)
 
         GenServer.reply(read.from, answer)
-        {:noreply, %{state | status_reads: reads}}
+        state = %{state | status_reads: reads}
+
+        state =
+          if match?(:onboarded, answer) or match?({:needs_onboarding, _}, answer),
+            do: put_in(state.last_status[read.provider], answer),
+            else: state
+
+        {:noreply, state}
     end
   end
 
@@ -867,7 +882,7 @@ defmodule Tightbeam.Credentials do
       {read, reads} ->
         cancel_status_worker(read.pid)
         Process.demonitor(read.monitor, [:flush])
-        GenServer.reply(read.from, unavailable(state.machine, read.provider, :timeout))
+        GenServer.reply(read.from, unanswered(state, read.provider))
         {:noreply, %{state | status_reads: reads}}
     end
   end
@@ -1221,7 +1236,7 @@ defmodule Tightbeam.Credentials do
         end
       end)
 
-    %{state | status_reads: reads}
+    %{state | status_reads: reads, last_status: Map.delete(state.last_status, provider)}
   end
 
   defp cancel_status_worker(pid) do
