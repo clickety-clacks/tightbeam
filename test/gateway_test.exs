@@ -11864,6 +11864,49 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  # The wake scheduler re-resolves every due prompt in the org whenever any
+  # recipient becomes ready. Hundreds of reread prompts falling due together
+  # held up all other delivery, so a run spaces them, across its steps too.
+  test "identity apply --all spaces the reread prompts it schedules", ctx do
+    base_dir = role_test_base("identity-apply-spacing")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+    keys = for n <- 1..3, do: identity_apply_step_session(ctx.db, "spacing-#{n}", revision)
+
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "model-release-intake", false},
+      "spaced guidance",
+      "test"
+    )
+
+    ensure_global_registry()
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    started = System.system_time(:millisecond)
+
+    first = apply.(%{origin: "user:flynn", params: %{all: true, limit: 2}})
+    rest = apply.(%{origin: "user:flynn", params: %{all: true, limit: 200, cursor: first.cursor}})
+    finished = System.system_time(:millisecond)
+    assert %{status: "complete", cursor: nil} = rest
+
+    due =
+      for key <- identity_apply_visiting_order(ctx.db), key in keys do
+        assert {:ok, [[due_at]]} =
+                 DB.query(ctx.db, "SELECT dueAt FROM wakes WHERE sessionKey=?1", [key])
+
+        due_at
+      end
+
+    # The first falls due at once; each later one a second after the one before,
+    # and the second step continues where the first stopped.
+    assert [first_due, second_due, third_due] = due
+    assert first_due in started..finished
+    assert second_due - first_due >= 1_000
+    assert third_due - second_due >= 1_000
+    assert third_due <= finished + 2_000
+  end
+
   # A step also ends on time, so one slow target cannot stretch a request.
   test "identity apply --all ends a step once its time budget is spent", ctx do
     base_dir = role_test_base("identity-apply-budget")

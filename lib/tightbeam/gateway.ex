@@ -6122,6 +6122,10 @@ defmodule Tightbeam.Gateway do
   @identity_apply_step_budget_ms 5_000
   # A stamp waits for the org-wide identity lock for a few seconds at most.
   @identity_apply_live_lock_retries 5
+  # Reread prompts of one run fall due this far apart. The wake scheduler
+  # re-resolves every due prompt in the org each time any recipient becomes
+  # ready, so hundreds falling due at once would hold up all other delivery.
+  @identity_apply_reread_spacing_ms 1_000
 
   defp identity_apply_result(config, db, %{params: %{all: true} = params}) do
     sessions = Org.list_for_user(db, "", true)
@@ -6156,33 +6160,41 @@ defmodule Tightbeam.Gateway do
     do: %{code: "not_found", message: "no matching session"}
 
   defp identity_apply_sessions(config, db, sessions, revision) do
-    {results, _archetype_snapshots} =
+    {results, _pass} =
       Enum.map_reduce(
         sessions,
-        %{},
-        &identity_apply_session_result(config, db, &1, revision, &2)
+        identity_apply_pass(revision, 0),
+        &identity_apply_session_result(config, db, &1, &2)
       )
 
     identity_apply_report(db, revision, results)
   end
 
+  # What one request carries from session to session: the run's revision, the
+  # archetype snapshots read so far, and how many reread prompts the run has
+  # scheduled, which spaces the next one.
+  defp identity_apply_pass(revision, rereads),
+    do: %{revision: revision, archetype_snapshots: %{}, rereads: rereads}
+
   # One bounded step of `--all`. Sessions are visited in a fixed order grouped
   # by archetype and harness, so a step reads few archetype snapshots and the
   # cursor names a position that later steps can resume from. The cursor also
   # carries the revision the run started with: a publication during the run
-  # shows up as `superseded` results instead of a silent mix of revisions.
+  # shows up as `superseded` results instead of a silent mix of revisions. It
+  # carries the count of reread prompts scheduled so far, so their spacing
+  # continues across steps.
   defp identity_apply_step(config, db, sessions, cursor, limit) do
     with {:ok, limit} <- identity_apply_step_limit(limit),
          {:ok, position} <- identity_apply_position(cursor) do
       ordered = Enum.sort_by(sessions, &identity_apply_order/1)
 
-      {revision, pending} =
+      {revision, rereads, pending} =
         case position do
           nil ->
-            {Identity.live_revision!(config.base_dir), ordered}
+            {Identity.live_revision!(config.base_dir), 0, ordered}
 
-          {revision, last} ->
-            {revision, Enum.drop_while(ordered, &(identity_apply_order(&1) <= last))}
+          {revision, last, rereads} ->
+            {revision, rereads, Enum.drop_while(ordered, &(identity_apply_order(&1) <= last))}
         end
 
       if ordered == [] do
@@ -6191,19 +6203,20 @@ defmodule Tightbeam.Gateway do
         budget = Map.get(config, :identity_apply_step_budget_ms, @identity_apply_step_budget_ms)
         deadline = System.monotonic_time(:millisecond) + budget
 
-        {results, _archetype_snapshots} =
+        {results, pass} =
           pending
           |> Enum.take(limit)
-          |> Enum.reduce_while({[], %{}}, fn session, {results, archetype_snapshots} ->
-            if results != [] and System.monotonic_time(:millisecond) >= deadline do
-              {:halt, {results, archetype_snapshots}}
-            else
-              {result, archetype_snapshots} =
-                identity_apply_session_result(config, db, session, revision, archetype_snapshots)
-
-              {:cont, {[result | results], archetype_snapshots}}
+          |> Enum.reduce_while(
+            {[], identity_apply_pass(revision, rereads)},
+            fn session, {results, pass} ->
+              if results != [] and System.monotonic_time(:millisecond) >= deadline do
+                {:halt, {results, pass}}
+              else
+                {result, pass} = identity_apply_session_result(config, db, session, pass)
+                {:cont, {[result | results], pass}}
+              end
             end
-          end)
+          )
 
         results = Enum.reverse(results)
         handled = length(results)
@@ -6212,7 +6225,7 @@ defmodule Tightbeam.Gateway do
         next =
           if remaining > 0 do
             last = pending |> Enum.at(handled - 1) |> identity_apply_order()
-            Base.url_encode64(JSON.encode!([revision | last]), padding: false)
+            Base.url_encode64(JSON.encode!([revision, pass.rereads | last]), padding: false)
           end
 
         db
@@ -6236,9 +6249,11 @@ defmodule Tightbeam.Gateway do
 
   defp identity_apply_position(cursor) when is_binary(cursor) do
     with {:ok, encoded} <- Base.url_decode64(cursor, padding: false),
-         {:ok, [revision, archetype, harness, session_key] = position} <- JSON.decode(encoded),
-         true <- Enum.all?(position, &is_binary/1) do
-      {:ok, {revision, [archetype, harness, session_key]}}
+         {:ok, [revision, rereads | [_archetype, _harness, _session_key] = last]} <-
+           JSON.decode(encoded),
+         true <- Enum.all?([revision | last], &is_binary/1),
+         true <- is_integer(rereads) and rereads >= 0 do
+      {:ok, {revision, last, rereads}}
     else
       _ -> {:error, "cursor is not one returned by identity apply"}
     end
@@ -6270,29 +6285,39 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  defp identity_apply_session_result(config, db, session, revision, archetype_snapshots) do
+  defp identity_apply_session_result(config, db, session, pass) do
     {read, archetype_snapshots} =
-      archetype_snapshot_once(config, revision, session, archetype_snapshots)
+      archetype_snapshot_once(config, pass.revision, session, pass.archetype_snapshots)
+
+    spacing =
+      Map.get(config, :identity_apply_reread_spacing_ms, @identity_apply_reread_spacing_ms)
+
+    reread_at = System.system_time(:millisecond) + pass.rereads * spacing
 
     result =
       try do
-        identity_apply_session(config, db, session, revision, read)
+        identity_apply_session(config, db, session, pass.revision, read, reread_at)
       rescue
         error -> identity_apply_exception_result(session, error)
       catch
         :exit, reason -> identity_apply_failure_result(session, "exit: #{inspect(reason)}")
       end
 
-    {result, archetype_snapshots}
+    rereads =
+      if result[:prompt_enqueue] == "recorded_pending",
+        do: pass.rereads + 1,
+        else: pass.rereads
+
+    {result, %{pass | archetype_snapshots: archetype_snapshots, rereads: rereads}}
   end
 
-  defp identity_apply_session(config, db, session, revision, read) do
+  defp identity_apply_session(config, db, session, revision, read, reread_at) do
     case Org.get(db, session.session_key) do
       %{state: "active"} = current ->
         snapshot = identity_apply_snapshot(config, current, session, revision, read)
 
         case identity_apply_already_current(db, current, snapshot, revision) do
-          nil -> identity_apply_locked(config, db, session, revision, read)
+          nil -> identity_apply_locked(config, db, session, revision, read, reread_at)
           result -> result
         end
 
@@ -6349,9 +6374,9 @@ defmodule Tightbeam.Gateway do
   # A turn being set up, a model change or a heal holds the session's lock for
   # as long as its adapter call takes. Apply makes one attempt and reports the
   # session as busy rather than wait behind it.
-  defp identity_apply_locked(config, db, session, revision, read) do
+  defp identity_apply_locked(config, db, session, revision, read, reread_at) do
     case try_session_mutation_lock(session.session_key, fn ->
-           identity_apply_session_at_revision(config, db, session, revision, read)
+           identity_apply_session_at_revision(config, db, session, revision, read, reread_at)
          end) do
       {:ok, result} when is_map(result) ->
         result
@@ -6374,7 +6399,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp identity_apply_session_at_revision(config, db, session, revision, read) do
+  defp identity_apply_session_at_revision(config, db, session, revision, read, reread_at) do
     case Org.get(db, session.session_key) do
       %{state: "active"} = current ->
         # Checked before any file is written: a run that started on an older
@@ -6396,7 +6421,7 @@ defmodule Tightbeam.Gateway do
               _ -> :ok
             end
 
-            identity_apply_stamp(config, db, current, snapshot, revision, files)
+            identity_apply_stamp(config, db, current, snapshot, revision, files, reread_at)
 
           live ->
             identity_apply_superseded_result(session, live, "not_started")
@@ -6410,13 +6435,16 @@ defmodule Tightbeam.Gateway do
   # The files are already written when this lock is taken. It covers only the
   # last live check and the stamp, so a publication and other sessions' applies
   # never wait behind one session's file writes.
-  defp identity_apply_stamp(config, db, session, snapshot, revision, files) do
+  defp identity_apply_stamp(config, db, session, snapshot, revision, files, reread_at) do
     case Identity.with_live_revision_lock(
            config.base_dir,
            @identity_apply_live_lock_retries,
            fn
-             ^revision -> identity_apply_persist_result(db, session, snapshot, revision, files)
-             live -> identity_apply_superseded_result(session, live, files)
+             ^revision ->
+               identity_apply_persist_result(db, session, snapshot, revision, files, reread_at)
+
+             live ->
+               identity_apply_superseded_result(session, live, files)
            end
          ) do
       :aborted ->
@@ -6456,7 +6484,7 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  defp identity_apply_persist_result(db, session, snapshot, revision, files) do
+  defp identity_apply_persist_result(db, session, snapshot, revision, files, reread_at) do
     result =
       try do
         DB.transaction(db, fn txn ->
@@ -6483,7 +6511,12 @@ defmodule Tightbeam.Gateway do
 
                 _pointer ->
                   notification =
-                    identity_apply_prompt_record_in_txn(txn, session.session_key, revision)
+                    identity_apply_prompt_record_in_txn(
+                      txn,
+                      session.session_key,
+                      revision,
+                      reread_at
+                    )
 
                   Map.put(notification, :stamp, "committed")
               end
@@ -6561,7 +6594,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp identity_apply_prompt_record_in_txn(txn, session_key, revision) do
+  defp identity_apply_prompt_record_in_txn(txn, session_key, revision, reread_at) do
     prompt = identity_apply_prompt(revision)
 
     case identity_apply_existing_prompt_in_txn(txn, session_key, prompt) do
@@ -6572,7 +6605,7 @@ defmodule Tightbeam.Gateway do
             target_role: nil,
             origin: "process:tightbeam",
             prompt: prompt,
-            due_at: System.system_time(:millisecond),
+            due_at: reread_at,
             consumer: "prompt",
             target_gate: 1
           })
