@@ -59,10 +59,11 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
 
   test "the smoke stops before any request when no owner is supplied" do
     for unset <- [nil, ""] do
-      if unset, do: System.put_env("TIGHTBEAM_SMOKE_OWNER", unset),
+      if unset,
+        do: System.put_env("TIGHTBEAM_SMOKE_OWNER", unset),
         else: System.delete_env("TIGHTBEAM_SMOKE_OWNER")
 
-      error = assert_raise Driver.Failure, fn -> Driver.run() end
+      error = assert_raise Module.concat(Driver, Failure), fn -> Driver.run() end
       assert error.message =~ "TIGHTBEAM_SMOKE_OWNER"
       assert error.message =~ "admin user id"
     end
