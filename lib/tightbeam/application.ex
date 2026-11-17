@@ -23,6 +23,7 @@ defmodule Tightbeam.Application do
   @impl true
   def start(_type, _args) do
     :persistent_term.erase({__MODULE__, :shutdown_deadline})
+    Tightbeam.AdapterHealthSnapshot.clear(Tightbeam.AdapterCoordinator)
     Tightbeam.SchedulerMisses.init()
 
     if Application.get_env(:tightbeam, :autostart, true) do

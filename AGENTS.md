@@ -28,6 +28,11 @@ the top of its notes naming the failure and safe replacement, and mark it
 prerelease so it cannot be latest. Delete a release only for a leaked secret or
 a legal problem.
 
+Every release note must include a **Breaking changes** section listing each
+client-visible change to responses, fields, delivery, or stored data that Chat,
+Tuner, ATC, or the Harklight Tightbeam adapter may depend on, or state
+"None".
+
 ## Keep the substrate neutral
 
 The substrate (`priv/seed`, `priv/guidance`, `priv/skills`, and Main's default

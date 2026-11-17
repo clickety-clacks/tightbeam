@@ -58,6 +58,16 @@ defmodule Tightbeam.EscalationTest do
     %{db: db, scheduler: scheduler, raiser: raiser}
   end
 
+  test "non-owner operator ruling proceeds with owner warning", ctx do
+    request = Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "Choose?"}))
+    call = owner_operator_rule(request.id, %{decision: "accept"})
+    call = %{call | origin: "user:other", principal: {:user, "other"}}
+
+    ruled = Escalation.operator_rule(ctx.db, call)
+    assert ruled.status == "ruled"
+    assert ruled.warning =~ "user:other ruled a request owned by flynn"
+  end
+
   test "resolve exposes all four shapes without mutating, and consume wins once", ctx do
     call = call(ctx.raiser, %{assignment_id: "a1", kind: "completion"})
     statute = statute()

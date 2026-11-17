@@ -272,11 +272,7 @@ defmodule Tightbeam.Wire.Router do
 
   get "/version" do
     coordinator = deps(conn)[:adapter_coordinator] || Tightbeam.AdapterCoordinator
-
-    health =
-      if Process.whereis(coordinator),
-        do: Tightbeam.AdapterCoordinator.health(coordinator),
-        else: %{}
+    snapshot = Tightbeam.AdapterHealthSnapshot.read(coordinator)
 
     # builds-identify-bytes: a running gateway states which bytes it is. version is
     # the release version (single home: the CLI-compat policy); build/sha are the
@@ -288,7 +284,8 @@ defmodule Tightbeam.Wire.Router do
       "build" => Tightbeam.BuildStamp.build(),
       "sha" => Tightbeam.BuildStamp.sha(),
       "features" => ["stale-turn-settlement-v1"],
-      "adapters" => health,
+      "adapters" => snapshot.adapters,
+      "adaptersAsOf" => snapshot.as_of,
       "diagnostics" => diagnostic_health(),
       "schedulerMisses" => Tightbeam.SchedulerMisses.count(),
       "eventPaths" => Tightbeam.SchedulerMisses.health()
@@ -4445,7 +4442,8 @@ defmodule Tightbeam.Wire.Router do
       ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body mementos owner_user_id)a,
     "work-item-fail" => ~w(reason work_item_id)a,
     "work-item-get" => ~w(work_item_id)a,
-    "work-item-handoff" => ~w(work_item_id title delivery_owner_session_key brief owner_user_id)a,
+    "work-item-handoff" =>
+      ~w(work_item_id title delivery_owner_session_key brief owner_user_id spec_ref_name spec_ref_sha256 is_bug priority)a,
     "work-item-icebox" => ~w(work_item_id)a,
     "work-item-reopen" => ~w(work_item_id)a,
     "work-item-trace" => ~w(work_item_id)a,
