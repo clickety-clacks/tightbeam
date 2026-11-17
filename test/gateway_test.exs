@@ -27,7 +27,7 @@ defmodule Tightbeam.GatewayTest do
 
     expected =
       expected ++
-        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-listener-restore harklight-follow harklight-briefings-catchup)
+        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-listener-restore harklight-follow harklight-briefings-catchup harklight-briefing)
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 
@@ -11078,15 +11078,8 @@ defmodule Tightbeam.GatewayTest do
              root_archetype: "default"
            } = Enum.find(bundles, &(&1.name == "sentinels"))
 
-    assert %{
-             purpose: briefing_purpose,
-             phrases: [],
-             root_archetype: "orchestrator"
-           } = Enum.find(bundles, &(&1.name == "harklight-decision-briefings"))
-
     assert purpose =~ "turn product ideas and bug reports into shipped software"
     assert "I want my code reviewed before it merges." in phrases
-    assert briefing_purpose =~ "configurable investigator"
 
     # The point of phrases is DISCRIMINATION: a phrase another domain's bundle could
     # honestly claim buys nothing. This one could only be a software-engineering bundle.

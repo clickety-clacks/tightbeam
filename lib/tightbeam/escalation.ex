@@ -822,15 +822,6 @@ defmodule Tightbeam.Escalation do
 
               inserted? = Txn.changes(txn) == 1
 
-              if inserted? and is_binary(raiser_session_key) do
-                Tightbeam.Supervision.activity_in_txn(
-                  txn,
-                  assignment_id,
-                  raiser_session_key,
-                  now
-                )
-              end
-
               [row] =
                 Txn.q(
                   txn,

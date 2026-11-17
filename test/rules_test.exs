@@ -2154,7 +2154,9 @@ defmodule Tightbeam.RulesTest do
         operator_ask_call(raiser.session_key, %{question: "Choose a route?"})
       )
 
-    assert [wake] = Wakes.list_pending(ctx.db)
+    assert [wake] =
+             Enum.filter(Wakes.list_pending(ctx.db), &(&1.origin == "remedy:filing-notice"))
+
     assert wake.session_key == recipient.session_key
     assert wake.prompt == "Investigate decision #{request.id}"
     assert wake.origin == "remedy:filing-notice"
@@ -2180,7 +2182,10 @@ defmodule Tightbeam.RulesTest do
     }
 
     assert {:ok, :ok} = DB.transaction(ctx.db, &Wakes.row_commit_in_txn(&1, [transition]))
-    assert [same_wake] = Wakes.list_pending(ctx.db)
+
+    assert [same_wake] =
+             Enum.filter(Wakes.list_pending(ctx.db), &(&1.origin == "remedy:filing-notice"))
+
     assert same_wake.wake_id == wake.wake_id
 
     assert {:ok, :ok} =
@@ -2216,7 +2221,9 @@ defmodule Tightbeam.RulesTest do
                other_request.id
              ])
 
-    assert [same_wake] = Wakes.list_pending(ctx.db)
+    assert [same_wake] =
+             Enum.filter(Wakes.list_pending(ctx.db), &(&1.origin == "remedy:filing-notice"))
+
     assert same_wake.wake_id == wake.wake_id
   end
 
@@ -3975,6 +3982,7 @@ defmodule Tightbeam.RulesTest do
     assert deadline_session == main_session
     assert deadline_prompt =~ question
     assert deadline_prompt =~ raiser_id
+
     assert {:ok, [["decision-request-filed", payload]]} =
              DB.query(ctx.db, "SELECT kind,payload FROM condition_facts WHERE scope=?1", [
                request_id

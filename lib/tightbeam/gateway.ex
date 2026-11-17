@@ -1043,6 +1043,9 @@ defmodule Tightbeam.Gateway do
       {"harklight-briefings-catchup", []} => fn call ->
         Tightbeam.HarklightBriefings.catchup(db, call, authorized: admin_caller?(db, call))
       end,
+      {"harklight-briefing", []} => fn call ->
+        Tightbeam.HarklightBriefings.exact(db, call, authorized: admin_caller?(db, call))
+      end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,
@@ -3085,9 +3088,15 @@ defmodule Tightbeam.Gateway do
   defp nudge_lane(lane_manager, session_key) do
     LaneManager.ensure_lane(lane_manager, session_key)
 
-    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{pid, _}] -> if Process.alive?(pid), do: :ok, else: :lane_down
-      [] -> :lane_down
+    case Process.whereis(Tightbeam.LaneRegistry) do
+      nil ->
+        :lane_down
+
+      _ ->
+        case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+          [{pid, _}] -> if Process.alive?(pid), do: :ok, else: :lane_down
+          [] -> :lane_down
+        end
     end
   catch
     :exit, reason ->

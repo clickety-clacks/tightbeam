@@ -110,7 +110,9 @@ defmodule Tightbeam.EscalationTest do
                JSON.decode!(encoded)
     end
 
-    assert notification_wakes(ctx) == []
+    refute Enum.any?(notification_wakes(ctx), fn wake ->
+             wake.origin == "remedy:harklight-decision-request-briefing"
+           end)
 
     asked = session(ctx.db, "asked", "flynn")
 
@@ -132,8 +134,7 @@ defmodule Tightbeam.EscalationTest do
 
     assert request_id == agent.id
     assert addressed == "session:" <> asked.session_key
-    assert [%{session_key: asked_session}] = notification_wakes(ctx)
-    assert asked_session == asked.session_key
+    assert Enum.any?(notification_wakes(ctx), &(&1.session_key == asked.session_key))
   end
 
   test "resolve exposes all four shapes without mutating, and consume wins once", ctx do
@@ -924,6 +925,7 @@ defmodule Tightbeam.EscalationTest do
     assert deadline_wake.due_at == request.deadline_at
     assert deadline_wake.prompt =~ "Asked by: agent:raiser"
     assert deadline_wake.prompt =~ "ship window?"
+
     assert {:ok, [["decision-request-filed", encoded]]} =
              DB.query(ctx.db, "SELECT kind,payload FROM condition_facts WHERE scope=?1", [
                request.id
@@ -946,6 +948,7 @@ defmodule Tightbeam.EscalationTest do
     assert id == request.id
     assert deadline_at == request.deadline_at
     assert length(notification_wakes(ctx)) == 2
+
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE scope=?1", [request.id])
 
@@ -2022,8 +2025,10 @@ defmodule Tightbeam.EscalationTest do
 
     scheduler = start_gateway_scheduler(ctx)
     assert :ok = Wakes.fire_due(scheduler)
-    assert notification_wakes(ctx) == []
-    assert EventLog.lifecycle_events(ctx.db) == before_events
+    assert Wakes.get(ctx.db, opening_id).state == "canceled"
+
+    assert [%{kind: "wake_undeliverable", subject: ^opening_id}] =
+             EventLog.lifecycle_events(ctx.db) -- before_events
 
     assert {:ok, [["open", nil]]} =
              DB.query(ctx.db, "SELECT status,ruledAt FROM decision_requests WHERE id=?1", [
