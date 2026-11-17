@@ -5,6 +5,8 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
   @branch_resolver Path.join(@root, "scripts/highest_0_1_branch.sh")
   @script Path.join(@root, "scripts/release_candidate.sh")
   @verifier Path.join(@root, "scripts/verify_release_candidate_manifest.py")
+  @stage_verifier Path.join(@root, "scripts/verify_release_candidate_stage.py")
+  @renderer Path.join(@root, "packaging/release-install/render_release.py")
   @workflow Path.join(@root, ".github/workflows/release-candidate.yml")
   @ci_workflow Path.join(@root, ".github/workflows/ci.yml")
 
@@ -253,9 +255,12 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert workflow =~ "proof:\n    needs: [metadata, package]\n    if: ${{ success() }}"
     refute before_proof =~ "release-candidate-proof-"
     assert proof_job =~ "release-candidate-proof-${{ needs.metadata.outputs.candidate_sha }}"
+    assert proof_job =~ "verify_release_candidate_stage.py create"
+    assert proof_job =~ "release-candidate-stage-${{ needs.metadata.outputs.candidate_sha }}"
 
     assert workflow =~
-             "No proof artifact exists unless metadata, both test jobs, and both package jobs passed."
+             ("Neither candidate artifact exists unless metadata, both test jobs, " <>
+                "and both package jobs passed.")
   end
 
   test "manifest verifier accepts complete exact evidence", evidence do
@@ -278,6 +283,61 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert {"", 0} = create_manifest(fixture)
     assert {"", 0} = verify_manifest(fixture)
     assert File.read!(fixture.manifest) =~ ~s("candidate_ref":"refs/heads/main")
+  end
+
+  test "main candidate staging preserves the package bytes for install", evidence do
+    fixture = proof_fixture!(evidence, "main")
+    fixture = Map.put(fixture, :workflow_sha, fixture.f2)
+    assert {"", 0} = create_manifest(fixture)
+    assert {"", 0} = verify_manifest(fixture)
+    stage_root = Path.join(fixture.root, "candidate-stage")
+    build = git!(fixture.repo, ["rev-list", "--count", fixture.f2])
+    tag = "v1.0.0+#{build}"
+
+    assert {"", 0} = stage_command(fixture, stage_root, "create", tag)
+    assert {"", 0} = stage_command(fixture, stage_root, "verify", tag)
+
+    package_name = "tightbeam-1.0.0-linux-x86_64-#{String.slice(fixture.f2, 0, 7)}.tgz"
+    assert File.read!(Path.join(stage_root, package_name)) == File.read!(fixture.package)
+    provenance = JSON.decode!(File.read!(Path.join(stage_root, "release-provenance.json")))
+    assert provenance["workflow"] == provenance["candidate"]["workflow"]
+    assert provenance["candidate"]["workflow_sha"] == fixture.f2
+    assert provenance["tag"] == tag
+
+    example = Path.join(@root, "packaging/release-install/example-release.json")
+    input = JSON.decode!(File.read!(example))
+    package_sha = file_sha256(Path.join(stage_root, package_name))
+
+    release =
+      Map.merge(input["release"], %{
+        "version" => "1.0.0",
+        "build" => String.to_integer(build),
+        "tag" => tag,
+        "source_commit" => fixture.f2,
+        "package" => package_name,
+        "package_sha256" => package_sha,
+        "build_id" => "sha256-#{package_sha}",
+        "checksums_sha256" => file_sha256(Path.join(stage_root, "SHA256SUMS")),
+        "provenance_sha256" => file_sha256(Path.join(stage_root, "release-provenance.json"))
+      })
+
+    input = Map.merge(input, %{"purpose" => "candidate-soak", "release" => release})
+    input_path = Path.join(fixture.root, "candidate-install.json")
+    output = Path.join(fixture.root, "candidate-install-bundle")
+    File.write!(input_path, JSON.encode!(input) <> "\n")
+
+    assert {_, 0} = command("python3", [@renderer, input_path, stage_root, output], cd: @root)
+    sheet = File.read!(Path.join(output, "install-sheet.md"))
+    assert sheet =~ "unpublished candidate"
+    assert sheet =~ "no tag or GitHub Release exists"
+    assert sheet =~ "Candidate workflow run 12345"
+    assert File.regular?(Path.join(output, "release-candidate-manifest.json"))
+    assert File.read!(Path.join(output, package_name)) == File.read!(fixture.package)
+
+    File.write!(Path.join(stage_root, package_name), "changed package bytes")
+    {changed, status} = stage_command(fixture, stage_root, "verify", tag)
+    assert status != 0
+    assert changed =~ "staged candidate package differs from its proof bytes"
   end
 
   test "manifest verifier fails closed on wrong source and package hashes", evidence do
@@ -417,6 +477,43 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
       "--expected-workflow-sha",
       fixture.workflow_sha
     ])
+  end
+
+  defp stage_command(fixture, stage_root, operation, tag) do
+    command(
+      "python3",
+      [
+        @stage_verifier,
+        operation,
+        "--proof-manifest",
+        fixture.manifest,
+        "--evidence-root",
+        fixture.evidence,
+        "--stage-root",
+        stage_root,
+        "--repository-root",
+        fixture.repo,
+        "--repository",
+        "clickety-clacks/tightbeam",
+        "--server-url",
+        "https://github.com",
+        "--run-id",
+        "12345",
+        "--source-sha",
+        fixture.f2,
+        "--workflow-sha",
+        fixture.workflow_sha,
+        "--release-tag",
+        tag,
+        "--version",
+        "1.0.0"
+      ],
+      cd: fixture.repo
+    )
+  end
+
+  defp file_sha256(path) do
+    path |> File.read!() |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
   end
 
   defp git_fixture! do

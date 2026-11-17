@@ -85,12 +85,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
-  test "all public checkout APIs retain the reviewed 190s budget over the 185s generation deadline" do
+  test "all public checkout APIs wait for the live adapter instead of expiring" do
     source = File.read!("lib/tightbeam/adapter_coordinator.ex")
-    assert source =~ "@adapter_readiness_timeout 185_000"
-    assert source =~ "@adapter_checkout_timeout 190_000"
-    assert length(Regex.scan(~r/GenServer\.call\([^\n]+@adapter_checkout_timeout\)/, source)) == 3
-    refute source =~ "{:adapter_for, key}, 30_000"
+    assert source =~ "@adapter_readiness_timeout :infinity"
+    assert length(Regex.scan(~r/GenServer\.call\([^\n]+:infinity\)/, source)) >= 3
   end
 
   test "gateway turn checkout reuses an ordinary live adapter while initialize is pending", ctx do
@@ -431,6 +429,79 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert is_integer(resolved_at)
   end
 
+  test "ordinary shutdown waits for a delayed park and settles it durably", ctx do
+    script = Path.join(ctx.test_dir, "shutdown_delayed_park.js")
+    File.write!(script, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), script],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             process_identity_dir: ctx.test_dir,
+             process_helper: @process_helper
+           ]
+         end,
+         db: ctx.db,
+         name: :shutdown_delayed_park_coordinator}
+      )
+
+    key = {:claude, "shared", "testhost"}
+    assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(fn ->
+             match?([%{state: "running"}], HarnessProcess.list(ctx.db))
+           end)
+
+    parent = self()
+    previous_runner = Application.get_env(:tightbeam, :harness_process_command_runner_for_test)
+
+    Application.put_env(:tightbeam, :harness_process_command_runner_for_test, fn executable,
+                                                                                 args,
+                                                                                 _timeout ->
+      if List.first(args) == "harness-group" do
+        send(parent, {:park_waiting, self()})
+
+        receive do
+          :finish_park -> :ok
+        end
+      end
+
+      System.cmd(executable, args, stderr_to_stdout: true)
+    end)
+
+    on_exit(fn ->
+      if previous_runner do
+        Application.put_env(:tightbeam, :harness_process_command_runner_for_test, previous_runner)
+      else
+        Application.delete_env(:tightbeam, :harness_process_command_runner_for_test)
+      end
+    end)
+
+    stopper = Task.async(fn -> GenServer.stop(coordinator, :shutdown, :infinity) end)
+    assert_receive {:park_waiting, park_task}, 10_000
+
+    try do
+      # The old ordinary shutdown budget was 30 seconds. The command remains
+      # gated past that boundary, so an elapsed-time cutoff cannot pass.
+      assert Task.yield(stopper, 31_000) == nil
+      assert [%{state: "park_requested", resolved_at: nil}] = HarnessProcess.list(ctx.db)
+    after
+      send(park_task, :finish_park)
+    end
+
+    assert :ok = Task.await(stopper, 30_000)
+    assert [%{state: "killed", resolved_at: resolved_at}] = HarnessProcess.list(ctx.db)
+    assert is_integer(resolved_at)
+    refute HarnessProcess.fenced?(ctx.db, key)
+  end
+
   test "supervisor shutdown runs Cursor group cleanup through the dedicated launcher", ctx do
     parent = self()
     name = :supervised_cursor_cleanup_coordinator
@@ -570,7 +641,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     assert wait_until(fn -> :sys.get_state(coordinator).adapters[key].waiters == [] end)
     entry = :sys.get_state(coordinator).adapters[key]
-    assert is_reference(entry.readiness_timer)
+    assert entry.readiness_timer == nil
   end
 
   test "duplicate restart messages coalesce behind one generation readiness task", ctx do
@@ -1284,7 +1355,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   @tag timeout: 5_000
-  test "adapter shutdown uses the application's remaining deadline", ctx do
+  test "explicit finite shutdown uses the application's remaining deadline", ctx do
     coordinator =
       start_supervised!(
         {AdapterCoordinator,
@@ -1292,6 +1363,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          db: ctx.db,
          adapter_context: fn _ -> [] end,
          adapter_opts: fn _key, _context -> [] end,
+         shutdown_budget_ms: 2_000,
          name: :shared_shutdown_deadline_coordinator}
       )
 
@@ -1316,11 +1388,11 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     end
   end
 
-  test "supervisor allowance exceeds the configured shutdown budget" do
+  test "normal shutdown waits for a definitive park result" do
     # The child_spec must read the configured option, not the module attribute:
     # a caller raising shutdown_budget_ms above the default would otherwise be
     # brutal-killed before its own internal deadline.
-    assert AdapterCoordinator.child_spec([]).shutdown > 30_000
+    assert AdapterCoordinator.child_spec([]).shutdown == :infinity
     assert AdapterCoordinator.child_spec(shutdown_budget_ms: 45_000).shutdown > 45_000
   end
 

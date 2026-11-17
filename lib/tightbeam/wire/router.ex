@@ -23,8 +23,9 @@ defmodule Tightbeam.Wire.Router do
   (the real client and the black-box drivers speak these; never rename):
   - GET  /version              — no auth; protocolVersion + health numbers.
   - POST /agent/dispatch       — cliToken auth; body {verb, target?, params,
-    as|asUser} → origin resolution; verb must be in the closed AGENT_VERBS
-    set (post excluded on purpose: an agent DM IS a wake-with-prompt).
+    as|asUser} → origin resolution; agent verbs use the closed AGENT_VERBS set.
+    The Chat service's human `post` path uses the org credential; session
+    credentials cannot invoke it.
   - POST /agent/tool-call-observed — SESSION token only; no body. The
     substrate-reserved PreToolUse hook reporting that this session is about to
     run `tightbeam artifact-record`. Not a verb: it writes no domain state, only
@@ -53,6 +54,7 @@ defmodule Tightbeam.Wire.Router do
 
   alias Tightbeam.{
     Assets,
+    AttachmentDelivery,
     CliCompatibility,
     DB,
     ConditionFacts,
@@ -73,9 +75,10 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
+                   "assess_attachments",
                    "session-custody-transfer",
                    "fact-demand",
                    "sentinel-demand",
@@ -272,11 +275,7 @@ defmodule Tightbeam.Wire.Router do
 
   get "/version" do
     coordinator = deps(conn)[:adapter_coordinator] || Tightbeam.AdapterCoordinator
-
-    health =
-      if Process.whereis(coordinator),
-        do: Tightbeam.AdapterCoordinator.health(coordinator),
-        else: %{}
+    snapshot = Tightbeam.AdapterHealthSnapshot.read(coordinator)
 
     # builds-identify-bytes: a running gateway states which bytes it is. version is
     # the release version (single home: the CLI-compat policy); build/sha are the
@@ -288,7 +287,8 @@ defmodule Tightbeam.Wire.Router do
       "build" => Tightbeam.BuildStamp.build(),
       "sha" => Tightbeam.BuildStamp.sha(),
       "features" => ["stale-turn-settlement-v1"],
-      "adapters" => health,
+      "adapters" => snapshot.adapters,
+      "adaptersAsOf" => snapshot.as_of,
       "diagnostics" => diagnostic_health(),
       "schedulerMisses" => Tightbeam.SchedulerMisses.count(),
       "eventPaths" => Tightbeam.SchedulerMisses.health()
@@ -332,55 +332,71 @@ defmodule Tightbeam.Wire.Router do
   post "/agent/dispatch" do
     with {:ok, auth} <- agent_dispatch_auth(conn) do
       with_json(conn, fn body, conn ->
-        with {:ok, verb} <- required_string(body["verb"]),
-             :ok <- allowed_agent_verb(verb, auth),
-             {:ok, origin, principal} <- agent_identity(body, auth, conn),
-             {:ok, session_key, target_meta} <- typed_target(verb, body, conn),
-             :ok <- visible_cancel_target(verb, session_key, principal, conn) do
-          call = %{
-            verb: verb,
-            origin: origin,
-            principal: principal,
-            # Retain the authenticated transport separately from the selected origin.
-            transport_session_key: authenticated_session_key(auth),
-            session_key: artifact_caller_session(verb, session_key, principal),
-            target_role: target_meta.role,
-            role_fallback: target_meta.fallback,
-            params: atomize_params(verb, body["params"] || %{})
-          }
+        cond do
+          body["verb"] == "post" and auth == :org ->
+            dispatch_rest_post(conn, auth, body)
 
-          call =
-            case Map.get(target_meta, :user_id) do
-              user_id when is_binary(user_id) -> Map.put(call, :target_user_id, user_id)
-              _ -> call
+          body["verb"] == "post" ->
+            error(conn, 400, "invalid_message", "verb not allowed: post")
+
+          body["verb"] == "assess_attachments" ->
+            with :ok <- allowed_agent_verb("assess_attachments", auth) do
+              dispatch_rest_assess_attachments(conn, auth, body)
+            else
+              {:error, status, code, message} -> error(conn, status, code, message)
             end
 
-          call =
-            case {verb, principal} do
-              {"artifact-content-fetch", {:session, session_key}} ->
-                Map.put(call, :rest_principal, %{
-                  kind: "session",
-                  id: session_key,
-                  is_admin: false
-                })
+          true ->
+            with {:ok, verb} <- required_string(body["verb"]),
+                 :ok <- allowed_agent_verb(verb, auth),
+                 {:ok, origin, principal} <- agent_identity(body, auth, conn),
+                 {:ok, session_key, target_meta} <- typed_target(verb, body, conn),
+                 :ok <- visible_cancel_target(verb, session_key, principal, conn) do
+              call = %{
+                verb: verb,
+                origin: origin,
+                principal: principal,
+                # Retain the authenticated transport separately from the selected origin.
+                transport_session_key: authenticated_session_key(auth),
+                session_key: artifact_caller_session(verb, session_key, principal),
+                target_role: target_meta.role,
+                role_fallback: target_meta.fallback,
+                params: atomize_params(verb, body["params"] || %{})
+              }
 
-              {"artifact-content-fetch", {:process, name}} ->
-                Map.put(call, :rest_principal, %{kind: "process", id: name, is_admin: true})
+              call =
+                case Map.get(target_meta, :user_id) do
+                  user_id when is_binary(user_id) -> Map.put(call, :target_user_id, user_id)
+                  _ -> call
+                end
 
-              {"artifact-content-fetch", {:user, user_id}} ->
-                Map.put(call, :rest_principal, state_principal_view({:user, user_id}, conn))
+              call =
+                case {verb, principal} do
+                  {"artifact-content-fetch", {:session, session_key}} ->
+                    Map.put(call, :rest_principal, %{
+                      kind: "session",
+                      id: session_key,
+                      is_admin: false
+                    })
 
-              _ ->
-                call
+                  {"artifact-content-fetch", {:process, name}} ->
+                    Map.put(call, :rest_principal, %{kind: "process", id: name, is_admin: true})
+
+                  {"artifact-content-fetch", {:user, user_id}} ->
+                    Map.put(call, :rest_principal, state_principal_view({:user, user_id}, conn))
+
+                  _ ->
+                    call
+                end
+
+              dispatch_response(conn, call, 200, &%{"result" => &1})
+            else
+              {:error, status, code, message} ->
+                error(conn, status, code, message)
+
+              {:error, status, code, message, diagnostic} ->
+                error(conn, status, code, message, diagnostic)
             end
-
-          dispatch_response(conn, call, 200, &%{"result" => &1})
-        else
-          {:error, status, code, message} ->
-            error(conn, status, code, message)
-
-          {:error, status, code, message, diagnostic} ->
-            error(conn, status, code, message, diagnostic)
         end
       end)
     else
@@ -3626,6 +3642,228 @@ defmodule Tightbeam.Wire.Router do
 
   defp allowed_agent_verb(verb, _auth), do: allowed_agent_verb(verb)
 
+  defp dispatch_rest_post(conn, auth, body) do
+    with {:ok, user_id} <- rest_post_user(auth, body),
+         {:ok, session_key} <- rest_post_target(body, user_id, conn),
+         {:ok, params} <- rest_post_params(body["params"]) do
+      case AttachmentDelivery.validate_post(
+             db(conn),
+             deps(conn).base_dir,
+             user_id,
+             params.attachments
+           ) do
+        :ok ->
+          rest_post_dispatch_response(conn, %{
+            verb: "post",
+            origin: "user:#{user_id}",
+            principal: {:user, user_id},
+            session_key: session_key,
+            params: params,
+            transport: :rest
+          })
+
+        {:error, :invalid_asset} ->
+          error(conn, 400, "invalid_message", "attachment asset is unavailable")
+
+        {:over_limit, offending_asset_ids} ->
+          json(conn, 413, %{
+            "error" => %{
+              "code" => "attachment_over_limit",
+              "message" => "This file exceeds the delivery limit."
+            },
+            "sessionKey" => session_key,
+            "clientMessageId" => params.client_message_id,
+            "maxDeliverableAttachmentBytes" => AttachmentDelivery.max_deliverable_bytes(),
+            "offendingAssetIds" => offending_asset_ids
+          })
+      end
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  defp rest_post_dispatch_response(conn, call) do
+    case Dispatch.dispatch(db(conn), handlers(conn), call) do
+      {:ok, %{dedupe: "conflict"}} ->
+        error(conn, 409, "client_message_conflict")
+
+      {:ok, %{dedupe: "skipped"}} ->
+        error(conn, 409, "not_deliverable")
+
+      {:ok, result} ->
+        json(conn, 200, %{"result" => result})
+
+      {:error, result} ->
+        dispatch_error(conn, call, error_status(result[:code]), result)
+
+      {:decision_pending, decision_request_id} ->
+        decision_pending(conn, decision_request_id)
+    end
+  end
+
+  defp dispatch_rest_assess_attachments(conn, auth, body) do
+    with {:ok, user_id} <- rest_post_user(auth, body),
+         {:ok, session_key} <- rest_post_target(body, user_id, conn),
+         {:ok, params} <- rest_assess_attachment_params(body["params"]) do
+      call = %{
+        verb: "assess_attachments",
+        origin: "user:#{user_id}",
+        principal: {:user, user_id},
+        session_key: session_key,
+        params: params,
+        transport: :rest
+      }
+
+      case Dispatch.dispatch(db(conn), handlers(conn), call) do
+        {:ok, result} ->
+          json(conn, 200, %{"result" => result})
+
+        {:error, %{code: "assessment-unavailable"}} ->
+          json(conn, 503, %{
+            "error" => %{
+              "code" => "assessment-unavailable",
+              "message" => AttachmentDelivery.assessment_unavailable_message()
+            },
+            "sessionKey" => session_key,
+            "clientMessageId" => params.client_message_id,
+            "maxDeliverableAttachmentBytes" => AttachmentDelivery.max_deliverable_bytes(),
+            "attachments" => AttachmentDelivery.unknown_assessments(params.asset_ids)
+          })
+
+        {:error, result} ->
+          dispatch_error(conn, call, error_status(result[:code]), result)
+
+        {:decision_pending, decision_request_id} ->
+          decision_pending(conn, decision_request_id)
+      end
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  defp rest_assess_attachment_params(params) when is_map(params) do
+    client_message_id = params["clientMessageId"]
+    asset_ids = params["assetIds"]
+
+    if is_binary(client_message_id) and String.starts_with?(client_message_id, "c_") and
+         is_list(asset_ids) and Enum.all?(asset_ids, &(is_binary(&1) and &1 != "")) do
+      {:ok, %{client_message_id: client_message_id, asset_ids: asset_ids}}
+    else
+      {:error, 400, "invalid_message", nil}
+    end
+  end
+
+  defp rest_assess_attachment_params(_params), do: {:error, 400, "invalid_message", nil}
+
+  defp rest_post_user(auth, body) do
+    user_id = body["asUser"]
+
+    if is_binary(user_id) and user_id != "" and
+         Enum.all?(~w(as asProcess asSession), &(not Map.has_key?(body, &1))) do
+      case auth do
+        :org -> {:ok, user_id}
+        {:session, %{owner_user_id: ^user_id}} -> {:ok, user_id}
+        _ -> {:error, 403, "principal_required", nil}
+      end
+    else
+      {:error, 403, "principal_required", nil}
+    end
+  end
+
+  defp rest_post_target(body, user_id, conn) do
+    key = body["sessionKey"]
+
+    cond do
+      not is_binary(key) or key == "" or
+          Enum.any?(~w(role userId target), &Map.has_key?(body, &1)) ->
+        {:error, 400, "invalid_message", nil}
+
+      true ->
+        session = Org.get(db(conn), key)
+        admin? = match?(%{is_admin: true}, Devices.user(db(conn), user_id))
+
+        cond do
+          is_nil(session) or (session.owner_user_id != user_id and not admin?) ->
+            {:error, 404, "not_found", nil}
+
+          session.state != "active" and
+              not rest_post_identity_exists?(db(conn), key, body["params"]) ->
+            {:error, 400, "not_deliverable", nil}
+
+          true ->
+            {:ok, key}
+        end
+    end
+  end
+
+  defp rest_post_identity_exists?(db, session_key, params) when is_map(params) do
+    case {params["deviceId"], params["clientMessageId"]} do
+      {device_id, client_message_id}
+      when is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
+             client_message_id != "" ->
+        case DB.query(
+               db,
+               "SELECT 1 FROM messages WHERE sessionKey=?1 AND deviceId=?2 AND clientMessageId=?3 LIMIT 1",
+               [session_key, device_id, client_message_id]
+             ) do
+          {:ok, [[1]]} -> true
+          {:ok, []} -> false
+          {:error, error} -> raise error
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp rest_post_identity_exists?(_db, _session_key, _params), do: false
+
+  defp rest_post_params(params) when is_map(params) do
+    id = params["clientMessageId"]
+    device_id = params["deviceId"]
+    content = params["content"]
+    attachments = Map.get(params, "attachments", [])
+
+    cond do
+      not is_binary(id) or not String.starts_with?(id, "c_") or
+        not is_binary(device_id) or device_id == "" or not is_binary(content) or
+        not is_list(attachments) or not Enum.all?(attachments, &rest_post_attachment?/1) ->
+        {:error, 400, "invalid_message", nil}
+
+      byte_size(content) > 64 * 1024 ->
+        {:error, 400, "payload_too_large", nil}
+
+      true ->
+        post_params = %{
+          client_message_id: id,
+          device_id: device_id,
+          content: content,
+          attachments: attachments
+        }
+
+        post_params =
+          if Map.has_key?(params, "submitter"),
+            do: Map.put(post_params, :submitter, params["submitter"]),
+            else: post_params
+
+        {:ok, post_params}
+    end
+  end
+
+  defp rest_post_params(_), do: {:error, 400, "invalid_message", nil}
+
+  defp rest_post_attachment?(%{
+         "assetId" => id,
+         "mimeType" => mime_type,
+         "filename" => filename,
+         "size" => size
+       })
+       when is_binary(id) and id != "" and is_binary(mime_type) and is_binary(filename) and
+              is_integer(size),
+       do: true
+
+  defp rest_post_attachment?(_), do: false
+
   defp agent_identity(%{"asProcess" => "tightbeam"}, _auth, _conn) do
     {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
   end
@@ -3738,7 +3976,7 @@ defmodule Tightbeam.Wire.Router do
   # `--session <key>` is a COHORT FILTER over creator identity, not a target, so
   # resolving it as one would turn a roster filter into a session-existence
   # oracle. Both verbs' selectors travel as ordinary body params.
-  @non_target_verbs ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
+  @non_target_verbs ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
 
   @non_target_verbs @non_target_verbs ++
                       [
@@ -3843,7 +4081,7 @@ defmodule Tightbeam.Wire.Router do
     do: session_key
 
   defp artifact_caller_session(verb, nil, {:session, session_key})
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow),
+       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow),
        do: session_key
 
   defp artifact_caller_session(_verb, session_key, _principal), do: session_key
@@ -4180,6 +4418,7 @@ defmodule Tightbeam.Wire.Router do
   defp error_status("unknown_assignment"), do: 404
   defp error_status("unknown_work_item"), do: 404
   defp error_status("server_error"), do: 500
+  defp error_status("assessment-unavailable"), do: 503
 
   defp error_status(code)
        when code in [
@@ -4307,6 +4546,7 @@ defmodule Tightbeam.Wire.Router do
     "harklight-settle" => ~w(message_id)a,
     "harklight-follow" => ~w(message_id handle)a,
     "harklight-cover" => ~w(handle)a,
+    "harklight-retry" => ~w(all message_id handle)a,
     "work-item-list" =>
       ~w(state status owner_user_id created_by_session created_by_user is_bug spec_ref_name holder_key limit after)a,
     "topline-placement-list" => ~w(state)a,
@@ -4382,7 +4622,7 @@ defmodule Tightbeam.Wire.Router do
     "host-env-set" => ~w(harness host key name sentinel value)a,
     "host-env-unset" => ~w(harness host key name sentinel)a,
     "host-toolchain-set" => ~w(dirs host)a,
-    "identity-apply" => ~w(all session_key)a,
+    "identity-apply" => ~w(all cursor limit session_key)a,
     "identity-edit" =>
       ~w(archetype content expected_revision idempotency_key manifest name path remove skill)a,
     "identity-relearn" => ~w(action idempotency_key)a,
@@ -4439,13 +4679,14 @@ defmodule Tightbeam.Wire.Router do
       ~w(adopted context display_name effort fast_mode harness host idempotency_key mode model reasoning_level session_key setting skill guidance thinking_level verbosity)a,
     "unlearn" => ~w(idempotency_key name)a,
     "wake" =>
-      ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class cron condition_kind condition_scope idempotency_key predicate replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
+      ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class cron condition_kind condition_scope idempotency_key predicate prod_id replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
     "work-item-close" => ~w(work_item_id)a,
     "work-item-create" =>
       ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body mementos owner_user_id)a,
     "work-item-fail" => ~w(reason work_item_id)a,
     "work-item-get" => ~w(work_item_id)a,
-    "work-item-handoff" => ~w(work_item_id title delivery_owner_session_key brief owner_user_id)a,
+    "work-item-handoff" =>
+      ~w(work_item_id title delivery_owner_session_key brief owner_user_id spec_ref_name spec_ref_sha256 is_bug priority)a,
     "work-item-icebox" => ~w(work_item_id)a,
     "work-item-reopen" => ~w(work_item_id)a,
     "work-item-trace" => ~w(work_item_id)a,
@@ -4535,7 +4776,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp dispatch_error(conn, %{verb: verb}, status, result)
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-follow) do
+       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow) do
     json(conn, status, %{"error" => wire_value(result)})
   end
 

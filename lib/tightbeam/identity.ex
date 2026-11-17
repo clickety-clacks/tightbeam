@@ -20,6 +20,9 @@ defmodule Tightbeam.Identity do
   @live "tightbeam/live"
   @required_refs ["main", @upstream, @live]
   @reserved_prefix "tightbeam__"
+  @not_live "nothing changed live, and sessions keep being served the live revision."
+  @publish_step "A successful `tightbeam identity edit` publishes everything on main."
+  @publish_step_later "Once it does, a successful `tightbeam identity edit` publishes everything on main."
   @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
   @bundle_setup_path "setup.md"
@@ -310,9 +313,33 @@ defmodule Tightbeam.Identity do
     with_live_revision_lock_in_dir(identity_dir(base_dir), fun)
   end
 
-  # Apply holds this lock for one target's materialization and durable stamp.
-  # Live-ref writers take the same lock so an older projection cannot write
-  # after a newer revision becomes live.
+  @doc false
+  # For a caller that resolved the live revision earlier in the same pass and
+  # takes the lock once per session: the same lock without repeating the
+  # repository checks of `init!/1`, and with a bounded wait. Returns `:aborted`
+  # when the lock stayed held for all `retries` further attempts.
+  def with_live_revision_lock(base_dir, retries, fun)
+      when is_integer(retries) and retries >= 0 and is_function(fun, 1) do
+    identity_dir = identity_dir(base_dir)
+    lock = {{__MODULE__, :live_revision, Path.expand(identity_dir)}, self()}
+
+    :global.trans(
+      lock,
+      fn -> fun.(git_output!(identity_dir, ["rev-parse", @live])) end,
+      [node() | Node.list()],
+      retries
+    )
+  end
+
+  @doc false
+  # The publication pointer alone, for a caller that already ran
+  # `live_revision!/1` in the same pass.
+  def current_live_revision!(base_dir),
+    do: git_output!(identity_dir(base_dir), ["rev-parse", @live])
+
+  # A session's stamp is committed under this lock. Live-ref writers take the
+  # same lock so an older projection cannot write after a newer revision
+  # becomes live.
   defp with_live_revision_lock_in_dir(identity_dir, fun) do
     lock = {{__MODULE__, :live_revision, Path.expand(identity_dir)}, self()}
 
@@ -1206,13 +1233,99 @@ defmodule Tightbeam.Identity do
   def status(base_dir) do
     dir = identity_dir(base_dir)
     live = live_revision!(base_dir)
+    source = git_output!(dir, ["rev-parse", "main"])
     conflicts = conflict_paths(dir)
+    missing = missing_installed_kungfu(base_dir, live)
 
     %{
       live_revision: live,
+      source_revision: source,
+      source_notice: source_notice(dir, source, live),
+      missing_installed_kungfu: missing,
+      missing_installed_kungfu_notice: format_missing_installed_kungfu_notice(missing),
       state: if(conflicts == [], do: :ready, else: :relearn_conflicted),
       conflicting_paths: conflicts
     }
+  end
+
+  @doc "Missing shipped paths and named rules for bundles learned into the live identity."
+  def missing_installed_kungfu(base_dir, revision \\ nil) do
+    dir = identity_dir(base_dir)
+    revision = revision || live_revision!(base_dir)
+
+    learned_bundle_names(dir, revision)
+    |> Enum.filter(&(&1 in available_bundle_names()))
+    |> Enum.flat_map(fn name ->
+      bundle_entries(name, bundle_dir(name))
+      |> Enum.flat_map(fn {path, shipped_bytes} ->
+        if path_exists_at?(dir, revision, path) do
+          missing_rule_names(path, shipped_bytes, git_show_bytes!(dir, revision, path))
+        else
+          [path]
+        end
+      end)
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  rescue
+    _error -> ["installed kungfu comparison unavailable"]
+  end
+
+  @doc false
+  def missing_installed_kungfu_notice(base_dir, revision \\ nil) do
+    base_dir |> missing_installed_kungfu(revision) |> format_missing_installed_kungfu_notice()
+  end
+
+  defp format_missing_installed_kungfu_notice(missing) do
+    case missing do
+      [] ->
+        nil
+
+      paths ->
+        "Installed kungfu is missing or unreadable in the live identity: " <>
+          Enum.join(paths, ", ") <> ". Run `tightbeam identity relearn` to install it."
+    end
+  end
+
+  defp missing_rule_names(path, shipped, live) do
+    if String.starts_with?(path, "rules/") or String.starts_with?(path, "rails/") do
+      shipped = Toml.decode!(shipped)
+      live = Toml.decode!(live)
+
+      for kind <- ~w(rule policy reaction statute),
+          entry <- Map.get(shipped, kind, []),
+          name = Map.get(entry, "name"),
+          is_binary(name),
+          not Enum.any?(Map.get(live, kind, []), &(Map.get(&1, "name") == name)),
+          do: "#{path} (#{kind} #{name})"
+    else
+      []
+    end
+  rescue
+    _error -> ["#{path} (live rule entries could not be inspected)"]
+  end
+
+  # A commit on the identity source (main) is not live until it is published.
+  defp source_notice(_dir, revision, revision), do: nil
+
+  defp source_notice(dir, source, live) do
+    head = "Identity source (main, #{source}) is not the live revision (#{live}): " <> @not_live
+
+    case System.cmd("git", ["merge-base", "--is-ancestor", live, source], cd: dir) do
+      {_output, 0} ->
+        head <> " " <> @publish_step
+
+      _ ->
+        head <>
+          " Main does not descend from live, so publication is refused until it does. " <>
+          @publish_step_later
+    end
+  end
+
+  defp unpublished_message(live) do
+    "Not published: the live revision is unchanged (#{live}); nothing changed live. " <>
+      "The commit exists on the identity source (main) only, and publication needs main " <>
+      "to descend from live; `tightbeam identity status` compares them. " <> @publish_step_later
   end
 
   defp identity_dir(base_dir), do: Path.join(base_dir, "identity")
@@ -1533,9 +1646,16 @@ defmodule Tightbeam.Identity do
   end
 
   defp path_exists_at?(dir, revision, path) do
-    case System.cmd("git", ["cat-file", "-e", "#{revision}:#{path}"], cd: dir) do
-      {_output, 0} -> true
-      {_output, _status} -> false
+    case System.cmd("git", ["ls-tree", "-r", "--name-only", revision, "--", path],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        output |> String.split("\n", trim: true) |> Enum.member?(path)
+
+      {output, status} ->
+        Logger.warning("git ls-tree failed (#{status}): #{String.trim(output)}")
+        false
     end
   end
 
@@ -1917,7 +2037,13 @@ defmodule Tightbeam.Identity do
           {:ok, revision}
 
         actual != expected ->
-          {:error, %{code: "identity_publication_conflict", expected: expected, actual: actual}}
+          {:error,
+           %{
+             code: "identity_publication_conflict",
+             message: unpublished_message(actual),
+             expected: expected,
+             actual: actual
+           }}
 
         true ->
           case System.cmd("git", ["merge-base", "--is-ancestor", expected, revision], cd: dir) do
@@ -1926,7 +2052,12 @@ defmodule Tightbeam.Identity do
               {:ok, revision}
 
             _ ->
-              {:error, %{code: "identity_publication_non_fast_forward", expected: expected}}
+              {:error,
+               %{
+                 code: "identity_publication_non_fast_forward",
+                 message: unpublished_message(actual),
+                 expected: expected
+               }}
           end
       end
     end)

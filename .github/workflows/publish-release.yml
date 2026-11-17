@@ -116,6 +116,13 @@ jobs:
           run-id: ${{ inputs.candidate_run_id }}
           github-token: ${{ github.token }}
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-stage-${{ inputs.candidate_sha }}
+          path: candidate-stage
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+
       - name: Verify candidate proof and package checksums
         shell: bash
         run: |
@@ -133,6 +140,28 @@ jobs:
           ' candidate-evidence/release-candidate-manifest.json > /dev/null
           python3 scripts/verify_release_candidate_manifest.py verify --manifest candidate-evidence/release-candidate-manifest.json --evidence-root candidate-evidence --repository-root . --expected-repository "$GITHUB_REPOSITORY" --expected-ref refs/heads/main --expected-source-sha "$CANDIDATE_SHA" --expected-workflow-sha "$CANDIDATE_SHA"
 
+      - name: Verify selector-ready candidate staging artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd candidate-stage
+            sha256sum --check SHA256SUMS
+          )
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cli/Cargo.toml)
+          python3 scripts/verify_release_candidate_stage.py verify \
+            --proof-manifest candidate-evidence/release-candidate-manifest.json \
+            --evidence-root candidate-evidence \
+            --stage-root candidate-stage \
+            --repository-root . \
+            --repository "$GITHUB_REPOSITORY" \
+            --server-url "$GITHUB_SERVER_URL" \
+            --run-id "$CANDIDATE_RUN_ID" \
+            --source-sha "$CANDIDATE_SHA" \
+            --workflow-sha "$CANDIDATE_SHA" \
+            --release-tag "$RELEASE_TAG" \
+            --version "$version"
+
       - name: Prepare release from the verified candidate bytes
         shell: bash
         run: |
@@ -140,10 +169,10 @@ jobs:
           identity=${RELEASE_TAG#v}
           version=${identity%%+*}
           short_sha=${CANDIDATE_SHA::7}
-          darwin_source=$(find candidate-evidence/packages/darwin-aarch64 -maxdepth 1 -type f -name 'tightbeam-*.tgz' -print)
-          linux_source=$(find candidate-evidence/packages/linux-x86_64 -maxdepth 1 -type f -name 'tightbeam-*.tgz' -print)
-          [ "$(printf '%s\n' "$darwin_source" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ]
-          [ "$(printf '%s\n' "$linux_source" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ]
+          darwin_source="candidate-stage/tightbeam-$version-darwin-aarch64-$short_sha.tgz"
+          linux_source="candidate-stage/tightbeam-$version-linux-x86_64-$short_sha.tgz"
+          test -f "$darwin_source"
+          test -f "$linux_source"
 
           release_dir="$RUNNER_TEMP/release"
           mkdir -p "$release_dir"
@@ -151,20 +180,26 @@ jobs:
           linux="tightbeam-$version-linux-x86_64-$short_sha.tgz"
           cp "$darwin_source" "$release_dir/$darwin"
           cp "$linux_source" "$release_dir/$linux"
-          cp candidate-evidence/release-candidate-manifest.json "$release_dir/release-candidate-manifest.json"
+          cp candidate-stage/release-candidate-manifest.json "$release_dir/release-candidate-manifest.json"
 
           (
             cd "$release_dir"
             sha256sum "$darwin" "$linux" release-candidate-manifest.json > SHA256SUMS
             manifest_sha=$(sha256sum release-candidate-manifest.json | awk '{print $1}')
-            jq -n --arg repository "$GITHUB_REPOSITORY" --arg tag "$RELEASE_TAG" --arg commit "$CANDIDATE_SHA" --arg candidate_run "$CANDIDATE_RUN_ID" --arg candidate_workflow "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" --arg manifest_sha "$manifest_sha" --arg install_approval_sha "$INSTALL_APPROVED_SHA" --arg soak_outcome "$SOAK_OUTCOME" --arg soak_sha "$SOAKED_SHA" --arg publication_run "$GITHUB_RUN_ID" --arg publication_workflow "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --arg darwin "$darwin" --arg linux "$linux" '
+            candidate_workflow=$(jq -er '.candidate.workflow' "$GITHUB_WORKSPACE/candidate-stage/release-provenance.json")
+            candidate_workflow_sha=$(jq -er '.candidate.workflow_sha' "$GITHUB_WORKSPACE/candidate-stage/release-provenance.json")
+            publication_workflow="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            jq -n --arg repository "$GITHUB_REPOSITORY" --arg tag "$RELEASE_TAG" --arg commit "$CANDIDATE_SHA" --arg candidate_run "$CANDIDATE_RUN_ID" --arg candidate_workflow "$candidate_workflow" --arg candidate_workflow_sha "$candidate_workflow_sha" --arg manifest_sha "$manifest_sha" --arg install_approval_sha "$INSTALL_APPROVED_SHA" --arg soak_outcome "$SOAK_OUTCOME" --arg soak_sha "$SOAKED_SHA" --arg publication_run "$GITHUB_RUN_ID" --arg publication_workflow "$publication_workflow" --arg darwin "$darwin" --arg linux "$linux" '
               {
+                format: "tightbeam-release-provenance/v1",
                 repository: $repository,
                 tag: $tag,
                 commit: $commit,
+                workflow: $publication_workflow,
                 candidate: {
                   run_id: $candidate_run,
                   workflow: $candidate_workflow,
+                  workflow_sha: $candidate_workflow_sha,
                   proof_manifest_sha256: $manifest_sha
                 },
                 install_approval: {approved_source_sha: $install_approval_sha},

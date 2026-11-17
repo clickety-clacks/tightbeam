@@ -29,6 +29,10 @@ client-chosen rebuild interval, recovery has no finite freshness bound.
 
 After any socket close, or when the expected heartbeat does not arrive, a
 client reconnects, authenticates, subscribes, and rebuilds its visible state.
+If one app's live-update backlog exceeds 64 MiB, the server sends that socket
+`{"type":"reload_required","reason":"backlog_overflow"}` and closes it with
+code 4008. The app must reload its visible state after reconnecting; other
+subscribers continue receiving their notices.
 It starts the subscription before the snapshot walk. A rebuild may remove a
 row by absence only when a complete walk began after a fresh subscription
 boundary and no notice for that row arrived on the current subscription. If a

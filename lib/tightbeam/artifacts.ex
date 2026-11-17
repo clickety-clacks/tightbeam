@@ -278,11 +278,23 @@ defmodule Tightbeam.Artifacts do
   """
   @spec record(DB.server(), map()) :: map()
   def record(db \\ Tightbeam.DB, call) do
-    case captured_input(call.params) do
-      {:ok, digest, bytes} -> record_with_content(db, call, digest, bytes)
-      error -> error
+    with :ok <- valid_record_shape(call.params) do
+      case captured_input(call.params) do
+        {:ok, digest, bytes} -> record_with_content(db, call, digest, bytes)
+        error -> error
+      end
     end
   end
+
+  defp valid_record_shape(%{title: title, origin_path: path})
+       when is_binary(title) and title != "" and is_binary(path) and path != "",
+       do: :ok
+
+  defp valid_record_shape(_),
+    do: %{
+      code: "invalid_artifact_record_shape",
+      message: "artifact-record requires title and originPath"
+    }
 
   defp record_with_content(db, call, digest, captured_bytes) do
     case {call[:principal], call[:session_key], call[:params][:work_item_id]} do

@@ -156,6 +156,19 @@ fn request(
     }
 }
 
+/// One step of `identity apply --all`: a bounded number of sessions, resumed
+/// from the cursor the previous step returned.
+fn build_identity_apply_step_request(identity: &Identity, cursor: Option<&str>) -> RequestSpec {
+    let mut params = vec![
+        "\"all\":true".to_owned(),
+        format!("\"limit\":{}", crate::identity_apply::STEP_LIMIT),
+    ];
+    if let Some(cursor) = cursor {
+        params.push(string_field("cursor", cursor));
+    }
+    request(identity, "identity-apply", vec![], params)
+}
+
 /// Build the dispatch request without performing discovery or network I/O.
 pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     let context = CommandContext::for_command(command);
@@ -187,6 +200,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             assignment_id,
             after_turn,
             replace_queued,
+            prod_id,
             idempotency_key,
             class,
         } => {
@@ -216,6 +230,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if *replace_queued {
                 params.push("\"replaceQueued\":true".to_owned());
+            }
+            if let Some(value) = prod_id {
+                params.push(string_field("prodId", value));
             }
             for (name, value) in [
                 ("cron", cron),
@@ -638,6 +655,20 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 vec![],
                 vec![selector],
             ))
+        }
+        Command::HarklightRetry {
+            identity,
+            all,
+            message,
+            handle,
+        } => {
+            let params = match (all, message, handle) {
+                (true, None, None) => vec!["\"all\":true".to_owned()],
+                (false, Some(message), None) => vec![string_field("messageId", message)],
+                (false, None, Some(handle)) => vec![string_field("handle", handle)],
+                _ => unreachable!("the parser requires exactly one Harklight retry selector"),
+            };
+            Ok(request(identity, "harklight-retry", vec![], params))
         }
         // Not a verb and not on /agent/dispatch: it changes no domain state, it
         // tells the gateway to look at this session's running turn NOW, while the
@@ -3868,6 +3899,23 @@ where
                 load_harnesses,
             )
         }
+        Command::IdentityApply {
+            identity,
+            session_key: None,
+            all: true,
+        } => {
+            let endpoint = discover_endpoint()?;
+            require_session_endpoint(&identity, &endpoint)?;
+            crate::identity_apply::run_all(
+                |cursor| {
+                    let request = build_identity_apply_step_request(&identity, cursor)
+                        .with_attempt_context(attempt_context.clone());
+                    send_request(&endpoint, &request, None)
+                },
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )
+        }
         command => {
             let endpoint = discover_endpoint()?;
             if let Some(reason) = local_harklight_identity_refusal(&command, &endpoint) {
@@ -3898,6 +3946,7 @@ where
                 }
             }
             let request = build_request(&command)?;
+            let mut command_failure = None;
             if let Some(result) = send_request(&endpoint, &request, None)? {
                 if matches!(command, Command::Wake { .. }) {
                     if let Some(warnings) = result.get("warnings").and_then(Value::as_array) {
@@ -3908,12 +3957,24 @@ where
                         }
                     }
                 }
+                if matches!(command, Command::HarklightRetry { .. })
+                    && result
+                        .pointer("/counts/failed")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|failed| failed > 0)
+                {
+                    command_failure =
+                        Some("harklight-retry: one or more selected handles remain unavailable");
+                }
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).expect("JSON value serializes")
                 );
             }
-            Ok(())
+            match command_failure {
+                Some(message) => Err(message.to_owned()),
+                None => Ok(()),
+            }
         }
     }
 }
@@ -4035,6 +4096,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightFollow { identity, .. }
         | Command::HarklightCover { identity, .. }
+        | Command::HarklightRetry { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::RoleBind { identity, .. }
@@ -4298,6 +4360,9 @@ mod tests {
                 "harklight-follow",
             ),
             (vec!["harklight-cover", "--session", "h"], "harklight-cover"),
+            (vec!["harklight-retry", "--all"], "harklight-retry"),
+            (vec!["harklight-retry", "--message", "m"], "harklight-retry"),
+            (vec!["harklight-retry", "--session", "h"], "harklight-retry"),
         ];
         for (args, verb) in commands {
             let command =
@@ -4320,6 +4385,14 @@ mod tests {
                 && body["params"].get("handle").is_some()
             {
                 assert_eq!(body["params"]["handle"], "h");
+            } else if verb == "harklight-retry" {
+                if body["params"].get("all").is_some() {
+                    assert_eq!(body["params"]["all"], true);
+                } else if body["params"].get("messageId").is_some() {
+                    assert_eq!(body["params"]["messageId"], "m");
+                } else {
+                    assert_eq!(body["params"]["handle"], "h");
+                }
             } else {
                 assert_eq!(body["params"]["messageId"], "m");
             }
@@ -4814,8 +4887,34 @@ mod tests {
         let ordinary_session_call = parse(&["work-item-get", "wi_1"]);
         assert!(requires_session_discovery(&ordinary_session_call));
 
+        let retry_call = parse(&["harklight-retry", "--all"]);
+        assert!(requires_session_discovery(&retry_call));
+
         let explicit_user = parse(&["add-user", "guest", "--as-user", "flynn"]);
         assert!(!requires_session_discovery(&explicit_user));
+    }
+
+    #[test]
+    fn harklight_retry_preserves_existing_authenticated_identities() {
+        let endpoint = Endpoint {
+            base: "http://gateway.example:11373".to_owned(),
+            token: "fixture-token".to_owned(),
+            origin: Origin::Session(PathBuf::from("/work/.tightbeam-session")),
+        };
+
+        for identity in [
+            Identity::User("owner".to_owned()),
+            Identity::Process("worker".to_owned()),
+        ] {
+            let command = Command::HarklightRetry {
+                identity,
+                all: true,
+                message: None,
+                handle: None,
+            };
+
+            assert_eq!(local_harklight_identity_refusal(&command, &endpoint), None);
+        }
     }
 
     /// The case the value comparison could not see.
@@ -6822,6 +6921,56 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_apply_all_asks_for_bounded_steps_and_resumes_from_the_cursor() {
+        use std::cell::RefCell;
+
+        let bodies = RefCell::new(Vec::new());
+        run_with(
+            Command::IdentityApply {
+                identity: Identity::User("flynn".to_owned()),
+                session_key: None,
+                all: true,
+            },
+            || {
+                Ok(Endpoint {
+                    base: "https://gateway.test".to_owned(),
+                    token: "tbc_test".to_owned(),
+                    origin: Origin::Provisioned,
+                })
+            },
+            |_endpoint, request, deadline| {
+                assert_eq!(deadline, None);
+                bodies.borrow_mut().push(request.body_json.clone());
+                let cursor = if bodies.borrow().len() == 1 {
+                    serde_json::json!("next-step")
+                } else {
+                    Value::Null
+                };
+                Ok(Some(serde_json::json!({
+                    "status": "complete",
+                    "complete": true,
+                    "identityRevision": "rev-1",
+                    "targetSessionKeys": [],
+                    "applied": [],
+                    "results": [],
+                    "total": 0,
+                    "cursor": cursor,
+                })))
+            },
+            |_, _| panic!("harness loader must not be called"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *bodies.borrow(),
+            vec![
+                r#"{"asUser":"flynn","verb":"identity-apply","params":{"all":true,"limit":100}}"#,
+                r#"{"asUser":"flynn","verb":"identity-apply","params":{"all":true,"limit":100,"cursor":"next-step"}}"#,
+            ]
+        );
     }
 
     #[test]

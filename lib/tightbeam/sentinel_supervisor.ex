@@ -9,9 +9,9 @@ defmodule Tightbeam.SentinelSupervisor do
   environment. Its output is appended to `sentinel.log` there, and the command's
   SHA-256 is recorded on its state row and in the log.
 
-  An exit restarts the child with backoff. After five consecutive exits that each
-  came within a minute of their start, the sentinel is recorded `stopped` and the
-  principal who last enabled it gets one wake. The wake is about supervision only;
+  An exit restarts the child with capped backoff. After five consecutive exits
+  within a minute of starting, the principal who last enabled it gets one wake;
+  the sentinel keeps restarting. The wake is about supervision only;
   what the sentinel watches is its own business.
   """
 
@@ -26,7 +26,7 @@ defmodule Tightbeam.SentinelSupervisor do
   alias Tightbeam.Wakes
 
   @fast_exit_ms 60_000
-  @stop_after 5
+  @notice_after 5
   @max_backoff_ms 60_000
 
   @doc false
@@ -234,33 +234,29 @@ defmodule Tightbeam.SentinelSupervisor do
     fast? = ended_at - child.started_at < state.fast_exit_ms
     failures = if fast?, do: Map.get(state.failures, qualified, 0) + 1, else: 0
 
-    if failures >= @stop_after do
+    if failures == @notice_after do
       reason =
         "exited #{failures} times in a row within #{div(state.fast_exit_ms, 1000)}s " <>
           "of starting; last status #{status}"
 
-      stop_after_failures(state, qualified, reason)
-      %{state | failures: Map.delete(state.failures, qualified)}
-    else
-      delay = min(state.backoff_unit_ms * Integer.pow(2, max(failures - 1, 0)), @max_backoff_ms)
-      Process.send_after(self(), {:restart, qualified}, delay)
-      put_in(state.failures[qualified], failures)
+      DB.background_pass(fn -> notify_quick_exits(state, qualified, reason) end)
     end
+
+    delay =
+      min(state.backoff_unit_ms * Integer.pow(2, min(max(failures - 1, 0), 60)), @max_backoff_ms)
+
+    Process.send_after(self(), {:restart, qualified}, delay)
+    put_in(state.failures[qualified], failures)
   end
 
-  defp stop_after_failures(state, qualified, reason) do
-    DB.background_pass(fn -> record_stopped(state, qualified, reason) end)
-  end
-
-  defp record_stopped(state, qualified, reason) do
+  defp notify_quick_exits(state, qualified, reason) do
     enabled_by = Sentinels.states(state.db, state.host)[qualified][:enabled_by]
-    :ok = Sentinels.mark_stopped(state.db, state.host, qualified, reason)
-    Logger.error("sentinel #{qualified} stopped on #{state.host}: #{reason}")
+    Logger.error("sentinel #{qualified} repeatedly exited on #{state.host}: #{reason}")
 
     prompt =
-      "Sentinel #{qualified} on #{state.host} is stopped: it #{reason}. " <>
+      "Sentinel #{qualified} on #{state.host} is restarting after it #{reason}. " <>
         "Its output is in #{Path.join([state.base_dir, "sentinels", qualified, "sentinel.log"])}. " <>
-        "Run `tightbeam doctor` for its state; `tightbeam sentinel enable #{qualified}` restarts it."
+        "Run `tightbeam doctor` for its state."
 
     case principal_session(state.db, enabled_by) do
       {:ok, session_key} ->
@@ -272,7 +268,7 @@ defmodule Tightbeam.SentinelSupervisor do
               prompt: prompt,
               due_at: System.system_time(:millisecond),
               sender_scheduled: true,
-              obligation_ref: Wakes.sentinel_stop_notice_ref(state.host, qualified)
+              obligation_ref: Wakes.sentinel_restart_notice_ref(state.host, qualified)
             })
           end)
 
@@ -280,7 +276,7 @@ defmodule Tightbeam.SentinelSupervisor do
 
       :none ->
         Logger.error(
-          "sentinel #{qualified} stop has no principal to wake (enabled by #{inspect(enabled_by)})"
+          "sentinel #{qualified} quick exits have no principal to wake (enabled by #{inspect(enabled_by)})"
         )
     end
   end

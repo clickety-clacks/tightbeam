@@ -121,6 +121,7 @@ defmodule Tightbeam.Rules do
     holder_archetype
     assignment_opener_session
     assignment_opener_or_coordinator_session
+    queue_backlog_recipient_session
     reviewed_producer_assignment_opener_session
     session_key
     session_unassigned_stretch_id
@@ -786,7 +787,7 @@ defmodule Tightbeam.Rules do
   @doc "Resolve a validated notice against the same transaction snapshot as its rule."
   @spec resolve_notice_in_txn(DB.Txn.t(), map(), map()) :: {:ok, map()} | {:error, term()}
   def resolve_notice_in_txn(%DB.Txn{} = txn, rule, call) do
-    RailRemedy.resolve_notice(txn, rule.notice, notice_bindings(txn, call))
+    RailRemedy.resolve_notice(txn, rule.notice, notice_bindings(txn, call, rule))
   end
 
   defp normalize_predicate_conditions(conditions) when is_list(conditions) do
@@ -1146,7 +1147,7 @@ defmodule Tightbeam.Rules do
     end)
   end
 
-  defp notice_bindings(db, call) do
+  defp notice_bindings(db, call, rule) do
     assignment =
       case fetch_fact("$assignment", db, call, %{}) do
         {:ok, value, _cache} -> value
@@ -1175,6 +1176,12 @@ defmodule Tightbeam.Rules do
         work_item_coordinator_session(db, work_item_id)
       end
 
+    queue_backlog_recipient_session =
+      if rule.name == "ac6a-queue-backlog" do
+        active_assignment_opener_session || work_item_coordinator_session ||
+          queue_owner_or_holder_session(db, Map.get(call.params, :session_key))
+      end
+
     delivery_owner_ref =
       case work_item_id && current_delivery_owner(db, work_item_id) do
         %{"accountableSessionKey" => session_key} -> "session:" <> session_key
@@ -1191,6 +1198,7 @@ defmodule Tightbeam.Rules do
       reviewed_producer_assignment_opener_session: reviewed_producer_assignment_opener_session,
       assignment_opener_or_coordinator_session:
         active_assignment_opener_session || work_item_coordinator_session,
+      queue_backlog_recipient_session: queue_backlog_recipient_session,
       session_key: Map.get(call.params, :session_key),
       session_unassigned_stretch_id: row_commit_value(db, call, "session.unassigned_stretch_id"),
       caller_session_key: caller_session_key(db, call),
@@ -1276,6 +1284,23 @@ defmodule Tightbeam.Rules do
   end
 
   defp active_notice_session(_db, _session_key), do: nil
+
+  defp queue_owner_or_holder_session(db, holder_session_key) when is_binary(holder_session_key) do
+    owner_main =
+      case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [
+             holder_session_key
+           ]) do
+        {:ok, [[owner_user_id]]} when is_binary(owner_user_id) ->
+          active_notice_session(db, Org.personal_session_key(owner_user_id))
+
+        _ ->
+          nil
+      end
+
+    owner_main || active_notice_session(db, holder_session_key)
+  end
+
+  defp queue_owner_or_holder_session(_db, _holder_session_key), do: nil
 
   defp caller_session_key(db, %{edge: :row_commit, params: params}) do
     caller_session_from_origin(db, Map.get(params, :caller_origin))
@@ -1441,7 +1466,17 @@ defmodule Tightbeam.Rules do
 
               []
             else
-              [{:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}]
+              if unsupported_policy_purpose?(policy) do
+                require Logger
+
+                Logger.warning(
+                  "#{path}: policy #{inspect(Map.get(policy, "name"))}: unsupported purpose: #{inspect(Map.get(policy, "purpose"))}"
+                )
+
+                []
+              else
+                [{:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}]
+              end
             end
           end)
 
@@ -1461,10 +1496,11 @@ defmodule Tightbeam.Rules do
         contents
       )
 
-    only_retired_policies? =
-      rules == [] and policy_entries != [] and Enum.all?(policy_entries, &retired_policy?/1)
+    only_skipped_policies? =
+      rules == [] and policy_entries != [] and
+        Enum.all?(policy_entries, &(retired_policy?(&1) or unsupported_policy_purpose?(&1)))
 
-    if rules == [] and policies == [] and reactions == [] and not only_retired_policies?,
+    if rules == [] and policies == [] and reactions == [] and not only_skipped_policies?,
       do: raise(ArgumentError, "#{path}: must contain one or more [[rule]] or [[policy]] tables")
 
     rules ++ policies ++ reactions
@@ -1474,6 +1510,13 @@ defmodule Tightbeam.Rules do
     do:
       is_map(policy) and
         Map.get(policy, "purpose") in ~w(wait-effort-relief wait-verification-admission)
+
+  defp unsupported_policy_purpose?(policy) when is_map(policy) do
+    purpose = Map.get(policy, "purpose")
+    purpose not in @policy_purposes
+  end
+
+  defp unsupported_policy_purpose?(_policy), do: false
 
   defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
     raw_name = Map.get(policy, "name")
@@ -2347,7 +2390,7 @@ defmodule Tightbeam.Rules do
   end
 
   defp fold_effect("deny", rule, _rest, db, call, _cache, to_close, to_consume, exit_class) do
-    error = denial_error(rule, call, "rule_denied", exit_class, notice_bindings(db, call))
+    error = denial_error(rule, call, "rule_denied", exit_class, notice_bindings(db, call, rule))
     {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
   end
 

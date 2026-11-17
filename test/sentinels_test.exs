@@ -534,7 +534,7 @@ defmodule Tightbeam.SentinelsTest do
       refute File.exists?(Path.join([ctx.base, "sentinels", "beta-bundle"]))
     end
 
-    test "repeated fast exits stop the sentinel and wake its enabler once", ctx do
+    test "repeated fast exits keep restarting and wake the enabler once", ctx do
       Org.create(ctx.db, %{
         session_key: Org.personal_session_key("flynn"),
         kind: "main",
@@ -559,74 +559,44 @@ defmodule Tightbeam.SentinelsTest do
       supervisor = start_supervisor!(ctx, backoff_unit_ms: 1)
 
       assert wait_until(fn ->
-               match?(
-                 %{state: "stopped"},
-                 Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"]
-               )
+               match?({:ok, [[1]]}, DB.query(ctx.db, "SELECT COUNT(*) FROM wakes"))
              end)
 
-      %{reason: reason} = Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"]
-      assert reason =~ "exited 5 times in a row"
-      assert reason =~ "last status 3"
+      assert Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"].state == "enabled"
 
       log =
         File.read!(Path.join([ctx.base, "sentinels", "alpha-bundle", "watch", "sentinel.log"]))
 
-      assert length(Regex.scan(~r/ exit alpha-bundle\/watch status=3/, log)) == 5
+      assert length(Regex.scan(~r/ exit alpha-bundle\/watch status=3/, log)) >= 5
+
+      assert wait_until(fn ->
+               log =
+                 File.read!(
+                   Path.join([ctx.base, "sentinels", "alpha-bundle", "watch", "sentinel.log"])
+                 )
+
+               length(Regex.scan(~r/ exit alpha-bundle\/watch status=3/, log)) >= 6
+             end)
 
       {:ok, wakes} =
         DB.query(ctx.db, "SELECT sessionKey,origin,prompt,obligationRef,state FROM wakes")
 
       assert [[session_key, "process:tightbeam", prompt, obligation_ref, "pending"]] = wakes
       assert session_key == Org.personal_session_key("flynn")
-      assert prompt =~ "Sentinel alpha-bundle/watch on #{ctx.host} is stopped"
-      assert prompt =~ "tightbeam sentinel enable alpha-bundle/watch"
-      assert obligation_ref == Wakes.sentinel_stop_notice_ref(ctx.host, "alpha-bundle/watch")
+      assert prompt =~ "Sentinel alpha-bundle/watch on #{ctx.host} is restarting"
+      assert prompt =~ "exited 5 times in a row"
+      assert obligation_ref == Wakes.sentinel_restart_notice_ref(ctx.host, "alpha-bundle/watch")
 
-      assert [%{state: "stopped", action: "run: tightbeam sentinel enable alpha-bundle/watch"}] =
-               Sentinels.setup(ctx.base, ctx.db, ctx.host, "alpha-bundle").pending
+      assert [] == Sentinels.setup(ctx.base, ctx.db, ctx.host, "alpha-bundle").pending
 
-      scheduler =
-        start_supervised!(
-          {Wakes,
-           db: ctx.db,
-           name: :sentinel_condition_notice_scheduler,
-           tick_ms: 60_000,
-           deliver: fn _wake -> :ok end}
-        )
-
-      assert :ok = Wakes.fire_due(scheduler)
-
-      assert {:ok, [["pending"]]} =
-               DB.query(ctx.db, "SELECT state FROM wakes WHERE obligationRef=?1", [obligation_ref])
-
-      enable!(ctx, "alpha-bundle/watch")
-
-      :ok =
-        Sentinels.mark_started(
-          ctx.db,
-          ctx.host,
-          "alpha-bundle/watch",
-          String.duplicate("a", 64),
-          2
-        )
-
-      assert {:ok, [["canceled"]]} =
-               DB.query(ctx.db, "SELECT state FROM wakes WHERE obligationRef=?1", [obligation_ref])
+      assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
       assert :ok =
                Ledger.finish(ctx.db, busy_turn.seq, "delivered", nil,
                  owner_lease: busy_turn.owner_lease
                )
 
-      assert :ok = Wakes.fire_due(scheduler)
-
-      assert {:ok, [[0]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT COUNT(*) FROM turns WHERE wakeId=(SELECT wakeId FROM wakes WHERE obligationRef=?1)",
-                 [obligation_ref]
-               )
+      assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
       # Children that exit at once never take the supervisor down with them.
       assert Process.alive?(supervisor)

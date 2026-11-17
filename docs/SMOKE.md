@@ -25,10 +25,13 @@ with existing supported credentials and a permitted non-production test host:
 ```sh
 TIGHTBEAM_BASE_DIR=/absolute/owned/test-base \
 TIGHTBEAM_SMOKE_OWNED_BASE=/absolute/owned/test-base \
+TIGHTBEAM_SMOKE_OWNER='<admin-user-id>' \
 TIGHTBEAM_SMOKE_MODE=readiness \
 mix run --no-start scripts/feature_smoke.exs
 ```
 
+`TIGHTBEAM_SMOKE_OWNER` is required: an admin user id present in the copied
+org's `state.db`. Without it the smoke stops before its first gateway request.
 Supply per-harness model/effort settings as required by the feature smoke.
 This route only spawns a new session, wakes it, reads its wake-bound delivered
 assistant reply and checks retirement. It does not install rules, edit identity
@@ -191,12 +194,17 @@ on 2026-07-25:
   ```sh
   TIGHTBEAM_BASE_DIR=/absolute/owned/test-base \
   TIGHTBEAM_SMOKE_OWNED_BASE=/absolute/owned/test-base \
+  TIGHTBEAM_SMOKE_OWNER='<admin-user-id>' \
   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-haiku-4-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-luna' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
   TIGHTBEAM_SMOKE_MODEL_CURSOR='<catalog-listed-cursor-model>' \
   TIGHTBEAM_SMOKE_MODEL_PI='opencode-go/gpt-5.6-luna' TIGHTBEAM_SMOKE_EFFORT_PI='medium' \
   mix run --no-start scripts/feature_smoke.exs
   ```
+
+  `TIGHTBEAM_SMOKE_OWNER` is required: an admin user id present in the copied
+  org's `state.db`. The smoke acts as that user and has no default; without it
+  the run stops before its first gateway request.
 
   Claude model ids are passed exactly to the installed local client. The catalog is
   useful discovery data, not an admission list: the smoke succeeds only when that

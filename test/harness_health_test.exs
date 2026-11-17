@@ -169,6 +169,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert incident.affectedAssignments == Enum.sort(Enum.map(ctx.sessions, & &1.assignment))
     refute ctx.outside_session in incident.affectedSessions
     refute "asg_health_outside" in incident.affectedAssignments
+
     assert Enum.map(incident.observations, & &1.correlation_id) == ["late", "failure-3"]
   end
 
@@ -265,9 +266,16 @@ defmodule Tightbeam.HarnessHealthTest do
       redaction_confirmed: true,
       cause: "normal turn 101 delivered",
       observed_at: recovery_at,
-      accepted_at: recovery_at,
+      accepted_at: recovery_at + 180_000,
       idempotency_key: "other-recovery-1"
     }
+
+    assert {:error, %{code: "stale_recovery_evidence"}} =
+             HarnessHealth.resolve_other(ctx.db, %{
+               recovery
+               | observed_at: at - 1,
+                 idempotency_key: "other-recovery-before-failure"
+             })
 
     assert {:resolved, resolved} = HarnessHealth.resolve_other(ctx.db, recovery)
     assert resolved.state == "resolved"
@@ -295,7 +303,7 @@ defmodule Tightbeam.HarnessHealthTest do
     refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "testhost", "other")
   end
 
-  test "other evidence validity accepts the 15-minute boundary and explains excess validity",
+  test "other evidence validity can exceed fifteen minutes",
        ctx do
     at = System.system_time(:millisecond)
     source_session = "agent:harness-health:validity-boundary"
@@ -326,26 +334,13 @@ defmodule Tightbeam.HarnessHealthTest do
       not_known_class_reason: "not one of the named failure classes",
       observed_at: at,
       accepted_at: at,
-      valid_until: at + 900_000,
+      valid_until: at + 3_600_000,
       world_status: "UNKNOWN",
       redaction_confirmed: true,
       idempotency_key: "other-validity-boundary"
     }
 
     assert {:opened, _opened} = HarnessHealth.observe_other(ctx.db, input)
-
-    assert {:error,
-            %{
-              code: "invalid_other_evidence",
-              message:
-                "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
-            }} =
-             HarnessHealth.observe_other(ctx.db, %{
-               input
-               | description: "unclassified evidence beyond validity limit",
-                 valid_until: at + 900_001,
-                 idempotency_key: "other-validity-over-limit"
-             })
   end
 
   test "public other opening deduplicates an owner main already present as an ancestor", ctx do
@@ -3220,6 +3215,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert opened["after"]["state"] == "open"
     assert opened["after"]["failureClass"] == "rate-limit-dead"
     assert opened["after"]["routesComplete"]
+
     assert opened["after"]["routes"] == [
              %{
                "harness" => "claude",
@@ -3228,6 +3224,7 @@ defmodule Tightbeam.HarnessHealthTest do
                "model" => failed_model
              }
            ]
+
     assert opened["after"]["fencePresent"]
     assert opened_facts["hold"]["state"] == "open"
     assert opened_facts["hold"]["routes"] == opened["after"]["routes"]
@@ -3452,7 +3449,8 @@ defmodule Tightbeam.HarnessHealthTest do
     assert second_resumed_turn.prompt == second_failure_prompt
   end
 
-  test "operator retry reports provider limit and credential refusal without releasing the fence", ctx do
+  test "operator retry reports provider limit and credential refusal without releasing the fence",
+       ctx do
     failure_turn =
       fail_health_turn!(
         ctx.db,
@@ -3522,8 +3520,11 @@ defmodule Tightbeam.HarnessHealthTest do
   test "recovery cycle records each route and releases only after all current routes succeed",
        ctx do
     [first | _] = ctx.sessions
+
     assert {:ok, [[owner_user_id]]} =
-             DB.query(ctx.db, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [first.session])
+             DB.query(ctx.db, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [
+               first.session
+             ])
 
     second_session = "agent:harness-health:recovery-route-two"
     second_assignment = "asg_health_recovery_route_two"
@@ -3603,8 +3604,18 @@ defmodule Tightbeam.HarnessHealthTest do
              Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, started_one)
 
     assert {:ok, [[wake_count_before_cycle]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
-    seed_running_recovery_checks!(ctx.db, incident.id, cycle_one, routes, started_one, owner_user_id)
-    [route_one, route_two] = Enum.sort_by(routes, &Tightbeam.HarnessHealth.RecoveryCheck.route_key/1)
+
+    seed_running_recovery_checks!(
+      ctx.db,
+      incident.id,
+      cycle_one,
+      routes,
+      started_one,
+      owner_user_id
+    )
+
+    [route_one, route_two] =
+      Enum.sort_by(routes, &Tightbeam.HarnessHealth.RecoveryCheck.route_key/1)
 
     assert {:ok, :ok} =
              DB.transaction(ctx.db, fn txn ->
@@ -3636,7 +3647,11 @@ defmodule Tightbeam.HarnessHealthTest do
              DB.query(
                ctx.db,
                "SELECT outcome,errorExcerpt,(SELECT COUNT(*) FROM row_reaction_events WHERE eventId=(SELECT eventId FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND routeKey=?3)) FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND routeKey=?3",
-               [incident.id, cycle_one, Tightbeam.HarnessHealth.RecoveryCheck.route_key(route_one)]
+               [
+                 incident.id,
+                 cycle_one,
+                 Tightbeam.HarnessHealth.RecoveryCheck.route_key(route_one)
+               ]
              )
 
     assert {:ok, :ok} =
@@ -3648,7 +3663,7 @@ defmodule Tightbeam.HarnessHealthTest do
                  Tightbeam.HarnessHealth.RecoveryCheck.route_key(route_two),
                  "failed",
                  "bounded provider error",
-                   started_one + 3_600_100
+                 started_one + 3_600_100
                )
              end)
 
@@ -3677,7 +3692,14 @@ defmodule Tightbeam.HarnessHealthTest do
     assert [%{"cycle_id" => ^cycle_two}] =
              Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, started_two)
 
-    seed_running_recovery_checks!(ctx.db, incident.id, cycle_two, routes, started_two, owner_user_id)
+    seed_running_recovery_checks!(
+      ctx.db,
+      incident.id,
+      cycle_two,
+      routes,
+      started_two,
+      owner_user_id
+    )
 
     assert {:ok, :ok} =
              DB.transaction(ctx.db, fn txn ->
@@ -3786,6 +3808,7 @@ defmodule Tightbeam.HarnessHealthTest do
              Tightbeam.HarnessHealth.RecoverySchedule.due_cycles(ctx.db)
 
     assert id == opened.id
+
     assert {:ok, [[^due_at]]} =
              DB.query(
                ctx.db,
@@ -3830,6 +3853,7 @@ defmodule Tightbeam.HarnessHealthTest do
              Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, revised_due_at)
 
     load_recovery_policy!([], 1_800_000)
+
     assert :ok =
              Tightbeam.HarnessHealth.RecoverySchedule.reconcile_open_holds(
                ctx.db,
@@ -3844,6 +3868,7 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     load_recovery_policy!(["rate-limit-dead"], 600_000)
+
     assert :ok =
              Tightbeam.HarnessHealth.RecoverySchedule.reconcile_open_holds(
                ctx.db,
@@ -3943,6 +3968,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
     scheduler_name = {:global, {:harness_health_recovery_test, make_ref()}}
     task_sup = start_supervised!(Task.Supervisor)
+
     base_dir =
       Path.join(
         System.tmp_dir!(),
@@ -4321,9 +4347,7 @@ defmodule Tightbeam.HarnessHealthTest do
     File.mkdir_p!(rules_dir)
 
     seed =
-      File.read!(
-        Path.join(:code.priv_dir(:tightbeam), "seed/rules/harness-health-recovery.toml")
-      )
+      File.read!(Path.join(:code.priv_dir(:tightbeam), "seed/rules/harness-health-recovery.toml"))
 
     changed =
       seed
@@ -4331,7 +4355,7 @@ defmodule Tightbeam.HarnessHealthTest do
         "eligible_failure_classes = [\"rate-limit-dead\"]",
         "eligible_failure_classes = #{JSON.encode!(eligible_classes)}"
       )
-      |> String.replace("interval_ms = 3600000", "interval_ms = #{interval_ms}")
+      |> String.replace("interval_ms = 120000", "interval_ms = #{interval_ms}")
 
     if changed == seed do
       raise "recovery policy fixture did not change the shipped seed"

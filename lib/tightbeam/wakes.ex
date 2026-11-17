@@ -45,6 +45,7 @@ defmodule Tightbeam.Wakes do
   @miss_lateness_ms 60_000
   @decision_request_notice_marker "decision-request-notice:"
   @sentinel_stop_notice_marker "sentinel-stop-notice:"
+  @sentinel_restart_notice_marker "sentinel-restart-notice:"
 
   @type db :: GenServer.server()
 
@@ -1724,6 +1725,15 @@ defmodule Tightbeam.Wakes do
         txn,
         wake,
         input.replacement_assignment_id
+      )
+    end
+
+    if is_binary(Map.get(input, :prod_id)) do
+      Tightbeam.QueuedMessageSuppression.replace_prod_in_txn(
+        txn,
+        wake,
+        Map.fetch!(input, :prod_sender),
+        input.prod_id
       )
     end
 
@@ -3595,6 +3605,12 @@ defmodule Tightbeam.Wakes do
             retry_wake_id
           )
 
+          Tightbeam.QueuedMessageSuppression.copy_prod_request_in_txn(
+            txn,
+            wake.wake_id,
+            retry_wake_id
+          )
+
           publish_change_in_txn(txn, "wake.scheduled", retry_wake_id)
           schedule_changed_in_txn(txn, {:schedule_changed, due_at})
         else
@@ -3765,6 +3781,8 @@ defmodule Tightbeam.Wakes do
       wake.wake_id,
       retry_wake_id
     )
+
+    Tightbeam.QueuedMessageSuppression.copy_prod_request_in_txn(txn, wake.wake_id, retry_wake_id)
 
     publish_change_in_txn(txn, "wake.scheduled", retry_wake_id)
     schedule_changed_in_txn(txn, {:schedule_changed, due_at})
@@ -4032,6 +4050,10 @@ defmodule Tightbeam.Wakes do
     do: @sentinel_stop_notice_marker <> JSON.encode!([host, qualified])
 
   @doc false
+  def sentinel_restart_notice_ref(host, qualified) when is_binary(host) and is_binary(qualified),
+    do: @sentinel_restart_notice_marker <> JSON.encode!([host, qualified])
+
+  @doc false
   def clear_decision_request_notice_in_txn(%Txn{} = txn, request_id)
       when is_binary(request_id) do
     ref = decision_request_notice_ref(request_id)
@@ -4220,6 +4242,8 @@ defmodule Tightbeam.Wakes do
           replacement_id
         )
 
+        Tightbeam.QueuedMessageSuppression.copy_prod_request_in_txn(txn, wake_id, replacement_id)
+
         [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
         wake = to_wake(row)
         schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
@@ -4374,6 +4398,9 @@ defmodule Tightbeam.Wakes do
       sender_withdrew_own_notice?(command) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
+      sender_replaced_own_prod?(txn, command, wake) ->
+        {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
+
       scheduler_delivery_without_source?(command, wake) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
@@ -4393,6 +4420,27 @@ defmodule Tightbeam.Wakes do
        do: true
 
   defp sender_withdrew_own_notice?(_command), do: false
+
+  # A sender's prod revision replaces its message, not the assignment or work
+  # item mentioned by that message. A closed link must not block withdrawal.
+  defp sender_replaced_own_prod?(
+         txn,
+         %{
+           requester: %{kind: "process", id: "tightbeam:assignments"},
+           reason_kind: "superseded",
+           causal_source: %{kind: "wake", id: replacement_id},
+           outcome: %{kind: "replacement", replacement_wake_id: replacement_id}
+         },
+         wake
+       ) do
+    Tightbeam.QueuedMessageSuppression.same_prod_scope_in_txn(
+      txn,
+      wake.wake_id,
+      replacement_id
+    )
+  end
+
+  defp sender_replaced_own_prod?(_txn, _command, _wake), do: false
 
   defp decision_request_notice_clear?(
          txn,
@@ -4901,7 +4949,7 @@ defmodule Tightbeam.Wakes do
 
     with true <- primary.impact != "linked_work_not_open",
          true <- is_binary(replacement_id) and replacement_id != wake.wake_id,
-         :ok <- replacement_matches(txn, replacement_id, primary, requester_id),
+         :ok <- replacement_matches(txn, replacement_id, primary, requester_id, wake.wake_id),
          true <- is_nil(Map.get(outcome, :disposition_kind)),
          true <- is_nil(Map.get(outcome, :disposition_id)),
          true <- is_nil(Map.get(outcome, :liveness_trigger)) do
@@ -5172,9 +5220,9 @@ defmodule Tightbeam.Wakes do
   # below, so those callers keep the exact same-primary-work rule they
   # always had.
   defp replacement_matches(txn, replacement_id, primary),
-    do: replacement_matches(txn, replacement_id, primary, nil)
+    do: replacement_matches(txn, replacement_id, primary, nil, nil)
 
-  defp replacement_matches(txn, replacement_id, primary, requester_id) do
+  defp replacement_matches(txn, replacement_id, primary, requester_id, source_wake_id) do
     case Txn.q(
            txn,
            "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId, digest FROM wakes WHERE wakeId=?1",
@@ -5207,6 +5255,14 @@ defmodule Tightbeam.Wakes do
                     txn,
                     replacement_id
                   ) == primary.id ->
+                :ok
+
+              requester_id == "tightbeam:assignments" and
+                  Tightbeam.QueuedMessageSuppression.same_prod_scope_in_txn(
+                    txn,
+                    source_wake_id,
+                    replacement_id
+                  ) ->
                 :ok
 
               digest_carrier_exemption?(requester_id, digest) ->
