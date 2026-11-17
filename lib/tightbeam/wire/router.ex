@@ -3835,13 +3835,19 @@ defmodule Tightbeam.Wire.Router do
         {:error, 400, "payload_too_large", nil}
 
       true ->
-        {:ok,
-         %{
-           client_message_id: id,
-           device_id: device_id,
-           content: content,
-           attachments: attachments
-         }}
+        post_params = %{
+          client_message_id: id,
+          device_id: device_id,
+          content: content,
+          attachments: attachments
+        }
+
+        post_params =
+          if Map.has_key?(params, "submitter"),
+            do: Map.put(post_params, :submitter, params["submitter"]),
+            else: post_params
+
+        {:ok, post_params}
     end
   end
 

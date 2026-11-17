@@ -51,6 +51,7 @@ defmodule Tightbeam.Projection do
           reply_to_client_message_id: String.t() | nil,
           llm_visible_message_id: String.t(),
           attachments: list(),
+          submitter: map() | nil,
           attention_tier: integer(),
           message_type: String.t() | nil,
           marker: %{kind: String.t(), from: String.t(), to: String.t()} | nil
@@ -100,10 +101,19 @@ defmodule Tightbeam.Projection do
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
-    with :ok <- DB.execute(db, @ddl),
-         :ok <- AttachmentDelivery.ensure_schema(db) do
-      :ok
+    :ok = DB.execute(db, @ddl)
+    :ok = AttachmentDelivery.ensure_schema(db)
+  end
+
+  @doc false
+  def ensure_submitter_column(db \\ Tightbeam.DB) do
+    {:ok, columns} = DB.query(db, "PRAGMA table_info(messages)")
+
+    unless Enum.any?(columns, fn row -> Enum.at(row, 1) == "submitter" end) do
+      :ok = DB.execute(db, "ALTER TABLE messages ADD COLUMN submitter TEXT")
     end
+
+    :ok
   end
 
   @doc """
@@ -144,8 +154,8 @@ defmodule Tightbeam.Projection do
           """
             INSERT INTO messages (id, sessionKey, role, content, timestamp, sender, deviceId,
               clientMessageId, replyToMessageId, replyToClientMessageId, llmVisibleMessageId, attachments,
-              attentionTier, messageType, markerKind, markerFrom, markerTo)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+              attentionTier, messageType, markerKind, markerFrom, markerTo, submitter)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
           """,
           [
             id,
@@ -164,7 +174,8 @@ defmodule Tightbeam.Projection do
             message_type,
             marker_kind,
             marker_from,
-            marker_to
+            marker_to,
+            if(input[:submitter], do: JSON.encode!(input[:submitter]))
           ]
         )
 
@@ -274,7 +285,7 @@ defmodule Tightbeam.Projection do
               SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                      clientMessageId, replyToMessageId, replyToClientMessageId,
                      llmVisibleMessageId, attachments, attentionTier,
-                     messageType, markerKind, markerFrom, markerTo
+                     messageType, markerKind, markerFrom, markerTo, submitter
               FROM messages
               WHERE sessionKey = ?1 AND deviceId = ?2 AND clientMessageId = ?3
             """,
@@ -289,9 +300,10 @@ defmodule Tightbeam.Projection do
       [row] ->
         message = to_message(row)
 
-        if message.content == Map.fetch!(input, :content),
-          do: {:duplicate, message},
-          else: {:conflict, message}
+        if message.content == Map.fetch!(input, :content) or
+             message.content == Map.get(input, :raw_content),
+           do: {:duplicate, message},
+           else: {:conflict, message}
 
       [] ->
         :new
@@ -440,7 +452,7 @@ defmodule Tightbeam.Projection do
           SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
                  llmVisibleMessageId, attachments, attentionTier,
-                 messageType, markerKind, markerFrom, markerTo
+                 messageType, markerKind, markerFrom, markerTo, submitter
           FROM messages WHERE id = ?1
         """,
         [id]
@@ -476,7 +488,7 @@ defmodule Tightbeam.Projection do
           SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
                  llmVisibleMessageId, attachments, attentionTier,
-                 messageType, markerKind, markerFrom, markerTo
+                 messageType, markerKind, markerFrom, markerTo, submitter
           FROM messages WHERE sessionKey = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3
         """,
         [session_key, after_seq, limit]
@@ -540,7 +552,7 @@ defmodule Tightbeam.Projection do
         SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                clientMessageId, replyToMessageId, replyToClientMessageId,
                llmVisibleMessageId, attachments, attentionTier,
-               messageType, markerKind, markerFrom, markerTo
+               messageType, markerKind, markerFrom, markerTo, submitter
         FROM messages WHERE id = ?1
       """,
       [id]
@@ -565,7 +577,8 @@ defmodule Tightbeam.Projection do
          message_type,
          marker_kind,
          marker_from,
-         marker_to
+         marker_to,
+         submitter
        ]) do
     %{
       seq: seq,
@@ -581,6 +594,7 @@ defmodule Tightbeam.Projection do
       reply_to_client_message_id: reply_to_client_message_id,
       llm_visible_message_id: llm_visible_message_id,
       attachments: JSON.decode!(attachments),
+      submitter: if(submitter, do: JSON.decode!(submitter)),
       attention_tier: attention_tier,
       message_type: message_type,
       marker: marker(marker_kind, marker_from, marker_to)

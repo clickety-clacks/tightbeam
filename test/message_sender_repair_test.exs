@@ -7,6 +7,7 @@ defmodule Tightbeam.MessageSenderRepairTest do
     name = :"sender_repair_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     :ok = Projection.ensure_schema(name)
+    :ok = Projection.ensure_submitter_column(name)
 
     :ok =
       DB.execute(name, """
