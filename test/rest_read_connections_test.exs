@@ -8,7 +8,7 @@ defmodule Tightbeam.RestReadConnectionsTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{DB, Devices, Model, Org, Projection}
+  alias Tightbeam.{DB, Devices, Ledger, Model, Org, Projection, StateResources}
   alias Tightbeam.Wire.Router
 
   setup do
@@ -203,6 +203,210 @@ defmodule Tightbeam.RestReadConnectionsTest do
       assert [%{"content" => content}] = JSON.decode!(response.resp_body)["items"]
       assert content == "message #{n}"
     end
+  end
+
+  test "a reader deadline returns a retryable HTTP 503", ctx do
+    response =
+      Tightbeam.Wire.RequestObservation.call(
+        conn(:get, "/api/sessions/history-reader/messages"),
+        fn _conn ->
+          DB.read_transaction!(ctx.db, fn txn ->
+            DB.Txn.q(%{txn | deadline: System.monotonic_time(:millisecond) - 1}, "SELECT 1")
+          end)
+        end
+      )
+
+    assert response.status == 503
+
+    assert %{
+             "error" => %{
+               "code" => "db_timeout",
+               "action" => "retry_safe",
+               "timeoutSource" => "reader_deadline",
+               "effectState" => "none"
+             }
+           } =
+             JSON.decode!(response.resp_body)
+  end
+
+  test "history pages preserve event ids, ordering and flags with cancellation members", ctx do
+    key = ctx.session.session_key
+    [first | _] = StateResources.query_messages_for_session(ctx.db, key)
+
+    {:ok, turn} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: key,
+        message_id: first.id,
+        origin: "process:test",
+        prompt: "history fixture"
+      })
+
+    :ok = execute!(ctx.db, "UPDATE turns SET wakeId='history-carrier' WHERE seq=?1", [turn])
+
+    :ok =
+      execute!(ctx.db, "UPDATE messages SET recordEventIds=?2 WHERE id=?1", [
+        first.id,
+        JSON.encode!(["z", "a"])
+      ])
+
+    :ok =
+      execute!(
+        ctx.db,
+        """
+        INSERT INTO wakes(wakeId, sessionKey, origin, prompt, dueAt, createdAt, recordEventIds)
+        VALUES ('history-carrier', ?1, 'process:test', 'carrier', 1, 1, '["b","a"]'),
+               ('history-member', ?1, 'process:test', 'member', 1, 1, '["c","b"]')
+        """,
+        [key]
+      )
+
+    {:appended, reply} =
+      Projection.append(ctx.db, %{
+        session_key: key,
+        role: "assistant",
+        content: "reply",
+        reply_to_message_id: first.id
+      })
+
+    assert StateResources.query_message(ctx.db, first.id).record_event_ids == ["a", "b", "z"]
+    assert_pages_match_full_history(ctx.db, key)
+    drop_cancellation_fixture_guards(ctx.db)
+    insert_cancellations(ctx.db, "history-member", "history-carrier")
+    assert_pages_match_full_history(ctx.db, key)
+    page = StateResources.query_messages_for_session_page(ctx.db, key, :earliest, 1)
+    assert hd(page.rows).record_event_ids == ["a", "b", "c", "z"]
+    assert StateResources.query_message(ctx.db, first.id).record_event_ids == ["a", "b", "c", "z"]
+    assert StateResources.query_message(ctx.db, reply.id).record_event_ids == ["a", "b", "c"]
+  end
+
+  test "history page scans cancellation rows at most once outside per-message subqueries", ctx do
+    drop_cancellation_fixture_guards(ctx.db)
+
+    :ok =
+      execute!(
+        ctx.db,
+        """
+        WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<2000)
+        INSERT INTO wakes(wakeId, sessionKey, origin, prompt, dueAt, createdAt)
+        SELECT 'unrelated-' || x, ?1, 'process:test', 'unrelated', 1, 1 FROM n
+        """,
+        [ctx.session.session_key]
+      )
+
+    :ok =
+      execute!(ctx.db, """
+      INSERT INTO wake_cancellations(wakeId,canceledAt,requesterKind,requesterId,reasonKind,
+        causalSourceKind,causalSourceId,outcomeKind,replacementWakeId,workImpactKind,actionNeeded)
+      SELECT wakeId,1,'process','tightbeam:batcher','superseded','wake','cause','replacement',
+        'unrelated-1','no_linked_work',0 FROM wakes WHERE wakeId LIKE 'unrelated-%' AND wakeId != 'unrelated-1'
+      """)
+
+    [first | _] = StateResources.query_messages_for_session(ctx.db, ctx.session.session_key)
+
+    {:ok, turn} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.session.session_key,
+        message_id: first.id,
+        origin: "process:test",
+        prompt: "plan fixture"
+      })
+
+    :ok = execute!(ctx.db, "UPDATE turns SET wakeId='unrelated-1' WHERE seq=?1", [turn])
+    parent = self()
+
+    DB.read_transaction!(ctx.db, fn txn ->
+      txn = DB.Txn.observe_queries(txn, parent)
+      StateResources.query_messages_for_session_page(txn, ctx.session.session_key, :latest, 500)
+    end)
+
+    statements = traced_queries([])
+    assert statements != []
+
+    plans =
+      Enum.map(statements, fn {sql, params} ->
+        {:ok, rows} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, params)
+        rows
+      end)
+
+    cancellation_scans =
+      for plan <- plans,
+          [id, parent, _, detail] <- plan,
+          Regex.match?(~r/SCAN (cancellation|wake_cancellations)\b/, detail),
+          do: {plan, id, parent}
+
+    assert length(cancellation_scans) <= 1
+
+    for {plan, _id, parent} <- cancellation_scans do
+      refute correlated_ancestor?(plan, parent)
+    end
+  end
+
+  defp correlated_ancestor?(_plan, 0), do: false
+
+  defp correlated_ancestor?(plan, id) do
+    case Enum.find(plan, &(hd(&1) == id)) do
+      [_, parent, _, detail] ->
+        String.contains?(detail, "CORRELATED") or correlated_ancestor?(plan, parent)
+
+      nil ->
+        false
+    end
+  end
+
+  defp traced_queries(acc) do
+    receive do
+      {:core_detail_trace, {:sql_query, sql, params}} -> traced_queries([{sql, params} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp assert_pages_match_full_history(db, key) do
+    all = StateResources.query_messages_for_session(db, key)
+
+    for {boundary, expected, before?, after?} <- [
+          {:earliest, Enum.take(all, 2), false, length(all) > 2},
+          {:latest, Enum.take(all, -2), length(all) > 2, false},
+          {{:after, [hd(all).seq]}, Enum.slice(all, 1, 2), true, length(all) > 3},
+          {{:before, [List.last(all).seq]}, all |> Enum.drop(-1) |> Enum.take(-2),
+           length(all) > 3, true}
+        ] do
+      page = StateResources.query_messages_for_session_page(db, key, boundary, 2)
+      assert page.rows == expected
+      assert page.flags.has_more_before == before?
+      assert page.flags.has_more_after == after?
+    end
+  end
+
+  # Synthetic cancellation fixtures exercise reads, independently of cancellation admission.
+  defp drop_cancellation_fixture_guards(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+    {:ok, triggers} =
+      DB.query(
+        db,
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='wake_cancellations'"
+      )
+
+    for [name] <- triggers, do: execute!(db, ~s(DROP TRIGGER "#{name}"))
+  end
+
+  defp insert_cancellations(db, member, carrier) do
+    :ok =
+      execute!(
+        db,
+        """
+        INSERT INTO wake_cancellations(wakeId,canceledAt,requesterKind,requesterId,reasonKind,
+          causalSourceKind,causalSourceId,outcomeKind,replacementWakeId,workImpactKind,actionNeeded)
+        VALUES (?1,1,'process','tightbeam:batcher','superseded','wake','cause','replacement',?2,'no_linked_work',0)
+        """,
+        [member, carrier]
+      )
+  end
+
+  defp execute!(db, sql, params \\ []) do
+    {:ok, _} = DB.query(db, sql, params)
+    :ok
   end
 
   defp get(ctx, path, bearer) do
