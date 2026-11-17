@@ -1175,7 +1175,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
       principal: {:session, "operator-raiser"},
       transport_session_key: "operator-raiser",
       session_key: nil,
-      params: %{question: "Ship the candidate?", options: [%{label: "ship"}, %{label: "hold"}]}
+      params:
+        Tightbeam.TestSupport.OperatorAskFixture.link(db, "operator-raiser", %{
+          question: "Ship the candidate?",
+          options: [%{label: "ship"}, %{label: "hold"}]
+        })
     }
 
     assert {:ok, %{status: "open"} = request} = Dispatch.dispatch(db, handlers, ask)

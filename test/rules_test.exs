@@ -2152,7 +2152,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{question: "Choose a route?"})
+        operator_ask_call(ctx.db, raiser.session_key, %{question: "Choose a route?"})
       )
 
     assert [wake] = Wakes.list_pending(ctx.db)
@@ -2209,7 +2209,7 @@ defmodule Tightbeam.RulesTest do
     other_request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(other_raiser.session_key, %{question: "Choose another route?"})
+        operator_ask_call(ctx.db, other_raiser.session_key, %{question: "Choose another route?"})
       )
 
     assert {:ok, [["decision-request-filed"]]} =
@@ -2244,7 +2244,7 @@ defmodule Tightbeam.RulesTest do
     old =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{question: "original decision?"})
+        operator_ask_call(ctx.db, raiser.session_key, %{question: "original decision?"})
       )
 
     put_raw(ctx, """
@@ -2267,7 +2267,7 @@ defmodule Tightbeam.RulesTest do
     assert %{code: "not_open"} =
              Escalation.operator_ask(
                ctx.db,
-               operator_ask_call(raiser.session_key, %{
+               operator_ask_call(ctx.db, raiser.session_key, %{
                  question: "refused replacement?",
                  supersedes: old.id,
                  assignment: closed_assignment.id
@@ -2797,7 +2797,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Review the filing?",
           assignment: bound.id
         })
@@ -2906,7 +2906,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Assign a reviewer?",
           assignment: bound.id
         })
@@ -3014,7 +3014,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Start a producer?",
           assignment: bound.id
         })
@@ -3116,7 +3116,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{question: "Unbound review?"})
+        operator_ask_call(ctx.db, raiser.session_key, %{question: "Unbound review?"})
       )
 
     assert Enum.any?(1..100, fn _ ->
@@ -3189,7 +3189,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Wake after ruling?",
           assignment: bound.id
         })
@@ -3307,7 +3307,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Deny the producer wake?",
           assignment: bound.id
         })
@@ -3412,7 +3412,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Resume after restart?",
           assignment: bound.id
         })
@@ -5267,13 +5267,13 @@ defmodule Tightbeam.RulesTest do
     }
   end
 
-  defp operator_ask_call(session_key, params) do
+  defp operator_ask_call(db, session_key, params) do
     %{
       verb: "operator-ask",
       origin: "agent:#{session_key}",
       principal: {:session, session_key},
       transport_session_key: session_key,
-      params: params
+      params: Tightbeam.TestSupport.OperatorAskFixture.link(db, session_key, params)
     }
   end
 

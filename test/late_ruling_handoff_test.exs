@@ -167,7 +167,11 @@ defmodule Tightbeam.LateRulingHandoffTest do
         origin: ctx.raiser.session_key,
         principal: {:session, ctx.raiser.session_key},
         transport_session_key: ctx.raiser.session_key,
-        params: %{question: "apply the incident ruling?", assignment_id: source.id}
+        params: %{
+          question: "apply the incident ruling?",
+          project: "Fixture product",
+          assignment_id: source.id
+        }
       })
 
     rename_request!(ctx.db, generated.id, @incident_request_id)
@@ -410,7 +414,11 @@ defmodule Tightbeam.LateRulingHandoffTest do
         origin: ctx.raiser.session_key,
         principal: {:session, ctx.raiser.session_key},
         transport_session_key: ctx.raiser.session_key,
-        params: %{question: "unroutable ruling?", assignment_id: source.id}
+        params: %{
+          question: "unroutable ruling?",
+          project: "Fixture product",
+          assignment_id: source.id
+        }
       })
 
     assert %{code: "predecessor_not_terminal"} =
@@ -517,7 +525,11 @@ defmodule Tightbeam.LateRulingHandoffTest do
         origin: ctx.raiser.session_key,
         principal: {:session, ctx.raiser.session_key},
         transport_session_key: ctx.raiser.session_key,
-        params: %{question: "consume this ruling?", assignment_id: source.id}
+        params: %{
+          question: "consume this ruling?",
+          project: "Fixture product",
+          assignment_id: source.id
+        }
       })
 
     assert %{state: "closed"} =

@@ -3992,7 +3992,7 @@ defmodule Tightbeam.Escalation do
 
     projected
     |> Map.put(:project, project)
-    |> Map.put(:project_attribution, if(project, do: "recorded", else: "unresolved"))
+    |> Map.put(:project_attribution, if(project, do: "known", else: "unresolved"))
     |> Map.put(
       :project_unresolved_reason,
       if(project, do: nil, else: project_unresolved_reason(request, context, assignment_state))

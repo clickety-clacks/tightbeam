@@ -1289,7 +1289,14 @@ defmodule Tightbeam.EscalationTest do
 
     assert Map.take(listed, parity_fields) == Map.take(detailed, parity_fields)
     assert Map.keys(Map.take(listed, parity_fields)) |> Enum.sort() == Enum.sort(parity_fields)
-    assert detailed.context == %{"note" => nil, "supersedes" => nil}
+
+    assert detailed.context == %{
+             "note" => nil,
+             "supersedes" => nil,
+             "project" => @fixture_project,
+             "workItemId" => @fixture_work_item
+           }
+
     assert is_binary(detailed.action_key)
 
     refiled =
@@ -3823,7 +3830,7 @@ defmodule Tightbeam.EscalationTest do
 
       assert %{
                project: "Tightbeam",
-               project_attribution: "recorded",
+               project_attribution: "known",
                project_unresolved_reason: nil,
                work_item_id: @fixture_work_item,
                association_status: "work-item",
@@ -3865,7 +3872,7 @@ defmodule Tightbeam.EscalationTest do
       assert %{
                status: "open",
                project: "Tightbeam",
-               project_attribution: "recorded",
+               project_attribution: "known",
                assignment_id: "a-project",
                work_item_id: @fixture_work_item,
                association_status: "assignment-removed"

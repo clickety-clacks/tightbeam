@@ -1863,11 +1863,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       principal: {:session, "holder"},
       session_key: "holder",
       origin: "agent:holder-role",
-      params: %{
-        question: question,
-        options: [%{label: "continue"}, %{label: "stop"}],
-        supersedes: supersedes
-      }
+      params:
+        Tightbeam.TestSupport.OperatorAskFixture.link(db, "holder", %{
+          question: question,
+          options: [%{label: "continue"}, %{label: "stop"}],
+          supersedes: supersedes
+        })
     })
   end
 
