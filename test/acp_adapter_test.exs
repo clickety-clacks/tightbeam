@@ -3297,6 +3297,20 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Adapter.knows_session?(adapter, "sess-1")
   end
 
+  test "strict apply returns an unknown runtime outcome when the adapter exits" do
+    adapter = spawn(fn -> :ok end)
+    ref = Process.monitor(adapter)
+    assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}
+
+    assert {:error, {:runtime_config_unknown, {:adapter_unavailable, :noproc}}} =
+             Adapter.apply_model_strict(
+               adapter,
+               "sess-1",
+               Model.new("gpt-new", effort: "high"),
+               Model.new("gpt-old", effort: "medium")
+             )
+  end
+
   test "strict apply does not retry an invalid-params model refusal" do
     {adapter, capture_path} =
       start_adapter(harness: :codex, fail_mode: "model-invalid-params")
