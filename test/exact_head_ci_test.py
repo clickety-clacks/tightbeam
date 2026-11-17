@@ -228,6 +228,13 @@ class ExactHeadCI(unittest.TestCase):
         self.assertEqual(re.findall(r'(?m)^          - os: (\S+)$', job),
                          ['ubuntu-24.04', 'macos-latest'])
 
+    def test_self_hosted_mac_checks_disk_before_the_suite(self):
+        job = self.jobs['test']
+        self.assertLess(
+            job.index('name: Require free disk space on the self-hosted macOS runner'),
+            job.index('run: scripts/verify_mix.sh'))
+        self.assertIn("if: runner.os == 'macOS' && runner.environment == 'self-hosted'", job)
+
     def test_only_a_superseded_pull_request_run_is_cancelled(self):
         group = re.search(r'(?m)^  group: \$\{\{ (.*) \}\}$', self.text).group(1)
         cancel = re.search(r'(?m)^  cancel-in-progress: \$\{\{ (.*) \}\}$', self.text).group(1)

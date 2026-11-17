@@ -125,6 +125,22 @@ jobs:
         if: matrix.platform == 'linux-x86_64' && runner.environment == 'self-hosted'
         run: echo "ImageOS=ubuntu24" >> "$GITHUB_ENV"
 
+      # The self-hosted Macs are shared machines. A full suite writes several GB
+      # (its own tmp/ tree plus build output); one run on a nearly full disk
+      # failed mid-suite with "no space left on device". Stop at once with a
+      # plain message instead.
+      - name: Require free disk space on the self-hosted macOS runner
+        if: runner.os == 'macOS' && runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          floor_gib=15
+          avail_gib=$(( $(df -Pk "$GITHUB_WORKSPACE" | awk 'NR==2 {print $4}') / 1048576 ))
+          if [ "$avail_gib" -lt "$floor_gib" ]; then
+            echo "::error::This runner has ${avail_gib} GiB free; a full macOS suite needs at least ${floor_gib} GiB. Free space on the runner's disk, then re-run."
+            exit 1
+          fi
+          echo "free disk: ${avail_gib} GiB (floor ${floor_gib} GiB)"
+
       - name: Set setup-beam target for the self-hosted macOS runner
         if: matrix.platform == 'darwin-aarch64' && runner.environment == 'self-hosted'
         run: echo "ImageOS=macos26" >> "$GITHUB_ENV"
