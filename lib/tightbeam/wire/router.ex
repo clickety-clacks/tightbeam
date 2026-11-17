@@ -78,6 +78,7 @@ defmodule Tightbeam.Wire.Router do
   @agent_verbs @agent_verbs ++
                  [
                    "assess_attachments",
+                   "post",
                    "session-custody-transfer",
                    "fact-demand",
                    "sentinel-demand",

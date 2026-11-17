@@ -13037,6 +13037,46 @@ defmodule Tightbeam.GatewayTest do
            ]
   end
 
+  test "shared post handler rechecks attachment size before accepting a socket send", ctx do
+    owner = ctx.device.user_id
+
+    asset =
+      Tightbeam.Assets.put(
+        ctx.db,
+        ctx.catalog_base,
+        owner,
+        "application/octet-stream",
+        "oversized.bin",
+        repeated_attachment_bytes(25_000_001)
+      )
+
+    config = gateway_config(ctx.catalog_base, ctx.db, 0)
+    handlers = Gateway.handlers(config)
+
+    result =
+      Dispatch.dispatch(ctx.db, handlers, %{
+        verb: "post",
+        origin: "user:#{owner}",
+        principal: {:user, owner},
+        session_key: "k1",
+        params: %{
+          content: "open oversized.bin",
+          device_id: "chat_test",
+          client_message_id: "c_socket_over_limit",
+          attachments: [attachment_ref(asset, "oversized.bin")]
+        }
+      })
+
+    assert {:error, %{code: "attachment_over_limit"}} = result
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId=?1", [
+               "c_socket_over_limit"
+             ])
+
+    refute_receive {:ensure_lane, "k1"}
+  end
+
   test "attachment assessment is ordered, selected-session scoped, and keeps uncertainty explicit",
        ctx do
     owner = ctx.device.user_id

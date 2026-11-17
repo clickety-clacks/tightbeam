@@ -819,19 +819,33 @@ defmodule Tightbeam.Gateway do
 
         case canonical_post_attachments(Map.get(p, :attachments)) do
           {:ok, attachments} ->
-            outcome =
-              deliver_prompt(call.session_key, call.origin, p.content,
-                db: db,
-                device_id: p.device_id,
-                client_message_id: p.client_message_id,
-                attachments: attachments,
-                creator_session_key: call.session_key,
-                queue_when_busy: true
-              )
+            case validate_post_attachments(db, config, call, attachments) do
+              :ok ->
+                outcome =
+                  deliver_prompt(call.session_key, call.origin, p.content,
+                    db: db,
+                    device_id: p.device_id,
+                    client_message_id: p.client_message_id,
+                    attachments: attachments,
+                    creator_session_key: call.session_key,
+                    queue_when_busy: true
+                  )
 
-            if outcome in [:appended, :queued],
-              do: %{ack: p.client_message_id},
-              else: %{dedupe: to_string(outcome)}
+                if outcome in [:appended, :queued],
+                  do: %{ack: p.client_message_id},
+                  else: %{dedupe: to_string(outcome)}
+
+              {:error, :invalid_asset} ->
+                %{code: "invalid_message", message: "attachment asset is unavailable"}
+
+              {:over_limit, offending_asset_ids} ->
+                %{
+                  code: "attachment_over_limit",
+                  message: "This file exceeds the delivery limit.",
+                  max_deliverable_attachment_bytes: AttachmentDelivery.max_deliverable_bytes(),
+                  offending_asset_ids: offending_asset_ids
+                }
+            end
 
           :error ->
             %{
@@ -1773,6 +1787,28 @@ defmodule Tightbeam.Gateway do
   end
 
   defp canonical_post_attachments(nil), do: {:ok, []}
+
+  defp validate_post_attachments(_db, _config, _call, []), do: :ok
+
+  defp validate_post_attachments(db, config, call, attachments) do
+    user_id =
+      case Map.get(call, :principal) do
+        {:user, id} when is_binary(id) ->
+          id
+
+        _ ->
+          case Map.get(call, :origin) do
+            "user:" <> id when id != "" -> id
+            _ -> nil
+          end
+      end
+
+    if is_binary(user_id) do
+      AttachmentDelivery.validate_post(db, config.base_dir, user_id, attachments)
+    else
+      {:error, :invalid_asset}
+    end
+  end
 
   defp canonical_post_attachments(attachments) when is_list(attachments) do
     if Enum.all?(attachments, &canonical_attachment?/1), do: {:ok, attachments}, else: :error
