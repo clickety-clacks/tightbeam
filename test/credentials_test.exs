@@ -445,6 +445,7 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
+    assert Credentials.status(:openai, server) == {:pending, nil}
     first = Credentials.status(:openai, server)
     assert match?({:needs_onboarding, _}, first)
     assert :atomics.get(calls, 1) > 1

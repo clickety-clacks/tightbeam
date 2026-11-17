@@ -269,6 +269,9 @@ defmodule Tightbeam.HarnessProcess.Recovery do
 
       {:error, _} = error ->
         error
+
+      {:pending, _} = pending ->
+        pending
     end
   end
 end

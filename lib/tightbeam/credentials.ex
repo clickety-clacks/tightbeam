@@ -68,29 +68,16 @@ defmodule Tightbeam.Credentials do
   @doc "Read lifecycle and canonical credential health without refreshing."
   @spec status(provider(), GenServer.server()) :: status()
   def status(provider, server \\ __MODULE__) do
-    await_status(provider, server, 250)
-  end
-
-  defp await_status(provider, server, delay_ms) do
     deadline = System.monotonic_time(:millisecond) + @status_budget_ms
 
-    answer =
-      try do
-        GenServer.call(server, {:status, provider, deadline}, @status_budget_ms)
-      catch
-        :exit, {:timeout, _} -> {:pending, nil}
+    try do
+      case GenServer.call(server, {:status, provider, deadline}, @status_budget_ms) do
+        {:pending, nil} = pending -> pending
+        {:pending, last} -> last
+        other -> other
       end
-
-    case answer do
-      {:pending, nil} ->
-        Process.sleep(delay_ms)
-        await_status(provider, server, min(delay_ms * 2, 5_000))
-
-      {:pending, last} ->
-        last
-
-      other ->
-        other
+    catch
+      :exit, {:timeout, _} -> {:pending, nil}
     end
   end
 

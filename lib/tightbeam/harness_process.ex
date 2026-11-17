@@ -934,6 +934,9 @@ defmodule Tightbeam.HarnessProcess do
       {:ok, output} ->
         parse_identity(output, row.launch_id)
 
+      {:pending, _} = pending ->
+        pending
+
       {:error, reason} ->
         {:error, reason}
     end
