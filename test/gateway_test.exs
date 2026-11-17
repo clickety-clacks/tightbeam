@@ -1,6 +1,7 @@
 defmodule Tightbeam.GatewayTest do
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
   use Tightbeam.TestCase, async: false
+  alias Tightbeam.HarnessSwitchContext
   alias Tightbeam.Model
   alias Tightbeam.Wire.ChangeSocket
 
@@ -5350,6 +5351,219 @@ defmodule Tightbeam.GatewayTest do
       DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", ["swapme"])
 
     assert total == 3, "the two earlier rows must still exist beneath the barrier"
+  end
+
+  test "enabled switch context is captured atomically and bound once to the first destination prompt",
+       ctx do
+    base_dir = role_test_base("swap-context")
+    host = Placement.local_host_name()
+    auth_dir = Tightbeam.Homes.home_path(base_dir, host, :codex)
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "auth.json"), "test-token")
+    learn_engineering_identity!(base_dir)
+    candidate = start_supervised!({CandidateAdapterStub, self()})
+    start_supervised!({CoordinatorStub, candidate})
+
+    start_supervised!(%{
+      id: :swap_context_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    Archetypes.load!(base_dir)
+    put_host_catalog(host, "codex", [])
+
+    put_host_catalog_entry(host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["medium"],
+      max_input_tokens: 272_000,
+      provider: :openai
+    })
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:harness_switch_context_enabled, true)
+      |> Map.put(
+        :harness_switch_context,
+        Application.fetch_env!(:tightbeam, :harness_switch_context)
+      )
+
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               "INSERT OR IGNORE INTO users (userId,isAdmin,createdAt) VALUES ('context-owner',0,1)"
+             )
+
+    Org.create(ctx.db, %{
+      session_key: "swap-context",
+      display_name: "Context switch",
+      owner_user_id: "context-owner",
+      origin: "user:context-owner",
+      archetype: "coder",
+      host: host,
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("before-model")
+    })
+
+    Org.set_identity_revision(ctx.db, "swap-context", Tightbeam.Identity.live_revision!(base_dir))
+
+    {source_seq, source_message} =
+      enqueue_gateway_prompt!(
+        ctx.db,
+        "swap-context",
+        "user:context-owner",
+        "WID19B_CAPTURED=keep-once"
+      )
+
+    assert {:ok, source_turn} = Ledger.claim_next(ctx.db, "swap-context", "source-fixture")
+    assert source_turn.seq == source_seq
+
+    assert :ok =
+             Ledger.finish(ctx.db, source_turn.seq, "delivered", nil,
+               owner_lease: source_turn.owner_lease
+             )
+
+    start_lane!(ctx.db, "swap-context")
+    before = Org.get(ctx.db, "swap-context")
+    handlers = Gateway.handlers(config)
+
+    assert %{ok: true, harness: "codex", model: "gpt-5.6-sol"} =
+             handlers["tune"].(%{
+               origin: "user:context-owner",
+               session_key: "swap-context",
+               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+             })
+
+    assert_receive {:candidate_guidance, "candidate-1", guidance}
+    refute guidance =~ "WID19B_CAPTURED=keep-once"
+
+    after_switch = Org.get(ctx.db, "swap-context")
+    assert after_switch.cleared_through_seq == before.cleared_through_seq
+
+    assert {:ok,
+            [
+              [
+                "claude",
+                "before-model",
+                "codex",
+                "gpt-5.6-sol",
+                processed_json,
+                "[]",
+                payload_evidence_json,
+                "pending"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT sourceHarness,sourceModel,destinationHarness,destinationModel,
+                      processedMessageIds,pendingMessageIds,destinationPayloadEvidence,state
+               FROM harness_switch_contexts WHERE sessionKey='swap-context'
+               """
+             )
+
+    assert JSON.decode!(processed_json) == [source_message.id]
+
+    destination_payload_evidence = JSON.decode!(payload_evidence_json)
+    destination_cwd = Placement.holder_workdir(config, after_switch)
+
+    expected_identity_bytes =
+      byte_size(guidance) +
+        byte_size(
+          JSON.encode!(%{
+            _meta: Tightbeam.Harness.Codex.session_config(%{cwd: destination_cwd}, guidance).meta
+          })
+        )
+
+    expected_tool_bytes =
+      byte_size(JSON.encode!(Gateway.mcp_servers_for_archetype("coder")))
+
+    assert destination_payload_evidence["identity_tokens_upper"] == expected_identity_bytes
+    assert destination_payload_evidence["tool_definition_tokens_upper"] == expected_tool_bytes
+
+    visible =
+      Projection.list_after(ctx.db, "swap-context", nil, 50, before.cleared_through_seq)
+
+    assert Enum.any?(visible, &(&1.id == source_message.id))
+    assert Enum.any?(visible, &(&1.marker && &1.marker.kind == "harness-switch"))
+
+    {destination_seq, _destination_message} =
+      enqueue_gateway_prompt!(
+        ctx.db,
+        "swap-context",
+        "user:context-owner",
+        "WID19B_CURRENT=verbatim"
+      )
+
+    assert {:ok, destination_turn} =
+             Ledger.claim_next(ctx.db, "swap-context", "destination-fixture")
+
+    assert destination_turn.seq == destination_seq
+    destination_turn = Map.put(destination_turn, :session_key, "swap-context")
+
+    destination_config =
+      config
+      |> Map.put(:base_dir, base_dir)
+      |> Map.put(:model_catalog, Tightbeam.ModelCatalog)
+
+    outbound_content = [
+      %{type: "text", text: "WID19B_CURRENT=verbatim\n\nimage [image bytes]"},
+      %{type: "image", data: "fixture-image-data", mimeType: "image/png"}
+    ]
+
+    assert {:ok, prepared} =
+             HarnessSwitchContext.prepare_turn(
+               ctx.db,
+               destination_turn,
+               Org.get(ctx.db, "swap-context"),
+               %{content: outbound_content, attempts: []},
+               destination_config
+             )
+
+    assert [
+             %{type: "text", text: historical_and_current},
+             image_block
+           ] = prepared.prompt
+
+    assert {:ok, [[persisted_turn_prompt]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE seq=?1", [destination_turn.seq])
+
+    assert persisted_turn_prompt == destination_turn.prompt
+
+    assert historical_and_current =~ "## Historical working context"
+    assert historical_and_current =~ "WID19B_CAPTURED=keep-once"
+    assert length(Regex.scan(~r/WID19B_CAPTURED=keep-once/, historical_and_current)) == 1
+    assert historical_and_current =~ "## Current input (verbatim; this turn only)"
+    assert historical_and_current =~ "WID19B_CURRENT=verbatim"
+    assert image_block == Enum.at(outbound_content, 1)
+
+    assert {:ok, [["bound", "fit_no_call"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,handoffOutcome FROM harness_switch_contexts WHERE sessionKey='swap-context'"
+             )
+
+    assert {:ok, [[budget_evidence_json]]} =
+             DB.query(
+               ctx.db,
+               "SELECT budgetEvidence FROM harness_switch_contexts WHERE sessionKey='swap-context'"
+             )
+
+    budget_evidence = JSON.decode!(budget_evidence_json)
+    assert budget_evidence["identity_tokens_upper"] == expected_identity_bytes
+    assert budget_evidence["tool_definition_tokens_upper"] == expected_tool_bytes
+    assert budget_evidence["reserve_tokens"] == 16_384
+
+    assert {:ok, retry_prompt} =
+             HarnessSwitchContext.prepare_turn(
+               ctx.db,
+               destination_turn,
+               Org.get(ctx.db, "swap-context"),
+               "recomputed current text must not replace the durable bind",
+               destination_config
+             )
+
+    assert retry_prompt.prompt == prepared.prompt
   end
 
   test "a failure between the barrier and its tombstone rolls BOTH back", ctx do
