@@ -84,6 +84,25 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
     end
   end
 
+  test "unanswered identity stays pending without replacing durable launch state", ctx do
+    {row, _} = prepare(ctx)
+
+    assert {:pending, :identity_not_answered} =
+             HarnessProcess.capture_identity(ctx.db, row.launch_id, 30)
+
+    assert [%{state: "launching", resolved_at: nil, last_error: nil}] =
+             HarnessProcess.list(ctx.db)
+
+    refute HarnessProcess.fenced?(ctx.db, @key)
+
+    terminal(row)
+
+    assert {:error, {:launch_identity_failed, _, {:launcher_failed, _}}} =
+             HarnessProcess.capture_identity(ctx.db, row.launch_id, 30)
+
+    assert HarnessProcess.fenced?(ctx.db, @key)
+  end
+
   test "exact connection exit is attributed before the identity deadline", ctx do
     {row, _} = prepare(ctx)
     File.write!(row.identity_path, "")

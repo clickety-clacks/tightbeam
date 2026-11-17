@@ -241,6 +241,12 @@ defmodule Tightbeam.HarnessProcess do
       {:ok, pid, pgid, boot, token} ->
         persist_identity(db, row, pid, pgid, boot, token, true)
 
+      {:pending, _reason} = pending ->
+        pending
+
+      {:error, {:identity_unavailable, :enoent}} ->
+        {:pending, :identity_not_answered}
+
       {:error, reason} ->
         failure = {:launch_identity_failed, launch_id, reason}
 
@@ -870,6 +876,9 @@ defmodule Tightbeam.HarnessProcess do
 
       {:error, reason} ->
         {:error, reason}
+
+      {:pending, reason} ->
+        {:error, {:pending, reason}}
     end
   end
 
@@ -901,8 +910,12 @@ defmodule Tightbeam.HarnessProcess do
                        true
                      ) do
                   {:ok, _} -> identity
+                  {:pending, _} = pending -> pending
                   {:error, _} = error -> error
                 end
+
+              {:pending, _} = pending ->
+                pending
 
               {:error, reason} ->
                 if System.monotonic_time(:millisecond) < until do
@@ -971,7 +984,7 @@ defmodule Tightbeam.HarnessProcess do
            timeout_ms
          ) do
       {output, 0} -> {:ok, output}
-      {:error, :timeout} -> {:error, :identity_read_timeout}
+      {:error, :timeout} -> {:pending, :identity_read_timeout}
       {output, status} -> {:error, {:identity_unavailable, status, one_line(output)}}
     end
   end
@@ -1478,6 +1491,7 @@ defmodule Tightbeam.HarnessProcess do
     case result do
       {_, 0} -> {:ok, :gone}
       {_, 3} -> {:ok, :live}
+      {:error, :timeout} -> {:pending, :identity_check_timeout}
       other -> {:error, {:identity_authority_unproved, other}}
     end
   end

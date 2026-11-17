@@ -370,12 +370,12 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    caller = Task.async(fn -> Credentials.status(:openai, server) end)
+    caller = Task.async(fn -> GenServer.call(server, {:status, :openai, System.monotonic_time(:millisecond) + 5_000}, 6_000) end)
     assert_receive {:status_probe_started, worker}
     monitor = Process.monitor(worker)
     assert map_size(:sys.get_state(server).status_reads) == 1
 
-    assert {:unavailable, %{host: "worker", provider: :openai, reason: :timeout}} =
+    assert {:pending, nil} =
              Task.await(caller, 6_000)
 
     assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 1_000
@@ -397,7 +397,7 @@ defmodule Tightbeam.CredentialsTest do
         end
       )
 
-    caller = Task.async(fn -> Credentials.status(:openai, server) end)
+    caller = Task.async(fn -> GenServer.call(server, {:status, :openai, System.monotonic_time(:millisecond) + 5_000}, 6_000) end)
 
     for _ <- 1..3 do
       assert_receive {:status_command, worker, _command}
@@ -407,9 +407,37 @@ defmodule Tightbeam.CredentialsTest do
     assert_receive {:status_command, stalled_worker, _command}
     monitor = Process.monitor(stalled_worker)
 
-    assert {:unavailable, %{reason: :timeout}} = Task.await(caller, 6_000)
+    assert {:pending, nil} = Task.await(caller, 6_000)
     assert_receive {:DOWN, ^monitor, :process, ^stalled_worker, _reason}, 1_000
     refute_receive {:status_command, _, _}
+  end
+
+  test "an unanswered first check retries and later timeouts retain a completed answer", ctx do
+    calls = :atomics.new(1, [])
+
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "worker",
+        ssh: "worker",
+        sh: fn command ->
+          if :atomics.add_get(calls, 1, 1) == 1 do
+            receive do: (:release_probe -> run_remote_command(command))
+          else
+            run_remote_command(command)
+          end
+        end
+      )
+
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+    assert :atomics.get(calls, 1) > 1
+
+    :sys.replace_state(server, fn state ->
+      %{state | sh: fn _command -> receive do: (:release_probe -> {"", 1}) end}
+    end)
+
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
   end
 
   test "queueing behind a lifecycle call cannot start an expired status read", ctx do
@@ -433,11 +461,10 @@ defmodule Tightbeam.CredentialsTest do
 
     caller = Task.async(fn -> Credentials.status(:openai, server_name) end)
 
-    assert {:unavailable, %{host: ^machine, provider: :openai, reason: :timeout}} =
-             Task.await(caller, 6_000)
-
+    Process.sleep(5_100)
     send(server, :release_gate)
     assert {:ok, _staging, _lease_id} = Task.await(lifecycle, 1_000)
+    assert {:needs_onboarding, :in_progress} = Task.await(caller, 6_000)
     assert :sys.get_state(server).status_reads == %{}
   end
 
@@ -476,10 +503,15 @@ defmodule Tightbeam.CredentialsTest do
     kind = Task.async(fn -> GenServer.call(server_name, {:kind, :openai}, :infinity) end)
     assert_receive {:kind_probe_started, worker}
 
-    caller = Task.async(fn -> Credentials.status(:openai, server_name) end)
+    caller = Task.async(fn ->
+      try do
+        GenServer.call(server_name, {:status, :openai, System.monotonic_time(:millisecond) + 5_000}, 5_000)
+      catch
+        :exit, {:timeout, _} -> :timed_out
+      end
+    end)
 
-    assert {:unavailable, %{host: ^machine, reason: :timeout}} =
-             Task.await(caller, 6_000)
+    assert :timed_out = Task.await(caller, 6_000)
 
     send(worker, :release_kind_probe)
     Task.await(kind, 1_000)
@@ -675,11 +707,11 @@ defmodule Tightbeam.CredentialsTest do
         ssh_bin: script
       )
 
-    caller = Task.async(fn -> Credentials.status(:openai, server) end)
+    caller = Task.async(fn -> GenServer.call(server, {:status, :openai, System.monotonic_time(:millisecond) + 5_000}, 6_000) end)
     read = await_status_read(server)
     monitor = Process.monitor(read.pid)
 
-    assert {:unavailable, %{host: "worker", provider: :openai, reason: :timeout}} =
+    assert {:pending, nil} =
              Task.await(caller, 6_000)
 
     assert_receive {:DOWN, ^monitor, :process, _, _reason}, 1_000

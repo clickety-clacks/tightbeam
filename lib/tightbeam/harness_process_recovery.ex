@@ -219,6 +219,9 @@ defmodule Tightbeam.HarnessProcess.Recovery do
 
           {:error, reason} ->
             {:error, {:termination_unproved, reason}}
+
+          {:pending, reason} ->
+            {:error, {:termination_unproved, {:pending, reason}}}
         end
     end
   end
