@@ -20,6 +20,8 @@ defmodule Tightbeam.Identity do
   @live "tightbeam/live"
   @required_refs ["main", @upstream, @live]
   @reserved_prefix "tightbeam__"
+  @not_live "nothing changed live, and sessions keep being served the live revision."
+  @publish_step "A successful `tightbeam identity edit` publishes everything on main."
   @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
   @bundle_setup_path "setup.md"
@@ -1206,13 +1208,35 @@ defmodule Tightbeam.Identity do
   def status(base_dir) do
     dir = identity_dir(base_dir)
     live = live_revision!(base_dir)
+    source = git_output!(dir, ["rev-parse", "main"])
     conflicts = conflict_paths(dir)
 
     %{
       live_revision: live,
+      source_revision: source,
+      source_notice: source_notice(dir, source, live),
       state: if(conflicts == [], do: :ready, else: :relearn_conflicted),
       conflicting_paths: conflicts
     }
+  end
+
+  # A commit on the identity source (main) is not live until it is published.
+  defp source_notice(_dir, revision, revision), do: nil
+
+  defp source_notice(dir, source, live) do
+    head = "Identity source (main, #{source}) is not the live revision (#{live}): " <> @not_live
+
+    case System.cmd("git", ["merge-base", "--is-ancestor", live, source], cd: dir) do
+      {_output, 0} -> head <> " " <> @publish_step
+      _ -> head <> " Main does not descend from live, so publication is refused until it does."
+    end
+  end
+
+  defp unpublished_message(live) do
+    "Not published: the live revision is unchanged (#{live}); nothing changed live. " <>
+      "The commit exists on the identity source (main) only, and publication needs main " <>
+      "to descend from live; `tightbeam identity status` compares them. Once it does, " <>
+      String.replace_prefix(@publish_step, "A successful", "a successful")
   end
 
   defp identity_dir(base_dir), do: Path.join(base_dir, "identity")
@@ -1917,7 +1941,13 @@ defmodule Tightbeam.Identity do
           {:ok, revision}
 
         actual != expected ->
-          {:error, %{code: "identity_publication_conflict", expected: expected, actual: actual}}
+          {:error,
+           %{
+             code: "identity_publication_conflict",
+             message: unpublished_message(actual),
+             expected: expected,
+             actual: actual
+           }}
 
         true ->
           case System.cmd("git", ["merge-base", "--is-ancestor", expected, revision], cd: dir) do
@@ -1926,7 +1956,12 @@ defmodule Tightbeam.Identity do
               {:ok, revision}
 
             _ ->
-              {:error, %{code: "identity_publication_non_fast_forward", expected: expected}}
+              {:error,
+               %{
+                 code: "identity_publication_non_fast_forward",
+                 message: unpublished_message(actual),
+                 expected: expected
+               }}
           end
       end
     end)
