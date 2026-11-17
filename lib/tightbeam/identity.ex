@@ -284,8 +284,12 @@ defmodule Tightbeam.Identity do
            cd: identity_dir,
            stderr_to_stdout: true
          ) do
-      {_output, 0} -> true
-      {_output, 1} -> false
+      {_output, 0} ->
+        true
+
+      {_output, 1} ->
+        false
+
       {output, status} -> raise "git rev-parse failed (#{status}): #{String.trim(output)}"
     end
   end
@@ -1547,7 +1551,8 @@ defmodule Tightbeam.Identity do
           raise "git cat-file failed (128): #{output}"
         end
 
-      {output, status} -> raise "git cat-file failed (#{status}): #{output}"
+      {output, status} ->
+        raise "git cat-file failed (#{status}): #{output}"
     end
   end
 
