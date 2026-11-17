@@ -2400,6 +2400,7 @@ defmodule Tightbeam.HarklightWakesTest do
   test "Gateway listener restoration follows the conversation's current receiver", %{
     db: db,
     call: call,
+    session: session,
     main: main
   } do
     assert {:ok, _} =
@@ -2446,6 +2447,14 @@ defmodule Tightbeam.HarklightWakesTest do
              HarklightWakes.restore_listener(db, call, @handle)
 
     refute_receive {:listener_started, @handle, _vendor_id}
+
+    # The origin session then retires; the receiver still owns the conversation.
+    assert {:ok, _} =
+             DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               session.session_key
+             ])
+
+    assert %{outcome: "refused"} = HarklightWakes.restore_listener(db, call, @handle)
 
     assert %{
              command: "listener-restore",
