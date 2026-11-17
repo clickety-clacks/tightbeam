@@ -641,6 +641,7 @@ Environment=PATH=/opt/tightbeam/current/tightbeam/bin:/usr/local/bin:/usr/bin:/b
 # LoadCredential=opencode-go-api-key:/home/you/secrets/opencode-go-api-key
 Restart=on-failure
 RestartSec=5s
+OOMPolicy=continue
 TimeoutStopSec=120s
 
 [Install]
@@ -656,6 +657,13 @@ and the harness CLIs must all be findable.
 `WantedBy=multi-user.target` is what makes it start at boot with nobody logged in.
 `Restart=on-failure` rather than `always`, so a deliberate `systemctl stop` stays
 stopped. Logs go to the journal — `journalctl -u tightbeam -f` (no `--user`).
+`OOMPolicy=continue` keeps an OOM kill of a harness or tool child from stopping
+all processes in the gateway unit. If the gateway's main process is killed,
+`Restart=on-failure` still restarts it. This does not limit memory use or control
+which process the kernel kills. See [systemd's OOM policy documentation](https://www.freedesktop.org/software/systemd/man/255/systemd.service.html#OOMPolicy=).
+For an existing unit, add this setting under `[Service]` and run
+`sudo systemctl daemon-reload`; on systemd 255 it takes effect without a gateway
+restart. Verify with `systemctl show tightbeam -p OOMPolicy` (`OOMPolicy=continue`).
 Give `TimeoutStopSec` room: shutdown drains in-flight turns.
 
 Verify: `systemctl is-enabled tightbeam` reports `enabled` (starts at boot) and
