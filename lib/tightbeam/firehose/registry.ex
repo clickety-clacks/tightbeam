@@ -17,6 +17,7 @@ defmodule Tightbeam.Firehose.Registry do
     lifecycle.terminal_credential_recovery_claimed
     lifecycle.terminal_credential_recovery_outcome
     lifecycle.terminal_credential_resolved
+    message.attachment_delivery.updated
   )
 
   @state_rows [

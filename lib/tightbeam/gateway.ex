@@ -62,6 +62,7 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.{
     AdapterCoordinator,
+    AttachmentDelivery,
     AdminProjection,
     Archetypes,
     Assets,
@@ -779,29 +780,102 @@ defmodule Tightbeam.Gateway do
     item_change = fn work_item_id, kind -> emit_item_change(db, work_item_id, kind) end
 
     %{
+      {"assess_attachments", []} => fn call ->
+        case {call[:principal], Org.get(db, call.session_key)} do
+          {{:user, user_id}, %{} = session} ->
+            client_message_id =
+              Map.get(call.params, :client_message_id, call.params["clientMessageId"])
+
+            asset_ids = Map.get(call.params, :asset_ids, call.params["assetIds"])
+
+            if is_binary(client_message_id) and is_list(asset_ids) do
+              case AttachmentDelivery.assess(
+                     db,
+                     config.base_dir,
+                     user_id,
+                     session,
+                     client_message_id,
+                     asset_ids
+                   ) do
+                {:ok, result} -> result
+                {:error, result} -> result
+              end
+            else
+              %{
+                code: "invalid_message",
+                message: "attachment assessment requires a message ID and asset IDs"
+              }
+            end
+
+          _ ->
+            %{
+              code: "assessment-unavailable",
+              message: AttachmentDelivery.assessment_unavailable_message()
+            }
+        end
+      end,
       {"post", ["message.created", "session.updated"]} => fn call ->
         p = call.params
 
-        case canonical_post_attachments(Map.get(p, :attachments)) do
-          {:ok, attachments} ->
-            outcome =
-              deliver_prompt(call.session_key, call.origin, p.content,
-                db: db,
-                device_id: p.device_id,
-                client_message_id: p.client_message_id,
-                attachments: attachments,
-                creator_session_key: call.session_key,
-                queue_when_busy: true
-              )
+        with {:ok, attachments} <- canonical_post_attachments(Map.get(p, :attachments)),
+             {:ok, submitter} <- canonical_submitter(Map.get(p, :submitter)) do
+          case validate_post_attachments(db, config, call, attachments) do
+            :ok ->
+              outcome =
+                deliver_prompt(call.session_key, call.origin, p.content,
+                  db: db,
+                  device_id: p.device_id,
+                  client_message_id: p.client_message_id,
+                  attachments: attachments,
+                  submitter: submitter,
+                  human_post: true,
+                  creator_session_key: call.session_key,
+                  queue_when_busy: true
+                )
 
-            if outcome in [:appended, :queued],
-              do: %{ack: p.client_message_id},
-              else: %{dedupe: to_string(outcome)}
+              if outcome in [:appended, :queued, :duplicate] do
+                receipt =
+                  human_post_receipt(db, call.session_key, p.device_id, p.client_message_id)
 
+                legacy_result =
+                  if outcome in [:appended, :queued],
+                    do: %{ack: p.client_message_id},
+                    else: %{dedupe: "duplicate"}
+
+                Map.merge(legacy_result, %{
+                  outcome: if(outcome == :duplicate, do: "duplicate", else: "recorded"),
+                  session_key: call.session_key,
+                  device_id: p.device_id,
+                  client_message_id: p.client_message_id,
+                  message_id: receipt.message_id,
+                  turn_seq: receipt.turn_seq
+                })
+              else
+                %{dedupe: to_string(outcome)}
+              end
+
+            {:error, :invalid_asset} ->
+              %{code: "invalid_message", message: "attachment asset is unavailable"}
+
+            {:over_limit, offending_asset_ids} ->
+              %{
+                code: "attachment_over_limit",
+                message: "This file exceeds the delivery limit.",
+                max_deliverable_attachment_bytes: AttachmentDelivery.max_deliverable_bytes(),
+                offending_asset_ids: offending_asset_ids
+              }
+          end
+        else
           :error ->
             %{
               code: "invalid_message",
               message: "attachments must be canonical attachment references"
+            }
+
+          {:error, :submitter} ->
+            %{
+              code: "invalid_message",
+              message: "submitter must contain nullable identity and displayName strings"
             }
         end
       end,
@@ -1694,7 +1768,7 @@ defmodule Tightbeam.Gateway do
     |> compile_handler_specs!()
   end
 
-  @direct_state_classes ~w(message.created transition.recorded tool_call.started tool_call.ended wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated)
+  @direct_state_classes ~w(message.created message.attachment_delivery.updated transition.recorded tool_call.started tool_call.ended wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated)
 
   @doc false
   @spec compile_handler_specs!(map()) ::
@@ -1733,11 +1807,59 @@ defmodule Tightbeam.Gateway do
 
   defp canonical_post_attachments(nil), do: {:ok, []}
 
+  defp validate_post_attachments(_db, _config, _call, []), do: :ok
+
+  defp validate_post_attachments(db, config, call, attachments) do
+    user_id =
+      case Map.get(call, :principal) do
+        {:user, id} when is_binary(id) ->
+          id
+
+        _ ->
+          case Map.get(call, :origin) do
+            "user:" <> id when id != "" -> id
+            _ -> nil
+          end
+      end
+
+    if is_binary(user_id) do
+      AttachmentDelivery.validate_post(db, config.base_dir, user_id, attachments)
+    else
+      {:error, :invalid_asset}
+    end
+  end
+
   defp canonical_post_attachments(attachments) when is_list(attachments) do
     if Enum.all?(attachments, &canonical_attachment?/1), do: {:ok, attachments}, else: :error
   end
 
   defp canonical_post_attachments(_attachments), do: :error
+
+  defp human_post_receipt(db, session_key, device_id, client_message_id) do
+    case DB.query(
+           db,
+           """
+           SELECT m.id,
+             (SELECT t.seq FROM turns t
+              WHERE t.sessionKey=m.sessionKey AND t.messageId=m.id
+              ORDER BY t.seq LIMIT 1)
+           FROM messages m
+           WHERE m.sessionKey=?1 AND m.deviceId=?2 AND m.clientMessageId=?3
+           ORDER BY m.seq DESC LIMIT 1
+           """,
+           [session_key, device_id, client_message_id]
+         ) do
+      {:ok, [[message_id, turn_seq]]} ->
+        %{message_id: message_id, turn_seq: turn_seq}
+
+      {:ok, []} ->
+        raise DB.Error,
+          message: "persisted human post is missing its canonical message receipt"
+
+      {:error, error} ->
+        raise error
+    end
+  end
 
   defp canonical_attachment?(attachment) when is_map(attachment) do
     Enum.sort(Map.keys(attachment)) == ~w(assetId filename mimeType size) and
@@ -2304,6 +2426,24 @@ defmodule Tightbeam.Gateway do
 
   def decorate_delivery_prompt(prompt, _sender), do: prompt
 
+  defp canonical_submitter(nil), do: {:ok, nil}
+
+  defp canonical_submitter(%{"identity" => identity, "displayName" => name} = value)
+       when (is_nil(identity) or is_binary(identity)) and (is_nil(name) or is_binary(name)) and
+              map_size(value) == 2 do
+    if is_nil(identity) and is_nil(name), do: {:ok, nil}, else: {:ok, value}
+  end
+
+  defp canonical_submitter(_), do: {:error, :submitter}
+
+  @doc false
+  def decorate_human_prompt(prompt, nil), do: "[from You]\n\n" <> prompt
+
+  def decorate_human_prompt(prompt, submitter) do
+    name = submitter["displayName"] || "You"
+    "[from #{name}]\n\n" <> prompt
+  end
+
   defp deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
     opts = delivery_attachments_in_txn(txn, opts)
     queued_human_post_delivery? = opts[:queued_human_post_delivery] == true
@@ -2311,7 +2451,11 @@ defmodule Tightbeam.Gateway do
     stamped =
       if queued_human_post_delivery?,
         do: prompt,
-        else: decorate_delivery_prompt(prompt, opts[:sender])
+        else:
+          if(opts[:human_post],
+            do: decorate_human_prompt(prompt, opts[:submitter]),
+            else: decorate_delivery_prompt(prompt, opts[:sender])
+          )
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
@@ -2357,6 +2501,7 @@ defmodule Tightbeam.Gateway do
                   role_fallback,
                   origin,
                   stamped,
+                  prompt,
                   opts
                 )
               end
@@ -2497,6 +2642,7 @@ defmodule Tightbeam.Gateway do
         "clientMessageId" => client_message_id,
         "sourceWakeId" => wake.wake_id,
         "payloadSha256" => payload_sha256,
+        "submitter" => opts[:submitter],
         "createdAt" => wake.created_at
       }
 
@@ -2510,7 +2656,8 @@ defmodule Tightbeam.Gateway do
              sender: origin,
              device_id: device_id,
              client_message_id: client_message_id,
-             attachments: Keyword.get(opts, :attachments, []) || []
+             attachments: Keyword.get(opts, :attachments, []) || [],
+             submitter: opts[:submitter]
            }) do
         {:appended, message} ->
           Tightbeam.Firehose.Publisher.message_in_txn(txn, target, message)
@@ -2543,7 +2690,16 @@ defmodule Tightbeam.Gateway do
 
   defp staged_prompt_target_gate(_target_gate), do: 1
 
-  defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
+  defp append_and_enqueue_in_txn(
+         txn,
+         target,
+         role_ref,
+         role_fallback,
+         origin,
+         stamped,
+         raw_prompt,
+         opts
+       ) do
     queued_human_post_delivery? = opts[:queued_human_post_delivery] == true
 
     human_source_messages =
@@ -2564,7 +2720,8 @@ defmodule Tightbeam.Gateway do
           sender: source.origin,
           device_id: source.device_id,
           client_message_id: source.client_message_id,
-          attachments: source.attachments
+          attachments: source.attachments,
+          submitter: source.submitter
         }
 
         case Projection.append_in_txn(txn, input) do
@@ -2583,11 +2740,12 @@ defmodule Tightbeam.Gateway do
     input = %{
       session_key: target,
       role: "user",
-      content: stamped,
+      content: if(opts[:human_post], do: raw_prompt, else: stamped),
       device_id: opts[:device_id],
       client_message_id: opts[:client_message_id],
       attachments: opts[:attachments] || [],
-      sender: opts[:sender] || origin
+      sender: opts[:sender] || origin,
+      submitter: opts[:submitter]
     }
 
     case Projection.append_in_txn(txn, input) do
@@ -3619,31 +3777,74 @@ defmodule Tightbeam.Gateway do
 
   @doc false
   def turn_prompt_content(db, turn, session_key, harness, base_dir) do
-    messages = turn_human_messages(db, turn, session_key)
+    case Org.get(db, session_key) do
+      %{} = session ->
+        session = Map.put(session, :harness, harness)
 
-    entries =
-      Enum.flat_map(messages, fn message ->
+        prepare_turn_prompt_content(db, turn, session, %{db: db, base_dir: base_dir}).content
+
+      _ ->
+        turn.prompt
+    end
+  end
+
+  @doc false
+  def prepare_turn_prompt_content(db, turn, session, config) do
+    prepared =
+      Enum.flat_map(turn_human_messages(db, turn, session.session_key), fn message ->
         message.attachments
         |> Enum.with_index(1)
         |> Enum.map(fn {attachment, index} ->
-          turn_attachment_entry(
-            db,
-            base_dir,
-            message,
-            attachment,
-            index,
-            Harness.inline_attachments?(harness)
-          )
+          prepare_turn_attachment(db, config, session, message, attachment, index)
         end)
       end)
 
-    case entries do
-      [] ->
-        turn.prompt
+    entries = Enum.map(prepared, fn item -> {item.label, item.block} end)
 
-      _entries ->
-        append_turn_attachment_labels(turn.prompt, entries)
+    attempts =
+      prepared
+      |> Enum.map(& &1.attempt)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(&Map.put(&1, :session_key, session.session_key))
+
+    %{
+      content:
+        if(entries == [],
+          do: turn.prompt,
+          else: append_turn_attachment_labels(turn.prompt, entries)
+        ),
+      attempts: attempts
+    }
+  end
+
+  defp prompt_with_attachment_outcomes(db, adapter, harness_session_id, prepared, opts) do
+    try do
+      result = Adapter.prompt(adapter, harness_session_id, prepared.content, opts)
+      outcome = if match?({:ok, _}, result), do: :accepted, else: :unknown
+      persist_attachment_attempts(db, prepared.attempts, outcome)
+      result
+    rescue
+      error ->
+        persist_attachment_attempts(db, prepared.attempts, :unknown)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        persist_attachment_attempts(db, prepared.attempts, :unknown)
+        :erlang.raise(kind, reason, __STACKTRACE__)
     end
+  end
+
+  defp persist_attachment_attempts(_db, [], _outcome), do: :ok
+
+  defp persist_attachment_attempts(db, attempts, outcome) do
+    AttachmentDelivery.record_attempts(db, attempts, outcome)
+  rescue
+    error ->
+      Logger.error(
+        "attachment delivery outcome could not be persisted: #{Exception.message(error)}"
+      )
+
+      :ok
   end
 
   defp turn_human_messages(db, turn, session_key) do
@@ -3651,7 +3852,7 @@ defmodule Tightbeam.Gateway do
       case DB.query(
              db,
              """
-             SELECT message.seq,message.attachments,member.publicationSeq
+             SELECT message.id,message.seq,message.clientMessageId,message.attachments,member.publicationSeq
              FROM wakes AS source
              JOIN messages AS message
                ON message.sessionKey=?2
@@ -3673,16 +3874,25 @@ defmodule Tightbeam.Gateway do
       [] ->
         case Projection.get(db, turn.message_id) do
           %{role: "user"} = message ->
-            [%{seq: message.seq, attachments: message.attachments}]
+            [
+              %{
+                id: message.id,
+                seq: message.seq,
+                client_message_id: message.client_message_id,
+                attachments: message.attachments
+              }
+            ]
 
           _ ->
             []
         end
 
       rows ->
-        Enum.map(rows, fn [seq, encoded_attachments, publication_seq] ->
+        Enum.map(rows, fn [id, seq, client_message_id, encoded_attachments, publication_seq] ->
           %{
+            id: id,
             seq: seq,
+            client_message_id: client_message_id,
             attachments: JSON.decode!(encoded_attachments),
             publication_seq: publication_seq
           }
@@ -3690,46 +3900,245 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp turn_attachment_entry(db, base_dir, message, attachment, index, covered_harness?) do
+  defp prepare_turn_attachment(db, config, session, message, attachment, index) do
     marker =
       case Map.get(message, :publication_seq) do
         publication_seq when is_integer(publication_seq) -> "[#{publication_seq}]"
         _ -> "message [#{message.seq}]"
       end
 
-    label =
-      "#{marker} attachment #{index} #{inspect(attachment["filename"])} " <>
-        "(#{attachment["mimeType"]}, #{attachment["size"]} bytes): "
-
+    filename = attachment["filename"]
     mime_type = attachment["mimeType"]
     asset_id = attachment["assetId"]
+    base_label = "#{marker} attachment #{index} #{inspect(filename)}"
 
+    with %{} = asset <- Assets.get(db, asset_id) do
+      label = "#{base_label} (#{mime_type}, #{asset.size} bytes): "
+
+      if mime_type in ["image/jpeg", "image/png"] do
+        prepare_inline_image(config, session, message, label, asset, mime_type, asset_id)
+      else
+        prepare_original_file(config, session, message, label, asset, filename, asset_id, index)
+      end
+    else
+      nil ->
+        attachment_entry(
+          message,
+          base_label <>
+            " (#{mime_type}, size unknown): unavailable: the stored attachment could not be found.",
+          nil,
+          asset_id,
+          "not-delivered",
+          %{
+            code: "attachment-unavailable",
+            message: "The stored attachment metadata is unavailable."
+          }
+        )
+    end
+  end
+
+  defp prepare_inline_image(config, session, message, label, asset, mime_type, asset_id) do
     cond do
-      mime_type not in ["image/jpeg", "image/png"] ->
-        {label <>
-           "original-file delivery is not included in this Gateway release; bytes were not sent.",
-         nil}
-
-      not covered_harness? ->
-        {label <>
-           "image content blocks are not enabled for this harness; bytes were not sent.", nil}
+      not Harness.inline_attachments?(session.harness) ->
+        attachment_entry(
+          message,
+          label <> "image content blocks are not enabled for this harness; bytes were not sent.",
+          nil,
+          asset_id,
+          "not-delivered",
+          %{code: "unsupported-delivery", message: "This file will not reach the agent."}
+        )
 
       true ->
-        case Assets.get(db, asset_id) do
-          nil ->
-            {label <> "unavailable: the stored attachment could not be found.", nil}
+        source = Assets.file_path(config.base_dir, asset_id)
+        limit = AttachmentDelivery.max_deliverable_bytes()
 
-          _asset ->
-            case File.read(Assets.file_path(base_dir, asset_id)) do
-              {:ok, bytes} ->
-                {label <> "included inline.",
-                 %{type: "image", data: Base.encode64(bytes), mimeType: mime_type}}
+        case File.stat(source) do
+          {:ok, %{size: size}} when size > limit ->
+            attachment_entry(
+              message,
+              label <> "unavailable: this file exceeds the delivery limit.",
+              nil,
+              asset_id,
+              "not-delivered",
+              %{code: "over-limit", message: "This file exceeds the delivery limit."}
+            )
 
-              {:error, _reason} ->
-                {label <> "unavailable: the stored attachment bytes could not be read.", nil}
+          {:ok, %{size: size}} when size != asset.size ->
+            attachment_entry(
+              message,
+              label <> "unavailable: the stored attachment bytes could not be verified.",
+              nil,
+              asset_id,
+              "unknown",
+              %{
+                code: "assessment-unavailable",
+                message: AttachmentDelivery.assessment_unavailable_message()
+              }
+            )
+
+          {:ok, %{size: size}} ->
+            case File.read(source) do
+              {:ok, bytes} when byte_size(bytes) == size ->
+                attachment_entry(
+                  message,
+                  label <> "included inline.",
+                  %{type: "image", data: Base.encode64(bytes), mimeType: mime_type},
+                  asset_id,
+                  "delivered",
+                  nil
+                )
+
+              _ ->
+                attachment_entry(
+                  message,
+                  label <> "unavailable: the stored attachment bytes could not be verified.",
+                  nil,
+                  asset_id,
+                  "unknown",
+                  %{
+                    code: "assessment-unavailable",
+                    message: AttachmentDelivery.assessment_unavailable_message()
+                  }
+                )
             end
+
+          {:error, :enoent} ->
+            attachment_entry(
+              message,
+              label <> "unavailable: the stored attachment bytes could not be read.",
+              nil,
+              asset_id,
+              "not-delivered",
+              %{
+                code: "attachment-unavailable",
+                message: "The stored attachment bytes are unavailable."
+              }
+            )
+
+          {:error, _reason} ->
+            attachment_entry(
+              message,
+              label <> "unavailable: the stored attachment bytes could not be read.",
+              nil,
+              asset_id,
+              "unknown",
+              %{
+                code: "assessment-unavailable",
+                message: AttachmentDelivery.assessment_unavailable_message()
+              }
+            )
         end
     end
+  end
+
+  defp prepare_original_file(config, session, message, label, asset, filename, asset_id, index) do
+    source = Assets.file_path(config.base_dir, asset_id)
+    limit = AttachmentDelivery.max_deliverable_bytes()
+
+    case {Harness.original_file_attachments?(session.harness), File.stat(source)} do
+      {false, _stat} ->
+        attachment_entry(
+          message,
+          label <> "original-file delivery is not enabled for this harness; bytes were not sent.",
+          nil,
+          asset_id,
+          "not-delivered",
+          %{code: "unsupported-delivery", message: "This file will not reach the agent."}
+        )
+
+      {true, {:ok, %{size: size}}} when size <= limit and size == asset.size ->
+        case Placement.deliver_attachment(config, session, message.id, source, index, filename) do
+          {:ok, agent_path, _sha256} ->
+            attachment_entry(
+              message,
+              label <> "original file bytes are available at #{agent_path}.",
+              nil,
+              asset_id,
+              "delivered",
+              nil
+            )
+
+          {:error, _reason} ->
+            attachment_entry(
+              message,
+              label <>
+                "unavailable: the original file could not be transferred to the agent workspace.",
+              nil,
+              asset_id,
+              "not-delivered",
+              %{
+                code: "transfer-failed",
+                message: "This file could not be delivered to the agent."
+              }
+            )
+        end
+
+      {true, {:ok, %{size: size}}} when size > limit ->
+        attachment_entry(
+          message,
+          label <> "unavailable: this file exceeds the delivery limit.",
+          nil,
+          asset_id,
+          "not-delivered",
+          %{code: "over-limit", message: "This file exceeds the delivery limit."}
+        )
+
+      {true, {:ok, _stat}} ->
+        attachment_entry(
+          message,
+          label <> "unavailable: the stored attachment bytes could not be verified.",
+          nil,
+          asset_id,
+          "unknown",
+          %{
+            code: "assessment-unavailable",
+            message: AttachmentDelivery.assessment_unavailable_message()
+          }
+        )
+
+      {true, {:error, :enoent}} ->
+        attachment_entry(
+          message,
+          label <> "unavailable: the stored attachment bytes could not be read.",
+          nil,
+          asset_id,
+          "not-delivered",
+          %{
+            code: "attachment-unavailable",
+            message: "The stored attachment bytes are unavailable."
+          }
+        )
+
+      {true, {:error, _reason}} ->
+        attachment_entry(
+          message,
+          label <> "unavailable: the stored attachment bytes could not be read.",
+          nil,
+          asset_id,
+          "unknown",
+          %{
+            code: "assessment-unavailable",
+            message: AttachmentDelivery.assessment_unavailable_message()
+          }
+        )
+    end
+  end
+
+  defp attachment_entry(message, label, block, asset_id, outcome, reason) do
+    attempt =
+      if is_binary(Map.get(message, :id)) and is_binary(Map.get(message, :client_message_id)) do
+        %{
+          message_id: message.id,
+          session_key: message[:session_key],
+          client_message_id: message.client_message_id,
+          asset_id: asset_id,
+          outcome: outcome,
+          reason: reason
+        }
+      end
+
+    %{label: label, block: block, attempt: attempt}
   end
 
   defp append_turn_attachment_labels(prompt, entries) do
@@ -3923,15 +4332,15 @@ defmodule Tightbeam.Gateway do
              {:ok, result} <-
                stage_with_session(
                  :prompt,
-                 Adapter.prompt(
+                 prompt_with_attachment_outcomes(
+                   db,
                    prompt_adapter,
                    harness_session_id,
-                   turn_prompt_content(
+                   prepare_turn_prompt_content(
                      db,
                      assignment_identity_refresh_brief(turn, identity_refresh_revision),
-                     active_session.session_key,
-                     active_session.harness,
-                     config.base_dir
+                     active_session,
+                     config
                    ),
                    trace_dispatch: fn request_id ->
                      case Tightbeam.TurnLifecycle.append(db, turn.seq, %{
@@ -4304,6 +4713,13 @@ defmodule Tightbeam.Gateway do
       [[item, published_at]] ->
         %{"liveRevision" => revision} = JSON.decode!(item)
 
+        # This runs in the database writer at every turn end, so its cost must
+        # not grow with turn history. A session's turns start in `seq` order, so
+        # its newest started turn alone decides whether it ran after the
+        # publication: one index step per session. Asking instead whether ANY
+        # turn started after the publication reads every turn row of every
+        # session that is behind, which on a large org held the writer for
+        # seconds per turn end from the moment a revision was published.
         [[late_count]] =
           Txn.q(
             txn,
@@ -4312,11 +4728,13 @@ defmodule Tightbeam.Gateway do
             FROM sessions AS session
             WHERE session.state = 'active'
               AND session.identityRevision IS NOT ?1
-              AND EXISTS (
-                SELECT 1 FROM turns AS turn
+              AND (
+                SELECT turn.startedAt FROM turns AS turn
                 WHERE turn.sessionKey = session.sessionKey
-                  AND turn.startedAt >= ?2
-              )
+                  AND turn.startedAt IS NOT NULL
+                ORDER BY turn.seq DESC
+                LIMIT 1
+              ) >= ?2
             """,
             [revision, published_at]
           )
