@@ -2013,7 +2013,8 @@ defmodule Tightbeam.Gateway do
     {result, incident} =
       with {:ok, session} <- repair_holder(db, assignment),
            {:ok, incident} <- repair_incident(db, assignment, session, call.params[:action]) do
-        {execute_assignment_repair(config, db, call, assignment, session, incident), incident}
+        {execute_assignment_repair(config, db, call, assignment, session, incident)
+         |> with_repair_fyi(incident), incident}
       else
         {:error, code, message} -> {%{ok: false, code: code, message: message}, nil}
       end
@@ -2126,11 +2127,22 @@ defmodule Tightbeam.Gateway do
       [[id, failure_class] | _] ->
         guidance = HarnessHealth.get(db, id).repair
 
+        # A repair other than the incident's recommended one runs as
+        # requested; the difference is stated as an FYI with its result.
         if action == guidance.action do
           {:ok, %{id: id, failure_class: failure_class, action: action}}
         else
-          {:error, "wrong_repair",
-           "#{failure_class} requires repair action #{guidance.action}, not #{inspect(action)}"}
+          {:ok,
+           %{
+             id: id,
+             failure_class: failure_class,
+             action: action,
+             fyi: [
+               Tightbeam.RecordFyis.line(
+                 "incident #{id} recommends #{guidance.action}; this repair requests #{action}"
+               )
+             ]
+           }}
         end
 
       [] when action == "relaunch" ->
@@ -2303,6 +2315,10 @@ defmodule Tightbeam.Gateway do
         end
     end
   end
+
+  defp with_repair_fyi(%{code: _} = result, _incident), do: result
+  defp with_repair_fyi(result, %{fyi: fyi}), do: Map.put(result, :fyi, fyi)
+  defp with_repair_fyi(result, _incident), do: result
 
   # The public message stays the inspected classification; the reason's own
   # structure and any carried node ride in the diagnostic.

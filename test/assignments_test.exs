@@ -5619,7 +5619,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert Enum.find(legacy, &(&1.id == review.id)).effectKind == "review"
   end
 
-  test "Proof 1: a conflicting review-assignment create is refused with review_item_conflict",
+  test "Proof 1: a review card on another work item is opened with an FYI naming both items",
        ctx do
     first_item = create_work_item(ctx, "Reviewed item")
     second_item = create_work_item(ctx, "Conflicting item")
@@ -5631,19 +5631,45 @@ defmodule Tightbeam.AssignmentsTest do
       assign_call({:user, "flynn"}, "conflicting review", nil, second_item.id)
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
 
-    assert %{
-             code: "review_item_conflict",
-             message: "a review assignment must belong to the item it reviews"
-           } = handle(ctx, "assign", conflict)
+    line =
+      "FYI: this review card is on work item #{second_item.id}; assignment #{reviewed.id} " <>
+        "it reviews is on work item #{first_item.id}; decide for yourself whether that is acceptable"
 
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM assignments WHERE subject = 'conflicting review'"
-             )
+    assert %{id: review_id, workItemId: item_id, reviewsAssignmentId: reviews_id, fyi: [^line]} =
+             handle(ctx, "assign", conflict)
+
+    assert item_id == second_item.id
+    assert reviews_id == reviewed.id
+
+    assert %{fyi: [^line]} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, review_id))
+
+    assert [line] ==
+             Assignments.list(ctx.db, %{state: "all"})
+             |> Enum.find(&(&1.id == review_id))
+             |> Map.fetch!(:fyi)
+
+    rest_row =
+      Tightbeam.StateResources.query_assignment(ctx.db, review_id, %{principal: {:user, "flynn"}})
+
+    assert %{fyi: [^line]} = rest_row
+    assert [^line] = Tightbeam.StateResources.assignment(rest_row)["fyi"]
+
+    assert %{fyi: []} =
+             Tightbeam.StateResources.query_assignment(ctx.db, reviewed.id, %{
+               principal: {:user, "flynn"}
+             })
+
+    # A review card on the reviewed card's own item carries no FYI.
+    aligned =
+      assign_call({:user, "flynn"}, "aligned review", nil, first_item.id)
+      |> put_in([:params, :reviews_assignment_id], reviewed.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    refute Map.has_key?(aligned, :fyi)
   end
 
-  test "Proof 2: a review assignment cannot itself be reviewed",
+  test "Proof 2: a review of a review card is opened with an FYI and traced on the item",
        ctx do
     item = create_work_item(ctx, "Review boundary")
     reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "base", nil, item.id))
@@ -5660,14 +5686,15 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert first_review.workItemId == nil
     assert Assignments.resolved_work_item_id(ctx.db, first_review.id) == item.id
+    refute Map.has_key?(first_review, :fyi)
 
-    assert %{
-             code: "review_of_review",
-             message: "a review assignment cannot itself be reviewed"
-           } = nested_review
+    line =
+      "FYI: assignment #{first_review.id} that this card reviews is itself a review card; " <>
+        "decide for yourself whether that is acceptable"
 
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'second review'")
+    assert %{reviewsAssignmentId: reviews_id, workItemId: nil, fyi: [^line]} = nested_review
+    assert reviews_id == first_review.id
+    assert Assignments.resolved_work_item_id(ctx.db, nested_review.id) == item.id
 
     trace =
       Tightbeam.WorkItems.__handle__(ctx.db, "work-item-trace", %{
@@ -5681,7 +5708,9 @@ defmodule Tightbeam.AssignmentsTest do
     traced_ids = Enum.map(trace.assignments, & &1.id)
 
     assert Enum.count(traced_ids, &(&1 == first_review.id)) == 1
-    assert Enum.sort(traced_ids) == Enum.sort([reviewed.id, first_review.id])
+
+    assert Enum.sort(traced_ids) ==
+             Enum.sort([reviewed.id, first_review.id, nested_review.id])
   end
 
   test "Proof 3: an assignment with neither key resolves to NONE", ctx do

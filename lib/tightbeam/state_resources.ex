@@ -23,7 +23,9 @@ defmodule Tightbeam.StateResources do
          sessions.provider, sessions.model, sessions.thinkingLevel, sessions.modelContext,
          sessions.host, sessions.clearedThroughSeq, sessions.state, sessions.createdAt,
          sessions.updatedAt, sessions.mechanicalStatus, sessions.updatedAt,
-         #{Tightbeam.Org.topology_parent_sql("sessions")}
+         #{Tightbeam.Org.topology_parent_sql("sessions")},
+         (SELECT fyi FROM record_fyis
+          WHERE recordKind = 'session' AND recordId = sessions.sessionKey)
   FROM sessions
   """
 
@@ -87,7 +89,8 @@ defmodule Tightbeam.StateResources do
              SELECT 1 FROM attests AS filed WHERE filed.assignmentId = a.id
            ) THEN 'open'
            ELSE 'active'
-         END
+         END,
+         (SELECT fyi FROM record_fyis WHERE recordKind = 'assignment' AND recordId = a.id)
   FROM assignments AS a
   LEFT JOIN work_items AS wi ON wi.id = a.workItemId
   """
@@ -258,7 +261,7 @@ defmodule Tightbeam.StateResources do
     "work items" =>
       ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
     "assignments" =>
-      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
+      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus fyi rowVersion),
     "attests" =>
       ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs fyi ts rowVersion),
     "wakes" =>
@@ -268,7 +271,7 @@ defmodule Tightbeam.StateResources do
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
-      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities rowVersion),
+      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities fyi rowVersion),
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "users" => ~w(userId isAdmin createdAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
@@ -476,6 +479,8 @@ defmodule Tightbeam.StateResources do
     {"assignments", "files"} => {:array, :string, :preserve},
     {"attests", "commitRefs"} => {:array, :commit_ref, :preserve},
     {"attests", "fyi"} => {:array, :string, :preserve},
+    {"assignments", "fyi"} => {:array, :string, :preserve},
+    {"sessions", "fyi"} => {:array, :string, :preserve},
     {"decision requests", "options"} => {:array, :decision_option, :preserve},
     {"decision requests", "context"} => :json,
     {"sessions", "overrides"} => :session_overrides,
@@ -1184,7 +1189,8 @@ defmodule Tightbeam.StateResources do
          updated_at,
          mechanical_status,
          row_version,
-         topology_parent
+         topology_parent,
+         fyi
        ]) do
     %{
       session_key: session_key,
@@ -1213,7 +1219,8 @@ defmodule Tightbeam.StateResources do
       created_at: created_at,
       updated_at: updated_at,
       mechanical_status: mechanical_status,
-      row_version: row_version
+      row_version: row_version,
+      fyi: record_fyi(fyi)
     }
   end
 
@@ -1992,7 +1999,8 @@ defmodule Tightbeam.StateResources do
          holder_provider,
          files,
          effect_kind,
-         derived_status
+         derived_status,
+         fyi
        ]) do
     %{
       id: id,
@@ -2018,9 +2026,14 @@ defmodule Tightbeam.StateResources do
       holder_provider: holder_provider,
       files: JSON.decode!(files),
       effect_kind: effect_kind,
-      derived_status: derived_status
+      derived_status: derived_status,
+      fyi: record_fyi(fyi)
     }
   end
+
+  # FYI lines recorded with the write that created a record, or [].
+  defp record_fyi(nil), do: []
+  defp record_fyi(fyi) when is_binary(fyi), do: JSON.decode!(fyi)
 
   defp bool_int(true), do: 1
   defp bool_int(false), do: 0
@@ -2170,6 +2183,8 @@ defmodule Tightbeam.StateResources do
         "updatedAt" => session_wire_value!(row, :updated_at, "updatedAt"),
         "mechanicalStatus" => session_wire_value!(row, :mechanical_status, "mechanicalStatus"),
         "capabilities" => %{"setHarness" => set_harness},
+        # Rows read from the sessions table carry their stored FYI lines.
+        "fyi" => value(row, :fyi) || [],
         "rowVersion" => session_wire_value!(row, :row_version, "rowVersion")
       }
     )

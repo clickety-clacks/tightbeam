@@ -2336,13 +2336,14 @@ defmodule Tightbeam.RulesTest do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     before_wake_ids = MapSet.new(Wakes.list_pending(ctx.db), & &1.wake_id)
 
-    assert %{code: "not_open"} =
+    # A linked assignment that does not exist still refuses the ask.
+    assert %{code: "not_found"} =
              Escalation.operator_ask(
                ctx.db,
                operator_ask_call(raiser.session_key, %{
                  question: "refused replacement?",
                  supersedes: old.id,
-                 assignment: closed_assignment.id
+                 assignment: closed_assignment.id <> "-missing"
                })
              )
 

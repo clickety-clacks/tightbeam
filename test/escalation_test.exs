@@ -1098,11 +1098,30 @@ defmodule Tightbeam.EscalationTest do
                operator_call(ctx.raiser, %{question: "foreign?", assignment: "a-foreign"})
              )
 
-    assert %{code: "not_open"} =
+    line =
+      "FYI: linked assignment a-closed is closed; decide for yourself whether that is acceptable"
+
+    assert %{id: closed_request_id, assignment_id: "a-closed", status: "open", fyi: [^line]} =
              Escalation.operator_ask(
                ctx.db,
                operator_call(ctx.raiser, %{question: "closed?", assignment: "a-closed"})
              )
+
+    # Re-asking the same question returns the open request with its FYI.
+    assert %{id: ^closed_request_id, fyi: [^line]} =
+             Escalation.operator_ask(
+               ctx.db,
+               operator_call(ctx.raiser, %{question: "closed?", assignment: "a-closed"})
+             )
+
+    reader = %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{}}
+
+    assert %{id: ^closed_request_id, fyi: [^line]} =
+             Escalation.get(ctx.db, reader, closed_request_id)
+
+    listed = Escalation.list(ctx.db, reader, "open")
+    assert %{fyi: [^line]} = Enum.find(listed, &(&1.id == closed_request_id))
+    refute listed |> Enum.find(&(&1.assignment_id == "a-owned")) |> Map.has_key?(:fyi)
 
     assert %{code: "not_found"} =
              Escalation.operator_ask(
@@ -1110,7 +1129,7 @@ defmodule Tightbeam.EscalationTest do
                operator_call(ctx.raiser, %{question: "missing?", assignment: "a-missing"})
              )
 
-    assert {:ok, [[2]]} =
+    assert {:ok, [[3]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
   end
 

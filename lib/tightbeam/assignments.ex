@@ -1036,12 +1036,19 @@ defmodule Tightbeam.Assignments do
 
     files = Enum.group_by(file_rows, &hd/1, &List.last/1)
     corrections = Tightbeam.AssignmentCommitRefCorrections.list_many(db, ids)
+    fyis = RecordFyis.list_many(db, "assignment", ids)
 
     Enum.map(assignments, fn assignment ->
       assignment
       |> Map.put(:files, Map.get(files, assignment.id, []))
       |> Map.put(:commitRefCorrections, Map.get(corrections, assignment.id, []))
       |> then(&Mementos.attach(db, "assignment", &1))
+      |> then(fn assignment ->
+        case Map.get(fyis, assignment.id) do
+          nil -> assignment
+          fyi -> Map.put(assignment, :fyi, fyi)
+        end
+      end)
     end)
   end
 
@@ -1867,6 +1874,7 @@ defmodule Tightbeam.Assignments do
         {:accepted_in_txn, event_id, {:created, assignment, delivery, effects}} ->
           close_memento_effects(db, call, effects)
           assignment = finalize_created_assignment(call, assignment, delivery)
+
           {:accepted_in_txn, event_id, %{assignment: assignment}}
 
         {:created, assignment, delivery, effects} ->
@@ -2214,6 +2222,7 @@ defmodule Tightbeam.Assignments do
           result =
             assignment(row)
             |> then(&Mementos.attach(db, "assignment", &1))
+            |> then(&RecordFyis.attach(db, "assignment", &1))
             |> Map.put(:reopenings, list_reopenings(db, assignment_id))
             |> Map.put(
               :commitRefCorrections,
@@ -2426,30 +2435,53 @@ defmodule Tightbeam.Assignments do
         reviews_assignment_id =
           if verb == "assign", do: call.params[:reviews_assignment_id], else: nil
 
-        if reviews_assignment_id do
-          case Txn.q(
-                 txn,
-                 "SELECT reviewsAssignmentId FROM assignments WHERE id = ?1",
-                 [reviews_assignment_id]
-               ) do
-            [] ->
-              raise UnknownReviewTarget, assignment_id: reviews_assignment_id
+        review_facts =
+          if reviews_assignment_id do
+            review_of_review_facts =
+              case Txn.q(
+                     txn,
+                     "SELECT reviewsAssignmentId FROM assignments WHERE id = ?1",
+                     [reviews_assignment_id]
+                   ) do
+                [] ->
+                  raise UnknownReviewTarget, assignment_id: reviews_assignment_id
 
-            [[nil]] ->
-              :ok
+                [[nil]] ->
+                  []
 
-            [[_reviews_assignment_id]] ->
-              throw(:review_of_review)
+                [[_reviews_assignment_id]] ->
+                  [
+                    "assignment #{reviews_assignment_id} that this card reviews is itself a review card"
+                  ]
+              end
+
+            reviewed_item_id =
+              resolve_work_item_id_in_txn(txn, reviews_assignment_id, MapSet.new())
+
+            item_facts =
+              cond do
+                is_nil(work_item_id) or work_item_id == reviewed_item_id ->
+                  []
+
+                is_nil(reviewed_item_id) ->
+                  [
+                    "this review card is on work item #{work_item_id}; " <>
+                      "assignment #{reviews_assignment_id} it reviews is on no work item"
+                  ]
+
+                true ->
+                  [
+                    "this review card is on work item #{work_item_id}; " <>
+                      "assignment #{reviews_assignment_id} it reviews is on work item #{reviewed_item_id}"
+                  ]
+              end
+
+            review_of_review_facts ++ item_facts
+          else
+            []
           end
-        end
 
-        if reviews_assignment_id do
-          reviewed_item_id = resolve_work_item_id_in_txn(txn, reviews_assignment_id, MapSet.new())
-
-          if not is_nil(work_item_id) and work_item_id != reviewed_item_id do
-            throw(:review_item_conflict)
-          end
-        end
+        fyi = Enum.map(Enum.uniq(review_facts), &RecordFyis.line/1)
 
         {subject, succeeds_assignment_id} = prepare_successor_in_txn!(txn, call)
 
@@ -2553,7 +2585,9 @@ defmodule Tightbeam.Assignments do
           )
         end
 
+        :ok = RecordFyis.put_in_txn(txn, "assignment", id, fyi)
         assignment = fetch_assignment!(txn, id)
+        assignment = if fyi == [], do: assignment, else: Map.put(assignment, :fyi, fyi)
 
         assignment =
           if parent_explanation,
@@ -2579,15 +2613,6 @@ defmodule Tightbeam.Assignments do
   catch
     {:work_item_not_open, work_item_id} ->
       error("work_item_not_open", "work item #{work_item_id} is not open")
-
-    :review_item_conflict ->
-      error(
-        "review_item_conflict",
-        "a review assignment must belong to the item it reviews"
-      )
-
-    :review_of_review ->
-      error("review_of_review", "a review assignment cannot itself be reviewed")
 
     {:successor_error, error} ->
       error
@@ -4779,8 +4804,13 @@ defmodule Tightbeam.Assignments do
       )
 
     case rows do
-      [row] -> assignment(row) |> then(&Mementos.attach(db, "assignment", &1))
-      [] -> nil
+      [row] ->
+        assignment(row)
+        |> then(&Mementos.attach(db, "assignment", &1))
+        |> then(&RecordFyis.attach(db, "assignment", &1))
+
+      [] ->
+        nil
     end
   end
 

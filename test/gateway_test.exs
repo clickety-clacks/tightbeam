@@ -3669,6 +3669,105 @@ defmodule Tightbeam.GatewayTest do
     assert attempt_seq == repaired.attemptTurnSeq
   end
 
+  test "a repair other than the incident's recommendation runs and states the difference",
+       ctx do
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignments
+                   (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+                 VALUES ('asg_other_repair','continue work','k1','flynn',1,'open',?1,?2)
+                 """,
+                 [session.harness, session.provider]
+               )
+             end)
+
+    {:ok, source_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-other-repair",
+        origin: "agent:k1",
+        prompt: "continue work",
+        assignment_id: "asg_other_repair"
+      })
+
+    {:ok, claimed_turn} = Ledger.claim_next(ctx.db, "k1", "test-lane")
+
+    :ok =
+      Ledger.finish(ctx.db, source_seq, "failed", "task crashed",
+        owner_lease: claimed_turn.owner_lease
+      )
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "gateway-repair-task-crash",
+               harness: session.harness,
+               host: session.host,
+               failure_class: "task_crash",
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               assignment_id: "asg_other_repair",
+               observed_at: 10,
+               cause: "adapter task crashed",
+               principal: "process:tightbeam"
+             })
+
+    assert HarnessHealth.get(ctx.db, incident.id).repair.action == "restart"
+
+    lane = :"other_repair_lane_#{System.unique_integer([:positive])}"
+    {:ok, lane_pid} = LaneDoorbell.start_link({self(), lane})
+    on_exit(fn -> if Process.alive?(lane_pid), do: GenServer.stop(lane_pid) end)
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["repair-assignment"]
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: lane,
+      params: %{
+        assignment_id: "asg_other_repair",
+        action: "rerun",
+        outcome: "not-completed",
+        idempotency_key: "other-repair-one"
+      }
+    }
+
+    line =
+      "FYI: incident #{incident.id} recommends restart; this repair requests rerun; " <>
+        "decide for yourself whether that is acceptable"
+
+    repaired = handler.(call)
+    assert %{ok: true, action: "rerun", fyi: [^line]} = repaired
+    assert repaired.incidentId == incident.id
+    assert repaired.sourceTurnSeq == source_seq
+    assert_receive {:ensure_lane, "k1"}
+
+    # The recorded repair outcome carries the FYI on replay.
+    assert handler.(call) == repaired
+
+    assert {:ok, [[^source_seq, "failed"], [attempt_seq, "queued"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status FROM turns WHERE assignmentId='asg_other_repair' ORDER BY seq"
+             )
+
+    assert attempt_seq == repaired.attemptTurnSeq
+
+    # The rerun's own outcome check still refuses an unreconciled outcome.
+    assert %{ok: false, code: "outcome_reconciliation_required"} =
+             unreconciled =
+             handler.(
+               call
+               |> put_in([:params, :idempotency_key], "other-repair-unreconciled")
+               |> update_in([:params], &Map.delete(&1, :outcome))
+             )
+
+    refute Map.has_key?(unreconciled, :fyi)
+  end
+
   test "an opener can relaunch a never-launched holder without revoking custody", ctx do
     session = Org.get(ctx.db, "k1")
 

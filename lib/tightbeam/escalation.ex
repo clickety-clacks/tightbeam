@@ -9,7 +9,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, RecordFyis, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Publisher}
 
@@ -2499,17 +2499,28 @@ defmodule Tightbeam.Escalation do
       nil ->
         result =
           with :ok <- filing_session_owner_in_txn(txn, session_key, owner_user_id),
-               :ok <- linked_assignment_in_txn(txn, ask.assignment_id, owner_user_id),
+               {:ok, facts} <- linked_assignment_in_txn(txn, ask.assignment_id, owner_user_id),
                :ok <- superseded_request_in_txn(txn, ask.supersedes, owner_user_id, raiser_id) do
-            insert_operator_request_in_txn(
-              txn,
-              session_key,
-              owner_user_id,
-              raiser_id,
-              action_key,
-              ask,
-              opts
-            )
+            request =
+              insert_operator_request_in_txn(
+                txn,
+                session_key,
+                owner_user_id,
+                raiser_id,
+                action_key,
+                ask,
+                opts
+              )
+
+            :ok =
+              RecordFyis.put_in_txn(
+                txn,
+                "decision_request",
+                request.id,
+                Enum.map(facts, &RecordFyis.line/1)
+              )
+
+            request
           else
             reason -> reason
           end
@@ -2517,11 +2528,13 @@ defmodule Tightbeam.Escalation do
         if not match?(%{code: _}, result),
           do: Publisher.maybe_accepted_in_txn(txn, call, result)
 
-        result
+        if match?(%{code: _}, result),
+          do: result,
+          else: RecordFyis.attach(txn, "decision_request", result)
 
       request ->
         Publisher.maybe_observed_accepted_in_txn(txn, call)
-        request
+        RecordFyis.attach(txn, "decision_request", request)
     end
   end
 
@@ -3254,8 +3267,10 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  defp linked_assignment_in_txn(_txn, nil, _owner_user_id), do: :ok
+  defp linked_assignment_in_txn(_txn, nil, _owner_user_id), do: {:ok, []}
 
+  # A request linked to a closed assignment is filed with an FYI. Its ruling
+  # takes the existing route for a ruling on a closed assignment.
   defp linked_assignment_in_txn(txn, assignment_id, _owner_user_id) do
     case Txn.q(
            txn,
@@ -3263,8 +3278,8 @@ defmodule Tightbeam.Escalation do
            [assignment_id]
          ) do
       [] -> error("not_found", "linked assignment not found")
-      [[state, _owner]] when state != "open" -> error("not_open", "linked assignment is not open")
-      [["open", _owner]] -> :ok
+      [["open", _owner]] -> {:ok, []}
+      [[_state, _owner]] -> {:ok, ["linked assignment #{assignment_id} is closed"]}
     end
   end
 
@@ -3780,9 +3795,21 @@ defmodule Tightbeam.Escalation do
 
     case invalid do
       [] ->
+        fyis =
+          RecordFyis.list_many(
+            txn,
+            "decision_request",
+            for(%{kind: "operator", id: id} <- parsed, do: id)
+          )
+
         Enum.map(parsed, fn
           %{kind: "operator"} = request ->
-            operator_projection(request, surface)
+            projection = operator_projection(request, surface)
+
+            case Map.get(fyis, request.id) do
+              nil -> projection
+              fyi -> Map.put(projection, :fyi, fyi)
+            end
 
           request ->
             if surface == :list do
