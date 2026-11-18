@@ -346,7 +346,7 @@ defmodule ItemlessSpawnDispatchRuntime do
 
   defp deliver_helper_result!(config, db, helper_key, caller) do
     {:ok, lane} = GenServer.start_link(ItemlessSpawnDoorbell, self())
-    {:ok, adapter} = AdapterStub.start_link(self())
+    {:ok, adapter} = AdapterStub.start_link({:unique_sessions, self()})
     {:ok, coordinator} = CoordinatorStub.start_link({adapter, self()})
 
     try do
