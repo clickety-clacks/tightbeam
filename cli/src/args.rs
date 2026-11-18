@@ -197,6 +197,7 @@ pub enum Command {
         body: Option<String>,
         choices: Vec<String>,
         files: Vec<String>,
+        answer_ui: Option<String>,
         vendor_session_id: Option<String>,
         supersedes: Vec<String>,
         decision_request_id: Option<String>,
@@ -409,6 +410,11 @@ pub enum Command {
         identity: Identity,
         assignment_id: String,
         reason: String,
+    },
+    AssignmentOpenerAccept {
+        identity: Identity,
+        assignment_id: String,
+        to_session_key: Option<String>,
     },
     ReopenAssignment {
         identity: Identity,
@@ -922,7 +928,7 @@ COMMANDS:
       --not-known-class <text> [--observed-at <epochMs>] --valid-until <epochMs> --world-status PROVEN|UNKNOWN
       --redaction-confirmed --key <idempotencyKey>
       exact_error requires --exact-error; probe_digest requires --output-digest.
-      --valid-until must be within 15 minutes after --observed-at (defaults to server acceptance time).
+      --valid-until must be in the future at server acceptance.
       UNKNOWN requires --evidence-mode exact_error.
       Admit a redacted, bounded evidence observation for a not-yet-named failure.
   harness-health-resolve-other --harness <harness> --host <host>
@@ -965,12 +971,13 @@ COMMANDS:
       --type fyi|request [--kind blocker|success]
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
       [--reply] [--supersedes <id>]...
-      [--body <text>] [--choices-json <array>] [--files-json <array>]
+      [--body <text>] [--choices-json <array>] [--files-json <array>] [--answer-ui <path>]
       [--vendor-session-id <id>] [--decision-request-id <dr_id>]
-      FYI is acknowledged with Seen; request needs a choice or --reply. Importance is
+      FYI is acknowledged with Seen; request needs a choice, --reply, or --answer-ui. Importance is
       your view; Harklight's ranking decides the priority the recipient sees.
       Correct and resend only after a definite refusal;
       settle an uncertain send with the same operation.
+      --answer-ui passes the UI/1 document path unchanged; keep its image files in --files-json.
       Use blocker when the recipient must act before work can continue, or success when work finished,
       shipped, or otherwise succeeded.
       A decision request id durably associates the send with its originating briefing.
@@ -1169,6 +1176,9 @@ COMMANDS:
   revoke-assignment <assignmentId> --reason "..."
       Revoke when the assignment handler already authorizes your principal.
       A non-owner caller receives a warning naming the work owner; revocation proceeds.
+  assignment-opener-accept <assignmentId> [--to <sessionKey>]
+      Accept opener duty for one open assignment whose opener retired.
+      The assignment stays open. The successor is you, or the named session.
   reopen-assignment <assignmentId> --reason <reason>
       Reopen an authorized closed assignment and record the reason.
       A non-owner caller receives a warning naming the work owner; reopening proceeds.
@@ -2400,7 +2410,7 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
             {
-                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest [--exact-error <text> | --output-digest <sha256>] --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> [--observed-at <ms>] --valid-until <ms> (within 15 minutes after --observed-at, which defaults to server acceptance time) --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey> (UNKNOWN requires exact_error evidence)".to_owned());
+                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest [--exact-error <text> | --output-digest <sha256>] --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> [--observed-at <ms>] --valid-until <ms> --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey> (UNKNOWN requires exact_error evidence)".to_owned());
             }
             let evidence_mode = nonempty(flags, "evidence-mode")
                 .ok_or_else(|| "--evidence-mode is required".to_owned())?;
@@ -2695,12 +2705,50 @@ fn parse_with_optional_catalog(
                             | "decision-request-id"
                             | "choices-json"
                             | "files-json"
+                            | "answer-ui"
                             | "vendor-session-id"
                             | "supersedes"
                     )
                 })
             {
-                return Err("usage: tightbeam harklight-send --session new|<handle> --sender-id <id> --title <text> --type fyi|request [--kind blocker|success] [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>] [--reply] [--body <text>] [--choices-json <array>] [--files-json <array>] [--vendor-session-id <id>] [--decision-request-id <dr_id>]".to_owned());
+                return Err("usage: tightbeam harklight-send --session new|<handle> --sender-id <id> --title <text> --type fyi|request [--kind blocker|success] [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>] [--reply] [--body <text>] [--choices-json <array>] [--files-json <array>] [--answer-ui <path>] [--vendor-session-id <id>] [--decision-request-id <dr_id>]".to_owned());
+            }
+            let answer_ui = flags.get("answer-ui").cloned();
+            if flags.contains_key("answer-ui") && answer_ui.as_deref().is_none_or(str::is_empty) {
+                return Err(
+                    "--answer-ui requires a non-empty path; provide a path or remove --answer-ui"
+                        .to_owned(),
+                );
+            }
+            let message_type = match nonempty(flags, "type") {
+                Some(value) => value,
+                None if answer_ui.is_some() => {
+                    return Err("--answer-ui requires --type request; add --type request or remove --answer-ui".to_owned());
+                }
+                None => {
+                    return Err("--type is required: use --type fyi for a Seen-only message or --type request for choices or a reply".to_owned());
+                }
+            };
+            if answer_ui.is_some() && message_type != "request" {
+                return Err(
+                    "--answer-ui requires --type request; add --type request or remove --answer-ui"
+                        .to_owned(),
+                );
+            }
+            if answer_ui.is_some()
+                && (flags.contains_key("choices-json") || flags.contains_key("reply"))
+            {
+                let mut conflicts = Vec::new();
+                if flags.contains_key("choices-json") {
+                    conflicts.push("--choices-json");
+                }
+                if flags.contains_key("reply") {
+                    conflicts.push("--reply");
+                }
+                return Err(format!(
+                    "--answer-ui carries its own inputs: remove {}, or drop --answer-ui and use --choices-json/--reply",
+                    conflicts.join(" and ")
+                ));
             }
             let decision_request_id = nonempty(flags, "decision-request-id");
             if parsed.duplicates.contains("decision-request-id")
@@ -2720,9 +2768,6 @@ fn parse_with_optional_catalog(
                 }
             };
             let sender_identity = identity(flags)?;
-            let message_type = nonempty(flags, "type").ok_or(
-                "--type is required: use --type fyi for a Seen-only message or --type request for choices or a reply",
-            )?;
             Ok(Command::HarklightSend {
                 identity: sender_identity,
                 session: nonempty(flags, "session").ok_or("--session is required")?,
@@ -2737,6 +2782,7 @@ fn parse_with_optional_catalog(
                 body: flags.get("body").cloned(),
                 choices: list("choices-json")?,
                 files: list("files-json")?,
+                answer_ui,
                 vendor_session_id: nonempty(flags, "vendor-session-id"),
                 supersedes: parsed
                     .repeated
@@ -3361,6 +3407,22 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 assignment_id: parsed.positional[1].clone(),
                 reason,
+            })
+        }
+        "assignment-opener-accept" => {
+            let usage =
+                "usage: tightbeam assignment-opener-accept <assignmentId> [--to <sessionKey>]";
+            if parsed.positional.len() != 2
+                || parsed.duplicates.contains("to")
+                || nonempty(flags, "role").is_some()
+                || nonempty(flags, "user").is_some()
+            {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::AssignmentOpenerAccept {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                to_session_key: nonempty(flags, "to"),
             })
         }
         "reopen-assignment" => {
@@ -4984,6 +5046,7 @@ mod tests {
                 body: None,
                 choices: vec!["Yes".to_owned(), "No".to_owned()],
                 files: vec!["/tmp/request.txt".to_owned()],
+                answer_ui: None,
                 vendor_session_id: None,
                 supersedes: vec![],
                 decision_request_id: None,
@@ -5111,6 +5174,116 @@ mod tests {
         for value in ["-1", "one"] {
             assert!(parse(strings(&["harklight-briefings-catchup", "--limit", value])).is_err());
         }
+    }
+
+    #[test]
+    fn answer_ui_is_a_request_path_with_its_own_controls() {
+        let parsed = parse(strings(&[
+            "harklight-send",
+            "--session",
+            "new",
+            "--sender-id",
+            "sender",
+            "--title",
+            "Choose a cover",
+            "--type",
+            "request",
+            "--answer-ui",
+            "/tmp/cover assets/answer-ui.json",
+            "--files-json",
+            r#"["/tmp/cover-a.jpg","/tmp/cover-b.jpg"]"#,
+        ]))
+        .unwrap();
+
+        let Command::HarklightSend {
+            answer_ui,
+            choices,
+            reply,
+            files,
+            ..
+        } = parsed
+        else {
+            panic!("expected Harklight send command");
+        };
+
+        assert_eq!(
+            answer_ui.as_deref(),
+            Some("/tmp/cover assets/answer-ui.json")
+        );
+        assert!(choices.is_empty());
+        assert!(!reply);
+        assert_eq!(files, ["/tmp/cover-a.jpg", "/tmp/cover-b.jpg"]);
+    }
+
+    #[test]
+    fn answer_ui_refusals_name_the_local_fix() {
+        let base = [
+            "harklight-send",
+            "--session",
+            "new",
+            "--sender-id",
+            "sender",
+            "--title",
+            "Choose a cover",
+        ];
+
+        let missing_type = [base.as_slice(), &["--answer-ui", "cover.json"]].concat();
+        assert_eq!(
+            parse(strings(&missing_type)),
+            Err(
+                "--answer-ui requires --type request; add --type request or remove --answer-ui"
+                    .to_owned()
+            )
+        );
+
+        let wrong_type = [
+            base.as_slice(),
+            &["--type", "fyi", "--answer-ui", "cover.json"],
+        ]
+        .concat();
+        assert_eq!(
+            parse(strings(&wrong_type)),
+            Err(
+                "--answer-ui requires --type request; add --type request or remove --answer-ui"
+                    .to_owned()
+            )
+        );
+
+        let reply_conflict = [
+            base.as_slice(),
+            &["--type", "request", "--answer-ui", "cover.json", "--reply"],
+        ]
+        .concat();
+        assert_eq!(
+            parse(strings(&reply_conflict)),
+            Err("--answer-ui carries its own inputs: remove --reply, or drop --answer-ui and use --choices-json/--reply".to_owned())
+        );
+
+        let empty_choices_conflict = [
+            base.as_slice(),
+            &[
+                "--type",
+                "request",
+                "--answer-ui",
+                "cover.json",
+                "--choices-json",
+                "[]",
+            ],
+        ]
+        .concat();
+        assert_eq!(
+            parse(strings(&empty_choices_conflict)),
+            Err("--answer-ui carries its own inputs: remove --choices-json, or drop --answer-ui and use --choices-json/--reply".to_owned())
+        );
+
+        let empty_path = [base.as_slice(), &["--type", "request", "--answer-ui", ""]].concat();
+        assert_eq!(
+            parse(strings(&empty_path)),
+            Err(
+                "--answer-ui requires a non-empty path; provide a path or remove --answer-ui"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]
@@ -5391,7 +5564,7 @@ mod tests {
             assert!(help.contains("--exact-error <text>"));
             assert!(help.contains("--output-digest <sha256>"));
             assert!(help.contains("exact_error requires --exact-error"));
-            assert!(help.contains("within 15 minutes after --observed-at"));
+            assert!(help.contains("--valid-until must be in the future at server acceptance."));
             assert!(help.contains("UNKNOWN requires --evidence-mode exact_error"));
         }
     }
@@ -6101,7 +6274,7 @@ mod tests {
         for required in [
             "--type fyi|request",
             "FYI is acknowledged with Seen",
-            "request needs a choice or --reply",
+            "request needs a choice, --reply, or --answer-ui",
             "Importance is",
             "your view;",
             "Harklight's ranking decides the priority the recipient sees",
@@ -6110,6 +6283,8 @@ mod tests {
             "settle an uncertain send with the same operation",
             "Use blocker when the recipient must act before work can continue",
             "shipped, or otherwise succeeded",
+            "--answer-ui passes the UI/1 document path unchanged",
+            "keep its image files in --files-json",
         ] {
             assert!(
                 entry.contains(required),
@@ -6802,6 +6977,7 @@ mod tests {
                 "assimilate",
                 "assign",
                 "assignment-get",
+                "assignment-opener-accept",
                 "assignments",
                 "artifact-record",
                 "artifact-content-fetch",

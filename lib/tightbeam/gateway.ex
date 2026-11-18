@@ -1791,6 +1791,9 @@ defmodule Tightbeam.Gateway do
       {"session-custody-transfer", ["wake.scheduled"]} => fn call ->
         Tightbeam.SessionCustodyTransfer.handle(db, call)
       end,
+      {"assignment-opener-accept", ["wake.scheduled"]} => fn call ->
+        Tightbeam.AssignmentOpenerAcceptance.handle(db, call)
+      end,
       {"session-po-set", ["wake.scheduled"]} => fn call ->
         SessionPoAssociations.handle(db, call)
       end,
@@ -6439,6 +6442,7 @@ defmodule Tightbeam.Gateway do
       end
 
     identity
+    |> Map.merge(Rules.status())
     |> Map.put(:sessions, sessions)
     |> maybe_put_guidance(guidance)
   end
@@ -7038,6 +7042,25 @@ defmodule Tightbeam.Gateway do
           stamp: "committed",
           enqueue: "already_pending",
           delivery: "pending",
+          reread: "unconfirmed",
+          wake_id: wake_id
+        }
+
+      existing_wakes != [] ->
+        # Delivery failure does not erase the notice. Recovery owns retries;
+        # another apply pass must not create a second source for this revision.
+        [[wake_id, _state] | _] = existing_wakes
+
+        delivery =
+          case NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id) do
+            [[_seq, status, _assignment_id] | _] -> status
+            [] -> "pending"
+          end
+
+        %{
+          stamp: "committed",
+          enqueue: "already_recorded",
+          delivery: delivery,
           reread: "unconfirmed",
           wake_id: wake_id
         }

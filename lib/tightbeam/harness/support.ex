@@ -700,9 +700,12 @@ defmodule Tightbeam.Harness.Support do
           base,
           "adapters",
           "node_modules",
-          profile.adapter_package,
+          module.install_package(),
           "package.json"
         ])
+
+      File.mkdir_p!(Path.dirname(package_json))
+      File.write!(package_json, JSON.encode!(%{"version" => profile.adapter_version}))
 
       File.chmod!(bundle, 0o751)
       if presence == :absent, do: File.rm!(adapter)

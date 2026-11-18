@@ -582,11 +582,6 @@ defmodule Tightbeam.AdminProjection do
   @doc "Build the allowlisted source entries after a successful Git publication."
   @spec served_entries(DB.server(), String.t()) :: [map()]
   def served_entries(db, base_dir) do
-    identity =
-      db
-      |> Tightbeam.StateResources.identity_snapshot(base_dir)
-      |> canonical_without_version("identity")
-
     kungfu =
       base_dir
       |> Tightbeam.StateResources.kungfu_names()
@@ -616,16 +611,21 @@ defmodule Tightbeam.AdminProjection do
         end
       end)
 
-    [
-      %{
-        resource: "identity",
-        key: "served",
-        class: "identity.updated",
-        refs: %{"name" => "served"},
-        item: identity
-      }
-      | kungfu
-    ]
+    [served_identity_entry(db, base_dir) | kungfu]
+  end
+
+  @doc "Build the served-identity entry for publication or a startup migration."
+  def served_identity_entry(db, base_dir) do
+    %{
+      resource: "identity",
+      key: "served",
+      class: "identity.updated",
+      refs: %{"name" => "served"},
+      item:
+        db
+        |> Tightbeam.StateResources.identity_snapshot(base_dir)
+        |> canonical_without_version("identity")
+    }
   end
 
   defp canonical_without_version(item, "identity") do
