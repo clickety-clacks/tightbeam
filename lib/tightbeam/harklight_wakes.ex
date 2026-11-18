@@ -1038,6 +1038,8 @@ defmodule Tightbeam.HarklightWakes do
 
   @impl true
   def init(opts) do
+    DB.owed_work()
+
     Process.flag(:trap_exit, true)
     send(self(), :restore)
     delays = Keyword.get(opts, :attach_retry_delays, @attach_retry_delays)
@@ -1091,6 +1093,8 @@ defmodule Tightbeam.HarklightWakes do
     state = Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle, :startup) end)
 
     Task.start(fn ->
+      DB.owed_work()
+
       Tightbeam.HarklightSend.recover_pending(state.db, runner: state.send_runner)
       HarklightLifecycle.process_terminals(state.db, runner: state.send_runner)
     end)
@@ -1263,7 +1267,12 @@ defmodule Tightbeam.HarklightWakes do
     if handle in Map.values(state.gone_tasks) do
       state
     else
-      {:ok, pid} = Task.start_link(fn -> send_origin_gone(handle) end)
+      {:ok, pid} =
+        Task.start_link(fn ->
+          DB.owed_work()
+          send_origin_gone(handle)
+        end)
+
       %{state | gone_tasks: Map.put(state.gone_tasks, Process.monitor(pid), handle)}
     end
   end
@@ -1427,7 +1436,10 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp schedule_answered_checks(manager, db, runner, candidates) do
-    Task.start(fn -> schedule_answered_checks_now(manager, db, runner, candidates) end)
+    Task.start(fn ->
+      DB.owed_work()
+      schedule_answered_checks_now(manager, db, runner, candidates)
+    end)
   end
 
   defp schedule_answered_checks_now(manager, db, runner, candidates) do
@@ -1540,7 +1552,10 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp mark_origin_gone_async(handle) do
-    case Task.start(fn -> send_origin_gone(handle) end) do
+    case Task.start(fn ->
+           DB.owed_work()
+           send_origin_gone(handle)
+         end) do
       {:ok, _pid} ->
         :ok
 
@@ -2129,6 +2144,8 @@ defmodule Tightbeam.HarklightWakes do
 
         {:ok, pid} =
           Task.start_link(fn ->
+            DB.owed_work()
+
             decision = decide_start(state, manager, handle, mode)
 
             case GenServer.call(manager, {:start_decided, handle, decision, mode}, :infinity) do

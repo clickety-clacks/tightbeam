@@ -35,6 +35,8 @@ defmodule Tightbeam.HarklightOriginListener do
 
   @impl true
   def init(opts) do
+    DB.owed_work()
+
     Process.flag(:trap_exit, true)
     send(self(), :restore)
 
@@ -239,7 +241,13 @@ defmodule Tightbeam.HarklightOriginListener do
       state
     else
       manager = self()
-      {:ok, pid} = Task.start_link(fn -> state.listener.(manager) end)
+
+      {:ok, pid} =
+        Task.start_link(fn ->
+          DB.owed_work()
+          state.listener.(manager)
+        end)
+
       %{state | worker: {pid, Process.monitor(pid)}, exit_status: nil}
     end
   end
@@ -313,6 +321,8 @@ defmodule Tightbeam.HarklightOriginListener do
       nil ->
         task =
           Task.async(fn ->
+            DB.owed_work()
+
             with {:ok, runner} <- runner(state.runner) do
               HarklightOrigin.migrate(state.db, handle,
                 runner: runner,

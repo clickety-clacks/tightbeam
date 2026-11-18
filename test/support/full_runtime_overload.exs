@@ -4,11 +4,11 @@ alias Tightbeam.{Boot, DB, Harness}
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 arena = Path.expand(base)
 ^arena = System.fetch_env!("TIGHTBEAM_BASE_DIR") |> Path.expand()
-evidence = Path.dirname(arena)
 "test" = System.fetch_env!("MIX_ENV")
 
 {:ok, _} = Application.ensure_all_started(:exqlite)
 {:ok, _} = Application.ensure_all_started(:crypto)
+System.put_env("RECOVERY_FIXTURE_ARENA", arena)
 Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:tightbeam, :fixture_harness, true)
@@ -107,6 +107,7 @@ import ExUnit.Assertions
 alias Tightbeam.{Model, Org, Wakes}
 
 key = "agent:overload:recipient"
+
 Org.create(DB, %{
   session_key: key,
   display_name: "Overload recipient",
@@ -122,42 +123,66 @@ Org.create(DB, %{
 })
 
 # Settle startup recovery, including both listener managers, before measuring.
-for name <- [Tightbeam.WakeScheduler, Tightbeam.LaneManager, Tightbeam.HarklightWakes,
-             Tightbeam.HarklightOriginListener], do: :sys.get_state(name)
+for name <- [
+      Tightbeam.WakeScheduler,
+      Tightbeam.LaneManager,
+      Tightbeam.HarklightWakes,
+      Tightbeam.HarklightOriginListener
+    ],
+    do: :sys.get_state(name)
 
 runtime = Process.whereis(Tightbeam.RuntimeSupervisor)
+
 children = fn ->
   Supervisor.which_children(runtime)
   |> Map.new(fn {id, pid, _, _} -> {id, pid} end)
 end
+
 before = children.()
 root = Process.whereis(Tightbeam.Supervisor)
-listener = Enum.find_value(before, fn
-  {{Bandit, _}, pid} -> pid
-  {Bandit, pid} -> pid
-  _ -> nil
-end)
+
+listener =
+  Enum.find_value(before, fn
+    {{Bandit, _}, pid} -> pid
+    {Bandit, pid} -> pid
+    _ -> nil
+  end)
+
 assert is_pid(listener)
 {:ok, {_address, port}} = ThousandIsland.listener_info(listener)
+
 http_ok = fn ->
   {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 1_000)
-  :ok = :gen_tcp.send(socket, "GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+
+  :ok =
+    :gen_tcp.send(socket, "GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+
   {:ok, response} = :gen_tcp.recv(socket, 0, 2_000)
   :gen_tcp.close(socket)
   assert response =~ "HTTP/1.1 200"
 end
+
 http_ok.()
 
 # Keep the scheduler at its boundary while recording one durable delivery.
 :ok = :sys.suspend(Tightbeam.WakeScheduler)
-wake = Wakes.schedule(DB, %{
-  session_key: key, origin: "process:tightbeam", prompt: "overload durable wake",
-  due_at: System.system_time(:millisecond), consumer: "prompt", target_gate: 1
-})
+
+wake =
+  Wakes.schedule(DB, %{
+    session_key: key,
+    origin: "process:tightbeam",
+    prompt: "overload durable wake",
+    due_at: System.system_time(:millisecond),
+    consumer: "prompt",
+    target_gate: 1
+  })
+
 owner = Process.whereis(DB)
 :ok = :sys.suspend(owner)
+
 for _ <- 1..128,
-  do: send(owner, {:"$gen_call", {self(), make_ref()}, {:query, "SELECT 1", []}})
+    do: send(owner, {:"$gen_call", {self(), make_ref()}, {:query, "SELECT 1", []}})
+
 assert DB.overloaded?(DB)
 
 # This is the synchronous production entry in the failed independent review.
@@ -174,6 +199,7 @@ try do
     http_ok.()
     Process.sleep(30)
   end
+
   assert Process.alive?(root)
   assert children.() == before
   assert Enum.all?(before, fn {_id, pid} -> is_pid(pid) and Process.alive?(pid) end)
@@ -182,17 +208,25 @@ try do
   Task.await(nudge, 10_000)
   :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
   deadline = System.monotonic_time(:millisecond) + 15_000
+
   wait = fn wait ->
-    {:ok, rows} = DB.query(DB, "SELECT status FROM turns WHERE wakeId=?1", [wake.wake_id])
+    {:ok, rows} =
+      DB.query(
+        DB,
+        "SELECT t.status FROM turns t JOIN wakes w ON w.deliveredTurnSeq=t.seq WHERE w.wakeId=?1",
+        [wake.wake_id]
+      )
+
     if rows != [["delivered"]] do
       assert System.monotonic_time(:millisecond) < deadline, inspect(rows)
       Process.sleep(25)
       wait.(wait)
     end
   end
+
   wait.(wait)
   :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
-  {:ok, [[1]]} = DB.query(DB, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+  {:ok, [[1]]} = DB.query(DB, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [key])
   assert children.() == before
   http_ok.()
   refute File.exists?(tripwire)
@@ -200,5 +234,34 @@ try do
 after
   :sys.resume(owner)
 end
+
+# A service can restart for an unrelated reason during a refusal interval.
+# Its initialization must wait, while the existing listener remains available.
+for child <- [Wakes, Tightbeam.LaneManager, Tightbeam.HarnessHealth.RecoveryScheduler] do
+  :ok = Supervisor.terminate_child(runtime, child)
+  :ok = :sys.suspend(owner)
+
+  for _ <- 1..128,
+      do: send(owner, {:"$gen_call", {self(), make_ref()}, {:query, "SELECT 1", []}})
+
+  assert DB.overloaded?(DB)
+  restart = Task.async(fn -> Supervisor.restart_child(runtime, child) end)
+
+  try do
+    assert Task.yield(restart, 200) == nil
+    http_ok.()
+    assert Process.alive?(root)
+    assert Process.alive?(listener)
+  after
+    :sys.resume(owner)
+  end
+
+  assert {:ok, restarted} = Task.await(restart, 10_000)
+  assert Process.alive?(restarted)
+  assert Process.whereis(Tightbeam.Supervisor) == root
+  http_ok.()
+end
+
+IO.puts("full-runtime-overload: startup recovery waits without restart cascade")
 
 Application.stop(:tightbeam)
