@@ -1704,6 +1704,93 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert turn_count(ctx.db, unknown.wake_id) == 0
   end
 
+
+  test "cutover adopts only eligible pending notices at the recorded watermark and reports them once",
+       ctx do
+    stop_supervised!(ctx.scheduler)
+    {_parent, _child, root} = completed_child(ctx)
+    forget_reaction_ledger!(ctx.db)
+
+    assert {:ok, [[watermark]]} =
+             DB.query(ctx.db, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO row_reaction_cutovers(source,watermark,adoptedAt,heldCount) VALUES(?1,?2,?3,0)",
+               ["terminal-notices/v1", JSON.encode!(%{"wakeRowid" => watermark}), System.system_time(:millisecond)]
+             )
+
+    later =
+      Wakes.schedule(ctx.db, %{
+        wake_id: "post-watermark-legacy-notice",
+        session_key: "other-parent",
+        owner_user_id: "flynn",
+        origin: "process:tightbeam",
+        prompt: "Legacy output written after the cutover watermark",
+        due_at: System.system_time(:millisecond) + 3_600_000,
+        obligation_ref: "terminal-child-owner-notification:unknown-assignment"
+      })
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+      end)
+
+    assert log =~ "OPERATOR NOTICE: terminal-notice cutover recorded"
+    assert log =~ "1 notice wake(s) were pending at that watermark; 1 were linked"
+
+    assert [adopted] = terminal_notices(ctx.db)
+    assert adopted.wake_id == root.wake_id
+    assert adopted.due_at == root.due_at
+
+    assert {:ok, [[encoded_watermark]]} =
+             DB.query(
+               ctx.db,
+               "SELECT watermark FROM row_reaction_cutovers WHERE source='terminal-notices/v1'"
+             )
+
+    assert JSON.decode!(encoded_watermark) == %{"wakeRowid" => watermark}
+
+    assert {:ok, [[same_watermark]]} =
+             DB.query(
+               ctx.db,
+               "SELECT watermark FROM row_reaction_cutovers WHERE source='terminal-notices/pending-adoption/v1'"
+             )
+
+    assert JSON.decode!(same_watermark) == %{"wakeRowid" => watermark}
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT heldCount FROM row_reaction_cutovers WHERE source='terminal-notices/v1'"
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT 1 FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [later.wake_id]
+             )
+
+    assert Wakes.get(ctx.db, later.wake_id).state == "pending"
+
+    repeated_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+      end)
+
+    refute repeated_log =~ "OPERATOR NOTICE: terminal-notice cutover recorded"
+    assert length(terminal_notices(ctx.db)) == 1
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [root.wake_id]
+             )
+  end
+
   test "an undelivered intent resumes once through transport lineage when its recipient becomes eligible",
        ctx do
     stop_supervised!(ctx.scheduler)

@@ -48,6 +48,97 @@ defmodule Tightbeam.LaneTest do
     %{db: db, reg: reg, task_sup: task_sup, lane_sup: lane_sup}
   end
 
+  test "durable changes wait for the terminal result and precede the next prompt", ctx do
+    parent = self()
+    first = enqueue!(ctx.db, "k1", "first")
+
+    runner = fn turn ->
+      send(parent, {:running_change_test, turn.prompt, self()})
+
+      receive do
+        :finish -> {:ok, %{text: turn.prompt}}
+      end
+    end
+
+    before_turn = fn key ->
+      for {id, _request} <- Tightbeam.RuntimeChanges.pending(ctx.db, key) do
+        {:ok, [[status]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [first])
+        send(parent, {:applied_change_test, status})
+        Tightbeam.RuntimeChanges.finish(ctx.db, id, %{ok: true})
+      end
+
+      :ok
+    end
+
+    start_supervised!(
+      {SessionLane,
+       session_key: "k1",
+       db: ctx.db,
+       task_sup: ctx.task_sup,
+       runner: runner,
+       before_turn: before_turn}
+    )
+
+    assert_receive {:running_change_test, "first", worker}, 1_000
+
+    accepted =
+      SessionLane.change_at_boundary(
+        "k1",
+        fn -> flunk("must not replace a running runtime") end,
+        fn -> Tightbeam.RuntimeChanges.enqueue(ctx.db, "k1", %{harness: "codex"}) end
+      )
+
+    assert %{ok: true, applies: "after_turn", change_id: id} = accepted
+    assert [{^id, %{"harness" => "codex"}}] = Tightbeam.RuntimeChanges.pending(ctx.db, "k1")
+    refute_received {:applied_change_test, _}
+
+    enqueue!(ctx.db, "k1", "second")
+    send(worker, :finish)
+    assert_receive {:applied_change_test, "delivered"}, 1_000
+    assert_receive {:running_change_test, "second", next_worker}, 1_000
+    assert Tightbeam.RuntimeChanges.pending(ctx.db, "k1") == []
+    send(next_worker, :finish)
+  end
+
+  test "a rolled-back runtime swap leaves its accepted change pending", %{db: db} do
+    %{change_id: id} = Tightbeam.RuntimeChanges.enqueue(db, "k1", %{harness: "codex"})
+
+    assert {:error, _} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.RuntimeChanges.finish_in_txn(txn, id, %{ok: true})
+               raise "swap did not commit"
+             end)
+
+    assert [{^id, _}] = Tightbeam.RuntimeChanges.pending(db, "k1")
+    assert "k1" in Tightbeam.RuntimeChanges.pending_sessions(db)
+  end
+
+  test "boot discovers accepted changes even without another queued prompt", ctx do
+    parent = self()
+    %{change_id: id} = Tightbeam.RuntimeChanges.enqueue(ctx.db, "k1", %{harness: "codex"})
+
+    start_supervised!(
+      {LaneManager,
+       name: :runtime_change_boot_manager,
+       db: ctx.db,
+       lane_sup: ctx.lane_sup,
+       task_sup: ctx.task_sup,
+       runner: fn _ -> flunk("a handoff must not replay a prompt") end,
+       before_turn: fn key ->
+         for {request_id, _} <- Tightbeam.RuntimeChanges.pending(ctx.db, key) do
+           Tightbeam.RuntimeChanges.finish(ctx.db, request_id, %{ok: true})
+           send(parent, {:recovered_change, request_id})
+         end
+
+         :ok
+       end}
+    )
+
+    assert_receive {:recovered_change, ^id}, 1_000
+    assert Tightbeam.RuntimeChanges.pending_sessions(ctx.db) == []
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE sessionKey='k1'")
+  end
+
   defp enqueue!(db, sk, prompt) do
     {:ok, seq} =
       Ledger.enqueue(db, %{

@@ -67,7 +67,7 @@ defmodule Tightbeam.Dispatch do
   @read_verbs ~w(facts-read fact-demand fact-producers artifact-content-fetch artifact-get artifacts mementos decision-requests
     decision-request host-env-list sentinel-list sentinel-events sentinel-subscriptions identity-status kungfu-list harness-processes
     role-list breathing work-item-get work-item-trace transcript execution-map execution-map-select
-    toplines topline topline-placement-list work-item-list attests assignment-get assignments inspect
+    toplines topline topline-placement-list work-item-list attests check-attest assignment-get assignments inspect
     harness-health-evidence-other)
 
   @db_transaction_diagnostic_fields ~w(
@@ -89,6 +89,16 @@ defmodule Tightbeam.Dispatch do
 
     try do
       Rules.with_snapshot(fn -> dispatch_call(db, handlers, call) end)
+    rescue
+      error ->
+        if DB.overload_error?(error) do
+          # The database owner refused a call this verb needed. The caller is
+          # told to retry; no audit row is queued on an owner refusing work.
+          Logger.warning("#{inspect(Map.get(call, :verb))} refused: database overloaded")
+          {:error, DB.overload_refusal()}
+        else
+          reraise error, __STACKTRACE__
+        end
     after
       if previous_audit,
         do: Process.put(:tightbeam_dispatch_audit, previous_audit),
@@ -802,6 +812,13 @@ defmodule Tightbeam.Dispatch do
   rescue
     exception in DB.Timeout ->
       reraise exception, __STACKTRACE__
+
+    exception in [DB.Overloaded, MatchError, CaseClauseError] ->
+      # An overloaded database is a refusal for the caller to retry, decided in
+      # dispatch/3, not a handler crash to record.
+      if DB.overload_error?(exception),
+        do: reraise(exception, __STACKTRACE__),
+        else: {:raised, exception, __STACKTRACE__}
 
     exception in Placement.Refusal ->
       diagnostic =

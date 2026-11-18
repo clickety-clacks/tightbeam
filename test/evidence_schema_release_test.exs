@@ -3,7 +3,7 @@ defmodule Tightbeam.EvidenceSchemaReleaseTest do
 
   alias Tightbeam.{DB, Schema}
 
-  @successor "session-custody-v1-0116"
+  @successor "session-custody-artifact-process-attribution-v1-0117"
 
   test "fresh and repeated boot retain the exact release successor and evidence objects" do
     db = start_supervised!({DB, path: ":memory:", name: nil})

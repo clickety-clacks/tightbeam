@@ -117,6 +117,19 @@ defmodule Tightbeam.SupervisionTest do
         due_at: future
       )
 
+    condition_wait =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        origin: "agent:holder",
+        creator_session_key: ctx.holder.session_key,
+        prompt: "re-read the assignment after it lands",
+        due_at: future,
+        assignment_id: assignment.id,
+        obligation_ref: assignment.id,
+        condition_kind: "assignment-landed",
+        condition_scope: assignment.id
+      })
+
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE wakes SET deliveredTurnSeq=123 WHERE wakeId=?1", [
                delivered_prompt.wake_id
@@ -131,6 +144,10 @@ defmodule Tightbeam.SupervisionTest do
     # A queued notice has already crossed the delivery boundary and cannot be recalled.
     assert %{state: "pending", delivered_turn_seq: 123} =
              Wakes.get(ctx.db, delivered_prompt.wake_id)
+
+    # Ordinary condition waits are outside the legacy inactivity namespace.
+    assert %{state: "pending", condition_kind: "assignment-landed"} =
+             Wakes.get(ctx.db, condition_wait.wake_id)
   end
 
   defp assign(ctx, subject, session_key \\ nil) do

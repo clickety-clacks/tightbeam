@@ -1,40 +1,48 @@
 defmodule Tightbeam.RowReactions.Cutover do
   @moduledoc false
+  require Logger
   alias Tightbeam.{RowReactions, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.RowReactions.{Snapshot, Store}
   @source "terminal-notices/v1"
+  @adoption_source "terminal-notices/pending-adoption/v1"
   @attest_source "assignment-attest-notices/v1"
   @root "terminal-child-owner-notification:"
   @reminder "terminal-child-owner-action-reminder:"
-  # Keep the canceled case aligned with Wakes.undelivered_notice_in_txn?/2:
-  # an unresolved recipient leaves delivery intent pending until it is retried.
-  @pending_legacy_wake """
-  (
-    (w.state='pending' AND w.deliveredTurnSeq IS NULL)
-    OR (
-      w.state='canceled' AND w.deliveredTurnSeq IS NULL
-      AND EXISTS (
-        SELECT 1 FROM wake_cancellations c
-        WHERE c.wakeId=w.wakeId AND c.reasonKind='target_unresolvable'
-      )
-      AND EXISTS (
-        SELECT 1 FROM lifecycle_events e
-        WHERE e.kind='wake_undeliverable' AND e.subject=w.wakeId
-      )
-    )
-  )
-  """
+  @notice "(obligationRef LIKE 'terminal-child-owner-notification:%' OR obligationRef LIKE 'terminal-child-owner-action-reminder:%')"
+  @pending_legacy_wake "w.state='pending' AND w.deliveredTurnSeq IS NULL"
 
   def adopt(txn) do
-    case Txn.q(txn, "SELECT 1 FROM row_reaction_cutovers WHERE source=?1", [@source]) do
+    watermark = terminal_watermark(txn)
+    adopt_pending_terminal_notices(txn, watermark)
+    adopt_attest_notices(txn, watermark)
+    :ok
+  end
+
+  defp terminal_watermark(txn) do
+    case Txn.q(txn, "SELECT watermark FROM row_reaction_cutovers WHERE source=?1", [@source]) do
+      [[encoded]] ->
+        JSON.decode!(encoded)["wakeRowid"]
+
+      [] ->
+        [[watermark]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
+
+        Txn.q(
+          txn,
+          "INSERT INTO row_reaction_cutovers(source,watermark,adoptedAt,heldCount) VALUES(?1,?2,?3,0)",
+          [@source, JSON.encode!(%{"wakeRowid" => watermark}), System.system_time(:millisecond)]
+        )
+
+        watermark
+    end
+  end
+
+  defp adopt_pending_terminal_notices(txn, watermark) do
+    case Txn.q(txn, "SELECT 1 FROM row_reaction_cutovers WHERE source=?1", [@adoption_source]) do
       [[1]] ->
         :ok
 
       [] ->
-        [[watermark]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
-        # One finite source population. Never replay old closes that had no
-        # output, and never grow this population on later rule publication.
         ids =
           Txn.q(
             txn,
@@ -51,7 +59,7 @@ defmodule Tightbeam.RowReactions.Cutover do
 
         held =
           Enum.count(ids, fn [id] ->
-            adopt_output(txn, Wakes.get_in_txn(txn, id), at) == "held"
+            adopt_output(txn, Wakes.get_in_txn(txn, id), at, watermark) == "held"
           end)
 
         remember_swept_terminal_deliveries(txn, watermark)
@@ -59,23 +67,26 @@ defmodule Tightbeam.RowReactions.Cutover do
         Txn.q(
           txn,
           "INSERT INTO row_reaction_cutovers(source,watermark,adoptedAt,heldCount) VALUES(?1,?2,?3,?4)",
-          [@source, JSON.encode!(%{"wakeRowid" => watermark}), at, held]
+          [@adoption_source, JSON.encode!(%{"wakeRowid" => watermark}), at, held]
         )
 
+        Txn.q(
+          txn,
+          "UPDATE row_reaction_cutovers SET heldCount=?1 WHERE source=?2",
+          [held, @source]
+        )
+
+        report(txn, watermark, length(ids) - held, held)
         :ok
     end
-
-    adopt_attest_notices(txn)
   end
 
-  defp adopt_attest_notices(txn) do
+  defp adopt_attest_notices(txn, watermark) do
     case Txn.q(txn, "SELECT 1 FROM row_reaction_cutovers WHERE source=?1", [@attest_source]) do
       [[1]] ->
         :ok
 
       [] ->
-        [[watermark]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
-
         ids =
           Txn.q(
             txn,
@@ -118,12 +129,18 @@ defmodule Tightbeam.RowReactions.Cutover do
         WHERE w.rowid<=?1 AND w.deliveredTurnSeq>?2
           AND (w.obligationRef LIKE ?3 OR w.obligationRef LIKE ?4)
           AND EXISTS (
+            SELECT 1 FROM wakes p
+            WHERE p.rowid<=?1 AND p.state='pending' AND p.deliveredTurnSeq IS NULL
+              AND p.obligationRef LIKE ?5
+              AND (p.obligationRef=w.obligationRef OR p.obligationRef=(?6 || w.wakeId))
+          )
+          AND EXISTS (
             SELECT 1 FROM turns t
             WHERE t.seq=w.deliveredTurnSeq AND t.sessionKey=w.sessionKey
           )
         ORDER BY w.deliveredTurnSeq,w.rowid
         """,
-        [watermark, bubble_cursor, @root <> "%", @reminder <> "%"]
+        [watermark, bubble_cursor, @root <> "%", @reminder <> "%", @reminder <> "%", @reminder]
       )
 
     # A restart can revisit ended turns after the durable bubble prefix.
@@ -200,7 +217,6 @@ defmodule Tightbeam.RowReactions.Cutover do
            prompt,
            capture: :all_but_first
          ) do
-      [attest_id, kind, assignment_id] -> [attest_id, kind, assignment_id]
       _ -> nil
     end
   end
@@ -291,11 +307,12 @@ defmodule Tightbeam.RowReactions.Cutover do
     "held"
   end
 
-  defp adopt_output(txn, wake, at) do
+  defp adopt_output(txn, wake, at, watermark) do
     {event, family, slot} =
       case wake.obligation_ref do
         @root <> _ -> {terminal_event(txn, wake), "terminal-handoff", "handoff"}
-        @reminder <> root -> {reminder_event(txn, wake, root), "terminal-action", "reminder"}
+        @reminder <> root ->
+          {reminder_event(txn, wake, root, watermark), "terminal-action", "reminder"}
       end
 
     unresolved = is_nil(event)
@@ -399,10 +416,14 @@ defmodule Tightbeam.RowReactions.Cutover do
     end
   end
 
-  defp reminder_event(txn, wake, root) do
+  defp reminder_event(txn, wake, root, watermark) do
     predecessors = [
       root
-      | Txn.q(txn, "SELECT wakeId FROM wakes WHERE obligationRef=?1", [@reminder <> root])
+      | Txn.q(
+          txn,
+          "SELECT wakeId FROM wakes WHERE rowid<=?1 AND obligationRef=?2",
+          [watermark, @reminder <> root]
+        )
         |> List.flatten()
     ]
 
@@ -421,4 +442,31 @@ defmodule Tightbeam.RowReactions.Cutover do
   end
 
   defp stringify(map), do: Map.new(map, fn {key, value} -> {Atom.to_string(key), value} end)
+
+  # Keep the operator report introduced on main while describing the bounded
+  # pending-only transition accurately. Reporting is advisory and cannot fail
+  # the cutover.
+  defp report(txn, watermark, linked, held) do
+    [[pending]] =
+      Txn.q(
+        txn,
+        "SELECT count(*) FROM wakes WHERE rowid<=?1 AND state='pending' AND #{@notice}",
+        [watermark]
+      )
+
+    Logger.warning(
+      "OPERATOR NOTICE: terminal-notice cutover recorded at wake rowid #{watermark}. " <>
+        "#{pending} notice wake(s) were pending at that watermark; #{linked} were linked " <>
+        "under their existing wake identities and #{held} remain held for reconciliation. " <>
+        "Delivered and canceled notices were left untouched. No wake was recreated during " <>
+        "cutover. To list the pending ones: SELECT wakeId,sessionKey,obligationRef FROM wakes " <>
+        "WHERE rowid<=#{watermark} AND state='pending' AND #{@notice}"
+    )
+  rescue
+    error ->
+      Logger.warning(
+        "OPERATOR NOTICE: terminal-notice cutover recorded at wake rowid #{watermark}; " <>
+          "the pending-action report failed (#{Exception.message(error)})"
+      )
+  end
 end

@@ -167,7 +167,9 @@ defmodule Tightbeam.JobForensicsTest do
   } do
     work_item(db, "wi_disp")
 
-    assert %{workItem: %{state: "iceboxed"}} = dispose(db, "work-item-icebox", "wi_disp")
+    assert %{workItem: %{state: "iceboxed"}} =
+             dispose(db, "work-item-icebox", "wi_disp", %{reason: "paused for review"})
+
     assert %{workItem: %{state: "open"}} = dispose(db, "work-item-reopen", "wi_disp")
     assert %{workItem: %{state: "closed"}} = dispose(db, "work-item-close", "wi_disp")
 
@@ -320,7 +322,7 @@ defmodule Tightbeam.JobForensicsTest do
       DB.transaction(db, fn txn ->
         Wakes.cancel_in_txn(txn, %{
           wake_id: wake.wake_id,
-          requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+          requester: %{kind: "process", id: "tightbeam:assignments"},
           reason_kind: "superseded",
           causal_source: %{kind: "wake", id: replacement.wake_id},
           outcome: %{kind: "replacement", replacement_wake_id: replacement.wake_id}
@@ -594,7 +596,7 @@ defmodule Tightbeam.JobForensicsTest do
           })
 
         assert typed_cancel_in_txn(txn, original.wake_id, %{
-                 requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                 requester: %{kind: "process", id: "tightbeam:assignments"},
                  reason_kind: "superseded",
                  causal_source: %{kind: "wake", id: replacement.wake_id},
                  outcome: %{kind: "replacement", replacement_wake_id: replacement.wake_id}
@@ -607,7 +609,7 @@ defmodule Tightbeam.JobForensicsTest do
 
     assert_proven_cancellation(entry, %{
       requesterKind: "process",
-      requesterId: "tightbeam:effort-checkin",
+      requesterId: "tightbeam:assignments",
       reasonKind: "superseded",
       causalSourceKind: "wake",
       causalSourceId: replacement.wake_id,
@@ -642,7 +644,7 @@ defmodule Tightbeam.JobForensicsTest do
                })
 
                assert typed_cancel_in_txn(txn, rollback_original.wake_id, %{
-                        requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                        requester: %{kind: "process", id: "tightbeam:assignments"},
                         reason_kind: "superseded",
                         causal_source: %{kind: "wake", id: rollback_replacement_id},
                         outcome: %{
@@ -907,7 +909,7 @@ defmodule Tightbeam.JobForensicsTest do
       ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
       """)
 
-    # A predecessor fixture must exclude later delivery and source columns.
+    # A predecessor fixture must exclude later delivery, source, and record-event stamp columns.
     :ok =
       DB.execute(legacy_db, """
       ALTER TABLE wakes DROP COLUMN sourceClientIdentity;
@@ -915,6 +917,7 @@ defmodule Tightbeam.JobForensicsTest do
       ALTER TABLE wakes DROP COLUMN sourceVisibilityScope;
       ALTER TABLE wakes DROP COLUMN sourceAddress;
       ALTER TABLE wakes DROP COLUMN deliveredTurnSeq;
+      ALTER TABLE wakes DROP COLUMN recordEventIds;
       """)
 
     assert {:ok, []} =

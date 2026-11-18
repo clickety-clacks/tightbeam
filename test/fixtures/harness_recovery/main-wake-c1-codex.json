@@ -1,0 +1,20 @@
+{
+  "provenance": {
+    "captureArtifactId": "art_c67b8748",
+    "captureArtifactSha256": "bceb0218b28055164dfc34ba04e92c202a861c3f9dc05c36f64237631fdcbaca",
+    "specimen": "C1",
+    "sourceRecordId": "hho_bd254f96-37f5-4105-b9e2-32cf95b4436d",
+    "observedAt": "2026-11-05T05:05:40Z",
+    "harness": "codex",
+    "failureClass": "rate-limit-dead",
+    "boundary": "captured terminal-failure observation reason projection"
+  },
+  "reason": {
+    "code": -32603,
+    "data": {
+      "codexErrorInfo": "usageLimitExceeded",
+      "message": "You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 8th, 2026 4:03 PM."
+    },
+    "message": "Internal error"
+  }
+}

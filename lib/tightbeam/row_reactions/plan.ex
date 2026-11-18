@@ -35,9 +35,12 @@ defmodule Tightbeam.RowReactions.Plan do
   end
 
   def compile!(rail, provenance, owner, owned_archetypes) do
-    fields!(rail, ~w(name family events when effects), ~w(bind archetypes))
+    fields!(rail, ~w(name family events when effects), ~w(bind english archetypes))
     Enum.each(~w(name family), &text!(rail[&1]))
     archetypes = validate_archetypes!(rail, owner, owned_archetypes)
+
+    english = Map.get(rail, "english")
+    if english, do: text!(english)
 
     unless is_list(rail["events"]) and rail["events"] != [],
       do: raise(ArgumentError, "reaction requires events")
@@ -91,6 +94,7 @@ defmodule Tightbeam.RowReactions.Plan do
       bindings: bindings,
       condition: rail["when"],
       effects: effects,
+      english: english,
       provenance: provenance
     }
   end
