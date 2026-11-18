@@ -204,7 +204,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       )
     end
 
-    Rules.load!(base, Map.keys(handlers))
+    Tightbeam.TerminalReactionFixture.load_work_items!(base, Map.keys(handlers), false)
     # Real wake scheduling and atomic carrier admission; the local doorbell
     # does not execute a provider or synthesize an assistant turn.
     # Nothing calls an adapter or manufactures an inference/tool-call result.

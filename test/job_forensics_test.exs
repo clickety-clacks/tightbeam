@@ -661,6 +661,20 @@ defmodule Tightbeam.JobForensicsTest do
   end
 
   test "work-item disposition cancellation names the durable disposition", %{db: db} do
+    law =
+      Path.join(
+        System.tmp_dir!(),
+        "disposition-reminder-law-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(law) end)
+
+    Tightbeam.TerminalReactionFixture.load_work_items!(
+      law,
+      Map.keys(Gateway.handlers(%{db: db})),
+      false
+    )
+
     work_item(db, "wi_dispose_wake")
 
     wake =
