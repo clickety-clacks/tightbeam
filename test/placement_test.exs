@@ -1742,7 +1742,9 @@ defmodule Tightbeam.PlacementTest do
     cli_bin = Path.join(base_dir, "bin")
     File.mkdir_p!(cli_bin)
 
-    node = System.find_executable("node")
+    # Resolve version-manager shims before the probe uses the fixture HOME.
+    {node, 0} = System.cmd("node", ["-p", "process.execPath"])
+    node = String.trim(node)
     shim = Path.join(cli_bin, "node")
 
     File.write!(

@@ -282,17 +282,23 @@ on 2026-07-25:
 
 9. [auto: J4] Post three messages back-to-back in Main without waiting: "say ONE",
    "say TWO", "say THREE".
-   PASS: three echoes immediately, and three distinct post rows in history in
-   post order, each with its own deviceId and clientMessageId. "say ONE" runs as
-   its own turn; its assistant reply carries ONE's clientMessageId. "say TWO" and
-   "say THREE", accepted while ONE's turn is queued or running, get no separate
-   turn: they are delivered together in the next ready-time batch, in post order,
-   as one carrier turn whose reply is not tied to either post's clientMessageId.
-   (If ONE's turn ends between those two posts, THREE may be a later carrier.)
-   The action does not ensure ONE reaches `running`; `queued` is busy. If ONE is
-   terminal before TWO is accepted, mark this row INCOMPLETE unless membership
-   proves TWO was staged. Never more than one Main turn `running`; every Main
-   turn reaches `delivered`; the indicator clears after the last carrier.
+   PASS: three identified user history rows and echoes appear in post order
+   before any assistant reply. ONE gets its own delivered turn and assistant
+   reply correlated by `clientMessageId`. TWO and THREE accepted while an
+   earlier turn or carrier is still pending have no own turn or post-specific
+   reply; each is recorded as a member of the next ready-time batch, whose
+   delivered carrier turns preserve source order. If readiness changes between
+   posts, later posts may use separate carriers; a post accepted only after all
+   earlier work is terminal may instead get its own turn and correlated reply.
+   DB: every post keeps its own ordered history row with `deviceId` and
+   `clientMessageId`; staged posts have one included batch membership and a
+   delivered carrier turn; never more than one `running` turn for the session.
+   The indicator stays sane throughout (on while running, cleared at the end).
+   Setup limit: back-to-back posts do not force ONE to reach `running`; `queued`
+   is busy. If ONE is terminal before TWO is accepted, J4 is INCOMPLETE unless
+   persisted membership proves TWO was staged. The action does not guarantee
+   ONE reaches `running`, so the membership checks establish whether the batch
+   scenario actually occurred.
 
 ## 5. Concurrency — multiple chats in parallel
 
@@ -355,11 +361,13 @@ once: a `/new` that died pre-model with `Session not found`).
     fresh post works and the model still has its context (same harness
     session re-adopted — pointer chain shows `loaded`, not `fallback`).
 15. [auto: J7] Queue two messages, SIGTERM before the first completes, restart.
-    PASS: the first turn reaches a terminal state; the queued post's separate
-    history row, with its deviceId and clientMessageId, survives. After the
-    recipient is ready, that post is included exactly once in the next
-    ready-time batch in class order, with no own turn or post-specific reply.
-    The carrier turn reaches `delivered` after restart without re-sending.
+    PASS: the second post's identified history row survives the restart and is
+    replayed after reconnect without re-sending. It has no own turn or
+    post-specific reply; its persisted batch membership is included in one
+    ready-time carrier turn that is created and delivered after the restarted
+    gateway is up. DB: the source row retains its `deviceId` and
+    `clientMessageId`, exactly one included membership points to the delivered
+    batch, and the first turn reaches a terminal status.
 
 ## 8. Wakes (agent comms surface)
 

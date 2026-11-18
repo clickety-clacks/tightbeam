@@ -149,6 +149,7 @@ defmodule ItemlessSpawnDispatchRuntime do
         row-reaction-handoff.toml
         row-reaction-terminal-action.toml
         verification.toml
+        harklight-decision-request-briefing.toml
         harness-health-recovery.toml
         harness-recovery-main-wake.toml
       )

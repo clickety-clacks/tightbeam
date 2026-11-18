@@ -777,6 +777,35 @@ defmodule Tightbeam.ConditionFacts do
              is_binary(required) and is_binary(path) do
     kind = if state == :compatible, do: "cli-compatible", else: "cli-incompatible"
 
+    # Every authenticated CLI call observes its version, and nearly always nothing
+    # changed. Ask that on a reader first, so an unchanged observation never
+    # takes the database writer; the transaction below re-checks before filing.
+    case cli_compatibility_unchanged?(db, kind, session_key) do
+      {:ok, true} -> :unchanged
+      {:ok, false} -> record_cli_compatibility(db, kind, session_key, offered, required, path)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp cli_compatibility_unchanged?(db, kind, session_key) do
+    case DB.query(
+           db,
+           """
+           SELECT kind FROM condition_facts INDEXED BY condition_facts_match
+           WHERE kind IN ('cli-incompatible', 'cli-compatible') AND scope = ?1
+           ORDER BY id DESC LIMIT 1
+           """,
+           [session_key]
+         ) do
+      {:ok, rows} -> {:ok, cli_compatibility_standing(rows) == kind}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp cli_compatibility_standing([["cli-incompatible"]]), do: "cli-incompatible"
+  defp cli_compatibility_standing(_rows), do: "cli-compatible"
+
+  defp record_cli_compatibility(db, kind, session_key, offered, required, path) do
     case DB.transaction(db, fn txn ->
            incompatible? = standing_in_txn?(txn, "cli-incompatible", session_key)
 

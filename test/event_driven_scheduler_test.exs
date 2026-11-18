@@ -39,6 +39,27 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     end
   end
 
+  # Forwards every request to the real owner and counts the write
+  # transactions a pass sends it.
+  defmodule CountingDB do
+    use GenServer
+    def start_link(db), do: GenServer.start_link(__MODULE__, db)
+    def init(db), do: {:ok, {db, 0}}
+
+    def handle_call(:reset, _from, {db, _count}), do: {:reply, :ok, {db, 0}}
+    def handle_call(:writes, _from, {_db, count} = state), do: {:reply, count, state}
+
+    def handle_call(request, _from, {db, count}) do
+      count =
+        if is_tuple(request) and
+             elem(request, 0) in [:transaction, :transaction_then, :transaction_until],
+           do: count + 1,
+           else: count
+
+      {:reply, GenServer.call(db, request, :infinity), {db, count}}
+    end
+  end
+
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = ensure_all_schemas(db)
@@ -374,6 +395,86 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
     assert :sys.get_state(pid).timer == nil
     refute_receive {:delivered, _, _}, 100
+  end
+
+  # wi_0b608f33: every turn end ran a readiness pass that resolved each prompt
+  # and recognized wait due anywhere in the org in its own write transaction,
+  # so a burst of a few hundred due prompts stalled the scheduler. A turn end
+  # must cost the same whether 2 or 40 prompts are due for other sessions.
+  test "a recipient's readiness pass does not grow with prompts due for other sessions", ctx do
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    counter = start_supervised!({CountingDB, ctx.db})
+
+    state = %{
+      db: counter,
+      delivery_opts: ctx.delivery_opts,
+      timer: nil,
+      deadline: nil,
+      scanned_through: -1,
+      retries: %{},
+      retry_attempts: %{},
+      internal_consumers: %{}
+    }
+
+    others = fn range ->
+      for i <- range do
+        key = "other-#{i}"
+
+        :ok =
+          DB.execute(ctx.db, """
+          INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,
+            provider,model,host,state,createdAt,updatedAt)
+          VALUES ('#{key}','#{key}','owner','user:owner','default','claude',
+            'anthropic','fable','testhost','active',1,1);
+          """)
+
+        now = System.system_time(:millisecond)
+        wake(ctx.db, now - 100, %{session_key: key, prompt: "due for #{key}"})
+        waited = wake(ctx.db, now - 100, %{session_key: key, wait_mode: "after-turn"})
+
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE wakes SET recognitionAt=?2 WHERE wakeId=?1", [
+            waited.wake_id,
+            now - 50
+          ])
+      end
+    end
+
+    ready_pass_writes = fn recipient ->
+      :ok =
+        DB.execute(ctx.db, """
+        INSERT OR IGNORE INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,
+          harness,provider,model,host,state,createdAt,updatedAt)
+        VALUES ('#{recipient}','#{recipient}','owner','user:owner','default','claude',
+          'anthropic','fable','testhost','active',1,1);
+        """)
+
+      own = wake(ctx.db, System.system_time(:millisecond) - 100, %{session_key: recipient})
+      :ok = GenServer.call(counter, :reset)
+      assert {:noreply, _} = Wakes.handle_cast({:recipient_ready, recipient}, state)
+      writes = GenServer.call(counter, :writes)
+
+      assert {:ok, [[seq]]} =
+               DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+                 own.wake_id
+               ])
+
+      assert is_integer(seq)
+      writes
+    end
+
+    others.(1..2)
+    few = ready_pass_writes.("recipient")
+    others.(3..40)
+    many = ready_pass_writes.("second-recipient")
+
+    assert {:ok, [[80]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE sessionKey LIKE 'other-%' AND state='pending'"
+             )
+
+    assert many == few
   end
 
   test "the recipient readiness signal drains its waiting notices without a fallback", ctx do

@@ -2197,7 +2197,9 @@ defmodule Tightbeam.RulesTest do
     # Besides the routed notice, main's deadline-lapse reminder waits for Main.
     {[deadline], [wake]} =
       Wakes.list_pending(ctx.db)
-      |> Enum.split_with(&String.starts_with?(&1.prompt, "Operator decision #{request.id} passed"))
+      |> Enum.split_with(
+        &String.starts_with?(&1.prompt, "Operator decision #{request.id} passed")
+      )
 
     assert deadline.due_at == request.deadline_at
     assert wake.session_key == recipient.session_key
@@ -2225,11 +2227,13 @@ defmodule Tightbeam.RulesTest do
     }
 
     assert {:ok, :ok} = DB.transaction(ctx.db, &Wakes.row_commit_in_txn(&1, [transition]))
+
     assert [same_wake] =
              Enum.reject(
                Wakes.list_pending(ctx.db),
                &String.starts_with?(&1.prompt, "Operator decision ")
              )
+
     assert same_wake.wake_id == wake.wake_id
 
     assert {:ok, :ok} =
@@ -2270,6 +2274,7 @@ defmodule Tightbeam.RulesTest do
                Wakes.list_pending(ctx.db),
                &String.starts_with?(&1.prompt, "Operator decision ")
              )
+
     assert same_wake.wake_id == wake.wake_id
   end
 
@@ -3427,6 +3432,8 @@ defmodule Tightbeam.RulesTest do
     path = Path.join(base, "state.db")
     {:ok, _} = DB.start_link(path: path, name: db, guard_inputs: [], payload_root: payload)
     :ok = Tightbeam.Schema.ensure_all(db)
+    # Gateway boot activates recognition after the schema pass (main 95404352).
+    :ok = Tightbeam.Recognition.activate(db)
     :ok = Wakes.activate_wait_recognition(db)
     :ok = Tightbeam.FilingRemedy.install_handlers(db, Gateway.handlers(%{db: db}))
 
@@ -3495,6 +3502,8 @@ defmodule Tightbeam.RulesTest do
 
     {:ok, _} = DB.start_link(path: path, name: db, guard_inputs: [], payload_root: payload)
     :ok = Tightbeam.Schema.ensure_all(db)
+    # Gateway boot activates recognition after the schema pass (main 95404352).
+    :ok = Tightbeam.Recognition.activate(db)
     :ok = Wakes.activate_wait_recognition(db)
     :ok = Tightbeam.FilingRemedy.install_handlers(db, Gateway.handlers(%{db: db}))
 
