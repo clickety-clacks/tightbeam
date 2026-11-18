@@ -602,7 +602,6 @@ defmodule Tightbeam.Firehose.PublisherTest do
       tests_passed
       |> put_in([:params, :verdict_kind], "blocked")
       |> put_in([:params, :note], "effect matrix blocker")
-      |> put_in([:params, :commit_refs], refs)
 
     assert {:ok, %{attest: %{verdictKind: "blocked"}}} =
              Dispatch.dispatch(db, handlers, blocked)
