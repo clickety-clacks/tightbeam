@@ -849,6 +849,33 @@ defmodule Tightbeam.StateResources do
     |> Enum.map(&session_query_row/1)
   end
 
+  @doc "Return all visible session message high-water marks using indexed latest-row seeks."
+  def query_session_message_sequences(db, principal) do
+    {where, params} =
+      cond do
+        principal.kind == "observer" -> {"1", []}
+        principal.is_admin -> {"1", []}
+        principal.kind == "session" -> {"1", []}
+        true -> {"sessions.ownerUserId = ?", [principal.id]}
+      end
+
+    observed_query(
+      db,
+      principal,
+      """
+      SELECT sessions.sessionKey,
+             COALESCE((SELECT m.seq FROM messages AS m
+                       WHERE m.sessionKey = sessions.sessionKey
+                       ORDER BY m.seq DESC LIMIT 1), 0)
+      FROM sessions
+      WHERE #{where}
+      ORDER BY sessions.sessionKey ASC
+      """,
+      params
+    )
+    |> Enum.map(fn [key, seq] -> %{"sessionKey" => key, "latestMessageSeq" => seq} end)
+  end
+
   @doc "Return a bounded page of sessions visible to one REST principal."
   def query_sessions_page(db, principal, boundary, limit, archetypes \\ nil) do
     trace_core_detail(principal, {:au4_visibility, "sessions"})
