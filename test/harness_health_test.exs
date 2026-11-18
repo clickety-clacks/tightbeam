@@ -4015,7 +4015,9 @@ defmodule Tightbeam.HarnessHealthTest do
   end
 
   test "recovery CLI selection follows pin, validated PATH, then adapter bundle" do
-    node = System.find_executable("node")
+    # Resolve version-manager shims before running with the fixture PATH.
+    {node, 0} = System.cmd("node", ["-p", "process.execPath"])
+    node = String.trim(node)
     assert is_binary(node)
 
     root =
