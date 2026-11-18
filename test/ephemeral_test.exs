@@ -22,7 +22,7 @@ defmodule Tightbeam.EphemeralTest do
   end
 
   @tag tmp_dir: true, timeout: 180_000
-  test "WI3FE full Dispatch admits a qualified helper and delivers its final result once",
+  test "WI3FE r2 full Dispatch covers helper delivery and scoped staffing refusals",
        %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
       tmp,
@@ -30,10 +30,12 @@ defmodule Tightbeam.EphemeralTest do
       "itemless-spawn-dispatch: ok"
     )
 
+    runtime_log = tmp |> Path.join("runtime.log") |> File.read!()
+    assert runtime_log =~ "R4: unreachable with shipped archetypes"
+    assert runtime_log =~ "adapter: synthetic; real model turn unproven"
+
     loaded_rule_set =
-      tmp
-      |> Path.join("runtime.log")
-      |> File.read!()
+      runtime_log
       |> String.split("\n")
       |> Enum.find(&String.starts_with?(&1, "loaded-rule-set: "))
 
