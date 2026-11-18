@@ -3854,7 +3854,7 @@ defmodule Tightbeam.EscalationTest do
       assert %{id: id} = ask.("a-association")
 
       assert %{project: nil, project_attribution: "unresolved", work_item_id: @fixture_work_item} =
-               Escalation.get(ctx.db, id)
+               operator_request(ctx, id)
     end
 
     test "a work-item ask records and lists its project", ctx do
