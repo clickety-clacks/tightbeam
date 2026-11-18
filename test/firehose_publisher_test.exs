@@ -598,6 +598,22 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
              Dispatch.dispatch(db, handlers, clean)
 
+    blocked =
+      tests_passed
+      |> put_in([:params, :verdict_kind], "blocked")
+      |> put_in([:params, :note], "effect matrix blocker")
+
+    assert {:ok, %{attest: %{verdictKind: "blocked"}}} =
+             Dispatch.dispatch(db, handlers, blocked)
+
+    cleared =
+      tests_passed
+      |> put_in([:params, :verdict_kind], "cleared")
+      |> put_in([:params, :note], "effect matrix blocker cleared")
+
+    assert {:ok, %{attest: %{verdictKind: "cleared"}}} =
+             Dispatch.dispatch(db, handlers, cleared)
+
     verified =
       tests_passed
       |> put_in([:params, :verdict_kind], "verified")
@@ -618,6 +634,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
           {"effect-dispatcher",
            "[verdict filed: reviewed-clean on #{review.id}: Synthetic review fixture]"},
           {"effect-target",
+           "[verdict filed: blocked on #{assignment.id}: effect matrix blocker]"},
+          {"effect-target",
+           "[verdict filed: cleared on #{assignment.id}: effect matrix blocker cleared]"},
+          {"effect-target",
            "[verdict filed: verified on #{assignment.id}: effect matrix tests passed]"},
           {"effect-target", "[completion filed on #{assignment.id}: effect matrix complete]"},
           {"effect-target", "[assignment closed: #{assignment.id} — completed]"}
@@ -628,7 +648,9 @@ defmodule Tightbeam.Firehose.PublisherTest do
     completion_effects = notice_state_classes(completion_publications)
     asynchronous_delivery = ~w(session.updated wake.fired)
 
-    assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
+    # R01 keeps an unlinked verified verdict quiet, so no opener-turn delivery
+    # effects accompany the durable attest and completion events.
+    refute Enum.any?(asynchronous_delivery, &(&1 in completion_effects))
 
     completion_attest_effects =
       completion_effects

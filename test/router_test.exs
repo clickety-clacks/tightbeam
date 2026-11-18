@@ -4034,20 +4034,22 @@ defmodule Tightbeam.Wire.RouterTest do
     assert session_opened.status == 200, session_opened.resp_body
     session_assignment = JSON.decode!(session_opened.resp_body)["result"]
 
+    # R01 notifies an opener for blockers, while ordinary unlinked verdicts stay quiet.
     process_notice =
       invoke.(
         "attest",
         %{
           assignmentId: session_assignment["id"],
           kind: "verdict",
-          verdictKind: "waiting",
-          note: "Process notification"
+          verdictKind: "blocked",
+          note: "Process blocker"
         },
         nil
       )
 
     assert process_notice["attest"]["byUser"] == nil
     assert process_notice["attest"]["bySession"] == nil
+    assert process_notice["attest"]["verdictKind"] == "blocked"
 
     assert {:ok, [["process:automation", nil]]} =
              DB.query(
