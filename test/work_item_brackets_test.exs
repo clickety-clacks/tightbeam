@@ -530,6 +530,37 @@ defmodule Tightbeam.WorkItemBracketsTest do
     Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
   end
 
+  test "changed rail controls terminal-state delivery eligibility without a compiled open-item filter",
+       ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Changed terminal eligibility"})
+    old_id = routing_wake_id(ctx.db, item.id)
+    disable_work_item_withdrawals(ctx)
+
+    assert %{ok: true} =
+             dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id, %{reason: "later"})
+
+    path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    bytes = File.read!(path)
+
+    bytes =
+      String.replace(
+        bytes,
+        ~s({ ref = "facts.work_item.state" }, "open"),
+        ~s({ ref = "facts.work_item.state" }, "iceboxed"), global: false)
+
+    File.write!(path, bytes)
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert Wakes.get(ctx.db, old_id).state == "pending"
+    deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, old_id))
+    replacement = routing_wake_id(ctx.db, item.id)
+    assert is_binary(replacement)
+    refute replacement == old_id
+    assert Wakes.get(ctx.db, replacement).state == "pending"
+    assert item_wake_count(ctx.db, item.id) == 1
+    assert WorkItems.state_for(ctx.db, item.id) == "iceboxed"
+  end
+
   ## Proof 1 — create arms bracket 1; keyed replay returns the original, arms nothing.
 
   test "Proof 1: create (keyed and keyless) arms bracket 1; keyed replay is inert", ctx do

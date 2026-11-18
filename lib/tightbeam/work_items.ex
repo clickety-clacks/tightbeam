@@ -1108,12 +1108,12 @@ defmodule Tightbeam.WorkItems do
       SELECT item_id,wake_id,wake_rowid FROM (
         SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
         FROM work_items wi JOIN wakes w ON w.wakeId=wi.routingWakeId
-        WHERE wi.state='open' AND w.deliveredTurnSeq IS NOT NULL
+        WHERE w.deliveredTurnSeq IS NOT NULL
           AND w.sessionKey=?2 AND w.wakeId=?1
         UNION ALL
         SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
         FROM work_items wi JOIN wakes w ON w.wakeId=wi.slateWakeId
-        WHERE wi.state='open' AND w.deliveredTurnSeq IS NOT NULL
+        WHERE w.deliveredTurnSeq IS NOT NULL
           AND w.sessionKey=?2 AND w.wakeId=?1
         UNION ALL
         SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
@@ -1122,7 +1122,7 @@ defmodule Tightbeam.WorkItems do
         JOIN wakes w ON w.wakeId=m.sourceWakeId
         JOIN work_items wi ON wi.routingWakeId=w.wakeId
         WHERE b.deliveryWakeId=?1 AND b.state='delivered'
-          AND w.sessionKey=?2 AND w.deliveredTurnSeq IS NOT NULL AND wi.state='open'
+          AND w.sessionKey=?2 AND w.deliveredTurnSeq IS NOT NULL
         UNION ALL
         SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
         FROM notice_batches b
@@ -1130,7 +1130,7 @@ defmodule Tightbeam.WorkItems do
         JOIN wakes w ON w.wakeId=m.sourceWakeId
         JOIN work_items wi ON wi.slateWakeId=w.wakeId
         WHERE b.deliveryWakeId=?1 AND b.state='delivered'
-          AND w.sessionKey=?2 AND w.deliveredTurnSeq IS NOT NULL AND wi.state='open'
+          AND w.sessionKey=?2 AND w.deliveredTurnSeq IS NOT NULL
       ) ORDER BY wake_rowid
       """,
       [wake_id, session_key]
