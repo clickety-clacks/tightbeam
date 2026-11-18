@@ -872,6 +872,7 @@ COMMANDS:
       eligible queued messages to that assignment's holder.
       --prod-id replaces your older queued, undelivered prod with the same id to
       the same session; the newest prompt and delivery time win.
+      The response lists withdrawn wakes in replacedWakeIds (empty when none).
       The accountable agent re-reads durable state and decides the next action.
       The fallback timer detects silence only; it does not select an action.
       A dependency predicate names conditions, optional bindings, and resolverRef.
