@@ -2268,6 +2268,94 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  # These response shapes are exercised by the adapter's model-invalid-params
+  # and model-refusal fixtures in acp_adapter_test.exs.
+  for {name, reason, diagnostic} <- [
+        {"fresh invalid params", %{"code" => -32_602, "message" => "Invalid params"},
+         %{"phase" => "model", "kind" => "jsonrpc_error"}},
+        {"fresh invalid model option",
+         %{"code" => -32_000, "message" => "Invalid value for config option model"},
+         %{"phase" => "model", "kind" => "jsonrpc_error"}},
+        {"wrapped invalid params",
+         {:model_apply_failed, %{"code" => -32_602, "message" => "Invalid params"}}, nil},
+        {"wrapped invalid model option",
+         {:model_apply_failed,
+          %{"code" => -32_000, "message" => "Invalid value for config option model"}}, nil},
+        {"double quoted model name",
+         %{"code" => -32_603, "message" => ~s(Model "future-model" not found)}, nil}
+      ] do
+    test "model selection refusal is not replayed: #{name}", ctx do
+      [failed, _second, healthy] = ctx.sessions
+
+      source =
+        fail_health_turn!(
+          ctx.db,
+          failed.session,
+          "selection-refusal",
+          "original prompt",
+          Tightbeam.ErrorDiagnostic.diagnosed(
+            unquote(Macro.escape(reason)),
+            unquote(Macro.escape(diagnostic))
+          ),
+          stage: :session
+        )
+
+      restore_health_turn!(ctx.db, healthy.session, "selection-restoration")
+
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [
+                 source.message_id
+               ])
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+                 [source.seq]
+               )
+    end
+  end
+
+  test "transport and rate limits during model application still recover once", ctx do
+    [failed, _second, healthy] = ctx.sessions
+
+    for {reason, kind} <- [
+          {{:adapter_unavailable, :noproc}, "exit"},
+          {:timeout, "timeout"},
+          {@captured_claude_rate_limit, "jsonrpc_error"},
+          {%{"status" => 429, "message" => "Too many requests"}, "http_response"}
+        ] do
+      message_id = "model-application-outage-#{kind}-#{System.unique_integer([:positive])}"
+
+      source =
+        fail_health_turn!(
+          ctx.db,
+          failed.session,
+          message_id,
+          "recover this prompt",
+          Tightbeam.ErrorDiagnostic.diagnosed(
+            {:model_apply_failed, reason},
+            %{"phase" => "model", "kind" => kind}
+          ),
+          stage: :session
+        )
+
+      restore_health_turn!(ctx.db, healthy.session, "outage-restoration-#{message_id}")
+      restore_health_turn!(ctx.db, healthy.session, "second-restoration-#{message_id}")
+
+      assert {:ok, [[2]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [message_id])
+
+      {:ok, redelivery} = Ledger.claim_next(ctx.db, failed.session, "recovery-test")
+      assert redelivery.message_id == source.message_id
+
+      assert :ok =
+               Ledger.finish(ctx.db, redelivery.seq, "delivered", nil,
+                 owner_lease: redelivery.owner_lease
+               )
+    end
+  end
+
   test "quoted model-not-found refusal is attempted once after route recovery", ctx do
     [failed, _second, healthy] = ctx.sessions
 

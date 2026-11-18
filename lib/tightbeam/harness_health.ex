@@ -18,6 +18,7 @@ defmodule Tightbeam.HarnessHealth do
     ConditionFacts,
     DB,
     EventLog,
+    ErrorDiagnostic,
     Gateway,
     Harness,
     HarnessProcess,
@@ -1085,7 +1086,9 @@ defmodule Tightbeam.HarnessHealth do
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
-    pre_request_refusal? = pre_request_model_selection_refusal?(failed_stage, reason)
+    diagnostic = ErrorDiagnostic.of(reason)
+    reason = ErrorDiagnostic.classified(reason)
+    pre_request_refusal? = pre_request_model_selection_refusal?(failed_stage, reason, diagnostic)
 
     case classify_turn_failure(reason) do
       nil ->
@@ -1156,7 +1159,50 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
-  defp pre_request_model_selection_refusal?(:session, reason) do
+  defp pre_request_model_selection_refusal?(:session, reason, diagnostic) do
+    selection_reason = model_application_reason(reason)
+    failure_class = classify_turn_failure(selection_reason)
+
+    model_phase? =
+      match?({:model_apply_failed, _}, reason) or match?(%{"phase" => "model"}, diagnostic)
+
+    # Model application can fail because the adapter or provider is down.
+    # Those failures still need recovery, even when the phase is model selection.
+    if failure_class in [
+         "auth-dead",
+         "rate-limit-dead",
+         "adapter_unavailable",
+         "task_crash",
+         "interrupted-outcome-unknown"
+       ] do
+      false
+    else
+      (model_phase? and model_selection_response?(selection_reason)) or
+        model_refusal_text?(selection_reason)
+    end
+  end
+
+  defp pre_request_model_selection_refusal?(_failed_stage, _reason, _diagnostic), do: false
+
+  defp model_application_reason({:model_apply_failed, reason}),
+    do: model_application_reason(reason)
+
+  defp model_application_reason(reason), do: reason
+
+  # Invalid params and the harness's config-option refusal are replies to the
+  # model-selection request. A timeout, transport exit, or generic internal error
+  # is not evidence that the requested model was refused.
+  defp model_selection_response?(%{"code" => code}) when code in [-32_602, -32_000], do: true
+  defp model_selection_response?(%{code: code}) when code in [-32_602, -32_000], do: true
+  defp model_selection_response?(_reason), do: false
+
+  defp model_refusal_text?(%{"message" => message}) when is_binary(message),
+    do: model_refusal_text?(message)
+
+  defp model_refusal_text?(%{message: message}) when is_binary(message),
+    do: model_refusal_text?(message)
+
+  defp model_refusal_text?(reason) do
     evidence = reason |> evidence_text() |> String.downcase()
 
     contains_any?(evidence, [
@@ -1167,8 +1213,6 @@ defmodule Tightbeam.HarnessHealth do
       "unsupported model"
     ]) or Regex.match?(~r/\bmodel(?:\s+['"][^'"]+['"])?\s+not found\b/, evidence)
   end
-
-  defp pre_request_model_selection_refusal?(_failed_stage, _reason), do: false
 
   @doc "Record a terminal class whose owner is the lane or boot reconciler."
   @spec observe_terminal_in_txn(Txn.t(), integer(), String.t(), String.t(), String.t()) ::
