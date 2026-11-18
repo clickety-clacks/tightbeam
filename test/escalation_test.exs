@@ -2256,13 +2256,17 @@ defmodule Tightbeam.EscalationTest do
     assert %{withdrawn_by: "user:flynn"} =
              Escalation.operator_withdraw(ctx.db, owner_withdraw)
 
+    # A session of another user may withdraw an open operator request too.
     foreign = session(ctx.db, "foreign", "other")
 
-    assert %{code: "not_owner"} =
+    foreign_target =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "cross-owner?"}))
+
+    assert %{status: "withdrawn", withdrawn_by: "agent:foreign"} =
              Escalation.operator_withdraw(ctx.db, %{
-               origin: "agent:raiser",
+               origin: "agent:foreign",
                principal: {:session, foreign.session_key},
-               params: %{request: old.id, reason: "cross-owner"}
+               params: %{request: foreign_target.id, reason: "cross-owner"}
              })
   end
 

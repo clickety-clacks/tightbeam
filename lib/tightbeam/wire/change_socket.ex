@@ -32,13 +32,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
     ref = Process.monitor(pid)
     backlog_counter = :atomics.new(1, signed: false)
 
-    :ok =
-      Hub.register(pid, self(), %{
-        mode: :pending,
-        db: db(state),
-        backlog_counter: backlog_counter
-      })
-
+    :ok = Hub.register(pid, self(), %{mode: :pending, backlog_counter: backlog_counter})
     {:ok, %{state | hub_monitor: ref, backlog_counter: backlog_counter}}
   end
 
@@ -154,7 +148,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
         :ok =
           Hub.register(hub(state), self(), %{
             mode: :filtered,
-            db: db(state),
             user_id: session.owner_user_id,
             principal_kind: :session,
             principal_id: session.session_key
@@ -185,7 +178,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
         :ok =
           Hub.register(hub(state), self(), %{
             mode: :filtered,
-            db: db(state),
             user_id: device.user_id,
             device_id: device.device_id,
             principal_kind: :user,
@@ -231,7 +223,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
       :ok =
         Hub.register(hub(state), self(), %{
           mode: :filtered,
-          db: db(state),
           user_id: user.user_id,
           principal_kind: :user,
           principal_id: user.user_id
@@ -384,7 +375,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
     :ok =
       Hub.register(hub(state), self(), %{
         mode: :filtered,
-        db: db(state),
         principal_kind: :observer,
         principal_id: "observer"
       })

@@ -51,6 +51,33 @@ defmodule Tightbeam.DBOverloadRefusalTest do
     length
   end
 
+  test "an unsent refusal carries its class and caller into diagnostics", %{db: db} do
+    start_supervised!({Diagnostics, notify: self()})
+    overload!(db)
+
+    RequestContext.bind(
+      %{
+        request_id: "req_retained",
+        principal_kind: "internal",
+        principal_ref: "internal:test",
+        caller: "POST /agent/dispatch"
+      },
+      fn ->
+        assert {:error, %DB.Overloaded{}} = DB.transaction(db, fn _ -> flunk("not sent") end)
+      end
+    )
+
+    assert_receive {:diagnostic,
+                    %{
+                      event: "db_caller_completed",
+                      result_class: "db_overloaded",
+                      caller: "POST /agent/dispatch",
+                      request_id: "req_retained"
+                    }}
+
+    assert queued(db) == 128
+  end
+
   describe "a dispatched verb" do
     for {shape, label} <- [
           {:match, "a strict match on the refused call"},

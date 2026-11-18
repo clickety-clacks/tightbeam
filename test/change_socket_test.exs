@@ -337,17 +337,19 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
   end
 
   test "archetype filters match the subject session and compose with existing filters", ctx do
+    state = start_named_hub(ctx)
+
     {:push, {:text, ready}, state} =
       subscribe(
         %{
           "type" => "subscribe",
           "subscriptionId" => "product-owners",
           "filters" => %{
-            "classes" => ["message.created", "topline.created"],
+            "classes" => ["message.created", "tool_call.", "topline.created", "session.spawned"],
             "archetype" => "product-owner"
           }
         },
-        ctx.state
+        state
       )
 
     assert JSON.decode!(ready)["type"] == "subscription_ready"
@@ -383,89 +385,43 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert JSON.decode!(unknown_ready)["type"] == "subscription_ready"
 
-    product_owner =
-      Org.create(ctx.db, %{
-        session_key: "agent:late-product-owner",
-        display_name: "Late product owner",
-        owner_user_id: ctx.device.user_id,
-        origin: "user:#{ctx.device.user_id}",
-        archetype: "product-owner",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
-
-    coder =
-      Org.create(ctx.db, %{
-        session_key: "agent:late-coder",
-        display_name: "Late coder",
-        owner_user_id: ctx.device.user_id,
-        origin: "user:#{ctx.device.user_id}",
-        archetype: "coder",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
+    # Both sessions are spawned after subscription_ready (AF3).
+    product_owner = create_session(ctx, "agent:late-product-owner", "product-owner")
+    coder = create_session(ctx, "agent:late-coder", "coder")
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM roles WHERE boundSessionKey=?1", [
                product_owner.session_key
              ])
 
-    for session <- [product_owner, coder] do
-      Hub.publish(ctx.hub, %{
-        "class" => "message.created",
-        "refs" => %{"sessionKey" => session.session_key},
-        "payload" => %{
-          "sessionKey" => session.session_key,
-          "sender" => "user:#{ctx.device.user_id}"
-        }
-      })
-    end
+    with_database_stalled(ctx, fn ->
+      for session <- [product_owner, coder], class <- ~w(message.created tool_call.started) do
+        Hub.publish(Hub, %{
+          "class" => class,
+          "refs" => %{"sessionKey" => session.session_key},
+          "payload" => %{
+            "sessionKey" => session.session_key,
+            "sender" => "user:#{ctx.device.user_id}"
+          }
+        })
+      end
 
-    Hub.publish(ctx.hub, %{"class" => "topline.created", "refs" => %{}, "payload" => %{}})
-    _barrier = Hub.sequence(ctx.hub, self())
+      Hub.publish(Hub, %{"class" => "topline.created", "refs" => %{}, "payload" => %{}})
+      hub_barrier!()
+    end)
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "message.created",
-                      "subscriptionId" => "product-owners",
-                      "refs" => %{"sessionKey" => "agent:late-product-owner"}
-                    }}
-
-    :ok = Hub.delivered(ctx.hub, self())
-    refute_receive {:firehose_notice, _}
+    assert received_notices() == [
+             {"product-owners", "session.spawned", "agent:late-product-owner"},
+             {"product-owners", "message.created", "agent:late-product-owner"},
+             {"product-owners", "tool_call.started", "agent:late-product-owner"}
+           ]
   end
 
   test "archetype filters use the current committed archetype after retirement and repointing",
        ctx do
-    session =
-      Org.create(ctx.db, %{
-        session_key: "agent:archetype-repoint",
-        display_name: "Archetype repoint",
-        owner_user_id: ctx.device.user_id,
-        origin: "user:#{ctx.device.user_id}",
-        archetype: "product-owner",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
-
-    coder =
-      Org.create(ctx.db, %{
-        session_key: "agent:archetype-role-coder",
-        display_name: "Archetype role coder",
-        owner_user_id: ctx.device.user_id,
-        origin: "user:#{ctx.device.user_id}",
-        archetype: "coder",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
+    state = start_named_hub(ctx)
+    session = create_session(ctx, "agent:archetype-repoint", "product-owner")
+    coder = create_session(ctx, "agent:archetype-role-coder", "coder")
 
     Roles.create!(ctx.db, "archetype-filter-role", ctx.device.user_id, session.session_key)
 
@@ -479,7 +435,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
             "archetype" => "product-owner"
           }
         },
-        ctx.state
+        state
       )
 
     assert JSON.decode!(po_ready)["type"] == "subscription_ready"
@@ -495,64 +451,133 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       )
 
     assert JSON.decode!(reviewer_ready)["type"] == "subscription_ready"
+
+    # Rebinding a role changes no archetype delivery (AF4).
     assert :ok = Roles.bind(ctx.db, "archetype-filter-role", coder.session_key)
 
-    for subject <- [session, coder] do
-      Hub.publish(ctx.hub, %{
-        "class" => "message.created",
-        "refs" => %{"sessionKey" => subject.session_key},
-        "payload" => %{"sessionKey" => subject.session_key}
-      })
-    end
+    with_database_stalled(ctx, fn ->
+      for subject <- [session, coder] do
+        Hub.publish(Hub, %{
+          "class" => "message.created",
+          "refs" => %{"sessionKey" => subject.session_key},
+          "payload" => %{"sessionKey" => subject.session_key}
+        })
+      end
 
-    _barrier = Hub.sequence(ctx.hub, self())
+      hub_barrier!()
+    end)
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "message.created",
-                      "subscriptionId" => "product-owner",
-                      "refs" => %{"sessionKey" => "agent:archetype-repoint"}
-                    }}
+    assert received_notices() == [
+             {"product-owner", "message.created", "agent:archetype-repoint"}
+           ]
 
-    :ok = Hub.delivered(ctx.hub, self())
-    refute_receive {:firehose_notice, _}
-
+    # Retirement keeps the archetype; the committed session.retired matches it (AF4).
     assert %{state: "retired"} =
-             retired =
              Org.retire(ctx.db, session.session_key, "user:#{ctx.device.user_id}", 1_000)
 
-    :ok =
-      Hub.committed(ctx.hub, "session.retired", retired, %{"sessionKey" => session.session_key})
+    with_database_stalled(ctx, fn -> hub_barrier!() end)
 
-    _barrier = Hub.sequence(ctx.hub, self())
+    assert {"product-owner", "session.retired", "agent:archetype-repoint"} in received_notices()
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "session.retired",
-                      "subscriptionId" => "product-owner",
-                      "refs" => %{"sessionKey" => "agent:archetype-repoint"}
-                    }}
-
-    :ok = Hub.delivered(ctx.hub, self())
-    refute_receive {:firehose_notice, _}
-
-    assert {:ok, repointed} =
+    # The repoint's own session.updated matches the resulting archetype (AF5).
+    assert {:ok, _repointed} =
              Org.repoint_retired_archetype(ctx.db, session.session_key, "reviewer-code")
 
-    :ok =
-      Hub.committed(ctx.hub, "session.updated", repointed, %{"sessionKey" => session.session_key})
+    with_database_stalled(ctx, fn ->
+      Hub.publish(Hub, %{
+        "class" => "message.created",
+        "refs" => %{"sessionKey" => session.session_key},
+        "payload" => %{"sessionKey" => session.session_key}
+      })
 
-    _barrier = Hub.sequence(ctx.hub, self())
+      hub_barrier!()
+    end)
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "session.updated",
-                      "subscriptionId" => "reviewer-code",
-                      "refs" => %{"sessionKey" => "agent:archetype-repoint"}
-                    }}
+    assert received_notices() == [
+             {"reviewer-code", "session.updated", "agent:archetype-repoint"}
+           ]
+  end
 
-    :ok = Hub.delivered(ctx.hub, self())
-    refute_receive {:firehose_notice, _}
+  test "a stalled database does not delay archetype matching or the hub's heartbeat answer",
+       ctx do
+    state = start_named_hub(ctx)
+    product_owner = create_session(ctx, "agent:stall-product-owner", "product-owner")
+    coder = create_session(ctx, "agent:stall-coder", "coder")
+
+    {:push, _ready, state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "all-messages",
+          "filters" => %{"classes" => ["message.created"]}
+        },
+        state
+      )
+
+    {:push, _ready, _state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "product-owners",
+          "filters" => %{"archetype" => "product-owner"}
+        },
+        state
+      )
+
+    before = hub_barrier!()
+
+    # The heartbeat asks the hub for this sequence with a 5 second deadline;
+    # it must answer while every notice is matched against a stalled database.
+    with_database_stalled(ctx, fn ->
+      for _ <- 1..50, session <- [product_owner, coder] do
+        Hub.publish(Hub, %{
+          "class" => "message.created",
+          "refs" => %{"sessionKey" => session.session_key},
+          "payload" => %{"sessionKey" => session.session_key}
+        })
+      end
+
+      assert hub_barrier!() == before + 150
+    end)
+
+    notices = received_notices()
+    assert Enum.count(notices, &match?({"all-messages", _, _}, &1)) == 100
+
+    assert Enum.filter(notices, &match?({"product-owners", _, _}, &1)) ==
+             List.duplicate({"product-owners", "message.created", product_owner.session_key}, 50)
+  end
+
+  test "a hub started after sessions exist matches them from its start-up load", ctx do
+    # No hub is listening by the production name yet, so these spawns reach none.
+    product_owner = create_session(ctx, "agent:preexisting-product-owner", "product-owner")
+    coder = create_session(ctx, "agent:preexisting-coder", "coder")
+    state = start_named_hub(ctx)
+
+    {:push, _ready, _state} =
+      subscribe(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "product-owners",
+          "filters" => %{"classes" => ["message.created"], "archetype" => "product-owner"}
+        },
+        state
+      )
+
+    with_database_stalled(ctx, fn ->
+      for session <- [product_owner, coder] do
+        Hub.publish(Hub, %{
+          "class" => "message.created",
+          "refs" => %{"sessionKey" => session.session_key},
+          "payload" => %{"sessionKey" => session.session_key}
+        })
+      end
+
+      hub_barrier!()
+    end)
+
+    assert received_notices() == [
+             {"product-owners", "message.created", "agent:preexisting-product-owner"}
+           ]
   end
 
   test "archetype filters accept null and reject non-string values", ctx do
@@ -1031,35 +1056,24 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
   test "a matching archetype event over the byte backlog closes with retryable code", ctx do
     {:push, {:text, _auth}, state} =
-      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, start_named_hub(ctx))
 
-    session =
-      Org.create(ctx.db, %{
-        session_key: "agent:backlog-product-owner",
-        display_name: "Backlog product owner",
-        owner_user_id: ctx.device.user_id,
-        origin: "user:#{ctx.device.user_id}",
-        archetype: "product-owner",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
+    session = create_session(ctx, "agent:backlog-product-owner", "product-owner")
 
     :ok =
-      Hub.subscribe(ctx.hub, self(), "work", %{
+      Hub.subscribe(Hub, self(), "work", %{
         "classes" => ["message.created"],
         "archetype" => "product-owner"
       })
 
-    Hub.publish(ctx.hub, %{
+    Hub.publish(Hub, %{
       "class" => "message.created",
       "refs" => %{"sessionKey" => session.session_key},
       "payload" => %{"content" => String.duplicate("x", 65 * 1_024 * 1_024)}
     })
 
-    assert Hub.sequence(ctx.hub, self()) == 1
-    assert %{overflowed: true, seq: 1} = Hub.connection_stats(ctx.hub, self())
+    assert Hub.sequence(Hub, self()) == 1
+    assert %{overflowed: true, seq: 1} = Hub.connection_stats(Hub, self())
     assert_receive :firehose_overflow, 5_000
     refute_receive {:firehose_notice, _notice}
 
@@ -1218,6 +1232,64 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert Tightbeam.StateVisibility.visible?(ctx.db, critical, "flynn", true)
     refute Tightbeam.StateVisibility.visible?(ctx.db, critical, "flynn", false)
+  end
+
+  # Session writes hand their committed rows to the hub registered under the
+  # production name, as in the gateway. Archetype tests subscribe through it.
+  defp start_named_hub(ctx) do
+    start_supervised!(Supervisor.child_spec({Hub, name: Hub, db: ctx.db}, id: :named_hub))
+
+    {:ok, state} =
+      ChangeSocket.init(%{
+        db: ctx.db,
+        firehose_hub: Hub,
+        cli_token: "org-token",
+        firehose_heartbeat_ms: 60_000,
+        model_catalog: %{}
+      })
+
+    state
+  end
+
+  defp create_session(ctx, session_key, archetype) do
+    Org.create(ctx.db, %{
+      session_key: session_key,
+      display_name: session_key,
+      owner_user_id: ctx.device.user_id,
+      origin: "user:#{ctx.device.user_id}",
+      archetype: archetype,
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+  end
+
+  # Holds the database owner, as a slow database does, while `fun` runs.
+  defp with_database_stalled(ctx, fun) do
+    db = GenServer.whereis(ctx.db)
+    :ok = :sys.suspend(db)
+
+    try do
+      fun.()
+    after
+      :ok = :sys.resume(db)
+    end
+  end
+
+  # The hub call a socket heartbeat makes; it fails if the hub cannot answer in time.
+  defp hub_barrier!, do: GenServer.call(Hub, {:sequence, self()}, 1_000)
+
+  defp received_notices do
+    receive do
+      {:firehose_notice, notice} ->
+        [
+          {notice["subscriptionId"], notice["class"], notice["refs"]["sessionKey"]}
+          | received_notices()
+        ]
+    after
+      0 -> []
+    end
   end
 
   defp inbound(payload, state),
