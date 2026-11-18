@@ -246,10 +246,11 @@ pub enum Command {
     /// observation is the session's by definition — the gateway resolves the
     /// turn from the session token, so there is nothing for a flag to say.
     ToolCallObserved,
-    /// Substrate-reserved: the GitHub PreToolUse hook guard. It reads the raw
-    /// tool-call JSON from stdin and refuses only GitHub-dependent calls when
-    /// this host's GitHub auth is not ready.
-    GithubAuthCheck,
+    /// Substrate statute check for the GitHub PreToolUse hook. It reads raw
+    /// tool-call JSON from stdin and uses the supplied TOML refusal template.
+    GithubAuthCheck {
+        text_template: Option<String>,
+    },
     Spawn {
         identity: Identity,
         owner_user_id: Option<String>,
@@ -2648,10 +2649,14 @@ fn parse_with_optional_catalog(
             Ok(Command::ToolCallObserved)
         }
         "github-auth-check" => {
-            if parsed.positional.len() != 1 || !flags.is_empty() {
-                return Err("usage: tightbeam github-auth-check".to_owned());
+            if parsed.positional.len() != 1 || flags.keys().any(|flag| flag != "text-template") {
+                return Err(
+                    "usage: tightbeam github-auth-check [--text-template <text>]".to_owned(),
+                );
             }
-            Ok(Command::GithubAuthCheck)
+            Ok(Command::GithubAuthCheck {
+                text_template: nonempty(flags, "text-template"),
+            })
         }
         "artifacts" => {
             if parsed.positional.len() != 1
@@ -5634,6 +5639,29 @@ mod tests {
         ] {
             assert_eq!(parse(args), Ok(Command::Help));
         }
+    }
+
+    #[test]
+    fn github_auth_check_accepts_only_its_optional_statute_template() {
+        assert_eq!(
+            parse(strings(&["github-auth-check"])),
+            Ok(Command::GithubAuthCheck {
+                text_template: None
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "github-auth-check",
+                "--text-template",
+                "Tightbeam cannot use GitHub from {host}: {detail}",
+            ])),
+            Ok(Command::GithubAuthCheck {
+                text_template: Some("Tightbeam cannot use GitHub from {host}: {detail}".to_owned())
+            })
+        );
+
+        assert!(parse(strings(&["github-auth-check", "--other", "value"])).is_err());
     }
 
     #[test]

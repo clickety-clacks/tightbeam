@@ -286,9 +286,7 @@ defmodule Tightbeam.Harness.Codex do
           bytes
 
         hooks ->
-          hooks
-          |> update_in(["hooks", "PreToolUse"], &(&1 ++ [Tightbeam.Rails.probe_entry()]))
-          |> JSON.encode!()
+          JSON.encode!(hooks)
       end
 
     rails = Tightbeam.Harness.CodexIdentity.hook_settings(rails)

@@ -8,6 +8,7 @@ source = "Substrate manual §identity; §6 admin-only"
 legibility = "event:denied(rule=admin-only-verb)"
 
 [[fixture.rule]]
+archetypes = ["*"]
 name = "admin-only-verb"
 verb = "spawn"
 text = "spawn is restricted to administrators"

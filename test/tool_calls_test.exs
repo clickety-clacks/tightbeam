@@ -847,8 +847,8 @@ defmodule Tightbeam.ToolCallsTest do
 
     {:ok, columns_after} = DB.query(ctx.db, "PRAGMA table_info(messages)", [])
 
-    assert Enum.map(columns_after, fn [_cid, name | _rest] -> name end) ==
-             message_columns ++ ["submitter"]
+    assert Enum.sort(Enum.map(columns_after, fn [_cid, name | _rest] -> name end)) ==
+             Enum.sort(message_columns ++ ["submitter"])
 
     {:ok, index_names} =
       DB.query(

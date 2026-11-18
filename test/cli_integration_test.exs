@@ -2243,8 +2243,17 @@ defmodule Tightbeam.CliIntegrationTest do
     Archetypes.load!(ctx.base_dir)
 
     for file <- ["engineering.toml", "verification.toml"] do
-      assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
-             "learn did not deliver rules/#{file} into the org's identity tree"
+      assert File.exists?(
+               Path.join([
+                 ctx.base_dir,
+                 "identity",
+                 "kungfu",
+                 "agentic-engineering",
+                 "rules",
+                 file
+               ])
+             ),
+             "learn did not deliver the receipt-owned rule #{file} into the org's identity tree"
     end
 
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -2266,7 +2275,7 @@ defmodule Tightbeam.CliIntegrationTest do
         display_name: "CLI Coder",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
+        archetype: "agentic-engineering.coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
@@ -2279,7 +2288,7 @@ defmodule Tightbeam.CliIntegrationTest do
         display_name: "CLI Reviewer",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "reviewer",
+        archetype: "agentic-engineering.reviewer-code",
         host: "testhost",
         harness: "codex",
         provider: "openai",
@@ -2292,7 +2301,7 @@ defmodule Tightbeam.CliIntegrationTest do
         display_name: "CLI Product Owner",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "product-owner",
+        archetype: "agentic-engineering.product-owner",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
@@ -2577,7 +2586,11 @@ defmodule Tightbeam.CliIntegrationTest do
     assert denied =~ "completion-requires-verification"
 
     assert %{status: "live", producer_key: verification_source_id} =
-             RailRemedy.episode(ctx.db, "completion-requires-verification", work_id)
+             RailRemedy.episode(
+               ctx.db,
+               "agentic-engineering.completion-requires-verification",
+               work_id
+             )
 
     verification_delivery =
       assert_cli_source_delivery!(ctx.db, verification_source_id, "cli-coder")
@@ -2638,7 +2651,11 @@ defmodule Tightbeam.CliIntegrationTest do
     assert attest_batch.prompt =~ "Attest "
 
     assert %{status: "live", producer_key: artifact_source_id} =
-             RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
+             RailRemedy.episode(
+               ctx.db,
+               "agentic-engineering.completion-requires-results-artifact",
+               work_id
+             )
 
     artifact_delivery = assert_cli_source_delivery!(ctx.db, artifact_source_id, "cli-coder")
     artifact_wake = artifact_delivery.source
@@ -2714,10 +2731,18 @@ defmodule Tightbeam.CliIntegrationTest do
              DB.query(ctx.db, "SELECT state, outcome FROM assignments WHERE id = ?1", [work_id])
 
     assert %{status: "closed"} =
-             RailRemedy.episode(ctx.db, "completion-requires-verification", work_id)
+             RailRemedy.episode(
+               ctx.db,
+               "agentic-engineering.completion-requires-verification",
+               work_id
+             )
 
     assert %{status: "closed"} =
-             RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
+             RailRemedy.episode(
+               ctx.db,
+               "agentic-engineering.completion-requires-results-artifact",
+               work_id
+             )
 
     # An absent work item is refused by name over the real wire, never as the
     # insert's foreign-key MatchError.
@@ -3027,6 +3052,7 @@ defmodule Tightbeam.CliIntegrationTest do
       [[rule]]
       name = "assignments-need-a-ruling"
       verb = "assignments"
+      archetypes = ["*"]
       text = "listing assignments is an owner decision in this fixture org"
       effect = "escalate"
       deny_when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]

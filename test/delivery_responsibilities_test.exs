@@ -29,19 +29,19 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     session(db, Org.personal_session_key("other"), "other", kind: "main")
 
     for {key, owner, archetype} <- [
-          {"pdo-a", "owner", "pdo"},
-          {"pdo-b", "owner", "pdo"},
-          {"successor-a", "owner", "coder"},
-          {"lane-a", "owner", "coder"},
-          {"lane-b", "owner", "coder"},
-          {"worker-a", "owner", "coder"},
-          {"peer", "owner", "coder"},
-          {"consult-po", "owner", "product-owner"},
-          {"intake-pdo", "owner", "pdo"},
-          {"office-orchestrator", "owner", "orchestrator"},
-          {"reviewer", "owner", "reviewer"},
-          {"foreign-pdo", "other", "pdo"},
-          {"foreign-worker", "other", "coder"}
+          {"pdo-a", "owner", "agentic-engineering.pdo"},
+          {"pdo-b", "owner", "agentic-engineering.pdo"},
+          {"successor-a", "owner", "agentic-engineering.coder"},
+          {"lane-a", "owner", "agentic-engineering.coder"},
+          {"lane-b", "owner", "agentic-engineering.coder"},
+          {"worker-a", "owner", "agentic-engineering.coder"},
+          {"peer", "owner", "agentic-engineering.coder"},
+          {"consult-po", "owner", "agentic-engineering.product-owner"},
+          {"intake-pdo", "owner", "agentic-engineering.pdo"},
+          {"office-orchestrator", "owner", "agentic-engineering.orchestrator"},
+          {"reviewer", "owner", "agentic-engineering.reviewer-code"},
+          {"foreign-pdo", "other", "agentic-engineering.pdo"},
+          {"foreign-worker", "other", "agentic-engineering.coder"}
         ] do
       session(db, key, owner, archetype: archetype)
     end
@@ -512,9 +512,9 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     wakes_before = count(db, "wakes")
 
     for {target, archetype} <- [
-          {"consult-po", "product-owner"},
-          {"intake-pdo", "pdo"},
-          {"office-orchestrator", "orchestrator"}
+          {"consult-po", "agentic-engineering.product-owner"},
+          {"intake-pdo", "agentic-engineering.pdo"},
+          {"office-orchestrator", "agentic-engineering.orchestrator"}
         ],
         verb <- ["assign", "dispatch"],
         effect <- ["code", "review"] do

@@ -58,7 +58,9 @@ defmodule Tightbeam.VersionAdapterHealthTest do
     assert %{"adapters" => %{}, "adaptersAsOf" => nil} = version(ctx.port)
 
     Application.put_env(:tightbeam, :adapter_failure_circuit, 1)
-    coordinator = start_coordinator(ctx)
+    # Keep autonomous circuit retries outside this short snapshot-read probe.
+    # The restart-loop test below still uses the normal fast retry setting.
+    coordinator = start_coordinator(ctx, backoff_base_ms: 60_000)
     key = {:claude, "shared", "testhost"}
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(ctx.coordinator, key)
     assert wait_until(fn -> AdapterCoordinator.ready?(ctx.coordinator, key) end)
@@ -169,22 +171,27 @@ defmodule Tightbeam.VersionAdapterHealthTest do
     IO.puts("version crash loop: requests=#{length(readings)} max_latency_us=#{max_latency_us}")
   end
 
-  defp start_coordinator(ctx) do
+  defp start_coordinator(ctx, overrides \\ []) do
     start_supervised!(
       {AdapterCoordinator,
-       adapter_sup: ctx.sup,
-       adapter_context: fn _ -> [] end,
-       adapter_opts: fn _, _ ->
+       Keyword.merge(
          [
-           harness: :claude,
-           cmd: [System.find_executable("node"), ctx.script],
-           home: ctx.test_dir,
-           cwd: ctx.test_dir
-         ]
-       end,
-       db: ctx.db,
-       backoff_base_ms: 40,
-       name: ctx.coordinator}
+           adapter_sup: ctx.sup,
+           adapter_context: fn _ -> [] end,
+           adapter_opts: fn _, _ ->
+             [
+               harness: :claude,
+               cmd: [System.find_executable("node"), ctx.script],
+               home: ctx.test_dir,
+               cwd: ctx.test_dir
+             ]
+           end,
+           db: ctx.db,
+           backoff_base_ms: 40,
+           name: ctx.coordinator
+         ],
+         overrides
+       )}
     )
   end
 

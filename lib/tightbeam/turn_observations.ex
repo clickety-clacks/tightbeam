@@ -130,7 +130,10 @@ defmodule Tightbeam.TurnObservations do
   end
 
   @impl true
-  def init(:ok), do: {:ok, %{windows: %{}}}
+  def init(:ok) do
+    Tightbeam.DB.owed_work()
+    {:ok, %{windows: %{}}}
+  end
 
   # The deadline rides only on the posts that MUTATE the window. A read carries
   # none: arriving late it changes nothing but the prune, which is idempotent

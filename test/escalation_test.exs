@@ -1019,7 +1019,8 @@ defmodule Tightbeam.EscalationTest do
         operator_call(ctx.raiser, %{question: "Which release window?", deadline: 10})
       )
 
-    [opening, deadline] = notification_wakes(ctx)
+    # 0.1.16's filing design sends no opening wake; only the deadline reminder.
+    [deadline] = notification_wakes(ctx)
     assert deadline.due_at == request.deadline_at
     assert deadline.state == "pending"
     assert deadline.prompt =~ request.id
@@ -1032,7 +1033,6 @@ defmodule Tightbeam.EscalationTest do
 
     assert Escalation.raw_by_id(ctx.db, request.id).status == "open"
     assert Wakes.get(ctx.db, deadline.wake_id).state == "fired"
-    assert Wakes.get(ctx.db, opening.wake_id).state == "fired"
 
     assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, deadline.wake_id)
@@ -1049,14 +1049,14 @@ defmodule Tightbeam.EscalationTest do
     assert content =~ deadline.prompt
     assert :ok = Wakes.fire_due(scheduler)
     assert turn_count(ctx.db, carrier_id) == 1
-    assert length(notification_wakes(ctx)) == 2
+    assert length(notification_wakes(ctx)) == 1
   end
 
   test "resolved operator requests retract their pending deadline reminder", ctx do
     stop_supervised!(Wakes)
 
     ruled = Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "Rule?"}))
-    [_, ruled_deadline] = notification_wakes(ctx)
+    [ruled_deadline] = notification_wakes(ctx)
 
     assert %{status: "ruled"} =
              Escalation.operator_rule(
