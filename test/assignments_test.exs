@@ -700,6 +700,61 @@ defmodule Tightbeam.AssignmentsTest do
                  [assignment.id]
                )
     end
+
+    test "attest cutover uses its own watermark after an earlier terminal cutover", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+      assignment = handle(ctx, "assign", assign_call({:session, "notice-parent"}, "legacy card"))
+
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "SELECT 1 FROM row_reaction_cutovers WHERE source='assignment-attest-notices/v1'"
+               )
+
+      assert {:ok, [[terminal_watermark]]} =
+               DB.query(ctx.db, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT OR REPLACE INTO row_reaction_cutovers(source,watermark,adoptedAt,heldCount) VALUES('terminal-notices/v1',?1,?2,0)",
+                 [
+                   JSON.encode!(%{"wakeRowid" => terminal_watermark}),
+                   System.system_time(:millisecond)
+                 ]
+               )
+
+      blocked = legacy_attest_notice!(ctx, assignment, "blocked")
+
+      assert {:ok, [[notice_rowid]]} =
+               DB.query(ctx.db, "SELECT rowid FROM wakes WHERE wakeId=?1", [blocked.wake_id])
+
+      assert notice_rowid > terminal_watermark
+      assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+      assert Wakes.get(ctx.db, blocked.wake_id).state == "pending"
+
+      assert {:ok, [["pending"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [blocked.wake_id]
+               )
+
+      assert {:ok, [[attest_watermark]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT CAST(json_extract(watermark,'$.wakeRowid') AS INTEGER) FROM row_reaction_cutovers WHERE source='assignment-attest-notices/v1'"
+               )
+
+      assert attest_watermark >= notice_rowid
+
+      assert {:ok, [[^terminal_watermark]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT CAST(json_extract(watermark,'$.wakeRowid') AS INTEGER) FROM row_reaction_cutovers WHERE source='terminal-notices/v1'"
+               )
+    end
   end
 
   describe "attest outcome condition facts" do

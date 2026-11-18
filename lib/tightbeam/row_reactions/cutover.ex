@@ -14,8 +14,9 @@ defmodule Tightbeam.RowReactions.Cutover do
 
   def adopt(txn) do
     watermark = terminal_watermark(txn)
+    attest_watermark = attest_watermark(txn)
     adopt_pending_terminal_notices(txn, watermark)
-    adopt_attest_notices(txn, watermark)
+    adopt_attest_notices(txn, attest_watermark)
     :ok
   end
 
@@ -33,6 +34,19 @@ defmodule Tightbeam.RowReactions.Cutover do
           [@source, JSON.encode!(%{"wakeRowid" => watermark}), System.system_time(:millisecond)]
         )
 
+        watermark
+    end
+  end
+
+  defp attest_watermark(txn) do
+    case Txn.q(txn, "SELECT watermark FROM row_reaction_cutovers WHERE source=?1", [
+           @attest_source
+         ]) do
+      [[encoded]] ->
+        JSON.decode!(encoded)["wakeRowid"]
+
+      [] ->
+        [[watermark]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
         watermark
     end
   end
