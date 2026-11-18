@@ -52,7 +52,15 @@ defmodule Tightbeam.ClientE2E.LegGateway do
           log_path: String.t()
         }
 
-  defstruct [:base_dir, :port, :os_pid, :os_command, :port_ref, :log_path, boot_opts: []]
+  defstruct [
+    :base_dir,
+    :port,
+    :os_pid,
+    :os_command,
+    :port_ref,
+    :log_path,
+    boot_opts: []
+  ]
 
   @copied ~w(adapters homes identity)
 
@@ -164,7 +172,11 @@ defmodule Tightbeam.ClientE2E.LegGateway do
         # booted process again, so every ours?-gated signal silently skips and
         # the gateway survives its own teardown/restart (found by the codex J7
         # leg: :port_still_answering with the BEAM orphaned to launchd).
-        {:ok, %{gateway | os_command: process_command(gateway.os_pid)}}
+        {:ok,
+         %{
+           gateway
+           | os_command: process_command(gateway.os_pid)
+         }}
 
       {:error, reason} ->
         # The half-booted gateway is returned WITH the error so the caller's

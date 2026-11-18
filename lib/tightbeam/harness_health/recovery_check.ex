@@ -191,6 +191,8 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
 
   defp start_check(task_sup, db, base_dir, check) do
     case Task.Supervisor.start_child(task_sup, fn ->
+           DB.owed_work()
+
            result =
              Tightbeam.Harness.RecoveryProbe.run_route(
                base_dir,

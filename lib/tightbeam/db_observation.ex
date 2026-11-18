@@ -4,6 +4,7 @@ defmodule Tightbeam.DBObservation do
   require Logger
 
   @key {__MODULE__, :observation}
+  @refused_key {__MODULE__, :refused_unsent}
   @transaction_capture_tag {__MODULE__, :wire_preserving_transaction}
   @operations %{
     "db.query" => nil,
@@ -107,6 +108,7 @@ defmodule Tightbeam.DBObservation do
   end
 
   defp observed_request(server, operation, budget, mode, build_request) do
+    Process.delete(@refused_key)
     context = RequestContext.capture()
     started = System.monotonic_time()
 
@@ -211,6 +213,8 @@ defmodule Tightbeam.DBObservation do
     budget = remaining(envelope)
 
     if not envelope.publication and Tightbeam.DB.overloaded?(server) do
+      Process.put(@refused_key, true)
+
       {:reply, response, _} =
         server(envelope, nil, fn ->
           {:reply, {:error, %Tightbeam.DB.Overloaded{}}, nil}
@@ -221,6 +225,11 @@ defmodule Tightbeam.DBObservation do
       GenServer.call(server, request, budget)
     end
   end
+
+  @doc false
+  # True once, for a call this client refused before sending it. An overload
+  # error that came back from the owner's own work is a result, not a refusal.
+  def take_unsent_refusal, do: Process.delete(@refused_key) == true
 
   defp transaction_callback(envelope, original_callback) do
     capture = {@transaction_capture_tag, envelope, original_callback}

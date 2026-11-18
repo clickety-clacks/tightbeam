@@ -217,6 +217,10 @@ defmodule Tightbeam.SessionLane do
 
   @impl true
   def init(opts) do
+    # Claiming and finishing turns is work the gateway owes: an overloaded
+    # database owner makes the lane wait, never crash or drop the turn.
+    DB.owed_work()
+
     state = %__MODULE__{
       session_key: Keyword.fetch!(opts, :session_key),
       db: Keyword.get(opts, :db, Tightbeam.DB),
@@ -279,10 +283,13 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp cancel_running_turn(state, audit) do
-    DB.background_pass(
-      fn -> cancel_turn(state, audit) end,
-      {:reply, {:error, %DB.Overloaded{}}, state}
-    )
+    # A cancel has a caller to answer, so it keeps the ordinary refusal.
+    DB.refusable(fn ->
+      DB.background_pass(
+        fn -> cancel_turn(state, audit) end,
+        {:reply, {:error, %DB.Overloaded{}}, state}
+      )
+    end)
   end
 
   defp cancel_turn(state, audit) do
@@ -715,6 +722,9 @@ defmodule Tightbeam.SessionLane do
 
         task =
           Task.Supervisor.async_nolink(state.task_sup, fn ->
+            # The claimed turn is owed too: its task waits out an overload
+            # instead of failing the turn on the refusal.
+            DB.owed_work()
             {turn.seq, runner.(Map.put(turn, :session_key, state.session_key))}
           end)
 

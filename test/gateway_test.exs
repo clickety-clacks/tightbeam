@@ -10883,7 +10883,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
-  test "REST human post accepts the owner's session token with asUser", ctx do
+  test "REST human post refuses session tokens and requires org user attribution", ctx do
     token = Org.get(ctx.db, "k1").cli_token
 
     body = %{
@@ -10893,12 +10893,14 @@ defmodule Tightbeam.GatewayTest do
       params: %{clientMessageId: "c_session_1", deviceId: "chat_test", content: "hello"}
     }
 
-    accepted = rest_post(ctx, token, body)
-    assert accepted.status == 200
-    assert %{"result" => %{"outcome" => "recorded"}} = JSON.decode!(accepted.resp_body)
+    rejected = rest_post(ctx, token, body)
+    assert rejected.status == 400
+
+    assert %{"error" => %{"code" => "invalid_message", "message" => "verb not allowed: post"}} =
+             JSON.decode!(rejected.resp_body)
 
     as_role = body |> Map.delete(:asUser) |> Map.put(:as, "coder")
-    refused = rest_post(ctx, token, as_role)
+    refused = rest_post(ctx, "tbc_test", as_role)
     assert refused.status == 403
     assert %{"error" => %{"code" => "principal_required"}} = JSON.decode!(refused.resp_body)
   end
