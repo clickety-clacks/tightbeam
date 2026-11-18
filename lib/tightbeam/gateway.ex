@@ -1780,6 +1780,9 @@ defmodule Tightbeam.Gateway do
       {"session-custody-transfer", ["wake.scheduled"]} => fn call ->
         Tightbeam.SessionCustodyTransfer.handle(db, call)
       end,
+      {"assignment-opener-accept", ["wake.scheduled"]} => fn call ->
+        Tightbeam.AssignmentOpenerAcceptance.handle(db, call)
+      end,
       {"session-po-set", ["wake.scheduled"]} => fn call ->
         SessionPoAssociations.handle(db, call)
       end,

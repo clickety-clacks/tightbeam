@@ -1173,6 +1173,22 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("reason", reason),
             ],
         )),
+        Command::AssignmentOpenerAccept {
+            identity,
+            assignment_id,
+            to_session_key,
+        } => {
+            let mut params = vec![string_field("assignmentId", assignment_id)];
+            if let Some(to_session_key) = to_session_key {
+                params.push(string_field("toSessionKey", to_session_key));
+            }
+            Ok(request(
+                identity,
+                "assignment-opener-accept",
+                vec![],
+                params,
+            ))
+        }
         Command::ReopenAssignment {
             identity,
             assignment_id,
@@ -4170,6 +4186,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::AssignmentStopTurn { identity, .. }
         | Command::CancelTurn { identity, .. }
         | Command::RevokeAssignment { identity, .. }
+        | Command::AssignmentOpenerAccept { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
         | Command::AssignmentCommitRefCorrect { identity, .. }
@@ -4858,6 +4875,39 @@ mod tests {
                     args.extend([flag, value]);
                 }
             }
+            assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn assignment_opener_accept_names_one_assignment_and_optional_successor() {
+        assert_eq!(
+            body(&["assignment-opener-accept", "asg_one", "--as-user", "owner"]),
+            r#"{"asUser":"owner","verb":"assignment-opener-accept","params":{"assignmentId":"asg_one"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "assignment-opener-accept",
+                "asg_one",
+                "--to",
+                "new seat",
+                "--as-user",
+                "owner",
+            ]),
+            r#"{"asUser":"owner","verb":"assignment-opener-accept","params":{"assignmentId":"asg_one","toSessionKey":"new seat"}}"#
+        );
+        for args in [
+            vec!["assignment-opener-accept"],
+            vec!["assignment-opener-accept", "asg_one", "asg_two"],
+            vec![
+                "assignment-opener-accept",
+                "asg_one",
+                "--to",
+                "a",
+                "--to",
+                "b",
+            ],
+        ] {
             assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
         }
     }
