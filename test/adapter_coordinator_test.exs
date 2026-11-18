@@ -2020,7 +2020,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # Only coordinator cancellation may release a hung command. A finite helper
     # deadline could otherwise finish tasks while we install monitors/tracing.
     timeout_override = Application.fetch_env(:tightbeam, :harness_process_command_timeout_ms)
-    Application.put_env(:tightbeam, :harness_process_command_timeout_ms, :infinity)
+    Application.put_env(:tightbeam, :harness_process_command_timeout_ms, 120_000)
 
     on_exit(fn ->
       case timeout_override do
