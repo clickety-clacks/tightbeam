@@ -1521,6 +1521,26 @@ defmodule Tightbeam.HarklightWakesTest do
         "remove --choices-json and --reply"
       },
       {Map.put(valid, :reply, false), "harklight_request_needs_answer_controls", "--reply"},
+      {
+        Map.put(valid, :answer_ui, "/tmp/answer-ui.json"),
+        "harklight_answer_ui_has_answer_controls",
+        "remove --reply"
+      },
+      {
+        Map.merge(valid, %{reply: false, choices: ["Cover A"], answer_ui: "/tmp/answer-ui.json"}),
+        "harklight_answer_ui_has_answer_controls",
+        "remove --choices-json"
+      },
+      {
+        Map.merge(valid, %{message_type: "fyi", reply: false, answer_ui: "/tmp/answer-ui.json"}),
+        "harklight_answer_ui_requires_request",
+        "--type request"
+      },
+      {
+        Map.put(valid, :answer_ui, ""),
+        "harklight_answer_ui_invalid",
+        "non-empty path"
+      },
       {Map.put(valid, :message_kind, "update"), "harklight_kind_invalid", "blocker or success"},
       {
         Map.put(valid, :importance, "urgent"),
@@ -1628,6 +1648,149 @@ defmodule Tightbeam.HarklightWakesTest do
            } = HarklightSend.send_request(db, send_call, runner: runner)
 
     assert session == call.session_key
+  end
+
+  test "answer UI path and image files pass through unchanged and V2 refusal reason is preserved",
+       %{db: db, call: call} do
+    answer_ui = "/tmp/cover assets/answer-ui.json"
+    files = ["/tmp/cover-a.jpg", "/tmp/cover-b.jpg"]
+    refusal_reason = "answer_ui names cover-c.jpg, which is absent from --files-json"
+
+    runner = fn args ->
+      case Enum.take(args, 2) do
+        ["send", "--prepare"] ->
+          pair_args = Enum.chunk_every(args, 2, 1, :discard)
+          assert Enum.member?(pair_args, ["--answer-ui", answer_ui])
+          assert ["--file", "/tmp/cover-a.jpg"] in pair_args
+          assert ["--file", "/tmp/cover-b.jpg"] in pair_args
+          refute "--reply" in args
+          refute "--choice" in args
+
+          op = Enum.at(args, 3)
+          hashes = [String.duplicate("a", 64), String.duplicate("b", 64)]
+
+          frame(%{
+            kind: "prepared",
+            op_id: op,
+            request: %{
+              type: "send",
+              op_id: op,
+              session_handle: @handle,
+              message: %{
+                sender_id: "sender",
+                message_id: "answer-ui-message",
+                title: "Choose a cover",
+                body: nil,
+                supersedes: []
+              },
+              files:
+                Enum.zip(files, hashes)
+                |> Enum.map(fn {path, hash} ->
+                  %{name: Path.basename(path), upload_pending: true, size: 4, sha256: hash}
+                end)
+            },
+            files:
+              Enum.zip(files, hashes)
+              |> Enum.map(fn {path, hash} ->
+                %{name: Path.basename(path), size_bytes: 4, sha256: hash}
+              end)
+          })
+
+        ["send", "--execute"] ->
+          op = List.last(args)
+          {JSON.encode!(%{kind: "refused", op_id: op, reason: refusal_reason}) <> "\n", 2}
+
+        other ->
+          flunk("unexpected Agent CLI invocation: #{inspect(other)}")
+      end
+    end
+
+    result =
+      HarklightSend.send_request(
+        db,
+        %{
+          call
+          | params: %{
+              harklight_session: @handle,
+              message_type: "request",
+              answer_ui: answer_ui,
+              sender_id: "sender",
+              title: "Choose a cover",
+              files: files
+            }
+        },
+        runner: runner
+      )
+
+    assert %{outcome: "refused", reason: ^refusal_reason, wake_effect: "none"} = result
+  end
+
+  test "answer UI prepared content is retained when the send commits", %{db: db, call: call} do
+    document = %{"schema" => "attention-client.ui/1", "opaque" => 18_446_744_073_709_551_617}
+
+    runner = fn args ->
+      op = if "--prepare" in args, do: Enum.at(args, 3), else: List.last(args)
+
+      case Enum.take(args, 2) do
+        ["send", "--prepare"] ->
+          assert ["--answer-ui", "/tmp/answer-ui.json"] in Enum.chunk_every(args, 2, 1, :discard)
+
+          frame(%{
+            kind: "prepared",
+            op_id: op,
+            files: [],
+            request: %{
+              type: "send",
+              op_id: op,
+              session_handle: @handle,
+              message: %{
+                sender_id: "sender",
+                message_id: "ui-committed",
+                title: "Choose",
+                answer_ui: document
+              }
+            }
+          })
+
+        ["send", "--execute"] ->
+          assert {:ok, [[payload]]} =
+                   DB.query(db, "SELECT payload FROM harklight_send_operations WHERE opId=?1", [
+                     op
+                   ])
+
+          assert JSON.decode!(payload)["request"]["message"]["answer_ui"] == document
+
+          frame(%{
+            kind: "committed",
+            operation: "send",
+            op_id: op,
+            response: %{
+              session_handle: @handle,
+              sender_id: "sender",
+              message_id: "ui-committed",
+              revision: 1
+            }
+          })
+      end
+    end
+
+    result =
+      HarklightSend.send_request(
+        db,
+        %{
+          call
+          | params: %{
+              harklight_session: @handle,
+              message_type: "request",
+              answer_ui: "/tmp/answer-ui.json",
+              sender_id: "sender",
+              title: "Choose"
+            }
+        },
+        runner: runner
+      )
+
+    assert %{outcome: "committed", state: "registered", message_id: "ui-committed"} = result
   end
 
   test "uncertain result stays unregistered and same-operation retry can bind it", %{

@@ -629,7 +629,7 @@ defmodule Tightbeam.HarklightSend do
     allowed =
       ~w(
         harklight_session sender_id title message_type message_kind importance stake by_when reply
-        body choices files vendor_session_id supersedes decision_request_id
+        body choices files answer_ui vendor_session_id supersedes decision_request_id
       )a
 
     session = params[:harklight_session]
@@ -644,6 +644,7 @@ defmodule Tightbeam.HarklightSend do
     body = params[:body]
     choices = params[:choices] || []
     files = params[:files] || []
+    answer_ui = params[:answer_ui]
     vendor = params[:vendor_session_id]
     supersedes = params[:supersedes] || []
     decision_request_id = params[:decision_request_id]
@@ -667,6 +668,10 @@ defmodule Tightbeam.HarklightSend do
       not (is_list(files) and Enum.all?(files, &(is_binary(&1) and &1 != ""))) ->
         {:error, "invalid_harklight_send"}
 
+      not (is_nil(answer_ui) or (is_binary(answer_ui) and answer_ui != "")) ->
+        {:error, "harklight_answer_ui_invalid",
+         "--answer-ui requires a non-empty path; provide a path or remove --answer-ui"}
+
       not (is_list(supersedes) and Enum.all?(supersedes, &is_binary/1)) ->
         {:error, "invalid_harklight_send"}
 
@@ -681,6 +686,22 @@ defmodule Tightbeam.HarklightSend do
       message_type not in ["fyi", "request"] ->
         {:error, "harklight_type_invalid",
          "--type must be fyi or request; got #{inspect(message_type)}"}
+
+      not is_nil(answer_ui) and message_type != "request" ->
+        {:error, "harklight_answer_ui_requires_request",
+         "--answer-ui requires --type request; add --type request or remove --answer-ui"}
+
+      not is_nil(answer_ui) and choices != [] and reply == true ->
+        {:error, "harklight_answer_ui_has_answer_controls",
+         "--answer-ui carries its own inputs: remove --choices-json and --reply, or drop --answer-ui and use --choices-json/--reply"}
+
+      not is_nil(answer_ui) and choices != [] ->
+        {:error, "harklight_answer_ui_has_answer_controls",
+         "--answer-ui carries its own inputs: remove --choices-json, or drop --answer-ui and use --choices-json/--reply"}
+
+      not is_nil(answer_ui) and reply == true ->
+        {:error, "harklight_answer_ui_has_answer_controls",
+         "--answer-ui carries its own inputs: remove --reply, or drop --answer-ui and use --choices-json/--reply"}
 
       not (is_nil(message_kind) or message_kind in ["blocker", "success"]) ->
         {:error, "harklight_kind_invalid",
@@ -704,7 +725,7 @@ defmodule Tightbeam.HarklightSend do
       message_type == "fyi" and (choices != [] or reply == true) ->
         {:error, "harklight_fyi_has_answer_controls"}
 
-      message_type == "request" and choices == [] and reply != true ->
+      message_type == "request" and is_nil(answer_ui) and choices == [] and reply != true ->
         {:error, "harklight_request_needs_answer_controls"}
 
       true ->
@@ -722,6 +743,7 @@ defmodule Tightbeam.HarklightSend do
            body: body,
            choices: choices,
            files: files,
+           answer_ui: answer_ui,
            vendor: vendor,
            supersedes: supersedes,
            decision_request_id: decision_request_id
@@ -754,6 +776,7 @@ defmodule Tightbeam.HarklightSend do
 
     args = if input.session == "new", do: args ++ ["--route", "other", "--controller"], else: args
     args = args ++ ["--type", input.message_type]
+    args = if input.answer_ui, do: args ++ ["--answer-ui", input.answer_ui], else: args
     args = if input.message_kind, do: args ++ ["--kind", input.message_kind], else: args
     args = if input.importance, do: args ++ ["--importance", input.importance], else: args
     args = if input.stake, do: args ++ ["--stake", input.stake], else: args

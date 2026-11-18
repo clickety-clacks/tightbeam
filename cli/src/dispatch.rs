@@ -555,6 +555,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             body,
             choices,
             files,
+            answer_ui,
             vendor_session_id,
             supersedes,
             decision_request_id,
@@ -580,6 +581,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             ];
             if let Some(value) = body {
                 params.push(string_field("body", value));
+            }
+            if let Some(value) = answer_ui {
+                params.push(string_field("answerUi", value));
             }
             if let Some(value) = vendor_session_id {
                 params.push(string_field("vendorSessionId", value));
@@ -4648,6 +4652,36 @@ mod tests {
 
         assert_eq!(request["verb"], "harklight-briefings-catchup");
         assert_eq!(request["params"]["limit"], 3);
+    }
+
+    #[test]
+    fn harklight_send_keeps_answer_ui_path_as_an_unchanged_scalar() {
+        let request: Value = serde_json::from_str(&body(&[
+            "harklight-send",
+            "--session",
+            "new",
+            "--sender-id",
+            "sender",
+            "--title",
+            "Choose a cover",
+            "--type",
+            "request",
+            "--answer-ui",
+            "/tmp/cover assets/answer-ui.json",
+            "--files-json",
+            r#"["/tmp/cover-a.jpg","/tmp/cover-b.jpg"]"#,
+        ]))
+        .unwrap();
+
+        assert_eq!(request["verb"], "harklight-send");
+        assert_eq!(
+            request["params"]["answerUi"],
+            "/tmp/cover assets/answer-ui.json"
+        );
+        assert_eq!(
+            request["params"]["files"],
+            serde_json::json!(["/tmp/cover-a.jpg", "/tmp/cover-b.jpg"])
+        );
     }
 
     #[test]
