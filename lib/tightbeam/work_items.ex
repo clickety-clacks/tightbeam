@@ -441,9 +441,14 @@ defmodule Tightbeam.WorkItems do
   end
 
   defp schedule_handoff_wake_in_txn(txn, call, item) do
+    {_user, handing_off_session} = creator(call.principal)
+
     Wakes.schedule_in_txn(txn, %{
       session_key: call.params[:delivery_owner_session_key],
       origin: call.origin,
+      # The handing-off session is this brief's sender: a failed delivery is
+      # reported to it like any other sent wake.
+      creator_session_key: handing_off_session,
       prompt:
         "Delivery-owner handoff for work item #{item.id} (#{item.title}):\n\n" <>
           call.params.brief,

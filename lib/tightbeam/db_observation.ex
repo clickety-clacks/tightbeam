@@ -16,7 +16,7 @@ defmodule Tightbeam.DBObservation do
     "db.reference_fence" => nil,
     "test.fixture" => nil
   }
-  @envelope_fields ~w(request_id db_call_id operation effect_kind principal_kind principal_ref timeout_source budget_ms)a
+  @envelope_fields ~w(request_id db_call_id operation caller effect_kind principal_kind principal_ref timeout_source budget_ms)a
 
   def operations, do: @operations
 
@@ -122,6 +122,7 @@ defmodule Tightbeam.DBObservation do
       request_id: context.request_id,
       db_call_id: RequestContext.id("dbc_"),
       operation: operation,
+      caller: Map.get(context, :caller, context.principal_ref),
       effect_kind: Map.fetch!(@operations, operation),
       principal_kind: context.principal_kind,
       principal_ref: context.principal_ref,
@@ -464,6 +465,8 @@ defmodule Tightbeam.DBObservation do
     emit(envelope, Map.merge(timing, %{event: "db_server_completed", cause: cause(class)}))
     timing
   end
+
+  defp result_class({:error, %Tightbeam.DB.Overloaded{}}, _, _), do: "db_overloaded"
 
   defp result_class(:ok, _, _), do: "ok"
   defp result_class({:ok, _}, _, _), do: "ok"

@@ -1500,13 +1500,15 @@ defmodule Tightbeam.Acp.Adapter do
           case {logical_message_id, state.tool_turns[sid], update["content"]} do
             {logical_id, %{session_key: session_key, turn_seq: turn_seq}, content}
             when is_binary(logical_id) and is_map(content) ->
-              case Tightbeam.TurnEvents.append_assistant_segment(
-                     state.db,
-                     session_key,
-                     turn_seq,
-                     logical_id,
-                     content
-                   ) do
+              case Tightbeam.DB.owed_work(fn ->
+                     Tightbeam.TurnEvents.append_assistant_segment(
+                       state.db,
+                       session_key,
+                       turn_seq,
+                       logical_id,
+                       content
+                     )
+                   end) do
                 {:ok, _event} ->
                   state
 
