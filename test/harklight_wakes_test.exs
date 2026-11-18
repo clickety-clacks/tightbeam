@@ -3831,6 +3831,45 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
   end
 
+  test "repeated same-ID loads and lane starts keep one attachment", %{db: db, session: session} do
+    path = Path.join(System.tmp_dir!(), "same-pointer-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm(path) end)
+
+    fake_harklight_agent!("""
+    printf '%s\\n' "$*" >> '#{path}'
+    if [ "$1" = attach ]; then
+      printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+    elif [ "$1" = listen ]; then
+      exec sleep 300
+    fi
+    """)
+
+    Org.append_pointer(db, session.session_key, "vendor-original", "created")
+    manager = start_supervised!({HarklightWakes, db: db})
+    assert eventually(fn -> is_port(:sys.get_state(manager).ports[@handle]) end)
+    worker = :sys.get_state(manager).workers[@handle]
+
+    for _ <- 1..5 do
+      Org.append_pointer(db, session.session_key, "vendor-original", "loaded")
+      GenServer.cast(manager, {:origin_ready, session.session_key})
+      assert :sys.get_state(manager).workers[@handle] == worker
+    end
+
+    calls = fn -> File.read!(path) |> String.split("\n", trim: true) end
+    assert Enum.count(calls.(), &String.starts_with?(&1, "attach ")) == 1
+    assert length(Org.pointer_chain(db, session.session_key)) == 6
+
+    Org.append_pointer(db, session.session_key, "vendor-replacement", "fallback")
+
+    assert eventually(fn ->
+             state = :sys.get_state(manager)
+             is_port(state.ports[@handle]) and state.workers[@handle] != worker
+           end)
+
+    assert Enum.count(calls.(), &String.starts_with?(&1, "attach ")) == 2
+    assert Enum.any?(calls.(), &String.contains?(&1, "--vendor-session-id vendor-replacement"))
+  end
+
   test "an overloaded listener-state write keeps the attachment and delivers the waiting entry once",
        %{db: db, session: session} do
     path = Path.join(System.tmp_dir!(), "state-write-#{System.unique_integer([:positive])}")
