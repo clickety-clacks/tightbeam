@@ -134,6 +134,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
     assert [
              @successor,
+             "session-custody-artifact-process-attribution-v1-0117",
              "session-custody-v1-0116",
              "artifact-process-attribution-v1-015",
              "closed-assignment-cannot-proceed-reconciliation-v1-015",

@@ -4261,7 +4261,7 @@ defmodule Tightbeam.Assignments do
          closedBySession: nil,
          closedByProcess: nil
        })
-       when outcome in ["completed", "revoked"] and is_integer(closed_at),
+       when outcome == "completed" and is_integer(closed_at),
        do: :ok
 
   defp lawful_closed_shape(%{
