@@ -3139,11 +3139,7 @@ defmodule Tightbeam.Escalation do
          {:ok, assignment_id} <- normalized_optional(operator_assignment_id(call)),
          {:ok, work_item_id} <- normalized_optional(operator_work_item_id(call)),
          :ok <- operator_association_present(assignment_id, work_item_id),
-         {:ok, project} <-
-           normalized_required(
-             param(call, :project),
-             "operator-ask requires --project naming the product this decision is about"
-           ),
+         {:ok, project} <- normalized_optional(param(call, :project)),
          {:ok, supersedes} <- normalized_optional(param(call, :supersedes)),
          {:ok, deadline_ms} <- normalize_operator_deadline(param(call, :deadline)) do
       {:ok,
@@ -3286,11 +3282,13 @@ defmodule Tightbeam.Escalation do
   # Resolves the work item an operator request is filed for. An assignment must
   # be open, as before; a named work item must exist under the same owner; and
   # when both are named they must agree. Returns the work item to record, which
-  # for an assignment-only ask is the assignment's own work item (possibly nil).
+  # for an assignment-only ask must be the assignment's existing work item.
   defp operator_association_in_txn(txn, ask, owner_user_id) do
     with {:ok, assignment_work_item_id} <-
            linked_assignment_in_txn(txn, ask.assignment_id, owner_user_id),
-         :ok <- linked_work_item_in_txn(txn, ask.work_item_id, owner_user_id) do
+         :ok <- linked_work_item_in_txn(txn, ask.work_item_id, owner_user_id),
+         :ok <- linked_work_item_in_txn(txn, assignment_work_item_id, owner_user_id),
+         :ok <- resolved_operator_work_item(ask.work_item_id || assignment_work_item_id) do
       cond do
         is_nil(ask.assignment_id) ->
           {:ok, ask.work_item_id}
@@ -3311,22 +3309,34 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  defp resolved_operator_work_item(nil),
+    do:
+      error("invalid", "linked assignment has no work item; add --work-item naming existing work")
+
+  defp resolved_operator_work_item(_id), do: :ok
+
   defp linked_assignment_in_txn(_txn, nil, _owner_user_id), do: {:ok, nil}
 
-  defp linked_assignment_in_txn(txn, assignment_id, _owner_user_id) do
+  defp linked_assignment_in_txn(txn, assignment_id, owner_user_id) do
     case Txn.q(
            txn,
            "SELECT a.state, s.ownerUserId, a.workItemId FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey WHERE a.id = ?1",
            [assignment_id]
          ) do
       [] ->
-        error("not_found", "linked assignment not found")
+        error(
+          "not_found",
+          "linked assignment not found; add --assignment or --work-item naming existing work"
+        )
 
       [[state, _owner, _work_item_id]] when state != "open" ->
         error("not_open", "linked assignment is not open")
 
-      [["open", _owner, work_item_id]] ->
+      [["open", ^owner_user_id, work_item_id]] ->
         {:ok, work_item_id}
+
+      [["open", _other_owner, _work_item_id]] ->
+        error("not_owner", "linked assignment belongs to another owner")
     end
   end
 
@@ -3336,7 +3346,7 @@ defmodule Tightbeam.Escalation do
     case Txn.q(txn, "SELECT ownerUserId FROM work_items WHERE id = ?1", [work_item_id]) do
       [[^owner_user_id]] -> :ok
       [[_other]] -> error("not_owner", "linked work item belongs to another owner")
-      [] -> error("not_found", "linked work item not found")
+      [] -> error("not_found", "linked work item not found; add --work-item naming existing work")
     end
   end
 

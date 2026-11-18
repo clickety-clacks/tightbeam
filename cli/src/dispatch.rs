@@ -1065,7 +1065,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     serde_json::to_string(&options).expect("operator option labels serialize")
                 ));
             }
-            params.push(string_field("project", project));
+            if let Some(value) = project {
+                params.push(string_field("project", value));
+            }
             // assignment_id and work_item_id are the names rule facts read.
             if let Some(value) = assignment_id {
                 params.push(string_field("assignment_id", value));
@@ -5742,6 +5744,18 @@ mod tests {
                 "parent",
             ]),
             r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","project":"Tightbeam","work_item_id":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "operator-ask",
+                "--question",
+                "continue?",
+                "--note",
+                "context",
+                "--assignment",
+                "asg_1"
+            ]),
+            r#"{"verb":"operator-ask","params":{"question":"continue?","note":"context","assignment_id":"asg_1"}}"#
         );
         assert_eq!(
             body(&[

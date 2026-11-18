@@ -1098,7 +1098,7 @@ defmodule Tightbeam.EscalationTest do
                operator_call(ctx.raiser, %{question: "owned?", assignment: "a-owned"})
              )
 
-    assert %{assignment_id: "a-foreign"} =
+    assert %{code: "not_owner"} =
              Escalation.operator_ask(
                ctx.db,
                operator_call(ctx.raiser, %{question: "foreign?", assignment: "a-foreign"})
@@ -1116,7 +1116,7 @@ defmodule Tightbeam.EscalationTest do
                operator_call(ctx.raiser, %{question: "missing?", assignment: "a-missing"})
              )
 
-    assert {:ok, [[2]]} =
+    assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
   end
 
@@ -3797,17 +3797,6 @@ defmodule Tightbeam.EscalationTest do
 
       assert message =~ "--assignment or --work-item"
 
-      assert %{code: "invalid", message: project_message} =
-               Escalation.operator_ask(
-                 ctx.db,
-                 bare_operator_call(ctx.raiser, %{
-                   question: "no product?",
-                   work_item_id: @fixture_work_item,
-                   project: "  "
-                 })
-               )
-
-      assert project_message =~ "--project"
       assert operator_request_count(ctx.db) == before
 
       assert {:ok, [[0]]} =
@@ -3815,6 +3804,57 @@ defmodule Tightbeam.EscalationTest do
                  ctx.db,
                  "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed'"
                )
+    end
+
+    test "assignment alone needs an existing same-owner work item and refuses without effects",
+         ctx do
+      insert_assignment!(ctx.db, "a-association", ctx.raiser.session_key, "open")
+      other = session(ctx.db, "foreign-association-holder", "someone-else")
+      insert_assignment!(ctx.db, "a-foreign", other.session_key, "open")
+      insert_work_item!(ctx.db, "wi-foreign-association", "someone-else")
+
+      before =
+        Enum.map(["decision_requests", "condition_facts", "wakes"], &table_count(ctx.db, &1))
+
+      ask = fn id ->
+        Escalation.operator_ask(
+          ctx.db,
+          bare_operator_call(ctx.raiser, %{question: "proceed?", assignment_id: id})
+        )
+      end
+
+      assert %{code: "not_owner"} = ask.("a-foreign")
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE assignments SET workItemId=NULL WHERE id='a-association'")
+
+      assert %{code: "invalid", message: message} = ask.("a-association")
+      assert message =~ "--work-item"
+
+      for {work_item, code} <- [
+            {"wi-missing", "not_found"},
+            {"wi-foreign-association", "not_owner"}
+          ] do
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE assignments SET workItemId=?1 WHERE id='a-association'", [
+            work_item
+          ])
+
+        assert %{code: ^code} = ask.("a-association")
+      end
+
+      assert Enum.map(["decision_requests", "condition_facts", "wakes"], &table_count(ctx.db, &1)) ==
+               before
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE assignments SET workItemId=?1 WHERE id='a-association'", [
+          @fixture_work_item
+        ])
+
+      assert %{id: id} = ask.("a-association")
+
+      assert %{project: nil, project_attribution: "unresolved", work_item_id: @fixture_work_item} =
+               Escalation.get(ctx.db, id)
     end
 
     test "a work-item ask records and lists its project", ctx do
@@ -4073,7 +4113,7 @@ defmodule Tightbeam.EscalationTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO assignments (id,subject,holderKey,holderFallback,openedBySession,openedAt,state) VALUES ('#{id}','linked','#{holder_key}',0,'#{holder_key}',1,'open')"
+        "INSERT INTO assignments (id,subject,holderKey,holderFallback,openedBySession,openedAt,state,workItemId) VALUES ('#{id}','linked','#{holder_key}',0,'#{holder_key}',1,'open','#{@fixture_work_item}')"
       )
 
     if state == "closed" do
