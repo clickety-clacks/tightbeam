@@ -217,6 +217,7 @@ defmodule Tightbeam.RowReactions.Cutover do
            prompt,
            capture: :all_but_first
          ) do
+      [attest_id, kind, assignment_id] -> [attest_id, kind, assignment_id]
       _ -> nil
     end
   end

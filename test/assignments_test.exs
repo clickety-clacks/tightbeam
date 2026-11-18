@@ -646,19 +646,22 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert :ok = Tightbeam.RowReactions.recover(ctx.db)
 
-      assert Wakes.get(ctx.db, ordinary.wake_id).state == "pending"
-      assert Wakes.get(ctx.db, blocked.wake_id).state == "pending"
-      assert Wakes.get(ctx.db, accepted.wake_id).delivered_turn_seq == accepted_seq
-      assert Wakes.get(ctx.db, canceled.wake_id).state == "canceled"
-      assert Wakes.get(ctx.db, undelivered.wake_id).state == "canceled"
-      assert Wakes.get(ctx.db, ambiguous.wake_id).state == "pending"
+      # Unlinked verified verdicts are quiet under R01-A2, so the old pending
+      # notice is adopted under its stable identity and then withdrawn.
+      assert Wakes.get(ctx.db, ordinary.wake_id).state == "canceled"
 
-      assert {:ok, [["pending"]]} =
+      assert {:ok, [["canceled"]]} =
                DB.query(
                  ctx.db,
                  "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
                  [ordinary.wake_id]
                )
+
+      assert Wakes.get(ctx.db, blocked.wake_id).state == "pending"
+      assert Wakes.get(ctx.db, accepted.wake_id).delivered_turn_seq == accepted_seq
+      assert Wakes.get(ctx.db, canceled.wake_id).state == "canceled"
+      assert Wakes.get(ctx.db, undelivered.wake_id).state == "canceled"
+      assert Wakes.get(ctx.db, ambiguous.wake_id).state == "pending"
 
       assert {:ok, [["pending"]]} =
                DB.query(
