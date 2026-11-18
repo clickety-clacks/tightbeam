@@ -354,13 +354,20 @@ defmodule Tightbeam.HarklightSend do
       op_id = Id.uuid4()
       request = args ++ ["--op-id", op_id]
 
-      case HarklightWakes.prepare_change(db, call, op_id, message, command, request) do
+      case HarklightWakes.prepare_change(
+             db,
+             call,
+             op_id,
+             message,
+             journal_command(command),
+             request
+           ) do
         %{state: "pending"} ->
           finish_change(
             db,
             record,
             op_id,
-            command,
+            journal_command(command),
             invoke(runner, request, "committed", op_id),
             command
           )
@@ -469,6 +476,35 @@ defmodule Tightbeam.HarklightSend do
 
   defp resolved(%{state: "pending", message_id: id}), do: {:error, {:unresolved, id}}
   defp resolved(_), do: :ok
+
+  defp journal_command("progress"), do: "revise"
+  defp journal_command(command), do: command
+
+  defp valid_progress?(percent, stage, note) do
+    is_integer(percent) and percent >= 0 and percent <= 100 and
+      is_binary(stage) and String.trim(stage) != "" and (is_nil(note) or is_binary(note))
+  end
+
+  defp change_args("progress", p, record) do
+    if Enum.all?(Map.keys(p), &(&1 in ~w(message_id percent stage note)a)) and
+         valid_progress?(p[:percent], p[:stage], p[:note]) do
+      args = [
+        "progress",
+        "--session",
+        record.handle,
+        "--request",
+        record.message_id,
+        "--percent",
+        to_string(p.percent),
+        "--stage",
+        p.stage
+      ]
+
+      {:ok, if(is_nil(p[:note]), do: args, else: args ++ ["--note", p.note])}
+    else
+      {:error, "invalid_harklight_progress"}
+    end
+  end
 
   defp change_args("retract", params, record) do
     if Map.keys(params) == [:message_id],
@@ -629,13 +665,16 @@ defmodule Tightbeam.HarklightSend do
     allowed =
       ~w(
         harklight_session sender_id title message_type message_kind importance stake by_when reply
-        body choices files answer_ui vendor_session_id supersedes decision_request_id
+        body choices files answer_ui vendor_session_id supersedes decision_request_id progress progress_stage progress_note
       )a
 
     session = params[:harklight_session]
     sender = params[:sender_id]
     title = params[:title]
-    message_type = params[:message_type]
+    progress = params[:progress]
+    progress_stage = params[:progress_stage]
+    progress_note = params[:progress_note]
+    message_type = params[:message_type] || if(not is_nil(progress), do: "fyi")
     message_kind = params[:message_kind]
     importance = params[:importance]
     stake = params[:stake]
@@ -679,6 +718,14 @@ defmodule Tightbeam.HarklightSend do
                (is_binary(decision_request_id) and
                   Regex.match?(@decision_request_id, decision_request_id))) ->
         {:error, "invalid_harklight_send"}
+
+      not is_nil(progress) and
+          (not valid_progress?(progress, progress_stage, progress_note) or message_type != "fyi" or
+             choices != [] or reply == true or not is_nil(answer_ui)) ->
+        {:error, "invalid_harklight_progress"}
+
+      is_nil(progress) and (not is_nil(progress_stage) or not is_nil(progress_note)) ->
+        {:error, "invalid_harklight_progress"}
 
       is_nil(message_type) ->
         {:error, "harklight_type_required"}
@@ -746,6 +793,9 @@ defmodule Tightbeam.HarklightSend do
            answer_ui: answer_ui,
            vendor: vendor,
            supersedes: supersedes,
+           progress: progress,
+           progress_stage: progress_stage,
+           progress_note: progress_note,
            decision_request_id: decision_request_id
          }}
     end
@@ -776,6 +826,19 @@ defmodule Tightbeam.HarklightSend do
 
     args = if input.session == "new", do: args ++ ["--route", "other", "--controller"], else: args
     args = args ++ ["--type", input.message_type]
+
+    args =
+      if is_nil(input.progress),
+        do: args,
+        else:
+          args ++
+            ["--progress", to_string(input.progress), "--progress-stage", input.progress_stage]
+
+    args =
+      if is_nil(input.progress_note),
+        do: args,
+        else: args ++ ["--progress-note", input.progress_note]
+
     args = if input.answer_ui, do: args ++ ["--answer-ui", input.answer_ui], else: args
     args = if input.message_kind, do: args ++ ["--kind", input.message_kind], else: args
     args = if input.importance, do: args ++ ["--importance", input.importance], else: args
@@ -801,6 +864,7 @@ defmodule Tightbeam.HarklightSend do
          is_binary(message["message_id"]) and message["message_id"] != "" and
          (message["supersedes"] || []) == input.supersedes and
          message["title"] == input.title and message["body"] == input.body and
+         prepared_progress?(message, input) and
          request["vendor_session_id"] == input.vendor and
          (input.session != "new" or request["route"] == "other") do
       {:ok, request, files}
@@ -810,6 +874,38 @@ defmodule Tightbeam.HarklightSend do
   end
 
   defp prepared_request(_, _, _), do: {:error, "harklight_prepared_mismatch"}
+
+  defp prepared_progress?(_message, %{progress: nil}), do: true
+
+  defp prepared_progress?(message, input) do
+    progress = message["progress"]
+
+    message["message_type"] == "fyi" and
+      message["answer_ui"] == %{
+        "schema" => "attention-client.actions/1",
+        "actions" => [
+          %{
+            "id" => "seen",
+            "label" => "Seen",
+            "kind" => "value",
+            "value" => %{"acknowledgment" => "seen"}
+          }
+        ]
+      } and
+      is_map(progress) and progress["percent"] == input.progress and
+      progress["stage"] == input.progress_stage and progress["note"] == input.progress_note and
+      is_binary(progress["updated_at"]) and valid_rfc3339?(progress["updated_at"]) and
+      progress["segments"] == [
+        %{
+          "stage" => input.progress_stage,
+          "width" => input.progress,
+          "note" => input.progress_note,
+          "visit_at" => progress["updated_at"],
+          "reported_percent" => input.progress,
+          "delta" => input.progress
+        }
+      ]
+  end
 
   defp handle_available(db, call, session_arg, handle) do
     case DB.query(db, "SELECT sessionKey,host FROM harklight_wake_handles WHERE handle=?1", [
@@ -922,7 +1018,7 @@ defmodule Tightbeam.HarklightSend do
     end
   rescue
     error ->
-      change? = Keyword.get(opts, :change, List.first(args) in ["revise", "retract"])
+      change? = Keyword.get(opts, :change, List.first(args) in ["revise", "retract", "progress"])
 
       reason =
         cond do
@@ -993,6 +1089,7 @@ defmodule Tightbeam.HarklightSend do
     case hd(args) do
       "retry" -> ["send", "retry"]
       "retract" -> ["withdraw"]
+      "progress" -> ["revise"]
       operation -> [operation]
     end
   end

@@ -1037,6 +1037,11 @@ defmodule Tightbeam.Gateway do
       {"harklight-send", []} => fn call ->
         HarklightSend.send_request(db, call, runner: Map.get(config, :harklight_send_runner))
       end,
+      {"harklight-progress", []} => fn call ->
+        HarklightSend.change_request(db, call, "progress",
+          runner: Map.get(config, :harklight_send_runner)
+        )
+      end,
       {"harklight-revise", []} => fn call ->
         HarklightSend.change_request(db, call, "revise",
           runner: Map.get(config, :harklight_send_runner)
