@@ -2806,7 +2806,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "Firehose cannot-proceed keeps sixteen-field attest shape and publishes no duplicate route",
+  test "Firehose cannot-proceed publishes an empty FYI array and no duplicate route",
        ctx do
     alias Tightbeam.Firehose.Hub
 
@@ -2836,6 +2836,7 @@ defmodule Tightbeam.AssignmentsTest do
     Hub.delivered(hub, self())
     assert_receive {:firehose_notice, %{"class" => "attest.filed", "payload" => attest}}
     assert attest["id"] == result.attest.id
+    assert attest["fyi"] == []
     Hub.delivered(hub, self())
     refute_receive {:firehose_notice, %{"class" => "assignment.closed"}}
 

@@ -118,6 +118,7 @@ defmodule Tightbeam.AttestFyiTest do
 
     assert completion.fyi == expected
     assert completion.attest.fyi == expected
+    assert Tightbeam.StateResources.attest(completion.attest)["fyi"] == expected
     assert completion.assignment.state == "closed"
     assert completion.assignment.outcome == "completed"
     assert read_back(ctx, ctx.code, completion.attest.id).fyi == expected

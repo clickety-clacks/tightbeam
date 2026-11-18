@@ -2781,9 +2781,9 @@ defmodule Tightbeam.CliIntegrationTest do
            } = machine_line!(refused)
   end
 
-  # Code-completion evidence remains required even when the org has no learned
-  # statutes; the refusal creates no remedy episode or wake.
-  test "real CLI requires code completion evidence on a rule-free org", ctx do
+  # Substrate evidence checks report missing facts without refusing completion;
+  # accepting the write creates no remedy episode or wake.
+  test "real CLI records missing code completion evidence as FYIs on a rule-free org", ctx do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     coder =
@@ -2832,21 +2832,31 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
-    {denied, denied_status} =
+    {accepted, accepted_status} =
       System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
         cd: coder_dir,
         stderr_to_stdout: true
       )
 
-    assert denied_status != 0
-    assert denied =~ "inapplicable_code_evidence"
+    assert accepted_status == 0
+    result = JSON.decode!(accepted)
 
-    assert {:ok, [["open", nil]]} =
+    expected = [
+      "FYI: this code assignment has no verified verdict from its holder; decide for yourself whether that is acceptable",
+      "FYI: this code assignment has no review conclusion; decide for yourself whether that is acceptable"
+    ]
+
+    assert result["fyi"] == expected
+    assert result["attest"]["fyi"] == expected
+
+    assert {:ok, [["closed", closing_attest_id]]} =
              DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
                work_id
              ])
 
-    assert {:ok, [[0]]} =
+    assert closing_attest_id == result["attest"]["id"]
+
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",

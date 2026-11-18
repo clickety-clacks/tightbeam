@@ -2078,7 +2078,7 @@ defmodule Tightbeam.StateResources do
 
   def attest(row) do
     reject_public_shape_drift!(row, "attests")
-    row |> public() |> closed_projection("attests")
+    row |> public() |> Map.put_new("fyi", []) |> closed_projection("attests")
   end
 
   def wake(nil), do: nil
