@@ -2002,7 +2002,7 @@ defmodule Tightbeam.Assignments do
         end
 
       id ->
-        {:replayed, fetch_assignment!(txn, id)}
+        {:replayed, RecordFyis.attach(txn, "assignment", fetch_assignment!(txn, id))}
     end
   end
 
