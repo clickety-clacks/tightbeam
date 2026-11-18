@@ -2267,16 +2267,28 @@ defmodule Tightbeam.HarklightWakesTest do
   end
 
   defp deliver_discussion_turn!(db, wake_id, session_key) do
-    assert {:ok, {:appended, ^session_key, _, _}} =
-             DB.transaction(db, fn txn ->
-               wake = Tightbeam.Wakes.get_in_txn(txn, wake_id)
+    result =
+      DB.transaction(db, fn txn ->
+        wake = Tightbeam.Wakes.get_in_txn(txn, wake_id)
 
-               Tightbeam.Gateway.deliver_prompt_in_txn(txn, session_key, wake.origin, wake.prompt,
-                 wake_id: wake_id,
-                 sender: wake.origin,
-                 fire_wake_in_txn: true
-               )
-             end)
+        Tightbeam.Gateway.deliver_prompt_in_txn(txn, session_key, wake.origin, wake.prompt,
+          wake_id: wake_id,
+          sender: wake.origin,
+          fire_wake_in_txn: true
+        )
+      end)
+
+    case result do
+      {:ok, {:appended, ^session_key, _, _}} ->
+        :ok
+
+      {:ok, {:staged, %{wake_id: ^wake_id}}} ->
+        assert [_carrier] =
+                 Tightbeam.NoticeBatcher.recover(db, System.system_time(:millisecond) + 1)
+
+      other ->
+        flunk("discussion delivery failed: #{inspect(other)}")
+    end
 
     assert {:ok, turn} = Tightbeam.Ledger.claim_next(db, session_key, "discussion-test")
     turn
@@ -2939,22 +2951,20 @@ defmodule Tightbeam.HarklightWakesTest do
     end
   end
 
-  test "an exhausted attachment window is one failure toward the listener budget", %{db: db} do
+  test "an exhausted attachment window retries again while the conversation is open", %{db: db} do
     calls =
       attachment_sequence(
         List.duplicate(
           {2, ~s({"kind":"refused","reason_source":"agent","reason_code":"transport_error"})},
           4
-        )
+        ) ++
+          [{0, ~s({"kind":"attached","ready_for_listen":true})}]
       )
 
     start_supervised!({HarklightWakes, db: db, attach_retry_delays: [1], retry_delays: [1]})
-
-    # Two workers, each spending its own window, then gone. Nothing follows.
-    expected = ["attach", "attach", "attach", "attach", "session"]
-    assert eventually(fn -> File.read!(calls) |> String.split("\n", trim: true) == expected end)
-    Process.sleep(100)
-    assert File.read!(calls) |> String.split("\n", trim: true) == expected
+    assert eventually(fn -> File.exists?(calls <> ".listening") end)
+    assert File.read!(calls) |> String.split("\n", trim: true) == List.duplicate("attach", 5)
+    assert {:ok, [["active"]]} = DB.query(db, "SELECT state FROM harklight_wake_handles")
   end
 
   test "retry window does not schedule an attempt beyond its deadline", %{db: db} do
@@ -4185,7 +4195,7 @@ defmodule Tightbeam.HarklightWakesTest do
     refute output =~ "session end"
   end
 
-  test "a running-origin outage reattaches within its budget without a blocker or replay", %{
+  test "a running-origin outage reattaches with one notice and no replay", %{
     db: db,
     session: session
   } do
@@ -4276,7 +4286,7 @@ defmodule Tightbeam.HarklightWakesTest do
                ["w_harklight_" <> @handle <> "_%"]
              )
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
                "w_harklight_notice_recovery_" <> @handle
              ])
@@ -4287,72 +4297,129 @@ defmodule Tightbeam.HarklightWakesTest do
     refute Enum.any?(commands, &String.starts_with?(&1, "session end "))
   end
 
-  test "a retryable running-gateway failure notifies only after bounded recovery is exhausted",
-       %{db: db} do
+  test "retryable listen failures keep recovering past the old budget with one notice", %{db: db} do
     gone_calls = fake_harklight_session_end_agent!()
     parent = self()
-    failures = :atomics.new(1, [])
 
     failure =
       {:harklight_failure, {"listener_stopped", "transport_error"}, "listen",
        ["origin request failed: simulated outage"]}
 
-    listener = fn manager, handle, _vendor_id ->
-      attempt = :atomics.add_get(failures, 1, 1)
-      :ok = GenServer.call(manager, {:finished, handle, failure})
-      send(parent, {:retryable_failure, attempt, self()})
-      receive do: (:exit_worker -> :ok)
+    listener = fn manager, handle, _ ->
+      send(parent, {:attempt, self()})
+
+      receive do
+        :fail ->
+          GenServer.call(manager, {:finished, handle, failure})
+
+        :recover ->
+          :ok = GenServer.call(manager, {:attached, handle})
+          send(parent, :recovered)
+          receive do: (:stop -> :ok)
+      end
     end
 
-    start_supervised!({HarklightWakes, db: db, listener: listener, retry_delays: [20]})
+    start_supervised!({HarklightWakes, db: db, listener: listener, retry_delays: [1]})
 
-    assert_receive {:retryable_failure, 1, first_worker}, 1_000
+    for _ <- 1..12 do
+      assert_receive {:attempt, worker}, 3000
+      ref = Process.monitor(worker)
+      send(worker, :fail)
+      assert_receive {:DOWN, ^ref, :process, ^worker, :normal}, 3000
+    end
 
-    assert {:ok, [[0]]} =
+    assert_receive {:attempt, worker}, 3000
+
+    assert {:ok, [[1]]} =
              DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
                "w_harklight_notice_recovery_" <> @handle
              ])
 
-    send(first_worker, :exit_worker)
-    assert_receive {:retryable_failure, 2, final_worker}, 1_000
+    refute File.exists?(gone_calls)
+    send(worker, :recover)
+    assert_receive :recovered, 3000
 
-    assert {:ok, [[0]]} =
-             DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
-               "w_harklight_notice_recovery_" <> @handle
+    assert {:ok, [["active", nil]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1", [
+               @handle
              ])
+  end
 
-    send(final_worker, :exit_worker)
+  test "many open conversations survive repeated transport failures and completed ones stop", %{
+    db: db,
+    session: session
+  } do
+    parent = self()
+    handles = [@handle | Enum.map(1..24, fn _ -> Tightbeam.Id.uuid4() end)]
 
-    assert eventually(fn ->
-             notice_recorded? =
-               match?(
-                 {:ok, [[1]]},
-                 DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId=?1", [
-                   "w_harklight_notice_recovery_" <> @handle
-                 ])
+    for handle <- tl(handles) do
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "INSERT INTO harklight_wake_handles(handle,sessionKey,host,vendorSessionId,state,createdAt,updatedAt) VALUES(?1,?2,?3,'vendor','active',2,2)",
+                 [handle, session.session_key, Placement.local_host_name()]
                )
+    end
 
-             gone_sent? =
-               case File.read(gone_calls) do
-                 {:ok, output} ->
-                   String.contains?(output, "session end --session #{@handle} --gone")
+    failure =
+      {:harklight_failure, {"attachment_refused", "transport_error"}, "attach",
+       ["origin transport request failed"]}
 
-                 {:error, _} ->
-                   false
-               end
+    listener = fn manager, handle, _ ->
+      send(parent, {:many_attempt, handle, self()})
 
-             notice_recorded? and gone_sent?
-           end)
+      receive do
+        :fail ->
+          GenServer.call(manager, {:finished, handle, failure})
 
-    assert {:ok, [["unavailable", error]]} =
+        :recover ->
+          :ok = GenServer.call(manager, {:attached, handle})
+          send(parent, {:many_recovered, handle, self()})
+          receive do: (:complete -> GenServer.call(manager, {:finished, handle, :complete}))
+      end
+    end
+
+    manager = start_supervised!({HarklightWakes, db: db, listener: listener, retry_delays: [1]})
+
+    for _ <- 1..12 do
+      attempts =
+        for _ <- handles do
+          assert_receive {:many_attempt, handle, worker}, 5000
+          {handle, worker}
+        end
+
+      assert MapSet.new(Enum.map(attempts, &elem(&1, 0))) == MapSet.new(handles)
+      Enum.each(attempts, fn {_, worker} -> send(worker, :fail) end)
+    end
+
+    for _ <- handles do
+      assert_receive {:many_attempt, _, worker}, 5000
+      send(worker, :recover)
+    end
+
+    for _ <- handles do
+      assert_receive {:many_recovered, _, worker}, 5000
+      ref = Process.monitor(worker)
+      send(worker, :complete)
+      assert_receive {:DOWN, ^ref, :process, ^worker, :normal}, 5000
+    end
+
+    assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+    assert :sys.get_state(manager).retry_timers == %{}
+    assert :sys.get_state(manager).priorities == %{}
+
+    assert {:ok, [[25]]} =
+             DB.query(db, "SELECT count(*) FROM harklight_wake_handles WHERE state='complete'")
+
+    assert {:ok, [[25]]} =
              DB.query(
                db,
-               "SELECT state,lastError FROM harklight_wake_handles WHERE handle=?1",
-               [@handle]
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_notice_recovery_%'"
              )
 
-    assert error =~ "listener_stopped"
-    refute_receive {:retryable_failure, 3, _worker}, 50
+    HarklightWakes.origin_ready(session.session_key)
+    assert :sys.get_state(manager).workers == %{}
+    refute_receive {:many_attempt, _, _}, 0
   end
 
   # Controller-side classification coverage. These are synthetic responses;
@@ -4368,7 +4435,7 @@ defmodule Tightbeam.HarklightWakesTest do
       code <- codes do
     @refusal_code code
     @refusal_attempts attempts
-    test "observed #{@refusal_code} reaches gone after #{@refusal_attempts} bounded attempts", %{
+    test "observed #{@refusal_code} preserves its retry classification", %{
       db: db
     } do
       path = Path.join(System.tmp_dir!(), "refusal-calls-#{System.unique_integer([:positive])}")
@@ -4386,32 +4453,54 @@ defmodule Tightbeam.HarklightWakesTest do
 
       fake_harklight_agent!("""
       printf '%s\n' "$*" >> '#{path}'
+      if [ "$1" = listen ]; then exec sleep 300; fi
       if [ "$1" = attach ]; then
+        count=$(wc -l < '#{path}' | tr -d ' ')
+        if [ "#{@refusal_attempts}" = 2 ] && [ "$count" -gt 3 ]; then
+          printf '%s\n' '{"kind":"attached","ready_for_listen":true}'
+          exit 0
+        fi
         printf '%s\n' '#{frame}'
         exit 2
       fi
       exit 0
       """)
 
-      # This measures the listener budget alone; transport codes would also
-      # spend the attachment retry window first.
       start_supervised!({HarklightWakes, db: db, retry_delays: [1], attach_retry_delays: []})
-      assert eventually(fn -> File.read!(path) =~ "session end --session #{@handle} --gone" end)
-      calls = File.read!(path) |> String.split("\n", trim: true)
-      assert Enum.count(calls, &String.starts_with?(&1, "attach ")) == @refusal_attempts
 
-      assert Enum.all?(
-               calls,
-               &(String.starts_with?(&1, "attach ") or
-                   &1 == "session end --session #{@handle} --gone")
-             )
+      if @refusal_attempts == 1 do
+        assert eventually(fn -> File.read!(path) =~ "session end --session #{@handle} --gone" end)
+        calls = File.read!(path) |> String.split("\n", trim: true)
+        assert Enum.count(calls, &String.starts_with?(&1, "attach ")) == 1
 
-      assert {:ok, [[error]]} = DB.query(db, "SELECT lastError FROM harklight_wake_handles")
-      assert error =~ "reason_code=#{@refusal_code}"
+        assert Enum.all?(
+                 calls,
+                 &(String.starts_with?(&1, "attach ") or
+                     &1 == "session end --session #{@handle} --gone")
+               )
+
+        assert {:ok, [[error]]} = DB.query(db, "SELECT lastError FROM harklight_wake_handles")
+        assert error =~ "reason_code=#{@refusal_code}"
+      else
+        assert eventually(fn -> File.read!(path) =~ "listen --follow --controller" end)
+        calls = File.read!(path) |> String.split("\n", trim: true)
+        assert Enum.count(calls, &String.starts_with?(&1, "attach ")) == 4
+        refute Enum.any?(calls, &String.starts_with?(&1, "session end "))
+
+        assert {:ok, [["active", nil]]} =
+                 DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+
+        assert {:ok, [[prompt]]} =
+                 DB.query(db, "SELECT prompt FROM wakes WHERE wakeId=?1", [
+                   "w_harklight_notice_recovery_" <> @handle
+                 ])
+
+        assert prompt =~ "reason_code=#{@refusal_code}"
+      end
     end
   end
 
-  test "successful quiet reattachments reset the consecutive failure budget", %{db: db} do
+  test "successful quiet reattachments reset backoff and later failures still recover", %{db: db} do
     calls = fake_harklight_session_end_agent!()
     test_pid = self()
 
@@ -4439,18 +4528,19 @@ defmodule Tightbeam.HarklightWakesTest do
       send(worker, :drop)
     end
 
-    # No captured event replenished the budget. After the final drop, its
-    # recovery attempt and one further retry can fail before reaching gone.
+    # No captured event is needed to reset backoff. Subsequent failures still
+    # recover beyond the former two-attempt allowance.
     assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
 
-    for _ <- 1..2 do
-      assert_receive {:listener_started, worker}, 1_000
+    for _ <- 1..5 do
+      assert_receive {:listener_started, worker}, 3000
       send(worker, :fail)
     end
 
-    assert eventually(fn ->
-             File.read(calls) == {:ok, "session end --session #{@handle} --gone\n"}
-           end)
+    assert_receive {:listener_started, worker}, 3000
+    send(worker, :attach)
+    assert_receive {:listener_attached, ^worker}, 3000
+    refute File.exists?(calls)
   end
 
   test "a releasing listener lock retries once then completes without gone", %{db: db} do
@@ -5213,7 +5303,9 @@ defmodule Tightbeam.HarklightWakesTest do
     refute Enum.any?(calls, &String.starts_with?(&1, "session end "))
   end
 
-  test "manual retry reports its recorded failure without scheduling another start", %{db: db} do
+  test "manual retry reports its recorded failure and keeps automatic recovery scheduled", %{
+    db: db
+  } do
     parent = self()
 
     assert {:ok, _} =
@@ -5241,7 +5333,7 @@ defmodule Tightbeam.HarklightWakesTest do
          db: db,
          listener: listener,
          send_runner: runner,
-         retry_delays: [1],
+         retry_delays: [60_000],
          attach_retry_delays: []}
       )
 
@@ -5264,7 +5356,9 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert eventually(fn ->
              state = :sys.get_state(manager)
-             state.workers == %{} and state.retry_timers == %{} and state.gone_tasks == %{}
+
+             state.workers == %{} and Map.has_key?(state.retry_timers, @handle) and
+               state.gone_tasks == %{}
            end)
 
     assert :sys.get_state(manager).manual_starts == MapSet.new()
@@ -5480,17 +5574,16 @@ defmodule Tightbeam.HarklightWakesTest do
              ])
   end
 
-  test "retry exhaustion marks gone and serializes later activation", %{db: db} do
+  test "permanent refusal marks gone and serializes later activation", %{db: db} do
     calls = fake_harklight_session_end_agent!(0, wait_for_session_end: true)
     test_pid = self()
 
     listener = fn manager, handle, _vendor ->
       send(test_pid, :attempt)
-      GenServer.call(manager, {:finished, handle, "listener_stopped"})
+      GenServer.call(manager, {:finished, handle, "listener_unsupported"})
     end
 
     start_supervised!({HarklightWakes, db: db, listener: listener, retry_delays: [1]})
-    assert_receive :attempt
     assert_receive :attempt
 
     assert eventually(fn ->
