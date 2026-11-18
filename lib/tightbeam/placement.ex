@@ -606,6 +606,14 @@ defmodule Tightbeam.Placement do
           else: ensure_opts
 
       ensure_workdir(host, path, content, ensure_opts)
+
+      ensure_session_rail_scope(
+        host,
+        path,
+        Rails.session_scope_content(holder_session.archetype),
+        ensure_opts
+      )
+
       path
     end
   end
@@ -635,6 +643,7 @@ defmodule Tightbeam.Placement do
     if Tightbeam.Ephemeral.session?(config.db, session.session_key) do
       host = fetch_session_host!(config, session)
       sh = Map.get(config, :sh, &system_cmd/1)
+      sh_out = Map.get(config, :sh_out, &system_cmd_out/1)
 
       run = fn args ->
         invocation = if host.ssh == nil, do: args, else: ["ssh" | @ssh_opts] ++ [host.ssh | args]
@@ -683,6 +692,15 @@ defmodule Tightbeam.Placement do
           {^cleaner, :directory, path} -> path
           {:DOWN, ^ref, :process, ^cleaner, reason} -> exit({:temporary_directory_failed, reason})
         end
+
+      ensure_session_rail_scope(
+        host,
+        path,
+        Rails.session_scope_content(session.archetype),
+        base_dir: config.base_dir,
+        sh: sh,
+        sh_out: sh_out
+      )
 
       Process.put({__MODULE__, :turn_directory}, path)
 
@@ -1168,8 +1186,9 @@ defmodule Tightbeam.Placement do
       "mkdir -p #{path} && " <>
         "{ find #{file} -maxdepth 0 -perm 600 -print 2>/dev/null | grep -q . && cat #{file} 2>/dev/null; true; } && " <>
         "if [ -d #{path}/.git/info ]; then " <>
-        "grep -qxF .tightbeam-session #{path}/.git/info/exclude 2>/dev/null || " <>
-        ~s(printf "\\n%s\\n" .tightbeam-session >> #{path}/.git/info/exclude; fi)
+        "for entry in .tightbeam-session #{Rails.session_scope_filename()}; do " <>
+        "grep -qxF \"$entry\" #{path}/.git/info/exclude 2>/dev/null || " <>
+        "printf '\\n%s\\n' \"$entry\" >> #{path}/.git/info/exclude; done; fi"
 
     {current, code} =
       sh_out.(["ssh" | @ssh_opts] ++ [dest, "sh", "-c", shell_quote(script)])
@@ -1214,7 +1233,73 @@ defmodule Tightbeam.Placement do
         separator = if existing == "" or String.ends_with?(existing, "\n"), do: "", else: "\n"
         File.write!(exclude, existing <> separator <> ".tightbeam-session\n")
       end
+
+      existing = if File.exists?(exclude), do: File.read!(exclude), else: ""
+      lines = String.split(existing, "\n")
+
+      if Rails.session_scope_filename() not in lines do
+        separator = if existing == "" or String.ends_with?(existing, "\n"), do: "", else: "\n"
+        File.write!(exclude, existing <> separator <> Rails.session_scope_filename() <> "\n")
+      end
     end
+  end
+
+  defp ensure_session_rail_scope(%{ssh: nil}, path, content, _opts) do
+    File.mkdir_p!(path)
+    file = Path.join(path, Rails.session_scope_filename())
+    current = if File.exists?(file), do: File.read!(file), else: nil
+    mode = if File.exists?(file), do: File.stat!(file).mode &&& 0o777, else: nil
+
+    if current != content or mode != 0o644 do
+      File.write!(file, content)
+      File.chmod!(file, 0o644)
+    end
+
+    heal_git_exclude(path)
+    :ok
+  end
+
+  defp ensure_session_rail_scope(%{ssh: dest}, path, content, opts) do
+    sh = Keyword.get(opts, :sh, &system_cmd/1)
+    sh_out = Keyword.get(opts, :sh_out, &system_cmd_out/1)
+    file = Path.join(path, Rails.session_scope_filename())
+
+    case sh_out.(["ssh" | @ssh_opts] ++ [dest, "cat", file]) do
+      {^content, 0} ->
+        :ok
+
+      _ ->
+        stage =
+          Path.join([
+            Keyword.fetch!(opts, :base_dir),
+            "staging",
+            "session-files",
+            Path.basename(path) <> "-scope-#{System.unique_integer([:positive])}"
+          ])
+
+        stage_file = Path.join(stage, Rails.session_scope_filename())
+        File.mkdir_p!(stage)
+
+        try do
+          File.write!(stage_file, content)
+          File.chmod!(stage_file, 0o644)
+
+          run!(sh, [
+            "rsync",
+            "-a",
+            "-e",
+            Enum.join(["ssh" | @ssh_opts], " "),
+            stage_file,
+            "#{dest}:#{path}/"
+          ])
+        after
+          File.rm_rf!(stage)
+        end
+    end
+
+    run!(sh, ["ssh" | @ssh_opts] ++ [dest, "chmod", "644", file])
+
+    :ok
   end
 
   @doc """
@@ -1522,7 +1607,7 @@ defmodule Tightbeam.Placement do
         remote_env: remote_env,
         lineage: lineage,
         model: Map.get(target, :default_model),
-        rails: Rails.hook_settings(),
+        rails: Rails.hook_settings(harness),
         statutes: Rails.statutes?(),
         ensure_workdir: &ensure_workdir/4,
         sh_out: Map.get(config, :sh_out)
@@ -1943,8 +2028,9 @@ defmodule Tightbeam.Placement do
         if Keyword.has_key?(opts, :sh), do: sh, else: &system_cmd_out/1
       end)
 
-    rails = Rails.hook_settings()
-    # Reserved rails call the `tightbeam` helper (and `gh`) by bare name; Cursor's
+    rails = Rails.hook_settings(harness)
+    # The GitHub statute check and artifact observation call the `tightbeam`
+    # helper (and `gh`) by bare name; Cursor's
     # wrapper carries the same PATH common_env gives every harness (see
     # CursorRails) because the dedicated identity's launcher pins PATH.
     # Only Cursor carries it; other harnesses must not require `cli_bin` here

@@ -1,7 +1,15 @@
 use super::bank::Gh;
-use super::probe::check_github_ready;
+use super::probe::check_github_ready_with_template;
 
 pub(super) fn check_tool_call_with(raw: &str, gh: &impl Gh) -> Result<(), String> {
+    check_tool_call_with_template(raw, gh, None)
+}
+
+pub(super) fn check_tool_call_with_template(
+    raw: &str,
+    gh: &impl Gh,
+    text_template: Option<&str>,
+) -> Result<(), String> {
     let mut remotes = Vec::new();
     let mut gh_repo = false;
 
@@ -54,12 +62,12 @@ pub(super) fn check_tool_call_with(raw: &str, gh: &impl Gh) -> Result<(), String
     }
 
     if remotes.is_empty() {
-        return check_github_ready("github.com", None, gh);
+        return check_github_ready_with_template("github.com", None, gh, text_template);
     }
 
     for remote in remotes {
         let hostname = github_hostname_from_remote(&remote).unwrap_or_else(|| "github.com".into());
-        check_github_ready(&hostname, Some(&remote), gh)?;
+        check_github_ready_with_template(&hostname, Some(&remote), gh, text_template)?;
     }
     Ok(())
 }

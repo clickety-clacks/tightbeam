@@ -7,6 +7,7 @@ kind = "remedy"
 source = "mechanism §C1 target schemas"
 legibility = "event:denied(rule=remedy-action-breadth);lifecycle:rail_remedy"
 [[fixture.rule]]
+archetypes = ["*"]
 name = "remedy-action-breadth"
 verb = "attest"
 text = "assign wake and spawn remedies resolve declared targets"
@@ -25,6 +26,7 @@ subject = "review {assignment_id}"
 reviews = "{assignment_id}"
 
 [[fixture.rule]]
+archetypes = ["*"]
 name = "remedy-action-wake"
 verb = "attest"
 text = "wake remedy resolves a declared target session"
@@ -43,6 +45,7 @@ prompt = "review {assignment_id}"
 after = 60000
 
 [[fixture.rule]]
+archetypes = ["*"]
 name = "remedy-action-spawn"
 verb = "attest"
 text = "spawn remedy resolves its declared identity"

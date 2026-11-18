@@ -211,7 +211,7 @@ if phase == "deliver" do
 
   for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
     File.cp!(
-      Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
+      Path.join([:code.priv_dir(:tightbeam), "seed/rules", name]),
       Path.join(rules, name)
     )
   end

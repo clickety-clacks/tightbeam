@@ -181,7 +181,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         | Command::CommandHelp(_)
         | Command::IdentityCurrent
         | Command::Doctor { .. }
-        | Command::GithubAuthCheck
+        | Command::GithubAuthCheck { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_)
         | Command::SessionConnect { .. } => {
@@ -3856,7 +3856,9 @@ where
         Command::SessionConnect { .. } => {
             unreachable!("session-connect is routed before the shared dispatcher")
         }
-        Command::GithubAuthCheck => crate::github_auth::check_tool_call_stdin(),
+        Command::GithubAuthCheck { text_template } => {
+            crate::github_auth::check_tool_call_stdin(text_template.as_deref())
+        }
         Command::Onboard {
             identity,
             owner_user_id,
@@ -4189,7 +4191,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::ToolCallObserved
-        | Command::GithubAuthCheck
+        | Command::GithubAuthCheck { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
     }

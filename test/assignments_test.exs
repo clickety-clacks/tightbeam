@@ -270,6 +270,30 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert retired.retired_session_keys == ["holder"]
     assert Org.get(ctx.db, "holder").state == "retired"
+
+    assert {:ok, [["closed", "revoked"]]} =
+             DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [linked.id])
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM work_items WHERE id=?1", [item.id])
+
+    assert {:ok, [[canceled_notice]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT c.wakeId FROM wake_cancellations c JOIN wakes w ON w.wakeId=c.wakeId
+               WHERE w.assignmentId=?1 AND w.state='canceled'
+                 AND c.requesterId='tightbeam:retirement'
+                 AND c.reasonKind='obligation_disposed'
+                 AND c.causalSourceKind='assignment_transition' AND c.causalSourceId=?1
+                 AND c.outcomeKind='disposition'
+                 AND c.dispositionKind='assignment_transition' AND c.dispositionId=?1
+                 AND c.livenessTriggerKind IS NULL AND c.actionNeeded=0
+               """,
+               [linked.id]
+             )
+
+    assert is_binary(canceled_notice)
   end
 
   describe "attest notices to assignment openers" do
@@ -6459,6 +6483,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     File.write!(Path.join(base, "identity/rules/deny.toml"), """
     [[rule]]
+    archetypes = ["*"]
     name = "deny-assign"
     verb = "assign"
     text = "assign denied"
@@ -6637,6 +6662,9 @@ defmodule Tightbeam.AssignmentsTest do
     Rules.load!(rules_base, Map.keys(ctx.handlers))
     on_exit(fn -> File.rm_rf!(rules_base) end)
 
+    qualified_coder =
+      session(ctx.db, "qualified-coder", "flynn", %{archetype: "agentic-engineering.coder"})
+
     work_item = create_work_item(ctx, "unlinked review completion")
     other_work_item = create_work_item(ctx, "unrelated review work")
     commit = String.duplicate("a", 40)
@@ -6645,6 +6673,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     producer =
       assign_call({:user, "flynn"}, "producer", nil, work_item.id)
+      |> Map.put(:session_key, qualified_coder.session_key)
       |> put_in([:params, :effect_kind], "code")
       |> then(&handle(ctx, "assign", &1))
 
@@ -6663,7 +6692,7 @@ defmodule Tightbeam.AssignmentsTest do
              |> then(&handle(ctx, "attest", &1))
 
     assert %{attest: %{verdictKind: "verified"}} =
-             attest_call({:session, "holder"}, producer.id, "verdict")
+             attest_call({:session, qualified_coder.session_key}, producer.id, "verdict")
              |> put_in([:params, :verdict_kind], "verified")
              |> put_in([:params, :commit_refs], producer_refs)
              |> then(&handle(ctx, "attest", &1))
@@ -6671,12 +6700,15 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(
              ctx.db,
              producer.id,
-             "holder",
+             qualified_coder.session_key,
              producer_refs
            ) == []
 
     assert {:deny, %{rule: "completion-requires-review"}} =
-             Rules.evaluate(ctx.db, attest_call({:session, "holder"}, producer.id, "completion"))
+             Rules.evaluate(
+               ctx.db,
+               attest_call({:session, qualified_coder.session_key}, producer.id, "completion")
+             )
 
     review =
       assign_call({:user, "flynn"}, "same-item review", nil, work_item.id)
@@ -6695,7 +6727,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(
              ctx.db,
              producer.id,
-             "holder",
+             qualified_coder.session_key,
              producer_refs
            ) == [
              "reviewed-clean"
@@ -6707,7 +6739,7 @@ defmodule Tightbeam.AssignmentsTest do
                  Dispatch.dispatch(
                    ctx.db,
                    ctx.handlers,
-                   attest_call({:session, "holder"}, producer.id, "completion")
+                   attest_call({:session, qualified_coder.session_key}, producer.id, "completion")
                  )
       end)
 

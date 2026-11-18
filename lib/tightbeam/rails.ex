@@ -51,56 +51,52 @@ defmodule Tightbeam.Rails do
   Rails-tier denial on both harnesses is for a cooperative agent — enumerated
   call denial, wired proven at boot for codex, not a sandbox or tamper-proof.
   Malicious/config-hostile actors are out of scope equally for both harnesses.
-  Reserved for later stages, refused by name at load: `mode = "block"` and
-  `check` predicates.
+  `check` selects one of the two checks carried by a TOML statute:
+  `github-auth` and `spawn-probe`.
 
-  Loading is boot-time and fail-closed: `<base_dir>/identity/rails/*.toml`
-  in filename order, every statute validated before the set is stored in
-  `:persistent_term`; a malformed statute fails the boot (bad law stops
-  the boot). Statute changes ride the home's extra_files into the manifest
-  hash: a law change is an identity change and regenerates homes.
+  Loading is boot-time and fail-closed: substrate files under
+  `<base_dir>/identity/rails/*.toml` and receipt-owned kungfu files under
+  `<base_dir>/identity/kungfu/*/rails/*.toml` are loaded in path order. Every
+  statute is validated before the set is stored in
+  `:persistent_term`; a malformed statute is logged and replaced by a
+  catch-all refusal. Statute changes ride the home's `extra_files` into the
+  manifest hash: a law change is an identity change and regenerates homes.
 
-  Hook commands are self-contained (no file paths, no environment
-  dependencies — homes live at different paths on gateway, staging, and
-  satellites). Pattern statutes match their POSIX ERE against the RAW
-  tool-call JSON on stdin, so no jq is required on satellites; patterns
-  should not rely on matching bare `"` characters, which arrive
-  JSON-escaped. Closed action statutes parse `tool_input.command` and classify
-  executable argv instead, so quoted prose cannot impersonate an action.
+  Hook settings stay self-contained: commands embed no home paths and need no
+  gateway connection. During per-session workdir provisioning, this module
+  compiles the session's active statute names with the shared
+  `Tightbeam.RailScope` matcher and writes them beside the qualified archetype
+  in a non-secret sidecar. Hook wrappers consult that compiled name set only
+  after their statute pattern or action matches. This keeps calls outside a
+  statute's pattern on the 0.1.16 pass path and avoids starting a BEAM runtime
+  per tool call. Pattern statutes match their POSIX ERE against the RAW
+  tool-call JSON on stdin, so no jq is required on satellites; patterns should
+  not rely on matching bare `"` characters, which arrive JSON-escaped. Closed
+  action statutes parse `tool_input.command` and classify executable argv
+  instead, so quoted prose cannot impersonate an action.
   """
 
   @persist_key __MODULE__
+  @session_scope_filename ".tightbeam-rail-scope.json"
   @statute_keys MapSet.new([
                   "name",
                   "on",
                   "mode",
                   "text",
                   "check",
+                  "archetypes",
                   "tool",
                   "pattern",
                   "action"
                 ])
   @actions ~w(git-stash git-reset-hard git-clean-force git-checkout-discard git-restore)
-  @probe_statute %{
-    name: "tightbeam-probe",
-    on: :tool_call,
-    mode: :gate,
-    tool: "Bash",
-    pattern: "tightbeam-gate-probe",
-    text: "Spawn wiring-check probe command; always refused by design."
-  }
   # Deliberately loose on what sits between the two words — the agent may write
   # `tightbeam  artifact-record`, or reach the binary by path. Loose is the right
   # direction here: a false match opens a window the record then binds, which is
   # the same turn it would have bound anyway, while a miss silently downgrades a
   # correct agent's evidence.
   @observation_pattern "tightbeam[^\"]*artifact-record"
-  # A cheap prefilter only — it may over-match freely (the CLI judges
-  # operations vs mentions), but it must never exclude an operation the CLI
-  # would gate. Every network-capable `git` verb reaches the checker because a
-  # named remote has no github.com literal. Local-only git commands still exit
-  # at the prefilter and never pay for a CLI process.
-  @github_auth_pattern "(github\\.com|gh[[:space:]]+(repo|pr|issue|api)|git[[:space:]]+(clone|fetch|pull|push|ls-remote|remote|submodule))"
+  @checks ~w(github-auth spawn-probe)
 
   @typedoc "A validated gate statute."
   @type statute :: %{
@@ -110,6 +106,8 @@ defmodule Tightbeam.Rails do
           tool: String.t(),
           pattern: String.t() | nil,
           action: String.t() | nil,
+          check: String.t() | nil,
+          archetypes: [String.t()],
           text: String.t()
         }
 
@@ -121,10 +119,7 @@ defmodule Tightbeam.Rails do
   @spec load!(String.t()) :: [statute()]
   def load!(base_dir) do
     statutes =
-      base_dir
-      |> Path.join("identity/rails/*.toml")
-      |> Path.wildcard()
-      |> Enum.sort()
+      statute_paths(base_dir)
       |> Enum.flat_map(fn path ->
         try do
           manifest = path |> File.read!() |> Toml.decode!()
@@ -135,7 +130,7 @@ defmodule Tightbeam.Rails do
               |> Enum.with_index(1)
               |> Enum.map(fn {raw, ordinal} ->
                 try do
-                  validate!(raw)
+                  validate!(raw, base_dir, path)
                 rescue
                   error ->
                     require Logger
@@ -147,12 +142,19 @@ defmodule Tightbeam.Rails do
                     tool = if is_map(raw), do: Map.get(raw, "tool"), else: nil
 
                     %{
-                      name: "unavailable-#{Path.basename(path, ".toml")}-#{ordinal}",
+                      name:
+                        qualified_name(
+                          base_dir,
+                          path,
+                          "unavailable-#{Path.basename(path, ".toml")}-#{ordinal}"
+                        ),
                       on: :tool_call,
                       mode: :gate,
                       tool: if(is_binary(tool) and String.trim(tool) != "", do: tool, else: ".*"),
                       pattern: ".*",
                       action: nil,
+                      check: nil,
+                      archetypes: fallback_archetypes(base_dir, path),
                       text: "Rail #{Path.basename(path)} entry #{ordinal} requires repair"
                     }
                 end
@@ -168,12 +170,15 @@ defmodule Tightbeam.Rails do
 
             [
               %{
-                name: "unavailable-" <> Path.basename(path, ".toml"),
+                name:
+                  qualified_name(base_dir, path, "unavailable-" <> Path.basename(path, ".toml")),
                 on: :tool_call,
                 mode: :gate,
                 tool: ".*",
                 pattern: ".*",
                 action: nil,
+                check: nil,
+                archetypes: fallback_archetypes(base_dir, path),
                 text: "Tool operations unavailable until rail #{Path.basename(path)} is repaired"
               }
             ]
@@ -199,6 +204,7 @@ defmodule Tightbeam.Rails do
             statute
             | pattern: ".*",
               action: nil,
+              check: nil,
               text: "Duplicate statute #{statute.name} requires repair"
           },
           else: statute
@@ -219,32 +225,49 @@ defmodule Tightbeam.Rails do
   the hook on the presence of GATE statutes would leave exactly the orgs that
   need the observation without one.
   """
-  @spec hook_settings() :: map()
-  def hook_settings do
+  @spec hook_settings(atom() | String.t()) :: map()
+  def hook_settings(harness) do
     statutes = :persistent_term.get(@persist_key, [])
+    statutes = Enum.filter(statutes, &enabled_for_harness?(&1, harness))
 
     %{
       "hooks" => %{
-        "PreToolUse" =>
-          Enum.map(statutes, &pre_tool_use_entry/1) ++ [github_auth_entry(), observation_entry()]
+        "PreToolUse" => Enum.map(statutes, &pre_tool_use_entry/1) ++ [observation_entry()]
       }
     }
+  end
+
+  @doc "The non-secret session scope sidecar filename."
+  @spec session_scope_filename() :: String.t()
+  def session_scope_filename, do: @session_scope_filename
+
+  @doc "Compile the active statute names for the current qualified archetype into a session workdir sidecar."
+  @spec session_scope_content(String.t()) :: String.t()
+  def session_scope_content(archetype) when is_binary(archetype) do
+    statutes =
+      :persistent_term.get(@persist_key, [])
+      |> Enum.filter(fn statute ->
+        Tightbeam.RailScope.matches_agents?(statute.archetypes, [archetype])
+      end)
+      |> Enum.map(& &1.name)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    JSON.encode!(%{"archetype" => archetype, "statutes" => statutes})
   end
 
   @doc """
   Whether any org LAW is loaded.
 
-  Distinct from `hook_settings/0` being present, which it now always is. Only law
+  Distinct from `hook_settings/1` being present, which it now always is. Only law
   can deny, so only law justifies the codex spawn wiring-check and its
   fail-closed boot: the reserved observation entry must never be able to block
   anything, a boot included.
   """
   @spec statutes?() :: boolean()
-  def statutes?, do: :persistent_term.get(@persist_key, []) != []
-
-  @doc "The compiled PreToolUse entry for the substrate-reserved codex spawn wiring-check."
-  @spec probe_entry() :: map()
-  def probe_entry, do: pre_tool_use_entry(@probe_statute)
+  def statutes? do
+    Enum.any?(:persistent_term.get(@persist_key, []), &is_nil(&1.check))
+  end
 
   @doc """
   The compiled PreToolUse entry for the substrate-reserved artifact-record
@@ -277,33 +300,8 @@ defmodule Tightbeam.Rails do
     }
   end
 
-  @doc """
-  The reserved GitHub auth gate. It is not operator law; it is platform
-  hygiene for a known credential seam. Non-GitHub commands exit immediately,
-  while GitHub-dependent shell calls ask the local CLI to prove host auth before
-  git can fall through to an interactive username/PAT prompt.
-  """
-  @spec github_auth_entry() :: map()
-  def github_auth_entry do
-    payload =
-      "input=$(cat); printf '%s' \"$input\" | " <>
-        "grep -qE \"#{escape_double_quoted(@github_auth_pattern)}\" - || exit 0; " <>
-        "printf '%s' \"$input\" | tightbeam github-auth-check || exit 2; exit 0"
-
-    %{
-      "matcher" => "Bash",
-      "hooks" => [
-        %{"type" => "command", "command" => "sh -c '" <> escape_single_quotes(payload) <> "'"}
-      ]
-    }
-  end
-
-  defp validate!(statute) when is_map(statute) do
+  defp validate!(statute, base_dir, path) when is_map(statute) do
     keys = Map.keys(statute) |> MapSet.new()
-
-    if MapSet.member?(keys, "check") do
-      raise ArgumentError, ~s|"check" (predicate statutes) is reserved for a later stage|
-    end
 
     unknown = keys |> MapSet.difference(@statute_keys) |> MapSet.to_list() |> Enum.sort()
 
@@ -312,6 +310,46 @@ defmodule Tightbeam.Rails do
     end
 
     name = Map.get(statute, "name")
+
+    check = Map.get(statute, "check")
+
+    if MapSet.member?(keys, "check") and check not in @checks do
+      raise ArgumentError,
+            "statute #{inspect(name)} in #{path} has unsupported check value #{inspect(check)}; " <>
+              "allowed values: #{Enum.join(@checks, ", ")}"
+    end
+
+    action = Map.get(statute, "action")
+
+    if not is_nil(check) and MapSet.member?(keys, "action") do
+      raise ArgumentError,
+            "statute #{inspect(name)} in #{path} cannot combine check value #{inspect(check)} " <>
+              "with action #{inspect(action)}; allowed check values: #{Enum.join(@checks, ", ")}"
+    end
+
+    archetypes =
+      case Map.fetch(statute, "archetypes") do
+        :error ->
+          []
+
+        {:ok, names} when is_list(names) ->
+          unless Enum.all?(names, &is_binary/1) do
+            raise ArgumentError,
+                  "statute #{inspect(name)} in #{path} archetypes must be a list of strings"
+          end
+
+          names
+
+        {:ok, other} ->
+          raise ArgumentError,
+                "statute #{inspect(name)} in #{path} archetypes must be a list of strings, " <>
+                  "got #{inspect(other)}"
+      end
+
+    owner =
+      Tightbeam.Identity.Provenance.owner_for_path(base_dir, Path.relative_to(path, base_dir))
+
+    validate_archetypes!(name, path, base_dir, owner, archetypes)
 
     cond do
       is_nil(name) ->
@@ -323,6 +361,8 @@ defmodule Tightbeam.Rails do
       true ->
         :ok
     end
+
+    qualified_name = Tightbeam.Identity.Provenance.qualify(owner, name)
 
     on =
       case Map.fetch(statute, "on") do
@@ -354,7 +394,6 @@ defmodule Tightbeam.Rails do
     end
 
     pattern = Map.get(statute, "pattern")
-    action = Map.get(statute, "action")
 
     case {pattern, action} do
       {pattern, nil} when is_binary(pattern) ->
@@ -392,32 +431,80 @@ defmodule Tightbeam.Rails do
     end
 
     %{
-      name: name,
+      name: qualified_name,
       on: on,
       mode: mode,
       tool: String.trim(tool),
       pattern: pattern,
       action: action,
+      check: check,
+      archetypes: archetypes,
       text: String.trim(text)
     }
   end
 
+  defp validate_archetypes!(_name, _path, _base_dir, :substrate, _archetypes), do: :ok
+
+  defp validate_archetypes!(name, path, base_dir, {:kungfu, kungfu}, archetypes) do
+    allowed =
+      base_dir
+      |> Tightbeam.Identity.Provenance.archetype_names(kungfu)
+      |> Enum.map(&Tightbeam.Identity.Provenance.qualify({:kungfu, kungfu}, &1))
+
+    invalid = Enum.reject(archetypes, &(&1 in allowed))
+
+    if invalid != [] do
+      raise ArgumentError,
+            "statute #{inspect(name)} in #{path} has out-of-scope archetypes " <>
+              "#{inspect(invalid)}; allowed names for #{kungfu}: #{Enum.join(allowed, ", ")}"
+    end
+  end
+
+  defp fallback_archetypes(base_dir, path) do
+    case Tightbeam.Identity.Provenance.owner_for_path(base_dir, Path.relative_to(path, base_dir)) do
+      :substrate ->
+        ["*"]
+
+      {:kungfu, kungfu} ->
+        base_dir
+        |> Tightbeam.Identity.Provenance.archetype_names(kungfu)
+        |> Enum.map(&Tightbeam.Identity.Provenance.qualify({:kungfu, kungfu}, &1))
+    end
+  end
+
+  defp qualified_name(base_dir, path, name) do
+    relative_path = Path.relative_to(path, base_dir)
+    owner = Tightbeam.Identity.Provenance.owner_for_path(base_dir, relative_path)
+    Tightbeam.Identity.Provenance.qualify(owner, name)
+  end
+
+  defp statute_paths(base_dir) do
+    identity = Path.join(base_dir, "identity")
+
+    (Path.wildcard(Path.join(identity, "rails/*.toml")) ++
+       Path.wildcard(Path.join(identity, "kungfu/*/rails/*.toml")))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
   defp pre_tool_use_entry(statute) do
     action = Map.get(statute, :action)
-
-    predicate =
-      if action do
-        "tightbeam rail-action #{action}; status=$?; " <>
-          "if [ \"$status\" -eq 1 ]; then exit 0; fi; " <>
-          "if [ \"$status\" -ne 0 ]; then " <>
-          "echo \"[gate: #{statute.name}] action classifier failed closed (status $status).\" >&2; exit 2; fi"
-      else
-        "grep -qE \"#{escape_double_quoted(statute.pattern)}\" - || exit 0"
-      end
+    check = Map.get(statute, :check)
 
     payload =
-      predicate <>
-        "; echo \"[gate: #{statute.name}] #{escape_double_quoted(one_line(statute.text))}\" >&2; exit 2"
+      case check do
+        "github-auth" ->
+          github_auth_check_payload(statute)
+
+        "spawn-probe" ->
+          pattern_gate_payload(statute)
+
+        nil when not is_nil(action) ->
+          action_gate_payload(statute)
+
+        nil ->
+          pattern_gate_payload(statute)
+      end
 
     %{
       "matcher" => statute.tool,
@@ -425,6 +512,55 @@ defmodule Tightbeam.Rails do
         %{"type" => "command", "command" => "sh -c '" <> escape_single_quotes(payload) <> "'"}
       ]
     }
+  end
+
+  defp action_gate_payload(statute) do
+    action = Map.get(statute, :action)
+    scope = scope_check(statute)
+
+    "input=$(cat); printf '%s' \"$input\" | tightbeam rail-action #{action}; status=$?; " <>
+      "if [ \"$status\" -eq 1 ]; then exit 0; fi; " <>
+      "if [ \"$status\" -ne 0 ]; then " <>
+      "echo \"[gate: #{statute.name}] action classifier failed closed (status $status).\" >&2; exit 2; fi; " <>
+      scope <> generic_refusal(statute)
+  end
+
+  defp pattern_gate_payload(statute) do
+    scope = scope_check(statute)
+
+    "input=$(cat); printf '%s' \"$input\" | grep -qE \"#{escape_double_quoted(statute.pattern)}\" - || exit 0; " <>
+      scope <> generic_refusal(statute)
+  end
+
+  defp github_auth_check_payload(statute) do
+    "input=$(cat); " <>
+      "printf '%s' \"$input\" | " <>
+      "grep -qE \"#{escape_double_quoted(statute.pattern)}\" - || exit 0; " <>
+      scope_check(statute) <>
+      "printf '%s' \"$input\" | tightbeam github-auth-check --text-template " <>
+      "'#{escape_single_quotes(one_line(statute.text))}' || exit 2; exit 0"
+  end
+
+  defp scope_check(%{archetypes: ["*"]}), do: ""
+
+  defp scope_check(statute) do
+    "tightbeam rail-scope-check --statute " <>
+      "'#{escape_single_quotes(statute.name)}' >/dev/null 2>&1; status=$?; " <>
+      "if [ \"$status\" -eq 1 ]; then exit 0; fi; " <>
+      "if [ \"$status\" -ne 0 ]; then " <>
+      "echo \"[gate: #{statute.name}] archetype scope check failed (status $status).\" >&2; exit 2; fi; "
+  end
+
+  defp enabled_for_harness?(%{check: "spawn-probe"}, harness)
+       when harness in [:codex, :pi, "codex", "pi"],
+       do: true
+
+  defp enabled_for_harness?(%{check: "spawn-probe"}, _harness), do: false
+
+  defp enabled_for_harness?(_statute, _harness), do: true
+
+  defp generic_refusal(statute) do
+    "echo \"[gate: #{statute.name}] #{escape_double_quoted(one_line(statute.text))}\" >&2; exit 2"
   end
 
   defp one_line(text), do: text |> String.split() |> Enum.join(" ")

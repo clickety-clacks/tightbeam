@@ -58,6 +58,61 @@ defmodule Tightbeam.ClientE2E.Substrate do
     |> List.first()
   end
 
+  @doc "The identified user history rows for one post, in stream order."
+  @spec human_post_rows(base_dir(), String.t(), String.t()) :: [map()]
+  def human_post_rows(base_dir, session_key, client_message_id) do
+    query(base_dir, """
+    SELECT seq, id, deviceId, clientMessageId, timestamp
+    FROM messages
+    WHERE sessionKey = #{quote_string(session_key)}
+      AND role = 'user'
+      AND clientMessageId = #{quote_string(client_message_id)}
+    ORDER BY seq
+    """)
+  end
+
+  @doc """
+  Persisted batch paths for one staged human post, including its source identity,
+  membership, delivery wake and carrier turn. The source identity is retained on
+  its wake; direct posts have no batch membership and are not returned here.
+  """
+  @spec staged_post_members(base_dir(), String.t(), String.t()) :: [map()]
+  def staged_post_members(base_dir, session_key, client_message_id) do
+    query(base_dir, """
+    SELECT source.wakeId AS sourceWakeId,
+           json_extract(source.sourceClientIdentity, '$.deviceId') AS deviceId,
+           json_extract(source.sourceClientIdentity, '$.clientMessageId') AS clientMessageId,
+           json_extract(source.sourceClientIdentity, '$.createdAt') AS stagedAt,
+           member.memberId, member.batchId, member.state AS memberState,
+           member.publicationSeq,
+           batch.state AS batchState, batch.deliveryWakeId,
+           carrier.deliveredTurnSeq AS carrierTurnSeq,
+           carrier_turn.seq AS carrierSeq, carrier_turn.status AS carrierStatus,
+           carrier_turn.createdAt AS carrierCreatedAt,
+           carrier_turn.startedAt AS carrierStartedAt,
+           carrier_turn.endedAt AS carrierEndedAt,
+           carrier_turn.isBatchCarrier AS carrierIsBatchCarrier,
+           history.seq AS historySeq, history.id AS historyMessageId,
+           history.deviceId AS historyDeviceId,
+           history.clientMessageId AS historyClientMessageId,
+           history.timestamp AS historyTimestamp
+    FROM messages AS history
+    JOIN wakes AS source INDEXED BY notice_source_client_identity
+      ON json_extract(source.sourceClientIdentity, '$.targetSessionKey') = history.sessionKey
+     AND json_extract(source.sourceClientIdentity, '$.deviceId') = history.deviceId
+     AND json_extract(source.sourceClientIdentity, '$.clientMessageId') = history.clientMessageId
+    JOIN notice_batch_members AS member ON member.sourceWakeId = source.wakeId
+    LEFT JOIN notice_batches AS batch ON batch.batchId = member.batchId
+    LEFT JOIN wakes AS carrier ON carrier.wakeId = batch.deliveryWakeId
+    LEFT JOIN turns AS carrier_turn ON carrier_turn.seq = carrier.deliveredTurnSeq
+    WHERE source.sourceClientIdentity IS NOT NULL
+      AND history.sessionKey = #{quote_string(session_key)}
+      AND history.clientMessageId = #{quote_string(client_message_id)}
+      AND history.role = 'user'
+    ORDER BY member.addedAt, member.memberId
+    """)
+  end
+
   @doc """
   Waits until the turn for `client_message_id` reaches a terminal status.
 

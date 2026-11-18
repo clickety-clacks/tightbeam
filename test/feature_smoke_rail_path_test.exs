@@ -18,6 +18,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
   alias Tightbeam.Wire.Router
   alias Tightbeam.FeatureSmokeDriverFixture, as: Driver
 
+  defp substrate_wildcard_rules(contents),
+    do: Tightbeam.TestRailScopeFixtures.wildcard_substrate(contents)
+
   setup_all do
     # Compile the real script's module without its top-level online entrypoint.
     # Only visibility and module name change; HTTP, SQL, assertions, setup and
@@ -115,6 +118,46 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       """)
     end
 
+    kungfu = "agentic-engineering"
+    kungfu_root = Path.join(base, "identity/kungfu/#{kungfu}")
+    archetype_dir = Path.join(kungfu_root, "archetypes")
+    kungfu_rules_dir = Path.join(kungfu_root, "rules")
+
+    kungfu_archetypes =
+      ~w(
+        coder guidance-reviewer guidance-writer integrator orchestrator pdo
+        product-owner recon reviewer-code reviewer-spec spec-writer team-planner
+      )
+
+    File.mkdir_p!(archetype_dir)
+    File.mkdir_p!(kungfu_rules_dir)
+
+    for name <- kungfu_archetypes do
+      File.write!(Path.join(archetype_dir, "#{name}.toml"), """
+      name = "#{name}"
+      skills = []
+      where = ["*"]
+      [guidance]
+      text = "Disposable qualified rail-path fixture."
+      """)
+    end
+
+    delivery_rule = "kungfu/#{kungfu}/rules/delivery.toml"
+
+    File.cp!(
+      "priv/kungfu/agentic-engineering/rules/delivery.toml",
+      Path.join(kungfu_rules_dir, "delivery.toml")
+    )
+
+    owned_paths =
+      (Enum.map(kungfu_archetypes, &"kungfu/#{kungfu}/archetypes/#{&1}.toml") ++ [delivery_rule])
+      |> Enum.sort()
+
+    File.write!(
+      Path.join(kungfu_root, "installed.toml"),
+      "name = \"#{kungfu}\"\npaths = [#{Enum.map_join(owned_paths, ", ", &inspect/1)}]\n"
+    )
+
     Archetypes.load!(base)
     File.write!(Path.join(base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
     Tightbeam.RecoveryFixture.place_adapter!(base, seed_credential: false)
@@ -149,21 +192,15 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     File.mkdir_p!(Path.join(base, "identity/rules"))
 
     for name <- ~w(topology engineering verification) do
-      File.cp!(
-        "test/support/fixtures/feature_smoke_#{name}.toml",
-        Path.join(base, "identity/rules/#{name}.toml")
-      )
+      source = File.read!("test/support/fixtures/feature_smoke_#{name}.toml")
+
+      File.write!(Path.join(base, "identity/rules/#{name}.toml"), source)
     end
 
-    File.cp!(
-      "priv/kungfu/agentic-engineering/rules/delivery.toml",
-      Path.join(base, "identity/rules/delivery.toml")
-    )
-
     for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
-      File.cp!(
-        Path.join("priv/kungfu/agentic-engineering/rules", name),
-        Path.join([base, "identity/rules", name])
+      File.write!(
+        Path.join([base, "identity/rules", name]),
+        substrate_wildcard_rules(File.read!(Path.join("priv/seed/rules", name)))
       )
     end
 
@@ -460,20 +497,21 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       if ctx.profile == :published do
         # Current packaged completion is an accountable wake, not automatic staffing.
         # Keep all additional installed posture/test-receipt rules loaded as well.
-        installed = File.read!(Path.join(ctx.base, "identity/rules/engineering.toml"))
+        engineering_path = Path.join(ctx.base, "identity/rules/engineering.toml")
+
+        installed = File.read!(engineering_path)
         [_completion, rest] = String.split(installed, "# Re-entry twin", parts: 2)
 
         # The fixture's rest already carries the posture gate the shipped file
         # ends with; take only the shipped completion rule.
-        [shipped_completion | _] =
-          String.split(
-            File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"),
-            "\n# Posture gate",
-            parts: 2
-          )
+        shipped_completion =
+          File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+          |> String.split("\n# Posture gate", parts: 2)
+          |> hd()
+          |> substrate_wildcard_rules()
 
         File.write!(
-          Path.join(ctx.base, "identity/rules/engineering.toml"),
+          engineering_path,
           shipped_completion <> "\n# Re-entry twin" <> rest
         )
 
