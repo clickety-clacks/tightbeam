@@ -41,13 +41,13 @@
 # own; this suite reads no credential and signs in nowhere. To compare unfixed and
 # fixed code, run the suite unchanged against an instance running each build.
 #
-# With SWITCH_E2E_BASE_DIR unset every case is SKIPPED with the reason printed. A
+# With no SWITCH_E2E_* variables set every case is SKIPPED with the reason printed. A
 # partial or unsafe configuration fails setup and names what is missing.
 
 defmodule Tightbeam.RealAdapterSwitchE2E do
   @moduledoc false
 
-  @required ~w(SWITCH_E2E_OWNED_BASE SWITCH_E2E_USER SWITCH_E2E_CLAUDE_FROM
+  @required ~w(SWITCH_E2E_BASE_DIR SWITCH_E2E_OWNED_BASE SWITCH_E2E_USER SWITCH_E2E_CLAUDE_FROM
                SWITCH_E2E_CLAUDE_TO SWITCH_E2E_CODEX_FROM SWITCH_E2E_CODEX_TO)
 
   @skip_reason """
@@ -60,9 +60,12 @@ defmodule Tightbeam.RealAdapterSwitchE2E do
 
   def skip_reason, do: @skip_reason
 
-  @doc "nil when an instance is named; otherwise the skip reason."
+  @doc "nil when any suite configuration is supplied; otherwise the skip reason."
   def unconfigured do
-    if blank?(System.get_env("SWITCH_E2E_BASE_DIR")), do: @skip_reason, else: nil
+    configured? =
+      Enum.any?(System.get_env(), fn {name, _} -> String.starts_with?(name, "SWITCH_E2E_") end)
+
+    if configured?, do: nil, else: @skip_reason
   end
 
   @doc "True when this run explicitly selected the suite's tag."
@@ -87,14 +90,20 @@ defmodule Tightbeam.RealAdapterSwitchE2E do
     problems =
       []
       |> add_if(missing != [], "unset: #{Enum.join(missing, ", ")}")
-      |> add_if(Path.type(base) != :absolute, "SWITCH_E2E_BASE_DIR must be an absolute path")
+      |> add_if(
+        not is_binary(base) or Path.type(base) != :absolute,
+        "SWITCH_E2E_BASE_DIR must be an absolute path"
+      )
       |> add_if(
         System.get_env("SWITCH_E2E_OWNED_BASE") != base,
         "SWITCH_E2E_OWNED_BASE must equal SWITCH_E2E_BASE_DIR: name the disposable base twice"
       )
-      |> add_if(not File.dir?(base), "SWITCH_E2E_BASE_DIR is not a directory: #{base}")
       |> add_if(
-        File.dir?(base) and not File.exists?(Path.join(base, "gateway.json")),
+        not (is_binary(base) and File.dir?(base)),
+        "SWITCH_E2E_BASE_DIR is not a directory: #{base}"
+      )
+      |> add_if(
+        is_binary(base) and File.dir?(base) and not File.exists?(Path.join(base, "gateway.json")),
         "no running gateway: #{base} has no gateway.json"
       )
       |> add_if(
