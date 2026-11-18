@@ -13547,6 +13547,115 @@ defmodule Tightbeam.GatewayTest do
              ])
   end
 
+  for status <- ["failed", "failed_unknown"] do
+    @tag failed_notice_status: status
+    test "identity apply reuses its notice after #{status} delivery", ctx do
+      base_dir = role_test_base("identity-apply-failed-notice")
+      learn_engineering_identity!(base_dir)
+      revision = Identity.live_revision!(base_dir)
+
+      session =
+        Org.create(ctx.db, %{
+          session_key: "agent:identity-apply-failed-notice",
+          display_name: "Identity apply retry",
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "agentic-engineering.coder",
+          identity_name: "agentic-engineering.coder",
+          identity_revision: revision,
+          host: "testhost",
+          harness: "codex",
+          provider: "openai",
+          model: Model.new("gpt-5.6-sol", effort: "medium")
+        })
+
+      Org.append_pointer(ctx.db, session.session_key, "thread-retry", "created")
+      cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+      Identity.provision_at!(base_dir, revision, "agentic-engineering.coder", :codex, cwd)
+
+      next =
+        identity_edit!(
+          base_dir,
+          "agentic-engineering.coder",
+          {:skill, "model-release-intake", false},
+          "retried served skill",
+          "test"
+        )
+
+      ensure_global_registry()
+
+      apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+      call = %{origin: "user:flynn", params: %{session_key: session.session_key}}
+
+      assert %{identity_revision: ^next, results: [%{wake_id: wake_id}]} = apply.(call)
+      opts = [conn_registry: ctx.registry, lane_manager: ctx.lane]
+      at = System.system_time(:millisecond) + 1_000
+      assert [carrier] = NoticeBatcher.recover(ctx.db, at, opts)
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, session.session_key, "failed-notice")
+      assert turn.wake_id == carrier
+
+      evidence = %{
+        "disposition" => "not_dispatched",
+        "reason" => "transport_capacity_exceeded",
+        "requestBytes" => 2,
+        "limitBytes" => 1
+      }
+
+      assert :ok =
+               Ledger.finish(ctx.db, turn.seq, ctx.failed_notice_status, "delivery failed",
+                 owner_lease: turn.owner_lease,
+                 prewrite_evidence:
+                   if(ctx.failed_notice_status == "failed", do: evidence, else: nil)
+               )
+
+      for _ <- 1..2 do
+        assert %{results: [%{prompt_enqueue: "already_recorded", wake_id: ^wake_id}]} =
+                 apply.(call)
+
+        assert {:ok, [[1]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM wakes WHERE sessionKey=?1 AND consumer='prompt' AND digest=0 AND prompt=?2",
+                   [session.session_key, Wakes.get(ctx.db, wake_id).prompt]
+                 )
+      end
+
+      if ctx.failed_notice_status == "failed" do
+        # A proven prewrite failure is retried by the existing restoration path,
+        # rather than by applying the identity again. The successor is transport
+        # lineage for the same notice, not a second identity-apply notice.
+        assert {:ok, [retry_id]} =
+                 DB.transaction(ctx.db, fn txn ->
+                   Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+                 end)
+
+        assert Tightbeam.NoticeAuthority.resolve!(ctx.db, retry_id).root_wake_id == wake_id
+
+        assert [retry_carrier] =
+                 NoticeBatcher.recover(ctx.db, Wakes.get(ctx.db, retry_id).due_at, opts)
+
+        assert {:ok, retry_turn} =
+                 Ledger.claim_next(ctx.db, session.session_key, "notice-recovered")
+
+        assert retry_turn.wake_id == retry_carrier
+        assert length(:binary.matches(retry_turn.prompt, "Re-read your Tightbeam skills")) == 1
+
+        assert :ok =
+                 Ledger.finish(ctx.db, retry_turn.seq, "delivered", nil,
+                   owner_lease: retry_turn.owner_lease
+                 )
+
+        assert [] = NoticeBatcher.recover(ctx.db, at + 60_000, opts)
+        assert %{results: [%{prompt_enqueue: "already_recorded"}]} = apply.(call)
+
+        assert {:ok, [[2]]} =
+                 DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [
+                   session.session_key
+                 ])
+      end
+    end
+  end
+
   # R-02: a retired session is not a target. Retiring is a state flip, not a
   # delete, so the row is still readable — and being readable is not the same as
   # being writable. A retired key answers exactly as an unknown key does, because
