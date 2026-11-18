@@ -335,7 +335,7 @@ defmodule Tightbeam.Gateway do
          {WorkspaceCleanup, config: Map.put(config, :db, db)},
          {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
          {Task, fn -> DB.owed_work(fn -> HarnessHealth.resume_other_routes(db) end) end},
-         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
+         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub, db: db},
          # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
          # statute, and the episode writer must already own the ordering before the first
          # evaluation runs. Explicitly a child rather than lazily started — a lazy start
