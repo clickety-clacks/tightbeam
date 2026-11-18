@@ -1309,6 +1309,7 @@ defmodule Tightbeam.RulesTest do
       assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
 
     producer_refs = fixture_commit_refs()
+    missing_commit = hd(producer_refs)["commit"]
 
     review_refs = [
       %{
