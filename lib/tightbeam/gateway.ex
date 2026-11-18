@@ -10748,8 +10748,8 @@ defmodule Tightbeam.Gateway do
       allow_queued = repair_tune_authorized?(db, call, session)
 
       {boundary, applies} =
-        model_change_boundary(config, db, session, allow_queued, fn running? ->
-          contain_model_change_failure(fn ->
+        contain_model_change_exit(fn ->
+          model_change_boundary(config, db, session, allow_queued, fn running? ->
             run_session_mutation(session.session_key, fn ->
               if running? do
                 apply_running_model(
@@ -10835,6 +10835,13 @@ defmodule Tightbeam.Gateway do
           |> Map.merge(runtime_actual(actual))
           |> Map.put(:projection_committed, false)
 
+        {:ok, {:error, {:runtime_config_not_sent, _reason}}} ->
+          tune_error(
+            "runtime_config_not_sent",
+            "the configuration request was not sent; nothing changed; retry the change",
+            diagnostic
+          )
+
         {:ok, {:error, {:runtime_config_unknown, _reason}}} ->
           tune_error(
             "runtime_config_unknown",
@@ -10876,15 +10883,34 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # The change runs inside the session's lane, where an escaping exit would
-  # stop the lane, kill its running turn and reach the client as an empty 500.
-  # The request may already have reached the harness, so the outcome is
-  # reported as unknown rather than refused.
-  defp contain_model_change_failure(fun) do
+  # Exceptions retain their original stack and DB classification through the
+  # lane's caller-side re-raise and Dispatch.invoke. Only transport exits need
+  # conversion here; after entering the boundary their effect can be unknown.
+  defp contain_model_change_exit(fun) do
     fun.()
   catch
-    kind, reason ->
-      {:error, {:runtime_config_unknown, {:change_failed, Exception.format_banner(kind, reason)}}}
+    :exit, reason ->
+      model_change_exit(reason, __STACKTRACE__, :runtime_config_unknown, nil)
+  end
+
+  defp model_change_exit(reason, stacktrace, code, sent) do
+    diagnostic =
+      ErrorDiagnostic.caught(:exit, reason, stacktrace,
+        operation: "tune",
+        phase: "model_boundary",
+        sent: sent
+      )
+
+    {{:ok, {:error, ErrorDiagnostic.diagnosed({code, reason}, diagnostic)}}, "now"}
+  end
+
+  # Admission cannot send a configuration request: a timeout here can only
+  # create a quiet lane later, never apply the requested model.
+  defp ensure_model_change_lane(config, session_key) do
+    LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session_key)
+  catch
+    :exit, reason ->
+      model_change_exit(reason, __STACKTRACE__, :runtime_config_not_sent, false)
   end
 
   defp runtime_actual(%Model{} = model) do
@@ -10931,30 +10957,30 @@ defmodule Tightbeam.Gateway do
   # a claim that tokens already being generated use the requested configuration.
   defp model_change_boundary(config, db, session, allow_queued, apply) do
     if Harness.running_model_tuning_supported?(session.harness) do
-      LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session.session_key)
+      with :ok <- ensure_model_change_lane(config, session.session_key) do
+        Tightbeam.SessionLane.change_at_boundary(
+          session.session_key,
+          fn ->
+            case config[:on_tune_fence] do
+              callback when is_function(callback, 0) -> callback.()
+              _ -> :ok
+            end
 
-      Tightbeam.SessionLane.change_at_boundary(
-        session.session_key,
-        fn ->
-          case config[:on_tune_fence] do
-            callback when is_function(callback, 0) -> callback.()
-            _ -> :ok
-          end
+            refused? =
+              if allow_queued,
+                do: Ledger.running?(db, session.session_key),
+                else: Ledger.pending_count(db, session.session_key) > 0
 
-          refused? =
-            if allow_queued,
-              do: Ledger.running?(db, session.session_key),
-              else: Ledger.pending_count(db, session.session_key) > 0
-
-          if refused?,
-            do: {{:error, :turn_in_progress}, "now"},
-            else: {{:ok, apply.(false)}, "now"}
-        end,
-        fn -> {{:ok, apply.(true)}, "after_turn"} end
-      )
-      |> case do
-        :no_lane -> {{:error, :no_lane}, "now"}
-        result -> result
+            if refused?,
+              do: {{:error, :turn_in_progress}, "now"},
+              else: {{:ok, apply.(false)}, "now"}
+          end,
+          fn -> {{:ok, apply.(true)}, "after_turn"} end
+        )
+        |> case do
+          :no_lane -> {{:error, :no_lane}, "now"}
+          result -> result
+        end
       end
     else
       {at_tune_boundary(config, db, session.session_key, fn -> apply.(false) end,
