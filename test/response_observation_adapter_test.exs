@@ -6,19 +6,6 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
   @max_diagnostic_queue 1_000_000
   @max_diagnostic_schedulers 4_096
 
-  # Selective event waits inherit ExUnit's test timeout. Fixture barriers below
-  # make missing diagnostics fail an assertion before waiting for notification.
-  defmacrop assert_event(pattern) do
-    quote do
-      event =
-        receive do
-          unquote(pattern) = received -> received
-        end
-
-      assert unquote(pattern) = event
-    end
-  end
-
   defmodule ClosingAdapter do
     # A test-only gate at the real adapter call. It closes the actual bound TCP
     # socket, then lets Bandit's real send observe the error; no idealized reply
@@ -441,16 +428,15 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
         id = RequestContext.id("req_")
         task = Task.async(fn -> request(port, "/timeout-close", id, :infinity) end)
 
-        assert_event({:before_send, sender, records})
+        assert {sender, records} = await_before_send()
 
         # The same request process has flushed its prior diagnostics. Missing
         # emission fails here instead of looking like a slow notification.
         assert %{db_call_id: call_id} =
                  Enum.find(records, &(&1.event == "db_call_abandoned" and &1.request_id == id))
 
-        assert_event(
-          {:diagnostic, %{event: "db_call_abandoned", request_id: ^id, db_call_id: ^call_id}}
-        )
+        assert %{event: "db_call_abandoned", request_id: ^id, db_call_id: ^call_id} =
+                 await_diagnostic("db_call_abandoned", id, call_id)
 
         if @order == :late_completion_first do
           :sys.resume(db, :infinity)
@@ -458,21 +444,18 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
         end
 
         send(sender, :close_socket)
-        assert_event({:request_observed, ^sender, records})
+        records = await_request_observed(sender)
         assert Enum.any?(records, &(&1.event == "http_response_terminal" and &1.request_id == id))
 
-        assert_event(
-          {:diagnostic,
-           %{
-             event: "http_response_terminal",
-             request_id: ^id,
-             db_call_id: ^call_id,
-             response_state: "started",
-             http_status: nil,
-             cause: "connection_reset",
-             timeout_source: "otp_db_call"
-           }}
-        )
+        assert %{
+                 event: "http_response_terminal",
+                 request_id: ^id,
+                 db_call_id: ^call_id,
+                 response_state: "started",
+                 http_status: nil,
+                 cause: "connection_reset",
+                 timeout_source: "otp_db_call"
+               } = await_diagnostic("http_response_terminal", id, call_id)
 
         assert {:error, _} = Task.await(task, :infinity)
 
@@ -483,6 +466,26 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
 
         assert_one_terminal(id)
       end)
+    end
+  end
+
+  # These selective waits inherit ExUnit's test timeout. The fixture barriers
+  # make missing diagnostics fail an assertion before waiting for notification.
+  defp await_before_send do
+    receive do
+      {:before_send, sender, records} -> {sender, records}
+    end
+  end
+
+  defp await_request_observed(sender) do
+    receive do
+      {:request_observed, ^sender, records} -> records
+    end
+  end
+
+  defp await_diagnostic(event, id, call_id) do
+    receive do
+      {:diagnostic, %{event: ^event, request_id: ^id, db_call_id: ^call_id} = record} -> record
     end
   end
 
@@ -506,15 +509,12 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
   # The abandoned request reaches the owner after its deadline: it is dropped
   # with a distinct result class and its effect never lands.
   defp assert_expired_effect(db, id, call_id) do
-    assert_event(
-      {:diagnostic,
-       %{
-         event: "db_server_completed",
-         request_id: ^id,
-         db_call_id: ^call_id,
-         result_class: "deadline_exceeded"
-       }}
-    )
+    assert %{
+             event: "db_server_completed",
+             request_id: ^id,
+             db_call_id: ^call_id,
+             result_class: "deadline_exceeded"
+           } = await_diagnostic("db_server_completed", id, call_id)
 
     # The completion event orders this check after the expired mutation. Wait
     # for the owner's query reply without introducing another observed call
