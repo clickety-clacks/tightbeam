@@ -195,10 +195,22 @@ defmodule Tightbeam.SessionLane do
   end
 
   # Both acceptance and execution share the lane mailbox with terminal handling.
+  # A failure inside either callback belongs to the caller that supplied it:
+  # it is raised again here, in the caller, while the lane and its running
+  # turn carry on.
   def change_at_boundary(session_key, apply, defer) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{pid, _}] -> GenServer.call(pid, {:change_at_boundary, apply, defer}, :infinity)
-      [] -> :no_lane
+      [{pid, _}] ->
+        case GenServer.call(pid, {:change_at_boundary, apply, defer}, :infinity) do
+          {:change_callback_failed, kind, reason, stacktrace} ->
+            :erlang.raise(kind, reason, stacktrace)
+
+          result ->
+            result
+        end
+
+      [] ->
+        :no_lane
     end
   end
 
@@ -500,9 +512,21 @@ defmodule Tightbeam.SessionLane do
 
   def handle_call({:change_at_boundary, apply, defer}, _from, state) do
     result =
-      if not is_nil(state.task_ref) or Ledger.running?(state.db, state.session_key),
-        do: defer.(),
-        else: apply.()
+      try do
+        if not is_nil(state.task_ref) or Ledger.running?(state.db, state.session_key),
+          do: defer.(),
+          else: apply.()
+      catch
+        # The callbacks are the caller's code. Letting their exit stop the
+        # lane would kill the turn it is running and lose the caller's reply.
+        kind, reason ->
+          Logger.error(
+            "session configuration change failed inside lane #{state.session_key}: " <>
+              Exception.format_banner(kind, reason, __STACKTRACE__)
+          )
+
+          {:change_callback_failed, kind, reason, __STACKTRACE__}
+      end
 
     {:reply, result, state}
   end

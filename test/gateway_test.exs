@@ -262,6 +262,50 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  # Fail only the model re-read in the mutation worker. Validation still uses
+  # the real DB, as do the lane and dispatch audit; no production hook is needed.
+  defmodule ModelReadFailureDB do
+    use GenServer
+    def start_link(state), do: GenServer.start_link(__MODULE__, state)
+
+    def init(state) do
+      :persistent_term.put({Tightbeam.DB, self()}, :model_read_test_proxy)
+      {:ok, state}
+    end
+
+    def terminate(_reason, _state), do: :persistent_term.erase({Tightbeam.DB, self()})
+
+    def handle_call(
+          {:db_call, envelope, {:query, sql, ["k1"]}} = request,
+          {caller, _} = from,
+          {db, requester, failure} = state
+        ) do
+      if caller != requester and String.contains?(sql, "FROM sessions") do
+        send(requester, {:model_read_failed, failure})
+
+        case failure do
+          :overload ->
+            Tightbeam.DBObservation.server(envelope, state, fn ->
+              {:reply, {:error, %Tightbeam.DB.Overloaded{}}, state}
+            end)
+
+          :timeout ->
+            {:noreply, state}
+
+          :exception ->
+            Tightbeam.DBObservation.server(envelope, state, fn ->
+              {:reply, {:ok, [[:malformed_session_row]]}, state}
+            end)
+        end
+      else
+        forward(request, from, db, state)
+      end
+    end
+
+    def handle_call(request, from, {db, _, _} = state), do: forward(request, from, db, state)
+    defp forward(request, _from, db, state), do: {:reply, GenServer.call(db, request), state}
+  end
+
   defmodule RepairCoordinatorStub do
     use GenServer
 
@@ -8121,6 +8165,231 @@ defmodule Tightbeam.GatewayTest do
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
                {:ok, [["delivered"]]}
            end)
+  end
+
+  test "running configuration reports an adapter checkout exit without stopping the lane", ctx do
+    base_dir = role_test_base("running-config-checkout-exit")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    host = Placement.local_host_name()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    Org.set_host(ctx.db, "k1", host)
+    Org.append_pointer(ctx.db, "k1", "running-session", "created")
+    put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+    before = Org.get(ctx.db, "k1").model
+
+    # The adapter checkout runs inside the lane ahead of any adapter call; an
+    # exit there (a coordinator that is busy past its checkout timeout, or
+    # gone) must reach the caller as a decodable refusal too.
+    start_supervised!({CoordinatorStub, {fn _key -> exit(:deliberate_checkout_exit) end, self()}})
+    {seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "keep running")
+    parent = self()
+
+    lane =
+      start_lane!(ctx.db, "k1", fn _ ->
+        send(parent, {:residency_exit_runner, self()})
+
+        receive do
+          :finish -> {:ok, %{}}
+        end
+      end)
+
+    assert_receive {:residency_exit_runner, worker}
+
+    assert %{ok: false, code: "runtime_config_unknown", diagnostic: %{}} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: origin,
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6", effort: "high"}
+             })
+
+    assert_received {:adapter_key, _key}
+    refute_received {:tune_config_applied, _, _}
+    assert Org.get(ctx.db, "k1").model == before
+    assert Process.alive?(lane)
+    assert Ledger.running?(ctx.db, "k1")
+    send(worker, :finish)
+
+    assert eventually(fn ->
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+               {:ok, [["delivered"]]}
+           end)
+  end
+
+  test "a running turn can request its own model change and receive a decoded refusal", ctx do
+    base_dir = role_test_base("self-issued-running-config")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    host = Placement.local_host_name()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    Org.set_host(ctx.db, "k1", host)
+    Org.append_pointer(ctx.db, "k1", "running-session", "created")
+    put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+    before = Org.get(ctx.db, "k1").model
+    adapter = start_supervised!({TuneAdapterStub, {self(), resident: true, apply_result: :exit}})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    {seq, _} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "change my own model")
+    parent = self()
+
+    lane =
+      start_lane!(ctx.db, "k1", fn _ ->
+        result =
+          Gateway.handlers(config)["tune"].(%{
+            origin: "session:k1",
+            principal: {:session, "k1"},
+            session_key: "k1",
+            params: %{setting: "set_model", model: "claude-sonnet-4-6", effort: "high"}
+          })
+
+        send(parent, {:self_tune_result, self(), JSON.decode!(JSON.encode!(result))})
+
+        receive do
+          :finish -> {:ok, %{}}
+        end
+      end)
+
+    assert_receive {:self_tune_result, worker,
+                    %{"ok" => false, "code" => "runtime_config_unknown", "diagnostic" => %{}}},
+                   5_000
+
+    assert Process.alive?(lane)
+    assert Process.alive?(worker)
+    assert Ledger.running?(ctx.db, "k1")
+    assert Org.get(ctx.db, "k1").model == before
+    send(worker, :finish)
+
+    assert eventually(fn ->
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+               {:ok, [["delivered"]]}
+           end)
+  end
+
+  test "a lane admission exit refuses an unsent model change while the turn survives", ctx do
+    base_dir = role_test_base("running-config-boundary-exit")
+    Archetypes.load!(base_dir)
+    host = Placement.local_host_name()
+    origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+    Org.set_host(ctx.db, "k1", host)
+    put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+    before = Org.get(ctx.db, "k1").model
+    {seq, _} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "keep running")
+    parent = self()
+
+    lane =
+      start_lane!(ctx.db, "k1", fn _ ->
+        send(parent, {:boundary_runner, self()})
+
+        receive do
+          :finish -> {:ok, %{}}
+        end
+      end)
+
+    assert_receive {:boundary_runner, worker}
+    {gone, monitor} = spawn_monitor(fn -> :ok end)
+    assert_receive {:DOWN, ^monitor, :process, ^gone, :normal}
+    config = Map.put(gateway_config(base_dir, ctx.db, 0), :lane_manager, gone)
+
+    result =
+      Gateway.handlers(config)["tune"].(%{
+        origin: origin,
+        session_key: "k1",
+        params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+      })
+
+    assert %{
+             "ok" => false,
+             "code" => "runtime_config_not_sent",
+             "diagnostic" => %{"kind" => "exit", "sent" => false, "stacktrace" => [_ | _]}
+           } = JSON.decode!(JSON.encode!(result))
+
+    assert Process.alive?(lane)
+    assert Ledger.running?(ctx.db, "k1")
+    assert Org.get(ctx.db, "k1").model == before
+    refute_received {:tune_config_applied, _, _}
+    send(worker, :finish)
+
+    assert eventually(fn ->
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+               {:ok, [["delivered"]]}
+           end)
+  end
+
+  for failure <- [:overload, :timeout, :exception] do
+    @model_read_failure failure
+    test "running model change preserves #{@model_read_failure} evidence through dispatch", ctx do
+      failure = @model_read_failure
+      base_dir = role_test_base("running-model-read-#{failure}")
+      Archetypes.load!(base_dir)
+      host = Placement.local_host_name()
+      origin = "user:" <> Org.get(ctx.db, "k1").owner_user_id
+      Org.set_host(ctx.db, "k1", host)
+      put_host_catalog(host, "claude", ["claude-sonnet-4-6"])
+      {seq, _} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "keep running")
+      parent = self()
+
+      lane =
+        start_lane!(ctx.db, "k1", fn _ ->
+          send(parent, {:model_read_runner, self()})
+
+          receive do
+            :finish -> {:ok, %{}}
+          end
+        end)
+
+      assert_receive {:model_read_runner, worker}
+      proxy = start_supervised!({ModelReadFailureDB, {ctx.db, self(), failure}})
+      config = gateway_config(base_dir, proxy, 0)
+      handlers = Gateway.handlers(config)
+      Rules.load!(base_dir, Map.keys(handlers))
+
+      call = %{
+        verb: "tune",
+        origin: origin,
+        session_key: "k1",
+        params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+      }
+
+      previous_timeout = Application.get_env(:tightbeam, :db_call_timeout_ms)
+      Application.put_env(:tightbeam, :db_call_timeout_ms, 1_000)
+
+      try do
+        case failure do
+          :overload ->
+            assert {:error, %{code: "db_overloaded"}} = Dispatch.dispatch(ctx.db, handlers, call)
+
+          :timeout ->
+            error = assert_raise DB.Timeout, fn -> Dispatch.dispatch(ctx.db, handlers, call) end
+            assert error.operation == "db.query"
+            assert error.effect_state == "unknown"
+            assert is_binary(error.db_call_id)
+
+          :exception ->
+            assert {:error,
+                    %{
+                      code: "server_error",
+                      diagnostic: %{
+                        "exception" => %{"type" => "FunctionClauseError", "stacktrace" => stack}
+                      }
+                    }} = Dispatch.dispatch(ctx.db, handlers, call)
+
+            assert Enum.any?(stack, &String.contains?(&1, "Tightbeam.Org.to_session"))
+        end
+      after
+        if previous_timeout,
+          do: Application.put_env(:tightbeam, :db_call_timeout_ms, previous_timeout),
+          else: Application.delete_env(:tightbeam, :db_call_timeout_ms)
+      end
+
+      assert_received {:model_read_failed, ^failure}
+      assert Process.alive?(lane)
+      assert Ledger.running?(ctx.db, "k1")
+      send(worker, :finish)
+
+      assert eventually(fn ->
+               DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+                 {:ok, [["delivered"]]}
+             end)
+    end
   end
 
   describe "session status reports its host's credential kind" do
