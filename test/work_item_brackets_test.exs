@@ -546,7 +546,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
       String.replace(
         bytes,
         ~s({ ref = "facts.work_item.state" }, "open"),
-        ~s({ ref = "facts.work_item.state" }, "iceboxed"), global: false)
+        ~s({ ref = "facts.work_item.state" }, "iceboxed"),
+        global: false
+      )
 
     File.write!(path, bytes)
     Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
