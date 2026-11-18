@@ -67,11 +67,10 @@ jobs:
     # event, path or label turns them into a compile-only check; a failure of
     # either suite fails the check.
     #
-    # Pull requests, the merge queue and manual runs use GitHub-hosted
-    # runners. The few self-hosted runners carry release work: release-line
-    # pushes, release candidates and packaging. Pull request suites there
-    # would queue release work behind them.
-    runs-on: ${{ matrix.name == 'macos' && github.event_name == 'push' && fromJSON('["self-hosted", "tb-macos"]') || matrix.os }}
+    # Pull requests, the merge queue and manual runs outside main use hosted
+    # runners. macOS push suites and trusted manual main suites use the
+    # existing self-hosted pool; Linux keeps its hosted matrix runner.
+    runs-on: ${{ matrix.name == 'macos' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && fromJSON('["self-hosted", "tb-macos"]') || matrix.os }}
     steps:
       - name: Validate exact source SHA
         shell: bash

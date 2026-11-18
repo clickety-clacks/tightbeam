@@ -232,15 +232,32 @@ class ExactHeadCI(unittest.TestCase):
             self.assertTrue(evaluate(condition, {
                 'github.event_name': event, 'inputs.docs_validation': 'off'}), event)
 
-    def test_pull_request_suites_stay_off_the_release_pools(self):
-        # The few self-hosted runners carry release work; pull request,
-        # merge-queue and manual suites run on hosted runners beside them.
+    def test_runner_routing_by_event_ref_and_platform(self):
+        # Evaluate the actual workflow expression: only macOS pushes and
+        # manual main suites use the existing self-hosted pool.
         job = self.jobs['test']
-        self.assertIn(
-            "    runs-on: ${{ matrix.name == 'macos' && github.event_name == 'push' && "
-            "fromJSON('[\"self-hosted\", \"tb-macos\"]') || matrix.os }}", job)
+        routing = re.search(r'(?m)^    runs-on: \$\{\{ (.*) \}\}$', job).group(1)
         self.assertEqual(re.findall(r'(?m)^          - os: (\S+)$', job),
                          ['ubuntu-24.04', 'macos-latest'])
+        refs = ('refs/heads/main', 'refs/heads/main-fix', 'refs/heads/0.1.16',
+                'refs/tags/v0.1.16', 'refs/pull/12/merge',
+                'refs/heads/gh-readonly-queue/main/pr-12-' + 'a' * 40)
+        for platform, hosted in (('linux', 'ubuntu-24.04'), ('macos', 'macos-latest')):
+            for event in ('push', 'workflow_dispatch', 'pull_request', 'merge_group'):
+                for ref in refs:
+                    # Fork and same-repository PRs must both stay hosted.
+                    for fork in (False, True) if event == 'pull_request' else (False,):
+                        with self.subTest(platform=platform, event=event, ref=ref, fork=fork):
+                            expected = hosted
+                            if platform == 'macos' and (
+                                    event == 'push' or
+                                    (event == 'workflow_dispatch' and ref == 'refs/heads/main')):
+                                expected = ['self-hosted', 'tb-macos']
+                            self.assertEqual(evaluate(routing, {
+                                'matrix.name': platform, 'matrix.os': hosted,
+                                'github.event_name': event, 'github.ref': ref,
+                                'github.event.pull_request.head.repo.fork': fork,
+                            }), expected)
 
     def test_self_hosted_mac_checks_disk_before_the_suite(self):
         job = self.jobs['test']
