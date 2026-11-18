@@ -8,9 +8,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     Devices,
     Gateway,
     Model,
-    NoticeBatcher,
     Org,
-    Projection,
     Roles,
     Wakes
   }
@@ -18,7 +16,6 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
   @host "oauth-testhost"
   @owner "oauth-operator"
   @main Org.personal_session_key(@owner)
-  @prompt_prefix "The OAuth token for "
 
   defmodule NoopScheduler do
     use GenServer
@@ -71,7 +68,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     %{base: base, db: db, registry: registry, lane: lane}
   end
 
-  test "Anthropic subscription finish delivers one immediate native wake to only its Main", ctx do
+  test "Anthropic subscription finish leaves idle sessions and Main asleep", ctx do
     assert %{user_id: "other-owner"} = Devices.add_user(ctx.db, "other-owner", false)
     create_session(ctx.db, "agent:product-a", @owner)
     create_session(ctx.db, "agent:product-b", @owner)
@@ -86,32 +83,10 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert %{provider: :anthropic, credential_kind: "subscription", status: "onboarded"} =
              finish(onboard, "anthropic", lease_id, "subscription")
 
-    assert_receive {:lane_started, @main}
-    assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE digest=0")
-    carrier_id = assert_main_wake!(ctx, wake_id, "anthropic")
-
-    assert [%{session_key: @main, sender: "process:tightbeam", content: content}] =
-             Projection.list_after(ctx.db, @main, nil, 10)
-
-    assert content =~ recovery_prompt("anthropic")
-
-    assert {:ok, [[@main, carrier_content, ^carrier_id, "queued"]]} =
-             DB.query(
-               ctx.db,
-               "SELECT sessionKey, prompt, wakeId, status FROM turns WHERE wakeId=?1",
-               [carrier_id]
-             )
-
-    assert carrier_content =~ recovery_prompt("anthropic")
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM wakes WHERE sessionKey IN ('agent:product-a','agent:product-b','agent:unrelated')"
-             )
+    assert_no_recovery_work!(ctx)
   end
 
-  test "OpenAI subscription finish targets the authenticated session owner's canonical Main",
+  test "OpenAI subscription finish leaves the caller and every Main asleep",
        ctx do
     assert %{user_id: "other-owner"} = Devices.add_user(ctx.db, "other-owner", false)
     other_main = Org.personal_session_key("other-owner")
@@ -135,10 +110,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert %{provider: :openai, credential_kind: "subscription", status: "onboarded"} =
              onboard.(call)
 
-    assert_receive {:lane_started, @main}
-    assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE digest=0")
-    _carrier_id = assert_main_wake!(ctx, wake_id, "openai", operator_session)
-    refute_received {:lane_started, ^other_main}
+    assert_no_recovery_work!(ctx)
   end
 
   for actor <- [:session, :process] do
@@ -179,10 +151,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
       }
 
       assert %{status: "onboarded"} = onboard.(finish)
-      assert_receive {:lane_started, @main}
-      assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE digest=0")
-      creator = if @actor == :session, do: session_key, else: nil
-      assert_main_wake!(ctx, wake_id, "openai", creator)
+      assert_no_recovery_work!(ctx)
     end
   end
 
@@ -228,11 +197,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
         }
       })
 
-    assert %{
-             code: "credential_recovered_wake_failed",
-             credential_recovered: true,
-             wake_scheduled: false
-           } = result
+    assert %{status: "onboarded", provider: :anthropic} = result
 
     assert_wake_count(ctx.db, 0)
     refute_received {:lane_started, _}
@@ -267,7 +232,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert_wake_count(ctx.db, 0)
   end
 
-  test "wake transaction failure reports credential-recovered partial success", ctx do
+  test "credential renewal succeeds without attempting a graph-wide recovery wake", ctx do
     start_credentials!(ctx)
     scheduler = start_noop_scheduler!()
     onboard = onboard_handler(ctx, scheduler)
@@ -285,22 +250,14 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
         """
       )
 
-    assert %{
-             code: "credential_recovered_wake_failed",
-             provider: :anthropic,
-             host: @host,
-             credential_recovered: true,
-             wake_scheduled: false,
-             message: message
-           } = finish(onboard, "anthropic", lease_id, "subscription")
+    assert %{status: "onboarded", provider: :anthropic} =
+             finish(onboard, "anthropic", lease_id, "subscription")
 
-    assert message =~ "subscription credential on #{@host} recovered"
-    assert message =~ "forced OAuth Main wake failure"
     assert Credentials.status(:anthropic, Credentials.server(@host)) == :onboarded
     assert_wake_count(ctx.db, 0)
   end
 
-  test "retiring Main before delivery suppresses the turn without fallback", ctx do
+  test "credential renewal leaves no recovery work to deliver after Main retires", ctx do
     create_session(ctx.db, "agent:other-main-candidate", @owner)
     start_credentials!(ctx)
     noop = start_noop_scheduler!()
@@ -308,27 +265,10 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     lease_id = begin_and_stage!(onboard, "anthropic", "subscription")
 
     assert %{status: "onboarded"} = finish(onboard, "anthropic", lease_id, "subscription")
-    assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes")
-
-    assert %{state: "pending", target_gate: 1, target_role: nil, reresolve: nil} =
-             Wakes.get(ctx.db, wake_id)
-
     assert %{state: "retired"} = Org.retire(ctx.db, @main, "user:#{@owner}", 1_000)
     scheduler = start_real_scheduler!(ctx)
     assert :ok = Wakes.fire_due(scheduler)
-
-    assert %{state: "canceled", target_role: nil, reresolve: nil} = Wakes.get(ctx.db, wake_id)
-
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM wakes WHERE sessionKey='agent:other-main-candidate'"
-             )
-
-    refute_received {:lane_started, _}
+    assert_no_recovery_work!(ctx)
   end
 
   test "finish cleanup refusal is distinct from credential rejection and supports retry", ctx do
@@ -483,42 +423,10 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     }
   end
 
-  defp assert_main_wake!(ctx, wake_id, provider, creator_session_key \\ nil) do
-    assert %{
-             session_key: @main,
-             target_role: nil,
-             origin: "process:tightbeam",
-             creator_session_key: ^creator_session_key,
-             prompt: prompt,
-             consumer: "prompt",
-             state: "fired",
-             condition_kind: nil,
-             work_item_id: nil,
-             assignment_id: nil,
-             target_gate: 1,
-             reresolve: nil,
-             class: "fyi",
-             class_election: "classifier",
-             delivery_rule: "notice-batching-v1 r2"
-           } = Wakes.get(ctx.db, wake_id)
-
-    assert prompt == recovery_prompt(provider)
-    assert prompt =~ @prompt_prefix
-
-    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
-             NoticeBatcher.source_refs(ctx.db, wake_id)
-
-    assert Wakes.get(ctx.db, carrier_id).state == "fired"
-    carrier_id
-  end
-
-  defp recovery_prompt(provider) do
-    "The OAuth token for #{provider} on #{@host} was refreshed. " <>
-      "Read the manifests for every installed or learned Kung Fu. " <>
-      "Read each manifest's declared main archetype. " <>
-      "Find live agents with those archetypes. " <>
-      "Notify each that the OAuth token was refreshed, and require each to inspect and " <>
-      "resume any stalled agent graph."
+  defp assert_no_recovery_work!(ctx) do
+    assert_wake_count(ctx.db, 0)
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    refute_received {:lane_started, _}
   end
 
   defp create_session(db, session_key, owner) do
