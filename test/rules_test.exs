@@ -2832,7 +2832,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(ctx.db, "filing-remedy-raiser", "flynn")
     recipient = session(ctx.db, "filing-remedy-recipient", "flynn")
-    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(ctx, raiser.session_key, "flynn")
 
     put_raw(ctx, """
     [[rule]]
@@ -3017,7 +3017,7 @@ defmodule Tightbeam.RulesTest do
              DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
 
     raiser = session(ctx.db, "filing-spawn-raiser", "flynn")
-    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(ctx, raiser.session_key, "flynn")
 
     for bin <- ["claude-agent-acp"] do
       adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", bin])
@@ -3217,7 +3217,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(ctx.db, "filing-held-raiser", "flynn")
     recipient = session(ctx.db, "filing-held-recipient", "flynn")
-    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(ctx, raiser.session_key, "flynn")
 
     put_raw(ctx, """
     [[rule]]
@@ -3335,7 +3335,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(ctx.db, "filing-denied-raiser", "fixture-owner")
     session(ctx.db, "filing-denied-recipient", "fixture-owner")
-    bound = assignment(ctx, raiser.session_key, {:user, "fixture-owner"})
+    bound = operator_assignment(ctx, raiser.session_key, "fixture-owner")
 
     put_raw(ctx, """
     [[rule]]
@@ -3442,7 +3442,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(db, "filing-restart-raiser", "flynn")
     recipient = session(db, "filing-restart-recipient", "flynn")
-    bound = assignment(%{ctx | db: db}, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(%{ctx | db: db}, raiser.session_key, "flynn")
 
     put_raw(ctx, """
     [[rule]]
@@ -5525,6 +5525,14 @@ defmodule Tightbeam.RulesTest do
       transport_session_key: session_key,
       params: Tightbeam.TestSupport.OperatorAskFixture.link(db, session_key, params)
     }
+  end
+
+  defp operator_assignment(ctx, holder_key, owner) do
+    Tightbeam.TestSupport.OperatorAskFixture.ensure_work_item!(ctx.db, owner)
+
+    assignment(ctx, holder_key, {:user, owner},
+      work_item_id: Tightbeam.TestSupport.OperatorAskFixture.work_item(owner)
+    )
   end
 
   defp assignment(ctx, holder_key, opener, opts \\ []) do

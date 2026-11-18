@@ -84,7 +84,10 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
         principal: {:session, "briefing-compiler"},
         session_key: "briefing-compiler",
         transport_session_key: "briefing-compiler",
-        params: %{question: "Which option?"}
+        params:
+          Tightbeam.TestSupport.OperatorAskFixture.link(db, "briefing-compiler", %{
+            question: "Which option?"
+          })
       })
 
     assert is_binary(request.id)

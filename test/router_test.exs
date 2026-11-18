@@ -1343,7 +1343,14 @@ defmodule Tightbeam.Wire.RouterTest do
     assert Map.keys(Map.take(listed_row, parity_fields)) |> Enum.sort() ==
              Enum.sort(parity_fields)
 
-    assert exact_row["context"] == %{"note" => nil, "supersedes" => nil}
+    assert exact_row["context"] == %{
+             "note" => nil,
+             "supersedes" => nil,
+             "project" => "Fixture product",
+             "workItemId" => asked["context"]["workItemId"]
+           }
+
+    assert is_binary(exact_row["context"]["workItemId"])
     assert is_binary(exact_row["actionKey"])
 
     assert exact_row["rulingAttribution"] == %{
