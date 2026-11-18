@@ -6,12 +6,28 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
   @max_diagnostic_queue 1_000_000
   @max_diagnostic_schedulers 4_096
 
+  # Selective event waits inherit ExUnit's test timeout. Fixture barriers below
+  # make missing diagnostics fail an assertion before waiting for notification.
+  defmacrop assert_event(pattern) do
+    quote do
+      event =
+        receive do
+          unquote(pattern) = received -> received
+        end
+
+      assert unquote(pattern) = event
+    end
+  end
+
   defmodule ClosingAdapter do
     # A test-only gate at the real adapter call. It closes the actual bound TCP
     # socket, then lets Bandit's real send observe the error; no idealized reply
     # or transport exception is manufactured by this fixture.
     def send_resp({adapter, payload, parent}, status, headers, body) do
-      send(parent, {:before_send, self()})
+      # This call follows the timeout diagnostic cast from this same process.
+      # Its reply proves the writer has stored that event before the gate opens.
+      records = GenServer.call(Tightbeam.Diagnostics, :records, :infinity)
+      send(parent, {:before_send, self(), records})
 
       receive do
         :close_socket -> ThousandIsland.Socket.close(payload.transport.socket)
@@ -37,23 +53,32 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
 
       conn = put_private(conn, :plug_route, {"/api/work-items", nil})
 
-      RequestObservation.call(conn, fn conn ->
-        if conn.request_path in ["/timeout", "/timeout-close"] do
-          DB.transaction(opts[:db], fn txn ->
-            DB.Txn.exec(txn, "INSERT INTO effects(value) VALUES (1)")
-          end)
+      try do
+        RequestObservation.call(conn, fn conn ->
+          if conn.request_path in ["/timeout", "/timeout-close"] do
+            DB.transaction(opts[:db], fn txn ->
+              DB.Txn.exec(txn, "INSERT INTO effects(value) VALUES (1)")
+            end)
+          end
+
+          sent = send_resp(conn, 200, "ok")
+
+          if conn.request_path == "/late" do
+            DB.transaction(opts[:db], fn txn ->
+              DB.Txn.exec(txn, "INSERT INTO effects(value) VALUES (1)")
+            end)
+          end
+
+          sent
+        end)
+      after
+        if conn.request_path == "/timeout-close" do
+          # RequestObservation has submitted its terminal event before this
+          # same-producer barrier, including when the real adapter send raises.
+          records = GenServer.call(Tightbeam.Diagnostics, :records, :infinity)
+          send(opts[:parent], {:request_observed, self(), records})
         end
-
-        sent = send_resp(conn, 200, "ok")
-
-        if conn.request_path == "/late" do
-          DB.transaction(opts[:db], fn txn ->
-            DB.Txn.exec(txn, "INSERT INTO effects(value) VALUES (1)")
-          end)
-        end
-
-        sent
-      end)
+      end
     end
   end
 
@@ -120,7 +145,7 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
   test "real send failure records started with no HTTP status exactly once", %{port: port} do
     id = RequestContext.id("req_")
     task = Task.async(fn -> request(port, "/close", id) end)
-    assert_receive {:before_send, sender}, 2_000
+    assert_receive {:before_send, sender, _records}, 2_000
     send(sender, :close_socket)
 
     assert_receive {:diagnostic,
@@ -414,37 +439,45 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
          } do
       with_suspended_db(db, fn ->
         id = RequestContext.id("req_")
-        task = Task.async(fn -> request(port, "/timeout-close", id) end)
+        task = Task.async(fn -> request(port, "/timeout-close", id, :infinity) end)
 
-        assert_receive {:diagnostic,
-                        %{event: "db_call_abandoned", request_id: ^id, db_call_id: call_id}},
-                       2_000
+        assert_event({:before_send, sender, records})
 
-        assert_receive {:before_send, sender}, 2_000
+        # The same request process has flushed its prior diagnostics. Missing
+        # emission fails here instead of looking like a slow notification.
+        assert %{db_call_id: call_id} =
+                 Enum.find(records, &(&1.event == "db_call_abandoned" and &1.request_id == id))
+
+        assert_event(
+          {:diagnostic, %{event: "db_call_abandoned", request_id: ^id, db_call_id: ^call_id}}
+        )
 
         if @order == :late_completion_first do
-          :sys.resume(db)
+          :sys.resume(db, :infinity)
           assert_expired_effect(db, id, call_id)
         end
 
         send(sender, :close_socket)
+        assert_event({:request_observed, ^sender, records})
+        assert Enum.any?(records, &(&1.event == "http_response_terminal" and &1.request_id == id))
 
-        assert_receive {:diagnostic,
-                        %{
-                          event: "http_response_terminal",
-                          request_id: ^id,
-                          db_call_id: ^call_id,
-                          response_state: "started",
-                          http_status: nil,
-                          cause: "connection_reset",
-                          timeout_source: "otp_db_call"
-                        }},
-                       2_000
+        assert_event(
+          {:diagnostic,
+           %{
+             event: "http_response_terminal",
+             request_id: ^id,
+             db_call_id: ^call_id,
+             response_state: "started",
+             http_status: nil,
+             cause: "connection_reset",
+             timeout_source: "otp_db_call"
+           }}
+        )
 
-        assert {:error, _} = Task.await(task, 5_000)
+        assert {:error, _} = Task.await(task, :infinity)
 
         if @order == :send_failure_first do
-          :sys.resume(db)
+          :sys.resume(db, :infinity)
           assert_expired_effect(db, id, call_id)
         end
 
@@ -456,12 +489,12 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
   defp with_suspended_db(db, fun) do
     previous = Application.fetch_env(:tightbeam, :db_call_timeout_ms)
     Application.put_env(:tightbeam, :db_call_timeout_ms, 50)
-    :sys.suspend(db)
+    :sys.suspend(db, :infinity)
 
     try do
       fun.()
     after
-      :sys.resume(db)
+      :sys.resume(db, :infinity)
 
       case previous do
         {:ok, value} -> Application.put_env(:tightbeam, :db_call_timeout_ms, value)
@@ -473,14 +506,15 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
   # The abandoned request reaches the owner after its deadline: it is dropped
   # with a distinct result class and its effect never lands.
   defp assert_expired_effect(db, id, call_id) do
-    assert_receive {:diagnostic,
-                    %{
-                      event: "db_server_completed",
-                      request_id: ^id,
-                      db_call_id: ^call_id,
-                      result_class: "deadline_exceeded"
-                    }},
-                   2_000
+    assert_event(
+      {:diagnostic,
+       %{
+         event: "db_server_completed",
+         request_id: ^id,
+         db_call_id: ^call_id,
+         result_class: "deadline_exceeded"
+       }}
+    )
 
     # The completion event orders this check after the expired mutation. Wait
     # for the owner's query reply without introducing another observed call
@@ -603,18 +637,18 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
   defp assert_one_terminal(id) do
     assert length(
              Enum.filter(
-               Diagnostics.records(),
+               GenServer.call(Diagnostics, :records, :infinity),
                &(&1.event == "http_response_terminal" and &1.request_id == id)
              )
            ) == 1
   end
 
-  defp request(port, path, id) do
+  defp request(port, path, id, timeout \\ 2_000) do
     :httpc.request(
       :get,
       {String.to_charlist("http://127.0.0.1:#{port}#{path}"),
        [{~c"x-tightbeam-request-id", String.to_charlist(id)}]},
-      [timeout: 2_000],
+      [timeout: timeout],
       body_format: :binary
     )
   end
