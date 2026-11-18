@@ -1,6 +1,6 @@
 defmodule Tightbeam.RowReactions.Notice do
   @moduledoc false
-  alias Tightbeam.{NoticeBatcher, Wakes}
+  alias Tightbeam.{HarnessRecoveryNotice, NoticeBatcher, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.RowReactions.Store
 
@@ -47,6 +47,29 @@ defmodule Tightbeam.RowReactions.Notice do
     do: withdraw(txn, id, action["plan"]["withdraw"], at)
 
   def execute(_txn, %{"status" => state}, _at) when state != "pending", do: :ok
+
+  def execute(
+        txn,
+        %{
+          "status" => "pending",
+          "plan" => %{"family" => "harness-recovery", "value" => recovery_notice}
+        } = action,
+        at
+      )
+      when is_map(recovery_notice) do
+    [org, _family, event_id, _slot] = action["plan"]["identity"]
+
+    {event, _facts} =
+      Store.event(txn, org, event_id) || raise ArgumentError, "recovery event is missing"
+
+    HarnessRecoveryNotice.admit_selected_recovery_in_txn(
+      txn,
+      action,
+      recovery_notice,
+      at,
+      event["cycleRelease"] == true
+    )
+  end
 
   def execute(txn, action, at) do
     value = action["plan"]["value"]

@@ -8,7 +8,10 @@ simpler adequate alternative when useful. Check every requirement and mechanism
 against the ask: each must cite the ask or a ruling it serves. An uncited one is a
 blocker unless the PO accepts it. Do not cut what the ask needs to save lines.
 
-Preserve supporting correctness, recovery, security and delivery behavior. Separate
+Preserve the supporting correctness, recovery, security and delivery behavior
+the ask needs. Recommend unrequested limits, thresholds, quotas or security
+mechanisms to the product owner with your reason; do not make their absence a
+blocker. Separate
 observations, reasoning and unknowns. Name what a contradiction or ambiguity
 prevents; marked non-core holes may remain nonblocking. Product-intent questions
 go to the PO and contract questions to the spec-writer through delivery ownership.

@@ -589,14 +589,14 @@ defmodule Tightbeam.Harness.Support do
     }
   end
 
-  defp ensure_adapter_vectors(_module, profile) do
+  defp ensure_adapter_vectors(module, profile) do
     for locality <- [:local, :remote],
         presence <- [:present, :absent] do
       case_name = "#{locality}_#{presence}"
 
       vector(
         case_name,
-        expected_adapter(profile, locality, presence),
+        expected_adapter(module, profile, locality, presence),
         %{profile: profile, locality: locality, presence: presence}
       )
     end
@@ -616,6 +616,16 @@ defmodule Tightbeam.Harness.Support do
     with_tmp("adapter", fn base ->
       adapter = adapter_path(base, profile.adapter_bin, locality)
       bundle = install_fake_adapter!(adapter, profile)
+
+      package_json =
+        Path.join([
+          base,
+          "adapters",
+          "node_modules",
+          profile.adapter_package,
+          "package.json"
+        ])
+
       File.chmod!(bundle, 0o751)
       if presence == :absent, do: File.rm!(adapter)
 
@@ -631,6 +641,9 @@ defmodule Tightbeam.Harness.Support do
             checks = Process.get({ref, :checks}, 0)
             Process.put({ref, :checks}, checks + 1)
             if presence == :absent and checks == 0, do: {"", 1}, else: {"", 0}
+
+          String.contains?(joined, "cat ") ->
+            {File.read!(package_json), 0}
 
           String.contains?(joined, "npm install") ->
             # npm's whole job here is to leave an executable at the adapter path, and the
@@ -687,11 +700,11 @@ defmodule Tightbeam.Harness.Support do
     end)
   end
 
-  defp expected_adapter(profile, locality, presence) do
-    expected_adapter_npm(profile, locality, presence)
+  defp expected_adapter(module, profile, locality, presence) do
+    expected_adapter_npm(module, profile, locality, presence)
   end
 
-  defp expected_adapter_npm(profile, locality, presence) do
+  defp expected_adapter_npm(module, profile, locality, presence) do
     detail =
       case {locality, presence} do
         {:local, :present} -> "adapters present"
@@ -702,7 +715,7 @@ defmodule Tightbeam.Harness.Support do
 
     %{
       result: {:ok, detail},
-      install_contribution: expected_install_contribution(locality, presence),
+      install_contribution: expected_install_contribution(module, locality, presence),
       bundle: profile.patched,
       mode: 0o751
     }
@@ -712,15 +725,14 @@ defmodule Tightbeam.Harness.Support do
   # the one machine that cannot supply its own. The two contribution strings differ only
   # in how the command reaches the host, which is the point — the script, and with it the
   # pinned package set, is shared.
-  defp expected_install_contribution(_locality, :present), do: ""
+  defp expected_install_contribution(_module, _locality, :present), do: ""
 
-  defp expected_install_contribution(locality, :absent) do
+  defp expected_install_contribution(module, locality, :absent) do
     packages =
-      Enum.map_join(
-        Tightbeam.Harness.all(),
-        " ",
-        &"#{&1.install_package()}@#{&1.adapter_version()}"
-      )
+      (Tightbeam.Harness.all() ++ [module])
+      |> Enum.uniq()
+      |> Enum.reject(&(&1 == Tightbeam.Harness.Cursor))
+      |> Enum.map_join(" ", &"#{&1.install_package()}@#{&1.adapter_version()}")
 
     script = "npm install --prefix '<BASE>/adapters' --no-save " <> packages
 

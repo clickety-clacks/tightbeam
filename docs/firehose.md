@@ -46,6 +46,11 @@ direct-application contract, follow that contract; otherwise, treat its
 notices as invalidations and read the detail route. These per-notice detail
 reads and the reads for composed views are the normal-path requests.
 
+The `session_record_event.created` class has a direct-application contract. Its
+payload is one record-event item, and clients append that item to the session's
+record-event feed. The stream remains lossy; after reconnect, clients rebuild
+the feed from `GET /api/sessions/:session_key/record-events`.
+
 After a close, the minimum request count for one rebuild is
 
 ```text
@@ -59,3 +64,7 @@ This is a lower bound. It assumes pages use `limit=500` and that no rows are
 added during the walk. If a collection's walk must restart, its pages are read
 again. The rebuild view models seven bulk collections: work items,
 assignments, attests, artifacts, turns, wakes, and sessions.
+For an archetype-filtered subscription, rebuild by listing sessions with the
+requested archetype filter and then using the existing per-session message and
+tool-call reads for each returned session. There is no cross-session message
+or tool-call collection.

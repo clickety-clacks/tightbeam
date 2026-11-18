@@ -10,6 +10,7 @@ defmodule Tightbeam.Firehose.Registry do
 
   @observational ~w(
     verb.accepted verb.denied rail.denied lifecycle.boot lifecycle.clean_shutdown
+    session_record_event.created
     lifecycle.dirty_exit lifecycle.takeover prod.fired
     lifecycle.terminal_credential_opened
     lifecycle.terminal_credential_suppression_activated
@@ -64,6 +65,8 @@ defmodule Tightbeam.Firehose.Registry do
     {"transition.recorded", "messages", "upsert", "messageId"},
     {"tool_call.started", "tool calls", "upsert", "toolCallId"},
     {"tool_call.ended", "tool calls", "upsert", "toolCallId"},
+    {"message.segment_recorded", "turn events", "upsert", "turnEventId"},
+    {"tool_call.event_recorded", "turn events", "upsert", "turnEventId"},
     {"condition_fact.filed", "condition-facts", "upsert", "factId"},
     {"critical_lease.updated", "critical-state", "upsert", "sessionKey"}
   ]
@@ -205,6 +208,7 @@ defmodule Tightbeam.Firehose.Registry do
     "read-markers" => :read_marker,
     "messages" => :message,
     "tool calls" => :tool_call,
+    "turn events" => :turn_event,
     "condition-facts" => :condition_fact,
     "critical-state" => :critical_state,
     "config" => :config,
@@ -284,6 +288,21 @@ defmodule Tightbeam.Firehose.Registry do
                 version_source: "tool_calls.rowVersion"
               })
               |> Map.put(:primary_refs, ["toolCallId", "sessionKey"])
+            end)
+          end)
+        end)
+        |> then(fn rows ->
+          Enum.reduce(~w(message.segment_recorded tool_call.event_recorded), rows, fn class,
+                                                                                      rows ->
+            Map.update!(rows, class, fn row ->
+              row
+              |> Map.merge(%{
+                query: :query_turn_event,
+                visibility: :visible?,
+                rebuild: true,
+                version_source: "turn_events.immutable"
+              })
+              |> Map.put(:primary_refs, ["turnEventId", "sessionKey"])
             end)
           end)
         end)

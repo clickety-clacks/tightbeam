@@ -62,7 +62,13 @@ defmodule Tightbeam.StateVisibility do
   end
 
   def visible?(db, %{"class" => class, "refs" => refs, "payload" => payload}, user_id, is_admin)
-      when class in ["transition.recorded", "tool_call.started", "tool_call.ended"] do
+      when class in [
+             "transition.recorded",
+             "tool_call.started",
+             "tool_call.ended",
+             "message.segment_recorded",
+             "tool_call.event_recorded"
+           ] do
     session_key = refs["sessionKey"] || payload["sessionKey"]
 
     is_admin or

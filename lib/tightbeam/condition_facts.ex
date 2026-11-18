@@ -17,7 +17,7 @@ defmodule Tightbeam.ConditionFacts do
   alias Tightbeam.DB.Txn
 
   @reserved_kinds ~w(
-    quota-recovered escalation-ruled operator-ruling-late-routed
+    quota-recovered escalation-ruled operator-ruling-late-routed decision-request-filed
     assignment-successor-created assignment-landed assignment-reviewed assignment-blocked
     user-alerted user-alert-cleared credential-present
     harness-auth-dead harness-auth-restored
@@ -87,8 +87,16 @@ defmodule Tightbeam.ConditionFacts do
     ON condition_facts (ownerUserId, kind, scope, id);
   """
 
+  @filing_index """
+  CREATE UNIQUE INDEX IF NOT EXISTS condition_facts_decision_request_filed
+    ON condition_facts (scope) WHERE kind = 'decision-request-filed'
+  """
+
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+
+  @doc false
+  def ensure_filing_index(db), do: DB.execute(db, @filing_index)
 
   @doc false
   def wake_hint(kind, scope) when is_binary(kind) do
@@ -267,6 +275,45 @@ defmodule Tightbeam.ConditionFacts do
     end
   end
 
+  defp consequence_admission(txn, %{kind: "decision-request-filed"} = input) do
+    payload = input[:payload]
+
+    case Txn.q(
+           txn,
+           "SELECT kind, raiserId, ownerUserId, assignmentId, raisedAt, expecterSessionKey, expecterUserId FROM decision_requests WHERE id=?1",
+           [input[:scope]]
+         ) do
+      [[kind, raiser, owner, assignment, raised_at, asked_session, asked_user]]
+      when is_map(payload) ->
+        addressed =
+          cond do
+            kind == "agent" and is_binary(asked_session) -> "session:" <> asked_session
+            kind == "agent" and is_binary(asked_user) -> "user:" <> asked_user
+            true -> "user:" <> owner
+          end
+
+        if input[:origin] == "process:tightbeam" and input[:owner_user_id] == owner and
+             payload == %{
+               "requestId" => input[:scope],
+               "kind" => kind,
+               "cause" => input[:cause],
+               "creatingPrincipal" => input[:creating_principal],
+               "raiserPrincipal" => raiser,
+               "assignmentId" => assignment,
+               "addressedPrincipal" => addressed,
+               "raisedAt" => raised_at
+             } and is_binary(input[:creating_principal]) and
+             is_binary(input[:cause]) do
+          :ok
+        else
+          {:error, %{code: "invalid", message: "filing fact must match its request"}}
+        end
+
+      _ ->
+        {:error, %{code: "invalid", message: "filing fact requires a committed request"}}
+    end
+  end
+
   defp consequence_admission(_txn, %{kind: _kind} = input) do
     if is_map(input[:sentinel_event]) do
       if is_map(input[:payload]),
@@ -408,6 +455,9 @@ defmodule Tightbeam.ConditionFacts do
 
     :ok = SentinelSubscriptions.fulfill_fact_in_txn(txn, fact)
     :ok = Tightbeam.Assignments.release_cannot_proceed_in_txn(txn, fact)
+
+    if kind == "escalation-ruled",
+      do: Tightbeam.Recognition.fulfill_fact_in_txn(txn, kind, scope)
 
     EventLog.lifecycle_in_txn(
       txn,
@@ -598,18 +648,33 @@ defmodule Tightbeam.ConditionFacts do
   defp notify_scheduler(_scheduler, _result), do: :ok
 
   defp condition_transition(fact, owner_user_id) do
+    bindings = %{
+      conditionKind: fact.kind,
+      conditionScope: fact.scope,
+      conditionAfterId: fact.fact_id - 1,
+      conditionFactId: fact.fact_id
+    }
+
+    bindings =
+      if fact.kind == "decision-request-filed",
+        do:
+          bindings
+          |> Map.put(:decisionRequestId, fact.scope)
+          |> Map.put(:assignmentId, fact.payload["assignmentId"]),
+        else: bindings
+
     %{
       verb: "condition",
       domain: "condition_fact",
       row_id: fact.fact_id,
       owner_user_id: owner_user_id,
-      principal: fact.origin,
-      bindings: %{
-        conditionKind: fact.kind,
-        conditionScope: fact.scope,
-        conditionAfterId: fact.fact_id - 1,
-        conditionFactId: fact.fact_id
-      },
+      principal:
+        if(fact.kind == "decision-request-filed",
+          do: fact.payload["creatingPrincipal"],
+          else: fact.origin
+        ),
+      cause: if(fact.kind == "decision-request-filed", do: fact.payload["cause"]),
+      bindings: bindings,
       field: %{name: "id", old: nil, new: fact.fact_id}
     }
   end
