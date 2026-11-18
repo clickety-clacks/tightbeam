@@ -1568,78 +1568,38 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert terminal_notices(ctx.db) == []
   end
 
-  test "cutover adopts pending output once and keeps its terminal occurrence identity", ctx do
-    stop_supervised!(ctx.scheduler)
-    {_parent, child, root} = completed_child(ctx)
-    forget_reaction_ledger!(ctx.db)
-    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-    assert [adopted] = terminal_notices(ctx.db)
-    assert adopted.wake_id == root.wake_id
-    assert adopted.due_at == root.due_at
-
-    assert {:ok, {:ok, replay}} =
-             DB.transaction(
-               ctx.db,
-               &Wakes.admit_terminal_notification_in_txn(&1, child.id)
-             )
-
-    assert replay.wake_id == root.wake_id
-    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-    assert length(terminal_notices(ctx.db)) == 1
-    start_scheduler(ctx.db)
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert_delivered_carrier(ctx.db, root.wake_id)
-    assert [_] = pending_reminders(ctx.db, root.wake_id)
-  end
-
-  test "cutover keeps an accepted delivery terminal and adopts only its pending successor", ctx do
-    {_parent, _child, root} = completed_child(ctx)
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-    carrier = assert_delivered_carrier(ctx.db, root.wake_id)
-    [reminder] = pending_reminders(ctx.db, root.wake_id)
-    stop_supervised!(ctx.scheduler)
-    forget_reaction_ledger!(ctx.db)
-    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-    assert assert_delivered_carrier(ctx.db, root.wake_id) == carrier
-    assert [adopted] = pending_reminders(ctx.db, root.wake_id)
-    assert adopted.wake_id == reminder.wake_id
-    assert adopted.due_at == reminder.due_at
-    assert length(terminal_notices(ctx.db)) == 1
-  end
-
-  test "unproven historical output is held with a reason while other pending output proceeds",
-       ctx do
+  test "cutover records its watermark once and adopts no earlier notice", ctx do
     stop_supervised!(ctx.scheduler)
     {_parent, _child, root} = completed_child(ctx)
-
-    unknown =
-      Wakes.schedule(ctx.db, %{
-        wake_id: "unknown-historical-output",
-        session_key: "other-parent",
-        owner_user_id: "flynn",
-        origin: "process:tightbeam",
-        prompt: "Historical output with no provable source",
-        due_at: System.system_time(:millisecond),
-        obligation_ref: "terminal-child-owner-notification:unknown-assignment"
-      })
-
     forget_reaction_ledger!(ctx.db)
+
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
     assert :ok = Tightbeam.RowReactions.recover(ctx.db)
 
-    assert {:ok, [["held", reason]]} =
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT heldCount FROM row_reaction_cutovers")
+
+    assert {:ok, []} =
              DB.query(
                ctx.db,
-               "SELECT status,lastError FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
-               [unknown.wake_id]
+               "SELECT 1 FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [root.wake_id]
              )
 
-    assert reason =~ "unproven"
+    # The earlier notice is still an ordinary pending wake and still delivers.
+    assert Wakes.get(ctx.db, root.wake_id).state == "pending"
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        forget_reaction_ledger!(ctx.db)
+        assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+      end)
+
+    assert log =~ "OPERATOR NOTICE: terminal-notice cutover recorded"
+    assert log =~ "1 notice wake(s) created before this upgrade are still pending"
     start_scheduler(ctx.db)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert_delivered_carrier(ctx.db, root.wake_id)
-    assert Wakes.get(ctx.db, unknown.wake_id).state == "pending"
-    assert turn_count(ctx.db, unknown.wake_id) == 0
   end
 
   test "an undelivered intent resumes once through transport lineage when its recipient becomes eligible",

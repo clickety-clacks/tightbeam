@@ -509,14 +509,37 @@ defmodule Tightbeam.ConformanceSupport do
     path |> decode_toml!() |> Map.fetch!("statute")
   end
 
-  def compiled_shipped_entries(root) do
+  def compiled_shipped_entries(root, harness \\ :codex, seed_files \\ []) do
     source = Path.expand("../../priv/kungfu/agentic-engineering/rails/engineering.toml", root)
     base = temp_dir!("conformance-rails")
     rails_dir = Path.join(base, "identity/rails")
     File.mkdir_p!(rails_dir)
-    File.cp!(source, Path.join(rails_dir, "engineering.toml"))
+
+    scoped_source =
+      source
+      |> File.read!()
+      |> String.replace(~r/^archetypes\s*=\s*\[[^\]]*\]\s*\n/m, "")
+      |> String.replace(
+        "[[statute]]",
+        "[[statute]]\narchetypes = [\"agentic-engineering.coder\"]"
+      )
+
+    File.write!(Path.join(rails_dir, "engineering.toml"), scoped_source)
+
+    Enum.each(seed_files, fn filename ->
+      seed = Path.expand("../../priv/seed/rails/#{filename}", root)
+      File.cp!(seed, Path.join(rails_dir, filename))
+    end)
+
     Rails.load!(base)
-    %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings()
+    File.write!(Path.join(base, ".tightbeam-session"), "fixture-session")
+
+    File.write!(
+      Path.join(base, Rails.session_scope_filename()),
+      Rails.session_scope_content("agentic-engineering.coder")
+    )
+
+    %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings(harness)
     {entries, base}
   end
 
@@ -525,7 +548,7 @@ defmodule Tightbeam.ConformanceSupport do
 
     try do
       Enum.each(fixture["cases"], fn kase ->
-        results = Enum.map(entries, &run_hook(&1, kase["input"]))
+        results = Enum.map(entries, &run_hook(&1, kase["input"], base))
 
         case kase["expect"] do
           "pass" ->
@@ -547,21 +570,84 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
-  defp run_hook(entry, input) do
+  defp run_hook(entry, input, cwd) do
     [%{"command" => command}] = entry["hooks"]
     ensure_real_rail_exec!()
     cli_dir = Path.expand("../cli/target/release", __DIR__)
 
+    hook_input =
+      case decode_hook_event(input) do
+        nil ->
+          JSON.encode!(%{
+            "tool_name" => "Bash",
+            "tool_input" => %{"command" => input},
+            "cwd" => cwd
+          })
+
+        event ->
+          event
+          |> Map.put("cwd", cwd)
+          |> JSON.encode!()
+      end
+
     {output, status} =
       System.cmd("sh", ["-c", "printf '%s' \"$TB_CONFORMANCE_INPUT\" | " <> command],
+        cd: cwd,
         env: [
-          {"TB_CONFORMANCE_INPUT", input},
+          {"TB_CONFORMANCE_INPUT", hook_input},
           {"PATH", cli_dir <> ":" <> System.get_env("PATH", "")}
         ],
         stderr_to_stdout: true
       )
 
     {entry, output, status}
+  end
+
+  defp decode_hook_event(input) do
+    case JSON.decode!(input) do
+      %{"tool_name" => _, "tool_input" => _} = event -> event
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  def assert_session_scope_invocation(root) do
+    {entries, base} = compiled_shipped_entries(root)
+
+    try do
+      entry =
+        Enum.find(entries, fn entry ->
+          [%{"command" => command}] = entry["hooks"]
+          String.contains?(command, "[gate: no-git-stash]")
+        end)
+
+      refute is_nil(entry)
+
+      unmatched_cwd = Path.join(base, "other-session")
+      File.mkdir_p!(unmatched_cwd)
+      File.write!(Path.join(unmatched_cwd, ".tightbeam-session"), "other-fixture-session")
+
+      File.write!(
+        Path.join(unmatched_cwd, Rails.session_scope_filename()),
+        Rails.session_scope_content("agentic-engineering.reviewer-code")
+      )
+
+      {_entry, matched_output, matched_status} = run_hook(entry, "git stash push", base)
+      assert matched_status == 2
+
+      assert matched_output =~
+               "[gate: no-git-stash] You ran a mutating git stash; destructive git is forbidden"
+
+      {_entry, unmatched_output, unmatched_status} =
+        run_hook(entry, "git stash push", unmatched_cwd)
+
+      assert unmatched_status == 0
+      assert unmatched_output == ""
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rails)
+    end
   end
 
   def assert_shipped_parity(fixtures, root) do
@@ -580,16 +666,31 @@ defmodule Tightbeam.ConformanceSupport do
     end)
   end
 
-  def assert_claude_wiring(root) do
-    {entries, base} = compiled_shipped_entries(root)
-    probe = Rails.probe_entry()
-    settings = %{"hooks" => %{"PreToolUse" => entries ++ [probe]}}
+  def assert_probe_harness_wiring(root) do
+    {entries, base} = compiled_shipped_entries(root, :codex, ["tightbeam-probe.toml"])
+
+    probe =
+      Enum.find(entries, fn entry ->
+        [%{"command" => command}] = entry["hooks"]
+        String.contains?(command, "[gate: tightbeam-probe]")
+      end)
+
+    claude_entries = get_in(Rails.hook_settings(:claude), ["hooks", "PreToolUse"])
+    pi_entries = get_in(Rails.hook_settings(:pi), ["hooks", "PreToolUse"])
 
     try do
-      assert probe in settings["hooks"]["PreToolUse"]
-      {_entry, output, status} = run_hook(probe, "tightbeam-gate-probe")
+      refute Enum.any?(claude_entries, fn entry -> entry == probe end)
+      assert Enum.any?(pi_entries, fn entry -> entry == probe end)
+      {_entry, output, status} = run_hook(probe, "tightbeam-gate-probe", base)
       assert status == 2
       assert output =~ "[gate: tightbeam-probe]"
+      {_entry, _output, pass_status} = run_hook(probe, "tightbeam-gate", base)
+      assert pass_status == 0
+
+      assert Enum.all?(claude_entries, fn entry ->
+               {_entry, _output, status} = run_hook(entry, "tightbeam-gate-probe", base)
+               status == 0
+             end)
     after
       File.rm_rf!(base)
       :persistent_term.erase(Rails)
@@ -600,6 +701,7 @@ defmodule Tightbeam.ConformanceSupport do
     base = temp_dir!("conformance-rules")
     prepare_rule_base!(base, fixture)
     handlers = Gateway.handlers(%{})
+    Archetypes.load!(base)
     Rules.load!(base, Map.keys(handlers))
 
     try do
@@ -2269,6 +2371,7 @@ defmodule Tightbeam.ConformanceSupport do
 
       base = """
       [[rule]]
+      #{optional_toml("archetypes", Map.get(rule, "archetypes", ["*"]))}
       name = #{toml_value(rule["name"])}
       verb = #{toml_value(rule["verb"])}
       text = #{toml_value(rule["text"])}
@@ -2735,8 +2838,12 @@ defmodule Tightbeam.ConformanceTest do
     Corpus.assert_shipped_parity(Enum.filter(@fixtures, &(&1["class"] == "C1")), @root)
   end
 
-  test "c1-wiring-claude compiles and refuses the reserved probe" do
-    Corpus.assert_claude_wiring(@root)
+  test "c1-probe uses TOML and only refuses for Codex and Pi" do
+    Corpus.assert_probe_harness_wiring(@root)
+  end
+
+  test "c1 rail scope uses the current hook event cwd archetype" do
+    Corpus.assert_session_scope_invocation(@root)
   end
 
   test "containment dependencies are named and green" do

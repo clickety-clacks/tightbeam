@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 // Engine contract: Pi d57c2d21916eaad1158031526ac6ec860eae5f14.
-// Automatic sources are bounded. pi-acp 0.0.33 still expands personal prompt
-// templates when a prompt starts with a matching slash name; this is not
-// complete Pi isolation. This launcher neither reads nor rewrites prompts.
+// Automatic sources are bounded. This launcher neither reads nor rewrites prompts.
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
@@ -19,6 +17,8 @@ function within(file, root) {
 function main() {
   const cwd = fs.realpathSync(process.cwd());
   const home = fs.realpathSync(process.env.PI_CODING_AGENT_DIR);
+  const realHome = process.env.PI_REAL_HOME;
+  if (!realHome || !path.isAbsolute(realHome)) throw new Error('Missing real Pi HOME');
   const extension = path.join(home, 'extensions', 'tightbeam.ts');
   if (!fs.statSync(extension).isFile()) throw new Error('Missing Tightbeam Pi extension');
   // Short switches are deliberately used: unsupported short options are errors,
@@ -66,7 +66,9 @@ function main() {
   }
   workspace(cwd);
   for (const file of [...skills].sort()) args.push('--skill', file);
-  const child = spawn('pi', [...args, ...process.argv.slice(2)], { stdio: 'inherit' });
+  const childEnv = { ...process.env, HOME: realHome };
+  delete childEnv.PI_REAL_HOME;
+  const child = spawn('pi', [...args, ...process.argv.slice(2)], { stdio: 'inherit', env: childEnv });
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal));
   child.on('error', error => { console.error(`Pi isolated launch failed: ${error.message}`); process.exitCode = 1; });
   child.on('exit', (code, signal) => {

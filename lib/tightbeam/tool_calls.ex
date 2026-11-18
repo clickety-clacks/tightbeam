@@ -103,6 +103,20 @@ defmodule Tightbeam.ToolCalls do
   )
   """
 
+  @messages_with_record_event_ids_ddl (case String.split(
+                                              String.trim(@messages_new_ddl),
+                                              "markerTo               TEXT,\n  CHECK ("
+                                            ) do
+                                         [prefix, suffix] ->
+                                           prefix <>
+                                             "markerTo               TEXT, recordEventIds TEXT,\n  CHECK (" <>
+                                             suffix
+
+                                         _ ->
+                                           raise ArgumentError,
+                                                 "expected one messages table CHECK marker"
+                                       end)
+
   @doc "Apply the one-time tool-call and transition schema migration."
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ DB) do
@@ -220,6 +234,14 @@ defmodule Tightbeam.ToolCalls do
     end
   end
 
+  defp without_added_message_columns(sql) do
+    Regex.replace(
+      ~r/markerTo TEXT,(?: (?:submitter|recordEventIds) TEXT,)* CHECK/,
+      sql,
+      "markerTo TEXT, CHECK"
+    )
+  end
+
   defp normalize_schema_sql(sql),
     do:
       sql
@@ -236,7 +258,15 @@ defmodule Tightbeam.ToolCalls do
       {"index", "tool_calls_session_anchor",
        "CREATE INDEX tool_calls_session_anchor ON tool_calls (sessionKey, afterMessageSeq)"},
       {"table", "messages",
-       String.replace(@messages_new_ddl, "messages_new", "messages", global: false)},
+       [
+         String.replace(@messages_new_ddl, "messages_new", "messages", global: false),
+         String.replace(
+           @messages_with_record_event_ids_ddl,
+           "messages_new",
+           "messages",
+           global: false
+         )
+       ]},
       {"index", "messages_session",
        "CREATE INDEX messages_session ON messages (sessionKey, seq)"},
       {"index", "messages_client_dedupe",
@@ -250,22 +280,27 @@ defmodule Tightbeam.ToolCalls do
              [type, name]
            ) do
         [[sql]] ->
-          matches_expected? = normalize_schema_sql(sql) == normalize_schema_sql(expected_sql)
-
-          # Projection adds submitter after this historical migration. SQLite places
-          # an added column immediately before the table-level CHECK constraint.
+          expected_sqls = List.wrap(expected_sql)
           actual_sql = normalize_schema_sql(sql)
-          submitter_column = "markerTo TEXT, submitter TEXT, CHECK"
 
-          matches_submitter? =
-            name == "messages" and String.contains?(actual_sql, submitter_column) and
-              String.replace(
-                actual_sql,
-                submitter_column,
-                "markerTo TEXT, CHECK"
-              ) == normalize_schema_sql(expected_sql)
+          matches_expected? =
+            Enum.any?(expected_sqls, fn candidate ->
+              actual_sql == normalize_schema_sql(candidate)
+            end)
 
-          unless matches_expected? or matches_submitter? do
+          # Later boot steps add messages.submitter (Projection) and
+          # messages.recordEventIds (RecordEvents) with ALTER TABLE, in an order
+          # that depends on which release line the database last ran. SQLite
+          # places each added column immediately before the table-level CHECK
+          # constraint, so compare with those added columns removed.
+          matches_added_columns? =
+            name == "messages" and
+              Enum.any?(expected_sqls, fn candidate ->
+                without_added_message_columns(actual_sql) ==
+                  without_added_message_columns(normalize_schema_sql(candidate))
+              end)
+
+          unless matches_expected? or matches_added_columns? do
             raise Tightbeam.Schema.ShapeError,
               message:
                 "incompatible_tool_call_transition_schema_object: #{inspect({type, name, sql})}"
@@ -431,6 +466,13 @@ defmodule Tightbeam.ToolCalls do
 
                row = fetch_by_harness_id_in_txn(txn, session_key, harness_tool_call_id)
                terminal? = terminal_status?(row.status)
+
+               Tightbeam.TurnEvents.record_tool_event_in_txn(
+                 txn,
+                 if(terminal?, do: "tool.ended", else: "tool.started"),
+                 row
+               )
+
                publish_tool_call_in_txn(txn, row, terminal?)
 
                if terminal? and row.status == "completed" and is_binary(compaction_from) do
@@ -448,6 +490,7 @@ defmodule Tightbeam.ToolCalls do
                if terminal_status?(Map.get(attributes, :status)) do
                  update_terminal_in_txn(txn, row, attributes)
                  updated = fetch_by_harness_id_in_txn(txn, session_key, harness_tool_call_id)
+                 Tightbeam.TurnEvents.record_tool_event_in_txn(txn, "tool.ended", updated)
                  publish_tool_call_in_txn(txn, updated, true)
 
                  if updated.status == "completed" and is_binary(compaction_from) do
@@ -912,10 +955,6 @@ defmodule Tightbeam.ToolCalls do
 
   defp with_read_transaction(%Txn{} = txn, fun), do: fun.(txn)
 
-  defp with_read_transaction(db, fun) do
-    case DB.transaction(db, fun) do
-      {:ok, result} -> result
-      {:error, error} -> raise error
-    end
-  end
+  # A read: it runs on a read connection, never in the database writer.
+  defp with_read_transaction(db, fun), do: DB.read_transaction!(db, fun)
 end

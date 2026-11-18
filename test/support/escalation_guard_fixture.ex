@@ -58,7 +58,7 @@ defmodule Tightbeam.EscalationGuardFixture do
       assert_receive {:scheduled_uncommitted, db_pid}, 2_000
 
       try do
-        assert {:ok, [[0, 0]]} =
+        assert {:ok, [[0, 1]]} =
                  readonly_query(
                    reader,
                    "SELECT (SELECT COUNT(*) FROM wakes WHERE conditionScope=?1), (SELECT COUNT(*) FROM condition_facts WHERE scope=?1)",
@@ -91,7 +91,7 @@ defmodule Tightbeam.EscalationGuardFixture do
         )
       end
 
-      assert {:ok, [[0, 0]]} =
+      assert {:ok, [[0, 1]]} =
                DB.query(
                  db,
                  "SELECT (SELECT COUNT(*) FROM wakes WHERE conditionScope=?1), (SELECT COUNT(*) FROM condition_facts WHERE scope=?1)",

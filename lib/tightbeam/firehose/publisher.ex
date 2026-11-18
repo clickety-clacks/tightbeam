@@ -37,7 +37,7 @@ defmodule Tightbeam.Firehose.Publisher do
   }
 
   @transactional_verbs MapSet.new(
-                         ~w(ask answer return work-item-create work-item-handoff work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest revoke-assignment reopen-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire operator-ask operator-rule operator-withdraw rule effort-rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
+                         ~w(ask answer return work-item-create work-item-handoff work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest revoke-assignment reopen-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire operator-ask operator-rule operator-withdraw rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
                        )
 
   @spec accepted(map(), term()) :: :ok
@@ -401,6 +401,22 @@ defmodule Tightbeam.Firehose.Publisher do
   end
 
   @spec committed_notice(String.t(), map(), map()) :: map()
+  def committed_notice(
+        "session_record_event.created" = class,
+        %{"eventId" => event_id, "at" => at} = item,
+        %{"sessionKey" => session_key}
+      )
+      when is_binary(event_id) and is_integer(at) and is_binary(session_key) do
+    %{
+      "class" => class,
+      "resource" => "record events",
+      "op" => "append",
+      "occurredAt" => at,
+      "refs" => %{"sessionKey" => session_key},
+      "payload" => item
+    }
+  end
+
   def committed_notice("kungfu.updated" = class, payload, refs)
       when is_map(payload) and is_map(refs) do
     name = payload["name"] || payload[:name]

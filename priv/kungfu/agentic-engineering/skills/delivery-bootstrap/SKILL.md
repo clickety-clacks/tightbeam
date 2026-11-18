@@ -13,6 +13,9 @@ arrangement; Main and PO do not become production staffers. A named agent retain
 intake until the receiving PDO explicitly accepts it on the same work item. Do
 not ask the user to repeat or reconfirm already-authorized work.
 
+When establishing delivery for a new project, have the accepted PDO establish
+its target branches and watcher coverage under the `landing` skill.
+
 Before production, read `tightbeam work-item-get <workItemId>` and inspect
 `deliveryOwnerSessionKey`. It is the one explicit accountable owner link for
 that item. Do not infer it from `ownerUserId`, PO association, role, ancestry,

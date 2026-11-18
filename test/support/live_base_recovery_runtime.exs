@@ -59,6 +59,7 @@ File.mkdir_p!(rules_dir)
 
 File.write!(Path.join(rules_dir, "boot-decision-recovery.toml"), """
 [[rule]]
+archetypes = ["*"]
 name = "observe-boot-decision-recovery"
 verb = "retire"
 edges = ["row-commit"]

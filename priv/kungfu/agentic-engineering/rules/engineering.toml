@@ -3,6 +3,7 @@
 # restriction and continue separable authorized work while it is corrected.
 
 [[policy]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "operational-evidence-for-unfiled-live-effects"
 purpose = "attest-operational-evidence"
 when = [
@@ -15,6 +16,7 @@ when = [
 # The notification does not force a reviewer-code assignment or satisfy completion checks.
 # Completion remains blocked until the required review evidence qualifies.
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "completion-requires-review"
 verb = "attest"
 text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards and substantive unlinked review-effect cards on the same work item, to be reviewed-clean on a card held by a different session; code completion also requires that review to cover every commit in the holder's latest verified result, and a missing-coverage refusal names the uncovered commits; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
@@ -49,6 +51,7 @@ prompt = "Coordinate independent review of assignment {assignment_id}; preserve 
 # `target.archetype` names the session about to hold the card; the assignment
 # facts describe the reviewed or prior card, never the one being opened.
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "implementation-requires-posture"
 verb = "assign"
 text = "implementation needs a posture ruling first: file posture-light or posture-heavy as a verdict on a card on this work item, with the reasoning, then assign"
@@ -56,11 +59,12 @@ external_producer = true
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "target.archetype", op = "eq", value = "coder" },
+  { fact = "target.archetype", op = "eq", value = "agentic-engineering.coder" },
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["posture-light", "posture-heavy"] },
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "implementation-dispatch-requires-posture"
 verb = "dispatch"
 text = "implementation needs a posture ruling first: file posture-light or posture-heavy as a verdict on a card on this work item, with the reasoning, then dispatch"
@@ -68,6 +72,6 @@ external_producer = true
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "target.archetype", op = "eq", value = "coder" },
+  { fact = "target.archetype", op = "eq", value = "agentic-engineering.coder" },
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["posture-light", "posture-heavy"] },
 ]

@@ -93,6 +93,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     File.write!(Path.join(base, "identity/rules/verification.toml"), """
     [[policy]]
+    archetypes = ["*"]
     name = "accountable-dependency-verifier"
     purpose = "wait-verification-admission"
     when = [
@@ -1140,7 +1141,11 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
       turn = running_turn(ctx.db, "resolver")
       handler = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})["wake"]
-      shipped = File.read!("priv/kungfu/agentic-engineering/rules/verification.toml")
+
+      shipped =
+        File.read!("priv/kungfu/agentic-engineering/rules/verification.toml")
+        |> Tightbeam.TestRailScopeFixtures.wildcard_substrate(["rule", "policy"])
+
       File.write!(Path.join(ctx.base, "identity/rules/verification.toml"), shipped)
       Rules.load!(ctx.base, ~w(wake attest))
 
@@ -1194,6 +1199,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       File.read!(
         Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__)
       )
+      |> Tightbeam.TestRailScopeFixtures.wildcard_substrate(["rule", "policy"])
 
     File.write!(Path.join(ctx.base, "identity/rules/verification.toml"), shipped)
     Rules.load!(ctx.base, ~w(wake attest))
@@ -1227,6 +1233,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     # inside registration. Evaluation must not execute notice/remedy effects.
     File.write!(Path.join(ctx.base, "identity/rules/pause.toml"), """
     [[rule]]
+    archetypes = ["*"]
     name = "pause-ancestor-admission"
     verb = "wake"
     text = "Admission paused."

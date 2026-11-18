@@ -2,6 +2,8 @@ defmodule Tightbeam.RailRemedyTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
+  @user_id "test-user"
+
   alias Tightbeam.{
     Archetypes,
     Assignments,
@@ -29,12 +31,15 @@ defmodule Tightbeam.RailRemedyTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('#{@user_id}', 0, 1)"
       )
 
-    holder = session(db, "holder", "flynn", "claude", "coder")
-    reviewer = session(db, "reviewer-session", "flynn", "claude", "reviewer")
-    Roles.create!(db, "reviewer", "flynn", reviewer.session_key)
+    holder = session(db, "holder", @user_id, "claude", "agentic-engineering.coder")
+
+    reviewer =
+      session(db, "reviewer-session", @user_id, "claude", "agentic-engineering.reviewer-code")
+
+    Roles.create!(db, "reviewer", @user_id, reviewer.session_key)
 
     # Canonicalize the tmp base: Darwin's System.tmp_dir!/0 sits under the /var
     # symlink (/var -> /private/var), and Containment.rail_profile/1 (the rail scratch
@@ -91,7 +96,7 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   test "completion review gate stores one ordinary notice for the accountable owner", ctx do
-    main = session(ctx.db, Org.personal_session_key("flynn"), "flynn", "claude", "orchestrator")
+    main = session(ctx.db, Org.personal_session_key(@user_id), @user_id, "claude", "orchestrator")
     assignment = assignment(ctx, "review staffing stays outside the core", "policy")
     load_completion_gate(ctx)
 
@@ -129,10 +134,50 @@ defmodule Tightbeam.RailRemedyTest do
     assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id) == nil
   end
 
+  test "learned engineering completion gate records the report and routes its qualified notice",
+       ctx do
+    main =
+      session(
+        ctx.db,
+        Org.personal_session_key(@user_id),
+        @user_id,
+        "claude",
+        "agentic-engineering.orchestrator"
+      )
+
+    assignment = assignment(ctx, "learned completion review", "policy")
+    assert :initialized = Tightbeam.Identity.init!(ctx.base_dir)
+    assert {:ok, _} = Tightbeam.Identity.learn!(ctx.base_dir, "agentic-engineering", "test")
+    Archetypes.load!(ctx.base_dir)
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    name = "agentic-engineering.completion-requires-review"
+    snapshot = Rules.effective_snapshot()
+    gate = Enum.find(snapshot.rules, &(&1.name == name))
+    assert gate.owner == {:kungfu, "agentic-engineering"}
+
+    # Exercise this consumer with the actual learned declaration, independently
+    # of the other completion prerequisites in the same bundle.
+    Rules.with_snapshot(%{snapshot | rules: [gate]}, fn ->
+      assert {:ok, %{assignment: %{state: "open"}, attest: %{kind: "completion"}}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+    end)
+
+    recipient = main.session_key
+
+    assert {:ok, [[^recipient, "prompt", 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,consumer,summon FROM wakes WHERE assignmentId=?1 AND origin=?2",
+               [assignment.id, "remedy:" <> name]
+             )
+
+    assert RailRemedy.episode(ctx.db, name, assignment.id) == nil
+  end
+
   test "completion review notice reaches the accountable session instead of the holder", ctx do
-    main = session(ctx.db, Org.personal_session_key("flynn"), "flynn", "claude", "orchestrator")
-    orchestrator = session(ctx.db, "lane-orchestrator", "flynn", "claude", "orchestrator")
-    delivery_owner = session(ctx.db, "delivery-owner", "flynn", "claude", "orchestrator")
+    main = session(ctx.db, Org.personal_session_key(@user_id), @user_id, "claude", "orchestrator")
+    orchestrator = session(ctx.db, "lane-orchestrator", @user_id, "claude", "orchestrator")
+    delivery_owner = session(ctx.db, "delivery-owner", @user_id, "claude", "orchestrator")
     item = work_item(ctx, "accountable review notice")
 
     {:ok, _} =
@@ -144,8 +189,8 @@ defmodule Tightbeam.RailRemedyTest do
     lane =
       Assignments.__handle__(ctx.db, "assign", %{
         verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "user:#{@user_id}",
+        principal: {:user, @user_id},
         session_key: orchestrator.session_key,
         target_role: nil,
         role_fallback: false,
@@ -232,7 +277,7 @@ defmodule Tightbeam.RailRemedyTest do
 
     review = assignment_row(ctx.db, review_id)
     assert review.reviewsAssignmentId == assignment.id
-    assert review.openedByUser == "flynn"
+    assert review.openedByUser == @user_id
     assert review.openedBySession == nil
 
     assert {:ok, [[principal]]} =
@@ -305,7 +350,7 @@ defmodule Tightbeam.RailRemedyTest do
       verb: "assign",
       origin: "remedy:completion-needs-review",
       principal:
-        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}},
+        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: @user_id}},
       session_key: ctx.reviewer.session_key,
       target_role: "reviewer",
       role_fallback: false,
@@ -584,7 +629,7 @@ defmodule Tightbeam.RailRemedyTest do
     assert %{session_key: ^producer} =
              Idempotency.get(
                ctx.db,
-               "flynn",
+               @user_id,
                "spawn",
                "rail-dispatch:spawn-remedy:#{assignment.id}:1"
              )
@@ -601,7 +646,7 @@ defmodule Tightbeam.RailRemedyTest do
           spawn.(%{
             verb: "spawn",
             origin: "remedy:spawn-race",
-            principal: {:remedy, %{statute: "spawn-race", action: "spawn", owner: "flynn"}},
+            principal: {:remedy, %{statute: "spawn-race", action: "spawn", owner: @user_id}},
             session_key: nil,
             params: %{
               display_name: "Unconstrained Racer",
@@ -641,7 +686,7 @@ defmodule Tightbeam.RailRemedyTest do
     assert %{session_key: target_session} = Wakes.get(ctx.db, first_wake_id)
     assert target_session == ctx.reviewer.session_key
 
-    Org.retire(ctx.db, target_session, "user:flynn", 1_000)
+    Org.retire(ctx.db, target_session, "user:#{@user_id}", 1_000)
 
     assert {:error, %{producer: second_wake_id}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
@@ -1084,7 +1129,7 @@ defmodule Tightbeam.RailRemedyTest do
 
   test "assign remedy principal is rejected by every non-assign assignment verb", ctx do
     principal =
-      {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}}
+      {:remedy, %{statute: "completion-needs-review", action: "assign", owner: @user_id}}
 
     expected = %{
       code: "process_denied",
@@ -1249,6 +1294,10 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   defp put_rules(ctx, contents) do
+    # These files are placed at the substrate path and model org-wide remedies.
+    contents =
+      Tightbeam.TestRailScopeFixtures.wildcard_substrate(contents, ["rule", "policy"])
+
     File.write!(Path.join(ctx.base_dir, "identity/rules/remedy.toml"), contents)
   end
 
@@ -1545,8 +1594,8 @@ defmodule Tightbeam.RailRemedyTest do
   defp work_item(ctx, title) do
     WorkItems.__handle__(ctx.db, "work-item-create", %{
       verb: "work-item-create",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:#{@user_id}",
+      principal: {:user, @user_id},
       params: %{title: title}
     })
   end
@@ -1566,8 +1615,8 @@ defmodule Tightbeam.RailRemedyTest do
 
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:#{@user_id}",
+      principal: {:user, @user_id},
       session_key: ctx.holder.session_key,
       target_role: nil,
       role_fallback: false,
@@ -1584,8 +1633,8 @@ defmodule Tightbeam.RailRemedyTest do
   defp linked_review(ctx, assignment_id, subject) do
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:#{@user_id}",
+      principal: {:user, @user_id},
       session_key: ctx.reviewer.session_key,
       target_role: nil,
       role_fallback: false,
@@ -1650,15 +1699,18 @@ defmodule Tightbeam.RailRemedyTest do
   defp revoke(ctx, assignment_id) do
     Assignments.__handle__(ctx.db, "revoke-assignment", %{
       verb: "revoke-assignment",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "user:#{@user_id}",
+      principal: {:user, @user_id},
       session_key: nil,
       params: %{assignment_id: assignment_id, reason: "test disposition"}
     })
   end
 
   defp load_completion_gate(ctx) do
-    shipped = File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+    shipped =
+      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      |> Tightbeam.TestRailScopeFixtures.wildcard_substrate(["rule", "policy"])
+
     File.write!(Path.join(ctx.base_dir, "identity/rules/completion.toml"), shipped)
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
   end
@@ -1686,7 +1738,7 @@ defmodule Tightbeam.RailRemedyTest do
 
   defp assignment_row(db, id) do
     Assignments.__handle__(db, "assignment-get", %{
-      principal: {:user, "flynn"},
+      principal: {:user, @user_id},
       params: %{assignment_id: id}
     })
   end
@@ -1801,7 +1853,7 @@ defmodule Tightbeam.RailRemedyTest do
 
     for {verb, _source} <- unavailable do
       assert {:deny, %{code: "rule_unavailable"}} =
-               Rules.evaluate(ctx.db, %{verb: verb, origin: "user:flynn", params: %{}})
+               Rules.evaluate(ctx.db, %{verb: verb, origin: "user:#{@user_id}", params: %{}})
     end
 
     %{message: log}

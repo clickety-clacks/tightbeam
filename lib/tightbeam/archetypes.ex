@@ -38,15 +38,13 @@ defmodule Tightbeam.Archetypes do
         }
 
   @doc """
-  Load every manifest under `<base_dir>/identity/archetypes/*.toml`, validate,
-  merge over the built-in default, and store the set in :persistent_term.
+  Load substrate and receipt-owned archetype manifests, qualify their names,
+  validate them, and store the set in :persistent_term.
   Invalid manifests or fragment dependencies are logged and leave only their
   dependent archetypes unavailable. Returns the loaded map (name => t()).
   """
   @spec load!(String.t()) :: %{optional(String.t()) => t()}
   def load!(base_dir) do
-    manifest_dir = Path.join([base_dir, "identity", "archetypes"])
-
     refuse_reserved_substrate_skills!(base_dir)
 
     library =
@@ -59,28 +57,23 @@ defmodule Tightbeam.Archetypes do
       |> MapSet.union(MapSet.new(Tightbeam.Homes.baseline_skill_names()))
 
     archetypes =
-      manifest_dir
-      |> Path.join("*.toml")
-      |> Path.wildcard()
-      |> Enum.sort()
+      base_dir
+      |> archetype_paths()
       |> Enum.reduce(%{"default" => builtin_default()}, fn path, loaded ->
-        try do
-          bytes = File.read!(path)
-          manifest = Toml.decode!(bytes)
+        case load_manifest(path, base_dir) do
+          {:ok, name, archetype} ->
+            Map.put(loaded, name, archetype)
 
-          archetype =
-            manifest
-            |> validate!(path)
-            |> Map.put(:source, %{
-              file: Path.relative_to(path, base_dir),
-              sha256: bytes |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
-            })
-
-          Map.put(loaded, archetype.name, archetype)
-        rescue
-          error ->
+          {:error, error} ->
             Logger.warning("archetype #{path} unavailable: #{Exception.message(error)}")
-            Map.delete(loaded, Path.basename(path, ".toml"))
+
+            case Path.split(Path.relative_to(path, base_dir)) do
+              ["identity", "archetypes", short_name] ->
+                Map.delete(loaded, Path.rootname(short_name))
+
+              _ ->
+                loaded
+            end
         end
       end)
 
@@ -136,6 +129,41 @@ defmodule Tightbeam.Archetypes do
     {archetypes, _fragments} = :persistent_term.get(@persist_key)
     Map.get(archetypes, name)
   end
+
+  @doc "Resolve an exact qualified name, reporting qualified candidates for a bare name."
+  @spec resolve(String.t()) :: {:ok, t()} | {:error, map()}
+  def resolve(name) when is_binary(name) do
+    case get(name) do
+      archetype when is_map(archetype) ->
+        {:ok, archetype}
+
+      nil ->
+        if String.contains?(name, ".") do
+          {:error, %{code: "unknown_archetype", message: "unknown archetype: #{name}"}}
+        else
+          candidates =
+            all()
+            |> Map.keys()
+            |> Enum.filter(&String.ends_with?(&1, "." <> name))
+            |> Enum.sort()
+
+          if candidates == [] do
+            {:error, %{code: "unknown_archetype", message: "unknown archetype: #{name}"}}
+          else
+            {:error,
+             %{
+               code: "qualified_archetype_required",
+               candidates: candidates,
+               message:
+                 "plain archetype #{name} is not a substrate archetype; use one of: #{Enum.join(candidates, ", ")}"
+             }}
+          end
+        end
+    end
+  end
+
+  def resolve(_name),
+    do: {:error, %{code: "unknown_archetype", message: "archetype name must be a string"}}
 
   @doc "Compile an archetype's MCP declarations to the ACP mcpServers shape."
   @spec acp_mcp_servers(t()) :: [map()]
@@ -283,6 +311,40 @@ defmodule Tightbeam.Archetypes do
   def names do
     {archetypes, _fragments} = :persistent_term.get(@persist_key)
     archetypes |> Map.keys() |> Enum.sort()
+  end
+
+  defp load_manifest(path, base_dir) do
+    bytes = File.read!(path)
+    relative = Path.relative_to(path, base_dir)
+    owner = Tightbeam.Identity.Provenance.owner_for_path(base_dir, relative)
+
+    archetype =
+      bytes
+      |> Toml.decode!()
+      |> validate!(path)
+
+    name = Tightbeam.Identity.Provenance.qualify(owner, archetype.name)
+
+    archetype =
+      archetype
+      |> Map.put(:name, name)
+      |> Map.put(:source, %{
+        file: relative,
+        sha256: bytes |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+      })
+
+    {:ok, name, archetype}
+  rescue
+    error -> {:error, error}
+  end
+
+  defp archetype_paths(base_dir) do
+    root = Path.join([base_dir, "identity"])
+
+    (Path.wildcard(Path.join([root, "archetypes", "*.toml"])) ++
+       Path.wildcard(Path.join([root, "kungfu", "*", "archetypes", "*.toml"])))
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   @doc """
@@ -549,6 +611,11 @@ defmodule Tightbeam.Archetypes do
           :tightbeam
           |> Application.app_dir(Path.join("priv/kungfu-template", template_relative))
           |> File.read!()
+          # The shipped template represents a receipt-owned kungfu bundle. A
+          # scaffold is written directly into the org identity before any
+          # install receipt owns these paths, so its references are substrate
+          # names and must stay unqualified.
+          |> String.replace("<name>.<name>-role", "<name>-role")
           |> String.replace("<name>", name)
           |> String.replace("<purpose>", toml_basic_string(purpose))
 

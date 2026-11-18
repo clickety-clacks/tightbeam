@@ -3,9 +3,10 @@ defmodule Tightbeam.AdapterCoordinator do
   Owner of adapter lifecycle (port spec §Adapter lifecycle — this module IS
   that section; no TS equivalent, the TS gateway restarted nothing).
 
-  One `Tightbeam.Acp.Adapter` per adapter key `{harness, archetype, host}`
+  One `Tightbeam.Acp.Adapter` per adapter key `{harness, identity, host}`
   (§Placement — a host is part of WHERE an adapter is, so it is part of WHICH
-  adapter it is), started
+  adapter it is). Most harnesses use placement-scoped `shared` keys; Pi has a
+  placement readiness key and one worker key per Tightbeam session. Adapters start
   lazily under a DynamicSupervisor with restart: :temporary — the coordinator
   owns ALL restarts, so `normal` exits and crashes take the same path (no
   supervisor auto-restart racing the coordinator's bookkeeping).
@@ -22,7 +23,8 @@ defmodule Tightbeam.AdapterCoordinator do
     `adapter_for/2` returns {:error, :degraded} so affected turns fail fast
     with a clear reason (carried as `{:diagnosed, :degraded, node}` naming the
     consecutive failures and the last cause), /version|/health reflects it, the gateway stays up.
-    A successful restart closes the circuit and resets the count.
+    The existing backoff retries continue while it is open; a successful
+    restart closes the circuit and resets the count.
   - Re-adoption semaphore: at most the configured number of concurrent session/load
     calls per machine (no thundering herd after an adapter bounce, and no machine
     queues behind another machine's recovery). session/load failure → that session
@@ -250,6 +252,11 @@ defmodule Tightbeam.AdapterCoordinator do
     # away, because that callback settles the OS process group it owns.
     Process.flag(:trap_exit, true)
 
+    # Recording an adapter's death and launching its replacement is work the
+    # gateway owes. On an overloaded database owner the coordinator waits: a
+    # crash here stops every adapter it holds, and with them every running turn.
+    Tightbeam.DB.owed_work()
+
     db = Keyword.get(opts, :db, Tightbeam.DB)
     :ok = Tightbeam.HarnessProcess.ensure_schema(db)
     :ok = Tightbeam.HarnessProcess.reconcile(db)
@@ -281,6 +288,10 @@ defmodule Tightbeam.AdapterCoordinator do
       # Production waits for definitive park results; private finite overrides
       # keep deadline exhaustion deterministic in fault tests.
       shutdown_budget_ms: Keyword.get(opts, :shutdown_budget_ms, @shutdown_budget_ms),
+      # Private deadline-clock seam: fault tests advance phases without racing
+      # scheduler latency. Production always uses the monotonic clock.
+      shutdown_clock:
+        Keyword.get(opts, :shutdown_clock, fn _phase -> System.monotonic_time(:millisecond) end),
       shutdown_settlement_budget_ms:
         Keyword.get(opts, :shutdown_settlement_budget_ms, @shutdown_settlement_budget_ms),
       shutdown_cancel_grace_ms:
@@ -350,9 +361,9 @@ defmodule Tightbeam.AdapterCoordinator do
     # One monotonic clock covers preparation, park attempts, durable settlement,
     # and nonblocking retirement. Reserve the final slice for settlement; if
     # either DB phase cannot finish, keep the outcome explicitly unresolved.
-    local_deadline = System.monotonic_time(:millisecond) + state.shutdown_budget_ms
+    local_deadline = state.shutdown_clock.(:start) + state.shutdown_budget_ms
     deadline = Tightbeam.Application.shutdown_deadline(local_deadline)
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+    remaining = max(deadline - state.shutdown_clock.(:remaining), 0)
 
     settlement_budget =
       if deadline < local_deadline,
@@ -373,7 +384,7 @@ defmodule Tightbeam.AdapterCoordinator do
     results =
       case preparation do
         :ok ->
-          if System.monotonic_time(:millisecond) >= park_deadline do
+          if state.shutdown_clock.(:park) >= park_deadline do
             budget_exhausted_results(pending)
           else
             pending
@@ -381,7 +392,8 @@ defmodule Tightbeam.AdapterCoordinator do
             |> collect_shutdown_results(
               park_deadline,
               settle_start,
-              state.shutdown_cancel_grace_ms
+              state.shutdown_cancel_grace_ms,
+              state.shutdown_clock
             )
           end
 
@@ -405,9 +417,13 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def handle_call({:adapter_for, key}, from, state) do
+    park_error = explicit_pi_park_error(key, state.db)
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
+      park_error ->
+        {:reply, park_error, state}
+
       reusable_entry?(entry) ->
         {:reply, checkout(entry), state}
 
@@ -517,9 +533,13 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp adapter_for_reply(key, context, from, state, authoritative?) do
+    park_error = explicit_pi_park_error(key, state.db)
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
+      park_error ->
+        {:reply, park_error, state}
+
       authoritative? and readiness_pending?(entry) and
           entry.context != normalize_context(context) ->
         {:noreply, replace_pending_readiness(key, entry, state, context, from)}
@@ -588,6 +608,16 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, :ok, state}
   end
 
+  defp explicit_pi_park_error(key, db) do
+    if Tightbeam.Placement.pi_session_adapter?(key) do
+      parent = Tightbeam.Placement.placement_adapter_key(key)
+
+      if Tightbeam.HarnessProcess.parked?(db, parent) do
+        {:error, {:park_fenced, key_name(parent)}}
+      end
+    end
+  end
+
   @impl true
   def handle_cast({:close_adapter, key}, state) do
     {_result, state} = do_close_adapter(key, state)
@@ -601,6 +631,31 @@ defmodule Tightbeam.AdapterCoordinator do
   defp do_close_adapter(key, state), do: do_close_adapter(key, state, :process_tree)
 
   defp do_close_adapter(key, state, cleanup_scope) do
+    keys =
+      case key do
+        {:pi, "shared", host} ->
+          state.adapters
+          |> Map.keys()
+          |> Enum.filter(fn
+            {:pi, _identity, ^host} = child -> Tightbeam.Placement.pi_session_adapter?(child)
+            _ -> false
+          end)
+          |> Enum.sort()
+          |> Kernel.++([key])
+
+        _ ->
+          [key]
+      end
+
+    Enum.reduce(keys, {:ok, state}, fn key, {result, state} ->
+      case do_close_adapter_one(key, state, cleanup_scope) do
+        {:ok, state} -> {result, state}
+        {{:error, _reason} = error, state} -> {if(result == :ok, do: error, else: result), state}
+      end
+    end)
+  end
+
+  defp do_close_adapter_one(key, state, cleanup_scope) do
     {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
     state = cancel_pending_starts(key, state)
 
@@ -730,11 +785,11 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  defp collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms) do
-    collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms, [])
+  defp collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms, clock) do
+    collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms, clock, [])
   end
 
-  defp collect_shutdown_results([], _deadline, _settle_start, _cancel_grace_ms, results),
+  defp collect_shutdown_results([], _deadline, _settle_start, _cancel_grace_ms, _clock, results),
     do: Enum.reverse(results)
 
   defp collect_shutdown_results(
@@ -742,16 +797,17 @@ defmodule Tightbeam.AdapterCoordinator do
          deadline,
          settle_start,
          cancel_grace_ms,
+         clock,
          results
        ) do
-    case Task.yield(task, max(deadline - System.monotonic_time(:millisecond), 0)) do
+    case Task.yield(task, max(deadline - clock.(:park_wait), 0)) do
       {:ok, result} ->
-        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, [
+        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, clock, [
           {key, process_row, result} | results
         ])
 
       {:exit, reason} ->
-        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, [
+        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, clock, [
           {key, process_row, {:error, {:shutdown_task_exit, reason}}} | results
         ])
 
@@ -762,7 +818,12 @@ defmodule Tightbeam.AdapterCoordinator do
         cancel_shutdown_tasks([current | rest])
 
         timed_out =
-          collect_cancelled_shutdown_results([current | rest], settle_start, cancel_grace_ms)
+          collect_cancelled_shutdown_results(
+            [current | rest],
+            settle_start,
+            cancel_grace_ms,
+            clock
+          )
 
         Enum.reverse(results) ++ timed_out
     end
@@ -774,7 +835,7 @@ defmodule Tightbeam.AdapterCoordinator do
     end)
   end
 
-  defp collect_cancelled_shutdown_results(tasks, settle_start, cancel_grace_ms) do
+  defp collect_cancelled_shutdown_results(tasks, settle_start, cancel_grace_ms, clock) do
     # The park deadline already budgets one full grace ahead of the reserve, so
     # a cancel that starts on time gets all of it. When park collection overran
     # its own deadline, the grace is truncated at the reserve boundary rather
@@ -782,11 +843,11 @@ defmodule Tightbeam.AdapterCoordinator do
     # unrecorded outcome beats a recorded outcome settlement can no longer
     # write.
     cancel_deadline =
-      min(System.monotonic_time(:millisecond) + cancel_grace_ms, settle_start)
+      min(clock.(:cancel) + cancel_grace_ms, settle_start)
 
     yielded =
       Enum.map(tasks, fn {key, process_row, task} ->
-        remaining = max(cancel_deadline - System.monotonic_time(:millisecond), 0)
+        remaining = max(cancel_deadline - clock.(:cancel_wait), 0)
         {key, process_row, task, Task.yield(task, remaining)}
       end)
 
@@ -827,7 +888,7 @@ defmodule Tightbeam.AdapterCoordinator do
          deadline,
          retired
        ) do
-    if System.monotonic_time(:millisecond) >= deadline do
+    if state.shutdown_clock.(:retire) >= deadline do
       {late, targets} = late_shutdown_outcomes([{key, process_row, result} | rest], state)
       {Enum.reverse(retired) ++ late, state, targets}
     else
@@ -1063,6 +1124,11 @@ defmodule Tightbeam.AdapterCoordinator do
   # still gets its row; the turn that asked for it gets its own spawn error.
   defp told_sessions(_db, _key, false = _was_ready?), do: []
 
+  # The placement-scoped Pi adapter is only the readiness/cache owner. Pi turns
+  # run on session-keyed workers, so losing this entry does not stop any active
+  # session worker and must not send them an adapter-down notice.
+  defp told_sessions(_db, {:pi, "shared", _host}, true), do: []
+
   defp told_sessions(db, {harness, "shared", host}, true) do
     {:ok, rows} =
       Tightbeam.DB.query(
@@ -1072,6 +1138,20 @@ defmodule Tightbeam.AdapterCoordinator do
       )
 
     Enum.map(rows, fn [session_key] -> session_key end)
+  end
+
+  defp told_sessions(db, {:pi, _identity, host} = key, true) do
+    with {:ok, session_key} <- Tightbeam.Placement.pi_session_key(key),
+         {:ok, [[^session_key]]} <-
+           Tightbeam.DB.query(
+             db,
+             "SELECT sessionKey FROM sessions WHERE state = 'active' AND harness = 'pi' AND host = ?1 AND sessionKey = ?2",
+             [host, session_key]
+           ) do
+      [session_key]
+    else
+      _ -> []
+    end
   end
 
   # Sessions reach a key the way the gateway builds one — harness and host,
@@ -1131,6 +1211,16 @@ defmodule Tightbeam.AdapterCoordinator do
             ErrorDiagnostic.of(reason)
           )
 
+        entry = Map.fetch!(state.adapters, readiness_key)
+
+        state =
+          retry_open_circuit_after_failure(
+            state,
+            readiness_key,
+            entry,
+            entry.generation
+          )
+
         {:noreply, finish_readiness(state, readiness_key, {:error, {:launch_refused, refusal}})}
 
       key = state.monitors[ref] ->
@@ -1187,7 +1277,7 @@ defmodule Tightbeam.AdapterCoordinator do
           # this adapter checked out, and the only one it can ask about.
           died_at = entry.generation
           generation = entry.generation + 1
-          timer = schedule_restart(state, key, generation, failures, circuit)
+          timer = schedule_restart(state, key, generation, failures)
 
           entry = %{
             entry
@@ -1263,6 +1353,14 @@ defmodule Tightbeam.AdapterCoordinator do
             {:noreply, start_adapter_unfenced(key, entry, state, opts)}
 
           {:error, refusal} ->
+            state =
+              retry_open_circuit_after_failure(
+                state,
+                key,
+                entry,
+                entry.generation
+              )
+
             {:noreply, finish_readiness(state, key, {:error, {:launch_refused, refusal}})}
         end
 
@@ -1274,6 +1372,7 @@ defmodule Tightbeam.AdapterCoordinator do
   def handle_info({:adapter_readiness_timeout, key, generation, token}, state) do
     case state.adapters[key] do
       %{generation: ^generation, readiness_token: ^token} = entry ->
+        failed_generation = entry.generation
         state = terminate_readiness_generation(key, entry, state, true)
 
         entry = %{
@@ -1285,6 +1384,7 @@ defmodule Tightbeam.AdapterCoordinator do
         }
 
         state = put_adapter(state, key, entry)
+        state = retry_open_circuit_after_failure(state, key, entry, failed_generation)
 
         refusal = %{code: "adapter_readiness_timeout", message: "Adapter readiness timed out"}
         {:noreply, finish_readiness(state, key, {:error, {:launch_refused, refusal}})}
@@ -1296,7 +1396,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_info({:restart_adapter, key, generation}, state) do
     case state.adapters[key] do
-      %{generation: ^generation, pid: nil, circuit: :closed} = entry ->
+      %{generation: ^generation, pid: nil} = entry ->
         cond do
           readiness_pending?(entry) ->
             {:noreply, state}
@@ -1536,7 +1636,7 @@ defmodule Tightbeam.AdapterCoordinator do
         circuit = if failures >= state.failure_circuit, do: :open, else: :closed
         generation = max(entry.generation, 1)
 
-        timer = schedule_restart(state, key, generation, failures, circuit)
+        timer = schedule_restart(state, key, generation, failures)
 
         entry = %{
           entry
@@ -1686,14 +1786,27 @@ defmodule Tightbeam.AdapterCoordinator do
     do: MapSet.put(ready_refs, monitor)
 
   defp put_ready_ref(ready_refs, _monitor), do: ready_refs
-  defp schedule_restart(_state, _key, _generation, _failures, :open), do: nil
 
-  defp schedule_restart(state, key, generation, failures, :closed) do
+  defp schedule_restart(state, key, generation, failures) do
     Process.send_after(
       self(),
       {:restart_adapter, key, generation},
       backoff(state, failures)
     )
+  end
+
+  defp retry_open_circuit_after_failure(state, key, entry, previous_generation) do
+    if entry.circuit == :open do
+      cancel_timer_flush(entry.timer, {:restart_adapter, key, previous_generation})
+
+      failures = entry.failures + 1
+      timer = schedule_restart(state, key, entry.generation, failures)
+      entry = %{entry | failures: failures, timer: timer}
+
+      put_adapter(state, key, entry)
+    else
+      state
+    end
   end
 
   defp ready_entry?(entry),

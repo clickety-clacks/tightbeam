@@ -1,4 +1,5 @@
 """Deterministic contract checks for exact-candidate CI (stdlib only)."""
+import json
 import os
 from pathlib import Path
 import re
@@ -12,17 +13,26 @@ WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml'
 
 def evaluate(expression, context):
     """Evaluate the small GitHub expression subset this workflow uses."""
-    tokens = re.findall(
-        r"\s*(&&|\|\||!=|==|[(),]|'[^']*'|startsWith|[A-Za-z_][\w.-]*)", expression)
-    if ''.join(tokens) != re.sub(r'\s+', '', expression):
+    token_pattern = re.compile(
+        r"\s*(&&|\|\||!=|==|[(),]|'[^']*'|startsWith|[A-Za-z_][\w.-]*)")
+    tokens = []
+    position = 0
+    for match in token_pattern.finditer(expression):
+        if expression[position:match.start()].strip():
+            raise ValueError('unsupported expression: ' + expression)
+        tokens.append(match.group(1))
+        position = match.end()
+    if expression[position:].strip():
         raise ValueError('unsupported expression: ' + expression)
     words = {'&&': ' and ', '||': ' or ', '!=': ' != ', '==': ' == ',
-             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts'}
+             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts',
+             'format': '_format', 'fromJSON': '_json'}
     code = ''.join(
         words.get(token) or (repr(token[1:-1]) if token.startswith("'")
                              else repr(context[token]))
         for token in tokens)
-    return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p)})
+    return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p),
+                       '_format': lambda f, *a: f.format(*a), '_json': json.loads})
 
 
 class ExactHeadCI(unittest.TestCase):
@@ -182,6 +192,12 @@ class ExactHeadCI(unittest.TestCase):
         self.assertIn('persist-credentials: false', job)
         self.assertIn('test "$DISPATCH_SHA" = "$CI_SOURCE_SHA"', job)
         self.assertIn('test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"', job)
+        self.assertIn('EXPECTED_BASE: ${{ inputs.candidate_base_sha }}', job)
+        self.assertIn('[[ "$EXPECTED_BASE" =~ ^[0-9a-f]{40}$ ]] || exit 1', job)
+        self.assertIn('git cat-file -e "$EXPECTED_BASE^{commit}"', job)
+        self.assertIn('test "$(git merge-base HEAD "$EXPECTED_BASE")" = "$EXPECTED_BASE"', job)
+        self.assertIn('git diff --exit-code "$EXPECTED_BASE" HEAD -- priv', job)
+        self.assertNotIn('git rev-parse HEAD^)', job)
         self.assertIn('python3 scripts/verify_shipped_privacy.py', job)
         self.assertIn('sh packaging/assemble.sh', job)
         self.assertIn('mix run --no-start scripts/docs_composition_52.exs', job)
@@ -199,6 +215,51 @@ class ExactHeadCI(unittest.TestCase):
         self.assertNotIn('merge_group:', publish)
         self.assertNotIn('on:\n  push:', publish)
 
+
+    def test_full_suites_run_on_every_event(self):
+        # The suites are the gate on pull requests too: no event switch may
+        # turn the test job back into a compile-only check.
+        self.assertNotIn('FULL_SUITE', self.text)
+        job = self.jobs['test']
+        steps = job.split('\n      - ')
+        for command in ('run: cargo build --release', 'run: scripts/verify_mix.sh',
+                        'run: cargo test'):
+            matching = [step for step in steps if command in step]
+            self.assertEqual(len(matching), 1, command)
+            self.assertNotRegex(matching[0], r'(?m)^        if:', command)
+        condition = re.search(r'(?m)^    if: (.*)$', job).group(1)
+        for event in ('pull_request', 'merge_group', 'push', 'workflow_dispatch'):
+            self.assertTrue(evaluate(condition, {
+                'github.event_name': event, 'inputs.docs_validation': 'off'}), event)
+
+    def test_pull_request_suites_stay_off_the_release_pools(self):
+        # The few self-hosted runners carry release work; pull request,
+        # merge-queue and manual suites run on hosted runners beside them.
+        job = self.jobs['test']
+        self.assertIn(
+            "    runs-on: ${{ matrix.name == 'macos' && github.event_name == 'push' && "
+            "fromJSON('[\"self-hosted\", \"tb-macos\"]') || matrix.os }}", job)
+        self.assertEqual(re.findall(r'(?m)^          - os: (\S+)$', job),
+                         ['ubuntu-24.04', 'macos-latest'])
+
+    def test_self_hosted_mac_checks_disk_before_the_suite(self):
+        job = self.jobs['test']
+        self.assertLess(
+            job.index('name: Require free disk space on the self-hosted macOS runner'),
+            job.index('run: scripts/verify_mix.sh'))
+        self.assertIn("if: runner.os == 'macOS' && runner.environment == 'self-hosted'", job)
+
+    def test_only_a_superseded_pull_request_run_is_cancelled(self):
+        group = re.search(r'(?m)^  group: \$\{\{ (.*) \}\}$', self.text).group(1)
+        cancel = re.search(r'(?m)^  cancel-in-progress: \$\{\{ (.*) \}\}$', self.text).group(1)
+        base = {'github.event.pull_request.number': 12, 'github.run_id': 99}
+        self.assertEqual(
+            evaluate(group, {**base, 'github.event_name': 'pull_request'}), 'ci-pr-12')
+        self.assertTrue(evaluate(cancel, {'github.event_name': 'pull_request'}))
+        for event in ('push', 'merge_group', 'workflow_dispatch'):
+            self.assertEqual(
+                evaluate(group, {**base, 'github.event_name': event}), 'ci-run-99', event)
+            self.assertFalse(evaluate(cancel, {'github.event_name': event}), event)
 
     def test_no_retired_branch_dependency(self):
         self.assertNotIn('release-candidate/', self.text)
