@@ -94,7 +94,7 @@ defmodule Tightbeam.Wire.RouterTest do
         })
 
       assert response.status == 200
-      JSON.decode!(response.resp_body)
+      JSON.decode!(response.resp_body)["result"]
     end
 
     first = send_wake.(params)
