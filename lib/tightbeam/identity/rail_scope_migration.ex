@@ -187,7 +187,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
                    # Bootstrap only seeds absent rows. Advance the existing served
                    # stamp with the same snapshot and allocator as publication, in
                    # this transaction so a failed migration rolls both back.
-                   [identity | _] = AdminProjection.served_entries(txn, base_dir)
+                   identity = AdminProjection.served_identity_entry(txn, base_dir)
 
                    AdminProjection.allocate_in_txn(
                      txn,
