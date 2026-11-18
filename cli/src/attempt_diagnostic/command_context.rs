@@ -48,7 +48,10 @@ impl CommandContext {
             // than the shared RequestSpec dispatcher and attempt/receipt path.
             // Do not claim that this command has that metadata until its
             // dedicated transport callers are explicitly integrated.
-            IdentityCurrent | GithubAuthCheck | SessionConnect { .. } | SessionDiagnose { .. } => {
+            IdentityCurrent
+            | GithubAuthCheck { .. }
+            | SessionConnect { .. }
+            | SessionDiagnose { .. } => {
                 return None;
             }
             Help => ("cli.help", Catalog),
@@ -74,8 +77,10 @@ impl CommandContext {
             HarklightRevise { .. } => ("cli.harklight_revise", DispatchPath),
             HarklightRetract { .. } => ("cli.harklight_retract", DispatchPath),
             HarklightSettle { .. } => ("cli.harklight_settle", DispatchPath),
+            HarklightListenerRestore { .. } => ("cli.harklight_listener_restore", DispatchPath),
             HarklightFollow { .. } => ("cli.harklight_follow", DispatchPath),
             HarklightCover { .. } => ("cli.harklight_cover", DispatchPath),
+            HarklightBriefingsCatchup { .. } => ("cli.harklight_briefings_catchup", DispatchPath),
             HarklightRetry { .. } => ("cli.harklight_retry", DispatchPath),
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
             Artifacts { .. } => ("cli.artifacts", DispatchPath),
@@ -88,10 +93,10 @@ impl CommandContext {
             SessionReparent { .. } => ("cli.session_reparent", DispatchPath),
             SessionCustodyTransfer { .. } => ("cli.session_custody_transfer", DispatchPath),
             SessionPoSet { .. } => ("cli.session_po_set", DispatchPath),
+            SessionRename { .. } => ("cli.session_rename", DispatchPath),
             Tune { .. } => ("cli.tune", DispatchPath),
             Assign { .. } => ("cli.assign", DispatchPath),
             Dispatch { .. } => ("cli.dispatch", DispatchPath),
-            EffortRule { .. } => ("cli.effort_rule", DispatchPath),
             Ask { .. } => ("cli.ask", DispatchPath),
             Answer { .. } => ("cli.answer", DispatchPath),
             // Current spelling changed; preserve the existing operation.
@@ -132,6 +137,7 @@ impl CommandContext {
             MementoSet { .. } => ("cli.memento_set", DispatchPath),
             Mementos { .. } => ("cli.mementos", DispatchPath),
             Attests { .. } => ("cli.attests", DispatchPath),
+            CheckAttest { .. } => ("cli.check_attest", DispatchPath),
             AssignmentGet { .. } => ("cli.assignment_get", DispatchPath),
             Assignments { .. } => ("cli.assignments", DispatchPath),
             CancelWake { .. } => ("cli.cancel_wake", DispatchPath),
@@ -319,7 +325,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
     use Command::*;
     use EffectContract::*;
     match command {
-        IdentityCurrent | GithubAuthCheck | SessionConnect { .. } => Unknown,
+        IdentityCurrent | GithubAuthCheck { .. } | SessionConnect { .. } => Unknown,
         Help
         | CommandHelp(_)
         | Doctor { .. }
@@ -342,6 +348,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | DurableTopline { .. }
         | Mementos { .. }
         | Attests { .. }
+        | CheckAttest { .. }
         | AssignmentGet { .. }
         | Assignments { .. }
         | IdentityStatus { .. }
@@ -368,6 +375,9 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         // A handoff commits the owner change and notification together, but
         // the command does not accept an idempotency key.
         WorkItemHandoff { .. } | RetireWithdraw { .. } => WriteWithoutIdempotency,
+
+        // Rename updates one stable session record and has no replay key.
+        SessionRename { .. } => WriteWithoutIdempotency,
 
         Wake {
             idempotency_key, ..
@@ -458,13 +468,14 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HarklightRevise { .. }
         | HarklightRetract { .. }
         | HarklightSettle { .. }
+        | HarklightListenerRestore { .. }
         | HarklightFollow { .. }
         | HarklightCover { .. }
+        | HarklightBriefingsCatchup { .. }
         | HarklightRetry { .. }
         | ToolCallObserved
         | RoleBind { .. }
         | Tune { .. }
-        | EffortRule { .. }
         | Ask { .. }
         | Answer { .. }
         | Return { .. }
@@ -571,6 +582,48 @@ mod tests {
         assert!(!debug.contains("PRIVATE_USER"));
         assert!(!debug.contains("PRIVATE_ASSIGNMENT"));
         assert!(!debug.contains("PRIVATE_REASON"));
+    }
+
+    #[test]
+    fn harklight_briefing_catchup_is_a_dispatch_write_without_retained_request_data() {
+        let command = Command::HarklightBriefingsCatchup {
+            identity: Identity::Session,
+            limit: Some(7),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.harklight_briefings_catchup"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        assert!(!format!("{context:?}").contains("7"));
+    }
+
+    #[test]
+    fn harklight_listener_restore_is_an_unkeyed_dispatch_write() {
+        let command = Command::HarklightListenerRestore {
+            identity: Identity::Session,
+            handle: "PRIVATE_HANDLE".into(),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.harklight_listener_restore"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        assert!(!format!("{context:?}").contains("PRIVATE_HANDLE"));
     }
 
     #[test]
@@ -835,7 +888,12 @@ mod tests {
     #[test]
     fn local_commands_and_separate_tool_endpoint_cannot_borrow_dispatch_context() {
         assert!(CommandContext::for_command(&Command::IdentityCurrent).is_none());
-        assert!(CommandContext::for_command(&Command::GithubAuthCheck).is_none());
+        assert!(
+            CommandContext::for_command(&Command::GithubAuthCheck {
+                text_template: None
+            })
+            .is_none()
+        );
         let context = CommandContext::for_command(&Command::ToolCallObserved).unwrap();
         assert_eq!(
             context

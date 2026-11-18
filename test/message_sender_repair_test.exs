@@ -8,6 +8,7 @@ defmodule Tightbeam.MessageSenderRepairTest do
     start_supervised!({DB, path: ":memory:", name: name})
     :ok = Projection.ensure_schema(name)
     :ok = Projection.ensure_submitter_column(name)
+    :ok = DB.execute(name, "ALTER TABLE messages ADD COLUMN recordEventIds TEXT")
 
     :ok =
       DB.execute(name, """

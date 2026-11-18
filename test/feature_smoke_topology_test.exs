@@ -18,10 +18,10 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
 
     for {key, archetype} <- [
           {Org.personal_session_key("owner"), "default"},
-          {"coordinator", "product-owner"},
-          {"parent", "orchestrator"},
-          {"worker", "coder"},
-          {"replacement", "coder"}
+          {"coordinator", "agentic-engineering.product-owner"},
+          {"parent", "agentic-engineering.orchestrator"},
+          {"worker", "agentic-engineering.coder"},
+          {"replacement", "agentic-engineering.coder"}
         ] do
       Org.create(db, %{
         session_key: key,
@@ -221,8 +221,11 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
       "note" => "One synthetic worker, no provider claim"
     })
 
+    # The posture rail lists only engineering coders, and R6 scopes a rail to
+    # every agent in the interaction. Use a second qualified coder as caller;
+    # the personal Main is substrate-owned and the orchestrator is not listed.
     for verb <- ["assign", "dispatch"] do
-      refused = wire(ctx, nil, verb, staffing(wi))
+      refused = wire(ctx, "replacement", verb, staffing(wi))
       assert refused["error"]["code"] == "rule_denied"
       assert refused["error"]["message"] =~ "posture"
     end

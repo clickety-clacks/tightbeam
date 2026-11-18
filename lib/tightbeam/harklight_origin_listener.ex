@@ -35,6 +35,8 @@ defmodule Tightbeam.HarklightOriginListener do
 
   @impl true
   def init(opts) do
+    DB.owed_work()
+
     Process.flag(:trap_exit, true)
     send(self(), :restore)
 

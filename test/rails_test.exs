@@ -20,6 +20,7 @@ defmodule Tightbeam.RailsTest do
     "name" => ~s("no-history-rewrites"),
     "on" => ~s("tool-call"),
     "tool" => ~s("Bash"),
+    "archetypes" => ~s(["*"]),
     "pattern" => ~s{"git (reset|stash|rebase|checkout \\\\.|restore|clean)"},
     "text" =>
       ~s("History-rewriting git commands are forbidden here: other agents may have uncommitted work in this tree.")
@@ -35,17 +36,34 @@ defmodule Tightbeam.RailsTest do
     File.write!(Path.join(ctx.rails_dir, file), "[[statute]]\n" <> fields <> "\n")
   end
 
+  defp assert_scope_check(command, statute) do
+    assert command =~ "tightbeam rail-scope-check"
+    assert command =~ "--statute"
+    assert command =~ statute
+  end
+
   test "empty and missing rails dirs are a valid empty set", ctx do
     assert Rails.load!(ctx.base_dir) == []
 
-    # No law, but still hooks: GitHub auth and artifact observation are
-    # substrate-reserved entries, not org statutes.
-    assert Rails.hook_settings() == %{
-             "hooks" => %{"PreToolUse" => [Rails.github_auth_entry(), Rails.observation_entry()]}
+    # No loaded TOML law means only the code-built observation remains.
+    assert Rails.hook_settings(:codex) == %{
+             "hooks" => %{"PreToolUse" => [Rails.observation_entry()]}
            }
 
     File.rm_rf!(ctx.rails_dir)
     assert Rails.load!(ctx.base_dir) == []
+  end
+
+  test "Claude and Codex scope checks resolve the caller from hook cwd", ctx do
+    write_statute(ctx, %{"archetypes" => ~s(["agentic-engineering.coder"])})
+    Rails.load!(ctx.base_dir)
+
+    for harness <- [:claude, :codex] do
+      settings = Rails.hook_settings(harness)
+      assert [%{"hooks" => [%{"command" => command}]} | _] = settings["hooks"]["PreToolUse"]
+      assert_scope_check(command, "no-history-rewrites")
+      refute command =~ "TIGHTBEAM_SESSION_WORKDIR"
+    end
   end
 
   test "a valid gate statute loads with mode defaulted", ctx do
@@ -56,6 +74,150 @@ defmodule Tightbeam.RailsTest do
     assert statute.on == :tool_call
     assert statute.mode == :gate
     assert statute.tool == "Bash"
+    assert Rails.statutes?()
+  end
+
+  test "receipt-owned flat kungfu rails load with qualified names", ctx do
+    identity = Path.join(ctx.base_dir, "identity")
+    bundle = Path.join(identity, "kungfu/agentic-engineering")
+    File.mkdir_p!(bundle)
+
+    File.write!(Path.join(bundle, "installed.toml"), """
+    name = "agentic-engineering"
+    paths = [
+      "archetypes/coder.toml",
+      "rails/engineering.toml",
+    ]
+    """)
+
+    statute_path = Path.join(ctx.rails_dir, "engineering.toml")
+
+    File.write!(statute_path, """
+    [[statute]]
+    name = "no-git-stash"
+    on = "tool-call"
+    archetypes = ["agentic-engineering.coder"]
+    tool = "Bash"
+    pattern = "git stash"
+    text = "Do not stash this worktree."
+    """)
+
+    assert [statute] = Rails.load!(ctx.base_dir)
+    assert statute.name == "agentic-engineering.no-git-stash"
+    assert statute.archetypes == ["agentic-engineering.coder"]
+
+    %{"hooks" => %{"PreToolUse" => [entry, _observation]}} = Rails.hook_settings(:codex)
+    [%{"command" => command}] = entry["hooks"]
+    assert_scope_check(command, "agentic-engineering.no-git-stash")
+
+    File.write!(statute_path, """
+    [[statute]]
+    name = "no-git-stash"
+    on = "tool-call"
+    archetypes = ["org-example-analyst"]
+    tool = "Bash"
+    pattern = "git stash"
+    text = "Do not stash this worktree."
+    """)
+
+    assert ExUnit.CaptureLog.capture_log(fn ->
+             assert [unavailable] = Rails.load!(ctx.base_dir)
+             assert unavailable.name == "agentic-engineering.unavailable-engineering-1"
+             assert unavailable.pattern == ".*"
+             assert unavailable.archetypes == ["agentic-engineering.coder"]
+           end) =~ "org-example-analyst"
+
+    File.write!(statute_path, """
+    [[statute]]
+    name = "no-git-stash"
+    on = "tool-call"
+    archetypes = ["*"]
+    tool = "Bash"
+    pattern = "git stash"
+    text = "Do not stash this worktree."
+    """)
+
+    assert ExUnit.CaptureLog.capture_log(fn ->
+             assert [unavailable] = Rails.load!(ctx.base_dir)
+             assert unavailable.name == "agentic-engineering.unavailable-engineering-1"
+             assert unavailable.archetypes == ["agentic-engineering.coder"]
+           end) =~ "out-of-scope archetypes [\"*\"]"
+  end
+
+  test "nested receipt-owned kungfu rails load with qualified names", ctx do
+    identity = Path.join(ctx.base_dir, "identity")
+    bundle = Path.join(identity, "kungfu/agentic-engineering")
+    rails_dir = Path.join(bundle, "rails")
+    File.mkdir_p!(rails_dir)
+
+    File.write!(Path.join(bundle, "installed.toml"), """
+    name = "agentic-engineering"
+    paths = [
+      "kungfu/agentic-engineering/archetypes/coder.toml",
+      "kungfu/agentic-engineering/rails/engineering.toml",
+    ]
+    """)
+
+    File.write!(Path.join(rails_dir, "engineering.toml"), """
+    [[statute]]
+    name = "no-git-stash"
+    on = "tool-call"
+    archetypes = ["agentic-engineering.coder"]
+    tool = "Bash"
+    pattern = "git stash"
+    text = "Do not stash this worktree."
+    """)
+
+    assert [statute] = Rails.load!(ctx.base_dir)
+    assert statute.name == "agentic-engineering.no-git-stash"
+    assert statute.archetypes == ["agentic-engineering.coder"]
+
+    %{"hooks" => %{"PreToolUse" => [entry, _observation]}} = Rails.hook_settings(:codex)
+    [%{"command" => command}] = entry["hooks"]
+    assert_scope_check(command, "agentic-engineering.no-git-stash")
+  end
+
+  test "shipped engineering statutes name the full bundle archetype inventory", ctx do
+    names = ~w(
+      coder guidance-reviewer guidance-writer integrator orchestrator pdo
+      product-owner recon reviewer-code reviewer-spec spec-writer team-planner
+    )
+
+    qualified = Enum.map(names, &"agentic-engineering.#{&1}")
+    bundle = Path.join([ctx.base_dir, "identity", "kungfu", "agentic-engineering"])
+    File.mkdir_p!(bundle)
+
+    paths =
+      Enum.map(names, &"archetypes/#{&1}.toml") ++ ["rails/engineering.toml"]
+
+    File.write!(
+      Path.join(bundle, "installed.toml"),
+      "name = \"agentic-engineering\"\npaths = #{inspect(paths)}\n"
+    )
+
+    source = Path.expand("../priv/kungfu/agentic-engineering/rails/engineering.toml", __DIR__)
+    File.cp!(source, Path.join(ctx.rails_dir, "engineering.toml"))
+
+    assert statutes = Rails.load!(ctx.base_dir)
+    assert length(statutes) == 5
+    assert Enum.all?(statutes, &(&1.archetypes == qualified))
+
+    assert Enum.map(statutes, & &1.name) == [
+             "agentic-engineering.no-git-stash",
+             "agentic-engineering.no-git-reset-hard",
+             "agentic-engineering.no-git-clean-force",
+             "agentic-engineering.no-git-checkout-discard",
+             "agentic-engineering.no-git-restore"
+           ]
+
+    scope =
+      Rails.session_scope_content("agentic-engineering.pdo")
+      |> JSON.decode!()
+
+    assert scope == %{
+             "archetype" => "agentic-engineering.pdo",
+             "statutes" => Enum.map(statutes, & &1.name) |> Enum.sort()
+           }
   end
 
   test "the invariant refusal: remind is not law", ctx do
@@ -70,7 +232,9 @@ defmodule Tightbeam.RailsTest do
     cases = [
       {%{"mode" => ~s("block")}, ~r/mode "block" is reserved for a later stage/},
       {%{"check" => ~s("curl janus")},
-       ~r/"check" \(predicate statutes\) is reserved for a later stage/},
+       ~r/unsupported check value "curl janus"; allowed values: github-auth, spawn-probe/},
+      {%{"check" => ~s("github-auth"), "action" => ~s("git-stash")},
+       ~r/cannot combine check value "github-auth" with action "git-stash"; allowed check values: github-auth, spawn-probe/},
       {%{"mode" => ~s("nonsense")}, ~r/unknown statute mode/},
       {%{"on" => ~s("turn-end")}, ~r/unknown statute event/},
       {%{"on" => :omit}, ~r/statute no-history-rewrites is missing "on"/},
@@ -120,24 +284,46 @@ defmodule Tightbeam.RailsTest do
            end) =~ "no-history-rewrites"
   end
 
-  test "an action statute compiles the closed argv classifier", ctx do
+  test "an action statute classifies before refusal without a wildcard scope lookup", ctx do
     write_statute(ctx, %{"pattern" => :omit, "action" => ~s("git-stash")})
     assert [statute] = Rails.load!(ctx.base_dir)
     assert statute.action == "git-stash"
     assert statute.pattern == nil
 
-    %{"hooks" => %{"PreToolUse" => [entry, github_auth, observation]}} = Rails.hook_settings()
-    assert github_auth == Rails.github_auth_entry()
+    %{"hooks" => %{"PreToolUse" => [entry, observation]}} = Rails.hook_settings(:codex)
     assert observation == Rails.observation_entry()
     assert [%{"command" => command}] = entry["hooks"]
 
-    assert command ==
-             "sh -c 'tightbeam rail-action git-stash; status=$?; " <>
-               "if [ \"$status\" -eq 1 ]; then exit 0; fi; " <>
-               "if [ \"$status\" -ne 0 ]; then " <>
-               "echo \"[gate: no-history-rewrites] action classifier failed closed (status $status).\" >&2; exit 2; fi; " <>
-               "echo \"[gate: no-history-rewrites] History-rewriting git commands are forbidden here: " <>
-               "other agents may have uncommitted work in this tree.\" >&2; exit 2'"
+    assert command =~ "input=$(cat)"
+    refute command =~ "rail-scope-check"
+    assert command =~ "tightbeam rail-action git-stash"
+    {action_index, _} = :binary.match(command, "rail-action")
+
+    {refusal_index, _} =
+      :binary.match(command, "History-rewriting git commands are forbidden here")
+
+    assert action_index < refusal_index
+    assert command =~ "action classifier failed closed (status $status)."
+    assert command =~ "History-rewriting git commands are forbidden here"
+  end
+
+  test "a scoped action classifies the call before checking its compiled session scope", ctx do
+    write_statute(ctx, %{
+      "archetypes" => ~s(["agentic-engineering.coder"]),
+      "pattern" => :omit,
+      "action" => ~s("git-stash")
+    })
+
+    Rails.load!(ctx.base_dir)
+    %{"hooks" => %{"PreToolUse" => [entry, _observation]}} = Rails.hook_settings(:codex)
+    [%{"command" => command}] = entry["hooks"]
+
+    assert command =~ "input=$(cat)"
+    assert_scope_check(command, "no-history-rewrites")
+    assert command =~ "tightbeam rail-action git-stash"
+    {scope_index, _} = :binary.match(command, "rail-scope-check")
+    {action_index, _} = :binary.match(command, "rail-action")
+    assert action_index < scope_index
   end
 
   test "duplicate names across files fail; files load in filename order", ctx do
@@ -156,36 +342,102 @@ defmodule Tightbeam.RailsTest do
     end)
   end
 
-  test "hook_settings compiles the byte-pinned PreToolUse entry", ctx do
+  test "duplicate named checks are quarantined as catch-all refusals", ctx do
+    check = %{
+      "name" => ~s("github-auth"),
+      "check" => ~s("github-auth"),
+      "pattern" => ~s(".*")
+    }
+
+    write_statute(ctx, check, "a.toml")
+    write_statute(ctx, check, "b.toml")
+
+    statutes = Rails.load!(ctx.base_dir)
+    assert Enum.all?(statutes, &(&1.check == nil and &1.pattern == ".*"))
+
+    %{"hooks" => %{"PreToolUse" => [first, second, _observation]}} =
+      Rails.hook_settings(:codex)
+
+    for entry <- [first, second] do
+      [%{"command" => command}] = entry["hooks"]
+      assert command =~ "Duplicate statute github-auth requires repair"
+      refute command =~ "github-auth-check"
+    end
+  end
+
+  test "wildcard hook pattern passes unrelated calls before refusing matches", ctx do
     write_statute(ctx, %{})
     Rails.load!(ctx.base_dir)
 
     # Statutes first, in filename-then-table order; reserved substrate entries
     # follow after operator law.
-    assert %{"hooks" => %{"PreToolUse" => [entry, github_auth, observation]}} =
-             Rails.hook_settings()
+    assert %{"hooks" => %{"PreToolUse" => [entry, observation]}} =
+             Rails.hook_settings(:codex)
 
-    assert github_auth == Rails.github_auth_entry()
     assert observation == Rails.observation_entry()
     assert entry["matcher"] == "Bash"
     assert [%{"type" => "command", "command" => command}] = entry["hooks"]
 
-    assert command ==
-             "sh -c 'grep -qE \"git (reset|stash|rebase|checkout \\\\.|restore|clean)\" - || exit 0; " <>
-               "echo \"[gate: no-history-rewrites] History-rewriting git commands are forbidden here: " <>
-               "other agents may have uncommitted work in this tree.\" >&2; exit 2'"
+    assert command =~ "input=$(cat)"
+    refute command =~ "rail-scope-check"
+    assert command =~ "grep -qE \"git (reset|stash|rebase|checkout"
+    {pattern_index, _} = :binary.match(command, "grep -qE")
+
+    {refusal_index, _} =
+      :binary.match(command, "History-rewriting git commands are forbidden here")
+
+    assert pattern_index < refusal_index
   end
 
-  test "github_auth_entry compiles the byte-pinned reserved GitHub readiness gate" do
-    assert %{
-             "matcher" => "Bash",
-             "hooks" => [%{"type" => "command", "command" => command}]
-           } = Rails.github_auth_entry()
+  test "seed statutes own the GitHub and wiring checks and preserve harness coverage", ctx do
+    seed_statutes(ctx)
+    assert [github, probe] = Rails.load!(ctx.base_dir)
+    assert github.name == "github-auth"
+    assert github.check == "github-auth"
+    assert github.archetypes == ["*"]
+    assert probe.name == "tightbeam-probe"
+    assert probe.check == "spawn-probe"
+    assert probe.archetypes == ["*"]
+    refute Rails.statutes?()
 
-    assert command ==
-             "sh -c 'input=$(cat); printf '\\''%s'\\'' \"$input\" | " <>
-               "grep -qE \"(github\\\\.com|gh[[:space:]]+(repo|pr|issue|api)|git[[:space:]]+(clone|fetch|pull|push|ls-remote|remote|submodule))\" - || exit 0; " <>
-               "printf '\\''%s'\\'' \"$input\" | tightbeam github-auth-check || exit 2; exit 0'"
+    %{"hooks" => %{"PreToolUse" => [github_entry, probe_entry, observation]}} =
+      Rails.hook_settings(:codex)
+
+    pi_entries = get_in(Rails.hook_settings(:pi), ["hooks", "PreToolUse"])
+
+    assert observation == Rails.observation_entry()
+    assert [%{"command" => command}] = github_entry["hooks"]
+
+    assert command =~ "input=$(cat)"
+    refute command =~ "rail-scope-check"
+    assert command =~ "github-auth-check --text-template"
+
+    assert command =~
+             "Tightbeam cannot use GitHub from {host} for {hostname}: failed phase {phase}"
+
+    {pattern_index, _} = :binary.match(command, "grep -qE")
+    {check_index, _} = :binary.match(command, "github-auth-check")
+    assert pattern_index < check_index
+
+    assert [%{"command" => probe_command}] = probe_entry["hooks"]
+    assert probe_entry in pi_entries
+    assert probe_command =~ "input=$(cat)"
+    refute probe_command =~ "rail-scope-check"
+    assert probe_command =~ "Spawn wiring-check probe command; always refused by design."
+    {pattern_index, _} = :binary.match(probe_command, "grep -qE")
+    {refusal_index, _} = :binary.match(probe_command, "Spawn wiring-check probe command")
+    assert pattern_index < refusal_index
+
+    claude_entries = get_in(Rails.hook_settings(:claude), ["hooks", "PreToolUse"])
+    cursor_entries = get_in(Rails.hook_settings(:cursor), ["hooks", "PreToolUse"])
+    refute Enum.any?(claude_entries ++ cursor_entries, &(&1 == probe_entry))
+    assert Enum.any?(claude_entries, &(&1 == github_entry))
+    assert Enum.any?(cursor_entries, &(&1 == github_entry))
+
+    refute Enum.any?(
+             get_in(Rails.hook_settings(:other), ["hooks", "PreToolUse"]),
+             &(&1 == probe_entry)
+           )
   end
 
   test "observation_entry compiles the byte-pinned reserved artifact-record observation" do
@@ -210,26 +462,80 @@ defmodule Tightbeam.RailsTest do
 
     Rails.load!(ctx.base_dir)
 
-    %{"hooks" => %{"PreToolUse" => [entry, _github_auth, _observation]}} =
-      Rails.hook_settings()
+    %{"hooks" => %{"PreToolUse" => [entry, _observation]}} =
+      Rails.hook_settings(:codex)
 
     [%{"command" => command}] = entry["hooks"]
 
-    assert command ==
-             "sh -c 'grep -qE \"echo (\\\\\\$HOME|\\\\\\$PATH)\\\\.\" - || exit 0; " <>
-               "echo \"[gate: no-env-dollars] Don'\\''t expand env here.\" >&2; exit 2'"
+    refute command =~ "rail-scope-check"
+    assert command =~ "echo (\\\\\\$HOME|\\\\\\$PATH)"
+    assert command =~ "Don'\\''t expand env here."
   end
 
-  test "probe_entry compiles the byte-pinned reserved wiring-check gate" do
-    assert %{
-             "matcher" => "Bash",
-             "hooks" => [%{"type" => "command", "command" => command}]
-           } = Rails.probe_entry()
+  test "session scope compiles matching names and wrappers check scope after pattern matches",
+       ctx do
+    write_statute(ctx, %{
+      "archetypes" => ~s(["agentic-engineering.coder"])
+    })
 
-    assert command ==
-             "sh -c 'grep -qE \"tightbeam-gate-probe\" - || exit 0; " <>
-               "echo \"[gate: tightbeam-probe] Spawn wiring-check probe command; " <>
-               "always refused by design.\" >&2; exit 2'"
+    Rails.load!(ctx.base_dir)
+
+    matched =
+      Rails.session_scope_content("agentic-engineering.coder")
+      |> JSON.decode!()
+
+    unmatched =
+      Rails.session_scope_content("agentic-engineering.reviewer-code")
+      |> JSON.decode!()
+
+    assert matched == %{
+             "archetype" => "agentic-engineering.coder",
+             "statutes" => ["no-history-rewrites"]
+           }
+
+    assert unmatched == %{
+             "archetype" => "agentic-engineering.reviewer-code",
+             "statutes" => []
+           }
+
+    %{"hooks" => %{"PreToolUse" => [entry, observation]}} = Rails.hook_settings(:codex)
+    [%{"command" => command}] = entry["hooks"]
+    assert_scope_check(command, "no-history-rewrites")
+    assert command =~ "if [ \"$status\" -eq 1 ]; then exit 0; fi"
+    assert command =~ "scope check failed (status $status)"
+    assert command =~ "grep -qE"
+    {scope_index, _} = :binary.match(command, "rail-scope-check")
+    {pattern_index, _} = :binary.match(command, "grep -qE")
+    assert pattern_index < scope_index
+    assert observation == Rails.observation_entry()
+  end
+
+  test "an agentless statute does not cover a session", ctx do
+    write_statute(ctx, %{"archetypes" => ~s([])})
+    Rails.load!(ctx.base_dir)
+
+    assert %{"archetype" => "agentic-engineering.coder", "statutes" => []} =
+             Rails.session_scope_content("agentic-engineering.coder")
+             |> JSON.decode!()
+
+    %{"hooks" => %{"PreToolUse" => [entry, _observation]}} = Rails.hook_settings(:codex)
+    [%{"command" => command}] = entry["hooks"]
+    assert_scope_check(command, "no-history-rewrites")
+    assert command =~ "if [ \"$status\" -eq 1 ]; then exit 0; fi"
+  end
+
+  test "wildcard rails compile active for every session without an invocation scope check", ctx do
+    write_statute(ctx, %{"archetypes" => ~s(["*"])})
+    Rails.load!(ctx.base_dir)
+
+    %{"hooks" => %{"PreToolUse" => [entry, _observation]}} = Rails.hook_settings(:codex)
+    [%{"command" => command}] = entry["hooks"]
+
+    refute command =~ "rail-scope-check"
+
+    assert %{"archetype" => "agentic-engineering.coder", "statutes" => ["no-history-rewrites"]} =
+             Rails.session_scope_content("agentic-engineering.coder")
+             |> JSON.decode!()
   end
 
   test "moduledoc pins permission bypass separately from codex hook trust and version facts" do
@@ -256,5 +562,19 @@ defmodule Tightbeam.RailsTest do
     if is_struct(expected, Regex), do: assert(log =~ expected)
     if is_binary(expected), do: assert(log =~ expected)
     %{message: log}
+  end
+
+  defp seed_statutes(ctx) do
+    seed_dir = Path.expand("../priv/seed/rails", __DIR__)
+
+    File.cp!(
+      Path.join(seed_dir, "github-auth.toml"),
+      Path.join(ctx.rails_dir, "github-auth.toml")
+    )
+
+    File.cp!(
+      Path.join(seed_dir, "tightbeam-probe.toml"),
+      Path.join(ctx.rails_dir, "tightbeam-probe.toml")
+    )
   end
 end

@@ -215,7 +215,11 @@ defmodule Tightbeam.IdentityPublicationFixture do
 
     call =
       identity_call(
-        %{archetype: "operating-model", content: "#include \"missing.md\"\n"},
+        %{
+          archetype: "default",
+          manifest: true,
+          content: default_manifest_with_include!(ctx, "missing.md")
+        },
         invocation
       )
 
@@ -332,7 +336,7 @@ defmodule Tightbeam.IdentityPublicationFixture do
         display_name: "Late coder",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
+        archetype: "agentic-engineering.coder",
         host: "testhost",
         harness: "codex",
         provider: "openai",
@@ -356,7 +360,7 @@ defmodule Tightbeam.IdentityPublicationFixture do
 
     assert session_key == session.session_key
     assert Identity.live_revision!(ctx.base_dir) == candidate.expected_prior
-    assert Archetypes.get("coder").name == "coder"
+    assert Archetypes.get("agentic-engineering.coder").name == "agentic-engineering.coder"
 
     assert %{state: "pending", candidate_revision: candidate_revision} =
              AdminProjection.identity_publication_marker(
@@ -655,8 +659,9 @@ defmodule Tightbeam.IdentityPublicationFixture do
     include_call =
       identity_call(
         %{
-          archetype: "operating-model",
-          content: "#include \"#{secret_include}\"\n"
+          archetype: "default",
+          manifest: true,
+          content: default_manifest_with_include!(ctx, secret_include)
         },
         include_invocation
       )
@@ -798,8 +803,9 @@ defmodule Tightbeam.IdentityPublicationFixture do
 
     first =
       post_identity_dispatch(router, cli_token, "flynn", %{
-        "archetype" => "operating-model",
-        "content" => "#include \"#{secret_path}\"\n",
+        "archetype" => "default",
+        "manifest" => true,
+        "content" => default_manifest_with_include!(ctx, secret_path),
         "idempotencyKey" => key
       })
 
@@ -858,6 +864,13 @@ defmodule Tightbeam.IdentityPublicationFixture do
       params: params,
       invocation_id: invocation_id
     }
+  end
+
+  defp default_manifest_with_include!(ctx, include_path) do
+    path = Path.join([ctx.base_dir, "identity", "archetypes", "default.toml"])
+
+    File.read!(path)
+    |> String.replace("#include \"operating-manual.md\"", "#include \"#{include_path}\"")
   end
 
   defp keyed_invocation(origin, verb, key) do
