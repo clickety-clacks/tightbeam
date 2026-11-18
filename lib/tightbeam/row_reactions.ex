@@ -36,6 +36,9 @@ defmodule Tightbeam.RowReactions do
         "transition" => if(transition, do: JSON.decode!(JSON.encode!(transition)))
       }
 
+      # Expressions and durable replay must see the same nested key types.
+      event = event |> JSON.encode!() |> JSON.decode!()
+
       # A repeated observation reads its captured event, rather than inventing
       # another occurrence or changing the occurrence timestamp.
       event =
@@ -52,6 +55,9 @@ defmodule Tightbeam.RowReactions do
 
   defp observation_principal({kind, id}) when kind in [:user, :session, :process],
     do: %{"kind" => Atom.to_string(kind), "id" => id}
+
+  defp observation_principal({:remedy, %{statute: statute, action: action, owner: owner}}),
+    do: %{"kind" => "remedy", "id" => statute, "action" => action, "ownerUserId" => owner}
 
   defp observation_principal(nil), do: nil
 

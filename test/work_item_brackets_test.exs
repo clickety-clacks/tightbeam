@@ -360,6 +360,32 @@ defmodule Tightbeam.WorkItemBracketsTest do
     JSON.decode!(event)
   end
 
+  test "changed rail sees source before and after facts identically at admission and recovery",
+       ctx do
+    path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    contents = File.read!(path)
+
+    condition =
+      ~s(when = { op = "and", args = [{ op = "eq", args = [{ ref = "event.operation" }, "reopened"] }, { op = "eq", args = [{ ref = "event.before.sourceRow.state" }, "iceboxed"] }, { op = "eq", args = [{ ref = "event.sourceAfter.state" }, "open"] }] })
+
+    File.write!(path, Regex.replace(~r/^when = .*$/m, contents, condition, global: false))
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    item = create(ctx, {:user, "flynn"}, %{title: "Initial source facts"})
+    assert routing_wake_id(ctx.db, item.id) == nil
+
+    assert %{ok: true} =
+             dispose(ctx, "work-item-icebox", {:user, "flynn"}, item.id, %{reason: "later"})
+
+    assert %{ok: true} = dispose(ctx, "work-item-reopen", {:user, "flynn"}, item.id)
+    id = routing_wake_id(ctx.db, item.id)
+    assert is_binary(id)
+    assert item_wake_count(ctx.db, item.id) == 1
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert routing_wake_id(ctx.db, item.id) == id
+    assert item_wake_count(ctx.db, item.id) == 1
+    assert Wakes.get(ctx.db, id).state == "pending"
+  end
+
   ## Proof 1 — create arms bracket 1; keyed replay returns the original, arms nothing.
 
   test "Proof 1: create (keyed and keyless) arms bracket 1; keyed replay is inert", ctx do
