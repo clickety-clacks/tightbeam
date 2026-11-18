@@ -3467,6 +3467,62 @@ defmodule Tightbeam.CliIntegrationTest do
     end
   end
 
+  test "real CLI briefing commands retain the authenticated caller through the router", ctx do
+    Org.set_host(ctx.db, ctx.session.session_key, Tightbeam.Placement.local_host_name())
+
+    {catchup_output, 0} =
+      System.cmd(ctx.binary, ["harklight-briefings-catchup"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"ok" => true, "listed" => 0} = JSON.decode!(catchup_output)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "harklight-briefings-catchup",
+                      session_key: "cli-holder",
+                      principal: {:session, "cli-holder"},
+                      transport_session_key: "cli-holder"
+                    }}
+
+    request =
+      Escalation.operator_ask(ctx.db, %{
+        origin: "agent:cli-holder",
+        principal: {:session, ctx.session.session_key},
+        params: %{question: "Which briefing route?", options: [%{label: "use it"}]}
+      })
+
+    {briefing_output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "harklight-briefing",
+          "--request",
+          request.id,
+          "--rearm-to-session",
+          ctx.session.session_key
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"ok" => true, "requestId" => request_id} = JSON.decode!(briefing_output)
+    assert request_id == request.id
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "harklight-briefing",
+                      session_key: "cli-holder",
+                      principal: {:session, "cli-holder"},
+                      transport_session_key: "cli-holder",
+                      params: %{request_id: ^request_id, rearm_to_session: "cli-holder"}
+                    }}
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request.id])
+  end
+
   test "real CLI keeps explicit Harklight identities local with session credentials",
        ctx do
     commands = [
