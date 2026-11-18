@@ -220,7 +220,8 @@ defmodule Tightbeam.TerminalCredentialFailure do
                  "closed-assignment-cannot-proceed-reconciliation-v1-015",
                  "session-custody-v1-0116",
                  "artifact-process-attribution-v1-015",
-                 "session-custody-artifact-process-attribution-v1-0117"
+                 "session-custody-artifact-process-attribution-v1-0117",
+                 "holder-role-provenance-v1-0118"
                ] ->
             readonly_views_from_conn(conn)
 
