@@ -1067,6 +1067,26 @@ defmodule Tightbeam.Gateway do
       {"harklight-retry", []} => fn call ->
         Tightbeam.HarklightWakes.retry_command(db, call)
       end,
+      {"harklight-read", []} => fn call ->
+        Tightbeam.HarklightAgentActions.read(db, call,
+          runner: Map.get(config, :harklight_send_runner)
+        )
+      end,
+      {"harklight-ack", []} => fn call ->
+        Tightbeam.HarklightAgentActions.acknowledge(db, call,
+          runner: Map.get(config, :harklight_send_runner)
+        )
+      end,
+      {"harklight-reply", []} => fn call ->
+        Tightbeam.HarklightAgentActions.reply(db, call,
+          runner: Map.get(config, :harklight_send_runner)
+        )
+      end,
+      {"harklight-result", []} => fn call ->
+        Tightbeam.HarklightAgentActions.result(db, call,
+          runner: Map.get(config, :harklight_send_runner)
+        )
+      end,
       {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,

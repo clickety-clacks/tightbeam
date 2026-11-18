@@ -899,6 +899,15 @@ defmodule Tightbeam.HarklightSend do
     end
   end
 
+  @doc false
+  def recover_action(runner, [command | _] = args, op_id) when command in ["reply", "result"] do
+    invoke(runner, ["retry", "--op-id", op_id], "committed", op_id,
+      change: true,
+      operations: ["retry", command],
+      fallback_args: args
+    )
+  end
+
   defp invoke(runner, args, expected, op_id, opts \\ []) do
     {output, status} = runner.(args)
 

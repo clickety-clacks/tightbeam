@@ -61,7 +61,7 @@ defmodule Tightbeam.HarklightLifecycle do
            """
            SELECT s.opId,s.sessionKey,s.payload,s.state,s.handle,s.senderId,s.messageId,r.outcome
            FROM harklight_send_operations s LEFT JOIN harklight_command_results r ON r.opId=s.opId
-           WHERE COALESCE(json_extract(s.payload,'$.operation_kind'),'send')<>'change'
+           WHERE COALESCE(json_extract(s.payload,'$.operation_kind'),'send') NOT IN ('change','action')
              AND (s.messageId=?1 OR json_extract(s.payload,'$.request.message.message_id')=?1)
            ORDER BY s.createdAt LIMIT 1
            """,
@@ -897,7 +897,7 @@ defmodule Tightbeam.HarklightLifecycle do
         pending_send_rows =
           Txn.q(
             txn,
-            "SELECT opId,payload FROM harklight_send_operations WHERE sessionKey=?1 AND state='pending' AND COALESCE(json_extract(payload,'$.operation_kind'),'send')<>'change' ORDER BY opId",
+            "SELECT opId,payload FROM harklight_send_operations WHERE sessionKey=?1 AND state='pending' AND COALESCE(json_extract(payload,'$.operation_kind'),'send') NOT IN ('change','action') ORDER BY opId",
             [session_key]
           )
 

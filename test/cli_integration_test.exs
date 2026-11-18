@@ -3365,7 +3365,34 @@ defmodule Tightbeam.CliIntegrationTest do
        ]},
       {"harklight-retract", ["harklight-retract", "--message", "message-example"]},
       {"harklight-settle", ["harklight-settle", "--message", "message-example"]},
-      {"harklight-follow", ["harklight-follow", "--message", "message-example"]}
+      {"harklight-follow", ["harklight-follow", "--message", "message-example"]},
+      {"harklight-read", ["harklight-read", "--handle", "handle-example"]},
+      {"harklight-ack",
+       ["harklight-ack", "--handle", "handle-example", "--event", "event-example"]},
+      {"harklight-reply",
+       [
+         "harklight-reply",
+         "--handle",
+         "handle-example",
+         "--request",
+         "request-example",
+         "--in-reply-to",
+         "event-example",
+         "--body",
+         "Example"
+       ]},
+      {"harklight-result",
+       [
+         "harklight-result",
+         "--handle",
+         "handle-example",
+         "--request",
+         "request-example",
+         "--in-reply-to",
+         "event-example",
+         "--status",
+         "received"
+       ]}
     ]
 
     for {flag, identity, principal} <- [
@@ -3489,7 +3516,36 @@ defmodule Tightbeam.CliIntegrationTest do
       {"harklight-follow", ["harklight-follow", "--message", "message-example"],
        "invalid Harklight command flags"},
       {"harklight-listener-restore", ["harklight-listener-restore", "--handle", "handle-example"],
-       "invalid Harklight command flags"}
+       "invalid Harklight command flags"},
+      {"harklight-read", ["harklight-read", "--handle", "handle-example"],
+       "invalid Harklight command flags"},
+      {"harklight-ack",
+       ["harklight-ack", "--handle", "handle-example", "--event", "event-example"],
+       "invalid Harklight command flags"},
+      {"harklight-reply",
+       [
+         "harklight-reply",
+         "--handle",
+         "handle-example",
+         "--request",
+         "request-example",
+         "--in-reply-to",
+         "event-example",
+         "--body",
+         "Example"
+       ], "invalid Harklight command flags"},
+      {"harklight-result",
+       [
+         "harklight-result",
+         "--handle",
+         "handle-example",
+         "--request",
+         "request-example",
+         "--in-reply-to",
+         "event-example",
+         "--status",
+         "received"
+       ], "invalid Harklight command flags"}
     ]
 
     endpoint = "http://127.0.0.1:#{ctx.port}"
