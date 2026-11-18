@@ -76,7 +76,8 @@ defmodule Tightbeam.HarnessHealth.Hold do
 
   @doc """
   The hold on an open assignment whose turn is queued behind a fence and that
-  has no failed turn to repair, or nil.
+  has no failed turn to repair and no running turn (a running assignment is
+  executing, not held), or nil.
   """
   @spec for_assignment(DB.server(), String.t()) :: t() | nil
   def for_assignment(db, assignment_id) do
@@ -91,7 +92,7 @@ defmodule Tightbeam.HarnessHealth.Hold do
              SELECT EXISTS(SELECT 1 FROM turns WHERE assignmentId=?1 AND status='queued'
                              AND startedAt IS NULL)
                 AND NOT EXISTS(SELECT 1 FROM turns WHERE assignmentId=?1
-                                 AND status IN ('failed','failed_unknown'))
+                                 AND status IN ('failed','failed_unknown','running'))
              """,
              [assignment_id]
            ),

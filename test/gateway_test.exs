@@ -4293,6 +4293,76 @@ defmodule Tightbeam.GatewayTest do
     refute Map.has_key?(read.("asg_held_linked"), :heldBehind)
   end
 
+  test "an assignment with a running turn is not held, though its queued follow-up is", ctx do
+    session = Org.get(ctx.db, "k1")
+    adapter_key = {:claude, "shared", "testhost"}
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+               VALUES ('asg_running_followup','executing','k1','flynn',10,'open',?1,?2)
+               """,
+               [session.harness, session.provider]
+             )
+
+    enqueue = fn id ->
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: "k1",
+          message_id: "m-#{id}",
+          origin: "agent:k1",
+          prompt: id,
+          assignment_id: "asg_running_followup"
+        })
+
+      seq
+    end
+
+    running_seq = enqueue.("running")
+    assert {:ok, %{seq: ^running_seq}} = Ledger.claim_next(ctx.db, "k1", "running-lane")
+    followup_seq = enqueue.("follow-up")
+
+    # Another session's rate limit sets the fence for the shared harness and host.
+    {:ok, _} = Tightbeam.HarnessProcess.begin_park(ctx.db, adapter_key)
+
+    assert Tightbeam.HarnessHealth.Hold.for_assignment(ctx.db, "asg_running_followup") == nil
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Gateway.handlers()
+      |> Map.fetch!("assignment-get")
+
+    read =
+      handler.(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{assignment_id: "asg_running_followup"}
+      })
+
+    refute Map.has_key?(read, :heldBehind)
+
+    # The queued turn row itself still shows the hold; the running one does not.
+    queued = StateResources.query_turn_by_seq(ctx.db, followup_seq) |> StateResources.turn()
+    assert is_integer(queued["holdSince"])
+    running = StateResources.query_turn_by_seq(ctx.db, running_seq) |> StateResources.turn()
+    refute Map.has_key?(running, :holdSince)
+    refute Map.has_key?(running, "holdSince")
+
+    # Repair behaves as for any executing assignment: not the held refusal.
+    repair = held_repair_handler(ctx)
+
+    for action <- ["resume", "relaunch"] do
+      assert %{ok: false, code: code} =
+               repair.(held_repair_call(ctx, "asg_running_followup", action))
+
+      refute code == "held_behind_incident"
+    end
+  end
+
   test "a lane that declines to start behind a fence records why for session-diagnose", ctx do
     held = held_behind_fence!(ctx)
 
