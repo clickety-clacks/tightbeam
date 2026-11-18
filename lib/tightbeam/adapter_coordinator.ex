@@ -252,6 +252,11 @@ defmodule Tightbeam.AdapterCoordinator do
     # away, because that callback settles the OS process group it owns.
     Process.flag(:trap_exit, true)
 
+    # Recording an adapter's death and launching its replacement is work the
+    # gateway owes. On an overloaded database owner the coordinator waits: a
+    # crash here stops every adapter it holds, and with them every running turn.
+    Tightbeam.DB.owed_work()
+
     db = Keyword.get(opts, :db, Tightbeam.DB)
     :ok = Tightbeam.HarnessProcess.ensure_schema(db)
     :ok = Tightbeam.HarnessProcess.reconcile(db)

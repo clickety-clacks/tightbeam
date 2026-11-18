@@ -1907,7 +1907,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            )
   end
 
-  test "retirement cutoff preserves late entries for the settlement reserve", ctx do
+  test "real-clock retirement cutoff finishes 24 late entries within its configured budget",
+       ctx do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
 
@@ -2033,7 +2034,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # is platform-dependent — 0 of 8 loaded macOS runs (elapsed 853-1284ms)
     # versus 3 of 6 Linux runs (1320-1338ms). What caught the base defect on
     # both platforms is the row-state,
-    # log-content and census oracles below, which this allowance leaves
+    # log-content and census oracles in the ordering case below, which this allowance leaves
     # untouched. With 24
     # retained adapters this also proves the bound does not degrade with
     # cardinality: the late entries' outcomes are decided before settlement, and
@@ -2044,6 +2045,238 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            "shutdown took #{elapsed_ms}ms against a configured #{budget_ms}ms budget " <>
              "(+#{observation_allowance_ms}ms observation allowance) with " <>
              "#{length(keys)} retained adapters; the deadline guarantee did not hold"
+
+    # The real-clock claim does not require settlement to finish in its reserve.
+    # The ordering case below owns every durable row/fence/event assertion.
+    assert log =~ "retirement late entry unresolved"
+    assert HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0
+  end
+
+  test "retirement cutoff preserves late entries for the settlement reserve", ctx do
+    path = Path.join(ctx.test_dir, "fake_harness.js")
+    File.write!(path, @fake)
+
+    helper = Path.expand("../cli/target/release/tightbeam", __DIR__)
+    slow_helper = Path.join(ctx.test_dir, "slow_harness_helper")
+
+    hung_command = Path.join(ctx.test_dir, "hung_command.js")
+    helper_ready = Path.join(ctx.test_dir, "helper_ready")
+    File.mkdir_p!(helper_ready)
+
+    File.write!(hung_command, """
+    process.stdin.resume();
+    require("node:fs").writeFileSync(process.argv[2] + "/" + process.pid, "ready");
+    """)
+
+    timeout_override = Application.fetch_env(:tightbeam, :harness_process_command_timeout_ms)
+    Application.put_env(:tightbeam, :harness_process_command_timeout_ms, 120_000)
+
+    on_exit(fn ->
+      case timeout_override do
+        {:ok, value} ->
+          Application.put_env(:tightbeam, :harness_process_command_timeout_ms, value)
+
+        :error ->
+          Application.delete_env(:tightbeam, :harness_process_command_timeout_ms)
+      end
+    end)
+
+    File.write!(
+      slow_helper,
+      "#!/bin/sh\n" <>
+        "if [ \"$1\" = \"harness-group\" ]; then exec node #{hung_command} #{helper_ready}; fi\n" <>
+        "exec #{helper} \"$@\"\n"
+    )
+
+    File.chmod!(slow_helper, 0o755)
+
+    # The cleanup owner. In the real tree this is Tightbeam.TurnTaskSupervisor,
+    # which starts before the coordinator under rest_for_one and so outlives its
+    # terminate/2; a standalone coordinator is given an equivalent owner here so
+    # the same handoff path is exercised rather than the inline fallback.
+    cleanup_owner =
+      start_supervised!(
+        {Task.Supervisor, name: :"shutdown_cutoff_cleanup_#{System.unique_integer([:positive])}"}
+      )
+
+    budget_ms = 60_000
+    settlement_ms = 15_000
+    owner = self()
+    cleanup_gate = make_ref()
+    filter_id = :"retirement_cleanup_gate_#{System.unique_integer([:positive])}"
+
+    # Primary filters run in the process issuing the log. Hold the actual late
+    # cleanup here until terminate/2 has returned; slow cleanup must never become
+    # a dependency of shutdown, regardless of adapter count or scheduler speed.
+    :ok =
+      :logger.add_primary_filter(
+        filter_id,
+        {fn event, _extra ->
+           case event do
+             %{msg: {:string, message}} ->
+               if String.starts_with?(
+                    IO.iodata_to_binary(message),
+                    "adapter shutdown retirement late entry unresolved before deadline for "
+                  ) do
+                 owner_ref = Process.monitor(owner)
+                 send(owner, {:late_cleanup_blocked, cleanup_gate, self()})
+
+                 receive do
+                   {:release_late_cleanup, ^cleanup_gate} -> :ok
+                   {:DOWN, ^owner_ref, :process, ^owner, _reason} -> :ok
+                 end
+
+                 Process.demonitor(owner_ref, [:flush])
+               end
+
+             _ ->
+               :ok
+           end
+
+           event
+         end, nil}
+      )
+
+    on_exit(fn -> :logger.remove_primary_filter(filter_id) end)
+
+    clock = fn
+      :start ->
+        now = System.monotonic_time(:millisecond)
+        Process.put(:retirement_cutoff_start, now)
+        send(owner, {:shutdown_started, now})
+        now
+
+      :park_wait ->
+        # Freeze before the first yield until every park helper is blocked.
+        # No wall-clock delay determines which results reach retirement.
+        {:monitors, monitors} = Process.info(self(), :monitors)
+        send(owner, {:park_tasks_started, self(), monitors})
+
+        receive do
+          :expire_parking -> :ok
+        end
+
+        Process.get(:retirement_cutoff_start) + budget_ms - settlement_ms
+
+      phase when phase in [:cancel, :cancel_wait, :retire] ->
+        now = Process.get(:retirement_cutoff_start) + budget_ms - settlement_ms
+        if phase == :retire, do: send(owner, {:retirement_cutoff, now})
+        now
+
+      _phase ->
+        Process.get(:retirement_cutoff_start)
+    end
+
+    {:ok, coordinator} =
+      AdapterCoordinator.start_link(
+        adapter_sup: ctx.sup,
+        adapter_context: fn _ -> [] end,
+        adapter_opts: fn _, _ ->
+          [
+            harness: :claude,
+            cmd: [System.find_executable("node"), path],
+            home: ctx.test_dir,
+            cwd: ctx.test_dir,
+            process_helper: slow_helper,
+            process_identity_dir: ctx.test_dir
+          ]
+        end,
+        db: ctx.db,
+        shutdown_budget_ms: budget_ms,
+        shutdown_settlement_budget_ms: settlement_ms,
+        # Expire parking and cancellation exactly at the reserve boundary.
+        # Retirement must defer cleanup and persist all 24 unresolved outcomes.
+        shutdown_cancel_grace_ms: 0,
+        shutdown_clock: clock,
+        shutdown_cleanup_supervisor: cleanup_owner,
+        name:
+          String.to_atom(
+            "shutdown_retirement_cutoff_coordinator_#{System.unique_integer([:positive])}"
+          )
+      )
+
+    Process.unlink(coordinator)
+
+    on_exit(fn ->
+      if Process.alive?(coordinator) do
+        send(coordinator, :expire_parking)
+        GenServer.stop(coordinator, :shutdown, :infinity)
+      end
+    end)
+
+    # Cardinality is the point: the deadline guarantee must not degrade as the
+    # retained-adapter count grows, and this also exceeds the 20-key log sample
+    # cap so the aggregate line's remainder path is exercised under load.
+    keys =
+      for index <- 1..24 do
+        {:claude, "shared", "shutdown-retirement-cutoff-host-#{index}"}
+      end
+
+    adapters =
+      for key <- keys do
+        assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+        assert %Tightbeam.Acp.Adapter{} = :sys.get_state(adapter, :infinity)
+        adapter
+      end
+
+    rows = HarnessProcess.list(ctx.db)
+    assert length(rows) == length(keys)
+    assert Enum.all?(rows, &(&1.state == "running"))
+    adapter_refs = Enum.map(adapters, &Process.monitor/1)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        stop = Task.async(fn -> GenServer.stop(coordinator, :shutdown, :infinity) end)
+        assert_receive {:park_tasks_started, ^coordinator, monitors}, 30_000
+        park_tasks = for {:process, pid} <- monitors, pid not in adapters, do: pid
+        assert length(park_tasks) == length(keys)
+        assert eventually(fn -> length(File.ls!(helper_ready)) == length(keys) end, 3_000)
+        send(coordinator, :expire_parking)
+        assert_receive {:late_cleanup_blocked, ^cleanup_gate, cleanup_pid}, 30_000
+        cleanup_ref = Process.monitor(cleanup_pid)
+
+        try do
+          refute cleanup_pid == coordinator,
+                 "late cleanup must run outside terminate/2 even when its logger blocks"
+
+          assert :ok = Task.await(stop, :infinity)
+          refute Process.alive?(coordinator)
+          assert Process.alive?(cleanup_pid)
+
+          # Settlement must precede this deliberately stalled cleanup as well.
+          settled = HarnessProcess.list(ctx.db)
+          assert length(settled) == length(keys)
+          assert Enum.all?(settled, &(&1.state == "kill_failed"))
+          assert Enum.all?(settled, &(&1.last_error =~ "shutdown_retirement_unresolved"))
+        after
+          send(cleanup_pid, {:release_late_cleanup, cleanup_gate})
+        end
+
+        assert_receive {:DOWN, ^cleanup_ref, :process, ^cleanup_pid, :normal}, 30_000
+
+        # The clock puts retirement at the reserve boundary, within the total
+        # budget. Settlement and the asynchronous cleanup must still complete;
+        # the unchanged row, log and census assertions detect skipped work.
+        assert_received {:retirement_cutoff, retirement_at}
+        assert_received {:shutdown_started, started_at}
+        assert retirement_at - started_at == budget_ms - settlement_ms
+
+        # Join cleanup before ending capture: descendant disappearance alone
+        # does not prove the cleanup task has emitted its aggregate log.
+        for pid <- Task.Supervisor.children(cleanup_owner) do
+          ref = Process.monitor(pid)
+          assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 30_000
+        end
+
+        for ref <- adapter_refs do
+          assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 30_000
+        end
+
+        assert eventually(
+                 fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
+                 1_000
+               )
+      end)
 
     assert log =~ "retirement late entry unresolved"
 
