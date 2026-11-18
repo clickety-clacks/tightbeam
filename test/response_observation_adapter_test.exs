@@ -482,7 +482,13 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
                     }},
                    2_000
 
-    assert {:ok, [[0]]} = confirmation_query(db, "SELECT count(*) FROM effects")
+    # The completion event orders this check after the expired mutation. Wait
+    # for the owner's query reply without introducing another observed call
+    # with the fixture's 50 ms deadline: scheduler load could expire that new
+    # call even though the mutation was correctly dropped. A dead owner still
+    # fails the call; the ExUnit test timeout bounds a wedged owner.
+    assert {:ok, [[0]]} =
+             GenServer.call(db, {:query, "SELECT count(*) FROM effects", []}, :infinity)
   end
 
   test "a timed-out confirmation query emits bounded scheduler context and still fails", %{
