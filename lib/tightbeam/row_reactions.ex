@@ -7,6 +7,44 @@ defmodule Tightbeam.RowReactions do
   alias Tightbeam.RowReactions.{Cutover, Notice, Snapshot, Store}
   require Logger
 
+  def observe_work_item_in_txn(txn, id, operation, source, before, transition \\ nil) do
+    Cutover.adopt(txn)
+
+    after_row =
+      Snapshot.current(txn, %{"kind" => "work_item_observation", "workItemId" => id}, %{})[
+        "work_item"
+      ]
+
+    if after_row do
+      event = %{
+        "id" => "work-item:#{id}:#{operation}:#{source.kind}:#{source.id}",
+        "org" => after_row["ownerUserId"],
+        "kind" => "work_item_observation",
+        "workItemId" => id,
+        "operation" => operation,
+        "at" => System.system_time(:millisecond),
+        "generation" => source.id,
+        "source" => stringify(source),
+        "principal" => %{"kind" => "process", "id" => "tightbeam"},
+        "before" => before,
+        "after" => after_row,
+        "transition" => if(transition, do: JSON.decode!(JSON.encode!(transition)))
+      }
+
+      # A repeated observation reads its captured event, rather than inventing
+      # another occurrence or changing the occurrence timestamp.
+      event =
+        case Store.event(txn, event["org"], event["id"]) do
+          {stored, _} -> stored
+          nil -> event
+        end
+
+      admit(txn, event)
+    else
+      []
+    end
+  end
+
   def harness_health_hold_in_txn(
         txn,
         incident_id,
@@ -394,6 +432,7 @@ defmodule Tightbeam.RowReactions do
             SELECT DISTINCT a.org,a.eventId FROM row_reaction_actions a
             JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
             WHERE a.status='pending' AND (json_extract(e.event,'$.terminal.work_item_id')=?1
+              OR json_extract(e.event,'$.workItemId')=?1
               OR EXISTS (SELECT 1 FROM json_each(e.facts,'$.terminal_sources') s
                 WHERE json_extract(s.value,'$.workItemId')=?1))
             """,

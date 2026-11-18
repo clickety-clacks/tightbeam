@@ -640,7 +640,11 @@ defmodule Tightbeam.Assignments do
 
       # Incomplete notice cancellation must see the real remaining-work bracket.
       # Both the bracket and notice still roll back with this terminal transition.
-      Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
+      Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id, %{
+        kind: "revocation",
+        id: revocation_id
+      })
+
       admit_revocation_notice!(txn, assignment_id, revocation_id, reaction_before)
 
       append_substrate(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
@@ -3057,7 +3061,11 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     closed_assignment = fetch_assignment!(txn, assignment.id)
-    Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
+
+    Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId, %{
+      kind: "attest",
+      id: attest.id
+    })
 
     case Wakes.admit_terminal_notification_in_txn(txn, assignment.id, reaction_before) do
       {:ok, _wake} ->
@@ -3823,7 +3831,12 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     revoked_assignment = fetch_assignment!(txn, assignment_id)
-    Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
+
+    Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId, %{
+      kind: "revocation",
+      id: revocation_id
+    })
+
     admit_revocation_notice!(txn, assignment_id, revocation_id, reaction_before)
     liveness_trigger = disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
 

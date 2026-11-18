@@ -1,19 +1,15 @@
 defmodule Tightbeam.WorkItems do
   @moduledoc """
-  Durable work identity across assignment eras and aspects, plus the two
-  lifecycle brackets (accountability-constitution §2 "No intent in limbo"):
+  Durable work identity across assignment eras and aspects.
 
-  - Bracket 1 (routed-or-deadline): create arms a `consumer='prompt'` wake to
-    the owner's personal session; the first `assign`/`dispatch` or a
-    `work-item-icebox` cancels it, and an ignored owner is re-nagged each
-    horizon by the re-arm on fire (the lattice does not watch holderless work).
-  - Bracket 2 (concluded-or-adjudicated): the last assignment close of a
-    non-terminal item arms a durable slate wake in the SAME close transaction;
-    the next `assign`/`dispatch` or a terminal disposition cancels it.
+  Committed creation, assignment, disposition and delivery observations feed
+  elected row-reaction rails. Those rails choose routing and slate reminders;
+  typed reference effects keep their saved wake identities in the source
+  transaction. The default engineering rails preserve the two lifecycle
+  brackets and rearm only after actual delivery.
 
-  The owner is ALWAYS a user (constitution §3): a session creator's item is
-  owned by that session's owning user. Terminal dispositions (icebox/close/
-  fail/reopen) are owner-or-admin verbs that write `state`/`failReason`.
+  The owner is a user. Terminal dispositions (icebox/close/fail/reopen) are
+  owner-or-admin verbs that write `state`/`failReason` independently of rails.
   """
 
   alias Tightbeam.{
@@ -34,9 +30,6 @@ defmodule Tightbeam.WorkItems do
 
   require Logger
   alias Tightbeam.Firehose.Publisher
-
-  @origin "process:tightbeam"
-  @default_triage_deadline_ms 86_400_000
 
   defmodule CancellationRefused do
     @moduledoc false
@@ -175,7 +168,7 @@ defmodule Tightbeam.WorkItems do
 
                 item = fetch_in_txn(txn, id)
                 Mementos.append_inline!(txn, "work_item", id, admitted)
-                on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
+                if routing_wake, do: on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
                 Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
                 {:created, item, routing_wake, admitted.memento_close_effects}
 
@@ -201,7 +194,10 @@ defmodule Tightbeam.WorkItems do
               )
 
           best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
+
+          if routing_wake,
+            do: best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
+
           handler_summary_work_item(db, item) |> then(&Mementos.attach(db, "work_item", &1))
 
         {:replayed, item} ->
@@ -336,7 +332,8 @@ defmodule Tightbeam.WorkItems do
             do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
 
           if is_map(routing_wake) do
-            best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
+            if routing_wake,
+              do: best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
           end
 
           %{
@@ -435,7 +432,7 @@ defmodule Tightbeam.WorkItems do
       item = fetch_in_txn(txn, id)
       item = apply_updates(txn, item, delivery_owner_update(params))
       routing_wake = arm_routing_in_txn(txn, id, item_owner, params.title)
-      on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
+      if routing_wake, do: on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
 
       {:ok, fetch_in_txn(txn, id), true, true, routing_wake}
     else
@@ -890,7 +887,12 @@ defmodule Tightbeam.WorkItems do
 
             [[transition_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
 
-            if verb != :reopen do
+            if verb == :reopen do
+              observe_item(txn, id, "reopened", %{
+                kind: "work_item_transition",
+                id: to_string(transition_id)
+              })
+            else
               cancel_brackets_in_txn(txn, id, %{
                 causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
                 outcome: %{
@@ -913,7 +915,7 @@ defmodule Tightbeam.WorkItems do
     end
 
     Txn.q(txn, "UPDATE work_items SET state = 'open', failReason = NULL WHERE id = ?1", [item.id])
-    arm_routing_in_txn(txn, item.id, item.ownerUserId, item.title)
+    :ok
   end
 
   defp apply_disposition(txn, item, verb, target, reason) do
@@ -1002,143 +1004,66 @@ defmodule Tightbeam.WorkItems do
   @doc "Cancel both bracket wakes through one typed transition and clear their ids."
   @spec cancel_brackets_in_txn(Txn.t(), String.t(), map()) :: :ok
   def cancel_brackets_in_txn(%Txn{} = txn, work_item_id, transition) do
-    case Txn.q(
-           txn,
-           "SELECT routingWakeId, slateWakeId FROM work_items WHERE id = ?1",
-           [work_item_id]
-         ) do
-      [[routing, slate]] ->
-        Enum.each([routing, slate], fn
-          wake_id when is_binary(wake_id) ->
-            cancel_bracket_in_txn(txn, wake_id, transition)
+    observe_item(txn, work_item_id, "transition", transition.causal_source, transition)
+    :ok
+  rescue
+    error in Tightbeam.RowReactions.Notice.WithdrawalRefused ->
+      raise CancellationRefused, wake_id: error.wake_id
+  end
 
-          nil ->
-            :ok
-        end)
+  @doc false
+  def arm_slate_in_txn(txn, work_item_id, source \\ nil)
 
-        if is_binary(routing) or is_binary(slate) do
-          Txn.q(
-            txn,
-            "UPDATE work_items SET routingWakeId = NULL, slateWakeId = NULL WHERE id = ?1",
-            [work_item_id]
-          )
-        end
-
-      [] ->
-        :ok
-    end
+  def arm_slate_in_txn(%Txn{} = txn, work_item_id, source) when is_binary(work_item_id) do
+    observe_item(
+      txn,
+      work_item_id,
+      "assignment_closed",
+      source || %{kind: "observation", id: Tightbeam.Id.uuid4()}
+    )
 
     :ok
   end
 
-  defp cancel_bracket_in_txn(txn, wake_id, transition) do
-    case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId = ?1", [wake_id]) do
-      [["pending"]] ->
-        command =
-          Map.merge(transition, %{
-            wake_id: wake_id,
-            requester: %{kind: "process", id: "tightbeam:work-items"},
-            reason_kind: "routing_bracket_satisfied"
-          })
+  def arm_slate_in_txn(_txn, nil, _source), do: :ok
 
-        if not Wakes.cancel_in_txn(txn, command),
-          do: raise(CancellationRefused, wake_id: wake_id)
-
-      [[state]] when state in ["fired", "canceled"] ->
-        :ok
-
-      [] ->
-        raise "work-item bracket references missing wake #{wake_id}"
-    end
-  end
-
-  @doc """
-  Arm bracket 2 (the slate wake) when this close left the item non-terminal
-  with zero open assignments. Called from every assignment-close path INSIDE
-  the close transaction.
-  """
-  @spec arm_slate_in_txn(Txn.t(), String.t() | nil) :: :ok
-  def arm_slate_in_txn(%Txn{} = txn, work_item_id) when is_binary(work_item_id) do
-    case Txn.q(
-           txn,
-           "SELECT state, ownerUserId, deliveryOwnerSessionKey FROM work_items WHERE id = ?1",
-           [work_item_id]
-         ) do
-      [["open", owner, delivery_owner]] ->
-        if not open_assignments?(txn, work_item_id) do
-          wake =
-            Wakes.schedule_in_txn(txn, %{
-              session_key: slate_recipient_in_txn(txn, delivery_owner, owner),
-              origin: @origin,
-              prompt:
-                Tightbeam.Reminders.render(txn, "work-item-slate", %{work_item_id: work_item_id}),
-              due_at: now(),
-              sender_scheduled: true,
-              work_item_id: work_item_id
-            })
-
-          Txn.q(txn, "UPDATE work_items SET slateWakeId = ?2 WHERE id = ?1", [
-            work_item_id,
-            wake.wake_id
-          ])
-        end
-
-      _ ->
-        :ok
-    end
-
-    :ok
-  end
-
-  def arm_slate_in_txn(%Txn{} = _txn, nil), do: :ok
-
-  @doc """
-  Re-arm a still-current routing or slate bracket after its durable delivery
-  record commits. The pointer match is the discriminator, so a replay or an
-  unrelated notice cannot advance the bracket twice.
-  """
-  @spec rearm_on_fire_in_txn(Txn.t(), String.t() | nil, map() | nil) :: :ok
+  @doc false
   def rearm_on_fire_in_txn(%Txn{} = txn, wake_id, %{work_item_id: item_id})
       when is_binary(item_id) and is_binary(wake_id) do
-    case Txn.q(
-           txn,
-           "SELECT state, ownerUserId, deliveryOwnerSessionKey, title, routingWakeId, slateWakeId FROM work_items WHERE id = ?1",
-           [item_id]
-         ) do
-      [[state, owner, delivery_owner, title, routing, slate]] ->
-        cond do
-          state == "open" and routing == wake_id ->
-            arm_routing_in_txn(txn, item_id, owner, title)
+    # Observe only a committed source-to-turn relation. A queued or failed wake
+    # has no delivery event and therefore supplies no rearm observation.
+    case Tightbeam.RowReactions.delivery_event(txn, wake_id) do
+      nil ->
+        :ok
 
-          state == "open" and slate == wake_id and not open_assignments?(txn, item_id) ->
-            replacement =
-              Wakes.schedule_in_txn(txn, %{
-                session_key: slate_recipient_in_txn(txn, delivery_owner, owner),
-                origin: @origin,
-                prompt:
-                  Tightbeam.Reminders.render(txn, "work-item-slate", %{work_item_id: item_id}),
-                due_at: now() + triage_deadline_ms(),
-                sender_scheduled: true,
-                work_item_id: item_id
-              })
+      event ->
+        observe_item(
+          txn,
+          item_id,
+          "delivered",
+          %{kind: "wake_delivery", id: event["id"]},
+          nil,
+          wake_id
+        )
 
-            Txn.q(txn, "UPDATE work_items SET slateWakeId = ?2 WHERE id = ?1", [
-              item_id,
-              replacement.wake_id
-            ])
-
-          true ->
-            :ok
-        end
-
-      [] ->
         :ok
     end
-
-    :ok
   end
 
-  def rearm_on_fire_in_txn(%Txn{} = _txn, _wake_id, _gate), do: :ok
+  def rearm_on_fire_in_txn(_txn, _wake_id, _gate), do: :ok
+
+  defp observe_item(txn, id, operation, source, transition \\ nil, delivered_id \\ nil) do
+    before = %{"deliveredWakeId" => delivered_id}
+
+    Tightbeam.RowReactions.observe_work_item_in_txn(
+      txn,
+      id,
+      operation,
+      source,
+      before,
+      transition
+    )
+  end
 
   @doc false
   @spec reconcile_delivered_brackets(DB.server(), String.t(), String.t()) ::
@@ -1221,31 +1146,13 @@ defmodule Tightbeam.WorkItems do
     |> Enum.reverse()
   end
 
-  defp slate_recipient_in_txn(txn, delivery_owner, owner) do
-    case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [delivery_owner]) do
-      [["active"]] -> delivery_owner
-      _ -> Org.personal_session_key(owner)
-    end
-  end
+  defp arm_routing_in_txn(txn, id, _owner, _title) do
+    actions = observe_item(txn, id, "created", %{kind: "work_item", id: id})
 
-  defp arm_routing_in_txn(txn, id, owner, title) do
-    wake =
-      Wakes.schedule_in_txn(txn, %{
-        session_key: Org.personal_session_key(owner),
-        origin: @origin,
-        prompt:
-          Tightbeam.Reminders.render(txn, "work-item-routing", %{work_item_id: id, title: title}),
-        due_at: now() + triage_deadline_ms(),
-        sender_scheduled: true,
-        work_item_id: id
-      })
-
-    Txn.q(txn, "UPDATE work_items SET routingWakeId = ?2 WHERE id = ?1", [id, wake.wake_id])
-    wake
-  end
-
-  defp triage_deadline_ms do
-    Application.get_env(:tightbeam, :work_item_triage_deadline_ms, @default_triage_deadline_ms)
+    Enum.find_value(actions, fn action ->
+      wake_id = get_in(action, ["result", "wake_id"])
+      if wake_id, do: Wakes.get_in_txn(txn, wake_id)
+    end)
   end
 
   ## Reads

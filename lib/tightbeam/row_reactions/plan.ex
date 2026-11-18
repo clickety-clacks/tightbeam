@@ -71,7 +71,9 @@ defmodule Tightbeam.RowReactions.Plan do
     Enum.each(effects, fn effect ->
       fields!(effect, ~w(slot kind when value), ~w(withdraw))
       text!(effect["slot"])
-      unless effect["kind"] == "notice", do: raise(ArgumentError, "unsupported reaction effect")
+
+      unless effect["kind"] in ["notice", "cancel_notice"],
+        do: raise(ArgumentError, "unsupported reaction effect")
 
       Enum.each(~w(when value withdraw), fn key ->
         Expression.validate!(effect[key])
@@ -242,10 +244,10 @@ defmodule Tightbeam.RowReactions.Plan do
     effect =
       case value do
         %{"session_key" => key} when is_binary(key) ->
-          [scope_session_archetype(facts, key)]
+          List.wrap(scope_session_archetype(facts, key))
 
         %{session_key: key} when is_binary(key) ->
-          [scope_session_archetype(facts, key)]
+          List.wrap(scope_session_archetype(facts, key))
 
         _ ->
           []

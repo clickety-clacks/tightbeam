@@ -89,16 +89,159 @@ defmodule Tightbeam.WorkItemBracketsTest do
     base = Path.join(System.tmp_dir!(), "tb-brackets-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base)
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-    Rules.load!(base, Map.keys(handlers))
+    Tightbeam.TerminalReactionFixture.load_work_items!(base, Map.keys(handlers))
     on_exit(fn -> File.rm_rf!(base) end)
 
     %{
       db: db,
+      law_base: base,
       handlers: handlers,
       flynn_main: flynn_main,
       holder: holder,
       dsession: dsession
     }
+  end
+
+  test "absent work-item rails preserve create, assignment and close results without reminders",
+       ctx do
+    Rules.load!(Path.join(ctx.law_base, "absent"), Map.keys(ctx.handlers))
+    item = create(ctx, {:user, "flynn"}, %{title: "No automatic reminders"})
+    assert item.state == "open"
+    assert routing_wake_id(ctx.db, item.id) == nil
+    {:ok, assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "No reminder work", item.id)
+    assert assignment.id
+    result = attest(ctx, "holder", assignment.id, "completion")
+    refute Map.has_key?(result, :code)
+    assert slate_wake_id(ctx.db, item.id) == nil
+    assert item_wake_count(ctx.db, item.id) == 0
+  end
+
+  test "changing a rail revises its pending wake in place and removing it cancels only the reaction",
+       ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Revise the reminder"})
+    id = routing_wake_id(ctx.db, item.id)
+    original = Wakes.get(ctx.db, id)
+    path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    bytes = File.read!(path)
+    File.write!(path, String.replace(bytes, "86400000", "7000"))
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    revised = Wakes.get(ctx.db, id)
+    assert routing_wake_id(ctx.db, item.id) == id
+    assert revised.due_at == original.due_at - 86_400_000 + 7000
+    File.rm!(path)
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert Wakes.get(ctx.db, id).state == "canceled"
+    assert routing_wake_id(ctx.db, item.id) == nil
+    assert WorkItems.state_for(ctx.db, item.id) == "open"
+    File.write!(path, bytes)
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert routing_wake_id(ctx.db, item.id) == nil
+    assert Wakes.get(ctx.db, id).state == "canceled"
+  end
+
+  test "pending legacy pointer adoption preserves the wake identity across recovery", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Adopt pending reminder"})
+    id = routing_wake_id(ctx.db, item.id)
+    wake = Wakes.get(ctx.db, id)
+    forget_reaction_pointer_ledger(ctx.db, item.id)
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert routing_wake_id(ctx.db, item.id) == id
+    assert Wakes.get(ctx.db, id).due_at == wake.due_at
+    assert item_wake_count(ctx.db, item.id) == 1
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert routing_wake_id(ctx.db, item.id) == id
+    assert item_wake_count(ctx.db, item.id) == 1
+
+    assert {:ok, [["pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [id]
+             )
+  end
+
+  test "canceled and missing legacy references are never replaced during adoption", ctx do
+    for status <- ["canceled", "missing"] do
+      item = create(ctx, {:user, "flynn"}, %{title: "Adopt #{status} reminder"})
+      id = routing_wake_id(ctx.db, item.id)
+      forget_reaction_pointer_ledger(ctx.db, item.id)
+
+      if status == "missing" do
+        assert {:ok, _} = DB.query(ctx.db, "DELETE FROM wakes WHERE wakeId=?1", [id])
+      else
+        assert {:ok, true} =
+                 DB.transaction(ctx.db, fn txn ->
+                   command = %{
+                     wake_id: id,
+                     requester: %{kind: "process", id: "tightbeam:row-reactions"},
+                     reason_kind: "superseded",
+                     causal_source: %{kind: "wake", id: id}
+                   }
+
+                   {:ok, outcome} = Wakes.public_cancellation_outcome_in_txn(txn, command)
+                   Wakes.cancel_in_txn(txn, Map.put(command, :outcome, outcome))
+                 end)
+      end
+
+      :ok = Tightbeam.RowReactions.recover(ctx.db)
+      assert routing_wake_id(ctx.db, item.id) == id
+
+      assert {:ok, [[actual]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [id]
+               )
+
+      assert actual == if(status == "missing", do: "held", else: "canceled")
+      assert item_wake_count(ctx.db, item.id) == 0
+    end
+  end
+
+  test "a pending current pointer and an unrelated delivery cannot rearm a reminder", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Require actual delivery"})
+    id = routing_wake_id(ctx.db, item.id)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               WorkItems.rearm_on_fire_in_txn(txn, id, %{work_item_id: item.id})
+             end)
+
+    assert routing_wake_id(ctx.db, item.id) == id
+    assert item_wake_count(ctx.db, item.id) == 1
+    other = create(ctx, {:user, "flynn"}, %{title: "Other pointer"})
+    other_id = routing_wake_id(ctx.db, other.id)
+    deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, other_id))
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               WorkItems.rearm_on_fire_in_txn(txn, other_id, %{work_item_id: item.id})
+             end)
+
+    assert routing_wake_id(ctx.db, item.id) == id
+    assert item_wake_count(ctx.db, item.id) == 1
+  end
+
+  defp forget_reaction_pointer_ledger(db, item_id) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "DELETE FROM row_reaction_actions WHERE eventId IN (SELECT eventId FROM row_reaction_events WHERE json_extract(event,'$.workItemId')=?1)",
+        [item_id]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "DELETE FROM row_reaction_events WHERE json_extract(event,'$.workItemId')=?1",
+        [item_id]
+      )
+
+    {:ok, _} =
+      DB.query(db, "DELETE FROM row_reaction_cutovers WHERE source='work-item-references/v1'")
   end
 
   ## Proof 1 — create arms bracket 1; keyed replay returns the original, arms nothing.
@@ -1190,7 +1333,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     base = Path.join(System.tmp_dir!(), "tb-brackets-rules-#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(base, "identity/rules"))
     File.write!(Path.join(base, "identity/rules/statute.toml"), toml)
-    Rules.load!(base, Map.keys(ctx.handlers))
+    Tightbeam.TerminalReactionFixture.load_work_items!(base, Map.keys(ctx.handlers))
   end
 
   defp maybe_put(map, _key, nil), do: map

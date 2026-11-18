@@ -17,7 +17,115 @@ defmodule Tightbeam.RowReactions.Cutover do
     attest_watermark = attest_watermark(txn)
     adopt_pending_terminal_notices(txn, watermark)
     adopt_attest_notices(txn, attest_watermark)
+    adopt_work_item_references(txn)
     :ok
+  end
+
+  # This one-time adapter links existing pointer identities to the common
+  # action ledger. It admits no new source transition or replacement wake.
+  defp adopt_work_item_references(txn) do
+    source = "work-item-references/v1"
+
+    case Txn.q(txn, "SELECT 1 FROM row_reaction_cutovers WHERE source=?1", [source]) do
+      [[1]] ->
+        :ok
+
+      [] ->
+        [[watermark]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
+
+        rows =
+          Txn.q(
+            txn,
+            "SELECT id,ownerUserId,routingWakeId,slateWakeId FROM work_items WHERE routingWakeId IS NOT NULL OR slateWakeId IS NOT NULL"
+          )
+
+        at = System.system_time(:millisecond)
+
+        for [id, owner, routing, slate] <- rows,
+            {field, wake_id, family, operation} <- [
+              {"routingWakeId", routing, "r04-work-item", "created"},
+              {"slateWakeId", slate, "r05-work-item", "assignment_closed"}
+            ],
+            is_binary(wake_id),
+            is_nil(Store.output_event(txn, wake_id)) do
+          wake = Wakes.get_in_txn(txn, wake_id)
+
+          event = %{
+            "id" => "legacy-work-item:" <> wake_id,
+            "org" => owner,
+            "kind" => "work_item_observation",
+            "workItemId" => id,
+            "operation" => operation,
+            "historical" => true,
+            "generation" => wake_id,
+            "source" => %{"kind" => "wake", "id" => wake_id},
+            "principal" => %{"kind" => "process", "id" => "tightbeam"},
+            "before" => nil,
+            "transition" => nil,
+            "at" => if(wake, do: wake.due_at, else: at)
+          }
+
+          facts = Snapshot.current(txn, event, %{})
+          interval = facts["configured_triage_deadline_ms"] || 86_400_000
+
+          event =
+            event
+            |> Map.put("after", facts["work_item"])
+            |> Map.update!("at", &if(field == "routingWakeId", do: &1 - interval, else: &1))
+
+          reference = %{
+            "resource" => "work_item",
+            "id" => id,
+            "field" => field,
+            "expected" => wake_id
+          }
+
+          value =
+            if wake do
+              Map.new(
+                ~w(wake_id session_key owner_user_id origin prompt due_at work_item_id)a,
+                fn key -> {Atom.to_string(key), Map.get(wake, key)} end
+              )
+              |> Map.merge(%{
+                "reference" => reference,
+                "on_unavailable" => "schedule",
+                "sender_scheduled" => true
+              })
+            else
+              %{"wake_id" => wake_id, "reference" => reference}
+            end
+
+          plan = %{
+            identity: [owner, family, event["id"], "notice"],
+            family: family,
+            slot: "notice",
+            source_event_id: event["id"],
+            rule: family,
+            provenance: %{"source" => source, "historical" => true},
+            kind: "notice",
+            selected: true,
+            value: value
+          }
+
+          status = if wake, do: legacy_notice_status(txn, wake), else: "held"
+
+          result = %{
+            "wake_id" => wake_id,
+            "adopted" => true,
+            "requested_due_at" => if(wake, do: wake.due_at)
+          }
+
+          Store.adopt(txn, event, facts, plan, status, result, at)
+        end
+
+        Txn.q(
+          txn,
+          "INSERT INTO row_reaction_cutovers(source,watermark,adoptedAt,heldCount) VALUES(?1,?2,?3,0)",
+          [source, JSON.encode!(%{"wakeRowid" => watermark}), at]
+        )
+
+        :ok
+    end
   end
 
   defp terminal_watermark(txn) do
