@@ -225,7 +225,7 @@ defmodule ItemlessSpawnDispatchRuntime do
       principal: {:session, caller},
       session_key: nil,
       params: %{
-        display_name: "WI3FE #{archetype}",
+        display_name: "WI3FE #{caller} #{archetype}",
         archetype: archetype,
         idempotency_key: "wi3fe-#{caller}-#{archetype}"
       }
