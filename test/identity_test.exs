@@ -26,6 +26,58 @@ defmodule Tightbeam.IdentityTest do
     %{base: runtime, root: base, source: source}
   end
 
+  test "identity writes finish automatic Git maintenance before returning", ctx do
+    trace = Path.join(ctx.root, "git-trace.jsonl")
+    System.put_env("GIT_TRACE2_EVENT", trace)
+
+    # Deliberately request background maintenance in the caller's config. Identity
+    # operations must still own their writers, including the initial seed commit.
+    config = [
+      {"maintenance.auto", "true"},
+      {"maintenance.autoDetach", "true"},
+      {"gc.autoDetach", "true"},
+      {"maintenance.gc.enabled", "true"},
+      {"gc.auto", "1"}
+    ]
+
+    index = String.to_integer(System.get_env("GIT_CONFIG_COUNT", "0"))
+    System.put_env("GIT_CONFIG_COUNT", Integer.to_string(index + length(config)))
+
+    for {{key, value}, offset} <- Enum.with_index(config, index) do
+      System.put_env("GIT_CONFIG_KEY_#{offset}", key)
+      System.put_env("GIT_CONFIG_VALUE_#{offset}", value)
+    end
+
+    assert :initialized = Identity.init!(ctx.base)
+    dir = Path.join(ctx.base, "identity")
+
+    # Git's auto-GC samples objects/17. These real SHA-1 blobs exceed the
+    # gc.auto=1 sample threshold, so this exercises a repack, not just a no-op.
+    for contents <- ~w(32 119 334) do
+      path = Path.join(ctx.root, "loose-object")
+      File.write!(path, contents)
+      git!(dir, ["hash-object", "-w", path])
+    end
+
+    learn_test_bundle!(ctx)
+
+    events = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&JSON.decode!/1)
+
+    refute Enum.any?(events, fn event ->
+             event["event"] == "region_enter" and event["label"] == "detach"
+           end)
+
+    repacks = Enum.filter(events, &(&1["event"] == "cmd_name" and &1["name"] == "repack"))
+    assert repacks != []
+
+    for repack <- repacks do
+      assert Enum.any?(events, fn event ->
+               event["event"] == "exit" and event["sid"] == repack["sid"] and
+                 event["code"] == 0
+             end)
+    end
+  end
+
   test "an unlearned bundle probe does not emit expected git fatal stderr", ctx do
     assert :initialized = Identity.init!(ctx.base)
     probe = "Tightbeam.Identity.public_kungfu(#{inspect(ctx.base)}, \"unlearned-bundle\")"

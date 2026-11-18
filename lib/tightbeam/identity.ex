@@ -1496,7 +1496,7 @@ defmodule Tightbeam.Identity do
   defp merge_upstream(dir, message, author, expected_prior, upstream_prior, before_commit) do
     case System.cmd(
            "git",
-           ["merge", "--no-ff", "--no-commit", @upstream, "-m", message],
+           synchronous_git_args(["merge", "--no-ff", "--no-commit", @upstream, "-m", message]),
            cd: dir,
            stderr_to_stdout: true,
            env: git_env(author)
@@ -2255,10 +2255,22 @@ defmodule Tightbeam.Identity do
   end
 
   defp git!(dir, args, author \\ nil) do
-    case System.cmd("git", args, cd: dir, stderr_to_stdout: true, env: git_env(author)) do
+    case System.cmd("git", synchronous_git_args(args),
+           cd: dir,
+           stderr_to_stdout: true,
+           env: git_env(author)
+         ) do
       {_output, 0} -> :ok
       {output, status} -> raise "git #{Enum.join(args, " ")} failed (#{status}): #{output}"
     end
+  end
+
+  # Commits and merges may launch automatic maintenance. Its default detached
+  # worker can still write into an initialization candidate after we rename it,
+  # or into a temporary identity after its owner starts removing it. Retain
+  # maintenance, but keep its lifetime inside the identity operation.
+  defp synchronous_git_args(args) do
+    ["-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false" | args]
   end
 
   defp git_env(nil), do: []
