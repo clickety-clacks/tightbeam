@@ -266,12 +266,22 @@ defmodule Tightbeam.DBCallTimeoutTest do
         end
       end)
 
-    assert_receive :old_migration_entered
+    # These messages establish ordering, not elapsed-time claims. Let ExUnit's
+    # test timeout bound the scenario instead of giving each producer one second of
+    # scheduler time to reach the next barrier.
+    receive do
+      :old_migration_entered -> :ok
+    end
 
-    assert_receive {:primary_timeout, %DB.Timeout{operation: "db.transaction", budget_ms: 25}}
+    receive do
+      {:primary_timeout, error} ->
+        assert %DB.Timeout{operation: "db.transaction", budget_ms: 25} = error
+    end
 
-    assert_receive {:DOWN, ^monitor, :process, ^caller,
-                    {%DB.Timeout{operation: "db.execute", budget_ms: 25}, _stack}}
+    receive do
+      {:DOWN, ^monitor, :process, ^caller, reason} ->
+        assert {%DB.Timeout{operation: "db.execute", budget_ms: 25}, _stack} = reason
+    end
 
     send(db, :finish_old_migration)
 
