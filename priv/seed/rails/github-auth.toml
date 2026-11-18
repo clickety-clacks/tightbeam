@@ -1,0 +1,9 @@
+[[statute]]
+name = "github-auth"
+on = "tool-call"
+mode = "gate"
+archetypes = ["*"]
+tool = "Bash"
+pattern = "(github\\.com|gh[[:space:]]+(repo|pr|issue|api)|git[[:space:]]+(clone|fetch|pull|push|ls-remote|remote|submodule))"
+check = "github-auth"
+text = "Tightbeam cannot use GitHub from {host} for {hostname}: failed phase {phase}; {state}: {detail}. Run: {repair}. Do not paste a PAT into an agent."

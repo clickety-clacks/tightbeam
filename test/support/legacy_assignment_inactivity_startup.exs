@@ -77,7 +77,27 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config, base: base} ->
              delivered_prompt.wake_id
            ])
 
+  retained_wakes =
+    for {origin, obligation} <- [
+          {"reaction:assignment-terminal-handoff", "terminal-child-preserved"},
+          {"remedy:sample-kungfu.pending-action", "other-kungfu-action"}
+        ] do
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: origin,
+        consumer: "prompt",
+        prompt: "preserved pending action",
+        due_at: future,
+        assignment_id: assignment.id,
+        obligation_ref: obligation
+      })
+    end
+
   _children = Gateway.children(config)
+
+  for wake <- retained_wakes do
+    assert %{state: "pending"} = Wakes.get(db, wake.wake_id)
+  end
 
   for wake <- [deadline, climb, prompt] do
     assert %{state: "canceled"} = Wakes.get(db, wake.wake_id)
