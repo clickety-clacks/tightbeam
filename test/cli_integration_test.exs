@@ -2447,17 +2447,21 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    # The posture verdict can now deliver before later CLI calls. Consume its
-    # carrier so the holder is ready for the implementation receipt notice.
-    assert {:ok, [[posture_notice_id]]} =
+    # The posture verdict is durable and satisfies the gate, but remains quiet
+    # because it is an unlinked ordinary verdict under R01.
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [topology_id, topology_notice_id]
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='posture-light'",
+               [topology_id]
              )
 
-    posture_delivery = assert_cli_source_delivery!(ctx.db, posture_notice_id, "cli-holder")
-    finish_cli_delivery!(ctx.db, "cli-holder", posture_delivery.seq)
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
+               [topology_id]
+             )
 
     {assigned, 0} =
       System.cmd(
