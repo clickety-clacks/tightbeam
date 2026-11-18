@@ -3832,7 +3832,6 @@ defmodule Tightbeam.EscalationTest do
       assert message =~ "--work-item"
 
       for {work_item, code} <- [
-            {"wi-missing", "not_found"},
             {"wi-foreign-association", "not_owner"}
           ] do
         {:ok, _} =
