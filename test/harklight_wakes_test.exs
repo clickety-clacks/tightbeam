@@ -7094,6 +7094,9 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
   end
 
+  # Includes two complete population scans and database setup on busy runners.
+  # Responsiveness while reads are blocked is checked separately below.
+  @tag timeout: 180_000
   test "194 pending status reads leave the manager responsive and new requests ungated", %{
     db: db,
     session: session,
@@ -7196,6 +7199,24 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert_receive {:restored, ^hung, nil}, 6_000
 
+    # Observe completion of the skipped workers, rather than requiring the
+    # whole population to drain within eventually/1's short polling window.
+    # An unexpected listener stays alive and fails this bounded wait; the
+    # exact survivor set and duplicate-listener checks still follow it.
+    await_skipped = fn controller ->
+      monitors =
+        for {handle, pid} <- :sys.get_state(controller).workers,
+            handle not in [target, hung],
+            do: {pid, Process.monitor(pid)}
+
+      for {pid, ref} <- monitors do
+        assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 30_000
+        assert reason in [:normal, :noproc]
+      end
+    end
+
+    await_skipped.(manager)
+
     assert eventually(fn ->
              Map.keys(:sys.get_state(manager).workers) |> MapSet.new() ==
                MapSet.new([target, hung])
@@ -7222,13 +7243,18 @@ defmodule Tightbeam.HarklightWakesTest do
          db: db, listener: completion_notifying_listener(parent), send_runner: runner}
       )
 
+    # This restore scans all 194 handles through the bounded decision pool.
+    # Its total duration is not the manager/new-request responsiveness bound
+    # asserted above: on a busy runner even successful reads can take >1s.
+    # Keep a finite failure deadline, and still require exactly both listeners.
     restored =
       for _ <- 1..2 do
-        assert_receive {:restored, handle, nil}, 1_000
+        assert_receive {:restored, handle, nil}, 30_000
         handle
       end
 
     assert MapSet.new(restored) == MapSet.new([target, hung])
+    await_skipped.(second)
     assert eventually(fn -> map_size(:sys.get_state(second).workers) == 2 end)
     restore_us = System.monotonic_time(:microsecond) - restore_at
     refute_receive {:restored, _, _}
