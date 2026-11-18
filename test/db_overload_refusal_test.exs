@@ -106,6 +106,23 @@ defmodule Tightbeam.DBOverloadRefusalTest do
     end
   end
 
+  test "a reader deadline retains its distinct retryable timeout response", %{db: db} do
+    start_supervised!({Diagnostics, notify: self()})
+
+    response =
+      Tightbeam.Wire.RequestObservation.call(Plug.Test.conn(:get, "/reader-deadline"), fn _ ->
+        DB.read_transaction!(db, fn _ -> raise DB.DeadlineExceeded end)
+      end)
+
+    assert response.status == 503
+    assert %{"error" => error} = JSON.decode!(response.resp_body)
+    assert error["code"] == "db_timeout"
+    assert error["timeoutSource"] == "reader_deadline"
+    assert error["operation"] == "db.read_transaction"
+    assert error["effectState"] == "none"
+    assert error["action"] == "retry_safe"
+  end
+
   describe "an HTTP request" do
     test "that meets the overload gets a 503 it can retry, not a bare 500", %{db: db} do
       start_supervised!({Diagnostics, notify: self()})
