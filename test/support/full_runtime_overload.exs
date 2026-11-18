@@ -191,6 +191,7 @@ nudge = Task.async(fn -> Wakes.nudge_matching(Tightbeam.WakeScheduler, 1) end)
 :ok = :sys.resume(Tightbeam.WakeScheduler)
 send(Tightbeam.HarnessHealth.RecoveryScheduler, :resume_due)
 GenServer.cast(Tightbeam.HarklightOriginListener, {:resume_session, key})
+GenServer.cast(Tightbeam.HarklightWakes, {:origin_ready, key})
 send(Tightbeam.WorkspaceCleanup, :drain)
 GenServer.cast(Tightbeam.Productions.BubbleSweeper, {:recognize, 0})
 
