@@ -356,6 +356,7 @@ defmodule Tightbeam.AttestFyiTest do
       name: "evidence-operation",
       purpose: "attest-operational-evidence",
       source: "test-policy",
+      archetypes: ["*"],
       conditions: [%{fact: "assignment.effect_kind", op: "eq", value: "evidence"}]
     }
 
