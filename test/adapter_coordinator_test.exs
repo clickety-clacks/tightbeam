@@ -1827,17 +1827,33 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            )
   end
 
-  test "real-clock shutdown completes within its configured budget when the DB is blocked", ctx do
+  test "real-clock retirement cutoff finishes 24 late entries within its configured budget",
+       ctx do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
-    helper = Path.expand("../cli/target/release/tightbeam", __DIR__)
-    budget_ms = 2_000
 
+    helper = Path.expand("../cli/target/release/tightbeam", __DIR__)
+    slow_helper = Path.join(ctx.test_dir, "slow_harness_helper")
+
+    File.write!(
+      slow_helper,
+      "#!/bin/sh\n" <>
+        "if [ \"$1\" = \"harness-group\" ]; then sleep 2; fi\n" <>
+        "exec #{helper} \"$@\"\n"
+    )
+
+    File.chmod!(slow_helper, 0o755)
+
+    # The cleanup owner. In the real tree this is Tightbeam.TurnTaskSupervisor,
+    # which starts before the coordinator under rest_for_one and so outlives its
+    # terminate/2; a standalone coordinator is given an equivalent owner here so
+    # the same handoff path is exercised rather than the inline fallback.
     cleanup_owner =
       start_supervised!(
-        {Task.Supervisor,
-         name: :"shutdown_real_clock_cleanup_#{System.unique_integer([:positive])}"}
+        {Task.Supervisor, name: :"shutdown_cutoff_cleanup_#{System.unique_integer([:positive])}"}
       )
+
+    budget_ms = 1_200
 
     {:ok, coordinator} =
       AdapterCoordinator.start_link(
@@ -1849,81 +1865,111 @@ defmodule Tightbeam.AdapterCoordinatorTest do
             cmd: [System.find_executable("node"), path],
             home: ctx.test_dir,
             cwd: ctx.test_dir,
-            process_helper: helper,
+            process_helper: slow_helper,
             process_identity_dir: ctx.test_dir
           ]
         end,
         db: ctx.db,
         shutdown_budget_ms: budget_ms,
         shutdown_settlement_budget_ms: 500,
+        # Zero grace pins this test to the late path by construction: the
+        # cancel deadline collapses to the reserve boundary, every hung park is
+        # force-killed with no cooperative wait, and retirement always enters
+        # past settle_start. At the default grace the premise is a race against
+        # the host's process-enumeration cost — deterministically lost on Linux,
+        # where 24 parks answer the cooperative cancel well inside 100ms and
+        # retirement runs early (0/24 late over 5 runs), and only incidentally
+        # won on macOS (24/24 late in the measured runs).
+        shutdown_cancel_grace_ms: 0,
         shutdown_cleanup_supervisor: cleanup_owner,
-        name: :"shutdown_real_clock_coordinator_#{System.unique_integer([:positive])}"
+        name:
+          String.to_atom(
+            "shutdown_retirement_cutoff_coordinator_#{System.unique_integer([:positive])}"
+          )
       )
 
     Process.unlink(coordinator)
     on_exit(fn -> if Process.alive?(coordinator), do: GenServer.stop(coordinator, :shutdown) end)
-    keys = [{:claude, "shared", "shutdown-real-clock-host"}]
-    [key] = keys
-    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
-    assert %Tightbeam.Acp.Adapter{} = :sys.get_state(adapter, :infinity)
-    assert [%{state: "running"}] = HarnessProcess.list(ctx.db)
-    adapter_ref = Process.monitor(adapter)
 
-    # Hold the DB past both real deadlines, rather than racing 24 row writes
-    # against the reserve. No shutdown_clock override: a callback that ignores
-    # its actual deadline must fail the elapsed-time assertion below.
-    :ok = :sys.suspend(ctx.db)
+    # Cardinality is the point: the deadline guarantee must not degrade as the
+    # retained-adapter count grows, and this also exceeds the 20-key log sample
+    # cap so the aggregate line's remainder path is exercised under load.
+    keys =
+      for index <- 1..24 do
+        {:claude, "shared", "shutdown-retirement-cutoff-host-#{index}"}
+      end
 
-    try do
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          started_at = System.monotonic_time()
-          assert :ok = GenServer.stop(coordinator, :shutdown, :infinity)
-          elapsed_native = System.monotonic_time() - started_at
-
-          send(
-            self(),
-            {:shutdown_elapsed_ms,
-             System.convert_time_unit(elapsed_native, :native, :millisecond)}
-          )
-        end)
-
-      assert_received {:shutdown_elapsed_ms, elapsed_ms}
-
-      # terminate/2 promises to complete within shutdown_budget_ms, and the V7
-      # concern — a callback overrunning its own budget passing unnoticed — still
-      # governs: the allowance below is measurement-scale, not phase-scale, so a
-      # real overrun of the 500ms reserve still fails. Without the allowance the
-      # bound's margin is negative by construction — it forbids what the code's
-      # own contract permits and can fail on a quiet host on a scheduling hiccup.
-      # Two costs land in elapsed_ms without being terminate's to spend:
-      # DB.transaction_until grants
-      # a final commit already in flight remaining + 50ms past the deadline rather
-      # than abort a durable outcome (observed +8..22ms), and the measurement
-      # starts before GenServer.stop dispatches, ahead of the callback's own clock
-      # (observed +12..26ms under 4x CPU oversubscription). 100ms is ~3x the worst
-      # observed sum of the two. This bound is a sanity check on the deadline
-      # contract. The separate 24-adapter logical-clock test below asserts late
-      # entry settlement, fences, events, bounded logging and descendant cleanup.
-      observation_allowance_ms = 100
-
-      assert elapsed_ms <= budget_ms + observation_allowance_ms,
-             "shutdown took #{elapsed_ms}ms against a configured #{budget_ms}ms budget " <>
-               "(+#{observation_allowance_ms}ms observation allowance) with " <>
-               "#{length(keys)} retained adapters; the deadline guarantee did not hold"
-
-      assert log =~ "preparation unresolved before deadline"
-      assert log =~ "durable outcomes unresolved before deadline"
-    after
-      :sys.resume(ctx.db)
+    for key <- keys do
+      assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     end
 
-    assert_receive {:DOWN, ^adapter_ref, :process, ^adapter, _reason}, 30_000
-
     assert eventually(
-             fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
-             1_000
+             fn ->
+               rows = HarnessProcess.list(ctx.db)
+               length(rows) == length(keys) and Enum.all?(rows, &(&1.state == "running"))
+             end,
+             300
            )
+
+    # The cleanup now runs on its own owner AFTER terminate/2 returns, so its log
+    # lands after GenServer.stop does. Waiting for the descendants to disappear
+    # inside the capture is what makes that line observable here; measuring the
+    # elapsed time before that wait is what keeps the deadline assertion honest.
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        # Deliberately looser than the budget so an overrun fails on the elapsed
+        # bound below with a real number, instead of exiting here on an ambiguous
+        # caller timeout.
+        started_at = System.monotonic_time()
+        assert :ok = GenServer.stop(coordinator, :shutdown, 3_000)
+        elapsed_native = System.monotonic_time() - started_at
+
+        send(
+          self(),
+          {:shutdown_elapsed_ms, System.convert_time_unit(elapsed_native, :native, :millisecond)}
+        )
+
+        assert eventually(
+                 fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
+                 1_000
+               )
+      end)
+
+    assert_received {:shutdown_elapsed_ms, elapsed_ms}
+
+    # terminate/2 promises to complete within shutdown_budget_ms, and the V7
+    # concern — a callback overrunning its own budget passing unnoticed — still
+    # governs: the allowance below is measurement-scale, not phase-scale, so a
+    # real overrun of the 500ms reserve still fails. Without the allowance the
+    # bound's margin is negative by construction — it forbids what the code's
+    # own contract permits and can fail on a quiet host on a scheduling hiccup.
+    # Two costs land in elapsed_ms without being terminate's to spend:
+    # DB.transaction_until grants
+    # a final commit already in flight remaining + 50ms past the deadline rather
+    # than abort a durable outcome (observed +8..22ms), and the measurement
+    # starts before GenServer.stop dispatches, ahead of the callback's own clock
+    # (observed +12..26ms under 4x CPU oversubscription). 100ms is ~3x the worst
+    # observed sum of the two. This bound is a sanity check on the deadline
+    # contract, not the regression detector: at the pre-fix base its catch rate
+    # is platform-dependent — 0 of 8 loaded macOS runs (elapsed 853-1284ms)
+    # versus 3 of 6 Linux runs (1320-1338ms). What caught the base defect on
+    # both platforms is the row-state,
+    # log-content and census oracles in the ordering case below, which this allowance leaves
+    # untouched. With 24
+    # retained adapters this also proves the bound does not degrade with
+    # cardinality: the late entries' outcomes are decided before settlement, and
+    # their cleanup is owned by someone else afterwards.
+    observation_allowance_ms = 100
+
+    assert elapsed_ms <= budget_ms + observation_allowance_ms,
+           "shutdown took #{elapsed_ms}ms against a configured #{budget_ms}ms budget " <>
+             "(+#{observation_allowance_ms}ms observation allowance) with " <>
+             "#{length(keys)} retained adapters; the deadline guarantee did not hold"
+
+    # The real-clock claim does not require settlement to finish in its reserve.
+    # The ordering case below owns every durable row/fence/event assertion.
+    assert log =~ "retirement late entry unresolved"
+    assert HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0
   end
 
   test "retirement cutoff preserves late entries for the settlement reserve", ctx do
