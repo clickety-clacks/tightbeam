@@ -51,10 +51,14 @@ defmodule Tightbeam.ApplicationShutdownTest do
   test "a drain that exhausts its allowance still stamps inside the budget", %{epoch: epoch} do
     Application.put_env(:tightbeam, :drain_timeout_ms, 5_500)
     :ok = DB.execute(DB, "INSERT INTO turns VALUES ('running')")
-    started = System.monotonic_time(:millisecond)
+    wall_started = System.system_time(:millisecond)
     assert :state = Tightbeam.Application.prep_stop(:state)
-    assert System.monotonic_time(:millisecond) - started < 900
-    assert_stamped(epoch)
+
+    # Measure the persisted stamp, not when this observer gets scheduled after
+    # prep_stop returns. Keep the real 900 ms bound (including the 500 ms drain),
+    # even if the observer resumes after that window has closed.
+    stamp = assert_stamped(epoch)
+    assert stamp - wall_started < 900
   end
 
   test "a short budget reserves time for the stamp" do
