@@ -3844,18 +3844,26 @@ defmodule Tightbeam.HarklightWakesTest do
     fi
     """)
 
+    calls = fn -> File.read!(path) |> String.split("\n", trim: true) end
+    listen_count = fn -> Enum.count(calls.(), &String.starts_with?(&1, "listen ")) end
+
     Org.append_pointer(db, session.session_key, "vendor-original", "created")
     manager = start_supervised!({HarklightWakes, db: db})
-    assert eventually(fn -> is_port(:sys.get_state(manager).ports[@handle]) end)
+
+    # A registered port only confirms the child wrapper's lifetime lock. Listen
+    # starts after attach succeeds, so its log entry confirms attach completed.
+    assert eventually(fn -> File.exists?(path) and listen_count.() == 1 end)
+    assert is_port(:sys.get_state(manager).ports[@handle])
     worker = :sys.get_state(manager).workers[@handle]
 
     for _ <- 1..5 do
       Org.append_pointer(db, session.session_key, "vendor-original", "loaded")
       GenServer.cast(manager, {:origin_ready, session.session_key})
+      # The synchronous round trip drains the preceding pointer handoff and
+      # origin_ready cast before checking that neither replaced the worker.
       assert :sys.get_state(manager).workers[@handle] == worker
     end
 
-    calls = fn -> File.read!(path) |> String.split("\n", trim: true) end
     assert Enum.count(calls.(), &String.starts_with?(&1, "attach ")) == 1
     assert length(Org.pointer_chain(db, session.session_key)) == 6
 
@@ -3866,8 +3874,10 @@ defmodule Tightbeam.HarklightWakesTest do
              is_port(state.ports[@handle]) and state.workers[@handle] != worker
            end)
 
-    assert Enum.count(calls.(), &String.starts_with?(&1, "attach ")) == 2
-    assert Enum.any?(calls.(), &String.contains?(&1, "--vendor-session-id vendor-replacement"))
+    assert eventually(fn -> listen_count.() == 2 end)
+    attach_calls = Enum.filter(calls.(), &String.starts_with?(&1, "attach "))
+    assert length(attach_calls) == 2
+    assert String.contains?(Enum.at(attach_calls, 1), "--vendor-session-id vendor-replacement")
   end
 
   test "an overloaded listener-state write keeps the attachment and delivers the waiting entry once",
