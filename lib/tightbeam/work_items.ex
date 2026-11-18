@@ -926,11 +926,6 @@ defmodule Tightbeam.WorkItems do
   end
 
   defp apply_disposition(txn, item, :reopen, "open", _reason) do
-    # iceboxed → open re-arms bracket 1 (the routing deadline resumes).
-    if is_binary(item.routingWakeId) or is_binary(item.slateWakeId) do
-      raise "terminal work item #{item.id} retained a live bracket reference"
-    end
-
     Txn.q(txn, "UPDATE work_items SET state = 'open', failReason = NULL WHERE id = ?1", [item.id])
     :ok
   end

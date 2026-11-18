@@ -8,6 +8,11 @@ defmodule Tightbeam.RowReactions.Reference do
     case Txn.q(txn, "SELECT #{field} FROM work_items WHERE id=?1", [id]) do
       [[current]] ->
         if current in [ref["expected"], value] do
+          if is_binary(current) and current != value and
+               Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [current]) == [] do
+            raise "reaction reference points at missing wake #{current}"
+          end
+
           Txn.q(txn, "UPDATE work_items SET #{field}=?2 WHERE id=?1", [id, value])
         else
           raise ArgumentError, "reaction reference changed before effect"
