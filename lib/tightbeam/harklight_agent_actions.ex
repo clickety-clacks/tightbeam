@@ -1,7 +1,7 @@
 defmodule Tightbeam.HarklightAgentActions do
   @moduledoc false
 
-  alias Tightbeam.{DB, Org, Placement}
+  alias Tightbeam.{DB, HarklightLifecycle, HarklightSend, HarklightWakes, Id, Org, Placement}
 
   @statuses ~w(received applied refused)
 
@@ -10,7 +10,7 @@ defmodule Tightbeam.HarklightAgentActions do
          :ok <- allowed_params(call.params, [:handle]),
          {:ok, handle} <- owned_handle(db, call, call.params[:handle]),
          {:ok, runner} <- runner(opts) do
-      run_read(runner, handle)
+      run_read(db, call, runner, handle)
     else
       {:error, code, reason} -> failure("read", code, reason, "refused")
       {:error, code} -> failure("read", code, reason_for(code), failure_outcome(code))
@@ -54,7 +54,7 @@ defmodule Tightbeam.HarklightAgentActions do
       ]
 
       args = maybe_add_op_id(args, op_id)
-      run_operation(runner, "reply", args, op_id)
+      run_operation(db, call, runner, "reply", args, op_id)
     else
       {:error, code, reason} -> failure("reply", code, reason, "refused")
       {:error, code} -> failure("reply", code, reason_for(code), failure_outcome(code))
@@ -84,7 +84,7 @@ defmodule Tightbeam.HarklightAgentActions do
       ]
 
       args = maybe_add_op_id(args, op_id)
-      run_operation(runner, "result", args, op_id)
+      run_operation(db, call, runner, "result", args, op_id)
     else
       {:error, code, reason} -> failure("result", code, reason, "refused")
       {:error, code} -> failure("result", code, reason_for(code), failure_outcome(code))
@@ -111,9 +111,10 @@ defmodule Tightbeam.HarklightAgentActions do
              handle
            ]) do
         {:ok, [[session_key, host]]} ->
-          if session_key == call.session_key and host == Placement.local_host_name(),
-            do: {:ok, handle},
-            else: {:error, "harklight_origin_mismatch"}
+          if host == Placement.local_host_name() and
+               (session_key == call.session_key or followed_or_delivered?(db, call, handle)),
+             do: {:ok, handle},
+             else: {:error, "harklight_origin_mismatch"}
 
         {:ok, _} ->
           {:error, "harklight_origin_mismatch"}
@@ -124,46 +125,108 @@ defmodule Tightbeam.HarklightAgentActions do
     end
   end
 
-  defp delivered_event(db, call, handle, event_id) do
+  defp followed_or_delivered?(db, call, handle) do
     case DB.query(
            db,
            """
-           SELECT 1
-           FROM harklight_wake_entries e
-           JOIN wakes w ON w.wakeId=e.wakeId
-           JOIN turns t ON t.seq=w.deliveredTurnSeq
-           JOIN harklight_wake_handles h ON h.handle=e.handle
-           WHERE e.handle=?1 AND e.eventId=?2
-             AND w.sessionKey=?3 AND t.sessionKey=?3
-             AND h.sessionKey=?3 AND h.host=?4
+           SELECT 1 WHERE EXISTS (
+             SELECT 1 FROM harklight_wake_follows WHERE handle=?1 AND sessionKey=?2
+           ) OR EXISTS (
+             SELECT 1 FROM harklight_wake_deliveries
+             WHERE handle=?1 AND COALESCE(currentRecipientSessionKey,sessionKey)=?2
+           )
            """,
-           [handle, event_id, call.session_key, Placement.local_host_name()]
+           [handle, call.session_key]
          ) do
-      {:ok, [[1]]} -> :ok
+      {:ok, [[1]]} -> true
+      _ -> false
+    end
+  end
+
+  @delivered_from """
+  FROM harklight_wake_entries e
+  JOIN harklight_wake_deliveries d ON d.handle=e.handle AND d.eventId=e.eventId
+  JOIN wakes w ON w.wakeId=d.wakeId OR w.wakeId IN (
+    SELECT wakeId FROM wake_retry_attempts WHERE rootWakeId=d.wakeId
+  )
+  JOIN turns t ON t.seq=w.deliveredTurnSeq
+  JOIN harklight_wake_handles h ON h.handle=e.handle
+  WHERE e.handle=?1 AND COALESCE(d.currentRecipientSessionKey,d.sessionKey)=?2
+    AND w.sessionKey=?2 AND t.sessionKey=?2 AND h.host=?3
+  """
+
+  defp delivered_event(db, call, handle, event_id) do
+    case delivered_request(db, call, handle, event_id) do
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
+
+  defp delivered_request_event(db, call, handle, event_id, request_id) do
+    case delivered_request(db, call, handle, event_id) do
+      {:ok, ^request_id} -> :ok
+      {:ok, _} -> {:error, "harklight_event_mismatch"}
+      error -> error
+    end
+  end
+
+  defp delivered_request(db, call, handle, event_id) do
+    case DB.query(db, "SELECT DISTINCT e.messageId " <> @delivered_from <> " AND e.eventId=?4", [
+           handle,
+           call.session_key,
+           Placement.local_host_name(),
+           event_id
+         ]) do
+      {:ok, [[message_id]]} -> {:ok, message_id}
       {:ok, []} -> {:error, "harklight_event_unknown"}
       {:error, _} -> {:error, "harklight_event_unavailable"}
     end
   end
 
-  defp delivered_request_event(db, call, handle, event_id, request_id) do
-    case DB.query(
-           db,
-           """
-           SELECT e.messageId
-           FROM harklight_wake_entries e
-           JOIN wakes w ON w.wakeId=e.wakeId
-           JOIN turns t ON t.seq=w.deliveredTurnSeq
-           JOIN harklight_wake_handles h ON h.handle=e.handle
-           WHERE e.handle=?1 AND e.eventId=?2
-             AND w.sessionKey=?3 AND t.sessionKey=?3
-             AND h.sessionKey=?3 AND h.host=?4
-           """,
-           [handle, event_id, call.session_key, Placement.local_host_name()]
-         ) do
-      {:ok, [[^request_id]]} -> :ok
-      {:ok, []} -> {:error, "harklight_event_unknown"}
-      {:ok, [[_other_request]]} -> {:error, "harklight_event_mismatch"}
-      {:error, _} -> {:error, "harklight_event_unavailable"}
+  defp run_read(db, call, runner, handle) do
+    case DB.query(db, "SELECT sessionKey FROM harklight_wake_handles WHERE handle=?1", [handle]) do
+      {:ok, [[owner]]} when owner == call.session_key ->
+        run_read(runner, handle)
+
+      {:ok, [[_owner]]} ->
+        with {:ok, rows} <-
+               DB.query(db, "SELECT DISTINCT e.eventId " <> @delivered_from, [
+                 handle,
+                 call.session_key,
+                 Placement.local_host_name()
+               ]) do
+          allowed = MapSet.new(rows, fn [event_id] -> event_id end)
+
+          case run_read(runner, handle) do
+            %{outcome: "received", output: output} = result ->
+              filtered =
+                output
+                |> String.split("\n", trim: true)
+                |> Enum.filter(fn line ->
+                  case JSON.decode(line) do
+                    {:ok, %{"kind" => "event", "event_id" => event_id}} ->
+                      MapSet.member?(allowed, to_string(event_id))
+
+                    _ ->
+                      false
+                  end
+                end)
+                |> Enum.join("\n")
+
+              %{result | output: filtered}
+
+            result ->
+              result
+          end
+        else
+          {:error, _} ->
+            failure(
+              "read",
+              "harklight_event_unavailable",
+              reason_for("harklight_event_unavailable"),
+              "failed"
+            )
+        end
     end
   end
 
@@ -268,67 +331,96 @@ defmodule Tightbeam.HarklightAgentActions do
       })
   end
 
-  defp run_operation(runner, command, args, requested_op_id) do
-    {output, status} = runner.(args)
+  defp run_operation(db, call, runner, command, args, requested_op_id) do
+    op_id = requested_op_id || Id.uuid4()
+    args = if requested_op_id, do: args, else: maybe_add_op_id(args, op_id)
+    payload = JSON.encode!(%{operation_kind: "action", command: command, args: args})
 
-    case frames(output) do
-      [%{"kind" => "committed", "operation" => ^command, "op_id" => op_id} = frame]
-      when status == 0 and is_binary(op_id) and
-             (is_nil(requested_op_id) or requested_op_id == op_id) ->
-        %{command: command, outcome: "committed", op_id: op_id, result: frame}
+    # Use the same immutable operation correlation and helper journal recovery as
+    # send/change settlement. The retry lookup must precede the helper's acted check.
+    :global.trans({{__MODULE__, db, op_id}, self()}, fn ->
+      case HarklightWakes.prepare_send(db, call, op_id, payload) do
+        %{state: _} ->
+          with {:ok, rows} <-
+                 DB.query(db, "SELECT effects FROM harklight_command_results WHERE opId=?1", [
+                   op_id
+                 ]) do
+            case rows do
+              [[json]] ->
+                saved = JSON.decode!(json)
 
-      [%{"kind" => "outcome_unknown", "op_id" => op_id} = frame]
-      when is_binary(op_id) and (is_nil(requested_op_id) or requested_op_id == op_id) ->
-        failure(
-          command,
-          "harklight_outcome_unknown",
-          frame["reason"] || String.trim(output),
-          "outcome_unknown",
-          maybe_put(%{result: frame}, :op_id, op_id)
-        )
+                Map.new(
+                  ~w(command outcome op_id result code reason)a
+                  |> Enum.filter(&Map.has_key?(saved, Atom.to_string(&1))),
+                  fn key -> {key, saved[Atom.to_string(key)]} end
+                )
 
-      [%{"kind" => "outcome_unknown"} = frame] ->
-        failure(
-          command,
-          "harklight_result_unconfirmed",
-          "Harklight returned an unknown result for a different or unidentified operation.",
-          "outcome_unknown",
-          maybe_put(%{result: frame}, :op_id, requested_op_id)
-        )
+              [] ->
+                with :ok <- HarklightWakes.mark_send_attempt(db, call, op_id, payload) do
+                  result =
+                    case HarklightSend.recover_action(runner, args, op_id) do
+                      {:ok, frame} ->
+                        %{command: command, outcome: "committed", op_id: op_id, result: frame}
 
-      [%{"kind" => "refused"} = frame] ->
-        if is_nil(requested_op_id) or is_nil(frame["op_id"]) or frame["op_id"] == requested_op_id do
+                      {:error, code, reason, outcome} ->
+                        failure(command, code, reason, outcome, %{op_id: op_id})
+                    end
+
+                  persist_action_result(db, result)
+                else
+                  {:error, code} ->
+                    failure(
+                      command,
+                      code,
+                      "The saved action could not be marked for execution; no action was run.",
+                      "failed",
+                      %{op_id: op_id}
+                    )
+                end
+            end
+          else
+            {:error, _} ->
+              failure(
+                command,
+                "harklight_action_unavailable",
+                "The saved action outcome could not be read; no action was run.",
+                "failed",
+                %{op_id: op_id}
+              )
+          end
+
+        %{code: code} ->
           failure(
             command,
-            "harklight_refused",
-            frame["reason"] || String.trim(output),
+            code,
+            "The operation ID must name this session's unchanged action; the saved operation was not run.",
             "refused",
-            maybe_put(%{result: frame}, :op_id, frame["op_id"])
+            %{op_id: op_id}
           )
-        else
-          failure(
-            command,
-            "harklight_result_unconfirmed",
-            "Harklight returned a refusal for a different operation.",
-            "outcome_unknown",
-            %{result: frame}
-          )
-        end
+      end
+    end)
+  end
 
-      [] when status == 2 ->
-        failure(command, "harklight_refused", String.trim(output), "refused")
+  defp persist_action_result(db, %{outcome: outcome} = result)
+       when outcome in ["committed", "refused"] do
+    case DB.transaction(db, fn txn ->
+           HarklightLifecycle.record_result_in_txn(txn, result.op_id, outcome, result)
+         end) do
+      {:ok, _} ->
+        result
 
-      _ ->
+      {:error, _} ->
         failure(
-          command,
-          "harklight_result_unconfirmed",
-          "Harklight did not confirm the operation: " <> String.trim(output),
-          "outcome_unknown"
+          result.command,
+          "harklight_action_unavailable",
+          "The helper outcome could not be saved; retry this unchanged action with the same operation ID.",
+          "outcome_unknown",
+          %{op_id: result.op_id}
         )
     end
-  rescue
-    error -> failure(command, "harklight_cli_failed", Exception.message(error), "failed")
   end
+
+  defp persist_action_result(_db, result), do: result
 
   defp frames(output) do
     output
@@ -343,9 +435,6 @@ defmodule Tightbeam.HarklightAgentActions do
 
   defp maybe_add_op_id(args, nil), do: args
   defp maybe_add_op_id(args, op_id), do: args ++ ["--op-id", op_id]
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp failure_outcome(code)
        when code in [

@@ -845,7 +845,7 @@ defmodule Tightbeam.HarklightWakesTest do
     assert prompt =~ "Origin"
     assert prompt =~ "has retired"
     refute prompt =~ "from your originating session"
-    assert prompt =~ "harklight-agent ack --session #{@handle} --event 1"
+    assert prompt =~ "tightbeam harklight-ack --handle #{@handle} --event 1"
     turn = deliver_discussion_turn!(db, wake_id, main.session_key)
     assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
 
@@ -7035,16 +7035,9 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:ok, [[follower_prompt]]} =
              DB.query(db, "SELECT prompt FROM wakes WHERE sessionKey=?1", [follower.session_key])
 
-    [owner_entry, owner_instructions] = String.split(owner_prompt, "\n\n", parts: 2)
-    [follower_entry, follower_instructions] = String.split(follower_prompt, "\n\n", parts: 2)
-    assert owner_entry == event(1, "discussion", "Reply")
-    assert follower_entry == owner_entry
-    assert owner_instructions =~ "tightbeam harklight-ack --handle #{@handle} --event 1"
-    assert owner_instructions =~ "tightbeam harklight-reply --handle #{@handle} --request request"
-    assert follower_instructions =~ "harklight-agent ack --session #{@handle} --event 1"
-    assert follower_instructions =~ "harklight-agent reply --session #{@handle} --request request"
+    assert follower_prompt == owner_prompt
 
-    assert {:ok, [[^follower_prompt]]} =
+    assert {:ok, [[^owner_prompt]]} =
              DB.query(db, "SELECT prompt FROM wakes WHERE sessionKey=?1", [
                second_follower.session_key
              ])
@@ -9194,6 +9187,9 @@ defmodule Tightbeam.HarklightWakesTest do
       send(test_pid, {:harklight_args, args})
 
       case hd(args) do
+        "retry" ->
+          {"no recorded operation with key #{List.last(args)}", 1}
+
         "read" ->
           {event(1, "discussion", "Question") <> "\n", 0}
 
@@ -9427,6 +9423,246 @@ defmodule Tightbeam.HarklightWakesTest do
                    op_id: requested_op_id,
                    reason: "The requested operation is unresolved."
                  })
+               end
+             )
+  end
+
+  test "native reply and result recover acted operations from the helper journal", %{
+    db: db,
+    call: call
+  } do
+    for command <- ["reply", "result"], loss <- [:response_lost, :unknown_then_acted] do
+      event_id =
+        if command == "reply",
+          do: if(loss == :response_lost, do: 81, else: 82),
+          else: if(loss == :response_lost, do: 83, else: 84)
+
+      assert :ok =
+               HarklightWakes.capture_line(db, @handle, event(event_id, "discussion", "Action"))
+
+      mark_completion_wakes_delivered(db, @handle)
+      op_id = Tightbeam.Id.uuid4()
+      {:ok, journal} = Agent.start_link(fn -> %{operations: %{}, effects: 0, acted: false} end)
+      on_exit(fn -> if Process.alive?(journal), do: Agent.stop(journal) end)
+
+      # Published helper retry reads its operation journal before validating an
+      # acted event; original reply/result validates acted first (v0.1.13).
+      runner = fn args ->
+        op = List.last(args)
+
+        Agent.get_and_update(journal, fn state ->
+          cond do
+            hd(args) == "retry" and Map.has_key?(state.operations, op) ->
+              {frame(state.operations[op]), state}
+
+            hd(args) == "retry" ->
+              {{"no recorded operation with key #{op}", 1}, state}
+
+            state.acted ->
+              {frame(%{kind: "refused", op_id: op, reason: "event is already acted"}), state}
+
+            true ->
+              committed = %{
+                kind: "committed",
+                operation: command,
+                op_id: op,
+                response: %{event_id: event_id}
+              }
+
+              state = %{
+                state
+                | operations: Map.put(state.operations, op, committed),
+                  effects: state.effects + 1,
+                  acted: true
+              }
+
+              output =
+                if loss == :response_lost,
+                  do: {"", 1},
+                  else: frame(%{kind: "outcome_unknown", op_id: op, reason: "response lost"})
+
+              {output, state}
+          end
+        end)
+      end
+
+      params = %{
+        handle: @handle,
+        request_id: "request",
+        in_reply_to: to_string(event_id),
+        op_id: op_id
+      }
+
+      params =
+        if command == "reply",
+          do: Map.put(params, :body, "Detail"),
+          else: Map.put(params, :status, "applied")
+
+      action = String.to_existing_atom(command)
+
+      invoke = fn params ->
+        apply(HarklightAgentActions, action, [db, %{call | params: params}, [runner: runner]])
+      end
+
+      assert %{outcome: "outcome_unknown", op_id: ^op_id} = invoke.(params)
+      assert %{outcome: "committed", op_id: ^op_id, result: recovered} = invoke.(params)
+      assert recovered["response"]["event_id"] == event_id
+      assert %{outcome: "committed", result: ^recovered} = invoke.(params)
+
+      changed =
+        if command == "reply",
+          do: Map.put(params, :body, "Changed"),
+          else: Map.put(params, :status, "refused")
+
+      assert %{outcome: "refused", code: "harklight_send_mismatch", op_id: ^op_id} =
+               invoke.(changed)
+
+      assert %{outcome: "refused", code: "harklight_refused", reason: "event is already acted"} =
+               invoke.(%{params | op_id: Tightbeam.Id.uuid4()})
+
+      assert Agent.get(journal, & &1.effects) == 1
+      assert {:ok, []} = HarklightWakes.pending_send_attempts(db)
+    end
+  end
+
+  test "native delivered follower actions keep message boundaries and use delivery receipts", %{
+    db: db,
+    call: call,
+    main: main
+  } do
+    follower = follower_session(db, main, "agent:native-follower")
+    follower_call = follow_call(call, follower, %{message_id: "request"})
+
+    assert %{outcome: "committed"} =
+             follow_for_test(db, follower_call, runner: lifecycle_runner(db))
+
+    assert :ok =
+             HarklightWakes.capture_line(db, @handle, event(1, "discussion", "Followed entry"))
+
+    assert :ok =
+             HarklightWakes.capture_line(db, @handle, event(2, "discussion", "Not delivered yet"))
+
+    other_op = Tightbeam.Id.uuid4()
+    other_payload = String.replace(@payload, "request", "unfollowed-request")
+    assert %{state: "pending"} = HarklightWakes.prepare_send(db, call, other_op, other_payload)
+
+    assert %{state: "registered"} =
+             HarklightWakes.bind_send(
+               db,
+               call,
+               other_op,
+               other_payload,
+               String.replace(@result, "\"request\"}", "\"unfollowed-request\"}"),
+               @handle,
+               "sender",
+               "unfollowed-request"
+             )
+
+    assert :ok =
+             HarklightWakes.capture_line(
+               db,
+               @handle,
+               event(3, "discussion", "Other message", "unfollowed-request")
+             )
+
+    assert {:ok, [[wake]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM harklight_wake_deliveries WHERE sessionKey=?1 AND eventId='1'",
+               [follower.session_key]
+             )
+
+    completion_turn(db, follower.session_key, wake, "delivered", nil)
+
+    runner = fn
+      ["read", "--session", @handle] ->
+        {event(1, "discussion", "Followed entry") <>
+           "\n" <>
+           event(2, "discussion", "Not delivered yet") <>
+           "\n" <> event(3, "discussion", "Other message", "unfollowed-request"), 0}
+
+      ["ack", "--session", @handle, "--event", "1"] ->
+        frame(%{kind: "acknowledged", event_id: "1", status: "delivered"})
+
+      ["retry", "--op-id", op] ->
+        {"no recorded operation with key #{op}", 1}
+
+      [command | args] when command in ["reply", "result"] ->
+        frame(%{kind: "committed", operation: command, op_id: List.last(args)})
+    end
+
+    assert %{outcome: "received", output: output} =
+             HarklightAgentActions.read(db, %{follower_call | params: %{handle: @handle}},
+               runner: runner
+             )
+
+    assert output =~ "Followed entry"
+    refute output =~ "Not delivered yet"
+    refute output =~ "Other message"
+
+    assert %{outcome: "acknowledged"} =
+             HarklightAgentActions.acknowledge(
+               db,
+               %{follower_call | params: %{handle: @handle, event_id: "1"}},
+               runner: runner
+             )
+
+    assert %{outcome: "refused", code: "harklight_event_unknown"} =
+             HarklightAgentActions.acknowledge(
+               db,
+               %{follower_call | params: %{handle: @handle, event_id: "2"}},
+               runner: runner
+             )
+
+    for action <- [:reply, :result] do
+      params = %{
+        handle: @handle,
+        request_id: "wrong-request",
+        in_reply_to: "1",
+        op_id: Tightbeam.Id.uuid4()
+      }
+
+      params =
+        if action == :reply,
+          do: Map.put(params, :body, "Details"),
+          else: Map.put(params, :status, "received")
+
+      assert %{outcome: "refused", code: "harklight_event_mismatch"} =
+               apply(HarklightAgentActions, action, [
+                 db,
+                 %{follower_call | params: params},
+                 [runner: runner]
+               ])
+
+      assert %{outcome: "committed"} =
+               apply(HarklightAgentActions, action, [
+                 db,
+                 %{follower_call | params: %{params | request_id: "request"}},
+                 [runner: runner]
+               ])
+    end
+  end
+
+  test "native uncertain exceptions preserve generated operation IDs", %{db: db, call: call} do
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "Question"))
+    mark_completion_wakes_delivered(db, @handle)
+    test_pid = self()
+    params = %{handle: @handle, request_id: "request", in_reply_to: "1", body: "Details"}
+
+    assert %{outcome: "outcome_unknown", op_id: op_id} =
+             HarklightAgentActions.reply(db, %{call | params: params},
+               runner: fn ["retry", "--op-id", op] ->
+                 send(test_pid, {:generated_operation, op})
+                 raise "connection lost"
+               end
+             )
+
+    assert_receive {:generated_operation, ^op_id}
+
+    assert %{outcome: "committed", op_id: ^op_id} =
+             HarklightAgentActions.reply(db, %{call | params: Map.put(params, :op_id, op_id)},
+               runner: fn ["retry", "--op-id", ^op_id] ->
+                 frame(%{kind: "committed", operation: "reply", op_id: op_id})
                end
              )
   end
