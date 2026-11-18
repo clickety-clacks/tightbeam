@@ -2282,7 +2282,17 @@ defmodule Tightbeam.HarnessHealthTest do
          {:model_apply_failed,
           %{"code" => -32_000, "message" => "Invalid value for config option model"}}, nil},
         {"double quoted model name",
-         %{"code" => -32_603, "message" => ~s(Model "future-model" not found)}, nil}
+         %{"code" => -32_603, "message" => ~s(Model "future-model" not found)}, nil},
+        {"typed atom-key model unavailable",
+         %{code: "model_unavailable", message: "Selected configuration rejected"}, nil},
+        {"typed string-key model unavailable",
+         %{"code" => "model_unavailable", "message" => "Selected configuration rejected"}, nil},
+        {"wrapped typed atom-key model unavailable",
+         {:model_apply_failed,
+          %{code: "model_unavailable", message: "Selected configuration rejected"}}, nil},
+        {"wrapped typed string-key model unavailable",
+         {:model_apply_failed,
+          %{"code" => "model_unavailable", "message" => "Selected configuration rejected"}}, nil}
       ] do
     test "model selection refusal is not replayed: #{name}", ctx do
       [failed, _second, healthy] = ctx.sessions
@@ -2313,6 +2323,44 @@ defmodule Tightbeam.HarnessHealthTest do
                  "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
                  [source.seq]
                )
+    end
+  end
+
+  for {name, reason} <- [
+        {"model phase", %{code: -32_000, message: "Sign in to continue"}},
+        {"model wrapper",
+         {:model_apply_failed, %{"code" => -32_000, "message" => "Sign in to continue"}}}
+      ] do
+    test "authentication-required response remains recoverable: #{name}", ctx do
+      [failed, _second, healthy] = ctx.sessions
+
+      source =
+        fail_health_turn!(
+          ctx.db,
+          failed.session,
+          "authentication-required",
+          "recover this prompt",
+          Tightbeam.ErrorDiagnostic.diagnosed(
+            unquote(Macro.escape(reason)),
+            %{"phase" => "model", "kind" => "jsonrpc_error"}
+          ),
+          stage: :session
+        )
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+                 [source.seq]
+               )
+
+      restore_health_turn!(ctx.db, healthy.session, "authentication-restoration")
+      restore_health_turn!(ctx.db, healthy.session, "second-authentication-restoration")
+
+      assert {:ok, [[2]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [
+                 source.message_id
+               ])
     end
   end
 

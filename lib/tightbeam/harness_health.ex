@@ -1177,7 +1177,8 @@ defmodule Tightbeam.HarnessHealth do
        ] do
       false
     else
-      (model_phase? and model_selection_response?(selection_reason)) or
+      failure_class == "model_unavailable" or
+        (model_phase? and model_selection_response?(selection_reason)) or
         model_refusal_text?(selection_reason)
     end
   end
@@ -1189,11 +1190,10 @@ defmodule Tightbeam.HarnessHealth do
 
   defp model_application_reason(reason), do: reason
 
-  # Invalid params and the harness's config-option refusal are replies to the
-  # model-selection request. A timeout, transport exit, or generic internal error
-  # is not evidence that the requested model was refused.
-  defp model_selection_response?(%{"code" => code}) when code in [-32_602, -32_000], do: true
-  defp model_selection_response?(%{code: code}) when code in [-32_602, -32_000], do: true
+  # Invalid params identifies a rejected model-selection request. Other codes,
+  # including authentication-required (-32000), need model-specific evidence.
+  defp model_selection_response?(%{"code" => -32_602}), do: true
+  defp model_selection_response?(%{code: -32_602}), do: true
   defp model_selection_response?(_reason), do: false
 
   defp model_refusal_text?(%{"message" => message}) when is_binary(message),
@@ -1210,7 +1210,8 @@ defmodule Tightbeam.HarnessHealth do
       "model unavailable",
       "model is not available",
       "unknown model",
-      "unsupported model"
+      "unsupported model",
+      "invalid value for config option model"
     ]) or Regex.match?(~r/\bmodel(?:\s+['"][^'"]+['"])?\s+not found\b/, evidence)
   end
 
