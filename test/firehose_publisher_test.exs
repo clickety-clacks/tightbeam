@@ -598,13 +598,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
              Dispatch.dispatch(db, handlers, clean)
 
-    verified =
+    blocked =
       tests_passed
-      |> put_in([:params, :verdict_kind], "verified")
+      |> put_in([:params, :verdict_kind], "blocked")
+      |> put_in([:params, :note], "effect matrix blocker")
       |> put_in([:params, :commit_refs], refs)
 
-    assert {:ok, %{attest: %{verdictKind: "verified"}}} =
-             Dispatch.dispatch(db, handlers, verified)
+    assert {:ok, %{attest: %{verdictKind: "blocked"}}} =
+             Dispatch.dispatch(db, handlers, blocked)
 
     completion = put_in(completion, [:params, :commit_refs], refs)
 
@@ -618,7 +619,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
           {"effect-dispatcher",
            "[verdict filed: reviewed-clean on #{review.id}: Synthetic review fixture]"},
           {"effect-target",
-           "[verdict filed: verified on #{assignment.id}: effect matrix tests passed]"},
+           "[verdict filed: blocked on #{assignment.id}: effect matrix blocker]"},
           {"effect-target", "[completion filed on #{assignment.id}: effect matrix complete]"},
           {"effect-target", "[assignment closed: #{assignment.id} — completed]"}
         ],

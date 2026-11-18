@@ -2407,20 +2407,20 @@ defmodule Tightbeam.CliIntegrationTest do
                stderr_to_stdout: true
              )
 
-    # Consume this exact notice turn before the next card's notice is eligible;
-    # filing an attest does not finish a recipient turn.
-    assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
+    # The verdict remains durable, but R01 keeps unlinked ordinary verdicts quiet.
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='topology-decided'",
+               [topology_id]
+             )
 
-    assert {:ok, [[topology_notice_id]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
                [topology_id]
              )
-
-    topology_delivery = assert_cli_source_delivery!(ctx.db, topology_notice_id, "cli-holder")
-    assert topology_delivery.source.prompt =~ topology_id
-    finish_cli_delivery!(ctx.db, "cli-holder", topology_delivery.seq)
 
     # The posture gate refuses a coder card on an unpostured work item, so the
     # slice is ruled first, through the same real CLI.
