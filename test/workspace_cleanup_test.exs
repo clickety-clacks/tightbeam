@@ -254,7 +254,8 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     :sys.replace_state(worker, fn state ->
       %{
         state
-        | relocation_failures:
+        | relocation_next_at: nil,
+          relocation_failures:
             Map.new(state.relocation_failures, fn {entry, _} ->
               {entry, System.monotonic_time(:millisecond) - 1}
             end)
@@ -503,6 +504,147 @@ defmodule Tightbeam.WorkspaceCleanupTest do
              "/remote/base/archive"
   end
 
+  test "absent archives are skipped for this process without changing records", ctx do
+    kept = Path.join(ctx.workspace, "kept")
+    File.write!(kept, "archive")
+    artifact = artifact(ctx, kept)
+    retire(ctx)
+
+    assert %{status: "completed"} =
+             WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+    old = Artifacts.get(ctx.db, artifact.artifact_id)
+    File.rm_rf!(Path.dirname(old.home))
+    destination = Path.join(ctx.base, "destination")
+    Application.put_env(:tightbeam, :archive_dir, destination)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(worker, :drain)
+        :sys.get_state(worker)
+      end)
+
+    moved = Artifacts.get(ctx.db, artifact.artifact_id)
+    assert moved.state == "archived"
+
+    assert moved.home == old.home
+
+    assert log =~ Path.dirname(old.home)
+    assert log =~ "are missing"
+    refute File.exists?(moved.home)
+
+    assert {:ok, [[archive_path]]} =
+             DB.query(
+               ctx.db,
+               "SELECT archivePath FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [ctx.session.session_key]
+             )
+
+    assert archive_path == Path.dirname(moved.home)
+    :sys.replace_state(worker, &%{&1 | relocation_next_at: nil})
+    send(worker, :drain)
+    state = :sys.get_state(worker)
+    assert Map.values(state.relocation_failures) == [:missing]
+    assert state.timer == nil
+    assert Artifacts.get(ctx.db, artifact.artifact_id).updated_at == moved.updated_at
+  end
+
+  test "relocation failures grow the sweep delay across different entries and cap it", ctx do
+    source = Path.join(ctx.base, "archive")
+    destination = Path.join(ctx.base, "destination")
+    File.mkdir_p!(source)
+    for n <- 1..12, do: File.write!(Path.join(source, "blocked-#{n}"), "not a directory")
+    Application.put_env(:tightbeam, :archive_dir, destination)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+
+    for expected <- [
+          2_000,
+          4_000,
+          8_000,
+          16_000,
+          32_000,
+          64_000,
+          128_000,
+          256_000,
+          300_000,
+          300_000
+        ] do
+      :sys.replace_state(worker, &%{&1 | relocation_next_at: nil})
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          send(worker, :drain)
+          state = :sys.get_state(worker)
+          assert Process.read_timer(state.timer) > expected - 1_000
+          assert Process.read_timer(state.timer) <= expected
+        end)
+
+      assert log =~ "exited with status 1"
+    end
+
+    File.mkdir_p!(Path.join(source, "aaa-good"))
+    :sys.replace_state(worker, &%{&1 | relocation_next_at: nil})
+    send(worker, :drain)
+    state = :sys.get_state(worker)
+    assert Process.read_timer(state.timer) <= 1_000
+    assert File.dir?(Path.join(destination, "aaa-good"))
+  end
+
+  test "due retirement work does not bypass relocation backoff", ctx do
+    source = Path.join(ctx.base, "archive")
+    destination = Path.join(ctx.base, "destination")
+    File.mkdir_p!(Path.join(source, "second"))
+    File.write!(Path.join(source, "first"), "blocked")
+    Application.put_env(:tightbeam, :archive_dir, destination)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    retire(ctx)
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+    send(worker, :drain)
+    state = :sys.get_state(worker)
+    assert Map.has_key?(state.relocation_failures, "first")
+
+    :sys.replace_state(
+      worker,
+      &%{&1 | relocation_next_at: System.monotonic_time(:millisecond) + 60_000}
+    )
+
+    for _ <- 1..3 do
+      DB.query(ctx.db, "UPDATE retired_workspace_cleanup SET completed=0,nextAt=0")
+      send(worker, :drain)
+      state = :sys.get_state(worker)
+      assert Process.read_timer(state.timer) <= 1_000
+      refute File.exists?(Path.join(destination, "second"))
+      assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT completed FROM retired_workspace_cleanup")
+    end
+  end
+
+  test "relocation warnings retain runner exception and timeout reasons", ctx do
+    File.mkdir_p!(Path.join([ctx.base, "archive", "entry"]))
+    Application.put_env(:tightbeam, :archive_dir, Path.join(ctx.base, "destination"))
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+
+    for {runner, reason} <- [
+          {fn _, _, _ -> raise "archive runner exploded" end, "archive runner exploded"},
+          {fn _, _, _ -> {:runner_timeout, 123} end, "timed out after 123ms"}
+        ] do
+      config = Map.put(ctx.config, :workspace_cleanup_runner, runner)
+      {:ok, state} = WorkspaceCleanup.init(config: config)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:noreply, updated} = WorkspaceCleanup.handle_info(:drain, state)
+          assert Map.has_key?(updated.relocation_failures, "entry")
+          Process.cancel_timer(updated.timer)
+        end)
+
+      assert log =~ reason
+      refute log =~ "String.trim"
+    end
+  end
+
   test "each drain relocates only one existing archive entry", ctx do
     source = Path.join(ctx.base, "archive")
     destination = Path.join(ctx.base, "destination")
@@ -542,6 +684,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     retry_at = Map.fetch!(state.relocation_failures, "first")
     assert retry_at > System.monotonic_time(:millisecond) + 290_000
 
+    :sys.replace_state(worker, &%{&1 | relocation_next_at: nil})
     send(worker, :drain)
     :sys.get_state(worker)
     assert File.read!(Path.join([destination, "second", "kept"])) == "preserve"
@@ -554,7 +697,11 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert File.dir?(Path.join(source, "first"))
 
     :sys.replace_state(worker, fn state ->
-      %{state | relocation_failures: %{"first" => System.monotonic_time(:millisecond) - 1}}
+      %{
+        state
+        | relocation_failures: %{"first" => System.monotonic_time(:millisecond) - 1},
+          relocation_next_at: nil
+      }
     end)
 
     send(worker, :drain)

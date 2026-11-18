@@ -217,6 +217,7 @@ defmodule Tightbeam.Ledger do
 
       if wake_id = Map.get(attrs, :wake_id) do
         Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
+        Tightbeam.HarnessRecoveryNotice.sync_attempt_turn_in_txn(txn, wake_id)
       end
 
       QueuedMessageSuppression.replace_own_queued_in_txn(txn, seq, attrs)
@@ -595,6 +596,9 @@ defmodule Tightbeam.Ledger do
                   [] -> {nil, nil, nil, nil}
                 end
 
+              # The redundant IN term lets SQLite use the partial index
+              # `turns_pending`; without it the lookup walks every turn the
+              # session ever had, in the writer, at every turn end.
               Txn.q(
                 txn,
                 """
@@ -603,6 +607,7 @@ defmodule Tightbeam.Ledger do
                       model = ?4, harness = ?5, thinkingLevel = ?6, modelContext = ?7
                   WHERE seq = (SELECT t.seq FROM turns AS t
                                WHERE t.sessionKey = ?1 AND t.status = 'queued'
+                                 AND t.status IN ('queued','running')
                                  AND EXISTS (
                                    SELECT 1 FROM sessions AS s
                                    WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
@@ -668,6 +673,7 @@ defmodule Tightbeam.Ledger do
                   DB.record_row_commit(txn, transition)
                 end
 
+                Tightbeam.RowReactions.turn_started_in_txn(txn, seq)
                 Publisher.turn_in_txn(txn, "turn.started", seq)
                 Org.sync_mechanical_status_in_txn(txn, session_key)
 
@@ -713,6 +719,13 @@ defmodule Tightbeam.Ledger do
       if transition, do: DB.record_row_commit(txn, transition)
       Publisher.turn_in_txn(txn, "turn.ended", seq)
 
+      Tightbeam.HarnessRecoveryNotice.settle_turn_in_txn(
+        txn,
+        seq,
+        "canceled",
+        System.system_time(:millisecond)
+      )
+
       case Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq=?1", [seq]) do
         [[session_key]] -> Org.sync_mechanical_status_in_txn(txn, session_key)
         [] -> :ok
@@ -727,9 +740,12 @@ defmodule Tightbeam.Ledger do
   # asked as a question instead of collapsed into a nil result.
   defp no_claim(%Txn{} = txn, session_key) do
     queued? =
-      Txn.q(txn, "SELECT 1 FROM turns WHERE sessionKey = ?1 AND status = 'queued' LIMIT 1", [
-        session_key
-      ]) != []
+      Txn.q(
+        txn,
+        "SELECT 1 FROM turns WHERE sessionKey = ?1 AND status = 'queued' " <>
+          "AND status IN ('queued','running') LIMIT 1",
+        [session_key]
+      ) != []
 
     if queued? do
       case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
@@ -825,6 +841,15 @@ defmodule Tightbeam.Ledger do
             )
             |> Enum.map(&hd/1)
             |> Enum.sort()
+
+          Enum.each(seqs, fn seq ->
+            Tightbeam.HarnessRecoveryNotice.settle_turn_in_txn(
+              txn,
+              seq,
+              "failed",
+              System.system_time(:millisecond)
+            )
+          end)
 
           Enum.each(
             seqs,
@@ -935,6 +960,7 @@ defmodule Tightbeam.Ledger do
       Publisher.turn_in_txn(txn, "turn.ended", seq)
       [[session_key]] = Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq = ?1", [seq])
       Org.sync_mechanical_status_in_txn(txn, session_key)
+      Tightbeam.HarnessRecoveryNotice.settle_turn_in_txn(txn, seq, terminal, now)
     end
 
     won
@@ -1044,6 +1070,16 @@ defmodule Tightbeam.Ledger do
     Enum.each(transitions, &DB.record_row_commit(txn, &1))
 
     seqs = Enum.map(rows, &hd/1)
+
+    Enum.each(seqs, fn seq ->
+      Tightbeam.HarnessRecoveryNotice.settle_turn_in_txn(
+        txn,
+        seq,
+        "canceled",
+        System.system_time(:millisecond)
+      )
+    end)
+
     Enum.each(seqs, &append_terminal_in_txn(txn, &1, "canceled", cause: "session-retired"))
     Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
     seqs
@@ -1119,6 +1155,15 @@ defmodule Tightbeam.Ledger do
             seqs,
             &append_terminal_in_txn(txn, &1, "failed_unknown", cause: "boot-recovery")
           )
+
+          Enum.each(seqs, fn seq ->
+            Tightbeam.HarnessRecoveryNotice.settle_turn_in_txn(
+              txn,
+              seq,
+              "failed_unknown",
+              now
+            )
+          end)
 
           publications =
             Enum.map(seqs, fn seq ->
@@ -1287,6 +1332,13 @@ defmodule Tightbeam.Ledger do
             )
 
             if Txn.changes(txn) == 1 do
+              Tightbeam.HarnessRecoveryNotice.settle_turn_in_txn(
+                txn,
+                seq,
+                "failed_unknown",
+                System.system_time(:millisecond)
+              )
+
               append_terminal_in_txn(txn, seq, "failed_unknown",
                 cause: "operator:clear-stranded",
                 principal: principal

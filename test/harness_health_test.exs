@@ -2051,6 +2051,160 @@ defmodule Tightbeam.HarnessHealthTest do
     )
   end
 
+  @tag :premature_health_redelivery
+  test "a genuine recovery cycle redelivers after a premature normal success", ctx do
+    [failed, corroborating, healthy] = ctx.sessions
+    message_id = "premature-health-recovery"
+    prompt = "continue after provider recovery"
+
+    _source =
+      fail_health_turn!(ctx.db, failed.session, message_id, prompt, @captured_claude_rate_limit,
+        assignment_id: failed.assignment
+      )
+
+    assert {:opened, initial_incident} =
+             HarnessHealth.observe(
+               ctx.db,
+               authoritative(
+                 failed,
+                 "rate-limit-dead",
+                 System.system_time(:millisecond),
+                 "premature-rate-limit-authority"
+               )
+             )
+
+    premature_recovery = restore_health_turn!(ctx.db, healthy.session, "premature-recovery")
+    restoration_seq = premature_recovery.seq
+    assert HarnessHealth.get(ctx.db, initial_incident.id).state == "resolved"
+
+    assert {:ok, [[first_redelivery_seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT redeliveryTurnSeq FROM health_redelivery_attempts WHERE sessionKey=?1 AND sourceMessageId=?2",
+               [failed.session, message_id]
+             )
+
+    assert first_redelivery_seq > premature_recovery.seq
+    {:ok, redelivery} = Ledger.claim_next(ctx.db, failed.session, "health-redelivery-test")
+    assert redelivery.seq == first_redelivery_seq
+    assert redelivery.message_id == message_id
+    redelivery = Map.put(redelivery, :session_key, failed.session)
+    failed_session = Org.get(ctx.db, failed.session)
+
+    assert {:ok, post_commit} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, redelivery.seq, "failed", "rate limit remains",
+                        owner_lease: redelivery.owner_lease
+                      )
+
+               HarnessHealth.observe_turn_failure_in_txn(
+                 txn,
+                 failed_session,
+                 redelivery,
+                 :prompt,
+                 @captured_claude_rate_limit
+               )
+             end)
+
+    if is_function(post_commit, 0), do: post_commit.()
+
+    assert {:ok, [[^restoration_seq, ^first_redelivery_seq, nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT restorationTurnSeq,redeliveryTurnSeq,cycleReleaseCorrelation,cycleReleaseTurnSeq FROM health_redelivery_attempts WHERE sessionKey=?1 AND sourceMessageId=?2",
+               [failed.session, message_id]
+             )
+
+    assert {:opened, recovered_incident} =
+             HarnessHealth.observe(
+               ctx.db,
+               authoritative(
+                 corroborating,
+                 "rate-limit-dead",
+                 System.system_time(:millisecond),
+                 "genuine-rate-limit-authority"
+               )
+             )
+
+    assert {:ok, %{"routesComplete" => true, "routes" => [route]}} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.RowReactions.Snapshot.harness_health_hold(txn, recovered_incident.id)
+             end)
+
+    assert {:ok, [[cycle_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cycleId FROM harness_health_recovery_schedules WHERE holdId=?1",
+               [recovered_incident.id]
+             )
+
+    started_at = System.system_time(:millisecond)
+
+    assert {:ok, 1} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE harness_health_recovery_schedules SET dueAt=?2 WHERE holdId=?1 AND cycleId=?3 AND status='pending'",
+                 [recovered_incident.id, started_at, cycle_id]
+               )
+
+               Tightbeam.DB.Txn.changes(txn)
+             end)
+
+    assert [%{"cycle_id" => ^cycle_id}] =
+             Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, started_at)
+
+    assert {:ok, [[owner_user_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT ownerUserId FROM sessions WHERE sessionKey=?1",
+               [failed.session]
+             )
+
+    seed_running_recovery_checks!(
+      ctx.db,
+      recovered_incident.id,
+      cycle_id,
+      [route],
+      started_at,
+      owner_user_id
+    )
+
+    route_key = Tightbeam.HarnessHealth.RecoveryCheck.route_key(route)
+
+    assert {:ok, {:released, release}} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.HarnessHealth.RecoveryCheck.record_result_in_txn(
+                 txn,
+                 recovered_incident.id,
+                 cycle_id,
+                 route_key,
+                 "succeeded",
+                 nil,
+                 started_at + 1
+               )
+             end)
+
+    start_supervised!({RecoveryLane, {ctx.db, self()}})
+
+    assert :ok =
+             Wakes.redeliver_cycle_release(
+               ctx.db,
+               release.correlation,
+               "claude",
+               "testhost"
+             )
+
+    assert {:ok, [[redelivery_seq, "queued", ^prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.seq,t.status,t.prompt FROM health_redelivery_attempts a JOIN turns t ON t.seq=a.cycleReleaseTurnSeq WHERE a.sessionKey=?1 AND a.sourceMessageId=?2",
+               [failed.session, message_id]
+             )
+
+    assert redelivery_seq > first_redelivery_seq
+  end
+
   test "text-classified auth failure without a typed carrier redelivers once as unclassified",
        ctx do
     [first, _second, healthy] = ctx.sessions
@@ -3677,7 +3831,7 @@ defmodule Tightbeam.HarnessHealthTest do
                [incident.id]
              )
 
-    assert next_due_at == started_one + 3_600_000
+    assert next_due_at == started_one + 120_000
     assert next_due_at < started_one + 3_600_100
 
     assert {:ok, [[cycle_two]]} =
@@ -3784,7 +3938,7 @@ defmodule Tightbeam.HarnessHealthTest do
                authoritative(first, "rate-limit-dead", 100, "recovery-schedule-open")
              )
 
-    assert {:ok, [[cycle_id, due_at, "pending", 3_600_000, hold_id]]} =
+    assert {:ok, [[cycle_id, due_at, "pending", 120_000, hold_id]]} =
              DB.query(
                ctx.db,
                "SELECT cycleId,dueAt,status,intervalMs,holdId FROM harness_health_recovery_schedules WHERE holdId=?1",
@@ -3792,7 +3946,7 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     assert hold_id == opened.id
-    assert due_at == 3_600_100
+    assert due_at == 120_100
     assert {:ok, [[wake_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
     assert [cycle] =
@@ -3846,7 +4000,7 @@ defmodule Tightbeam.HarnessHealthTest do
                [opened.id]
              )
 
-    assert initial_due_at == 3_600_100
+    assert initial_due_at == 120_100
     assert revised_due_at == 1_800_100
 
     assert [%{"cycle_id" => ^cycle_id}] =
@@ -3890,7 +4044,7 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     refute next_cycle_id == cycle_id
-    assert next_due_at == revised_due_at + 600_000
+    assert next_due_at == revised_due_at + 2_400_000
     assert next_due_at > revised_due_at + 1_000
   end
 
@@ -4015,7 +4169,9 @@ defmodule Tightbeam.HarnessHealthTest do
   end
 
   test "recovery CLI selection follows pin, validated PATH, then adapter bundle" do
-    node = System.find_executable("node")
+    # Resolve version-manager shims before running with the fixture PATH.
+    {node, 0} = System.cmd("node", ["-p", "process.execPath"])
+    node = String.trim(node)
     assert is_binary(node)
 
     root =

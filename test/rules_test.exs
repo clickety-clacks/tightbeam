@@ -37,6 +37,7 @@ defmodule Tightbeam.RulesTest do
     end)
 
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+    :ok = Tightbeam.FilingRemedy.install_handlers(db, handlers)
     Rules.load!(Path.join(base_dir, "missing-rules"), Map.keys(handlers))
 
     %{
@@ -55,6 +56,23 @@ defmodule Tightbeam.RulesTest do
     File.rm_rf!(Path.join(ctx.base_dir, "identity/rules"))
     assert Rules.load!(ctx.base_dir, ["post"]) == []
     assert :ok = Rules.evaluate(ctx.db, call())
+  end
+
+  test "scope errors deny only after conditions match", ctx do
+    put_rule(ctx, rule("lazy-scope", "attest", "attest.kind", "eq", "completion"))
+    Rules.load!(ctx.base_dir, ["attest"])
+
+    assert :ok =
+             Rules.evaluate(
+               :missing_db,
+               p3_call("attest", {:session, "scope-holder"}, %{kind: "progress"})
+             )
+
+    assert {:deny, %{code: "rule_error", reason: "scope_unavailable", fact: "rail.scope"}} =
+             Rules.evaluate(
+               :missing_db,
+               p3_call("attest", {:session, "scope-holder"}, %{kind: "completion"})
+             )
   end
 
   test "Dispatch without a prior load uses the persistent-term default", ctx do
@@ -781,6 +799,8 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "a declared denial precedes required owner data without changing domain state", ctx do
+    Tightbeam.Archetypes.load!(ctx.base_dir)
+
     config = %{
       db: ctx.db,
       base_dir: ctx.base_dir,
@@ -1581,10 +1601,15 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "shipped completion is recorded while a same-source independent review is pending", ctx do
-    holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer-code")
+    holder = engineering_session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
 
-    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+    reviewer =
+      engineering_session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer-code")
+
+    owner =
+      engineering_session(ctx.db, Org.personal_session_key("flynn"), "flynn",
+        archetype: "orchestrator"
+      )
 
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
@@ -1681,9 +1706,13 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "shipped completion records pending release and live-mutation work", ctx do
-    holder = session(ctx.db, "non-code-completion-holder", "flynn", archetype: "coder")
+    holder =
+      engineering_session(ctx.db, "non-code-completion-holder", "flynn", archetype: "coder")
 
-    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+    owner =
+      engineering_session(ctx.db, Org.personal_session_key("flynn"), "flynn",
+        archetype: "orchestrator"
+      )
 
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
@@ -1712,11 +1741,15 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "changes-requested wakes and reopens the author card, then clean review closes it", ctx do
-    holder = session(ctx.db, "review-change-author", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "review-change-judge", "reviewer", archetype: "reviewer-code")
+    holder = engineering_session(ctx.db, "review-change-author", "flynn", archetype: "coder")
+
+    reviewer =
+      engineering_session(ctx.db, "review-change-judge", "reviewer", archetype: "reviewer-code")
 
     _owner =
-      session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
+      engineering_session(ctx.db, Org.personal_session_key("flynn"), "flynn",
+        archetype: "orchestrator"
+      )
 
     {:ok, _} =
       DB.query(
@@ -1979,9 +2012,16 @@ defmodule Tightbeam.RulesTest do
     :ok =
       DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('reviewer',1)")
 
-    coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
-    noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
-    reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")
+    coder = engineering_session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
+
+    noncoder =
+      engineering_session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
+
+    reviewer =
+      engineering_session(ctx.db, "receipt-exempt-reviewer", "reviewer",
+        archetype: "reviewer-code"
+      )
+
     closed = assignment(ctx, coder.session_key, {:user, "flynn"}, effect_kind: "coordination")
     open_coder = assignment(ctx, coder.session_key, {:user, "flynn"})
 
@@ -2119,6 +2159,123 @@ defmodule Tightbeam.RulesTest do
              )
 
     assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.prompt == "post observed"))
+  end
+
+  test "a filing fact selects its addressed principal and routes an exact request notice", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+
+    raiser = session(ctx.db, "filing-raiser", "flynn")
+    recipient = session(ctx.db, "briefing-recipient", "flynn")
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "filing-notice"
+    verb = "condition"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "route an addressed decision request"
+    deny_when = [
+      { fact = "condition_fact.kind", op = "eq", value = "decision-request-filed" },
+      { fact = "decision_request.addressed_principal", op = "eq", value = "user:flynn" },
+      { fact = "condition_fact.matches", op = "eq", value = true }
+    ]
+
+    [rule.notice]
+    target_session = "briefing-recipient"
+    prompt = "Investigate decision {decision_request_id}"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(raiser.session_key, %{question: "Choose a route?"})
+      )
+
+    # Besides the routed notice, main's deadline-lapse reminder waits for Main.
+    {[deadline], [wake]} =
+      Wakes.list_pending(ctx.db)
+      |> Enum.split_with(
+        &String.starts_with?(&1.prompt, "Operator decision #{request.id} passed")
+      )
+
+    assert deadline.due_at == request.deadline_at
+    assert wake.session_key == recipient.session_key
+    assert wake.prompt == "Investigate decision #{request.id}"
+    assert wake.origin == "remedy:filing-notice"
+
+    assert {:ok, [[fact_id]]} =
+             DB.query(ctx.db, "SELECT id FROM condition_facts WHERE scope=?1", [request.id])
+
+    transition = %{
+      verb: "condition",
+      domain: "condition_fact",
+      row_id: fact_id,
+      owner_user_id: "flynn",
+      principal: "agent:filing-raiser",
+      cause: "operator-ask",
+      bindings: %{
+        conditionKind: "decision-request-filed",
+        conditionScope: request.id,
+        conditionAfterId: fact_id - 1,
+        conditionFactId: fact_id,
+        decisionRequestId: request.id
+      },
+      field: %{name: "id", old: nil, new: fact_id}
+    }
+
+    assert {:ok, :ok} = DB.transaction(ctx.db, &Wakes.row_commit_in_txn(&1, [transition]))
+
+    assert [same_wake] =
+             Enum.reject(
+               Wakes.list_pending(ctx.db),
+               &String.starts_with?(&1.prompt, "Operator decision ")
+             )
+
+    assert same_wake.wake_id == wake.wake_id
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               ready_key = {Wakes, :wait_recognition_ready, txn.conn}
+               previous = Process.get(ready_key)
+               Process.put(ready_key, false)
+
+               try do
+                 assert_raise Wakes.RuleEvaluationUnavailable, fn ->
+                   Wakes.row_commit_in_txn(txn, [transition])
+                 end
+               after
+                 Process.put(ready_key, previous)
+               end
+
+               :ok
+             end)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('other',0,1)")
+
+    other_raiser = session(ctx.db, "other-filing-raiser", "other")
+
+    other_request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(other_raiser.session_key, %{question: "Choose another route?"})
+      )
+
+    assert {:ok, [["decision-request-filed"]]} =
+             DB.query(ctx.db, "SELECT kind FROM condition_facts WHERE scope=?1", [
+               other_request.id
+             ])
+
+    assert [same_wake] =
+             Enum.reject(
+               Wakes.list_pending(ctx.db),
+               &String.starts_with?(&1.prompt, "Operator decision ")
+             )
+
+    assert same_wake.wake_id == wake.wake_id
   end
 
   test "refused operator ask does not publish a fabricated supersession", ctx do
@@ -2295,6 +2452,7 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "row-commit queue facts are scoped to the queued session and caller", ctx do
+    session(ctx.db, "queue-spammer", "rules-test-owner", archetype: "default")
     target = session(ctx.db, "queue-fact-target", "flynn", archetype: "coder")
     other = session(ctx.db, "queue-fact-other", "flynn", archetype: "coder")
 
@@ -2668,10 +2826,753 @@ defmodule Tightbeam.RulesTest do
     end)
   end
 
+  test "filing remedy wake keeps one producer and episode across replay", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+
+    raiser = session(ctx.db, "filing-remedy-raiser", "flynn")
+    recipient = session(ctx.db, "filing-remedy-recipient", "flynn")
+    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "filing-remedy-wake"
+    verb = "condition"
+    edges = ["row-commit"]
+    effect = "remedy"
+    text = "wake for filed request"
+    deny_when = [{ fact = "condition_fact.kind", op = "eq", value = "decision-request-filed" }]
+
+    [rule.remedy]
+    action = "wake"
+    target_session = "filing-remedy-recipient"
+    [rule.remedy.params]
+    prompt = "Review decision {decision_request_id}"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(raiser.session_key, %{
+          question: "Review the filing?",
+          assignment: bound.id
+        })
+      )
+
+    assert is_binary(request.id)
+
+    assert Enum.any?(1..100, fn _ ->
+             case DB.query(
+                    ctx.db,
+                    "SELECT status,producerKey,occurrence FROM rail_remedy_episodes WHERE statute='filing-remedy-wake' AND subject=?1",
+                    [request.id]
+                  ) do
+               {:ok, [["live", key, 1]]} when is_binary(key) ->
+                 true
+
+               _ ->
+                 Process.sleep(20)
+                 false
+             end
+           end)
+
+    assert {:ok, [[wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE origin='remedy:filing-remedy-wake' AND prompt=?1",
+               ["Review decision #{request.id}"]
+             )
+
+    assert {:ok, [["live", ^wake_id, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,producerKey,occurrence FROM rail_remedy_episodes WHERE statute='filing-remedy-wake' AND subject=?1",
+               [request.id]
+             )
+
+    assert {:ok, [[fact_id]]} =
+             DB.query(ctx.db, "SELECT id FROM condition_facts WHERE scope=?1", [request.id])
+
+    transition = %{
+      verb: "condition",
+      domain: "condition_fact",
+      row_id: fact_id,
+      owner_user_id: "flynn",
+      principal: "agent:#{raiser.session_key}",
+      cause: "operator-ask",
+      bindings: %{
+        conditionKind: "decision-request-filed",
+        conditionScope: request.id,
+        conditionAfterId: fact_id - 1,
+        conditionFactId: fact_id,
+        decisionRequestId: request.id,
+        assignmentId: bound.id
+      },
+      field: %{name: "id", old: nil, new: fact_id}
+    }
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn -> Wakes.row_commit_in_txn(txn, [transition]) end)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='remedy:filing-remedy-wake'"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM pending_recognition WHERE id LIKE 'filing-remedy:%'"
+             )
+
+    assert recipient.session_key != raiser.session_key
+  end
+
+  test "filing remedy assign creates an ordinary bound obligation", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+
+    raiser = session(ctx.db, "filing-assign-raiser", "flynn")
+    recipient = session(ctx.db, "filing-assign-recipient", "flynn")
+    Roles.create!(ctx.db, "filing-reviewer", "flynn", recipient.session_key)
+    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+    attach_work_item(ctx, bound.id, "wi_filing_assign")
+    set_work_item_owner(ctx, "wi_filing_assign", raiser.session_key)
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "filing-remedy-assign"
+    verb = "condition"
+    edges = ["row-commit"]
+    effect = "remedy"
+    text = "assign review for a filed request"
+    deny_when = [{ fact = "condition_fact.kind", op = "eq", value = "decision-request-filed" }]
+
+    [rule.remedy]
+    action = "assign"
+    target_role = "filing-reviewer"
+    [rule.remedy.params]
+    subject = "Review filing {decision_request_id}"
+    work_item = "{work_item_id}"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(raiser.session_key, %{
+          question: "Assign a reviewer?",
+          assignment: bound.id
+        })
+      )
+
+    assigned? =
+      Enum.any?(1..100, fn _ ->
+        case DB.query(
+               ctx.db,
+               "SELECT status,producerKey FROM rail_remedy_episodes WHERE statute='filing-remedy-assign' AND subject=?1",
+               [request.id]
+             ) do
+          {:ok, [["live", key]]} when is_binary(key) ->
+            true
+
+          _ ->
+            Process.sleep(20)
+            false
+        end
+      end)
+
+    assert assigned?,
+           inspect(
+             DB.query(
+               ctx.db,
+               "SELECT detail FROM lifecycle_events WHERE kind='rail_remedy' AND subject='filing-remedy-assign' ORDER BY rowid DESC LIMIT 3"
+             )
+           )
+
+    assert {:ok, [[producer_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT producerKey FROM rail_remedy_episodes WHERE statute='filing-remedy-assign' AND subject=?1",
+               [request.id]
+             )
+
+    recipient_key = recipient.session_key
+
+    assert {:ok, [[^recipient_key, "open", subject]]} =
+             DB.query(ctx.db, "SELECT holderKey,state,subject FROM assignments WHERE id=?1", [
+               producer_id
+             ])
+
+    assert subject == "Review filing #{request.id}"
+    assert producer_id != bound.id
+  end
+
+  test "filing remedy spawn creates one named producer session", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+
+    raiser = session(ctx.db, "filing-spawn-raiser", "flynn")
+    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+
+    for bin <- ["claude-agent-acp"] do
+      adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", bin])
+      File.mkdir_p!(Path.dirname(adapter))
+      File.write!(adapter, "#!/bin/sh\nexit 0\n")
+      File.chmod!(adapter, 0o755)
+    end
+
+    manifest =
+      Path.join([
+        ctx.base_dir,
+        "adapters",
+        "node_modules",
+        Tightbeam.Harness.Claude.install_package(),
+        "package.json"
+      ])
+
+    File.mkdir_p!(Path.dirname(manifest))
+
+    File.write!(
+      manifest,
+      JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()})
+    )
+
+    auth_dir = Tightbeam.Homes.home_path(ctx.base_dir, "testhost", :claude)
+    File.mkdir_p!(auth_dir)
+
+    File.write!(
+      Path.join(auth_dir, ".credentials.json"),
+      ~s({"claudeAiOauth":{"accessToken":"test-token"}})
+    )
+
+    Tightbeam.Archetypes.load!(ctx.base_dir)
+
+    spawn_handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: ctx.base_dir,
+        default_harness: :claude,
+        default_model: Model.new("claude-fable-5"),
+        credential_status: fn _ -> :onboarded end,
+        credential_kind: fn _ -> :subscription end,
+        patch_adapter: fn _, _ -> :ok end
+      })
+
+    :ok = Tightbeam.FilingRemedy.install_handlers(ctx.db, spawn_handlers)
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "filing-remedy-spawn"
+    verb = "condition"
+    edges = ["row-commit"]
+    effect = "remedy"
+    text = "spawn a producer for a filed request"
+    deny_when = [{ fact = "condition_fact.kind", op = "eq", value = "decision-request-filed" }]
+
+    [rule.remedy]
+    action = "spawn"
+    name = "filing-worker"
+    harness = "claude"
+    model = "claude-fable-5"
+    [rule.remedy.params]
+    display = "Filing worker"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(spawn_handlers))
+
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(raiser.session_key, %{
+          question: "Start a producer?",
+          assignment: bound.id
+        })
+      )
+
+    assert Enum.any?(1..100, fn _ ->
+             case DB.query(
+                    ctx.db,
+                    "SELECT attempts FROM pending_recognition WHERE id LIKE 'filing-remedy:%' LIMIT 1"
+                  ) do
+               {:ok, [[attempts]]} when attempts >= 1 ->
+                 true
+
+               _ ->
+                 Process.sleep(20)
+                 false
+             end
+           end)
+
+    # The producer was committed before its first completion receipt. Expire the
+    # existing lease and let the ordinary retry reconcile the same operation key.
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE rail_remedy_episodes SET openedAt=0 WHERE statute='filing-remedy-spawn' AND subject=?1",
+                 [request.id]
+               )
+
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE pending_recognition SET nextAt=?1 WHERE id LIKE 'filing-remedy:%'",
+                 [System.system_time(:millisecond)]
+               )
+
+               Tightbeam.Recognition.nudge_in_txn(txn)
+               :ok
+             end)
+
+    assert Enum.any?(1..100, fn _ ->
+             case DB.query(
+                    ctx.db,
+                    "SELECT status,producerKey FROM rail_remedy_episodes WHERE statute='filing-remedy-spawn' AND subject=?1",
+                    [request.id]
+                  ) do
+               {:ok, [["live", key]]} when is_binary(key) ->
+                 true
+
+               _ ->
+                 Process.sleep(20)
+                 false
+             end
+           end)
+
+    assert {:ok, [[producer_key]]} =
+             DB.query(
+               ctx.db,
+               "SELECT producerKey FROM rail_remedy_episodes WHERE statute='filing-remedy-spawn' AND subject=?1",
+               [request.id]
+             )
+
+    assert {:ok, [["filing-worker", "Filing worker"]]} =
+             DB.query(ctx.db, "SELECT handle,displayName FROM sessions WHERE sessionKey=?1", [
+               producer_key
+             ])
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM sessions WHERE handle='filing-worker'"
+             )
+  end
+
+  test "filing remedy without assignment remains an attributable failed effect", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+
+    raiser = session(ctx.db, "filing-unbound-raiser", "flynn")
+    session(ctx.db, "filing-unbound-recipient", "flynn")
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "filing-remedy-unbound"
+    verb = "condition"
+    edges = ["row-commit"]
+    effect = "remedy"
+    text = "wake for a filed request"
+    deny_when = [{ fact = "condition_fact.kind", op = "eq", value = "decision-request-filed" }]
+
+    [rule.remedy]
+    action = "wake"
+    target_session = "filing-unbound-recipient"
+    [rule.remedy.params]
+    prompt = "Review {decision_request_id}"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(raiser.session_key, %{question: "Unbound review?"})
+      )
+
+    assert Enum.any?(1..100, fn _ ->
+             case DB.query(
+                    ctx.db,
+                    "SELECT detail FROM lifecycle_events WHERE kind='rail_remedy' AND subject='filing-remedy-unbound' ORDER BY rowid DESC LIMIT 1"
+                  ) do
+               {:ok, [[detail]]} ->
+                 JSON.decode!(detail)["outcome"] == "unbound"
+
+               _ ->
+                 Process.sleep(20)
+                 false
+             end
+           end)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed' AND scope=?1",
+               [request.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='remedy:filing-remedy-unbound'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM pending_recognition WHERE id LIKE 'filing-remedy:%'"
+             )
+  end
+
+  test "a later ruling resumes the same held filing remedy wake", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+
+    raiser = session(ctx.db, "filing-held-raiser", "flynn")
+    recipient = session(ctx.db, "filing-held-recipient", "flynn")
+    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "filing-held-remedy"
+    verb = "condition"
+    edges = ["row-commit"]
+    effect = "remedy"
+    text = "wake for a filed request"
+    deny_when = [{ fact = "condition_fact.kind", op = "eq", value = "decision-request-filed" }]
+
+    [rule.remedy]
+    action = "wake"
+    target_session = "filing-held-recipient"
+    [rule.remedy.params]
+    prompt = "Review {decision_request_id}"
+
+    [[rule]]
+    name = "held-remedy-needs-ruling"
+    verb = "wake"
+    effect = "escalate"
+    text = "a remedy wake requires a ruling"
+    deny_when = [{ fact = "caller.origin_class", op = "eq", value = "remedy" }]
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(raiser.session_key, %{
+          question: "Wake after ruling?",
+          assignment: bound.id
+        })
+      )
+
+    assert Enum.any?(1..100, fn _ ->
+             case DB.query(
+                    ctx.db,
+                    "SELECT w.scope FROM pending_recognition_waits w WHERE w.kind='escalation-ruled'"
+                  ) do
+               {:ok, [[scope]]} when is_binary(scope) ->
+                 true
+
+               _ ->
+                 Process.sleep(20)
+                 false
+             end
+           end)
+
+    assert {:ok, [[held_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT scope FROM pending_recognition_waits WHERE kind='escalation-ruled'"
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [held_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='remedy:filing-held-remedy'"
+             )
+
+    assert %{status: "ruled"} =
+             Escalation.rule(
+               ctx.db,
+               %{
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 params: %{request_id: held_id, decision: "allow"}
+               },
+               authorized: true
+             )
+
+    assert Enum.any?(1..100, fn _ ->
+             case DB.query(
+                    ctx.db,
+                    "SELECT status FROM rail_remedy_episodes WHERE statute='filing-held-remedy' AND subject=?1",
+                    [request.id]
+                  ) do
+               {:ok, [["live"]]} ->
+                 true
+
+               _ ->
+                 Process.sleep(20)
+                 false
+             end
+           end)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='remedy:filing-held-remedy' AND sessionKey=?1",
+               [recipient.session_key]
+             )
+
+    assert {:ok, [["consumed"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [held_id])
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed' AND scope=?1",
+               [request.id]
+             )
+  end
+
+  test "a denied ruling leaves the filed remedy without a producer", ctx do
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('fixture-owner',0,1)"
+             )
+
+    raiser = session(ctx.db, "filing-denied-raiser", "fixture-owner")
+    session(ctx.db, "filing-denied-recipient", "fixture-owner")
+    bound = assignment(ctx, raiser.session_key, {:user, "fixture-owner"})
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "filing-denied-remedy"
+    verb = "condition"
+    edges = ["row-commit"]
+    effect = "remedy"
+    text = "wake for a filed request"
+    deny_when = [{ fact = "condition_fact.kind", op = "eq", value = "decision-request-filed" }]
+
+    [rule.remedy]
+    action = "wake"
+    target_session = "filing-denied-recipient"
+    [rule.remedy.params]
+    prompt = "Review {decision_request_id}"
+
+    [[rule]]
+    name = "filing-denied-hold"
+    verb = "wake"
+    effect = "escalate"
+    text = "the producer wake needs a ruling"
+    deny_when = [{ fact = "caller.origin_class", op = "eq", value = "remedy" }]
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(raiser.session_key, %{
+          question: "Deny the producer wake?",
+          assignment: bound.id
+        })
+      )
+
+    assert Enum.any?(1..100, fn _ ->
+             case DB.query(ctx.db, "SELECT scope FROM pending_recognition_waits") do
+               {:ok, [[_]]} ->
+                 true
+
+               _ ->
+                 Process.sleep(20)
+                 false
+             end
+           end)
+
+    assert {:ok, [[held_id]]} = DB.query(ctx.db, "SELECT scope FROM pending_recognition_waits")
+
+    assert %{status: "ruled"} =
+             Escalation.rule(
+               ctx.db,
+               %{
+                 origin: "user:fixture-owner",
+                 principal: {:user, "fixture-owner"},
+                 params: %{request_id: held_id, decision: "deny"}
+               },
+               authorized: true
+             )
+
+    assert Enum.any?(1..100, fn _ ->
+             case DB.query(
+                    ctx.db,
+                    "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rail_remedy' AND subject='filing-denied-remedy'"
+                  ) do
+               {:ok, [[count]]} when count >= 2 ->
+                 true
+
+               _ ->
+                 Process.sleep(20)
+                 false
+             end
+           end)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='remedy:filing-denied-remedy'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM condition_facts WHERE kind='decision-request-filed' AND scope=?1",
+               [request.id]
+             )
+  end
+
+  test "a held filing remedy survives database restart until its ruling", ctx do
+    db = :"filing_restart_#{System.unique_integer([:positive])}"
+
+    %{base: base, payload: payload} =
+      Tightbeam.GuardRuntimeFixture.prepare!(ctx.base_dir, "escalation_delivery_runtime.exs")
+
+    path = Path.join(base, "state.db")
+    {:ok, _} = DB.start_link(path: path, name: db, guard_inputs: [], payload_root: payload)
+    :ok = Tightbeam.Schema.ensure_all(db)
+    # Gateway boot activates recognition after the schema pass (main 95404352).
+    :ok = Tightbeam.Recognition.activate(db)
+    :ok = Wakes.activate_wait_recognition(db)
+    :ok = Tightbeam.FilingRemedy.install_handlers(db, Gateway.handlers(%{db: db}))
+
+    assert {:ok, _} =
+             DB.query(db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+
+    raiser = session(db, "filing-restart-raiser", "flynn")
+    recipient = session(db, "filing-restart-recipient", "flynn")
+    bound = assignment(%{ctx | db: db}, raiser.session_key, {:user, "flynn"})
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "filing-restart-remedy"
+    verb = "condition"
+    edges = ["row-commit"]
+    effect = "remedy"
+    text = "wake after ruling"
+    deny_when = [{ fact = "condition_fact.kind", op = "eq", value = "decision-request-filed" }]
+
+    [rule.remedy]
+    action = "wake"
+    target_session = "filing-restart-recipient"
+    [rule.remedy.params]
+    prompt = "Review {decision_request_id}"
+
+    [[rule]]
+    name = "filing-restart-hold"
+    verb = "wake"
+    effect = "escalate"
+    text = "hold the producer wake"
+    deny_when = [{ fact = "caller.origin_class", op = "eq", value = "remedy" }]
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    request =
+      Escalation.operator_ask(
+        db,
+        operator_ask_call(raiser.session_key, %{
+          question: "Resume after restart?",
+          assignment: bound.id
+        })
+      )
+
+    assert Enum.any?(1..100, fn _ ->
+             case DB.query(
+                    db,
+                    "SELECT scope FROM pending_recognition_waits WHERE kind='escalation-ruled'"
+                  ) do
+               {:ok, [[_]]} ->
+                 true
+
+               _ ->
+                 Process.sleep(20)
+                 false
+             end
+           end)
+
+    assert {:ok, [[held_id]]} =
+             DB.query(
+               db,
+               "SELECT scope FROM pending_recognition_waits WHERE kind='escalation-ruled'"
+             )
+
+    GenServer.stop(db)
+
+    {:ok, _} = DB.start_link(path: path, name: db, guard_inputs: [], payload_root: payload)
+    :ok = Tightbeam.Schema.ensure_all(db)
+    # Gateway boot activates recognition after the schema pass (main 95404352).
+    :ok = Tightbeam.Recognition.activate(db)
+    :ok = Wakes.activate_wait_recognition(db)
+    :ok = Tightbeam.FilingRemedy.install_handlers(db, Gateway.handlers(%{db: db}))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM pending_recognition_waits WHERE kind='escalation-ruled' AND scope=?1",
+               [held_id]
+             )
+
+    assert %{status: "ruled"} =
+             Escalation.rule(
+               db,
+               %{
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 params: %{request_id: held_id, decision: "allow"}
+               },
+               authorized: true
+             )
+
+    assert Enum.any?(1..100, fn _ ->
+             case DB.query(
+                    db,
+                    "SELECT status FROM rail_remedy_episodes WHERE statute='filing-restart-remedy' AND subject=?1",
+                    [request.id]
+                  ) do
+               {:ok, [["live"]]} ->
+                 true
+
+               _ ->
+                 Process.sleep(20)
+                 false
+             end
+           end)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='remedy:filing-restart-remedy' AND sessionKey=?1",
+               [recipient.session_key]
+             )
+
+    assert {:ok, [["consumed"]]} =
+             DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [held_id])
+
+    GenServer.stop(db)
+  end
+
   test "AC6a backlog crosses at 20, preserves protected traffic, and replays without a notice loop",
        ctx do
-    holder = session(ctx.db, "ac6a-backlog-self-holder", "flynn", archetype: "coder")
-    caller = session(ctx.db, "ac6a-backlog-caller", "flynn", archetype: "coder")
+    holder = engineering_session(ctx.db, "ac6a-backlog-self-holder", "flynn", archetype: "coder")
+    caller = engineering_session(ctx.db, "ac6a-backlog-caller", "flynn", archetype: "coder")
     opened = assignment(ctx, holder.session_key, {:user, "flynn"})
     work_item_id = "wi_ac6a_backlog_replay"
     attach_work_item(ctx, opened.id, work_item_id)
@@ -2922,7 +3823,7 @@ defmodule Tightbeam.RulesTest do
 
   test "AC6a sender flood stays deduped across claims and resets after either recovery", ctx do
     {holder, opened} = ac6a_backlog_fixture(ctx, "flood-claim-regression")
-    sender = session(ctx.db, "ac6a-flood-claim-sender", "flynn", archetype: "coder")
+    sender = engineering_session(ctx.db, "ac6a-flood-claim-sender", "flynn", archetype: "coder")
     flood_origin = "remedy:ac6a-sender-flood"
 
     send_turn = fn id ->
@@ -2987,9 +3888,9 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "AC6a age and sender-flood thresholds fire on crossing, then dedupe", ctx do
-    holder = session(ctx.db, "ac6a-age-holder", "flynn", archetype: "coder")
-    sender = session(ctx.db, "ac6a-flood-sender", "flynn", archetype: "coder")
-    opener = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    holder = engineering_session(ctx.db, "ac6a-age-holder", "flynn", archetype: "coder")
+    sender = engineering_session(ctx.db, "ac6a-flood-sender", "flynn", archetype: "coder")
+    opener = engineering_session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
     opened = assignment(ctx, holder.session_key, {:user, "flynn"})
     work_item_id = "wi_ac6a_age_threshold"
     attach_work_item(ctx, opened.id, work_item_id)
@@ -3070,7 +3971,7 @@ defmodule Tightbeam.RulesTest do
 
     assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
 
-    flood_holder = session(ctx.db, "ac6a-flood-holder", "flynn", archetype: "coder")
+    flood_holder = engineering_session(ctx.db, "ac6a-flood-holder", "flynn", archetype: "coder")
     sender_role = "ac6a-flood-sender-role"
     assert %{name: ^sender_role} = Roles.create!(ctx.db, sender_role, "flynn", sender.session_key)
     flood_assignment = assignment(ctx, flood_holder.session_key, {:user, "flynn"})
@@ -3151,7 +4052,9 @@ defmodule Tightbeam.RulesTest do
 
     assert notice_count(ctx.db, "remedy:ac6a-sender-flood") == 1
 
-    threshold_holder = session(ctx.db, "ac6a-flood-threshold-holder", "flynn", archetype: "coder")
+    threshold_holder =
+      engineering_session(ctx.db, "ac6a-flood-threshold-holder", "flynn", archetype: "coder")
+
     threshold_assignment = assignment(ctx, threshold_holder.session_key, {:user, "flynn"})
     attach_work_item(ctx, threshold_assignment.id, "wi_ac6a_flood_exact_threshold")
 
@@ -3198,7 +4101,9 @@ defmodule Tightbeam.RulesTest do
     assert exact_threshold_target == sender.session_key
     assert notice_count(ctx.db, "remedy:ac6a-sender-flood") == 2
 
-    user_holder = session(ctx.db, "ac6a-flood-user-holder", "flynn", archetype: "coder")
+    user_holder =
+      engineering_session(ctx.db, "ac6a-flood-user-holder", "flynn", archetype: "coder")
+
     user_assignment = assignment(ctx, user_holder.session_key, {:user, "flynn"})
     attach_work_item(ctx, user_assignment.id, "wi_ac6a_user_flood")
 
@@ -3395,18 +4300,25 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "AC6a third review rejection spans fresh reviewers and fires once at equality", ctx do
-    review_opener = session(ctx.db, "ac6a-rejection-review-opener", "flynn")
+    review_opener = engineering_session(ctx.db, "ac6a-rejection-review-opener", "flynn")
 
     producer_rounds =
       for index <- 1..4 do
-        opener = session(ctx.db, "ac6a-rejection-producer-opener-#{index}", "flynn")
-        holder = session(ctx.db, "ac6a-rejection-producer-#{index}", "flynn", archetype: "coder")
+        opener = engineering_session(ctx.db, "ac6a-rejection-producer-opener-#{index}", "flynn")
+
+        holder =
+          engineering_session(ctx.db, "ac6a-rejection-producer-#{index}", "flynn",
+            archetype: "coder"
+          )
+
         {opener, holder}
       end
 
     reviewers =
       for index <- 1..4 do
-        session(ctx.db, "ac6a-rejection-reviewer-#{index}", "flynn", archetype: "reviewer-code")
+        engineering_session(ctx.db, "ac6a-rejection-reviewer-#{index}", "flynn",
+          archetype: "reviewer-code"
+        )
       end
 
     work_item_id = "wi_ac6a_third_review_rejection"
@@ -3519,9 +4431,12 @@ defmodule Tightbeam.RulesTest do
   test "AC6a fourth review and fix rounds route through real assignment and attest commits",
        ctx do
     assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
-    opener = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
-    fix_holder = session(ctx.db, "ac6a-round-fix-holder", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "ac6a-round-reviewer", "flynn", archetype: "reviewer-code")
+    opener = engineering_session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    fix_holder = engineering_session(ctx.db, "ac6a-round-fix-holder", "flynn", archetype: "coder")
+
+    reviewer =
+      engineering_session(ctx.db, "ac6a-round-reviewer", "flynn", archetype: "reviewer-code")
+
     review_item = "wi_ac6a_review_round"
     create_work_item(ctx, review_item)
     set_work_item_owner(ctx, review_item, opener.session_key)
@@ -3659,12 +4574,80 @@ defmodule Tightbeam.RulesTest do
     assert notice_count(ctx.db, churn_origin) == 2
   end
 
+  test "learned AC6a unowned stretch files an operator decision under its qualified name", ctx do
+    Devices.add_user(ctx.db, "scope-test-owner", false)
+    agent = engineering_session(ctx.db, "learned-unowned", "scope-test-owner", archetype: "coder")
+    assert :initialized = Tightbeam.Identity.init!(ctx.base_dir)
+    assert {:ok, _} = Tightbeam.Identity.learn!(ctx.base_dir, "agentic-engineering", "test")
+    Tightbeam.Archetypes.load!(ctx.base_dir)
+    rules = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    name = "agentic-engineering.ac6a-unassigned-agent-turn"
+    assert Enum.any?(rules, &(&1.name == name and &1.owner == {:kungfu, "agentic-engineering"}))
+    :ok = Wakes.activate_wait_recognition(ctx.db)
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: agent.session_key,
+               message_id: "learned-unowned-turn",
+               origin: "session:" <> agent.session_key,
+               prompt: "work without an assignment"
+             })
+
+    assert {:ok, %{seq: seq, owner_lease: lease}} =
+             Ledger.claim_next(ctx.db, agent.session_key, "learned-unowned-claim")
+
+    assert {:ok, [["open", "scope-test-owner"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,ownerUserId FROM decision_requests WHERE kind='operator'"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed' AND subject=?1",
+               [name]
+             )
+
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: lease)
+  end
+
+  test "a below-threshold queued turn does not resolve notice recipients or read their history",
+       ctx do
+    Devices.add_user(ctx.db, "scope-test-owner", false)
+    agent = engineering_session(ctx.db, "below-backlog", "scope-test-owner", archetype: "coder")
+    load_ac6a_rules(ctx)
+    db_pid = Process.whereis(ctx.db)
+    assert 1 == :erlang.trace_pattern({Rules, :notice_bindings, 3}, true, [:local])
+    assert 1 == :erlang.trace(db_pid, true, [:call, {:tracer, self()}])
+
+    try do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: agent.session_key,
+                 message_id: "below-backlog-turn",
+                 origin: "session:" <> agent.session_key,
+                 prompt: "one queued turn"
+               })
+
+      ref = :erlang.trace_delivered(db_pid)
+      assert_receive {:trace_delivered, ^db_pid, ^ref}
+      refute_received {:trace, ^db_pid, :call, {Rules, :notice_bindings, _}}
+    after
+      :erlang.trace(db_pid, false, [:call])
+      :erlang.trace_pattern({Rules, :notice_bindings, 3}, false, [:local])
+    end
+  end
+
   test "AC6a routes unassigned agent stretches to the item coordinator once and excludes human starts",
        ctx do
     assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
-    agent = session(ctx.db, "ac6a-unassigned-agent", "flynn", archetype: "coder")
-    foreign_sender = session(ctx.db, "ac6a-foreign-agent", "flynn", archetype: "coder")
-    human_started = session(ctx.db, "ac6a-human-started", "flynn", archetype: "coder")
+    agent = engineering_session(ctx.db, "ac6a-unassigned-agent", "flynn", archetype: "coder")
+
+    foreign_sender =
+      engineering_session(ctx.db, "ac6a-foreign-agent", "flynn", archetype: "coder")
+
+    human_started = engineering_session(ctx.db, "ac6a-human-started", "flynn", archetype: "coder")
     agent_role = "ac6a-unassigned-agent-role"
     assert %{name: ^agent_role} = Roles.create!(ctx.db, agent_role, "flynn", agent.session_key)
 
@@ -3771,7 +4754,9 @@ defmodule Tightbeam.RulesTest do
     assert :ok =
              Ledger.finish(ctx.db, assigned_seq, "delivered", nil, owner_lease: assigned_lease)
 
-    reviewer = session(ctx.db, "ac6a-unassigned-reviewer", "flynn", archetype: "reviewer-code")
+    reviewer =
+      engineering_session(ctx.db, "ac6a-unassigned-reviewer", "flynn", archetype: "reviewer-code")
+
     refs = verified_code_refs(ctx, opened, agent, reviewer)
 
     assert %{assignment: %{state: "closed", outcome: "completed"}} =
@@ -3831,7 +4816,9 @@ defmodule Tightbeam.RulesTest do
 
     assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 2
 
-    no_context = session(ctx.db, "ac6a-unassigned-no-context", "flynn", archetype: "coder")
+    no_context =
+      engineering_session(ctx.db, "ac6a-unassigned-no-context", "flynn", archetype: "coder")
+
     no_context_role = "ac6a-unassigned-no-context-role"
 
     assert %{name: ^no_context_role} =
@@ -3863,7 +4850,7 @@ defmodule Tightbeam.RulesTest do
     assert question =~ "Session: #{no_context.session_key}"
     assert context =~ "stretch=initial:#{no_context.session_key}"
 
-    assert {:ok, [[main_session, notification_prompt], [deadline_session, deadline_prompt]]} =
+    assert {:ok, [[deadline_session, deadline_prompt]]} =
              DB.query(
                ctx.db,
                "SELECT sessionKey,prompt FROM wakes WHERE origin='process:tightbeam' " <>
@@ -3871,11 +4858,17 @@ defmodule Tightbeam.RulesTest do
                ["%#{request_id}%"]
              )
 
-    assert main_session == Org.personal_session_key("flynn")
-    assert notification_prompt =~ question
-    assert deadline_session == main_session
+    assert deadline_session == Org.personal_session_key("flynn")
     assert deadline_prompt =~ question
     assert deadline_prompt =~ raiser_id
+
+    assert {:ok, [["decision-request-filed", payload]]} =
+             DB.query(ctx.db, "SELECT kind,payload FROM condition_facts WHERE scope=?1", [
+               request_id
+             ])
+
+    assert %{"requestId" => ^request_id, "addressedPrincipal" => "user:flynn"} =
+             JSON.decode!(payload)
 
     assert {:ok, [["running"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [no_context_seq])
@@ -3903,12 +4896,17 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
 
-    assert {:ok, [[2]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE origin='process:tightbeam' AND prompt LIKE ?1",
                ["%#{request_id}%"]
              )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE scope=?1", [
+               request_id
+             ])
 
     assert :ok =
              Ledger.finish(ctx.db, replay_seq, "delivered", nil, owner_lease: replay_lease)
@@ -4003,7 +5001,7 @@ defmodule Tightbeam.RulesTest do
 
   test "AC6a absent or invalid opener falls back and asks once per unowned stretch",
        ctx do
-    holder = session(ctx.db, "ac6a-fallback-holder", "flynn", archetype: "coder")
+    holder = engineering_session(ctx.db, "ac6a-fallback-holder", "flynn", archetype: "coder")
     opened = assignment(ctx, holder.session_key, {:user, "flynn"})
     work_item_id = "wi_ac6a_invalid_opener_fallback"
     attach_work_item(ctx, opened.id, work_item_id)
@@ -4038,7 +5036,8 @@ defmodule Tightbeam.RulesTest do
     assert [fallback_target, fallback_assignment, fallback_work_item] ==
              [coordinator.session_key, opened.id, work_item_id]
 
-    absent_holder = session(ctx.db, "ac6a-absent-opener-holder", "flynn", archetype: "coder")
+    absent_holder =
+      engineering_session(ctx.db, "ac6a-absent-opener-holder", "flynn", archetype: "coder")
 
     absent_opener_assignment =
       assignment(ctx, absent_holder.session_key, {:user, "flynn"}, work_item_id: work_item_id)
@@ -4070,7 +5069,8 @@ defmodule Tightbeam.RulesTest do
     assert [absent_fallback_target, absent_fallback_assignment, absent_fallback_item] ==
              [coordinator.session_key, absent_opener_assignment.id, work_item_id]
 
-    no_context = session(ctx.db, "ac6a-missing-owner-context", "flynn", archetype: "coder")
+    no_context =
+      engineering_session(ctx.db, "ac6a-missing-owner-context", "flynn", archetype: "coder")
 
     for index <- 1..20 do
       assert {:ok, _} =
@@ -4098,8 +5098,8 @@ defmodule Tightbeam.RulesTest do
 
     assert no_context_target == no_context.session_key
 
-    main = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
-    other_no_context = session(ctx.db, "ac6a-owner-main-fallback-holder", "flynn")
+    main = engineering_session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    other_no_context = engineering_session(ctx.db, "ac6a-owner-main-fallback-holder", "flynn")
 
     for index <- 1..20 do
       assert {:ok, _} =
@@ -4125,6 +5125,106 @@ defmodule Tightbeam.RulesTest do
                ctx.db,
                "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed' AND subject='ac6a-queue-backlog'"
              )
+  end
+
+  test "AC6a backlog skips substrate Main and reaches the engineering holder", ctx do
+    main =
+      session(ctx.db, Org.personal_session_key("scope-owner"), "scope-owner",
+        kind: "main",
+        archetype: "default"
+      )
+
+    holder =
+      engineering_session(ctx.db, "scoped-backlog-holder", "scope-owner", archetype: "coder")
+
+    load_ac6a_rules(ctx)
+
+    for index <- 1..20 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: holder.session_key,
+                 message_id: "scoped-backlog-#{index}",
+                 origin: "process:seed",
+                 prompt: "backlog without assignment context"
+               })
+    end
+
+    assert {:ok, [[recipient]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:ac6a-queue-backlog'"
+             )
+
+    assert recipient == holder.session_key
+    refute recipient == main.session_key
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed'"
+             )
+  end
+
+  test "AC6a backlog skips a substrate current opener and reaches the engineering holder", ctx do
+    main =
+      session(ctx.db, Org.personal_session_key("scope-owner"), "scope-owner",
+        kind: "main",
+        archetype: "default"
+      )
+
+    holder =
+      engineering_session(ctx.db, "scoped-opener-holder", "scope-owner", archetype: "coder")
+
+    opened = assignment(ctx, holder.session_key, {:session, main.session_key})
+    load_ac6a_rules(ctx)
+
+    for index <- 1..20 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: holder.session_key,
+                 assignment_id: opened.id,
+                 message_id: "scoped-opener-#{index}",
+                 origin: "process:seed",
+                 prompt: "backlog with an out-of-scope current opener"
+               })
+    end
+
+    assert {:ok, [[recipient, assignment_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,assignmentId FROM wakes WHERE origin='remedy:ac6a-queue-backlog'"
+             )
+
+    assert recipient == holder.session_key
+    assert assignment_id == opened.id
+    refute recipient == main.session_key
+  end
+
+  test "AC6a backlog without an eligible active recipient uses the existing unavailable result",
+       ctx do
+    session(ctx.db, Org.personal_session_key("scope-owner"), "scope-owner",
+      kind: "main",
+      archetype: "default"
+    )
+
+    holder = engineering_session(ctx.db, "unavailable-backlog-holder", "scope-owner")
+    [rule | _] = Enum.filter(load_ac6a_rules(ctx), &(&1.name == "ac6a-queue-backlog"))
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               holder.session_key
+             ])
+
+    assert {:ok, {:error, "queue_backlog_recipient_session"}} =
+             DB.transaction(ctx.db, fn txn ->
+               Rules.resolve_notice_in_txn(txn, rule, %{
+                 verb: "post",
+                 origin: "process:seed",
+                 edge: :row_commit,
+                 principal: {:process, "seed"},
+                 params: %{session_key: holder.session_key}
+               })
+             end)
   end
 
   test "ad hoc predicates validate ownership and make nil fail every operator", ctx do
@@ -4655,8 +5755,8 @@ defmodule Tightbeam.RulesTest do
   end
 
   defp ac6a_backlog_fixture(ctx, name) do
-    holder = session(ctx.db, "ac6a-#{name}", "flynn", archetype: "coder")
-    session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    holder = engineering_session(ctx.db, "ac6a-#{name}", "flynn", archetype: "coder")
+    engineering_session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
     opened = assignment(ctx, holder.session_key, {:user, "flynn"})
     attach_work_item(ctx, opened.id, "wi_ac6a_#{name}")
     load_ac6a_rules(ctx)
@@ -4728,7 +5828,8 @@ defmodule Tightbeam.RulesTest do
   end
 
   defp setup_work_item_coordinator(ctx, work_item_id) do
-    coordinator = session(ctx.db, "ac6a-work-item-coordinator", "flynn", archetype: "pdo")
+    coordinator =
+      engineering_session(ctx.db, "ac6a-work-item-coordinator", "flynn", archetype: "pdo")
 
     set_work_item_owner(ctx, work_item_id, coordinator.session_key)
     coordinator
@@ -4816,6 +5917,18 @@ defmodule Tightbeam.RulesTest do
     dir = Path.join(ctx.base_dir, "identity/rules")
     File.mkdir_p!(dir)
     path = Path.join(dir, filename)
+
+    # Rules in this module are substrate fixtures intended to apply across
+    # archetypes. Make that scope explicit when the fixture leaves it implicit.
+    contents =
+      if String.contains?(contents, "archetypes =") do
+        contents
+      else
+        contents
+        |> String.replace("[[rule]]", "[[rule]]\narchetypes = [\"*\"]")
+        |> String.replace("[[policy]]", "[[policy]]\narchetypes = [\"*\"]")
+      end
+
     File.write!(path, contents)
     path
   end
@@ -4847,6 +5960,13 @@ defmodule Tightbeam.RulesTest do
   defp toml(value) when is_binary(value), do: inspect(value)
   defp toml(value) when is_boolean(value) or is_integer(value), do: to_string(value)
   defp toml(value) when is_list(value), do: "[" <> Enum.map_join(value, ", ", &toml/1) <> "]"
+
+  # Shipped engineering rails require every participant, including recipients,
+  # to use a qualified archetype from their declared scope (R3, C2 and C6).
+  defp engineering_session(db, key, owner, opts \\ []) do
+    archetype = Keyword.get(opts, :archetype, "orchestrator")
+    session(db, key, owner, Keyword.put(opts, :archetype, "agentic-engineering." <> archetype))
+  end
 
   defp session(db, key, owner, opts \\ []) do
     Org.create(db, %{

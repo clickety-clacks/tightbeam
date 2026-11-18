@@ -44,15 +44,35 @@ defmodule Tightbeam.SubtreeGuidanceTest do
 
     Org.create(
       db,
-      base(%{session_key: "worker-a", kind: "custom", spawned_by: "coord", archetype: "coder"})
+      base(%{
+        session_key: "worker-a",
+        kind: "custom",
+        spawned_by: "coord",
+        archetype: "coder",
+        display_name: "Worker A"
+      })
     )
 
     Org.create(
       db,
-      base(%{session_key: "worker-b", kind: "custom", spawned_by: "coord", archetype: "reviewer"})
+      base(%{
+        session_key: "worker-b",
+        kind: "custom",
+        spawned_by: "coord",
+        archetype: "reviewer",
+        display_name: "Worker B"
+      })
     )
 
-    Org.create(db, base(%{session_key: "outsider", kind: "custom", spawned_by: @main}))
+    Org.create(
+      db,
+      base(%{
+        session_key: "outsider",
+        kind: "custom",
+        spawned_by: @main,
+        display_name: "Outsider"
+      })
+    )
 
     for key <- [@main, "coord", "worker-a", "worker-b", "outsider"] do
       Org.append_pointer(db, key, "harness-#{key}", "created")
@@ -145,7 +165,13 @@ defmodule Tightbeam.SubtreeGuidanceTest do
 
     Org.create(
       db,
-      base(%{session_key: "unstarted", kind: "custom", spawned_by: "coord", archetype: "coder"})
+      base(%{
+        session_key: "unstarted",
+        kind: "custom",
+        spawned_by: "coord",
+        archetype: "coder",
+        display_name: "Unstarted"
+      })
     )
 
     {:ok, result} = SubtreeGuidance.set(db, "coord", "style", nil, "Write plainly.")

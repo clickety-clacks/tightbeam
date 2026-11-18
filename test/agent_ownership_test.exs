@@ -53,7 +53,10 @@ defmodule Tightbeam.AgentOwnershipTest do
     end
 
     create(db, main, "one", %{kind: "main"})
-    assert_raise Tightbeam.DB.Error, fn -> create(db, main, "one", %{kind: "main"}) end
+
+    assert_raise Tightbeam.DB.Error, fn ->
+      create(db, main, "one", %{kind: "main", display_name: "Duplicate main attempt"})
+    end
   end
 
   defp create(db, key, owner, extra \\ %{}) do

@@ -67,6 +67,7 @@ defmodule Tightbeam.Rules do
 
   @persist_key __MODULE__
   @policy_key {__MODULE__, :policies}
+  @diagnostics_key {__MODULE__, :diagnostics}
   @snapshot_key {__MODULE__, :effective_snapshot}
   @call_snapshot_key {__MODULE__, :call_snapshot}
   @rule_keys MapSet.new([
@@ -81,10 +82,18 @@ defmodule Tightbeam.Rules do
                "notice",
                "remedy",
                "external_producer",
-               "recurrence_suppression"
+               "recurrence_suppression",
+               "archetypes"
              ])
   @condition_keys MapSet.new(["fact", "op", "value"])
-  @policy_keys MapSet.new(["name", "purpose", "when", "verification", "evidence_memento"])
+  @policy_keys MapSet.new([
+                 "name",
+                 "purpose",
+                 "when",
+                 "verification",
+                 "evidence_memento",
+                 "archetypes"
+               ])
   @verification_keys MapSet.new(["trigger", "terminal", "fallback"])
   @policy_purposes ~w(wait-effort-relief wait-verification-admission attest-file-effect-evidence attest-operational-evidence)
   @recurrence_keys MapSet.new([
@@ -115,6 +124,7 @@ defmodule Tightbeam.Rules do
                ])
   @binding_tokens ~w(
     assignment_id
+    decision_request_id
     work_item_id
     holder_key
     holder_role
@@ -159,6 +169,7 @@ defmodule Tightbeam.Rules do
     "target.state" => :string,
     "target.delivery_responsibility" => :string,
     "spawn.archetype" => :string,
+    "spawn.itemless_ephemeral_caller_qualified" => :bool,
     "org.live_sessions_owned_by_caller" => :int,
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
@@ -203,10 +214,12 @@ defmodule Tightbeam.Rules do
     "assign.declared_files_overlap_open" => :bool,
     "assign.delegates_delivery" => :bool,
     "decision_request.status" => :string,
+    "decision_request.addressed_principal" => :string,
     "artifact.present" => :bool,
     "artifact.content_sha256" => :string,
     "review.qualifying_verdict_kinds" => {:list, :string},
     "condition_fact.matches" => :bool,
+    "condition_fact.kind" => :string,
     "wait.obligation_matches" => :bool,
     "wait.admitted" => :bool,
     "wait.after_turn_eligible" => :bool,
@@ -326,9 +339,17 @@ defmodule Tightbeam.Rules do
   @doc false
   def work_item_review_verdict_count_sql, do: @work_item_review_verdict_count_sql
   @artifact_facts ~w(artifact.present artifact.content_sha256 review.qualifying_verdict_kinds)
+  @archetype_facts MapSet.new([
+                     "spawn.archetype",
+                     "target.archetype",
+                     "assignment.holder_archetype"
+                   ])
   @type condition :: %{fact: String.t(), op: String.t(), value: term()}
   @type rule :: %{
           name: String.t(),
+          short_name: String.t(),
+          owner: Tightbeam.Identity.Provenance.owner(),
+          archetypes: [String.t()],
           verb: String.t(),
           text: String.t(),
           conditions: [condition()],
@@ -350,11 +371,11 @@ defmodule Tightbeam.Rules do
     declarations = Tightbeam.Mementos.read_declarations!(law_base, identity_manifest_sha)
 
     :persistent_term.put({__MODULE__, :unavailable_verbs}, %{})
+    :persistent_term.put(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
 
     entries =
       law_base
-      |> Path.join("identity/rules/*.toml")
-      |> Path.wildcard()
+      |> rule_paths()
       |> Enum.sort()
       |> Enum.flat_map(fn path ->
         try do
@@ -401,6 +422,15 @@ defmodule Tightbeam.Rules do
               Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
             )
 
+            Enum.each(affected, fn verb ->
+              record_unavailable_verb(%{
+                verb: verb,
+                file: diagnostic_file(path, law_base),
+                name: "<file>",
+                reason: Exception.message(error)
+              })
+            end)
+
             []
         end
       end)
@@ -410,7 +440,7 @@ defmodule Tightbeam.Rules do
           # after loading, so pin executable checks as well as their declarations.
           check =
             if revision && rule.check do
-              path = Path.join([law_base, "identity", "rails", "scripts", rule.check.script])
+              path = Path.join([law_base, "identity", rule.check.identity_path])
               Map.put(rule.check, :published_bytes, File.read!(path))
             else
               rule.check
@@ -445,6 +475,14 @@ defmodule Tightbeam.Rules do
         if duplicates[rule.name] > 1 do
           require Logger
           Logger.warning("rule #{rule.name} unavailable: duplicate name in #{rule.source}")
+
+          record_unavailable_verb(%{
+            verb: rule.verb,
+            file: diagnostic_file(rule.source, law_base),
+            name: rule.name,
+            reason: "duplicate name"
+          })
+
           unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
 
           :persistent_term.put(
@@ -468,6 +506,15 @@ defmodule Tightbeam.Rules do
             Enum.reduce(verbs, unavailable, &Map.put(&2, &1, policy.source))
           )
 
+          Enum.each(verbs, fn verb ->
+            record_unavailable_verb(%{
+              verb: verb,
+              file: diagnostic_file(policy.source, law_base),
+              name: policy.name,
+              reason: "duplicate policy name"
+            })
+          end)
+
           true
         else
           false
@@ -488,6 +535,14 @@ defmodule Tightbeam.Rules do
           error ->
             require Logger
             Logger.warning("rule #{rule.name} unavailable: #{Exception.message(error)}")
+
+            record_unavailable_verb(%{
+              verb: rule.verb,
+              file: diagnostic_file(rule.source, law_base),
+              name: rule.name,
+              reason: Exception.message(error)
+            })
+
             unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
 
             :persistent_term.put(
@@ -523,6 +578,26 @@ defmodule Tightbeam.Rules do
     })
 
     rules
+  end
+
+  @doc "Return the rule availability diagnostics from the most recent load."
+  def status do
+    diagnostics =
+      :persistent_term.get(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
+
+    unavailable =
+      diagnostics.unavailable_verbs
+      |> Enum.sort_by(&{&1.verb, &1.file, &1.name || ""})
+
+    skipped =
+      diagnostics.skipped_policies
+      |> Enum.sort_by(&{&1.file, &1.name})
+
+    %{
+      recording_available: unavailable == [],
+      unavailable_verbs: unavailable,
+      skipped_policies: skipped
+    }
   end
 
   @doc false
@@ -620,6 +695,7 @@ defmodule Tightbeam.Rules do
     with_snapshot(fn ->
       effective_snapshot().policies
       |> Enum.filter(&(&1.purpose == purpose))
+      |> Enum.filter(&policy_scope_matches?(&1, db, call))
       |> Enum.sort_by(& &1.name)
       |> Enum.find_value(:none, fn policy ->
         case evaluate_conditions(policy.conditions, policy, db, call, %{}) do
@@ -641,6 +717,13 @@ defmodule Tightbeam.Rules do
   def select_policy_in_txn(%DB.Txn{} = txn, purpose, context) do
     effective_snapshot().policies
     |> Enum.filter(&(&1.purpose == purpose))
+    |> Enum.filter(
+      &policy_scope_matches?(&1, txn, %{
+        origin: "process:tightbeam",
+        params: %{},
+        policy_context: context
+      })
+    )
     |> Enum.sort_by(& &1.name)
     |> Enum.find_value(:none, fn policy ->
       call = %{origin: "process:tightbeam", params: %{}, policy_context: context}
@@ -679,9 +762,9 @@ defmodule Tightbeam.Rules do
 
     case Map.get(:persistent_term.get({__MODULE__, :unavailable_verbs}, %{}), verb) do
       nil ->
-        rules
-        |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
-        |> decide_rules(db, call, %{}, [], [])
+        candidate_rules = Enum.filter(rules, &(&1.verb == verb and edge in &1.edges))
+
+        decide_rules(candidate_rules, db, call, %{}, [], [])
 
       source ->
         {{:deny,
@@ -1073,7 +1156,8 @@ defmodule Tightbeam.Rules do
 
     :persistent_term.get(@persist_key, [])
     |> Enum.filter(fn rule ->
-      verb in rule.verbs and "row-commit" in rule.edges and rule.effect == "notice" and
+      verb in rule.verbs and "row-commit" in rule.edges and
+        rule.effect in ["notice", "remedy"] and
         row_domain_candidate?(rule, domain)
     end)
     |> Enum.flat_map(fn rule ->
@@ -1093,7 +1177,15 @@ defmodule Tightbeam.Rules do
 
             case evaluate_conditions(rule.conditions, rule, txn, candidate_call, %{}) do
               {:match, cache} ->
-                {:halt, [{:notice, rule, candidate_call, evidence_facts(rule.conditions, cache)}]}
+                if effect_scope_matches?(rule, rule.effect, txn, candidate_call) do
+                  {:halt,
+                   [
+                     {String.to_atom(rule.effect), rule, candidate_call,
+                      evidence_facts(rule.conditions, cache)}
+                   ]}
+                else
+                  {:cont, []}
+                end
 
               {:no_match, _cache} ->
                 {:cont, []}
@@ -1177,9 +1269,10 @@ defmodule Tightbeam.Rules do
       end
 
     queue_backlog_recipient_session =
-      if rule.name == "ac6a-queue-backlog" do
-        active_assignment_opener_session || work_item_coordinator_session ||
-          queue_owner_or_holder_session(db, Map.get(call.params, :session_key))
+      if rule.name in ["ac6a-queue-backlog", "agentic-engineering.ac6a-queue-backlog"] do
+        eligible_notice_session(db, rule, active_assignment_opener_session) ||
+          eligible_notice_session(db, rule, work_item_coordinator_session) ||
+          queue_owner_or_holder_session(db, Map.get(call.params, :session_key), rule)
       end
 
     delivery_owner_ref =
@@ -1190,6 +1283,7 @@ defmodule Tightbeam.Rules do
 
     %{
       assignment_id: assignment && assignment.id,
+      decision_request_id: Map.get(call.params, :decision_request_id),
       work_item_id: work_item_id,
       holder_key: assignment && assignment.holder_key,
       holder_role: assignment && assignment[:holder_role],
@@ -1285,7 +1379,8 @@ defmodule Tightbeam.Rules do
 
   defp active_notice_session(_db, _session_key), do: nil
 
-  defp queue_owner_or_holder_session(db, holder_session_key) when is_binary(holder_session_key) do
+  defp queue_owner_or_holder_session(db, holder_session_key, rule)
+       when is_binary(holder_session_key) do
     owner_main =
       case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [
              holder_session_key
@@ -1297,10 +1392,21 @@ defmodule Tightbeam.Rules do
           nil
       end
 
-    owner_main || active_notice_session(db, holder_session_key)
+    eligible_notice_session(db, rule, owner_main) ||
+      eligible_notice_session(db, rule, holder_session_key)
   end
 
-  defp queue_owner_or_holder_session(_db, _holder_session_key), do: nil
+  defp queue_owner_or_holder_session(_db, _holder_session_key, _rule), do: nil
+
+  defp eligible_notice_session(db, rule, key) do
+    with key when is_binary(key) <- active_notice_session(db, key),
+         true <-
+           Tightbeam.RailScope.matches_agents?(rule.archetypes, [session_archetype(db, key)]) do
+      key
+    else
+      _ -> nil
+    end
+  end
 
   defp caller_session_key(db, %{edge: :row_commit, params: params}) do
     caller_session_from_origin(db, Map.get(params, :caller_origin))
@@ -1394,8 +1500,353 @@ defmodule Tightbeam.Rules do
 
   defp field(map, key), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
 
+  defp rule_paths(base_dir) do
+    root = Path.join(base_dir, "identity")
+
+    (Path.wildcard(Path.join([root, "rules", "*.toml"])) ++
+       Path.wildcard(Path.join([root, "kungfu", "*", "rules", "*.toml"])))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp owned_archetypes(_base_dir, :substrate), do: MapSet.new()
+
+  defp owned_archetypes(base_dir, {:kungfu, name}) do
+    base_dir
+    |> Tightbeam.Identity.Provenance.archetype_names(name)
+    |> Enum.map(&Tightbeam.Identity.Provenance.qualify({:kungfu, name}, &1))
+    |> MapSet.new()
+  end
+
+  defp validate_archetypes!(entry, owner, owned_archetypes, fail) do
+    names = Map.get(entry, "archetypes", [])
+
+    unless is_list(names) and Enum.all?(names, &is_binary/1),
+      do: fail.("archetypes must be a list of strings")
+
+    if Enum.uniq(names) != names,
+      do: fail.("archetypes must not contain duplicates")
+
+    if "*" in names and names != ["*"],
+      do: fail.(~s(archetypes "*" must be the only entry))
+
+    case owner do
+      :substrate ->
+        names
+
+      {:kungfu, name} ->
+        foreign = Enum.reject(names, &MapSet.member?(owned_archetypes, &1))
+
+        if foreign != [] do
+          allowed = owned_archetypes |> MapSet.to_list() |> Enum.sort()
+
+          fail.(
+            "kungfu rail archetypes contain #{Enum.map_join(foreign, ", ", &inspect/1)}; " <>
+              "kungfu #{name} may name only its own archetypes; allowed names: " <>
+              Enum.join(allowed, ", ")
+          )
+        end
+
+        names
+    end
+  end
+
+  defp validate_kungfu_condition_names!(_conditions, :substrate, _owned_archetypes, _fail),
+    do: :ok
+
+  defp validate_kungfu_condition_names!(conditions, {:kungfu, name}, owned_archetypes, fail) do
+    Enum.each(conditions, fn %{fact: fact, op: op, value: value} ->
+      if MapSet.member?(@archetype_facts, fact) do
+        values = if op in ["in", "not_in"], do: value, else: [value]
+        foreign = Enum.reject(values, &MapSet.member?(owned_archetypes, &1))
+
+        if foreign != [] do
+          allowed = owned_archetypes |> MapSet.to_list() |> Enum.sort()
+
+          fail.(
+            "kungfu #{name} archetype comparison #{fact} #{op} #{inspect(value)} names " <>
+              "foreign archetype(s) #{Enum.map_join(foreign, ", ", &inspect/1)}; " <>
+              "allowed names: #{Enum.join(allowed, ", ")}"
+          )
+        end
+      end
+    end)
+  end
+
+  defp policy_scope_matches?(rail, db, call) do
+    case participant_archetypes(db, call) do
+      [_ | _] = participants ->
+        Tightbeam.RailScope.matches_agents?(rail.archetypes, participants)
+
+      [] ->
+        if rail.owner == :substrate,
+          do: true,
+          else: zero_agent_belongs?(rail, db, call)
+    end
+  rescue
+    _ -> false
+  end
+
+  defp participant_archetypes(db, call) do
+    principal_keys =
+      case Map.get(call, :principal) do
+        {:session, key} when is_binary(key) -> [key]
+        _ -> []
+      end
+
+    params = Map.get(call, :params, %{}) || %{}
+
+    explicit_keys =
+      [
+        :session_key,
+        :holder_key,
+        :parent_session_key,
+        :new_parent_session_key,
+        :delivery_owner_session_key,
+        :target_session
+      ]
+      |> Enum.flat_map(fn key ->
+        case Map.get(params, key) || Map.get(params, Atom.to_string(key)) do
+          value when is_binary(value) and value != "" -> [value]
+          _ -> []
+        end
+      end)
+
+    target_keys =
+      case Map.get(call, :session_key) do
+        key when is_binary(key) and key != "" -> [key]
+        _ -> []
+      end
+
+    assignment_keys =
+      if Map.get(call, :verb) == "assign" do
+        []
+      else
+        assignment_id = Map.get(params, :assignment_id) || Map.get(params, "assignment_id")
+
+        case assignment_holder(db, assignment_id) do
+          key when is_binary(key) -> [key]
+          _ -> []
+        end
+      end
+
+    session_archetypes =
+      (principal_keys ++ explicit_keys ++ target_keys ++ assignment_keys)
+      |> Enum.uniq()
+      |> Enum.map(&session_archetype(db, &1))
+
+    spawn_archetypes =
+      if Map.get(call, :verb) == "spawn" do
+        [spawn_archetype(db, params)]
+      else
+        []
+      end
+
+    session_archetypes ++ spawn_archetypes
+  end
+
+  defp session_archetype(db, key) do
+    session =
+      case db do
+        %DB.Txn{} = txn -> Org.get_in_txn(txn, key)
+        _ -> Org.get(db, key)
+      end
+
+    if session, do: session.archetype, else: nil
+  end
+
+  defp assignment_holder(_db, id) when not is_binary(id), do: nil
+
+  defp assignment_holder(db, id) do
+    case DB.query(db, "SELECT holderKey FROM assignments WHERE id=?1", [id]) do
+      {:ok, [[key]]} -> key
+      _ -> nil
+    end
+  end
+
+  defp spawn_archetype(db, params) do
+    raw =
+      Map.get(params, :archetype) || Map.get(params, "archetype") ||
+        Org.get_setting(db, "default-archetype") || "default"
+
+    case Tightbeam.Archetypes.resolve(raw) do
+      {:ok, archetype} -> archetype.name
+      {:error, %{code: "qualified_archetype_required"}} -> nil
+      {:error, _} -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp effect_scope_matches?(rail, effect, db, call) do
+    case effect_scope_result(rail, effect, db, call) do
+      {:ok, matches?} -> matches?
+      {:error, _reason} -> false
+    end
+  end
+
+  defp effect_scope_result(rail, effect, db, call) do
+    base = participant_archetypes(db, call)
+    recipients = effect_recipient_archetypes(rail, effect, db, call)
+    participants = base ++ recipients
+
+    matches? =
+      cond do
+        participants != [] ->
+          Tightbeam.RailScope.matches_agents?(rail.archetypes, participants)
+
+        rail.owner == :substrate ->
+          true
+
+        true ->
+          zero_agent_belongs?(rail, db, call)
+      end
+
+    {:ok, matches?}
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp effect_recipient_archetypes(rail, "notice", db, call) do
+    case RailRemedy.resolve_notice(db, rail.notice, notice_bindings(db, call, rail)) do
+      {:ok, %{bound_session: key}} when is_binary(key) -> [session_archetype(db, key)]
+      _ -> []
+    end
+  end
+
+  defp effect_recipient_archetypes(%{remedy: remedy} = rail, "remedy", db, call)
+       when is_map(remedy) do
+    bindings = notice_bindings(db, call, rail)
+    target = Map.get(remedy, :target, %{})
+
+    case remedy.action do
+      "spawn" ->
+        value = interpolate_scope_value(target[:archetype], bindings)
+        [spawn_archetype(db, %{archetype: value})]
+
+      action when action in ["wake", "assign"] ->
+        case remedy_target_session(db, remedy, bindings, action) do
+          key when is_binary(key) -> [session_archetype(db, key)]
+          _ -> []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp effect_recipient_archetypes(_rail, _effect, _db, _call), do: []
+
+  defp remedy_target_session(db, remedy, bindings, action) do
+    target = Map.get(remedy, :target, %{})
+
+    cond do
+      is_binary(target[:target_session]) ->
+        interpolate_scope_value(target.target_session, bindings)
+
+      is_binary(target[:target_role]) ->
+        role = interpolate_scope_value(target.target_role, bindings)
+
+        case Roles.resolve(db, role) do
+          {:ok, key, _fallback?} -> key
+          _ -> nil
+        end
+
+      action == "spawn" ->
+        nil
+
+      true ->
+        nil
+    end
+  end
+
+  defp interpolate_scope_value(value, bindings) when is_binary(value) do
+    Regex.replace(~r/\{([^{}]+)\}/, value, fn _match, token ->
+      case Map.get(bindings, String.to_existing_atom(token)) do
+        nil -> ""
+        value when is_binary(value) -> value
+        value -> to_string(value)
+      end
+    end)
+  rescue
+    _ -> nil
+  end
+
+  defp interpolate_scope_value(value, _bindings), do: value
+
+  defp zero_agent_belongs?(%{owner: {:kungfu, name}, base_dir: base_dir}, db, call) do
+    groups = interaction_record_session_groups(db, call)
+
+    own_archetypes = owned_archetypes(base_dir, {:kungfu, name})
+
+    groups != [] and
+      Enum.all?(groups, fn sessions ->
+        sessions != [] and
+          Enum.all?(sessions, fn key ->
+            case session_archetype(db, key) do
+              archetype when is_binary(archetype) -> MapSet.member?(own_archetypes, archetype)
+              _ -> false
+            end
+          end)
+      end)
+  end
+
+  defp zero_agent_belongs?(_rail, _db, _call), do: false
+
+  defp interaction_record_session_groups(db, %{edge: :row_commit, transition: transition})
+       when is_map(transition) do
+    domain = Map.get(transition, :domain) || Map.get(transition, "domain")
+    row_id = Map.get(transition, :row_id) || Map.get(transition, "row_id")
+    record_session_groups(db, domain, row_id)
+  end
+
+  defp interaction_record_session_groups(db, call) do
+    params = Map.get(call, :params, %{}) || %{}
+    verb = Map.get(call, :verb)
+
+    case {verb, Map.get(params, :work_item_id) || Map.get(params, "work_item_id")} do
+      {verb, id}
+      when verb in ~w(work-item-update work-item-handoff work-item-icebox work-item-reopen work-item-close work-item-fail) and
+             is_binary(id) ->
+        record_session_groups(db, "work_item", id)
+
+      _ ->
+        []
+    end
+  end
+
+  defp record_session_groups(_db, _domain, nil), do: []
+
+  defp record_session_groups(db, domain, id) when is_binary(id) do
+    {table, key, fields} =
+      case domain do
+        "work_item" -> {"work_items", "id", ["createdBySession", "deliveryOwnerSessionKey"]}
+        "assignment" -> {"assignments", "id", ["openedBySession", "holderKey"]}
+        "attest" -> {"attests", "id", ["bySession"]}
+        "decision_request" -> {"decision_requests", "id", ["raiserSessionKey"]}
+        "artifact" -> {"artifacts", "artifactId", ["createdBySession"]}
+        "wake" -> {"wakes", "wakeId", ["creatorSessionKey"]}
+        "turn" -> {"turns", "seq", ["sessionKey"]}
+        _ -> {nil, nil, []}
+      end
+
+    if table do
+      case DB.query(db, "SELECT #{Enum.join(fields, ",")} FROM #{table} WHERE #{key}=?1", [id]) do
+        {:ok, [row]} -> [row |> Enum.filter(&is_binary/1) |> Enum.uniq()]
+        _ -> []
+      end
+    else
+      []
+    end
+  end
+
   defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
     contents = File.read!(path)
+    relative = Path.relative_to(path, Path.join(base_dir, "identity"))
+    owner = Tightbeam.Identity.Provenance.owner_for_path(base_dir, relative)
+    owned_archetypes = owned_archetypes(base_dir, owner)
 
     if String.trim(contents) == "" do
       raise ArgumentError, "#{path}: empty TOML"
@@ -1420,7 +1871,16 @@ defmodule Tightbeam.Rules do
           |> Enum.map(fn {rule, ordinal} ->
             try do
               {:rule,
-               validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)}
+               validate_rule!(
+                 path,
+                 ordinal,
+                 rule,
+                 valid_verbs,
+                 base_dir,
+                 identity_manifest_sha,
+                 owner,
+                 owned_archetypes
+               )}
             rescue
               error ->
                 require Logger
@@ -1437,6 +1897,15 @@ defmodule Tightbeam.Rules do
                   {__MODULE__, :unavailable_verbs},
                   Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
                 )
+
+                Enum.each(affected, fn affected_verb ->
+                  record_unavailable_verb(%{
+                    verb: affected_verb,
+                    file: diagnostic_file(path, base_dir),
+                    name: if(is_map(rule), do: Map.get(rule, "name"), else: "##{ordinal}"),
+                    reason: Exception.message(error)
+                  })
+                end)
 
                 {:unavailable, path}
             end
@@ -1460,8 +1929,11 @@ defmodule Tightbeam.Rules do
             if retired_policy?(policy) do
               require Logger
 
-              Logger.warning(
-                "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose #{Map.get(policy, "purpose")} is retired"
+              record_skipped_policy(
+                path,
+                base_dir,
+                Map.get(policy, "name"),
+                "skipped: purpose #{Map.get(policy, "purpose")} is retired"
               )
 
               []
@@ -1469,13 +1941,27 @@ defmodule Tightbeam.Rules do
               if unsupported_policy_purpose?(policy) do
                 require Logger
 
-                Logger.warning(
-                  "#{path}: policy #{inspect(Map.get(policy, "name"))}: unsupported purpose: #{inspect(Map.get(policy, "purpose"))}"
+                record_skipped_policy(
+                  path,
+                  base_dir,
+                  Map.get(policy, "name"),
+                  "unsupported purpose: #{inspect(Map.get(policy, "purpose"))}"
                 )
 
                 []
               else
-                [{:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}]
+                [
+                  {:policy,
+                   validate_policy!(
+                     path,
+                     ordinal,
+                     policy,
+                     base_dir,
+                     identity_manifest_sha,
+                     owner,
+                     owned_archetypes
+                   )}
+                ]
               end
             end
           end)
@@ -1518,7 +2004,49 @@ defmodule Tightbeam.Rules do
 
   defp unsupported_policy_purpose?(_policy), do: false
 
-  defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
+  defp record_skipped_policy(path, base_dir, name, reason) do
+    file = diagnostic_file(path, base_dir)
+    separator = if String.starts_with?(reason, "skipped:"), do: " ", else: ": "
+    warning = "#{file}: policy #{inspect(name)}#{separator}#{reason}"
+    require Logger
+    Logger.warning("#{path}: policy #{inspect(name)}#{separator}#{reason}")
+    item = %{file: file, name: name, reason: reason, message: warning}
+
+    update_diagnostics(fn diagnostics ->
+      %{diagnostics | skipped_policies: [item | diagnostics.skipped_policies]}
+    end)
+  end
+
+  defp record_unavailable_verb(diagnostic) do
+    update_diagnostics(fn diagnostics ->
+      update_in(diagnostics.unavailable_verbs, &[diagnostic | &1])
+    end)
+  end
+
+  defp update_diagnostics(fun) do
+    current =
+      :persistent_term.get(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
+
+    :persistent_term.put(@diagnostics_key, fun.(current))
+  end
+
+  defp diagnostic_file(path, law_base) do
+    identity_root = Path.expand(Path.join(law_base, "identity"))
+    relative = Path.relative_to(Path.expand(path), identity_root)
+
+    if String.starts_with?(relative, "../"), do: Path.basename(path), else: relative
+  end
+
+  defp validate_policy!(
+         path,
+         ordinal,
+         policy,
+         base_dir,
+         identity_manifest_sha,
+         owner,
+         owned_archetypes
+       )
+       when is_map(policy) do
     raw_name = Map.get(policy, "name")
 
     label =
@@ -1534,6 +2062,8 @@ defmodule Tightbeam.Rules do
     unless purpose in @policy_purposes, do: fail.("unsupported purpose: #{inspect(purpose)}")
 
     conditions = validate_policy_conditions!(Map.get(policy, "when"), fail)
+    archetypes = validate_archetypes!(policy, owner, owned_archetypes, fail)
+    validate_kungfu_condition_names!(conditions, owner, owned_archetypes, fail)
     verification = validate_policy_verification!(purpose, Map.get(policy, "verification"), fail)
     evidence_memento = Map.get(policy, "evidence_memento")
 
@@ -1562,18 +2092,30 @@ defmodule Tightbeam.Rules do
     end
 
     %{
-      name: raw_name,
+      name: Tightbeam.Identity.Provenance.qualify(owner, raw_name),
+      short_name: raw_name,
+      owner: owner,
+      archetypes: archetypes,
       purpose: purpose,
       conditions: conditions,
       verification: verification,
       evidence_memento: evidence_memento,
       source: path,
+      base_dir: base_dir,
       identity_manifest_sha: identity_manifest_sha
     }
   end
 
-  defp validate_policy!(path, ordinal, _policy, _identity_manifest_sha),
-    do: raise(ArgumentError, "#{path}: policy ##{ordinal}: policy must be a table")
+  defp validate_policy!(
+         path,
+         ordinal,
+         _policy,
+         _base_dir,
+         _identity_manifest_sha,
+         _owner,
+         _owned_archetypes
+       ),
+       do: raise(ArgumentError, "#{path}: policy ##{ordinal}: policy must be a table")
 
   defp validate_policy_conditions!(conditions, fail) do
     unless is_list(conditions) and conditions != [] and Enum.all?(conditions, &is_map/1),
@@ -1612,7 +2154,16 @@ defmodule Tightbeam.Rules do
   defp validate_policy_verification!(_purpose, _verification, fail),
     do: fail.("verification is valid only for wait-verification-admission")
 
-  defp validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)
+  defp validate_rule!(
+         path,
+         ordinal,
+         rule,
+         valid_verbs,
+         base_dir,
+         identity_manifest_sha,
+         owner,
+         owned_archetypes
+       )
        when is_map(rule) do
     raw_name = Map.get(rule, "name")
     label = if valid_name?(raw_name), do: "rule #{inspect(raw_name)}", else: "rule ##{ordinal}"
@@ -1631,7 +2182,9 @@ defmodule Tightbeam.Rules do
     validate_tokens!(text, fail)
 
     conditions = validate_conditions!(Map.get(rule, "deny_when"), fail)
-    check = validate_check!(Map.get(rule, "check"), base_dir, fail)
+    archetypes = validate_archetypes!(rule, owner, owned_archetypes, fail)
+    validate_kungfu_condition_names!(conditions, owner, owned_archetypes, fail)
+    check = validate_check!(Map.get(rule, "check"), base_dir, owner, fail)
 
     if conditions == [] and is_nil(check),
       do: fail.("must carry at least one of deny_when or [rule.check]")
@@ -1642,12 +2195,29 @@ defmodule Tightbeam.Rules do
     effect =
       validate_effect!(Map.get(rule, "effect", "deny"), check, Map.has_key?(rule, "effect"), fail)
 
-    if "row-commit" in edges and effect != "notice",
-      do: fail.(~s(edge "row-commit" requires effect = "notice"))
+    filing_remedy? =
+      effect == "remedy" and edges == ["row-commit"] and verb == "condition" and
+        Enum.any?(conditions, fn condition ->
+          condition.fact == "condition_fact.kind" and condition.op == "eq" and
+            condition.value == "decision-request-filed"
+        end)
+
+    if "row-commit" in edges and effect != "notice" and not filing_remedy?,
+      do: fail.(~s(edge "row-commit" requires effect = "notice" or a filing-gated remedy))
 
     effects = if check, do: Map.values(check.effects), else: [effect]
     notice = validate_notice!(Map.get(rule, "notice"), effect, fail)
-    remedy = validate_remedy!(Map.get(rule, "remedy"), conditions, check, effects, fail, raw_name)
+
+    remedy =
+      validate_remedy!(
+        Map.get(rule, "remedy"),
+        conditions,
+        check,
+        effects,
+        fail,
+        raw_name,
+        filing_remedy?
+      )
 
     recurrence_suppression =
       validate_recurrence_suppression!(Map.get(rule, "recurrence_suppression"), fail)
@@ -1668,7 +2238,10 @@ defmodule Tightbeam.Rules do
       do: fail.("external_producer is valid only on a verdict-fact gate")
 
     %{
-      name: raw_name,
+      name: Tightbeam.Identity.Provenance.qualify(owner, raw_name),
+      short_name: raw_name,
+      owner: owner,
+      archetypes: archetypes,
       verb: verb,
       verbs: verbs,
       text: String.trim(text),
@@ -1686,7 +2259,16 @@ defmodule Tightbeam.Rules do
     }
   end
 
-  defp validate_rule!(path, ordinal, _rule, _valid_verbs, _base_dir, _identity_manifest_sha) do
+  defp validate_rule!(
+         path,
+         ordinal,
+         _rule,
+         _valid_verbs,
+         _base_dir,
+         _identity_manifest_sha,
+         _owner,
+         _owned_archetypes
+       ) do
     raise ArgumentError, "#{path}: rule ##{ordinal}: rule must be a table"
   end
 
@@ -1877,16 +2459,30 @@ defmodule Tightbeam.Rules do
   defp validate_notice!(_notice, _effect, fail),
     do: fail.(~s([rule.notice] requires effect = "notice"))
 
-  defp validate_check!(nil, _base_dir, _fail), do: nil
+  defp check_identity_path(_base_dir, :substrate, script, _fail),
+    do: Path.join(["rails", "scripts", script])
 
-  defp validate_check!(check, base_dir, fail) when is_map(check) do
+  defp check_identity_path(base_dir, {:kungfu, name} = owner, script, fail) do
+    # A learned check travels with its bundle. Legacy receipts may still name
+    # the flat path; both loading and execution use the selected identity path.
+    candidates = ["kungfu/#{name}/rails/scripts/#{script}", "rails/scripts/#{script}"]
+
+    Enum.find(candidates, fn relative ->
+      Tightbeam.Identity.Provenance.owner_for_path(base_dir, relative) == owner
+    end) || fail.("check script #{script} is not supplied by kungfu #{name}")
+  end
+
+  defp validate_check!(nil, _base_dir, _owner, _fail), do: nil
+
+  defp validate_check!(check, base_dir, owner, fail) when is_map(check) do
     unknown = unknown_keys(check, @check_keys)
     if unknown != [], do: fail.("check has unknown keys: #{Enum.join(unknown, ", ")}")
 
     script = Map.get(check, "script")
     unless valid_name?(script), do: fail.("check script has an invalid or missing name")
 
-    path = Path.join([base_dir, "identity", "rails", "scripts", script])
+    identity_path = check_identity_path(base_dir, owner, script, fail)
+    path = Path.join([base_dir, "identity", identity_path])
 
     case File.stat(path) do
       {:ok, %File.Stat{type: :regular, mode: mode}} when (mode &&& 0o111) != 0 -> :ok
@@ -1914,14 +2510,21 @@ defmodule Tightbeam.Rules do
     unless Enum.all?(effects, fn {_token, effect} -> effect in ~w(allow deny remedy escalate) end),
            do: fail.("check effects must be one of allow, deny, remedy, escalate")
 
-    %{script: script, returns: returns, timeout_ms: timeout_ms, effects: effects}
+    %{
+      script: script,
+      identity_path: identity_path,
+      returns: returns,
+      timeout_ms: timeout_ms,
+      effects: effects
+    }
   end
 
-  defp validate_check!(_check, _base_dir, fail), do: fail.("check must be a table")
+  defp validate_check!(_check, _base_dir, _owner, fail), do: fail.("check must be a table")
 
-  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _name), do: nil
+  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _name, _filing?), do: nil
 
-  defp validate_remedy!(remedy, conditions, check, effects, fail, name) when is_map(remedy) do
+  defp validate_remedy!(remedy, conditions, check, effects, fail, name, filing?)
+       when is_map(remedy) do
     unknown = unknown_keys(remedy, @remedy_keys)
     if unknown != [], do: fail.("remedy has unknown keys: #{Enum.join(unknown, ", ")}")
 
@@ -1999,7 +2602,8 @@ defmodule Tightbeam.Rules do
       check && not is_nil(produces) ->
         fail.("script-effect remedy must omit produces")
 
-      is_nil(check) and requirements == [] and artifact_requirements(conditions) == [] ->
+      is_nil(check) and requirements == [] and artifact_requirements(conditions) == [] and
+          not filing? ->
         fail.("predicate remedy requires a verdict-fact or artifact-fact gate")
 
       is_nil(check) and requirements == [] and not is_nil(produces) ->
@@ -2040,7 +2644,7 @@ defmodule Tightbeam.Rules do
     }
   end
 
-  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _name),
+  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _name, _filing?),
     do: fail.("remedy must be a table")
 
   defp validate_interpolation!(field, value, fail) when field in @embedded_fields do
@@ -2283,21 +2887,53 @@ defmodule Tightbeam.Rules do
   defp decide_rules([rule | rest], db, call, cache, to_close, to_consume) do
     case evaluate_conditions(rule.conditions, rule, db, call, cache) do
       {:no_match, cache} ->
-        decide_rules(rest, db, call, cache, maybe_close(rule, db, call, to_close), to_consume)
+        # Recovery is also a rail effect: an out-of-scope rule cannot close an episode.
+        to_close =
+          if rule.remedy && effect_scope_matches?(rule, rule.effect, db, call),
+            do: maybe_close(rule, db, call, to_close),
+            else: to_close
+
+        decide_rules(rest, db, call, cache, to_close, to_consume)
 
       {:error, fact} ->
-        error =
-          denial_error(rule, call, "rule_denied", nil)
-          |> Map.merge(%{
-            code: "rule_error",
-            fact: fact,
-            message: "#{rule.name}: failed to compute #{fact}"
-          })
+        # A demanded fact failure remains a failure, unless scope proves this
+        # rule cannot affect the interaction. Preserve the fact diagnostic if
+        # the same unavailable database also prevents resolving scope.
+        case effect_scope_result(rule, rule.effect, db, call) do
+          {:ok, false} ->
+            decide_rules(rest, db, call, cache, to_close, to_consume)
 
-        {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+          _ ->
+            error =
+              denial_error(rule, call, "rule_denied", nil)
+              |> Map.merge(%{
+                code: "rule_error",
+                fact: fact,
+                message: "#{rule.name}: failed to compute #{fact}"
+              })
+
+            {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+        end
 
       {:match, cache} ->
-        evaluate_reached_rule(rule, rest, db, call, cache, to_close, to_consume)
+        case effect_scope_result(rule, rule.effect, db, call) do
+          {:ok, true} ->
+            evaluate_reached_rule(rule, rest, db, call, cache, to_close, to_consume)
+
+          {:ok, false} ->
+            decide_rules(rest, db, call, cache, to_close, to_consume)
+
+          {:error, _reason} ->
+            error =
+              denial_error(rule, call, "scope_unavailable", nil)
+              |> Map.merge(%{
+                code: "rule_error",
+                fact: "rail.scope",
+                message: "#{rule.name}: failed to resolve rail scope"
+              })
+
+            {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
+        end
     end
   end
 
@@ -2365,18 +3001,42 @@ defmodule Tightbeam.Rules do
     end
   end
 
-  defp fold_effect("allow", rule, rest, db, call, cache, to_close, to_consume, _exit_class),
-    do:
-      decide_rules(
-        rest,
-        db,
-        call,
-        cache,
-        maybe_close(rule, db, call, to_close),
-        to_consume
-      )
+  defp fold_effect(effect, rule, rest, db, call, cache, to_close, to_consume, exit_class) do
+    fold_effect_matched(effect, rule, rest, db, call, cache, to_close, to_consume, exit_class)
+  end
 
-  defp fold_effect("notice", rule, rest, db, call, cache, to_close, to_consume, _exit_class) do
+  defp fold_effect_matched(
+         "allow",
+         rule,
+         rest,
+         db,
+         call,
+         cache,
+         to_close,
+         to_consume,
+         _exit_class
+       ),
+       do:
+         decide_rules(
+           rest,
+           db,
+           call,
+           cache,
+           maybe_close(rule, db, call, to_close),
+           to_consume
+         )
+
+  defp fold_effect_matched(
+         "notice",
+         rule,
+         rest,
+         db,
+         call,
+         cache,
+         to_close,
+         to_consume,
+         _exit_class
+       ) do
     evidence = evidence_facts(rule.conditions, cache)
 
     decide_rules(
@@ -2389,18 +3049,48 @@ defmodule Tightbeam.Rules do
     )
   end
 
-  defp fold_effect("deny", rule, _rest, db, call, _cache, to_close, to_consume, exit_class) do
+  defp fold_effect_matched(
+         "deny",
+         rule,
+         _rest,
+         db,
+         call,
+         _cache,
+         to_close,
+         to_consume,
+         exit_class
+       ) do
     error = denial_error(rule, call, "rule_denied", exit_class, notice_bindings(db, call, rule))
     {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
   end
 
-  defp fold_effect("remedy", rule, _rest, _db, call, _cache, to_close, to_consume, exit_class) do
+  defp fold_effect_matched(
+         "remedy",
+         rule,
+         _rest,
+         _db,
+         call,
+         _cache,
+         to_close,
+         to_consume,
+         exit_class
+       ) do
     error = denial_error(rule, call, "remedy_fired", exit_class)
 
     {{:remedy, rule, gated_ref(call), error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
   end
 
-  defp fold_effect("escalate", rule, rest, db, call, cache, to_close, to_consume, exit_class) do
+  defp fold_effect_matched(
+         "escalate",
+         rule,
+         rest,
+         db,
+         call,
+         cache,
+         to_close,
+         to_consume,
+         exit_class
+       ) do
     ctx = %{
       question: rule.text,
       error: denial_error(rule, call, "escalated", exit_class)
@@ -2648,12 +3338,29 @@ defmodule Tightbeam.Rules do
   end
 
   defp compute_fact("spawn.archetype", db, call, cache) do
-    value =
+    requested =
       if call.verb == "spawn" do
         Map.get(call.params, :archetype) || Org.get_setting(db, "default-archetype") || "default"
       end
 
+    value =
+      case requested && Tightbeam.Archetypes.resolve(requested) do
+        {:ok, archetype} -> archetype.name
+        _ -> nil
+      end
+
     {value, cache}
+  end
+
+  defp compute_fact("spawn.itemless_ephemeral_caller_qualified", db, call, cache) do
+    target_archetype =
+      Map.get(call.params, :archetype) || Org.get_setting(db, "default-archetype") || "default"
+
+    {DeliveryResponsibilities.qualified_itemless_ephemeral_spawn?(
+       db,
+       call,
+       target_archetype
+     ), cache}
   end
 
   defp compute_fact("org.live_sessions_owned_by_caller", db, call, cache) do
@@ -2966,6 +3673,29 @@ defmodule Tightbeam.Rules do
       end
 
     {value, cache}
+  end
+
+  defp compute_fact("decision_request.addressed_principal", db, call, cache) do
+    decision_id = Map.get(call.params, :decision_request_id)
+    owner = Map.get(call, :predicate_owner_user_id)
+
+    value =
+      case DB.query(
+             db,
+             "SELECT expecterSessionKey,expecterUserId,ownerUserId FROM decision_requests WHERE id=?1 AND ownerUserId=?2",
+             [decision_id, owner]
+           ) do
+        {:ok, [[session, _user, _owner]]} when is_binary(session) -> "session:" <> session
+        {:ok, [[_session, user, _owner]]} when is_binary(user) -> "user:" <> user
+        {:ok, [[_session, _user, owner]]} -> "user:" <> owner
+        {:ok, []} -> nil
+      end
+
+    {value, cache}
+  end
+
+  defp compute_fact("condition_fact.kind", _db, call, cache) do
+    {get_in(call, [:predicate_bindings, "conditionKind"]), cache}
   end
 
   defp compute_fact("artifact.present", _db, call, cache) do

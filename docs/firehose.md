@@ -46,6 +46,30 @@ direct-application contract, follow that contract; otherwise, treat its
 notices as invalidations and read the detail route. These per-notice detail
 reads and the reads for composed views are the normal-path requests.
 
+The `session_record_event.created` class has a direct-application contract. Its
+payload is one record-event item, and clients append that item to the session's
+record-event feed. The stream remains lossy; after reconnect, clients rebuild
+the feed from `GET /api/sessions/:session_key/record-events`.
+
+For transcript catch-up after reconnect, `GET /api/session-message-sequences`
+returns `{"items":[{"sessionKey":"example","latestMessageSeq":123}]}` for all
+sessions visible under the same authentication and `asUser` rules as
+`GET /api/sessions`. Items are ordered by `sessionKey` ascending, without paging.
+Only `asUser` is accepted as a query parameter. `latestMessageSeq` is the maximum
+global `messages.seq` stored for that session, across all roles and message types,
+including cleared history; an empty session returns `0`. It is a sequence from
+message history, not a message count or a Firehose sequence. The endpoint uses
+one read-connection query with an indexed latest-row seek per visible session,
+without reading transcript bodies or using the database writer. Read markers
+remain available separately from `GET /api/read-markers`.
+
+Subscribe before reading this snapshot, then fetch history only for sessions
+whose sequence advanced beyond the client's stored high-water mark. Persist
+that mark after catching up through the observed sequence; a bounded history
+read may need more pages to reach it. Continue applying live events while
+catching up. This is an additive REST snapshot; existing roster and Firehose
+payloads are unchanged. It does not detect edits to existing messages.
+
 After a close, the minimum request count for one rebuild is
 
 ```text
@@ -59,3 +83,7 @@ This is a lower bound. It assumes pages use `limit=500` and that no rows are
 added during the walk. If a collection's walk must restart, its pages are read
 again. The rebuild view models seven bulk collections: work items,
 assignments, attests, artifacts, turns, wakes, and sessions.
+For an archetype-filtered subscription, rebuild by listing sessions with the
+requested archetype filter and then using the existing per-session message and
+tool-call reads for each returned session. There is no cross-session message
+or tool-call collection.

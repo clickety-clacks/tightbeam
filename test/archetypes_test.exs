@@ -86,13 +86,25 @@ defmodule Tightbeam.ArchetypesTest do
     assert snapshot.guidance =~ "### `agentic-engineering`"
     refute snapshot.guidance =~ "tightbeam learn __list__"
 
-    assert Rails.load!(ctx.base_dir) == []
+    assert Enum.map(Rails.load!(ctx.base_dir), & &1.name) == ["github-auth", "tightbeam-probe"]
+    refute Rails.statutes?()
     assert Rules.load!(ctx.base_dir, []) == []
     refute File.exists?(Path.join(identity_dir, "skills"))
-    refute File.exists?(Path.join(identity_dir, "rails"))
+
+    assert Path.wildcard(Path.join(identity_dir, "rails/*.toml")) ==
+             [
+               Path.join(identity_dir, "rails/github-auth.toml"),
+               Path.join(identity_dir, "rails/tightbeam-probe.toml")
+             ]
 
     assert Path.wildcard(Path.join(identity_dir, "rules/*.toml")) ==
-             [Path.join(identity_dir, "rules/harness-health-recovery.toml")]
+             [
+               Path.join(identity_dir, "rules/harklight-decision-request-briefing.toml"),
+               Path.join(identity_dir, "rules/harness-health-recovery.toml"),
+               Path.join(identity_dir, "rules/harness-recovery-main-wake.toml"),
+               Path.join(identity_dir, "rules/row-reaction-handoff.toml"),
+               Path.join(identity_dir, "rules/row-reaction-terminal-action.toml")
+             ]
 
     assert File.read!(Path.join(identity_dir, "rules/harness-health-recovery.toml")) ==
              File.read!(
@@ -292,7 +304,7 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     assert role_guidance.("product-owner") =~ "have delivery ownership commission its\nbytes"
-    assert role_guidance.("pdo") =~ "You own landing order and branch health"
+    assert role_guidance.("pdo") =~ "You own landing order, watcher coverage and branch health"
 
     for role <- ~w(product-owner orchestrator) do
       refute role_guidance.(role) =~ heading
@@ -303,7 +315,13 @@ defmodule Tightbeam.ArchetypesTest do
     revision = Identity.live_revision!(ctx.base_dir)
 
     for role <- ~w(product-owner orchestrator), harness <- [:codex, :claude] do
-      served = Identity.snapshot_at!(ctx.base_dir, revision, role, harness).guidance
+      served =
+        Identity.snapshot_at!(
+          ctx.base_dir,
+          revision,
+          "agentic-engineering.#{role}",
+          harness
+        ).guidance
 
       assert length(String.split(served, heading)) == 2
       if role == "orchestrator", do: assert(served =~ "Land reviewed work promptly")
@@ -320,12 +338,39 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w(coder default guidance-reviewer guidance-writer integrator orchestrator pdo product-owner recon reviewer-code reviewer-spec spec-writer team-planner)
+             ~w(
+               agentic-engineering.coder
+               agentic-engineering.guidance-reviewer
+               agentic-engineering.guidance-writer
+               agentic-engineering.integrator
+               agentic-engineering.orchestrator
+               agentic-engineering.pdo
+               agentic-engineering.product-owner
+               agentic-engineering.recon
+               agentic-engineering.reviewer-code
+               agentic-engineering.reviewer-spec
+               agentic-engineering.spec-writer
+               agentic-engineering.team-planner
+               default
+             )
 
     engineering_roles =
-      ~w(coder orchestrator pdo product-owner reviewer-code reviewer-spec recon spec-writer team-planner guidance-writer guidance-reviewer integrator)
+      ~w(
+        agentic-engineering.coder
+        agentic-engineering.orchestrator
+        agentic-engineering.pdo
+        agentic-engineering.product-owner
+        agentic-engineering.reviewer-code
+        agentic-engineering.reviewer-spec
+        agentic-engineering.recon
+        agentic-engineering.spec-writer
+        agentic-engineering.team-planner
+        agentic-engineering.guidance-writer
+        agentic-engineering.guidance-reviewer
+        agentic-engineering.integrator
+      )
 
-    assert loaded["product-owner"].skills ==
+    assert loaded["agentic-engineering.product-owner"].skills ==
              [
                "repository-retirement",
                "tightbeam-dispatching",
@@ -344,20 +389,20 @@ defmodule Tightbeam.ArchetypesTest do
              )
     end
 
-    assert loaded["pdo"].skills ==
+    assert loaded["agentic-engineering.pdo"].skills ==
              ["repository-retirement", "human-communication", "landing", "delivery-bootstrap"]
 
-    assert loaded["orchestrator"].skills ==
+    assert loaded["agentic-engineering.orchestrator"].skills ==
              ["repository-retirement", "landing", "delivery-bootstrap"]
 
     assert Enum.all?(loaded, fn
-             {"pdo", _archetype} -> true
+             {"agentic-engineering.pdo", _archetype} -> true
              {_role, archetype} -> "human-communication" not in archetype.skills
            end)
 
     refute Map.has_key?(loaded, "reviewer")
 
-    for role <- ~w(reviewer-code reviewer-spec) do
+    for role <- ~w(agentic-engineering.reviewer-code agentic-engineering.reviewer-spec) do
       refute Enum.any?(loaded[role].skills, &String.starts_with?(&1, "review"))
       refute "spec-conformance" in loaded[role].skills
     end
@@ -382,7 +427,7 @@ defmodule Tightbeam.ArchetypesTest do
       Identity.snapshot_at!(
         ctx.base_dir,
         Identity.live_revision!(ctx.base_dir),
-        "coder",
+        "agentic-engineering.coder",
         :codex
       )
 
@@ -393,7 +438,7 @@ defmodule Tightbeam.ArchetypesTest do
       Identity.snapshot_at!(
         ctx.base_dir,
         Identity.live_revision!(ctx.base_dir),
-        "product-owner",
+        "agentic-engineering.product-owner",
         :codex
       )
 
@@ -412,11 +457,23 @@ defmodule Tightbeam.ArchetypesTest do
     assert coder.guidance =~ "Load `repository-retirement` before disposing"
     refute coder.guidance =~ "hands you a specific checkout"
 
-    for role <- ~w(team-planner guidance-writer guidance-reviewer integrator) do
+    for role <- ~w(
+          agentic-engineering.team-planner
+          agentic-engineering.guidance-writer
+          agentic-engineering.guidance-reviewer
+          agentic-engineering.integrator
+        ) do
       snapshot =
         Identity.snapshot_at!(ctx.base_dir, Identity.live_revision!(ctx.base_dir), role, :codex)
 
-      assert Map.keys(snapshot.skills) == ["repository-retirement"]
+      expected_skill_keys =
+        if role == "agentic-engineering.integrator" do
+          ["landing", "repository-retirement"]
+        else
+          ["repository-retirement"]
+        end
+
+      assert Map.keys(snapshot.skills) == expected_skill_keys
       assert snapshot.guidance =~ "# How Tightbeam works"
       refute Regex.match?(~r/^#include/m, snapshot.guidance)
     end
@@ -441,10 +498,17 @@ defmodule Tightbeam.ArchetypesTest do
     assert retirement =~ "reconcile it before"
     refute retirement =~ "git push origin --delete"
 
-    writer = Identity.snapshot!(ctx.base_dir, "guidance-writer", :codex)
-    reviewer = Identity.snapshot!(ctx.base_dir, "guidance-reviewer", :codex)
-    orchestrator = Identity.snapshot!(ctx.base_dir, "orchestrator", :codex)
-    planner = Identity.snapshot!(ctx.base_dir, "team-planner", :codex)
+    writer =
+      Identity.snapshot!(ctx.base_dir, "agentic-engineering.guidance-writer", :codex)
+
+    reviewer =
+      Identity.snapshot!(ctx.base_dir, "agentic-engineering.guidance-reviewer", :codex)
+
+    orchestrator =
+      Identity.snapshot!(ctx.base_dir, "agentic-engineering.orchestrator", :codex)
+
+    planner =
+      Identity.snapshot!(ctx.base_dir, "agentic-engineering.team-planner", :codex)
 
     for snapshot <- [writer, reviewer] do
       assert snapshot.guidance =~ "# Guidance and policy craft"
@@ -502,10 +566,10 @@ defmodule Tightbeam.ArchetypesTest do
                ~s(#include "operating-manual.md")
              )
 
-      served =
-        Identity.snapshot_at!(ctx.base_dir, revision, archetype.name, :codex).guidance
+      qualified_name = "agentic-engineering.#{archetype.name}"
+      served = Identity.snapshot_at!(ctx.base_dir, revision, qualified_name, :codex).guidance
 
-      assert served =~ "# Tightbeam · #{archetype.name}\n\n# How Tightbeam works"
+      assert served =~ "# Tightbeam · #{qualified_name}\n\n# How Tightbeam works"
       assert served =~ "# Engineering practice"
       refute served =~ ~s(#include ")
     end
@@ -522,7 +586,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     revision = Identity.live_revision!(ctx.base_dir)
 
-    for role <- ~w(reviewer-code reviewer-spec) do
+    for role <- ~w(agentic-engineering.reviewer-code agentic-engineering.reviewer-spec) do
       guidance = Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).guidance
 
       assert guidance =~ "its note is capped at 2,000 characters"
@@ -718,6 +782,18 @@ defmodule Tightbeam.ArchetypesTest do
     assert git!(identity_dir, ["log", "-1", "--format=%s|%an"]) ==
              "kungfu-scaffold: demo|user:flynn"
 
+    scaffold_manifest =
+      identity_dir
+      |> Path.join("kungfu/demo/manifest.toml")
+      |> File.read!()
+      |> Toml.decode!()
+
+    assert scaffold_manifest["root_archetype"] == "demo-role"
+
+    for path <- paths do
+      refute File.read!(path) =~ "demo.demo-role"
+    end
+
     assert Archetypes.load!(ctx.base_dir)["demo-role"].skills == []
   end
 
@@ -823,14 +899,16 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     for {role, harness, family, effort, preferences} <- [
-          {"pdo", :codex, "gpt-6-sol", "low", [{"gpt-6-sol", "low"}]},
-          {"orchestrator", :codex, "gpt-6-luna", "max", [{"gpt-6-luna", "max"}]},
-          {"coder", :codex, "gpt-6-luna", "max", [{"gpt-6-luna", "max"}]},
-          {"spec-writer", :claude, "claude-opus-5-5", "high",
+          {"agentic-engineering.pdo", :codex, "gpt-6-sol", "low", [{"gpt-6-sol", "low"}]},
+          {"agentic-engineering.orchestrator", :codex, "gpt-6-luna", "max",
+           [{"gpt-6-luna", "max"}]},
+          {"agentic-engineering.coder", :codex, "gpt-6-luna", "max", [{"gpt-6-luna", "max"}]},
+          {"agentic-engineering.spec-writer", :claude, "claude-opus-5-5", "high",
            [{"claude-opus-5-5", "high"}, {"gpt-6-astra", "high"}]},
-          {"reviewer-code", :claude, "claude-opus-5-5", "high",
+          {"agentic-engineering.reviewer-code", :claude, "claude-opus-5-5", "high",
            [{"claude-opus-5-5", "high"}, {"gpt-6-sol", "high"}]},
-          {"reviewer-spec", :codex, "gpt-6-astra", "xhigh", [{"gpt-6-astra", "xhigh"}]}
+          {"agentic-engineering.reviewer-spec", :codex, "gpt-6-astra", "xhigh",
+           [{"gpt-6-astra", "xhigh"}]}
         ] do
       model = Tightbeam.Model.new(family, effort: effort)
       assert loaded[role].defaults == %{harness: harness, model: model}

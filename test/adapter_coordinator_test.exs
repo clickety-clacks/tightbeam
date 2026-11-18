@@ -1066,7 +1066,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            end)
   end
 
-  test "an open circuit suppresses automatic restart but permits authoritative recovery", ctx do
+  test "an open circuit automatically retries and recovers after a successful boot", ctx do
     old_value = Application.get_env(:tightbeam, :adapter_failure_circuit)
 
     on_exit(fn ->
@@ -1083,34 +1083,67 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     owner = self()
     boot_attempt = :atomics.new(1, signed: false)
 
+    # The timeout event is triggered explicitly below. Keep a generous
+    # readiness deadline, then cancel the held retry's deadline before its
+    # authoritative refusal replacement so that step cannot race the timer.
     coordinator =
-      start_supervised!(
-        {AdapterCoordinator,
-         adapter_sup: ctx.sup,
-         backoff_base_ms: 1,
-         adapter_context: fn _ -> [] end,
-         adapter_opts: fn _, context ->
-           attempt = :atomics.add_get(boot_attempt, 1, 1)
+      start_supervised!({
+        AdapterCoordinator,
+        adapter_sup: ctx.sup,
+        backoff_base_ms: 250,
+        readiness_timeout_ms: 300_000,
+        adapter_context: fn _ -> [] end,
+        adapter_opts: fn _, context ->
+          attempt = :atomics.add_get(boot_attempt, 1, 1)
 
-           if attempt == 1 do
-             [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
-           else
-             send(owner, {:recovery_boot_started, self(), context})
+          cond do
+            attempt == 1 ->
+              [
+                harness: :claude,
+                cmd: [System.find_executable("false")],
+                home: "/tmp",
+                cwd: "/tmp"
+              ]
 
-             receive do
-               {:release_recovery_boot, pid} when pid == self() ->
-                 [
-                   harness: :claude,
-                   cmd: [System.find_executable("node"), path],
-                   home: ctx.test_dir,
-                   cwd: ctx.test_dir
-                 ]
-             end
-           end
-         end,
-         db: ctx.db,
-         name: :circuit_latch_recovery_coordinator}
-      )
+            attempt == 2 ->
+              send(owner, {:automatic_recovery_timeout_started, self(), context})
+              Process.sleep(:infinity)
+
+            attempt == 3 ->
+              send(owner, {:automatic_recovery_preflight_exit_started, self(), context})
+
+              receive do
+                {:exit_automatic_recovery_preflight, pid} when pid == self() ->
+                  exit(:simulated_preflight_exit)
+              end
+
+            attempt == 4 ->
+              send(owner, {:automatic_recovery_pending_started, self(), context})
+              Process.sleep(:infinity)
+
+            attempt == 5 ->
+              send(owner, {:automatic_recovery_refusal_started, self(), context})
+
+              {:error,
+               %{code: "temporary_refusal", message: "The launch refusal remains visible"}}
+
+            true ->
+              send(owner, {:automatic_recovery_boot_started, self(), context})
+
+              receive do
+                {:release_automatic_recovery_boot, pid} when pid == self() ->
+                  [
+                    harness: :claude,
+                    cmd: [System.find_executable("node"), path],
+                    home: ctx.test_dir,
+                    cwd: ctx.test_dir
+                  ]
+              end
+          end
+        end,
+        db: ctx.db,
+        name: :circuit_latch_recovery_coordinator
+      })
 
     key = {:claude, "default", "testhost"}
     assert {:ok, _first_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
@@ -1122,33 +1155,78 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
-    # The threshold opens the latch before any restart can be admitted. The
-    # public checkout must not observe a generation started by an automatic
-    # restart while the latch is open.
-    refute wait_until(fn -> :atomics.get(boot_attempt, 1) > 1 end, 100)
+    assert_receive {:automatic_recovery_timeout_started, timed_out_readiness_task, []}, 10_000
+    assert is_pid(timed_out_readiness_task)
 
-    assert {:error,
-            {:diagnosed, :degraded,
-             %{
-               "kind" => "circuit_open",
-               "consecutiveFailures" => 1,
-               "cause" => %{"generation" => 1}
-             }}} = AdapterCoordinator.adapter_for(coordinator, key)
+    timed_out_entry = :sys.get_state(coordinator).adapters[key]
 
-    # Credential lifecycle recovery is the authoritative boundary: it may
-    # start a replacement while ordinary checkout remains degraded.
-    recovery =
-      Task.async(fn ->
-        AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
-      end)
+    # Exercise the scheduled timeout handler without depending on the configured
+    # wall-clock deadline. The next automatic preflight proves it re-armed restart.
+    send(
+      coordinator,
+      {:adapter_readiness_timeout, key, timed_out_entry.generation,
+       timed_out_entry.readiness_token}
+    )
 
-    assert_receive {:recovery_boot_started, readiness_task, [credential_kind: :subscription]}
+    assert_receive {:automatic_recovery_preflight_exit_started, exited_readiness_task, []}, 10_000
+    assert is_pid(exited_readiness_task)
 
-    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 1}}} =
+    timeout_recovery_entry = :sys.get_state(coordinator).adapters[key]
+    assert timeout_recovery_entry.circuit == :open
+    assert timeout_recovery_entry.failures == 2
+    send(exited_readiness_task, {:exit_automatic_recovery_preflight, exited_readiness_task})
+
+    assert_receive {:automatic_recovery_pending_started, pending_readiness_task, []}, 10_000
+    assert is_pid(pending_readiness_task)
+
+    down_recovery_entry = :sys.get_state(coordinator).adapters[key]
+    assert down_recovery_entry.circuit == :open
+    assert down_recovery_entry.failures == 3
+
+    # Freeze the coordinator and cancel this intentionally held attempt's
+    # readiness deadline before queuing the credential reset. The reset then
+    # replaces the pending preflight in mailbox order, without racing a timer.
+    :ok = :sys.suspend(coordinator)
+
+    request =
+      try do
+        refusal_entry = :sys.get_state(coordinator).adapters[key]
+        assert refusal_entry.readiness_task == pending_readiness_task
+        remaining_timeout = Process.cancel_timer(refusal_entry.readiness_timer)
+        assert is_integer(remaining_timeout) and remaining_timeout > 0
+
+        :gen_server.send_request(
+          coordinator,
+          {:adapter_for, key, [credential_kind: :subscription]}
+        )
+      after
+        :sys.resume(coordinator)
+      end
+
+    assert {:reply,
+            {:error,
+             {:launch_refused,
+              %{code: "temporary_refusal", message: "The launch refusal remains visible"}}}} =
+             :gen_server.wait_response(request, 10_000)
+
+    assert_receive {:automatic_recovery_refusal_started, refusal_readiness_task,
+                    [credential_kind: :subscription]},
+                   10_000
+
+    assert is_pid(refusal_readiness_task)
+
+    # The next automatic attempt proves the explicit refusal re-armed restart.
+
+    assert_receive {:automatic_recovery_boot_started, readiness_task, []}, 10_000
+
+    recovery_entry = :sys.get_state(coordinator).adapters[key]
+    assert recovery_entry.circuit == :open
+    assert recovery_entry.failures == 4
+
+    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 4}}} =
              AdapterCoordinator.adapter_for(coordinator, key)
 
-    send(readiness_task, {:release_recovery_boot, readiness_task})
-    assert {:ok, recovery_adapter, 2} = Task.await(recovery)
+    send(readiness_task, {:release_automatic_recovery_boot, readiness_task})
 
     assert wait_until(fn ->
              match?(
@@ -1157,7 +1235,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
            end)
 
-    assert {:ok, ^recovery_adapter, 2} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert :atomics.get(boot_attempt, 1) == 6
+    assert AdapterCoordinator.ready?(coordinator, key)
+    assert {:ok, _recovered_adapter, 4} = AdapterCoordinator.adapter_for(coordinator, key)
   end
 
   # What the coordinator itself says it is doing: {holding a slot, waiting for one}.
@@ -1827,7 +1907,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            )
   end
 
-  test "retirement cutoff preserves late entries for the settlement reserve", ctx do
+  test "real-clock retirement cutoff finishes 24 late entries within its configured budget",
+       ctx do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
 
@@ -1953,7 +2034,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # is platform-dependent — 0 of 8 loaded macOS runs (elapsed 853-1284ms)
     # versus 3 of 6 Linux runs (1320-1338ms). What caught the base defect on
     # both platforms is the row-state,
-    # log-content and census oracles below, which this allowance leaves
+    # log-content and census oracles in the ordering case below, which this allowance leaves
     # untouched. With 24
     # retained adapters this also proves the bound does not degrade with
     # cardinality: the late entries' outcomes are decided before settlement, and
@@ -1964,6 +2045,238 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            "shutdown took #{elapsed_ms}ms against a configured #{budget_ms}ms budget " <>
              "(+#{observation_allowance_ms}ms observation allowance) with " <>
              "#{length(keys)} retained adapters; the deadline guarantee did not hold"
+
+    # The real-clock claim does not require settlement to finish in its reserve.
+    # The ordering case below owns every durable row/fence/event assertion.
+    assert log =~ "retirement late entry unresolved"
+    assert HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0
+  end
+
+  test "retirement cutoff preserves late entries for the settlement reserve", ctx do
+    path = Path.join(ctx.test_dir, "fake_harness.js")
+    File.write!(path, @fake)
+
+    helper = Path.expand("../cli/target/release/tightbeam", __DIR__)
+    slow_helper = Path.join(ctx.test_dir, "slow_harness_helper")
+
+    hung_command = Path.join(ctx.test_dir, "hung_command.js")
+    helper_ready = Path.join(ctx.test_dir, "helper_ready")
+    File.mkdir_p!(helper_ready)
+
+    File.write!(hung_command, """
+    process.stdin.resume();
+    require("node:fs").writeFileSync(process.argv[2] + "/" + process.pid, "ready");
+    """)
+
+    timeout_override = Application.fetch_env(:tightbeam, :harness_process_command_timeout_ms)
+    Application.put_env(:tightbeam, :harness_process_command_timeout_ms, 120_000)
+
+    on_exit(fn ->
+      case timeout_override do
+        {:ok, value} ->
+          Application.put_env(:tightbeam, :harness_process_command_timeout_ms, value)
+
+        :error ->
+          Application.delete_env(:tightbeam, :harness_process_command_timeout_ms)
+      end
+    end)
+
+    File.write!(
+      slow_helper,
+      "#!/bin/sh\n" <>
+        "if [ \"$1\" = \"harness-group\" ]; then exec node #{hung_command} #{helper_ready}; fi\n" <>
+        "exec #{helper} \"$@\"\n"
+    )
+
+    File.chmod!(slow_helper, 0o755)
+
+    # The cleanup owner. In the real tree this is Tightbeam.TurnTaskSupervisor,
+    # which starts before the coordinator under rest_for_one and so outlives its
+    # terminate/2; a standalone coordinator is given an equivalent owner here so
+    # the same handoff path is exercised rather than the inline fallback.
+    cleanup_owner =
+      start_supervised!(
+        {Task.Supervisor, name: :"shutdown_cutoff_cleanup_#{System.unique_integer([:positive])}"}
+      )
+
+    budget_ms = 60_000
+    settlement_ms = 15_000
+    owner = self()
+    cleanup_gate = make_ref()
+    filter_id = :"retirement_cleanup_gate_#{System.unique_integer([:positive])}"
+
+    # Primary filters run in the process issuing the log. Hold the actual late
+    # cleanup here until terminate/2 has returned; slow cleanup must never become
+    # a dependency of shutdown, regardless of adapter count or scheduler speed.
+    :ok =
+      :logger.add_primary_filter(
+        filter_id,
+        {fn event, _extra ->
+           case event do
+             %{msg: {:string, message}} ->
+               if String.starts_with?(
+                    IO.iodata_to_binary(message),
+                    "adapter shutdown retirement late entry unresolved before deadline for "
+                  ) do
+                 owner_ref = Process.monitor(owner)
+                 send(owner, {:late_cleanup_blocked, cleanup_gate, self()})
+
+                 receive do
+                   {:release_late_cleanup, ^cleanup_gate} -> :ok
+                   {:DOWN, ^owner_ref, :process, ^owner, _reason} -> :ok
+                 end
+
+                 Process.demonitor(owner_ref, [:flush])
+               end
+
+             _ ->
+               :ok
+           end
+
+           event
+         end, nil}
+      )
+
+    on_exit(fn -> :logger.remove_primary_filter(filter_id) end)
+
+    clock = fn
+      :start ->
+        now = System.monotonic_time(:millisecond)
+        Process.put(:retirement_cutoff_start, now)
+        send(owner, {:shutdown_started, now})
+        now
+
+      :park_wait ->
+        # Freeze before the first yield until every park helper is blocked.
+        # No wall-clock delay determines which results reach retirement.
+        {:monitors, monitors} = Process.info(self(), :monitors)
+        send(owner, {:park_tasks_started, self(), monitors})
+
+        receive do
+          :expire_parking -> :ok
+        end
+
+        Process.get(:retirement_cutoff_start) + budget_ms - settlement_ms
+
+      phase when phase in [:cancel, :cancel_wait, :retire] ->
+        now = Process.get(:retirement_cutoff_start) + budget_ms - settlement_ms
+        if phase == :retire, do: send(owner, {:retirement_cutoff, now})
+        now
+
+      _phase ->
+        Process.get(:retirement_cutoff_start)
+    end
+
+    {:ok, coordinator} =
+      AdapterCoordinator.start_link(
+        adapter_sup: ctx.sup,
+        adapter_context: fn _ -> [] end,
+        adapter_opts: fn _, _ ->
+          [
+            harness: :claude,
+            cmd: [System.find_executable("node"), path],
+            home: ctx.test_dir,
+            cwd: ctx.test_dir,
+            process_helper: slow_helper,
+            process_identity_dir: ctx.test_dir
+          ]
+        end,
+        db: ctx.db,
+        shutdown_budget_ms: budget_ms,
+        shutdown_settlement_budget_ms: settlement_ms,
+        # Expire parking and cancellation exactly at the reserve boundary.
+        # Retirement must defer cleanup and persist all 24 unresolved outcomes.
+        shutdown_cancel_grace_ms: 0,
+        shutdown_clock: clock,
+        shutdown_cleanup_supervisor: cleanup_owner,
+        name:
+          String.to_atom(
+            "shutdown_retirement_cutoff_coordinator_#{System.unique_integer([:positive])}"
+          )
+      )
+
+    Process.unlink(coordinator)
+
+    on_exit(fn ->
+      if Process.alive?(coordinator) do
+        send(coordinator, :expire_parking)
+        GenServer.stop(coordinator, :shutdown, :infinity)
+      end
+    end)
+
+    # Cardinality is the point: the deadline guarantee must not degrade as the
+    # retained-adapter count grows, and this also exceeds the 20-key log sample
+    # cap so the aggregate line's remainder path is exercised under load.
+    keys =
+      for index <- 1..24 do
+        {:claude, "shared", "shutdown-retirement-cutoff-host-#{index}"}
+      end
+
+    adapters =
+      for key <- keys do
+        assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+        assert %Tightbeam.Acp.Adapter{} = :sys.get_state(adapter, :infinity)
+        adapter
+      end
+
+    rows = HarnessProcess.list(ctx.db)
+    assert length(rows) == length(keys)
+    assert Enum.all?(rows, &(&1.state == "running"))
+    adapter_refs = Enum.map(adapters, &Process.monitor/1)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        stop = Task.async(fn -> GenServer.stop(coordinator, :shutdown, :infinity) end)
+        assert_receive {:park_tasks_started, ^coordinator, monitors}, 30_000
+        park_tasks = for {:process, pid} <- monitors, pid not in adapters, do: pid
+        assert length(park_tasks) == length(keys)
+        assert eventually(fn -> length(File.ls!(helper_ready)) == length(keys) end, 3_000)
+        send(coordinator, :expire_parking)
+        assert_receive {:late_cleanup_blocked, ^cleanup_gate, cleanup_pid}, 30_000
+        cleanup_ref = Process.monitor(cleanup_pid)
+
+        try do
+          refute cleanup_pid == coordinator,
+                 "late cleanup must run outside terminate/2 even when its logger blocks"
+
+          assert :ok = Task.await(stop, :infinity)
+          refute Process.alive?(coordinator)
+          assert Process.alive?(cleanup_pid)
+
+          # Settlement must precede this deliberately stalled cleanup as well.
+          settled = HarnessProcess.list(ctx.db)
+          assert length(settled) == length(keys)
+          assert Enum.all?(settled, &(&1.state == "kill_failed"))
+          assert Enum.all?(settled, &(&1.last_error =~ "shutdown_retirement_unresolved"))
+        after
+          send(cleanup_pid, {:release_late_cleanup, cleanup_gate})
+        end
+
+        assert_receive {:DOWN, ^cleanup_ref, :process, ^cleanup_pid, :normal}, 30_000
+
+        # The clock puts retirement at the reserve boundary, within the total
+        # budget. Settlement and the asynchronous cleanup must still complete;
+        # the unchanged row, log and census assertions detect skipped work.
+        assert_received {:retirement_cutoff, retirement_at}
+        assert_received {:shutdown_started, started_at}
+        assert retirement_at - started_at == budget_ms - settlement_ms
+
+        # Join cleanup before ending capture: descendant disappearance alone
+        # does not prove the cleanup task has emitted its aggregate log.
+        for pid <- Task.Supervisor.children(cleanup_owner) do
+          ref = Process.monitor(pid)
+          assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 30_000
+        end
+
+        for ref <- adapter_refs do
+          assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 30_000
+        end
+
+        assert eventually(
+                 fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
+                 1_000
+               )
+      end)
 
     assert log =~ "retirement late entry unresolved"
 
@@ -1996,8 +2309,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   # The companion to the retirement-cutoff test above: the same 24 hung parks,
-  # but with a grace the cooperative cancel can answer within on every
-  # platform. It pins the non-late half of the contract, which no other test
+  # but with phase ordering controlled by a logical deadline clock. It pins
+  # the non-late half of the contract, which no other test
   # distinguishes: the forced-exhaustion test earlier in this file matches
   # "shutdown_budget_exhausted" as a substring, and the late path's
   # {:shutdown_retirement_unresolved, :shutdown_budget_exhausted} satisfies
@@ -2008,11 +2321,34 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     helper = Path.expand("../cli/target/release/tightbeam", __DIR__)
     slow_helper = Path.join(ctx.test_dir, "slow_harness_helper")
+    hung_command = Path.join(ctx.test_dir, "hung_command.js")
+    helper_ready = Path.join(ctx.test_dir, "helper_ready")
+    File.mkdir_p!(helper_ready)
+
+    File.write!(hung_command, """
+    process.stdin.resume();
+    require("node:fs").writeFileSync(process.argv[2] + "/" + process.pid, "ready");
+    """)
+
+    # Only coordinator cancellation may release a hung command. A finite helper
+    # deadline could otherwise finish tasks while we install monitors/tracing.
+    timeout_override = Application.fetch_env(:tightbeam, :harness_process_command_timeout_ms)
+    Application.put_env(:tightbeam, :harness_process_command_timeout_ms, 120_000)
+
+    on_exit(fn ->
+      case timeout_override do
+        {:ok, value} ->
+          Application.put_env(:tightbeam, :harness_process_command_timeout_ms, value)
+
+        :error ->
+          Application.delete_env(:tightbeam, :harness_process_command_timeout_ms)
+      end
+    end)
 
     File.write!(
       slow_helper,
       "#!/bin/sh\n" <>
-        "if [ \"$1\" = \"harness-group\" ]; then sleep 2; fi\n" <>
+        "if [ \"$1\" = \"harness-group\" ]; then exec node #{hung_command} #{helper_ready}; fi\n" <>
         "exec #{helper} \"$@\"\n"
     )
 
@@ -2023,11 +2359,36 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         {Task.Supervisor, name: :"shutdown_grace_cleanup_#{System.unique_integer([:positive])}"}
       )
 
-    # The grace must exceed what consumes it: 24 concurrent process-group
-    # enumerations cost ~31ms on Linux and ~197ms on macOS, so
-    # one second holds a >5x margin on the slower platform. The budget grows by
-    # the same second so the park phase keeps the cutoff test's shape: parks
-    # get ~900ms against a 2s hang and always time out into the cancel path.
+    owner = self()
+
+    clock = fn
+      :start ->
+        now = System.monotonic_time(:millisecond)
+        Process.put(:cancel_grace_clock_start, now)
+        now
+
+      :park_wait ->
+        # All tasks exist before the first yield. Let the test monitor them
+        # before expiring parking; cancellation must complete normally, rather
+        # than merely getting the same ledger result through brutal kills.
+        unless Process.get(:cancel_grace_parking_expired, false) do
+          {:monitors, monitors} = Process.info(self(), :monitors)
+          send(owner, {:park_tasks_started, self(), monitors})
+
+          receive do
+            :expire_parking -> Process.put(:cancel_grace_parking_expired, true)
+          end
+        end
+
+        Process.get(:cancel_grace_clock_start) + 15_000
+
+      phase when phase in [:cancel, :cancel_wait, :retire] ->
+        Process.get(:cancel_grace_clock_start) + 15_000
+
+      _phase ->
+        Process.get(:cancel_grace_clock_start)
+    end
+
     {:ok, coordinator} =
       AdapterCoordinator.start_link(
         adapter_sup: ctx.sup,
@@ -2043,9 +2404,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
           ]
         end,
         db: ctx.db,
-        shutdown_budget_ms: 2_400,
-        shutdown_settlement_budget_ms: 500,
-        shutdown_cancel_grace_ms: 1_000,
+        shutdown_budget_ms: 60_000,
+        shutdown_settlement_budget_ms: 15_000,
+        shutdown_cancel_grace_ms: 30_000,
+        shutdown_clock: clock,
         shutdown_cleanup_supervisor: cleanup_owner,
         name:
           String.to_atom(
@@ -2054,16 +2416,24 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       )
 
     Process.unlink(coordinator)
-    on_exit(fn -> if Process.alive?(coordinator), do: GenServer.stop(coordinator, :shutdown) end)
+
+    on_exit(fn ->
+      if Process.alive?(coordinator) do
+        send(coordinator, :expire_parking)
+        GenServer.stop(coordinator, :shutdown, 30_000)
+      end
+    end)
 
     keys =
       for index <- 1..24 do
         {:claude, "shared", "shutdown-grace-settled-host-#{index}"}
       end
 
-    for key <- keys do
-      assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
-    end
+    adapters =
+      for key <- keys do
+        assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+        adapter
+      end
 
     assert eventually(
              fn ->
@@ -2075,7 +2445,28 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert :ok = GenServer.stop(coordinator, :shutdown, 5_000)
+        stop = Task.async(fn -> GenServer.stop(coordinator, :shutdown, 30_000) end)
+        assert_receive {:park_tasks_started, ^coordinator, monitors}, 30_000
+
+        park_tasks = for {:process, pid} <- monitors, pid not in adapters, do: pid
+        assert length(park_tasks) == length(keys)
+        # Each marker is written after that helper has armed its stdin wait.
+        # With command expiry disabled no task can finish during this barrier.
+        assert eventually(fn -> length(File.ls!(helper_ready)) == length(keys) end, 3_000)
+        refs = Enum.map(park_tasks, &Process.monitor/1)
+        for pid <- park_tasks, do: :erlang.trace(pid, true, [:receive, {:tracer, self()}])
+        send(coordinator, :expire_parking)
+
+        for pid <- park_tasks do
+          assert_receive {:trace, ^pid, :receive, {:tightbeam_shutdown_cancel, ^coordinator}},
+                         30_000
+        end
+
+        for ref <- refs do
+          assert_receive {:DOWN, ^ref, :process, _pid, :normal}, 30_000
+        end
+
+        assert :ok = Task.await(stop, 30_000)
 
         assert eventually(
                  fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
@@ -2288,6 +2679,76 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     assert wait_until(fn -> AdapterCoordinator.ready?(coordinator, key) end, 500)
     assert coordinator_generation(coordinator, key) == 2
+  end
+
+  test "closing one Pi session worker reaps only its process group and leaves its sibling ready",
+       ctx do
+    script = Path.join(ctx.test_dir, "pi_session_worker.js")
+
+    File.write!(script, """
+    const fs = require("node:fs");
+    const { spawn } = require("node:child_process");
+    const rl = require("node:readline").createInterface({ input: process.stdin });
+    const child = spawn("/bin/sh", ["-c", "exec sleep 300"], { stdio: "ignore" });
+    fs.writeFileSync(process.env.PI_CHILD_PID_FILE, String(child.pid));
+    const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\\n");
+    rl.on("line", (line) => {
+      const m = JSON.parse(line);
+      if (m.method === "initialize") send({ id: m.id, result: { protocolVersion: 1 } });
+    });
+    """)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn key, _ ->
+           {:ok, session_key} = Tightbeam.Placement.pi_session_key(key)
+           child_pid_file = Path.join(ctx.test_dir, session_key <> ".child-pid")
+
+           [
+             harness: :pi,
+             cmd: [System.find_executable("node"), script],
+             env: [{"PI_CHILD_PID_FILE", child_pid_file}],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             stderr_path: Path.join(ctx.test_dir, session_key <> ".stderr"),
+             process_identity_dir: ctx.test_dir,
+             process_helper: @process_helper
+           ]
+         end,
+         db: ctx.db,
+         name: :pi_session_process_group_coordinator}
+      )
+
+    key_a = Tightbeam.Placement.pi_session_adapter_key("session-a", "testhost")
+    key_b = Tightbeam.Placement.pi_session_adapter_key("session-b", "testhost")
+
+    assert {:ok, adapter_a, 1} = AdapterCoordinator.adapter_for(coordinator, key_a)
+    assert {:ok, adapter_b, 1} = AdapterCoordinator.adapter_for(coordinator, key_b)
+    await_ready!(coordinator, key_a)
+    await_ready!(coordinator, key_b)
+
+    pid_a = read_child_pid!(Path.join(ctx.test_dir, "session-a.child-pid"))
+    pid_b = read_child_pid!(Path.join(ctx.test_dir, "session-b.child-pid"))
+    rows = HarnessProcess.list(ctx.db)
+    row_a = Enum.find(rows, &(&1.adapter_key == AdapterCoordinator.key_name(key_a)))
+    row_b = Enum.find(rows, &(&1.adapter_key == AdapterCoordinator.key_name(key_b)))
+    assert row_a.process_group_id != row_b.process_group_id
+    ref = Process.monitor(adapter_a)
+
+    assert :ok = AdapterCoordinator.close_adapter(coordinator, key_a)
+    assert_receive {:DOWN, ^ref, :process, ^adapter_a, _reason}, 2_000
+    assert eventually(fn -> not process_active?(pid_a) end)
+    assert process_active?(pid_b)
+    assert Process.alive?(adapter_b)
+    assert AdapterCoordinator.ready?(coordinator, key_b)
+    assert {:ok, ^adapter_b, 1} = AdapterCoordinator.adapter_for(coordinator, key_b)
+
+    rows = Map.new(HarnessProcess.list(ctx.db), &{&1.adapter_key, &1})
+    assert Map.fetch!(rows, AdapterCoordinator.key_name(key_a)).resolved_at
+    assert Map.fetch!(rows, AdapterCoordinator.key_name(key_b)).resolved_at == nil
   end
 
   test "load-slot queue caps concurrency at three and releases on borrower exit", ctx do
@@ -2733,6 +3194,96 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
   end
 
+  test "a Pi placement readiness death does not notify or stop session workers", ctx do
+    session_row_key =
+      seed_session!(ctx.db,
+        harness: "pi",
+        provider: "opencode_go",
+        model: Tightbeam.Model.new("opencode-go/gpt-5.6-luna")
+      )
+
+    coordinator =
+      start_fake_coordinator(ctx, :pi_readiness_only_coordinator, :pi)
+
+    placement_key = {:pi, "shared", "testhost"}
+    worker_key = Tightbeam.Placement.pi_session_adapter_key(session_row_key, "testhost")
+
+    assert {:ok, readiness_adapter, 1} =
+             AdapterCoordinator.adapter_for(coordinator, placement_key)
+
+    assert {:ok, session_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, worker_key)
+    await_ready!(coordinator, placement_key)
+    await_ready!(coordinator, worker_key)
+
+    Process.exit(readiness_adapter, :kill)
+
+    assert eventually(fn -> coordinator_generation(coordinator, placement_key) == 2 end)
+    assert Process.alive?(session_adapter)
+    assert AdapterCoordinator.ready?(coordinator, worker_key)
+    assert [] = Tightbeam.Projection.list_after(ctx.db, session_row_key, nil, 10)
+  end
+
+  test "a Pi placement launch does not fence workers, but an explicit park does", ctx do
+    path = Path.join(ctx.test_dir, "pi-session-readiness.js")
+    File.write!(path, @fake)
+
+    placement_key = {:pi, "shared", "testhost"}
+    worker_key = Tightbeam.Placement.pi_session_adapter_key("session-a", "testhost")
+    blocked_worker_key = Tightbeam.Placement.pi_session_adapter_key("session-b", "testhost")
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn key, _ ->
+           process_key =
+             key
+             |> AdapterCoordinator.key_name()
+             |> String.replace(~r/[^a-zA-Z0-9._-]/, "_")
+
+           [
+             harness: :pi,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             stderr_path: Path.join(ctx.test_dir, process_key <> ".stderr"),
+             process_identity_dir: Path.join(ctx.test_dir, "process-identities"),
+             process_helper: @process_helper
+           ]
+         end,
+         db: ctx.db,
+         name: :pi_readiness_launch_does_not_fence_workers}
+      )
+
+    assert {:ok, _readiness_adapter, 1} =
+             AdapterCoordinator.adapter_for(coordinator, placement_key)
+
+    await_ready!(coordinator, placement_key)
+
+    placement_name = AdapterCoordinator.key_name(placement_key)
+
+    assert [%{adapter_key: ^placement_name, state: "running", resolved_at: nil}] =
+             HarnessProcess.list(ctx.db)
+
+    assert HarnessProcess.fenced?(ctx.db, placement_key)
+    refute HarnessProcess.parked?(ctx.db, placement_key)
+
+    assert {:ok, _session_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, worker_key)
+    await_ready!(coordinator, worker_key)
+
+    assert {:ok, :park_recorded} =
+             DB.transaction(ctx.db, fn txn ->
+               _ = HarnessProcess.begin_park_in_txn(txn, placement_key)
+               :park_recorded
+             end)
+
+    assert HarnessProcess.parked?(ctx.db, placement_key)
+
+    assert {:error, {:park_fenced, ^placement_name}} =
+             AdapterCoordinator.adapter_for(coordinator, blocked_worker_key)
+  end
+
   # `start_supervised!` is not a boot barrier: Acp.Adapter returns from init
   # before `node` is spawned, and only {:adapter_ready, key} marks the entry
   # ready. A death BEFORE that point is a boot failure, which deliberately
@@ -2744,7 +3295,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            )
   end
 
-  defp seed_session!(db) do
+  defp seed_session!(db, opts \\ []) do
     :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
     session_key = "agent:main:clawline:flynn:main"
 
@@ -2756,9 +3307,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       origin: "user:flynn",
       archetype: "default",
       host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Tightbeam.Model.new("claude-fable-5")
+      harness: Keyword.get(opts, :harness, "claude"),
+      provider: Keyword.get(opts, :provider, "anthropic"),
+      model: Keyword.get(opts, :model, Tightbeam.Model.new("claude-fable-5"))
     })
 
     session_key
@@ -2777,7 +3328,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     seq
   end
 
-  defp start_fake_coordinator(ctx, name) do
+  defp start_fake_coordinator(ctx, name, harness \\ :claude) do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
 
@@ -2787,7 +3338,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
        adapter_context: fn _ -> [] end,
        adapter_opts: fn _, _ ->
          [
-           harness: :claude,
+           harness: harness,
            cmd: [System.find_executable("node"), path],
            home: ctx.test_dir,
            cwd: ctx.test_dir
@@ -2809,6 +3360,19 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       true ->
         Process.sleep(10)
         eventually(fun, tries - 1)
+    end
+  end
+
+  defp read_child_pid!(path) do
+    assert wait_until(fn -> File.exists?(path) end, 1_000)
+    {pid, ""} = path |> File.read!() |> String.trim() |> Integer.parse()
+    pid
+  end
+
+  defp process_active?(pid) do
+    case System.cmd("ps", ["-o", "stat=", "-p", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {state, 0} -> not String.starts_with?(String.trim(state), "Z")
+      _ -> false
     end
   end
 end

@@ -86,7 +86,10 @@ defmodule Tightbeam.RailEpisodes do
   end
 
   @impl true
-  def init(:ok), do: {:ok, %{incarnation: make_ref(), seq: 0, last_summon: %{}}}
+  def init(:ok) do
+    Tightbeam.DB.owed_work()
+    {:ok, %{incarnation: make_ref(), seq: 0, last_summon: %{}}}
+  end
 
   @impl true
   def handle_call({:evaluating, db, statute}, _from, state) do

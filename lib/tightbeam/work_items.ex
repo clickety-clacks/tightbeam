@@ -160,6 +160,7 @@ defmodule Tightbeam.WorkItems do
                   ]
                 )
 
+                publish_work_item_filed_record_event_in_txn(txn, id)
                 put_priority_in_txn(txn, id, priority)
                 stamp_version_in_txn(txn, id, created_at)
                 routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
@@ -347,6 +348,8 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
+  defp handoff_refusal(%{code: "unknown_work_item"} = error), do: error
+
   defp handoff_refusal(%{code: "unknown_delivery_owner", message: message} = error),
     do:
       Map.put(
@@ -426,6 +429,7 @@ defmodule Tightbeam.WorkItems do
         ]
       )
 
+      publish_work_item_filed_record_event_in_txn(txn, id)
       put_priority_in_txn(txn, id, priority)
       stamp_version_in_txn(txn, id, created_at)
       item = fetch_in_txn(txn, id)
@@ -537,6 +541,21 @@ defmodule Tightbeam.WorkItems do
 
   defp publish_item_result_in_txn(txn, call, _item, false),
     do: Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+  defp publish_work_item_filed_record_event_in_txn(txn, work_item_id) do
+    case Tightbeam.RecordEvents.work_item_filed_in_txn(txn, work_item_id) do
+      nil ->
+        :ok
+
+      {session_key, item} ->
+        Publisher.committed_in_txn(
+          txn,
+          "session_record_event.created",
+          item,
+          %{"sessionKey" => session_key}
+        )
+    end
+  end
 
   defp update_in_txn(txn, params) do
     case fetch_in_txn(txn, params[:work_item_id]) do
@@ -770,8 +789,9 @@ defmodule Tightbeam.WorkItems do
   ## Terminal dispositions (owner-or-admin) — icebox/reopen/close/fail
 
   defp dispose_result(db, call, verb) do
-    with :ok <- ensure_body_schema_for_use(db),
-         :ok <- principal_allowed(call.principal) do
+    with :ok <- principal_allowed(call.principal),
+         :ok <- valid_icebox_reason(verb, call.params[:reason]),
+         :ok <- ensure_body_schema_for_use(db) do
       id = call.params[:work_item_id]
       reason = call.params[:reason]
 
@@ -835,7 +855,7 @@ defmodule Tightbeam.WorkItems do
 
           item.state == target ->
             # Same-state transition is a no-op success — changes nothing, and
-            # emits no doorbell (fail keeps its prior reason untouched).
+            # emits no doorbell (icebox/fail keep their prior reason untouched).
             {:disposed, item, false, item.state}
 
           not transition_allowed?(item.state, target) ->
@@ -904,7 +924,7 @@ defmodule Tightbeam.WorkItems do
   defp apply_disposition(txn, item, verb, target, reason) do
     # icebox/close/fail all cancel BOTH brackets (after a last-close a slate
     # wake may exist, so every disposition must cancel bracket 2 too).
-    fail_reason = if verb == :fail, do: reason, else: nil
+    fail_reason = if verb in [:icebox, :fail], do: reason, else: nil
 
     Txn.q(
       txn,
@@ -912,6 +932,17 @@ defmodule Tightbeam.WorkItems do
       [item.id, target, fail_reason]
     )
   end
+
+  defp valid_icebox_reason(:icebox, reason) when is_binary(reason) do
+    if String.valid?(reason) and String.trim(reason) != "",
+      do: :ok,
+      else: error("missing_reason", "work-item-icebox requires a non-empty reason")
+  end
+
+  defp valid_icebox_reason(:icebox, _reason),
+    do: error("missing_reason", "work-item-icebox requires a non-empty reason")
+
+  defp valid_icebox_reason(_verb, _reason), do: :ok
 
   defp target_state(:icebox), do: "iceboxed"
   defp target_state(:reopen), do: "open"
@@ -1035,14 +1066,14 @@ defmodule Tightbeam.WorkItems do
   def arm_slate_in_txn(%Txn{} = txn, work_item_id) when is_binary(work_item_id) do
     case Txn.q(
            txn,
-           "SELECT state, ownerUserId FROM work_items WHERE id = ?1",
+           "SELECT state, ownerUserId, deliveryOwnerSessionKey FROM work_items WHERE id = ?1",
            [work_item_id]
          ) do
-      [["open", owner]] ->
+      [["open", owner, delivery_owner]] ->
         if not open_assignments?(txn, work_item_id) do
           wake =
             Wakes.schedule_in_txn(txn, %{
-              session_key: Org.personal_session_key(owner),
+              session_key: slate_recipient_in_txn(txn, delivery_owner, owner),
               origin: @origin,
               prompt:
                 Tightbeam.Reminders.render(txn, "work-item-slate", %{work_item_id: work_item_id}),
@@ -1076,10 +1107,10 @@ defmodule Tightbeam.WorkItems do
       when is_binary(item_id) and is_binary(wake_id) do
     case Txn.q(
            txn,
-           "SELECT state, ownerUserId, title, routingWakeId, slateWakeId FROM work_items WHERE id = ?1",
+           "SELECT state, ownerUserId, deliveryOwnerSessionKey, title, routingWakeId, slateWakeId FROM work_items WHERE id = ?1",
            [item_id]
          ) do
-      [[state, owner, title, routing, slate]] ->
+      [[state, owner, delivery_owner, title, routing, slate]] ->
         cond do
           state == "open" and routing == wake_id ->
             arm_routing_in_txn(txn, item_id, owner, title)
@@ -1087,7 +1118,7 @@ defmodule Tightbeam.WorkItems do
           state == "open" and slate == wake_id and not open_assignments?(txn, item_id) ->
             replacement =
               Wakes.schedule_in_txn(txn, %{
-                session_key: Org.personal_session_key(owner),
+                session_key: slate_recipient_in_txn(txn, delivery_owner, owner),
                 origin: @origin,
                 prompt:
                   Tightbeam.Reminders.render(txn, "work-item-slate", %{work_item_id: item_id}),
@@ -1193,6 +1224,13 @@ defmodule Tightbeam.WorkItems do
         failures
     end)
     |> Enum.reverse()
+  end
+
+  defp slate_recipient_in_txn(txn, delivery_owner, owner) do
+    case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [delivery_owner]) do
+      [["active"]] -> delivery_owner
+      _ -> Org.personal_session_key(owner)
+    end
   end
 
   defp arm_routing_in_txn(txn, id, owner, title) do

@@ -84,6 +84,10 @@ defmodule Tightbeam.Firehose.Rebuild do
   defp query(db, class, refs, _user_id) when class in ~w(tool_call.started tool_call.ended),
     do: StateResources.query_tool_call_for_rebuild(db, fetch!(refs, "toolCallId"))
 
+  defp query(db, class, refs, _user_id)
+       when class in ~w(message.segment_recorded tool_call.event_recorded),
+       do: StateResources.query_turn_event_for_rebuild(db, fetch!(refs, "turnEventId"))
+
   defp query(db, class, refs, _user_id) when class in ~w(session.updated session.harness_changed),
     do: StateResources.query_session(db, fetch!(refs, "sessionKey"))
 
@@ -99,6 +103,22 @@ defmodule Tightbeam.Firehose.Rebuild do
   # Registry primary refs from the canonical projection.
   defp authoritative_refs("condition_fact.filed", %{origin: origin}),
     do: %{"principal" => origin}
+
+  defp authoritative_refs(class, %{session_key: session_key, turn_seq: turn_seq} = event)
+       when class in ["message.segment_recorded", "tool_call.event_recorded"] do
+    refs = %{"sessionKey" => session_key, "turnSeq" => turn_seq}
+
+    refs =
+      cond do
+        is_binary(event.message_id) -> Map.put(refs, "messageId", event.message_id)
+        is_binary(event.tool_call_id) -> Map.put(refs, "toolCallId", event.tool_call_id)
+        true -> refs
+      end
+
+    if is_binary(event.assignment_id),
+      do: Map.put(refs, "assignmentId", event.assignment_id),
+      else: refs
+  end
 
   defp authoritative_refs("read_marker.updated", %{user_id: user_id}),
     do: %{"userId" => user_id}

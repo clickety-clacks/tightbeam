@@ -4,6 +4,7 @@
 name = "<name>-example"
 on = "tool-call"
 mode = "gate"
+archetypes = ["<name>.<name>-role"]
 tool = "Bash"
 pattern = "TIGHTBEAM_KUNGFU_TEMPLATE_PLACEHOLDER_NEVER_MATCHES"
 text = "Replace this starter statute with the kungfu's real enforceable law."

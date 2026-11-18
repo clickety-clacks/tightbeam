@@ -76,21 +76,41 @@ defmodule Tightbeam.CompletionHandoffRestart do
 
   # After an ordinary boot the parent's queued turn runs and ends; the
   # turn-end sweeper then stores the reminder from the delivered record.
-  def restarted!(evidence, booted_at) do
+  def restarted!(evidence, booted_at, deadline) do
     %{"root" => root_id, "seq" => seq} = JSON.decode!(File.read!(evidence))
 
-    await!(
-      fn ->
-        ended?(seq) and pending_reminders(root_id) != [] and sweeper_cursor() >= seq
-      end,
-      fn ->
-        %{
-          turns: rows("SELECT seq,wakeId,status,startedAt,endedAt FROM turns ORDER BY seq"),
-          reminders: Enum.map(reminders(root_id), &Map.take(&1, [:wake_id, :state])),
-          cursor: sweeper_cursor()
-        }
+    # Subscribe before sampling the durable row: completion either preceded
+    # the sample or leaves a turn.ended notice in this process's mailbox.
+    :ok = Tightbeam.Firehose.Hub.register()
+
+    unless ended?(seq) do
+      receive do
+        {:firehose_notice, %{"class" => "turn.ended", "refs" => %{"turnSeq" => ^seq}}} ->
+          :ok
+      after
+        remaining(deadline) -> diagnostic_timeout!(root_id, :turn_ended)
       end
-    )
+    end
+
+    # turn.ended is published during the lane's terminal transaction, before
+    # its on_terminal callback sends recognition to the sweeper. Wait for the
+    # lane callback to return, then for the sweeper to handle that cast. Neither
+    # barrier runs reconciliation on the test's behalf.
+    lane =
+      case Registry.lookup(Tightbeam.LaneRegistry, @parent) do
+        [{pid, _}] -> pid
+        [] -> diagnostic_timeout!(root_id, :lane_missing)
+      end
+
+    barrier!(lane, deadline, root_id, :lane)
+    barrier!(Tightbeam.Productions.BubbleSweeper, deadline, root_id, :sweeper)
+    Tightbeam.Firehose.Hub.unregister()
+
+    assert ended?(seq)
+    assert sweeper_cursor() >= seq
+    # A slow consistency repair must not turn a missed startup/terminal signal
+    # into a passing result once the private polling deadline is gone.
+    assert %{lanes: 0, bubble: 0} = Tightbeam.SchedulerMisses.health().by_loop
 
     [[status, started_at]] = rows("SELECT status,startedAt FROM turns WHERE seq=?1", [seq])
     assert status in ["delivered", "failed", "failed_unknown"]
@@ -102,6 +122,54 @@ defmodule Tightbeam.CompletionHandoffRestart do
     assert String.starts_with?(reminder.condition_kind, "terminal-child-owner-action-")
     assert reminder.condition_scope == root_id
     reminder
+  end
+
+  # This deadline only reports a stalled child before ExUnit's outer bound;
+  # success still requires the event, both callback barriers and every assertion.
+  defp remaining(deadline), do: max(0, deadline - System.monotonic_time(:millisecond))
+
+  defp barrier!(server, deadline, root_id, phase) do
+    :sys.get_state(server, remaining(deadline))
+  catch
+    :exit, reason -> diagnostic_timeout!(root_id, {phase, reason})
+  end
+
+  defp diagnostic_timeout!(root_id, phase) do
+    lane =
+      case Registry.lookup(Tightbeam.LaneRegistry, @parent) do
+        [{pid, _}] ->
+          %{
+            exists: Process.alive?(pid),
+            process: Process.info(pid, [:status, :current_function, :message_queue_len]),
+            task_state: diagnostic(fn -> GenServer.call(pid, :diagnostic_snapshot, 1_000) end)
+          }
+
+        [] ->
+          %{exists: false, task_state: :no_lane}
+      end
+
+    dump = %{
+      phase: phase,
+      turns:
+        diagnostic(fn ->
+          rows("SELECT seq,wakeId,status,startedAt,endedAt FROM turns ORDER BY seq")
+        end),
+      reminders:
+        diagnostic(fn -> Enum.map(reminders(root_id), &Map.take(&1, [:wake_id, :state])) end),
+      cursor: diagnostic(fn -> sweeper_cursor() end),
+      scheduler_misses: diagnostic(fn -> Tightbeam.SchedulerMisses.health() end),
+      lane: lane
+    }
+
+    raise "completion handoff restart timed out: #{inspect(dump, limit: :infinity)}"
+  end
+
+  defp diagnostic(fun) do
+    fun.()
+  rescue
+    error -> {:unavailable, Exception.message(error)}
+  catch
+    kind, reason -> {:unavailable, kind, reason}
   end
 
   defp assign!(opener, holder, subject, item_id) do
@@ -162,24 +230,6 @@ defmodule Tightbeam.CompletionHandoffRestart do
     {:ok, rows} = DB.query(DB, sql, params)
     rows
   end
-
-  defp await!(predicate, diagnostic, deadline \\ nil) do
-    deadline = deadline || System.monotonic_time(:millisecond) + 90_000
-
-    cond do
-      predicate.() ->
-        :ok
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        raise "completion handoff restart timed out: #{inspect(diagnostic.(), limit: :infinity)}"
-
-      true ->
-        receive do
-        after
-          50 -> await!(predicate, diagnostic, deadline)
-        end
-    end
-  end
 end
 
 # Both phases boot the same assembled payload through ordinary Application
@@ -211,7 +261,7 @@ if phase == "deliver" do
 
   for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
     File.cp!(
-      Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name]),
+      Path.join([:code.priv_dir(:tightbeam), "seed/rules", name]),
       Path.join(rules, name)
     )
   end
@@ -269,6 +319,7 @@ base_tmp = Path.join(base, "tmp")
 File.mkdir_p!(base_tmp)
 System.put_env("TMPDIR", base_tmp)
 
+diagnostic_deadline = System.monotonic_time(:millisecond) + 180_000
 booted_at = System.system_time(:millisecond)
 {:ok, _apps} = Application.ensure_all_started(:tightbeam)
 
@@ -304,7 +355,9 @@ if phase == "deliver" do
   # An abrupt stop: no application shutdown, no drain, no queued casts.
   System.halt(0)
 else
-  reminder = Tightbeam.CompletionHandoffRestart.restarted!(evidence, booted_at)
+  reminder =
+    Tightbeam.CompletionHandoffRestart.restarted!(evidence, booted_at, diagnostic_deadline)
+
   false = File.exists?(tripwire)
   IO.puts("completion-handoff-restart: restart ok reminder=#{reminder.wake_id}")
 end

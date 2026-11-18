@@ -27,7 +27,10 @@ times per recipient), a query or remote call per item in a loop, a per-row
 subquery over a whole table or view, recomputing unchanged state on a schedule,
 reading full history to answer a question about one record, unbounded
 accumulation, and retries with no end. On a hot path with nothing bounding its
-input, that growth is a blocker under either posture, light review included.
+input, flag that growth under either posture, light review included, and
+recommend how to handle it to the delivery owner with your reason. Recommend
+unrequested limits, thresholds, quotas or security mechanisms rather than
+making their absence a blocker.
 Where a query's cost depends on the plan the database chooses, ask for that plan
 on production-size data; a passing test on a small fixture does not establish it.
 

@@ -133,7 +133,12 @@ defmodule Tightbeam.CliIntegrationTest do
           {"tune",
            fn call ->
              send(test_pid, {:cli_call, call})
-             %{ok: false, code: "same_harness", message: "omit --harness"}
+
+             if call.params[:setting] == "rename" do
+               real_handlers["tune"].(call)
+             else
+               %{ok: false, code: "same_harness", message: "omit --harness"}
+             end
            end}
 
         {verb, handler} ->
@@ -383,6 +388,151 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='cli-worker'")
+  end
+
+  test "session rename uses stable keys and preserves history, assignment, and ownership", ctx do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+    owner_id = ctx.session.owner_user_id
+
+    {:appended, history} =
+      Projection.append(ctx.db, %{
+        session_key: ctx.worker.session_key,
+        role: "user",
+        content: "history before rename"
+      })
+
+    assert {created, 0} =
+             run.(["work-item-create", "--title", "rename wire", "--as-user", owner_id])
+
+    work_item_id = JSON.decode!(created)["id"]
+
+    assert {assigned, 0} =
+             run.([
+               "assign",
+               "--session",
+               "cli-worker",
+               "--subject",
+               "existing work",
+               "--effect-kind",
+               "coordination",
+               "--work-item",
+               work_item_id,
+               "--as-user",
+               owner_id
+             ])
+
+    assignment_id = JSON.decode!(assigned)["id"]
+
+    # Prove this is the existing same-owner path, not an administrator shortcut.
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE users SET isAdmin=0 WHERE userId=?1", [owner_id])
+
+    {renamed_output, rename_status} =
+      run.([
+        "session-rename",
+        "--session",
+        "cli-worker",
+        "--display-name",
+        "  New Worker  "
+      ])
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "tune",
+                      session_key: "cli-worker",
+                      principal: {:session, "cli-holder"},
+                      params: %{setting: "rename", display_name: "  New Worker  "}
+                    }}
+
+    assert rename_status == 0, renamed_output
+    assert JSON.decode!(renamed_output)["stream"]["displayName"] == "  New Worker  "
+
+    assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
+    assert Org.get(ctx.db, "  New Worker  ") == nil
+    assert {:ok, "cli-worker", false} = Roles.resolve(ctx.db, "cli-worker")
+
+    assert {:ok, [["cli-worker", "open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT holderKey,state FROM assignments WHERE id=?1",
+               [assignment_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE id=?1 AND sessionKey='cli-worker'",
+               [history.id]
+             )
+
+    # A session owned by another user remains protected by the existing tune
+    # authorization rule, even though the CLI command accepts its stable key.
+    outsider_id = "rename-outsider"
+
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 0, 1)", [
+        outsider_id
+      ])
+
+    other =
+      Org.create(ctx.db, %{
+        session_key: "other-owner-worker",
+        display_name: "Other Worker",
+        owner_user_id: outsider_id,
+        origin: "user:" <> outsider_id,
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    {collision, status} =
+      run.(["session-rename", "--session", "cli-worker", "--display-name", " other worker "])
+
+    assert status != 0
+    assert %{"code" => "display_name_taken", "ok" => false} = JSON.decode!(collision)
+    assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
+
+    {empty_name, status} =
+      run.(["session-rename", "--session", "cli-worker", "--display-name", "  \t "])
+
+    assert status != 0
+    assert %{"code" => "display_name_empty", "ok" => false} = JSON.decode!(empty_name)
+    assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
+
+    {denied, status} =
+      run.([
+        "session-rename",
+        "--session",
+        other.session_key,
+        "--display-name",
+        "Changed by owner"
+      ])
+
+    assert status != 0
+    assert %{"code" => "not_found", "ok" => false} = JSON.decode!(denied)
+    assert Org.get(ctx.db, other.session_key).display_name == "Other Worker"
+
+    assert {self_renamed, 0} =
+             run.([
+               "session-rename",
+               "--session",
+               "cli-holder",
+               "--display-name",
+               "Renamed Holder"
+             ])
+
+    assert JSON.decode!(self_renamed)["stream"]["sessionKey"] == "cli-holder"
+    assert Org.get(ctx.db, "cli-holder").display_name == "Renamed Holder"
+
+    {empty_name, status} =
+      run.(["session-rename", "--session", "cli-worker", "--display-name", "  "])
+
+    assert status != 0
+    assert %{"code" => "display_name_empty", "ok" => false} = JSON.decode!(empty_name)
+    assert Org.get(ctx.db, "cli-worker").display_name == "  New Worker  "
   end
 
   test "typed consequence crosses the real CLI wire with authenticated assignment custody", ctx do
@@ -2093,8 +2243,17 @@ defmodule Tightbeam.CliIntegrationTest do
     Archetypes.load!(ctx.base_dir)
 
     for file <- ["engineering.toml", "verification.toml"] do
-      assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
-             "learn did not deliver rules/#{file} into the org's identity tree"
+      assert File.exists?(
+               Path.join([
+                 ctx.base_dir,
+                 "identity",
+                 "kungfu",
+                 "agentic-engineering",
+                 "rules",
+                 file
+               ])
+             ),
+             "learn did not deliver the receipt-owned rule #{file} into the org's identity tree"
     end
 
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -2116,7 +2275,7 @@ defmodule Tightbeam.CliIntegrationTest do
         display_name: "CLI Coder",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
+        archetype: "agentic-engineering.coder",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
@@ -2129,7 +2288,7 @@ defmodule Tightbeam.CliIntegrationTest do
         display_name: "CLI Reviewer",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "reviewer",
+        archetype: "agentic-engineering.reviewer-code",
         host: "testhost",
         harness: "codex",
         provider: "openai",
@@ -2142,7 +2301,7 @@ defmodule Tightbeam.CliIntegrationTest do
         display_name: "CLI Product Owner",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "product-owner",
+        archetype: "agentic-engineering.product-owner",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
@@ -2248,20 +2407,20 @@ defmodule Tightbeam.CliIntegrationTest do
                stderr_to_stdout: true
              )
 
-    # Consume this exact notice turn before the next card's notice is eligible;
-    # filing an attest does not finish a recipient turn.
-    assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
+    # The verdict remains durable, but R01 keeps unlinked ordinary verdicts quiet.
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='topology-decided'",
+               [topology_id]
+             )
 
-    assert {:ok, [[topology_notice_id]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
                [topology_id]
              )
-
-    topology_delivery = assert_cli_source_delivery!(ctx.db, topology_notice_id, "cli-holder")
-    assert topology_delivery.source.prompt =~ topology_id
-    finish_cli_delivery!(ctx.db, "cli-holder", topology_delivery.seq)
 
     # The posture gate refuses a coder card on an unpostured work item, so the
     # slice is ruled first, through the same real CLI.
@@ -2288,17 +2447,21 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    # The posture verdict can now deliver before later CLI calls. Consume its
-    # carrier so the holder is ready for the implementation receipt notice.
-    assert {:ok, [[posture_notice_id]]} =
+    # The posture verdict is durable and satisfies the gate, but remains quiet
+    # because it is an unlinked ordinary verdict under R01.
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [topology_id, topology_notice_id]
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='posture-light'",
+               [topology_id]
              )
 
-    posture_delivery = assert_cli_source_delivery!(ctx.db, posture_notice_id, "cli-holder")
-    finish_cli_delivery!(ctx.db, "cli-holder", posture_delivery.seq)
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
+               [topology_id]
+             )
 
     {assigned, 0} =
       System.cmd(
@@ -2416,7 +2579,8 @@ defmodule Tightbeam.CliIntegrationTest do
     ]
 
     # A1 first denial: the completion is refused and the wake names the
-    # missing verification verdict.
+    # missing verification verdict. The ordinary tests-passed receipt is
+    # durable but does not create an R01 opener notice.
     {denied, denied_status} =
       System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
@@ -2427,7 +2591,11 @@ defmodule Tightbeam.CliIntegrationTest do
     assert denied =~ "completion-requires-verification"
 
     assert %{status: "live", producer_key: verification_source_id} =
-             RailRemedy.episode(ctx.db, "completion-requires-verification", work_id)
+             RailRemedy.episode(
+               ctx.db,
+               "agentic-engineering.completion-requires-verification",
+               work_id
+             )
 
     verification_delivery =
       assert_cli_source_delivery!(ctx.db, verification_source_id, "cli-coder")
@@ -2436,16 +2604,19 @@ defmodule Tightbeam.CliIntegrationTest do
     assert verification_wake.prompt =~ "no verification verdict is filed"
     assert verification_wake.prompt =~ work_id
 
-    assert {:ok, [[receipt_notice_id]]} =
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='tests-passed'",
+               [work_id]
+             )
+
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
                [work_id]
              )
-
-    receipt_delivery = assert_cli_source_delivery!(ctx.db, receipt_notice_id, "cli-holder")
-    assert receipt_delivery.source.prompt =~ "Attest "
-    finish_cli_delivery!(ctx.db, "cli-holder", receipt_delivery.seq)
 
     {_verified, 0} =
       System.cmd(
@@ -2466,6 +2637,13 @@ defmodule Tightbeam.CliIntegrationTest do
 
     finish_cli_delivery!(ctx.db, "cli-coder", verification_delivery.seq)
 
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='verified'",
+               [work_id]
+             )
+
     # A1 second denial: the artifact statute prods next, naming its own record.
     {denied_again, denied_again_status} =
       System.cmd(ctx.binary, completion_args,
@@ -2476,19 +2654,19 @@ defmodule Tightbeam.CliIntegrationTest do
     assert denied_again_status != 0
     assert denied_again =~ "completion-requires-results-artifact"
 
-    assert {:ok, [[verified_notice_id]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [work_id, receipt_notice_id]
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
+               [work_id]
              )
 
-    attest_delivery = assert_cli_source_delivery!(ctx.db, verified_notice_id, "cli-holder")
-    attest_batch = Wakes.get(ctx.db, attest_delivery.carrier_id)
-    assert attest_batch.prompt =~ "Attest "
-
     assert %{status: "live", producer_key: artifact_source_id} =
-             RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
+             RailRemedy.episode(
+               ctx.db,
+               "agentic-engineering.completion-requires-results-artifact",
+               work_id
+             )
 
     artifact_delivery = assert_cli_source_delivery!(ctx.db, artifact_source_id, "cli-coder")
     artifact_wake = artifact_delivery.source
@@ -2564,10 +2742,18 @@ defmodule Tightbeam.CliIntegrationTest do
              DB.query(ctx.db, "SELECT state, outcome FROM assignments WHERE id = ?1", [work_id])
 
     assert %{status: "closed"} =
-             RailRemedy.episode(ctx.db, "completion-requires-verification", work_id)
+             RailRemedy.episode(
+               ctx.db,
+               "agentic-engineering.completion-requires-verification",
+               work_id
+             )
 
     assert %{status: "closed"} =
-             RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
+             RailRemedy.episode(
+               ctx.db,
+               "agentic-engineering.completion-requires-results-artifact",
+               work_id
+             )
 
     # An absent work item is refused by name over the real wire, never as the
     # insert's foreign-key MatchError.
@@ -2877,6 +3063,7 @@ defmodule Tightbeam.CliIntegrationTest do
       [[rule]]
       name = "assignments-need-a-ruling"
       verb = "assignments"
+      archetypes = ["*"]
       text = "listing assignments is an owner decision in this fixture org"
       effect = "escalate"
       deny_when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
@@ -2943,8 +3130,8 @@ defmodule Tightbeam.CliIntegrationTest do
     refute_receive {:cli_call, %{verb: "assignments"}}
   end
 
-  test "real CLI retired producer verbs are unknown commands", ctx do
-    for verb <- ["run-tests", "run-smoke", "cancel-producer-job"] do
+  test "real CLI retired verbs are unknown commands", ctx do
+    for verb <- ["run-tests", "run-smoke", "cancel-producer-job", "effort-rule"] do
       {output, status} =
         System.cmd(ctx.binary, [verb, "asg_1"],
           cd: ctx.workdir,
@@ -2954,135 +3141,6 @@ defmodule Tightbeam.CliIntegrationTest do
       assert status != 0
       assert output =~ "unknown command"
     end
-  end
-
-  test "real CLI prefers the expecter but permits an exact-id delegate with canonical replay",
-       ctx do
-    continue_request = open_effort_request(ctx, "continue")
-    worker_dir = session_workdir!(ctx, ctx.worker)
-
-    {requests, 0} =
-      System.cmd(ctx.binary, ["decision-requests", "--status", "open"],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert requests =~ continue_request
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "decision-requests",
-                      principal: {:session, "cli-holder"},
-                      params: %{status: "open"}
-                    }}
-
-    {worker_requests, 0} =
-      System.cmd(ctx.binary, ["decision-requests", "--status", "open"],
-        cd: worker_dir,
-        stderr_to_stdout: true
-      )
-
-    refute worker_requests =~ continue_request
-
-    {exact, 0} =
-      System.cmd(ctx.binary, ["decision-request", "--request", continue_request],
-        cd: worker_dir,
-        stderr_to_stdout: true
-      )
-
-    assert %{
-             "decisionRequest" => %{
-               "id" => ^continue_request,
-               "kind" => "effort",
-               "expecterSessionKey" => "cli-holder",
-               "assignmentId" => assignment_id
-             }
-           } = JSON.decode!(exact)
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "decision-request",
-                      principal: {:session, "cli-worker"},
-                      params: %{request: ^continue_request}
-                    }}
-
-    {:ok, [[generation_count]]} =
-      DB.query(
-        ctx.db,
-        "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId = ?1",
-        [assignment_id]
-      )
-
-    {continued, 0} =
-      System.cmd(
-        ctx.binary,
-        ["effort-rule", "--request", continue_request, "--action", "continue"],
-        cd: worker_dir,
-        stderr_to_stdout: true
-      )
-
-    assert continued =~ "continue"
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "effort-rule",
-                      principal: {:session, "cli-worker"},
-                      params: %{request: ^continue_request, action: "continue"}
-                    }}
-
-    assert {:ok, [["session:cli-worker"]]} =
-             DB.query(ctx.db, "SELECT ruledBy FROM decision_requests WHERE id = ?1", [
-               continue_request
-             ])
-
-    {replayed, 0} =
-      System.cmd(
-        ctx.binary,
-        ["effort-rule", "--request", continue_request, "--action", "continue"],
-        cd: worker_dir,
-        stderr_to_stdout: true
-      )
-
-    assert replayed =~ "continue"
-
-    assert {:ok, [[count_after_replay]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId = ?1",
-               [assignment_id]
-             )
-
-    assert count_after_replay == generation_count
-
-    {refused_replay, refused_status} =
-      System.cmd(
-        ctx.binary,
-        ["effort-rule", "--request", continue_request, "--action", "continue"],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert refused_status != 0
-    assert refused_replay =~ "not_open"
-
-    dismiss_request = open_effort_request(ctx, "dismiss")
-
-    {dismissed, 0} =
-      System.cmd(
-        ctx.binary,
-        ["effort-rule", "--request", dismiss_request, "--action", "dismiss"],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert dismissed =~ "dismiss"
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "effort-rule",
-                      principal: {:session, "cli-holder"},
-                      params: %{request: ^dismiss_request, action: "dismiss"}
-                    }}
   end
 
   test "real gateway dispatch preserves ruled list and exact response equality",
@@ -3440,6 +3498,8 @@ defmodule Tightbeam.CliIntegrationTest do
       {"harklight-settle", ["harklight-settle", "--message", "message-example"],
        "invalid Harklight command flags"},
       {"harklight-follow", ["harklight-follow", "--message", "message-example"],
+       "invalid Harklight command flags"},
+      {"harklight-listener-restore", ["harklight-listener-restore", "--handle", "handle-example"],
        "invalid Harklight command flags"}
     ]
 
@@ -3707,70 +3767,6 @@ defmodule Tightbeam.CliIntegrationTest do
                         priority: 7
                       }
                     }}
-  end
-
-  defp open_effort_request(ctx, action) do
-    key = "effort-#{action}-#{System.unique_integer([:positive])}"
-
-    {dispatched, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "dispatch",
-          "--holder",
-          "cli-worker",
-          "--subject",
-          "effort #{action}",
-          "--brief",
-          "Exercise the #{action} ruling path.",
-          "--key",
-          key
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assignment_id = JSON.decode!(dispatched)["id"]
-
-    assert_receive {:cli_call, %{verb: "dispatch", params: %{idempotency_key: ^key}}}
-
-    request_id = "dr_" <> Tightbeam.Id.uuid4()
-    now = System.system_time(:millisecond)
-
-    legacy_deadline =
-      Wakes.schedule(ctx.db, %{
-        session_key: "cli-holder",
-        origin: "process:tightbeam",
-        consumer: "effort_deadline",
-        prompt: nil,
-        due_at: now + 60_000,
-        assignment_id: assignment_id
-      })
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        """
-        INSERT INTO decision_requests
-          (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
-           lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
-           question, options, context, status)
-        VALUES (?1, 'effort', 'process:tightbeam', 'flynn', ?2, 'cli-holder',
-                1, 1, ?3, ?4, ?5, ?6, ?7, ?8, 'open')
-        """,
-        [
-          request_id,
-          assignment_id,
-          legacy_deadline.wake_id,
-          now,
-          now + 60_000,
-          "Continue or dismiss?",
-          JSON.encode!(["continue", "dismiss"]),
-          JSON.encode!(%{"actions" => ["continue", "dismiss"]})
-        ]
-      )
-
-    request_id
   end
 
   test "real CLI rejects closed or retired Topline shapes before router dispatch", ctx do

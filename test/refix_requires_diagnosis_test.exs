@@ -34,10 +34,10 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
-    holder = session(db, "fix-holder", "coder")
-    recon = session(db, "recon-holder", "recon")
-    po = session(db, "fix-po", "product-owner")
-    pdo = session(db, "fix-pdo", "pdo")
+    holder = session(db, "fix-holder", "agentic-engineering.coder")
+    recon = session(db, "recon-holder", "agentic-engineering.recon")
+    po = session(db, "fix-po", "agentic-engineering.product-owner")
+    pdo = session(db, "fix-pdo", "agentic-engineering.pdo")
     Roles.create!(db, "recon", "flynn", recon.session_key)
     Roles.create!(db, "product-owner:refix", "flynn", po.session_key)
 
@@ -77,9 +77,9 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     refute Enum.any?(ctx.rules, &(&1.name == "wake-obligation-registration-authority"))
 
     expected = [
-      "completion-requires-review",
-      "completion-requires-verification",
-      "completion-requires-results-artifact"
+      "agentic-engineering.completion-requires-review",
+      "agentic-engineering.completion-requires-verification",
+      "agentic-engineering.completion-requires-results-artifact"
     ]
 
     names =
@@ -89,7 +89,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
     assert names == expected
 
-    refute Enum.any?(ctx.rules, &(&1.name == "refix-requires-diagnosis"))
+    refute Enum.any?(ctx.rules, &(&1.name == "agentic-engineering.refix-requires-diagnosis"))
   end
 
   test "completed evidence work does not force recon before a repair", ctx do
@@ -124,7 +124,11 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
                  origin: "user:flynn",
                  principal: {:user, "flynn"},
                  session_key: nil,
-                 params: %{work_item_id: item.id}
+                 params:
+                   if(verb == "work-item-icebox",
+                     do: %{work_item_id: item.id, reason: "deferred for review"},
+                     else: %{work_item_id: item.id}
+                   )
                })
 
       assert {:error, %{code: "work_item_not_open"}} =

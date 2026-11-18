@@ -2,17 +2,20 @@
 # Core authorization still applies to every caller; coordination and linked
 # review retain their existing intake paths.
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-spawn-staffing-needs-work-item"
 verb = "spawn"
 text = "Worker staffing requires a known work item. Create or link the work item before retrying."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "spawn.archetype", op = "not_in", value = ["orchestrator", "product-owner", "pdo"] },
+  { fact = "spawn.archetype", op = "not_in", value = ["agentic-engineering.orchestrator", "agentic-engineering.product-owner", "agentic-engineering.pdo"] },
   { fact = "work_item.reference_state", op = "ne", value = "known" },
+  { fact = "spawn.itemless_ephemeral_caller_qualified", op = "eq", value = false },
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-spawn-referenced-work-item-must-exist"
 verb = "spawn"
 text = "Referenced work item {work_item_id} does not exist. Correct the item reference or create the item before retrying."
@@ -23,6 +26,7 @@ deny_when = [
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-spawn-staffing-needs-topology"
 verb = "spawn"
 text = "Production staffing requires returned attributable topology for this work item. Current delivery owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item assignment holder retry."
@@ -35,6 +39,7 @@ deny_when = [
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-assign-staffing-needs-work-item"
 verb = "assign"
 text = "Engineering staffing requires a known work item. Link intake, consultation, review, and production assignments to their durable item before retrying."
@@ -45,6 +50,7 @@ deny_when = [
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-assign-production-needs-delivery-owner"
 verb = "assign"
 text = "Production staffing of work item {work_item_id} requires a current delivery owner. Use work-item-handoff --work-item {work_item_id} --delivery-owner <sessionKey> --brief \"<brief>\" to set the intended office and deliver its brief in one call, then dispatch an implementation worker."
@@ -58,6 +64,7 @@ deny_when = [
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-assign-production-office-target-refused"
 verb = "assign"
 text = "Production work, including review, cannot be assigned to a product-owner, PDO, or orchestrator session. Assign a qualified non-office worker or use a genuine coordination handoff."
@@ -65,10 +72,11 @@ edges = ["verb"]
 effect = "deny"
 deny_when = [
   { fact = "assign.effect_kind", op = "ne", value = "coordination" },
-  { fact = "target.archetype", op = "in", value = ["product-owner", "pdo", "orchestrator"] },
+  { fact = "target.archetype", op = "in", value = ["agentic-engineering.product-owner", "agentic-engineering.pdo", "agentic-engineering.orchestrator"] },
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-assign-production-needs-topology"
 verb = "assign"
 text = "Production staffing requires returned attributable topology for this work item. Current delivery owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item assignment holder retry."
@@ -83,6 +91,7 @@ deny_when = [
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-assign-labeled-coordination-needs-delivery-owner"
 verb = "assign"
 text = "Coordination work sent to a non-office target requires a delivery owner for work item {work_item_id}. Set the intended owner explicitly with work-item-update --delivery-owner before retrying."
@@ -91,11 +100,12 @@ effect = "deny"
 deny_when = [
   { fact = "assign.is_linked_review", op = "ne", value = true },
   { fact = "assign.effect_kind", op = "eq", value = "coordination" },
-  { fact = "target.archetype", op = "not_in", value = ["product-owner", "pdo"] },
+  { fact = "target.archetype", op = "not_in", value = ["agentic-engineering.product-owner", "agentic-engineering.pdo"] },
   { fact = "work_item.has_delivery_owner", op = "ne", value = true },
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-assign-labeled-coordination-needs-topology"
 verb = "assign"
 text = "Coordination staffing for this work item requires returned attributable topology. Current delivery owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item assignment holder retry."
@@ -105,12 +115,13 @@ external_producer = true
 deny_when = [
   { fact = "assign.is_linked_review", op = "ne", value = true },
   { fact = "assign.effect_kind", op = "eq", value = "coordination" },
-  { fact = "target.archetype", op = "not_in", value = ["product-owner", "pdo"] },
+  { fact = "target.archetype", op = "not_in", value = ["agentic-engineering.product-owner", "agentic-engineering.pdo"] },
   { fact = "work_item.delivery_owner_state", op = "eq", value = "current" },
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-dispatch-staffing-needs-work-item"
 verb = "dispatch"
 text = "Engineering staffing requires a known work item. Link the dispatch to its durable item before retrying."
@@ -121,6 +132,7 @@ deny_when = [
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-dispatch-production-needs-delivery-owner"
 verb = "dispatch"
 text = "Production staffing of work item {work_item_id} requires a current delivery owner. Use work-item-handoff --work-item {work_item_id} --delivery-owner <sessionKey> --brief \"<brief>\" to set the intended office and deliver its brief in one call, then dispatch an implementation worker."
@@ -133,6 +145,7 @@ deny_when = [
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-dispatch-production-office-target-refused"
 verb = "dispatch"
 text = "Production work, including review, cannot be dispatched to a product-owner, PDO, or orchestrator session. Use work-item-handoff with either --work-item <workItemId> or --title \"<title>\", plus --delivery-owner <sessionKey> and --brief \"<brief>\", to hand coordination to the office in one call; staff production separately."
@@ -140,10 +153,11 @@ edges = ["verb"]
 effect = "deny"
 deny_when = [
   { fact = "assign.effect_kind", op = "ne", value = "coordination" },
-  { fact = "target.archetype", op = "in", value = ["product-owner", "pdo", "orchestrator"] },
+  { fact = "target.archetype", op = "in", value = ["agentic-engineering.product-owner", "agentic-engineering.pdo", "agentic-engineering.orchestrator"] },
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-dispatch-production-needs-topology"
 verb = "dispatch"
 text = "Production staffing requires returned attributable topology for this work item. Current delivery owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item assignment holder retry."
@@ -157,6 +171,7 @@ deny_when = [
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-dispatch-labeled-coordination-needs-delivery-owner"
 verb = "dispatch"
 text = "Coordination work sent to a non-office target requires a delivery owner for work item {work_item_id}. Set the intended owner explicitly with work-item-update --delivery-owner before retrying."
@@ -164,11 +179,12 @@ edges = ["verb"]
 effect = "deny"
 deny_when = [
   { fact = "assign.effect_kind", op = "eq", value = "coordination" },
-  { fact = "target.archetype", op = "not_in", value = ["product-owner", "pdo"] },
+  { fact = "target.archetype", op = "not_in", value = ["agentic-engineering.product-owner", "agentic-engineering.pdo"] },
   { fact = "work_item.has_delivery_owner", op = "ne", value = true },
 ]
 
 [[rule]]
+archetypes = ["agentic-engineering.coder", "agentic-engineering.guidance-reviewer", "agentic-engineering.guidance-writer", "agentic-engineering.integrator", "agentic-engineering.orchestrator", "agentic-engineering.pdo", "agentic-engineering.product-owner", "agentic-engineering.recon", "agentic-engineering.reviewer-code", "agentic-engineering.reviewer-spec", "agentic-engineering.spec-writer", "agentic-engineering.team-planner"]
 name = "engineering-dispatch-labeled-coordination-needs-topology"
 verb = "dispatch"
 text = "Coordination dispatch for this work item requires returned attributable topology. Current delivery owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item assignment holder retry."
@@ -177,7 +193,7 @@ effect = "deny"
 external_producer = true
 deny_when = [
   { fact = "assign.effect_kind", op = "eq", value = "coordination" },
-  { fact = "target.archetype", op = "not_in", value = ["product-owner", "pdo"] },
+  { fact = "target.archetype", op = "not_in", value = ["agentic-engineering.product-owner", "agentic-engineering.pdo"] },
   { fact = "work_item.delivery_owner_state", op = "eq", value = "current" },
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
 ]

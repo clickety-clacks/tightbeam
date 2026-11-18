@@ -21,6 +21,28 @@ defmodule Tightbeam.EphemeralTest do
     Tightbeam.GuardRuntimeFixture.run!(tmp, "live_base_ephemeral.exs", "ephemeral-runtime: ok")
   end
 
+  @tag tmp_dir: true, timeout: 180_000
+  test "WI3FE r2 full Dispatch covers helper delivery and scoped staffing refusals",
+       %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_itemless_spawn_dispatch.exs",
+      "itemless-spawn-dispatch: ok"
+    )
+
+    runtime_log = tmp |> Path.join("runtime.log") |> File.read!()
+    assert runtime_log =~ "R4: unreachable with shipped archetypes"
+    assert runtime_log =~ "adapter: synthetic; real model turn unproven"
+
+    loaded_rule_set =
+      runtime_log
+      |> String.split("\n")
+      |> Enum.find(&String.starts_with?(&1, "loaded-rule-set: "))
+
+    assert is_binary(loaded_rule_set)
+    IO.puts(loaded_rule_set)
+  end
+
   setup do
     db =
       start_supervised!(
@@ -197,6 +219,8 @@ defmodule Tightbeam.EphemeralTest do
   test "R2.3 read rules still deny without escalating the helper", %{db: db} do
     rule = %{
       name: "read-approval",
+      owner: :substrate,
+      archetypes: ["*"],
       verb: "inspect",
       verbs: ["inspect"],
       text: "approval required",
@@ -250,7 +274,7 @@ defmodule Tightbeam.EphemeralTest do
       Placement.with_turn_directory(config, helper, fn ->
         path = Placement.holder_workdir(config, helper)
         assert path != "/"
-        assert File.ls!(path) == []
+        assert File.ls!(path) == [".tightbeam-rail-scope.json"]
         File.write!(Path.join(path, "scratch"), "discard")
         path
       end)
@@ -262,7 +286,7 @@ defmodule Tightbeam.EphemeralTest do
       Placement.with_turn_directory(config, helper, fn ->
         next = Placement.holder_workdir(config, helper)
         refute next == path
-        assert File.ls!(next) == []
+        assert File.ls!(next) == [".tightbeam-rail-scope.json"]
         next
       end)
 
@@ -275,12 +299,13 @@ defmodule Tightbeam.EphemeralTest do
     assert {:ok, _} = Placement.register_host(db, "testhost", %{ssh: nil, base_dir: tmp})
     helper = Org.get(db, "helper")
     owner = self()
+    fixture = Path.join(tmp, "helper-cleanup-fixture")
 
     sh = fn
       ["mktemp" | _] ->
-        {"/tmp/helper-cleanup-fixture\n", 0}
+        {fixture <> "\n", 0}
 
-      ["rm", "-rf", "--", "/tmp/helper-cleanup-fixture"] ->
+      ["rm", "-rf", "--", ^fixture] ->
         send(owner, {:cleanup_attempted, self()})
         {"removal failed", 1}
     end
@@ -308,7 +333,7 @@ defmodule Tightbeam.EphemeralTest do
       end)
 
     assert log =~ "Ephemeral temporary directory cleanup failed for helper"
-    assert log =~ "/tmp/helper-cleanup-fixture"
+    assert log =~ fixture
     assert log =~ "removal failed"
   end
 
@@ -317,12 +342,13 @@ defmodule Tightbeam.EphemeralTest do
     assert {:ok, _} = Placement.register_host(db, "testhost", %{ssh: nil, base_dir: tmp})
     helper = Org.get(db, "helper")
     owner = self()
+    fixture = Path.join(tmp, "helper-owner-death-fixture")
 
     sh = fn
       ["mktemp" | _] ->
-        {"/tmp/helper-owner-death-fixture\n", 0}
+        {fixture <> "\n", 0}
 
-      ["rm", "-rf", "--", "/tmp/helper-owner-death-fixture"] ->
+      ["rm", "-rf", "--", ^fixture] ->
         send(owner, :owner_death_cleanup)
         {"", 0}
     end
@@ -422,6 +448,91 @@ defmodule Tightbeam.EphemeralTest do
     assert :ok = Schema.ensure_all(db)
     assert Ephemeral.available?(db)
     assert {:ok, [[0]]} = DB.query(db, "SELECT id FROM ephemeral_migration")
+  end
+
+  # wi_0b608f33: every turn's workdir lookup and identity apply's file step ask
+  # this question. It only reads, so it must not queue behind the database
+  # writer: while the writer is busy with something slow, the answer still comes.
+  test "R2.5 the ephemeral lookup answers while the database writer is busy" do
+    base_dir =
+      System.tmp_dir!()
+      |> Path.join("tightbeam-ephemeral-reader-#{System.unique_integer([:positive])}")
+      |> Tightbeam.LiveBaseAdmission.canonical!()
+
+    File.mkdir_p!(base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    payload_root = Path.join(base_dir, "payload")
+    File.mkdir_p!(Path.join(payload_root, "ebin"))
+    File.mkdir_p!(Path.join(payload_root, "priv"))
+    File.write!(Path.join(payload_root, "priv/ephemeral-reader-test"), "test payload")
+
+    {:ok, manifest} =
+      Tightbeam.LiveBaseGuard.generate_manifest(Tightbeam.LiveBasePayload.files!(payload_root))
+
+    File.write!(Path.join(payload_root, "build-manifest.json"), JSON.encode!(manifest))
+
+    db =
+      start_supervised!(
+        Supervisor.child_spec(
+          {DB,
+           path: Path.join(base_dir, "state.db"),
+           name: nil,
+           guard_inputs: [],
+           payload_root: payload_root},
+          id: {:ephemeral_reader, System.unique_integer([:positive])}
+        )
+      )
+
+    :ok = ensure_all_schemas(db)
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('owner',1,1)")
+
+    for key <- ["caller", "helper", "ordinary"] do
+      Org.create(db, %{
+        session_key: key,
+        display_name: key,
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+    end
+
+    refute Ephemeral.session?(db, "helper")
+    assert {:ok, _} = DB.transaction(db, &Ephemeral.stamp_in_txn(&1, "helper", "caller"))
+    assert Ephemeral.session?(db, "helper")
+
+    parent = self()
+
+    writer =
+      Task.async(fn ->
+        DB.transaction(db, fn _txn ->
+          send(parent, {:writer_held, self()})
+
+          receive do
+            :release -> :released
+          after
+            10_000 -> raise "writer was not released"
+          end
+        end)
+      end)
+
+    assert_receive {:writer_held, owner}, 5_000
+
+    lookups =
+      Task.async(fn ->
+        {Ephemeral.available?(db), Ephemeral.session?(db, "helper"),
+         Ephemeral.session?(db, "ordinary")}
+      end)
+
+    answered = Task.yield(lookups, 2_000)
+    send(owner, :release)
+
+    assert {:ok, {true, true, false}} = answered
+    assert {:ok, :released} = Task.await(writer, 5_000)
   end
 
   test "R2.1-R2.5 migration and stamped elections survive restart", %{db: db} do

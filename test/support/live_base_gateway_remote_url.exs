@@ -11,7 +11,7 @@ end
 defmodule GuardRemoteUrl do
   import ExUnit.Assertions
   import Tightbeam.TestCase, only: [register_hosts: 2]
-  alias Tightbeam.{ConnRegistry, Gateway, Identity, Ledger, Model, Org}
+  alias Tightbeam.{ConnRegistry, Gateway, Identity, Ledger, Model, Org, Rails}
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
 
   def run do
@@ -70,24 +70,51 @@ defmodule GuardRemoteUrl do
                      )
 
               assert File.lstat!(stage_file).type == :regular
-              assert Bitwise.band(File.stat!(stage_file).mode, 0o777) == 0o600
-              send(parent, {:delivered_session_file, File.read!(stage_file)})
+              content = File.read!(stage_file)
+
+              expected_mode =
+                if content == Rails.session_scope_content("default"),
+                  do: 0o644,
+                  else: 0o600
+
+              assert Bitwise.band(File.stat!(stage_file).mode, 0o777) == expected_mode
+              send(parent, {:delivered_session_file, content})
             end
           end
 
-          if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
-               Enum.any?(command, &String.contains?(&1, "cat")),
-             do: {"", 42},
-             else: {"", 0}
+          cond do
+            Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+                Enum.any?(command, &String.contains?(&1, "cat")) ->
+              {"", 42}
+
+            Enum.any?(
+              command,
+              &String.contains?(&1, "/@agentclientprotocol/claude-agent-acp/package.json")
+            ) ->
+              {JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()}), 0}
+
+            true ->
+              {"", 0}
+          end
         end
 
         sh_out = fn command ->
           assert_synthetic_command!(command)
 
-          if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
-               Enum.any?(command, &String.contains?(&1, "cat")),
-             do: {"", 42},
-             else: {"", 0}
+          cond do
+            Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+                Enum.any?(command, &String.contains?(&1, "cat")) ->
+              {"", 42}
+
+            Enum.any?(
+              command,
+              &String.contains?(&1, "/@agentclientprotocol/claude-agent-acp/package.json")
+            ) ->
+              {JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()}), 0}
+
+            true ->
+              {"", 0}
+          end
         end
 
         config =
