@@ -1827,6 +1827,105 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            )
   end
 
+  test "real-clock shutdown completes within its configured budget when the DB is blocked", ctx do
+    path = Path.join(ctx.test_dir, "fake_harness.js")
+    File.write!(path, @fake)
+    helper = Path.expand("../cli/target/release/tightbeam", __DIR__)
+    budget_ms = 2_000
+
+    cleanup_owner =
+      start_supervised!(
+        {Task.Supervisor,
+         name: :"shutdown_real_clock_cleanup_#{System.unique_integer([:positive])}"}
+      )
+
+    {:ok, coordinator} =
+      AdapterCoordinator.start_link(
+        adapter_sup: ctx.sup,
+        adapter_context: fn _ -> [] end,
+        adapter_opts: fn _, _ ->
+          [
+            harness: :claude,
+            cmd: [System.find_executable("node"), path],
+            home: ctx.test_dir,
+            cwd: ctx.test_dir,
+            process_helper: helper,
+            process_identity_dir: ctx.test_dir
+          ]
+        end,
+        db: ctx.db,
+        shutdown_budget_ms: budget_ms,
+        shutdown_settlement_budget_ms: 500,
+        shutdown_cleanup_supervisor: cleanup_owner,
+        name: :"shutdown_real_clock_coordinator_#{System.unique_integer([:positive])}"
+      )
+
+    Process.unlink(coordinator)
+    on_exit(fn -> if Process.alive?(coordinator), do: GenServer.stop(coordinator, :shutdown) end)
+    keys = [{:claude, "shared", "shutdown-real-clock-host"}]
+    [key] = keys
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert %Tightbeam.Acp.Adapter{} = :sys.get_state(adapter, :infinity)
+    assert [%{state: "running"}] = HarnessProcess.list(ctx.db)
+    adapter_ref = Process.monitor(adapter)
+
+    # Hold the DB past both real deadlines, rather than racing 24 row writes
+    # against the reserve. No shutdown_clock override: a callback that ignores
+    # its actual deadline must fail the elapsed-time assertion below.
+    :ok = :sys.suspend(ctx.db)
+
+    try do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          started_at = System.monotonic_time()
+          assert :ok = GenServer.stop(coordinator, :shutdown, :infinity)
+          elapsed_native = System.monotonic_time() - started_at
+
+          send(
+            self(),
+            {:shutdown_elapsed_ms,
+             System.convert_time_unit(elapsed_native, :native, :millisecond)}
+          )
+        end)
+
+      assert_received {:shutdown_elapsed_ms, elapsed_ms}
+
+      # terminate/2 promises to complete within shutdown_budget_ms, and the V7
+      # concern — a callback overrunning its own budget passing unnoticed — still
+      # governs: the allowance below is measurement-scale, not phase-scale, so a
+      # real overrun of the 500ms reserve still fails. Without the allowance the
+      # bound's margin is negative by construction — it forbids what the code's
+      # own contract permits and can fail on a quiet host on a scheduling hiccup.
+      # Two costs land in elapsed_ms without being terminate's to spend:
+      # DB.transaction_until grants
+      # a final commit already in flight remaining + 50ms past the deadline rather
+      # than abort a durable outcome (observed +8..22ms), and the measurement
+      # starts before GenServer.stop dispatches, ahead of the callback's own clock
+      # (observed +12..26ms under 4x CPU oversubscription). 100ms is ~3x the worst
+      # observed sum of the two. This bound is a sanity check on the deadline
+      # contract. The separate 24-adapter logical-clock test below asserts late
+      # entry settlement, fences, events, bounded logging and descendant cleanup.
+      observation_allowance_ms = 100
+
+      assert elapsed_ms <= budget_ms + observation_allowance_ms,
+             "shutdown took #{elapsed_ms}ms against a configured #{budget_ms}ms budget " <>
+               "(+#{observation_allowance_ms}ms observation allowance) with " <>
+               "#{length(keys)} retained adapters; the deadline guarantee did not hold"
+
+      assert log =~ "preparation unresolved before deadline"
+      assert log =~ "durable outcomes unresolved before deadline"
+    after
+      :sys.resume(ctx.db)
+    end
+
+    assert_receive {:DOWN, ^adapter_ref, :process, ^adapter, _reason}, 30_000
+
+    assert eventually(
+             fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
+             1_000
+           )
+  end
+
   test "retirement cutoff preserves late entries for the settlement reserve", ctx do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
