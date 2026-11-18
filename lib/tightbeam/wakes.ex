@@ -1764,14 +1764,20 @@ defmodule Tightbeam.Wakes do
       )
     end
 
-    if is_binary(Map.get(input, :prod_id)) do
-      Tightbeam.QueuedMessageSuppression.replace_prod_in_txn(
-        txn,
-        wake,
-        Map.fetch!(input, :prod_sender),
-        input.prod_id
-      )
-    end
+    wake =
+      if is_binary(Map.get(input, :prod_id)) do
+        replaced_ids =
+          Tightbeam.QueuedMessageSuppression.replace_prod_in_txn(
+            txn,
+            wake,
+            Map.fetch!(input, :prod_sender),
+            input.prod_id
+          )
+
+        Map.put(wake, :replaced_wake_ids, replaced_ids)
+      else
+        wake
+      end
 
     if is_binary(condition_kind) do
       EventLog.lifecycle_in_txn(
