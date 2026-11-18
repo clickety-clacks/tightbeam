@@ -596,6 +596,9 @@ defmodule Tightbeam.Ledger do
                   [] -> {nil, nil, nil, nil}
                 end
 
+              # The redundant IN term lets SQLite use the partial index
+              # `turns_pending`; without it the lookup walks every turn the
+              # session ever had, in the writer, at every turn end.
               Txn.q(
                 txn,
                 """
@@ -604,6 +607,7 @@ defmodule Tightbeam.Ledger do
                       model = ?4, harness = ?5, thinkingLevel = ?6, modelContext = ?7
                   WHERE seq = (SELECT t.seq FROM turns AS t
                                WHERE t.sessionKey = ?1 AND t.status = 'queued'
+                                 AND t.status IN ('queued','running')
                                  AND EXISTS (
                                    SELECT 1 FROM sessions AS s
                                    WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
@@ -736,9 +740,12 @@ defmodule Tightbeam.Ledger do
   # asked as a question instead of collapsed into a nil result.
   defp no_claim(%Txn{} = txn, session_key) do
     queued? =
-      Txn.q(txn, "SELECT 1 FROM turns WHERE sessionKey = ?1 AND status = 'queued' LIMIT 1", [
-        session_key
-      ]) != []
+      Txn.q(
+        txn,
+        "SELECT 1 FROM turns WHERE sessionKey = ?1 AND status = 'queued' " <>
+          "AND status IN ('queued','running') LIMIT 1",
+        [session_key]
+      ) != []
 
     if queued? do
       case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
