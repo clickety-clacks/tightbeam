@@ -133,12 +133,8 @@ defmodule Tightbeam.DeliveryResponsibilities do
         work_item_id = Map.get(params, :work_item_id)
 
         with :ok <- validate_supplied_owner_reference(params),
-             :ok <- required_work_item(work_item_id),
-             :ok <- known_work_item(txn, work_item_id),
-             {:ok, owner} <- owner_for_staffing(txn, work_item_id, call, opts),
-             :ok <- supplied_owner_matches(params, owner, work_item_id, call.verb),
-             :ok <- owner_available(owner, work_item_id, call, opts) do
-          :ok
+             {:ok, facts} <- staffing_owner_facts(txn, params, work_item_id, call, opts) do
+          staffing_result(facts)
         else
           %{code: _} = error -> error
           {:error, code, message} -> refusal(code, message)
@@ -197,17 +193,17 @@ defmodule Tightbeam.DeliveryResponsibilities do
           :ok
 
         is_nil(work_item_id) ->
-          supplied_owner_matches(params, nil, nil, nil)
+          supplied_owner_matches(params, nil, nil)
 
         is_binary(work_item_id) ->
           with :ok <- known_work_item(txn, work_item_id),
                {:ok, owner} <- owner_for_staffing(txn, work_item_id, %{}, []),
-               :ok <- supplied_owner_matches(params, owner, work_item_id, nil) do
-            :ok
+               {:ok, facts} <- supplied_owner_matches(params, owner, work_item_id) do
+            staffing_result(facts)
           end
 
         true ->
-          required_work_item(work_item_id)
+          staffing_owner_facts(txn, params, work_item_id, %{}, [])
       end
     end
   end
@@ -285,14 +281,36 @@ defmodule Tightbeam.DeliveryResponsibilities do
     end
   end
 
-  defp required_work_item(work_item_id) when is_binary(work_item_id), do: :ok
+  # A staffing call that names no work item, or an item whose recorded owner
+  # is absent, unavailable or different from the one the call names, is
+  # admitted. Each such fact is returned as an FYI line for the caller to
+  # judge. Who may staff an owned item stays a refusal (delivery_owner_required).
+  defp staffing_owner_facts(_txn, params, nil, _call, _opts) do
+    case supplied_owner_matches(params, nil, nil) do
+      :ok -> {:ok, ["this production staffing names no work item"]}
+      error -> error
+    end
+  end
 
-  defp required_work_item(_work_item_id),
+  defp staffing_owner_facts(txn, params, work_item_id, call, opts)
+       when is_binary(work_item_id) do
+    with :ok <- known_work_item(txn, work_item_id),
+         {:ok, owner} <- owner_for_staffing(txn, work_item_id, call, opts),
+         {:ok, supplied_facts} <- supplied_owner_matches(params, owner, work_item_id),
+         {:ok, owner_facts} <- owner_available(txn, owner, work_item_id, call, opts) do
+      {:ok, Enum.uniq(supplied_facts ++ owner_facts)}
+    end
+  end
+
+  defp staffing_owner_facts(_txn, _params, _work_item_id, _call, _opts),
     do:
       refusal(
         "work_item_required",
         "production staffing requires an exact work item; create or link the item before staffing"
       )
+
+  defp staffing_result([]), do: :ok
+  defp staffing_result(facts), do: {:ok, facts}
 
   defp owner_for_staffing(txn, work_item_id, _call, _opts),
     do: {:ok, current_owner_in_txn(txn, work_item_id)}
@@ -309,7 +327,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
         )
   end
 
-  defp supplied_owner_matches(params, owner, work_item_id, verb) do
+  defp supplied_owner_matches(params, owner, work_item_id) do
     references =
       params
       |> supplied_owner_references()
@@ -320,7 +338,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
 
     cond do
       references == [] ->
-        :ok
+        if is_nil(work_item_id), do: :ok, else: {:ok, []}
 
       is_nil(work_item_id) ->
         refusal(
@@ -329,19 +347,20 @@ defmodule Tightbeam.DeliveryResponsibilities do
         )
 
       is_nil(owner) ->
-        missing_owner_refusal(work_item_id, verb)
+        {:ok, [missing_owner_fact(work_item_id)]}
 
       Enum.any?(references, &(&1 != owner["accountableSessionKey"])) ->
         expected = owner["accountableSessionKey"]
         supplied = Enum.map_join(references, ", ", &"session:#{&1}")
 
-        refusal(
-          "delivery_owner_mismatch",
-          "work item #{work_item_id} records delivery owner session:#{expected}, not #{supplied}; retry with the recorded owner or explicitly update the link with work-item-update --delivery-owner"
-        )
+        {:ok,
+         [
+           "work item #{work_item_id} records delivery owner session:#{expected}; " <>
+             "this call names #{supplied}"
+         ]}
 
       true ->
-        :ok
+        {:ok, []}
     end
   end
 
@@ -351,39 +370,31 @@ defmodule Tightbeam.DeliveryResponsibilities do
         do: Map.get(params, key)
   end
 
-  defp owner_available(nil, work_item_id, %{verb: "dispatch"}, _opts) do
-    missing_owner_refusal(work_item_id, "dispatch")
+  defp missing_owner_fact(work_item_id),
+    do: "work item #{work_item_id} has no recorded delivery owner"
+
+  defp unavailable_owner_fact(txn, owner, work_item_id) do
+    state =
+      case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [owner]) do
+        [[state]] when is_binary(state) -> state
+        _ -> "not recorded"
+      end
+
+    "work item #{work_item_id} records delivery owner session:#{owner}, whose session is #{state}"
   end
 
-  defp owner_available(nil, work_item_id, _call, _opts) do
-    refusal(
-      "delivery_owner_missing",
-      "work item #{work_item_id} has no recorded delivery owner; set the intended owner explicitly with work-item-update --delivery-owner before production staffing"
-    )
-  end
-
-  defp missing_owner_refusal(work_item_id, "dispatch") do
-    refusal(
-      "delivery_owner_missing",
-      "work item #{work_item_id} has no recorded delivery owner; use work-item-handoff --work-item #{work_item_id} --delivery-owner <sessionKey> --brief \"<brief>\" to set the intended office and deliver its brief in one call before production staffing"
-    )
-  end
-
-  defp missing_owner_refusal(work_item_id, _verb) do
-    refusal(
-      "delivery_owner_missing",
-      "work item #{work_item_id} has no recorded delivery owner; set the intended owner explicitly with work-item-update --delivery-owner before production staffing"
-    )
-  end
+  defp owner_available(_txn, nil, work_item_id, _call, _opts),
+    do: {:ok, [missing_owner_fact(work_item_id)]}
 
   defp owner_available(
+         _txn,
          %{"accountableSessionKey" => owner, "deliveryState" => "current"},
          work_item_id,
          call,
          opts
        ) do
     if caller_is_responsible?(owner, work_item_id, call, opts) do
-      :ok
+      {:ok, []}
     else
       refusal(
         "delivery_owner_required",
@@ -392,12 +403,8 @@ defmodule Tightbeam.DeliveryResponsibilities do
     end
   end
 
-  defp owner_available(%{"accountableSessionKey" => owner}, work_item_id, _call, _opts) do
-    refusal(
-      "delivery_owner_unavailable",
-      "work item #{work_item_id} records delivery owner session:#{owner}, but that session is unavailable; explicitly replace the link with work-item-update --delivery-owner before production staffing"
-    )
-  end
+  defp owner_available(txn, %{"accountableSessionKey" => owner}, work_item_id, _call, _opts),
+    do: {:ok, [unavailable_owner_fact(txn, owner, work_item_id)]}
 
   defp production_staffing_operation?(call, opts) do
     case call.verb do

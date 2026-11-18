@@ -5160,7 +5160,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert assignment_count(ctx.db) == assignment_count_before_unrelated + 1
   end
 
-  test "assign and dispatch refuse a foreign caller even after exact fired rumination", ctx do
+  test "ownerless staffing records FYIs regardless of caller rumination", ctx do
     work_item = create_work_item(ctx, "Foreign caller cannot gain authority by ruminating")
     baseline = assignment_count(ctx.db)
 
@@ -5173,14 +5173,14 @@ defmodule Tightbeam.AssignmentsTest do
             {:session, "other-session"},
             "foreign production",
             "Rumination is not authorization.",
-            nil,
+            "ownerless-#{state}-#{verb}",
             work_item.id
           )
           |> Map.put(:verb, verb)
           |> put_in([:params, :effect_kind], "code")
 
-        assert {:error, %{code: "delivery_owner_missing"}} =
-                 Dispatch.dispatch(ctx.db, ctx.handlers, call)
+        assert {:ok, %{fyi: [line]}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+        assert line == ownerless_fyi(work_item.id)
 
         forged =
           Map.put(call, :__tb_ownerless_fired_rumination_precheck__, {
@@ -5190,16 +5190,15 @@ defmodule Tightbeam.AssignmentsTest do
             "other-session"
           })
 
-        assert {:error, %{code: "delivery_owner_missing"}} =
-                 Dispatch.dispatch(ctx.db, ctx.handlers, forged)
+        assert {:ok, %{fyi: [^line]}} = Dispatch.dispatch(ctx.db, ctx.handlers, forged)
 
         if state == "fired" do
-          assert %{code: "delivery_owner_missing"} = handle(ctx, verb, forged)
+          assert {:ok, %{fyi: [^line]}} = Dispatch.dispatch(ctx.db, ctx.handlers, forged)
         end
       end
     end
 
-    assert assignment_count(ctx.db) == baseline
+    assert assignment_count(ctx.db) == baseline + 4
 
     # Core-only authentic same-user controls remain admitted for both verbs.
     session(ctx.db, "dispatcher", "flynn")
@@ -5256,7 +5255,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert assignment_count(ctx.db) == baseline + 1
   end
 
-  test "unowned dispatch rejects canceled and mismatched routing brackets", ctx do
+  test "ownerless dispatch accepts a canceled bracket and preserves a mismatched wake", ctx do
     canceled_item = create_work_item(ctx, "Canceled routing bracket")
     mismatched_item = seed_unrouted_work_item(ctx, "Mismatched routing bracket")
     mismatched_source_item = create_work_item(ctx, "Mismatched routing source")
@@ -5305,25 +5304,32 @@ defmodule Tightbeam.AssignmentsTest do
 
     baseline = assignment_count(ctx.db)
 
-    for item <- [canceled_item, mismatched_item] do
-      assert {:error, %{code: "delivery_owner_missing"}} =
-               Dispatch.dispatch(
-                 ctx.db,
-                 ctx.handlers,
-                 dispatch_call(
-                   {:session, "holder"},
-                   "invalid routing bracket",
-                   "Do not dispatch.",
-                   nil,
-                   item.id
-                 )
-               )
+    call_for = fn item ->
+      dispatch_call(
+        {:session, "holder"},
+        "ownerless routing bracket",
+        "Open ownerless staffing with an FYI.",
+        nil,
+        item.id
+      )
     end
 
-    assert assignment_count(ctx.db) == baseline
+    assert {:ok, %{fyi: [line]}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, call_for.(canceled_item))
+
+    assert line == ownerless_fyi(canceled_item.id)
+
+    # An item pointing at another item's wake is malformed live state. The
+    # existing typed cancellation must refuse rather than cancel that wake.
+    assert_raise WorkItems.CancellationRefused, fn ->
+      handle(ctx, "dispatch", call_for.(mismatched_item))
+    end
+
+    assert Wakes.get(ctx.db, mismatched_source_wake_id).state == "pending"
+    assert assignment_count(ctx.db) == baseline + 1
   end
 
-  test "rumination alone cannot authorize unowned dispatch without a routing bracket", ctx do
+  test "ownerless dispatch records FYIs for rumination without a routing bracket", ctx do
     pending_item = seed_unrouted_work_item(ctx, "Pending rumination without bracket")
     wrong_item = seed_unrouted_work_item(ctx, "Wrong-item rumination target")
     wrong_item_source = seed_unrouted_work_item(ctx, "Wrong-item rumination source")
@@ -5345,7 +5351,7 @@ defmodule Tightbeam.AssignmentsTest do
           {wrong_item, "wrong-item fired rumination"},
           {wrong_caller_item, "wrong-caller fired rumination"}
         ] do
-      assert {:error, %{code: "delivery_owner_missing"}} =
+      assert {:ok, %{fyi: [line]}} =
                Dispatch.dispatch(
                  ctx.db,
                  ctx.handlers,
@@ -5357,12 +5363,14 @@ defmodule Tightbeam.AssignmentsTest do
                    item.id
                  )
                )
+
+      assert line == ownerless_fyi(item.id)
     end
 
-    assert assignment_count(ctx.db) == baseline
+    assert assignment_count(ctx.db) == baseline + 4
   end
 
-  test "raw DB-seeded unowned dispatch refuses a missing bracket and forged receipt", ctx do
+  test "raw ownerless dispatch records the same FYI on replay with a forged receipt", ctx do
     work_item = seed_unrouted_work_item(ctx, "Raw unowned item")
     caller = "holder"
 
@@ -5371,14 +5379,14 @@ defmodule Tightbeam.AssignmentsTest do
         {:session, caller},
         "raw ownerless dispatch",
         "A raw item has no routing bracket.",
-        nil,
+        "raw-ownerless-replay",
         work_item.id
       )
 
     baseline = assignment_count(ctx.db)
 
-    assert {:error, %{code: "delivery_owner_missing"}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert {:ok, %{id: id, fyi: [line]}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert line == ownerless_fyi(work_item.id)
 
     forged =
       Map.put(call, :__tb_ownerless_fired_rumination_precheck__, {
@@ -5388,10 +5396,10 @@ defmodule Tightbeam.AssignmentsTest do
         caller
       })
 
-    assert {:error, %{code: "delivery_owner_missing"}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, forged)
+    assert {:ok, %{id: ^id, fyi: [^line]}} = Dispatch.dispatch(ctx.db, ctx.handlers, forged)
+    assert handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, id)).fyi == [line]
 
-    assert assignment_count(ctx.db) == baseline
+    assert assignment_count(ctx.db) == baseline + 1
   end
 
   test "review and file declarations are assign-only inputs", ctx do
@@ -8510,4 +8518,8 @@ defmodule Tightbeam.AssignmentsTest do
       MapSet.member?(wake_ids, wake_id)
     end)
   end
+
+  defp ownerless_fyi(id),
+    do:
+      "FYI: work item #{id} has no recorded delivery owner; decide for yourself whether that is acceptable"
 end

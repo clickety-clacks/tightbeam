@@ -1621,6 +1621,11 @@ defmodule Tightbeam.Assignments do
                 :ok ->
                   :proceed
 
+                # Staffing-owner facts are stated as FYIs when the assignment
+                # is created; they do not stop the dispatch here.
+                {:ok, _facts} ->
+                  :proceed
+
                 %{code: _} = error ->
                   {:refuse, error}
               end
@@ -2422,15 +2427,17 @@ defmodule Tightbeam.Assignments do
         # F7 amendment: dispatch persists workItemId exactly as assign does.
         work_item_id = call.params[:work_item_id]
 
-        case Tightbeam.DeliveryResponsibilities.check_staffing_owner_in_txn(
-               txn,
-               call,
-               target_session_key: call.session_key,
-               target_archetype: target_archetype
-             ) do
-          :ok -> :ok
-          %{code: _} = error -> throw({:delivery_owner_error, error})
-        end
+        staffing_facts =
+          case Tightbeam.DeliveryResponsibilities.check_staffing_owner_in_txn(
+                 txn,
+                 call,
+                 target_session_key: call.session_key,
+                 target_archetype: target_archetype
+               ) do
+            :ok -> []
+            {:ok, facts} -> facts
+            %{code: _} = error -> throw({:delivery_owner_error, error})
+          end
 
         reviews_assignment_id =
           if verb == "assign", do: call.params[:reviews_assignment_id], else: nil
@@ -2481,7 +2488,7 @@ defmodule Tightbeam.Assignments do
             []
           end
 
-        fyi = Enum.map(Enum.uniq(review_facts), &RecordFyis.line/1)
+        fyi = Enum.map(Enum.uniq(staffing_facts ++ review_facts), &RecordFyis.line/1)
 
         {subject, succeeds_assignment_id} = prepare_successor_in_txn!(txn, call)
 

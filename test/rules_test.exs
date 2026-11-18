@@ -2445,13 +2445,6 @@ defmodule Tightbeam.RulesTest do
         session_key: target.session_key
       })
 
-    assert %{code: "work_item_required"} =
-             Assignments.__handle__(
-               ctx.db,
-               "assign",
-               update_in(call.params, &Map.delete(&1, :work_item_id))
-             )
-
     assert %{id: _assignment_id} = Assignments.__handle__(ctx.db, "assign", call)
 
     assert [wake] =
@@ -2465,6 +2458,18 @@ defmodule Tightbeam.RulesTest do
              |> Enum.find(&(&1.kind == "rule_notice" and &1.subject == wake.wake_id))
 
     assert detail =~ ~s("principal":"remedy:assignment-remedy")
+
+    # A remedy assignment that names no work item is opened with an FYI.
+    assert %{workItemId: nil, fyi: [line]} =
+             Assignments.__handle__(
+               ctx.db,
+               "assign",
+               update_in(call.params, &Map.delete(&1, :work_item_id))
+             )
+
+    assert line ==
+             "FYI: this production staffing names no work item; " <>
+               "decide for yourself whether that is acceptable"
   end
 
   test "row-commit queue facts are scoped to the queued session and caller", ctx do

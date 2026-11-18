@@ -3721,7 +3721,15 @@ defmodule Tightbeam.Gateway do
       |> Map.merge(published_identity(session.model))
       |> Map.put(:capabilities, StateResources.session(session)["capabilities"])
 
-    Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
+    item = Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
+
+    case Map.get(
+           Tightbeam.RecordFyis.list_many(db, "session", [session.session_key]),
+           session.session_key
+         ) do
+      nil -> item
+      fyi -> Map.put(item, :fyi, fyi)
+    end
   end
 
   # A catalog entry for a reader who has to pick one — an operator reading a
@@ -9326,8 +9334,20 @@ defmodule Tightbeam.Gateway do
                     )
 
                   case staffing do
-                    :ok ->
+                    %{code: _} = denial ->
+                      {:delivery_owner_denied, denial}
+
+                    staffing ->
                       session = Org.create_in_txn(txn, input)
+
+                      # Staffing-owner facts are stated as FYIs on the spawned session.
+                      :ok =
+                        Tightbeam.RecordFyis.put_in_txn(
+                          txn,
+                          "session",
+                          session.session_key,
+                          staffing_fyi(staffing)
+                        )
 
                       if is_nil(caller.caller_session) and
                            String.starts_with?(call.origin, "user:") and
@@ -9384,9 +9404,6 @@ defmodule Tightbeam.Gateway do
                       )
 
                       {:created, session}
-
-                    %{code: _} = denial ->
-                      {:delivery_owner_denied, denial}
                   end
                 end
               else
@@ -9496,23 +9513,33 @@ defmodule Tightbeam.Gateway do
   defp finish_spawn(db, _call, caller, session) do
     stream = Payloads.stream_session(session)
     broadcast(db, caller.owner_user_id, Payloads.stream_created(stream))
-    spawn_result(session, stream)
+    spawned_session_result(db, session, stream)
   end
 
   defp spawn_replay(db, session_key) do
     session = Org.get(db, session_key)
-    spawn_result(session, Payloads.stream_session(session))
+    spawned_session_result(db, session, Payloads.stream_session(session))
   end
 
-  defp spawn_result(session, stream) do
-    %{
+  defp spawned_session_result(db, session, stream) do
+    result = %{
       stream: stream,
       session_key: session.session_key,
       handle: session.handle,
       requested: published_identity(session.model),
       running_status: "not reported by #{session.harness}"
     }
+
+    fyis = Tightbeam.RecordFyis.list_many(db, "session", [session.session_key])
+
+    case Map.get(fyis, session.session_key) do
+      nil -> result
+      fyi -> Map.put(result, :fyi, fyi)
+    end
   end
+
+  defp staffing_fyi({:ok, facts}), do: Enum.map(facts, &Tightbeam.RecordFyis.line/1)
+  defp staffing_fyi(:ok), do: []
 
   defp held_spawn_name_refusal(_db, nil), do: nil
 

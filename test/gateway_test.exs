@@ -5333,6 +5333,78 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{type: :regular}} = File.lstat(Path.join(fixture_home, "fixture.json"))
   end
 
+  test "spawn staffing an item with no recorded delivery owner states it as an FYI", ctx do
+    base_dir = role_test_base("spawn-staffing-fyi")
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
+    adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
+    File.mkdir_p!(Path.dirname(adapter))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    Archetypes.load!(base_dir)
+    candidate = start_supervised!({CandidateAdapterStub, self()})
+    start_supervised!({CoordinatorStub, candidate})
+    ensure_global_registry()
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :fixture)
+      |> Map.put(:default_model, Model.new("fixture-model"))
+
+    handlers = Gateway.handlers(config)
+
+    item =
+      handlers["work-item-create"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{title: "Ownerless spawn staffing"}
+      })
+
+    line =
+      "FYI: work item #{item.id} has no recorded delivery owner; " <>
+        "decide for yourself whether that is acceptable"
+
+    spawn_call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{
+        display_name: "Ownerless staffing",
+        idempotency_key: "spawn-staffing-fyi",
+        work_item_id: item.id
+      }
+    }
+
+    assert %{session_key: spawned_key, fyi: [^line]} = handlers["spawn"].(spawn_call)
+    assert %{session_key: ^spawned_key, fyi: [^line]} = handlers["spawn"].(spawn_call)
+
+    assert %{fyi: [^line]} = StateResources.query_session(ctx.db, spawned_key)
+
+    assert [^line] =
+             ctx.db
+             |> StateResources.query_session(spawned_key)
+             |> StateResources.session()
+             |> Map.fetch!("fyi")
+
+    inspected =
+      handlers["inspect"].(%{origin: "user:flynn", principal: {:user, "flynn"}, params: %{}})
+
+    assert %{fyi: [^line]} = Enum.find(inspected.sessions, &(&1.session_key == spawned_key))
+
+    # A session spawned with no staffing fact carries an empty list on REST.
+    assert %{session_key: plain_key} =
+             plain =
+             handlers["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{display_name: "Plain spawn", idempotency_key: "spawn-staffing-plain"}
+             })
+
+    refute Map.has_key?(plain, :fyi)
+    assert %{fyi: []} = StateResources.query_session(ctx.db, plain_key)
+  end
+
   test "a harness swap leaves a tombstone ABOVE its own barrier", ctx do
     base_dir = role_test_base("swap-tombstone")
     auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
