@@ -3,7 +3,7 @@ defmodule Tightbeam.AssignmentsTest do
   alias Tightbeam.Model
 
   @session_identity_shape "session-identity-v1-0114"
-  @current_shape "session-custody-v1-0116"
+  @current_shape "session-custody-artifact-process-attribution-v1-0117"
 
   alias Tightbeam.{
     Assignments,
@@ -270,6 +270,30 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert retired.retired_session_keys == ["holder"]
     assert Org.get(ctx.db, "holder").state == "retired"
+
+    assert {:ok, [["closed", "revoked"]]} =
+             DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [linked.id])
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM work_items WHERE id=?1", [item.id])
+
+    assert {:ok, [[canceled_notice]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT c.wakeId FROM wake_cancellations c JOIN wakes w ON w.wakeId=c.wakeId
+               WHERE w.assignmentId=?1 AND w.state='canceled'
+                 AND c.requesterId='tightbeam:retirement'
+                 AND c.reasonKind='obligation_disposed'
+                 AND c.causalSourceKind='assignment_transition' AND c.causalSourceId=?1
+                 AND c.outcomeKind='disposition'
+                 AND c.dispositionKind='assignment_transition' AND c.dispositionId=?1
+                 AND c.livenessTriggerKind IS NULL AND c.actionNeeded=0
+               """,
+               [linked.id]
+             )
+
+    assert is_binary(canceled_notice)
   end
 
   describe "attest notices to assignment openers" do
@@ -690,12 +714,19 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
   end
 
-  test "dispatch and a bound plain-after recheck teach the exact card fact", ctx do
+  test "dispatch omits a child check hint while a bound plain-after recheck teaches the card fact",
+       ctx do
     dispatch =
       dispatch_call({:user, "flynn"}, "waitable card", "Inspect the card.", "wait-hint")
 
     assignment = dispatch!(ctx, dispatch)
-    hint = assignment.condition_wake_hint
+    refute Map.has_key?(assignment, :condition_wake_hint)
+
+    replay = dispatch!(ctx, dispatch)
+    assert replay.id == assignment.id
+    refute Map.has_key?(replay, :condition_wake_hint)
+
+    hint = Assignments.condition_wait_hint(ctx.db, assignment.id)
     assert hint.kind == "assignment-landed"
     assert hint.scope == assignment.id
     assert hint.fallback_after == "2h"
@@ -708,13 +739,6 @@ defmodule Tightbeam.AssignmentsTest do
     assert hint.record_dependency.message =~ "not a complete --predicate"
     assert hint.record_dependency.message =~ "caller-selected resolverRef"
     assert hint.record_dependency.message =~ "No necessity or verifier assignment is required"
-    assert hint.message =~ "--when-fact assignment-landed"
-    assert hint.message =~ "assignmentId=#{assignment.id}"
-    assert hint.message =~ "assignment.state"
-    assert hint.message =~ "completion attestation only"
-
-    assert %{condition_wake_hint: replay_hint} = dispatch!(ctx, dispatch)
-    assert replay_hint.scope == assignment.id
 
     recheck =
       call("wake", {:user, "flynn"}, "holder", %{
@@ -3758,6 +3782,54 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
+  test "a settled cannot-proceed replays identically and permits a new lifecycle after reopen",
+       ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, "reopened dependency")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    first_filing =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "wait for the opener to decide")
+
+    first_block = handle(ctx, "attest", first_filing)
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "resume the dependency")
+             )
+
+    settled_replay = handle(ctx, "attest", first_filing)
+
+    assert settled_replay.replayed
+    assert settled_replay.cannotProceed.id == first_block.cannotProceed.id
+    assert settled_replay.cannotProceed.state == "settled"
+    assert Assignments.attest_count(ctx.db, assignment.id) == 1
+
+    second_filing =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the dependency is blocked for a new reason")
+
+    second_block = handle(ctx, "attest", second_filing)
+
+    assert %{assignment: %{state: "open"}, cannotProceed: %{state: "standing"}} = second_block
+    assert second_block.cannotProceed.id != first_block.cannotProceed.id
+    assert second_block.decisionRequest.id != first_block.decisionRequest.id
+
+    third_filing = put_in(second_filing, [:params, :note], "a third reason")
+    assert %{code: "cannot_proceed_conflict"} = handle(ctx, "attest", third_filing)
+
+    assert Assignments.attest_count(ctx.db, assignment.id) == 2
+  end
+
   test "install reconciliation disposes a closed completed hold by its completion attest", ctx do
     {assignment, blocked, closing_attest_id, closed_at} =
       stranded_completed_assignment(ctx, "stranded completed assignment")
@@ -6512,6 +6584,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     File.write!(Path.join(base, "identity/rules/deny.toml"), """
     [[rule]]
+    archetypes = ["*"]
     name = "deny-assign"
     verb = "assign"
     text = "assign denied"
@@ -6609,6 +6682,15 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
 
+    artifact_only_verification =
+      attest_call({:session, "holder"}, producer.id, "verdict")
+      |> put_in([:params, :verdict_kind], "verified")
+      |> put_in([:params, :artifact_id], "art_code_report")
+      |> put_in([:params, :content_sha256], String.duplicate("a", 64))
+
+    assert %{code: "invalid_commit_refs"} =
+             handle(ctx, "attest", artifact_only_verification)
+
     assert %{attest: %{verdictKind: "verified"}} =
              attest_call({:session, "holder"}, producer.id, "verdict")
              |> put_in([:params, :verdict_kind], "verified")
@@ -6690,6 +6772,9 @@ defmodule Tightbeam.AssignmentsTest do
     Rules.load!(rules_base, Map.keys(ctx.handlers))
     on_exit(fn -> File.rm_rf!(rules_base) end)
 
+    qualified_coder =
+      session(ctx.db, "qualified-coder", "flynn", %{archetype: "agentic-engineering.coder"})
+
     work_item = create_work_item(ctx, "unlinked review completion")
     other_work_item = create_work_item(ctx, "unrelated review work")
     commit = String.duplicate("a", 40)
@@ -6698,6 +6783,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     producer =
       assign_call({:user, "flynn"}, "producer", nil, work_item.id)
+      |> Map.put(:session_key, qualified_coder.session_key)
       |> put_in([:params, :effect_kind], "code")
       |> then(&handle(ctx, "assign", &1))
 
@@ -6716,7 +6802,7 @@ defmodule Tightbeam.AssignmentsTest do
              |> then(&handle(ctx, "attest", &1))
 
     assert %{attest: %{verdictKind: "verified"}} =
-             attest_call({:session, "holder"}, producer.id, "verdict")
+             attest_call({:session, qualified_coder.session_key}, producer.id, "verdict")
              |> put_in([:params, :verdict_kind], "verified")
              |> put_in([:params, :commit_refs], producer_refs)
              |> then(&handle(ctx, "attest", &1))
@@ -6724,12 +6810,15 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(
              ctx.db,
              producer.id,
-             "holder",
+             qualified_coder.session_key,
              producer_refs
            ) == []
 
     assert {:deny, %{rule: "completion-requires-review"}} =
-             Rules.evaluate(ctx.db, attest_call({:session, "holder"}, producer.id, "completion"))
+             Rules.evaluate(
+               ctx.db,
+               attest_call({:session, qualified_coder.session_key}, producer.id, "completion")
+             )
 
     review =
       assign_call({:user, "flynn"}, "same-item review", nil, work_item.id)
@@ -6748,7 +6837,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(
              ctx.db,
              producer.id,
-             "holder",
+             qualified_coder.session_key,
              producer_refs
            ) == [
              "reviewed-clean"
@@ -6760,7 +6849,7 @@ defmodule Tightbeam.AssignmentsTest do
                  Dispatch.dispatch(
                    ctx.db,
                    ctx.handlers,
-                   attest_call({:session, "holder"}, producer.id, "completion")
+                   attest_call({:session, qualified_coder.session_key}, producer.id, "completion")
                  )
       end)
 
@@ -7157,6 +7246,299 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  test "code completion uses a verified correction on the closed clean review", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    work_item = create_work_item(ctx, "verified review correction completion")
+    commit = String.duplicate("a", 40)
+    producer_refs = [%{"repo" => "testhost:/tmp/producer", "commit" => commit}]
+
+    producer =
+      assign_call({:user, "flynn"}, "producer", nil, work_item.id)
+      |> put_in([:params, :effect_kind], "code")
+      |> then(&handle(ctx, "assign", &1))
+
+    review =
+      assign_call({:user, "flynn"}, "review", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{kind: "completion"}, assignment: %{state: "closed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "other-session"}, review.id, "completion")
+             )
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    artifact_id = "art_review_correction_#{System.unique_integer([:positive])}"
+    correction_id = "crc_review_correction_#{System.unique_integer([:positive])}"
+    created_at = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, createdBySession, workItemId,
+                  producedByAssignmentId, originPath, contentSha256, state, createdAt, updatedAt)
+               VALUES (?1, 'report', 'review evidence', 'other-session', ?2,
+                       ?3, '/tmp/review-evidence.md', ?4, 'in-workspace', ?5, ?5)
+               """,
+               [artifact_id, work_item.id, review.id, String.duplicate("b", 64), created_at]
+             )
+
+    correction_refs = [
+      %{
+        "repo" => "testhost:/tmp/reviewer",
+        "remote" => "origin",
+        "ref" => "refs/heads/main",
+        "commit" => commit,
+        "verifiedRefCommit" => commit
+      }
+    ]
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_commit_ref_corrections
+                 (id, assignmentId, commitRefs, reason, evidenceArtifactId,
+                  actorKind, actorRef, cause, idempotencyKey, requestFingerprint,
+                  verifiedAt, createdAt)
+               VALUES (?1, ?2, ?3, 'verified review coverage', ?4, 'session',
+                       'other-session', 'historical_canonical_commitref_correction',
+                       ?5, ?6, NULL, ?7)
+               """,
+               [
+                 correction_id,
+                 review.id,
+                 JSON.encode!(correction_refs),
+                 artifact_id,
+                 correction_id,
+                 String.duplicate("c", 64),
+                 created_at
+               ]
+             )
+
+    completion = attest_call({:session, "holder"}, producer.id, "completion")
+
+    assert %{code: "inapplicable_code_evidence", message: message} =
+             handle(ctx, "attest", completion)
+
+    assert message =~ "latest independent clean review is missing verified producer commits"
+    assert message =~ commit
+
+    verified_at = created_at + 1
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignment_commit_ref_corrections SET verifiedAt=?1 WHERE id=?2",
+               [verified_at, correction_id]
+             )
+
+    assert %{attest: %{kind: "completion"}} =
+             result =
+             handle(ctx, "attest", completion)
+
+    assert result.assignment.state == "closed"
+    assert result.assignment.outcome == "completed"
+
+    assert {:ok, [[nil, "reviewed-clean"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT commitRefs,verdictKind
+               FROM attests
+               WHERE assignmentId=?1 AND kind='verdict'
+               """,
+               [review.id]
+             )
+
+    assert {:ok, [correction_row]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,commitRefs,verifiedAt,actorRef " <>
+                 "FROM assignment_commit_ref_corrections WHERE id=?1",
+               [correction_id]
+             )
+
+    assert correction_row == [
+             correction_id,
+             JSON.encode!(correction_refs),
+             verified_at,
+             "other-session"
+           ]
+  end
+
+  test "code completion ignores a verified correction authored by the producer", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    work_item = create_work_item(ctx, "producer correction cannot supply review coverage")
+    commit = String.duplicate("a", 40)
+    producer_refs = [%{"repo" => "testhost:/tmp/producer", "commit" => commit}]
+
+    producer =
+      assign_call({:user, "flynn"}, "producer", nil, work_item.id)
+      |> put_in([:params, :effect_kind], "code")
+      |> then(&handle(ctx, "assign", &1))
+
+    review =
+      assign_call({:user, "flynn"}, "review", nil, work_item.id)
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :effect_kind], "review")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{kind: "completion"}, assignment: %{state: "closed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "other-session"}, review.id, "completion")
+             )
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], producer_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    artifact_id = "art_producer_correction_#{System.unique_integer([:positive])}"
+    correction_id = "crc_producer_correction_#{System.unique_integer([:positive])}"
+    created_at = System.system_time(:millisecond)
+    verified_at = created_at + 1
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, createdBySession, workItemId,
+                  producedByAssignmentId, originPath, contentSha256, state, createdAt, updatedAt)
+               VALUES (?1, 'report', 'review evidence', 'other-session', ?2,
+                       ?3, '/tmp/review-evidence.md', ?4, 'in-workspace', ?5, ?5)
+               """,
+               [artifact_id, work_item.id, review.id, String.duplicate("b", 64), created_at]
+             )
+
+    correction_refs = [
+      %{
+        "repo" => "testhost:/tmp/producer",
+        "remote" => "origin",
+        "ref" => "refs/heads/main",
+        "commit" => commit,
+        "verifiedRefCommit" => commit
+      }
+    ]
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_commit_ref_corrections
+                 (id, assignmentId, commitRefs, reason, evidenceArtifactId,
+                  actorKind, actorRef, cause, idempotencyKey, requestFingerprint,
+                  verifiedAt, createdAt)
+               VALUES (?1, ?2, ?3, 'verified review coverage', ?4, 'session',
+                       ?5, 'historical_canonical_commitref_correction', ?6, ?7, ?8, ?9)
+               """,
+               [
+                 correction_id,
+                 review.id,
+                 JSON.encode!(correction_refs),
+                 artifact_id,
+                 producer.holderKey,
+                 correction_id,
+                 String.duplicate("c", 64),
+                 verified_at,
+                 created_at
+               ]
+             )
+
+    completion = attest_call({:session, "holder"}, producer.id, "completion")
+
+    assert %{code: "inapplicable_code_evidence", message: message} =
+             handle(ctx, "attest", completion)
+
+    assert message =~ "latest independent clean review is missing verified producer commits"
+    assert message =~ commit
+
+    assert %{state: "open", closingAttestId: nil} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, producer.id)
+             )
+
+    assert {:ok, [[nil, "reviewed-clean"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT commitRefs,verdictKind FROM attests WHERE assignmentId=?1 AND kind='verdict'",
+               [review.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+               [producer.id]
+             )
+
+    assert {:ok, [correction_row]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,commitRefs,verifiedAt,actorKind,actorRef " <>
+                 "FROM assignment_commit_ref_corrections WHERE id=?1",
+               [correction_id]
+             )
+
+    assert correction_row == [
+             correction_id,
+             JSON.encode!(correction_refs),
+             verified_at,
+             "session",
+             producer.holderKey
+           ]
+  end
+
   test "code completion refuses a linked clean review recorded for a different commit", ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
@@ -7249,6 +7631,166 @@ defmodule Tightbeam.AssignmentsTest do
              {"surrender", 20, "att_surrender"},
              {"progress", 30, "att_progress"}
            ]
+  end
+
+  test "attest records without probing and check-attest checks only its files", ctx do
+    item = create_work_item(ctx, "file check")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+
+    for {id, producer, origin, state, home} <- [
+          {"art_attached", nil, "lab1:/files/attached", "in-workspace", nil},
+          {"art_present", assignment.id, "lab1:/files/present", "in-workspace", nil},
+          {"art_missing", assignment.id, "lab1:/files/missing", "in-workspace", nil},
+          {"art_unreachable", assignment.id, "lab1:/files/unreachable", "in-workspace", nil},
+          {"art_disappeared_host", assignment.id, "missinghost:/files/unknown", "in-workspace",
+           nil},
+          {"art_archived", assignment.id, "lab1:/files/old", "archived", "/files/archive"},
+          {"art_unrelated", nil, "lab1:/files/unrelated", "in-workspace", nil}
+        ] do
+      seed_file_artifact(ctx.db, item.id, id, producer, origin, state, home)
+    end
+
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        sh: fn _ ->
+          send(parent, :attest_probe)
+          {"", 0}
+        end,
+        file_stat: fn path ->
+          send(parent, {:checked, path})
+
+          case path do
+            "/files/missing" -> {:error, :enoent}
+            "/files/unreachable" -> {:error, :eacces}
+            _ -> {:ok, %{}}
+          end
+        end
+      })
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> then(&handlers["attest"].(&1))
+
+    assert attested.attest.kind == "progress"
+    refute Map.has_key?(attested, :referents)
+    refute_received :attest_probe
+    refute_received {:checked, _}
+
+    # Only verdict attests can carry an attached artifact. Seed that existing
+    # record shape so the check exercises both file sources.
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO attests
+          (id, assignmentId, kind, verdictKind, byUser, artifactId, contentSha256, ts)
+        VALUES ('att_with_artifact', ?1, 'verdict', 'user-ruling', 'flynn',
+                'art_attached', ?2, 2)
+        """,
+        [assignment.id, String.duplicate("a", 64)]
+      )
+
+    assert {:ok, result} =
+             Dispatch.dispatch(
+               ctx.db,
+               handlers,
+               call("check-attest", {:session, "holder"}, nil, %{attest_id: "att_with_artifact"})
+             )
+
+    assert Enum.map(result.files, &{&1.artifactId, &1.status, &1[:error]}) == [
+             {"art_archived", "present", nil},
+             {"art_attached", "present", nil},
+             {"art_disappeared_host", "could_not_access", "unknown host: missinghost"},
+             {"art_missing", "absent", nil},
+             {"art_present", "present", nil},
+             {"art_unreachable", "could_not_access", "eacces"}
+           ]
+
+    assert result.summary ==
+             "absent: lab1:/files/missing; could not access: missinghost:/files/unknown, lab1:/files/unreachable"
+
+    assert_received {:checked, "/files/archive"}
+    refute_received {:checked, "/files/old"}
+    refute_received {:checked, "/files/unrelated"}
+    refute_received :attest_probe
+  end
+
+  test "a blocked requested file check does not block another attest", ctx do
+    item = create_work_item(ctx, "blocked check")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+    seed_file_artifact(ctx.db, item.id, "art_blocked", assignment.id, "lab1:/files/blocked")
+    first = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        file_stat: fn _path ->
+          send(parent, {:check_entered, self()})
+
+          receive do
+            :release_check -> {:ok, %{}}
+          end
+        end
+      })
+
+    check =
+      Task.async(fn ->
+        Dispatch.dispatch(
+          ctx.db,
+          handlers,
+          call("check-attest", {:session, "holder"}, nil, %{attest_id: first.attest.id})
+        )
+      end)
+
+    assert_receive {:check_entered, check_pid}, 5_000
+    assert check_pid == check.pid
+
+    another =
+      Task.async(fn ->
+        handlers["attest"].(attest_call({:session, "holder"}, assignment.id, "progress"))
+      end)
+
+    assert %{attest: %{kind: "progress"}} = Task.await(another, 10_000)
+    send(check.pid, :release_check)
+
+    assert {:ok, %{files: [%{status: "present"}], summary: "All 1 files are present on disk."}} =
+             Task.await(check, 10_000)
+  end
+
+  test "check-attest reports real local file presence and disappearance", ctx do
+    item = create_work_item(ctx, "local file")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+    path = Path.join(Application.fetch_env!(:tightbeam, :base_dir), "checked-file")
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, "recorded bytes")
+
+    seed_file_artifact(
+      ctx.db,
+      item.id,
+      "art_local",
+      assignment.id,
+      "#{Tightbeam.Placement.local_host_name()}:#{path}"
+    )
+
+    attested = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
+    check = fn ->
+      Gateway.handlers(%{db: ctx.db, base_dir: Application.fetch_env!(:tightbeam, :base_dir)})[
+        "check-attest"
+      ].(%{params: %{attest_id: attested.attest.id}})
+    end
+
+    assert %{files: [%{status: "present"}], summary: "All 1 files are present on disk."} =
+             check.()
+
+    File.rm!(path)
+    assert %{files: [%{status: "absent"}]} = check.()
   end
 
   test "accepted handler rolls back when its event append fails", ctx do
@@ -7438,6 +7980,28 @@ defmodule Tightbeam.AssignmentsTest do
     assert settled.releaseFactCheck.matcherPredicate == true
     assert settled.releaseFactCheck.eligible == false
     assert snapshot.() == before_settled_reads
+  end
+
+  defp seed_file_artifact(
+         db,
+         work_item_id,
+         id,
+         producer,
+         origin,
+         state \\ "in-workspace",
+         home \\ nil
+       ) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO artifacts
+          (artifactId, kind, title, createdBySession, workItemId,
+           producedByAssignmentId, originPath, state, home, createdAt, updatedAt)
+        VALUES (?1, 'report', ?1, 'holder', ?2, ?3, ?4, ?5, ?6, 1, 1)
+        """,
+        [id, work_item_id, producer, origin, state, home]
+      )
   end
 
   defp handle(ctx, verb, call)

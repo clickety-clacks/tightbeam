@@ -1,0 +1,9 @@
+[[statute]]
+name = "tightbeam-probe"
+on = "tool-call"
+mode = "gate"
+archetypes = ["*"]
+tool = "Bash"
+pattern = "tightbeam-gate-probe"
+check = "spawn-probe"
+text = "Spawn wiring-check probe command; always refused by design."

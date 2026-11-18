@@ -3,6 +3,7 @@
 # This is record-level enforcement, not a file-write sandbox.
 
 [[rule]]
+archetypes = ["*"]
 name = "assign-worker-staffing-needs-topology"
 verb = "assign"
 text = "Ask the PO for topology advice on this work item with a coordination assignment; record the returned recommendation as topology-decided, then staff workers."
@@ -10,11 +11,12 @@ external_producer = true
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "target.archetype", op = "not_in", value = ["pdo", "orchestrator", "product-owner"] },
+  { fact = "target.archetype", op = "not_in", value = ["agentic-engineering.pdo", "agentic-engineering.orchestrator", "agentic-engineering.product-owner"] },
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
 ]
 
 [[rule]]
+archetypes = ["*"]
 name = "dispatch-worker-staffing-needs-topology"
 verb = "dispatch"
 text = "Ask the PO for topology advice on this work item with a coordination assignment; record the returned recommendation as topology-decided, then staff workers."
@@ -22,11 +24,12 @@ external_producer = true
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "target.archetype", op = "not_in", value = ["pdo", "orchestrator", "product-owner"] },
+  { fact = "target.archetype", op = "not_in", value = ["agentic-engineering.pdo", "agentic-engineering.orchestrator", "agentic-engineering.product-owner"] },
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
 ]
 
 [[rule]]
+archetypes = ["*"]
 name = "orchestrator-completion-needs-topology"
 verb = "attest"
 text = "Obtain and record the PO's returned topology recommendation as topology-decided on this work item before completing delivery coordination. Small tasks also require consultation."
@@ -35,6 +38,6 @@ edges = ["verb"]
 effect = "deny"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.holder_archetype", op = "in", value = ["pdo", "orchestrator"] },
+  { fact = "assignment.holder_archetype", op = "in", value = ["agentic-engineering.pdo", "agentic-engineering.orchestrator"] },
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
 ]

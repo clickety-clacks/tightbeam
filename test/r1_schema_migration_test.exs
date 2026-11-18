@@ -12,7 +12,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     db: db
   } do
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["session-custody-v1-0116"]]
+    assert shape(db) == [["session-custody-artifact-process-attribution-v1-0117"]]
     assert_columns(db)
     seed(db)
     assert rows(db, "SELECT reminderState FROM assignments") == [[nil]]
@@ -32,7 +32,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     facts = rows(db, "SELECT * FROM condition_facts")
     objects = guards(db)
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["session-custody-v1-0116"]]
+    assert shape(db) == [["session-custody-artifact-process-attribution-v1-0117"]]
     # Preserve every historical value despite Firehose's explicit table rebuild.
     assert rows(db, "SELECT #{Enum.join(assignment_columns, ",")} FROM assignments") ==
              assignments
@@ -62,7 +62,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     assert rows(db, "PRAGMA foreign_key_check") == []
   end
 
-  test "R1 stamp refusal rolls back both columns and preserves exact old rows and guards", %{
+  test "R1 stamp refusal rolls back both columns and preserves old rows and predecessor stamp", %{
     db: db
   } do
     load_o2(db)
@@ -74,13 +74,35 @@ defmodule Tightbeam.R1SchemaMigrationTest do
         "CREATE TRIGGER refuse_r1 BEFORE UPDATE ON schema_stamp WHEN NEW.shape='row-driven-r1-v1-019' BEGIN SELECT RAISE(ABORT, 'R1 fixture refusal'); END"
       )
 
+    assignments = rows(db, "SELECT * FROM assignments")
+    facts = rows(db, "SELECT * FROM condition_facts")
     before = snapshot(db)
     assert_raise DB.Error, fn -> Schema.ensure_all(db) end
     assert snapshot(db) == before
+
+    assert rows(
+             db,
+             "SELECT name FROM sqlite_master WHERE name LIKE 'harness_switch_context%' ORDER BY name"
+           ) == []
+
+    assert rows(db, "SELECT * FROM assignments") == assignments
+    assert rows(db, "SELECT * FROM condition_facts") == facts
     assert shape(db) == [["row-driven-o2-v1-019"]]
+    refute "reminderState" in columns(db, "assignments")
+    refute "payload" in columns(db, "condition_facts")
     :ok = DB.execute(db, "DROP TRIGGER refuse_r1")
     assert :ok = Schema.ensure_all(db)
     assert_columns(db)
+
+    assert rows(
+             db,
+             "SELECT name FROM sqlite_master WHERE name LIKE 'harness_switch_context%' ORDER BY name"
+           ) ==
+             [
+               ["harness_switch_context_message"],
+               ["harness_switch_context_pending"],
+               ["harness_switch_contexts"]
+             ]
   end
 
   test "unknown shape refuses without changing rows or adopting R1", %{db: db} do

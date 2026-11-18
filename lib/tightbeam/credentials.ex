@@ -524,6 +524,8 @@ defmodule Tightbeam.Credentials do
 
   @impl true
   def init(opts) do
+    Tightbeam.DB.owed_work()
+
     machine = Keyword.fetch!(opts, :machine)
 
     {:ok,
@@ -1438,7 +1440,7 @@ defmodule Tightbeam.Credentials do
       desired = %{
         harness: module.id(),
         machine: state.machine,
-        rails: Rails.hook_settings(),
+        rails: Rails.hook_settings(module.id()),
         credential_home: home
       }
 

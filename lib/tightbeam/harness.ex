@@ -83,6 +83,8 @@ defmodule Tightbeam.Harness do
   @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan() | launch_result()
   @callback ensure_adapter(target()) :: ensure_result()
   @callback session_config(map(), binary()) :: map()
+  @doc "Optional harness-owned metadata for loading an existing ACP session."
+  @callback session_load_meta(map(), binary()) :: map()
   @doc "An evidenced ACP submission limit across all text parts, in Unicode scalar values."
   @callback submission_text_limit() :: pos_integer() | nil
   @doc "Optional per-thread guidance projection before the first model turn."
@@ -126,12 +128,16 @@ defmodule Tightbeam.Harness do
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
 
   @callback records_tool_calls?() :: boolean()
+  @doc "Whether a running turn accepts model tuning without replacing its conversation."
+  @callback running_model_tuning_supported?() :: boolean()
 
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       records_tool_calls?: 0,
+                      running_model_tuning_supported?: 0,
                       submission_text_limit: 0,
+                      session_load_meta: 2,
                       project_session_identity: 3,
                       verify_session_identity_hook: 2
 
@@ -159,6 +165,16 @@ defmodule Tightbeam.Harness do
 
   @spec ensure_adapter(module(), target()) :: ensure_result()
   def ensure_adapter(module, target), do: module.ensure_adapter(target)
+
+  @spec session_load_meta(atom() | module(), map(), binary()) :: map()
+  def session_load_meta(harness, session, guidance) do
+    module = module!(harness)
+    Code.ensure_loaded!(module)
+
+    if function_exported?(module, :session_load_meta, 2),
+      do: module.session_load_meta(session, guidance),
+      else: module.session_config(session, guidance).meta
+  end
 
   @spec materialize_legacy_credential_link(module(), target(), String.t()) ::
           credential_migration_result()
@@ -195,6 +211,22 @@ defmodule Tightbeam.Harness do
     module = module!(harness)
     Code.ensure_loaded!(module)
     function_exported?(module, :records_tool_calls?, 0) and module.records_tool_calls?()
+  end
+
+  @spec running_model_tuning_supported?(atom() | binary()) :: boolean()
+  def running_model_tuning_supported?(harness) do
+    case Enum.find(known(), fn module ->
+           harness in [module, module.id(), module.wire_name()]
+         end) do
+      nil ->
+        false
+
+      module ->
+        Code.ensure_loaded!(module)
+
+        function_exported?(module, :running_model_tuning_supported?, 0) and
+          module.running_model_tuning_supported?()
+    end
   end
 
   @callback conformance_vectors() :: %{

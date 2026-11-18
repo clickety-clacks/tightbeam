@@ -28,8 +28,9 @@ defmodule Tightbeam.Placement do
      expects (%{code: ...}), citing what was denied and the allowed set, so
      agents learn the law by hitting it.
 
-  2. `adapter_opts/2` — build the Acp.Adapter start opts for an adapter key
-     {harness, "shared", host}:
+  2. `adapter_opts/2` — build Acp.Adapter start opts for a placement key
+     {harness, "shared", host}; Pi also uses one session-keyed worker key:
+     {pi, "pi-session:" <> sessionKey, host}.
      - local: exactly the previous behavior (local binary path, local home
        from Homes.project, env in the local Port).
      - remote: cmd is SSH-WRAPPED — ["ssh", dest, "exec", "env", "K=V"...,
@@ -103,8 +104,36 @@ defmodule Tightbeam.Placement do
           optional(:toolchain_dirs) => [String.t()]
         }
 
-  @typedoc "Adapter key. The reserved identity `shared` is the one runtime per harness+host."
+  @typedoc "Adapter key. `shared` is placement-scoped; Pi also has private session keys."
   @type adapter_key :: {harness :: atom(), archetype :: String.t(), host :: String.t()}
+
+  @pi_session_identity_prefix "pi-session:"
+
+  @doc false
+  def pi_session_adapter_key(session_key, host) when is_binary(session_key) and is_binary(host),
+    do: {:pi, @pi_session_identity_prefix <> session_key, host}
+
+  @doc false
+  def pi_session_adapter?({:pi, @pi_session_identity_prefix <> _session_key, _host}), do: true
+  def pi_session_adapter?(_key), do: false
+
+  @doc false
+  def pi_session_key({:pi, @pi_session_identity_prefix <> session_key, _host}),
+    do: {:ok, session_key}
+
+  def pi_session_key(_key), do: :error
+
+  @doc false
+  def placement_adapter_key({harness, _identity, host}), do: {harness, "shared", host}
+
+  @doc false
+  def pi_private_home(%{base_dir: base_dir}, "shared") do
+    Path.join([base_dir, "work", "pi-readiness-home"])
+  end
+
+  def pi_private_home(%{base_dir: _base_dir} = host, @pi_session_identity_prefix <> session_key) do
+    Path.join([host_workdir_path(host, session_key), ".tightbeam", "pi-home"])
+  end
 
   @hosts_ddl """
   CREATE TABLE IF NOT EXISTS hosts (
@@ -606,6 +635,14 @@ defmodule Tightbeam.Placement do
           else: ensure_opts
 
       ensure_workdir(host, path, content, ensure_opts)
+
+      ensure_session_rail_scope(
+        host,
+        path,
+        Rails.session_scope_content(holder_session.archetype),
+        ensure_opts
+      )
+
       path
     end
   end
@@ -635,6 +672,7 @@ defmodule Tightbeam.Placement do
     if Tightbeam.Ephemeral.session?(config.db, session.session_key) do
       host = fetch_session_host!(config, session)
       sh = Map.get(config, :sh, &system_cmd/1)
+      sh_out = Map.get(config, :sh_out, &system_cmd_out/1)
 
       run = fn args ->
         invocation = if host.ssh == nil, do: args, else: ["ssh" | @ssh_opts] ++ [host.ssh | args]
@@ -683,6 +721,15 @@ defmodule Tightbeam.Placement do
           {^cleaner, :directory, path} -> path
           {:DOWN, ^ref, :process, ^cleaner, reason} -> exit({:temporary_directory_failed, reason})
         end
+
+      ensure_session_rail_scope(
+        host,
+        path,
+        Rails.session_scope_content(session.archetype),
+        base_dir: config.base_dir,
+        sh: sh,
+        sh_out: sh_out
+      )
 
       Process.put({__MODULE__, :turn_directory}, path)
 
@@ -747,86 +794,6 @@ defmodule Tightbeam.Placement do
           nil
       end
     end
-  end
-
-  @doc """
-  Stat paths on the host that holds them — the write-detection half of referent
-  verification. Local and remote hosts use a bounded shell invocation.
-
-  A present path returns its mtime, so the answer is evidence of a write and not
-  merely of existence. `stat` spells its format differently on BSD and GNU, so
-  the command tries both; a host with neither reports the path unverifiable
-  rather than guessing.
-
-  A host that cannot be reached reports THAT. The answer is about the check, so
-  a caller can never turn it into a statement about the claim that named the
-  path, or about the credential that failed to reach the host.
-  """
-  @spec check_origins(map(), String.t(), [String.t()]) ::
-          %{String.t() => {:present, integer()} | :absent | {:error, String.t()}}
-  def check_origins(_config, _host_name, []), do: %{}
-
-  def check_origins(config, host_name, paths) do
-    case hosts_for(config)[host_name] do
-      nil ->
-        Map.new(paths, &{&1, {:error, "no host named #{host_name} is registered"}})
-
-      host ->
-        command = check_origins_command(paths)
-        runner = Map.get(config, :sh, &system_cmd/1)
-
-        invocation =
-          if host.ssh == nil do
-            ["sh", "-lc", command]
-          else
-            ["ssh" | @ssh_opts] ++ [host.ssh, "sh", "-lc", shell_quote(command)]
-          end
-
-        result =
-          if host.ssh == nil do
-            run_probe(runner, invocation)
-          else
-            run_bounded(runner, invocation, 8_000)
-          end
-
-        case result do
-          {:ok, output} -> parse_origin_checks(output, paths)
-          {:error, reason} -> Map.new(paths, &{&1, {:error, reason}})
-        end
-    end
-  end
-
-  defp check_origins_command(paths) do
-    """
-    set -u
-    for p in #{Enum.map_join(paths, " ", &shell_quote/1)}; do
-      if test ! -e "$p"; then
-        printf 'A\\t0\\t%s\\n' "$p"
-      elif m=$(stat -f %m "$p" 2>/dev/null) || m=$(stat -c %Y "$p" 2>/dev/null); then
-        printf 'P\\t%s\\t%s\\n' "$m" "$p"
-      else
-        printf 'U\\t0\\t%s\\n' "$p"
-      fi
-    done
-    """
-  end
-
-  defp parse_origin_checks(output, paths) do
-    seen =
-      output
-      |> String.split("\n", trim: true)
-      |> Enum.reduce(%{}, fn line, acc ->
-        case String.split(line, "\t", parts: 3) do
-          ["P", mtime, path] -> Map.put(acc, path, {:present, String.to_integer(mtime)})
-          ["A", _mtime, path] -> Map.put(acc, path, :absent)
-          ["U", _mtime, path] -> Map.put(acc, path, {:error, "this host has no usable stat"})
-          _ -> acc
-        end
-      end)
-
-    Map.new(paths, fn path ->
-      {path, Map.get(seen, path, {:error, "the check returned no answer for this path"})}
-    end)
   end
 
   @doc """
@@ -979,59 +946,6 @@ defmodule Tightbeam.Placement do
     :ok
   end
 
-  defp run_bounded(runner, invocation, timeout_ms) do
-    caller = self()
-    tag = make_ref()
-
-    {pid, monitor} =
-      spawn_monitor(fn ->
-        result =
-          try do
-            case runner.(invocation) do
-              {output, 0} -> {:ok, output}
-              {output, status} -> {:error, "probe exited #{status}: #{String.trim(output)}"}
-            end
-          rescue
-            error -> {:error, "probe failed: #{Exception.message(error)}"}
-          catch
-            kind, reason -> {:error, "probe failed: #{kind}: #{inspect(reason)}"}
-          end
-
-        send(caller, {tag, result})
-      end)
-
-    receive do
-      {^tag, result} ->
-        Process.demonitor(monitor, [:flush])
-        result
-
-      {:DOWN, ^monitor, :process, ^pid, reason} ->
-        {:error, "probe failed: #{Exception.format_exit(reason)}"}
-    after
-      timeout_ms ->
-        Process.exit(pid, :kill)
-
-        receive do
-          {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
-        end
-
-        {:error, "probe timed out"}
-    end
-  end
-
-  defp run_probe(runner, invocation) do
-    try do
-      case runner.(invocation) do
-        {output, 0} -> {:ok, output}
-        {output, status} -> {:error, "probe exited #{status}: #{String.trim(output)}"}
-      end
-    rescue
-      error -> {:error, "probe failed: #{Exception.message(error)}"}
-    catch
-      kind, reason -> {:error, "probe failed: #{kind}: #{inspect(reason)}"}
-    end
-  end
-
   defp upsert_host_in_txn(txn, name, entry) do
     DB.Txn.q(
       txn,
@@ -1168,8 +1082,9 @@ defmodule Tightbeam.Placement do
       "mkdir -p #{path} && " <>
         "{ find #{file} -maxdepth 0 -perm 600 -print 2>/dev/null | grep -q . && cat #{file} 2>/dev/null; true; } && " <>
         "if [ -d #{path}/.git/info ]; then " <>
-        "grep -qxF .tightbeam-session #{path}/.git/info/exclude 2>/dev/null || " <>
-        ~s(printf "\\n%s\\n" .tightbeam-session >> #{path}/.git/info/exclude; fi)
+        "for entry in .tightbeam-session #{Rails.session_scope_filename()}; do " <>
+        "grep -qxF \"$entry\" #{path}/.git/info/exclude 2>/dev/null || " <>
+        "printf '\\n%s\\n' \"$entry\" >> #{path}/.git/info/exclude; done; fi"
 
     {current, code} =
       sh_out.(["ssh" | @ssh_opts] ++ [dest, "sh", "-c", shell_quote(script)])
@@ -1214,7 +1129,73 @@ defmodule Tightbeam.Placement do
         separator = if existing == "" or String.ends_with?(existing, "\n"), do: "", else: "\n"
         File.write!(exclude, existing <> separator <> ".tightbeam-session\n")
       end
+
+      existing = if File.exists?(exclude), do: File.read!(exclude), else: ""
+      lines = String.split(existing, "\n")
+
+      if Rails.session_scope_filename() not in lines do
+        separator = if existing == "" or String.ends_with?(existing, "\n"), do: "", else: "\n"
+        File.write!(exclude, existing <> separator <> Rails.session_scope_filename() <> "\n")
+      end
     end
+  end
+
+  defp ensure_session_rail_scope(%{ssh: nil}, path, content, _opts) do
+    File.mkdir_p!(path)
+    file = Path.join(path, Rails.session_scope_filename())
+    current = if File.exists?(file), do: File.read!(file), else: nil
+    mode = if File.exists?(file), do: File.stat!(file).mode &&& 0o777, else: nil
+
+    if current != content or mode != 0o644 do
+      File.write!(file, content)
+      File.chmod!(file, 0o644)
+    end
+
+    heal_git_exclude(path)
+    :ok
+  end
+
+  defp ensure_session_rail_scope(%{ssh: dest}, path, content, opts) do
+    sh = Keyword.get(opts, :sh, &system_cmd/1)
+    sh_out = Keyword.get(opts, :sh_out, &system_cmd_out/1)
+    file = Path.join(path, Rails.session_scope_filename())
+
+    case sh_out.(["ssh" | @ssh_opts] ++ [dest, "cat", file]) do
+      {^content, 0} ->
+        :ok
+
+      _ ->
+        stage =
+          Path.join([
+            Keyword.fetch!(opts, :base_dir),
+            "staging",
+            "session-files",
+            Path.basename(path) <> "-scope-#{System.unique_integer([:positive])}"
+          ])
+
+        stage_file = Path.join(stage, Rails.session_scope_filename())
+        File.mkdir_p!(stage)
+
+        try do
+          File.write!(stage_file, content)
+          File.chmod!(stage_file, 0o644)
+
+          run!(sh, [
+            "rsync",
+            "-a",
+            "-e",
+            Enum.join(["ssh" | @ssh_opts], " "),
+            stage_file,
+            "#{dest}:#{path}/"
+          ])
+        after
+          File.rm_rf!(stage)
+        end
+    end
+
+    run!(sh, ["ssh" | @ssh_opts] ++ [dest, "chmod", "644", file])
+
+    :ok
   end
 
   @doc """
@@ -1522,7 +1503,7 @@ defmodule Tightbeam.Placement do
         remote_env: remote_env,
         lineage: lineage,
         model: Map.get(target, :default_model),
-        rails: Rails.hook_settings(),
+        rails: Rails.hook_settings(harness),
         statutes: Rails.statutes?(),
         ensure_workdir: &ensure_workdir/4,
         sh_out: Map.get(config, :sh_out)
@@ -1539,6 +1520,15 @@ defmodule Tightbeam.Placement do
         end
       end)
       |> Kernel.++(checked_opts)
+
+    launch_opts =
+      if harness == :pi do
+        launch_opts
+        |> Keyword.put(:pi_private_home, pi_private_home(host_config, identity_name))
+        |> Keyword.put(:statutes, identity_name == "shared" and Rails.statutes?())
+      else
+        launch_opts
+      end
 
     process_identity_dir =
       if harness == :cursor and is_nil(host_config.ssh),
@@ -1943,8 +1933,9 @@ defmodule Tightbeam.Placement do
         if Keyword.has_key?(opts, :sh), do: sh, else: &system_cmd_out/1
       end)
 
-    rails = Rails.hook_settings()
-    # Reserved rails call the `tightbeam` helper (and `gh`) by bare name; Cursor's
+    rails = Rails.hook_settings(harness)
+    # The GitHub statute check and artifact observation call the `tightbeam`
+    # helper (and `gh`) by bare name; Cursor's
     # wrapper carries the same PATH common_env gives every harness (see
     # CursorRails) because the dedicated identity's launcher pins PATH.
     # Only Cursor carries it; other harnesses must not require `cli_bin` here
