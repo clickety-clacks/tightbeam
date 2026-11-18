@@ -1820,7 +1820,7 @@ fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, St
             ));
         }
     }
-    let state = nonempty(flags, "state");
+    let state = flags.get("state").cloned();
     if let Some(value) = &state {
         if !matches!(value.as_str(), "open" | "iceboxed" | "closed" | "failed") {
             return Err(format!(
@@ -7208,7 +7208,7 @@ mod tests {
             vec!["execution-map"],
             vec!["execution-map-select", "--under", "wi_example"],
         ] {
-            for state in ["all", "opne"] {
+            for state in ["all", "opne", ""] {
                 let mut args = prefix.clone();
                 args.extend(["--state", state, "--as-user", "owner"]);
                 assert_eq!(
@@ -7216,6 +7216,17 @@ mod tests {
                     format!("bad --state value: {state} (use open, iceboxed, closed, or failed)")
                 );
             }
+            let mut args = prefix.clone();
+            args.extend(["--as-user", "owner", "--state"]);
+            assert_eq!(
+                parse(strings(&args)).unwrap_err(),
+                "bad --state value:  (use open, iceboxed, closed, or failed)"
+            );
+            let mut args = prefix.clone();
+            args.extend(["--as-user", "owner"]);
+            let command = parse(strings(&args)).unwrap();
+            let body = crate::dispatch::build_request(&command).unwrap().body_json;
+            assert!(!body.contains(r#""state":"#));
             for state in ["open", "iceboxed", "closed", "failed"] {
                 let mut args = prefix.clone();
                 args.extend(["--state", state, "--as-user", "owner"]);

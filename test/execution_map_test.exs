@@ -838,7 +838,7 @@ defmodule Tightbeam.ExecutionMapTest do
       params =
         if verb == "execution-map", do: %{state: "all"}, else: %{state: "all", under: "wi_routed"}
 
-      response = post_dispatch(opts, %{verb: verb, asUser: "flynn", params: params})
+      response = post_dispatch(opts, %{verb: verb, asUser: "fixture-owner", params: params})
 
       assert response.status == 400
 
