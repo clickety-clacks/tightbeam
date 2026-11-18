@@ -117,7 +117,7 @@ defmodule Tightbeam.HarnessPiTest do
   end
 
   test "isolated engine launcher inventories workspace inputs without personal discovery" do
-    # Resolve version-manager shims before the launcher replaces HOME.
+    # Resolve version-manager shims before running with the fixture PATH.
     {node, 0} = System.cmd("node", ["-p", "process.execPath"])
     node = String.trim(node)
 
