@@ -310,7 +310,9 @@ defmodule Tightbeam.RowReactions.Cutover do
   defp adopt_output(txn, wake, at, watermark) do
     {event, family, slot} =
       case wake.obligation_ref do
-        @root <> _ -> {terminal_event(txn, wake), "terminal-handoff", "handoff"}
+        @root <> _ ->
+          {terminal_event(txn, wake), "terminal-handoff", "handoff"}
+
         @reminder <> root ->
           {reminder_event(txn, wake, root, watermark), "terminal-action", "reminder"}
       end

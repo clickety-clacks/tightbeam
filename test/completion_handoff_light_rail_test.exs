@@ -1704,7 +1704,6 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert turn_count(ctx.db, unknown.wake_id) == 0
   end
 
-
   test "cutover adopts only eligible pending notices at the recorded watermark and reports them once",
        ctx do
     stop_supervised!(ctx.scheduler)
@@ -1718,7 +1717,11 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
              DB.query(
                ctx.db,
                "INSERT INTO row_reaction_cutovers(source,watermark,adoptedAt,heldCount) VALUES(?1,?2,?3,0)",
-               ["terminal-notices/v1", JSON.encode!(%{"wakeRowid" => watermark}), System.system_time(:millisecond)]
+               [
+                 "terminal-notices/v1",
+                 JSON.encode!(%{"wakeRowid" => watermark}),
+                 System.system_time(:millisecond)
+               ]
              )
 
     later =
