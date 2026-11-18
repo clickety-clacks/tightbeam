@@ -88,6 +88,7 @@ defmodule GuardPathNotes do
 
         revision = Identity.live_revision!(base)
         cwd = Placement.holder_workdir(config, session)
+
         snapshot =
           Identity.provision_at!(base, revision, "agentic-engineering.coder", :claude, cwd)
 
