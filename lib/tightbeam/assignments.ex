@@ -2910,10 +2910,9 @@ defmodule Tightbeam.Assignments do
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
       %{holderKey: holder} = assignment ->
+        # Any session, user or automation may record what happened; the row
+        # names who filed it.
         cond do
-          not match?({:session, _}, call.principal) ->
-            error("not_holder", "assignment is held by session #{holder}")
-
           assignment.state != "open" and call.params[:kind] == "cannot-proceed" ->
             cannot_proceed_closed(assignment.outcome)
 
@@ -3049,10 +3048,10 @@ defmodule Tightbeam.Assignments do
       txn,
       """
       UPDATE assignments SET state = 'closed', outcome = 'completed', closedAt = ?2,
-        closedBySession = ?3, closingAttestId = ?4
+        closedBySession = ?3, closedByUser = ?5, closingAttestId = ?4
       WHERE id = ?1 AND state = 'open'
       """,
-      [assignment.id, attest.ts, attest.bySession, attest.id]
+      [assignment.id, attest.ts, attest.bySession, attest.id, attest.byUser]
     )
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
@@ -4254,6 +4253,17 @@ defmodule Tightbeam.Assignments do
        when is_integer(closed_at),
        do: :ok
 
+  # An automation act keeps both typed actors empty; the event names it.
+  defp lawful_closed_shape(%{
+         outcome: outcome,
+         closedAt: closed_at,
+         closedByUser: nil,
+         closedBySession: nil,
+         closedByProcess: nil
+       })
+       when outcome in ["completed", "revoked"] and is_integer(closed_at),
+       do: :ok
+
   defp lawful_closed_shape(%{
          outcome: outcome,
          closedAt: closed_at,
@@ -4799,11 +4809,8 @@ defmodule Tightbeam.Assignments do
       {:ok, []} ->
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
-      {:ok, [[holder, state, reviews_assignment_id, _effect_kind]]} when kind == "completion" ->
+      {:ok, [[_holder, state, reviews_assignment_id, _effect_kind]]} when kind == "completion" ->
         cond do
-          not match?({:session, _}, call.principal) ->
-            error("not_holder", "assignment is held by session #{holder}")
-
           state != "open" ->
             assignment_closed()
 
@@ -4817,11 +4824,8 @@ defmodule Tightbeam.Assignments do
             :ok
         end
 
-      {:ok, [[holder, state, nil, effect_kind]]} when kind == "verdict" ->
+      {:ok, [[_holder, state, nil, effect_kind]]} when kind == "verdict" ->
         cond do
-          not match?({:session, _}, call.principal) ->
-            error("not_holder", "assignment is held by session #{holder}")
-
           effect_kind == "review" and
               call.params[:verdict_kind] in @review_conclusion_verdict_kinds ->
             if state == "open", do: :ok, else: assignment_closed()

@@ -1483,8 +1483,9 @@ defmodule Tightbeam.Wakes do
         LEFT JOIN users owner ON owner.userId=CASE
           WHEN a.openedBySession IS NOT NULL THEN parent.ownerUserId
         ELSE COALESCE(a.openedByUser, w.ownerUserId) END
-        WHERE a.id=?1 AND a.state='closed' AND a.closedBySession=a.holderKey
-          AND a.closedByUser IS NULL AND t.bySession=a.holderKey AND t.byUser IS NULL
+        WHERE a.id=?1 AND a.state='closed'
+          AND a.closedBySession IS t.bySession AND a.closedByUser IS t.byUser
+          AND a.closedByProcess IS NULL
           AND t.ts=a.closedAt
           AND ((a.outcome='completed' AND t.kind='completion')
             OR (a.outcome='surrendered' AND t.kind='surrender'))
