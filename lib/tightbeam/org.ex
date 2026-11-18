@@ -1771,6 +1771,7 @@ defmodule Tightbeam.Org do
   @spec append_pointer_in_txn(Txn.t(), String.t(), String.t(), String.t()) :: pointer()
   def append_pointer_in_txn(txn, session_key, harness_session_id, reason) do
     session = must_get(txn, session_key)
+    previous_pointer = current_pointer_snapshot_in_txn(txn, session_key)
     created_at = now()
 
     source_session_ref =
@@ -1794,7 +1795,11 @@ defmodule Tightbeam.Org do
       ]
     )
 
-    Txn.handoff(txn, Tightbeam.HarklightWakes, {:pointer_changed, session_key})
+    # Loading an existing harness session still belongs in the pointer history,
+    # but does not invalidate its healthy Harklight listener.
+    if is_nil(previous_pointer) or previous_pointer.harness_session_id != harness_session_id do
+      Txn.handoff(txn, Tightbeam.HarklightWakes, {:pointer_changed, session_key})
+    end
 
     %{
       session_key: session_key,

@@ -1388,6 +1388,8 @@ defmodule Tightbeam.HarklightWakes do
 
   @impl true
   def init(opts) do
+    DB.owed_work()
+
     Process.flag(:trap_exit, true)
     send(self(), :restore)
     delays = Keyword.get(opts, :attach_retry_delays, @attach_retry_delays)
@@ -2288,11 +2290,15 @@ defmodule Tightbeam.HarklightWakes do
   def handle_call({:attached, handle}, from, state) do
     result =
       if valid_worker?(state, handle, from) do
-        case DB.query(
-               state.db,
-               "UPDATE harklight_wake_handles SET state='active',lastError=NULL,updatedAt=?2 WHERE handle=?1",
-               [handle, System.system_time(:millisecond)]
-             ) do
+        # The listener worker already owns the attachment-state retry (#804).
+        # Preserve its refusal/backoff path instead of blocking the manager here.
+        case DB.refusable(fn ->
+               DB.query(
+                 state.db,
+                 "UPDATE harklight_wake_handles SET state='active',lastError=NULL,updatedAt=?2 WHERE handle=?1",
+                 [handle, System.system_time(:millisecond)]
+               )
+             end) do
           {:ok, _} -> :ok
           {:error, _} -> {:error, "attachment_state_unavailable"}
         end

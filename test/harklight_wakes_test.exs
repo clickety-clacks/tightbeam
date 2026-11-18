@@ -5013,6 +5013,55 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
   end
 
+  test "repeated same-ID loads and lane starts keep one attachment", %{db: db, session: session} do
+    path = Path.join(System.tmp_dir!(), "same-pointer-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm(path) end)
+
+    fake_harklight_agent!("""
+    printf '%s\\n' "$*" >> '#{path}'
+    if [ "$1" = attach ]; then
+      printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+    elif [ "$1" = listen ]; then
+      exec sleep 300
+    fi
+    """)
+
+    calls = fn -> File.read!(path) |> String.split("\n", trim: true) end
+    listen_count = fn -> Enum.count(calls.(), &String.starts_with?(&1, "listen ")) end
+
+    Org.append_pointer(db, session.session_key, "vendor-original", "created")
+    manager = start_supervised!({HarklightWakes, db: db})
+
+    # A registered port only confirms the child wrapper's lifetime lock. Listen
+    # starts after attach succeeds, so its log entry confirms attach completed.
+    assert eventually(fn -> File.exists?(path) and listen_count.() == 1 end)
+    assert is_port(:sys.get_state(manager).ports[@handle])
+    worker = :sys.get_state(manager).workers[@handle]
+
+    for _ <- 1..5 do
+      Org.append_pointer(db, session.session_key, "vendor-original", "loaded")
+      GenServer.cast(manager, {:origin_ready, session.session_key})
+      # The synchronous round trip drains the preceding pointer handoff and
+      # origin_ready cast before checking that neither replaced the worker.
+      assert :sys.get_state(manager).workers[@handle] == worker
+    end
+
+    assert Enum.count(calls.(), &String.starts_with?(&1, "attach ")) == 1
+    assert length(Org.pointer_chain(db, session.session_key)) == 6
+
+    Org.append_pointer(db, session.session_key, "vendor-replacement", "fallback")
+
+    assert eventually(fn ->
+             state = :sys.get_state(manager)
+             is_port(state.ports[@handle]) and state.workers[@handle] != worker
+           end)
+
+    assert eventually(fn -> listen_count.() == 2 end)
+    attach_calls = Enum.filter(calls.(), &String.starts_with?(&1, "attach "))
+    assert length(attach_calls) == 2
+    assert String.contains?(Enum.at(attach_calls, 1), "--vendor-session-id vendor-replacement")
+  end
+
   test "an overloaded listener-state write keeps the attachment and delivers the waiting entry once",
        %{db: db, session: session} do
     path = Path.join(System.tmp_dir!(), "state-write-#{System.unique_integer([:positive])}")
@@ -8276,11 +8325,17 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
   end
 
+  # Includes two complete population scans and database setup on busy runners.
+  # Responsiveness while reads are blocked is checked separately below.
+  @tag timeout: 180_000
   test "194 pending status reads leave the manager responsive and new requests ungated", %{
     db: db,
     session: session,
-    call: call
+    call: call,
+    timeout: timeout
   } do
+    started_at = System.monotonic_time(:millisecond)
+    deadline = started_at + timeout
     handles = [@handle | Enum.map(1..193, fn _ -> Tightbeam.Id.uuid4() end)]
 
     for {handle, index} <- Enum.with_index(tl(handles)),
@@ -8288,7 +8343,6 @@ defmodule Tightbeam.HarklightWakesTest do
 
     parent = self()
     {:ok, phase} = Agent.start_link(fn -> nil end)
-    started_at = System.monotonic_time(:millisecond)
 
     runner = fn ["status", "--session", handle] ->
       open = Agent.get(phase, & &1)
@@ -8378,6 +8432,32 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert_receive {:restored, ^hung, nil}, 6_000
 
+    # Observe completion of the skipped workers, rather than requiring the
+    # whole population to drain within eventually/1's short polling window.
+    # Collect exits in arrival order against one deadline from the test budget,
+    # not a fresh timeout per worker. An unexpected listener stays alive and
+    # fails the wait; exact survivors and duplicate checks still follow it.
+    await_skipped = fn controller ->
+      monitors =
+        for {handle, pid} <- :sys.get_state(controller).workers,
+            handle not in [target, hung],
+            into: %{},
+            do: {Process.monitor(pid), pid}
+
+      Enum.reduce(monitors, monitors, fn _, pending ->
+        remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+        assert_receive {:DOWN, ref, :process, pid, reason} when is_map_key(pending, ref),
+                       remaining
+
+        assert Map.fetch!(pending, ref) == pid
+        assert reason in [:normal, :noproc]
+        Map.delete(pending, ref)
+      end)
+    end
+
+    await_skipped.(manager)
+
     assert eventually(fn ->
              Map.keys(:sys.get_state(manager).workers) |> MapSet.new() ==
                MapSet.new([target, hung])
@@ -8404,13 +8484,19 @@ defmodule Tightbeam.HarklightWakesTest do
          db: db, listener: completion_notifying_listener(parent), send_runner: runner}
       )
 
+    # This restore scans all 194 handles through the bounded decision pool.
+    # Its total duration is not the manager/new-request responsiveness bound
+    # asserted above: on a busy runner even successful reads can take >1s.
+    # Use the same finite population deadline and require exactly both listeners.
     restored =
       for _ <- 1..2 do
-        assert_receive {:restored, handle, nil}, 1_000
+        remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+        assert_receive {:restored, handle, nil}, remaining
         handle
       end
 
     assert MapSet.new(restored) == MapSet.new([target, hung])
+    await_skipped.(second)
     assert eventually(fn -> map_size(:sys.get_state(second).workers) == 2 end)
     restore_us = System.monotonic_time(:microsecond) - restore_at
     refute_receive {:restored, _, _}
