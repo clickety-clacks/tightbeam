@@ -26,7 +26,7 @@ defmodule GuardPathNotes do
           display_name: "Path notes target",
           owner_user_id: "test-owner",
           origin: "user:test-owner",
-          archetype: "coder",
+          archetype: "agentic-engineering.coder",
           host: "testhost",
           harness: "claude",
           provider: "anthropic",
@@ -88,7 +88,7 @@ defmodule GuardPathNotes do
 
         revision = Identity.live_revision!(base)
         cwd = Placement.holder_workdir(config, session)
-        snapshot = Identity.provision_at!(base, revision, "coder", :claude, cwd)
+        snapshot = Identity.provision_at!(base, revision, "agentic-engineering.coder", :claude, cwd)
 
         Org.set_identity_stamp(
           db,
