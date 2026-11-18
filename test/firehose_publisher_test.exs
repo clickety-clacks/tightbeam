@@ -648,7 +648,9 @@ defmodule Tightbeam.Firehose.PublisherTest do
     completion_effects = notice_state_classes(completion_publications)
     asynchronous_delivery = ~w(session.updated wake.fired)
 
-    assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
+    # R01 keeps an unlinked verified verdict quiet, so no opener-turn delivery
+    # effects accompany the durable attest and completion events.
+    refute Enum.any?(asynchronous_delivery, &(&1 in completion_effects))
 
     completion_attest_effects =
       completion_effects
