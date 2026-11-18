@@ -237,6 +237,19 @@ defmodule Tightbeam.DB do
   end
 
   @doc false
+  # The refusal itself, or the strict match on a database result that it tripped.
+  def overload_error?(%Overloaded{}), do: true
+  def overload_error?(%MatchError{term: {:error, %Overloaded{}}}), do: true
+  def overload_error?(%CaseClauseError{term: {:error, %Overloaded{}}}), do: true
+  def overload_error?(_error), do: false
+
+  @doc false
+  # What a caller is told when its operation met the refusal: nothing is wrong
+  # with the request, and the same request can be sent again.
+  def overload_refusal,
+    do: %{code: "db_overloaded", message: "database overloaded; retry later"}
+
+  @doc false
   def reader(server, sql) do
     if Regex.match?(~r/\A(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(SELECT|WITH|EXPLAIN)\b/i, sql) do
       with pid when is_pid(pid) <- GenServer.whereis(server),
