@@ -73,7 +73,9 @@ defmodule Tightbeam.Ephemeral do
   # writer's queue.
   def session?(db, key) do
     available?(db) and
-      query(db, "SELECT 1 FROM ephemeral_sessions WHERE sessionKey=?1", [key]) != []
+      DB.read_transaction!(db, fn txn ->
+        Txn.q(txn, "SELECT 1 FROM ephemeral_sessions WHERE sessionKey=?1", [key]) != []
+      end)
   end
 
   defp owner(%DB.Migration{server: server}), do: owner(server)
