@@ -51,6 +51,25 @@ payload is one record-event item, and clients append that item to the session's
 record-event feed. The stream remains lossy; after reconnect, clients rebuild
 the feed from `GET /api/sessions/:session_key/record-events`.
 
+For transcript catch-up after reconnect, `GET /api/session-message-sequences`
+returns `{"items":[{"sessionKey":"example","latestMessageSeq":123}]}` for all
+sessions visible under the same authentication and `asUser` rules as
+`GET /api/sessions`. Items are ordered by `sessionKey` ascending, without paging.
+Only `asUser` is accepted as a query parameter. `latestMessageSeq` is the maximum
+global `messages.seq` stored for that session, across all roles and message types,
+including cleared history; an empty session returns `0`. It is a sequence from
+message history, not a message count or a Firehose sequence. The endpoint uses
+one read-connection query with an indexed latest-row seek per visible session,
+without reading transcript bodies or using the database writer. Read markers
+remain available separately from `GET /api/read-markers`.
+
+Subscribe before reading this snapshot, then fetch history only for sessions
+whose sequence advanced beyond the client's stored high-water mark. Persist
+that mark after catching up through the observed sequence; a bounded history
+read may need more pages to reach it. Continue applying live events while
+catching up. This is an additive REST snapshot; existing roster and Firehose
+payloads are unchanged. It does not detect edits to existing messages.
+
 After a close, the minimum request count for one rebuild is
 
 ```text

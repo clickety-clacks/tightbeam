@@ -63,6 +63,15 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         sender_scheduled: true
       })
 
+    assert first.replaced_wake_ids == []
+    assert second.replaced_wake_ids == [first.wake_id]
+    assert third.replaced_wake_ids == [second.wake_id]
+
+    for wake <- [other_id, other_sender, other_recipient],
+        do: assert(wake.replaced_wake_ids == [])
+
+    refute Map.has_key?(ordinary, :replaced_wake_ids)
+
     assert Wakes.get(db, first.wake_id).state == "canceled"
     assert Wakes.get(db, second.wake_id).state == "canceled"
     assert Wakes.get(db, third.wake_id).state == "pending"
@@ -99,21 +108,37 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     assert {:ok, [["canceled"]]} =
              DB.query(db, "SELECT status FROM turns WHERE seq=?1", [queued_seq])
 
+    assert newest.replaced_wake_ids == [queued.wake_id]
     assert Wakes.get(db, newest.wake_id).state == "pending"
 
     running = prod_wake!(db, "running", "running", "bridge", "k1", 60_000)
     running_seq = deliver_wake!(db, running)
     assert {:ok, %{seq: ^running_seq, owner_lease: lease}} = Ledger.claim_next(db, "k1", "lane")
-    _later = prod_wake!(db, "later", "running", "bridge", "k1", 120_000)
+    later = prod_wake!(db, "later", "running", "bridge", "k1", 120_000)
+
+    assert later.replaced_wake_ids == []
 
     assert {:ok, [["running"]]} =
              DB.query(db, "SELECT status FROM turns WHERE seq=?1", [running_seq])
 
     assert :ok = Ledger.finish(db, running_seq, "delivered", nil, owner_lease: lease)
-    _after_delivery = prod_wake!(db, "after delivery", "running", "bridge", "k1", 180_000)
+    after_delivery = prod_wake!(db, "after delivery", "running", "bridge", "k1", 180_000)
+
+    assert after_delivery.replaced_wake_ids == [later.wake_id]
+    refute running.wake_id in after_delivery.replaced_wake_ids
 
     assert {:ok, [["delivered"]]} =
              DB.query(db, "SELECT status FROM turns WHERE seq=?1", [running_seq])
+  end
+
+  @tag prod_id_replacement: true
+  test "a delivered predecessor is not listed", %{db: db} do
+    old = prod_wake!(db, "old", "page", "bridge", "k1", 60_000)
+    seq = deliver_wake!(db, old)
+    assert {:ok, %{seq: ^seq, owner_lease: lease}} = Ledger.claim_next(db, "k1", "lane")
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: lease)
+    new = prod_wake!(db, "new", "page", "bridge", "k1", 120_000)
+    assert new.replaced_wake_ids == []
   end
 
   @tag prod_id_replacement: true
@@ -126,7 +151,8 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     assert [%{delivery_wake_id: ^carrier, member_state: "included"}] =
              NoticeBatcher.source_refs(db, old.wake_id)
 
-    _new = prod_wake!(db, "newer prod", "page", "bridge", "k1", 60_000)
+    new = prod_wake!(db, "newer prod", "page", "bridge", "k1", 60_000)
+    assert new.replaced_wake_ids == []
     assert {:ok, [[prompt]]} = DB.query(db, "SELECT prompt FROM turns WHERE wakeId=?1", [carrier])
     assert prompt =~ "already sealed"
 

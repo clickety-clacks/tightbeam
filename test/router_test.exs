@@ -64,12 +64,49 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   @tag prod_id_replacement: true
-  test "wake prod id crosses the wire parameter boundary" do
+  test "wake prod id crosses the wire parameter boundary", ctx do
     assert %{prod_id: "page", prompt: "revised"} =
              Router.atomize_params_for_test("wake", %{
                "prodId" => "page",
                "prompt" => "revised"
              })
+
+    target = create_session(ctx.db, "prod-target", ctx.device.user_id)
+    config = %{base_dir: ctx.base_dir, db: ctx.db, port: 0}
+    handlers = Gateway.handlers(config)
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+    ctx = %{ctx | opts: opts}
+
+    params = %{
+      prompt: "first",
+      at: System.system_time(:millisecond) + 60_000,
+      prodId: "page",
+      idempotencyKey: "prod-first"
+    }
+
+    send_wake = fn params ->
+      response =
+        dispatch_cli(ctx, "tbc_test", %{
+          verb: "wake",
+          asProcess: "bridge",
+          sessionKey: target.session_key,
+          params: params
+        })
+
+      assert response.status == 200
+      JSON.decode!(response.resp_body)["result"]
+    end
+
+    first = send_wake.(params)
+    assert first["replacedWakeIds"] == []
+    second_params = %{params | prompt: "second", idempotencyKey: "prod-second"}
+    second = send_wake.(second_params)
+    assert second["replacedWakeIds"] == [first["wakeId"]]
+    assert send_wake.(second_params) == second
+    third = send_wake.(%{params | prompt: "third", idempotencyKey: "prod-third"})
+    assert third["replacedWakeIds"] == [second["wakeId"]]
+    ordinary = send_wake.(Map.drop(params, [:prodId, :idempotencyKey]))
+    refute Map.has_key?(ordinary, "replacedWakeIds")
   end
 
   test "unknown keys cannot create atoms or borrow another verb's parameters" do
@@ -107,6 +144,12 @@ defmodule Tightbeam.Wire.RouterTest do
              "acceptedAt" => 123,
              "sessionKey" => "source"
            }) == %{accepted_at: 123, session_key: "source"}
+  end
+
+  test "harklight send atomizes the answer UI path without changing its value" do
+    assert Router.atomize_params_for_test("harklight-send", %{
+             "answerUi" => "/tmp/cover assets/answer-ui.json"
+           }) == %{answer_ui: "/tmp/cover assets/answer-ui.json"}
   end
 
   test "changes route refuses missing upgrade or unsupported protocol before authentication" do
@@ -4028,20 +4071,22 @@ defmodule Tightbeam.Wire.RouterTest do
     assert session_opened.status == 200, session_opened.resp_body
     session_assignment = JSON.decode!(session_opened.resp_body)["result"]
 
+    # R01 notifies an opener for blockers, while ordinary unlinked verdicts stay quiet.
     process_notice =
       invoke.(
         "attest",
         %{
           assignmentId: session_assignment["id"],
           kind: "verdict",
-          verdictKind: "waiting",
-          note: "Process notification"
+          verdictKind: "blocked",
+          note: "Process blocker"
         },
         nil
       )
 
     assert process_notice["attest"]["byUser"] == nil
     assert process_notice["attest"]["bySession"] == nil
+    assert process_notice["attest"]["verdictKind"] == "blocked"
 
     assert {:ok, [["process:automation", nil]]} =
              DB.query(

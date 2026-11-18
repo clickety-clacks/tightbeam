@@ -1764,14 +1764,20 @@ defmodule Tightbeam.Wakes do
       )
     end
 
-    if is_binary(Map.get(input, :prod_id)) do
-      Tightbeam.QueuedMessageSuppression.replace_prod_in_txn(
-        txn,
-        wake,
-        Map.fetch!(input, :prod_sender),
-        input.prod_id
-      )
-    end
+    wake =
+      if is_binary(Map.get(input, :prod_id)) do
+        replaced_ids =
+          Tightbeam.QueuedMessageSuppression.replace_prod_in_txn(
+            txn,
+            wake,
+            Map.fetch!(input, :prod_sender),
+            input.prod_id
+          )
+
+        Map.put(wake, :replaced_wake_ids, replaced_ids)
+      else
+        wake
+      end
 
     if is_binary(condition_kind) do
       EventLog.lifecycle_in_txn(
@@ -2759,29 +2765,63 @@ defmodule Tightbeam.Wakes do
     case Txn.q(
            txn,
            """
-           SELECT w.verificationState,a.state,a.holderKey
-           FROM wakes w JOIN assignments a ON a.id=w.verificationAssignmentId
-           WHERE w.wakeId=?1 AND w.verificationAssignmentId=?2
+           SELECT w.verificationState,w.verificationAssignmentId,verifier.state,verifier.holderKey,
+                  w.assignmentId,parent.state,parent.holderKey,w.firedAt
+           FROM wakes w
+           JOIN assignments verifier ON verifier.id=w.verificationAssignmentId
+           LEFT JOIN assignments parent ON parent.id=w.assignmentId
+           WHERE w.wakeId=?1
            """,
-           [attrs.wait_id, attrs.assignment_id]
+           [attrs.wait_id]
          ) do
-      [[state, "open", holder_key]] when holder_key == attrs.by_session ->
-        case {attrs.verdict_kind, state} do
-          {"wait-verified", "provisional"} ->
-            :ok
+      [
+        [
+          state,
+          verifier_id,
+          verifier_state,
+          verifier_holder,
+          parent_id,
+          parent_state,
+          parent_holder,
+          fired_at
+        ]
+      ] ->
+        verifier_holds_verdict =
+          attrs.assignment_id == verifier_id and verifier_state == "open" and
+            verifier_holder == attrs.by_session
 
-          {"wait-challenged", state} when state in ~w(provisional confirmed) ->
-            :ok
+        parent_holds_verdict =
+          attrs.assignment_id == parent_id and parent_state == "open" and
+            parent_holder == attrs.by_session and verifier_state == "closed" and
+            not is_nil(fired_at)
 
-          _ ->
-            wait_error("invalid_wait_verdict", "wait verification transition is already terminal")
+        if verifier_holds_verdict or parent_holds_verdict do
+          verification_verdict_transition(state, attrs.verdict_kind)
+        else
+          wait_error(
+            "invalid_wait_verdict",
+            "wait verdict requires the named open verifier and holder, or the current holder of the open wait assignment after the verifier closes and the wait fires"
+          )
         end
 
       _ ->
         wait_error(
           "invalid_wait_verdict",
-          "wait verdict requires the named open verifier assignment and its recorded holder"
+          "wait verdict requires the named open verifier and holder, or the current holder of the open wait assignment after the verifier closes and the wait fires"
         )
+    end
+  end
+
+  defp verification_verdict_transition(state, verdict_kind) do
+    case {verdict_kind, state} do
+      {"wait-verified", "provisional"} ->
+        :ok
+
+      {"wait-challenged", state} when state in ~w(provisional confirmed) ->
+        :ok
+
+      _ ->
+        wait_error("invalid_wait_verdict", "wait verification transition is already terminal")
     end
   end
 

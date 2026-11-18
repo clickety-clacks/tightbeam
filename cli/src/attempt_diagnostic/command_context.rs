@@ -110,6 +110,7 @@ impl CommandContext {
             AssignmentStopTurn { .. } => ("cli.assignment_stop_turn", DispatchPath),
             CancelTurn { .. } => ("cli.cancel_turn", DispatchPath),
             RevokeAssignment { .. } => ("cli.revoke_assignment", DispatchPath),
+            AssignmentOpenerAccept { .. } => ("cli.assignment_opener_accept", DispatchPath),
             ReopenAssignment { .. } => ("cli.reopen_assignment", DispatchPath),
             RepairAssignment { .. } => ("cli.repair_assignment", DispatchPath),
             AssignmentCommitRefCorrect { .. } => {
@@ -487,6 +488,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | AssignmentStopTurn { .. }
         | CancelTurn { .. }
         | RevokeAssignment { .. }
+        | AssignmentOpenerAccept { .. }
         | ReopenAssignment { .. }
         | WorkItemUpdate { .. }
         | Attend { .. }

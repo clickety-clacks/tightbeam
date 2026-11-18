@@ -1,6 +1,7 @@
 defmodule Tightbeam.Firehose.Publisher do
   @moduledoc "Post-commit translation from accepted dispatch verbs to live notices."
 
+  require Logger
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.StateResources
@@ -41,10 +42,36 @@ defmodule Tightbeam.Firehose.Publisher do
                        )
 
   @spec accepted(map(), term()) :: :ok
-  def accepted(call, result), do: Hub.accepted(hub(call), nil, call, result)
+  def accepted(call, result), do: Hub.accepted(hub(call), call, result)
 
+  @doc """
+  Publish the notices for an accepted verb whose canonical row is read from
+  `db`. The read runs here, in the caller, so the hub never waits on the
+  database. If the read fails, for example because the database refuses an
+  overloaded caller, the state notice is left out and logged; the hub still
+  receives the verb's observation notice.
+  """
   @spec accepted(GenServer.server(), map(), term()) :: :ok
-  def accepted(db, call, result), do: Hub.accepted(hub(call), db, call, result)
+  def accepted(db, call, result) do
+    notices =
+      try do
+        accepted_notices(db, call, result)
+      rescue
+        error -> state_notice_unavailable(call, inspect(error.__struct__))
+      catch
+        :exit, _reason -> state_notice_unavailable(call, "exit")
+      end
+
+    Hub.publish_all(hub(call), notices)
+  end
+
+  defp state_notice_unavailable(call, failure) do
+    Logger.warning(
+      "firehose state notice not built verb=#{inspect(call[:verb])} failure=#{failure}"
+    )
+
+    [observation_notice("verb.accepted", call)]
+  end
 
   @spec transactional_verb?(String.t()) :: boolean()
   def transactional_verb?(verb), do: MapSet.member?(@transactional_verbs, verb)
@@ -62,7 +89,7 @@ defmodule Tightbeam.Firehose.Publisher do
     Txn.handoff(
       txn,
       Hub.destination(hub(call)),
-      {:accepted, nil, call, canonical_in_txn(txn, call, result)}
+      {:accepted, call, canonical_in_txn(txn, call, result)}
     )
   end
 
@@ -490,7 +517,7 @@ defmodule Tightbeam.Firehose.Publisher do
     build(
       "wake.canceled",
       call,
-      Tightbeam.Wakes.get(db, wake_id) || %{wake_id: wake_id},
+      (db && Tightbeam.Wakes.get(db, wake_id)) || %{wake_id: wake_id},
       &StateResources.wake/1
     )
   end
