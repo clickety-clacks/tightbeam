@@ -164,6 +164,13 @@ defmodule Tightbeam.ExecutionMap do
   """
   @spec roster(DB.server(), map()) :: map()
   def roster(db, call) do
+    case validate_roster_filters(call.params) do
+      :ok -> roster_validated(db, call)
+      error -> error
+    end
+  end
+
+  defp roster_validated(db, call) do
     world = world(db, call)
     appearing = appearing(world, call.params)
 
@@ -180,6 +187,13 @@ defmodule Tightbeam.ExecutionMap do
   """
   @spec topline(DB.server(), map()) :: map()
   def topline(db, call) do
+    case validate_roster_filters(call.params) do
+      :ok -> topline_validated(db, call)
+      error -> error
+    end
+  end
+
+  defp topline_validated(db, call) do
     params = call.params
 
     cond do
@@ -345,6 +359,28 @@ defmodule Tightbeam.ExecutionMap do
       edge_basis: @edge_basis,
       coverage: %{attribution_cutoff: world.cutoff, basis: @coverage_basis}
     }
+  end
+
+  defp validate_roster_filters(params) do
+    cond do
+      not is_nil(params[:state]) and params[:state] not in ~w(open iceboxed closed failed) ->
+        invalid(
+          "bad --state value: #{inspect(params[:state])} (use open, iceboxed, closed, or failed)"
+        )
+
+      not is_nil(params[:origin]) and params[:origin] not in ~w(user session all) ->
+        invalid("bad --origin value: #{inspect(params[:origin])} (use user, session, or all)")
+
+      not is_nil(params[:quiet_over]) and
+          not (is_integer(params[:quiet_over]) and params[:quiet_over] >= 0) ->
+        invalid("--quiet-over must be a nonnegative duration in milliseconds")
+
+      not is_nil(params[:spec_sha]) and is_nil(params[:spec]) ->
+        invalid("--spec-sha requires --spec <name>")
+
+      true ->
+        :ok
+    end
   end
 
   ## Roster filters — they select which authorized nodes APPEAR, nothing else
