@@ -120,19 +120,21 @@ defmodule ItemlessSpawnDispatchRuntime do
 
       count_before = count_sessions(db)
 
-      assert {:error,
-              %{
-                code: "work_item_required",
-                message:
-                  "production staffing requires an exact work item; create or link the item before staffing"
-              }} =
+      # This bare helper archetype has no configured staffing rule. The W9
+      # substrate check now accepts its missing item and records the fact.
+      line =
+        "FYI: this production staffing names no work item; decide for yourself whether that is acceptable"
+
+      assert {:ok, %{session_key: unqualified_helper, fyi: [^line]}} =
                Dispatch.dispatch(
                  db,
                  handlers,
                  spawn_call("unqualified", "session:unqualified", "helper")
+                 |> put_in([:params, :display_name], "WI3FE unqualified helper")
                )
 
-      assert count_sessions(db) == count_before
+      assert count_sessions(db) == count_before + 1
+      assert Tightbeam.StateResources.query_session(db, unqualified_helper).fyi == [line]
 
       assert_ephemeral_obligation_refusal!(db, handlers, "caller")
 
