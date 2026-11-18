@@ -76,7 +76,7 @@ defmodule Tightbeam.ApplicationShutdownTest do
                       _destination, committed_at},
                      test_timeout
 
-      assert System.convert_time_unit(committed_at, :native, :millisecond) - started < 900
+      assert System.convert_time_unit(committed_at, :nanosecond, :millisecond) - started < 900
 
       stamp = assert_stamped(epoch)
       assert stamp - wall_started < 900
