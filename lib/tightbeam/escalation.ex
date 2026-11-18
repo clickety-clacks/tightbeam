@@ -2243,16 +2243,21 @@ defmodule Tightbeam.Escalation do
 
   @doc "Fetch one decision request by its complete id without changing visibility policy."
   @spec raw_by_id(DB.server(), String.t() | nil) :: map() | nil
-  def raw_by_id(db, id), do: get_raw(db, id)
+  def raw_by_id(db, id), do: attach_operator_fyis(db, get_raw(db, id))
 
   @doc false
   @spec raw_by_id_in_txn(Txn.t(), String.t() | nil) :: map() | nil
   def raw_by_id_in_txn(txn, id) do
     case Txn.q(txn, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id]) do
-      [row] -> request_from_row(row)
+      [row] -> attach_operator_fyis(txn, request_from_row(row))
       [] -> nil
     end
   end
+
+  defp attach_operator_fyis(db, %{kind: "operator"} = request),
+    do: RecordFyis.attach(db, "decision_request", request)
+
+  defp attach_operator_fyis(_db, request), do: request
 
   @doc false
   @spec publish_decision_transition_in_txn(Txn.t(), map() | nil, map()) :: map()

@@ -1107,6 +1107,108 @@ defmodule Tightbeam.Firehose.PublisherTest do
     end
   end
 
+  test "completion and operator-request publications preserve recorded FYIs" do
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneStub, name: Tightbeam.LaneManager})
+    db = :firehose_record_fyis_db
+    scheduler = :firehose_record_fyis_scheduler
+    start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!(Supervisor.child_spec({LaneStub, name: scheduler}, id: scheduler))
+    :ok = Tightbeam.Schema.ensure_all(db)
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',1,1)")
+    register_testhost(db)
+    holder = Org.personal_session_key("flynn")
+    handlers = Gateway.handlers(%{db: db, wake_scheduler: scheduler})
+
+    call = %{
+      verb: "assign",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: holder,
+      target_role: nil,
+      role_fallback: false,
+      params: %{subject: "plain evidence", effect_kind: "evidence"}
+    }
+
+    assert {:ok, plain} = Dispatch.dispatch(db, handlers, call)
+
+    assert {:ok, inner} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               put_in(call.params, %{
+                 subject: "inner review",
+                 reviews_assignment_id: plain.id
+               })
+             )
+
+    assert {:ok, outer} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               put_in(call.params, %{
+                 subject: "outer review",
+                 reviews_assignment_id: inner.id
+               })
+             )
+
+    line =
+      "FYI: assignment #{inner.id} that this card reviews is itself a review card; " <>
+        "decide for yourself whether that is acceptable"
+
+    assert outer.fyi == [line]
+
+    for {assignment, expected} <- [{plain, []}, {outer, [line]}] do
+      _ = drain_notices()
+
+      complete = %{
+        verb: "attest",
+        origin: "agent:" <> holder,
+        principal: {:session, holder},
+        session_key: nil,
+        params: %{assignment_id: assignment.id, kind: "completion", note: "finished evidence"}
+      }
+
+      assert {:ok, %{assignment: %{state: "closed"}}} =
+               Dispatch.dispatch(db, handlers, complete)
+
+      assert %{"assignment.closed" => [notice]} = observed_state_notices()
+      assert notice["payload"]["id"] == assignment.id
+      assert notice["payload"]["fyi"] == expected
+      assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"]["fyi"] == expected
+
+      assert StateResources.query_assignment(db, assignment.id, %{principal: {:user, "flynn"}}).fyi ==
+               expected
+    end
+
+    _ = drain_notices()
+
+    ask = %{
+      verb: "operator-ask",
+      origin: "agent:" <> holder,
+      principal: {:session, holder},
+      session_key: nil,
+      params: %{question: "Keep this completed evidence?", assignment: outer.id}
+    }
+
+    expected = [
+      "FYI: linked assignment #{outer.id} is closed; decide for yourself whether that is acceptable"
+    ]
+
+    assert {:ok, %{fyi: ^expected} = request} = Dispatch.dispatch(db, handlers, ask)
+    assert %{"decision_request.opened" => [notice]} = observed_state_notices()
+    assert notice["payload"]["id"] == request.id
+    assert notice["payload"]["fyi"] == expected
+    assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"]["fyi"] == expected
+
+    # The nontransactional publisher uses the corresponding raw read path.
+    assert :ok = Publisher.accepted(db, ask, request)
+    assert %{"decision_request.opened" => [notice]} = observed_state_notices()
+    assert notice["payload"]["fyi"] == expected
+    assert Escalation.raw_by_id(db, request.id).fyi == expected
+  end
+
   test "0.1.9 operator decisions emit opened, ruled, and withdrawn classes" do
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
 

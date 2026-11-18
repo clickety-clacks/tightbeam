@@ -4823,8 +4823,13 @@ defmodule Tightbeam.Assignments do
 
   defp fetch_assignment(txn, id) do
     case Txn.q(txn, "SELECT #{columns()} FROM assignments WHERE id = ?1", [id]) do
-      [row] -> assignment(row) |> then(&Mementos.attach(txn, "assignment", &1))
-      [] -> nil
+      [row] ->
+        assignment(row)
+        |> then(&Mementos.attach(txn, "assignment", &1))
+        |> then(&RecordFyis.attach(txn, "assignment", &1))
+
+      [] ->
+        nil
     end
   end
 

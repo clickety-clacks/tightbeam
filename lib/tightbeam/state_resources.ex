@@ -2087,7 +2087,8 @@ defmodule Tightbeam.StateResources do
   end
 
   def work_item(row), do: public(row)
-  def assignment(row), do: public(row)
+  def assignment(nil), do: nil
+  def assignment(row), do: row |> public() |> Map.put_new("fyi", [])
 
   def attest(row) do
     reject_public_shape_drift!(row, "attests")
