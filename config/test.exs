@@ -35,5 +35,6 @@ config :tightbeam, :harklight_child_opts,
 config :tightbeam, :harklight_recovery_options,
   attach_spacing_ms: 0,
   slow_attach_spacing_ms: 0,
+  outage_notice_delay_ms: 0,
   cooldown_base_ms: 1,
   cooldown_max_ms: 2

@@ -103,7 +103,10 @@ defmodule Tightbeam.HarklightAttachPacingTest do
     state = %{state | attach_slots: MapSet.new([pid]), probe_times: %{150 => 0}}
 
     state =
-      Enum.reduce(1..20, state, fn _, state ->
+      Enum.reduce(1..20, state, fn n, state ->
+        pid = state.workers[n]
+        state = %{state | attach_slots: MapSet.new([pid])}
+
         {:reply, :ok, state} =
           HarklightWakes.handle_call({:attach_result, :transport}, {pid, make_ref()}, state)
 
@@ -123,7 +126,7 @@ defmodule Tightbeam.HarklightAttachPacingTest do
   end
 
   test "a shared outage across 150 conversations converges to one probe per five minutes" do
-    state = scheduler() |> workers(150)
+    state = scheduler(transport_failure_window_ms: 86_400_000) |> workers(150)
     waiting = :queue.from_list(for {_, pid} <- state.workers, do: {pid, make_ref()})
 
     {state, probes} =
@@ -146,6 +149,46 @@ defmodule Tightbeam.HarklightAttachPacingTest do
     assert state.transport_failures == state.failure_threshold + 10
     assert :queue.is_empty(state.attach_waiting)
     assert state.attach_gate_timer == nil
+  end
+
+  test "one noisy conversation cannot open or refresh the shared cooldown" do
+    state = scheduler() |> workers(1)
+    pid = state.workers[1]
+    state = %{state | attach_slots: MapSet.new([pid])}
+
+    state =
+      Enum.reduce(1..20, state, fn _, state ->
+        {:reply, :ok, state} =
+          HarklightWakes.handle_call({:attach_result, :transport}, {pid, make_ref()}, state)
+
+        state
+      end)
+
+    assert state.transport_failures == 1
+    assert state.cooldown_until == 0
+    assert state.attach_next_at == 10_000
+  end
+
+  test "distinct failure witnesses expire from the configured window" do
+    state = scheduler(transport_failure_window_ms: 100) |> workers(4)
+
+    state =
+      Enum.reduce(1..4, state, fn n, state ->
+        Process.put(:pacing_now, n * 101)
+        pid = state.workers[n]
+
+        {:reply, :ok, state} =
+          HarklightWakes.handle_call({:attach_result, :transport}, {pid, make_ref()}, %{
+            state
+            | attach_slots: MapSet.new([pid])
+          })
+
+        state
+      end)
+
+    assert map_size(state.failed_handles) == 1
+    assert state.transport_failures == 1
+    assert state.cooldown_until == 0
   end
 
   test "a nontransport refusal cannot trip the shared cooldown" do

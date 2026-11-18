@@ -10,6 +10,7 @@ defmodule Tightbeam.HarklightWakes do
   require Logger
   alias Tightbeam.{DB, ErrorDiagnostic, HarklightLifecycle, Org, Placement, Supervision, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.HarklightListenerOutage, as: Outage
 
   @attach_retry_delays []
   @attach_retry_window_ms 180_000
@@ -134,6 +135,7 @@ defmodule Tightbeam.HarklightWakes do
 
   def ensure_schema(db \\ DB) do
     with :ok <- DB.execute(db, @ddl),
+         :ok <- Outage.ensure_schema(db),
          :ok <- HarklightLifecycle.ensure_schema(db),
          :ok <- Tightbeam.HarklightOrigin.ensure_schema(db),
          :ok <- Tightbeam.HarklightBriefings.ensure_schema(db) do
@@ -1422,6 +1424,9 @@ defmodule Tightbeam.HarklightWakes do
        starts_in_flight: MapSet.new(),
        manual_starts: MapSet.new(),
        retry_timers: %{},
+       outage_timers: %{},
+       outage_notice_delay: Keyword.get(opts, :outage_notice_delay_ms, 600_000),
+       wall_now: Keyword.get(opts, :wall_now, fn -> System.system_time(:millisecond) end),
        gone_tasks: %{},
        deferred: MapSet.new(),
        retry_delays:
@@ -1456,6 +1461,10 @@ defmodule Tightbeam.HarklightWakes do
        attach_next_at: Keyword.get(opts, :now, fn -> System.monotonic_time(:millisecond) end).(),
        attach_gate_timer: nil,
        transport_failures: 0,
+       failed_handles: %{},
+       failure_window: Keyword.get(opts, :transport_failure_window_ms, 600_000),
+       disconnect_until: nil,
+       disconnect_window: Keyword.get(opts, :disconnect_burst_window_ms, 30_000),
        cooldown_until: Keyword.get(opts, :now, fn -> System.monotonic_time(:millisecond) end).(),
        cooldown_base: Keyword.get(opts, :cooldown_base_ms, 30_000),
        cooldown_max: Keyword.get(opts, :cooldown_max_ms, 300_000),
@@ -1476,6 +1485,12 @@ defmodule Tightbeam.HarklightWakes do
       )
 
     state = Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle, :startup) end)
+
+    state =
+      case Outage.pending(state.db) do
+        {:ok, episodes} -> Enum.reduce(episodes, state, &arm_outage(&2, &1))
+        {:error, _} -> state
+      end
 
     Task.start(fn ->
       Tightbeam.HarklightSend.recover_pending(state.db, runner: state.send_runner)
@@ -1523,6 +1538,39 @@ defmodule Tightbeam.HarklightWakes do
       {_, ^token} ->
         {:noreply,
          start_worker(%{state | retry_timers: Map.delete(state.retry_timers, handle)}, handle)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:outage_notice, handle, episode, token}, state) do
+    case Map.get(state.outage_timers, handle) do
+      {_, ^token} ->
+        state = %{state | outage_timers: Map.delete(state.outage_timers, handle)}
+
+        case Outage.notify(
+               state.db,
+               handle,
+               episode,
+               state.wall_now.(),
+               state.outage_notice_delay
+             ) do
+          {:ok, {:early, row}} ->
+            {:noreply, arm_outage(state, row)}
+
+          {:ok, _} ->
+            {:noreply, state}
+
+          {:error, _} ->
+            {:noreply,
+             arm_outage(state, [
+               handle,
+               episode,
+               state.wall_now.() - state.outage_notice_delay + 1_000,
+               nil
+             ])}
+        end
 
       _ ->
         {:noreply, state}
@@ -1642,38 +1690,74 @@ defmodule Tightbeam.HarklightWakes do
 
         if listener_eligible?(state.db, handle, session_key, host) and
              retryable_failure?(status) and is_integer(delay) do
-          token = make_ref()
-
-          timer =
-            Process.send_after(
-              self(),
-              {:retry_listener, handle, token},
-              jitter(delay, state.retry_jitter)
-            )
-
-          notify_recovery_failure(state.db, handle, status)
-
-          %{
-            state
-            | attempts:
-                Map.put(state.attempts, handle, min(attempt + 1, length(state.retry_delays))),
-              retry_timers: Map.put(state.retry_timers, handle, {timer, token})
-          }
+          schedule_recovery(state, handle)
         else
-          notify_recovery_failure(state.db, handle, status)
-          start_gone(state, handle)
+          state |> begin_outage(handle, status) |> start_gone(handle)
         end
 
       {:ok, _} ->
         forget_recovery(state, handle)
 
       {:error, _} ->
+        schedule_recovery(state, handle)
+    end
+  end
+
+  defp schedule_recovery(state, handle) do
+    state = begin_outage(state, handle, Map.get(state.failures, handle, "listener_unavailable"))
+    state = cancel_retry(state, handle)
+    attempt = Map.get(state.attempts, handle, 0)
+    delay = Enum.at(state.retry_delays, attempt, List.last(state.retry_delays)) || 1_000
+    token = make_ref()
+
+    timer =
+      Process.send_after(
+        self(),
+        {:retry_listener, handle, token},
+        jitter(delay, state.retry_jitter)
+      )
+
+    %{
+      state
+      | attempts: Map.put(state.attempts, handle, min(attempt + 1, length(state.retry_delays))),
+        retry_timers: Map.put(state.retry_timers, handle, {timer, token})
+    }
+  end
+
+  defp begin_outage(state, handle, status) do
+    case Outage.start(state.db, handle, failure_details(status), state.wall_now.()) do
+      {:ok, row} when is_list(row) -> arm_outage(state, row)
+      _ -> state
+    end
+  end
+
+  defp arm_outage(state, [_handle, _episode, _started, notice]) when is_binary(notice), do: state
+
+  defp arm_outage(state, [handle, episode, started, nil]) do
+    if Map.has_key?(state.outage_timers, handle) do
+      state
+    else
+      delay = max(0, started + state.outage_notice_delay - state.wall_now.())
+      token = make_ref()
+      timer = Process.send_after(self(), {:outage_notice, handle, episode, token}, delay)
+      %{state | outage_timers: Map.put(state.outage_timers, handle, {timer, token})}
+    end
+  end
+
+  defp cancel_outage_timer(state, handle) do
+    case Map.pop(state.outage_timers, handle) do
+      {nil, _} ->
         state
+
+      {{timer, _}, timers} ->
+        Process.cancel_timer(timer)
+        %{state | outage_timers: timers}
     end
   end
 
   defp forget_recovery(state, handle) do
-    state = cancel_retry(state, handle)
+    Outage.finish(state.db, handle, false, state.wall_now.())
+    state = cancel_outage_timer(cancel_retry(state, handle), handle)
 
     %{
       state
@@ -1701,7 +1785,7 @@ defmodule Tightbeam.HarklightWakes do
     code not in ~w(missing_journal unproven_handle invalid_handle invalid_attachment
       invalid_attachment_receipt support_mismatch configuration_error
       not_found forbidden operation_conflict invalid_field unsupported_version
-      feed_gap feed_conflict invalid_notice invalid_response)
+      feed_gap feed_conflict invalid_notice)
   end
 
   defp retryable_failure?({:harklight_failure, error, _, _}), do: retryable_failure?(error)
@@ -1712,7 +1796,8 @@ defmodule Tightbeam.HarklightWakes do
       unexpected_listener_line)
 
   defp transient_origin_failure?({:harklight_failure, {_error, code}, operation, _diagnostic})
-       when operation in ["attach", "listen"] and code in ["transport_error", "timeout"],
+       when operation in ["attach", "listen"] and
+              code in ["transport_error", "timeout", "invalid_response", "storage_unavailable"],
        do: true
 
   defp transient_origin_failure?({:harklight_failure, error, operation, diagnostic})
@@ -1727,6 +1812,7 @@ defmodule Tightbeam.HarklightWakes do
   def terminate(_reason, state) do
     if state.attach_gate_timer, do: Process.cancel_timer(elem(state.attach_gate_timer, 0))
     Enum.each(state.retry_timers, fn {_, {timer, _}} -> Process.cancel_timer(timer) end)
+    Enum.each(state.outage_timers, fn {_, {timer, _}} -> Process.cancel_timer(timer) end)
     Enum.each(state.ports, fn {_handle, port} -> close_listener_port(port) end)
     Enum.each(state.workers, fn {_handle, worker} -> Process.exit(worker, :shutdown) end)
   end
@@ -1803,7 +1889,7 @@ defmodule Tightbeam.HarklightWakes do
 
     {:noreply,
      Enum.reduce(rows, state, fn [handle], acc ->
-       if Map.has_key?(acc.retry_timers, handle), do: acc, else: start_worker(acc, handle)
+       start_worker(cancel_retry(acc, handle), handle, :urgent)
      end)}
   end
 
@@ -2025,7 +2111,8 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp stop_worker(state, handle) do
-    state = cancel_retry(state, handle)
+    Outage.finish(state.db, handle, false, state.wall_now.())
+    state = cancel_outage_timer(cancel_retry(state, handle), handle)
 
     case Map.fetch(state.workers, handle) do
       {:ok, worker} ->
@@ -2120,26 +2207,58 @@ defmodule Tightbeam.HarklightWakes do
     Enum.find_value(state.workers, fn {handle, worker} -> if worker == pid, do: handle end)
   end
 
-  defp transport_result(state, :transport) do
-    failures = min(state.transport_failures + 1, state.failure_threshold + 10)
+  defp transport_result(state, {:transport, handle}) do
     now = state.now.()
+
+    witnesses =
+      Map.reject(state.failed_handles, fn {_handle, at} -> at < now - state.failure_window end)
+
+    new_handle? = not Map.has_key?(witnesses, handle)
+    witnesses = Map.put(witnesses, handle, now)
+    failures = min(map_size(witnesses), state.failure_threshold + 10)
 
     state = %{
       state
-      | transport_failures: failures,
+      | failed_handles: witnesses,
+        transport_failures: failures,
         slow_lane: true,
-        quick_successes: 0,
-        attach_next_at: max(state.attach_next_at, now + state.slow_spacing)
+        quick_successes: 0
     }
 
-    if failures >= state.failure_threshold do
+    # Repeated failures from one conversation do not postpone other grants.
+    state =
+      if new_handle?,
+        do: %{state | attach_next_at: max(state.attach_next_at, now + state.slow_spacing)},
+        else: state
+
+    if new_handle? and failures >= state.failure_threshold do
       ceiling =
         min(
           state.cooldown_max,
           state.cooldown_base * Integer.pow(2, failures - state.failure_threshold)
         )
 
-      %{state | cooldown_until: now + jitter(ceiling, state.retry_jitter)}
+      %{
+        state
+        | cooldown_until: max(state.cooldown_until, now + jitter(ceiling, state.retry_jitter))
+      }
+    else
+      state
+    end
+  end
+
+  defp transport_result(state, :disconnected) do
+    now = state.now.()
+
+    if is_nil(state.disconnect_until) or now >= state.disconnect_until do
+      %{
+        state
+        | slow_lane: true,
+          quick_successes: 0,
+          disconnect_until: now + state.disconnect_window,
+          cooldown_until:
+            max(state.cooldown_until, now + jitter(state.cooldown_base, state.retry_jitter))
+      }
     else
       state
     end
@@ -2156,6 +2275,8 @@ defmodule Tightbeam.HarklightWakes do
     %{
       state
       | transport_failures: 0,
+        failed_handles: %{},
+        disconnect_until: nil,
         probe_times: %{},
         cooldown_until: now,
         slow_lane: slow,
@@ -2218,7 +2339,6 @@ defmodule Tightbeam.HarklightWakes do
 
   defp listener_start_in_flight?(state, handle) do
     MapSet.member?(state.starts_in_flight, handle) or
-      Map.has_key?(state.retry_timers, handle) or
       Map.has_key?(state.retry_waiters, handle) or
       MapSet.member?(state.restart, handle)
   end
@@ -2360,7 +2480,7 @@ defmodule Tightbeam.HarklightWakes do
             cond do
               already_running? -> state
               Map.has_key?(state.workers, handle) -> force_worker(state, handle, :existing)
-              true -> start_worker(state, handle, :existing)
+              true -> start_worker(cancel_retry(state, handle), handle, :urgent)
             end
 
           {:reply, {:ok, if(already_running?, do: "active", else: "restoring")}, state}
@@ -2424,7 +2544,7 @@ defmodule Tightbeam.HarklightWakes do
             {false, {:listen, _}, {:start, started_for}} ->
               update_retry_started_for(state, handle, started_for)
 
-            {false, :skip, {:start, _}} ->
+            {false, reply, {:start, _}} when reply in [:skip, :retry] ->
               complete_retry_waiter(
                 state,
                 handle,
@@ -2453,7 +2573,11 @@ defmodule Tightbeam.HarklightWakes do
   def handle_call({:attach_result, outcome}, {pid, _}, state) do
     state =
       if MapSet.member?(state.attach_slots, pid),
-        do: transport_result(state, outcome),
+        do:
+          transport_result(
+            state,
+            if(outcome == :transport, do: {:transport, worker_handle(state, pid)}, else: outcome)
+          ),
         else: state
 
     {:reply, :ok, state}
@@ -2478,10 +2602,22 @@ defmodule Tightbeam.HarklightWakes do
         {:error, "listener_fenced"}
       end
 
+    result =
+      if result == :ok do
+        case Outage.finish(state.db, handle, true, state.wall_now.()) do
+          {:ok, :ok} -> :ok
+          {:error, _} -> {:error, "attachment_state_unavailable"}
+        end
+      else
+        result
+      end
+
     # Quiet conversations may reconnect without capturing another event. Only
     # consecutive failed attachments increase the recovery delay.
     state =
       if result == :ok do
+        state = cancel_outage_timer(state, handle)
+
         state = %{
           state
           | attempts: Map.delete(state.attempts, handle),
@@ -2523,10 +2659,15 @@ defmodule Tightbeam.HarklightWakes do
         state = %{state | failures: Map.put(state.failures, handle, status)}
 
         state =
+          if status == :complete,
+            do: cancel_outage_timer(state, handle),
+            else: begin_outage(state, handle, status)
+
+        state =
           case status do
             {:harklight_failure, _, "listen", _} ->
               if transient_origin_failure?(status),
-                do: transport_result(state, :transport),
+                do: transport_result(state, :disconnected),
                 else: state
 
             _ ->
@@ -2575,12 +2716,12 @@ defmodule Tightbeam.HarklightWakes do
     case Txn.q(txn, "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1", [
            handle
          ]) do
-      [[session_key, current_state]] when current_state in ["active", "unavailable"] ->
+      [[_session_key, current_state]] when current_state in ["active", "unavailable"] ->
         now = System.system_time(:millisecond)
         completed = status == :complete
         next_state = if completed, do: "complete", else: "unavailable"
 
-        {error, operation, diagnostic} =
+        {error, _operation, diagnostic} =
           if completed, do: {nil, nil, nil}, else: failure_details(status)
 
         Txn.q(
@@ -2591,68 +2732,12 @@ defmodule Tightbeam.HarklightWakes do
 
         if completed, do: HarklightLifecycle.complete_in_txn(txn, handle)
 
-        # Suppress only an explicitly identified origin transport failure
-        # until its first manager-owned recovery is scheduled. Other failures keep
-        # their immediate owner notice.
-        if not completed and not transient_origin_failure?(status),
-          do:
-            notify_owner_in_txn(
-              txn,
-              session_key,
-              handle,
-              if(error == "origin_unavailable",
-                do: "origin_unavailable",
-                else: "listener_failure"
-              ),
-              error,
-              operation,
-              diagnostic,
-              now
-            )
+        if completed, do: Outage.finish_in_txn(txn, handle, false, now)
 
         :ok
 
       _ ->
         :ok
-    end
-  end
-
-  defp notify_recovery_failure(db, handle, status) do
-    {error, operation, diagnostic} = failure_details(status)
-    now = System.system_time(:millisecond)
-
-    case DB.transaction(db, fn txn ->
-           case Txn.q(
-                  txn,
-                  "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1",
-                  [
-                    handle
-                  ]
-                ) do
-             [[session_key, state]] when state in ["active", "unavailable"] ->
-               notify_owner_in_txn(
-                 txn,
-                 session_key,
-                 handle,
-                 if(error == "origin_unavailable",
-                   do: "origin_unavailable",
-                   else: "listener_failure"
-                 ),
-                 error,
-                 operation,
-                 diagnostic,
-                 now
-               )
-
-             _ ->
-               :ok
-           end
-         end) do
-      {:ok, _} ->
-        :ok
-
-      {:error, _} ->
-        Logger.error("Harklight recovery notice could not be recorded for handle=#{handle}")
     end
   end
 
@@ -2778,7 +2863,7 @@ defmodule Tightbeam.HarklightWakes do
           end
 
         priorities =
-          if mode in [:new_request, :retry],
+          if mode in [:new_request, :retry, :urgent],
             do: Map.put(state.priorities, handle, System.system_time(:millisecond)),
             else: Map.put_new(state.priorities, handle, priority)
 
@@ -2791,6 +2876,7 @@ defmodule Tightbeam.HarklightWakes do
             case GenServer.call(manager, {:start_decided, handle, decision, mode}, :infinity) do
               {:listen, vendor_id} -> state.listener.(manager, handle, vendor_id)
               :skip -> :ok
+              :retry -> :ok
             end
           end)
 
@@ -2898,6 +2984,10 @@ defmodule Tightbeam.HarklightWakes do
 
           {:skip, state}
         end
+
+      {:error, _} ->
+        {:retry,
+         %{state | failures: Map.put(state.failures, handle, "listener_state_unavailable")}}
 
       _ ->
         {:skip, state}
@@ -3178,7 +3268,7 @@ defmodule Tightbeam.HarklightWakes do
       case JSON.decode(line) do
         {:ok, %{"kind" => kind, "reason_code" => code}}
         when kind in ["refused", "connection_error", "outcome_unknown"] and
-               code in ["transport_error", "timeout"] ->
+               code in ["transport_error", "timeout", "invalid_response", "storage_unavailable"] ->
           true
 
         _ ->
