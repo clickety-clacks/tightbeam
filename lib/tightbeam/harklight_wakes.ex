@@ -403,7 +403,19 @@ defmodule Tightbeam.HarklightWakes do
         Wakes.schedule_in_txn(txn, %{
           session_key: successor,
           origin: "process:tightbeam",
-          prompt: entry_prompt(txn, origin, line, handle, event, sender, message, kind, author),
+          prompt:
+            entry_prompt(
+              txn,
+              origin,
+              line,
+              handle,
+              event,
+              sender,
+              message,
+              kind,
+              author,
+              successor
+            ),
           due_at: System.system_time(:millisecond),
           creator_session_key: origin,
           class: "blocker"
@@ -3605,19 +3617,6 @@ defmodule Tightbeam.HarklightWakes do
     else
       wake_id = "w_harklight_" <> handle <> "_" <> String.pad_leading(event_id, 20, "0")
 
-      prompt =
-        entry_prompt(
-          txn,
-          session_key,
-          line,
-          handle,
-          event_id,
-          sender_id,
-          message_id,
-          kind,
-          author
-        )
-
       now = System.system_time(:millisecond)
 
       recipients =
@@ -3671,7 +3670,19 @@ defmodule Tightbeam.HarklightWakes do
                 wake_id: recipient_wake_id,
                 session_key: recipient,
                 origin: "process:tightbeam",
-                prompt: prompt,
+                prompt:
+                  entry_prompt(
+                    txn,
+                    session_key,
+                    line,
+                    handle,
+                    event_id,
+                    sender_id,
+                    message_id,
+                    kind,
+                    author,
+                    recipient
+                  ),
                 due_at: now,
                 creator_session_key: session_key,
                 class: "blocker"
@@ -3808,8 +3819,13 @@ defmodule Tightbeam.HarklightWakes do
     |> Base.encode16(case: :lower)
   end
 
-  defp entry_prompt(txn, origin, line, handle, event, sender, message, kind, author) do
-    instruction = handling_instruction(handle, event, message, kind, author)
+  defp entry_prompt(txn, origin, line, handle, event, sender, message, kind, author, recipient) do
+    instruction =
+      if recipient == origin do
+        handling_instruction(handle, event, message, kind, author)
+      else
+        legacy_handling_instruction(handle, event, message)
+      end
 
     instruction =
       case Org.get_in_txn(txn, origin) do
@@ -3832,6 +3848,14 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp handling_instruction(handle, event_id, message_id, _kind, _author) do
+    "Handle this Harklight entry from your originating session. Read it with `tightbeam harklight-read --handle #{handle}` and acknowledge it with `tightbeam harklight-ack --handle #{handle} --event #{event_id}` before acting. Reading does not acknowledge the entry. " <>
+      "For a person discussion, reply with `tightbeam harklight-reply --handle #{handle} --request #{message_id} --in-reply-to #{event_id} --body <reply> [--op-id <uuid>]`. Reuse the same operation ID if the result is uncertain. " <>
+      "For an answered terminal by a person, reconcile any earlier effect before applying once, then report with `tightbeam harklight-result --handle #{handle} --request #{message_id} --in-reply-to #{event_id} --status applied|refused|received [--op-id <uuid>]`. An agent-authored terminal is not the person's choice. " <>
+      "For cleared, expired or superseded, stop work on that request; do not treat it as approval. " <>
+      "If delivered is true, check prior effects before acting again. Do not run listen; the controller listens."
+  end
+
+  defp legacy_handling_instruction(handle, event_id, message_id) do
     "Handle this Harklight entry from your originating session. First run `harklight-agent ack --session #{handle} --event #{event_id}`. " <>
       "For a person discussion, reply with `harklight-agent reply --session #{handle} --request #{message_id} --in-reply-to #{event_id} --body <reply>`. " <>
       "For an answered terminal, reconcile any earlier effect before applying once, then report with `harklight-agent result --session #{handle} --request #{message_id} --in-reply-to #{event_id} --status applied|refused`. " <>

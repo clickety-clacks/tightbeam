@@ -78,6 +78,10 @@ impl CommandContext {
             HarklightRetract { .. } => ("cli.harklight_retract", DispatchPath),
             HarklightSettle { .. } => ("cli.harklight_settle", DispatchPath),
             HarklightListenerRestore { .. } => ("cli.harklight_listener_restore", DispatchPath),
+            HarklightRead { .. } => ("cli.harklight_read", DispatchPath),
+            HarklightAck { .. } => ("cli.harklight_ack", DispatchPath),
+            HarklightReply { .. } => ("cli.harklight_reply", DispatchPath),
+            HarklightResult { .. } => ("cli.harklight_result", DispatchPath),
             HarklightFollow { .. } => ("cli.harklight_follow", DispatchPath),
             HarklightCover { .. } => ("cli.harklight_cover", DispatchPath),
             HarklightBriefingsCatchup { .. } => ("cli.harklight_briefings_catchup", DispatchPath),
@@ -365,10 +369,18 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HarnessProcesses { .. }
         | UpdateClients { .. } => Read,
 
+        HarklightRead { .. } => Read,
+
         // Settlement resolves the launch row, may remove its park fence and
         // records a lifecycle event. It carries no idempotency key; the
         // guarded operation itself reports already-settled on a repeat.
         HarnessProcessSettle { .. } => WriteWithoutIdempotency,
+
+        HarklightAck { .. } => WriteWithoutIdempotency,
+
+        HarklightReply { op_id, .. } | HarklightResult { op_id, .. } => {
+            keyed_write(op_id.as_deref())
+        }
 
         SentinelPost { key, .. } => keyed_write(Some(key)),
 
@@ -907,6 +919,66 @@ mod tests {
                 .operation_for_request("POST", "/agent/dispatch")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn harklight_native_actions_have_read_and_write_effects() {
+        let commands = [
+            (
+                Command::HarklightRead {
+                    identity: Identity::Session,
+                    handle: "PRIVATE_HANDLE".into(),
+                },
+                "cli.harklight_read",
+                EffectContract::Read,
+            ),
+            (
+                Command::HarklightAck {
+                    identity: Identity::Session,
+                    handle: "PRIVATE_HANDLE".into(),
+                    event: "PRIVATE_EVENT".into(),
+                },
+                "cli.harklight_ack",
+                EffectContract::WriteWithoutIdempotency,
+            ),
+            (
+                Command::HarklightReply {
+                    identity: Identity::Session,
+                    handle: "PRIVATE_HANDLE".into(),
+                    request: "PRIVATE_REQUEST".into(),
+                    in_reply_to: "PRIVATE_EVENT".into(),
+                    body: "PRIVATE_BODY".into(),
+                    op_id: Some("PRIVATE_OP".into()),
+                },
+                "cli.harklight_reply",
+                EffectContract::WriteWithExistingIdempotency,
+            ),
+            (
+                Command::HarklightResult {
+                    identity: Identity::Session,
+                    handle: "PRIVATE_HANDLE".into(),
+                    request: "PRIVATE_REQUEST".into(),
+                    in_reply_to: "PRIVATE_EVENT".into(),
+                    status: "applied".into(),
+                    op_id: None,
+                },
+                "cli.harklight_result",
+                EffectContract::WriteWithoutIdempotency,
+            ),
+        ];
+
+        for (command, operation, expected_effect) in commands {
+            let context = CommandContext::for_command(&command).unwrap();
+            assert_eq!(
+                context
+                    .operation_for_request("POST", "/agent/dispatch")
+                    .unwrap()
+                    .as_str(),
+                operation
+            );
+            assert_eq!(effect(context, "POST", "/agent/dispatch"), expected_effect);
+            assert!(!format!("{context:?}").contains("PRIVATE_"));
+        }
     }
 
     #[test]

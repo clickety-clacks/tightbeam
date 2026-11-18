@@ -649,6 +649,63 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("handle", handle)],
         )),
+        Command::HarklightRead { identity, handle } => Ok(request(
+            identity,
+            "harklight-read",
+            vec![],
+            vec![string_field("handle", handle)],
+        )),
+        Command::HarklightAck {
+            identity,
+            handle,
+            event,
+        } => Ok(request(
+            identity,
+            "harklight-ack",
+            vec![],
+            vec![
+                string_field("handle", handle),
+                string_field("eventId", event),
+            ],
+        )),
+        Command::HarklightReply {
+            identity,
+            handle,
+            request: request_id,
+            in_reply_to,
+            body,
+            op_id,
+        } => {
+            let mut params = vec![
+                string_field("handle", handle),
+                string_field("requestId", request_id),
+                string_field("inReplyTo", in_reply_to),
+                string_field("body", body),
+            ];
+            if let Some(op_id) = op_id {
+                params.push(string_field("opId", op_id));
+            }
+            Ok(request(identity, "harklight-reply", vec![], params))
+        }
+        Command::HarklightResult {
+            identity,
+            handle,
+            request: request_id,
+            in_reply_to,
+            status,
+            op_id,
+        } => {
+            let mut params = vec![
+                string_field("handle", handle),
+                string_field("requestId", request_id),
+                string_field("inReplyTo", in_reply_to),
+                string_field("status", status),
+            ];
+            if let Some(op_id) = op_id {
+                params.push(string_field("opId", op_id));
+            }
+            Ok(request(identity, "harklight-result", vec![], params))
+        }
         Command::HarklightFollow {
             identity,
             message,
@@ -4107,6 +4164,10 @@ fn local_harklight_identity_refusal(
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightListenerRestore { identity, .. }
+        | Command::HarklightRead { identity, .. }
+        | Command::HarklightAck { identity, .. }
+        | Command::HarklightReply { identity, .. }
+        | Command::HarklightResult { identity, .. }
         | Command::HarklightFollow { identity, .. }
         | Command::HarklightCover { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
@@ -4139,6 +4200,10 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightListenerRestore { identity, .. }
+        | Command::HarklightRead { identity, .. }
+        | Command::HarklightAck { identity, .. }
+        | Command::HarklightReply { identity, .. }
+        | Command::HarklightResult { identity, .. }
         | Command::HarklightFollow { identity, .. }
         | Command::HarklightCover { identity, .. }
         | Command::HarklightRetry { identity, .. }
@@ -4451,6 +4516,70 @@ mod tests {
             if verb == "harklight-revise" {
                 assert_eq!(body["params"]["baseRevision"], 2);
                 assert_eq!(body["params"]["clearChoices"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn harklight_agent_actions_wire_the_existing_server_inputs() {
+        let commands: &[&[&str]] = &[
+            &["harklight-read", "--handle", "h"],
+            &["harklight-ack", "--handle", "h", "--event", "e"],
+            &[
+                "harklight-reply",
+                "--handle",
+                "h",
+                "--request",
+                "m",
+                "--in-reply-to",
+                "e",
+                "--body",
+                "answer",
+                "--op-id",
+                "op-1",
+            ],
+            &[
+                "harklight-result",
+                "--handle",
+                "h",
+                "--request",
+                "m",
+                "--in-reply-to",
+                "e",
+                "--status",
+                "received",
+            ],
+        ];
+        let verbs = [
+            "harklight-read",
+            "harklight-ack",
+            "harklight-reply",
+            "harklight-result",
+        ];
+
+        for (args, verb) in commands.iter().zip(verbs) {
+            let command =
+                crate::args::parse(args.iter().map(|value| (*value).to_owned()).collect()).unwrap();
+            let request = build_request(&command).unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+            assert_eq!(body["verb"], verb);
+            assert_eq!(body["params"]["handle"], "h");
+            match verb {
+                "harklight-read" => {}
+                "harklight-ack" => assert_eq!(body["params"]["eventId"], "e"),
+                "harklight-reply" => {
+                    assert_eq!(body["params"]["requestId"], "m");
+                    assert_eq!(body["params"]["inReplyTo"], "e");
+                    assert_eq!(body["params"]["body"], "answer");
+                    assert_eq!(body["params"]["opId"], "op-1");
+                }
+                "harklight-result" => {
+                    assert_eq!(body["params"]["requestId"], "m");
+                    assert_eq!(body["params"]["inReplyTo"], "e");
+                    assert_eq!(body["params"]["status"], "received");
+                    assert!(body["params"].get("opId").is_none());
+                }
+                _ => unreachable!(),
             }
         }
     }
