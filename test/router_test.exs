@@ -1100,7 +1100,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(reviewed.resp_body)["result"]["review"]["outcome"] == "confirmed_other"
   end
 
-  test "repair-assignment crosses the agent wire with opener auth, no-incident refusal, and replay",
+  test "repair-assignment crosses the agent wire across owners with no-incident refusal and replay",
        ctx do
     owner = ctx.device.user_id
     holder = create_session(ctx.db, "repair-wire-holder", owner)
@@ -1135,11 +1135,23 @@ defmodule Tightbeam.Wire.RouterTest do
                [assignment.id]
              )
 
-    unauthorized = dispatch_cli(ctx, "tbc_test", %{request | asUser: "not-the-opener"})
-    assert unauthorized.status == 403
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "not_authorized"
+    cross_owner =
+      request
+      |> Map.put(:asUser, "not-the-opener")
+      |> put_in([:params, :idempotencyKey], "repair-wire-cross-owner")
+      |> then(&dispatch_cli(ctx, "tbc_test", &1))
 
-    assert {:ok, [[0]]} =
+    assert cross_owner.status == 400
+    assert JSON.decode!(cross_owner.resp_body)["error"]["code"] == "no_open_incident"
+
+    assert {:ok, [["user:not-the-opener"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT principal FROM assignment_repair_attempts WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId=?1",
@@ -1161,7 +1173,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert replay.status == 400
     assert JSON.decode!(replay.resp_body) == JSON.decode!(refused.resp_body)
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[2]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId=?1",
