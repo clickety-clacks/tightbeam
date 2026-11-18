@@ -375,11 +375,18 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     @tag :tmp_dir
     @tag timeout: 120_000
     test "retains every runtime child and delivers a deferred wake once", %{tmp_dir: tmp} do
-      Tightbeam.GuardRuntimeFixture.run!(
-        tmp,
-        "full_runtime_overload.exs",
-        "full-runtime-overload: listener survived; durable wake delivered once"
-      )
+      fixture = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "full_runtime_overload.exs")
+
+      {output, status} =
+        System.cmd(fixture.executable, fixture.args,
+          env: [{"MIX_ENV", "test"} | fixture.env],
+          stderr_to_stdout: true
+        )
+
+      File.write!(Path.join(tmp, "runtime.log"), output)
+      assert status == 0, output
+      assert output =~ "full-runtime-overload: listener survived; durable wake delivered once"
+      assert output =~ "full-runtime-overload: startup recovery waits without restart cascade"
     end
   end
 
