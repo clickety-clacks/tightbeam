@@ -7094,11 +7094,17 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
   end
 
+  # Includes two complete population scans and database setup on busy runners.
+  # Responsiveness while reads are blocked is checked separately below.
+  @tag timeout: 180_000
   test "194 pending status reads leave the manager responsive and new requests ungated", %{
     db: db,
     session: session,
-    call: call
+    call: call,
+    timeout: timeout
   } do
+    started_at = System.monotonic_time(:millisecond)
+    deadline = started_at + timeout
     handles = [@handle | Enum.map(1..193, fn _ -> Tightbeam.Id.uuid4() end)]
 
     for {handle, index} <- Enum.with_index(tl(handles)),
@@ -7106,7 +7112,6 @@ defmodule Tightbeam.HarklightWakesTest do
 
     parent = self()
     {:ok, phase} = Agent.start_link(fn -> nil end)
-    started_at = System.monotonic_time(:millisecond)
 
     runner = fn ["status", "--session", handle] ->
       open = Agent.get(phase, & &1)
@@ -7196,6 +7201,32 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert_receive {:restored, ^hung, nil}, 6_000
 
+    # Observe completion of the skipped workers, rather than requiring the
+    # whole population to drain within eventually/1's short polling window.
+    # Collect exits in arrival order against one deadline from the test budget,
+    # not a fresh timeout per worker. An unexpected listener stays alive and
+    # fails the wait; exact survivors and duplicate checks still follow it.
+    await_skipped = fn controller ->
+      monitors =
+        for {handle, pid} <- :sys.get_state(controller).workers,
+            handle not in [target, hung],
+            into: %{},
+            do: {Process.monitor(pid), pid}
+
+      Enum.reduce(monitors, monitors, fn _, pending ->
+        remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+        assert_receive {:DOWN, ref, :process, pid, reason} when is_map_key(pending, ref),
+                       remaining
+
+        assert Map.fetch!(pending, ref) == pid
+        assert reason in [:normal, :noproc]
+        Map.delete(pending, ref)
+      end)
+    end
+
+    await_skipped.(manager)
+
     assert eventually(fn ->
              Map.keys(:sys.get_state(manager).workers) |> MapSet.new() ==
                MapSet.new([target, hung])
@@ -7222,13 +7253,19 @@ defmodule Tightbeam.HarklightWakesTest do
          db: db, listener: completion_notifying_listener(parent), send_runner: runner}
       )
 
+    # This restore scans all 194 handles through the bounded decision pool.
+    # Its total duration is not the manager/new-request responsiveness bound
+    # asserted above: on a busy runner even successful reads can take >1s.
+    # Use the same finite population deadline and require exactly both listeners.
     restored =
       for _ <- 1..2 do
-        assert_receive {:restored, handle, nil}, 1_000
+        remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+        assert_receive {:restored, handle, nil}, remaining
         handle
       end
 
     assert MapSet.new(restored) == MapSet.new([target, hung])
+    await_skipped.(second)
     assert eventually(fn -> map_size(:sys.get_state(second).workers) == 2 end)
     restore_us = System.monotonic_time(:microsecond) - restore_at
     refute_receive {:restored, _, _}
