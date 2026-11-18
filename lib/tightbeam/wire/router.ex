@@ -4706,7 +4706,7 @@ defmodule Tightbeam.Wire.Router do
   @param_keys %{
     "harklight-send" => ~w(
         harklight_session sender_id title message_type message_kind importance stake by_when reply
-        body choices files vendor_session_id supersedes decision_request_id
+        body choices files answer_ui vendor_session_id supersedes decision_request_id
       )a,
     "harklight-revise" => ~w(message_id base_revision title body choices clear_choices)a,
     "harklight-retract" => ~w(message_id)a,

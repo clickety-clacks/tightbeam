@@ -109,6 +109,12 @@ defmodule Tightbeam.Wire.RouterTest do
            }) == %{accepted_at: 123, session_key: "source"}
   end
 
+  test "harklight send atomizes the answer UI path without changing its value" do
+    assert Router.atomize_params_for_test("harklight-send", %{
+             "answerUi" => "/tmp/cover assets/answer-ui.json"
+           }) == %{answer_ui: "/tmp/cover assets/answer-ui.json"}
+  end
+
   test "changes route refuses missing upgrade or unsupported protocol before authentication" do
     hub = :"router_refused_changes_hub_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.Firehose.Hub, name: hub})
