@@ -8126,9 +8126,7 @@ defmodule Tightbeam.GatewayTest do
     # The adapter checkout runs inside the lane ahead of any adapter call; an
     # exit there (a coordinator that is busy past its checkout timeout, or
     # gone) must reach the caller as a decodable refusal too.
-    start_supervised!(
-      {CoordinatorStub, {fn _key -> exit(:deliberate_checkout_exit) end, self()}}
-    )
+    start_supervised!({CoordinatorStub, {fn _key -> exit(:deliberate_checkout_exit) end, self()}})
     {seq, _message} = enqueue_gateway_prompt!(ctx.db, "k1", origin, "keep running")
     parent = self()
 

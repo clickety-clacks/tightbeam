@@ -10884,8 +10884,7 @@ defmodule Tightbeam.Gateway do
     fun.()
   catch
     kind, reason ->
-      {:error,
-       {:runtime_config_unknown, {:change_failed, Exception.format_banner(kind, reason)}}}
+      {:error, {:runtime_config_unknown, {:change_failed, Exception.format_banner(kind, reason)}}}
   end
 
   defp runtime_actual(%Model{} = model) do
