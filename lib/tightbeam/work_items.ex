@@ -156,7 +156,7 @@ defmodule Tightbeam.WorkItems do
                 publish_work_item_filed_record_event_in_txn(txn, id)
                 put_priority_in_txn(txn, id, priority)
                 stamp_version_in_txn(txn, id, created_at)
-                routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
+                routing_wake = arm_routing_in_txn(txn, id, call.principal, created_at)
 
                 if key do
                   Txn.q(
@@ -431,7 +431,7 @@ defmodule Tightbeam.WorkItems do
       stamp_version_in_txn(txn, id, created_at)
       item = fetch_in_txn(txn, id)
       item = apply_updates(txn, item, delivery_owner_update(params))
-      routing_wake = arm_routing_in_txn(txn, id, item_owner, params.title)
+      routing_wake = arm_routing_in_txn(txn, id, call.principal, created_at)
       if routing_wake, do: on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
 
       {:ok, fetch_in_txn(txn, id), true, true, routing_wake}
@@ -887,14 +887,31 @@ defmodule Tightbeam.WorkItems do
 
             [[transition_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
 
+            [[transition_at]] =
+              Txn.q(txn, "SELECT at FROM causal_events WHERE seq=?1", [transition_id])
+
+            observation = %{
+              principal: principal,
+              at: transition_at,
+              before: item,
+              after: disposed,
+              work_item_before: item
+            }
+
             if verb == :reopen do
-              observe_item(txn, id, "reopened", %{
-                kind: "work_item_transition",
-                id: to_string(transition_id)
-              })
+              observe_item(
+                txn,
+                id,
+                "reopened",
+                Map.merge(observation, %{
+                  kind: "work_item_transition",
+                  id: to_string(transition_id)
+                })
+              )
             else
               cancel_brackets_in_txn(txn, id, %{
                 causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
+                observation: observation,
                 outcome: %{
                   kind: "disposition",
                   disposition_kind: "work_item_transition",
@@ -1004,7 +1021,8 @@ defmodule Tightbeam.WorkItems do
   @doc "Cancel both bracket wakes through one typed transition and clear their ids."
   @spec cancel_brackets_in_txn(Txn.t(), String.t(), map()) :: :ok
   def cancel_brackets_in_txn(%Txn{} = txn, work_item_id, transition) do
-    observe_item(txn, work_item_id, "transition", transition.causal_source, transition)
+    source = Map.merge(transition.causal_source, Map.get(transition, :observation, %{}))
+    observe_item(txn, work_item_id, "transition", source, Map.delete(transition, :observation))
     :ok
   rescue
     error in Tightbeam.RowReactions.Notice.WithdrawalRefused ->
@@ -1041,7 +1059,14 @@ defmodule Tightbeam.WorkItems do
           txn,
           item_id,
           "delivered",
-          %{kind: "wake_delivery", id: event["id"]},
+          %{
+            kind: "wake_delivery",
+            id: event["id"],
+            principal: {:process, "tightbeam"},
+            at: event["at"],
+            before: event["before"],
+            after: event["after"]
+          },
           nil,
           wake_id
         )
@@ -1146,8 +1171,21 @@ defmodule Tightbeam.WorkItems do
     |> Enum.reverse()
   end
 
-  defp arm_routing_in_txn(txn, id, _owner, _title) do
-    actions = observe_item(txn, id, "created", %{kind: "work_item", id: id})
+  defp arm_routing_in_txn(txn, id, principal, at) do
+    actions =
+      observe_item(txn, id, "created", %{
+        kind: "work_item",
+        id: id,
+        principal: principal,
+        at: at,
+        before: nil,
+        after:
+          Tightbeam.RowReactions.Snapshot.current(
+            txn,
+            %{"kind" => "work_item_observation", "workItemId" => id},
+            %{}
+          )["work_item"]
+      })
 
     Enum.find_value(actions, fn action ->
       wake_id = get_in(action, ["result", "wake_id"])

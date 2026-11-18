@@ -17,17 +17,22 @@ defmodule Tightbeam.RowReactions do
 
     if after_row do
       event = %{
-        "id" => "work-item:#{id}:#{operation}:#{source.kind}:#{source.id}",
+        "id" => "work-item:#{id}:#{operation}:#{source.kind}:#{source[:generation] || source.id}",
         "org" => after_row["ownerUserId"],
         "kind" => "work_item_observation",
         "workItemId" => id,
         "operation" => operation,
-        "at" => System.system_time(:millisecond),
-        "generation" => source.id,
-        "source" => stringify(source),
-        "principal" => %{"kind" => "process", "id" => "tightbeam"},
-        "before" => before,
+        "at" => source[:at] || after_row["createdAt"],
+        "generation" => source[:generation] || source.id,
+        "source" => stringify(Map.take(source, [:kind, :id])),
+        "principal" => observation_principal(source[:principal]),
+        "before" =>
+          Map.merge(before || %{}, %{
+            "workItem" => source[:work_item_before],
+            "sourceRow" => source[:before]
+          }),
         "after" => after_row,
+        "sourceAfter" => source[:after],
         "transition" => if(transition, do: JSON.decode!(JSON.encode!(transition)))
       }
 
@@ -44,6 +49,11 @@ defmodule Tightbeam.RowReactions do
       []
     end
   end
+
+  defp observation_principal({kind, id}) when kind in [:user, :session, :process],
+    do: %{"kind" => Atom.to_string(kind), "id" => id}
+
+  defp observation_principal(nil), do: nil
 
   def harness_health_hold_in_txn(
         txn,

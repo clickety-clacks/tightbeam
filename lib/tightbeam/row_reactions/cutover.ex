@@ -62,7 +62,8 @@ defmodule Tightbeam.RowReactions.Cutover do
             "principal" => %{"kind" => "process", "id" => "tightbeam"},
             "before" => nil,
             "transition" => nil,
-            "at" => if(wake, do: wake.due_at, else: at)
+            "at" => if(wake, do: wake.created_at, else: at),
+            "scheduleBaseAt" => if(wake, do: wake.due_at, else: at)
           }
 
           facts = Snapshot.current(txn, event, %{})
@@ -71,7 +72,10 @@ defmodule Tightbeam.RowReactions.Cutover do
           event =
             event
             |> Map.put("after", facts["work_item"])
-            |> Map.update!("at", &if(field == "routingWakeId", do: &1 - interval, else: &1))
+            |> Map.update!(
+              "scheduleBaseAt",
+              &if(field == "routingWakeId", do: &1 - interval, else: &1)
+            )
 
           reference = %{
             "resource" => "work_item",

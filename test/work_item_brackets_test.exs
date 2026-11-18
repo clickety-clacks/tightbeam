@@ -244,6 +244,122 @@ defmodule Tightbeam.WorkItemBracketsTest do
       DB.query(db, "DELETE FROM row_reaction_cutovers WHERE source='work-item-references/v1'")
   end
 
+  test "unaltered declarations cancel mixed-archetype slate references atomically", ctx do
+    Tightbeam.TerminalReactionFixture.load_work_items!(
+      ctx.law_base,
+      Map.keys(ctx.handlers),
+      false
+    )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET archetype='agentic-engineering.pdo' WHERE sessionKey='dsession'"
+             )
+
+    for action <- ["assign", "close", "missing", "refused"] do
+      item = create(ctx, {:user, "flynn"}, %{title: "Mixed audience #{action}"})
+      update(ctx, item.id, %{delivery_owner_session_key: "dsession"})
+      {:ok, assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "work", item.id)
+      complete(ctx, "holder", assignment.id)
+      slate = slate_wake_id(ctx.db, item.id)
+      assert Wakes.get(ctx.db, slate).session_key == "dsession"
+
+      case action do
+        "assign" ->
+          assert {:ok, _} = disp_assign(ctx, {:user, "flynn"}, "holder", "next", item.id)
+          assert slate_wake_id(ctx.db, item.id) == nil
+          assert Wakes.get(ctx.db, slate).state == "canceled"
+
+        "close" ->
+          assert %{ok: true} = dispose(ctx, "work-item-close", {:user, "flynn"}, item.id)
+          assert slate_wake_id(ctx.db, item.id) == nil
+          assert Wakes.get(ctx.db, slate).state == "canceled"
+
+        "missing" ->
+          assert {:ok, _} = DB.query(ctx.db, "DELETE FROM wakes WHERE wakeId=?1", [slate])
+          assert {:error, _} = disp_assign(ctx, {:user, "flynn"}, "holder", "refuse", item.id)
+          assert slate_wake_id(ctx.db, item.id) == slate
+
+          assert {:ok, [[0]]} =
+                   DB.query(
+                     ctx.db,
+                     "SELECT COUNT(*) FROM assignments WHERE workItemId=?1 AND state='open'",
+                     [item.id]
+                   )
+
+        "refused" ->
+          assert {:error, %WorkItems.CancellationRefused{}} =
+                   DB.transaction(ctx.db, fn txn ->
+                     Txn.q(txn, "UPDATE work_items SET title='Must roll back' WHERE id=?1", [
+                       item.id
+                     ])
+
+                     WorkItems.cancel_brackets_in_txn(txn, item.id, %{
+                       causal_source: %{kind: "session_transition", id: "missing-session"},
+                       outcome: %{kind: "no_replacement"}
+                     })
+                   end)
+
+          assert get(ctx, item.id).workItem.title == item.title
+          assert slate_wake_id(ctx.db, item.id) == slate
+          assert Wakes.get(ctx.db, slate).state == "pending"
+      end
+    end
+  end
+
+  test "observations retain user/session principals, source times and overwritten states", ctx do
+    user_item = create(ctx, {:user, "flynn"}, %{title: "User source"})
+    session_item = create(ctx, {:session, "holder"}, %{title: "Session source"})
+    user_event = item_observation(ctx.db, user_item.id, "created")
+    assert user_event["principal"] == %{"kind" => "user", "id" => "flynn"}
+    assert user_event["before"]["sourceRow"] == nil
+    assert user_event["sourceAfter"]["id"] == user_item.id
+    assert user_event["at"] == user_event["sourceAfter"]["createdAt"]
+
+    assert item_observation(ctx.db, session_item.id, "created")["principal"] == %{
+             "kind" => "session",
+             "id" => "holder"
+           }
+
+    assert %{ok: true} =
+             dispose(ctx, "work-item-icebox", {:user, "flynn"}, user_item.id, %{reason: "later"})
+
+    closed = item_observation(ctx.db, user_item.id, "transition")
+    assert closed["before"]["sourceRow"]["state"] == "open"
+    assert closed["sourceAfter"]["state"] == "iceboxed"
+    assert closed["principal"] == %{"kind" => "user", "id" => "flynn"}
+    assert %{ok: true} = dispose(ctx, "work-item-reopen", {:session, "holder"}, user_item.id)
+    reopened = item_observation(ctx.db, user_item.id, "reopened")
+    assert reopened["before"]["sourceRow"]["state"] == "iceboxed"
+    assert reopened["sourceAfter"]["state"] == "open"
+    assert reopened["principal"] == %{"kind" => "session", "id" => "holder"}
+
+    {:ok, assignment} =
+      disp_assign(ctx, {:session, "holder"}, "holder", "actual source", user_item.id)
+
+    assigned = item_observation(ctx.db, user_item.id, "transition")
+    assert assigned["before"]["sourceRow"] == nil
+    assert assigned["sourceAfter"]["id"] == assignment.id
+    assert assigned["principal"] == %{"kind" => "session", "id" => "holder"}
+    complete(ctx, "holder", assignment.id)
+    finished = item_observation(ctx.db, user_item.id, "assignment_closed")
+    assert finished["before"]["sourceRow"]["state"] == "open"
+    assert finished["sourceAfter"]["state"] == "closed"
+    assert finished["principal"] == %{"kind" => "session", "id" => "holder"}
+  end
+
+  defp item_observation(db, id, operation) do
+    {:ok, [[event]]} =
+      DB.query(
+        db,
+        "SELECT event FROM row_reaction_events WHERE json_extract(event,'$.workItemId')=?1 AND json_extract(event,'$.operation')=?2 ORDER BY rowid DESC LIMIT 1",
+        [id, operation]
+      )
+
+    JSON.decode!(event)
+  end
+
   ## Proof 1 — create arms bracket 1; keyed replay returns the original, arms nothing.
 
   test "Proof 1: create (keyed and keyless) arms bracket 1; keyed replay is inert", ctx do

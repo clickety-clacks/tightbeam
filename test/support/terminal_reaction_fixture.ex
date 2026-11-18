@@ -1,7 +1,7 @@
 defmodule Tightbeam.TerminalReactionFixture do
   @moduledoc false
 
-  def load_work_items!(root, verbs) do
+  def load_work_items!(root, verbs, wildcard \\ true) do
     rules = Path.join(root, "identity/rules")
     File.mkdir_p!(rules)
 
@@ -13,7 +13,11 @@ defmodule Tightbeam.TerminalReactionFixture do
         )
       )
 
-    contents = String.replace(contents, ~r/^archetypes = .*$/m, "archetypes = [\"*\"]")
+    contents =
+      if wildcard,
+        do: String.replace(contents, ~r/^archetypes = .*$/m, "archetypes = [\"*\"]"),
+        else: contents
+
     File.write!(Path.join(rules, "row-reaction-work-items.toml"), contents)
     Tightbeam.Rules.load!(root, verbs)
     root

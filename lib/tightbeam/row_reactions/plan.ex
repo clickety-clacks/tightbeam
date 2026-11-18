@@ -35,9 +35,14 @@ defmodule Tightbeam.RowReactions.Plan do
   end
 
   def compile!(rail, provenance, owner, owned_archetypes) do
-    fields!(rail, ~w(name family events when effects), ~w(bind english archetypes))
+    fields!(rail, ~w(name family events when effects), ~w(bind english archetypes policy_context))
     Enum.each(~w(name family), &text!(rail[&1]))
     archetypes = validate_archetypes!(rail, owner, owned_archetypes)
+
+    policy_context = Map.get(rail, "policy_context", "participants")
+
+    unless policy_context in ["participants", "organization"],
+      do: raise(ArgumentError, "unsupported reaction policy context")
 
     english = Map.get(rail, "english")
     if english, do: text!(english)
@@ -85,6 +90,7 @@ defmodule Tightbeam.RowReactions.Plan do
 
     %{
       mode: :event,
+      policy_context: policy_context,
       name: Tightbeam.Identity.Provenance.qualify(owner, rail["name"]),
       short_name: rail["name"],
       owner: owner,
@@ -237,6 +243,10 @@ defmodule Tightbeam.RowReactions.Plan do
   defp expression_reference(_), do: nil
 
   defp archetype_reference?(name), do: String.ends_with?(name, ".archetype")
+
+  # Organization-level declarations elect policy independently of their audience.
+  # Session-scoped declarations retain the existing participant restrictions.
+  defp scope_matches?(%{policy_context: "organization"}, _event, _facts, _value), do: true
 
   defp scope_matches?(rail, _event, facts, value) do
     base = Map.get(facts, "scope_participant_archetypes", [])
