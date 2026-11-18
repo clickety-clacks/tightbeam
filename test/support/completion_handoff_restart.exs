@@ -79,18 +79,31 @@ defmodule Tightbeam.CompletionHandoffRestart do
   def restarted!(evidence, booted_at) do
     %{"root" => root_id, "seq" => seq} = JSON.decode!(File.read!(evidence))
 
-    await!(
-      fn ->
-        ended?(seq) and pending_reminders(root_id) != [] and sweeper_cursor() >= seq
-      end,
-      fn ->
-        %{
-          turns: rows("SELECT seq,wakeId,status,startedAt,endedAt FROM turns ORDER BY seq"),
-          reminders: Enum.map(reminders(root_id), &Map.take(&1, [:wake_id, :state])),
-          cursor: sweeper_cursor()
-        }
+    # Subscribe before sampling the durable row: completion either preceded
+    # the sample or leaves a turn.ended notice in this process's mailbox.
+    :ok = Tightbeam.Firehose.Hub.register()
+
+    unless ended?(seq) do
+      receive do
+        {:firehose_notice, %{"class" => "turn.ended", "refs" => %{"turnSeq" => ^seq}}} ->
+          :ok
       end
-    )
+    end
+
+    # turn.ended is published during the lane's terminal transaction, before
+    # its on_terminal callback sends recognition to the sweeper. Wait for the
+    # lane callback to return, then for the sweeper to handle that cast. Neither
+    # barrier runs reconciliation on the test's behalf.
+    [{lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, @parent)
+    :sys.get_state(lane, :infinity)
+    :sys.get_state(Tightbeam.Productions.BubbleSweeper, :infinity)
+    Tightbeam.Firehose.Hub.unregister()
+
+    assert ended?(seq)
+    assert sweeper_cursor() >= seq
+    # A slow consistency repair must not turn a missed startup/terminal signal
+    # into a passing result once the private polling deadline is gone.
+    assert %{lanes: 0, bubble: 0} = Tightbeam.SchedulerMisses.health().by_loop
 
     [[status, started_at]] = rows("SELECT status,startedAt FROM turns WHERE seq=?1", [seq])
     assert status in ["delivered", "failed", "failed_unknown"]
@@ -161,24 +174,6 @@ defmodule Tightbeam.CompletionHandoffRestart do
   defp rows(sql, params \\ []) do
     {:ok, rows} = DB.query(DB, sql, params)
     rows
-  end
-
-  defp await!(predicate, diagnostic, deadline \\ nil) do
-    deadline = deadline || System.monotonic_time(:millisecond) + 90_000
-
-    cond do
-      predicate.() ->
-        :ok
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        raise "completion handoff restart timed out: #{inspect(diagnostic.(), limit: :infinity)}"
-
-      true ->
-        receive do
-        after
-          50 -> await!(predicate, diagnostic, deadline)
-        end
-    end
   end
 end
 
