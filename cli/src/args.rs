@@ -923,7 +923,7 @@ COMMANDS:
       --not-known-class <text> [--observed-at <epochMs>] --valid-until <epochMs> --world-status PROVEN|UNKNOWN
       --redaction-confirmed --key <idempotencyKey>
       exact_error requires --exact-error; probe_digest requires --output-digest.
-      --valid-until must be within 15 minutes after --observed-at (defaults to server acceptance time).
+      --valid-until must be in the future at server acceptance.
       UNKNOWN requires --evidence-mode exact_error.
       Admit a redacted, bounded evidence observation for a not-yet-named failure.
   harness-health-resolve-other --harness <harness> --host <host>
@@ -2402,7 +2402,7 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
             {
-                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest [--exact-error <text> | --output-digest <sha256>] --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> [--observed-at <ms>] --valid-until <ms> (within 15 minutes after --observed-at, which defaults to server acceptance time) --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey> (UNKNOWN requires exact_error evidence)".to_owned());
+                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest [--exact-error <text> | --output-digest <sha256>] --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> [--observed-at <ms>] --valid-until <ms> --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey> (UNKNOWN requires exact_error evidence)".to_owned());
             }
             let evidence_mode = nonempty(flags, "evidence-mode")
                 .ok_or_else(|| "--evidence-mode is required".to_owned())?;
@@ -5540,7 +5540,7 @@ mod tests {
             assert!(help.contains("--exact-error <text>"));
             assert!(help.contains("--output-digest <sha256>"));
             assert!(help.contains("exact_error requires --exact-error"));
-            assert!(help.contains("within 15 minutes after --observed-at"));
+            assert!(help.contains("--valid-until must be in the future at server acceptance."));
             assert!(help.contains("UNKNOWN requires --evidence-mode exact_error"));
         }
     }

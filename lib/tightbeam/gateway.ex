@@ -6428,6 +6428,7 @@ defmodule Tightbeam.Gateway do
       end
 
     identity
+    |> Map.merge(Rules.status())
     |> Map.put(:sessions, sessions)
     |> maybe_put_guidance(guidance)
   end
