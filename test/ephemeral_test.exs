@@ -64,9 +64,7 @@ defmodule Tightbeam.EphemeralTest do
       })
     end
 
-    refute Ephemeral.session?(db, "helper")
     assert {:ok, _} = DB.transaction(db, &Ephemeral.stamp_in_txn(&1, "helper", "caller"))
-    assert Ephemeral.session?(db, "helper")
     %{db: db}
   end
 
@@ -501,7 +499,9 @@ defmodule Tightbeam.EphemeralTest do
       })
     end
 
+    refute Ephemeral.session?(db, "helper")
     assert {:ok, _} = DB.transaction(db, &Ephemeral.stamp_in_txn(&1, "helper", "caller"))
+    assert Ephemeral.session?(db, "helper")
 
     parent = self()
 
