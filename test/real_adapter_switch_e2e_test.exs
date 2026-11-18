@@ -389,7 +389,7 @@ defmodule Tightbeam.RealAdapterSwitchE2E do
 end
 
 defmodule Tightbeam.RealAdapterSwitchE2ETest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.RealAdapterSwitchE2E, as: E2E
 
