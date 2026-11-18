@@ -10837,10 +10837,9 @@ defmodule Tightbeam.GatewayTest do
       params: %{clientMessageId: "c_rest_2", deviceId: "chat_test", content: "hello"}
     }
 
-    # Main #775: only the org credential may REST-post as a user.
     device = rest_post(ctx, ctx.device.token, body)
-    assert device.status == 400
-    assert %{"error" => %{"message" => "verb not allowed: post"}} = JSON.decode!(device.resp_body)
+    assert device.status == 401
+    assert %{"error" => %{"code" => "auth_failed"}} = JSON.decode!(device.resp_body)
 
     no_user = rest_post(ctx, "tbc_test", Map.delete(body, :asUser))
     assert no_user.status == 403

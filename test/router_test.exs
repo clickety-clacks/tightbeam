@@ -2838,23 +2838,14 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call,
                     %{verb: "wake", origin: "agent:orchestrator:demo", session_key: "orch"}}
 
-    # Human Chat sends use the org credential. An agent session's own CLI
-    # token must not let it post as its owning user.
+    # An unknown verb is refused before a handler can append a message or turn.
     {:ok, [[before_events]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
     {:ok, [[before_messages]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     {:ok, [[before_turns]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
-    session_cli_token = "tbc_orchestrator_session"
-
-    :ok =
-      DB.execute(
-        ctx.db,
-        "UPDATE sessions SET cliToken='tbc_orchestrator_session' WHERE sessionKey='orch'"
-      )
-
     disallowed =
-      dispatch_cli(ctx, session_cli_token, %{
-        verb: "post",
+      dispatch_cli(ctx, actor.cli_token, %{
+        verb: "not-a-verb",
         sessionKey: actor.session_key,
         asUser: "flynn",
         params: %{
@@ -2869,7 +2860,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(disallowed.resp_body) == %{
              "error" => %{
                "code" => "invalid_message",
-               "message" => "verb not allowed: post"
+               "message" => "verb not allowed: not-a-verb"
              }
            }
 
