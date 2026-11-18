@@ -1996,8 +1996,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   # The companion to the retirement-cutoff test above: the same 24 hung parks,
-  # but with a grace the cooperative cancel can answer within on every
-  # platform. It pins the non-late half of the contract, which no other test
+  # but with phase ordering controlled by a logical deadline clock. It pins
+  # the non-late half of the contract, which no other test
   # distinguishes: the forced-exhaustion test earlier in this file matches
   # "shutdown_budget_exhausted" as a substring, and the late path's
   # {:shutdown_retirement_unresolved, :shutdown_budget_exhausted} satisfies
@@ -2012,7 +2012,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     File.write!(
       slow_helper,
       "#!/bin/sh\n" <>
-        "if [ \"$1\" = \"harness-group\" ]; then sleep 2; fi\n" <>
+        "if [ \"$1\" = \"harness-group\" ]; then exec node -e 'process.stdin.resume()'; fi\n" <>
         "exec #{helper} \"$@\"\n"
     )
 
@@ -2023,11 +2023,32 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         {Task.Supervisor, name: :"shutdown_grace_cleanup_#{System.unique_integer([:positive])}"}
       )
 
-    # The grace must exceed what consumes it: 24 concurrent process-group
-    # enumerations cost ~31ms on Linux and ~197ms on macOS, so
-    # one second holds a >5x margin on the slower platform. The budget grows by
-    # the same second so the park phase keeps the cutoff test's shape: parks
-    # get ~900ms against a 2s hang and always time out into the cancel path.
+    owner = self()
+
+    clock = fn
+      :start ->
+        now = System.monotonic_time(:millisecond)
+        Process.put(:cancel_grace_clock_start, now)
+        now
+
+      :park_wait ->
+        # All tasks exist before the first yield. Let the test monitor them
+        # before expiring parking; cancellation must complete normally, rather
+        # than merely getting the same ledger result through brutal kills.
+        {:monitors, monitors} = Process.info(self(), :monitors)
+        send(owner, {:park_tasks_started, self(), monitors})
+
+        receive do
+          :expire_parking -> Process.get(:cancel_grace_clock_start) + 15_000
+        end
+
+      phase when phase in [:cancel, :cancel_wait, :retire] ->
+        Process.get(:cancel_grace_clock_start) + 15_000
+
+      _phase ->
+        Process.get(:cancel_grace_clock_start)
+    end
+
     {:ok, coordinator} =
       AdapterCoordinator.start_link(
         adapter_sup: ctx.sup,
@@ -2043,9 +2064,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
           ]
         end,
         db: ctx.db,
-        shutdown_budget_ms: 2_400,
-        shutdown_settlement_budget_ms: 500,
-        shutdown_cancel_grace_ms: 1_000,
+        shutdown_budget_ms: 60_000,
+        shutdown_settlement_budget_ms: 15_000,
+        shutdown_cancel_grace_ms: 30_000,
+        shutdown_clock: clock,
         shutdown_cleanup_supervisor: cleanup_owner,
         name:
           String.to_atom(
@@ -2054,16 +2076,24 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       )
 
     Process.unlink(coordinator)
-    on_exit(fn -> if Process.alive?(coordinator), do: GenServer.stop(coordinator, :shutdown) end)
+
+    on_exit(fn ->
+      if Process.alive?(coordinator) do
+        send(coordinator, :expire_parking)
+        GenServer.stop(coordinator, :shutdown, 30_000)
+      end
+    end)
 
     keys =
       for index <- 1..24 do
         {:claude, "shared", "shutdown-grace-settled-host-#{index}"}
       end
 
-    for key <- keys do
-      assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
-    end
+    adapters =
+      for key <- keys do
+        assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+        adapter
+      end
 
     assert eventually(
              fn ->
@@ -2075,7 +2105,25 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert :ok = GenServer.stop(coordinator, :shutdown, 5_000)
+        stop = Task.async(fn -> GenServer.stop(coordinator, :shutdown, 30_000) end)
+        assert_receive {:park_tasks_started, ^coordinator, monitors}, 30_000
+
+        park_tasks = for {:process, pid} <- monitors, pid not in adapters, do: pid
+        assert length(park_tasks) == length(keys)
+        refs = Enum.map(park_tasks, &Process.monitor/1)
+        for pid <- park_tasks, do: :erlang.trace(pid, true, [:receive, {:tracer, self()}])
+        send(coordinator, :expire_parking)
+
+        for pid <- park_tasks do
+          assert_receive {:trace, ^pid, :receive, {:tightbeam_shutdown_cancel, ^coordinator}},
+                         30_000
+        end
+
+        for ref <- refs do
+          assert_receive {:DOWN, ^ref, :process, _pid, :normal}, 30_000
+        end
+
+        assert :ok = Task.await(stop, 30_000)
 
         assert eventually(
                  fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
