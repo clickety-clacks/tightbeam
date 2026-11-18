@@ -217,6 +217,8 @@ defmodule Tightbeam.EphemeralTest do
   test "R2.3 read rules still deny without escalating the helper", %{db: db} do
     rule = %{
       name: "read-approval",
+      owner: :substrate,
+      archetypes: ["*"],
       verb: "inspect",
       verbs: ["inspect"],
       text: "approval required",
@@ -270,7 +272,7 @@ defmodule Tightbeam.EphemeralTest do
       Placement.with_turn_directory(config, helper, fn ->
         path = Placement.holder_workdir(config, helper)
         assert path != "/"
-        assert File.ls!(path) == []
+        assert File.ls!(path) == [".tightbeam-rail-scope.json"]
         File.write!(Path.join(path, "scratch"), "discard")
         path
       end)
@@ -282,7 +284,7 @@ defmodule Tightbeam.EphemeralTest do
       Placement.with_turn_directory(config, helper, fn ->
         next = Placement.holder_workdir(config, helper)
         refute next == path
-        assert File.ls!(next) == []
+        assert File.ls!(next) == [".tightbeam-rail-scope.json"]
         next
       end)
 
@@ -295,12 +297,13 @@ defmodule Tightbeam.EphemeralTest do
     assert {:ok, _} = Placement.register_host(db, "testhost", %{ssh: nil, base_dir: tmp})
     helper = Org.get(db, "helper")
     owner = self()
+    fixture = Path.join(tmp, "helper-cleanup-fixture")
 
     sh = fn
       ["mktemp" | _] ->
-        {"/tmp/helper-cleanup-fixture\n", 0}
+        {fixture <> "\n", 0}
 
-      ["rm", "-rf", "--", "/tmp/helper-cleanup-fixture"] ->
+      ["rm", "-rf", "--", ^fixture] ->
         send(owner, {:cleanup_attempted, self()})
         {"removal failed", 1}
     end
@@ -328,7 +331,7 @@ defmodule Tightbeam.EphemeralTest do
       end)
 
     assert log =~ "Ephemeral temporary directory cleanup failed for helper"
-    assert log =~ "/tmp/helper-cleanup-fixture"
+    assert log =~ fixture
     assert log =~ "removal failed"
   end
 
@@ -337,12 +340,13 @@ defmodule Tightbeam.EphemeralTest do
     assert {:ok, _} = Placement.register_host(db, "testhost", %{ssh: nil, base_dir: tmp})
     helper = Org.get(db, "helper")
     owner = self()
+    fixture = Path.join(tmp, "helper-owner-death-fixture")
 
     sh = fn
       ["mktemp" | _] ->
-        {"/tmp/helper-owner-death-fixture\n", 0}
+        {fixture <> "\n", 0}
 
-      ["rm", "-rf", "--", "/tmp/helper-owner-death-fixture"] ->
+      ["rm", "-rf", "--", ^fixture] ->
         send(owner, :owner_death_cleanup)
         {"", 0}
     end

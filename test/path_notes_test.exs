@@ -87,6 +87,20 @@ defmodule Tightbeam.PathNotesTest do
                "could not check /x:  first  second; check before relying on it"
     end
 
+    test "CRLF, LF and CR each become one space without changing other characters" do
+      for {error, expected} <- [
+            {" a\r\nb\nc\rd ", " a b c d "},
+            {"a\n\nb", "a  b"},
+            {"a\r\n\n\r", "a"},
+            {"\r\n\n\r", ""},
+            {"a\n ", "a  "},
+            {"\ta\tb\t", "\ta\tb\t"}
+          ] do
+        assert PathNotes.note("/x", %{status: "could_not_access", error: error}) ==
+                 "could not check /x: #{expected}; check before relying on it"
+      end
+    end
+
     test "notes follow the delivered text after a blank line" do
       assert PathNotes.append("brief", ["a", "b"]) == "brief\n\na\nb"
       assert PathNotes.append("brief", []) == "brief"

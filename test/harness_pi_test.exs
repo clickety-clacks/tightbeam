@@ -77,10 +77,14 @@ defmodule Tightbeam.HarnessPiTest do
   end
 
   test "isolated engine launcher inventories workspace inputs without personal discovery" do
+    # Resolve version-manager shims before running with the fixture PATH.
+    {node, 0} = System.cmd("node", ["-p", "process.execPath"])
+    node = String.trim(node)
+
     # The launcher reports realpaths; macOS resolves the temp dir's /var through
     # /private, so expectations are built from the resolved root.
     {root, 0} =
-      System.cmd("node", [
+      System.cmd(node, [
         "-e",
         "process.stdout.write(require('fs').realpathSync(process.argv[1]))",
         tmp_dir!("pi-isolation")
@@ -92,6 +96,7 @@ defmodule Tightbeam.HarnessPiTest do
     real_home = Path.join(root, "real-home")
     bin = Path.join(root, "bin")
     for dir <- [cwd, home, private_home, real_home, bin], do: File.mkdir_p!(dir)
+    File.ln_s!(node, Path.join(bin, "node"))
 
     write = fn file ->
       File.mkdir_p!(Path.dirname(file))
@@ -133,7 +138,7 @@ defmodule Tightbeam.HarnessPiTest do
     ]
 
     run = fn ->
-      System.cmd("node", [launcher, "--mode", "rpc", "--no-themes"],
+      System.cmd(node, [launcher, "--mode", "rpc", "--no-themes"],
         cd: cwd,
         env: env,
         stderr_to_stdout: true
@@ -363,6 +368,19 @@ defmodule Tightbeam.HarnessPiTest do
     assert_receive {:catalog_command, ["/absolute/sh", "-c", script]}
     assert script =~ "'/absolute/curl'"
     assert Pi.extension_source(%{"hooks" => %{}}) =~ ~s(spawnSync("/bin/sh")
+  end
+
+  test "Pi rail hooks capture session cwd at session start and ignore tool cwd" do
+    source = Pi.extension_source(%{"hooks" => %{}})
+
+    assert source =~ "pi.on(\"session_start\", async (_event, ctx) =>"
+
+    assert source =~
+             "sessionWorkdir = typeof ctx?.cwd === \"string\" && ctx.cwd ? resolve(ctx.cwd) : \"\""
+
+    assert source =~ "cwd: sessionWorkdir || process.cwd()"
+    assert source =~ "TIGHTBEAM_SESSION_WORKDIR: sessionWorkdir"
+    refute source =~ "event?.cwd"
   end
 
   defp adapter_fixture(base, version \\ "0.0.34") do

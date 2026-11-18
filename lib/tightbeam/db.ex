@@ -91,6 +91,10 @@ defmodule Tightbeam.DB do
   end
 
   @queue_limit 128
+  @owed_work_key {__MODULE__, :owed_work}
+  @admission_poll_ms 10
+  @admission_poll_max_ms 250
+  @admission_report_ms 10_000
   @startup_progress_ms 5_000
   @deadline_key {__MODULE__, :deadline}
   @statement_cache_key {__MODULE__, :statement_cache}
@@ -110,6 +114,101 @@ defmodule Tightbeam.DB do
 
       _ ->
         false
+    end
+  end
+
+  @doc """
+  Mark work the gateway itself owes, so that it waits out an overloaded owner.
+
+  An overloaded owner refuses a new call so that its caller can be told to
+  retry later. Work the gateway owes has no caller to tell: a session lane
+  claiming or finishing a turn, or the task running that turn, is its own
+  retrier, and a refusal handed to it becomes a crash or a lost turn. The
+  refusal is issued before the call is sent, so nothing has run and asking
+  again cannot repeat an effect.
+
+  Inside this scope a refused call therefore waits outside the owner's queue
+  until the queue is back under its limit and is then sent again as an ordinary
+  call with its ordinary timeout. The queue limit is unchanged and binds every
+  other caller. Each wait is logged. Calls that carry their own deadline
+  (`transaction_until/3`, `query_until/4`) keep returning the refusal.
+
+  `owed_work/0` marks the calling process for its lifetime; `owed_work/1` marks
+  it while `fun` runs. `refusable/1` is the way back: inside a marked process it
+  runs `fun` with the ordinary refusal, for the calls that process makes on
+  behalf of a caller who can be told to retry.
+  """
+  @spec owed_work() :: :ok
+  def owed_work do
+    Process.put(@owed_work_key, true)
+    :ok
+  end
+
+  @spec owed_work((-> result)) :: result when result: term()
+  def owed_work(fun) when is_function(fun, 0) do
+    previous = Process.get(@owed_work_key)
+    Process.put(@owed_work_key, true)
+
+    try do
+      fun.()
+    after
+      if previous == nil,
+        do: Process.delete(@owed_work_key),
+        else: Process.put(@owed_work_key, previous)
+    end
+  end
+
+  @spec refusable((-> result)) :: result when result: term()
+  def refusable(fun) when is_function(fun, 0) do
+    previous = Process.delete(@owed_work_key)
+
+    try do
+      fun.()
+    after
+      if previous != nil, do: Process.put(@owed_work_key, previous)
+    end
+  end
+
+  @doc false
+  def owed_work?, do: Process.get(@owed_work_key) == true
+
+  @doc false
+  # Block until the owner's queue is back under its limit. Returns the wait in ms.
+  def await_admission(server, operation) do
+    started = System.monotonic_time(:millisecond)
+    Logger.warning("database overloaded; owed work is waiting to send #{operation}")
+    waited = admission_wait(server, operation, started, started, @admission_poll_ms)
+
+    if waited >= @admission_report_ms,
+      do: Logger.warning("database overload passed; owed #{operation} sent after #{waited}ms")
+
+    waited
+  end
+
+  defp admission_wait(server, operation, started, reported, pause) do
+    # Jitter keeps a crowd of waiting lanes from re-asking in the same instant.
+    Process.sleep(pause + :rand.uniform(pause))
+    now = System.monotonic_time(:millisecond)
+
+    cond do
+      not overloaded?(server) ->
+        now - started
+
+      now - reported >= @admission_report_ms ->
+        Logger.warning(
+          "database still overloaded; owed #{operation} has waited #{now - started}ms"
+        )
+
+        admission_wait(server, operation, started, now, pause)
+
+      true ->
+        admission_wait(
+          server,
+          operation,
+          started,
+          reported,
+          min(pause * 2, @admission_poll_max_ms)
+        )
     end
   end
 
@@ -136,6 +235,19 @@ defmodule Tightbeam.DB do
         reraise error, __STACKTRACE__
       end
   end
+
+  @doc false
+  # The refusal itself, or the strict match on a database result that it tripped.
+  def overload_error?(%Overloaded{}), do: true
+  def overload_error?(%MatchError{term: {:error, %Overloaded{}}}), do: true
+  def overload_error?(%CaseClauseError{term: {:error, %Overloaded{}}}), do: true
+  def overload_error?(_error), do: false
+
+  @doc false
+  # What a caller is told when its operation met the refusal: nothing is wrong
+  # with the request, and the same request can be sent again.
+  def overload_refusal,
+    do: %{code: "db_overloaded", message: "database overloaded; retry later"}
 
   @doc false
   def reader(server, sql) do
@@ -351,6 +463,38 @@ defmodule Tightbeam.DB do
       end
     end
   end
+
+  @doc """
+  `read_transaction/2` for a request path: the callback's result, or a raised
+  error. A read that runs out of time on its read connection raises the same
+  sanitized `Timeout` a caller's wait for the owner does, so a client is told
+  to retry rather than handed a server error.
+  """
+  @spec read_transaction!(server(), (Tightbeam.DB.Txn.t() -> result)) :: result
+        when result: term()
+  def read_transaction!(server \\ __MODULE__, fun) when is_function(fun, 1) do
+    case read_transaction(server, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise_read_error!(error)
+    end
+  end
+
+  @doc """
+  Raise the error a failed `read_transaction/2` returned. A read that ran out
+  of time on its read connection becomes the sanitized `Timeout`.
+  """
+  @spec raise_read_error!(Exception.t() | term()) :: no_return()
+  def raise_read_error!(%DeadlineExceeded{}) do
+    raise Timeout,
+      request_id: Tightbeam.RequestContext.capture().request_id,
+      operation: "db.read_transaction",
+      effect_kind: "read",
+      budget_ms: call_timeout(),
+      timeout_source: "reader_deadline",
+      effect_state: "none"
+  end
+
+  def raise_read_error!(error), do: raise(error)
 
   @doc """
   Commit one transaction, then run a publication callback after the owner has replied.
@@ -619,7 +763,17 @@ defmodule Tightbeam.DB do
     if Process.get(@startup_wait_key) do
       call(migration_context(server), request)
     else
-      DBObservation.call(server, request, operation, budget)
+      reply = DBObservation.call(server, request, operation, budget)
+      unsent? = DBObservation.take_unsent_refusal()
+
+      # A refused call was never sent. Owed work asks again once the queue has
+      # room; every other caller is handed the refusal.
+      if unsent? and owed_work?() and match?({:error, %Overloaded{}}, reply) do
+        await_admission(server, operation)
+        observed_call(server, request, operation, budget)
+      else
+        reply
+      end
     end
   end
 

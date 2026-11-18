@@ -32,7 +32,7 @@ defmodule ItemlessSpawnDispatchRuntime do
 
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
 
-  @staffing_rule "engineering-spawn-staffing-needs-work-item"
+  @staffing_rule "agentic-engineering.engineering-spawn-staffing-needs-work-item"
   @staffing_message "#{@staffing_rule}: Worker staffing requires a known work item. Create or link the work item before retrying."
 
   def run do
@@ -64,9 +64,9 @@ defmodule ItemlessSpawnDispatchRuntime do
         )
 
       for {key, archetype} <- [
-            {"caller", "default"},
-            {"unqualified", "default"},
-            {"coordinator", "pdo"}
+            {"caller", "agentic-engineering.coder"},
+            {"unqualified", "agentic-engineering.coder"},
+            {"coordinator", "agentic-engineering.pdo"}
           ] do
         Org.create(db, %{
           session_key: key,
@@ -115,14 +115,24 @@ defmodule ItemlessSpawnDispatchRuntime do
       assert_exact_staffing_refusal!(
         db,
         handlers,
-        spawn_call("caller", "session:caller", "coder")
+        spawn_call("caller", "session:caller", "agentic-engineering.coder")
       )
 
-      assert_exact_staffing_refusal!(
-        db,
-        handlers,
-        spawn_call("unqualified", "session:unqualified", "helper")
-      )
+      count_before = count_sessions(db)
+
+      assert {:error,
+              %{
+                code: "work_item_required",
+                message:
+                  "production staffing requires an exact work item; create or link the item before staffing"
+              }} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 spawn_call("unqualified", "session:unqualified", "helper")
+               )
+
+      assert count_sessions(db) == count_before
 
       assert_ephemeral_obligation_refusal!(db, handlers, "caller")
 
@@ -139,16 +149,18 @@ defmodule ItemlessSpawnDispatchRuntime do
         row-reaction-handoff.toml
         row-reaction-terminal-action.toml
         verification.toml
+        harklight-decision-request-briefing.toml
         harness-health-recovery.toml
         harness-recovery-main-wake.toml
       )
       |> Enum.sort()
 
     files =
-      Path.wildcard(Path.join([base, "identity", "rules", "*.toml"]))
+      (Path.wildcard(Path.join([base, "identity", "rules", "*.toml"])) ++
+         Path.wildcard(Path.join([base, "identity", "kungfu", "*", "rules", "*.toml"])))
       |> Enum.sort()
 
-    assert Enum.map(files, &Path.basename/1) == expected
+    assert Enum.sort(Enum.map(files, &Path.basename/1)) == expected
 
     hashes =
       Enum.map(files, fn path ->

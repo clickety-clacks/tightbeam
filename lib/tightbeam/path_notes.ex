@@ -153,8 +153,8 @@ defmodule Tightbeam.PathNotes do
 
   # The system error is passed through as reported. A note is one line, so an
   # error that itself contains line breaks has each break replaced by one space
-  # and trailing breaks dropped; no other character changes. (The multi-line
-  # rule is pending the delivery owner's ruling on R6.)
+  # and trailing breaks dropped; no other character changes (delivery ruling
+  # art_87e1cae7 on R6).
   defp one_line(error) do
     error = to_string(error)
 

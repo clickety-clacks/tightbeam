@@ -22,6 +22,7 @@ mod probe;
 mod process_tree;
 mod rail_action;
 mod session_connect;
+mod session_rail_scope;
 mod skills;
 mod transport_receipt;
 mod users;
@@ -71,6 +72,17 @@ fn main() {
     if args.first().is_some_and(|arg| arg == "rail-action") {
         match rail_action::run(&args[1..]) {
             Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    if args.first().is_some_and(|arg| arg == "rail-scope-check") {
+        match session_rail_scope::run(&args[1..]) {
+            Ok(true) => std::process::exit(0),
+            Ok(false) => std::process::exit(1),
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(2);

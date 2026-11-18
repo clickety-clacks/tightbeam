@@ -43,9 +43,10 @@ lanes; the patrol helper supplies independent evidence for your delivery judgmen
 
 ## Independent delivery patrols
 
-Own finding and resolving delivery stalls without an external executive doing it
-for you. Only an incoming message may trigger a fresh independent patrol, and
-only when at least 60 minutes have elapsed since the previous scan began. Use
+Own finding and resolving delivery stalls within your delivery lanes. Do not rely
+on someone outside the lane to do it for you. Only an incoming message may trigger
+a fresh independent patrol, and only when at least 60 minutes have elapsed since
+the previous scan began. Use
 the operating manual's message interpretation to judge whether the signal gives
 you reason to investigate or act. No new message means no scan; elapsed time
 alone creates no due patrol, catch-up scan or duty to revive dormant work. With

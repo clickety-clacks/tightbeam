@@ -2963,10 +2963,14 @@ defmodule Tightbeam.Wakes do
 
   defp request_unowned_agent_stretch_decision_in_txn(
          txn,
-         %{name: "ac6a-unassigned-agent-turn"},
+         %{name: name},
          call,
          evidence
-       ) do
+       )
+       when name in [
+              "ac6a-unassigned-agent-turn",
+              "agentic-engineering.ac6a-unassigned-agent-turn"
+            ] do
     session_key = Map.get(call.params, :session_key)
     caller_origin = Map.get(call.params, :caller_origin)
 
@@ -2988,7 +2992,7 @@ defmodule Tightbeam.Wakes do
           EventLog.lifecycle_in_txn(
             txn,
             "rule_notice_failed",
-            "ac6a-unassigned-agent-turn",
+            name,
             "operator decision request failed (#{code}): #{message}"
           )
 
@@ -5164,10 +5168,13 @@ defmodule Tightbeam.Wakes do
 
   defp retirement_no_replacement_without_liveness?(_command, _outcome), do: false
 
+  # Retirement closes assignments in the same transaction before disposing their
+  # notices. That closed assignment is the disposition proof even when its
+  # parent work item stays open without a pending routing or inactivity wake.
   defp completed_assignment_without_liveness?(
          txn,
          %{
-           requester: %{kind: "process", id: "tightbeam:assignments"},
+           requester: %{kind: "process", id: requester_id},
            reason_kind: "obligation_disposed",
            causal_source: %{kind: "assignment_transition", id: assignment_id}
          },
@@ -5178,7 +5185,8 @@ defmodule Tightbeam.Wakes do
          },
          %{assignment_id: assignment_id},
          %{kind: "work_item", id: work_item_id, impact: "linked_work_open"}
-       ) do
+       )
+       when requester_id in ["tightbeam:assignments", "tightbeam:retirement"] do
     case Txn.q(
            txn,
            "SELECT 1 FROM assignments WHERE id=?1 AND workItemId=?2 AND state='closed'",
@@ -6522,9 +6530,13 @@ defmodule Tightbeam.Wakes do
 
   @impl true
   def init(opts) do
+    Tightbeam.DB.owed_work()
+
     Tightbeam.RowReactions.recover(Keyword.get(opts, :db, Tightbeam.DB))
 
     state = %{
+      identity_staleness_check: Keyword.get(opts, :identity_staleness_check),
+      identity_staleness_interval_ms: Keyword.get(opts, :identity_staleness_interval_ms),
       deliver: Keyword.fetch!(opts, :deliver),
       db: Keyword.get(opts, :db, Tightbeam.DB),
       timer: nil,
@@ -6538,6 +6550,10 @@ defmodule Tightbeam.Wakes do
       delivery_opts: Keyword.get(opts, :delivery_opts, []),
       internal_consumers: Keyword.get(opts, :internal_consumers, %{})
     }
+
+    if state.identity_staleness_check do
+      Process.send_after(self(), :identity_staleness_check, state.identity_staleness_interval_ms)
+    end
 
     Process.send_after(self(), :detect_misses, @miss_detector_ms)
     send(self(), :recover_notices)
@@ -6646,6 +6662,12 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_info({:timeout, _stale_timer, :due}, state), do: {:noreply, state}
+
+  def handle_info(:identity_staleness_check, state) do
+    DB.background_pass(state.identity_staleness_check)
+    Process.send_after(self(), :identity_staleness_check, state.identity_staleness_interval_ms)
+    {:noreply, state}
+  end
 
   def handle_info(:detect_misses, state) do
     state = DB.background_pass(fn -> detect_misses(state) end, state)
@@ -6995,6 +7017,10 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  # A recipient-specific pass reads only the waits that can resolve to that
+  # recipient (resolved_recipient/2): session-addressed waits stored for it and
+  # waits for a role bound to it. Waits addressed to other sessions never match
+  # and would only cost a write transaction each at every turn end.
   defp deliver_eligible_waits(db, delivery_opts, recipient \\ nil) do
     {:ok, rows} =
       DB.query(
@@ -7002,7 +7028,9 @@ defmodule Tightbeam.Wakes do
         """
         SELECT wakeId FROM wakes
         WHERE state='pending' AND waitMode IS NOT NULL AND recognitionAt IS NOT NULL
-          AND firedAt IS NULL AND (?1 IS NULL OR sessionKey=?1 OR targetRole IS NOT NULL OR targetGate<>0)
+          AND firedAt IS NULL AND (?1 IS NULL
+            OR (targetRole IS NULL AND sessionKey=?1)
+            OR targetRole IN (SELECT name FROM roles WHERE boundSessionKey=?1))
         ORDER BY recognitionAt,wakeId
         """,
         [recipient]
