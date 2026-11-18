@@ -100,6 +100,47 @@ defmodule Tightbeam.LaneTest do
     send(next_worker, :finish)
   end
 
+  test "a change that fails inside the lane leaves the lane and its running turn alive", ctx do
+    parent = self()
+    seq = enqueue!(ctx.db, "k1", "first")
+
+    runner = fn turn ->
+      send(parent, {:failing_change_turn, turn.prompt, self()})
+
+      receive do
+        :finish -> {:ok, %{text: turn.prompt}}
+      end
+    end
+
+    lane =
+      start_supervised!(
+        {SessionLane, session_key: "k1", db: ctx.db, task_sup: ctx.task_sup, runner: runner}
+      )
+
+    assert_receive {:failing_change_turn, "first", worker}, 1_000
+
+    # A configuration callback whose own call exits, as an adapter call that
+    # times out does, reaches the caller that supplied it.
+    assert {:deliberate_change_exit, _} =
+             catch_exit(
+               SessionLane.change_at_boundary(
+                 "k1",
+                 fn -> flunk("must not apply while the turn is running") end,
+                 fn -> exit({:deliberate_change_exit, :timeout}) end
+               )
+             )
+
+    assert Process.alive?(lane)
+    assert [{^lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k1")
+
+    send(worker, :finish)
+
+    assert eventually(fn ->
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+               {:ok, [["delivered"]]}
+           end)
+  end
+
   test "a rolled-back runtime swap leaves its accepted change pending", %{db: db} do
     %{change_id: id} = Tightbeam.RuntimeChanges.enqueue(db, "k1", %{harness: "codex"})
 
