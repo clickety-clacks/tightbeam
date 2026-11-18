@@ -353,6 +353,18 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     end
   end
 
+  describe "the full application runtime" do
+    @tag :tmp_dir
+    @tag timeout: 120_000
+    test "retains every runtime child and delivers a deferred wake once", %{tmp_dir: tmp} do
+      Tightbeam.GuardRuntimeFixture.run!(
+        tmp,
+        "full_runtime_overload.exs",
+        "full-runtime-overload: listener survived; durable wake delivered once"
+      )
+    end
+  end
+
   describe "the process tree" do
     test "keeps its listener, lanes and supervisors through an overload burst", %{db: db} do
       # The production shape: lanes sit under their own supervisor ahead of the
