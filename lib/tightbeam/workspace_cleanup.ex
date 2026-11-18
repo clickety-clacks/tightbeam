@@ -28,7 +28,16 @@ defmodule Tightbeam.WorkspaceCleanup do
   def init(opts) do
     config = Keyword.fetch!(opts, :config)
     timer = Process.send_after(self(), :drain, 30_000)
-    {:ok, %{config: config, db: Map.get(config, :db, DB), timer: timer, relocation_failures: %{}}}
+
+    {:ok,
+     %{
+       config: config,
+       db: Map.get(config, :db, DB),
+       timer: timer,
+       relocation_failures: %{},
+       relocation_backoff: 1_000,
+       relocation_next_at: nil
+     }}
   end
 
   def handle_info(:drain, state) do
@@ -65,12 +74,43 @@ defmodule Tightbeam.WorkspaceCleanup do
           60_000
       end
 
-    {relocation_delay, relocation_failures} =
-      relocate_archive(state.config, state.db, state.relocation_failures)
+    now = System.monotonic_time(:millisecond)
+
+    {relocation_delay, relocation_failures, backoff} =
+      if state.relocation_next_at && state.relocation_next_at > now do
+        {state.relocation_next_at - now, state.relocation_failures, state.relocation_backoff}
+      else
+        relocate_archive(
+          state.config,
+          state.db,
+          state.relocation_failures,
+          state.relocation_backoff
+        )
+      end
+
+    next_at =
+      cond do
+        state.relocation_next_at && state.relocation_next_at > now ->
+          state.relocation_next_at
+
+        relocation_delay && backoff > 1_000 ->
+          System.monotonic_time(:millisecond) + relocation_delay
+
+        true ->
+          nil
+      end
 
     delay = if relocation_delay, do: min(delay || relocation_delay, relocation_delay), else: delay
     timer = if delay, do: Process.send_after(self(), :drain, delay)
-    {:noreply, %{state | timer: timer, relocation_failures: relocation_failures}}
+
+    {:noreply,
+     %{
+       state
+       | timer: timer,
+         relocation_failures: relocation_failures,
+         relocation_backoff: backoff,
+         relocation_next_at: next_at
+     }}
   end
 
   def archive_root(%{ssh: nil} = host),
@@ -78,7 +118,7 @@ defmodule Tightbeam.WorkspaceCleanup do
 
   def archive_root(host), do: Path.join(host.base_dir, "archive")
 
-  defp relocate_archive(config, db, failures) do
+  defp relocate_archive(config, db, failures, backoff) do
     source = Path.join(config.base_dir, "archive")
     destination = archive_root(%{ssh: nil, base_dir: config.base_dir})
 
@@ -116,31 +156,38 @@ defmodule Tightbeam.WorkspaceCleanup do
 
       entry =
         Enum.find(entries, &(not Map.has_key?(failures, &1))) ||
-          Enum.find(entries, &(Map.fetch!(failures, &1) <= now))
+          Enum.find(entries, &(is_integer(failures[&1]) and failures[&1] <= now))
 
       if entry do
         case relocate_entry(config, db, source, destination, entry) do
           :ok ->
-            {1_000, Map.delete(failures, entry)}
+            {1_000, Map.delete(failures, entry), 1_000}
 
-          :retry ->
-            {1_000, Map.put(failures, entry, System.monotonic_time(:millisecond) + 300_000)}
+          result when result in [:retry, :missing] ->
+            delay = min(backoff * 2, 300_000)
+
+            retry_at =
+              if result == :missing,
+                do: :missing,
+                else: System.monotonic_time(:millisecond) + 300_000
+
+            {delay, Map.put(failures, entry, retry_at), delay}
         end
       else
-        delay = failures |> Map.values() |> Enum.min(fn -> nil end)
-        {if(delay, do: max(delay - now, 1_000)), failures}
+        delay = failures |> Map.values() |> Enum.filter(&is_integer/1) |> Enum.min(fn -> nil end)
+        {if(delay, do: max(delay - now, 1_000)), failures, backoff}
       end
     else
-      {nil, failures}
+      {nil, failures, backoff}
     end
   rescue
     error ->
       Logger.warning("archive relocation deferred: #{Exception.message(error)}")
-      {300_000, failures}
+      {300_000, failures, backoff}
   catch
     kind, error ->
       Logger.warning("archive relocation deferred: #{kind}: #{inspect(error)}")
-      {300_000, failures}
+      {300_000, failures, backoff}
   end
 
   defp relocate_entry(config, db, source, destination, entry) do
@@ -148,12 +195,34 @@ defmodule Tightbeam.WorkspaceCleanup do
     target = Path.join(destination, entry)
 
     script =
-      move_script() <> "\nmove_workspace " <> shell_quote(old) <> " " <> shell_quote(target)
+      move_script() <>
+        """
+
+        if [ ! -e #{shell_quote(old)} ] && [ ! -L #{shell_quote(old)} ] &&
+           [ ! -e #{shell_quote(target)} ] && [ ! -L #{shell_quote(target)} ]; then
+          exit 3
+        fi
+        move_workspace #{shell_quote(old)} #{shell_quote(target)}
+        """
 
     runner = Map.get(config, :workspace_cleanup_runner) || (&system_runner/3)
 
-    {_output, 0} =
-      run_bounded(runner, ["sh", "-c", script], script, "", @default_runner_timeout_ms)
+    case run_bounded(runner, ["sh", "-c", script], script, "", @default_runner_timeout_ms) do
+      {_, 0} ->
+        :ok
+
+      {_, 3} ->
+        throw({:archive_missing, old, target})
+
+      {:runner_timeout, timeout_ms} ->
+        raise "archive move timed out after #{timeout_ms}ms"
+
+      {:runner_exception, detail} ->
+        raise "archive move runner failed: #{detail}"
+
+      {output, status} when is_binary(output) and is_integer(status) ->
+        raise "archive move exited with status #{status}: #{String.trim(output)}"
+    end
 
     {:ok, :ok} =
       DB.transaction(db, fn txn ->
@@ -185,6 +254,10 @@ defmodule Tightbeam.WorkspaceCleanup do
       Logger.warning("archive relocation deferred for #{entry}: #{Exception.message(error)}")
       :retry
   catch
+    {:archive_missing, old, target} ->
+      Logger.warning("archive relocation skipped: source #{old} and target #{target} are missing")
+      :missing
+
     kind, error ->
       Logger.warning("archive relocation deferred for #{entry}: #{kind}: #{inspect(error)}")
       :retry

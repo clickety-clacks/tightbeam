@@ -181,7 +181,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         | Command::CommandHelp(_)
         | Command::IdentityCurrent
         | Command::Doctor { .. }
-        | Command::GithubAuthCheck
+        | Command::GithubAuthCheck { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_)
         | Command::SessionConnect { .. } => {
@@ -557,6 +557,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             files,
             vendor_session_id,
             supersedes,
+            decision_request_id,
         } => {
             let mut params = vec![
                 format!(
@@ -594,6 +595,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = by_when {
                 params.push(string_field("byWhen", value));
+            }
+            if let Some(value) = decision_request_id {
+                params.push(string_field("decisionRequestId", value));
             }
             Ok(request(identity, "harklight-send", vec![], params))
         }
@@ -638,6 +642,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             "harklight-cover",
             vec![],
             vec![string_field("handle", session)],
+        )),
+        Command::HarklightListenerRestore { identity, handle } => Ok(request(
+            identity,
+            "harklight-listener-restore",
+            vec![],
+            vec![string_field("handle", handle)],
         )),
         Command::HarklightFollow {
             identity,
@@ -834,6 +844,19 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("idempotencyKey", idempotency_key),
             ],
         )),
+        Command::SessionRename {
+            identity,
+            session_key,
+            display_name,
+        } => Ok(request(
+            identity,
+            "tune",
+            vec![string_field("sessionKey", session_key)],
+            vec![
+                string_field("setting", "rename"),
+                string_field("displayName", display_name),
+            ],
+        )),
         Command::Tune {
             identity,
             session_key,
@@ -974,19 +997,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
-        Command::EffortRule {
-            identity,
-            request_id,
-            action,
-        } => Ok(request(
-            identity,
-            "effort-rule",
-            vec![],
-            vec![
-                string_field("request", request_id),
-                string_field("action", action),
-            ],
-        )),
         Command::Ask {
             identity,
             target,
@@ -1102,6 +1112,18 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 params.push(string_field("status", value));
             }
             Ok(request(identity, "decision-requests", vec![], params))
+        }
+        Command::HarklightBriefingsCatchup { identity, limit } => {
+            let params = limit
+                .map(|value| format!("\"limit\":{value}"))
+                .into_iter()
+                .collect();
+            Ok(request(
+                identity,
+                "harklight-briefings-catchup",
+                vec![],
+                params,
+            ))
         }
         Command::DecisionRequest {
             identity,
@@ -1478,11 +1500,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         Command::WorkItemIcebox {
             identity,
             work_item_id,
+            reason,
         } => Ok(request(
             identity,
             "work-item-icebox",
             vec![],
-            vec![string_field("workItemId", work_item_id)],
+            vec![
+                string_field("workItemId", work_item_id),
+                string_field("reason", reason),
+            ],
         )),
         Command::WorkItemReopen {
             identity,
@@ -1614,6 +1640,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             "attests",
             vec![],
             vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::CheckAttest {
+            identity,
+            attest_id,
+        } => Ok(request(
+            identity,
+            "check-attest",
+            vec![],
+            vec![string_field("attestId", attest_id)],
         )),
         Command::AssignmentGet {
             identity,
@@ -3872,7 +3907,9 @@ where
         Command::SessionConnect { .. } => {
             unreachable!("session-connect is routed before the shared dispatcher")
         }
-        Command::GithubAuthCheck => crate::github_auth::check_tool_call_stdin(),
+        Command::GithubAuthCheck { text_template } => {
+            crate::github_auth::check_tool_call_stdin(text_template.as_deref())
+        }
         Command::Onboard {
             identity,
             owner_user_id,
@@ -4077,9 +4114,15 @@ fn local_harklight_identity_refusal(
         {
             Some("harklight-send requires the authenticated session or one of its roles")
         }
+        Command::HarklightBriefingsCatchup { identity, .. }
+            if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
+        {
+            Some("harklight-briefings-catchup requires an active admin-owned session")
+        }
         Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
+        | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
         | Command::HarklightCover { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
@@ -4107,9 +4150,11 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
+        | Command::HarklightBriefingsCatchup { identity, .. }
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
+        | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
         | Command::HarklightCover { identity, .. }
         | Command::HarklightRetry { identity, .. }
@@ -4122,10 +4167,10 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::SessionReparent { identity, .. }
         | Command::SessionCustodyTransfer { identity, .. }
         | Command::SessionPoSet { identity, .. }
+        | Command::SessionRename { identity, .. }
         | Command::SessionConnect { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
-        | Command::EffortRule { identity, .. }
         | Command::Ask { identity, .. }
         | Command::Answer { identity, .. }
         | Command::Return { identity, .. }
@@ -4162,6 +4207,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::MementoSet { identity, .. }
         | Command::Mementos { identity, .. }
         | Command::Attests { identity, .. }
+        | Command::CheckAttest { identity, .. }
         | Command::AssignmentGet { identity, .. }
         | Command::Assignments { identity, .. }
         | Command::CancelWake { identity, .. }
@@ -4206,7 +4252,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::ToolCallObserved
-        | Command::GithubAuthCheck
+        | Command::GithubAuthCheck { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
     }
@@ -4369,6 +4415,10 @@ mod tests {
                 "harklight-settle",
             ),
             (
+                vec!["harklight-listener-restore", "--handle", "h"],
+                "harklight-listener-restore",
+            ),
+            (
                 vec!["harklight-follow", "--message", "m"],
                 "harklight-follow",
             ),
@@ -4401,6 +4451,8 @@ mod tests {
             } else if (verb == "harklight-follow" || verb == "harklight-cover")
                 && body["params"].get("handle").is_some()
             {
+                assert_eq!(body["params"]["handle"], "h");
+            } else if verb == "harklight-listener-restore" {
                 assert_eq!(body["params"]["handle"], "h");
             } else if verb == "harklight-retry" {
                 if body["params"].get("all").is_some() {
@@ -4562,6 +4614,8 @@ mod tests {
             "Question",
             "--type",
             "request",
+            "--decision-request-id",
+            "dr_12345678-1234-4234-8234-123456789abc",
             "--choices-json",
             r#"["Yes"]"#,
         ]))
@@ -4571,6 +4625,10 @@ mod tests {
         assert_eq!(request["params"]["senderId"], "sender");
         assert_eq!(request["params"]["messageType"], "request");
         assert_eq!(request["params"]["reply"], false);
+        assert_eq!(
+            request["params"]["decisionRequestId"],
+            "dr_12345678-1234-4234-8234-123456789abc"
+        );
         assert_eq!(request["params"]["choices"], serde_json::json!(["Yes"]));
         assert!(request.get("sessionKey").is_none());
         assert!(request["params"].get("sessionKey").is_none());
@@ -4598,6 +4656,15 @@ mod tests {
         assert!(request.get("sessionKey").is_none());
         assert!(request["params"].get("sessionKey").is_none());
         assert!(request["params"].get("informational").is_none());
+    }
+
+    #[test]
+    fn catchup_limit_is_sent_as_a_number() {
+        let request: Value =
+            serde_json::from_str(&body(&["harklight-briefings-catchup", "--limit", "3"])).unwrap();
+
+        assert_eq!(request["verb"], "harklight-briefings-catchup");
+        assert_eq!(request["params"]["limit"], 3);
     }
 
     #[test]
@@ -4840,6 +4907,47 @@ mod tests {
                 }
             }
             assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn session_rename_sends_the_display_name_on_the_stable_session_target() {
+        assert_eq!(
+            body(&[
+                "session-rename",
+                "--session",
+                "session key with spaces",
+                "--display-name",
+                "  ATC PO  ",
+                "--as-user",
+                "rename-owner"
+            ]),
+            r#"{"asUser":"rename-owner","verb":"tune","sessionKey":"session key with spaces","params":{"setting":"rename","displayName":"  ATC PO  "}}"#
+        );
+
+        // The CLI preserves an explicit empty value for the server's shared
+        // parameter-specific validation instead of treating it as a missing flag.
+        assert_eq!(
+            body(&[
+                "session-rename",
+                "--session",
+                "session-key",
+                "--display-name",
+                ""
+            ]),
+            r#"{"verb":"tune","sessionKey":"session-key","params":{"setting":"rename","displayName":""}}"#
+        );
+
+        for missing in ["--session", "--display-name"] {
+            let mut args = vec!["session-rename"];
+            for (flag, value) in [("--session", "session-key"), ("--display-name", "New Name")] {
+                if flag != missing {
+                    args.extend([flag, value]);
+                }
+            }
+            assert!(
+                crate::args::parse(args.iter().map(|value| (*value).to_owned()).collect()).is_err()
+            );
         }
     }
 
@@ -5629,18 +5737,6 @@ mod tests {
         );
 
         assert_eq!(
-            body(&[
-                "effort-rule",
-                "--request",
-                "dr_1",
-                "--action",
-                "continue",
-                "--as",
-                "parent",
-            ]),
-            r#"{"as":"parent","verb":"effort-rule","params":{"request":"dr_1","action":"continue"}}"#
-        );
-        assert_eq!(
             body(&["decision-requests", "--status", "open", "--as", "parent"]),
             r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#
         );
@@ -5855,6 +5951,10 @@ mod tests {
         assert_eq!(
             body(&["attests", "asg_1", "--as", "reviewer"]),
             r#"{"as":"reviewer","verb":"attests","params":{"assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&["check-attest", "att_1", "--as", "reviewer"]),
+            r#"{"as":"reviewer","verb":"check-attest","params":{"attestId":"att_1"}}"#
         );
         assert_eq!(
             body(&[
@@ -6073,8 +6173,15 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null,"priority":1}}"#
         );
         assert_eq!(
-            body(&["work-item-icebox", "wi_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"work-item-icebox","params":{"workItemId":"wi_1"}}"#
+            body(&[
+                "work-item-icebox",
+                "wi_1",
+                "--reason",
+                "waiting on a decision",
+                "--as-user",
+                "fixture-user"
+            ]),
+            r#"{"asUser":"fixture-user","verb":"work-item-icebox","params":{"workItemId":"wi_1","reason":"waiting on a decision"}}"#
         );
         assert_eq!(
             body(&["work-item-reopen", "wi_1", "--as-user", "flynn"]),

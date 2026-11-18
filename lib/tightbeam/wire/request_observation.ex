@@ -3,6 +3,7 @@ defmodule Tightbeam.Wire.RequestObservation do
   alias Tightbeam.{DB, Diagnostics, RequestContext}
   alias Tightbeam.Wire.{OperationRegistry, ResponseObservationAdapter}
   import Plug.Conn
+  require Logger
 
   @key {__MODULE__, :response}
   @request_id ~r/\Areq_[A-Za-z0-9_-]{22}\z/
@@ -44,7 +45,13 @@ defmodule Tightbeam.Wire.RequestObservation do
                   end
 
                 nil ->
-                  reraise error, __STACKTRACE__
+                  observation = Process.get(@key)
+
+                  if overloaded?(error) and observation.state == "not_started" do
+                    overloaded_response(observation.conn)
+                  else
+                    reraise error, __STACKTRACE__
+                  end
               end
           end
 
@@ -133,6 +140,28 @@ defmodule Tightbeam.Wire.RequestObservation do
   defp timeout(%DB.Timeout{} = error), do: error
   defp timeout(%Plug.Conn.WrapperError{reason: reason}), do: timeout(reason)
   defp timeout(_), do: nil
+
+  defp overloaded?(%Plug.Conn.WrapperError{reason: reason}), do: overloaded?(reason)
+  defp overloaded?(error), do: DB.overload_error?(error)
+
+  # The database owner refused a call this request needed. Nothing is wrong with
+  # the request: say so, instead of letting the refusal surface as a bare 500.
+  defp overloaded_response(conn) do
+    # The route template, never the concrete path: no identifier reaches the log.
+    operation =
+      case conn.private[:plug_route] do
+        {template, _dispatch} -> OperationRegistry.http(conn.method, template)
+        _ -> OperationRegistry.http(conn.method, nil)
+      end
+
+    Logger.warning("#{operation} refused: database overloaded")
+
+    conn
+    |> put_resp_header("retry-after", "1")
+    |> json(503, %{
+      error: Map.put(DB.overload_refusal(), :requestId, RequestContext.capture().request_id)
+    })
+  end
 
   defp timeout_response(conn, failure) do
     json(conn, 503, %{

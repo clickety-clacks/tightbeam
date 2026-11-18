@@ -259,8 +259,8 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert proof_job =~ "release-candidate-stage-${{ needs.metadata.outputs.candidate_sha }}"
 
     assert workflow =~
-             ("Neither candidate artifact exists unless metadata, both test jobs, " <>
-                "and both package jobs passed.")
+             "Neither candidate artifact exists unless metadata, both test jobs, " <>
+               "and both package jobs passed."
   end
 
   test "manifest verifier accepts complete exact evidence", evidence do

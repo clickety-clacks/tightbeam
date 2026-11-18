@@ -89,7 +89,11 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
              "sessionKey" => "selected"
            } = reply
 
-    for filters <- [%{}, %{"sessionKey" => "sibling"}] do
+    for filters <- [
+          %{},
+          %{"sessionKey" => "sibling"},
+          %{"archetype" => "product-owner"}
+        ] do
       send_frame(changes, %{type: "subscribe", subscriptionId: "bad", filters: filters})
       {reply, _} = recv_frame(changes)
       assert reply["code"] == "invalid_request"
@@ -423,6 +427,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
 
     File.write!(Path.join(rules_dir, "post.toml"), """
     [[rule]]
+    archetypes = ["*"]
     name = "post-disabled"
     verb = "post"
     deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
@@ -447,6 +452,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
 
     File.write!(Path.join(rules_dir, "post.toml"), """
     [[rule]]
+    archetypes = ["*"]
     name = "post-decision"
     verb = "post"
     effect = "escalate"

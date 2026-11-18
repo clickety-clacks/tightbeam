@@ -199,6 +199,11 @@ pub enum Command {
         files: Vec<String>,
         vendor_session_id: Option<String>,
         supersedes: Vec<String>,
+        decision_request_id: Option<String>,
+    },
+    HarklightBriefingsCatchup {
+        identity: Identity,
+        limit: Option<u32>,
     },
     HarklightRevise {
         identity: Identity,
@@ -221,6 +226,10 @@ pub enum Command {
         identity: Identity,
         session: String,
     },
+    HarklightListenerRestore {
+        identity: Identity,
+        handle: String,
+    },
     HarklightFollow {
         identity: Identity,
         message: Option<String>,
@@ -237,10 +246,11 @@ pub enum Command {
     /// observation is the session's by definition — the gateway resolves the
     /// turn from the session token, so there is nothing for a flag to say.
     ToolCallObserved,
-    /// Substrate-reserved: the GitHub PreToolUse hook guard. It reads the raw
-    /// tool-call JSON from stdin and refuses only GitHub-dependent calls when
-    /// this host's GitHub auth is not ready.
-    GithubAuthCheck,
+    /// Substrate statute check for the GitHub PreToolUse hook. It reads raw
+    /// tool-call JSON from stdin and uses the supplied TOML refusal template.
+    GithubAuthCheck {
+        text_template: Option<String>,
+    },
     Spawn {
         identity: Identity,
         owner_user_id: Option<String>,
@@ -299,6 +309,11 @@ pub enum Command {
         po_role: String,
         idempotency_key: String,
     },
+    SessionRename {
+        identity: Identity,
+        session_key: String,
+        display_name: String,
+    },
     SessionConnect {
         identity: Identity,
         session_key: String,
@@ -335,11 +350,6 @@ pub enum Command {
         idempotency_key: Option<String>,
         succeeds: Option<String>,
         parent_assignment: Option<String>,
-    },
-    EffortRule {
-        identity: Identity,
-        request_id: String,
-        action: String,
     },
     Ask {
         identity: Identity,
@@ -511,6 +521,7 @@ pub enum Command {
     WorkItemIcebox {
         identity: Identity,
         work_item_id: String,
+        reason: String,
     },
     WorkItemReopen {
         identity: Identity,
@@ -558,6 +569,10 @@ pub enum Command {
     Attests {
         identity: Identity,
         assignment_id: String,
+    },
+    CheckAttest {
+        identity: Identity,
+        attest_id: String,
     },
     AssignmentGet {
         identity: Identity,
@@ -942,9 +957,11 @@ COMMANDS:
       [--body <text>] [--choices-json <array>] [--clear-choices]
   harklight-retract --message <id>
   harklight-settle --message <id>
-      Settle one unresolved send using its original operation and inputs.
+      Settle one unresolved Harklight operation using its saved request and original operation ID.
   harklight-cover --session <handle>
       Explicitly move your conversation to the shared origin listener.
+  harklight-listener-restore --handle <handle>
+      Restore this session's Gateway-managed listener on its existing delivery route.
   harklight-follow (--message <id> | --handle <handle>)
       Follow a message or conversation sent through Tightbeam.
   harklight-retry (--all | --message <id> | --session <handle>)
@@ -954,13 +971,17 @@ COMMANDS:
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
       [--reply] [--supersedes <id>]...
       [--body <text>] [--choices-json <array>] [--files-json <array>]
-      [--vendor-session-id <id>]
+      [--vendor-session-id <id>] [--decision-request-id <dr_id>]
       FYI is acknowledged with Seen; request needs a choice or --reply. Importance is
       your view; Harklight's ranking decides the priority the recipient sees.
       Correct and resend only after a definite refusal;
       settle an uncertain send with the same operation.
       Use blocker when the recipient must act before work can continue, or success when work finished,
       shipped, or otherwise succeeded.
+      A decision request id durably associates the send with its originating briefing.
+  harklight-briefings-catchup [--limit <count>]
+      Reconcile all of your open decision requests, stage every disposition, and
+      admit at most the requested number of uncovered briefings (default: stage only).
   artifact-content-fetch <artifactId>
       Fetch captured bytes as contentBase64 with contentSha256 and contentSize.
       Reads stored custody only, never the origin path; uncaptured content is reported unavailable.
@@ -1007,6 +1028,9 @@ COMMANDS:
   role-bind --role <name> --session <key>
       Move one office to an active session. The gateway applies its existing
       role-binding authorization.
+
+  session-rename --session <key> --display-name <label>
+      Change a session's display name without changing its stable session key.
 
   session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]
       Run the persistent NDJSON stdin/stdout connection for one selected session.
@@ -1100,9 +1124,9 @@ COMMANDS:
   topline-concern-unlink-work <concernId> <workItemId> --reason <text> --key <idempotencyKey>
   topline-work-leave-unlinked <workItemId> --reason <text> --key <idempotencyKey>
   topline-placement-list [--state pending|resolved|all]
-  work-item-icebox <workItemId>
+  work-item-icebox <workItemId> --reason <text>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
-      assignments; work-item-reopen resumes it.
+      assignments; records the reason; work-item-reopen resumes it.
   work-item-reopen <workItemId>
   work-item-close <workItemId>
       Conclude an item (→ closed). Requires zero open assignments.
@@ -1126,9 +1150,6 @@ COMMANDS:
       Atomically open an assignment and wake its holder with the card id.
       For assign/dispatch without a work item, an external process supplies
       --owner <user> for notices. Session callers retain their own attribution.
-  effort-rule --request <decisionRequestId> --action continue|dismiss
-      Rule an effort-without-effect check-in whose complete id you hold. The
-      current expecter is the preferred responder, not an authorization gate.
   ask (--session <key> | --role <name> | --user <id>) --question <text> [--about <assignment>]
   answer --request <dr_id> --answer <text>
   return --request <dr_id> --reason <text>
@@ -1145,8 +1166,7 @@ COMMANDS:
   decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
       List decision requests visible to your principal.
   decision-request --request <decisionRequestId>
-      Read one effort request by complete id. Other request kinds keep their
-      existing visibility rules.
+      Read one decision request by complete id.
   assignment-stop-turn <assignmentId> --reason "<why>"
       Stop the current turn only when you opened that assignment.
   cancel-turn --session <key>
@@ -1182,6 +1202,8 @@ COMMANDS:
       and accepts the three release-fact flags only as one complete tuple.
   attests <assignmentId>
       List every attest filed against an assignment.
+  check-attest <attestId>
+      Check the files recorded on an attest's assignment and attached artifact.
   assignment-get <assignmentId> [--fact-id <id>]
       Read the assignment's current cannot-proceed release tuple and state. When
       --fact-id is supplied, also read that existing fact and report the stored
@@ -2632,10 +2654,14 @@ fn parse_with_optional_catalog(
             Ok(Command::ToolCallObserved)
         }
         "github-auth-check" => {
-            if parsed.positional.len() != 1 || !flags.is_empty() {
-                return Err("usage: tightbeam github-auth-check".to_owned());
+            if parsed.positional.len() != 1 || flags.keys().any(|flag| flag != "text-template") {
+                return Err(
+                    "usage: tightbeam github-auth-check [--text-template <text>]".to_owned(),
+                );
             }
-            Ok(Command::GithubAuthCheck)
+            Ok(Command::GithubAuthCheck {
+                text_template: nonempty(flags, "text-template"),
+            })
         }
         "artifacts" => {
             if parsed.positional.len() != 1
@@ -2674,6 +2700,7 @@ fn parse_with_optional_catalog(
                             | "by-when"
                             | "reply"
                             | "body"
+                            | "decision-request-id"
                             | "choices-json"
                             | "files-json"
                             | "vendor-session-id"
@@ -2681,7 +2708,17 @@ fn parse_with_optional_catalog(
                     )
                 })
             {
-                return Err("usage: tightbeam harklight-send --session new|<handle> --sender-id <id> --title <text> --type fyi|request [--kind blocker|success] [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>] [--reply] [--body <text>] [--choices-json <array>] [--files-json <array>] [--vendor-session-id <id>]".to_owned());
+                return Err("usage: tightbeam harklight-send --session new|<handle> --sender-id <id> --title <text> --type fyi|request [--kind blocker|success] [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>] [--reply] [--body <text>] [--choices-json <array>] [--files-json <array>] [--vendor-session-id <id>] [--decision-request-id <dr_id>]".to_owned());
+            }
+            let decision_request_id = nonempty(flags, "decision-request-id");
+            if parsed.duplicates.contains("decision-request-id")
+                || decision_request_id
+                    .as_deref()
+                    .is_some_and(|id| !complete_decision_request_id(id))
+            {
+                return Err(
+                    "--decision-request-id must be a complete decision request id".to_owned(),
+                );
             }
             let list = |name: &str| -> Result<Vec<String>, String> {
                 match flags.get(name) {
@@ -2714,6 +2751,7 @@ fn parse_with_optional_catalog(
                     .get("supersedes")
                     .cloned()
                     .unwrap_or_default(),
+                decision_request_id,
             })
         }
         "harklight-revise" | "harklight-retract" | "harklight-settle" => {
@@ -2778,6 +2816,19 @@ fn parse_with_optional_catalog(
             Ok(Command::HarklightCover {
                 identity: identity(flags)?,
                 session: nonempty(flags, "session").ok_or("--session is required")?,
+            })
+        }
+        "harklight-listener-restore" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "handle")
+                })
+            {
+                return Err("invalid Harklight command flags".to_owned());
+            }
+            Ok(Command::HarklightListenerRestore {
+                identity: identity(flags)?,
+                handle: nonempty(flags, "handle").ok_or("--handle is required")?,
             })
         }
         "harklight-follow" => {
@@ -2974,6 +3025,28 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
             })
         }
+        "session-rename" => {
+            let usage = "usage: tightbeam session-rename --session <key> --display-name <label>";
+
+            if parsed.positional.len() != 1
+                || flags
+                    .keys()
+                    .any(|flag| matches!(flag.as_str(), "role" | "user"))
+            {
+                return Err(usage.to_owned());
+            }
+
+            Ok(Command::SessionRename {
+                identity: identity(flags)?,
+                session_key: nonempty(flags, "session").ok_or("--session is required")?,
+                // Preserve an explicitly empty value so the owning system can
+                // return the same parameter-specific validation as other rename paths.
+                display_name: flags
+                    .get("display-name")
+                    .cloned()
+                    .ok_or("--display-name is required")?,
+            })
+        }
         "session-connect" => {
             let usage = "usage: tightbeam session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]";
             if parsed.positional.len() != 1
@@ -3101,25 +3174,6 @@ fn parse_with_optional_catalog(
                 parent_assignment: flags.get("parent-assignment").cloned(),
             })
         }
-        "effort-rule" => {
-            let request_id = nonempty(flags, "request");
-            let action = nonempty(flags, "action");
-            if parsed.positional.get(1).is_some() || request_id.is_none() || action.is_none() {
-                return Err(
-                    "usage: tightbeam effort-rule --request <id> --action continue|dismiss"
-                        .to_owned(),
-                );
-            }
-            let action = action.expect("checked above");
-            if action != "continue" && action != "dismiss" {
-                return Err("--action must be continue or dismiss".to_owned());
-            }
-            Ok(Command::EffortRule {
-                identity: identity(flags)?,
-                request_id: request_id.expect("checked above"),
-                action,
-            })
-        }
         "ask" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -3228,6 +3282,31 @@ fn parse_with_optional_catalog(
             Ok(Command::DecisionRequests {
                 identity: identity(flags)?,
                 status: nonempty(flags, "status"),
+            })
+        }
+        "harklight-briefings-catchup" => {
+            if parsed.positional.len() != 1
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "limit"))
+                || parsed.duplicates.contains("limit")
+            {
+                return Err(
+                    "usage: tightbeam harklight-briefings-catchup [--limit <count>]".to_owned(),
+                );
+            }
+
+            let limit = nonempty(flags, "limit")
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| "--limit must be a nonnegative integer".to_owned())
+                })
+                .transpose()?;
+
+            Ok(Command::HarklightBriefingsCatchup {
+                identity: identity(flags)?,
+                limit,
             })
         }
         "decision-request" => {
@@ -3750,11 +3829,17 @@ fn parse_with_optional_catalog(
         }
         "work-item-icebox" => {
             if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam work-item-icebox <workItemId>".to_owned());
+                return Err(
+                    "usage: tightbeam work-item-icebox <workItemId> --reason <text>".to_owned(),
+                );
             }
+            let reason = nonempty(flags, "reason")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "--reason is required and must be non-empty".to_owned())?;
             Ok(Command::WorkItemIcebox {
                 identity: identity(flags)?,
                 work_item_id: parsed.positional[1].clone(),
+                reason,
             })
         }
         "work-item-reopen" => {
@@ -3930,6 +4015,15 @@ fn parse_with_optional_catalog(
                 assignment_id: parsed.positional[1].clone(),
             })
         }
+        "check-attest" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam check-attest <attestId>".to_owned());
+            }
+            Ok(Command::CheckAttest {
+                identity: identity(flags)?,
+                attest_id: parsed.positional[1].clone(),
+            })
+        }
         "assignment-get" => {
             if parsed.positional.len() != 2 {
                 return Err(
@@ -4102,7 +4196,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -4916,7 +5010,47 @@ mod tests {
                 files: vec!["/tmp/request.txt".to_owned()],
                 vendor_session_id: None,
                 supersedes: vec![],
+                decision_request_id: None,
             })
+        );
+
+        assert!(matches!(
+            parse(strings(&[
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "sender",
+                "--title",
+                "Question",
+                "--type",
+                "request",
+                "--reply",
+                "--decision-request-id",
+                "dr_12345678-1234-4234-8234-123456789abc",
+            ])),
+            Ok(Command::HarklightSend {
+                decision_request_id: Some(id),
+                ..
+            }) if id == "dr_12345678-1234-4234-8234-123456789abc"
+        ));
+
+        assert!(
+            parse(strings(&[
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "sender",
+                "--title",
+                "Question",
+                "--type",
+                "request",
+                "--reply",
+                "--decision-request-id",
+                "not-an-id",
+            ]))
+            .is_err()
         );
 
         assert!(matches!(parse(strings(&[
@@ -4978,6 +5112,29 @@ mod tests {
             ])),
             Err("--type is required: use --type fyi for a Seen-only message or --type request for choices or a reply".to_owned())
         );
+    }
+
+    #[test]
+    fn harklight_briefings_catchup_defaults_to_staging_and_accepts_bounded_limit() {
+        assert_eq!(
+            parse(strings(&["harklight-briefings-catchup"])),
+            Ok(Command::HarklightBriefingsCatchup {
+                identity: Identity::Session,
+                limit: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&["harklight-briefings-catchup", "--limit", "3"])),
+            Ok(Command::HarklightBriefingsCatchup {
+                identity: Identity::Session,
+                limit: Some(3),
+            })
+        );
+
+        for value in ["-1", "one"] {
+            assert!(parse(strings(&["harklight-briefings-catchup", "--limit", value])).is_err());
+        }
     }
 
     #[test]
@@ -5101,6 +5258,7 @@ mod tests {
             ],
             &["harklight-retract", "--message", "message-example"],
             &["harklight-settle", "--message", "message-example"],
+            &["harklight-listener-restore", "--handle", "handle-example"],
             &["harklight-follow", "--message", "message-example"],
         ];
 
@@ -5120,6 +5278,7 @@ mod tests {
                     Command::HarklightRevise { identity, .. }
                     | Command::HarklightRetract { identity, .. }
                     | Command::HarklightSettle { identity, .. }
+                    | Command::HarklightListenerRestore { identity, .. }
                     | Command::HarklightFollow { identity, .. } => identity,
                     other => panic!("unexpected command: {other:?}"),
                 };
@@ -5488,6 +5647,29 @@ mod tests {
         ] {
             assert_eq!(parse(args), Ok(Command::Help));
         }
+    }
+
+    #[test]
+    fn github_auth_check_accepts_only_its_optional_statute_template() {
+        assert_eq!(
+            parse(strings(&["github-auth-check"])),
+            Ok(Command::GithubAuthCheck {
+                text_template: None
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "github-auth-check",
+                "--text-template",
+                "Tightbeam cannot use GitHub from {host}: {detail}",
+            ])),
+            Ok(Command::GithubAuthCheck {
+                text_template: Some("Tightbeam cannot use GitHub from {host}: {detail}".to_owned())
+            })
+        );
+
+        assert!(parse(strings(&["github-auth-check", "--other", "value"])).is_err());
     }
 
     #[test]
@@ -6651,6 +6833,7 @@ mod tests {
                 "artifacts",
                 "attest",
                 "attests",
+                "check-attest",
                 "add-user",
                 "breathing",
                 "cancel-wake",
@@ -6664,14 +6847,15 @@ mod tests {
                 "dispatch",
                 "doctor",
                 "session-diagnose",
-                "effort-rule",
                 "harness-process",
+                "harklight-briefings-catchup",
                 "harklight-send",
                 "harklight-revise",
                 "harklight-retract",
                 "harklight-settle",
                 "harklight-follow",
                 "harklight-cover",
+                "harklight-listener-restore",
                 "harklight-retry",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
@@ -6700,6 +6884,7 @@ mod tests {
                 "session-connect",
                 "session-reparent",
                 "session-custody-transfer",
+                "session-rename",
                 "skill",
                 "session-po-set",
                 "settle-turn",
@@ -7890,7 +8075,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-follow, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -8216,6 +8401,38 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn work_item_icebox_requires_a_non_blank_reason() {
+        for args in [
+            strings(&["work-item-icebox", "wi_1"]),
+            strings(&["work-item-icebox", "wi_1", "--reason", ""]),
+            strings(&["work-item-icebox", "wi_1", "--reason", " \t "]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("--reason is required and must be non-empty".to_owned())
+            );
+        }
+
+        assert!(matches!(
+            parse(strings(&[
+                "work-item-icebox",
+                "wi_1",
+                "--reason",
+                "waiting on a decision",
+                "--as-user",
+                "fixture-user",
+            ])),
+            Ok(Command::WorkItemIcebox {
+                identity: Identity::User(user_id),
+                work_item_id,
+                reason,
+            }) if user_id == "fixture-user"
+                && work_item_id == "wi_1"
+                && reason == "waiting on a decision"
+        ));
     }
 
     #[test]

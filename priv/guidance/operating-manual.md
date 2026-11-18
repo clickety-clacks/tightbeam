@@ -24,6 +24,45 @@ When a recipient is held by a harness incident, parked, its lane is down, or it 
 
 Advance actionable work immediately; before you end a turn with it unfinished, leave its next step on the record: `tightbeam wake --session <your-key> --assignment <id> --after-turn --prompt "<next action>"`. When the next step waits on another row, name the resolver (`--predicate`). Default dependency fallbacks to three hours (`--fallback-after 3h`, or `--after 3h` when no record or fact can notify you) to detect missing or overdue notification, not to make repeated early status checks. Scheduling is not progress; only a recorded effect is.
 
+### Orchestration patterns
+
+Optional examples; variables stand for existing session keys, a work item,
+scope and returned assignment IDs.
+
+One observer can serve many watchers:
+
+```sh
+tightbeam fact-producer-claim --producer observer --kind build.ready --live-for 1h
+tightbeam wake --session "$WATCHER" --when-fact build.ready --when-scope "$SCOPE" --fallback-after 3h --prompt "Read the build result"
+tightbeam condition --kind build.ready --scope "$SCOPE"
+```
+
+A claim advertises coverage; it does not start an observer. Each watcher can
+register the wake; the observer files the fact when it observes the result.
+A fallback asks for readback, not an assumed success.
+
+For parallel work, dispatch independent parts:
+
+```sh
+tightbeam dispatch --to "$WORKER" --work-item "$WI" --effect-kind code --subject "Part A" --brief "Implement the agreed part"
+tightbeam attests "$A"
+tightbeam attests "$B"
+```
+
+Repeat dispatch for part B. Completion notices can bring the opener back to
+join the recorded outcomes; closure alone is not success. For a staged join,
+start the next group after reading the results it needs.
+
+A coordinator can join later:
+
+```sh
+tightbeam work-item-handoff --work-item "$WI" --delivery-owner "$COORD" --brief "Coordinate remaining work from the recorded results"
+```
+
+This changes delivery ownership, not worker custody. If no event producer
+exists, a bounded external check can use
+`tightbeam wake --session "$SELF" --after 3h --prompt "Read external build status"`.
+
 ### Manage communications
 
 Manage communications as part of delivering the work. Use the available priority, cancellation and replacement controls to keep queued messages relevant and get time-sensitive requests to the people who need to act.

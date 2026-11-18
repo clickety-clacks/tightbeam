@@ -15,7 +15,24 @@ template = Path.join(arena, "template")
 File.mkdir_p!(template)
 File.write!(Path.join(template, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
 Tightbeam.RecoveryFixture.place_adapter!(template, seed_credential: false)
-:initialized = Tightbeam.Identity.init!(template)
+# Exercise startup migration from the neutral seed that predates scoped rails.
+# A current seed already has those rails and legitimately needs no new revision.
+legacy_seed = Path.join(arena, "legacy-seed")
+
+for relative <- ["archetypes/default.toml", "guidance/operating-model.md"] do
+  destination = Path.join(legacy_seed, relative)
+  File.mkdir_p!(Path.dirname(destination))
+  File.cp!(Path.join(:code.priv_dir(:tightbeam), "seed/#{relative}"), destination)
+end
+
+Application.put_env(:tightbeam, :identity_seed_dir, legacy_seed)
+
+try do
+  :initialized = Tightbeam.Identity.init!(template)
+after
+  Application.delete_env(:tightbeam, :identity_seed_dir)
+end
+
 identity_revision = Tightbeam.Identity.live_revision!(template)
 File.mkdir_p!(Path.join(template, "homes/testhost"))
 File.write!(Path.join(template, "homes/testhost/synthetic.txt"), "no credentials\n")
@@ -99,7 +116,18 @@ try do
   :ok = DB.assert_base_admitted!(DB, base)
   stamp = hd(Tightbeam.Schema.guard_compatible_stamps())
   {:ok, [[^stamp]]} = DB.query(DB, "SELECT shape FROM schema_stamp", [])
-  ^identity_revision = Tightbeam.Identity.live_revision!(base)
+  migrated_identity_revision = Tightbeam.Identity.live_revision!(base)
+  true = is_binary(migrated_identity_revision)
+  false = migrated_identity_revision == identity_revision
+
+  seed_rails = Path.join(:code.priv_dir(:tightbeam), "seed/rails")
+
+  for filename <- ["github-auth.toml", "tightbeam-probe.toml"] do
+    expected = Toml.decode!(File.read!(Path.join(seed_rails, filename)))
+    actual = Toml.decode!(File.read!(Path.join([base, "identity", "rails", filename])))
+    ^expected = actual
+  end
+
   true = File.regular?(Path.join(base, "build-owner.json"))
   true = File.regular?(Path.join(base, "gateway.json"))
   {:ok, [[0]]} = DB.query(DB, "SELECT COUNT(*) FROM users", [])

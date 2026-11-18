@@ -1,0 +1,19 @@
+{
+  "provenance": {
+    "captureArtifactId": "art_c67b8748",
+    "captureArtifactSha256": "bceb0218b28055164dfc34ba04e92c202a861c3f9dc05c36f64237631fdcbaca",
+    "specimen": "C2",
+    "sourceRecordId": "hho_4d9d4b68-0388-4705-8142-9356ac553dd4",
+    "observedAt": "2026-11-06T16:52:57Z",
+    "harness": "claude",
+    "failureClass": "rate-limit-dead",
+    "boundary": "captured terminal-failure observation reason projection"
+  },
+  "reason": {
+    "code": -32603,
+    "data": {
+      "errorKind": "rate_limit"
+    },
+    "message": "Internal error: You've hit your weekly limit · resets Nov 10, 6am (UTC)"
+  }
+}
