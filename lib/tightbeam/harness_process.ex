@@ -1247,7 +1247,10 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp await_command(port, output, deadline) do
-    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+    remaining_ms =
+      if deadline == :infinity,
+        do: :infinity,
+        else: max(deadline - System.monotonic_time(:millisecond), 0)
 
     if remaining_ms == 0 do
       terminate_command_port(port)
@@ -1784,6 +1787,9 @@ defmodule Tightbeam.HarnessProcess do
   defp identity_wait_ms,
     do: Application.get_env(:tightbeam, :harness_process_identity_wait_ms, @command_timeout_ms)
 
+  # The private command-timeout override can disable independent helper expiry
+  # in cancellation tests. Production retains the finite default.
+  defp deadline(:infinity), do: :infinity
   defp deadline(timeout_ms), do: System.monotonic_time(:millisecond) + timeout_ms
   defp identity_authority_path(path), do: path <> ".authority"
   defp now, do: System.system_time(:millisecond)

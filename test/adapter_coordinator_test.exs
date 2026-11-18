@@ -2008,11 +2008,34 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     helper = Path.expand("../cli/target/release/tightbeam", __DIR__)
     slow_helper = Path.join(ctx.test_dir, "slow_harness_helper")
+    hung_command = Path.join(ctx.test_dir, "hung_command.js")
+    helper_ready = Path.join(ctx.test_dir, "helper_ready")
+    File.mkdir_p!(helper_ready)
+
+    File.write!(hung_command, """
+    process.stdin.resume();
+    require("node:fs").writeFileSync(process.argv[2] + "/" + process.pid, "ready");
+    """)
+
+    # Only coordinator cancellation may release a hung command. A finite helper
+    # deadline could otherwise finish tasks while we install monitors/tracing.
+    timeout_override = Application.fetch_env(:tightbeam, :harness_process_command_timeout_ms)
+    Application.put_env(:tightbeam, :harness_process_command_timeout_ms, :infinity)
+
+    on_exit(fn ->
+      case timeout_override do
+        {:ok, value} ->
+          Application.put_env(:tightbeam, :harness_process_command_timeout_ms, value)
+
+        :error ->
+          Application.delete_env(:tightbeam, :harness_process_command_timeout_ms)
+      end
+    end)
 
     File.write!(
       slow_helper,
       "#!/bin/sh\n" <>
-        "if [ \"$1\" = \"harness-group\" ]; then exec node -e 'process.stdin.resume()'; fi\n" <>
+        "if [ \"$1\" = \"harness-group\" ]; then exec node #{hung_command} #{helper_ready}; fi\n" <>
         "exec #{helper} \"$@\"\n"
     )
 
@@ -2035,12 +2058,16 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         # All tasks exist before the first yield. Let the test monitor them
         # before expiring parking; cancellation must complete normally, rather
         # than merely getting the same ledger result through brutal kills.
-        {:monitors, monitors} = Process.info(self(), :monitors)
-        send(owner, {:park_tasks_started, self(), monitors})
+        unless Process.get(:cancel_grace_parking_expired, false) do
+          {:monitors, monitors} = Process.info(self(), :monitors)
+          send(owner, {:park_tasks_started, self(), monitors})
 
-        receive do
-          :expire_parking -> Process.get(:cancel_grace_clock_start) + 15_000
+          receive do
+            :expire_parking -> Process.put(:cancel_grace_parking_expired, true)
+          end
         end
+
+        Process.get(:cancel_grace_clock_start) + 15_000
 
       phase when phase in [:cancel, :cancel_wait, :retire] ->
         Process.get(:cancel_grace_clock_start) + 15_000
@@ -2110,6 +2137,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
         park_tasks = for {:process, pid} <- monitors, pid not in adapters, do: pid
         assert length(park_tasks) == length(keys)
+        # Each marker is written after that helper has armed its stdin wait.
+        # With command expiry disabled no task can finish during this barrier.
+        assert eventually(fn -> length(File.ls!(helper_ready)) == length(keys) end, 3_000)
         refs = Enum.map(park_tasks, &Process.monitor/1)
         for pid <- park_tasks, do: :erlang.trace(pid, true, [:receive, {:tracer, self()}])
         send(coordinator, :expire_parking)
