@@ -85,6 +85,7 @@ defmodule Tightbeam.LegacyCredentialMigrationTest do
       stage_adapter!(remote_base, fixture.harness)
 
       assert :ok = ensure_ready(ctx, fixture.harness, "worker", &run_local_ssh/1)
+      assert_claude_adapter_patched(remote_base, fixture.harness)
       assert {:ok, %{type: :regular}} = File.lstat(paths.entry)
       assert File.read!(paths.entry) == fixture.bytes
       assert File.read!(paths.source) == fixture.bytes
@@ -122,6 +123,7 @@ defmodule Tightbeam.LegacyCredentialMigrationTest do
 
       assert {:error, :enoent} = File.lstat(remote_paths.entry)
       assert :ok = ensure_ready(ctx, fixture.harness, "worker", &run_local_ssh/1)
+      assert_claude_adapter_patched(remote_base, fixture.harness)
       assert {:ok, %{type: :regular, mode: remote_mode}} = File.lstat(remote_paths.entry)
       assert Bitwise.band(remote_mode, 0o777) == 0o600
       assert File.read!(remote_paths.entry) == fixture.bytes
@@ -477,7 +479,82 @@ defmodule Tightbeam.LegacyCredentialMigrationTest do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "#!/bin/sh\nexit 0\n")
     File.chmod!(path, 0o755)
+
+    if harness == :claude do
+      package =
+        Path.join([
+          base_dir,
+          "adapters",
+          "node_modules",
+          "@agentclientprotocol",
+          "claude-agent-acp"
+        ])
+
+      bundle = Path.join([package, "dist", "acp-agent.js"])
+      File.mkdir_p!(Path.dirname(bundle))
+      File.write!(Path.join(package, "package.json"), JSON.encode!(%{"version" => "0.81.0"}))
+      File.write!(bundle, Tightbeam.Harness.ClaudeFoldedPrompt.fixture())
+    end
+
+    if harness == :codex do
+      package =
+        Path.join([
+          base_dir,
+          "adapters",
+          "node_modules",
+          "@agentclientprotocol",
+          "codex-acp"
+        ])
+
+      bundle = Path.join([package, "dist", "index.js"])
+      File.mkdir_p!(Path.dirname(bundle))
+
+      File.write!(
+        Path.join(package, "package.json"),
+        JSON.encode!(%{"version" => Tightbeam.Harness.Codex.adapter_version()})
+      )
+
+      File.write!(bundle, codex_adapter_fixture_source())
+    end
   end
+
+  defp codex_adapter_fixture_source do
+    "  async resumeSession(request) {\n" <>
+      "    await this.codexClient.threadResume({\n" <>
+      "      excludeTurns: true,\n" <>
+      "      modelProvider: await this.getResumeModelProvider(),\n" <>
+      "      threadId: request.sessionId\n" <>
+      "    });\n" <>
+      "  }\n" <>
+      "  async loadSession(request) {\n" <>
+      "    await this.codexClient.threadResume({\n" <>
+      "      excludeTurns: true,\n" <>
+      "      modelProvider: await this.getResumeModelProvider(),\n" <>
+      "      threadId: request.sessionId\n" <>
+      "    });\n" <>
+      "  }\n"
+  end
+
+  defp assert_claude_adapter_patched(base_dir, :claude) do
+    bundle =
+      Path.join([
+        base_dir,
+        "adapters",
+        "node_modules",
+        "@agentclientprotocol",
+        "claude-agent-acp",
+        "dist",
+        "acp-agent.js"
+      ])
+
+    expected =
+      Tightbeam.Harness.ClaudeFoldedPrompt.fixture()
+      |> Tightbeam.Harness.ClaudeFoldedPrompt.patch()
+
+    assert File.read!(bundle) == expected
+  end
+
+  defp assert_claude_adapter_patched(_base_dir, :codex), do: :ok
 
   defp ensure_ready(ctx, harness, host, sh \\ nil) do
     opts = [db: ctx.db, patch_adapter: fn _harness, _path -> :ok end]

@@ -51,6 +51,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
         }
 
   @ids ~w(J0 J1 J2 J3 J4 J5 J6 J7 J8)
+  @terminal_turn_statuses ~w(delivered canceled failed failed_unknown)
 
   @no_gateway "this journey restarts the gateway, so it needs the runner's leg " <>
                 "gateway handle (`:gateway` in the journey context); the in-process " <>
@@ -134,9 +135,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "queueing",
       action: ~s(post "say ONE", "say TWO", "say THREE" back-to-back without waiting),
       client:
-        "three echoes before any assistant reply; three assistant bubbles whose replyToClientMessageId order matches the post order",
+        "three identified echoes arrive in post order before any assistant reply; ONE has its own correlated assistant reply. A later post accepted while an earlier direct turn or carrier is pending has no own turn or post-specific reply and is delivered through ordered batch membership; later posts may use separate carriers when readiness changes, or a direct turn once no earlier path is pending. If ONE ended before TWO was accepted and TWO has no staged membership, report INCOMPLETE because this setup did not exercise the batch path",
       substrate:
-        "never more than one `running` turn for the session (sampled DURING the run); all three turn rows `delivered`"
+        "one identified user history row per post in source order, each retaining deviceId and clientMessageId; ONE has a delivered direct turn; each post staged while earlier work is pending has exactly one included membership and a delivered batch-carrier turn, with no own turn; never more than one `running` turn for the session (sampled DURING the run). Back-to-back posts do not guarantee ONE reached running; queued is busy"
     },
     %{
       journey: "J5",
@@ -213,9 +214,10 @@ defmodule Tightbeam.ClientE2E.Journeys do
       label: "restart queue survival",
       action:
         "queue a second post behind a running one, restart before the first completes, re-send NOTHING",
-      client: "the client reconnects and needs no re-send for the queued work to finish",
+      client:
+        "the client reconnects with the second post's same identified history row replayed; no re-send is needed, and the staged post has no own turn or post-specific reply while its ready-time carrier is delivered after restart",
       substrate:
-        "the queued turn row survives the restart and reaches `delivered`; the interrupted first turn reaches a terminal status"
+        "the second post's identified user history row and exactly one included batch membership survive; the linked carrier turn is created and delivered after the restarted gateway is up, and the first turn reaches a terminal status"
     },
     %{
       journey: "J8",
@@ -547,79 +549,130 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
     ctx = %{ctx | client: client}
 
-    {ctx, samples} =
+    {{observations, timed_out?}, samples} =
       Substrate.sample_while(ctx.base_dir, 200, fn ->
-        Enum.reduce(ids, ctx, fn id, ctx ->
-          {_frame, client} =
-            await_frame(
-              ctx.client,
-              watermark,
-              &(&1["type"] == "message" and &1["role"] == "assistant" and
-                  &1["replyToClientMessageId"] == id),
-              ctx.turn_wait_ms
-            )
-
-          %{ctx | client: client}
-        end)
+        await_post_paths(ctx.base_dir, ctx.main_key, ids, ctx.turn_wait_ms)
       end)
 
-    # The batch's LAST clear arrives after its last reply, so judging the
-    # indicator the instant the third reply lands reads the third turn's
-    # `typing=true` as the final state. Drain until the SEQUENCE settles —
-    # awaiting "a typing=false" from the batch watermark would match turn one's
-    # clear and prove nothing, which is the same stale-match trap the oracle
-    # itself was fixed for.
+    # Batch carrier replies are not correlated to any one source post. Read
+    # through the settled indicator sequence after every persisted delivery
+    # path is terminal, rather than waiting for one reply per source id.
     client = drain_until_settled(ctx.client, watermark, ctx.main_key, 30_000)
     client = SimClient.settle(client, ctx.settle_ms)
     ctx = %{ctx | client: client}
     frames = SimClient.frames_since(ctx.client, watermark)
 
-    # SMOKE step 9's last clause — "the indicator stays sane throughout (on
-    # while running, cleared at the end)" — was unasserted. Three queued turns
-    # that leave the indicator spinning is precisely the shape of the bug this
-    # journey is for.
-    last_reply_at =
+    last_assistant_at =
       frames
       |> Enum.with_index()
       |> Enum.reduce(nil, fn {f, i}, acc ->
-        if f["type"] == "message" and f["role"] == "assistant" and
-             f["replyToClientMessageId"] in ids,
-           do: i,
-           else: acc
+        if f["type"] == "message" and f["role"] == "assistant",
+          do: i,
+          else: acc
       end)
 
     indicator_error =
       cond do
-        is_nil(last_reply_at) -> nil
+        is_nil(last_assistant_at) -> nil
         is_nil(indicator_on_at(frames, ctx.main_key, 0)) -> "the typing indicator never turned on"
-        true -> indicator_settled_error(frames, ctx.main_key, last_reply_at)
+        true -> indicator_settled_error(frames, ctx.main_key, last_assistant_at)
       end
 
     echoes =
-      for f <- frames, f["type"] == "message", f["role"] == "user", do: f["clientMessageId"]
+      for f <- frames,
+          f["type"] == "message",
+          f["role"] == "user",
+          f["clientMessageId"] in ids,
+          do: f["clientMessageId"]
 
     replies =
       for f <- frames,
           f["type"] == "message",
           f["role"] == "assistant",
+          f["replyToClientMessageId"] in ids,
           do: f["replyToClientMessageId"]
+
+    direct_ids = Enum.filter(ids, &(observations[&1].direct_turn != nil))
+    staged_ids = Enum.filter(ids, &(observations[&1].staged_members != []))
+    history_error = j4_history_error(ids, observations, ctx.client.device_id)
+    path_error = j4_path_error(ids, observations)
+    busy_error = j4_busy_path_error(ids, observations)
+    batch_order_error = j4_batch_order_error(ids, observations)
+    reply_error = j4_reply_error(ids, direct_ids, staged_ids, replies)
+    setup_incomplete? = j4_too_fast_two?(ids, observations)
 
     first_reply_index =
       Enum.find_index(frames, &(&1["type"] == "message" and &1["role"] == "assistant"))
 
     echo_indexes =
-      for {f, i} <- Enum.with_index(frames), f["type"] == "message", f["role"] == "user", do: i
+      for {f, i} <- Enum.with_index(frames),
+          f["type"] == "message",
+          f["role"] == "user",
+          f["clientMessageId"] in ids,
+          do: i
 
-    turns = Enum.map(ids, &Substrate.turn_for_client_message(ctx.base_dir, &1))
     peak = Substrate.busiest_lane(samples, ctx.main_key)
 
     row =
       cond do
-        Enum.take(echoes, 3) != ids ->
+        timed_out? ->
+          Scorecard.fail(
+            "9",
+            "queueing",
+            "one or more direct or staged delivery paths did not reach a terminal state: " <>
+              inspect(Enum.map(ids, &{&1, observations[&1]})),
+            journey: "J4"
+          )
+
+        echoes != ids ->
           Scorecard.fail(
             "9",
             "queueing",
             "echoes were #{inspect(echoes)}, expected #{inspect(ids)}",
+            journey: "J4"
+          )
+
+        history_error ->
+          Scorecard.fail(
+            "9",
+            "queueing",
+            history_error,
+            journey: "J4"
+          )
+
+        path_error ->
+          Scorecard.fail(
+            "9",
+            "queueing",
+            path_error,
+            journey: "J4"
+          )
+
+        busy_error ->
+          Scorecard.fail("9", "queueing", busy_error, journey: "J4")
+
+        batch_order_error ->
+          Scorecard.fail("9", "queueing", batch_order_error, journey: "J4")
+
+        reply_error ->
+          Scorecard.fail("9", "queueing", reply_error, journey: "J4")
+
+        peak > 1 ->
+          Scorecard.fail("9", "queueing", "#{peak} turns were running at once in one lane",
+            journey: "J4"
+          )
+
+        indicator_error ->
+          Scorecard.fail("9", "queueing", "across the queued batch, #{indicator_error}",
+            journey: "J4"
+          )
+
+        setup_incomplete? ->
+          Scorecard.incomplete(
+            "9",
+            "queueing",
+            "ONE reached a terminal state before TWO was accepted and TWO has no persisted " <>
+              "batch membership; the back-to-back setup did not exercise batching",
             journey: "J4"
           )
 
@@ -631,37 +684,258 @@ defmodule Tightbeam.ClientE2E.Journeys do
             journey: "J4"
           )
 
-        Enum.filter(replies, &(&1 in ids)) != ids ->
-          Scorecard.fail(
-            "9",
-            "queueing",
-            "assistant replies arrived out of order: #{inspect(replies)}",
-            journey: "J4"
-          )
-
-        peak > 1 ->
-          Scorecard.fail("9", "queueing", "#{peak} turns were running at once in one lane",
-            journey: "J4"
-          )
-
-        Enum.any?(turns, &(is_nil(&1) or &1["status"] != "delivered")) ->
-          Scorecard.fail(
-            "9",
-            "queueing",
-            "turn rows: #{inspect(Enum.map(turns, &(&1 && &1["status"])))}",
-            journey: "J4"
-          )
-
-        indicator_error ->
-          Scorecard.fail("9", "queueing", "across the queued batch, #{indicator_error}",
-            journey: "J4"
-          )
-
         true ->
           Scorecard.pass("9", "queueing", journey: "J4")
       end
 
     {ctx, [row]}
+  end
+
+  defp j4_history_error(ids, observations, device_id) do
+    rows = Enum.flat_map(ids, &observations[&1].history_rows)
+    ordered_ids = Enum.map(rows, & &1["clientMessageId"])
+    history_sequences = Enum.map(rows, & &1["seq"])
+
+    cond do
+      ordered_ids != ids ->
+        "identified user history rows were #{inspect(ordered_ids)}, expected #{inspect(ids)}"
+
+      Enum.any?(history_sequences, &(not is_integer(&1))) or
+          history_sequences != Enum.sort(history_sequences) ->
+        "user history rows were not persisted in post order: #{inspect(history_sequences)}"
+
+      Enum.any?(rows, &(&1["deviceId"] != device_id)) ->
+        "a user history row did not retain the posting device identity"
+
+      true ->
+        nil
+    end
+  end
+
+  defp j4_path_error(ids, observations) do
+    Enum.find_value(ids, fn id ->
+      %{direct_turn: direct, staged_members: members} = observations[id]
+
+      cond do
+        length(observations[id].history_rows) != 1 ->
+          "#{id} has #{length(observations[id].history_rows)} user history rows, expected one"
+
+        length(members) > 1 ->
+          "#{id} has more than one persisted batch membership"
+
+        direct && members != [] ->
+          "#{id} has both a direct turn and staged batch membership"
+
+        id == hd(ids) and (is_nil(direct) or members != []) ->
+          "ONE did not use its own direct turn"
+
+        is_map(direct) and direct["status"] != "delivered" ->
+          "#{id} direct turn ended as #{direct["status"]}, not delivered"
+
+        direct ->
+          nil
+
+        members == [] ->
+          "#{id} has neither a direct turn nor persisted batch membership"
+
+        true ->
+          [member] = members
+
+          cond do
+            member["deviceId"] !=
+                observations[id].history_rows |> List.first() |> Map.get("deviceId") ->
+              "#{id} staged identity did not match its user history row"
+
+            member["clientMessageId"] != id or member["historyClientMessageId"] != id ->
+              "#{id} batch membership did not retain its clientMessageId"
+
+            member["memberState"] != "included" or member["batchState"] != "delivered" ->
+              "#{id} batch membership/batch ended as #{inspect({member["memberState"], member["batchState"]})}"
+
+            member["carrierTurnSeq"] == nil or member["carrierStatus"] != "delivered" or
+                member["carrierIsBatchCarrier"] != 1 ->
+              "#{id} has no delivered batch-carrier turn"
+
+            is_nil(member["historySeq"]) ->
+              "#{id} staged user history row was not materialized"
+
+            true ->
+              nil
+          end
+      end
+    end)
+  end
+
+  defp j4_busy_path_error(ids, observations) do
+    ids
+    |> Enum.with_index()
+    |> Enum.drop(1)
+    |> Enum.find_value(fn {id, index} ->
+      accepted_at =
+        observations[id].history_rows |> List.first() |> then(&(&1 && &1["timestamp"]))
+
+      earlier_busy? =
+        if is_integer(accepted_at) do
+          Enum.take(ids, index)
+          |> Enum.any?(fn earlier_id ->
+            path_end = post_path_end_at(observations[earlier_id])
+            is_nil(path_end) or path_end > accepted_at
+          end)
+        else
+          false
+        end
+
+      if earlier_busy? and observations[id].staged_members == [] do
+        "#{id} was accepted while an earlier turn/carrier was pending but got its own turn " <>
+          "instead of joining a ready-time batch"
+      end
+    end)
+  end
+
+  defp j4_batch_order_error(ids, observations) do
+    members = Enum.flat_map(ids, &observations[&1].staged_members)
+    publication_sequences = Enum.map(members, & &1["publicationSeq"])
+    carrier_sequences = Enum.map(members, & &1["carrierTurnSeq"])
+    [one_id | later_ids] = ids
+    one_ended_at = post_path_end_at(observations[one_id])
+
+    same_ready_batch? =
+      if is_integer(one_ended_at) do
+        staged_while_one_busy =
+          Enum.filter(later_ids, fn id ->
+            accepted_at =
+              observations[id].history_rows
+              |> List.first()
+              |> then(&(&1 && &1["timestamp"]))
+
+            is_integer(accepted_at) and accepted_at < one_ended_at and
+              observations[id].staged_members != []
+          end)
+
+        staged_batch_ids =
+          Enum.flat_map(staged_while_one_busy, fn id ->
+            Enum.map(observations[id].staged_members, & &1["batchId"])
+          end)
+
+        length(staged_while_one_busy) < 2 or length(Enum.uniq(staged_batch_ids)) == 1
+      else
+        true
+      end
+
+    cond do
+      Enum.any?(publication_sequences, &(not is_integer(&1))) ->
+        "a staged post has no persisted publication sequence"
+
+      publication_sequences != Enum.sort(publication_sequences) ->
+        "batch membership order differs from post order: #{inspect(publication_sequences)}"
+
+      Enum.any?(carrier_sequences, &(not is_integer(&1))) ->
+        "a staged post has no linked carrier turn sequence"
+
+      carrier_sequences != Enum.sort(carrier_sequences) ->
+        "ready-time carrier turns do not preserve staged post order: #{inspect(carrier_sequences)}"
+
+      not same_ready_batch? ->
+        "posts staged before ONE finished were split across ready-time batches"
+
+      true ->
+        nil
+    end
+  end
+
+  defp j4_reply_error(ids, direct_ids, staged_ids, replies) do
+    counts = Enum.frequencies(replies)
+
+    cond do
+      Enum.any?(staged_ids, &(Map.get(counts, &1, 0) != 0)) ->
+        "a batch-staged post received a post-specific assistant reply: #{inspect(replies)}"
+
+      Enum.any?(direct_ids, &(Map.get(counts, &1, 0) != 1)) ->
+        "direct turns and source-correlated replies differ: turns=#{inspect(direct_ids)} replies=#{inspect(replies)}"
+
+      Enum.filter(ids, &(Map.get(counts, &1, 0) == 1)) != direct_ids ->
+        "direct assistant replies arrived out of post order: #{inspect(replies)}"
+
+      true ->
+        nil
+    end
+  end
+
+  defp j4_too_fast_two?([one_id, two_id | _], observations) do
+    one_ended_at = post_path_end_at(observations[one_id])
+    two = observations[two_id]
+    two_accepted_at = two.history_rows |> List.first() |> then(&(&1 && &1["timestamp"]))
+
+    is_integer(one_ended_at) and is_integer(two_accepted_at) and
+      one_ended_at <= two_accepted_at and two.staged_members == []
+  end
+
+  defp post_path_end_at(%{direct_turn: direct}) when is_map(direct), do: direct["endedAt"]
+
+  defp post_path_end_at(%{staged_members: [member]}), do: member["carrierEndedAt"]
+  defp post_path_end_at(_), do: nil
+
+  defp await_post_paths(base_dir, session_key, ids, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    poll_post_paths(base_dir, session_key, ids, deadline)
+  end
+
+  defp poll_post_paths(base_dir, session_key, ids, deadline) do
+    observations = Map.new(ids, &{&1, post_observation(base_dir, session_key, &1)})
+
+    cond do
+      Enum.all?(ids, &post_path_settled?(observations[&1])) ->
+        {observations, false}
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {observations, true}
+
+      true ->
+        Process.sleep(200)
+        poll_post_paths(base_dir, session_key, ids, deadline)
+    end
+  end
+
+  defp post_observation(base_dir, session_key, client_message_id) do
+    %{
+      history_rows: Substrate.human_post_rows(base_dir, session_key, client_message_id),
+      direct_turn: Substrate.turn_for_client_message(base_dir, client_message_id),
+      staged_members: Substrate.staged_post_members(base_dir, session_key, client_message_id)
+    }
+  end
+
+  defp post_path_settled?(%{direct_turn: %{"status" => status}}),
+    do: status in @terminal_turn_statuses
+
+  defp post_path_settled?(%{staged_members: members}) when members != [] do
+    Enum.any?(members, fn member ->
+      member["memberState"] == "canceled" or
+        member["batchState"] in ~w(delivery_failed canceled delivered)
+    end)
+  end
+
+  defp post_path_settled?(_), do: false
+
+  defp await_post_admission(base_dir, session_key, client_message_id, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    poll_post_admission(base_dir, session_key, client_message_id, deadline)
+  end
+
+  defp poll_post_admission(base_dir, session_key, client_message_id, deadline) do
+    observation = post_observation(base_dir, session_key, client_message_id)
+
+    cond do
+      observation.history_rows != [] and
+          (observation.direct_turn != nil or observation.staged_members != []) ->
+        {:ok, observation}
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {:error, observation}
+
+      true ->
+        Process.sleep(200)
+        poll_post_admission(base_dir, session_key, client_message_id, deadline)
+    end
   end
 
   # --- J5: concurrency ---------------------------------------------------------
@@ -1593,116 +1867,283 @@ defmodule Tightbeam.ClientE2E.Journeys do
     {ctx, row}
   end
 
-  # Step 15: queued (not-yet-running) turns survive a restart and run to
-  # delivered without being re-sent.
+  # Step 15: a staged human post survives restart and is included in the next
+  # ready-time carrier without being re-sent.
   defp j7_queue_survival(ctx) do
     {:ok, client, first} =
       SimClient.post(ctx.client, ctx.main_key, "Count to 200 slowly, one line per number.")
 
-    {:ok, client, second} = SimClient.post(client, ctx.main_key, "say exactly: SURVIVED")
-    ctx = %{ctx | client: client}
+    first_running = await_turn_running(ctx.base_dir, first, 60_000)
 
-    # Wait until the substrate has actually parked the second turn in `queued`
-    # behind the running first — killing before that proves nothing about queue
-    # durability.
-    queued? = await_queued(ctx.base_dir, second, 60_000)
+    if is_nil(first_running) or first_running["status"] != "running" do
+      {ctx,
+       Scorecard.incomplete(
+         "15",
+         "restart queue survival",
+         "ONE did not reach `running` before the second post, so this setup cannot prove " <>
+           "that a staged post survived behind active work",
+         journey: "J7"
+       )}
+    else
+      {:ok, client, second} = SimClient.post(client, ctx.main_key, "say exactly: SURVIVED")
+      ctx = %{ctx | client: client}
 
-    case LegGateway.restart(ctx.gateway) do
-      {:error, reason} ->
-        {ctx,
-         Scorecard.fail("15", "restart queue survival", "restart failed: #{inspect(reason)}",
-           journey: "J7"
-         )}
+      case await_post_admission(ctx.base_dir, ctx.main_key, second, 60_000) do
+        {:error, observation} ->
+          {ctx,
+           Scorecard.fail(
+             "15",
+             "restart queue survival",
+             "the second post had no persisted history row or direct/staged delivery path: " <>
+               inspect(observation),
+             journey: "J7"
+           )}
 
-      {:ok, gateway} ->
-        ctx = %{ctx | gateway: gateway}
-
-        case reconnect(ctx) do
-          {:error, reason} ->
-            {ctx,
-             Scorecard.fail(
-               "15",
-               "restart queue survival",
-               "client could not reconnect: #{inspect(reason)}",
-               journey: "J7"
-             )}
-
-          {:ok, ctx} ->
-            # NOTHING is re-sent here. That is the assertion.
-            second_turn =
-              case Substrate.await_turn_terminal(ctx.base_dir, second, ctx.turn_wait_ms) do
-                {:ok, row} -> row
-                {:error, :timeout, row} -> row
-              end
-
-            first_turn = Substrate.turn_for_client_message(ctx.base_dir, first)
-
-            row =
-              cond do
-                not queued? ->
-                  Scorecard.incomplete(
-                    "15",
-                    "restart queue survival",
-                    "the second turn never reached `queued` before the restart, so queue " <>
-                      "durability had nothing to survive",
-                    journey: "J7"
-                  )
-
-                is_nil(second_turn) ->
-                  Scorecard.fail(
-                    "15",
-                    "restart queue survival",
-                    "the queued turn's row vanished across the restart",
-                    journey: "J7"
-                  )
-
-                second_turn["status"] != "delivered" ->
-                  Scorecard.fail(
-                    "15",
-                    "restart queue survival",
-                    "the queued turn is #{second_turn["status"]} after the restart, not delivered",
-                    journey: "J7"
-                  )
-
-                is_nil(first_turn) or
-                    first_turn["status"] not in ~w(delivered failed failed_unknown) ->
-                  Scorecard.fail(
-                    "15",
-                    "restart queue survival",
-                    "the interrupted first turn is #{inspect(first_turn && first_turn["status"])} — not terminal",
-                    journey: "J7"
-                  )
-
-                true ->
-                  Scorecard.pass("15", "restart queue survival", journey: "J7")
-              end
-
-            {ctx, row}
-        end
+        {:ok, admission} ->
+          j7_restart_staged_post(ctx, first, second, admission)
+      end
     end
   end
 
-  defp await_queued(base_dir, client_message_id, timeout_ms) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-    poll_queued(base_dir, client_message_id, deadline)
+  defp j7_restart_staged_post(ctx, first, second, admission) do
+    second_history = List.first(admission.history_rows)
+    first_before_restart = Substrate.turn_for_client_message(ctx.base_dir, first)
+
+    first_busy_at_acceptance? =
+      is_map(first_before_restart) and
+        (is_nil(first_before_restart["endedAt"]) or
+           first_before_restart["endedAt"] > second_history["timestamp"])
+
+    staged_member = List.first(admission.staged_members)
+
+    stage_pending? =
+      length(admission.staged_members) == 1 and is_nil(admission.direct_turn) and
+        staged_member["memberState"] in ["active", "included"] and
+        staged_member["batchState"] in ["open", "sealed", "delivery_pending"]
+
+    cond do
+      not first_busy_at_acceptance? ->
+        {ctx,
+         Scorecard.incomplete(
+           "15",
+           "restart queue survival",
+           "ONE reached a terminal state before TWO was accepted, so the required " <>
+             "running-behind setup did not occur",
+           journey: "J7"
+         )}
+
+      admission.direct_turn != nil ->
+        {ctx,
+         Scorecard.fail(
+           "15",
+           "restart queue survival",
+           "TWO received its own turn while ONE was still active instead of a staged " <>
+             "batch membership",
+           journey: "J7"
+         )}
+
+      not stage_pending? ->
+        {ctx,
+         Scorecard.fail(
+           "15",
+           "restart queue survival",
+           "TWO did not have exactly one pending persisted batch membership before restart: " <>
+             inspect(admission.staged_members),
+           journey: "J7"
+         )}
+
+      true ->
+        j7_restart_and_verify_staged_post(ctx, first, second, second_history, staged_member)
+    end
   end
 
-  # `queued` ONLY. Accepting `running` would let a second turn that already
-  # started stand in for one waiting behind the first, which is the very thing
-  # step 15 exists to prove survives a restart.
-  defp poll_queued(base_dir, client_message_id, deadline) do
+  defp j7_restart_and_verify_staged_post(ctx, first, second, original_history, original_member) do
+    first_before_signal = Substrate.turn_for_client_message(ctx.base_dir, first)
+
+    if is_nil(first_before_signal) or
+         first_before_signal["status"] not in ["queued", "running"] or
+         not is_nil(first_before_signal["endedAt"]) do
+      {ctx,
+       Scorecard.incomplete(
+         "15",
+         "restart queue survival",
+         "ONE completed before restart began, so the action did not restart with work still active",
+         journey: "J7"
+       )}
+    else
+      # Recovery may create the carrier before the restarted HTTP listener answers.
+      restart_started_at = System.system_time(:millisecond)
+
+      case LegGateway.restart(ctx.gateway) do
+        {:error, reason} ->
+          {ctx,
+           Scorecard.fail("15", "restart queue survival", "restart failed: #{inspect(reason)}",
+             journey: "J7"
+           )}
+
+        {:ok, gateway} ->
+          ctx = %{ctx | gateway: gateway}
+
+          case reconnect(ctx) do
+            {:error, reason} ->
+              {ctx,
+               Scorecard.fail(
+                 "15",
+                 "restart queue survival",
+                 "client could not reconnect: #{inspect(reason)}",
+                 journey: "J7"
+               )}
+
+            {:ok, ctx} ->
+              {observations, timed_out?} =
+                await_post_paths(ctx.base_dir, ctx.main_key, [second], ctx.turn_wait_ms)
+
+              client = SimClient.settle(ctx.client, ctx.settle_ms)
+              ctx = %{ctx | client: client}
+              observation = observations[second]
+              history = List.first(observation.history_rows)
+              member = List.first(observation.staged_members)
+              first_after_restart = Substrate.turn_for_client_message(ctx.base_dir, first)
+              frames = SimClient.frames(ctx.client)
+
+              replayed_history =
+                Enum.filter(frames, fn frame ->
+                  frame["type"] == "message" and frame["role"] == "user" and
+                    frame["clientMessageId"] == second
+                end)
+
+              staged_replies =
+                Enum.filter(frames, fn frame ->
+                  frame["type"] == "message" and frame["role"] == "assistant" and
+                    frame["replyToClientMessageId"] == second
+                end)
+
+              row =
+                cond do
+                  timed_out? ->
+                    Scorecard.fail(
+                      "15",
+                      "restart queue survival",
+                      "TWO's staged carrier path did not reach a terminal state after restart",
+                      journey: "J7"
+                    )
+
+                  length(observation.history_rows) != 1 ->
+                    Scorecard.fail(
+                      "15",
+                      "restart queue survival",
+                      "TWO's identified user history row did not survive exactly once",
+                      journey: "J7"
+                    )
+
+                  history["id"] != original_history["id"] or
+                      history["seq"] != original_history["seq"] ->
+                    Scorecard.fail(
+                      "15",
+                      "restart queue survival",
+                      "TWO's original history row identity or stream position changed across restart",
+                      journey: "J7"
+                    )
+
+                  length(observation.staged_members) != 1 or observation.direct_turn != nil ->
+                    Scorecard.fail(
+                      "15",
+                      "restart queue survival",
+                      "TWO no longer has exactly one staged membership and no own turn",
+                      journey: "J7"
+                    )
+
+                  history["deviceId"] != ctx.client.device_id or
+                    member["deviceId"] != history["deviceId"] or
+                    member["clientMessageId"] != second or
+                    member["historyClientMessageId"] != second or
+                    member["historyMessageId"] != history["id"] or
+                    member["memberId"] != original_member["memberId"] or
+                      member["batchId"] != original_member["batchId"] ->
+                    Scorecard.fail(
+                      "15",
+                      "restart queue survival",
+                      "TWO's identified history row did not survive with its original device " <>
+                        "and clientMessageId",
+                      journey: "J7"
+                    )
+
+                  member["memberState"] != "included" or member["batchState"] != "delivered" or
+                    member["carrierTurnSeq"] == nil or member["carrierStatus"] != "delivered" or
+                      member["carrierIsBatchCarrier"] != 1 ->
+                    Scorecard.fail(
+                      "15",
+                      "restart queue survival",
+                      "TWO's membership did not reach one delivered batch-carrier turn",
+                      journey: "J7"
+                    )
+
+                  not is_integer(member["carrierCreatedAt"]) or
+                      member["carrierCreatedAt"] <= restart_started_at ->
+                    Scorecard.fail(
+                      "15",
+                      "restart queue survival",
+                      "the carrier turn was created before the restart began",
+                      journey: "J7"
+                    )
+
+                  length(replayed_history) != 1 or
+                      List.first(replayed_history)["id"] != history["id"] ->
+                    Scorecard.fail(
+                      "15",
+                      "restart queue survival",
+                      "reconnect did not replay TWO's same identified user history row",
+                      journey: "J7"
+                    )
+
+                  staged_replies != [] ->
+                    Scorecard.fail(
+                      "15",
+                      "restart queue survival",
+                      "TWO received a post-specific assistant reply despite using a batch carrier",
+                      journey: "J7"
+                    )
+
+                  is_nil(first_after_restart) or
+                      first_after_restart["status"] not in @terminal_turn_statuses ->
+                    Scorecard.fail(
+                      "15",
+                      "restart queue survival",
+                      "ONE did not reach a terminal state after restart",
+                      journey: "J7"
+                    )
+
+                  true ->
+                    Scorecard.pass("15", "restart queue survival", journey: "J7")
+                end
+
+              {ctx, row}
+          end
+      end
+    end
+  end
+
+  defp await_turn_running(base_dir, client_message_id, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    poll_turn_running(base_dir, client_message_id, deadline, nil)
+  end
+
+  defp poll_turn_running(base_dir, client_message_id, deadline, last) do
     row = Substrate.turn_for_client_message(base_dir, client_message_id)
 
     cond do
-      is_map(row) and row["status"] == "queued" ->
-        true
+      is_map(row) and row["status"] == "running" ->
+        row
+
+      is_map(row) and row["status"] in @terminal_turn_statuses ->
+        row
 
       System.monotonic_time(:millisecond) >= deadline ->
-        false
+        row || last
 
       true ->
         Process.sleep(200)
-        poll_queued(base_dir, client_message_id, deadline)
+        poll_turn_running(base_dir, client_message_id, deadline, row || last)
     end
   end
 

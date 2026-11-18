@@ -1,6 +1,6 @@
 use crate::process_tree::{Process, ProcessStartTime, Snapshot, read_process};
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod signal;
 use signal::BoundProcess;
@@ -675,15 +675,13 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Option<Sweep>, String> 
         failures: Vec::new(),
         caller: unsafe { libc::getpid() },
     };
-    let deadline = Instant::now() + Duration::from_secs(2);
-
-    match freeze_sweep_leader(target, &mut sweep, deadline)? {
+    match freeze_sweep_leader(target, &mut sweep)? {
         LeaderFreeze::Gone => return Ok(None),
         LeaderFreeze::Failed => return Ok(Some(sweep)),
         LeaderFreeze::Ready => {}
     }
 
-    if freeze_tree_until_stable(target, &mut sweep, deadline)? {
+    if freeze_tree_until_stable(target, &mut sweep)? {
         sweep
             .failures
             .push("harness tree freeze did not prove complete before kill".into());
@@ -691,17 +689,10 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Option<Sweep>, String> 
     Ok(Some(sweep))
 }
 
-fn freeze_tree_until_stable(
-    target: &HarnessTarget,
-    sweep: &mut Sweep,
-    deadline: Instant,
-) -> Result<bool, String> {
+fn freeze_tree_until_stable(target: &HarnessTarget, sweep: &mut Sweep) -> Result<bool, String> {
     for _ in 0..FREEZE_ROUNDS {
-        if !freeze_tree_round(target, sweep, deadline)? {
+        if !freeze_tree_round(target, sweep)? {
             return Ok(false);
-        }
-        if Instant::now() >= deadline {
-            break;
         }
     }
     Ok(true)
@@ -731,11 +722,7 @@ enum LeaderFreeze {
     Ready,
 }
 
-fn freeze_sweep_leader(
-    target: &HarnessTarget,
-    sweep: &mut Sweep,
-    deadline: Instant,
-) -> Result<LeaderFreeze, String> {
+fn freeze_sweep_leader(target: &HarnessTarget, sweep: &mut Sweep) -> Result<LeaderFreeze, String> {
     // Caller exclusion is decided before STOP. There is no group broadcast capable of
     // stopping the caller, even when it is the recorded leader or shares its group.
     if sweep.leader.instance.pid == sweep.caller {
@@ -751,10 +738,7 @@ fn freeze_sweep_leader(
             target.pgid
         )),
         ProcessSignalResult::Delivered => {
-            if matches!(
-                wait_for_leader_freeze(target, sweep, deadline)?,
-                LeaderFreeze::Gone
-            ) {
+            if matches!(wait_for_leader_freeze(target, sweep)?, LeaderFreeze::Gone) {
                 return Ok(LeaderFreeze::Gone);
             }
         }
@@ -783,9 +767,8 @@ fn record_gone_leader_freeze(
 fn wait_for_leader_freeze(
     target: &HarnessTarget,
     sweep: &mut Sweep,
-    deadline: Instant,
 ) -> Result<LeaderFreeze, String> {
-    match wait_for_stopped(&sweep.leader, deadline) {
+    match wait_for_stopped(&sweep.leader) {
         Ok(true) => {}
         Ok(false) if target.revalidate_authority()? == HarnessAuthority::Gone => {
             return Ok(LeaderFreeze::Gone);
@@ -798,11 +781,7 @@ fn wait_for_leader_freeze(
     Ok(LeaderFreeze::Ready)
 }
 
-fn freeze_tree_round(
-    target: &HarnessTarget,
-    sweep: &mut Sweep,
-    deadline: Instant,
-) -> Result<bool, String> {
+fn freeze_tree_round(target: &HarnessTarget, sweep: &mut Sweep) -> Result<bool, String> {
     if let Err(reason) = require_sweep_authority(target, &sweep.leader) {
         sweep.failures.push(reason);
         return Ok(false);
@@ -817,7 +796,7 @@ fn freeze_tree_round(
         }
     };
     let pending = pending_tree_members(target, sweep, &snapshot);
-    capture_pending_members(target, sweep, &snapshot, pending, deadline)
+    capture_pending_members(target, sweep, &snapshot, pending)
 }
 
 fn pending_tree_members(
@@ -847,14 +826,13 @@ fn capture_pending_members(
     sweep: &mut Sweep,
     snapshot: &Snapshot,
     mut pending: Vec<libc::pid_t>,
-    deadline: Instant,
 ) -> Result<bool, String> {
     let mut added = false;
     // Discover parent before child even when numeric PID order has wrapped. A whole
     // snapshot can contain many generations; FREEZE_ROUNDS does not limit tree depth.
     loop {
         let (remaining, advanced, captured) =
-            capture_pending_pass(target, sweep, snapshot, pending, deadline);
+            capture_pending_pass(target, sweep, snapshot, pending);
         added |= captured;
         if remaining.is_empty() {
             return Ok(added);
@@ -874,7 +852,6 @@ fn capture_pending_pass(
     sweep: &mut Sweep,
     snapshot: &Snapshot,
     pending: Vec<libc::pid_t>,
-    deadline: Instant,
 ) -> (Vec<libc::pid_t>, bool, bool) {
     let mut remaining = Vec::new();
     let mut advanced = false;
@@ -892,7 +869,7 @@ fn capture_pending_pass(
         };
         let captured = capture_member(observed, anchor);
         advanced = true;
-        if record_captured_member(target, sweep, observed.pid, captured, deadline) {
+        if record_captured_member(target, sweep, observed.pid, captured) {
             added = true;
         }
     }
@@ -912,13 +889,11 @@ fn record_captured_member(
     sweep: &mut Sweep,
     pid: libc::pid_t,
     captured: Result<Option<BoundProcess>, String>,
-    deadline: Instant,
 ) -> bool {
     match captured {
         Ok(Some(process)) => {
             sweep.frozen.insert(pid, process);
-            if let Err(reason) = stop_process(&sweep.frozen[&pid], target, &sweep.leader, deadline)
-            {
+            if let Err(reason) = stop_process(&sweep.frozen[&pid], target, &sweep.leader) {
                 sweep.failures.push(reason);
             }
             true
@@ -992,7 +967,6 @@ fn stop_process(
     process: &BoundProcess,
     target: &HarnessTarget,
     leader: &BoundProcess,
-    deadline: Instant,
 ) -> Result<(), String> {
     require_sweep_authority(target, leader)?;
     match process.signal(libc::SIGSTOP)? {
@@ -1005,10 +979,10 @@ fn stop_process(
         }
         ProcessSignalResult::Delivered => {}
     }
-    wait_for_stopped(process, deadline).map(|_| ())
+    wait_for_stopped(process).map(|_| ())
 }
 
-fn wait_for_stopped(process: &BoundProcess, deadline: Instant) -> Result<bool, String> {
+fn wait_for_stopped(process: &BoundProcess) -> Result<bool, String> {
     loop {
         let current = match read_process(process.instance.pid) {
             Ok(current) => current,
@@ -1033,12 +1007,6 @@ fn wait_for_stopped(process: &BoundProcess, deadline: Instant) -> Result<bool, S
         }
         if current.stopped {
             return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "process {} did not enter the frozen state",
-                process.instance.pid
-            ));
         }
         std::thread::sleep(Duration::from_millis(1));
     }

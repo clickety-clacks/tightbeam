@@ -133,6 +133,12 @@ new yes before acting; read-only inventory can proceed while waiting.
    any of them, and offer to begin. Do not wait to be asked, and do not report
    the upgrade as done before the last step. Have Main lead the user through it.
 
+   Restarting the gateway is not upgrade completion: without the guidance
+   steps below, the release's code runs with the previous release's guidance,
+   and nothing warns about it until a new identity is published. If the user
+   defers any step, record the deferral and what remains out of date; do not
+   report a deferred step as done.
+
    1. **Relearn.** `tightbeam identity relearn` imports the release's version
       of every learned kungfu bundle and merges it with the org's identity.
       Before running it, explain what the release changes in the guidance.
@@ -170,11 +176,10 @@ new yes before acting; read-only inventory can proceed while waiting.
    6. **Confirm.** `tightbeam identity status` must show no conflicts and no
       stale sessions.
 
-   Restarting the gateway is not upgrade completion: without these steps the
-   release's code runs with the previous release's guidance, and nothing warns
-   about it until a new identity is published. If the user defers any step,
-   record the deferral and name what remains out of date; do not report a
-   deferred step as done.
+   7. **Finish kungfu setup.** For every learned bundle, run
+      `tightbeam kungfu setup <bundle>`. Complete every pending item it reports,
+      or tell the user what remains and why. The command reports setup
+      requirements; it does not perform setup for you.
 
 ## 0.1.8 to 0.1.9 database rehearsal
 

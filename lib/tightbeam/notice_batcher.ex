@@ -595,43 +595,31 @@ defmodule Tightbeam.NoticeBatcher do
       restore_unclaimed_sources(db, at)
     end
 
-    {:ok, ready_ids} = DB.transaction(db, &ready_sources_in_txn(&1, at, recipient))
+    # List and resolve ready sources on a read snapshot, without a write
+    # transaction per source. Resolution only reads the stored address and the
+    # current role binding; the drain transaction below re-checks both before
+    # anything is admitted. Only a source whose recipient does not resolve (or
+    # whose read failed) takes the write path, which disposes of it if it is
+    # still unresolved. A failed source rolls back only that source, never an
+    # unrelated recipient. Preparation happens once, inside the recipient's own
+    # drain transaction, and only when that recipient can receive.
+    {:ok, resolved} =
+      DB.read_transaction(db, fn txn ->
+        txn
+        |> ready_sources_in_txn(at, recipient)
+        |> Enum.map(&{&1, read_source_recipient_in_txn(txn, &1)})
+      end)
 
-    # Group ready sources by recipient without preparing them. Preparation
-    # happens once, inside the recipient's own drain transaction, and only when
-    # that recipient can receive. A source whose recipient does not resolve
-    # keeps the old path: prepare it here and dispose of it if still unresolved.
-    # A failed source rolls back only that source, never an unrelated recipient.
     {recipients, deferred_ids} =
-      Enum.reduce(ready_ids, {[], MapSet.new()}, fn wake_id, {targets, deferred} ->
-        case DB.transaction_then(
-               db,
-               fn txn -> source_recipient_in_txn(txn, wake_id, at) end,
-               fn txn, target ->
-                 Wakes.row_commit_in_txn(txn, [])
-                 target
-               end
-             ) do
-          {:ok, nil} ->
-            {targets, deferred}
+      Enum.reduce(resolved, {[], MapSet.new()}, fn
+        {_wake_id, :gone}, acc ->
+          acc
 
-          {:ok, {:undeliverable, wake_id, source_recipient, notice}} ->
-            publish_undeliverable_outcome(db, wake_id, source_recipient, notice)
-            {targets, deferred}
+        {wake_id, {:target, target}}, {targets, deferred} ->
+          {[{target, wake_id} | targets], deferred}
 
-          {:ok, target} ->
-            {[{target, wake_id} | targets], deferred}
-
-          {:error, %DB.Overloaded{} = error} ->
-            raise error
-
-          {:error, error} ->
-            reason =
-              if match?(%DB.Error{}, error), do: :persistence_refused, else: :recognition_failed
-
-            Logger.warning("notice source #{wake_id} preparation deferred: #{reason}")
-            {targets, MapSet.put(deferred, wake_id)}
-        end
+        {wake_id, :unresolved}, acc ->
+          resolve_source_for_write(db, wake_id, at, acc)
       end)
 
     recipients =
@@ -683,6 +671,40 @@ defmodule Tightbeam.NoticeBatcher do
       end)
 
     deliveries
+  end
+
+  # The write path for a source the read snapshot could not resolve: resolve
+  # it again in its own transaction and dispose of it if it is still
+  # unresolvable.
+  defp resolve_source_for_write(db, wake_id, at, {targets, deferred}) do
+    case DB.transaction_then(
+           db,
+           fn txn -> source_recipient_in_txn(txn, wake_id, at) end,
+           fn txn, target ->
+             Wakes.row_commit_in_txn(txn, [])
+             target
+           end
+         ) do
+      {:ok, nil} ->
+        {targets, deferred}
+
+      {:ok, {:undeliverable, wake_id, source_recipient, notice}} ->
+        publish_undeliverable_outcome(db, wake_id, source_recipient, notice)
+        {targets, deferred}
+
+      {:ok, target} ->
+        {[{target, wake_id} | targets], deferred}
+
+      {:error, %DB.Overloaded{} = error} ->
+        raise error
+
+      {:error, error} ->
+        reason =
+          if match?(%DB.Error{}, error), do: :persistence_refused, else: :recognition_failed
+
+        Logger.warning("notice source #{wake_id} preparation deferred: #{reason}")
+        {targets, MapSet.put(deferred, wake_id)}
+    end
   end
 
   defp restore_unclaimed_sources(db, at) do
@@ -790,13 +812,35 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  defp ready_sources_in_txn(txn, at, recipient \\ nil) do
-    Txn.q(
-      txn,
-      """
+  # A recipient-specific pass considers only the sources that can resolve to
+  # that recipient: its own session-addressed prompts, prompts for a role bound
+  # to it, and role prompts whose role resolves to no active session (so they
+  # are still disposed of promptly). A session-addressed prompt resolves only to
+  # its own stored session (Gateway.delivery_target/3), so prompts addressed to
+  # other sessions can never belong to this recipient. Without this, every turn
+  # end walked every prompt due anywhere in the org.
+  @recipient_candidates_sql """
+  AND w.wakeId IN (
+    SELECT c.wakeId FROM wakes c
+    WHERE c.sessionKey=?2 AND c.state='pending' AND c.consumer='prompt'
+      AND c.targetRole IS NULL
+    UNION ALL
+    SELECT c.wakeId FROM wakes c
+    WHERE c.targetRole IS NOT NULL AND c.state='pending' AND c.consumer='prompt'
+      AND NOT EXISTS (
+        SELECT 1 FROM roles r JOIN sessions s ON s.sessionKey=r.boundSessionKey
+        WHERE r.name=c.targetRole AND s.state='active' AND s.sessionKey<>?2))
+  """
+
+  # Every ready source in the org (`:all`), or only those that can resolve to
+  # one recipient (`:recipient`, parameter ?2).
+  defp ready_sources_sql(scope) when scope in [:all, :recipient] do
+    candidates = if scope == :recipient, do: @recipient_candidates_sql, else: ""
+
+    """
       SELECT w.wakeId FROM wakes w
       WHERE w.state='pending' AND w.consumer='prompt' AND w.digest=0
-        AND (?2 IS NULL OR w.sessionKey=?2 OR w.targetRole IS NOT NULL OR w.targetGate<>0)
+        #{candidates}
         AND COALESCE(w.deliveryRule,'')<>'turn-boundary-digest r1'
         AND COALESCE(w.obligationRef,'') NOT LIKE 'effort-holder-prod:%'
         AND COALESCE(w.prompt,'') NOT LIKE 'Effort check-in % expired after 24 hours%'
@@ -812,9 +856,17 @@ defmodule Tightbeam.NoticeBatcher do
         WHEN 'fyi' THEN 4 WHEN 'information' THEN 4 ELSE 5 END,
         w.createdAt,COALESCE((SELECT root.rowid FROM wake_retry_attempts r
           JOIN wakes root ON root.wakeId=r.rootWakeId WHERE r.wakeId=w.wakeId),w.rowid)
-      """,
-      [at, recipient]
-    )
+    """
+  end
+
+  defp ready_sources_in_txn(txn, at, recipient \\ nil) do
+    {sql, params} =
+      if is_nil(recipient),
+        do: {ready_sources_sql(:all), [at]},
+        else: {ready_sources_sql(:recipient), [at, recipient]}
+
+    txn
+    |> Txn.q(sql, params)
     |> Enum.map(&hd/1)
     |> then(&Tightbeam.HarklightLifecycle.ready_sources_in_txn(txn, &1))
   end
@@ -845,6 +897,24 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
+  # Read-only counterpart of source_recipient_in_txn for the resolution
+  # snapshot. An unresolvable source, or one whose read fails, is left to the
+  # write path.
+  defp read_source_recipient_in_txn(txn, wake_id) do
+    case Wakes.get_in_txn(txn, wake_id) do
+      %{state: "pending"} = wake ->
+        case source_delivery_target(txn, wake) do
+          {target, _, _} -> {:target, target}
+          nil -> :unresolved
+        end
+
+      _ ->
+        :gone
+    end
+  rescue
+    _error -> :unresolved
+  end
+
   # A busy recipient's sources are left untouched until it can receive. For a
   # free recipient, re-check readiness and prepare only its own sources, each
   # once, in this transaction. A source that fails preparation rolls back to
@@ -854,7 +924,7 @@ defmodule Tightbeam.NoticeBatcher do
       :busy
     else
       sources =
-        ready_sources_in_txn(txn, at)
+        ready_sources_in_txn(txn, at, target)
         |> Enum.filter(&MapSet.member?(own_ids, &1))
         |> Enum.reject(&MapSet.member?(deferred_ids, &1))
         |> Enum.flat_map(fn wake_id ->
@@ -1673,7 +1743,7 @@ defmodule Tightbeam.NoticeBatcher do
 
   defp queued_sources_ready_excluding_in_txn?(txn, session_key, target_role, source_wake_id, at) do
     recipient_running?(txn, session_key, target_role) or
-      Enum.any?(ready_sources_in_txn(txn, at), fn wake_id ->
+      Enum.any?(ready_sources_in_txn(txn, at, session_key), fn wake_id ->
         wake_id != source_wake_id and
           case source_delivery_target(txn, Wakes.get_in_txn(txn, wake_id)) do
             {^session_key, _, _} -> true
