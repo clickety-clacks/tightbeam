@@ -1834,10 +1834,32 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     helper = Path.expand("../cli/target/release/tightbeam", __DIR__)
     slow_helper = Path.join(ctx.test_dir, "slow_harness_helper")
 
+    hung_command = Path.join(ctx.test_dir, "hung_command.js")
+    helper_ready = Path.join(ctx.test_dir, "helper_ready")
+    File.mkdir_p!(helper_ready)
+
+    File.write!(hung_command, """
+    process.stdin.resume();
+    require("node:fs").writeFileSync(process.argv[2] + "/" + process.pid, "ready");
+    """)
+
+    timeout_override = Application.fetch_env(:tightbeam, :harness_process_command_timeout_ms)
+    Application.put_env(:tightbeam, :harness_process_command_timeout_ms, 120_000)
+
+    on_exit(fn ->
+      case timeout_override do
+        {:ok, value} ->
+          Application.put_env(:tightbeam, :harness_process_command_timeout_ms, value)
+
+        :error ->
+          Application.delete_env(:tightbeam, :harness_process_command_timeout_ms)
+      end
+    end)
+
     File.write!(
       slow_helper,
       "#!/bin/sh\n" <>
-        "if [ \"$1\" = \"harness-group\" ]; then sleep 2; fi\n" <>
+        "if [ \"$1\" = \"harness-group\" ]; then exec node #{hung_command} #{helper_ready}; fi\n" <>
         "exec #{helper} \"$@\"\n"
     )
 
@@ -1852,7 +1874,37 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         {Task.Supervisor, name: :"shutdown_cutoff_cleanup_#{System.unique_integer([:positive])}"}
       )
 
-    budget_ms = 1_200
+    budget_ms = 60_000
+    settlement_ms = 15_000
+    owner = self()
+
+    clock = fn
+      :start ->
+        now = System.monotonic_time(:millisecond)
+        Process.put(:retirement_cutoff_start, now)
+        send(owner, {:shutdown_started, now})
+        now
+
+      :park_wait ->
+        # Freeze before the first yield until every park helper is blocked.
+        # No wall-clock delay determines which results reach retirement.
+        {:monitors, monitors} = Process.info(self(), :monitors)
+        send(owner, {:park_tasks_started, self(), monitors})
+
+        receive do
+          :expire_parking -> :ok
+        end
+
+        Process.get(:retirement_cutoff_start) + budget_ms - settlement_ms
+
+      phase when phase in [:cancel, :cancel_wait, :retire] ->
+        now = Process.get(:retirement_cutoff_start) + budget_ms - settlement_ms
+        if phase == :retire, do: send(owner, {:retirement_cutoff, now})
+        now
+
+      _phase ->
+        Process.get(:retirement_cutoff_start)
+    end
 
     {:ok, coordinator} =
       AdapterCoordinator.start_link(
@@ -1870,16 +1922,11 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         end,
         db: ctx.db,
         shutdown_budget_ms: budget_ms,
-        shutdown_settlement_budget_ms: 500,
-        # Zero grace pins this test to the late path by construction: the
-        # cancel deadline collapses to the reserve boundary, every hung park is
-        # force-killed with no cooperative wait, and retirement always enters
-        # past settle_start. At the default grace the premise is a race against
-        # the host's process-enumeration cost — deterministically lost on Linux,
-        # where 24 parks answer the cooperative cancel well inside 100ms and
-        # retirement runs early (0/24 late over 5 runs), and only incidentally
-        # won on macOS (24/24 late in the measured runs).
+        shutdown_settlement_budget_ms: settlement_ms,
+        # Expire parking and cancellation exactly at the reserve boundary.
+        # Retirement must defer cleanup and persist all 24 unresolved outcomes.
         shutdown_cancel_grace_ms: 0,
+        shutdown_clock: clock,
         shutdown_cleanup_supervisor: cleanup_owner,
         name:
           String.to_atom(
@@ -1888,7 +1935,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       )
 
     Process.unlink(coordinator)
-    on_exit(fn -> if Process.alive?(coordinator), do: GenServer.stop(coordinator, :shutdown) end)
+
+    on_exit(fn ->
+      if Process.alive?(coordinator) do
+        send(coordinator, :expire_parking)
+        GenServer.stop(coordinator, :shutdown, :infinity)
+      end
+    end)
 
     # Cardinality is the point: the deadline guarantee must not degrade as the
     # retained-adapter count grows, and this also exceeds the 20-key log sample
@@ -1898,72 +1951,51 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         {:claude, "shared", "shutdown-retirement-cutoff-host-#{index}"}
       end
 
-    for key <- keys do
-      assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
-    end
+    adapters =
+      for key <- keys do
+        assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+        assert %Tightbeam.Acp.Adapter{} = :sys.get_state(adapter, :infinity)
+        adapter
+      end
 
-    assert eventually(
-             fn ->
-               rows = HarnessProcess.list(ctx.db)
-               length(rows) == length(keys) and Enum.all?(rows, &(&1.state == "running"))
-             end,
-             300
-           )
+    rows = HarnessProcess.list(ctx.db)
+    assert length(rows) == length(keys)
+    assert Enum.all?(rows, &(&1.state == "running"))
+    adapter_refs = Enum.map(adapters, &Process.monitor/1)
 
-    # The cleanup now runs on its own owner AFTER terminate/2 returns, so its log
-    # lands after GenServer.stop does. Waiting for the descendants to disappear
-    # inside the capture is what makes that line observable here; measuring the
-    # elapsed time before that wait is what keeps the deadline assertion honest.
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        # Deliberately looser than the budget so an overrun fails on the elapsed
-        # bound below with a real number, instead of exiting here on an ambiguous
-        # caller timeout.
-        started_at = System.monotonic_time()
-        assert :ok = GenServer.stop(coordinator, :shutdown, 3_000)
-        elapsed_native = System.monotonic_time() - started_at
+        stop = Task.async(fn -> GenServer.stop(coordinator, :shutdown, :infinity) end)
+        assert_receive {:park_tasks_started, ^coordinator, monitors}, 30_000
+        park_tasks = for {:process, pid} <- monitors, pid not in adapters, do: pid
+        assert length(park_tasks) == length(keys)
+        assert eventually(fn -> length(File.ls!(helper_ready)) == length(keys) end, 3_000)
+        send(coordinator, :expire_parking)
+        assert :ok = Task.await(stop, :infinity)
 
-        send(
-          self(),
-          {:shutdown_elapsed_ms, System.convert_time_unit(elapsed_native, :native, :millisecond)}
-        )
+        # The clock puts retirement at the reserve boundary, within the total
+        # budget. Settlement and the asynchronous cleanup must still complete;
+        # the unchanged row, log and census assertions detect skipped work.
+        assert_received {:retirement_cutoff, retirement_at}
+        assert_received {:shutdown_started, started_at}
+        assert retirement_at - started_at == budget_ms - settlement_ms
+
+        # Join cleanup before ending capture: descendant disappearance alone
+        # does not prove the cleanup task has emitted its aggregate log.
+        for pid <- Task.Supervisor.children(cleanup_owner) do
+          ref = Process.monitor(pid)
+          assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 30_000
+        end
+
+        for ref <- adapter_refs do
+          assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 30_000
+        end
 
         assert eventually(
                  fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
                  1_000
                )
       end)
-
-    assert_received {:shutdown_elapsed_ms, elapsed_ms}
-
-    # terminate/2 promises to complete within shutdown_budget_ms, and the V7
-    # concern — a callback overrunning its own budget passing unnoticed — still
-    # governs: the allowance below is measurement-scale, not phase-scale, so a
-    # real overrun of the 500ms reserve still fails. Without the allowance the
-    # bound's margin is negative by construction — it forbids what the code's
-    # own contract permits and can fail on a quiet host on a scheduling hiccup.
-    # Two costs land in elapsed_ms without being terminate's to spend:
-    # DB.transaction_until grants
-    # a final commit already in flight remaining + 50ms past the deadline rather
-    # than abort a durable outcome (observed +8..22ms), and the measurement
-    # starts before GenServer.stop dispatches, ahead of the callback's own clock
-    # (observed +12..26ms under 4x CPU oversubscription). 100ms is ~3x the worst
-    # observed sum of the two. This bound is a sanity check on the deadline
-    # contract, not the regression detector: at the pre-fix base its catch rate
-    # is platform-dependent — 0 of 8 loaded macOS runs (elapsed 853-1284ms)
-    # versus 3 of 6 Linux runs (1320-1338ms). What caught the base defect on
-    # both platforms is the row-state,
-    # log-content and census oracles below, which this allowance leaves
-    # untouched. With 24
-    # retained adapters this also proves the bound does not degrade with
-    # cardinality: the late entries' outcomes are decided before settlement, and
-    # their cleanup is owned by someone else afterwards.
-    observation_allowance_ms = 100
-
-    assert elapsed_ms <= budget_ms + observation_allowance_ms,
-           "shutdown took #{elapsed_ms}ms against a configured #{budget_ms}ms budget " <>
-             "(+#{observation_allowance_ms}ms observation allowance) with " <>
-             "#{length(keys)} retained adapters; the deadline guarantee did not hold"
 
     assert log =~ "retirement late entry unresolved"
 
