@@ -4493,13 +4493,36 @@ defmodule Tightbeam.GatewayTest do
         origin: "process:#{sender}",
         principal: {:process, sender},
         session_key: "k1",
-        params: %{prompt: prompt, at: due_at, prod_id: "page"}
+        params: %{
+          prompt: prompt,
+          at: due_at,
+          prod_id: "page",
+          idempotency_key: "#{sender}-#{prompt}"
+        }
       }
     end
 
     first = wake.(call.("bridge", "first"))
     other = wake.(call.("other", "other sender"))
+    second = wake.(call.("bridge", "second"))
     latest = wake.(call.("bridge", "revised"))
+
+    assert first.replaced_wake_ids == []
+    assert other.replaced_wake_ids == []
+    assert second.replaced_wake_ids == [first.wake_id]
+    assert latest.replaced_wake_ids == [second.wake_id]
+    assert wake.(call.("bridge", "revised")) == latest
+    assert wake.(call.("bridge", "first")).replaced_wake_ids == []
+    assert wake.(call.("bridge", "second")).replaced_wake_ids == [first.wake_id]
+
+    ordinary_call = call.("bridge", "ordinary")
+    ordinary = wake.(%{ordinary_call | params: Map.delete(ordinary_call.params, :prod_id)})
+    refute Map.has_key?(ordinary, :replaced_wake_ids)
+
+    refute Map.has_key?(
+             wake.(%{ordinary_call | params: Map.delete(ordinary_call.params, :prod_id)}),
+             :replaced_wake_ids
+           )
 
     assert Wakes.get(ctx.db, first.wake_id).state == "canceled"
     assert Wakes.get(ctx.db, other.wake_id).state == "pending"

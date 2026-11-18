@@ -8324,6 +8324,7 @@ defmodule Tightbeam.Gateway do
 
         if is_map(wake) and is_binary(wake[:wake_id]) do
           wake_response(wake)
+          |> maybe_add_replaced_wake_ids(wake)
           |> maybe_add_producer_warning(wake)
           |> maybe_add_after_fact_hint(db, p)
         else
@@ -8349,7 +8350,9 @@ defmodule Tightbeam.Gateway do
         do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
 
     if prior do
-      wake = Wakes.get_in_txn(txn, prior.session_key)
+      wake =
+        Wakes.get_in_txn(txn, prior.session_key)
+        |> replay_wake_replacement_in_txn(txn, call.origin, p.idempotency_key)
 
       if is_map(wake),
         do: Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
@@ -8365,6 +8368,18 @@ defmodule Tightbeam.Gateway do
           idempotency_key: p.idempotency_key,
           session_key: wake.wake_id
         })
+
+        if Map.has_key?(wake, :replaced_wake_ids) do
+          DB.Txn.q(
+            txn,
+            "UPDATE wire_idempotency SET responseJson=?3 WHERE ownerUserId=?1 AND operation='wake' AND idempotencyKey=?2",
+            [
+              call.origin,
+              p.idempotency_key,
+              JSON.encode!(%{replacedWakeIds: wake.replaced_wake_ids})
+            ]
+          )
+        end
       end
 
       if is_map(wake) and is_binary(wake[:wake_id]),
@@ -8373,6 +8388,28 @@ defmodule Tightbeam.Gateway do
       maybe_warn_unserved_in_txn(txn, wake, p[:condition_kind])
     end
   end
+
+  defp replay_wake_replacement_in_txn(wake, txn, owner, key) when is_map(wake) do
+    case DB.Txn.q(
+           txn,
+           "SELECT responseJson FROM wire_idempotency WHERE ownerUserId=?1 AND operation='wake' AND idempotencyKey=?2",
+           [owner, key]
+         ) do
+      [[response]] when is_binary(response) ->
+        %{"replacedWakeIds" => ids} = JSON.decode!(response)
+        Map.put(wake, :replaced_wake_ids, ids)
+
+      [[nil]] ->
+        wake
+    end
+  end
+
+  defp replay_wake_replacement_in_txn(wake, _txn, _owner, _key), do: wake
+
+  defp maybe_add_replaced_wake_ids(response, %{replaced_wake_ids: ids}),
+    do: Map.put(response, :replaced_wake_ids, ids)
+
+  defp maybe_add_replaced_wake_ids(response, _wake), do: response
 
   defp maybe_warn_unserved_in_txn(txn, %{wake_id: _} = wake, kind) when is_binary(kind) do
     if ConditionFacts.substrate_defined_kind?(kind) or FactProducers.served_in_txn?(txn, kind) do
