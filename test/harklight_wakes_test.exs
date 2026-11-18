@@ -7035,7 +7035,19 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:ok, [[follower_prompt]]} =
              DB.query(db, "SELECT prompt FROM wakes WHERE sessionKey=?1", [follower.session_key])
 
-    assert follower_prompt == owner_prompt
+    [owner_entry, owner_instructions] = String.split(owner_prompt, "\n\n", parts: 2)
+    [follower_entry, follower_instructions] = String.split(follower_prompt, "\n\n", parts: 2)
+    assert owner_entry == event(1, "discussion", "Reply")
+    assert follower_entry == owner_entry
+    assert owner_instructions =~ "tightbeam harklight-ack --handle #{@handle} --event 1"
+    assert owner_instructions =~ "tightbeam harklight-reply --handle #{@handle} --request request"
+    assert follower_instructions =~ "harklight-agent ack --session #{@handle} --event 1"
+    assert follower_instructions =~ "harklight-agent reply --session #{@handle} --request request"
+
+    assert {:ok, [[^follower_prompt]]} =
+             DB.query(db, "SELECT prompt FROM wakes WHERE sessionKey=?1", [
+               second_follower.session_key
+             ])
 
     assert Enum.count(
              follow_for_test(db, conversation_call, runner: runner).subscriptions,
