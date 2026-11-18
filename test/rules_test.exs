@@ -1309,7 +1309,6 @@ defmodule Tightbeam.RulesTest do
       assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
 
     producer_refs = fixture_commit_refs()
-    missing_commit = hd(producer_refs)["commit"]
 
     review_refs = [
       %{
@@ -3040,6 +3039,22 @@ defmodule Tightbeam.RulesTest do
       File.write!(adapter, "#!/bin/sh\nexit 0\n")
       File.chmod!(adapter, 0o755)
     end
+
+    manifest =
+      Path.join([
+        ctx.base_dir,
+        "adapters",
+        "node_modules",
+        Tightbeam.Harness.Claude.install_package(),
+        "package.json"
+      ])
+
+    File.mkdir_p!(Path.dirname(manifest))
+
+    File.write!(
+      manifest,
+      JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()})
+    )
 
     auth_dir = Tightbeam.Homes.home_path(ctx.base_dir, "testhost", :claude)
     File.mkdir_p!(auth_dir)
@@ -5226,7 +5241,8 @@ defmodule Tightbeam.RulesTest do
              end)
   end
 
-  test "ad hoc predicates validate ownership and make nil fail every operator", ctx do
+  test "ad hoc predicates accept other owners' rows, refuse unknown rows and make nil fail every operator",
+       ctx do
     own = session(ctx.db, "predicate-own", "flynn")
     foreign = session(ctx.db, "predicate-foreign", "kay")
     own_assignment = assignment(ctx, own.session_key, {:user, "flynn"})
@@ -5257,14 +5273,21 @@ defmodule Tightbeam.RulesTest do
                })
     end
 
-    assert {:error, %{code: "invalid_predicate", message: ownership_error}} =
+    assert {:ok, %{matched: true, facts: [{"assignment.state", "open"}]}} =
              Rules.evaluate_predicate(ctx.db, %{
                owner_user_id: "flynn",
                conditions: [%{fact: "assignment.state", op: "eq", value: "open"}],
                bindings: %{assignment_id: foreign_assignment.id}
              })
 
-    assert ownership_error == "unknown or inaccessible assignment binding"
+    assert {:error, %{code: "invalid_predicate", message: unknown_error}} =
+             Rules.evaluate_predicate(ctx.db, %{
+               owner_user_id: "flynn",
+               conditions: [%{fact: "assignment.state", op: "eq", value: "open"}],
+               bindings: %{assignment_id: "asg_does_not_exist"}
+             })
+
+    assert unknown_error == "unknown assignment binding"
 
     for condition <- [
           %{fact: "assignment.unknown", op: "eq", value: "open"},

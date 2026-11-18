@@ -335,7 +335,7 @@ defmodule Tightbeam.Gateway do
          {WorkspaceCleanup, config: Map.put(config, :db, db)},
          {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
          {Task, fn -> DB.owed_work(fn -> HarnessHealth.resume_other_routes(db) end) end},
-         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
+         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub, db: db},
          # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
          # statute, and the episode writer must already own the ordering before the first
          # evaluation runs. Explicitly a child rather than lazily started — a lazy start
@@ -1780,6 +1780,9 @@ defmodule Tightbeam.Gateway do
       {"session-custody-transfer", ["wake.scheduled"]} => fn call ->
         Tightbeam.SessionCustodyTransfer.handle(db, call)
       end,
+      {"assignment-opener-accept", ["wake.scheduled"]} => fn call ->
+        Tightbeam.AssignmentOpenerAcceptance.handle(db, call)
+      end,
       {"session-po-set", ["wake.scheduled"]} => fn call ->
         SessionPoAssociations.handle(db, call)
       end,
@@ -2078,28 +2081,13 @@ defmodule Tightbeam.Gateway do
   defp repair_assignment(_db, _assignment_id),
     do: {:error, "invalid_request", "repair-assignment requires assignmentId"}
 
-  defp repair_authorized(db, call, assignment) do
-    allowed =
-      case call.principal do
-        {:user, user} ->
-          assignment.opened_by_user == user or admin_caller?(db, call)
+  # Any user, session or automation may repair; the attempt records who asked.
+  defp repair_authorized(_db, %{principal: {kind, _}}, _assignment)
+       when kind in [:user, :session, :process],
+       do: :ok
 
-        {:session, session} ->
-          assignment.opened_by_session == session or
-            assignment.opened_by_user == principal_caller(db, call).owner_user_id or
-            admin_caller?(db, call)
-
-        {:process, _} ->
-          true
-
-        _ ->
-          false
-      end
-
-    if allowed,
-      do: :ok,
-      else: {:error, "not_authorized", "assignment repair requires its opener or an admin"}
-  end
+  defp repair_authorized(_db, _call, _assignment),
+    do: {:error, "principal_required", "assignment repair requires a user, session or process"}
 
   defp repair_holder(db, assignment) do
     case Org.get(db, assignment.holder) do
@@ -6428,6 +6416,7 @@ defmodule Tightbeam.Gateway do
       end
 
     identity
+    |> Map.merge(Rules.status())
     |> Map.put(:sessions, sessions)
     |> maybe_put_guidance(guidance)
   end
@@ -7027,6 +7016,25 @@ defmodule Tightbeam.Gateway do
           stamp: "committed",
           enqueue: "already_pending",
           delivery: "pending",
+          reread: "unconfirmed",
+          wake_id: wake_id
+        }
+
+      existing_wakes != [] ->
+        # Delivery failure does not erase the notice. Recovery owns retries;
+        # another apply pass must not create a second source for this revision.
+        [[wake_id, _state] | _] = existing_wakes
+
+        delivery =
+          case NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id) do
+            [[_seq, status, _assignment_id] | _] -> status
+            [] -> "pending"
+          end
+
+        %{
+          stamp: "committed",
+          enqueue: "already_recorded",
+          delivery: delivery,
           reread: "unconfirmed",
           wake_id: wake_id
         }
@@ -8324,6 +8332,7 @@ defmodule Tightbeam.Gateway do
 
         if is_map(wake) and is_binary(wake[:wake_id]) do
           wake_response(wake)
+          |> maybe_add_replaced_wake_ids(wake)
           |> maybe_add_producer_warning(wake)
           |> maybe_add_after_fact_hint(db, p)
         else
@@ -8349,7 +8358,9 @@ defmodule Tightbeam.Gateway do
         do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
 
     if prior do
-      wake = Wakes.get_in_txn(txn, prior.session_key)
+      wake =
+        Wakes.get_in_txn(txn, prior.session_key)
+        |> replay_wake_replacement_in_txn(txn, call.origin, p.idempotency_key)
 
       if is_map(wake),
         do: Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
@@ -8365,6 +8376,18 @@ defmodule Tightbeam.Gateway do
           idempotency_key: p.idempotency_key,
           session_key: wake.wake_id
         })
+
+        if Map.has_key?(wake, :replaced_wake_ids) do
+          DB.Txn.q(
+            txn,
+            "UPDATE wire_idempotency SET responseJson=?3 WHERE ownerUserId=?1 AND operation='wake' AND idempotencyKey=?2",
+            [
+              call.origin,
+              p.idempotency_key,
+              JSON.encode!(%{replacedWakeIds: wake.replaced_wake_ids})
+            ]
+          )
+        end
       end
 
       if is_map(wake) and is_binary(wake[:wake_id]),
@@ -8373,6 +8396,28 @@ defmodule Tightbeam.Gateway do
       maybe_warn_unserved_in_txn(txn, wake, p[:condition_kind])
     end
   end
+
+  defp replay_wake_replacement_in_txn(wake, txn, owner, key) when is_map(wake) do
+    case DB.Txn.q(
+           txn,
+           "SELECT responseJson FROM wire_idempotency WHERE ownerUserId=?1 AND operation='wake' AND idempotencyKey=?2",
+           [owner, key]
+         ) do
+      [[response]] when is_binary(response) ->
+        %{"replacedWakeIds" => ids} = JSON.decode!(response)
+        Map.put(wake, :replaced_wake_ids, ids)
+
+      [[nil]] ->
+        wake
+    end
+  end
+
+  defp replay_wake_replacement_in_txn(wake, _txn, _owner, _key), do: wake
+
+  defp maybe_add_replaced_wake_ids(response, %{replaced_wake_ids: ids}),
+    do: Map.put(response, :replaced_wake_ids, ids)
+
+  defp maybe_add_replaced_wake_ids(response, _wake), do: response
 
   defp maybe_warn_unserved_in_txn(txn, %{wake_id: _} = wake, kind) when is_binary(kind) do
     if ConditionFacts.substrate_defined_kind?(kind) or FactProducers.served_in_txn?(txn, kind) do
@@ -10748,26 +10793,28 @@ defmodule Tightbeam.Gateway do
       allow_queued = repair_tune_authorized?(db, call, session)
 
       {boundary, applies} =
-        model_change_boundary(config, db, session, allow_queued, fn running? ->
-          run_session_mutation(session.session_key, fn ->
-            if running? do
-              apply_running_model(
-                config,
-                db,
-                Org.get(db, session.session_key),
-                new_ref,
-                routed.provider
-              )
-            else
-              apply_tuned_model(
-                config,
-                db,
-                session,
-                new_ref,
-                routed.provider,
-                call[:principal] || call.origin
-              )
-            end
+        contain_model_change_exit(fn ->
+          model_change_boundary(config, db, session, allow_queued, fn running? ->
+            run_session_mutation(session.session_key, fn ->
+              if running? do
+                apply_running_model(
+                  config,
+                  db,
+                  Org.get(db, session.session_key),
+                  new_ref,
+                  routed.provider
+                )
+              else
+                apply_tuned_model(
+                  config,
+                  db,
+                  session,
+                  new_ref,
+                  routed.provider,
+                  call[:principal] || call.origin
+                )
+              end
+            end)
           end)
         end)
 
@@ -10833,6 +10880,13 @@ defmodule Tightbeam.Gateway do
           |> Map.merge(runtime_actual(actual))
           |> Map.put(:projection_committed, false)
 
+        {:ok, {:error, {:runtime_config_not_sent, _reason}}} ->
+          tune_error(
+            "runtime_config_not_sent",
+            "the configuration request was not sent; nothing changed; retry the change",
+            diagnostic
+          )
+
         {:ok, {:error, {:runtime_config_unknown, _reason}}} ->
           tune_error(
             "runtime_config_unknown",
@@ -10872,6 +10926,36 @@ defmodule Tightbeam.Gateway do
     else
       {:error, denial} -> normalize_tune_denial(denial)
     end
+  end
+
+  # Exceptions retain their original stack and DB classification through the
+  # lane's caller-side re-raise and Dispatch.invoke. Only transport exits need
+  # conversion here; after entering the boundary their effect can be unknown.
+  defp contain_model_change_exit(fun) do
+    fun.()
+  catch
+    :exit, reason ->
+      model_change_exit(reason, __STACKTRACE__, :runtime_config_unknown, nil)
+  end
+
+  defp model_change_exit(reason, stacktrace, code, sent) do
+    diagnostic =
+      ErrorDiagnostic.caught(:exit, reason, stacktrace,
+        operation: "tune",
+        phase: "model_boundary",
+        sent: sent
+      )
+
+    {{:ok, {:error, ErrorDiagnostic.diagnosed({code, reason}, diagnostic)}}, "now"}
+  end
+
+  # Admission cannot send a configuration request: a timeout here can only
+  # create a quiet lane later, never apply the requested model.
+  defp ensure_model_change_lane(config, session_key) do
+    LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session_key)
+  catch
+    :exit, reason ->
+      model_change_exit(reason, __STACKTRACE__, :runtime_config_not_sent, false)
   end
 
   defp runtime_actual(%Model{} = model) do
@@ -10918,30 +11002,30 @@ defmodule Tightbeam.Gateway do
   # a claim that tokens already being generated use the requested configuration.
   defp model_change_boundary(config, db, session, allow_queued, apply) do
     if Harness.running_model_tuning_supported?(session.harness) do
-      LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session.session_key)
+      with :ok <- ensure_model_change_lane(config, session.session_key) do
+        Tightbeam.SessionLane.change_at_boundary(
+          session.session_key,
+          fn ->
+            case config[:on_tune_fence] do
+              callback when is_function(callback, 0) -> callback.()
+              _ -> :ok
+            end
 
-      Tightbeam.SessionLane.change_at_boundary(
-        session.session_key,
-        fn ->
-          case config[:on_tune_fence] do
-            callback when is_function(callback, 0) -> callback.()
-            _ -> :ok
-          end
+            refused? =
+              if allow_queued,
+                do: Ledger.running?(db, session.session_key),
+                else: Ledger.pending_count(db, session.session_key) > 0
 
-          refused? =
-            if allow_queued,
-              do: Ledger.running?(db, session.session_key),
-              else: Ledger.pending_count(db, session.session_key) > 0
-
-          if refused?,
-            do: {{:error, :turn_in_progress}, "now"},
-            else: {{:ok, apply.(false)}, "now"}
-        end,
-        fn -> {{:ok, apply.(true)}, "after_turn"} end
-      )
-      |> case do
-        :no_lane -> {{:error, :no_lane}, "now"}
-        result -> result
+            if refused?,
+              do: {{:error, :turn_in_progress}, "now"},
+              else: {{:ok, apply.(false)}, "now"}
+          end,
+          fn -> {{:ok, apply.(true)}, "after_turn"} end
+        )
+        |> case do
+          :no_lane -> {{:error, :no_lane}, "now"}
+          result -> result
+        end
       end
     else
       {at_tune_boundary(config, db, session.session_key, fn -> apply.(false) end,

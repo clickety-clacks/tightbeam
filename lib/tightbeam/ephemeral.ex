@@ -37,16 +37,30 @@ defmodule Tightbeam.Ephemeral do
     end
   end
 
+  # The flag lives in the database owner process, where transactions read it,
+  # and is published under the owner's pid so a caller outside a transaction
+  # can read it without queueing at the writer.
   defp set_available(db, available) do
-    {:ok, _} = DB.transaction(db, fn _ -> Process.put({__MODULE__, :available}, available) end)
+    {:ok, _} =
+      DB.transaction(db, fn _ ->
+        Process.put({__MODULE__, :available}, available)
+        :persistent_term.put({__MODULE__, :available, self()}, available)
+      end)
+
     :ok
   end
 
   def available?(%Txn{}), do: Process.get({__MODULE__, :available}, true)
 
   def available?(db) do
-    {:ok, available} = DB.transaction(db, &available?/1)
-    available
+    case owner(db) do
+      pid when is_pid(pid) ->
+        :persistent_term.get({__MODULE__, :available, pid}, true)
+
+      nil ->
+        {:ok, available} = DB.transaction(db, &available?/1)
+        available
+    end
   end
 
   def session?(%Txn{} = txn, key) do
@@ -54,10 +68,19 @@ defmodule Tightbeam.Ephemeral do
       Txn.q(txn, "SELECT 1 FROM ephemeral_sessions WHERE sessionKey=?1", [key]) != []
   end
 
+  # A read: on a file-backed database it goes to the reader pool, so the
+  # workdir lookup of every turn and apply's file step do not wait behind the
+  # writer's queue.
   def session?(db, key) do
-    {:ok, result} = DB.transaction(db, &session?(&1, key))
-    result
+    available?(db) and
+      DB.read_transaction!(db, fn txn ->
+        Txn.q(txn, "SELECT 1 FROM ephemeral_sessions WHERE sessionKey=?1", [key]) != []
+      end)
   end
+
+  defp owner(%DB.Migration{server: server}), do: owner(server)
+  defp owner(pid) when is_pid(pid), do: pid
+  defp owner(name), do: GenServer.whereis(name)
 
   def stamp_in_txn(txn, key, caller) do
     unless available?(txn), do: raise("ephemeral feature unavailable")

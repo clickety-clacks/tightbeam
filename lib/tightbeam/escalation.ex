@@ -3308,26 +3308,19 @@ defmodule Tightbeam.Escalation do
 
   defp operator_decision(_request, %{mode: "text", value: value}), do: {:ok, value}
 
-  defp operator_withdrawer_in_txn(txn, call, request) do
+  defp operator_withdrawer_in_txn(_txn, call, _request) do
     case Map.get(call, :principal) do
       {:process, name} ->
         {:ok, "process:" <> name}
 
-      {:user, owner_user_id} when owner_user_id == request.owner_user_id ->
-        {:ok, "user:" <> owner_user_id}
+      {:user, user_id} ->
+        {:ok, "user:" <> user_id}
 
-      {:session, session_key} ->
-        case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session_key]) do
-          [[owner_user_id]]
-          when owner_user_id == request.owner_user_id ->
-            {:ok, call.origin}
-
-          _ ->
-            {:error, error("not_owner", "operator or same-owner raiser required")}
-        end
+      {:session, _session_key} ->
+        {:ok, call.origin}
 
       _ ->
-        {:error, error("not_owner", "operator or same-owner raiser required")}
+        {:error, error("principal_required", "withdrawal requires a user, session or process")}
     end
   end
 

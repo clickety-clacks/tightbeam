@@ -241,21 +241,29 @@ defmodule Tightbeam.DBCallTimeoutTest do
   end
 
   test "an abandoned ordinary transaction rolls back before its next statement" do
-    Application.put_env(:tightbeam, :db_call_timeout_ms, 25)
+    # This is a liveness budget for admission, not an elapsed-time assertion.
+    # The callback must enter before it expires, then remain blocked until both
+    # the real transaction call and its cleanup call have timed out.
+    budget_ms = 2_000
+    Application.put_env(:tightbeam, :db_call_timeout_ms, budget_ms)
     db = start_supervised!({DB, path: ":memory:", name: nil})
     parent = self()
 
     {caller, monitor} =
       spawn_monitor(fn ->
         try do
-          DB.transaction(db, fn txn ->
-            send(parent, :old_migration_entered)
-            receive do: (:finish_old_migration -> :ok)
-            DB.Txn.exec(txn, "CREATE TABLE old_migration_committed(id INTEGER)")
-          end)
+          result =
+            DB.transaction(db, fn txn ->
+              DB.Txn.exec(txn, "CREATE TABLE old_migration_started(id INTEGER)")
+              send(parent, {:old_migration_entered, System.monotonic_time(), txn.deadline})
+              receive do: (:finish_old_migration -> :ok)
+              DB.Txn.exec(txn, "CREATE TABLE old_migration_committed(id INTEGER)")
+            end)
+
+          send(parent, {:transaction_returned, result})
         rescue
           error in DB.Timeout ->
-            send(parent, {:primary_timeout, error})
+            send(parent, {:primary_timeout, error, System.monotonic_time()})
             reraise error, __STACKTRACE__
         after
           try do
@@ -266,12 +274,37 @@ defmodule Tightbeam.DBCallTimeoutTest do
         end
       end)
 
-    assert_receive :old_migration_entered
+    # Lifecycle events inherit ExUnit's test timeout, rather than a separate
+    # scheduling window for each message. An expired queued call must not pass
+    # as an admitted transaction that was subsequently abandoned.
+    entered_at =
+      receive do
+        {:old_migration_entered, entered_at, deadline} ->
+          assert System.convert_time_unit(entered_at, :native, :millisecond) < deadline,
+                 "callback admission must precede the transaction deadline"
 
-    assert_receive {:primary_timeout, %DB.Timeout{operation: "db.transaction", budget_ms: 25}}
+          entered_at
 
-    assert_receive {:DOWN, ^monitor, :process, ^caller,
-                    {%DB.Timeout{operation: "db.execute", budget_ms: 25}, _stack}}
+        {:primary_timeout, _, _} ->
+          flunk("transaction call timed out before callback admission")
+
+        {:transaction_returned, result} ->
+          flunk("transaction returned before callback admission: #{inspect(result)}")
+
+        {:DOWN, ^monitor, :process, ^caller, reason} ->
+          flunk("transaction caller exited before callback admission: #{inspect(reason)}")
+      end
+
+    receive do
+      {:primary_timeout, error, timed_out_at} ->
+        assert %DB.Timeout{operation: "db.transaction", budget_ms: ^budget_ms} = error
+        assert entered_at < timed_out_at, "callback must enter before the caller times out"
+    end
+
+    receive do
+      {:DOWN, ^monitor, :process, ^caller, reason} ->
+        assert {%DB.Timeout{operation: "db.execute", budget_ms: ^budget_ms}, _stack} = reason
+    end
 
     send(db, :finish_old_migration)
 
@@ -279,6 +312,14 @@ defmodule Tightbeam.DBCallTimeoutTest do
              DB.query(
                DB.migration_context(db),
                "SELECT name FROM sqlite_master WHERE name='old_migration_committed'"
+             )
+
+    # Work done before abandonment must roll back too, even if the next
+    # statement was correctly refused before reaching SQLite.
+    assert {:ok, []} =
+             DB.query(
+               DB.migration_context(db),
+               "SELECT name FROM sqlite_master WHERE name='old_migration_started'"
              )
   end
 
