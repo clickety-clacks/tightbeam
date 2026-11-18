@@ -107,6 +107,28 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     )
   end
 
+  defp trace_due_timer(pid) do
+    1 = :erlang.trace(pid, true, [:receive, {:tracer, self()}])
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: :erlang.trace(pid, false, [:receive])
+    end)
+  end
+
+  defp await_due_timer(pid, due) do
+    state = :sys.get_state(pid, 30_000)
+    assert state.deadline == due
+    timer = state.timer
+    assert is_reference(timer)
+
+    # Observe the actual due timer rather than firing it from the test. Cross a
+    # mailbox barrier so its handler has committed delivery before we inspect it.
+    # This generous observation bound does not relax delivery-lateness assertions.
+    assert_receive {:trace, ^pid, :receive, {:timeout, ^timer, :due}}, 30_000
+    :sys.get_state(pid, 30_000)
+    :erlang.trace(pid, false, [:receive])
+  end
+
   defp wake(db, due_at, extra \\ %{}) do
     Wakes.schedule(
       db,
@@ -282,13 +304,15 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert :sys.get_state(pid).timer == nil
   end
 
-  @tag timeout: 20_000
+  @tag timeout: 60_000
   test "a wake inserted after boot fires at its ten second deadline without a tick", ctx do
     pid = scheduler(ctx)
+    trace_due_timer(pid)
     later = wake(ctx.db, System.system_time(:millisecond) + 60_000, %{consumer: "test"})
     due = System.system_time(:millisecond) + 10_000
     scheduled = wake(ctx.db, due, %{consumer: "test"})
-    assert_receive {:delivered, id, fired_at}, 11_000
+    await_due_timer(pid, due)
+    assert_received {:delivered, id, fired_at}
     assert id == scheduled.wake_id
     assert fired_at >= due
     assert fired_at - due < 1_000
@@ -322,9 +346,11 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "recipient", "testhost")
     pid = scheduler(ctx)
-    # Let startup recovery and the one-time backfill finish before inserting.
-    Process.sleep(300)
-    assert :sys.get_state(pid).timer == nil
+    # Run the backfill explicitly, then cross a scheduler mailbox barrier. Startup
+    # recovery was already queued by init; no elapsed-time guess is needed.
+    send(pid, :backfill_wake_delivery)
+    assert :sys.get_state(pid, 30_000).timer == nil
+    trace_due_timer(pid)
 
     evidence =
       Tightbeam.NoticeSubmission.prewrite_evidence(
@@ -343,8 +369,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
              end)
 
     due = Wakes.get(ctx.db, successor).due_at
-    assert :sys.get_state(pid).deadline == due
-    Process.sleep(1_500)
+    await_due_timer(pid, due)
 
     assert [%{delivery_wake_id: carrier, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, successor)
