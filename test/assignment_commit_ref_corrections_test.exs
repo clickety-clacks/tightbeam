@@ -75,6 +75,16 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     assert entry.verifiedAt == correction.verifiedAt
   end
 
+  test "the declared remote may be origin while the configured URL still proves it", ctx do
+    origin_ref = Map.put(ref(ctx), "remote", "origin")
+    call = with_param(ctx, :commit_refs, [origin_ref])
+
+    assert %{correction: correction} = correct(call, {:session, "po-owner"})
+    assert is_integer(correction.verifiedAt)
+    assert [%{"remote" => "origin", "verifiedRefCommit" => verified}] = correction.commitRefs
+    assert verified == ctx.commit
+  end
+
   test "a correction replaces an assignment's attest refs in the work-item summary", ctx do
     original_refs = [
       %{"repo" => "old-host:/old/repository", "commit" => String.duplicate("a", 40)},
@@ -387,14 +397,37 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     refute_received {:git_ran, _, _, _}
   end
 
-  test "unreadable canonical refs are recorded with a warning and no verification time", ctx do
+  test "failed canonical checks are recorded by name with no verification time", ctx do
+    tree = git_output!(ctx.repo, ["rev-parse", "#{ctx.commit}^{tree}"])
+
+    local_ahead =
+      git_output!(ctx.repo, ["commit-tree", tree, "-p", ctx.commit, "-m", "local ahead"])
+
+    unrelated = git_output!(ctx.repo, ["commit-tree", tree, "-m", "unrelated"])
+
+    git!(ctx.repo, ["update-ref", "refs/heads/main", local_ahead])
+    git!(ctx.repo, ["update-ref", "refs/heads/local-only", ctx.commit])
+    git!(ctx.repo, ["update-ref", "refs/heads/unrelated", unrelated])
+    git!(ctx.repo, ["push", "origin", "refs/heads/unrelated"])
+
     bad_refs = [
-      {"asg_bad_remote", Map.put(ref(ctx), "remote", "missing")},
-      {"asg_bad_ref", Map.put(ref(ctx), "ref", "refs/heads/missing")},
-      {"asg_bad_commit", Map.put(ref(ctx), "commit", String.duplicate("f", 40))}
+      {"asg_bad_remote", Map.put(ref(ctx), "remote", "missing"),
+       "declared_remote_matches_origin"},
+      {"asg_bad_ref", Map.put(ref(ctx), "ref", "refs/heads/missing"),
+       "declared_local_ref_resolution"},
+      {"asg_bad_commit", Map.put(ref(ctx), "commit", String.duplicate("f", 40)),
+       "declared_commit_resolution"},
+      {"asg_origin_bad_ref",
+       Map.merge(ref(ctx), %{"remote" => "origin", "ref" => "refs/heads/missing"}),
+       "declared_local_ref_resolution"},
+      {"asg_missing_remote_ref", Map.put(ref(ctx), "ref", "refs/heads/local-only"),
+       "declared_remote_ref_resolution"},
+      {"asg_remote_ref_mismatch", ref(ctx), "remote_ref_matches_declared_local_ref"},
+      {"asg_non_ancestor", Map.put(ref(ctx), "ref", "refs/heads/unrelated"),
+       "commit_is_ancestor_of_declared_local_ref"}
     ]
 
-    for {assignment_id, requested_ref} <- bad_refs do
+    for {assignment_id, requested_ref, failed_check} <- bad_refs do
       insert_closed_assignment!(ctx.db, assignment_id)
 
       correction_call =
@@ -405,20 +438,116 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          assert %{warning: warning, correction: correction} =
+          assert %{warning: warning, verificationFailure: ^failed_check, correction: correction} =
                    correct(correction_call, {:session, "po-owner"})
 
-          assert warning =~ "without successful canonical Git verification"
+          assert warning =~ "canonical Git check failed: #{failed_check}"
           assert correction.assignmentId == assignment_id
           assert is_nil(correction.verifiedAt)
           assert correction.commitRefs == [requested_ref]
         end)
 
-      assert log =~ "commit_ref_correction_unverified assignmentId=#{assignment_id}"
+      assert log =~
+               "commit_ref_correction_unverified assignmentId=#{assignment_id} failedCheck=#{failed_check}"
 
       assert [%{verifiedAt: nil, commitRefs: [^requested_ref]}] =
                AssignmentCommitRefCorrections.list(ctx.db, assignment_id)
     end
+  end
+
+  test "an exact replay verifies an origin-based correction with a full ref without changing history",
+       ctx do
+    assignment_id = "asg_review_reverify_valid"
+    insert_closed_review_assignment!(ctx.db, assignment_id)
+
+    requested_ref =
+      Map.merge(ref(ctx), %{
+        "remote" => "origin",
+        "ref" => "refs/heads/docs/external-agent-skill-016"
+      })
+
+    call =
+      ctx
+      |> with_param(:assignment_id, assignment_id)
+      |> with_param(:commit_refs, [requested_ref])
+      |> with_param(:idempotency_key, "review-reverify-valid")
+
+    assert %{
+             correction: original,
+             verificationFailure: "declared_local_ref_resolution"
+           } = correct(call, {:session, "po-owner"})
+
+    assert is_nil(original.verifiedAt)
+    assert [original_history] = correction_history(ctx.db, assignment_id)
+    original_lifecycle = lifecycle(ctx.db, assignment_id)
+    assert [original] = AssignmentCommitRefCorrections.list(ctx.db, assignment_id)
+
+    git!(ctx.repo, ["update-ref", requested_ref["ref"], ctx.commit])
+    git!(ctx.repo, ["push", "origin", requested_ref["ref"]])
+
+    assert %{correction: verified} = correct(call, {:session, "po-owner"})
+    assert is_integer(verified.verifiedAt)
+    assert Map.delete(verified, :verifiedAt) == Map.delete(original, :verifiedAt)
+    assert verified.commitRefs == original.commitRefs
+    refute Map.has_key?(hd(verified.commitRefs), "verifiedRefCommit")
+
+    assert [verified] = AssignmentCommitRefCorrections.list(ctx.db, assignment_id)
+    assert [verified_history] = correction_history(ctx.db, assignment_id)
+    assert verified_history == Map.put(original_history, :verifiedAt, verified.verifiedAt)
+    assert lifecycle(ctx.db, assignment_id) == original_lifecycle
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1",
+               [assignment_id]
+             )
+  end
+
+  test "an invalid correction replay preserves its named failure and history",
+       ctx do
+    assignment_id = "asg_review_reverify_invalid"
+    insert_closed_review_assignment!(ctx.db, assignment_id)
+
+    requested_ref = Map.put(ref(ctx), "remote", "missing")
+
+    call =
+      ctx
+      |> with_param(:assignment_id, assignment_id)
+      |> with_param(:commit_refs, [requested_ref])
+      |> with_param(:idempotency_key, "review-reverify-invalid")
+
+    assert %{correction: original, verificationFailure: "declared_remote_matches_origin"} =
+             correct(call, {:session, "po-owner"})
+
+    assert is_nil(original.verifiedAt)
+    assert [original_history] = correction_history(ctx.db, assignment_id)
+    original_lifecycle = lifecycle(ctx.db, assignment_id)
+
+    assert %{
+             correction: ^original,
+             warning: warning,
+             verificationFailure: "declared_remote_matches_origin"
+           } = correct(call, {:session, "po-owner"})
+
+    assert warning =~ "canonical Git check failed: declared_remote_matches_origin"
+    assert [^original] = AssignmentCommitRefCorrections.list(ctx.db, assignment_id)
+    assert [^original_history] = correction_history(ctx.db, assignment_id)
+    assert lifecycle(ctx.db, assignment_id) == original_lifecycle
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_commit_ref_corrections WHERE assignmentId=?1",
+               [assignment_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1",
+               [assignment_id]
+             )
   end
 
   test "same request replays, changed replay conflicts, and a second correction is denied", ctx do
@@ -566,6 +695,54 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
         if Tightbeam.DB.Txn.changes(txn) != 1, do: raise("fixture assignment missing")
         :ok
       end)
+  end
+
+  defp insert_closed_review_assignment!(db, assignment_id) do
+    closing_attest_id = "att_review_close_#{assignment_id}"
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DB.Txn.q(
+          txn,
+          """
+          INSERT INTO assignments
+            (id, subject, holderKey, openedBySession, openedAt, state, outcome,
+             closedAt, closedBySession, closingAttestId, workItemId)
+          VALUES (?1, 'closed review', 'holder-owner', 'po-owner', 5,
+                  'open', NULL, NULL, NULL, NULL, 'wi_history')
+          """,
+          [assignment_id]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          "INSERT INTO attests (id, assignmentId, kind, bySession, ts) " <>
+            "VALUES (?1, ?2, 'completion', 'holder-owner', 6)",
+          [closing_attest_id, assignment_id]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          "UPDATE assignments SET state='closed', outcome='completed', closedAt=6, " <>
+            "closedBySession='holder-owner', closingAttestId=?1 WHERE id=?2",
+          [closing_attest_id, assignment_id]
+        )
+
+        :ok
+      end)
+  end
+
+  defp correction_history(db, assignment_id) do
+    trace =
+      WorkItems.__handle__(db, "work-item-trace", %{
+        principal: {:user, "owner"},
+        params: %{work_item_id: "wi_history"}
+      })
+
+    Enum.filter(
+      trace.timeline,
+      &(&1.type == "commit_ref_correction" and &1.assignmentId == assignment_id)
+    )
   end
 
   defp recreate_legacy_correction_table!(db) do

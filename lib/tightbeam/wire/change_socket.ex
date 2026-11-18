@@ -9,7 +9,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
   require Logger
   @max_subscriptions 100
   @turn_classes ~w(turn.queued turn.started turn.ended)
-  @filter_keys ~w(classes sessionKey workItemId origin principal)
+  @filter_keys ~w(classes sessionKey workItemId origin principal archetype)
   defstruct phase: :unauthed,
             user_id: nil,
             device_id: nil,
@@ -31,6 +31,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
     pid = GenServer.whereis(hub(state))
     ref = Process.monitor(pid)
     backlog_counter = :atomics.new(1, signed: false)
+
     :ok = Hub.register(pid, self(), %{mode: :pending, backlog_counter: backlog_counter})
     {:ok, %{state | hub_monitor: ref, backlog_counter: backlog_counter}}
   end

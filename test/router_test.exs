@@ -7,6 +7,7 @@ defmodule Tightbeam.Wire.RouterTest do
   alias Tightbeam.{
     Assignments,
     Assets,
+    ConditionFacts,
     Credentials,
     DB,
     Devices,
@@ -24,8 +25,30 @@ defmodule Tightbeam.Wire.RouterTest do
   alias Tightbeam.Wire.Router
   alias Tightbeam.TestSupport.DBFailureReportingFixture
 
+  # Reads reach the real database; every write transaction is refused the way
+  # an overloaded database owner refuses it.
+  defmodule WriterOverloadedDB do
+    use GenServer
+    def start_link(db), do: GenServer.start_link(__MODULE__, db)
+    def init(db), do: {:ok, db}
+
+    def handle_call({:transaction, _fun}, _from, db),
+      do: {:reply, {:error, %Tightbeam.DB.Overloaded{}}, db}
+
+    def handle_call({:transaction_until, _fun, _deadline}, _from, db),
+      do: {:reply, {:error, %Tightbeam.DB.Overloaded{}}, db}
+
+    def handle_call(request, _from, db), do: {:reply, GenServer.call(db, request), db}
+
+    def handle_cast(request, db) do
+      GenServer.cast(db, request)
+      {:noreply, db}
+    end
+  end
+
   @nonterminal_operator_detail_keys ~w(
-    actionKey assignmentId consumedAt context deadlineAt deadlineWakeId decision
+    actionKey assignmentId consumedAt context currentExpecterSessionKey currentRaiserSessionKey
+    deadlineAt deadlineWakeId decision
     effortGeneration expecterSessionKey expecterUserId id kind lineageRung options
     ownerUserId parkWakeId question raiserId raiserSessionKey raisedAt rationale
     ruledAt ruledBy ruledViaSessionKey rulingFactId statuteName status withdrawnAt
@@ -41,12 +64,49 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   @tag prod_id_replacement: true
-  test "wake prod id crosses the wire parameter boundary" do
+  test "wake prod id crosses the wire parameter boundary", ctx do
     assert %{prod_id: "page", prompt: "revised"} =
              Router.atomize_params_for_test("wake", %{
                "prodId" => "page",
                "prompt" => "revised"
              })
+
+    target = create_session(ctx.db, "prod-target", ctx.device.user_id)
+    config = %{base_dir: ctx.base_dir, db: ctx.db, port: 0}
+    handlers = Gateway.handlers(config)
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+    ctx = %{ctx | opts: opts}
+
+    params = %{
+      prompt: "first",
+      at: System.system_time(:millisecond) + 60_000,
+      prodId: "page",
+      idempotencyKey: "prod-first"
+    }
+
+    send_wake = fn params ->
+      response =
+        dispatch_cli(ctx, "tbc_test", %{
+          verb: "wake",
+          asProcess: "bridge",
+          sessionKey: target.session_key,
+          params: params
+        })
+
+      assert response.status == 200
+      JSON.decode!(response.resp_body)["result"]
+    end
+
+    first = send_wake.(params)
+    assert first["replacedWakeIds"] == []
+    second_params = %{params | prompt: "second", idempotencyKey: "prod-second"}
+    second = send_wake.(second_params)
+    assert second["replacedWakeIds"] == [first["wakeId"]]
+    assert send_wake.(second_params) == second
+    third = send_wake.(%{params | prompt: "third", idempotencyKey: "prod-third"})
+    assert third["replacedWakeIds"] == [second["wakeId"]]
+    ordinary = send_wake.(Map.drop(params, [:prodId, :idempotencyKey]))
+    refute Map.has_key?(ordinary, "replacedWakeIds")
   end
 
   test "unknown keys cannot create atoms or borrow another verb's parameters" do
@@ -76,17 +136,20 @@ defmodule Tightbeam.Wire.RouterTest do
            }) == %{keep_open_descendants: true, idempotency_key: "retry-retire"}
   end
 
-  test "effort and health parameters preserve accepted aliases" do
+  test "onboard and health parameters preserve accepted aliases" do
     assert Router.atomize_params_for_test("onboard", %{"ownerUserId" => "flynn"}) ==
              %{owner_user_id: "flynn"}
-
-    assert Router.atomize_params_for_test("effort-rule", %{"requestId" => "request"}) ==
-             %{request_id: "request"}
 
     assert Router.atomize_params_for_test("harness-health-observe-other", %{
              "acceptedAt" => 123,
              "sessionKey" => "source"
            }) == %{accepted_at: 123, session_key: "source"}
+  end
+
+  test "harklight send atomizes the answer UI path without changing its value" do
+    assert Router.atomize_params_for_test("harklight-send", %{
+             "answerUi" => "/tmp/cover assets/answer-ui.json"
+           }) == %{answer_ui: "/tmp/cover assets/answer-ui.json"}
   end
 
   test "changes route refuses missing upgrade or unsupported protocol before authentication" do
@@ -1258,6 +1321,8 @@ defmodule Tightbeam.Wire.RouterTest do
     assert open_detail.status == 200
     open_row = JSON.decode!(open_detail.resp_body)["result"]["decisionRequest"]
     assert Enum.sort(Map.keys(open_row)) == Enum.sort(@nonterminal_operator_detail_keys)
+    assert open_row["currentRaiserSessionKey"] == raiser.session_key
+    assert open_row["currentExpecterSessionKey"] == open_row["expecterSessionKey"]
     refute Map.has_key?(open_row, "ruledViaPrincipal")
     refute Map.has_key?(open_row, "ruledViaSessionState")
     refute Map.has_key?(open_row, "rulingAttribution")
@@ -1824,6 +1889,55 @@ defmodule Tightbeam.Wire.RouterTest do
     assert hd(health["recent"])["lateMs"] == 25_000
     assert hd(health["recent"])["loop"] == "wake"
     assert is_integer(hd(health["recent"])["at"])
+  end
+
+  # wi_0b608f33: every CLI call records whether the caller's CLI version is
+  # compatible. When the database writer is overloaded that record cannot be
+  # written, and the command the caller asked for must still run and return its
+  # own result. An unchanged observation does not need the writer at all; a real
+  # change is recorded by the next call that finds the writer available.
+  test "a CLI command runs when its compatibility observation cannot be written", ctx do
+    session = create_session(ctx.db, "observed-cli", "flynn")
+    overloaded = Keyword.put(ctx.opts, :db, start_supervised!({WriterOverloadedDB, ctx.db}))
+    required = Tightbeam.CliCompatibility.required_version()
+
+    call = fn opts, version ->
+      conn(:post, "/agent/dispatch", JSON.encode!(%{verb: "inspect", params: %{}}))
+      |> put_req_header("authorization", "Bearer #{session.cli_token}")
+      |> put_req_header("x-tightbeam-cli-version", version)
+      |> Router.call(Router.init(opts))
+    end
+
+    incompatible? = fn ->
+      ConditionFacts.standing?(ctx.db, "cli-incompatible", session.session_key)
+    end
+
+    # Nothing changed: the command runs, and nothing asked the writer.
+    {ok, log} = ExUnit.CaptureLog.with_log(fn -> call.(overloaded, required) end)
+    assert ok.status == 200, ok.resp_body
+    assert_receive {:call, %{verb: "inspect"}}
+    refute log =~ "not recorded"
+
+    # A mismatch that cannot be recorded: the caller still gets the real refusal.
+    {refused, log} = ExUnit.CaptureLog.with_log(fn -> call.(overloaded, "0.2.0") end)
+    assert refused.status == 426
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "incompatible_cli"
+    assert log =~ "CLI compatibility observation for observed-cli not recorded"
+    refute incompatible?.()
+
+    # The writer is back: the next call records the mismatch.
+    assert call.(ctx.opts, "0.2.0").status == 426
+    assert incompatible?.()
+
+    # Back on the required version while the writer is refused: the command runs,
+    # and the mismatch stands until a call can record that it cleared.
+    {ok, _log} = ExUnit.CaptureLog.with_log(fn -> call.(overloaded, required) end)
+    assert ok.status == 200, ok.resp_body
+    assert_receive {:call, %{verb: "inspect"}}
+    assert incompatible?.()
+
+    assert call.(ctx.opts, required).status == 200
+    refute incompatible?.()
   end
 
   test "CLI exact-version refusal is loud after bearer authentication", ctx do
@@ -3957,20 +4071,22 @@ defmodule Tightbeam.Wire.RouterTest do
     assert session_opened.status == 200, session_opened.resp_body
     session_assignment = JSON.decode!(session_opened.resp_body)["result"]
 
+    # R01 notifies an opener for blockers, while ordinary unlinked verdicts stay quiet.
     process_notice =
       invoke.(
         "attest",
         %{
           assignmentId: session_assignment["id"],
           kind: "verdict",
-          verdictKind: "waiting",
-          note: "Process notification"
+          verdictKind: "blocked",
+          note: "Process blocker"
         },
         nil
       )
 
     assert process_notice["attest"]["byUser"] == nil
     assert process_notice["attest"]["bySession"] == nil
+    assert process_notice["attest"]["verdictKind"] == "blocked"
 
     assert {:ok, [["process:automation", nil]]} =
              DB.query(

@@ -31,6 +31,236 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     %{base_dir: base_dir}
   end
 
+  test "migration publication produces a staleness notice for a session on the prior revision",
+       ctx do
+    init_fixture!(ctx.base_dir)
+    db = start_db!()
+    seed_migration_rows!(db)
+    Tightbeam.Devices.add_user(db, "sample-owner", true)
+    ensure_main_session(db, "sample-owner")
+    prior = Identity.live_revision!(ctx.base_dir)
+    Tightbeam.Org.set_identity_revision(db, "session-fixture", prior)
+    :ok = Tightbeam.AdminProjection.bootstrap_served(db, ctx.base_dir)
+
+    report = RailScopeMigration.run!(ctx.base_dir, db)
+    revision = report["result_revision"]
+    refute revision == prior
+    # Boot's later bootstrap must not hide the migration's publication.
+    :ok = Tightbeam.AdminProjection.bootstrap_served(db, ctx.base_dir)
+
+    {:ok, seq} =
+      Tightbeam.Ledger.enqueue(db, %{
+        session_key: "session-fixture",
+        message_id: "migration-staleness-turn",
+        origin: "user:sample-owner",
+        prompt: "fixture"
+      })
+
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE turns SET status='delivered', startedAt=?2, endedAt=?2 WHERE seq=?1",
+               [seq, now]
+             )
+
+    assert {:scheduled, 1, ^revision} =
+             Tightbeam.Gateway.identity_staleness_alarm_for_test(db, now)
+
+    target = Tightbeam.Org.personal_session_key("sample-owner")
+
+    assert {:ok, [[^target, prompt]]} =
+             DB.query(db, "SELECT sessionKey,prompt FROM wakes WHERE origin='process:tightbeam'")
+
+    assert prompt =~ revision
+    assert :already_notified = Tightbeam.Gateway.identity_staleness_alarm_for_test(db, now)
+  end
+
+  @briefing_source "rules/briefings.toml"
+  @briefing_namespaced_source "kungfu/harklight-decision-briefings/rules/briefings.toml"
+  @briefing_destination "rules/harklight-decision-request-briefing.toml"
+
+  test "configured 0.1.16 briefings keep their owner and route across upgrade", ctx do
+    init_briefing_fixture!(ctx.base_dir, true)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    original = File.read!(Path.join(identity_dir, @briefing_source))
+    db = start_db!()
+    Tightbeam.Devices.add_user(db, "briefing-test-owner", true)
+
+    for key <- ["briefing-compiler", "briefing-consumer"] do
+      Tightbeam.Org.create(db, %{
+        session_key: key,
+        display_name: key,
+        kind: "custom",
+        owner_user_id: "briefing-test-owner",
+        origin: "user:briefing-test-owner",
+        archetype: "default",
+        host: Tightbeam.Placement.local_host_name(),
+        harness: "codex",
+        provider: "openai",
+        model: Tightbeam.Model.new("fable")
+      })
+    end
+
+    first = RailScopeMigration.run!(ctx.base_dir, db)
+    migrated = File.read!(Path.join(identity_dir, @briefing_destination))
+    # Scope insertion is the only byte change, including the configured fields.
+    assert String.replace(migrated, "archetypes = [\"*\"]\n", "") == original
+    refute File.exists?(Path.join(identity_dir, @briefing_source))
+    refute File.exists?(Path.join(identity_dir, @briefing_namespaced_source))
+
+    receipt =
+      Toml.decode!(
+        File.read!(Path.join(identity_dir, "kungfu/harklight-decision-briefings/installed.toml"))
+      )
+
+    refute @briefing_source in receipt["paths"]
+    refute @briefing_destination in receipt["paths"]
+    assert Provenance.owner_for_path(ctx.base_dir, @briefing_destination) == :substrate
+
+    handlers = Tightbeam.Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+    Tightbeam.Rules.load!(ctx.base_dir, Map.keys(handlers))
+    on_exit(fn -> Tightbeam.Rules.load!("/missing-briefing-migration-reset", []) end)
+
+    request =
+      Tightbeam.Escalation.operator_ask(db, %{
+        verb: "operator-ask",
+        origin: "agent:briefing-compiler",
+        principal: {:session, "briefing-compiler"},
+        session_key: "briefing-compiler",
+        transport_session_key: "briefing-compiler",
+        params: %{question: "Which option?"}
+      })
+
+    assert is_binary(request.id)
+
+    assert {:ok, [["briefing-consumer"]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:harklight-decision-request-briefing'"
+             )
+
+    revision = git!(identity_dir, ["rev-parse", "main"])
+    assert RailScopeMigration.run!(ctx.base_dir, db) == first
+    assert git!(identity_dir, ["rev-parse", "main"]) == revision
+    assert File.read!(Path.join(identity_dir, @briefing_destination)) == migrated
+  end
+
+  test "a legacy briefing with explicit wildcard scope is still written at its new path", ctx do
+    init_briefing_fixture!(ctx.base_dir, true)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    source = Path.join(identity_dir, @briefing_source)
+    bytes = File.read!(source) |> String.replace("verb =", "archetypes = [\"*\"]\nverb =")
+    File.write!(source, bytes)
+    commit_fixture!(identity_dir, "fixture: explicitly scoped legacy briefing")
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
+    assert File.read!(Path.join(identity_dir, @briefing_destination)) == bytes
+    refute File.exists?(source)
+  end
+
+  test "an already namespaced learned briefing also relocates", ctx do
+    init_briefing_fixture!(ctx.base_dir, true)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    source = Path.join(identity_dir, @briefing_source)
+    bytes = File.read!(source)
+    File.mkdir_p!(Path.dirname(Path.join(identity_dir, @briefing_namespaced_source)))
+    File.rename!(source, Path.join(identity_dir, @briefing_namespaced_source))
+    receipt = Path.join(identity_dir, "kungfu/harklight-decision-briefings/installed.toml")
+
+    File.write!(
+      receipt,
+      String.replace(File.read!(receipt), @briefing_source, @briefing_namespaced_source)
+    )
+
+    commit_fixture!(identity_dir, "fixture: namespaced learned briefing")
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
+    migrated = File.read!(Path.join(identity_dir, @briefing_destination))
+    assert String.replace(migrated, "archetypes = [\"*\"]\n", "") == bytes
+    refute File.exists?(Path.join(identity_dir, @briefing_namespaced_source))
+  end
+
+  test "an organization-owned flat briefing remains substrate law", ctx do
+    init_briefing_fixture!(ctx.base_dir, true)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    File.rm!(Path.join(identity_dir, "kungfu/harklight-decision-briefings/installed.toml"))
+    commit_fixture!(identity_dir, "fixture: organization-owned flat briefing")
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
+    assert File.exists?(Path.join(identity_dir, @briefing_source))
+    refute File.exists?(Path.join(identity_dir, @briefing_destination))
+  end
+
+  test "unconfigured learned briefings migrate without error", ctx do
+    init_briefing_fixture!(ctx.base_dir, false)
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
+    bytes = File.read!(Path.join([ctx.base_dir, "identity", @briefing_destination]))
+    assert bytes =~ "CONFIGURE_OWNER_ID"
+    assert bytes =~ "CONFIGURE_DECISION_BRIEFING_ROLE"
+    refute File.exists?(Path.join([ctx.base_dir, "identity", @briefing_source]))
+  end
+
+  test "never-learned briefings migrate without error", ctx do
+    Identity.init!(ctx.base_dir)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    File.rm!(Path.join(identity_dir, @briefing_destination))
+    commit_fixture!(identity_dir, "fixture: before briefing substrate seed existed")
+    git!(identity_dir, ["update-ref", "refs/heads/tightbeam/upstream", "main"])
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
+    refute File.exists?(Path.join([ctx.base_dir, "identity", @briefing_source]))
+  end
+
+  test "an existing substrate briefing keeps its configuration", ctx do
+    init_briefing_fixture!(ctx.base_dir, true)
+    identity_dir = Path.join(ctx.base_dir, "identity")
+
+    existing =
+      File.read!(Path.join(identity_dir, @briefing_source))
+      |> String.replace("briefing-consumer", "existing-consumer")
+      |> String.replace("verb =", "archetypes = [\"*\"]\nverb =")
+
+    File.write!(Path.join(identity_dir, @briefing_destination), existing)
+    commit_fixture!(identity_dir, "fixture: existing substrate briefing")
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, start_db!())
+    assert File.read!(Path.join(identity_dir, @briefing_destination)) == existing
+    assert File.read!(Path.join(identity_dir, @briefing_namespaced_source)) =~ "briefing-consumer"
+  end
+
+  defp init_briefing_fixture!(base_dir, configured?) do
+    Identity.init!(base_dir)
+    identity_dir = Path.join(base_dir, "identity")
+    # Released 0.1.16 learns rules flat; its receipt supplies bundle ownership.
+    legacy = File.read!(Path.join(__DIR__, "fixtures/rail-scope-migration/legacy-briefings.toml"))
+
+    File.rm!(Path.join(identity_dir, @briefing_destination))
+    File.mkdir_p!(Path.dirname(Path.join(identity_dir, @briefing_source)))
+    File.write!(Path.join(identity_dir, @briefing_source), legacy)
+
+    File.mkdir_p!(Path.join(identity_dir, "kungfu/harklight-decision-briefings"))
+
+    File.write!(
+      Path.join(identity_dir, "kungfu/harklight-decision-briefings/installed.toml"),
+      "name = \"harklight-decision-briefings\"\npaths = #{inspect([@briefing_source])}\n"
+    )
+
+    commit_fixture!(identity_dir, "fixture: learned 0.1.16 briefing rule")
+    # Released learn imports the unconfigured bundle into upstream before the
+    # organization configures its main branch. Both refs have the flat path.
+    git!(identity_dir, ["update-ref", "refs/heads/tightbeam/upstream", "main"])
+
+    if configured? do
+      configured =
+        legacy
+        |> String.replace("user:CONFIGURE_OWNER_ID", "user:briefing-test-owner")
+        |> String.replace(
+          "target_role = \"CONFIGURE_DECISION_BRIEFING_ROLE\"",
+          "target_session = \"briefing-consumer\""
+        )
+
+      File.write!(Path.join(identity_dir, @briefing_source), configured)
+      commit_fixture!(identity_dir, "fixture: configure learned briefing on main")
+    end
+  end
+
   test "receipt-owned files migrate once and preserve later agentless rails", ctx do
     init_fixture!(ctx.base_dir)
     db = start_db!()

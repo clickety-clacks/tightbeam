@@ -165,7 +165,9 @@ defmodule Tightbeam.Homes do
     {remote_stamp, stamp_exit} =
       target.sh.(["ssh" | Support.ssh_opts()] ++ [target.host_config.ssh, "cat", remote_manifest])
 
-    if stamp_exit not in [0, 1], do: raise("remote stamp check failed with exit #{stamp_exit}")
+    if stamp_exit not in [0, 1] do
+      raise "remote stamp check failed with exit #{stamp_exit}: #{remote_stamp}"
+    end
 
     staged_stamp = File.read!(staged.manifest_path)
 

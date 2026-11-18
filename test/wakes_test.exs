@@ -1205,6 +1205,8 @@ defmodule Tightbeam.WakesTest do
     db: db,
     scheduler: scheduler
   } do
+    test_pid = self()
+
     scheduler_pid =
       start_supervised!(
         {Wakes,
@@ -1212,7 +1214,12 @@ defmodule Tightbeam.WakesTest do
          name: scheduler,
          tick_ms: 60_000,
          deliver: fn _wake -> :ok end,
-         internal_consumers: %{"exiting" => fn _wake -> exit(:consumer_boom) end}}
+         internal_consumers: %{
+           "exiting" => fn wake ->
+             send(test_pid, {:internal_consumer_attempt, wake.wake_id})
+             exit(:consumer_boom)
+           end
+         }}
       )
 
     wake =
@@ -1239,9 +1246,13 @@ defmodule Tightbeam.WakesTest do
     assert subject == wake.wake_id
     assert detail =~ "consumer_boom"
 
-    # The retry deadline starts the next attempt without another write.
-    Process.sleep(1_100)
-    :sys.get_state(scheduler)
+    # The retry deadline starts the next attempt without another write. Wait
+    # for that attempt, then cross a scheduler barrier so its failure is recorded.
+    # Sleeping past the deadline does not order us after the timer under load.
+    wake_id = wake.wake_id
+    assert_received {:internal_consumer_attempt, ^wake_id}
+    assert_receive {:internal_consumer_attempt, ^wake_id}, 30_000
+    :sys.get_state(scheduler, 30_000)
 
     assert length(
              Enum.filter(EventLog.lifecycle_events(db), &(&1.kind == "wake_delivery_failed"))

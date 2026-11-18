@@ -32,6 +32,8 @@ defmodule Tightbeam.Wire.Router do
     the in-memory observation window Artifacts reads for its evidence class.
   - GET  /api/streams          — device auth; owner-only catalog (even admins).
   - POST /api/streams          — spawn verb (displayName + idempotencyKey).
+  - GET  /api/session-message-sequences — roster visibility; all session keys and
+    latest global transcript sequences (0 when empty), sorted by key, unpaged.
   - GET  /api/trackable-sessions — static {sessions: []} (client probe).
   - PATCH  /api/streams/:key   — tune(rename). DELETE /api/streams/:key —
     retire (absent session + idempotencyKey still dispatches; else 404).
@@ -51,6 +53,8 @@ defmodule Tightbeam.Wire.Router do
   use Plug.Router
 
   @websocket_read_timeout :infinity
+
+  require Logger
 
   alias Tightbeam.{
     Assets,
@@ -75,11 +79,12 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-cover harklight-retry harklight-briefings-catchup harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests check-attest revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
                    "assess_attachments",
                    "session-custody-transfer",
+                   "assignment-opener-accept",
                    "fact-demand",
                    "sentinel-demand",
                    "fact-producer-claim",
@@ -121,6 +126,11 @@ defmodule Tightbeam.Wire.Router do
       resource: "tool calls",
       query: :query_tool_call,
       serializer: :tool_call
+    },
+    turn_events: %{
+      resource: "turn events",
+      query: :query_turn_event,
+      serializer: :turn_event
     },
     roles: %{resource: "roles", query: :query_role, serializer: :role},
     facts: %{
@@ -597,6 +607,10 @@ defmodule Tightbeam.Wire.Router do
     )
   end
 
+  get "/api/session-message-sequences" do
+    session_message_sequences(conn)
+  end
+
   get "/api/sessions" do
     session_index(conn)
   end
@@ -618,6 +632,14 @@ defmodule Tightbeam.Wire.Router do
       conn,
       Map.fetch!(@core_detail_specs, :tool_calls),
       {session_key, tool_call_id}
+    )
+  end
+
+  get "/api/sessions/:session_key/turn-events/:turn_event_id" do
+    core_detail(
+      conn,
+      Map.fetch!(@core_detail_specs, :turn_events),
+      {session_key, turn_event_id}
     )
   end
 
@@ -651,8 +673,22 @@ defmodule Tightbeam.Wire.Router do
     )
   end
 
+  get "/api/sessions/:session_key/record-events" do
+    session_collection(
+      conn,
+      session_key,
+      "record events",
+      :query_record_events_for_session_page,
+      :record_event
+    )
+  end
+
   get "/api/sessions/:session_key/tool-calls" do
     tool_calls_collection(conn, session_key)
+  end
+
+  get "/api/sessions/:session_key/turn-events" do
+    turn_events_collection(conn, session_key)
   end
 
   get "/api/sessions/:session_key/wakes" do
@@ -1029,7 +1065,8 @@ defmodule Tightbeam.Wire.Router do
         state_error(conn, spec.resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
@@ -1154,7 +1191,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> state_error(conn, "read markers", status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       state_error(conn, "read markers", 500, "projection_invalid", nil)
   end
 
@@ -1252,6 +1290,20 @@ defmodule Tightbeam.Wire.Router do
 
   defp observer_principal, do: %{kind: "observer", id: "observer", is_admin: false}
 
+  defp session_message_sequences(conn) do
+    with {:ok, auth} <- core_detail_auth(conn, "sessions"),
+         {:ok, query} <- observer_read_query(conn, "sessions"),
+         {:ok, principal} <- observer_read_route_principal(auth, query, conn),
+         true <- Enum.all?(Map.keys(query), &(&1 == "asUser")) do
+      json(conn, 200, %{
+        "items" => StateResources.query_session_message_sequences(db(conn), principal)
+      })
+    else
+      false -> error(conn, 400, "invalid_filter")
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
   defp session_index(conn) do
     with {:ok, auth} <-
            core_detail_operation(conn, "sessions", :bearer_auth, fn ->
@@ -1265,7 +1317,7 @@ defmodule Tightbeam.Wire.Router do
            core_detail_operation(conn, "sessions", :principal_resolution, fn ->
              core_detail_route_principal(auth, query, conn, "sessions")
            end),
-         :ok <-
+         {:ok, filters} <-
            core_detail_operation(conn, "sessions", :request_validation, fn ->
              session_index_request(query)
            end),
@@ -1274,7 +1326,7 @@ defmodule Tightbeam.Wire.Router do
              query,
              "sessions.collection",
              "sessions",
-             %{},
+             filters,
              principal,
              &session_tuple?/1,
              @state_history_default_limit,
@@ -1289,7 +1341,8 @@ defmodule Tightbeam.Wire.Router do
                db(conn),
                core_detail_trace_principal(conn, principal),
                boundary,
-               limit
+               limit,
+               Map.get(filters, "archetype")
              )
            end),
          page <-
@@ -1299,7 +1352,7 @@ defmodule Tightbeam.Wire.Router do
              &session_tuple/1,
              "sessions.collection",
              "sessions",
-             %{},
+             filters,
              principal,
              :asc
            ),
@@ -1319,7 +1372,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> state_error(conn, "sessions", status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       state_error(conn, "sessions", 500, "projection_invalid", nil)
   end
 
@@ -1330,9 +1384,24 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp session_index_request(query) do
-    if Enum.all?(Map.keys(query), &(&1 in ["asUser", "limit", "before", "after", "tail"])),
-      do: :ok,
-      else: {:error, 400, "invalid_filter", nil}
+    archetypes = Map.get(query, "archetype", [])
+
+    cond do
+      not Enum.all?(
+        Map.keys(query),
+        &(&1 in ["asUser", "limit", "before", "after", "tail", "archetype"])
+      ) ->
+        {:error, 400, "invalid_filter", nil}
+
+      not (is_list(archetypes) and Enum.all?(archetypes, &is_binary/1)) ->
+        {:error, 400, "invalid_filter", nil}
+
+      true ->
+        case archetypes |> Enum.uniq() |> Enum.sort() do
+          [] -> {:ok, %{}}
+          values -> {:ok, %{"archetype" => values}}
+        end
+    end
   end
 
   defp stream_collection_request(query) do
@@ -1607,6 +1676,14 @@ defmodule Tightbeam.Wire.Router do
   defp session_collection_tuple("transcript messages", %{seq: seq}), do: [seq]
   defp session_collection_tuple("turns", %{seq: seq}), do: [seq]
   defp session_collection_tuple("tool calls", %{seq: seq, id: id}), do: [seq, id]
+  defp session_collection_tuple("record events", %{"at" => at, "eventId" => id}), do: [at, id]
+
+  defp session_collection_tuple("turn events", %{
+         turn_seq: turn_seq,
+         turn_event_seq: event_seq,
+         id: id
+       }),
+       do: [turn_seq, event_seq, id]
 
   defp session_collection_tuple("wakes", %{created_at: created_at, wake_id: wake_id}),
     do: [created_at, wake_id]
@@ -1617,6 +1694,14 @@ defmodule Tightbeam.Wire.Router do
 
   defp session_collection_tuple?("tool calls", [seq, id]),
     do: is_integer(seq) and seq > 0 and is_binary(id) and id != ""
+
+  defp session_collection_tuple?("turn events", [turn_seq, event_seq, id]),
+    do:
+      is_integer(turn_seq) and turn_seq > 0 and is_integer(event_seq) and event_seq > 0 and
+        is_binary(id) and id != ""
+
+  defp session_collection_tuple?("record events", [at, id]),
+    do: is_integer(at) and is_binary(id) and id != ""
 
   defp session_collection_tuple?(
          "wakes",
@@ -1664,7 +1749,10 @@ defmodule Tightbeam.Wire.Router do
              principal,
              &session_collection_tuple?(resource, &1),
              @state_history_default_limit,
-             if(resource == "transcript messages", do: :latest, else: :earliest),
+             if(resource in ["transcript messages", "record events"],
+               do: :latest,
+               else: :earliest
+             ),
              :earliest,
              :latest
            ),
@@ -1712,7 +1800,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> state_error(conn, resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       state_error(conn, resource, 500, "projection_invalid", nil)
   end
 
@@ -1880,7 +1969,7 @@ defmodule Tightbeam.Wire.Router do
     allowed =
       if resource == "tool calls",
         do: allowed ++ ["afterMessageSeqFromInclusive", "afterMessageSeqToExclusive"],
-        else: allowed
+        else: if(resource == "turn events", do: allowed ++ ["turnSeq"], else: allowed)
 
     valid_keys? = Enum.all?(Map.keys(query), &(&1 in allowed))
 
@@ -1956,8 +2045,75 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> state_error(conn, resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       state_error(conn, "tool calls", 500, "projection_invalid", nil)
+  end
+
+  defp turn_events_collection(conn, session_key) do
+    resource = "turn events"
+    route = "session.turn_events.collection:#{session_key}"
+
+    with {:ok, auth} <- selected_session_auth(conn),
+         {:ok, request} <- decode_state_query(conn),
+         {:ok, principal, request} <-
+           session_collection_principal(auth, request, conn, session_key, resource),
+         :ok <- session_collection_request(request, session_key, resource),
+         {:ok, turn_seq} <- state_nonnegative_integer_filter(request, "turnSeq"),
+         true <- is_nil(turn_seq) or turn_seq > 0,
+         filters <- %{"turnSeq" => cursor_filter_value(turn_seq)},
+         {:ok, limit, boundary} <-
+           state_page_request(
+             request,
+             route,
+             resource,
+             filters,
+             principal,
+             &session_collection_tuple?(resource, &1),
+             @state_default_limit,
+             :latest,
+             :earliest,
+             :latest
+           ),
+         session when not is_nil(session) <-
+           StateResources.query_session(db(conn), %{key: session_key, principal: principal}),
+         page_result <-
+           StateResources.query_turn_events_for_session_page(
+             db(conn),
+             session_key,
+             boundary,
+             limit,
+             turn_seq
+           ),
+         page <-
+           state_page_metadata(
+             page_result.rows,
+             page_result.flags,
+             &session_collection_tuple(resource, &1),
+             route,
+             resource,
+             filters,
+             principal,
+             :asc
+           ),
+         items <- Enum.map(page_result.rows, &StateResources.turn_event/1),
+         item_bytes <-
+           Enum.map(items, &StateResources.encode_item(resource, &1, state_catalog(conn))) do
+      body =
+        "{" <>
+          ~s("schemaVersion":1,"resource":"turn events","items":[) <>
+          Enum.join(item_bytes, ",") <>
+          "],\"page\":" <> JSON.encode!(page) <> "}"
+
+      state_send(conn, 200, body)
+    else
+      false -> state_error(conn, resource, 400, "invalid_filter", nil)
+      nil -> state_error(conn, resource, 404, "not_found", nil)
+      {:error, status, code, message} -> state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "turn events", 500, "projection_invalid", nil)
   end
 
   defp state_nonnegative_integer_filter(query, key) do
@@ -2142,6 +2298,10 @@ defmodule Tightbeam.Wire.Router do
   defp core_detail_key("tool calls", {session_key, tool_call_id})
        when is_binary(session_key) and is_binary(tool_call_id),
        do: {:ok, {session_key, tool_call_id}}
+
+  defp core_detail_key("turn events", {session_key, turn_event_id})
+       when is_binary(session_key) and is_binary(turn_event_id),
+       do: {:ok, {session_key, turn_event_id}}
 
   defp core_detail_key("host environment", {host, harness, name})
        when is_binary(host) and is_binary(harness) and is_binary(name),
@@ -2561,7 +2721,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       d1_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
@@ -2769,7 +2930,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       d1_error(conn, "execution map", 500, "projection_invalid", nil)
   end
 
@@ -2985,7 +3147,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> d1_error(conn, "attests", status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       d1_error(conn, "attests", 500, "projection_invalid", nil)
   end
 
@@ -3004,7 +3167,8 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       d1_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
@@ -3025,7 +3189,8 @@ defmodule Tightbeam.Wire.Router do
         d1_error(conn, "work-item trace", status, code, message)
     end
   rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
+    error in [ArgumentError, KeyError, MatchError] ->
+      reraise_overload(error, __STACKTRACE__)
       d1_error(conn, "work-item trace", 500, "projection_invalid", nil)
   end
 
@@ -3498,17 +3663,33 @@ defmodule Tightbeam.Wire.Router do
            required,
            conn.request_path
          ) do
-      {:error, reason} ->
-        {:error, 503, "mismatch_state_unavailable", "CLI mismatch state could not be recorded",
-         ErrorDiagnostic.from_reason(reason,
-           operation: "observe_cli_compatibility",
-           origin: "gateway",
-           cli_state: state
-         )}
-
-      _ ->
-        :ok
+      {:error, reason} -> cli_compatibility_unrecorded(session, state, reason)
+      _ -> :ok
     end
+  rescue
+    error -> cli_compatibility_unrecorded(session, state, error)
+  catch
+    :exit, reason -> cli_compatibility_unrecorded(session, state, {:exit, reason})
+  end
+
+  # The observation is bookkeeping about the caller, not the command it asked
+  # for. When it cannot be recorded (the database writer is overloaded or slow)
+  # the command still runs and returns its own result; a real change is recorded
+  # by the next call that finds the writer available.
+  defp cli_compatibility_unrecorded(session, state, reason) do
+    node =
+      ErrorDiagnostic.from_reason(reason,
+        operation: "observe_cli_compatibility",
+        origin: "gateway",
+        cli_state: state
+      )
+
+    Logger.warning(
+      "CLI compatibility observation for #{session.session_key} not recorded; " <>
+        "continuing: " <> JSON.encode!(node)
+    )
+
+    :ok
   end
 
   defp cli_token_auth(conn) do
@@ -3976,7 +4157,7 @@ defmodule Tightbeam.Wire.Router do
   # `--session <key>` is a COHORT FILTER over creator identity, not a target, so
   # resolving it as one would turn a roster filter into a session-existence
   # oracle. Both verbs' selectors travel as ordinary body params.
-  @non_target_verbs ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
+  @non_target_verbs ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-cover harklight-retry harklight-briefings-catchup harklight-follow settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
 
   @non_target_verbs @non_target_verbs ++
                       [
@@ -4081,7 +4262,7 @@ defmodule Tightbeam.Wire.Router do
     do: session_key
 
   defp artifact_caller_session(verb, nil, {:session, session_key})
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow),
+       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-cover harklight-retry harklight-follow),
        do: session_key
 
   defp artifact_caller_session(_verb, session_key, _principal), do: session_key
@@ -4408,6 +4589,12 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  # A read that met the overloaded database owner is not an invalid projection.
+  # Let the request boundary answer it as the retryable refusal it is.
+  defp reraise_overload(error, stacktrace) do
+    if DB.overload_error?(error), do: reraise(error, stacktrace), else: :ok
+  end
+
   defp error_status("forbidden"), do: 403
 
   defp error_status(code)
@@ -4419,6 +4606,7 @@ defmodule Tightbeam.Wire.Router do
   defp error_status("unknown_work_item"), do: 404
   defp error_status("server_error"), do: 500
   defp error_status("assessment-unavailable"), do: 503
+  defp error_status("db_overloaded"), do: 503
 
   defp error_status(code)
        when code in [
@@ -4498,7 +4686,7 @@ defmodule Tightbeam.Wire.Router do
   # delivery uses it to bind the wake to its authoritative decision row.
   #
   # Scoped per verb deliberately: `assignmentId` is an ORDINARY caller param on
-  # attest/assign/dispatch/effort-rule, which name the assignment they act on. A
+  # attest/assign/dispatch, which name the assignment they act on. A
   # blanket strip breaks all of those (the CLI round-trip suite proves it), so the
   # spec's "stripped from any agent/dispatch param map" is read as scoped to the
   # carrier it is written about, not to the parameter name everywhere.
@@ -4539,13 +4727,15 @@ defmodule Tightbeam.Wire.Router do
   @param_keys %{
     "harklight-send" => ~w(
         harklight_session sender_id title message_type message_kind importance stake by_when reply
-        body choices files vendor_session_id supersedes
+        body choices files answer_ui vendor_session_id supersedes decision_request_id
       )a,
     "harklight-revise" => ~w(message_id base_revision title body choices clear_choices)a,
     "harklight-retract" => ~w(message_id)a,
     "harklight-settle" => ~w(message_id)a,
+    "harklight-listener-restore" => ~w(handle)a,
     "harklight-follow" => ~w(message_id handle)a,
     "harklight-cover" => ~w(handle)a,
+    "harklight-briefings-catchup" => ~w(limit)a,
     "harklight-retry" => ~w(all message_id handle)a,
     "work-item-list" =>
       ~w(state status owner_user_id created_by_session created_by_user is_bug spec_ref_name holder_key limit after)a,
@@ -4590,6 +4780,7 @@ defmodule Tightbeam.Wire.Router do
     "attest" =>
       ~w(artifact_id assignment_id commit_refs content_sha256 kind mementos note release_fact_kind release_fact_principal_ref release_fact_scope verdict_kind wait_id)a,
     "attests" => ~w(assignment_id)a,
+    "check-attest" => ~w(attest_id)a,
     "breathing" => ~w(target_id target_kind)a,
     "cancel" => ~w(assignment_id reason)a,
     "condition" => ~w(idempotency_key kind payload scope)a,
@@ -4599,7 +4790,6 @@ defmodule Tightbeam.Wire.Router do
     "decision-requests" => ~w(status)a,
     "dispatch" =>
       ~w(brief effect_kind holder_key idempotency_key mementos prompt session_key subject succeeds_assignment_id parent_assignment_id work_item_id workdir_root owner_user_id)a,
-    "effort-rule" => ~w(action request request_id)a,
     "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
     "execution-map-select" =>
       ~w(assignments under origin owner state spec spec_sha session quiet_over)a,
@@ -4666,6 +4856,7 @@ defmodule Tightbeam.Wire.Router do
     "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
     "session-custody-transfer" =>
       ~w(from_session_key idempotency_key parent_session_key to_session_key)a,
+    "assignment-opener-accept" => ~w(assignment_id to_session_key)a,
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
     "spawn" =>
       ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id owner_user_id)a,
@@ -4687,7 +4878,7 @@ defmodule Tightbeam.Wire.Router do
     "work-item-get" => ~w(work_item_id)a,
     "work-item-handoff" =>
       ~w(work_item_id title delivery_owner_session_key brief owner_user_id spec_ref_name spec_ref_sha256 is_bug priority)a,
-    "work-item-icebox" => ~w(work_item_id)a,
+    "work-item-icebox" => ~w(reason work_item_id)a,
     "work-item-reopen" => ~w(work_item_id)a,
     "work-item-trace" => ~w(work_item_id)a,
     "work-item-update" =>
@@ -4776,7 +4967,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp dispatch_error(conn, %{verb: verb}, status, result)
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-cover harklight-retry harklight-follow) do
+       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-cover harklight-retry harklight-follow) do
     json(conn, status, %{"error" => wire_value(result)})
   end
 

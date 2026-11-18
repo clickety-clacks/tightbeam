@@ -65,6 +65,71 @@ defmodule Tightbeam.RestBulkSnapshotsRoutesTest do
     }
   end
 
+  test "message sequences include all visible sessions, global sequences and cleared history",
+       ctx do
+    for n <- 41..510, do: session!(ctx.db, "reader-worker-#{n}", "reader")
+    key = ctx.reader_session.session_key
+    other = ctx.other_session.session_key
+
+    for {session, role, content} <- [
+          {key, "user", "prompt"},
+          {other, "assistant", "other"},
+          {key, "assistant", "reply"}
+        ] do
+      {:appended, _} =
+        Tightbeam.Projection.append(ctx.db, %{session_key: session, role: role, content: content})
+    end
+
+    {:ok, [[latest]]} =
+      DB.query(ctx.db, "SELECT MAX(seq) FROM messages WHERE sessionKey=?", [key])
+
+    {:ok, []} =
+      DB.query(ctx.db, "UPDATE sessions SET clearedThroughSeq=? WHERE sessionKey=?", [latest, key])
+
+    response = get(ctx, "/api/session-message-sequences")
+    assert response.status == 200, response.resp_body
+    items = JSON.decode!(response.resp_body)["items"]
+    assert length(items) == 511
+    keys = Enum.map(items, & &1["sessionKey"])
+    assert keys == Enum.sort(keys)
+    refute other in keys
+    assert %{"sessionKey" => key, "latestMessageSeq" => latest} in items
+    assert latest > 2
+    assert %{"sessionKey" => hd(ctx.bulk_sessions).session_key, "latestMessageSeq" => 0} in items
+
+    {:appended, next} =
+      Tightbeam.Projection.append(ctx.db, %{session_key: key, role: "user", content: "next"})
+
+    updated = JSON.decode!(get(ctx, "/api/session-message-sequences").resp_body)["items"]
+    assert %{"sessionKey" => key, "latestMessageSeq" => next.seq} in updated
+  end
+
+  test "sequence visibility matches roster for devices, sessions, observers and asUser", ctx do
+    for {token, query} <- [
+          {ctx.reader_token, ""},
+          {ctx.admin_token, ""},
+          {ctx.reader_session.cli_token, ""},
+          {ctx.org_token, ""},
+          {"unknown", ""},
+          {ctx.org_token, "?asUser=reader"},
+          {ctx.reader_token, "?asUser=other"},
+          {ctx.reader_session.cli_token, "?asUser=other"}
+        ] do
+      roster = get(ctx, "/api/sessions" <> query, token)
+      response = get(ctx, "/api/session-message-sequences" <> query, token)
+      assert response.status == roster.status
+      assert response.status == 200, response.resp_body
+
+      expected =
+        JSON.decode!(roster.resp_body)["items"] |> Enum.map(& &1["sessionKey"]) |> Enum.sort()
+
+      actual = JSON.decode!(response.resp_body)["items"] |> Enum.map(& &1["sessionKey"])
+      assert actual == expected
+    end
+
+    assert get(ctx, "/api/session-message-sequences?limit=1").status == 400
+  end
+
   test "bulk wakes walk 1,200 visible rows across 40 sessions in three bounded pages", ctx do
     insert_wake_rows(ctx.db, ctx.bulk_sessions, 1_200)
     insert_wake(ctx.db, "wake-hidden", ctx.other_session.session_key, 2_000_000)

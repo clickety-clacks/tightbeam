@@ -5,6 +5,7 @@ defmodule Tightbeam.SessionDiagnose do
   @max_body 1024
   @max_response 4096
   @lane_timeout 200
+  @snapshot_timeout_ms 500
 
   # The snapshot does not query the DB, create lanes, or call adapters.
   def handle(conn, deps) do
@@ -38,6 +39,7 @@ defmodule Tightbeam.SessionDiagnose do
   @doc false
   def bounded_snapshot(fun) when is_function(fun, 0) do
     parent = self()
+    deadline = System.monotonic_time(:millisecond) + @snapshot_timeout_ms
     reply_alias = :erlang.alias()
     tag = make_ref()
 
@@ -67,16 +69,21 @@ defmodule Tightbeam.SessionDiagnose do
           {:DOWN, ^worker_monitor, :process, ^worker, _} -> :ok
           {:DOWN, ^caller_monitor, :process, ^parent, _} -> Process.exit(worker, :kill)
         after
-          500 -> Process.exit(worker, :kill)
+          remaining_ms(deadline) -> Process.exit(worker, :kill)
         end
       end)
 
     try do
       receive do
-        {^tag, result} -> result
-        {:DOWN, ^monitor, :process, ^guardian, _} -> :unavailable
+        {^tag, result} ->
+          result
+
+        {:DOWN, ^monitor, :process, ^guardian, _} ->
+          # The guardian exits after terminating a worker at the deadline. A
+          # late DOWN must keep timeout semantics if it beats receive's timeout.
+          if System.monotonic_time(:millisecond) >= deadline, do: :timeout, else: :unavailable
       after
-        500 -> :timeout
+        remaining_ms(deadline) -> :timeout
       end
     after
       # Revocation drops future replies. A reply already delivered during the
@@ -90,6 +97,10 @@ defmodule Tightbeam.SessionDiagnose do
         0 -> :ok
       end
     end
+  end
+
+  defp remaining_ms(deadline) do
+    max(deadline - System.monotonic_time(:millisecond), 0)
   end
 
   defp compatible(conn) do

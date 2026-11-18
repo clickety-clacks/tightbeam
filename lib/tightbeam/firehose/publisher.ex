@@ -1,6 +1,7 @@
 defmodule Tightbeam.Firehose.Publisher do
   @moduledoc "Post-commit translation from accepted dispatch verbs to live notices."
 
+  require Logger
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.StateResources
@@ -37,14 +38,40 @@ defmodule Tightbeam.Firehose.Publisher do
   }
 
   @transactional_verbs MapSet.new(
-                         ~w(ask answer return work-item-create work-item-handoff work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest revoke-assignment reopen-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire operator-ask operator-rule operator-withdraw rule effort-rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
+                         ~w(ask answer return work-item-create work-item-handoff work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest revoke-assignment reopen-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire operator-ask operator-rule operator-withdraw rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
                        )
 
   @spec accepted(map(), term()) :: :ok
-  def accepted(call, result), do: Hub.accepted(hub(call), nil, call, result)
+  def accepted(call, result), do: Hub.accepted(hub(call), call, result)
 
+  @doc """
+  Publish the notices for an accepted verb whose canonical row is read from
+  `db`. The read runs here, in the caller, so the hub never waits on the
+  database. If the read fails, for example because the database refuses an
+  overloaded caller, the state notice is left out and logged; the hub still
+  receives the verb's observation notice.
+  """
   @spec accepted(GenServer.server(), map(), term()) :: :ok
-  def accepted(db, call, result), do: Hub.accepted(hub(call), db, call, result)
+  def accepted(db, call, result) do
+    notices =
+      try do
+        accepted_notices(db, call, result)
+      rescue
+        error -> state_notice_unavailable(call, inspect(error.__struct__))
+      catch
+        :exit, _reason -> state_notice_unavailable(call, "exit")
+      end
+
+    Hub.publish_all(hub(call), notices)
+  end
+
+  defp state_notice_unavailable(call, failure) do
+    Logger.warning(
+      "firehose state notice not built verb=#{inspect(call[:verb])} failure=#{failure}"
+    )
+
+    [observation_notice("verb.accepted", call)]
+  end
 
   @spec transactional_verb?(String.t()) :: boolean()
   def transactional_verb?(verb), do: MapSet.member?(@transactional_verbs, verb)
@@ -62,7 +89,7 @@ defmodule Tightbeam.Firehose.Publisher do
     Txn.handoff(
       txn,
       Hub.destination(hub(call)),
-      {:accepted, nil, call, canonical_in_txn(txn, call, result)}
+      {:accepted, call, canonical_in_txn(txn, call, result)}
     )
   end
 
@@ -401,6 +428,22 @@ defmodule Tightbeam.Firehose.Publisher do
   end
 
   @spec committed_notice(String.t(), map(), map()) :: map()
+  def committed_notice(
+        "session_record_event.created" = class,
+        %{"eventId" => event_id, "at" => at} = item,
+        %{"sessionKey" => session_key}
+      )
+      when is_binary(event_id) and is_integer(at) and is_binary(session_key) do
+    %{
+      "class" => class,
+      "resource" => "record events",
+      "op" => "append",
+      "occurredAt" => at,
+      "refs" => %{"sessionKey" => session_key},
+      "payload" => item
+    }
+  end
+
   def committed_notice("kungfu.updated" = class, payload, refs)
       when is_map(payload) and is_map(refs) do
     name = payload["name"] || payload[:name]
@@ -474,7 +517,7 @@ defmodule Tightbeam.Firehose.Publisher do
     build(
       "wake.canceled",
       call,
-      Tightbeam.Wakes.get(db, wake_id) || %{wake_id: wake_id},
+      (db && Tightbeam.Wakes.get(db, wake_id)) || %{wake_id: wake_id},
       &StateResources.wake/1
     )
   end

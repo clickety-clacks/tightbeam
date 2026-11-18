@@ -1,4 +1,5 @@
 """Deterministic contract checks for exact-candidate CI (stdlib only)."""
+import json
 import os
 from pathlib import Path
 import re
@@ -12,19 +13,26 @@ WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml'
 
 def evaluate(expression, context):
     """Evaluate the small GitHub expression subset this workflow uses."""
-    tokens = re.findall(
-        r"\s*(&&|\|\||!=|==|[(),]|'[^']*'|startsWith|[A-Za-z_][\w.-]*)", expression)
-    if ''.join(tokens) != re.sub(r'\s+', '', expression):
+    token_pattern = re.compile(
+        r"\s*(&&|\|\||!=|==|[(),]|'[^']*'|startsWith|[A-Za-z_][\w.-]*)")
+    tokens = []
+    position = 0
+    for match in token_pattern.finditer(expression):
+        if expression[position:match.start()].strip():
+            raise ValueError('unsupported expression: ' + expression)
+        tokens.append(match.group(1))
+        position = match.end()
+    if expression[position:].strip():
         raise ValueError('unsupported expression: ' + expression)
     words = {'&&': ' and ', '||': ' or ', '!=': ' != ', '==': ' == ',
              '(': '(', ')': ')', ',': ',', 'startsWith': '_starts',
-             'format': '_format'}
+             'format': '_format', 'fromJSON': '_json'}
     code = ''.join(
         words.get(token) or (repr(token[1:-1]) if token.startswith("'")
                              else repr(context[token]))
         for token in tokens)
     return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p),
-                       '_format': lambda f, *a: f.format(*a)})
+                       '_format': lambda f, *a: f.format(*a), '_json': json.loads})
 
 
 class ExactHeadCI(unittest.TestCase):
@@ -184,6 +192,12 @@ class ExactHeadCI(unittest.TestCase):
         self.assertIn('persist-credentials: false', job)
         self.assertIn('test "$DISPATCH_SHA" = "$CI_SOURCE_SHA"', job)
         self.assertIn('test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"', job)
+        self.assertIn('EXPECTED_BASE: ${{ inputs.candidate_base_sha }}', job)
+        self.assertIn('[[ "$EXPECTED_BASE" =~ ^[0-9a-f]{40}$ ]] || exit 1', job)
+        self.assertIn('git cat-file -e "$EXPECTED_BASE^{commit}"', job)
+        self.assertIn('test "$(git merge-base HEAD "$EXPECTED_BASE")" = "$EXPECTED_BASE"', job)
+        self.assertIn('git diff --exit-code "$EXPECTED_BASE" HEAD -- priv', job)
+        self.assertNotIn('git rev-parse HEAD^)', job)
         self.assertIn('python3 scripts/verify_shipped_privacy.py', job)
         self.assertIn('sh packaging/assemble.sh', job)
         self.assertIn('mix run --no-start scripts/docs_composition_52.exs', job)

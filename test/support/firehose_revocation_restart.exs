@@ -142,7 +142,7 @@ try do
     assert rows.(reopened, "SELECT priorClosedByProcess FROM assignment_reopenings") == [[nil]]
 
     assert rows.(reopened, "SELECT shape FROM schema_stamp") ==
-             [["session-custody-v1-0116"]]
+             [["session-custody-artifact-process-attribution-v1-0117"]]
 
     assert rows.(reopened, "PRAGMA foreign_key_check") == []
     assert File.read!(Path.join(base, "build-owner.json")) == marker

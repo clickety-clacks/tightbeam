@@ -41,6 +41,11 @@ defmodule Tightbeam.Wakes do
 
   alias Tightbeam.DB.Txn
 
+  defmodule RuleEvaluationUnavailable do
+    @moduledoc false
+    defexception message: "filing rule evaluation is not ready"
+  end
+
   @miss_detector_ms 180_000
   @miss_lateness_ms 60_000
   @decision_request_notice_marker "decision-request-notice:"
@@ -409,11 +414,26 @@ defmodule Tightbeam.Wakes do
         correlation
       )
       when is_binary(incident_id) and is_binary(failure_class) and is_binary(correlation) do
-    health_redelivery_sources_in_txn(txn, incident_id, failure_class)
+    health_redelivery_sources_in_txn(txn, incident_id, failure_class, true)
     |> Enum.reduce(0, fn [idempotency_key | _rest], count ->
       Txn.q(
         txn,
-        "UPDATE health_redelivery_attempts SET cycleReleaseCorrelation=?2 WHERE idempotencyKey=?1 AND restorationTurnSeq IS NULL AND redeliveryTurnSeq IS NULL AND cycleReleaseCorrelation IS NULL AND cycleReleaseTurnSeq IS NULL",
+        """
+        UPDATE health_redelivery_attempts
+        SET cycleReleaseCorrelation=?2
+        WHERE idempotencyKey=?1 AND cycleReleaseCorrelation IS NULL
+          AND cycleReleaseTurnSeq IS NULL
+          AND (
+            (restorationTurnSeq IS NULL AND redeliveryTurnSeq IS NULL)
+            OR EXISTS (
+              SELECT 1 FROM turns failed
+              WHERE failed.seq=health_redelivery_attempts.redeliveryTurnSeq
+                AND failed.sessionKey=health_redelivery_attempts.sessionKey
+                AND failed.messageId=health_redelivery_attempts.sourceMessageId
+                AND failed.status='failed'
+            )
+          )
+        """,
         [idempotency_key, correlation]
       )
 
@@ -467,7 +487,23 @@ defmodule Tightbeam.Wakes do
       [[_incident_id]] ->
         Txn.q(
           txn,
-          "SELECT idempotencyKey,sessionKey,sourceMessageId,sourceTurnSeq,sourceWakeId,origin,prompt,roleRef,roleFallback,assignmentId,jobRef,requestRef,cycleReleaseCorrelation FROM health_redelivery_attempts WHERE cycleReleaseCorrelation=?1 AND sourceHarness=?2 AND sourceHost=?3 AND redeliveryTurnSeq IS NULL AND cycleReleaseTurnSeq IS NULL AND parentSessionKey IS NULL ORDER BY sourceTurnSeq",
+          """
+          SELECT idempotencyKey,sessionKey,sourceMessageId,sourceTurnSeq,sourceWakeId,origin,
+                 prompt,roleRef,roleFallback,assignmentId,jobRef,requestRef,cycleReleaseCorrelation
+          FROM health_redelivery_attempts
+          WHERE cycleReleaseCorrelation=?1 AND sourceHarness=?2 AND sourceHost=?3
+            AND cycleReleaseTurnSeq IS NULL AND parentSessionKey IS NULL
+            AND (
+              redeliveryTurnSeq IS NULL OR EXISTS (
+                SELECT 1 FROM turns failed
+                WHERE failed.seq=health_redelivery_attempts.redeliveryTurnSeq
+                  AND failed.sessionKey=health_redelivery_attempts.sessionKey
+                  AND failed.messageId=health_redelivery_attempts.sourceMessageId
+                  AND failed.status='failed'
+              )
+            )
+          ORDER BY sourceTurnSeq
+          """,
           [correlation, harness, host]
         )
         |> Enum.each(fn source ->
@@ -1728,14 +1764,20 @@ defmodule Tightbeam.Wakes do
       )
     end
 
-    if is_binary(Map.get(input, :prod_id)) do
-      Tightbeam.QueuedMessageSuppression.replace_prod_in_txn(
-        txn,
-        wake,
-        Map.fetch!(input, :prod_sender),
-        input.prod_id
-      )
-    end
+    wake =
+      if is_binary(Map.get(input, :prod_id)) do
+        replaced_ids =
+          Tightbeam.QueuedMessageSuppression.replace_prod_in_txn(
+            txn,
+            wake,
+            Map.fetch!(input, :prod_sender),
+            input.prod_id
+          )
+
+        Map.put(wake, :replaced_wake_ids, replaced_ids)
+      else
+        wake
+      end
 
     if is_binary(condition_kind) do
       EventLog.lifecycle_in_txn(
@@ -2723,29 +2765,63 @@ defmodule Tightbeam.Wakes do
     case Txn.q(
            txn,
            """
-           SELECT w.verificationState,a.state,a.holderKey
-           FROM wakes w JOIN assignments a ON a.id=w.verificationAssignmentId
-           WHERE w.wakeId=?1 AND w.verificationAssignmentId=?2
+           SELECT w.verificationState,w.verificationAssignmentId,verifier.state,verifier.holderKey,
+                  w.assignmentId,parent.state,parent.holderKey,w.firedAt
+           FROM wakes w
+           JOIN assignments verifier ON verifier.id=w.verificationAssignmentId
+           LEFT JOIN assignments parent ON parent.id=w.assignmentId
+           WHERE w.wakeId=?1
            """,
-           [attrs.wait_id, attrs.assignment_id]
+           [attrs.wait_id]
          ) do
-      [[state, "open", holder_key]] when holder_key == attrs.by_session ->
-        case {attrs.verdict_kind, state} do
-          {"wait-verified", "provisional"} ->
-            :ok
+      [
+        [
+          state,
+          verifier_id,
+          verifier_state,
+          verifier_holder,
+          parent_id,
+          parent_state,
+          parent_holder,
+          fired_at
+        ]
+      ] ->
+        verifier_holds_verdict =
+          attrs.assignment_id == verifier_id and verifier_state == "open" and
+            verifier_holder == attrs.by_session
 
-          {"wait-challenged", state} when state in ~w(provisional confirmed) ->
-            :ok
+        parent_holds_verdict =
+          attrs.assignment_id == parent_id and parent_state == "open" and
+            parent_holder == attrs.by_session and verifier_state == "closed" and
+            not is_nil(fired_at)
 
-          _ ->
-            wait_error("invalid_wait_verdict", "wait verification transition is already terminal")
+        if verifier_holds_verdict or parent_holds_verdict do
+          verification_verdict_transition(state, attrs.verdict_kind)
+        else
+          wait_error(
+            "invalid_wait_verdict",
+            "wait verdict requires the named open verifier and holder, or the current holder of the open wait assignment after the verifier closes and the wait fires"
+          )
         end
 
       _ ->
         wait_error(
           "invalid_wait_verdict",
-          "wait verdict requires the named open verifier assignment and its recorded holder"
+          "wait verdict requires the named open verifier and holder, or the current holder of the open wait assignment after the verifier closes and the wait fires"
         )
+    end
+  end
+
+  defp verification_verdict_transition(state, verdict_kind) do
+    case {verdict_kind, state} do
+      {"wait-verified", "provisional"} ->
+        :ok
+
+      {"wait-challenged", state} when state in ~w(provisional confirmed) ->
+        :ok
+
+      _ ->
+        wait_error("invalid_wait_verdict", "wait verification transition is already terminal")
     end
   end
 
@@ -2814,6 +2890,11 @@ defmodule Tightbeam.Wakes do
   def row_commit_in_txn(%Txn{} = txn, transitions) do
     transitions = List.wrap(transitions) ++ DB.take_row_commits(txn)
 
+    if not wait_recognition_ready?(txn) and
+         Enum.any?(transitions, &filing_transition?/1) do
+      raise RuleEvaluationUnavailable
+    end
+
     if wait_recognition_ready?(txn) do
       txn
       |> RuleRuntime.row_commit_effects_in_txn(transitions)
@@ -2831,8 +2912,11 @@ defmodule Tightbeam.Wakes do
               )
           end
 
+        {:remedy, rule, call, _evidence} ->
+          Tightbeam.FilingRemedy.enqueue_in_txn(txn, rule, call)
+
         {:error, rule, message} ->
-          EventLog.lifecycle_in_txn(txn, "rule_notice_failed", rule.name, message)
+          EventLog.lifecycle_in_txn(txn, "rule_effect_failed", rule.name, message)
       end)
 
       recognize_wait_transitions_in_txn(txn, transitions)
@@ -2840,6 +2924,12 @@ defmodule Tightbeam.Wakes do
 
     :ok
   end
+
+  defp filing_transition?(%{domain: "condition_fact", bindings: bindings})
+       when is_map(bindings),
+       do: bindings[:conditionKind] == "decision-request-filed"
+
+  defp filing_transition?(_), do: false
 
   @doc "Execute an actor-owned rule notice without changing the governed decision."
   @spec deliver_rule_notice(DB.server(), map(), map(), list()) :: :ok
@@ -2859,7 +2949,7 @@ defmodule Tightbeam.Wakes do
   defp deliver_rule_notice_in_txn(txn, rule, call, evidence) do
     case RuleRuntime.resolve_notice_in_txn(txn, rule, call) do
       {:ok, resolved} ->
-        wake_id = rule_notice_wake_id(rule, resolved)
+        wake_id = rule_notice_wake_id(rule, resolved, call)
 
         if is_binary(wake_id) and
              Txn.q(
@@ -2959,9 +3049,24 @@ defmodule Tightbeam.Wakes do
   defp request_unowned_agent_stretch_decision_in_txn(_txn, _rule, _call, _evidence),
     do: :not_applicable
 
-  defp rule_notice_wake_id(_rule, %{idempotency_key: nil}), do: nil
+  defp rule_notice_wake_id(rule, resolved, %{transition: transition, params: params})
+       when is_map(transition) do
+    if is_binary(params[:decision_request_id]) and transition[:domain] == "condition_fact" and
+         get_in(params, [:decision_request_id]) == transition[:bindings][:decisionRequestId] and
+         transition[:bindings][:conditionKind] == "decision-request-filed" do
+      digest =
+        :crypto.hash(:sha256, rule.name <> "\0" <> params.decision_request_id)
+        |> Base.encode16(case: :lower)
 
-  defp rule_notice_wake_id(rule, %{bound_session: session_key, idempotency_key: key})
+      "w_rule_" <> digest
+    else
+      rule_notice_wake_id(rule, resolved, nil)
+    end
+  end
+
+  defp rule_notice_wake_id(_rule, %{idempotency_key: nil}, _call), do: nil
+
+  defp rule_notice_wake_id(rule, %{bound_session: session_key, idempotency_key: key}, _call)
        when is_binary(session_key) and is_binary(key) do
     digest =
       :crypto.hash(:sha256, rule.name <> "\0" <> session_key <> "\0" <> key)
@@ -2970,7 +3075,7 @@ defmodule Tightbeam.Wakes do
     "w_rule_" <> digest
   end
 
-  defp rule_notice_wake_id(_rule, _resolved), do: nil
+  defp rule_notice_wake_id(_rule, _resolved, _call), do: nil
 
   defp principal_session({:session, session_key}), do: session_key
   defp principal_session(_principal), do: nil
@@ -3172,8 +3277,7 @@ defmodule Tightbeam.Wakes do
           Txn.q(
             txn,
             """
-            UPDATE health_redelivery_attempts
-            SET restorationTurnSeq=NULL,redeliveryTurnSeq=NULL
+            UPDATE health_redelivery_attempts SET restorationTurnSeq=NULL,redeliveryTurnSeq=NULL
             WHERE sessionKey=?1 AND sourceMessageId=?2 AND redeliveryTurnSeq=?3
               AND parentSessionKey IS NULL
             """,
@@ -3389,7 +3493,12 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp health_redelivery_sources_in_txn(txn, incident_id, failure_class) do
+  defp health_redelivery_sources_in_txn(
+         txn,
+         incident_id,
+         failure_class,
+         allow_failed_redelivery \\ false
+       ) do
     Txn.q(
       txn,
       """
@@ -3408,7 +3517,10 @@ defmodule Tightbeam.Wakes do
         AND observed.status='failed'
         AND observed.messageId IS NOT NULL
         AND a.failureClass=?2
-        AND a.redeliveryTurnSeq IS NULL
+        AND (
+          a.redeliveryTurnSeq IS NULL OR
+          (?3=1 AND a.redeliveryTurnSeq=observed.seq)
+        )
         AND a.cycleReleaseCorrelation IS NULL
         AND a.cycleReleaseTurnSeq IS NULL
         AND a.parentSessionKey IS NULL
@@ -3423,7 +3535,7 @@ defmodule Tightbeam.Wakes do
         )
       ORDER BY a.sourceTurnSeq
       """,
-      [incident_id, failure_class]
+      [incident_id, failure_class, if(allow_failed_redelivery, do: 1, else: 0)]
     )
   end
 
@@ -3498,8 +3610,17 @@ defmodule Tightbeam.Wakes do
       UPDATE health_redelivery_attempts
       SET cycleReleaseTurnSeq=?2
       WHERE idempotencyKey=?1 AND cycleReleaseCorrelation=?3
-        AND restorationTurnSeq IS NULL AND redeliveryTurnSeq IS NULL
         AND cycleReleaseTurnSeq IS NULL
+        AND (
+          (restorationTurnSeq IS NULL AND redeliveryTurnSeq IS NULL)
+          OR EXISTS (
+            SELECT 1 FROM turns failed
+            WHERE failed.seq=health_redelivery_attempts.redeliveryTurnSeq
+              AND failed.sessionKey=health_redelivery_attempts.sessionKey
+              AND failed.messageId=health_redelivery_attempts.sourceMessageId
+              AND failed.status='failed'
+          )
+        )
       """,
       [idempotency_key, redelivery_turn_seq, correlation]
     )
@@ -4298,7 +4419,6 @@ defmodule Tightbeam.Wakes do
     "tightbeam:escalation" => ~w(obligation_disposed),
     "tightbeam:sentinel-supervisor" => ~w(condition_cleared),
     "tightbeam:harness-health" => ~w(condition_cleared),
-    "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
     "tightbeam:supervision" => ~w(superseded),
     "tightbeam:row-reactions" => ~w(superseded),
     "tightbeam:rail-remedy" => ~w(superseded),
@@ -4389,7 +4509,19 @@ defmodule Tightbeam.Wakes do
         cancellation_reference(command, canceled_at)
       )
 
-      commit_cancellation(txn, wake, cancellation)
+      result = commit_cancellation(txn, wake, cancellation)
+
+      if result != false do
+        Tightbeam.HarnessRecoveryNotice.settle_wake_cancellation_in_txn(
+          txn,
+          wake.wake_id,
+          %{"kind" => cancellation.requester_kind, "id" => cancellation.requester_id},
+          cancellation.reason_kind,
+          canceled_at
+        )
+      end
+
+      result
     else
       _ -> false
     end
@@ -4766,23 +4898,6 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp durable_source(
-         txn,
-         %{
-           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-           reason_kind: "superseded"
-         },
-         "progress_attest",
-         source_id,
-         wake,
-         _canceled_at
-       )
-       when is_binary(source_id) and source_id != "" do
-    if effort_holder_prod_attest?(txn, source_id, wake),
-      do: {:ok, source_id, nil},
-      else: :error
-  end
-
   defp durable_source(txn, _command, source_kind, source_id, wake, _canceled_at)
        when source_kind != "verb_call" and is_binary(source_id) and source_id != "" do
     case validate_source(txn, source_kind, source_id, wake) do
@@ -5045,8 +5160,6 @@ defmodule Tightbeam.Wakes do
       nil ->
         if inactivity_policy_action_cancellation?(command, outcome, wake, primary) or
              retirement_no_replacement_without_liveness?(command, outcome) or
-             exact_terminal_effort_request?(txn, command, outcome, wake, primary) or
-             cleared_effort_holder_prod_without_liveness?(txn, command, outcome, wake, primary) or
              completed_assignment_without_liveness?(txn, command, outcome, wake, primary) or
              cleared_decision_notice_without_liveness?(txn, command, outcome, wake, primary),
            do: {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}},
@@ -5095,10 +5208,13 @@ defmodule Tightbeam.Wakes do
 
   defp retirement_no_replacement_without_liveness?(_command, _outcome), do: false
 
+  # Retirement closes assignments in the same transaction before disposing their
+  # notices. That closed assignment is the disposition proof even when its
+  # parent work item stays open without a pending routing or inactivity wake.
   defp completed_assignment_without_liveness?(
          txn,
          %{
-           requester: %{kind: "process", id: "tightbeam:assignments"},
+           requester: %{kind: "process", id: requester_id},
            reason_kind: "obligation_disposed",
            causal_source: %{kind: "assignment_transition", id: assignment_id}
          },
@@ -5109,7 +5225,8 @@ defmodule Tightbeam.Wakes do
          },
          %{assignment_id: assignment_id},
          %{kind: "work_item", id: work_item_id, impact: "linked_work_open"}
-       ) do
+       )
+       when requester_id in ["tightbeam:assignments", "tightbeam:retirement"] do
     case Txn.q(
            txn,
            "SELECT 1 FROM assignments WHERE id=?1 AND workItemId=?2 AND state='closed'",
@@ -5146,77 +5263,6 @@ defmodule Tightbeam.Wakes do
 
   defp cleared_decision_notice_without_liveness?(_txn, _command, _outcome, _wake, _primary),
     do: false
-
-  # An open effort request is itself the agent's exit. Once the current
-  # expecter transitions that exact request, the transition is sufficient
-  # typed proof to cancel only its own deadline controller. This does not
-  # stand in for liveness on any other wake: every identity and carrier field
-  # is joined back to the terminal request row in this transaction.
-  defp exact_terminal_effort_request?(
-         txn,
-         command,
-         %{
-           kind: "disposition",
-           disposition_kind: "decision_request_transition",
-           disposition_id: request_id
-         },
-         %{
-           wake_id: wake_id,
-           assignment_id: assignment_id,
-           consumer: "effort_deadline"
-         },
-         %{kind: "assignment", id: assignment_id, impact: "linked_work_open"}
-       ) do
-    with %{
-           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-           reason_kind: "obligation_disposed",
-           causal_source: %{kind: "decision_request", id: ^request_id}
-         } <- command,
-         %{id: ^request_id, assignment_id: ^assignment_id, deadline_wake_id: ^wake_id} <-
-           Escalation.effort_terminal_in_txn(txn, request_id) do
-      true
-    else
-      _ -> false
-    end
-  end
-
-  defp exact_terminal_effort_request?(_txn, _command, _outcome, _wake, _primary), do: false
-
-  defp cleared_effort_holder_prod_without_liveness?(
-         txn,
-         %{
-           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-           reason_kind: "superseded",
-           causal_source: %{kind: "progress_attest", id: attest_id},
-           outcome: %{kind: "no_replacement"} = outcome
-         },
-         %{kind: "no_replacement"} = outcome,
-         wake,
-         %{kind: "assignment", id: assignment_id, impact: "linked_work_open"}
-       )
-       when wake.assignment_id == assignment_id and is_binary(attest_id) do
-    effort_holder_prod_attest?(txn, attest_id, wake)
-  end
-
-  defp cleared_effort_holder_prod_without_liveness?(_txn, _command, _outcome, _wake, _primary),
-    do: false
-
-  defp effort_holder_prod_attest?(txn, attest_id, wake) do
-    assignment_id = wake.assignment_id
-    holder = wake.session_key
-
-    is_binary(assignment_id) and is_binary(holder) and
-      wake.obligation_ref == Tightbeam.EffortCheckin.holder_prod_ref(assignment_id) and
-      Txn.q(
-        txn,
-        """
-        SELECT 1 FROM attests t JOIN assignments a ON a.id=t.assignmentId
-        WHERE t.id=?1 AND t.assignmentId=?2 AND t.bySession=?3
-          AND a.holderKey=?3 AND a.state='open'
-        """,
-        [attest_id, assignment_id, holder]
-      ) == [[1]]
-  end
 
   # The plain 3-arity form is every OTHER caller of this check (today, only
   # `validate_liveness/5`'s `pending_wake` clause, which is not a batcher
@@ -6524,9 +6570,13 @@ defmodule Tightbeam.Wakes do
 
   @impl true
   def init(opts) do
+    Tightbeam.DB.owed_work()
+
     Tightbeam.RowReactions.recover(Keyword.get(opts, :db, Tightbeam.DB))
 
     state = %{
+      identity_staleness_check: Keyword.get(opts, :identity_staleness_check),
+      identity_staleness_interval_ms: Keyword.get(opts, :identity_staleness_interval_ms),
       deliver: Keyword.fetch!(opts, :deliver),
       db: Keyword.get(opts, :db, Tightbeam.DB),
       timer: nil,
@@ -6540,6 +6590,10 @@ defmodule Tightbeam.Wakes do
       delivery_opts: Keyword.get(opts, :delivery_opts, []),
       internal_consumers: Keyword.get(opts, :internal_consumers, %{})
     }
+
+    if state.identity_staleness_check do
+      Process.send_after(self(), :identity_staleness_check, state.identity_staleness_interval_ms)
+    end
 
     Process.send_after(self(), :detect_misses, @miss_detector_ms)
     send(self(), :recover_notices)
@@ -6648,6 +6702,12 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_info({:timeout, _stale_timer, :due}, state), do: {:noreply, state}
+
+  def handle_info(:identity_staleness_check, state) do
+    DB.background_pass(state.identity_staleness_check)
+    Process.send_after(self(), :identity_staleness_check, state.identity_staleness_interval_ms)
+    {:noreply, state}
+  end
 
   def handle_info(:detect_misses, state) do
     state = DB.background_pass(fn -> detect_misses(state) end, state)
@@ -6997,6 +7057,10 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  # A recipient-specific pass reads only the waits that can resolve to that
+  # recipient (resolved_recipient/2): session-addressed waits stored for it and
+  # waits for a role bound to it. Waits addressed to other sessions never match
+  # and would only cost a write transaction each at every turn end.
   defp deliver_eligible_waits(db, delivery_opts, recipient \\ nil) do
     {:ok, rows} =
       DB.query(
@@ -7004,7 +7068,9 @@ defmodule Tightbeam.Wakes do
         """
         SELECT wakeId FROM wakes
         WHERE state='pending' AND waitMode IS NOT NULL AND recognitionAt IS NOT NULL
-          AND firedAt IS NULL AND (?1 IS NULL OR sessionKey=?1 OR targetRole IS NOT NULL OR targetGate<>0)
+          AND firedAt IS NULL AND (?1 IS NULL
+            OR (targetRole IS NULL AND sessionKey=?1)
+            OR targetRole IN (SELECT name FROM roles WHERE boundSessionKey=?1))
         ORDER BY recognitionAt,wakeId
         """,
         [recipient]

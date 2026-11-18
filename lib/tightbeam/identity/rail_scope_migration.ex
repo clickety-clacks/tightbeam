@@ -7,7 +7,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   identity repository so it survives a refused boot without becoming served law.
   """
 
-  alias Tightbeam.{DB, Identity}
+  alias Tightbeam.{AdminProjection, DB, Identity}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Identity.{Provenance, TomlEdit}
 
@@ -183,6 +183,21 @@ defmodule Tightbeam.Identity.RailScopeMigration do
                  if plan.identity_changed? do
                    candidate_revision = apply_identity_plan!(dir, plan, revision)
                    :ok = publish_identity!(base_dir, revision, candidate_revision)
+
+                   # Bootstrap only seeds absent rows. Advance the existing served
+                   # stamp with the same snapshot and allocator as publication, in
+                   # this transaction so a failed migration rolls both back.
+                   identity = AdminProjection.served_identity_entry(txn, base_dir)
+
+                   AdminProjection.allocate_in_txn(
+                     txn,
+                     "identity",
+                     "served",
+                     System.system_time(:millisecond),
+                     fingerprint: AdminProjection.fingerprint(identity.item),
+                     item: JSON.encode!(identity.item)
+                   )
+
                    candidate_revision
                  else
                    revision
@@ -265,16 +280,18 @@ defmodule Tightbeam.Identity.RailScopeMigration do
       stops: duplicate_stops ++ reaction_scan.stops
     }
 
+    initial = plan_decision_briefing(initial)
     upstream = plan_upstream(initial)
 
     initial
     |> plan_archetypes()
     |> plan_scoped_files()
-    |> plan_receipts(reaction_scan.removed_paths)
+    |> plan_receipts(initial.removals)
     |> plan_manifests()
     |> plan_seed_reactions(seed_reactions, reaction_scan)
     |> plan_seed_rails(seed_rails)
     |> plan_rail_names()
+    |> Map.put(:entries, entries)
     |> finalize_plan()
     |> Map.put(:upstream, upstream)
     |> then(fn plan ->
@@ -293,6 +310,35 @@ defmodule Tightbeam.Identity.RailScopeMigration do
               Enum.map(upstream.flagged_conditions, &Map.put(&1, "ref", "tightbeam/upstream"))
       }
     end)
+  end
+
+  # 0.1.16 shipped this org-wide rule in an optional bundle. Preserve its
+  # configured bytes as substrate law before applying kungfu scope isolation.
+  defp plan_decision_briefing(plan) do
+    bundle = "harklight-decision-briefings"
+
+    source =
+      Enum.find(
+        ["rules/briefings.toml", "kungfu/#{bundle}/rules/briefings.toml"],
+        &(Map.has_key?(plan.entries, &1) and
+            Map.get(plan.owner_by_path, &1) == {:kungfu, bundle})
+      )
+
+    destination = "rules/harklight-decision-request-briefing.toml"
+
+    if source && not Map.has_key?(plan.entries, destination) do
+      bytes = Map.fetch!(plan.entries, source)
+
+      %{
+        plan
+        | entries: plan.entries |> Map.delete(source) |> Map.put(destination, bytes),
+          removals: MapSet.put(plan.removals, source),
+          removed_entries:
+            plan.removed_entries ++ [%{"file" => source, "moved_to" => destination}]
+      }
+    else
+      plan
+    end
   end
 
   defp plan_upstream(main) do
