@@ -1883,6 +1883,9 @@ defmodule Tightbeam.Acp.AdapterTest do
     task_sup = start_supervised!({Task.Supervisor, []})
     {adapter, capture} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
     {replacement, replacement_capture} = start_adapter(probe: false)
+    conn = Adapter.conn(adapter)
+    adapter_monitor = Process.monitor(adapter)
+    conn_monitor = Process.monitor(conn)
     parent = self()
 
     enqueue = fn text ->
@@ -1903,18 +1906,86 @@ defmodule Tightbeam.Acp.AdapterTest do
     runner = fn turn ->
       send(parent, {:ran, turn.seq})
       selected = if turn.seq == first, do: adapter, else: replacement
-      Adapter.prompt(selected, "lane-session", turn.prompt, timeout: 1_000, cancel_grace: 50)
+
+      Adapter.prompt(selected, "lane-session", turn.prompt,
+        timeout: @explicit_prompt_timeout,
+        trace_dispatch: fn id ->
+          send(parent, {:dispatched, turn.seq, id})
+          :ok
+        end
+      )
     end
 
     lane =
       start_supervised!(
-        {SessionLane, session_key: "timeout-lane", db: db, task_sup: task_sup, runner: runner}
+        {SessionLane,
+         session_key: "timeout-lane",
+         db: db,
+         task_sup: task_sup,
+         runner: runner,
+         on_terminal: fn _session_key, seq -> send(parent, {:terminal, seq}) end}
       )
 
-    assert_receive {:ran, ^first}, 2_000
+    # ExUnit bounds the test as a whole; scheduling and harness startup do not
+    # consume a short prompt budget or a separate successor wait budget.
+    assert(
+      receive do
+        {:ran, ^first} -> true
+      end
+    )
+
+    id =
+      receive do
+        {:dispatched, ^first, id} -> id
+      end
+
+    assert is_integer(id)
+
+    # A reply on the same transport proves the harness consumed the preceding
+    # prompt before teardown closes its port (and its capture file).
+    assert {:ok, _} = Tightbeam.Acp.Conn.request(conn, "initialize", %{}, timeout: :infinity)
+    %{token: token} = :sys.get_state(conn).pending[id]
     assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [second])
-    assert_receive {:ran, ^second}, 3_000
-    assert eventually(fn -> :sys.get_state(lane).task_ref == nil end)
+
+    # This case checks lane recovery, not elapsed time. Drive the same expiry
+    # messages as the timers, in order, after dispatch and the queued assertion.
+    # The separate bounded-teardown test exercises the real timers.
+    send(conn, {:prompt_deadline, id, token})
+    send(conn, {:prompt_cancel_expired, id, token})
+
+    assert(
+      receive do
+        {:DOWN, ^adapter_monitor, :process, ^adapter,
+         {:prompt_cancel_unacknowledged, "lane-session"}} ->
+          true
+      end
+    )
+
+    assert(
+      receive do
+        {:DOWN, ^conn_monitor, :process, ^conn, _} -> true
+      end
+    )
+
+    assert(
+      receive do
+        {:ran, ^second} -> true
+      end
+    )
+
+    assert(
+      receive do
+        {:terminal, ^first} -> true
+      end
+    )
+
+    assert(
+      receive do
+        {:terminal, ^second} -> true
+      end
+    )
+
+    assert :sys.get_state(lane).task_ref == nil
 
     assert {:ok, [["failed"], ["delivered"]]} =
              DB.query(db, "SELECT status FROM turns WHERE seq IN (?1,?2) ORDER BY seq", [
