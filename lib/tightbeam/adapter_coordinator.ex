@@ -283,6 +283,10 @@ defmodule Tightbeam.AdapterCoordinator do
       # Production waits for definitive park results; private finite overrides
       # keep deadline exhaustion deterministic in fault tests.
       shutdown_budget_ms: Keyword.get(opts, :shutdown_budget_ms, @shutdown_budget_ms),
+      # Private deadline-clock seam: fault tests advance phases without racing
+      # scheduler latency. Production always uses the monotonic clock.
+      shutdown_clock:
+        Keyword.get(opts, :shutdown_clock, fn _phase -> System.monotonic_time(:millisecond) end),
       shutdown_settlement_budget_ms:
         Keyword.get(opts, :shutdown_settlement_budget_ms, @shutdown_settlement_budget_ms),
       shutdown_cancel_grace_ms:
@@ -352,9 +356,9 @@ defmodule Tightbeam.AdapterCoordinator do
     # One monotonic clock covers preparation, park attempts, durable settlement,
     # and nonblocking retirement. Reserve the final slice for settlement; if
     # either DB phase cannot finish, keep the outcome explicitly unresolved.
-    local_deadline = System.monotonic_time(:millisecond) + state.shutdown_budget_ms
+    local_deadline = state.shutdown_clock.(:start) + state.shutdown_budget_ms
     deadline = Tightbeam.Application.shutdown_deadline(local_deadline)
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+    remaining = max(deadline - state.shutdown_clock.(:remaining), 0)
 
     settlement_budget =
       if deadline < local_deadline,
@@ -375,7 +379,7 @@ defmodule Tightbeam.AdapterCoordinator do
     results =
       case preparation do
         :ok ->
-          if System.monotonic_time(:millisecond) >= park_deadline do
+          if state.shutdown_clock.(:park) >= park_deadline do
             budget_exhausted_results(pending)
           else
             pending
@@ -383,7 +387,8 @@ defmodule Tightbeam.AdapterCoordinator do
             |> collect_shutdown_results(
               park_deadline,
               settle_start,
-              state.shutdown_cancel_grace_ms
+              state.shutdown_cancel_grace_ms,
+              state.shutdown_clock
             )
           end
 
@@ -775,11 +780,11 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  defp collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms) do
-    collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms, [])
+  defp collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms, clock) do
+    collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms, clock, [])
   end
 
-  defp collect_shutdown_results([], _deadline, _settle_start, _cancel_grace_ms, results),
+  defp collect_shutdown_results([], _deadline, _settle_start, _cancel_grace_ms, _clock, results),
     do: Enum.reverse(results)
 
   defp collect_shutdown_results(
@@ -787,16 +792,17 @@ defmodule Tightbeam.AdapterCoordinator do
          deadline,
          settle_start,
          cancel_grace_ms,
+         clock,
          results
        ) do
-    case Task.yield(task, max(deadline - System.monotonic_time(:millisecond), 0)) do
+    case Task.yield(task, max(deadline - clock.(:park_wait), 0)) do
       {:ok, result} ->
-        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, [
+        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, clock, [
           {key, process_row, result} | results
         ])
 
       {:exit, reason} ->
-        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, [
+        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, clock, [
           {key, process_row, {:error, {:shutdown_task_exit, reason}}} | results
         ])
 
@@ -807,7 +813,12 @@ defmodule Tightbeam.AdapterCoordinator do
         cancel_shutdown_tasks([current | rest])
 
         timed_out =
-          collect_cancelled_shutdown_results([current | rest], settle_start, cancel_grace_ms)
+          collect_cancelled_shutdown_results(
+            [current | rest],
+            settle_start,
+            cancel_grace_ms,
+            clock
+          )
 
         Enum.reverse(results) ++ timed_out
     end
@@ -819,7 +830,7 @@ defmodule Tightbeam.AdapterCoordinator do
     end)
   end
 
-  defp collect_cancelled_shutdown_results(tasks, settle_start, cancel_grace_ms) do
+  defp collect_cancelled_shutdown_results(tasks, settle_start, cancel_grace_ms, clock) do
     # The park deadline already budgets one full grace ahead of the reserve, so
     # a cancel that starts on time gets all of it. When park collection overran
     # its own deadline, the grace is truncated at the reserve boundary rather
@@ -827,11 +838,11 @@ defmodule Tightbeam.AdapterCoordinator do
     # unrecorded outcome beats a recorded outcome settlement can no longer
     # write.
     cancel_deadline =
-      min(System.monotonic_time(:millisecond) + cancel_grace_ms, settle_start)
+      min(clock.(:cancel) + cancel_grace_ms, settle_start)
 
     yielded =
       Enum.map(tasks, fn {key, process_row, task} ->
-        remaining = max(cancel_deadline - System.monotonic_time(:millisecond), 0)
+        remaining = max(cancel_deadline - clock.(:cancel_wait), 0)
         {key, process_row, task, Task.yield(task, remaining)}
       end)
 
@@ -872,7 +883,7 @@ defmodule Tightbeam.AdapterCoordinator do
          deadline,
          retired
        ) do
-    if System.monotonic_time(:millisecond) >= deadline do
+    if state.shutdown_clock.(:retire) >= deadline do
       {late, targets} = late_shutdown_outcomes([{key, process_row, result} | rest], state)
       {Enum.reverse(retired) ++ late, state, targets}
     else
