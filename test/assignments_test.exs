@@ -3991,6 +3991,160 @@ defmodule Tightbeam.AssignmentsTest do
     assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "canceled"
   end
 
+  test "later independent reviews settle the original pending completion with different or absent refs",
+       ctx do
+    session(ctx.db, "deferred-parent", "flynn")
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    producer_refs = [
+      %{"repo" => "testhost:/tmp/deferred-producer", "commit" => String.duplicate("a", 40)}
+    ]
+
+    different_refs = [
+      %{"repo" => "testhost:/tmp/deferred-review", "commit" => String.duplicate("b", 40)}
+    ]
+
+    for {label, review_refs} <- [{"different", different_refs}, {"absent", nil}] do
+      item = create_work_item(ctx, "deferred completion #{label}")
+
+      producer =
+        terminal_notice_assign_call({:session, "deferred-parent"}, "deferred #{label}", item.id)
+        |> put_in([:params, :effect_kind], "code")
+        |> then(&handle(ctx, "assign", &1))
+
+      review =
+        assign_call({:user, "flynn"}, "deferred review #{label}", nil, item.id)
+        |> put_in([:params, :reviews_assignment_id], producer.id)
+        |> Map.put(:session_key, "other-session")
+        |> then(&handle(ctx, "assign", &1))
+
+      pending =
+        attest_call({:session, "holder"}, producer.id, "completion")
+        |> Map.put(:review_pending, true)
+        |> then(&handle(ctx, "attest", &1))
+
+      assert pending.assignment.state == "open"
+      assert pending.fyi == [fyi("this code assignment has no verified verdict from its holder")]
+      original_id = pending.attest.id
+
+      assert %{attest: %{verdictKind: "verified"}} =
+               attest_call({:session, "holder"}, producer.id, "verdict")
+               |> put_in([:params, :verdict_kind], "verified")
+               |> put_in([:params, :commit_refs], producer_refs)
+               |> then(&handle(ctx, "attest", &1))
+
+      assert {:ok, [["open", nil]]} =
+               DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
+                 producer.id
+               ])
+
+      assert %{attest: %{verdictKind: "reviewed-clean"}} =
+               attest_call({:session, "other-session"}, review.id, "verdict")
+               |> put_in([:params, :verdict_kind], "reviewed-clean")
+               |> put_in([:params, :commit_refs], review_refs)
+               |> then(&handle(ctx, "attest", &1))
+
+      assert {:ok, [["closed", "completed", ^original_id, closed_at]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT state,outcome,closingAttestId,closedAt FROM assignments WHERE id=?1",
+                 [producer.id]
+               )
+
+      assert closed_at == pending.attest.ts
+      assert read_back_fyi(ctx, producer.id, original_id) == pending.fyi
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+                 [producer.id]
+               )
+
+      assert [notice] = Enum.filter(terminal_notices(ctx.db), &(&1.assignment_id == producer.id))
+      assert notice.session_key == "deferred-parent"
+      assert notice.creator_session_key == "holder"
+      assert notice.due_at == pending.attest.ts
+      assert notice.prompt =~ original_id
+    end
+  end
+
+  test "deferred code completion still needs holder verification and independent clean review",
+       ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    for {verification, reviewer} <- [
+          {nil, "other-session"},
+          {"verification-failed", "other-session"},
+          {"verified", "holder"}
+        ] do
+      producer =
+        handle(
+          ctx,
+          "assign",
+          assign_call({:user, "flynn"}, "missing prerequisite #{verification} #{reviewer}")
+        )
+
+      review =
+        assign_call({:user, "flynn"}, "prerequisite review")
+        |> put_in([:params, :reviews_assignment_id], producer.id)
+        |> Map.put(:session_key, reviewer)
+        |> then(&handle(ctx, "assign", &1))
+
+      pending =
+        attest_call({:session, "holder"}, producer.id, "completion")
+        |> Map.put(:review_pending, true)
+        |> then(&handle(ctx, "attest", &1))
+
+      assert pending.assignment.state == "open"
+
+      if verification do
+        assert %{attest: %{kind: "verdict"}} =
+                 attest_call({:session, "holder"}, producer.id, "verdict")
+                 |> put_in([:params, :verdict_kind], verification)
+                 |> put_in([:params, :commit_refs], [
+                   %{
+                     "repo" => "testhost:/tmp/deferred-prerequisite",
+                     "commit" => String.duplicate("a", 40)
+                   }
+                 ])
+                 |> then(&handle(ctx, "attest", &1))
+      end
+
+      assert %{attest: %{verdictKind: "reviewed-clean"}} =
+               attest_call({:session, reviewer}, review.id, "verdict")
+               |> put_in([:params, :verdict_kind], "reviewed-clean")
+               |> then(&handle(ctx, "attest", &1))
+
+      assert {:ok, [["open", nil]]} =
+               DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
+                 producer.id
+               ])
+
+      assert Enum.filter(terminal_notices(ctx.db), &(&1.assignment_id == producer.id)) == []
+    end
+  end
+
   test "a clean review settles cannot-proceed after review-pending completion", ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
 

@@ -3587,18 +3587,27 @@ defmodule Tightbeam.Assignments do
   end
 
   defp settle_completed_assignment_after_review_in_txn(txn, call, producer, completion) do
-    completion_call =
-      call
-      |> Map.delete(:fyi)
-      |> Map.put(:params, %{assignment_id: producer.id, kind: "completion"})
+    qualified? =
+      if producer.effectKind == "code" do
+        verification =
+          latest_verification_conclusion_in_txn(txn, producer.id, producer.holderKey)
 
-    # The automatic close after a clean review keeps its strict condition: it
-    # happens only when the completion checks find nothing to report.
-    if producer.state == "open" and
-         match?(
-           {:ok, checked} when not is_map_key(checked, :fyi),
-           applicable_code_completion_in_txn(txn, producer, completion_call)
-         ) do
+        review = latest_review_conclusion_in_txn(txn, producer.id)
+
+        match?(
+          %{kind: "verified", holder: holder} when holder == producer.holderKey,
+          verification
+        ) and
+          match?(
+            %{kind: "reviewed-clean", holder: holder} when holder != producer.holderKey,
+            review
+          )
+      else
+        true
+      end
+
+    # Informational FYIs do not qualify or veto this automatic transition.
+    if producer.state == "open" and qualified? do
       close_completed_assignment_in_txn(txn, call, producer, completion)
     end
 
