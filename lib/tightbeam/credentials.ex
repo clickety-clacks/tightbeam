@@ -524,6 +524,8 @@ defmodule Tightbeam.Credentials do
 
   @impl true
   def init(opts) do
+    Tightbeam.DB.owed_work()
+
     machine = Keyword.fetch!(opts, :machine)
 
     {:ok,

@@ -6528,6 +6528,8 @@ defmodule Tightbeam.Wakes do
 
   @impl true
   def init(opts) do
+    Tightbeam.DB.owed_work()
+
     Tightbeam.RowReactions.recover(Keyword.get(opts, :db, Tightbeam.DB))
 
     state = %{

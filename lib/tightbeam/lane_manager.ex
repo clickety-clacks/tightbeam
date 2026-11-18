@@ -63,6 +63,8 @@ defmodule Tightbeam.LaneManager do
 
   @impl true
   def init(opts) do
+    Tightbeam.DB.owed_work()
+
     state = %__MODULE__{
       name: Keyword.get(opts, :name, __MODULE__),
       db: Keyword.get(opts, :db, Tightbeam.DB),
