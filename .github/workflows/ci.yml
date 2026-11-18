@@ -70,6 +70,7 @@ jobs:
     # Pull requests, the merge queue and manual runs outside main use hosted
     # runners. macOS push suites and trusted manual main suites use the
     # existing self-hosted pool; Linux keeps its hosted matrix runner.
+    # The main-ref comparison uses Actions' case-insensitive string equality.
     runs-on: ${{ matrix.name == 'macos' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && fromJSON('["self-hosted", "tb-macos"]') || matrix.os }}
     steps:
       - name: Validate exact source SHA
