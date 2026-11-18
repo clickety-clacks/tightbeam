@@ -7053,7 +7053,7 @@ defmodule Tightbeam.AssignmentsTest do
              closedByProcess: nil
            } = closed
 
-    assert %{assignment: %{state: "open"}} =
+    assert %{state: "open"} =
              handle(
                ctx,
                "reopen-assignment",
