@@ -5530,9 +5530,15 @@ defmodule Tightbeam.RulesTest do
   defp operator_assignment(ctx, holder_key, owner) do
     Tightbeam.TestSupport.OperatorAskFixture.ensure_work_item!(ctx.db, owner)
 
-    assignment(ctx, holder_key, {:user, owner},
-      work_item_id: Tightbeam.TestSupport.OperatorAskFixture.work_item(owner)
-    )
+    work_item_id = Tightbeam.TestSupport.OperatorAskFixture.work_item(owner)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE work_items SET deliveryOwnerSessionKey=?1 WHERE id=?2", [
+        holder_key,
+        work_item_id
+      ])
+
+    assignment(ctx, holder_key, {:user, owner}, work_item_id: work_item_id)
   end
 
   defp assignment(ctx, holder_key, opener, opts \\ []) do
