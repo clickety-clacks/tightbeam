@@ -7,7 +7,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   identity repository so it survives a refused boot without becoming served law.
   """
 
-  alias Tightbeam.{DB, Identity}
+  alias Tightbeam.{AdminProjection, DB, Identity}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Identity.{Provenance, TomlEdit}
 
@@ -183,6 +183,21 @@ defmodule Tightbeam.Identity.RailScopeMigration do
                  if plan.identity_changed? do
                    candidate_revision = apply_identity_plan!(dir, plan, revision)
                    :ok = publish_identity!(base_dir, revision, candidate_revision)
+
+                   # Bootstrap only seeds absent rows. Advance the existing served
+                   # stamp with the same snapshot and allocator as publication, in
+                   # this transaction so a failed migration rolls both back.
+                   identity = AdminProjection.served_identity_entry(txn, base_dir)
+
+                   AdminProjection.allocate_in_txn(
+                     txn,
+                     "identity",
+                     "served",
+                     System.system_time(:millisecond),
+                     fingerprint: AdminProjection.fingerprint(identity.item),
+                     item: JSON.encode!(identity.item)
+                   )
+
                    candidate_revision
                  else
                    revision

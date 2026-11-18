@@ -31,6 +31,52 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     %{base_dir: base_dir}
   end
 
+  test "migration publication produces a staleness notice for a session on the prior revision",
+       ctx do
+    init_fixture!(ctx.base_dir)
+    db = start_db!()
+    seed_migration_rows!(db)
+    Tightbeam.Devices.add_user(db, "sample-owner", true)
+    ensure_main_session(db, "sample-owner")
+    prior = Identity.live_revision!(ctx.base_dir)
+    Tightbeam.Org.set_identity_revision(db, "session-fixture", prior)
+    :ok = Tightbeam.AdminProjection.bootstrap_served(db, ctx.base_dir)
+
+    report = RailScopeMigration.run!(ctx.base_dir, db)
+    revision = report["result_revision"]
+    refute revision == prior
+    # Boot's later bootstrap must not hide the migration's publication.
+    :ok = Tightbeam.AdminProjection.bootstrap_served(db, ctx.base_dir)
+
+    {:ok, seq} =
+      Tightbeam.Ledger.enqueue(db, %{
+        session_key: "session-fixture",
+        message_id: "migration-staleness-turn",
+        origin: "user:sample-owner",
+        prompt: "fixture"
+      })
+
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE turns SET status='delivered', startedAt=?2, endedAt=?2 WHERE seq=?1",
+               [seq, now]
+             )
+
+    assert {:scheduled, 1, ^revision} =
+             Tightbeam.Gateway.identity_staleness_alarm_for_test(db, now)
+
+    target = Tightbeam.Org.personal_session_key("sample-owner")
+
+    assert {:ok, [[^target, prompt]]} =
+             DB.query(db, "SELECT sessionKey,prompt FROM wakes WHERE origin='process:tightbeam'")
+
+    assert prompt =~ revision
+    assert :already_notified = Tightbeam.Gateway.identity_staleness_alarm_for_test(db, now)
+  end
+
   @briefing_source "rules/briefings.toml"
   @briefing_namespaced_source "kungfu/harklight-decision-briefings/rules/briefings.toml"
   @briefing_destination "rules/harklight-decision-request-briefing.toml"
