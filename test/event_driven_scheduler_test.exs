@@ -121,15 +121,12 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     timer = state.timer
     assert is_reference(timer)
 
-    # Observe the actual due timer rather than firing it from the test. A due
-    # pass can queue further work, so wait for delivery as well, then cross a
-    # mailbox barrier before inspecting the handler's committed state.
-    # These observation bounds do not relax delivery-lateness assertions.
+    # Observe the actual due timer rather than firing it from the test, then
+    # cross a mailbox barrier before inspecting the handler's committed state.
+    # This observation bound does not relax delivery-lateness assertions.
     assert_receive {:trace, ^pid, :receive, {:timeout, ^timer, :due}}, 30_000
-    assert_receive {:delivered, id, fired_at}, 30_000
     :sys.get_state(pid, 30_000)
     :erlang.trace(pid, false, [:receive])
-    {id, fired_at}
   end
 
   defp wake(db, due_at, extra \\ %{}) do
@@ -314,7 +311,8 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     later = wake(ctx.db, System.system_time(:millisecond) + 60_000, %{consumer: "test"})
     due = System.system_time(:millisecond) + 10_000
     scheduled = wake(ctx.db, due, %{consumer: "test"})
-    {id, fired_at} = await_due_timer(pid, due)
+    await_due_timer(pid, due)
+    assert_received {:delivered, id, fired_at}
     assert id == scheduled.wake_id
     assert fired_at >= due
     assert fired_at - due < 1_000
@@ -371,9 +369,12 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
              end)
 
     due = Wakes.get(ctx.db, successor).due_at
-    {carrier, _fired_at} = await_due_timer(pid, due)
+    await_due_timer(pid, due)
+    # Prompt recognition can queue another pass to form and deliver the carrier.
+    # Observe that committed state, rather than guessing how long both passes take.
+    assert await_state(ctx.db, successor, "fired", System.monotonic_time(:millisecond) + 30_000)
 
-    assert [%{delivery_wake_id: ^carrier, batch_state: "delivered"}] =
+    assert [%{delivery_wake_id: carrier, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, successor)
 
     assert {:ok, [[delivered_at]]} =
