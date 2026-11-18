@@ -567,8 +567,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
       |> Enum.with_index()
       |> Enum.reduce(nil, fn {f, i}, acc ->
         if f["type"] == "message" and f["role"] == "assistant",
-           do: i,
-           else: acc
+          do: i,
+          else: acc
       end)
 
     indicator_error =
@@ -743,7 +743,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
 
           cond do
             member["deviceId"] !=
-                (observations[id].history_rows |> List.first() |> Map.get("deviceId")) ->
+                observations[id].history_rows |> List.first() |> Map.get("deviceId") ->
               "#{id} staged identity did not match its user history row"
 
             member["clientMessageId"] != id or member["historyClientMessageId"] != id ->
@@ -771,7 +771,8 @@ defmodule Tightbeam.ClientE2E.Journeys do
     |> Enum.with_index()
     |> Enum.drop(1)
     |> Enum.find_value(fn {id, index} ->
-      accepted_at = observations[id].history_rows |> List.first() |> then(&(&1 && &1["timestamp"]))
+      accepted_at =
+        observations[id].history_rows |> List.first() |> then(&(&1 && &1["timestamp"]))
 
       earlier_busy? =
         if is_integer(accepted_at) do
@@ -903,7 +904,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
     }
   end
 
-  defp post_path_settled?(%{direct_turn: %{ "status" => status }}),
+  defp post_path_settled?(%{direct_turn: %{"status" => status}}),
     do: status in @terminal_turn_statuses
 
   defp post_path_settled?(%{staged_members: members}) when members != [] do
@@ -2053,11 +2054,11 @@ defmodule Tightbeam.ClientE2E.Journeys do
                     )
 
                   history["deviceId"] != ctx.client.device_id or
-                      member["deviceId"] != history["deviceId"] or
-                      member["clientMessageId"] != second or
-                      member["historyClientMessageId"] != second or
-                      member["historyMessageId"] != history["id"] or
-                      member["memberId"] != original_member["memberId"] or
+                    member["deviceId"] != history["deviceId"] or
+                    member["clientMessageId"] != second or
+                    member["historyClientMessageId"] != second or
+                    member["historyMessageId"] != history["id"] or
+                    member["memberId"] != original_member["memberId"] or
                       member["batchId"] != original_member["batchId"] ->
                     Scorecard.fail(
                       "15",
@@ -2068,7 +2069,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
                     )
 
                   member["memberState"] != "included" or member["batchState"] != "delivered" or
-                      member["carrierTurnSeq"] == nil or member["carrierStatus"] != "delivered" or
+                    member["carrierTurnSeq"] == nil or member["carrierStatus"] != "delivered" or
                       member["carrierIsBatchCarrier"] != 1 ->
                     Scorecard.fail(
                       "15",
