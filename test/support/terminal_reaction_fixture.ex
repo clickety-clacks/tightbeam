@@ -7,7 +7,7 @@ defmodule Tightbeam.TerminalReactionFixture do
     File.mkdir_p!(rules)
 
     for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
-      source = Path.join([:code.priv_dir(:tightbeam), "kungfu/agentic-engineering/rules", name])
+      source = Path.join([:code.priv_dir(:tightbeam), "seed/rules", name])
       File.cp!(source, Path.join(rules, name))
     end
 

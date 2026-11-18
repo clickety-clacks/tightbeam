@@ -75,7 +75,7 @@ defmodule Tightbeam.RailScriptTest do
         display_name: "Rail holder",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
+        archetype: "default",
         host: "testhost",
         harness: "claude",
         provider: "anthropic",
@@ -443,7 +443,7 @@ defmodule Tightbeam.RailScriptTest do
         display_name: "Remote rail holder",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "coder",
+        archetype: "default",
         host: "remote-testhost",
         harness: "claude",
         provider: "anthropic",
@@ -591,7 +591,8 @@ defmodule Tightbeam.RailScriptTest do
     escalated_call = %{
       call()
       | origin: "agent:rail-holder",
-        principal: {:session, ctx.holder.session_key}
+        principal: {:session, ctx.holder.session_key},
+        session_key: ctx.holder.session_key
     }
 
     handlers = %{
@@ -868,7 +869,8 @@ defmodule Tightbeam.RailScriptTest do
              Dispatch.dispatch(ctx.db, handlers, %{
                call(%{work_item_id: "w-two"})
                | origin: "agent:rail-holder",
-                 principal: {:session, ctx.holder.session_key}
+                 principal: {:session, ctx.holder.session_key},
+                 session_key: ctx.holder.session_key
              })
 
     assert {:ok, [[1]]} =
@@ -1741,6 +1743,7 @@ defmodule Tightbeam.RailScriptTest do
   defp rule(script) do
     %{
       name: "fixture-rail",
+      archetypes: ["*"],
       check: %{script: script, returns: ["pass"], timeout_ms: 100, effects: %{"pass" => "allow"}}
     }
   end
@@ -1763,6 +1766,7 @@ defmodule Tightbeam.RailScriptTest do
 
     """
     [[rule]]
+    archetypes = ["*"]
     name = "script-escalate"
     verb = "#{verb}"
     text = "fixture"

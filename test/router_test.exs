@@ -7,6 +7,7 @@ defmodule Tightbeam.Wire.RouterTest do
   alias Tightbeam.{
     Assignments,
     Assets,
+    ConditionFacts,
     Credentials,
     DB,
     Devices,
@@ -24,8 +25,30 @@ defmodule Tightbeam.Wire.RouterTest do
   alias Tightbeam.Wire.Router
   alias Tightbeam.TestSupport.DBFailureReportingFixture
 
+  # Reads reach the real database; every write transaction is refused the way
+  # an overloaded database owner refuses it.
+  defmodule WriterOverloadedDB do
+    use GenServer
+    def start_link(db), do: GenServer.start_link(__MODULE__, db)
+    def init(db), do: {:ok, db}
+
+    def handle_call({:transaction, _fun}, _from, db),
+      do: {:reply, {:error, %Tightbeam.DB.Overloaded{}}, db}
+
+    def handle_call({:transaction_until, _fun, _deadline}, _from, db),
+      do: {:reply, {:error, %Tightbeam.DB.Overloaded{}}, db}
+
+    def handle_call(request, _from, db), do: {:reply, GenServer.call(db, request), db}
+
+    def handle_cast(request, db) do
+      GenServer.cast(db, request)
+      {:noreply, db}
+    end
+  end
+
   @nonterminal_operator_detail_keys ~w(
-    actionKey assignmentId consumedAt context deadlineAt deadlineWakeId decision
+    actionKey assignmentId consumedAt context currentExpecterSessionKey currentRaiserSessionKey
+    deadlineAt deadlineWakeId decision
     effortGeneration expecterSessionKey expecterUserId id kind lineageRung options
     ownerUserId parkWakeId question raiserId raiserSessionKey raisedAt rationale
     ruledAt ruledBy ruledViaSessionKey rulingFactId statuteName status withdrawnAt
@@ -1255,6 +1278,8 @@ defmodule Tightbeam.Wire.RouterTest do
     assert open_detail.status == 200
     open_row = JSON.decode!(open_detail.resp_body)["result"]["decisionRequest"]
     assert Enum.sort(Map.keys(open_row)) == Enum.sort(@nonterminal_operator_detail_keys)
+    assert open_row["currentRaiserSessionKey"] == raiser.session_key
+    assert open_row["currentExpecterSessionKey"] == open_row["expecterSessionKey"]
     refute Map.has_key?(open_row, "ruledViaPrincipal")
     refute Map.has_key?(open_row, "ruledViaSessionState")
     refute Map.has_key?(open_row, "rulingAttribution")
@@ -1821,6 +1846,55 @@ defmodule Tightbeam.Wire.RouterTest do
     assert hd(health["recent"])["lateMs"] == 25_000
     assert hd(health["recent"])["loop"] == "wake"
     assert is_integer(hd(health["recent"])["at"])
+  end
+
+  # wi_0b608f33: every CLI call records whether the caller's CLI version is
+  # compatible. When the database writer is overloaded that record cannot be
+  # written, and the command the caller asked for must still run and return its
+  # own result. An unchanged observation does not need the writer at all; a real
+  # change is recorded by the next call that finds the writer available.
+  test "a CLI command runs when its compatibility observation cannot be written", ctx do
+    session = create_session(ctx.db, "observed-cli", "flynn")
+    overloaded = Keyword.put(ctx.opts, :db, start_supervised!({WriterOverloadedDB, ctx.db}))
+    required = Tightbeam.CliCompatibility.required_version()
+
+    call = fn opts, version ->
+      conn(:post, "/agent/dispatch", JSON.encode!(%{verb: "inspect", params: %{}}))
+      |> put_req_header("authorization", "Bearer #{session.cli_token}")
+      |> put_req_header("x-tightbeam-cli-version", version)
+      |> Router.call(Router.init(opts))
+    end
+
+    incompatible? = fn ->
+      ConditionFacts.standing?(ctx.db, "cli-incompatible", session.session_key)
+    end
+
+    # Nothing changed: the command runs, and nothing asked the writer.
+    {ok, log} = ExUnit.CaptureLog.with_log(fn -> call.(overloaded, required) end)
+    assert ok.status == 200, ok.resp_body
+    assert_receive {:call, %{verb: "inspect"}}
+    refute log =~ "not recorded"
+
+    # A mismatch that cannot be recorded: the caller still gets the real refusal.
+    {refused, log} = ExUnit.CaptureLog.with_log(fn -> call.(overloaded, "0.2.0") end)
+    assert refused.status == 426
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "incompatible_cli"
+    assert log =~ "CLI compatibility observation for observed-cli not recorded"
+    refute incompatible?.()
+
+    # The writer is back: the next call records the mismatch.
+    assert call.(ctx.opts, "0.2.0").status == 426
+    assert incompatible?.()
+
+    # Back on the required version while the writer is refused: the command runs,
+    # and the mismatch stands until a call can record that it cleared.
+    {ok, _log} = ExUnit.CaptureLog.with_log(fn -> call.(overloaded, required) end)
+    assert ok.status == 200, ok.resp_body
+    assert_receive {:call, %{verb: "inspect"}}
+    assert incompatible?.()
+
+    assert call.(ctx.opts, required).status == 200
+    refute incompatible?.()
   end
 
   test "CLI exact-version refusal is loud after bearer authentication", ctx do
@@ -2866,7 +2940,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(disallowed.resp_body) == %{
              "error" => %{
                "code" => "invalid_message",
-               "message" => "verb not allowed: not-a-verb"
+               "message" => "verb not allowed: post"
              }
            }
 

@@ -14,6 +14,29 @@ change. In that change, re-check each external-agent skill shipped by
 Pull request CI runs `scripts/verify_external_skills.py`; the existing push
 checks for `0.1.*` branches remain for compatibility.
 
+## Pass the pre-candidate gates
+
+Before building any release candidate, all three gates must pass:
+
+1. **Release parity:** Every change shipped in every earlier release must be on
+   `main`, or be accounted for by a recorded equivalent implementation or an
+   intentional removal explicitly ruled by the product owner. Any missing
+   feature blocks the candidate. Listing it under **Breaking changes** does
+   not satisfy this gate.
+2. **Upgrade:** The proposed release commit must boot and migrate cleanly from a
+   database shaped like the previous release's. Run this on an isolated host
+   and database; never use the live installation.
+3. **Pull-request suites:** The `ci` workflow's `test` job reports `linux` and
+   `macos` checks. For every pull request, including those targeting `main`,
+   both checks run the full `scripts/verify_mix.sh` and `cargo test` suites
+   (after `cargo build --release`); no path, label, or event condition turns a
+   pull request into a compile-only run. Both checks must pass before a
+   candidate is built. Do not merge a pull request with either check red. At
+   present, these are reporting checks, not required status checks on `main`,
+   so GitHub does not block a red merge automatically.
+
+Do not build a release candidate until all three gates hold.
+
 ## Build the final unpublished candidate
 
 1. Select the reviewed commit at the current `main` tip and record its full
@@ -55,6 +78,18 @@ is the final check; other testing stays in CI and isolated environments.
 If the soak fails or finds a defect, do not publish the candidate. Fix the
 source through a reviewed change to `main` and build a fresh candidate. The
 failed candidate remains unpublished.
+
+## Fourth release gate: production health
+
+Before publishing or promoting a release, record a health check with a
+`healthy` result for the exact candidate build running on the maintainers'
+production deployment under real load, and close the installed acceptance for
+that build. Do not publish or promote until the check is recorded and the
+acceptance is closed.
+
+This gate applies to publishing or promoting a release, not installing an
+unpublished candidate for testing. The separate exact-install approval still
+applies.
 
 ## Publish the same bytes
 

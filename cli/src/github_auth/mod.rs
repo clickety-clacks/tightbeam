@@ -53,13 +53,13 @@ pub fn onboard(hostname: &str, remote: Option<&str>) -> Result<(), String> {
     probe::onboard_with(hostname, remote, &base_dir, gh)
 }
 
-pub fn check_tool_call_stdin() -> Result<(), String> {
+pub fn check_tool_call_stdin(text_template: Option<&str>) -> Result<(), String> {
     let mut raw = String::new();
     std::io::stdin()
         .read_to_string(&mut raw)
         .map_err(|error| format!("could not read tool-call JSON from stdin: {error}"))?;
     let base_dir = crate::base_dir::resolve();
-    guard::check_tool_call_with(&raw, &RealGh::using_banked(&base_dir))
+    guard::check_tool_call_with_template(&raw, &RealGh::using_banked(&base_dir), text_template)
 }
 
 /// The Tightbeam-owned gh config dir. One shared dir, not per-hostname:

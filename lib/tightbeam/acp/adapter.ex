@@ -211,11 +211,19 @@ defmodule Tightbeam.Acp.Adapter do
   @doc """
   Best-effort ACP teardown for one harness session; adapter failures never
   escape the caller. `diagnostic: true` returns a failed close as a
-  `Tightbeam.ErrorDiagnostic` carrier instead of the bare reason.
+  `Tightbeam.ErrorDiagnostic` carrier instead of the bare reason. A caller may
+  pass `request_timeout` to bound the ACP close request and its local wait; the
+  default remains the existing 60-second request budget.
   """
   @spec close_session(adapter(), String.t(), keyword()) :: :ok | {:error, term()}
   def close_session(adapter, session_id, opts \\ []) do
-    call(adapter, {:close_session, session_id, opts}, 65_000)
+    request_timeout = Keyword.get(opts, :request_timeout, 60_000)
+
+    if is_integer(request_timeout) and request_timeout > 0 do
+      call(adapter, {:close_session, session_id, opts}, request_timeout + 5_000)
+    else
+      {:error, :invalid_close_timeout}
+    end
   rescue
     reason -> {:error, {:adapter_unavailable, reason}}
   catch
@@ -842,8 +850,12 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp session_call({:close_session, sid, opts}, _from, state) do
     diagnostic? = Keyword.get(opts, :diagnostic, false)
+    request_timeout = Keyword.get(opts, :request_timeout, 60_000)
 
-    case Conn.request(state.conn, "session/close", %{sessionId: sid}, diagnostic: diagnostic?) do
+    case Conn.request(state.conn, "session/close", %{sessionId: sid},
+           timeout: request_timeout,
+           diagnostic: diagnostic?
+         ) do
       {:ok, _result} ->
         state = %{
           state

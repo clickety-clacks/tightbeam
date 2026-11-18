@@ -626,6 +626,8 @@ defmodule Tightbeam.HarnessHealth.RecoveryScheduler do
 
   @impl true
   def init(opts) do
+    Tightbeam.DB.owed_work()
+
     db = Keyword.fetch!(opts, :db)
     base_dir = Keyword.get(opts, :base_dir)
     task_sup = Keyword.get(opts, :task_sup)

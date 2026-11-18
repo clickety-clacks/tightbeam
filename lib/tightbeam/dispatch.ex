@@ -89,6 +89,16 @@ defmodule Tightbeam.Dispatch do
 
     try do
       Rules.with_snapshot(fn -> dispatch_call(db, handlers, call) end)
+    rescue
+      error ->
+        if DB.overload_error?(error) do
+          # The database owner refused a call this verb needed. The caller is
+          # told to retry; no audit row is queued on an owner refusing work.
+          Logger.warning("#{inspect(Map.get(call, :verb))} refused: database overloaded")
+          {:error, DB.overload_refusal()}
+        else
+          reraise error, __STACKTRACE__
+        end
     after
       if previous_audit,
         do: Process.put(:tightbeam_dispatch_audit, previous_audit),
@@ -235,7 +245,10 @@ defmodule Tightbeam.Dispatch do
       {:remedy, statute, ref, error} ->
         outcome = RailRemedy.fire(db, handlers, statute, ref, call)
 
-        if statute.name == "completion-requires-review" and verb == "attest" and
+        if statute.name in [
+             "completion-requires-review",
+             "agentic-engineering.completion-requires-review"
+           ] and verb == "attest" and
              call.params[:kind] == "completion" and review_notice_routed?(outcome) do
           # A missing review keeps the assignment open, but it does not erase
           # the holder's completion report. The remedy's notice is stored
@@ -799,6 +812,13 @@ defmodule Tightbeam.Dispatch do
   rescue
     exception in DB.Timeout ->
       reraise exception, __STACKTRACE__
+
+    exception in [DB.Overloaded, MatchError, CaseClauseError] ->
+      # An overloaded database is a refusal for the caller to retry, decided in
+      # dispatch/3, not a handler crash to record.
+      if DB.overload_error?(exception),
+        do: reraise(exception, __STACKTRACE__),
+        else: {:raised, exception, __STACKTRACE__}
 
     exception in Placement.Refusal ->
       diagnostic =
