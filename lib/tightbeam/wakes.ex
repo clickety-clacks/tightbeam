@@ -5671,7 +5671,14 @@ defmodule Tightbeam.Wakes do
         # A source with no sending session (a system notice) is surfaced once to
         # its recipient's accountable owner instead; it is never replayed.
         {recipient, told_as} =
-          case sender_failure_recipient(creator, origin) do
+          case failed_source_recipient_in_txn(
+                 txn,
+                 wake_id,
+                 target,
+                 assignment_id,
+                 creator,
+                 origin
+               ) do
             recipient when is_binary(recipient) ->
               {recipient, :sender}
 
@@ -5680,8 +5687,8 @@ defmodule Tightbeam.Wakes do
               if String.starts_with?(wake_id, "bubble:"),
                 do: {nil, nil},
                 else:
-                  {interrupted_redelivery_parent_in_txn(txn, target, assignment_id),
-                   {:owner, target}}
+                  {interrupted_redelivery_parent_in_txn(txn, target, assignment_id) ||
+                     failed_source_owner_in_txn(txn, target), {:owner, target}}
           end
 
         if is_binary(recipient) do
@@ -5712,6 +5719,30 @@ defmodule Tightbeam.Wakes do
       end)
 
     {:notices, notices}
+  end
+
+  defp failed_source_recipient_in_txn(txn, wake_id, target, assignment_id, creator, origin) do
+    # Dispatch stages this canonical brief when its holder is busy. Assignment
+    # attribution alone also occurs on ordinary wakes, whose sender stays owed.
+    dispatch? =
+      is_binary(assignment_id) and
+        case Txn.q(txn, "SELECT prompt FROM wakes WHERE wakeId=?1", [wake_id]) do
+          [[prompt]] -> String.starts_with?(prompt, "[assignment: #{assignment_id}]\n\n")
+          _ -> false
+        end
+
+    if dispatch?,
+      do: interrupted_redelivery_parent_in_txn(txn, target, assignment_id),
+      else: sender_failure_recipient(creator, origin)
+  end
+
+  defp failed_source_owner_in_txn(txn, target) do
+    # The existing terminal failure route alerts the user's personal stream
+    # when there is no active ancestor. A parentless Main can be that stream.
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target]) do
+      [[owner]] when is_binary(owner) -> Tightbeam.Org.personal_session_key(owner)
+      _ -> nil
+    end
   end
 
   defp failed_delivery_uncertainty("failed_unknown"),
