@@ -108,25 +108,38 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
   end
 
   defp trace_due_timer(pid) do
-    1 = :erlang.trace(pid, true, [:receive, {:tracer, self()}])
+    parent = self()
+
+    debug = fn
+      previous, {:noreply, %{timer: timer, deadline: due}}, _name when is_reference(timer) ->
+        if timer != previous, do: send(parent, {:timer_armed, pid, due, timer})
+        timer
+
+      previous, {:in, {:timeout, timer, :due}}, _name ->
+        send(parent, {:due_timer_received, pid, timer})
+        previous
+
+      previous, _event, _name ->
+        previous
+    end
+
+    :ok = :sys.install(pid, {:deadline_test, debug, nil}, 30_000)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: :erlang.trace(pid, false, [:receive])
+      if Process.alive?(pid), do: :sys.remove(pid, :deadline_test, 30_000)
     end)
   end
 
   defp await_due_timer(pid, due) do
-    state = :sys.get_state(pid, 30_000)
-    assert state.deadline == due
-    timer = state.timer
+    # Capture arming in the scheduler, so an observer that resumes after expiry
+    # can use buffered evidence even though the live timer has already changed.
+    assert_receive {:timer_armed, ^pid, ^due, timer}, 30_000
     assert is_reference(timer)
-
-    # Observe the actual due timer rather than firing it from the test, then
-    # cross a mailbox barrier before inspecting the handler's committed state.
-    # This observation bound does not relax delivery-lateness assertions.
-    assert_receive {:trace, ^pid, :receive, {:timeout, ^timer, :due}}, 30_000
+    assert_receive {:due_timer_received, ^pid, ^timer}, 30_000
+    # Order state inspection behind the timeout handler. The observation bounds
+    # do not relax either test's real delivery-lateness assertions.
     :sys.get_state(pid, 30_000)
-    :erlang.trace(pid, false, [:receive])
+    :sys.remove(pid, :deadline_test, 30_000)
   end
 
   defp wake(db, due_at, extra \\ %{}) do
