@@ -1976,6 +1976,42 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     budget_ms = 60_000
     settlement_ms = 15_000
     owner = self()
+    cleanup_gate = make_ref()
+    filter_id = :"retirement_cleanup_gate_#{System.unique_integer([:positive])}"
+
+    # Primary filters run in the process issuing the log. Hold the actual late
+    # cleanup here until terminate/2 has returned; slow cleanup must never become
+    # a dependency of shutdown, regardless of adapter count or scheduler speed.
+    :ok =
+      :logger.add_primary_filter(
+        filter_id,
+        {fn event, _extra ->
+           case event do
+             %{msg: {:string, message}} ->
+               if String.starts_with?(
+                    IO.iodata_to_binary(message),
+                    "adapter shutdown retirement late entry unresolved before deadline for "
+                  ) do
+                 owner_ref = Process.monitor(owner)
+                 send(owner, {:late_cleanup_blocked, cleanup_gate, self()})
+
+                 receive do
+                   {:release_late_cleanup, ^cleanup_gate} -> :ok
+                   {:DOWN, ^owner_ref, :process, ^owner, _reason} -> :ok
+                 end
+
+                 Process.demonitor(owner_ref, [:flush])
+               end
+
+             _ ->
+               :ok
+           end
+
+           event
+         end, nil}
+      )
+
+    on_exit(fn -> :logger.remove_primary_filter(filter_id) end)
 
     clock = fn
       :start ->
@@ -2070,7 +2106,27 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         assert length(park_tasks) == length(keys)
         assert eventually(fn -> length(File.ls!(helper_ready)) == length(keys) end, 3_000)
         send(coordinator, :expire_parking)
-        assert :ok = Task.await(stop, :infinity)
+        assert_receive {:late_cleanup_blocked, ^cleanup_gate, cleanup_pid}, 30_000
+        cleanup_ref = Process.monitor(cleanup_pid)
+
+        try do
+          refute cleanup_pid == coordinator,
+                 "late cleanup must run outside terminate/2 even when its logger blocks"
+
+          assert :ok = Task.await(stop, :infinity)
+          refute Process.alive?(coordinator)
+          assert Process.alive?(cleanup_pid)
+
+          # Settlement must precede this deliberately stalled cleanup as well.
+          settled = HarnessProcess.list(ctx.db)
+          assert length(settled) == length(keys)
+          assert Enum.all?(settled, &(&1.state == "kill_failed"))
+          assert Enum.all?(settled, &(&1.last_error =~ "shutdown_retirement_unresolved"))
+        after
+          send(cleanup_pid, {:release_late_cleanup, cleanup_gate})
+        end
+
+        assert_receive {:DOWN, ^cleanup_ref, :process, ^cleanup_pid, :normal}, 30_000
 
         # The clock puts retirement at the reserve boundary, within the total
         # budget. Settlement and the asynchronous cleanup must still complete;
