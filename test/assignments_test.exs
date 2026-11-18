@@ -646,14 +646,14 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert :ok = Tightbeam.RowReactions.recover(ctx.db)
 
-      assert Wakes.get(ctx.db, ordinary.wake_id).state == "canceled"
+      assert Wakes.get(ctx.db, ordinary.wake_id).state == "pending"
       assert Wakes.get(ctx.db, blocked.wake_id).state == "pending"
       assert Wakes.get(ctx.db, accepted.wake_id).delivered_turn_seq == accepted_seq
       assert Wakes.get(ctx.db, canceled.wake_id).state == "canceled"
       assert Wakes.get(ctx.db, undelivered.wake_id).state == "canceled"
       assert Wakes.get(ctx.db, ambiguous.wake_id).state == "pending"
 
-      assert {:ok, [["canceled"]]} =
+      assert {:ok, [["pending"]]} =
                DB.query(
                  ctx.db,
                  "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",

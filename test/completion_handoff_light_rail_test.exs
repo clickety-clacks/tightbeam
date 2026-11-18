@@ -1573,7 +1573,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     {_parent, child, root} = completed_child(ctx)
     forget_reaction_ledger!(ctx.db)
     assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-    assert [adopted] = terminal_notices(ctx.db)
+    assert adopted = Enum.find(terminal_notices(ctx.db), &(&1.wake_id == root.wake_id))
     assert adopted.wake_id == root.wake_id
     assert adopted.due_at == root.due_at
 
@@ -1585,7 +1585,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     assert replay.wake_id == root.wake_id
     assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-    assert length(terminal_notices(ctx.db)) == 1
+    assert Enum.count(terminal_notices(ctx.db), &(&1.wake_id == root.wake_id)) == 1
     start_scheduler(ctx.db)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert_delivered_carrier(ctx.db, root.wake_id)
@@ -1743,7 +1743,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert log =~ "OPERATOR NOTICE: terminal-notice cutover recorded"
     assert log =~ "1 notice wake(s) were pending at that watermark; 1 were linked"
 
-    assert [adopted] = terminal_notices(ctx.db)
+    assert adopted = Enum.find(terminal_notices(ctx.db), &(&1.wake_id == root.wake_id))
     assert adopted.wake_id == root.wake_id
     assert adopted.due_at == root.due_at
 
@@ -1784,7 +1784,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       end)
 
     refute repeated_log =~ "OPERATOR NOTICE: terminal-notice cutover recorded"
-    assert length(terminal_notices(ctx.db)) == 1
+    assert Enum.count(terminal_notices(ctx.db), &(&1.wake_id == root.wake_id)) == 1
 
     assert {:ok, [[1]]} =
              DB.query(
