@@ -4199,6 +4199,9 @@ defmodule Tightbeam.HarklightWakesTest do
     db: db,
     session: session
   } do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
     calls = Path.join(System.tmp_dir!(), "running-outage-#{System.unique_integer([:positive])}")
     attach_count = calls <> ".attach"
     listen_count = calls <> ".listen"
@@ -4243,7 +4246,8 @@ defmodule Tightbeam.HarklightWakesTest do
     exit 2
     """)
 
-    start_supervised!({HarklightWakes, db: db, attach_retry_delays: [], retry_delays: [10, 20]})
+    manager =
+      start_supervised!({HarklightWakes, db: db, attach_retry_delays: [], retry_delays: [10, 20]})
 
     assert eventually(fn ->
              match?(
@@ -4295,6 +4299,11 @@ defmodule Tightbeam.HarklightWakesTest do
     assert Enum.count(commands, &String.starts_with?(&1, "attach --session #{@handle}")) == 3
     assert Enum.count(commands, &String.starts_with?(&1, "listen --follow --controller")) == 2
     refute Enum.any?(commands, &String.starts_with?(&1, "session end "))
+
+    worker = Map.fetch!(:sys.get_state(manager).workers, @handle)
+    ref = Process.monitor(worker)
+    File.write!(release, "finish listener")
+    assert_receive {:DOWN, ^ref, :process, ^worker, :normal}, 5000
   end
 
   test "retryable listen failures keep recovering past the old budget with one notice", %{db: db} do
