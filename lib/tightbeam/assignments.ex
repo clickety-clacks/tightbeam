@@ -649,6 +649,7 @@ defmodule Tightbeam.Assignments do
             is_binary(revoked_by_user) -> {:user, revoked_by_user}
             is_binary(revoked_by_session) -> {:session, revoked_by_session}
             is_binary(revoked_by_process) -> {:process, revoked_by_process}
+            true -> {:process, principal}
           end,
         before: reaction_before,
         after: Tightbeam.RowReactions.Snapshot.assignment(txn, assignment_id)

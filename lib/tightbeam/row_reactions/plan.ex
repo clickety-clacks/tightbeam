@@ -254,10 +254,10 @@ defmodule Tightbeam.RowReactions.Plan do
     effect =
       case value do
         %{"session_key" => key} when is_binary(key) ->
-          List.wrap(scope_session_archetype(facts, key))
+          [scope_session_archetype(facts, key)]
 
         %{session_key: key} when is_binary(key) ->
-          List.wrap(scope_session_archetype(facts, key))
+          [scope_session_archetype(facts, key)]
 
         _ ->
           []
