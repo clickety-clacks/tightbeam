@@ -4030,6 +4030,423 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
+  # Turns queued behind a rate-limit park fence. Two assignments, both open and
+  # holding only a queued turn (nothing has run, nothing has failed):
+  #   * `asg_held_linked` was open when the incident opened, so the incident's
+  #     affected-work snapshot links it;
+  #   * `asg_held_after` is opened after the incident, so it is not linked.
+  defp held_behind_fence!(ctx) do
+    session = Org.get(ctx.db, "k1")
+    adapter_key = {:claude, "shared", "testhost"}
+
+    open_assignment = fn id, opened_at ->
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO assignments
+                   (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+                 VALUES (?1,'continue held work','k1','flynn',?2,'open',?3,?4)
+                 """,
+                 [id, opened_at, session.harness, session.provider]
+               )
+
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: "k1",
+          message_id: "m-#{id}",
+          origin: "agent:k1",
+          prompt: "held behind the fence",
+          assignment_id: id
+        })
+
+      seq
+    end
+
+    linked_seq = open_assignment.("asg_held_linked", 100)
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "held-fence-incident",
+               harness: session.harness,
+               host: session.host,
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               observed_at: 110,
+               cause: "usage limit",
+               principal: "process:tightbeam"
+             })
+
+    after_seq = open_assignment.("asg_held_after", 120)
+
+    # The fixture is only meaningful while the fence stands and the incident is
+    # open, and while neither turn has been started by anything.
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert HarnessHealth.get(ctx.db, incident.id).state == "open"
+
+    assert {:ok, [["asg_held_linked"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId FROM harness_health_assignments WHERE incidentId=?1",
+               [incident.id]
+             )
+
+    assert {:ok, [[^linked_seq, "queued"], [^after_seq, "queued"]]} =
+             DB.query(ctx.db, "SELECT seq,status FROM turns ORDER BY seq")
+
+    %{incident: incident, adapter_key: adapter_key, linked_seq: linked_seq, after_seq: after_seq}
+  end
+
+  defp held_repair_handler(ctx) do
+    {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
+
+    ctx.catalog_base
+    |> gateway_config(ctx.db, 0)
+    |> Map.put(:adapter_coordinator, coordinator)
+    |> Gateway.handlers()
+    |> Map.fetch!("repair-assignment")
+  end
+
+  defp held_repair_call(ctx, assignment_id, action) do
+    %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: ctx.lane,
+      params: %{
+        assignment_id: assignment_id,
+        action: action,
+        idempotency_key: "held-#{assignment_id}-#{action}"
+      }
+    }
+  end
+
+  # Whatever the action, and whether or not the incident links the assignment,
+  # a turn queued behind a park fence gets one answer: it is held, not stuck.
+  test "repair of a turn queued behind a park fence is refused as held, for every action", ctx do
+    held = held_behind_fence!(ctx)
+    handler = held_repair_handler(ctx)
+
+    for assignment_id <- ["asg_held_after", "asg_held_linked"],
+        action <- ["resume", "relaunch", "restart", "rerun", "tune"] do
+      assert %{ok: false, code: "held_behind_incident", message: message} =
+               handler.(held_repair_call(ctx, assignment_id, action))
+
+      assert message =~ held.incident.id
+      assert message =~ "rate-limit incident"
+      assert message =~ "harness-health-retry #{held.incident.id}"
+    end
+
+    assert HarnessHealth.get(ctx.db, held.incident.id).state == "open"
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, held.adapter_key)
+  end
+
+  test "the held refusal names the assignment whose failure opened the incident", ctx do
+    failed = failed_repair_route!(ctx, "asg_held_source", "rate-limit-dead", 60)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+               VALUES ('asg_held_behind','later work','k1','flynn',70,'open','claude','anthropic')
+               """
+             )
+
+    {:ok, _} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-asg_held_behind",
+        origin: "agent:k1",
+        prompt: "later work",
+        assignment_id: "asg_held_behind"
+      })
+
+    handler = held_repair_handler(ctx)
+
+    assert %{ok: false, code: "held_behind_incident", message: message} =
+             handler.(held_repair_call(ctx, "asg_held_behind", "resume"))
+
+    assert message =~ failed.incident.id
+    assert message =~ "opened the incident is asg_held_source"
+
+    # The failing assignment itself still repairs through its failed turn.
+    assert %{ok: true, action: "resume"} =
+             handler.(held_repair_call(ctx, "asg_held_source", "resume"))
+  end
+
+  # A refused repair must have no effect. These two ask the same refused resume
+  # and fail if it reaches past the refusal.
+  test "a refused resume of a held turn does not close the shared adapter", ctx do
+    held = held_behind_fence!(ctx)
+    handler = held_repair_handler(ctx)
+
+    assert %{ok: false, code: "held_behind_incident"} =
+             handler.(held_repair_call(ctx, "asg_held_linked", "resume"))
+
+    refute_receive {:repair_close_adapter, _}, 100
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, held.adapter_key)
+  end
+
+  test "a refused resume of a held turn leaves the park fence standing", ctx do
+    held = held_behind_fence!(ctx)
+    handler = held_repair_handler(ctx)
+
+    assert %{ok: false, code: "held_behind_incident"} =
+             handler.(held_repair_call(ctx, "asg_held_linked", "resume"))
+
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, held.adapter_key)
+    assert HarnessHealth.get(ctx.db, held.incident.id).state == "open"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE status NOT IN ('queued')"
+             )
+  end
+
+  # Not held (no fence), linked to the incident, only a queued turn: the repair
+  # has no failed turn to rerun and must refuse before it touches anything.
+  defp linked_without_failed_turn!(ctx, assignment_id, failure_class, observed_at) do
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+               VALUES (?1,'queued only','k1','flynn',?2,'open',?3,?4)
+               """,
+               [assignment_id, observed_at, session.harness, session.provider]
+             )
+
+    {:ok, _seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-#{assignment_id}",
+        origin: "agent:k1",
+        prompt: "queued only",
+        assignment_id: assignment_id
+      })
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "linked-#{assignment_id}",
+               harness: session.harness,
+               host: session.host,
+               failure_class: failure_class,
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               observed_at: observed_at + 1,
+               cause: failure_class,
+               principal: "process:tightbeam"
+             })
+
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
+    incident
+  end
+
+  test "a refused restart with no failed turn does not close the shared adapter", ctx do
+    linked_without_failed_turn!(ctx, "asg_restart_nofail", "adapter_unavailable", 200)
+    handler = held_repair_handler(ctx)
+
+    assert %{ok: false, code: "no_failed_turn"} =
+             handler.(held_repair_call(ctx, "asg_restart_nofail", "restart"))
+
+    refute_receive {:repair_close_adapter, _}, 100
+  end
+
+  test "a refused tune with no failed turn does not retune the session", ctx do
+    linked_without_failed_turn!(ctx, "asg_tune_nofail", "model_unavailable", 300)
+    handler = held_repair_handler(ctx)
+    before = Org.get(ctx.db, "k1").model
+
+    call = held_repair_call(ctx, "asg_tune_nofail", "tune")
+    call = put_in(call, [:params, :model], "claude-sonnet-4-6")
+
+    assert %{ok: false, code: "no_failed_turn"} = handler.(call)
+    assert Org.get(ctx.db, "k1").model == before
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE content LIKE '%model retune%'")
+  end
+
+  # ---- the hold is readable, on every surface ----
+
+  test "a queued turn behind a park fence reads as held on the turn, and others do not", ctx do
+    held = held_behind_fence!(ctx)
+
+    turn = StateResources.query_turn_by_seq(ctx.db, held.linked_seq) |> StateResources.turn()
+    assert turn["status"] == "queued"
+    assert turn["holdIncidentId"] == held.incident.id
+    assert turn["holdFailureClass"] == "rate-limit-dead"
+    assert is_integer(turn["holdSince"])
+    assert turn["holdRelease"] =~ "harness-health-retry #{held.incident.id}"
+
+    # Once the fence lifts the same turn reads as an ordinary queued turn.
+    :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, held.adapter_key)
+    turn = StateResources.query_turn_by_seq(ctx.db, held.linked_seq) |> StateResources.turn()
+    assert turn["status"] == "queued"
+    refute Map.has_key?(turn, "holdSince")
+    refute Map.has_key?(turn, "holdIncidentId")
+  end
+
+  test "a fence with no open incident still reads as held, with no incident named", ctx do
+    session = Org.get(ctx.db, "k1")
+    adapter_key = {:claude, "shared", "testhost"}
+    {:ok, _} = Tightbeam.HarnessProcess.begin_park(ctx.db, adapter_key)
+
+    {:ok, seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-fence-only",
+        origin: "agent:k1",
+        prompt: "behind a bare fence"
+      })
+
+    turn = StateResources.query_turn_by_seq(ctx.db, seq) |> StateResources.turn()
+    assert turn["holdIncidentId"] == nil
+    assert turn["holdFailureClass"] == nil
+    assert turn["holdRelease"] =~ "no open harness-health incident"
+
+    hold = Tightbeam.HarnessHealth.Hold.for_host(ctx.db, session.harness, session.host)
+    assert hold.incident_id == nil
+    assert hold.since == turn["holdSince"]
+  end
+
+  test "the turn read and the host read agree about the same hold", ctx do
+    held = held_behind_fence!(ctx)
+    session = Org.get(ctx.db, "k1")
+
+    hold = Tightbeam.HarnessHealth.Hold.for_host(ctx.db, session.harness, session.host)
+    turn = StateResources.query_turn_by_seq(ctx.db, held.after_seq) |> StateResources.turn()
+
+    assert {hold.incident_id, hold.failure_class, hold.since, hold.release} ==
+             {turn["holdIncidentId"], turn["holdFailureClass"], turn["holdSince"],
+              turn["holdRelease"]}
+  end
+
+  test "assignment-get names the hold on a held assignment only", ctx do
+    held = held_behind_fence!(ctx)
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Gateway.handlers()
+      |> Map.fetch!("assignment-get")
+
+    read = fn id ->
+      handler.(%{origin: "user:flynn", principal: {:user, "flynn"}, params: %{assignment_id: id}})
+    end
+
+    for id <- ["asg_held_linked", "asg_held_after"] do
+      assert %{heldBehind: behind} = read.(id)
+      assert behind.incidentId == held.incident.id
+      assert behind.failureClass == "rate-limit-dead"
+      assert behind.release =~ "harness-health-retry #{held.incident.id}"
+    end
+
+    :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, held.adapter_key)
+    refute Map.has_key?(read.("asg_held_linked"), :heldBehind)
+  end
+
+  test "an assignment with a running turn is not held, though its queued follow-up is", ctx do
+    session = Org.get(ctx.db, "k1")
+    adapter_key = {:claude, "shared", "testhost"}
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+               VALUES ('asg_running_followup','executing','k1','flynn',10,'open',?1,?2)
+               """,
+               [session.harness, session.provider]
+             )
+
+    enqueue = fn id ->
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: "k1",
+          message_id: "m-#{id}",
+          origin: "agent:k1",
+          prompt: id,
+          assignment_id: "asg_running_followup"
+        })
+
+      seq
+    end
+
+    running_seq = enqueue.("running")
+    assert {:ok, %{seq: ^running_seq}} = Ledger.claim_next(ctx.db, "k1", "running-lane")
+    followup_seq = enqueue.("follow-up")
+
+    # Another session's rate limit sets the fence for the shared harness and host.
+    {:ok, _} = Tightbeam.HarnessProcess.begin_park(ctx.db, adapter_key)
+
+    assert Tightbeam.HarnessHealth.Hold.for_assignment(ctx.db, "asg_running_followup") == nil
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Gateway.handlers()
+      |> Map.fetch!("assignment-get")
+
+    read =
+      handler.(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{assignment_id: "asg_running_followup"}
+      })
+
+    refute Map.has_key?(read, :heldBehind)
+
+    # The queued turn row itself still shows the hold; the running one does not.
+    queued = StateResources.query_turn_by_seq(ctx.db, followup_seq) |> StateResources.turn()
+    assert is_integer(queued["holdSince"])
+    running = StateResources.query_turn_by_seq(ctx.db, running_seq) |> StateResources.turn()
+    refute Map.has_key?(running, :holdSince)
+    refute Map.has_key?(running, "holdSince")
+
+    # Repair behaves as for any executing assignment: not the held refusal.
+    repair = held_repair_handler(ctx)
+
+    for action <- ["resume", "relaunch"] do
+      assert %{ok: false, code: code} =
+               repair.(held_repair_call(ctx, "asg_running_followup", action))
+
+      refute code == "held_behind_incident"
+    end
+  end
+
+  test "a lane that declines to start behind a fence records why for session-diagnose", ctx do
+    held = held_behind_fence!(ctx)
+
+    pid =
+      start_supervised!(
+        {SessionLane,
+         session_key: "k1",
+         db: ctx.db,
+         task_sup: Tightbeam.TurnTaskSupervisor,
+         runner: fn _turn -> flunk("a held turn must not start") end}
+      )
+
+    assert :ok = SessionLane.nudge("k1")
+    refute_receive {:never, _}, 100
+
+    assert %{held: %{incident_id: incident_id, failure_class: "rate-limit-dead"}} =
+             GenServer.call(pid, :diagnostic_snapshot)
+
+    assert incident_id == held.incident.id
+
+    snapshot = Tightbeam.SessionDiagnose.snapshot("k1", %{db: ctx.db})
+    assert %{status: "fenced", incidentId: ^incident_id} = snapshot.parkGate
+    assert snapshot.parkGate.release =~ held.incident.id
+  end
+
   defp failed_repair_route!(ctx, assignment_id, failure_class, observed_at) do
     session = Org.get(ctx.db, "k1")
 
@@ -4987,6 +5404,184 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[^wakes_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
     assert Path.wildcard(Path.join(base_dir, "**/*")) |> Enum.sort() == workdir_paths_before
     assert Idempotency.get(ctx.db, owner_user_id, "spawn", "spawn-office-only") == nil
+  end
+
+  test "spawn refuses a selected durable fence before creating sessions or first-turn work",
+       ctx do
+    base_dir = role_test_base("spawn-fence")
+    ensure_global_registry()
+
+    {:ok, :no_launch} =
+      Tightbeam.HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
+
+    before = spawn_creation_counts(ctx.db)
+
+    for {where, suffix} <- [
+          {["*"], "wildcard"},
+          {["testhost"], "single"},
+          {["testhost", "testhost-b"], "multiple"}
+        ] do
+      manifests = Path.join([base_dir, "identity", "archetypes"])
+      File.mkdir_p!(manifests)
+
+      File.write!(Path.join(manifests, "default.toml"), """
+      name = "default"
+      where = #{inspect(where)}
+      """)
+
+      Archetypes.load!(base_dir)
+      spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+      for {selection, mode} <- [
+            {%{}, "default"},
+            {%{harness: "claude", model: "claude-fable-5", host: "testhost"}, "explicit"}
+          ] do
+        key = "spawn-fenced-#{suffix}-#{mode}"
+
+        assert %{code: "harness_fenced", message: message} =
+                 spawn.(%{
+                   origin: "user:flynn",
+                   session_key: nil,
+                   params:
+                     Map.merge(
+                       %{
+                         display_name: "Fenced #{suffix} #{mode}",
+                         handle: key,
+                         idempotency_key: key
+                       },
+                       selection
+                     )
+                 })
+
+        assert message =~ "claude"
+        assert message =~ "testhost"
+        assert message =~ "fenced"
+        assert spawn_creation_counts(ctx.db) == before
+        assert Idempotency.get(ctx.db, "flynn", "spawn", key) == nil
+        assert Roles.get(ctx.db, key) == nil
+      end
+    end
+  end
+
+  test "spawn checks the first preference's harness without falling back to another host or model",
+       ctx do
+    base_dir = placement_test_base("spawn-preference-fence", ["testhost-d", "testhost-b"])
+    ensure_global_registry()
+    manifest = Path.join([base_dir, "identity", "archetypes", "default.toml"])
+
+    File.write!(
+      manifest,
+      File.read!(manifest) <>
+        """
+
+        [defaults]
+        harness = "claude"
+
+        [[model_preferences]]
+        harness = "codex"
+        model = "gpt-5.6-sol"
+        effort = "medium"
+
+        [[model_preferences]]
+        harness = "claude"
+        model = "claude-fable-5"
+        """
+    )
+
+    Archetypes.load!(base_dir)
+
+    register_hosts(ctx.db, %{
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
+    })
+
+    {:ok, :no_launch} =
+      Tightbeam.HarnessProcess.begin_park(ctx.db, {:codex, "shared", "testhost-d"})
+
+    config = gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, &successful_readiness_probe/1)
+    spawn = Gateway.handlers(config)["spawn"]
+    before = spawn_creation_counts(ctx.db)
+
+    for selection <- [%{}, %{host: "testhost-d"}] do
+      assert %{code: "harness_fenced", message: message} =
+               spawn.(%{
+                 origin: "user:flynn",
+                 session_key: nil,
+                 params:
+                   Map.merge(
+                     %{display_name: "Preference fenced", idempotency_key: "preference-fenced"},
+                     selection
+                   )
+               })
+
+      assert message =~ "codex"
+      assert message =~ "testhost-d"
+      assert spawn_creation_counts(ctx.db) == before
+    end
+
+    assert %{session_key: key} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Explicit alternative",
+                 harness: "claude",
+                 model: "claude-fable-5",
+                 idempotency_key: "explicit-alternative"
+               }
+             })
+
+    assert %{harness: "claude", host: "testhost-d"} = Org.get(ctx.db, key)
+  end
+
+  test "spawn allows other fence scopes and running launches, and replays success after a fence",
+       ctx do
+    base_dir = role_test_base("spawn-fence-scopes")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+
+    for key <- [
+          {:codex, "shared", "testhost"},
+          {:claude, "shared", "testhost-b"},
+          {:claude, "dedicated", "testhost"}
+        ] do
+      {:ok, :no_launch} = Tightbeam.HarnessProcess.begin_park(ctx.db, key)
+    end
+
+    {:ok, _} =
+      DB.query(ctx.db, """
+      INSERT INTO harness_processes
+        (launchId, adapterKey, harness, preset, host, helperPath, identityPath, launchSequence, state, createdAt)
+      VALUES ('spawn-running', 'claude:shared@testhost', 'claude', 'shared', 'testhost',
+              '/synthetic/helper', '/synthetic/identity', 1, 'running', 1)
+      """)
+
+    assert Tightbeam.HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    call = %{
+      origin: "user:flynn",
+      session_key: nil,
+      params: %{display_name: "Unfenced spawn", idempotency_key: "unfenced-spawn"}
+    }
+
+    assert %{session_key: key} = spawn.(call)
+    assert %{harness: "claude", host: "testhost"} = Org.get(ctx.db, key)
+    before_replay = spawn_creation_counts(ctx.db)
+
+    assert {:ok, %{state: "park_requested"}} =
+             Tightbeam.HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
+
+    assert %{session_key: ^key} = spawn.(call)
+    assert spawn_creation_counts(ctx.db) == before_replay
+  end
+
+  defp spawn_creation_counts(db) do
+    for table <- ["sessions", "turns", "messages", "wire_idempotency", "roles"] do
+      {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM #{table}")
+      {table, count}
+    end
   end
 
   test "fresh PDO and orchestrator spawns resolve their defaults without changing coder choice",

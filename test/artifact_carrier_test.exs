@@ -641,6 +641,8 @@ defmodule Tightbeam.ArtifactCarrierTest do
   end
 
   defp rebuild_artifacts_to_process_predecessor!(db, columns) do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_attest_lifecycle!(db)
+
     {:ok, :ok} =
       DB.migration_transaction(
         db,
@@ -691,7 +693,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
               # A main-line database before the 0.1.16 merge: session custody
               # applied, artifact process attribution not yet.
               "session-custody-v1-0116",
-              "session-custody-artifact-process-attribution-v1-0117"
+              "attest-lifecycle-actor-v1-0117"
             ]
           )
 

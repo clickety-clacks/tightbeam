@@ -286,10 +286,15 @@ defmodule Tightbeam.HarklightBriefingsTest do
   end
 
   defp open_request(ctx, question) do
+    {:session, session_key} = ctx.call.principal
+
     Escalation.operator_ask(ctx.db, %{
       ctx.call
       | verb: "operator-ask",
-        params: %{question: question}
+        params:
+          Tightbeam.TestSupport.OperatorAskFixture.link(ctx.db, session_key, %{
+            question: question
+          })
     })
   end
 

@@ -834,6 +834,20 @@ defmodule Tightbeam.ExecutionMapTest do
     assert ok.status == 200
     assert [%{"id" => "wi_routed"}] = JSON.decode!(ok.resp_body)["result"]["items"]
 
+    for verb <- ["execution-map", "execution-map-select"] do
+      params =
+        if verb == "execution-map", do: %{state: "all"}, else: %{state: "all", under: "wi_routed"}
+
+      response = post_dispatch(opts, %{verb: verb, asUser: "fixture-owner", params: params})
+
+      assert response.status == 400
+
+      assert %{"code" => "invalid", "message" => message} =
+               JSON.decode!(response.resp_body)["error"]
+
+      assert message =~ "use open, iceboxed, closed, or failed"
+    end
+
     # `--session` is a COHORT FILTER over creator identity, so it travels as a
     # body param. A top-level typed target is refused BEFORE any lookup, which is
     # what stops the roster filter from becoming a session-existence oracle: an
@@ -899,6 +913,28 @@ defmodule Tightbeam.ExecutionMapTest do
                  "message" => "breathing takes no typed target"
                }
              } = JSON.decode!(response.resp_body)
+    end
+  end
+
+  test "gateway refuses unknown roster enum values and malformed filter combinations", ctx do
+    item!(ctx.db, "wi_state_filter", state: "open")
+
+    for kind <- [:roster, :topline] do
+      base = if kind == :topline, do: %{under: "wi_state_filter"}, else: %{}
+
+      for value <- ["all", "opne"] do
+        assert %{code: "invalid", message: message} =
+                 read(ctx, kind, Map.put(base, :state, value))
+
+        assert message =~ "use open, iceboxed, closed, or failed"
+      end
+
+      assert ids(read(ctx, kind, Map.put(base, :state, "open"))) == ["wi_state_filter"]
+      assert ids(read(ctx, kind, Map.put(base, :state, "closed"))) == []
+
+      for filters <- [%{origin: "typo"}, %{quiet_over: "2h"}, %{spec_sha: "abc"}] do
+        assert %{code: "invalid"} = read(ctx, kind, Map.merge(base, filters))
+      end
     end
   end
 

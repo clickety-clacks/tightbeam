@@ -373,7 +373,9 @@ pub enum Command {
         question: String,
         note: Option<String>,
         options: Option<Vec<String>>,
+        project: Option<String>,
         assignment_id: Option<String>,
+        work_item_id: Option<String>,
         deadline_ms: Option<String>,
         supersedes: Option<String>,
     },
@@ -1156,9 +1158,10 @@ COMMANDS:
   ask (--session <key> | --role <name> | --user <id>) --question <text> [--about <assignment>]
   answer --request <dr_id> --answer <text>
   return --request <dr_id> --reason <text>
-  operator-ask --question <q> [--note <t>] [--options a,b,c]
-               [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]
-      File an owner-scoped operator decision request.
+  operator-ask --question <q> [--project <product>] (--assignment <asgId> | --work-item <wiId>)
+               [--note <t>] [--options a,b,c] [--deadline <dur>] [--supersedes <dr_id>]
+      File an owner-scoped operator decision request linked to existing work.
+      --project optionally records the product name for display.
   operator-rule <dr_id> (--decision <label> | --response <text>)
                 [--rationale <text>]
       Record the operator's resolution. A session that presented the request runs it
@@ -1831,6 +1834,14 @@ fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, St
             ));
         }
     }
+    let state = flags.get("state").cloned();
+    if let Some(value) = &state {
+        if !matches!(value.as_str(), "open" | "iceboxed" | "closed" | "failed") {
+            return Err(format!(
+                "bad --state value: {value} (use open, iceboxed, closed, or failed)"
+            ));
+        }
+    }
     // --spec-sha narrows a --spec cohort; alone it selects nothing nameable.
     if flags.contains_key("spec-sha") && nonempty(flags, "spec").is_none() {
         return Err("--spec-sha requires --spec <name>".to_owned());
@@ -1838,7 +1849,7 @@ fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, St
     Ok(ToplineFilters {
         origin,
         owner: nonempty(flags, "owner"),
-        state: nonempty(flags, "state"),
+        state,
         quiet_over_ms: nonempty(flags, "quiet-over")
             .map(|value| parse_duration("quiet-over", &value))
             .transpose()?,
@@ -3261,10 +3272,19 @@ fn parse_with_optional_catalog(
         }
         "operator-ask" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam operator-ask --question <q> [--note <t>] [--options a,b,c] [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
+                return Err("usage: tightbeam operator-ask --question <q> [--project <product>] (--assignment <asgId> | --work-item <wiId>) [--note <t>] [--options a,b,c] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
             }
             let question =
                 nonempty(flags, "question").ok_or_else(|| "--question is required".to_owned())?;
+            let project = nonempty(flags, "project");
+            let assignment_id = nonempty(flags, "assignment");
+            let work_item_id = nonempty(flags, "work-item");
+            if assignment_id.is_none() && work_item_id.is_none() {
+                return Err(
+                    "--assignment or --work-item is required: name the work this decision serves"
+                        .to_owned(),
+                );
+            }
             let options = flags
                 .get("options")
                 .map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>());
@@ -3277,7 +3297,9 @@ fn parse_with_optional_catalog(
                 question,
                 note: nonempty(flags, "note"),
                 options,
-                assignment_id: nonempty(flags, "assignment"),
+                project,
+                assignment_id,
+                work_item_id,
                 deadline_ms,
                 supersedes: nonempty(flags, "supersedes"),
             })
@@ -7372,6 +7394,41 @@ mod tests {
     // by assignment id — so `--assignments X --state closed` could return an OPEN
     // item after the CLI had promised the filter was applied.
     #[test]
+    fn execution_map_state_is_a_closed_enum() {
+        for prefix in [
+            vec!["execution-map"],
+            vec!["execution-map-select", "--under", "wi_example"],
+        ] {
+            for state in ["all", "opne", ""] {
+                let mut args = prefix.clone();
+                args.extend(["--state", state, "--as-user", "owner"]);
+                assert_eq!(
+                    parse(strings(&args)).unwrap_err(),
+                    format!("bad --state value: {state} (use open, iceboxed, closed, or failed)")
+                );
+            }
+            let mut args = prefix.clone();
+            args.extend(["--as-user", "owner", "--state"]);
+            assert_eq!(
+                parse(strings(&args)).unwrap_err(),
+                "bad --state value:  (use open, iceboxed, closed, or failed)"
+            );
+            let mut args = prefix.clone();
+            args.extend(["--as-user", "owner"]);
+            let command = parse(strings(&args)).unwrap();
+            let body = crate::dispatch::build_request(&command).unwrap().body_json;
+            assert!(!body.contains(r#""state":"#));
+            for state in ["open", "iceboxed", "closed", "failed"] {
+                let mut args = prefix.clone();
+                args.extend(["--state", state, "--as-user", "owner"]);
+                let command = parse(strings(&args)).unwrap();
+                let body = crate::dispatch::build_request(&command).unwrap().body_json;
+                assert!(body.contains(&format!(r#""state":"{state}""#)));
+            }
+        }
+    }
+
+    #[test]
     fn assignment_selection_refuses_every_roster_filter() {
         for (flag, value) in [
             ("origin", "user"),
@@ -8242,6 +8299,8 @@ mod tests {
                 "release train",
                 "--options",
                 "accept,wait",
+                "--project",
+                "Tightbeam",
                 "--assignment",
                 "asg_1",
                 "--deadline",
@@ -8256,7 +8315,9 @@ mod tests {
                 question: "ship window?".to_owned(),
                 note: Some("release train".to_owned()),
                 options: Some(vec!["accept".to_owned(), "wait".to_owned()]),
+                project: Some("Tightbeam".to_owned()),
                 assignment_id: Some("asg_1".to_owned()),
+                work_item_id: None,
                 deadline_ms: Some("7200000".to_owned()),
                 supersedes: Some("dr_old".to_owned()),
             })

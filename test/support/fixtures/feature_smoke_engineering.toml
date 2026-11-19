@@ -35,6 +35,7 @@ action = "wake"
 produces = "reviewed-clean"
 target_session = "{holder_key}"
 on_rule_denied = "surface"
+accountable_notice = true
 [rule.remedy.params]
 prompt = "Coordinate independent review of assignment {assignment_id}; preserve current evidence and direct staffing through its accountable owner."
 
