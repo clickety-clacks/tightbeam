@@ -2015,6 +2015,7 @@ defmodule Tightbeam.Gateway do
   defp execute_claimed_assignment_repair(config, db, call, assignment, attempt_id) do
     {result, incident} =
       with {:ok, session} <- repair_holder(db, assignment),
+           :ok <- refuse_held(db, assignment),
            {:ok, incident} <- repair_incident(db, assignment, session, call.params[:action]) do
         {execute_assignment_repair(config, db, call, assignment, session, incident), incident}
       else
@@ -2096,6 +2097,27 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # An assignment whose only turn is queued behind a standing park fence has
+  # nothing to repair: the turn starts when the fence lifts. Every action gets
+  # the same answer, whether or not the incident links the assignment.
+  defp refuse_held(db, assignment) do
+    case HarnessHealth.Hold.for_assignment(db, assignment.id) do
+      nil ->
+        :ok
+
+      hold ->
+        opener =
+          if hold.opened_by_assignment_id,
+            do:
+              " The assignment whose failure opened the incident is #{hold.opened_by_assignment_id}.",
+            else: ""
+
+        {:error, "held_behind_incident",
+         "this assignment's turn is held, not stuck; nothing here to repair. " <>
+           hold.release <> opener}
+    end
+  end
+
   defp repair_incident(db, assignment, session, action) do
     {:ok, rows} =
       DB.query(
@@ -2140,25 +2162,32 @@ defmodule Tightbeam.Gateway do
        ) do
     model = call.params[:model]
 
-    if is_binary(model) and model != "" do
-      tuned =
-        tune_result(
-          config,
-          db,
-          call
-          |> Map.put(:session_key, session.session_key)
-          |> Map.put(
-            :params,
-            %{setting: "set_model", model: model}
-            |> maybe_put(:effort, call.params[:effort])
-            |> maybe_put(:context, call.params[:context])
-          )
-          |> Map.put(:repair_assignment_id, assignment.id)
-        )
+    cond do
+      not (is_binary(model) and model != "") ->
+        %{ok: false, code: "model_required", message: "model_unavailable repair requires --model"}
 
-      if Map.has_key?(tuned, :code), do: tuned, else: rerun_latest(db, call, assignment, incident)
-    else
-      %{ok: false, code: "model_required", message: "model_unavailable repair requires --model"}
+      not failed_turn_available?(db, call, assignment) ->
+        no_failed_turn()
+
+      true ->
+        tuned =
+          tune_result(
+            config,
+            db,
+            call
+            |> Map.put(:session_key, session.session_key)
+            |> Map.put(
+              :params,
+              %{setting: "set_model", model: model}
+              |> maybe_put(:effort, call.params[:effort])
+              |> maybe_put(:context, call.params[:context])
+            )
+            |> Map.put(:repair_assignment_id, assignment.id)
+          )
+
+        if Map.has_key?(tuned, :code),
+          do: tuned,
+          else: rerun_latest(db, call, assignment, incident)
     end
   end
 
@@ -2174,16 +2203,22 @@ defmodule Tightbeam.Gateway do
     coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
     key = adapter_key(session)
 
-    case AdapterCoordinator.close_adapter(coordinator, key) do
-      :ok ->
-        if incident.failure_class == "rate-limit-dead" do
-          :ok = HarnessProcess.complete_park(db, key)
-        end
+    # Refuse before closing the adapter or lifting the fence: both reach every
+    # session on this harness and host, not only this assignment.
+    if failed_turn_available?(db, call, assignment) do
+      case AdapterCoordinator.close_adapter(coordinator, key) do
+        :ok ->
+          if incident.failure_class == "rate-limit-dead" do
+            :ok = HarnessProcess.complete_park(db, key)
+          end
 
-        rerun_latest(db, call, assignment, incident)
+          rerun_latest(db, call, assignment, incident)
 
-      {:error, reason} ->
-        repair_failed(reason, operation: "close_adapter", phase: "repair_#{action}")
+        {:error, reason} ->
+          repair_failed(reason, operation: "close_adapter", phase: "repair_#{action}")
+      end
+    else
+      no_failed_turn()
     end
   end
 
@@ -2235,6 +2270,26 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # The terminal turn a repair would rerun: the explicit one, or the latest.
+  # Read before any repair effect so a refusal changes nothing.
+  defp failed_turn_available?(db, call, assignment) do
+    seq = call.params[:turn_seq]
+
+    {sql, args} =
+      if is_integer(seq) do
+        {"SELECT 1 FROM turns WHERE seq=?2 AND assignmentId=?1 AND status IN ('failed','failed_unknown')",
+         [assignment.id, seq]}
+      else
+        {"SELECT 1 FROM turns WHERE assignmentId=?1 AND status IN ('failed','failed_unknown') LIMIT 1",
+         [assignment.id]}
+      end
+
+    match?({:ok, [[1]]}, DB.query(db, sql, args))
+  end
+
+  defp no_failed_turn,
+    do: %{ok: false, code: "no_failed_turn", message: "assignment has no terminal failed turn"}
+
   defp rerun_latest(db, call, assignment, incident) do
     source_seq = call.params[:turn_seq]
 
@@ -2260,7 +2315,7 @@ defmodule Tightbeam.Gateway do
 
     cond do
       not is_integer(source_seq) ->
-        %{ok: false, code: "no_failed_turn", message: "assignment has no terminal failed turn"}
+        no_failed_turn()
 
       not is_binary(repair_key) or repair_key == "" ->
         %{ok: false, code: "idempotency_key_required", message: "repair requires --key"}
