@@ -163,6 +163,46 @@ defmodule Tightbeam.WorkItemBracketsTest do
              )
   end
 
+  test "legacy reminders adopted before their rails load are held, then resume once", ctx do
+    routed = create(ctx, {:user, "flynn"}, %{title: "Adopt before rails"})
+    id = routing_wake_id(ctx.db, routed.id)
+    wake = Wakes.get(ctx.db, id)
+    forget_reaction_pointer_ledger(ctx.db, routed.id)
+
+    action_state = fn ->
+      DB.query(
+        ctx.db,
+        "SELECT status,lastError FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+        [id]
+      )
+    end
+
+    # First boot of the new release: the identity holds no work-item rails yet.
+    Rules.load!(Path.join(ctx.law_base, "absent"), Map.keys(ctx.handlers))
+
+    for _ <- 1..2 do
+      :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+      assert {:ok, [["held", "rail-not-loaded:" <> _]]} = action_state.()
+      assert routing_wake_id(ctx.db, routed.id) == id
+      assert Wakes.get(ctx.db, id).state == "pending"
+      assert item_wake_count(ctx.db, routed.id) == 1
+    end
+
+    # Relearn publishes the rails; the next law load resumes the same wake once.
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+
+    for _ <- 1..2 do
+      :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+      assert {:ok, [["pending", nil]]} = action_state.()
+      assert routing_wake_id(ctx.db, routed.id) == id
+      assert Wakes.get(ctx.db, id).due_at == wake.due_at
+      assert Wakes.get(ctx.db, id).state == "pending"
+      assert item_wake_count(ctx.db, routed.id) == 1
+    end
+  end
+
   test "canceled and missing legacy references are never replaced during adoption", ctx do
     for status <- ["canceled", "missing"] do
       item = create(ctx, {:user, "flynn"}, %{title: "Adopt #{status} reminder"})

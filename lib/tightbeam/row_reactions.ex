@@ -384,6 +384,7 @@ defmodule Tightbeam.RowReactions do
     case DB.transaction(db, fn txn ->
            if ready?(txn) do
              Cutover.adopt(txn)
+             Store.resume_unloaded_rail_holds(txn)
              for {event, _} <- Store.pending_events(txn), do: reconcile_safely(txn, event)
              RecoverySchedule.reconcile_open_holds_in_txn(txn, System.system_time(:millisecond))
            end

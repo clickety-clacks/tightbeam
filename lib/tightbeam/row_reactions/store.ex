@@ -120,18 +120,68 @@ defmodule Tightbeam.RowReactions.Store do
             [action["id"], JSON.encode!(plan), digest(plan.value), at]
           )
 
-        plan ->
-          withdrawn = Map.put(action["plan"], "withdraw", plan && plan.withdraw)
+        nil ->
+          if hold_for_unloaded_rail?(action) do
+            hold_unloaded_rail(txn, action, at)
+          else
+            cancel_unplanned(txn, action, nil, at)
+          end
 
-          Txn.q(
-            txn,
-            "UPDATE row_reaction_actions SET plan=?2,status='canceled',updatedAt=?3 WHERE id=?1 AND status='pending'",
-            [action["id"], JSON.encode!(withdrawn), at]
-          )
+        plan ->
+          cancel_unplanned(txn, action, plan, at)
       end
     end
 
     actions(txn, event["org"], event["id"])
+  end
+
+  # Adopted legacy work-item pointers predate the rails that now own them. While
+  # no loaded rail declares their family, the pointer is held, not canceled, so
+  # a first boot ahead of the rail files cannot drop reminders that are owed.
+  @legacy_source "work-item-references/v1"
+  @unloaded_marker "rail-not-loaded:"
+
+  defp hold_for_unloaded_rail?(action) do
+    get_in(action, ["plan", "provenance", "source"]) == @legacy_source and
+      not Rules.reaction_family_loaded?(action["plan"]["family"])
+  end
+
+  defp hold_unloaded_rail(txn, action, at) do
+    Txn.q(
+      txn,
+      "UPDATE row_reaction_actions SET status='held',lastError=?2,updatedAt=?3 WHERE id=?1 AND status='pending'",
+      [action["id"], @unloaded_marker <> action["plan"]["family"], at]
+    )
+  end
+
+  # Returns held legacy pointers to pending once a rail for their family loads.
+  # Only holds this module placed are resumed; every other held action stays held.
+  def resume_unloaded_rail_holds(txn) do
+    for [id, family] <-
+          Txn.q(
+            txn,
+            "SELECT id,family FROM row_reaction_actions WHERE status='held' AND lastError LIKE ?1",
+            [@unloaded_marker <> "%"]
+          ),
+        Rules.reaction_family_loaded?(family) do
+      Txn.q(
+        txn,
+        "UPDATE row_reaction_actions SET status='pending',lastError=NULL,updatedAt=?2 WHERE id=?1 AND status='held'",
+        [id, System.system_time(:millisecond)]
+      )
+    end
+
+    :ok
+  end
+
+  defp cancel_unplanned(txn, action, plan, at) do
+    withdrawn = Map.put(action["plan"], "withdraw", plan && plan.withdraw)
+
+    Txn.q(
+      txn,
+      "UPDATE row_reaction_actions SET plan=?2,status='canceled',updatedAt=?3 WHERE id=?1 AND status='pending'",
+      [action["id"], JSON.encode!(withdrawn), at]
+    )
   end
 
   def event(txn, org, id) do
