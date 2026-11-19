@@ -5406,6 +5406,184 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, owner_user_id, "spawn", "spawn-office-only") == nil
   end
 
+  test "spawn refuses a selected durable fence before creating sessions or first-turn work",
+       ctx do
+    base_dir = role_test_base("spawn-fence")
+    ensure_global_registry()
+
+    {:ok, :no_launch} =
+      Tightbeam.HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
+
+    before = spawn_creation_counts(ctx.db)
+
+    for {where, suffix} <- [
+          {["*"], "wildcard"},
+          {["testhost"], "single"},
+          {["testhost", "testhost-b"], "multiple"}
+        ] do
+      manifests = Path.join([base_dir, "identity", "archetypes"])
+      File.mkdir_p!(manifests)
+
+      File.write!(Path.join(manifests, "default.toml"), """
+      name = "default"
+      where = #{inspect(where)}
+      """)
+
+      Archetypes.load!(base_dir)
+      spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+      for {selection, mode} <- [
+            {%{}, "default"},
+            {%{harness: "claude", model: "claude-fable-5", host: "testhost"}, "explicit"}
+          ] do
+        key = "spawn-fenced-#{suffix}-#{mode}"
+
+        assert %{code: "harness_fenced", message: message} =
+                 spawn.(%{
+                   origin: "user:flynn",
+                   session_key: nil,
+                   params:
+                     Map.merge(
+                       %{
+                         display_name: "Fenced #{suffix} #{mode}",
+                         handle: key,
+                         idempotency_key: key
+                       },
+                       selection
+                     )
+                 })
+
+        assert message =~ "claude"
+        assert message =~ "testhost"
+        assert message =~ "fenced"
+        assert spawn_creation_counts(ctx.db) == before
+        assert Idempotency.get(ctx.db, "flynn", "spawn", key) == nil
+        assert Roles.get(ctx.db, key) == nil
+      end
+    end
+  end
+
+  test "spawn checks the first preference's harness without falling back to another host or model",
+       ctx do
+    base_dir = placement_test_base("spawn-preference-fence", ["testhost-d", "testhost-b"])
+    ensure_global_registry()
+    manifest = Path.join([base_dir, "identity", "archetypes", "default.toml"])
+
+    File.write!(
+      manifest,
+      File.read!(manifest) <>
+        """
+
+        [defaults]
+        harness = "claude"
+
+        [[model_preferences]]
+        harness = "codex"
+        model = "gpt-5.6-sol"
+        effort = "medium"
+
+        [[model_preferences]]
+        harness = "claude"
+        model = "claude-fable-5"
+        """
+    )
+
+    Archetypes.load!(base_dir)
+
+    register_hosts(ctx.db, %{
+      "testhost-d" => %{ssh: "testhost-d", base_dir: "/srv/testhost-d", cli_bin: nil},
+      "testhost-b" => %{ssh: "testhost-b", base_dir: "/srv/testhost-b", cli_bin: nil}
+    })
+
+    {:ok, :no_launch} =
+      Tightbeam.HarnessProcess.begin_park(ctx.db, {:codex, "shared", "testhost-d"})
+
+    config = gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, &successful_readiness_probe/1)
+    spawn = Gateway.handlers(config)["spawn"]
+    before = spawn_creation_counts(ctx.db)
+
+    for selection <- [%{}, %{host: "testhost-d"}] do
+      assert %{code: "harness_fenced", message: message} =
+               spawn.(%{
+                 origin: "user:flynn",
+                 session_key: nil,
+                 params:
+                   Map.merge(
+                     %{display_name: "Preference fenced", idempotency_key: "preference-fenced"},
+                     selection
+                   )
+               })
+
+      assert message =~ "codex"
+      assert message =~ "testhost-d"
+      assert spawn_creation_counts(ctx.db) == before
+    end
+
+    assert %{session_key: key} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Explicit alternative",
+                 harness: "claude",
+                 model: "claude-fable-5",
+                 idempotency_key: "explicit-alternative"
+               }
+             })
+
+    assert %{harness: "claude", host: "testhost-d"} = Org.get(ctx.db, key)
+  end
+
+  test "spawn allows other fence scopes and running launches, and replays success after a fence",
+       ctx do
+    base_dir = role_test_base("spawn-fence-scopes")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+
+    for key <- [
+          {:codex, "shared", "testhost"},
+          {:claude, "shared", "testhost-b"},
+          {:claude, "dedicated", "testhost"}
+        ] do
+      {:ok, :no_launch} = Tightbeam.HarnessProcess.begin_park(ctx.db, key)
+    end
+
+    {:ok, _} =
+      DB.query(ctx.db, """
+      INSERT INTO harness_processes
+        (launchId, adapterKey, harness, preset, host, helperPath, identityPath, launchSequence, state, createdAt)
+      VALUES ('spawn-running', 'claude:shared@testhost', 'claude', 'shared', 'testhost',
+              '/synthetic/helper', '/synthetic/identity', 1, 'running', 1)
+      """)
+
+    assert Tightbeam.HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    call = %{
+      origin: "user:flynn",
+      session_key: nil,
+      params: %{display_name: "Unfenced spawn", idempotency_key: "unfenced-spawn"}
+    }
+
+    assert %{session_key: key} = spawn.(call)
+    assert %{harness: "claude", host: "testhost"} = Org.get(ctx.db, key)
+    before_replay = spawn_creation_counts(ctx.db)
+
+    assert {:ok, %{state: "park_requested"}} =
+             Tightbeam.HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
+
+    assert %{session_key: ^key} = spawn.(call)
+    assert spawn_creation_counts(ctx.db) == before_replay
+  end
+
+  defp spawn_creation_counts(db) do
+    for table <- ["sessions", "turns", "messages", "wire_idempotency", "roles"] do
+      {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM #{table}")
+      {table, count}
+    end
+  end
+
   test "fresh PDO and orchestrator spawns resolve their defaults without changing coder choice",
        ctx do
     base_dir = role_test_base("engineering-default-spawn")

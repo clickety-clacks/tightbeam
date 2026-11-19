@@ -9392,7 +9392,8 @@ defmodule Tightbeam.Gateway do
                  p.idempotency_key
                ) do
             nil ->
-              with nil <- held_spawn_name_refusal(txn, p[:handle]),
+              with :ok <- spawn_fence_check_in_txn(txn, routed.harness, host),
+                   nil <- held_spawn_name_refusal(txn, p[:handle]),
                    true <- not is_nil(Archetypes.get(archetype.name)) do
                 if spawn_cap_reached_in_txn?(
                      txn,
@@ -9474,6 +9475,9 @@ defmodule Tightbeam.Gateway do
                   end
                 end
               else
+                {:error, denial} ->
+                  {:spawn_denied, denial}
+
                 false ->
                   {:error, :unknown_archetype}
 
@@ -9492,6 +9496,9 @@ defmodule Tightbeam.Gateway do
 
         {:ok, {:cap_exceeded, cap}} ->
           spawn_cap_exceeded(cap, caller.owner_user_id)
+
+        {:ok, {:spawn_denied, denial}} ->
+          denial
 
         {:ok, {:name_taken, refusal}} ->
           refusal
@@ -9524,6 +9531,18 @@ defmodule Tightbeam.Gateway do
     else
       {:error, denial} ->
         classified_denial("placement_denied", denial)
+    end
+  end
+
+  defp spawn_fence_check_in_txn(txn, harness, host) do
+    if HarnessProcess.parked_in_txn?(txn, {Harness.parse!(harness).id(), "shared", host}) do
+      {:error,
+       %{
+         code: "harness_fenced",
+         message: "cannot spawn: selected harness #{harness} on host #{host} is fenced"
+       }}
+    else
+      :ok
     end
   end
 
