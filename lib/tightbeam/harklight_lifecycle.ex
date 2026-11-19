@@ -126,10 +126,6 @@ defmodule Tightbeam.HarklightLifecycle do
     end
   end
 
-  def unresolved(db, ids) do
-    Enum.find(ids, fn id -> match?(%{state: "pending"}, lookup(db, id)) end)
-  end
-
   def effects_in_txn(txn, op_id) do
     case Txn.q(txn, "SELECT effects FROM harklight_command_results WHERE opId=?1", [op_id]) do
       [[json]] -> decode_effects(JSON.decode!(json))
@@ -209,6 +205,17 @@ defmodule Tightbeam.HarklightLifecycle do
     warnings = JSON.decode!(result)["supersedes_warnings"] || []
     ids = Enum.uniq(message["supersedes"] || [])
 
+    # Targets left out of the request because their own send is unresolved.
+    unresolved =
+      for id <- prepared["unresolved_supersedes"] || [] do
+        %{
+          message_id: id,
+          effect: "unchanged",
+          reason:
+            "unresolved: that send's outcome is unknown, so it was not superseded; run tightbeam harklight-settle --message #{id}, then supersede it again if needed"
+        }
+      end
+
     {effects, pending} =
       Enum.map_reduce(ids, [], fn id, pending ->
         warning = Enum.find(warnings, &(&1["message_id"] == id))
@@ -248,7 +255,7 @@ defmodule Tightbeam.HarklightLifecycle do
 
     record_result_in_txn(txn, op_id, "committed", %{
       wake_effect: "subscribed",
-      supersedes: effects,
+      supersedes: effects ++ unresolved,
       pending_delivery: pending
     })
   end

@@ -6188,6 +6188,74 @@ defmodule Tightbeam.HarklightWakesTest do
     assert :ok = HarklightSend.recover_pending(db, runner: no_op)
   end
 
+  test "a supersede naming an outcome_unknown send applies the valid targets and warns for it", %{
+    db: db,
+    call: call
+  } do
+    params = fn supersedes ->
+      %{
+        harklight_session: @handle,
+        message_type: "request",
+        reply: true,
+        sender_id: "sender",
+        title: "Replacement",
+        supersedes: supersedes
+      }
+    end
+
+    assert %{outcome: "outcome_unknown", message_id: "replacement"} =
+             HarklightSend.send_request(db, %{call | params: params.([])},
+               runner: lifecycle_runner(db, unknown: true)
+             )
+
+    # A supersede whose only target is the unresolved send is still refused.
+    no_op = fn _ -> flunk("a supersede of only an unresolved send ran Harklight") end
+
+    assert %{outcome: "refused", code: "harklight_send_unresolved"} =
+             HarklightSend.send_request(db, %{call | params: params.(["replacement"])},
+               runner: no_op
+             )
+
+    parent = self()
+    base = lifecycle_runner(db, message_id: "second-replacement")
+
+    runner = fn args ->
+      send(parent, {:harklight_args, args})
+      base.(args)
+    end
+
+    result =
+      HarklightSend.send_request(
+        db,
+        %{call | params: params.(["request", "replacement", "replacement"])},
+        runner: runner
+      )
+
+    assert %{
+             outcome: "committed",
+             message_id: "second-replacement",
+             wake_effect: "subscribed"
+           } = result
+
+    assert_received {:harklight_args, ["send", "--prepare" | prepare_args]}
+
+    assert Enum.chunk_every(prepare_args, 2, 1, :discard)
+           |> Enum.member?(["--supersedes", "request"])
+
+    refute "replacement" in prepare_args
+
+    assert [
+             %{message_id: "request", effect: "ended"},
+             %{message_id: "replacement", effect: "unchanged", reason: reason}
+           ] = result.supersedes
+
+    assert reason =~ "harklight-settle --message replacement"
+
+    # The unresolved send is untouched and can still be settled.
+    assert %{state: "pending"} = HarklightLifecycle.lookup(db, "replacement")
+    assert %{state: "committed"} = HarklightLifecycle.lookup(db, "second-replacement")
+  end
+
   test "refused send keeps its minted ID and is not recovered again", %{db: db, call: call} do
     runner = lifecycle_runner(db, refused: true)
 
@@ -8169,7 +8237,7 @@ defmodule Tightbeam.HarklightWakesTest do
               session_handle: @handle,
               message: %{
                 sender_id: "sender",
-                message_id: "replacement",
+                message_id: opts[:message_id] || "replacement",
                 title: "Replacement",
                 supersedes: supersedes
               }

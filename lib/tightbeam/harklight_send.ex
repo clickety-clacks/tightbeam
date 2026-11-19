@@ -10,13 +10,13 @@ defmodule Tightbeam.HarklightSend do
     result =
       with :ok <- origin!(db, call),
            {:ok, input} <- inputs(call.params),
-           nil <- HarklightLifecycle.unresolved(db, input.supersedes),
+           {:ok, input, unresolved} <- split_unresolved(db, input),
            {:ok, runner} <- runner(opts) do
-        send_with_association(db, call, input, runner, opts)
+        send_with_association(db, call, Map.put(input, :unresolved, unresolved), runner, opts)
         |> Map.put(:message_type, input.message_type)
         |> Map.put(:message_type_label, type_label(input.message_type))
       else
-        id when is_binary(id) -> unresolved_result("send", id)
+        {:unresolved, id} -> unresolved_result("send", id)
         {:error, code, reason} -> failure("send", code, reason, "failed")
         {:error, reason} -> failure("send", reason, early_reason(reason), "failed")
       end
@@ -27,6 +27,24 @@ defmodule Tightbeam.HarklightSend do
         else: result
 
     unchanged_targets(result, call.params[:supersedes])
+  end
+
+  # A superseded target whose own send is unresolved (outcome unknown) cannot be
+  # acted on yet. It is dropped from the request and reported per target, like
+  # the invalid, unknown and closed targets Harklight warns about. A send whose
+  # only supersede targets are unresolved is still refused as a whole.
+  defp split_unresolved(db, input) do
+    {pending, usable} =
+      Enum.split_with(
+        input.supersedes,
+        &match?(%{state: "pending"}, HarklightLifecycle.lookup(db, &1))
+      )
+
+    cond do
+      pending == [] -> {:ok, input, []}
+      usable == [] -> {:unresolved, hd(pending)}
+      true -> {:ok, %{input | supersedes: usable}, Enum.uniq(pending)}
+    end
   end
 
   defp send_with_association(db, call, %{decision_request_id: nil} = input, runner, opts) do
@@ -78,7 +96,7 @@ defmodule Tightbeam.HarklightSend do
 
     with {:ok, request, files} <- prepared_request(prepared, input, op_id),
          :ok <- handle_available(db, call, input.session, request["session_handle"]),
-         payload = send_payload(request, files, input.decision_request_id),
+         payload = send_payload(request, files, input.decision_request_id, input.unresolved),
          %{state: "pending"} <- HarklightWakes.prepare_send(db, call, op_id, payload) do
       :global.trans({{__MODULE__, db, op_id}, self()}, fn ->
         with :ok <- HarklightWakes.mark_send_attempt(db, call, op_id, payload) do
@@ -102,16 +120,15 @@ defmodule Tightbeam.HarklightSend do
     end
   end
 
-  defp send_payload(request, files, nil),
-    do: JSON.encode!(%{"request" => request, "files" => files})
+  defp send_payload(request, files, decision_request_id, unresolved) do
+    %{"request" => request, "files" => files}
+    |> put_unless_nil("decision_request_id", decision_request_id)
+    |> put_unless_nil("unresolved_supersedes", if(unresolved != [], do: unresolved))
+    |> JSON.encode!()
+  end
 
-  defp send_payload(request, files, decision_request_id),
-    do:
-      JSON.encode!(%{
-        "request" => request,
-        "files" => files,
-        "decision_request_id" => decision_request_id
-      })
+  defp put_unless_nil(map, _key, nil), do: map
+  defp put_unless_nil(map, key, value), do: Map.put(map, key, value)
 
   defp finish_send(db, call, op_id, payload, request, response, command, opts) do
     identity = prepared_identity(%{"request" => request}) |> Map.put(:op_id, op_id)
