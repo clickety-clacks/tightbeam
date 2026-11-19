@@ -4820,7 +4820,7 @@ defmodule Tightbeam.Gateway do
                 active_session,
                 turn,
                 failed_stage,
-                raw_reason
+                ErrorDiagnostic.diagnosed(raw_reason, diagnostic)
               )
             end
 
