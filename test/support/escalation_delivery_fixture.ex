@@ -127,7 +127,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
   defp scenario(1, ctx) do
     block_filing_facts!(ctx.db)
-    assert_aborts!(fn -> Escalation.operator_ask(ctx.db, operator_call()) end)
+    assert_aborts!(fn -> Escalation.operator_ask(ctx.db, operator_call(ctx.db)) end)
     assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'") == 0
 
     assert count(
@@ -136,7 +136,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
            ) == 0
 
     unblock_filing_facts!(ctx.db)
-    request = Escalation.operator_ask(ctx.db, operator_call())
+    request = Escalation.operator_ask(ctx.db, operator_call(ctx.db))
     assert request.kind == "operator"
     assert request.status == "open"
 
@@ -725,13 +725,14 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     }
   end
 
-  defp operator_call do
+  defp operator_call(db) do
     %{
       verb: "operator-ask",
       origin: "agent:raiser",
       principal: {:session, "raiser"},
       transport_session_key: "raiser",
-      params: %{question: "ship window?"}
+      params:
+        Tightbeam.TestSupport.OperatorAskFixture.link(db, "raiser", %{question: "ship window?"})
     }
   end
 

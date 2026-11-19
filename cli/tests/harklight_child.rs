@@ -125,8 +125,12 @@ fn stop_barrier_waits_for_the_live_cli() {
 fn wrapper_death_cannot_masquerade_as_child_exit() {
     let mut running = start("echo $$; exec sleep 60");
     let pid = child_pid(&mut running);
+    // Child::wait closes its stdin. Keep it open until the wrapper is dead:
+    // otherwise its EOF handler can kill the child while SIGKILL is pending.
+    let input = running.child.stdin.take().unwrap();
     running.child.kill().unwrap();
     running.child.wait().unwrap();
+    drop(input);
     let mut waiting = barrier(&running.lock);
     std::thread::sleep(Duration::from_millis(100));
     assert!(waiting.try_wait().unwrap().is_none());

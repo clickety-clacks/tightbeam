@@ -1165,11 +1165,28 @@ defmodule Tightbeam.RulesTest do
     assert loaded.external_producer
     assert loaded.remedy.action == "wake"
     assert loaded.remedy.produces == "reviewed-clean"
+    assert loaded.remedy.accountable_notice
     refute Map.has_key?(loaded.remedy.params, :reviews)
 
-    put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
+    # The exception is the rule's own declaration, never its name: the same rule
+    # without the declaration needs the linked-review binding, and the same
+    # declaration under another name keeps the exception.
+    put_raw(ctx, String.replace(shipped, "accountable_notice = true\n", ""))
 
     assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end)
+
+    put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
+    assert [renamed] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    assert renamed.remedy.accountable_notice
+
+    put_raw(
+      ctx,
+      String.replace(shipped, "accountable_notice = true", "accountable_notice = \"yes\"")
+    )
+
+    assert_unavailable(ctx, ~r/accountable_notice must be a boolean/, fn ->
       Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     end)
 
@@ -1190,6 +1207,7 @@ defmodule Tightbeam.RulesTest do
     assigned =
       shipped
       |> String.replace(~s(action = "wake"), ~s(action = "assign"))
+      |> String.replace("accountable_notice = true\n", "")
       |> String.replace(~s(target_session = "{holder_key}"), ~s(target_role = "reviewer-code"))
       |> String.replace(~r/^prompt = .*$/m, ~s(subject = "review {assignment_id}"))
 
@@ -1755,7 +1773,8 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "changes-requested wakes and reopens the author card, then clean review closes it", ctx do
+  test "changes-requested wakes and reopens the author card, then fresh completion and clean review close it",
+       ctx do
     holder = engineering_session(ctx.db, "review-change-author", "flynn", archetype: "coder")
 
     reviewer =
@@ -1871,6 +1890,16 @@ defmodule Tightbeam.RulesTest do
                wake.prompt =~ "requested changes"
            end)
 
+    # Reopening invalidates the earlier completion. Record the repaired work
+    # before a clean review can close this new round.
+    assert %{attest: %{verdictKind: "verified"}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+
+    assert {:ok, %{assignment: %{state: "open"}, attest: fresh_completion}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call)
+
+    assert fresh_completion.id != completion_attest.id
+
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
              commit_ref_verdict(
                ctx,
@@ -1887,7 +1916,7 @@ defmodule Tightbeam.RulesTest do
                [producer.id]
              )
 
-    assert closing_attest_id == completion_attest.id
+    assert closing_attest_id == fresh_completion.id
   end
 
   test "completion accepts a closed linked review of the exact integrated heads", ctx do
@@ -2206,7 +2235,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{question: "Choose a route?"})
+        operator_ask_call(ctx.db, raiser.session_key, %{question: "Choose a route?"})
       )
 
     # Besides the routed notice, main's deadline-lapse reminder waits for Main.
@@ -2276,7 +2305,7 @@ defmodule Tightbeam.RulesTest do
     other_request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(other_raiser.session_key, %{question: "Choose another route?"})
+        operator_ask_call(ctx.db, other_raiser.session_key, %{question: "Choose another route?"})
       )
 
     assert {:ok, [["decision-request-filed"]]} =
@@ -2316,7 +2345,7 @@ defmodule Tightbeam.RulesTest do
     old =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{question: "original decision?"})
+        operator_ask_call(ctx.db, raiser.session_key, %{question: "original decision?"})
       )
 
     put_raw(ctx, """
@@ -2339,7 +2368,7 @@ defmodule Tightbeam.RulesTest do
     assert %{code: "not_open"} =
              Escalation.operator_ask(
                ctx.db,
-               operator_ask_call(raiser.session_key, %{
+               operator_ask_call(ctx.db, raiser.session_key, %{
                  question: "refused replacement?",
                  supersedes: old.id,
                  assignment: closed_assignment.id
@@ -2847,7 +2876,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(ctx.db, "filing-remedy-raiser", "flynn")
     recipient = session(ctx.db, "filing-remedy-recipient", "flynn")
-    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(ctx, raiser.session_key, "flynn")
 
     put_raw(ctx, """
     [[rule]]
@@ -2870,7 +2899,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Review the filing?",
           assignment: bound.id
         })
@@ -2979,7 +3008,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Assign a reviewer?",
           assignment: bound.id
         })
@@ -3032,7 +3061,7 @@ defmodule Tightbeam.RulesTest do
              DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
 
     raiser = session(ctx.db, "filing-spawn-raiser", "flynn")
-    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(ctx, raiser.session_key, "flynn")
 
     for bin <- ["claude-agent-acp"] do
       adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", bin])
@@ -3103,7 +3132,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Start a producer?",
           assignment: bound.id
         })
@@ -3205,7 +3234,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{question: "Unbound review?"})
+        operator_ask_call(ctx.db, raiser.session_key, %{question: "Unbound review?"})
       )
 
     assert Enum.any?(1..100, fn _ ->
@@ -3248,7 +3277,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(ctx.db, "filing-held-raiser", "flynn")
     recipient = session(ctx.db, "filing-held-recipient", "flynn")
-    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(ctx, raiser.session_key, "flynn")
 
     put_raw(ctx, """
     [[rule]]
@@ -3278,7 +3307,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Wake after ruling?",
           assignment: bound.id
         })
@@ -3366,7 +3395,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(ctx.db, "filing-denied-raiser", "fixture-owner")
     session(ctx.db, "filing-denied-recipient", "fixture-owner")
-    bound = assignment(ctx, raiser.session_key, {:user, "fixture-owner"})
+    bound = operator_assignment(ctx, raiser.session_key, "fixture-owner")
 
     put_raw(ctx, """
     [[rule]]
@@ -3396,7 +3425,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Deny the producer wake?",
           assignment: bound.id
         })
@@ -3473,7 +3502,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(db, "filing-restart-raiser", "flynn")
     recipient = session(db, "filing-restart-recipient", "flynn")
-    bound = assignment(%{ctx | db: db}, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(%{ctx | db: db}, raiser.session_key, "flynn")
 
     put_raw(ctx, """
     [[rule]]
@@ -3503,7 +3532,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Resume after restart?",
           assignment: bound.id
         })
@@ -5640,14 +5669,28 @@ defmodule Tightbeam.RulesTest do
     }
   end
 
-  defp operator_ask_call(session_key, params) do
+  defp operator_ask_call(db, session_key, params) do
     %{
       verb: "operator-ask",
       origin: "agent:#{session_key}",
       principal: {:session, session_key},
       transport_session_key: session_key,
-      params: params
+      params: Tightbeam.TestSupport.OperatorAskFixture.link(db, session_key, params)
     }
+  end
+
+  defp operator_assignment(ctx, holder_key, owner) do
+    Tightbeam.TestSupport.OperatorAskFixture.ensure_work_item!(ctx.db, owner)
+
+    work_item_id = Tightbeam.TestSupport.OperatorAskFixture.work_item(owner)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE work_items SET deliveryOwnerSessionKey=?1 WHERE id=?2", [
+        holder_key,
+        work_item_id
+      ])
+
+    assignment(ctx, holder_key, {:user, owner}, work_item_id: work_item_id)
   end
 
   defp assignment(ctx, holder_key, opener, opts \\ []) do

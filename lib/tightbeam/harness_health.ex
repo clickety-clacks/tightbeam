@@ -18,6 +18,7 @@ defmodule Tightbeam.HarnessHealth do
     ConditionFacts,
     DB,
     EventLog,
+    ErrorDiagnostic,
     Gateway,
     Harness,
     HarnessProcess,
@@ -1085,12 +1086,19 @@ defmodule Tightbeam.HarnessHealth do
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
+    diagnostic = ErrorDiagnostic.of(reason)
+    reason = ErrorDiagnostic.classified(reason)
+    pre_request_refusal? = pre_request_model_selection_refusal?(failed_stage, reason, diagnostic)
+
     case classify_turn_failure(reason) do
       nil ->
         # The terminal failure path has no assistant output. Preserve a
         # message-bearing unclassified failure so the next successful turn on
         # this harness and host can act as the bounded recovery signal.
-        Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        unless pre_request_refusal? do
+          Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        end
+
         nil
 
       failure_class ->
@@ -1131,22 +1139,80 @@ defmodule Tightbeam.HarnessHealth do
             principal: turn.origin || "process:tightbeam"
           })
 
-        redelivery_failure_class =
-          case typed_redelivery_failure_class(reason) do
-            ^failure_class -> failure_class
-            _ -> "unclassified"
-          end
+        unless pre_request_refusal? do
+          redelivery_failure_class =
+            case typed_redelivery_failure_class(reason) do
+              ^failure_class -> failure_class
+              _ -> "unclassified"
+            end
 
-        Wakes.record_health_redelivery_source_in_txn(
-          txn,
-          turn.seq,
-          redelivery_failure_class
-        )
+          Wakes.record_health_redelivery_source_in_txn(
+            txn,
+            turn.seq,
+            redelivery_failure_class
+          )
+        end
 
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
         after_harness_health_commit(result)
     end
+  end
+
+  defp pre_request_model_selection_refusal?(:session, reason, diagnostic) do
+    selection_reason = model_application_reason(reason)
+    failure_class = classify_turn_failure(selection_reason)
+
+    model_phase? =
+      match?({:model_apply_failed, _}, reason) or match?(%{"phase" => "model"}, diagnostic)
+
+    # Model application can fail because the adapter or provider is down.
+    # Those failures still need recovery, even when the phase is model selection.
+    if failure_class in [
+         "auth-dead",
+         "rate-limit-dead",
+         "adapter_unavailable",
+         "task_crash",
+         "interrupted-outcome-unknown"
+       ] do
+      false
+    else
+      failure_class == "model_unavailable" or
+        (model_phase? and model_selection_response?(selection_reason)) or
+        model_refusal_text?(selection_reason)
+    end
+  end
+
+  defp pre_request_model_selection_refusal?(_failed_stage, _reason, _diagnostic), do: false
+
+  defp model_application_reason({:model_apply_failed, reason}),
+    do: model_application_reason(reason)
+
+  defp model_application_reason(reason), do: reason
+
+  # Invalid params identifies a rejected model-selection request. Other codes,
+  # including authentication-required (-32000), need model-specific evidence.
+  defp model_selection_response?(%{"code" => -32_602}), do: true
+  defp model_selection_response?(%{code: -32_602}), do: true
+  defp model_selection_response?(_reason), do: false
+
+  defp model_refusal_text?(%{"message" => message}) when is_binary(message),
+    do: model_refusal_text?(message)
+
+  defp model_refusal_text?(%{message: message}) when is_binary(message),
+    do: model_refusal_text?(message)
+
+  defp model_refusal_text?(reason) do
+    evidence = reason |> evidence_text() |> String.downcase()
+
+    contains_any?(evidence, [
+      "model_unavailable",
+      "model unavailable",
+      "model is not available",
+      "unknown model",
+      "unsupported model",
+      "invalid value for config option model"
+    ]) or Regex.match?(~r/\bmodel(?:\s+['"][^'"]+['"])?\s+not found\b/, evidence)
   end
 
   @doc "Record a terminal class whose owner is the lane or boot reconciler."

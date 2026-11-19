@@ -214,14 +214,17 @@ pub enum Command {
         body: Option<String>,
         choices: Vec<String>,
         clear_choices: bool,
+        session: Option<String>,
     },
     HarklightRetract {
         identity: Identity,
         message: String,
+        session: Option<String>,
     },
     HarklightSettle {
         identity: Identity,
         message: String,
+        op_id: Option<String>,
     },
     HarklightCover {
         identity: Identity,
@@ -373,7 +376,9 @@ pub enum Command {
         question: String,
         note: Option<String>,
         options: Option<Vec<String>>,
+        project: Option<String>,
         assignment_id: Option<String>,
+        work_item_id: Option<String>,
         deadline_ms: Option<String>,
         supersedes: Option<String>,
     },
@@ -956,10 +961,15 @@ COMMANDS:
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
   harklight-revise --message <id> --base-revision <n> --title <text>
-      [--body <text>] [--choices-json <array>] [--clear-choices]
-  harklight-retract --message <id>
-  harklight-settle --message <id>
+      [--body <text>] [--choices-json <array>] [--clear-choices] [--session <handle>]
+  harklight-retract --message <id> [--session <handle>]
+      For a message Tightbeam has no send record for, --session <handle> names its
+      Harklight session and the change is passed to Harklight with no wake or
+      subscription effect. Harklight decides whether the change is allowed.
+  harklight-settle --message <id> [--op-id <key>]
       Settle one unresolved Harklight operation using its saved request and original operation ID.
+      For a message Tightbeam has no record for, --op-id <key> names the Harklight
+      operation to retry; the retry has no wake or subscription effect.
   harklight-cover --session <handle>
       Explicitly move your conversation to the shared origin listener.
   harklight-listener-restore --handle <handle>
@@ -1156,9 +1166,10 @@ COMMANDS:
   ask (--session <key> | --role <name> | --user <id>) --question <text> [--about <assignment>]
   answer --request <dr_id> --answer <text>
   return --request <dr_id> --reason <text>
-  operator-ask --question <q> [--note <t>] [--options a,b,c]
-               [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]
-      File an owner-scoped operator decision request.
+  operator-ask --question <q> [--project <product>] (--assignment <asgId> | --work-item <wiId>)
+               [--note <t>] [--options a,b,c] [--deadline <dur>] [--supersedes <dr_id>]
+      File an owner-scoped operator decision request linked to existing work.
+      --project optionally records the product name for display.
   operator-rule <dr_id> (--decision <label> | --response <text>)
                 [--rationale <text>]
       Record the operator's resolution. A session that presented the request runs it
@@ -1831,6 +1842,14 @@ fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, St
             ));
         }
     }
+    let state = flags.get("state").cloned();
+    if let Some(value) = &state {
+        if !matches!(value.as_str(), "open" | "iceboxed" | "closed" | "failed") {
+            return Err(format!(
+                "bad --state value: {value} (use open, iceboxed, closed, or failed)"
+            ));
+        }
+    }
     // --spec-sha narrows a --spec cohort; alone it selects nothing nameable.
     if flags.contains_key("spec-sha") && nonempty(flags, "spec").is_none() {
         return Err("--spec-sha requires --spec <name>".to_owned());
@@ -1838,7 +1857,7 @@ fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, St
     Ok(ToplineFilters {
         origin,
         owner: nonempty(flags, "owner"),
-        state: nonempty(flags, "state"),
+        state,
         quiet_over_ms: nonempty(flags, "quiet-over")
             .map(|value| parse_duration("quiet-over", &value))
             .transpose()?,
@@ -2799,6 +2818,8 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| {
                     !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "message")
+                        && !(command != "harklight-settle" && flag == "session")
+                        && !(command == "harklight-settle" && flag == "op-id")
                         && !(revise
                             && matches!(
                                 flag.as_str(),
@@ -2815,8 +2836,16 @@ fn parse_with_optional_catalog(
             let identity = identity(flags)?;
             let message = nonempty(flags, "message").ok_or("--message is required")?;
             match command {
-                "harklight-retract" => Ok(Command::HarklightRetract { identity, message }),
-                "harklight-settle" => Ok(Command::HarklightSettle { identity, message }),
+                "harklight-retract" => Ok(Command::HarklightRetract {
+                    identity,
+                    message,
+                    session: nonempty(flags, "session"),
+                }),
+                "harklight-settle" => Ok(Command::HarklightSettle {
+                    identity,
+                    message,
+                    op_id: nonempty(flags, "op-id"),
+                }),
                 _ => {
                     let base_revision = nonempty(flags, "base-revision")
                         .ok_or("--base-revision is required")?
@@ -2840,6 +2869,7 @@ fn parse_with_optional_catalog(
                         body: flags.get("body").cloned(),
                         choices,
                         clear_choices,
+                        session: nonempty(flags, "session"),
                     })
                 }
             }
@@ -3261,10 +3291,19 @@ fn parse_with_optional_catalog(
         }
         "operator-ask" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam operator-ask --question <q> [--note <t>] [--options a,b,c] [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
+                return Err("usage: tightbeam operator-ask --question <q> [--project <product>] (--assignment <asgId> | --work-item <wiId>) [--note <t>] [--options a,b,c] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
             }
             let question =
                 nonempty(flags, "question").ok_or_else(|| "--question is required".to_owned())?;
+            let project = nonempty(flags, "project");
+            let assignment_id = nonempty(flags, "assignment");
+            let work_item_id = nonempty(flags, "work-item");
+            if assignment_id.is_none() && work_item_id.is_none() {
+                return Err(
+                    "--assignment or --work-item is required: name the work this decision serves"
+                        .to_owned(),
+                );
+            }
             let options = flags
                 .get("options")
                 .map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>());
@@ -3277,7 +3316,9 @@ fn parse_with_optional_catalog(
                 question,
                 note: nonempty(flags, "note"),
                 options,
-                assignment_id: nonempty(flags, "assignment"),
+                project,
+                assignment_id,
+                work_item_id,
                 deadline_ms,
                 supersedes: nonempty(flags, "supersedes"),
             })
@@ -5306,6 +5347,56 @@ mod tests {
                 if base_revision == revision.parse::<i64>().unwrap())
             );
         }
+    }
+
+    #[test]
+    fn harklight_change_commands_accept_session_and_op_id_only_where_they_apply() {
+        assert!(matches!(
+            parse(strings(&["harklight-retract", "--message", "m", "--session", "h"])),
+            Ok(Command::HarklightRetract { session: Some(ref s), .. }) if s == "h"
+        ));
+        assert!(matches!(
+            parse(strings(&[
+                "harklight-revise",
+                "--message",
+                "m",
+                "--base-revision",
+                "1",
+                "--title",
+                "t",
+                "--session",
+                "h",
+            ])),
+            Ok(Command::HarklightRevise { session: Some(ref s), .. }) if s == "h"
+        ));
+        assert!(matches!(
+            parse(strings(&["harklight-settle", "--message", "m", "--op-id", "k"])),
+            Ok(Command::HarklightSettle { op_id: Some(ref k), .. }) if k == "k"
+        ));
+        assert!(matches!(
+            parse(strings(&["harklight-retract", "--message", "m"])),
+            Ok(Command::HarklightRetract { session: None, .. })
+        ));
+        assert!(
+            parse(strings(&[
+                "harklight-settle",
+                "--message",
+                "m",
+                "--session",
+                "h"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "harklight-retract",
+                "--message",
+                "m",
+                "--op-id",
+                "k"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -7372,6 +7463,41 @@ mod tests {
     // by assignment id — so `--assignments X --state closed` could return an OPEN
     // item after the CLI had promised the filter was applied.
     #[test]
+    fn execution_map_state_is_a_closed_enum() {
+        for prefix in [
+            vec!["execution-map"],
+            vec!["execution-map-select", "--under", "wi_example"],
+        ] {
+            for state in ["all", "opne", ""] {
+                let mut args = prefix.clone();
+                args.extend(["--state", state, "--as-user", "owner"]);
+                assert_eq!(
+                    parse(strings(&args)).unwrap_err(),
+                    format!("bad --state value: {state} (use open, iceboxed, closed, or failed)")
+                );
+            }
+            let mut args = prefix.clone();
+            args.extend(["--as-user", "owner", "--state"]);
+            assert_eq!(
+                parse(strings(&args)).unwrap_err(),
+                "bad --state value:  (use open, iceboxed, closed, or failed)"
+            );
+            let mut args = prefix.clone();
+            args.extend(["--as-user", "owner"]);
+            let command = parse(strings(&args)).unwrap();
+            let body = crate::dispatch::build_request(&command).unwrap().body_json;
+            assert!(!body.contains(r#""state":"#));
+            for state in ["open", "iceboxed", "closed", "failed"] {
+                let mut args = prefix.clone();
+                args.extend(["--state", state, "--as-user", "owner"]);
+                let command = parse(strings(&args)).unwrap();
+                let body = crate::dispatch::build_request(&command).unwrap().body_json;
+                assert!(body.contains(&format!(r#""state":"{state}""#)));
+            }
+        }
+    }
+
+    #[test]
     fn assignment_selection_refuses_every_roster_filter() {
         for (flag, value) in [
             ("origin", "user"),
@@ -8242,6 +8368,8 @@ mod tests {
                 "release train",
                 "--options",
                 "accept,wait",
+                "--project",
+                "Tightbeam",
                 "--assignment",
                 "asg_1",
                 "--deadline",
@@ -8256,7 +8384,9 @@ mod tests {
                 question: "ship window?".to_owned(),
                 note: Some("release train".to_owned()),
                 options: Some(vec!["accept".to_owned(), "wait".to_owned()]),
+                project: Some("Tightbeam".to_owned()),
                 assignment_id: Some("asg_1".to_owned()),
+                work_item_id: None,
                 deadline_ms: Some("7200000".to_owned()),
                 supersedes: Some("dr_old".to_owned()),
             })

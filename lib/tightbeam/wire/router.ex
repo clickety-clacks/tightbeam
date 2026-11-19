@@ -4718,6 +4718,9 @@ defmodule Tightbeam.Wire.Router do
   # handler reads, so the link silently never landed.
   @param_aliases %{
     "assign" => %{reviews: :reviews_assignment_id},
+    # Rules and obligation facts read assignment_id and work_item_id; the CLI
+    # has always sent operator-ask's link as "assignment".
+    "operator-ask" => %{assignment: :assignment_id, work_item: :work_item_id},
     "tune" => %{
       reasoning_level: :reasoningLevel,
       fast_mode: :fastMode
@@ -4729,9 +4732,9 @@ defmodule Tightbeam.Wire.Router do
         harklight_session sender_id title message_type message_kind importance stake by_when reply
         body choices files answer_ui vendor_session_id supersedes decision_request_id
       )a,
-    "harklight-revise" => ~w(message_id base_revision title body choices clear_choices)a,
-    "harklight-retract" => ~w(message_id)a,
-    "harklight-settle" => ~w(message_id)a,
+    "harklight-revise" => ~w(message_id base_revision title body choices clear_choices handle)a,
+    "harklight-retract" => ~w(message_id handle)a,
+    "harklight-settle" => ~w(message_id op_id)a,
     "harklight-listener-restore" => ~w(handle)a,
     "harklight-follow" => ~w(message_id handle)a,
     "harklight-cover" => ~w(handle)a,
@@ -4825,7 +4828,7 @@ defmodule Tightbeam.Wire.Router do
     "onboard" =>
       ~w(provider phase kind machine lease_id reason source code callback_url owner_user_id)a,
     "operator-ask" =>
-      ~w(assignment assignment_id choices context deadline idempotency_key note options owner_user_id question supersedes work_item_id)a,
+      ~w(assignment assignment_id choices context deadline idempotency_key note options owner_user_id project question supersedes work_item work_item_id)a,
     "operator-rule" => ~w(decision idempotency_key rationale reason request request_id response)a,
     "operator-withdraw" => ~w(idempotency_key reason request request_id)a,
     "register-host" => ~w(adapter_bin_dir base_dir cli_bin name ssh)a,

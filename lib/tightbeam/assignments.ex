@@ -2215,6 +2215,21 @@ defmodule Tightbeam.Assignments do
               do: Map.put(result, :cannotProceed, cannot_proceed),
               else: result
 
+          result =
+            case Tightbeam.HarnessHealth.Hold.for_assignment(db, assignment_id) do
+              nil ->
+                result
+
+              hold ->
+                Map.put(result, :heldBehind, %{
+                  incidentId: hold.incident_id,
+                  failureClass: hold.failure_class,
+                  since: hold.since,
+                  openedByAssignmentId: hold.opened_by_assignment_id,
+                  release: hold.release
+                })
+            end
+
           case call.params[:fact_id] do
             nil ->
               result
@@ -3022,10 +3037,9 @@ defmodule Tightbeam.Assignments do
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
       %{holderKey: holder} = assignment ->
+        # Any session, user or automation may record what happened; the row
+        # names who filed it.
         cond do
-          not match?({:session, _}, call.principal) ->
-            error("not_holder", "assignment is held by session #{holder}")
-
           assignment.state != "open" and call.params[:kind] == "cannot-proceed" ->
             cannot_proceed_closed(assignment.outcome)
 
@@ -3164,10 +3178,10 @@ defmodule Tightbeam.Assignments do
       txn,
       """
       UPDATE assignments SET state = 'closed', outcome = 'completed', closedAt = ?2,
-        closedBySession = ?3, closingAttestId = ?4
+        closedBySession = ?3, closedByUser = ?5, closingAttestId = ?4
       WHERE id = ?1 AND state = 'open'
       """,
-      [assignment.id, attest.ts, attest.bySession, attest.id]
+      [assignment.id, attest.ts, attest.bySession, attest.id, attest.byUser]
     )
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
@@ -3607,11 +3621,29 @@ defmodule Tightbeam.Assignments do
       end
 
     # Informational FYIs do not qualify or veto this automatic transition.
-    if producer.state == "open" and qualified? do
+    if producer.state == "open" and
+         not completion_superseded_by_reopening?(txn, producer.id, completion) and
+         qualified? do
       close_completed_assignment_in_txn(txn, call, producer, completion)
     end
 
     :ok
+  end
+
+  # A reopening starts a new round: the completion that closed the earlier
+  # round, or any completion recorded before the reopening, no longer stands for
+  # the reopened assignment. A clean review must not close the reopened row with
+  # it; the holder records a fresh completion instead.
+  defp completion_superseded_by_reopening?(txn, assignment_id, completion) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM assignment_reopenings
+      WHERE assignmentId=?1 AND (ts > ?2 OR priorClosingAttestId=?3)
+      LIMIT 1
+      """,
+      [assignment_id, completion.ts, completion.id]
+    ) != []
   end
 
   defp reopen_completed_assignment_for_review_in_txn(
@@ -4384,6 +4416,17 @@ defmodule Tightbeam.Assignments do
        when is_integer(closed_at),
        do: :ok
 
+  # An automation act keeps both typed actors empty; the event names it.
+  defp lawful_closed_shape(%{
+         outcome: outcome,
+         closedAt: closed_at,
+         closedByUser: nil,
+         closedBySession: nil,
+         closedByProcess: nil
+       })
+       when outcome == "completed" and is_integer(closed_at),
+       do: :ok
+
   defp lawful_closed_shape(%{
          outcome: outcome,
          closedAt: closed_at,
@@ -4871,11 +4914,8 @@ defmodule Tightbeam.Assignments do
       {:ok, []} ->
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
-      {:ok, [[holder, state, reviews_assignment_id, _effect_kind]]} when kind == "completion" ->
+      {:ok, [[_holder, state, reviews_assignment_id, _effect_kind]]} when kind == "completion" ->
         cond do
-          not match?({:session, _}, call.principal) ->
-            error("not_holder", "assignment is held by session #{holder}")
-
           state != "open" ->
             assignment_closed()
 
@@ -4886,11 +4926,8 @@ defmodule Tightbeam.Assignments do
             {:ok, call}
         end
 
-      {:ok, [[holder, state, nil, effect_kind]]} when kind == "verdict" ->
+      {:ok, [[_holder, state, nil, effect_kind]]} when kind == "verdict" ->
         cond do
-          not match?({:session, _}, call.principal) ->
-            error("not_holder", "assignment is held by session #{holder}")
-
           effect_kind == "review" and
               call.params[:verdict_kind] in @review_conclusion_verdict_kinds ->
             if state == "open", do: {:ok, call}, else: assignment_closed()
