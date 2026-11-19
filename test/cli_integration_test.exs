@@ -3149,10 +3149,11 @@ defmodule Tightbeam.CliIntegrationTest do
       Escalation.operator_ask(ctx.db, %{
         origin: "agent:cli-holder",
         principal: {:session, ctx.session.session_key},
-        params: %{
-          question: "ship terminal parity?",
-          options: [%{label: "ship"}, %{label: "hold"}]
-        }
+        params:
+          Tightbeam.TestSupport.OperatorAskFixture.link(ctx.db, ctx.session.session_key, %{
+            question: "ship terminal parity?",
+            options: [%{label: "ship"}, %{label: "hold"}]
+          })
       })
 
     ruled =

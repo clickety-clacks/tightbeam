@@ -39,7 +39,12 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_call(ctx.raiser, %{question: "canonical request identity?"})
+        operator_call(
+          ctx.raiser,
+          Tightbeam.TestSupport.OperatorAskFixture.link(ctx.db, ctx.raiser.session_key, %{
+            question: "canonical request identity?"
+          })
+        )
       )
 
     assert %{status: "ruled"} =

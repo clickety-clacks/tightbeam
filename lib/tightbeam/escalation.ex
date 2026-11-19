@@ -2499,7 +2499,7 @@ defmodule Tightbeam.Escalation do
       nil ->
         result =
           with :ok <- filing_session_owner_in_txn(txn, session_key, owner_user_id),
-               :ok <- linked_assignment_in_txn(txn, ask.assignment_id, owner_user_id),
+               {:ok, work_item_id} <- operator_association_in_txn(txn, ask, owner_user_id),
                :ok <- superseded_request_in_txn(txn, ask.supersedes, owner_user_id, raiser_id) do
             insert_operator_request_in_txn(
               txn,
@@ -2507,7 +2507,7 @@ defmodule Tightbeam.Escalation do
               owner_user_id,
               raiser_id,
               action_key,
-              ask,
+              %{ask | work_item_id: work_item_id},
               opts
             )
           else
@@ -2551,6 +2551,8 @@ defmodule Tightbeam.Escalation do
         note: "rule=ac6a-unassigned-agent-turn; session=#{session_key}; stretch=#{stretch_id}",
         options: [%{"label" => "accept"}, %{"label" => "dismiss"}],
         assignment_id: nil,
+        project_unresolved_reason:
+          "raised by Tightbeam for an agent turn that has no assignment or work item",
         supersedes: nil,
         deadline_ms: decision_deadline_ms()
       }
@@ -2654,7 +2656,7 @@ defmodule Tightbeam.Escalation do
         action_key,
         ask.question,
         JSON.encode!(ask.options),
-        JSON.encode!(%{"note" => ask.note, "supersedes" => ask.supersedes})
+        JSON.encode!(operator_request_context(ask))
       ]
     )
 
@@ -3135,6 +3137,9 @@ defmodule Tightbeam.Escalation do
          {:ok, note} <- normalized_optional(param(call, :note)),
          {:ok, options} <- normalize_operator_options(param(call, :options)),
          {:ok, assignment_id} <- normalized_optional(operator_assignment_id(call)),
+         {:ok, work_item_id} <- normalized_optional(operator_work_item_id(call)),
+         :ok <- operator_association_present(assignment_id, work_item_id),
+         {:ok, project} <- normalized_optional(param(call, :project)),
          {:ok, supersedes} <- normalized_optional(param(call, :supersedes)),
          {:ok, deadline_ms} <- normalize_operator_deadline(param(call, :deadline)) do
       {:ok,
@@ -3143,6 +3148,8 @@ defmodule Tightbeam.Escalation do
          note: note,
          options: options,
          assignment_id: assignment_id,
+         work_item_id: work_item_id,
+         project: project,
          supersedes: supersedes,
          deadline_ms: deadline_ms
        }}
@@ -3238,6 +3245,8 @@ defmodule Tightbeam.Escalation do
       "normalizedOptions" => ask.options,
       "normalizedNote" => ask.note,
       "assignmentId" => ask.assignment_id,
+      "workItemId" => ask.work_item_id,
+      "project" => ask.project,
       "supersedes" => ask.supersedes
     }
 
@@ -3247,6 +3256,22 @@ defmodule Tightbeam.Escalation do
   defp operator_assignment_id(call),
     do: param(call, :assignment_id) || param(call, :assignment)
 
+  defp operator_work_item_id(call),
+    do: param(call, :work_item_id) || param(call, :work_item)
+
+  # Every operator request must be traceable to the work it serves, so the
+  # operator can see which product is asking. The system-raised unowned-turn
+  # request does not pass through here; it records why it has no association.
+  defp operator_association_present(nil, nil),
+    do:
+      {:error,
+       error(
+         "invalid",
+         "operator-ask requires --assignment or --work-item naming the work this decision serves"
+       )}
+
+  defp operator_association_present(_assignment_id, _work_item_id), do: :ok
+
   defp filing_session_owner_in_txn(txn, session_key, _owner_user_id) do
     case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session_key]) do
       [[_owner]] -> :ok
@@ -3254,17 +3279,74 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  defp linked_assignment_in_txn(_txn, nil, _owner_user_id), do: :ok
+  # Resolves the work item an operator request is filed for. An assignment must
+  # be open, as before; a named work item must exist under the same owner; and
+  # when both are named they must agree. Returns the work item to record, which
+  # for an assignment-only ask must be the assignment's existing work item.
+  defp operator_association_in_txn(txn, ask, owner_user_id) do
+    with {:ok, assignment_work_item_id} <-
+           linked_assignment_in_txn(txn, ask.assignment_id, owner_user_id),
+         :ok <- linked_work_item_in_txn(txn, ask.work_item_id, owner_user_id),
+         :ok <- linked_work_item_in_txn(txn, assignment_work_item_id, owner_user_id),
+         :ok <- resolved_operator_work_item(ask.work_item_id || assignment_work_item_id) do
+      cond do
+        is_nil(ask.assignment_id) ->
+          {:ok, ask.work_item_id}
 
-  defp linked_assignment_in_txn(txn, assignment_id, _owner_user_id) do
+        is_nil(ask.work_item_id) ->
+          {:ok, assignment_work_item_id}
+
+        ask.work_item_id == assignment_work_item_id ->
+          {:ok, ask.work_item_id}
+
+        true ->
+          error(
+            "invalid",
+            "linked assignment #{ask.assignment_id} serves work item " <>
+              "#{assignment_work_item_id || "(none)"}, not #{ask.work_item_id}"
+          )
+      end
+    end
+  end
+
+  defp resolved_operator_work_item(nil),
+    do:
+      error("invalid", "linked assignment has no work item; add --work-item naming existing work")
+
+  defp resolved_operator_work_item(_id), do: :ok
+
+  defp linked_assignment_in_txn(_txn, nil, _owner_user_id), do: {:ok, nil}
+
+  defp linked_assignment_in_txn(txn, assignment_id, owner_user_id) do
     case Txn.q(
            txn,
-           "SELECT a.state, s.ownerUserId FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey WHERE a.id = ?1",
+           "SELECT a.state, s.ownerUserId, a.workItemId FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey WHERE a.id = ?1",
            [assignment_id]
          ) do
-      [] -> error("not_found", "linked assignment not found")
-      [[state, _owner]] when state != "open" -> error("not_open", "linked assignment is not open")
-      [["open", _owner]] -> :ok
+      [] ->
+        error(
+          "not_found",
+          "linked assignment not found; add --assignment or --work-item naming existing work"
+        )
+
+      [[state, _owner, _work_item_id]] when state != "open" ->
+        error("not_open", "linked assignment is not open")
+
+      [["open", ^owner_user_id, work_item_id]] ->
+        {:ok, work_item_id}
+
+      [["open", _other_owner, _work_item_id]] ->
+        error("not_owner", "linked assignment belongs to another owner")
+    end
+  end
+
+  defp linked_work_item_in_txn(_txn, nil, _owner_user_id), do: :ok
+
+  defp linked_work_item_in_txn(txn, work_item_id, owner_user_id) do
+    case Txn.q(txn, "SELECT ownerUserId FROM work_items WHERE id = ?1", [work_item_id]) do
+      [[^owner_user_id]] -> :ok
+      [[_other]] -> error("not_owner", "linked work item belongs to another owner")
+      [] -> error("not_found", "linked work item not found; add --work-item naming existing work")
     end
   end
 
@@ -3773,16 +3855,23 @@ defmodule Tightbeam.Escalation do
 
     case invalid do
       [] ->
+        assignment_work_items = assignment_work_items_in_txn(txn, parsed)
+
         Enum.map(parsed, fn
           %{kind: "operator"} = request ->
-            operator_projection(request, surface)
+            request
+            |> operator_projection(surface)
+            |> with_project_attribution(request, assignment_work_items)
 
           request ->
-            if surface == :list do
-              list_projection(request)
-            else
-              without_agent_fields(request)
-            end
+            projected =
+              if surface == :list do
+                list_projection(request)
+              else
+                without_agent_fields(request)
+              end
+
+            with_project_attribution(projected, request, assignment_work_items)
         end)
 
       invalid ->
@@ -3859,6 +3948,100 @@ defmodule Tightbeam.Escalation do
         ])
       end
     end
+  end
+
+  # Which of the listed requests' assignments still exist, and the work item
+  # each serves. A missing key means the assignment row is gone.
+  defp assignment_work_items_in_txn(txn, requests) do
+    ids = requests |> Enum.map(& &1.assignment_id) |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+    ids
+    |> Enum.chunk_every(500)
+    |> Enum.flat_map(fn chunk ->
+      {predicate, params} = in_predicate("id", chunk, [])
+      Txn.q(txn, "SELECT id, workItemId FROM assignments WHERE #{predicate}", params)
+    end)
+    |> Map.new(fn [id, work_item_id] -> {id, work_item_id} end)
+  end
+
+  # Every listed or read request names its product, or says plainly why it
+  # cannot. The product is only ever the one recorded when the request was
+  # filed; nothing is inferred from sessions, roles or later custody, and a
+  # request whose assignment has since been removed is still listed.
+  defp with_project_attribution(projected, request, assignment_work_items) do
+    context = if is_map(request.context), do: request.context, else: %{}
+    project = nonblank_context_string(context, "project")
+
+    assignment_state =
+      cond do
+        not is_binary(request.assignment_id) -> :none
+        Map.has_key?(assignment_work_items, request.assignment_id) -> :present
+        true -> :removed
+      end
+
+    work_item_id =
+      nonblank_context_string(context, "workItemId") ||
+        if(assignment_state == :present,
+          do: Map.get(assignment_work_items, request.assignment_id)
+        )
+
+    association_status =
+      case {assignment_state, work_item_id} do
+        {:present, _} -> "assignment"
+        {:removed, _} -> "assignment-removed"
+        {:none, id} when is_binary(id) -> "work-item"
+        {:none, nil} -> "none"
+      end
+
+    projected
+    |> Map.put(:project, project)
+    |> Map.put(:project_attribution, if(project, do: "known", else: "unresolved"))
+    |> Map.put(
+      :project_unresolved_reason,
+      if(project, do: nil, else: project_unresolved_reason(request, context, assignment_state))
+    )
+    |> Map.put(:work_item_id, work_item_id)
+    |> Map.put(:association_status, association_status)
+  end
+
+  defp project_unresolved_reason(request, context, assignment_state) do
+    base =
+      nonblank_context_string(context, "projectUnresolvedReason") ||
+        case request.kind do
+          "operator" -> "no project was recorded when this request was filed"
+          "effort" -> "effort check-ins do not record a project"
+          "statute" -> "rule approval requests do not record a project"
+          "agent" -> "questions between agents do not record a project"
+          _ -> "no project was recorded for this request"
+        end
+
+    if assignment_state == :removed,
+      do: base <> "; its assignment #{request.assignment_id} no longer exists",
+      else: base
+  end
+
+  defp nonblank_context_string(context, key) do
+    case Map.get(context, key) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp operator_request_context(ask) do
+    [
+      {"project", Map.get(ask, :project)},
+      {"workItemId", Map.get(ask, :work_item_id)},
+      {"projectUnresolvedReason", Map.get(ask, :project_unresolved_reason)}
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+    |> Map.merge(%{"note" => ask.note, "supersedes" => ask.supersedes})
   end
 
   defp without_agent_fields(%{kind: "agent"} = request), do: request
