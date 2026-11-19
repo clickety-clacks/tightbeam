@@ -419,13 +419,7 @@ defmodule Tightbeam.Rules do
             mark_unavailable(
               affected,
               path,
-              unavailable_scope(
-                law_base,
-                Tightbeam.Identity.Provenance.owner_for_path(
-                  law_base,
-                  Path.relative_to(path, Path.join(law_base, "identity"))
-                )
-              )
+              unavailable_scope_for_path(law_base, path)
             )
 
             Enum.each(affected, fn verb ->
@@ -1836,6 +1830,20 @@ defmodule Tightbeam.Rules do
   end
 
   defp unavailable_scope(_base_dir, _owner), do: :all
+
+  # The owner of a broken file may itself be unreadable (an unreadable or
+  # conflicting receipt); that leaves the verb unavailable for everyone.
+  defp unavailable_scope_for_path(base_dir, path) do
+    owner =
+      Tightbeam.Identity.Provenance.owner_for_path(
+        base_dir,
+        Path.relative_to(path, Path.join(base_dir, "identity"))
+      )
+
+    unavailable_scope(base_dir, owner)
+  rescue
+    _ -> :all
+  end
 
   defp mark_unavailable(verbs, source, scope) do
     unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})

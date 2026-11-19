@@ -296,6 +296,30 @@ defmodule Tightbeam.RailScopeRulesTest do
     end
   end
 
+  test "a rule file whose owner cannot be resolved makes verbs unavailable instead of crashing",
+       ctx do
+    seed_sessions!(ctx.db)
+    write_second_kungfu!(ctx.db, ctx.base_dir)
+
+    # Two receipts claim the same rule file, so its owner is ambiguous.
+    File.write!(
+      Path.join(ctx.base_dir, "identity/kungfu/#{@second_kungfu}/installed.toml"),
+      "name = \"#{@second_kungfu}\"\npaths = [\"kungfu/#{@kungfu}/rules/scoped.toml\"]\n"
+    )
+
+    log = ExUnit.CaptureLog.capture_log(fn -> load_rules!(ctx.base_dir) end)
+    assert log =~ "claimed by multiple kungfu receipts"
+
+    assert {:deny, %{code: "rule_unavailable"}} =
+             Rules.evaluate(
+               ctx.db,
+               session_call("work-item-close", "sample-creator", "sample-coordinator")
+             )
+
+    assert {:deny, %{code: "rule_unavailable"}} =
+             Rules.evaluate(ctx.db, session_call("work-item-close", "sample-substrate", nil))
+  end
+
   test "an org-written rule or statute without archetypes warns at load", ctx do
     File.write!(
       Path.join(ctx.base_dir, "identity/rules/substrate.toml"),
