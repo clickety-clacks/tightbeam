@@ -8,6 +8,8 @@ defmodule Tightbeam.RailScopeRulesTest do
   @other_archetype "org-example-auditor"
   @qualified "sample-kungfu.org-example-analyst"
   @qualified_other "sample-kungfu.org-example-auditor"
+  @second_kungfu "second-kungfu"
+  @second_qualified "second-kungfu.org-example-reviewer"
 
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
@@ -182,6 +184,225 @@ defmodule Tightbeam.RailScopeRulesTest do
     assert log =~ "foreign-condition"
     assert log =~ "support-agent"
     assert log =~ "archetype comparison"
+  end
+
+  test "a refused kungfu rule makes its verb unavailable only for that kungfu's agents", ctx do
+    seed_sessions!(ctx.db)
+    seed_work_items!(ctx.db)
+
+    File.write!(
+      Path.join(ctx.base_dir, "identity/kungfu/#{@kungfu}/rules/scoped.toml"),
+      """
+      [[rule]]
+      name = "refused-close"
+      verb = "work-item-close"
+      text = "denied"
+      archetypes = ["support-agent"]
+      deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
+      """
+    )
+
+    ExUnit.CaptureLog.capture_log(fn -> load_rules!(ctx.base_dir) end)
+
+    # Agents inside the kungfu still cannot use the verb.
+    assert {:deny, %{code: "rule_unavailable"}} =
+             Rules.evaluate(
+               ctx.db,
+               session_call("work-item-close", "sample-creator", "sample-coordinator")
+             )
+
+    assert {:deny, %{code: "rule_unavailable"}} =
+             Rules.evaluate(ctx.db, call("work-item-close", "work-owned"))
+
+    # Agents outside the kungfu, and records that involve none of its agents, are untouched.
+    assert :ok =
+             Rules.evaluate(ctx.db, session_call("work-item-close", "sample-substrate", nil))
+
+    assert :ok =
+             Rules.evaluate(
+               ctx.db,
+               session_call("work-item-close", "sample-creator", "sample-substrate")
+             )
+
+    assert :ok = Rules.evaluate(ctx.db, call("work-item-close", "work-foreign"))
+    assert :ok = Rules.evaluate(ctx.db, call("work-item-close", "work-user"))
+
+    # Other verbs are not affected for anyone.
+    assert :ok =
+             Rules.evaluate(
+               ctx.db,
+               session_call("work-item-reopen", "sample-creator", "sample-coordinator")
+             )
+  end
+
+  test "a refused org-written rule still makes its verb unavailable for every agent", ctx do
+    seed_sessions!(ctx.db)
+
+    File.write!(
+      Path.join(ctx.base_dir, "identity/rules/substrate.toml"),
+      """
+      [[rule]]
+      name = "refused-org-close"
+      verb = "work-item-close"
+      text = "denied"
+      archetypes = ["*"]
+      deny_when = [{ fact = "no.such.fact", op = "eq", value = "user" }]
+      """
+    )
+
+    ExUnit.CaptureLog.capture_log(fn -> load_rules!(ctx.base_dir) end)
+
+    for {caller, target} <- [
+          {"sample-creator", "sample-coordinator"},
+          {"sample-substrate", nil}
+        ] do
+      assert {:deny, %{code: "rule_unavailable"}} =
+               Rules.evaluate(ctx.db, session_call("work-item-close", caller, target))
+    end
+  end
+
+  test "a cross-kungfu handoff with no substrate rail is allowed and fires no kungfu rail",
+       ctx do
+    seed_sessions!(ctx.db)
+    write_second_kungfu!(ctx.db, ctx.base_dir)
+
+    File.write!(
+      Path.join(ctx.base_dir, "identity/kungfu/#{@kungfu}/rules/scoped.toml"),
+      handoff_rule("sample-handoff", @qualified)
+    )
+
+    File.write!(
+      Path.join(ctx.base_dir, "identity/kungfu/#{@second_kungfu}/rules/handoff.toml"),
+      handoff_rule("second-handoff", @second_qualified)
+    )
+
+    Rules.load!(ctx.base_dir, ~w(work-item-handoff work-item-icebox))
+
+    # Positive controls: each kungfu's own rail fires inside that kungfu.
+    assert_denied_by(
+      Rules.evaluate(ctx.db, handoff_call("sample-creator", "sample-coordinator")),
+      "sample-kungfu.sample-handoff"
+    )
+
+    assert_denied_by(
+      Rules.evaluate(ctx.db, handoff_call("second-owner", "second-peer")),
+      "second-kungfu.second-handoff"
+    )
+
+    # Crossing the boundary in either direction involves no rail of either kungfu.
+    for {from, to} <- [{"sample-creator", "second-owner"}, {"second-owner", "sample-creator"}] do
+      assert {:allow, [], []} = Rules.decide(ctx.db, handoff_call(from, to))
+      assert :ok = Rules.evaluate(ctx.db, handoff_call(from, to))
+    end
+  end
+
+  test "an org-written rule or statute without archetypes warns at load", ctx do
+    File.write!(
+      Path.join(ctx.base_dir, "identity/rules/substrate.toml"),
+      """
+      [[rule]]
+      name = "omits-archetypes"
+      verb = "work-item-icebox"
+      text = "denied"
+      deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
+
+      [[rule]]
+      name = "names-archetypes"
+      verb = "work-item-icebox"
+      text = "denied"
+      archetypes = ["*"]
+      deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
+
+      [[policy]]
+      name = "policy-omits-archetypes"
+      purpose = "attest-operational-evidence"
+      when = [{ fact = "assignment.effect_kind", op = "eq", value = "live_mutation" }]
+      """
+    )
+
+    log = ExUnit.CaptureLog.capture_log(fn -> load_rules!(ctx.base_dir) end)
+    assert log =~ ~s(rule "omits-archetypes" omits archetypes)
+    assert log =~ ~s(policy "policy-omits-archetypes" omits archetypes)
+    refute log =~ "names-archetypes"
+    # A kungfu rule without archetypes is agentless by design and does not warn.
+    refute log =~ "agentless-close"
+
+    File.mkdir_p!(Path.join(ctx.base_dir, "identity/rails"))
+
+    File.write!(
+      Path.join(ctx.base_dir, "identity/rails/org.toml"),
+      """
+      [[statute]]
+      name = "org-omits"
+      on = "tool-call"
+      mode = "gate"
+      tool = "Bash"
+      pattern = "nothing-to-see"
+      text = "denied"
+
+      [[statute]]
+      name = "org-names"
+      on = "tool-call"
+      mode = "gate"
+      archetypes = ["*"]
+      tool = "Bash"
+      pattern = "nothing-to-see"
+      text = "denied"
+      """
+    )
+
+    on_exit(fn -> :persistent_term.erase(Tightbeam.Rails) end)
+    log = ExUnit.CaptureLog.capture_log(fn -> Tightbeam.Rails.load!(ctx.base_dir) end)
+    assert log =~ ~s(statute "org-omits" omits archetypes)
+    refute log =~ "org-names"
+  end
+
+  defp write_second_kungfu!(db, base_dir) do
+    identity_dir = Path.join(base_dir, "identity")
+    root = Path.join(identity_dir, "kungfu/#{@second_kungfu}")
+    File.mkdir_p!(Path.join(root, "archetypes"))
+    File.mkdir_p!(Path.join(root, "rules"))
+
+    File.write!(
+      Path.join(root, "archetypes/org-example-reviewer.toml"),
+      "name = \"org-example-reviewer\"\nskills = []\nwhere = [\"*\"]\n"
+    )
+
+    File.write!(
+      Path.join(root, "installed.toml"),
+      "name = \"#{@second_kungfu}\"\npaths = [\"kungfu/#{@second_kungfu}/archetypes/org-example-reviewer.toml\", \"kungfu/#{@second_kungfu}/rules/handoff.toml\"]\n"
+    )
+
+    for key <- ["second-owner", "second-peer"] do
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt) VALUES(?1,?1,'sample-owner','user:sample-owner',?2,'claude','anthropic','fixture-model',1,1)",
+                 [key, @second_qualified]
+               )
+    end
+
+    :ok
+  end
+
+  defp handoff_rule(name, qualified) do
+    """
+    [[rule]]
+    name = "#{name}"
+    verb = "work-item-handoff"
+    text = "denied"
+    archetypes = ["#{qualified}"]
+    deny_when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
+    """
+  end
+
+  defp handoff_call(from, to) do
+    %{
+      verb: "work-item-handoff",
+      origin: "agent:#{from}",
+      principal: {:session, from},
+      params: %{work_item_id: "work-handoff", delivery_owner_session_key: to}
+    }
   end
 
   defp write_identity!(base_dir) do
