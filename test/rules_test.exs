@@ -1736,7 +1736,8 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "changes-requested wakes and reopens the author card, then clean review closes it", ctx do
+  test "changes-requested wakes and reopens the author card, then fresh completion and clean review close it",
+       ctx do
     holder = engineering_session(ctx.db, "review-change-author", "flynn", archetype: "coder")
 
     reviewer =
@@ -1852,6 +1853,16 @@ defmodule Tightbeam.RulesTest do
                wake.prompt =~ "requested changes"
            end)
 
+    # Reopening invalidates the earlier completion. Record the repaired work
+    # before a clean review can close this new round.
+    assert %{attest: %{verdictKind: "verified"}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+
+    assert {:ok, %{assignment: %{state: "open"}, attest: fresh_completion}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call)
+
+    assert fresh_completion.id != completion_attest.id
+
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
              commit_ref_verdict(
                ctx,
@@ -1868,7 +1879,7 @@ defmodule Tightbeam.RulesTest do
                [producer.id]
              )
 
-    assert closing_attest_id == completion_attest.id
+    assert closing_attest_id == fresh_completion.id
   end
 
   test "completion accepts a closed linked review of the exact integrated heads", ctx do

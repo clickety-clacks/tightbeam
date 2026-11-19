@@ -3479,11 +3479,28 @@ defmodule Tightbeam.Assignments do
     completion_call = Map.put(call, :params, %{assignment_id: producer.id, kind: "completion"})
 
     if producer.state == "open" and
+         not completion_superseded_by_reopening?(txn, producer.id, completion) and
          applicable_code_completion_in_txn(txn, producer, completion_call) == :ok do
       close_completed_assignment_in_txn(txn, call, producer, completion)
     end
 
     :ok
+  end
+
+  # A reopening starts a new round: the completion that closed the earlier
+  # round, or any completion recorded before the reopening, no longer stands for
+  # the reopened assignment. A clean review must not close the reopened row with
+  # it; the holder records a fresh completion instead.
+  defp completion_superseded_by_reopening?(txn, assignment_id, completion) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM assignment_reopenings
+      WHERE assignmentId=?1 AND (ts > ?2 OR priorClosingAttestId=?3)
+      LIMIT 1
+      """,
+      [assignment_id, completion.ts, completion.id]
+    ) != []
   end
 
   defp reopen_completed_assignment_for_review_in_txn(
