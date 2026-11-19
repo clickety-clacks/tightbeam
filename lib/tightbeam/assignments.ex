@@ -1146,14 +1146,13 @@ defmodule Tightbeam.Assignments do
 
   A linked review conclusion for this producer takes precedence over unlinked
   review conclusions on the same work item. An unlinked same-item review can
-  qualify only when no linked conclusion exists. When the selected clean review
-  and the producer's latest verification include commit refs, the review must
-  include every verified producer commit; additional reviewed commits do not
-  disqualify it.
+  qualify only when no linked conclusion exists. The commit refs a review or a
+  verification names are evidence for readers; they do not decide whether the
+  review qualifies.
   """
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
           [String.t()]
-  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
+  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, _commit_refs) do
     {:ok, rows} =
       DB.query(
         db,
@@ -1187,7 +1186,7 @@ defmodule Tightbeam.Assignments do
             v.ts DESC, v.rowid DESC
           LIMIT 1
         )
-        SELECT reviewHolderKey, verdictKind, commitRefs
+        SELECT reviewHolderKey, verdictKind
         FROM winning_verdict
         WHERE reviewHolderKey != ?2
           AND verdictKind = 'reviewed-clean'
@@ -1196,17 +1195,8 @@ defmodule Tightbeam.Assignments do
       )
 
     case rows do
-      [[_review_holder, "reviewed-clean", encoded_refs]] ->
-        review_refs = if is_binary(encoded_refs), do: JSON.decode!(encoded_refs), else: nil
-
-        if review_covers_commit_refs?(review_refs, commit_refs) do
-          ["reviewed-clean"]
-        else
-          []
-        end
-
-      _ ->
-        []
+      [[_review_holder, "reviewed-clean"]] -> ["reviewed-clean"]
+      _ -> []
     end
   end
 
@@ -2206,6 +2196,21 @@ defmodule Tightbeam.Assignments do
             if is_map(cannot_proceed),
               do: Map.put(result, :cannotProceed, cannot_proceed),
               else: result
+
+          result =
+            case Tightbeam.HarnessHealth.Hold.for_assignment(db, assignment_id) do
+              nil ->
+                result
+
+              hold ->
+                Map.put(result, :heldBehind, %{
+                  incidentId: hold.incident_id,
+                  failureClass: hold.failure_class,
+                  since: hold.since,
+                  openedByAssignmentId: hold.opened_by_assignment_id,
+                  release: hold.release
+                })
+            end
 
           case call.params[:fact_id] do
             nil ->
@@ -4860,32 +4865,7 @@ defmodule Tightbeam.Assignments do
           review
         )
 
-    review_refs =
-      if review_pending?,
-        do: nil,
-        else: completion_review_commit_refs_in_txn(txn, review, assignment.holderKey)
-
-    review_covers_producer_commits? =
-      review_pending? or
-        review_covers_commit_refs?(
-          review_refs,
-          verification && verification.commit_refs
-        )
-
     cond do
-      verification_qualifies? and independent_clean_review? and
-          not review_covers_producer_commits? ->
-        uncovered_commits =
-          uncovered_producer_commits(
-            review_refs,
-            verification && verification.commit_refs
-          )
-
-        error(
-          "inapplicable_code_evidence",
-          "latest independent clean review is missing verified producer commits: #{Enum.join(uncovered_commits, ", ")}"
-        )
-
       verification_qualifies? and independent_clean_review? ->
         if match?(%{linked?: false}, review) do
           Logger.warning("completion_review_missing_link accepted assignmentId=#{assignment.id}")
@@ -4945,87 +4925,6 @@ defmodule Tightbeam.Assignments do
         nil
     end
   end
-
-  # A correction supplements a closed clean review only when its verdict omitted refs.
-  defp completion_review_commit_refs_in_txn(
-         txn,
-         %{
-           kind: "reviewed-clean",
-           review_state: "closed",
-           review_assignment_id: review_id,
-           commit_refs: nil
-         },
-         producer_holder
-       ) do
-    case Txn.q(
-           txn,
-           """
-           SELECT commitRefs
-           FROM assignment_commit_ref_corrections
-           WHERE assignmentId=?1 AND verifiedAt IS NOT NULL
-             AND NOT (actorKind='session' AND actorRef=?2)
-           """,
-           [review_id, producer_holder]
-         ) do
-      [[encoded_refs]] -> JSON.decode!(encoded_refs)
-      [] -> nil
-    end
-  end
-
-  defp completion_review_commit_refs_in_txn(_txn, %{commit_refs: review_refs}, _producer_holder),
-    do: review_refs
-
-  defp completion_review_commit_refs_in_txn(_txn, _review, _producer_holder), do: nil
-
-  defp review_covers_commit_refs?(_review_refs, nil), do: true
-  defp review_covers_commit_refs?(_review_refs, []), do: true
-
-  defp review_covers_commit_refs?(review_refs, producer_refs)
-       when is_list(review_refs) and is_list(producer_refs) do
-    review_commits =
-      review_refs
-      |> Enum.flat_map(fn
-        %{"commit" => commit} when is_binary(commit) -> [String.downcase(commit)]
-        _ -> []
-      end)
-      |> MapSet.new()
-
-    Enum.all?(producer_refs, fn
-      %{"commit" => commit} when is_binary(commit) ->
-        MapSet.member?(review_commits, String.downcase(commit))
-
-      _ ->
-        false
-    end)
-  end
-
-  defp review_covers_commit_refs?(_review_refs, _producer_refs), do: false
-
-  defp uncovered_producer_commits(review_refs, producer_refs) when is_list(producer_refs) do
-    review_refs = if is_list(review_refs), do: review_refs, else: []
-
-    reviewed_commits =
-      review_refs
-      |> Enum.flat_map(fn
-        %{"commit" => commit} when is_binary(commit) -> [String.downcase(commit)]
-        _ -> []
-      end)
-      |> MapSet.new()
-
-    producer_refs
-    |> Enum.flat_map(fn
-      %{"commit" => commit} when is_binary(commit) ->
-        commit = String.downcase(commit)
-        if MapSet.member?(reviewed_commits, commit), do: [], else: [commit]
-
-      _ ->
-        []
-    end)
-    |> Enum.uniq()
-    |> Enum.sort()
-  end
-
-  defp uncovered_producer_commits(_review_refs, _producer_refs), do: []
 
   defp latest_verification_conclusion_in_txn(txn, assignment_id, holder) do
     case Txn.q(

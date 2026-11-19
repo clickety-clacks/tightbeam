@@ -809,9 +809,9 @@ defmodule Tightbeam.Rules do
       fail = fn message -> raise ArgumentError, message end
       validate_predicate_conditions!(conditions, fail)
       conditions = validate_conditions!(conditions, fail)
-      bindings = validate_bindings_in_txn!(txn, conditions, raw_bindings, owner_user_id)
+      bindings = validate_bindings_in_txn!(txn, conditions, raw_bindings)
 
-      candidates = artifact_candidates_in_txn(txn, conditions, bindings, owner_user_id)
+      candidates = artifact_candidates_in_txn(txn, conditions, bindings)
 
       result =
         Enum.reduce_while(candidates, nil, fn candidate, _acc ->
@@ -894,7 +894,8 @@ defmodule Tightbeam.Rules do
     String.downcase(String.first(value)) <> String.slice(value, 1..-1//1)
   end
 
-  defp validate_bindings_in_txn!(txn, conditions, raw_bindings, owner_user_id)
+  # Bindings must name existing rows; whose rows they are does not matter.
+  defp validate_bindings_in_txn!(txn, conditions, raw_bindings)
        when is_map(raw_bindings) do
     bindings = normalize_bindings(raw_bindings)
     unknown = Map.keys(bindings) -- @predicate_binding_keys
@@ -907,28 +908,20 @@ defmodule Tightbeam.Rules do
 
     if MapSet.member?(facts, "work_item.state") do
       id = required_binding!(bindings, "workItemId")
-      ensure_owned_row!(txn, "work item", id, owner_user_id, "work_items", "id", "ownerUserId")
+      ensure_row!(txn, "work item", id, "work_items", "id")
     end
 
     if Enum.any?(facts, &(&1 in ~w(assignment.state assignment.outcome))) do
       id = required_binding!(bindings, "assignmentId")
 
-      unless owned_assignment?(txn, id, owner_user_id),
-        do: raise(ArgumentError, "unknown or inaccessible assignment binding")
+      unless assignment_exists?(txn, id),
+        do: raise(ArgumentError, "unknown assignment binding")
     end
 
     if MapSet.member?(facts, "decision_request.status") do
       id = required_binding!(bindings, "decisionRequestId")
 
-      ensure_owned_row!(
-        txn,
-        "decision request",
-        id,
-        owner_user_id,
-        "decision_requests",
-        "id",
-        "ownerUserId"
-      )
+      ensure_row!(txn, "decision request", id, "decision_requests", "id")
     end
 
     bindings =
@@ -936,7 +929,7 @@ defmodule Tightbeam.Rules do
         Map.put(
           bindings,
           "artifact",
-          validate_artifact_binding_in_txn!(txn, Map.get(bindings, "artifact"), owner_user_id)
+          validate_artifact_binding_in_txn!(txn, Map.get(bindings, "artifact"))
         )
       else
         bindings
@@ -961,7 +954,7 @@ defmodule Tightbeam.Rules do
     bindings
   end
 
-  defp validate_bindings_in_txn!(_txn, _conditions, _raw_bindings, _owner_user_id),
+  defp validate_bindings_in_txn!(_txn, _conditions, _raw_bindings),
     do: raise(ArgumentError, "predicate bindings must be an object")
 
   defp predicate_binding_key(key) when is_atom(key) do
@@ -990,29 +983,15 @@ defmodule Tightbeam.Rules do
     end
   end
 
-  defp ensure_owned_row!(txn, label, id, owner, table, id_column, owner_column) do
-    sql = "SELECT 1 FROM #{table} WHERE #{id_column}=?1 AND #{owner_column}=?2"
-
-    if DB.Txn.q(txn, sql, [id, owner]) != [[1]],
-      do: raise(ArgumentError, "unknown or inaccessible #{label} binding")
+  defp ensure_row!(txn, label, id, table, id_column) do
+    if DB.Txn.q(txn, "SELECT 1 FROM #{table} WHERE #{id_column}=?1", [id]) != [[1]],
+      do: raise(ArgumentError, "unknown #{label} binding")
   end
 
-  defp owned_assignment?(txn, id, owner) do
-    DB.Txn.q(
-      txn,
-      """
-      SELECT 1
-      FROM assignments a
-      JOIN sessions s ON s.sessionKey=a.holderKey
-      LEFT JOIN work_items wi ON wi.id=a.workItemId
-      WHERE a.id=?1 AND s.ownerUserId=?2
-        AND (a.workItemId IS NULL OR wi.ownerUserId=?2)
-      """,
-      [id, owner]
-    ) == [[1]]
-  end
+  defp assignment_exists?(txn, id),
+    do: DB.Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1", [id]) == [[1]]
 
-  defp validate_artifact_binding_in_txn!(txn, binding, owner) when is_map(binding) do
+  defp validate_artifact_binding_in_txn!(txn, binding) when is_map(binding) do
     binding = Map.new(binding, fn {key, value} -> {predicate_binding_key(key), value} end)
     keys = Map.keys(binding) |> Enum.sort()
 
@@ -1028,7 +1007,7 @@ defmodule Tightbeam.Rules do
               "artifact identity binding requires nonblank artifactId and contentSha256"
             )
 
-        ensure_owned_artifact!(txn, artifact_id, owner)
+        ensure_artifact!(txn, artifact_id)
 
       keys in [["producedByAssignmentId"], ["contentSha256", "producedByAssignmentId"]] ->
         producer = Map.get(binding, "producedByAssignmentId")
@@ -1038,8 +1017,8 @@ defmodule Tightbeam.Rules do
                  (is_nil(hash) or (is_binary(hash) and hash != "")),
                do: raise(ArgumentError, "artifact producer binding is malformed")
 
-        unless owned_assignment?(txn, producer, owner),
-          do: raise(ArgumentError, "unknown or inaccessible artifact producer binding")
+        unless assignment_exists?(txn, producer),
+          do: raise(ArgumentError, "unknown artifact producer binding")
 
       true ->
         raise ArgumentError,
@@ -1049,25 +1028,21 @@ defmodule Tightbeam.Rules do
     binding
   end
 
-  defp validate_artifact_binding_in_txn!(_txn, _binding, _owner),
+  defp validate_artifact_binding_in_txn!(_txn, _binding),
     do: raise(ArgumentError, "bindings are missing artifact")
 
-  defp ensure_owned_artifact!(txn, artifact_id, owner) do
+  defp ensure_artifact!(txn, artifact_id) do
     rows =
       DB.Txn.q(
         txn,
-        """
-        SELECT 1 FROM artifacts art
-        JOIN work_items wi ON wi.id=art.workItemId
-        WHERE art.artifactId=?1 AND wi.ownerUserId=?2
-        """,
-        [artifact_id, owner]
+        "SELECT 1 FROM artifacts art JOIN work_items wi ON wi.id=art.workItemId WHERE art.artifactId=?1",
+        [artifact_id]
       )
 
-    if rows != [[1]], do: raise(ArgumentError, "unknown or inaccessible artifact binding")
+    if rows != [[1]], do: raise(ArgumentError, "unknown artifact binding")
   end
 
-  defp artifact_candidates_in_txn(txn, conditions, bindings, owner) do
+  defp artifact_candidates_in_txn(txn, conditions, bindings) do
     if Enum.any?(conditions, &(&1.fact in @artifact_facts)) do
       binding = Map.get(bindings, "artifact")
 
@@ -1079,26 +1054,26 @@ defmodule Tightbeam.Rules do
               """
               SELECT art.artifactId, art.contentSha256, art.producedByAssignmentId
               FROM artifacts art JOIN work_items wi ON wi.id=art.workItemId
-              WHERE art.artifactId=?1 AND wi.ownerUserId=?2
+              WHERE art.artifactId=?1
               """,
-              [artifact_id, owner]
+              [artifact_id]
             )
 
           %{"producedByAssignmentId" => producer} = artifact_binding ->
             expected_hash = Map.get(artifact_binding, "contentSha256")
-            hash_clause = if is_binary(expected_hash), do: " AND art.contentSha256=?3", else: ""
+            hash_clause = if is_binary(expected_hash), do: " AND art.contentSha256=?2", else: ""
 
             params =
               if is_binary(expected_hash),
-                do: [producer, owner, expected_hash],
-                else: [producer, owner]
+                do: [producer, expected_hash],
+                else: [producer]
 
             DB.Txn.q(
               txn,
               """
               SELECT art.artifactId, art.contentSha256, art.producedByAssignmentId
               FROM artifacts art JOIN work_items wi ON wi.id=art.workItemId
-              WHERE art.producedByAssignmentId=?1 AND wi.ownerUserId=?2#{hash_clause}
+              WHERE art.producedByAssignmentId=?1#{hash_clause}
               ORDER BY art.createdAt, art.artifactId
               """,
               params
@@ -1165,12 +1140,7 @@ defmodule Tightbeam.Rules do
         row_commit_candidate_calls_in_txn(txn, rule, call)
         |> Enum.flat_map(fn candidate_call ->
           candidates =
-            artifact_candidates_in_txn(
-              txn,
-              rule.conditions,
-              candidate_call.predicate_bindings,
-              owner
-            )
+            artifact_candidates_in_txn(txn, rule.conditions, candidate_call.predicate_bindings)
 
           Enum.reduce_while(candidates, [], fn candidate, [] ->
             candidate_call = Map.put(candidate_call, :artifact_candidate, candidate)
@@ -3496,25 +3466,8 @@ defmodule Tightbeam.Rules do
         {nil, cache}
 
       assignment, cache ->
-        kinds =
-          if assignment.effect_kind == "code" and get_in(call, [:params, :kind]) == "completion" do
-            # Let the transaction report uncovered producer commits by hash;
-            # this rule only distinguishes a clean independent review from no
-            # such review or a blocking review verdict.
-            Assignments.qualifying_review_verdict_kinds(
-              db,
-              assignment.id,
-              assignment.holder_key
-            )
-          else
-            Assignments.qualifying_review_verdict_kinds(
-              db,
-              assignment.id,
-              assignment.holder_key
-            )
-          end
-
-        {kinds, cache}
+        {Assignments.qualifying_review_verdict_kinds(db, assignment.id, assignment.holder_key),
+         cache}
     end)
   end
 
@@ -3581,17 +3534,8 @@ defmodule Tightbeam.Rules do
         {nil, cache}
 
       work_item_id, cache ->
-        owner = Map.get(call, :predicate_owner_user_id)
-
-        {sql, params} =
-          if is_binary(owner) do
-            {"SELECT state FROM work_items WHERE id=?1 AND ownerUserId=?2", [work_item_id, owner]}
-          else
-            {"SELECT state FROM work_items WHERE id=?1", [work_item_id]}
-          end
-
         value =
-          case DB.query(db, sql, params) do
+          case DB.query(db, "SELECT state FROM work_items WHERE id=?1", [work_item_id]) do
             {:ok, [[state]]} -> state
             {:ok, []} -> nil
           end
@@ -3660,13 +3604,12 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("decision_request.status", db, call, cache) do
     decision_id = Map.get(call.params, :decision_request_id)
-    owner = Map.get(call, :predicate_owner_user_id)
 
     value =
       case DB.query(
              db,
-             "SELECT status FROM decision_requests WHERE id=?1 AND ownerUserId=?2",
-             [decision_id, owner]
+             "SELECT status FROM decision_requests WHERE id=?1 AND ?2 IS NOT NULL",
+             [decision_id, Map.get(call, :predicate_owner_user_id)]
            ) do
         {:ok, [[status]]} -> status
         {:ok, []} -> nil
@@ -3677,13 +3620,12 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("decision_request.addressed_principal", db, call, cache) do
     decision_id = Map.get(call.params, :decision_request_id)
-    owner = Map.get(call, :predicate_owner_user_id)
 
     value =
       case DB.query(
              db,
-             "SELECT expecterSessionKey,expecterUserId,ownerUserId FROM decision_requests WHERE id=?1 AND ownerUserId=?2",
-             [decision_id, owner]
+             "SELECT expecterSessionKey,expecterUserId,ownerUserId FROM decision_requests WHERE id=?1 AND ?2 IS NOT NULL",
+             [decision_id, Map.get(call, :predicate_owner_user_id)]
            ) do
         {:ok, [[session, _user, _owner]]} when is_binary(session) -> "session:" <> session
         {:ok, [[_session, user, _owner]]} when is_binary(user) -> "user:" <> user
@@ -4462,17 +4404,7 @@ defmodule Tightbeam.Rules do
     assignment =
       case Map.get(call.params, :assignment_id) || Map.get(call.params, "assignment_id") do
         id when is_binary(id) ->
-          case Map.get(call, :predicate_owner_user_id) do
-            owner when is_binary(owner) ->
-              assignment_context(
-                db,
-                "WHERE a.id = ?1 AND s.ownerUserId = ?2 AND (a.workItemId IS NULL OR wi.ownerUserId = ?2)",
-                [id, owner]
-              )
-
-            _ ->
-              assignment_context(db, "WHERE a.id = ?1", [id])
-          end
+          assignment_context(db, "WHERE a.id = ?1", [id])
 
         _ ->
           case Map.get(call.params, :reviews_assignment_id) ||
