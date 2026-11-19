@@ -320,6 +320,21 @@ defmodule Tightbeam.RailScopeRulesTest do
              Rules.evaluate(ctx.db, session_call("work-item-close", "sample-substrate", nil))
   end
 
+  test "an unreadable receipt makes verbs unavailable instead of crashing the load", ctx do
+    seed_sessions!(ctx.db)
+
+    File.write!(
+      Path.join(ctx.base_dir, "identity/kungfu/#{@kungfu}/installed.toml"),
+      "not = [toml"
+    )
+
+    log = ExUnit.CaptureLog.capture_log(fn -> assert is_list(load_rules!(ctx.base_dir)) end)
+    assert log =~ "unavailable"
+
+    assert {:deny, %{code: "rule_unavailable"}} =
+             Rules.evaluate(ctx.db, session_call("work-item-close", "sample-substrate", nil))
+  end
+
   test "an org-written rule or statute without archetypes warns at load", ctx do
     File.write!(
       Path.join(ctx.base_dir, "identity/rules/substrate.toml"),
