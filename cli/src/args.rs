@@ -1834,6 +1834,14 @@ fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, St
             ));
         }
     }
+    let state = flags.get("state").cloned();
+    if let Some(value) = &state {
+        if !matches!(value.as_str(), "open" | "iceboxed" | "closed" | "failed") {
+            return Err(format!(
+                "bad --state value: {value} (use open, iceboxed, closed, or failed)"
+            ));
+        }
+    }
     // --spec-sha narrows a --spec cohort; alone it selects nothing nameable.
     if flags.contains_key("spec-sha") && nonempty(flags, "spec").is_none() {
         return Err("--spec-sha requires --spec <name>".to_owned());
@@ -1841,7 +1849,7 @@ fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, St
     Ok(ToplineFilters {
         origin,
         owner: nonempty(flags, "owner"),
-        state: nonempty(flags, "state"),
+        state,
         quiet_over_ms: nonempty(flags, "quiet-over")
             .map(|value| parse_duration("quiet-over", &value))
             .transpose()?,
@@ -7385,6 +7393,41 @@ mod tests {
     // filters to BOTH topline modes and sent them, while the reader selects solely
     // by assignment id — so `--assignments X --state closed` could return an OPEN
     // item after the CLI had promised the filter was applied.
+    #[test]
+    fn execution_map_state_is_a_closed_enum() {
+        for prefix in [
+            vec!["execution-map"],
+            vec!["execution-map-select", "--under", "wi_example"],
+        ] {
+            for state in ["all", "opne", ""] {
+                let mut args = prefix.clone();
+                args.extend(["--state", state, "--as-user", "owner"]);
+                assert_eq!(
+                    parse(strings(&args)).unwrap_err(),
+                    format!("bad --state value: {state} (use open, iceboxed, closed, or failed)")
+                );
+            }
+            let mut args = prefix.clone();
+            args.extend(["--as-user", "owner", "--state"]);
+            assert_eq!(
+                parse(strings(&args)).unwrap_err(),
+                "bad --state value:  (use open, iceboxed, closed, or failed)"
+            );
+            let mut args = prefix.clone();
+            args.extend(["--as-user", "owner"]);
+            let command = parse(strings(&args)).unwrap();
+            let body = crate::dispatch::build_request(&command).unwrap().body_json;
+            assert!(!body.contains(r#""state":"#));
+            for state in ["open", "iceboxed", "closed", "failed"] {
+                let mut args = prefix.clone();
+                args.extend(["--state", state, "--as-user", "owner"]);
+                let command = parse(strings(&args)).unwrap();
+                let body = crate::dispatch::build_request(&command).unwrap().body_json;
+                assert!(body.contains(&format!(r#""state":"{state}""#)));
+            }
+        }
+    }
+
     #[test]
     fn assignment_selection_refuses_every_roster_filter() {
         for (flag, value) in [
