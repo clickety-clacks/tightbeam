@@ -1,14 +1,53 @@
 # Tightbeam
 
-Agent orchestration needs a real machine part—not another layer of ad hoc glue.
-Tightbeam coordinates the vendors’ own harnesses rather than repackaging models
-in a generic shell: Claude runs in Claude Code; Codex runs in Codex.
+Tightbeam runs an organization of AI agents on one or more machines. It gives each agent a role, passes messages between agents, records the work and enforces your rules. If an agent crashes or loses its context, it picks up from the record. Tightbeam provides:
 
-It keeps durable, first-party facts about work in one shared source of truth.
-At the substrate layer, it turns guidance into deterministic rails: rules
-enforced across agents and sessions, not left to each model’s inference.
+- **Messaging between agents.** Any agent can message any other agent in the organization, across sessions and machines. Agents hand off work, ask questions and report results to each other directly.
+- **Event-based waking.** Agents wake when other agents or processes have something for them to act on, such as completed work or a pull request's checks finishing. Timed waits and polling are kept to a minimum. A sleeping agent uses no model turns.
+- **Guidance and skill isolation.** An "archetype" gives an agent only the guidance and skills its job needs. Its context stays focused on the work it has to do.
+- **Message queue manipulation.** A sender can cancel a queued message, replace changed instructions or mark a message's urgency, so agents do not act on outdated instructions.
+- **Message batching.** Messages batch so they can be handled in one turn.
+- **Durable records.** Tasks, responsibilities and results are stored as records that outlast conversations. An agent that crashes, restarts or loses its context picks up from the records.
+- **Observability.** The [firehose](docs/firehose.md) streams its published events so reports and user interfaces can show activity across the organization.
+- **Decisions that come to you.** When an agent needs a product choice it is not allowed to make, it files a decision request. You get the question, the agent's recommendation and the choices. When you answer, the agent wakes with your answer.
+- **Deterministic rails.** Agents sometimes ignore guidance and skills. A rail is a rule Tightbeam enforces, so agents cannot skip it. For example, a rail can require a review before any work counts as done.
+- **Ordinary agent harnesses.** Agents run in ordinary harnesses such as Claude Code and Codex. Tightbeam passes your model and settings through unchanged and shows you the harness's own output, including failures.
 
-You RUN tightbeam; you do not depend on it. There is no Hex package.
+Tightbeam is a construction set. Rules, roles and process are not built in. You and your agents decide who writes, who reviews, who decides scope and when a change counts as done. You can build a software team, a research desk, a support rotation or a one-person shop with specialists on call. Tightbeam ships with a software engineering template called a "kung fu". You can use it, change it or write your own.
+
+A software dark factory runs one fixed process unattended. A personal agent such as OpenClaw puts many tools behind one assistant. Tightbeam runs many agents as an organization you design, and it keeps running when you are away.
+
+[Install a verified release](#install-only-a-verified-release-package), or [upgrade an existing installation](docs/UPGRADE.md).
+
+## Tightbeam in detail
+
+The gateway runs a graph of agents and keeps a permanent record of what each agent is working on, what it has done and what has been checked. Agents run on any machine in your network, in the harness you choose.
+
+## Principles
+
+These principles decide what Tightbeam is and how it changes.
+
+**User and agent agency.** You and your agents decide the shape of your organization, its process and its teams.
+
+**Domain knowledge belongs in "kung fu".** A kung fu bundle supplies the roles, guidance, skills and rules for a kind of work. The core handles records, messages and agents without needing to know what a pull request, a support ticket or a research paper is. You can teach Tightbeam more than one domain.
+
+**Only enough guidance for the job.** Each agent gets the guidance and skills it needs for the work it has to do. Its context stays focused on that job.
+
+**Rails where you want them, agency everywhere else.** Tightbeam "rails" ensure agents behave deterministically at critical moments in your workflows. You choose the rules, such as requiring a review before work counts as done. Tightbeam applies them the same way every time. Everything else is left to the agents' judgment.
+
+**Built for your private network.** Run Tightbeam on machines you control, with the credential, service and sandbox setup described below.
+
+**The record is the truth, not the context.** Records show what needs doing, who is responsible, what has been done and what has been checked. Agents recover their work from these records after compaction or restart. You can see why anything happened without reading chat logs.
+
+**Wake on events.** Agents sleep until another agent or process has something for them to act on. Timed waits and polling are kept to a minimum.
+
+**Keep the natural harness and augment it.** Each agent runs in the harness its model was built to use. Tightbeam adds the tools for agents to communicate and work together as an organization.
+
+**Let modern models orchestrate.** Modern models can plan work, choose tools and delegate. Tightbeam gives them shared records, messages, wakes and other agents to work with. The models decide how to put those tools to use.
+
+**Agnostic to harness and model, compatible with their features.** Claude and Codex agents run in the same organization, and each can use its own harness's features. Changing harness preserves the Tightbeam session, role and work, but starts a fresh engine context. The agent can recover from the durable records; this is not a lossless transfer of its live context.
+
+**Tightbeam is headless.** You know best how you should interact with it. There is no required user interface. That said, we've written some great UIs for it: the [chat component](https://github.com/clickety-clacks/tightbeam-chat), the [air-traffic-control view](https://github.com/clickety-clacks/tightbeam-atc), the [tuner](https://github.com/clickety-clacks/tightbeam-tuner) and the [decisions widget](https://github.com/clickety-clacks/tightbeam-decisions-omarchy). Use them or build your own.
 
 Upgrading an existing installation? Start with [docs/UPGRADE.md](docs/UPGRADE.md)
 before staging or replacing a package.
