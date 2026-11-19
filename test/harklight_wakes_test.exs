@@ -4253,6 +4253,14 @@ defmodule Tightbeam.HarklightWakesTest do
     assert eventually(fn -> not Process.alive?(worker) end)
   end
 
+  # Listener start first reads Harklight status through the Agent CLI, which
+  # HarklightLifecycle bounds with a 5s read deadline, and starts the listener
+  # on whatever that read yields. The start can therefore legitimately take as
+  # long as that deadline plus the read task's shutdown grace; ExUnit's default
+  # 1s assert_receive window is below the product's own bound. Wait for the
+  # event itself and bound only a hang, using twice the product deadline.
+  @listener_start_bound_ms 10_000
+
   test "another active follow receiver keeps a retired origin not-gone", %{
     db: db,
     call: call,
@@ -4284,7 +4292,8 @@ defmodule Tightbeam.HarklightWakesTest do
     end
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
-    assert_receive {:listener_running, worker}
+    assert_receive {:listener_running, worker}, @listener_start_bound_ms
+    worker_down = Process.monitor(worker)
 
     {:ok, _} =
       DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
@@ -4319,11 +4328,15 @@ defmodule Tightbeam.HarklightWakesTest do
     assert retired_last.state == "retired"
     :sys.get_state(HarklightWakes)
 
-    assert eventually(fn ->
-             File.read(calls) == {:ok, "session end --session #{@handle} --gone\n"}
-           end)
+    # The gone call is a subprocess started outside the manager, so its output
+    # file is the only observation of it; poll that against the same bound
+    # rather than eventually/1's default 2s window.
+    assert eventually(
+             fn -> File.read(calls) == {:ok, "session end --session #{@handle} --gone\n"} end,
+             div(@listener_start_bound_ms, 10)
+           )
 
-    assert eventually(fn -> not Process.alive?(worker) end)
+    assert_receive {:DOWN, ^worker_down, :process, ^worker, _reason}, @listener_start_bound_ms
   end
 
   test "a first transient attach failure waits for recovery before marking gone", %{db: db} do
