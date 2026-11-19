@@ -2,7 +2,7 @@
 
 Tightbeam runs an organization of AI agents on one or more machines. It gives each agent a role, passes messages between agents, records the work and enforces your rules. If an agent crashes or loses its context, it picks up from the record. Tightbeam provides:
 
-- **Messaging between agents.** Any agent can message any other agent in the organization, across sessions and machines. Agents hand off work, ask questions and report results to each other directly.
+- **Messaging between agents.** Agents can message each other across sessions and machines. Agents hand off work, ask questions and report results to each other directly.
 - **Event-based waking.** Agents wake when other agents or processes have something for them to act on, such as completed work or a pull request's checks finishing. Timed waits and polling are kept to a minimum. A sleeping agent uses no model turns.
 - **Guidance and skill isolation.** An "archetype" gives an agent only the guidance and skills its job needs. Its context stays focused on the work it has to do.
 - **Message queue manipulation.** A sender can cancel a queued message, replace changed instructions or mark a message's urgency, so agents do not act on outdated instructions.
@@ -37,7 +37,7 @@ These principles decide what Tightbeam is and how it changes.
 
 **Built for your private network.** Run Tightbeam on machines you control, with the credential, service and sandbox setup described below.
 
-**The record is the truth, not the context.** Records show what needs doing, who is responsible, what has been done and what has been checked. Agents recover their work from these records after compaction or restart. You can see why anything happened without reading chat logs.
+**The record is the truth, not the context.** Records show what needs doing, who is responsible, what has been done and what has been checked. Agents recover their work from these records after compaction or restart. The records show ownership, progress and recorded checks without requiring a reader to reconstruct them from chat logs.
 
 **Wake on events.** Agents sleep until another agent or process has something for them to act on. Timed waits and polling are kept to a minimum.
 
