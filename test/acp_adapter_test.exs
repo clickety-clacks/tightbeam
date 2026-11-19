@@ -232,8 +232,19 @@ defmodule Tightbeam.Acp.AdapterTest do
   const efforts = {};
   const fastValues = {};
   const offeredModels = {};
+  // Sessions the adapter holds in memory. Recorded from the pinned
+  // claude-agent-acp 0.81.0 (dist/fork-session.js, dist/acp-agent.js): session/fork
+  // writes a forked transcript through the Claude Agent SDK and returns ONLY
+  // { sessionId }; it never registers that id. Until session/load (or resume)
+  // registers it, set_config_option, set_mode, prompt and close on the fork id
+  // throw "Session not found", which the ACP SDK 1.5.0 (errorToResult) sends as
+  // -32603 "Internal error" with data.details.
   const liveSessions = new Set();
   const conversationHistory = {};
+  const unloadedFork = (sid) =>
+    typeof sid === "string" && sid.startsWith("sess-fork-") && !liveSessions.has(sid);
+  const sessionNotFound = (id) =>
+    send({ id, error: { code: -32603, message: "Internal error", data: { details: "Session not found" } } });
   const defaultOfferedModels = [
     "default", "opus[1m]", "claude-fable-5[1m]", "nova[1m]", "sonnet", "haiku",
     "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol", "orbit-9"
@@ -362,26 +373,19 @@ defmodule Tightbeam.Acp.AdapterTest do
         models[sid] = models[m.params.sessionId] || "haiku";
         offeredModels[sid] = [...offeredModelMenu];
         conversationHistory[sid] = [...(conversationHistory[m.params.sessionId] || [])];
-        if (failMode === "resident-two-claude-models") {
-          return send({ id: m.id, result: { sessionId: sid } });
-        }
-        return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
+        // The real fork answers with the new id alone: no configOptions, not live.
+        return send({ id: m.id, result: { sessionId: sid } });
       }
       case "session/close": {
         capture(m);
         const sid = m.params.sessionId;
-        if (failMode === "resident-two-claude-models" && sid.startsWith("sess-fork-") && !liveSessions.has(sid)) {
-          return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
-        }
+        if (unloadedFork(sid)) return sessionNotFound(m.id);
         liveSessions.delete(sid);
         return send({ id: m.id, result: {} });
       }
       case "session/set_config_option": {
         capture(m);
-        if (failMode === "resident-two-claude-models" &&
-            m.params.sessionId.startsWith("sess-fork-") && !liveSessions.has(m.params.sessionId)) {
-          return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
-        }
+        if (unloadedFork(m.params.sessionId)) return sessionNotFound(m.id);
         if (failMode === "resident-two-claude-models" &&
             m.params.configId === "model" && m.params.value === "claude-sonnet-5") {
           models[m.params.sessionId] = "sonnet";
@@ -547,6 +551,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       }
       case "session/set_mode": {
         capture(m);
+        if (unloadedFork(m.params.sessionId)) return sessionNotFound(m.id);
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: {} }), 75);
         if (gateMode === "mode-refused-data" && m.params.sessionId === "probe-sess") {
           return send({ id: m.id, error: { code: -32000, message: "mode refused", data: { modeId: m.params.modeId, policy: "probe mode denied" } } });
@@ -561,10 +566,8 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = m.params.sessionId;
         capture(m);
         const text = m.params.prompt?.[0]?.text;
+        if (unloadedFork(sid)) return sessionNotFound(m.id);
         if (failMode === "resident-two-claude-models") {
-          if (sid.startsWith("sess-fork-") && !liveSessions.has(sid)) {
-            return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
-          }
           if (sid.startsWith("sess-fork-") &&
               !conversationHistory[sid]?.includes("persist the resident Claude conversation")) {
             return send({ id: m.id, error: { code: -32000, message: "Forked conversation history missing" } });
