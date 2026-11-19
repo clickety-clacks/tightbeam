@@ -439,6 +439,36 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     assert File.read!(Path.join(dir, "rules/topology.toml")) == expected
   end
 
+  test "a learned completion review rail gains its accountable-notice declaration", ctx do
+    init_fixture!(ctx.base_dir)
+    db = start_db!()
+    dir = Path.join(ctx.base_dir, "identity")
+
+    legacy =
+      "priv/kungfu/agentic-engineering/rules/engineering.toml"
+      |> File.read!()
+      |> String.split("\n# Posture gate")
+      |> hd()
+      |> String.replace(~r/^archetypes = .*\n/m, "")
+      |> String.replace("accountable_notice = true\n", "")
+
+    refute legacy =~ "accountable_notice"
+    File.write!(Path.join(dir, "rules/engineering.toml"), legacy)
+    commit_fixture!(dir, "fixture: learned 0.1.16 completion review rail")
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, db)
+
+    migrated = File.read!(Path.join(dir, "rules/engineering.toml"))
+    assert migrated =~ "accountable_notice = true"
+
+    # The migrated copy loads and keeps the rail's behaviour.
+    handlers = Tightbeam.Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+    on_exit(fn -> Tightbeam.Rules.load!("/missing-accountable-notice-reset", []) end)
+
+    assert rules = Tightbeam.Rules.load!(ctx.base_dir, Map.keys(handlers))
+    assert [rule] = Enum.filter(rules, &(&1.short_name == "completion-requires-review"))
+    assert rule.remedy.accountable_notice
+  end
+
   test "migrated relearn preserves substrate namesakes and merges org kungfu edits", ctx do
     init_fixture!(ctx.base_dir, verb: "post")
     db = start_db!()

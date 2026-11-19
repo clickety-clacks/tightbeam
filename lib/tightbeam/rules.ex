@@ -120,6 +120,7 @@ defmodule Tightbeam.Rules do
                  "archetype",
                  "host",
                  "on_rule_denied",
+                 "accountable_notice",
                  "params"
                ])
   @binding_tokens ~w(
@@ -415,11 +416,10 @@ defmodule Tightbeam.Rules do
                   MapSet.to_list(verbs)
               end
 
-            unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
-
-            :persistent_term.put(
-              {__MODULE__, :unavailable_verbs},
-              Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
+            mark_unavailable(
+              affected,
+              path,
+              unavailable_scope_for_path(law_base, path)
             )
 
             Enum.each(affected, fn verb ->
@@ -483,12 +483,7 @@ defmodule Tightbeam.Rules do
             reason: "duplicate name"
           })
 
-          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
-
-          :persistent_term.put(
-            {__MODULE__, :unavailable_verbs},
-            Map.put(unavailable, rule.verb, rule.source)
-          )
+          mark_unavailable([rule.verb], rule.source, unavailable_scope(law_base, rule.owner))
 
           true
         else
@@ -499,12 +494,7 @@ defmodule Tightbeam.Rules do
     policies =
       Enum.reject(policies, fn policy ->
         if duplicates[policy.name] > 1 do
-          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
-
-          :persistent_term.put(
-            {__MODULE__, :unavailable_verbs},
-            Enum.reduce(verbs, unavailable, &Map.put(&2, &1, policy.source))
-          )
+          mark_unavailable(verbs, policy.source, unavailable_scope(law_base, policy.owner))
 
           Enum.each(verbs, fn verb ->
             record_unavailable_verb(%{
@@ -543,12 +533,7 @@ defmodule Tightbeam.Rules do
               reason: Exception.message(error)
             })
 
-            unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
-
-            :persistent_term.put(
-              {__MODULE__, :unavailable_verbs},
-              Map.put(unavailable, rule.verb, rule.source)
-            )
+            mark_unavailable([rule.verb], rule.source, unavailable_scope(law_base, rule.owner))
 
             false
         end
@@ -760,7 +745,7 @@ defmodule Tightbeam.Rules do
     verb = Map.fetch!(call, :verb)
     edge = edge(call)
 
-    case Map.get(:persistent_term.get({__MODULE__, :unavailable_verbs}, %{}), verb) do
+    case unavailable_source(db, call, verb) do
       nil ->
         candidate_rules = Enum.filter(rules, &(&1.verb == verb and edge in &1.edges))
 
@@ -1521,6 +1506,24 @@ defmodule Tightbeam.Rules do
     end
   end
 
+  # An org-written entry without `archetypes` names no agent, so it can only
+  # apply to records that involve no agent at all. Say so at load rather than
+  # leaving it to be discovered when the entry never fires.
+  defp warn_omitted_archetypes(entry, :substrate, path, label) do
+    unless Map.has_key?(entry, "archetypes") do
+      require Logger
+
+      Logger.warning(
+        "#{path}: #{label} omits archetypes and applies to no agent; " <>
+          ~s(add archetypes = ["*"] to apply it to every agent)
+      )
+    end
+
+    :ok
+  end
+
+  defp warn_omitted_archetypes(_entry, _owner, _path, _label), do: :ok
+
   defp validate_kungfu_condition_names!(_conditions, :substrate, _owned_archetypes, _fail),
     do: :ok
 
@@ -1812,6 +1815,70 @@ defmodule Tightbeam.Rules do
     end
   end
 
+  # A refused rule makes its verb unavailable only where the rule would have
+  # applied. A kungfu's refused rule is confined to that kungfu's own archetypes
+  # (the way a refused tool-call rail is); substrate and org-written rules stay
+  # unavailable for everyone.
+  defp unavailable_scope(base_dir, {:kungfu, _name} = owner) do
+    %{
+      owner: owner,
+      base_dir: base_dir,
+      archetypes: base_dir |> owned_archetypes(owner) |> MapSet.to_list() |> Enum.sort()
+    }
+  rescue
+    _ -> :all
+  end
+
+  defp unavailable_scope(_base_dir, _owner), do: :all
+
+  # The owner of a broken file may itself be unreadable (an unreadable or
+  # conflicting receipt); that leaves the verb unavailable for everyone.
+  defp unavailable_scope_for_path(base_dir, path) do
+    owner =
+      Tightbeam.Identity.Provenance.owner_for_path(
+        base_dir,
+        Path.relative_to(path, Path.join(base_dir, "identity"))
+      )
+
+    unavailable_scope(base_dir, owner)
+  rescue
+    _ -> :all
+  end
+
+  defp mark_unavailable(verbs, source, scope) do
+    unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+    :persistent_term.put(
+      {__MODULE__, :unavailable_verbs},
+      Enum.reduce(verbs, unavailable, fn verb, acc ->
+        Map.update(acc, verb, [{source, scope}], &[{source, scope} | &1])
+      end)
+    )
+  end
+
+  defp unavailable_source(db, call, verb) do
+    entries = Map.get(:persistent_term.get({__MODULE__, :unavailable_verbs}, %{}), verb, [])
+
+    Enum.find_value(entries, fn {source, scope} ->
+      if unavailable_scope_applies?(scope, db, call), do: source
+    end)
+  end
+
+  defp unavailable_scope_applies?(:all, _db, _call), do: true
+
+  defp unavailable_scope_applies?(scope, db, call) do
+    case participant_archetypes(db, call) do
+      [_ | _] = participants ->
+        Tightbeam.RailScope.matches_agents?(scope.archetypes, participants)
+
+      [] ->
+        zero_agent_belongs?(scope, db, call)
+    end
+  rescue
+    # A scope that cannot be resolved keeps the verb closed.
+    _ -> true
+  end
+
   defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
     contents = File.read!(path)
     relative = Path.relative_to(path, Path.join(base_dir, "identity"))
@@ -1861,12 +1928,7 @@ defmodule Tightbeam.Rules do
 
                 verb = if is_map(rule), do: Map.get(rule, "verb"), else: nil
                 affected = if MapSet.member?(valid_verbs, verb), do: [verb], else: valid_verbs
-                unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
-
-                :persistent_term.put(
-                  {__MODULE__, :unavailable_verbs},
-                  Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
-                )
+                mark_unavailable(affected, path, unavailable_scope(base_dir, owner))
 
                 Enum.each(affected, fn affected_verb ->
                   record_unavailable_verb(%{
@@ -2033,6 +2095,7 @@ defmodule Tightbeam.Rules do
 
     conditions = validate_policy_conditions!(Map.get(policy, "when"), fail)
     archetypes = validate_archetypes!(policy, owner, owned_archetypes, fail)
+    warn_omitted_archetypes(policy, owner, path, label)
     validate_kungfu_condition_names!(conditions, owner, owned_archetypes, fail)
     verification = validate_policy_verification!(purpose, Map.get(policy, "verification"), fail)
     evidence_memento = Map.get(policy, "evidence_memento")
@@ -2153,6 +2216,7 @@ defmodule Tightbeam.Rules do
 
     conditions = validate_conditions!(Map.get(rule, "deny_when"), fail)
     archetypes = validate_archetypes!(rule, owner, owned_archetypes, fail)
+    warn_omitted_archetypes(rule, owner, path, label)
     validate_kungfu_condition_names!(conditions, owner, owned_archetypes, fail)
     check = validate_check!(Map.get(rule, "check"), base_dir, owner, fail)
 
@@ -2185,7 +2249,6 @@ defmodule Tightbeam.Rules do
         check,
         effects,
         fail,
-        raw_name,
         filing_remedy?
       )
 
@@ -2491,9 +2554,9 @@ defmodule Tightbeam.Rules do
 
   defp validate_check!(_check, _base_dir, _owner, fail), do: fail.("check must be a table")
 
-  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _name, _filing?), do: nil
+  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _filing?), do: nil
 
-  defp validate_remedy!(remedy, conditions, check, effects, fail, name, filing?)
+  defp validate_remedy!(remedy, conditions, check, effects, fail, filing?)
        when is_map(remedy) do
     unknown = unknown_keys(remedy, @remedy_keys)
     if unknown != [], do: fail.("remedy has unknown keys: #{Enum.join(unknown, ", ")}")
@@ -2511,6 +2574,14 @@ defmodule Tightbeam.Rules do
     unless on_rule_denied in ~w(block surface),
       do: fail.("remedy on_rule_denied must be block or surface")
 
+    accountable_notice = Map.get(remedy, "accountable_notice", false)
+
+    unless is_boolean(accountable_notice),
+      do: fail.("remedy accountable_notice must be a boolean")
+
+    if accountable_notice and action != "wake",
+      do: fail.("remedy accountable_notice is valid only on a wake remedy")
+
     {required_top, allowed_top, required_params, allowed_params} =
       case action do
         "assign" ->
@@ -2527,7 +2598,7 @@ defmodule Tightbeam.Rules do
     present_top =
       remedy
       |> Map.keys()
-      |> Enum.filter(&(&1 not in ~w(action produces on_rule_denied params)))
+      |> Enum.filter(&(&1 not in ~w(action produces on_rule_denied accountable_notice params)))
 
     missing_top = required_top -- present_top
     if missing_top != [], do: fail.("remedy #{action} is missing #{Enum.join(missing_top, ", ")}")
@@ -2590,9 +2661,9 @@ defmodule Tightbeam.Rules do
         :ok
     end
 
-    # This gate records one ordinary holder notice; it does not create a linked
-    # review assignment or require the linked-review remedy binding.
-    if not (name == "completion-requires-review" and action == "wake") and
+    # An accountable-notice remedy records one ordinary notice; it does not create a
+    # linked review assignment or require the linked-review remedy binding.
+    if not accountable_notice and
          is_nil(check) and
          Enum.any?(requirements, fn {fact, kinds} ->
            fact in @linked_review_facts and produces in kinds
@@ -2606,6 +2677,7 @@ defmodule Tightbeam.Rules do
       action: action,
       produces: produces,
       on_rule_denied: on_rule_denied,
+      accountable_notice: accountable_notice,
       target:
         remedy
         |> Map.take(allowed_top)
@@ -2614,7 +2686,7 @@ defmodule Tightbeam.Rules do
     }
   end
 
-  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _name, _filing?),
+  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _filing?),
     do: fail.("remedy must be a table")
 
   defp validate_interpolation!(field, value, fail) when field in @embedded_fields do

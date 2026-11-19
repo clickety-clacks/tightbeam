@@ -1161,11 +1161,28 @@ defmodule Tightbeam.RulesTest do
     assert loaded.external_producer
     assert loaded.remedy.action == "wake"
     assert loaded.remedy.produces == "reviewed-clean"
+    assert loaded.remedy.accountable_notice
     refute Map.has_key?(loaded.remedy.params, :reviews)
 
-    put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
+    # The exception is the rule's own declaration, never its name: the same rule
+    # without the declaration needs the linked-review binding, and the same
+    # declaration under another name keeps the exception.
+    put_raw(ctx, String.replace(shipped, "accountable_notice = true\n", ""))
 
     assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end)
+
+    put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
+    assert [renamed] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    assert renamed.remedy.accountable_notice
+
+    put_raw(
+      ctx,
+      String.replace(shipped, "accountable_notice = true", "accountable_notice = \"yes\"")
+    )
+
+    assert_unavailable(ctx, ~r/accountable_notice must be a boolean/, fn ->
       Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     end)
 
@@ -1186,6 +1203,7 @@ defmodule Tightbeam.RulesTest do
     assigned =
       shipped
       |> String.replace(~s(action = "wake"), ~s(action = "assign"))
+      |> String.replace("accountable_notice = true\n", "")
       |> String.replace(~s(target_session = "{holder_key}"), ~s(target_role = "reviewer-code"))
       |> String.replace(~r/^prompt = .*$/m, ~s(subject = "review {assignment_id}"))
 
