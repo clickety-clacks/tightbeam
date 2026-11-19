@@ -205,12 +205,87 @@ defmodule Tightbeam.HarklightSend do
   end
 
   def settle(db, call, opts \\ []) do
+    message = call.params[:message_id]
+    op_id = call.params[:op_id]
+
     with :ok <- origin!(db, call) do
-      recover_one(db, call.params[:message_id], opts)
+      send_record = HarklightLifecycle.lookup(db, message)
+      change_record = HarklightLifecycle.lookup_change(db, message)
+
+      cond do
+        is_nil(send_record) and is_nil(change_record) ->
+          settle_unrecorded(call, message, op_id, opts)
+
+        op_id_contradicts?(op_id, send_record, change_record) ->
+          failure(
+            "settle",
+            "harklight_op_id_mismatch",
+            early_reason("harklight_op_id_mismatch"),
+            "refused",
+            identity(send_record) |> Map.put_new(:message_id, message)
+          )
+
+        true ->
+          recover_one(db, message, opts)
+      end
     else
       {:error, code} -> failure("settle", code, early_reason(code), "failed")
     end
   end
+
+  defp op_id_contradicts?(nil, _send, _change), do: false
+
+  defp op_id_contradicts?(op_id, send, change),
+    do: op_id not in for(%{op_id: id} <- [send, change], do: id)
+
+  # Tightbeam has no record of this message, so it cannot find the operation to
+  # retry. The caller names it; Harklight alone decides what that retry does.
+  # No wake or subscription bookkeeping is created or changed.
+  defp settle_unrecorded(_call, message, nil, _opts) do
+    failure(
+      "settle",
+      "harklight_op_id_required",
+      early_reason("harklight_op_id_required"),
+      "refused",
+      %{message_id: message}
+    )
+  end
+
+  defp settle_unrecorded(_call, message, op_id, opts) do
+    with {:uuid, true} <- {:uuid, is_binary(op_id) and Regex.match?(@uuid4, op_id)},
+         {:ok, runner} <- runner(opts) do
+      case invoke(runner, ["retry", "--op-id", op_id], "committed", op_id,
+             change: true,
+             operations: ["retry", "send", "revise", "withdraw"]
+           ) do
+        {:ok, _frame} ->
+          Map.merge(%{message_id: message, op_id: op_id}, no_subscription_effect())
+          |> Map.merge(%{command: "settle", outcome: "committed"})
+
+        {:error, code, reason, outcome} ->
+          failure("settle", code, reason, outcome, %{message_id: message, op_id: op_id})
+      end
+    else
+      {:uuid, false} ->
+        failure(
+          "settle",
+          "harklight_op_id_invalid",
+          early_reason("harklight_op_id_invalid"),
+          "refused",
+          %{message_id: message}
+        )
+
+      {:error, code} ->
+        failure("settle", code, early_reason(code), "failed", %{message_id: message})
+    end
+  end
+
+  defp no_subscription_effect,
+    do: %{
+      wake_effect: "none",
+      subscription_effect: "none",
+      note: HarklightLifecycle.no_subscription_effect_note()
+    }
 
   defp recover_one(db, message, opts) do
     send_record = HarklightLifecycle.lookup(db, message)
@@ -270,7 +345,9 @@ defmodule Tightbeam.HarklightSend do
     end)
   end
 
-  defp recover_change(db, message, opts, send_record, %{op_id: op_id}) do
+  defp recover_change(db, message, opts, send_record, %{op_id: op_id} = pending) do
+    target = change_target_for_settle(send_record, pending)
+
     :global.trans({{__MODULE__, db, "change", message}, self()}, fn ->
       case HarklightLifecycle.lookup_change(db, message) do
         %{state: "pending"} = change ->
@@ -283,7 +360,7 @@ defmodule Tightbeam.HarklightSend do
           with :ok <- origin!(db, call), {:ok, runner} <- runner(opts) do
             finish_change(
               db,
-              send_record,
+              target,
               op_id,
               change.command,
               invoke(
@@ -305,7 +382,7 @@ defmodule Tightbeam.HarklightSend do
                 early_reason(code) <>
                   " The saved #{change.command} request remains unresolved; retry settlement when the originating session is available.",
                 "failed",
-                identity(send_record) |> Map.put(:op_id, op_id)
+                identity(target) |> Map.put(:op_id, op_id)
               )
           end
 
@@ -314,6 +391,20 @@ defmodule Tightbeam.HarklightSend do
       end
     end)
   end
+
+  # With no send record, the saved change request is the only source of the
+  # session handle; the change was made without any subscription bookkeeping.
+  defp change_target_for_settle(nil, change) do
+    handle =
+      case Enum.find_index(change.request || [], &(&1 == "--session")) do
+        nil -> nil
+        index -> Enum.at(change.request, index + 1)
+      end
+
+    %{handle: handle, message_id: change.message_id, unrecorded: true}
+  end
+
+  defp change_target_for_settle(send_record, _change), do: send_record
 
   defp already_settled_change(send_record, nil), do: already_settled(send_record, nil)
 
@@ -364,7 +455,7 @@ defmodule Tightbeam.HarklightSend do
   defp change_request_locked(db, call, command, opts) do
     message = call.params[:message_id]
 
-    with {:ok, record} <- known_message(db, message),
+    with {:ok, record} <- change_target(db, message, call.params[:handle]),
          :ok <- resolved(record),
          {:ok, args} <- change_args(command, call.params, record),
          {:ok, runner} <- runner(opts) do
@@ -386,8 +477,8 @@ defmodule Tightbeam.HarklightSend do
           failure(command, code, early_reason(code), "failed", identity(record))
       end
     else
-      {:error, :unknown_message} ->
-        unknown_message(command, message)
+      {:error, {:refused, code}} ->
+        failure(command, code, early_reason(code), "refused", %{message_id: message})
 
       {:error, {:unresolved, id}} ->
         unresolved_result(command, id)
@@ -477,10 +568,25 @@ defmodule Tightbeam.HarklightSend do
     end
   end
 
-  defp known_message(db, message) do
+  # With a send record, its handle is used and a contradicting --session is
+  # refused. Without one, the caller's --session handle is passed through to
+  # Harklight, which alone decides whether the change is allowed; the change then
+  # touches no wake or subscription state.
+  defp change_target(db, message, handle) do
     case HarklightLifecycle.lookup(db, message) do
-      nil -> {:error, :unknown_message}
-      record -> {:ok, record}
+      nil when is_nil(handle) ->
+        {:error, {:refused, "harklight_session_required"}}
+
+      nil ->
+        if is_binary(handle) and Regex.match?(@uuid4, handle),
+          do: {:ok, %{handle: handle, message_id: message, unrecorded: true}},
+          else: {:error, {:refused, "harklight_session_invalid"}}
+
+      %{handle: recorded} when is_binary(handle) and handle != recorded ->
+        {:error, {:refused, "harklight_session_mismatch"}}
+
+      record ->
+        {:ok, record}
     end
   end
 
@@ -488,7 +594,7 @@ defmodule Tightbeam.HarklightSend do
   defp resolved(_), do: :ok
 
   defp change_args("retract", params, record) do
-    if Map.keys(params) == [:message_id],
+    if Enum.all?(Map.keys(params), &(&1 in [:message_id, :handle])),
       do: {:ok, ["retract", "--session", record.handle, "--request", record.message_id]},
       else: {:error, "invalid_harklight_retract"}
   end
@@ -498,7 +604,7 @@ defmodule Tightbeam.HarklightSend do
 
     if Enum.all?(
          Map.keys(p),
-         &(&1 in ~w(message_id base_revision title body choices clear_choices)a)
+         &(&1 in ~w(message_id base_revision title body choices clear_choices handle)a)
        ) and
          is_integer(p[:base_revision]) and p.base_revision > 0 and is_binary(p[:title]) and
          p.title != "" and
@@ -545,6 +651,7 @@ defmodule Tightbeam.HarklightSend do
     end
   end
 
+  defp identity(nil), do: %{}
   defp identity(record), do: Map.take(record, [:op_id, :handle, :sender_id, :message_id])
 
   defp prepared_identity(prepared) do
@@ -624,6 +731,28 @@ defmodule Tightbeam.HarklightSend do
 
   defp early_reason("harklight_reply_invalid"),
     do: "--reply is a flag; omit it or include it without a value"
+
+  defp early_reason("harklight_session_required"),
+    do:
+      "Tightbeam has no send record for this message, so it does not know its Harklight session. Run the command again with --session <handle>, the session the message was sent in, to pass it to Harklight anyway."
+
+  defp early_reason("harklight_session_invalid"),
+    do: "--session must be a Harklight session handle (a UUID)."
+
+  defp early_reason("harklight_session_mismatch"),
+    do:
+      "--session does not match the Harklight session Tightbeam recorded for this message; no operation was run. Remove --session or use the recorded one."
+
+  defp early_reason("harklight_op_id_required"),
+    do:
+      "Tightbeam has no record of this message, so it does not know which Harklight operation to retry. Run the command again with --op-id <key>, the operation key of the unresolved Harklight operation."
+
+  defp early_reason("harklight_op_id_invalid"),
+    do: "--op-id must be a Harklight operation key (a UUID)."
+
+  defp early_reason("harklight_op_id_mismatch"),
+    do:
+      "--op-id does not match any operation Tightbeam recorded for this message; no operation was run. Remove --op-id or use the recorded one."
 
   defp early_reason(code), do: "The command did not run: #{code}."
 

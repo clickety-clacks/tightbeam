@@ -613,6 +613,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             body,
             choices,
             clear_choices,
+            session,
         } => {
             let mut params = vec![
                 string_field("messageId", message),
@@ -627,20 +628,33 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(body) = body {
                 params.push(string_field("body", body));
             }
+            if let Some(session) = session {
+                params.push(string_field("handle", session));
+            }
             Ok(request(identity, "harklight-revise", vec![], params))
         }
-        Command::HarklightRetract { identity, message } => Ok(request(
+        Command::HarklightRetract {
             identity,
-            "harklight-retract",
-            vec![],
-            vec![string_field("messageId", message)],
-        )),
-        Command::HarklightSettle { identity, message } => Ok(request(
+            message,
+            session,
+        } => {
+            let mut params = vec![string_field("messageId", message)];
+            if let Some(session) = session {
+                params.push(string_field("handle", session));
+            }
+            Ok(request(identity, "harklight-retract", vec![], params))
+        }
+        Command::HarklightSettle {
             identity,
-            "harklight-settle",
-            vec![],
-            vec![string_field("messageId", message)],
-        )),
+            message,
+            op_id,
+        } => {
+            let mut params = vec![string_field("messageId", message)];
+            if let Some(op_id) = op_id {
+                params.push(string_field("opId", op_id));
+            }
+            Ok(request(identity, "harklight-settle", vec![], params))
+        }
         Command::HarklightCover { identity, session } => Ok(request(
             identity,
             "harklight-cover",
@@ -4482,6 +4496,48 @@ mod tests {
                 assert_eq!(body["params"]["baseRevision"], 2);
                 assert_eq!(body["params"]["clearChoices"], true);
             }
+        }
+    }
+
+    #[test]
+    fn harklight_change_commands_send_session_and_op_id_when_given() {
+        for (args, verb, key, value) in [
+            (
+                vec!["harklight-retract", "--message", "m", "--session", "h"],
+                "harklight-retract",
+                "handle",
+                "h",
+            ),
+            (
+                vec![
+                    "harklight-revise",
+                    "--message",
+                    "m",
+                    "--base-revision",
+                    "2",
+                    "--title",
+                    "new",
+                    "--session",
+                    "h",
+                ],
+                "harklight-revise",
+                "handle",
+                "h",
+            ),
+            (
+                vec!["harklight-settle", "--message", "m", "--op-id", "k"],
+                "harklight-settle",
+                "opId",
+                "k",
+            ),
+        ] {
+            let command =
+                crate::args::parse(args.into_iter().map(str::to_owned).collect()).unwrap();
+            let request = build_request(&command).unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+            assert_eq!(body["verb"], verb);
+            assert_eq!(body["params"]["messageId"], "m");
+            assert_eq!(body["params"][key], value);
         }
     }
 

@@ -6383,6 +6383,219 @@ defmodule Tightbeam.HarklightWakesTest do
              )
   end
 
+  describe "a message Tightbeam has no send record for" do
+    @other_handle "9b2c1f64-0d58-4e0b-8a8e-6a1f3f3a9c11"
+    @loose_op "5f0c7a52-3e0b-4b8d-9d5a-2f6c1d3b7e90"
+
+    defp committed_runner(parent, operation) do
+      fn args ->
+        send(parent, {:harklight_args, args})
+
+        frame(%{
+          kind: "committed",
+          operation: operation,
+          op_id: List.last(args),
+          response: %{revision: 3}
+        })
+      end
+    end
+
+    defp assert_no_local_effects(db) do
+      for table <- ~w(harklight_subscription_ends harklight_wake_follows) do
+        assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM #{table}")
+      end
+    end
+
+    test "revise reaches Harklight and reports no subscription effect", %{db: db, call: call} do
+      revised = %{
+        call
+        | params: %{
+            message_id: "raw-message",
+            base_revision: 2,
+            title: "Updated",
+            handle: @other_handle
+          }
+      }
+
+      result =
+        HarklightSend.change_request(db, revised, "revise",
+          runner: committed_runner(self(), "revise")
+        )
+
+      assert %{
+               outcome: "committed",
+               message_id: "raw-message",
+               revision: 3,
+               wake_effect: "none",
+               subscription_effect: "none",
+               note: "no subscription effect" <> _
+             } = result
+
+      assert_received {:harklight_args,
+                       ["revise", "--session", @other_handle, "--request", "raw-message" | _]}
+
+      assert_no_local_effects(db)
+    end
+
+    test "retract reaches Harklight and reports no subscription effect", %{db: db, call: call} do
+      retracted = %{call | params: %{message_id: "raw-message", handle: @other_handle}}
+
+      result =
+        HarklightSend.change_request(db, retracted, "retract",
+          runner: committed_runner(self(), "withdraw")
+        )
+
+      assert %{
+               outcome: "committed",
+               message_id: "raw-message",
+               wake_effect: "none",
+               subscription_effect: "none",
+               note: "no subscription effect" <> _
+             } = result
+
+      assert_received {:harklight_args,
+                       [
+                         "retract",
+                         "--session",
+                         @other_handle,
+                         "--request",
+                         "raw-message",
+                         "--op-id",
+                         _
+                       ]}
+
+      assert_no_local_effects(db)
+    end
+
+    test "settle retries the named operation and reports no subscription effect", %{
+      db: db,
+      call: call
+    } do
+      settled = %{call | params: %{message_id: "raw-message", op_id: @loose_op}}
+
+      result = HarklightSend.settle(db, settled, runner: committed_runner(self(), "retry"))
+
+      assert %{
+               command: "settle",
+               outcome: "committed",
+               op_id: @loose_op,
+               wake_effect: "none",
+               subscription_effect: "none",
+               note: "no subscription effect" <> _
+             } = result
+
+      assert_received {:harklight_args, ["retry", "--op-id", @loose_op]}
+      assert_no_local_effects(db)
+    end
+
+    test "an unrecorded uncertain retract can be settled from its saved request", %{
+      db: db,
+      call: call
+    } do
+      retracted = %{call | params: %{message_id: "raw-message", handle: @other_handle}}
+
+      assert %{outcome: "outcome_unknown"} =
+               HarklightSend.change_request(db, retracted, "retract",
+                 runner: fn args ->
+                   {JSON.encode!(%{kind: "outcome_unknown", op_id: List.last(args)}), 7}
+                 end
+               )
+
+      assert %{outcome: "committed", wake_effect: "none", subscription_effect: "none"} =
+               HarklightSend.settle(db, %{call | params: %{message_id: "raw-message"}},
+                 runner: committed_runner(self(), "withdraw")
+               )
+
+      assert_received {:harklight_args, ["retry", "--op-id", _]}
+      assert_no_local_effects(db)
+    end
+
+    test "Harklight's refusal is passed back, not replaced by a local check", %{
+      db: db,
+      call: call
+    } do
+      retracted = %{call | params: %{message_id: "raw-message", handle: @other_handle}}
+
+      assert %{outcome: "refused", code: "harklight_refused", reason: "not your message"} =
+               HarklightSend.change_request(db, retracted, "retract",
+                 runner: fn _ -> {"not your message", 2} end
+               )
+    end
+
+    test "a missing or malformed flag is refused by name without running Harklight", %{
+      db: db,
+      call: call
+    } do
+      no_op = fn _ -> flunk("Harklight ran without the identifier it needs") end
+
+      for command <- ["retract", "revise"] do
+        params = %{message_id: "raw-message", base_revision: 1, title: "T"}
+        params = if command == "retract", do: Map.take(params, [:message_id]), else: params
+
+        assert %{outcome: "refused", code: "harklight_session_required", reason: reason} =
+                 HarklightSend.change_request(db, %{call | params: params}, command,
+                   runner: no_op
+                 )
+
+        assert reason =~ "--session"
+
+        assert %{outcome: "refused", code: "harklight_session_invalid"} =
+                 HarklightSend.change_request(
+                   db,
+                   %{call | params: Map.put(params, :handle, "--not-a-handle")},
+                   command,
+                   runner: no_op
+                 )
+      end
+
+      assert %{outcome: "refused", code: "harklight_op_id_required", reason: reason} =
+               HarklightSend.settle(db, %{call | params: %{message_id: "raw-message"}},
+                 runner: no_op
+               )
+
+      assert reason =~ "--op-id"
+
+      assert %{outcome: "refused", code: "harklight_op_id_invalid"} =
+               HarklightSend.settle(
+                 db,
+                 %{call | params: %{message_id: "raw-message", op_id: "nope"}},
+                 runner: no_op
+               )
+    end
+
+    test "a flag that contradicts the local record is refused", %{db: db, call: call} do
+      no_op = fn _ -> flunk("Harklight ran despite a contradicting flag") end
+
+      assert %{outcome: "refused", code: "harklight_session_mismatch"} =
+               HarklightSend.change_request(
+                 db,
+                 %{call | params: %{message_id: "request", handle: @other_handle}},
+                 "retract",
+                 runner: no_op
+               )
+
+      assert %{outcome: "refused", code: "harklight_op_id_mismatch"} =
+               HarklightSend.settle(
+                 db,
+                 %{call | params: %{message_id: "request", op_id: @loose_op}},
+                 runner: no_op
+               )
+    end
+
+    test "the recorded session handle may be repeated without effect on a recorded message", %{
+      db: db,
+      call: call
+    } do
+      assert %{outcome: "committed", wake_effect: "ended"} =
+               HarklightSend.change_request(
+                 db,
+                 %{call | params: %{message_id: "request", handle: @handle}},
+                 "retract",
+                 runner: committed_runner(self(), "withdraw")
+               )
+    end
+  end
+
   test "uncertain revise is settled with its original operation ID and saved request", %{
     db: db,
     call: call
