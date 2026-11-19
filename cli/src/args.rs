@@ -214,14 +214,17 @@ pub enum Command {
         body: Option<String>,
         choices: Vec<String>,
         clear_choices: bool,
+        session: Option<String>,
     },
     HarklightRetract {
         identity: Identity,
         message: String,
+        session: Option<String>,
     },
     HarklightSettle {
         identity: Identity,
         message: String,
+        op_id: Option<String>,
     },
     HarklightCover {
         identity: Identity,
@@ -958,10 +961,15 @@ COMMANDS:
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
   harklight-revise --message <id> --base-revision <n> --title <text>
-      [--body <text>] [--choices-json <array>] [--clear-choices]
-  harklight-retract --message <id>
-  harklight-settle --message <id>
+      [--body <text>] [--choices-json <array>] [--clear-choices] [--session <handle>]
+  harklight-retract --message <id> [--session <handle>]
+      For a message Tightbeam has no send record for, --session <handle> names its
+      Harklight session and the change is passed to Harklight with no wake or
+      subscription effect. Harklight decides whether the change is allowed.
+  harklight-settle --message <id> [--op-id <key>]
       Settle one unresolved Harklight operation using its saved request and original operation ID.
+      For a message Tightbeam has no record for, --op-id <key> names the Harklight
+      operation to retry; the retry has no wake or subscription effect.
   harklight-cover --session <handle>
       Explicitly move your conversation to the shared origin listener.
   harklight-listener-restore --handle <handle>
@@ -2810,6 +2818,8 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| {
                     !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "message")
+                        && !(command != "harklight-settle" && flag == "session")
+                        && !(command == "harklight-settle" && flag == "op-id")
                         && !(revise
                             && matches!(
                                 flag.as_str(),
@@ -2826,8 +2836,16 @@ fn parse_with_optional_catalog(
             let identity = identity(flags)?;
             let message = nonempty(flags, "message").ok_or("--message is required")?;
             match command {
-                "harklight-retract" => Ok(Command::HarklightRetract { identity, message }),
-                "harklight-settle" => Ok(Command::HarklightSettle { identity, message }),
+                "harklight-retract" => Ok(Command::HarklightRetract {
+                    identity,
+                    message,
+                    session: nonempty(flags, "session"),
+                }),
+                "harklight-settle" => Ok(Command::HarklightSettle {
+                    identity,
+                    message,
+                    op_id: nonempty(flags, "op-id"),
+                }),
                 _ => {
                     let base_revision = nonempty(flags, "base-revision")
                         .ok_or("--base-revision is required")?
@@ -2851,6 +2869,7 @@ fn parse_with_optional_catalog(
                         body: flags.get("body").cloned(),
                         choices,
                         clear_choices,
+                        session: nonempty(flags, "session"),
                     })
                 }
             }
@@ -5328,6 +5347,56 @@ mod tests {
                 if base_revision == revision.parse::<i64>().unwrap())
             );
         }
+    }
+
+    #[test]
+    fn harklight_change_commands_accept_session_and_op_id_only_where_they_apply() {
+        assert!(matches!(
+            parse(strings(&["harklight-retract", "--message", "m", "--session", "h"])),
+            Ok(Command::HarklightRetract { session: Some(ref s), .. }) if s == "h"
+        ));
+        assert!(matches!(
+            parse(strings(&[
+                "harklight-revise",
+                "--message",
+                "m",
+                "--base-revision",
+                "1",
+                "--title",
+                "t",
+                "--session",
+                "h",
+            ])),
+            Ok(Command::HarklightRevise { session: Some(ref s), .. }) if s == "h"
+        ));
+        assert!(matches!(
+            parse(strings(&["harklight-settle", "--message", "m", "--op-id", "k"])),
+            Ok(Command::HarklightSettle { op_id: Some(ref k), .. }) if k == "k"
+        ));
+        assert!(matches!(
+            parse(strings(&["harklight-retract", "--message", "m"])),
+            Ok(Command::HarklightRetract { session: None, .. })
+        ));
+        assert!(
+            parse(strings(&[
+                "harklight-settle",
+                "--message",
+                "m",
+                "--session",
+                "h"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "harklight-retract",
+                "--message",
+                "m",
+                "--op-id",
+                "k"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
