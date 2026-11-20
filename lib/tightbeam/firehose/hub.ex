@@ -2,8 +2,8 @@ defmodule Tightbeam.Firehose.Hub do
   @moduledoc "Live-only Firehose fanout; startup is owned by Gateway."
   use GenServer
   require Logger
+  alias Tightbeam.DB
   alias Tightbeam.Firehose.Publisher
-  alias Tightbeam.StateResources
 
   # An approximately 2 GB held-backlog budget across 30 stalled apps gives each app about 64 MB.
   @max_app_backlog_bytes 64 * 1_024 * 1_024
@@ -12,7 +12,6 @@ defmodule Tightbeam.Firehose.Hub do
     @moduledoc false
     defstruct monitor: nil,
               mode: :pending,
-              db: Tightbeam.DB,
               user_id: nil,
               device_id: nil,
               principal_kind: nil,
@@ -26,7 +25,11 @@ defmodule Tightbeam.Firehose.Hub do
               overflowed: false
   end
 
-  defstruct sockets: %{}, shutting_down: false, shutdown_waiter: nil
+  # `archetypes` maps each committed session key to its archetype for the
+  # archetype filter. It is loaded once at start and then kept current from the
+  # session notices this process already receives, so matching never reads the
+  # database per notice or subscription.
+  defstruct sockets: %{}, archetypes: %{}, shutting_down: false, shutdown_waiter: nil
 
   # Committed outboxes use the same admission path as direct publications.
   def destination(server), do: server
@@ -78,17 +81,37 @@ defmodule Tightbeam.Firehose.Hub do
 
   def publish(server \\ __MODULE__, notice), do: GenServer.cast(server, {:publish, notice})
 
+  @doc "Fan out several notices in order, with no other publication between them."
+  def publish_all(server, notices), do: GenServer.cast(server, {:publish_all, notices})
+
   def committed(server \\ __MODULE__, class, payload, refs),
     do: GenServer.cast(server, {:committed, class, payload, refs})
 
-  def accepted(server, db, call, result),
-    do: GenServer.cast(server, {:accepted, db, call, result})
+  # Builds notices from the committed result alone; callers that need a
+  # canonical database read use Publisher.accepted/3, which reads first.
+  def accepted(server, call, result),
+    do: GenServer.cast(server, {:accepted, call, result})
 
   def denied(server, call, error),
     do: GenServer.cast(server, {:denied, call, error})
 
   @impl true
-  def init(_opts), do: {:ok, %__MODULE__{}}
+  def init(opts) do
+    archetypes =
+      case Keyword.get(opts, :db) do
+        nil -> %{}
+        db -> load_archetypes(db)
+      end
+
+    {:ok, %__MODULE__{archetypes: archetypes}}
+  end
+
+  # The name is registered before init runs, so a session change committed
+  # after this read is already queued here and is applied in commit order.
+  defp load_archetypes(db) do
+    {:ok, rows} = DB.query(db, "SELECT sessionKey, archetype FROM sessions", [])
+    Map.new(rows, fn [session_key, archetype] -> {session_key, archetype} end)
+  end
 
   @impl true
   def handle_call({:register, pid, opts}, _from, state) do
@@ -104,7 +127,6 @@ defmodule Tightbeam.Firehose.Hub do
           socket,
           Map.take(opts, [
             :mode,
-            :db,
             :user_id,
             :device_id,
             :principal_kind,
@@ -149,7 +171,7 @@ defmodule Tightbeam.Firehose.Hub do
             remaining_notices = Enum.reverse(remaining_notices)
 
             {snapshot_frames, seq} =
-              matching_notice_frames(notices, id, filters, socket.seq, socket.db)
+              matching_notice_frames(notices, id, filters, socket.seq, state.archetypes)
 
             {pending_frames, seq} =
               matching_notice_frames(
@@ -157,7 +179,7 @@ defmodule Tightbeam.Firehose.Hub do
                 id,
                 filters,
                 seq,
-                socket.db
+                state.archetypes
               )
 
             ready = %{"type" => "subscription_ready", "subscriptionId" => id}
@@ -224,6 +246,9 @@ defmodule Tightbeam.Firehose.Hub do
   def handle_cast({:publish, notice}, state),
     do: {:noreply, fanout(state, notice)}
 
+  def handle_cast({:publish_all, notices}, state),
+    do: {:noreply, Enum.reduce(notices, state, &fanout(&2, &1))}
+
   def handle_cast({:committed, _, _, _}, %{shutting_down: true} = state),
     do: {:noreply, state}
 
@@ -231,6 +256,9 @@ defmodule Tightbeam.Firehose.Hub do
       when class in ~w(session.spawned session.updated session.harness_changed session.retired) do
     session_key = refs["sessionKey"] || payload[:session_key] || payload["sessionKey"]
     owner = refs["ownerUserId"] || payload[:owner_user_id] || payload["ownerUserId"]
+
+    state =
+      track_archetype(state, session_key, payload[:archetype] || payload["archetype"])
 
     probe = %{
       "class" => class,
@@ -249,7 +277,7 @@ defmodule Tightbeam.Firehose.Hub do
             false
 
           true ->
-            interested?(socket, probe)
+            interested?(socket, probe, state.archetypes)
         end
       end)
 
@@ -264,28 +292,28 @@ defmodule Tightbeam.Firehose.Hub do
   def handle_cast({:committed, class, payload, refs}, state),
     do: {:noreply, fanout(state, Publisher.committed_notice(class, payload, refs))}
 
-  def handle_cast({:accepted, db, call, result}, state),
+  def handle_cast({:accepted, call, result}, state),
     do:
       {:noreply,
-       Enum.reduce(Publisher.accepted_notices(db, call, result), state, &fanout(&2, &1))}
+       Enum.reduce(Publisher.accepted_notices(nil, call, result), state, &fanout(&2, &1))}
 
   def handle_cast({:denied, call, error}, state),
     do: {:noreply, Enum.reduce(Publisher.denied_notices(call, error), state, &fanout(&2, &1))}
 
   def handle_cast(_, state), do: {:noreply, state}
 
-  defp interested?(%{mode: :all}, _notice), do: true
+  defp interested?(%{mode: :all}, _notice, _archetypes), do: true
 
-  defp interested?(socket, notice) do
+  defp interested?(socket, notice, archetypes) do
     Enum.any?(Map.merge(socket.subscriptions, socket.pending_subscriptions), fn {_id, filters} ->
-      matches?(notice, filters, socket.db)
+      matches?(notice, filters, archetypes)
     end)
   end
 
   defp deliver_to_interested(state, recipients, notice) do
     sockets =
       Enum.reduce(recipients, state.sockets, fn {pid, socket}, sockets ->
-        Map.put(sockets, pid, deliver_matching_notice(socket, pid, notice))
+        Map.put(sockets, pid, deliver_matching_notice(socket, pid, notice, state.archetypes))
       end)
 
     %{state | sockets: sockets}
@@ -294,35 +322,51 @@ defmodule Tightbeam.Firehose.Hub do
   defp fanout(%{shutting_down: true} = state, _), do: state
 
   defp fanout(state, notice) do
+    state = track_notice_archetype(state, notice)
+
     sockets =
       Map.new(state.sockets, fn {pid, socket} ->
-        {pid, deliver_notice(socket, pid, notice)}
+        {pid, deliver_notice(socket, pid, notice, state.archetypes)}
       end)
 
     %{state | sockets: sockets}
   end
 
-  defp deliver_notice(%{mode: :pending} = socket, _, _), do: socket
-  defp deliver_notice(%{overflowed: true} = socket, _, _), do: socket
+  # Session notices carry the committed session row; keep the archetype map
+  # current before matching, so a spawn or repoint matches its own notice.
+  defp track_notice_archetype(state, %{"class" => "session." <> _, "payload" => payload})
+       when is_map(payload),
+       do: track_archetype(state, payload["sessionKey"], payload["archetype"])
 
-  defp deliver_notice(socket, pid, notice) do
+  defp track_notice_archetype(state, _notice), do: state
+
+  defp track_archetype(state, session_key, archetype)
+       when is_binary(session_key) and is_binary(archetype),
+       do: put_in(state.archetypes[session_key], archetype)
+
+  defp track_archetype(state, _session_key, _archetype), do: state
+
+  defp deliver_notice(%{mode: :pending} = socket, _, _, _), do: socket
+  defp deliver_notice(%{overflowed: true} = socket, _, _, _), do: socket
+
+  defp deliver_notice(socket, pid, notice, archetypes) do
     if revoked?(notice, socket) do
       send(pid, :firehose_revoked)
       socket
     else
-      deliver_matching_notice(socket, pid, notice)
+      deliver_matching_notice(socket, pid, notice, archetypes)
     end
   end
 
-  defp deliver_matching_notice(socket, pid, notice) do
+  defp deliver_matching_notice(socket, pid, notice, archetypes) do
     pending_subscriptions =
       socket.pending_subscriptions
-      |> Enum.filter(fn {_id, filters} -> matches?(notice, filters, socket.db) end)
+      |> Enum.filter(fn {_id, filters} -> matches?(notice, filters, archetypes) end)
 
     frames =
       if socket.mode == :all,
         do: [notice],
-        else: matching_frames(notice, socket.subscriptions, socket.seq, socket.db)
+        else: matching_frames(notice, socket.subscriptions, socket.seq, archetypes)
 
     if (frames == [] and pending_subscriptions == []) or secret_payload?(notice["payload"]) do
       socket
@@ -428,10 +472,10 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp outbound_message(frame), do: {:firehose_notice, Publisher.wire_notice(frame)}
 
-  defp matching_notice_frames(notices, id, filters, seq, db) do
+  defp matching_notice_frames(notices, id, filters, seq, archetypes) do
     {frames, seq} =
       Enum.reduce(notices, {[], seq}, fn notice, {frames, seq} ->
-        case matching_frames(notice, %{id => filters}, seq, db) do
+        case matching_frames(notice, %{id => filters}, seq, archetypes) do
           [] ->
             {frames, seq}
 
@@ -443,11 +487,11 @@ defmodule Tightbeam.Firehose.Hub do
     {Enum.reverse(frames), seq}
   end
 
-  defp matching_frames(notice, subscriptions, seq, db) do
+  defp matching_frames(notice, subscriptions, seq, archetypes) do
     {frames, _seq} =
       Enum.sort(subscriptions)
       |> Enum.reduce({[], seq}, fn {id, filters}, {frames, n} ->
-        if matches?(notice, filters, db),
+        if matches?(notice, filters, archetypes),
           do:
             {[
                Map.merge(notice, %{
@@ -464,11 +508,12 @@ defmodule Tightbeam.Firehose.Hub do
     Enum.reverse(frames)
   end
 
-  def matches?(notice, filters) do
-    matches?(notice, filters, Tightbeam.DB)
-  end
-
-  def matches?(notice, filters, db) do
+  @doc """
+  Match one notice against one subscription's filters. `archetypes` maps
+  session keys to their committed archetype; the archetype filter is decided
+  from it alone, never by reading the database.
+  """
+  def matches?(notice, filters, archetypes \\ %{}) do
     refs = notice["refs"] || %{}
     classes = filters["classes"]
 
@@ -481,10 +526,10 @@ defmodule Tightbeam.Firehose.Hub do
       Enum.all?(
         ~w(sessionKey workItemId origin principal),
         &(is_nil(filters[&1]) or filters[&1] == refs[&1])
-      ) and archetype_matches?(db, notice, filters)
+      ) and archetype_matches?(archetypes, notice, filters)
   end
 
-  defp archetype_matches?(db, notice, filters) do
+  defp archetype_matches?(archetypes, notice, filters) do
     case filters["archetype"] do
       nil ->
         true
@@ -492,10 +537,7 @@ defmodule Tightbeam.Firehose.Hub do
       archetype when is_binary(archetype) ->
         case get_in(notice, ["refs", "sessionKey"]) do
           session_key when is_binary(session_key) ->
-            case StateResources.query_session(db, session_key) do
-              %{archetype: ^archetype} -> true
-              _ -> false
-            end
+            Map.get(archetypes, session_key) == archetype
 
           _ ->
             false

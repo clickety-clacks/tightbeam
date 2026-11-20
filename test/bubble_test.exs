@@ -620,6 +620,261 @@ defmodule Tightbeam.Productions.BubbleTest do
              )
   end
 
+  defp undelivered_notices(db, session_key, seq) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT content FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+        [session_key, "wake-undelivered:#{seq}"]
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
+  test "a failed direct dispatch brief tells the assignment's accountable opener", ctx do
+    opener = session(ctx.db, "dispatch-opener", ctx.main.session_key)
+
+    assignment =
+      Assignments.__handle__(ctx.db, "dispatch", %{
+        verb: "dispatch",
+        origin: "agent:#{opener.session_key}",
+        principal: {:session, opener.session_key},
+        session_key: ctx.holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "dispatch subject", brief: "private dispatch brief"}
+      })
+
+    assert is_binary(assignment.id)
+
+    # An idle holder takes the brief straight into its queue: a turn, no wake.
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "dispatch-brief")
+    assert turn.wake_id == nil
+    assert turn.prompt =~ "private dispatch brief"
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed_unknown", "adapter_unavailable",
+               owner_lease: turn.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+
+    assert [content] = undelivered_notices(ctx.db, opener.session_key, turn.seq)
+    assert content =~ "Assignment #{assignment.id} brief to #{ctx.holder.session_key}"
+    assert content =~ "delivery turn #{turn.seq} is failed_unknown"
+    assert content =~ "prior effects must be reconciled"
+    refute content =~ "private dispatch brief"
+    refute content =~ "adapter_unavailable"
+
+    # The opener is accountable for the assignment; the holder's parent is not
+    # told a second time through this path.
+    assert undelivered_notices(ctx.db, ctx.supervisor.session_key, turn.seq) == []
+    assert Ledger.pending_count(ctx.db, opener.session_key) == 0
+  end
+
+  test "a failed busy-holder dispatch brief tells the transferred opener", ctx do
+    opener = session(ctx.db, "dispatch-opener", ctx.main.session_key)
+    successor = session(ctx.db, "dispatch-successor", ctx.main.session_key)
+    busy = hold_recipient!(ctx.db, ctx.holder.session_key)
+
+    assignment =
+      Assignments.__handle__(ctx.db, "dispatch", %{
+        verb: "dispatch",
+        origin: "agent:#{opener.session_key}",
+        principal: {:session, opener.session_key},
+        session_key: ctx.holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "dispatch subject", brief: "private dispatch brief"}
+      })
+
+    [wake] = Tightbeam.Wakes.list_for_session(ctx.db, ctx.holder.session_key)
+    assert wake.assignment_id == assignment.id
+    assert wake.creator_session_key == opener.session_key
+    finish_busy_recipient!(ctx.db, busy)
+    [carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "dispatch-brief")
+    assert turn.wake_id == carrier_id
+
+    result =
+      Tightbeam.Gateway.handlers(%{db: ctx.db})["session-custody-transfer"].(%{
+        principal: {:user, "flynn"},
+        params: %{
+          from_session_key: opener.session_key,
+          to_session_key: successor.session_key,
+          idempotency_key: "dispatch-opener-transfer"
+        }
+      })
+
+    assert is_binary(result["eventId"])
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed_unknown", "adapter_unavailable",
+               owner_lease: turn.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+    assert [content] = undelivered_notices(ctx.db, successor.session_key, turn.seq)
+    assert content =~ "Wake #{wake.wake_id} undelivered"
+    assert undelivered_notices(ctx.db, opener.session_key, turn.seq) == []
+    assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert Ledger.pending_count(ctx.db, ctx.holder.session_key) == 0
+  end
+
+  test "a failed senderless notice to parentless Main surfaces its source once", ctx do
+    wake =
+      Tightbeam.Wakes.schedule(ctx.db, %{
+        session_key: ctx.main.session_key,
+        origin: "process:tightbeam",
+        prompt: "private system notice",
+        due_at: 0
+      })
+
+    assert :appended =
+             Tightbeam.Gateway.deliver_prompt(ctx.main.session_key, wake.origin, wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               sender: wake.origin,
+               fire_wake_in_txn: true
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.main.session_key, "system-notice")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed_unknown", "adapter_unavailable",
+               owner_lease: turn.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+    assert [content] = undelivered_notices(ctx.db, ctx.main.session_key, turn.seq)
+    assert content =~ "Wake #{wake.wake_id} undelivered"
+    refute content =~ "private system notice"
+    assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wake_retry_attempts")
+    assert Ledger.pending_count(ctx.db, ctx.main.session_key) == 0
+  end
+
+  test "a failed delivery-owner handoff brief tells the session that handed it off", ctx do
+    sender = session(ctx.db, "handoff-sender", ctx.main.session_key)
+
+    assert %{workItem: item, wakeScheduled: true} =
+             Tightbeam.WorkItems.__handle__(ctx.db, "work-item-handoff", %{
+               verb: "work-item-handoff",
+               origin: "agent:#{sender.session_key}",
+               principal: {:session, sender.session_key},
+               session_key: nil,
+               supervision_interval_ms: 1_000,
+               params: %{
+                 title: "Handoff item",
+                 delivery_owner_session_key: ctx.holder.session_key,
+                 brief: "private handoff brief"
+               }
+             })
+
+    assert [wake] =
+             Enum.filter(
+               Tightbeam.Wakes.list_for_session(ctx.db, ctx.holder.session_key),
+               &(&1.prompt =~ "Delivery-owner handoff for work item #{item.id}")
+             )
+
+    assert wake.creator_session_key == sender.session_key
+
+    # Delivered as a notice-batch member, as in the recorded specimens.
+    busy = hold_recipient!(ctx.db, ctx.holder.session_key)
+
+    assert :queued =
+             Tightbeam.Gateway.deliver_prompt(ctx.holder.session_key, wake.origin, wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               fire_wake_in_txn: true
+             )
+
+    finish_busy_recipient!(ctx.db, busy)
+    [carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "handoff-brief")
+    assert turn.wake_id == carrier_id
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed_unknown", "adapter_unavailable",
+               owner_lease: turn.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+
+    assert [content] = undelivered_notices(ctx.db, sender.session_key, turn.seq)
+    assert content =~ "Wake #{wake.wake_id} undelivered"
+    assert content =~ "delivery turn #{turn.seq} is failed_unknown"
+    refute content =~ "private handoff brief"
+    refute content =~ "accountable owner"
+  end
+
+  for {label, fixture} <- [
+        {"direct", :direct},
+        {"batched", :batched}
+      ] do
+    @senderless_fixture fixture
+    test "a failed #{label} system notice with no sender is surfaced once to the recipient's accountable owner",
+         ctx do
+      wake =
+        Tightbeam.Wakes.schedule(ctx.db, %{
+          session_key: ctx.holder.session_key,
+          origin: "process:tightbeam",
+          prompt: "private system notice",
+          due_at: 0
+        })
+
+      assert wake.creator_session_key == nil
+
+      busy =
+        if @senderless_fixture == :batched, do: hold_recipient!(ctx.db, ctx.holder.session_key)
+
+      delivery =
+        Tightbeam.Gateway.deliver_prompt(ctx.holder.session_key, wake.origin, wake.prompt,
+          db: ctx.db,
+          wake_id: wake.wake_id,
+          sender: wake.origin,
+          fire_wake_in_txn: true
+        )
+
+      if busy do
+        assert delivery == :queued
+        finish_busy_recipient!(ctx.db, busy)
+        [_carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
+      else
+        assert delivery == :appended
+      end
+
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "system-notice")
+
+      assert :ok =
+               Ledger.finish(ctx.db, turn.seq, "failed_unknown", "adapter_unavailable",
+                 owner_lease: turn.owner_lease
+               )
+
+      assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+      assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+
+      # The holder's current parent is its accountable owner.
+      assert [content] = undelivered_notices(ctx.db, ctx.supervisor.session_key, turn.seq)
+      assert content =~ "Wake #{wake.wake_id} undelivered"
+      assert content =~ "delivery turn #{turn.seq} is failed_unknown"
+      assert content =~ "addressed to #{ctx.holder.session_key}"
+      assert content =~ "accountable owner"
+      refute content =~ "private system notice"
+
+      # Surfaced, never replayed: the source is not re-armed and no retry exists.
+      assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "fired"
+      assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wake_retry_attempts")
+      assert Ledger.pending_count(ctx.db, ctx.holder.session_key) == 0
+    end
+  end
+
   test "a spawned session's failed turn stages one deduped notice behind its busy parent", ctx do
     {:appended, current_message} =
       Tightbeam.Projection.append(ctx.db, %{

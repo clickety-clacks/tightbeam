@@ -126,10 +126,6 @@ defmodule Tightbeam.HarklightLifecycle do
     end
   end
 
-  def unresolved(db, ids) do
-    Enum.find(ids, fn id -> match?(%{state: "pending"}, lookup(db, id)) end)
-  end
-
   def effects_in_txn(txn, op_id) do
     case Txn.q(txn, "SELECT effects FROM harklight_command_results WHERE opId=?1", [op_id]) do
       [[json]] -> decode_effects(JSON.decode!(json))
@@ -141,7 +137,7 @@ defmodule Tightbeam.HarklightLifecycle do
 
   defp decode_effects(value) when is_map(value) do
     keys =
-      ~w(wake_effect supersedes pending_delivery message_id effect reason acknowledgment subscription_state handle event_id session_key follower kind state replacement_id follows)a
+      ~w(wake_effect subscription_effect note supersedes pending_delivery message_id effect reason acknowledgment subscription_state handle event_id session_key follower kind state replacement_id follows)a
 
     Map.new(value, fn {k, v} ->
       {Enum.find(keys, k, &(Atom.to_string(&1) == k)), decode_effects(v)}
@@ -170,13 +166,28 @@ defmodule Tightbeam.HarklightLifecycle do
     end)
   end
 
+  @no_subscription_effect_note "no subscription effect: Tightbeam has no send record for this message, so it changed no wake or subscription"
+
+  def no_subscription_effect_note, do: @no_subscription_effect_note
+
   def record_change_result(db, record, op_id, command, outcome)
       when command in ["revise", "retract"] and outcome in ["committed", "refused", "failed"] do
+    unrecorded? = Map.get(record, :unrecorded, false)
+
     DB.transaction(db, fn txn ->
       case effects_in_txn(txn, op_id) do
         nil ->
           effects =
             case {command, outcome} do
+              # A message Tightbeam has no send record for has no subscription
+              # to keep or end; the change went straight to Harklight.
+              {_, "committed"} when unrecorded? ->
+                %{
+                  wake_effect: "none",
+                  subscription_effect: "none",
+                  note: @no_subscription_effect_note
+                }
+
               {"retract", "committed"} ->
                 %{
                   wake_effect: "ended",
@@ -208,6 +219,17 @@ defmodule Tightbeam.HarklightLifecycle do
     message = request["message"] || %{}
     warnings = JSON.decode!(result)["supersedes_warnings"] || []
     ids = Enum.uniq(message["supersedes"] || [])
+
+    # Targets left out of the request because their own send is unresolved.
+    unresolved =
+      for id <- prepared["unresolved_supersedes"] || [] do
+        %{
+          message_id: id,
+          effect: "unchanged",
+          reason:
+            "unresolved: that send's outcome is unknown, so it was not superseded; run tightbeam harklight-settle --message #{id}, then supersede it again if needed"
+        }
+      end
 
     {effects, pending} =
       Enum.map_reduce(ids, [], fn id, pending ->
@@ -248,7 +270,7 @@ defmodule Tightbeam.HarklightLifecycle do
 
     record_result_in_txn(txn, op_id, "committed", %{
       wake_effect: "subscribed",
-      supersedes: effects,
+      supersedes: effects ++ unresolved,
       pending_delivery: pending
     })
   end

@@ -18,6 +18,7 @@ defmodule Tightbeam.HarnessHealth do
     ConditionFacts,
     DB,
     EventLog,
+    ErrorDiagnostic,
     Gateway,
     Harness,
     HarnessProcess,
@@ -1085,12 +1086,19 @@ defmodule Tightbeam.HarnessHealth do
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
+    diagnostic = ErrorDiagnostic.of(reason)
+    reason = ErrorDiagnostic.classified(reason)
+    pre_request_refusal? = pre_request_model_selection_refusal?(failed_stage, reason, diagnostic)
+
     case classify_turn_failure(reason) do
       nil ->
         # The terminal failure path has no assistant output. Preserve a
         # message-bearing unclassified failure so the next successful turn on
         # this harness and host can act as the bounded recovery signal.
-        Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        unless pre_request_refusal? do
+          Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        end
+
         nil
 
       failure_class ->
@@ -1131,22 +1139,80 @@ defmodule Tightbeam.HarnessHealth do
             principal: turn.origin || "process:tightbeam"
           })
 
-        redelivery_failure_class =
-          case typed_redelivery_failure_class(reason) do
-            ^failure_class -> failure_class
-            _ -> "unclassified"
-          end
+        unless pre_request_refusal? do
+          redelivery_failure_class =
+            case typed_redelivery_failure_class(reason) do
+              ^failure_class -> failure_class
+              _ -> "unclassified"
+            end
 
-        Wakes.record_health_redelivery_source_in_txn(
-          txn,
-          turn.seq,
-          redelivery_failure_class
-        )
+          Wakes.record_health_redelivery_source_in_txn(
+            txn,
+            turn.seq,
+            redelivery_failure_class
+          )
+        end
 
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
         after_harness_health_commit(result)
     end
+  end
+
+  defp pre_request_model_selection_refusal?(:session, reason, diagnostic) do
+    selection_reason = model_application_reason(reason)
+    failure_class = classify_turn_failure(selection_reason)
+
+    model_phase? =
+      match?({:model_apply_failed, _}, reason) or match?(%{"phase" => "model"}, diagnostic)
+
+    # Model application can fail because the adapter or provider is down.
+    # Those failures still need recovery, even when the phase is model selection.
+    if failure_class in [
+         "auth-dead",
+         "rate-limit-dead",
+         "adapter_unavailable",
+         "task_crash",
+         "interrupted-outcome-unknown"
+       ] do
+      false
+    else
+      failure_class == "model_unavailable" or
+        (model_phase? and model_selection_response?(selection_reason)) or
+        model_refusal_text?(selection_reason)
+    end
+  end
+
+  defp pre_request_model_selection_refusal?(_failed_stage, _reason, _diagnostic), do: false
+
+  defp model_application_reason({:model_apply_failed, reason}),
+    do: model_application_reason(reason)
+
+  defp model_application_reason(reason), do: reason
+
+  # Invalid params identifies a rejected model-selection request. Other codes,
+  # including authentication-required (-32000), need model-specific evidence.
+  defp model_selection_response?(%{"code" => -32_602}), do: true
+  defp model_selection_response?(%{code: -32_602}), do: true
+  defp model_selection_response?(_reason), do: false
+
+  defp model_refusal_text?(%{"message" => message}) when is_binary(message),
+    do: model_refusal_text?(message)
+
+  defp model_refusal_text?(%{message: message}) when is_binary(message),
+    do: model_refusal_text?(message)
+
+  defp model_refusal_text?(reason) do
+    evidence = reason |> evidence_text() |> String.downcase()
+
+    contains_any?(evidence, [
+      "model_unavailable",
+      "model unavailable",
+      "model is not available",
+      "unknown model",
+      "unsupported model",
+      "invalid value for config option model"
+    ]) or Regex.match?(~r/\bmodel(?:\s+['"][^'"]+['"])?\s+not found\b/, evidence)
   end
 
   @doc "Record a terminal class whose owner is the lane or boot reconciler."
@@ -2045,44 +2111,24 @@ defmodule Tightbeam.HarnessHealth do
   defp promotion_close_authorized?(txn, {kind, value}, promotion_id)
        when kind in [:user, :session] do
     case kind do
+      # Any user, or any active session, may close an existing promotion.
       :user ->
-        admin_user?(txn, value) or
-          Txn.q(
-            txn,
-            "SELECT 1 FROM harness_health_class_promotions p JOIN harness_health_incidents i ON i.id IN (p.firstIncidentId,p.secondIncidentId) JOIN harness_health_observations o ON o.id=i.openObservationId JOIN sessions s ON s.sessionKey=o.sessionKey WHERE p.id=?1 AND s.ownerUserId=?2",
-            [promotion_id, value]
-          ) != []
+        promotion_exists?(txn, promotion_id)
 
       :session ->
-        case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [value]) do
-          [["active"]] ->
-            Txn.q(
-              txn,
-              """
-              SELECT o.sessionKey,s.ownerUserId,r.custodian
-              FROM harness_health_class_promotions p
-              JOIN harness_health_incidents i ON i.id IN (p.firstIncidentId,p.secondIncidentId)
-              JOIN harness_health_observations o ON o.id=i.openObservationId
-              JOIN sessions s ON s.sessionKey=o.sessionKey
-              LEFT JOIN harness_health_other_reviews r ON r.incidentId=i.id
-              WHERE p.id=?1
-              """,
-              [promotion_id]
-            )
-            |> Enum.any?(fn [source, owner, custodian] ->
-              value == source or value == custodian or
-                session_owner_authorized?(txn, value, owner)
-            end)
-
-          _ ->
-            false
-        end
+        Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [value]) == [["active"]] and
+          promotion_exists?(txn, promotion_id)
     end
   end
 
   defp promotion_close_authorized?(_txn, {:process, _name}, _id), do: true
 
   defp promotion_close_authorized?(_txn, _principal, _promotion_id), do: false
+
+  defp promotion_exists?(txn, promotion_id),
+    do:
+      Txn.q(txn, "SELECT 1 FROM harness_health_class_promotions WHERE id=?1", [promotion_id]) !=
+        []
 
   defp review_authorized?(_txn, _id, {:process, _name}), do: true
 
@@ -2101,19 +2147,11 @@ defmodule Tightbeam.HarnessHealth do
         [incident_id]
       )
 
+    # Any user or session may act on an existing incident, whoever owns it.
     case {rows, principal} do
-      {[[source, custodian, owner]], {:session, session}} ->
-        session == custodian or session == source or
-          session_owner_authorized?(txn, session, owner)
-
-      {[[_, _, owner]], {:user, user}} ->
-        user == owner or admin_user?(txn, user)
-
-      {[[_, _, owner]], "user:" <> user} ->
-        user == owner or admin_user?(txn, user)
-
-      _ ->
-        false
+      {[_row], {kind, _}} when kind in [:session, :user] -> true
+      {[_row], "user:" <> _user} -> true
+      _ -> false
     end
   end
 
@@ -2134,19 +2172,11 @@ defmodule Tightbeam.HarnessHealth do
         [incident_id]
       )
 
+    # Any user or session may act on an existing incident, whoever owns it.
     case {rows, principal} do
-      {[[source, owner, custodian]], {:session, session}} ->
-        session == source or session == custodian or
-          session_owner_authorized?(txn, session, owner)
-
-      {[[_, owner, _]], {:user, user}} ->
-        user == owner or admin_user?(txn, user)
-
-      {[[_, owner, _]], "user:" <> user} ->
-        user == owner or admin_user?(txn, user)
-
-      _ ->
-        false
+      {[_row], {kind, _}} when kind in [:session, :user] -> true
+      {[_row], "user:" <> _user} -> true
+      _ -> false
     end
   end
 
@@ -3059,14 +3089,9 @@ defmodule Tightbeam.HarnessHealth do
            "SELECT ownerUserId,state FROM sessions WHERE sessionKey=?1 AND harness=?2 AND host=?3",
            [input.source_session_key, input.harness, input.host]
          ) do
-      [[owner_user_id, "active"]] ->
-        unless other_source_authorized?(
-                 txn,
-                 input.principal_identity,
-                 input.source_session_key,
-                 owner_user_id
-               ),
-               do: raise(ArgumentError, "not_authorized")
+      [[_owner_user_id, "active"]] ->
+        unless other_source_authorized?(input.principal_identity),
+          do: raise(ArgumentError, "not_authorized")
 
       [[_, _]] ->
         raise(ArgumentError, "source_not_active")
@@ -3076,23 +3101,13 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
-  defp other_source_authorized?(txn, {:session, session_key}, source, owner),
-    do: session_key == source or session_owner_authorized?(txn, session_key, owner)
+  # Any user, session or automation may report a failure seen on any session.
+  defp other_source_authorized?({kind, _value}) when kind in [:session, :user, :process],
+    do: true
 
-  defp other_source_authorized?(txn, {:user, user}, _source, owner),
-    do: user == owner or admin_user?(txn, user)
-
-  defp other_source_authorized?(txn, user, source, owner) when is_binary(user) do
-    case user do
-      "session:" <> session -> other_source_authorized?(txn, {:session, session}, source, owner)
-      "user:" <> user_id -> other_source_authorized?(txn, {:user, user_id}, source, owner)
-      _ -> false
-    end
-  end
-
-  defp other_source_authorized?(_txn, {:process, _name}, _source, _owner), do: true
-
-  defp other_source_authorized?(_txn, _principal, _source, _owner), do: false
+  defp other_source_authorized?("session:" <> _session), do: true
+  defp other_source_authorized?("user:" <> _user), do: true
+  defp other_source_authorized?(_principal), do: false
 
   defp admin_user?(txn, user),
     do: Txn.q(txn, "SELECT 1 FROM users WHERE userId=?1 AND isAdmin=1", [user]) == [[1]]

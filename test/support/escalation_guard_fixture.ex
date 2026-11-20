@@ -13,6 +13,7 @@ defmodule Tightbeam.EscalationGuardFixture do
       :ok = Schema.ensure_all(db)
       :ok = DB.assert_base_admitted!(db, base)
       Devices.add_user(db, "flynn", true)
+      Tightbeam.TestSupport.OperatorAskFixture.ensure_work_item!(db, "flynn")
       marker = File.read!(Path.join(base, "build-owner.json"))
 
       case mode do
@@ -201,7 +202,14 @@ defmodule Tightbeam.EscalationGuardFixture do
       origin: "agent:raiser",
       principal: {:session, session.session_key},
       transport_session_key: session.session_key,
-      params: params
+      params:
+        Map.merge(
+          %{
+            project: Tightbeam.TestSupport.OperatorAskFixture.project(),
+            work_item_id: Tightbeam.TestSupport.OperatorAskFixture.work_item("flynn")
+          },
+          params
+        )
     }
   end
 

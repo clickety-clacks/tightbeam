@@ -619,6 +619,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
            ), changes}
       end
 
+    rail = declare_legacy_accountable_notice(key, rail)
     context = migration_context(key, rail)
 
     {rail, condition_changes} =
@@ -629,6 +630,19 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   end
 
   defp migrate_rail(other, _key, _path, _owner, _owned, _name_map, changes), do: {other, changes}
+
+  # Earlier releases gave the substrate a built-in exemption for the completion
+  # review rail, found by its name. The exemption is now data the rail declares,
+  # so a rail learned before the change gets the declaration here; without it the
+  # rail would no longer load. Only this migration knows the legacy name.
+  defp declare_legacy_accountable_notice(
+         "rule",
+         %{"name" => "completion-requires-review", "remedy" => %{"action" => "wake"} = remedy} =
+           rail
+       ),
+       do: %{rail | "remedy" => Map.put_new(remedy, "accountable_notice", true)}
+
+  defp declare_legacy_accountable_notice(_key, rail), do: rail
 
   defp migration_context("rule", rail) do
     verbs = List.wrap(Map.get(rail, "verb")) ++ List.wrap(Map.get(rail, "verbs"))

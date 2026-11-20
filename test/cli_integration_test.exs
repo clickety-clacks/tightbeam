@@ -2407,20 +2407,20 @@ defmodule Tightbeam.CliIntegrationTest do
                stderr_to_stdout: true
              )
 
-    # Consume this exact notice turn before the next card's notice is eligible;
-    # filing an attest does not finish a recipient turn.
-    assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
+    # The verdict remains durable, but R01 keeps unlinked ordinary verdicts quiet.
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='topology-decided'",
+               [topology_id]
+             )
 
-    assert {:ok, [[topology_notice_id]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
                [topology_id]
              )
-
-    topology_delivery = assert_cli_source_delivery!(ctx.db, topology_notice_id, "cli-holder")
-    assert topology_delivery.source.prompt =~ topology_id
-    finish_cli_delivery!(ctx.db, "cli-holder", topology_delivery.seq)
 
     # The posture gate refuses a coder card on an unpostured work item, so the
     # slice is ruled first, through the same real CLI.
@@ -2447,17 +2447,21 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    # The posture verdict can now deliver before later CLI calls. Consume its
-    # carrier so the holder is ready for the implementation receipt notice.
-    assert {:ok, [[posture_notice_id]]} =
+    # The posture verdict is durable and satisfies the gate, but remains quiet
+    # because it is an unlinked ordinary verdict under R01.
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [topology_id, topology_notice_id]
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='posture-light'",
+               [topology_id]
              )
 
-    posture_delivery = assert_cli_source_delivery!(ctx.db, posture_notice_id, "cli-holder")
-    finish_cli_delivery!(ctx.db, "cli-holder", posture_delivery.seq)
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
+               [topology_id]
+             )
 
     {assigned, 0} =
       System.cmd(
@@ -2575,7 +2579,8 @@ defmodule Tightbeam.CliIntegrationTest do
     ]
 
     # A1 first denial: the completion is refused and the wake names the
-    # missing verification verdict.
+    # missing verification verdict. The ordinary tests-passed receipt is
+    # durable but does not create an R01 opener notice.
     {denied, denied_status} =
       System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
@@ -2599,16 +2604,19 @@ defmodule Tightbeam.CliIntegrationTest do
     assert verification_wake.prompt =~ "no verification verdict is filed"
     assert verification_wake.prompt =~ work_id
 
-    assert {:ok, [[receipt_notice_id]]} =
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='tests-passed'",
+               [work_id]
+             )
+
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
                [work_id]
              )
-
-    receipt_delivery = assert_cli_source_delivery!(ctx.db, receipt_notice_id, "cli-holder")
-    assert receipt_delivery.source.prompt =~ "Attest "
-    finish_cli_delivery!(ctx.db, "cli-holder", receipt_delivery.seq)
 
     {_verified, 0} =
       System.cmd(
@@ -2629,6 +2637,13 @@ defmodule Tightbeam.CliIntegrationTest do
 
     finish_cli_delivery!(ctx.db, "cli-coder", verification_delivery.seq)
 
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='verified'",
+               [work_id]
+             )
+
     # A1 second denial: the artifact statute prods next, naming its own record.
     {denied_again, denied_again_status} =
       System.cmd(ctx.binary, completion_args,
@@ -2639,16 +2654,12 @@ defmodule Tightbeam.CliIntegrationTest do
     assert denied_again_status != 0
     assert denied_again =~ "completion-requires-results-artifact"
 
-    assert {:ok, [[verified_notice_id]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [work_id, receipt_notice_id]
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
+               [work_id]
              )
-
-    attest_delivery = assert_cli_source_delivery!(ctx.db, verified_notice_id, "cli-holder")
-    attest_batch = Wakes.get(ctx.db, attest_delivery.carrier_id)
-    assert attest_batch.prompt =~ "Attest "
 
     assert %{status: "live", producer_key: artifact_source_id} =
              RailRemedy.episode(
@@ -3138,10 +3149,11 @@ defmodule Tightbeam.CliIntegrationTest do
       Escalation.operator_ask(ctx.db, %{
         origin: "agent:cli-holder",
         principal: {:session, ctx.session.session_key},
-        params: %{
-          question: "ship terminal parity?",
-          options: [%{label: "ship"}, %{label: "hold"}]
-        }
+        params:
+          Tightbeam.TestSupport.OperatorAskFixture.link(ctx.db, ctx.session.session_key, %{
+            question: "ship terminal parity?",
+            options: [%{label: "ship"}, %{label: "hold"}]
+          })
       })
 
     ruled =
