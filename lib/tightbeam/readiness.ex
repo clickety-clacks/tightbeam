@@ -217,7 +217,14 @@ defmodule Tightbeam.Readiness do
   defp binary_state(_module, false, _config), do: {:unknown, :not_probed_on_satellite}
 
   defp binary_state(module, true, config) do
-    probe = Map.get(config, :harness_binary_probe, &Placement.harness_binary_probe/2)
+    probe =
+      Map.get(config, :harness_binary_probe) ||
+        fn harness, cli_bin ->
+          Placement.harness_binary_probe(harness, cli_bin,
+            base_dir: config.base_dir,
+            db: Map.get(config, :db, Tightbeam.DB)
+          )
+        end
 
     case probe.(module.id(), Path.join(config.base_dir, "bin")) do
       # The version string is doctor's to display; readiness needs only the

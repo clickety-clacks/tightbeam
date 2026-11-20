@@ -99,11 +99,41 @@ Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 if missing_executable do
   empty_bin = Path.join(base, "empty-executable-path")
   File.mkdir_p!(empty_bin)
+
+  # Pi's conformance vector resolves ssh while constructing its expected argv.
+  # Keep that helper executable discoverable without permitting a remote call.
+  ssh = Path.join(empty_bin, "ssh")
+  File.write!(ssh, "#!/bin/sh\necho 'ssh: forbidden' >> \"$GUARD_TRIPWIRE\"\nexit 64\n")
+  File.chmod!(ssh, 0o755)
+
   System.put_env("PATH", empty_bin)
+
+  # The refusal case must exclude managed adapter fallbacks as well as usable
+  # native CLIs. Gateway probes search the isolated base/bin before PATH and
+  # configured toolchain directories, so an empty PATH alone can still discover
+  # a system-installed executable. Shadow every known CLI there with a probe-only
+  # failure so the refusal stays deterministic without changing the host.
+  for module <- Harness.all() do
+    %{input: %{profile: profile}} =
+      Enum.find(
+        module.conformance_vectors()["ensure_adapter"],
+        &(&1.case == "local_present")
+      )
+
+    File.rm!(Path.join([base, "adapters", "node_modules", ".bin", profile.adapter_bin]))
+
+    cli = Path.join([base, "bin", module.cli_binary()])
+    File.mkdir_p!(Path.dirname(cli))
+    File.write!(cli, "#!/bin/sh\nexit 127\n")
+    File.chmod!(cli, 0o755)
+  end
+
+  managed_codex = Path.join([base, "adapters", "node_modules", ".bin", "codex"])
+  if File.exists?(managed_codex), do: File.rm!(managed_codex)
 
   for module <- Harness.all() do
     nil = System.find_executable(module.cli_binary())
-    false = File.exists?(Path.join([base, "bin", module.cli_binary()]))
+    true = File.exists?(Path.join([base, "bin", module.cli_binary()]))
   end
 
   File.write!(
