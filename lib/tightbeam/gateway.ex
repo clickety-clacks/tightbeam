@@ -380,6 +380,8 @@ defmodule Tightbeam.Gateway do
           db: db,
           name: Tightbeam.AdapterCoordinator},
          {Tightbeam.Productions.BubbleSweeper, db: db},
+         {Tightbeam.PathNotes,
+          db: db, stat_config: Map.take(config, [:file_stat, :ssh_executable])},
          {Tightbeam.LaneManager,
           db: db,
           lane_sup: Tightbeam.LaneSupervisor,
@@ -2020,6 +2022,7 @@ defmodule Tightbeam.Gateway do
   defp execute_claimed_assignment_repair(config, db, call, assignment, attempt_id) do
     {result, incident} =
       with {:ok, session} <- repair_holder(db, assignment),
+           :ok <- refuse_held(db, assignment),
            {:ok, incident} <- repair_incident(db, assignment, session, call.params[:action]) do
         {execute_assignment_repair(config, db, call, assignment, session, incident), incident}
       else
@@ -2101,6 +2104,27 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # An assignment whose only turn is queued behind a standing park fence has
+  # nothing to repair: the turn starts when the fence lifts. Every action gets
+  # the same answer, whether or not the incident links the assignment.
+  defp refuse_held(db, assignment) do
+    case HarnessHealth.Hold.for_assignment(db, assignment.id) do
+      nil ->
+        :ok
+
+      hold ->
+        opener =
+          if hold.opened_by_assignment_id,
+            do:
+              " The assignment whose failure opened the incident is #{hold.opened_by_assignment_id}.",
+            else: ""
+
+        {:error, "held_behind_incident",
+         "this assignment's turn is held, not stuck; nothing here to repair. " <>
+           hold.release <> opener}
+    end
+  end
+
   defp repair_incident(db, assignment, session, action) do
     {:ok, rows} =
       DB.query(
@@ -2145,25 +2169,32 @@ defmodule Tightbeam.Gateway do
        ) do
     model = call.params[:model]
 
-    if is_binary(model) and model != "" do
-      tuned =
-        tune_result(
-          config,
-          db,
-          call
-          |> Map.put(:session_key, session.session_key)
-          |> Map.put(
-            :params,
-            %{setting: "set_model", model: model}
-            |> maybe_put(:effort, call.params[:effort])
-            |> maybe_put(:context, call.params[:context])
-          )
-          |> Map.put(:repair_assignment_id, assignment.id)
-        )
+    cond do
+      not (is_binary(model) and model != "") ->
+        %{ok: false, code: "model_required", message: "model_unavailable repair requires --model"}
 
-      if Map.has_key?(tuned, :code), do: tuned, else: rerun_latest(db, call, assignment, incident)
-    else
-      %{ok: false, code: "model_required", message: "model_unavailable repair requires --model"}
+      not failed_turn_available?(db, call, assignment) ->
+        no_failed_turn()
+
+      true ->
+        tuned =
+          tune_result(
+            config,
+            db,
+            call
+            |> Map.put(:session_key, session.session_key)
+            |> Map.put(
+              :params,
+              %{setting: "set_model", model: model}
+              |> maybe_put(:effort, call.params[:effort])
+              |> maybe_put(:context, call.params[:context])
+            )
+            |> Map.put(:repair_assignment_id, assignment.id)
+          )
+
+        if Map.has_key?(tuned, :code),
+          do: tuned,
+          else: rerun_latest(db, call, assignment, incident)
     end
   end
 
@@ -2179,16 +2210,22 @@ defmodule Tightbeam.Gateway do
     coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
     key = adapter_key(session)
 
-    case AdapterCoordinator.close_adapter(coordinator, key) do
-      :ok ->
-        if incident.failure_class == "rate-limit-dead" do
-          :ok = HarnessProcess.complete_park(db, key)
-        end
+    # Refuse before closing the adapter or lifting the fence: both reach every
+    # session on this harness and host, not only this assignment.
+    if failed_turn_available?(db, call, assignment) do
+      case AdapterCoordinator.close_adapter(coordinator, key) do
+        :ok ->
+          if incident.failure_class == "rate-limit-dead" do
+            :ok = HarnessProcess.complete_park(db, key)
+          end
 
-        rerun_latest(db, call, assignment, incident)
+          rerun_latest(db, call, assignment, incident)
 
-      {:error, reason} ->
-        repair_failed(reason, operation: "close_adapter", phase: "repair_#{action}")
+        {:error, reason} ->
+          repair_failed(reason, operation: "close_adapter", phase: "repair_#{action}")
+      end
+    else
+      no_failed_turn()
     end
   end
 
@@ -2240,6 +2277,26 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # The terminal turn a repair would rerun: the explicit one, or the latest.
+  # Read before any repair effect so a refusal changes nothing.
+  defp failed_turn_available?(db, call, assignment) do
+    seq = call.params[:turn_seq]
+
+    {sql, args} =
+      if is_integer(seq) do
+        {"SELECT 1 FROM turns WHERE seq=?2 AND assignmentId=?1 AND status IN ('failed','failed_unknown')",
+         [assignment.id, seq]}
+      else
+        {"SELECT 1 FROM turns WHERE assignmentId=?1 AND status IN ('failed','failed_unknown') LIMIT 1",
+         [assignment.id]}
+      end
+
+    match?({:ok, [[1]]}, DB.query(db, sql, args))
+  end
+
+  defp no_failed_turn,
+    do: %{ok: false, code: "no_failed_turn", message: "assignment has no terminal failed turn"}
+
   defp rerun_latest(db, call, assignment, incident) do
     source_seq = call.params[:turn_seq]
 
@@ -2265,7 +2322,7 @@ defmodule Tightbeam.Gateway do
 
     cond do
       not is_integer(source_seq) ->
-        %{ok: false, code: "no_failed_turn", message: "assignment has no terminal failed turn"}
+        no_failed_turn()
 
       not is_binary(repair_key) or repair_key == "" ->
         %{ok: false, code: "idempotency_key_required", message: "repair requires --key"}
@@ -4470,6 +4527,9 @@ defmodule Tightbeam.Gateway do
 
     runner = fn turn ->
       session = Org.get(db, turn.session_key)
+      # Path checks start before anything else so they have the most time to
+      # return; the prompt below never waits for them.
+      path_plan = Tightbeam.PathNotes.claimed(db, turn)
       echo = Projection.get(db, turn.message_id)
       correlation = (echo && echo.client_message_id) || turn.message_id
       publish_turn_state(db, turn.session_key, correlation, "running", nil)
@@ -4566,7 +4626,7 @@ defmodule Tightbeam.Gateway do
                    db,
                    prompt_adapter,
                    harness_session_id,
-                   prepared_prompt,
+                   Tightbeam.PathNotes.annotate(prepared_prompt, path_plan),
                    trace_dispatch: fn request_id ->
                      case Tightbeam.TurnLifecycle.append(db, turn.seq, %{
                             event_key: "prompt:dispatched",
@@ -4770,7 +4830,7 @@ defmodule Tightbeam.Gateway do
                 active_session,
                 turn,
                 failed_stage,
-                raw_reason
+                ErrorDiagnostic.diagnosed(raw_reason, diagnostic)
               )
             end
 
@@ -9342,7 +9402,8 @@ defmodule Tightbeam.Gateway do
                  p.idempotency_key
                ) do
             nil ->
-              with nil <- held_spawn_name_refusal(txn, p[:handle]),
+              with :ok <- spawn_fence_check_in_txn(txn, routed.harness, host),
+                   nil <- held_spawn_name_refusal(txn, p[:handle]),
                    true <- not is_nil(Archetypes.get(archetype.name)) do
                 if spawn_cap_reached_in_txn?(
                      txn,
@@ -9424,6 +9485,9 @@ defmodule Tightbeam.Gateway do
                   end
                 end
               else
+                {:error, denial} ->
+                  {:spawn_denied, denial}
+
                 false ->
                   {:error, :unknown_archetype}
 
@@ -9442,6 +9506,9 @@ defmodule Tightbeam.Gateway do
 
         {:ok, {:cap_exceeded, cap}} ->
           spawn_cap_exceeded(cap, caller.owner_user_id)
+
+        {:ok, {:spawn_denied, denial}} ->
+          denial
 
         {:ok, {:name_taken, refusal}} ->
           refusal
@@ -9474,6 +9541,18 @@ defmodule Tightbeam.Gateway do
     else
       {:error, denial} ->
         classified_denial("placement_denied", denial)
+    end
+  end
+
+  defp spawn_fence_check_in_txn(txn, harness, host) do
+    if HarnessProcess.parked_in_txn?(txn, {Harness.parse!(harness).id(), "shared", host}) do
+      {:error,
+       %{
+         code: "harness_fenced",
+         message: "cannot spawn: selected harness #{harness} on host #{host} is fenced"
+       }}
+    else
+      :ok
     end
   end
 

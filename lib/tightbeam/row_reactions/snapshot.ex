@@ -130,6 +130,36 @@ defmodule Tightbeam.RowReactions.Snapshot do
     end
   end
 
+  def current(txn, %{"kind" => "work_item_observation", "workItemId" => id} = event, _recorded) do
+    item =
+      one(
+        txn,
+        "work_items",
+        ~w(id title ownerUserId state deliveryOwnerSessionKey routingWakeId slateWakeId createdAt createdByUser createdBySession createdContextKnown),
+        "id=?1",
+        [id]
+      )
+
+    [[count]] =
+      Txn.q(txn, "SELECT COUNT(*) FROM assignments WHERE workItemId=?1 AND state='open'", [id])
+
+    personal = if item, do: Org.personal_session_key(item["ownerUserId"])
+
+    %{
+      "work_item" => item,
+      "open_assignment_count" => count,
+      "personal_session_key" => personal,
+      "sessions" =>
+        sessions(txn, [
+          personal,
+          item && item["deliveryOwnerSessionKey"],
+          get_in(event, ["principal", "id"])
+        ]),
+      "configured_triage_deadline_ms" =>
+        Application.get_env(:tightbeam, :work_item_triage_deadline_ms)
+    }
+  end
+
   def current(txn, %{"kind" => "assignment"} = event, _recorded) do
     terminal = event["terminal"]
 

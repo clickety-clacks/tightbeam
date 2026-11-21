@@ -275,7 +275,7 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
         origin: raiser.session_key,
         principal: {:session, raiser.session_key},
         transport_session_key: raiser.session_key,
-        params: %{question: "continue?", assignment_id: assignment.id}
+        params: %{question: "continue?", project: "Fixture product", assignment_id: assignment.id}
       })
 
     assert version_of(db, request.id) == 1

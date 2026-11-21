@@ -351,6 +351,16 @@ defmodule Tightbeam.Rails do
 
     validate_archetypes!(name, path, base_dir, owner, archetypes)
 
+    # An org-written statute without `archetypes` names no agent and never fires.
+    if owner == :substrate and not Map.has_key?(statute, "archetypes") do
+      require Logger
+
+      Logger.warning(
+        "#{path}: statute #{inspect(name)} omits archetypes and applies to no agent; " <>
+          ~s(add archetypes = ["*"] to apply it to every agent)
+      )
+    end
+
     cond do
       is_nil(name) ->
         raise ArgumentError, ~s(statute is missing "name")

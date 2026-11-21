@@ -153,7 +153,8 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     assert message =~ metadata.id
   end
 
-  test "operational evidence requires captured bytes from the original holder", ctx do
+  test "operational evidence requires the original holder and states byte differences as facts",
+       ctx do
     captured = capture(ctx, "operation and observed result")
 
     call = %{
@@ -165,30 +166,52 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       }
     }
 
-    assert {:ok, %{artifact_id: artifact_id, sha256: digest}} =
-             DB.transaction(ctx.db, fn txn -> OperationalEvidence.validate!(txn, call) end)
+    validate = fn candidate ->
+      DB.transaction(ctx.db, fn txn -> OperationalEvidence.validate!(txn, candidate) end)
+    end
 
-    assert artifact_id == captured.id
-    assert digest == captured.hash
+    assert {:ok, {%{assignment_id: assignment_id, artifact_id: artifact_id, sha256: digest}, []}} =
+             validate.(call)
 
-    wrong = put_in(call, [:params, :content_sha256], String.duplicate("0", 64))
+    assert {assignment_id, artifact_id, digest} == {ctx.assignment_id, captured.id, captured.hash}
 
-    assert {:error, %Mementos.Refusal{code: "operational_evidence_invalid"}} =
-             DB.transaction(ctx.db, fn txn -> OperationalEvidence.validate!(txn, wrong) end)
+    zeros = String.duplicate("0", 64)
+    wrong = put_in(call, [:params, :content_sha256], zeros)
+
+    assert {:ok, {%{artifact_id: ^artifact_id, sha256: ^zeros}, wrong_facts}} = validate.(wrong)
+
+    assert wrong_facts == [
+             "the captured bytes of artifact #{captured.id} have sha256 #{captured.hash}; " <>
+               "this verdict cites #{zeros}"
+           ]
 
     metadata = capture(ctx, nil)
     uncaptured = put_in(call, [:params, :artifact_id], metadata.id)
 
+    assert {:ok, {%{artifact_id: uncaptured_id}, uncaptured_facts}} = validate.(uncaptured)
+    assert uncaptured_id == metadata.id
+
+    assert uncaptured_facts == [
+             "artifact #{metadata.id} has no captured content, so its sha256 was not " <>
+               "compared with its bytes"
+           ]
+
+    # An unknown artifact, a malformed digest, and a card the caller does not
+    # hold as an open producing assignment still refuse.
     assert {:error, %Mementos.Refusal{code: "content_not_captured"}} =
-             DB.transaction(ctx.db, fn txn -> OperationalEvidence.validate!(txn, uncaptured) end)
+             validate.(put_in(call, [:params, :artifact_id], "art_missing"))
+
+    assert {:error, %Mementos.Refusal{code: "operational_evidence_invalid"}} =
+             validate.(put_in(call, [:params, :content_sha256], "not-a-digest"))
 
     another = put_in(call, [:params, :assignment_id], "another-assignment")
 
     assert {:error, %Mementos.Refusal{code: "operational_evidence_invalid"}} =
-             DB.transaction(ctx.db, fn txn -> OperationalEvidence.validate!(txn, another) end)
+             validate.(another)
   end
 
-  test "attest policy selects captured operational evidence from stored assignment scope", ctx do
+  test "attest policy selects captured operational evidence from stored assignment scope and states an unchecked route",
+       ctx do
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -230,11 +253,19 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       end)
     end
 
-    assert {:ok, %{validated_operational_evidence: %{artifact_id: artifact_id}}} = prepare.(call)
+    assert {:ok, %{validated_operational_evidence: %{artifact_id: artifact_id}} = selected} =
+             prepare.(call)
+
     assert artifact_id == captured.id
+    refute Map.has_key?(selected, :fyi)
 
     missing = put_in(call, [:params, :artifact_id], nil)
-    assert {:error, %Mementos.Refusal{code: "operational_evidence_invalid"}} = prepare.(missing)
+
+    assert {:error,
+            %Mementos.Refusal{
+              code: "operational_evidence_invalid",
+              message: "artifactId and contentSha256 are required together"
+            }} = prepare.(missing)
 
     {:ok, _} =
       DB.query(
@@ -250,19 +281,35 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     overbroad = Map.put(snapshot, :policies, [overbroad_policy])
 
-    assert {:error, %Mementos.Refusal{code: "non_file_operational_evidence_policy_inactive"}} =
+    # With declared files the artifact leaves the operational route: the pair is
+    # kept unchecked and an FYI says why.
+    unchecked_fyi = [
+      "FYI: the artifact on this verdict was not checked as operational evidence because " <>
+        "declared files are present for this assignment; decide for yourself whether that is acceptable"
+    ]
+
+    assert {:ok, overbroad_prepared} =
              DB.transaction(ctx.db, fn txn ->
                Rules.with_snapshot(overbroad, fn -> AttestEvidence.prepare_in_txn!(txn, call) end)
              end)
 
+    assert overbroad_prepared.fyi == unchecked_fyi
+    refute Map.has_key?(overbroad_prepared, :validated_operational_evidence)
+
+    assert {overbroad_prepared.params.artifact_id, overbroad_prepared.params.content_sha256} ==
+             {captured.id, captured.hash}
+
     replacement = Map.put(overbroad, :active_admission_contract, %{"attest" => "replacement"})
 
-    assert {:error, %Mementos.Refusal{code: "non_file_operational_evidence_policy_inactive"}} =
+    assert {:ok, replacement_prepared} =
              DB.transaction(ctx.db, fn txn ->
                Rules.with_snapshot(replacement, fn ->
                  AttestEvidence.prepare_in_txn!(txn, call)
                end)
              end)
+
+    assert replacement_prepared.fyi == unchecked_fyi
+    refute Map.has_key?(replacement_prepared, :validated_operational_evidence)
 
     file_policy = %{
       name: "file-evidence",
@@ -294,15 +341,20 @@ defmodule Tightbeam.FileEffectValidationPortTest do
         {"example/evidence", ["file-evidence/v1:#{captured.id}:#{captured.hash}"]}
       ])
 
-    assert {:error, %Mementos.Refusal{code: "file_effect_evidence_policy_inactive"}} =
+    assert {:ok, legacy_prepared} =
              DB.transaction(ctx.db, fn txn ->
                Rules.with_snapshot(legacy_with_file_policy, fn ->
                  AttestEvidence.prepare_in_txn!(txn, manifest_call)
                end)
              end)
+
+    assert legacy_prepared.fyi == unchecked_fyi
+    refute Map.has_key?(legacy_prepared, :validated_operational_evidence)
+    refute Map.has_key?(legacy_prepared, :validated_file_effect)
   end
 
-  test "replacement file selection derives the comparison from captured manifest bytes", ctx do
+  test "replacement file selection derives the comparison from captured manifest bytes; legacy states it unchecked",
+       ctx do
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -371,6 +423,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     end
 
     assert {:ok, prepared} = prepare.(call, snapshot)
+    refute Map.has_key?(prepared, :fyi)
     assert prepared.file_effect_manifest.valid
     assert prepared.memento_comparison_value == pointer
     assert prepared.validated_file_effect.after.sha256 == after_file.hash
@@ -382,8 +435,18 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     legacy = put_in(snapshot, [:active_admission_contract, "attest"], "legacy")
 
-    assert {:error, %Mementos.Refusal{code: "file_effect_evidence_policy_inactive"}} =
-             prepare.(call, legacy)
+    # Outside the replacement phase the manifest is not compared; the pair is
+    # kept and an FYI says it was not checked.
+    assert {:ok, legacy_prepared} = prepare.(call, legacy)
+
+    assert legacy_prepared.fyi == [
+             "FYI: the artifact on this verdict was not checked as operational evidence because " <>
+               "declared files are present for this assignment; decide for yourself whether that is acceptable"
+           ]
+
+    refute Map.has_key?(legacy_prepared, :validated_file_effect)
+    refute Map.has_key?(legacy_prepared, :file_effect_manifest)
+    refute Map.has_key?(legacy_prepared, :memento_comparison_value)
   end
 
   test "attached non-code artifact is retained without a selected operational policy", ctx do
@@ -452,7 +515,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
              )
   end
 
-  test "a captured artifact does not replace code commit refs", ctx do
+  test "a captured artifact does not replace code commit refs: the verdict carries an FYI", ctx do
     captured = capture(ctx, "code result")
     snapshot = Rules.effective_snapshot() |> Map.put(:policies, [])
 
@@ -471,13 +534,31 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       }
     }
 
-    assert %{code: "invalid_commit_refs"} =
-             Rules.with_snapshot(snapshot, fn -> ctx.handlers["attest"].(call) end)
+    file = fn candidate ->
+      Rules.with_snapshot(snapshot, fn -> ctx.handlers["attest"].(candidate) end)
+    end
+
+    # Half an evidence pair still refuses and records nothing.
+    assert %{code: "invalid_revision_binding"} =
+             file.(put_in(call, [:params, :content_sha256], nil))
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM attests WHERE assignmentId=?1", [
                ctx.assignment_id
              ])
+
+    expected_fyi = [
+      "FYI: this verified verdict carries no commit refs; decide for yourself whether that is acceptable"
+    ]
+
+    assert %{attest: %{id: attest_id, commitRefs: nil} = attest, fyi: ^expected_fyi} =
+             file.(call)
+
+    assert {attest.artifactId, attest.contentSha256} == {captured.id, captured.hash}
+    assert attest.fyi == expected_fyi
+
+    assert [%{id: ^attest_id, fyi: ^expected_fyi}] =
+             Tightbeam.Assignments.list_attests(ctx.db, ctx.assignment_id)
   end
 
   test "legacy code remains outside operational evidence under an overbroad policy", ctx do
@@ -559,7 +640,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     assert Mementos.current(ctx.db, "attest", attest_id, "example/progress") == ["observed"]
   end
 
-  test "verified accepts artifact-only evidence without git refs and still refuses an empty claim",
+  test "verified accepts artifact-only evidence without git refs and records an empty claim with an FYI",
        ctx do
     {:ok, _} =
       DB.query(
@@ -599,8 +680,15 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       Rules.with_snapshot(snapshot, fn -> ctx.handlers["attest"].(candidate) end)
     end
 
-    assert %{code: "invalid_commit_refs"} = file.(call)
-    assert %{code: "invalid_commit_refs"} = file.(put_in(call, [:params, :commit_refs], []))
+    no_refs_fyi = [
+      "FYI: this verified verdict carries no commit refs; decide for yourself whether that is acceptable"
+    ]
+
+    assert %{attest: %{id: empty_id, commitRefs: nil, artifactId: nil}, fyi: ^no_refs_fyi} =
+             file.(call)
+
+    assert %{attest: %{id: empty_refs_id, artifactId: nil}, fyi: ^no_refs_fyi} =
+             file.(put_in(call, [:params, :commit_refs], []))
 
     {:ok, _} =
       DB.query(
@@ -618,19 +706,35 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       |> put_in([:params, :artifact_id], captured.id)
       |> put_in([:params, :content_sha256], captured.hash)
 
-    log =
-      ExUnit.CaptureLog.capture_log(fn ->
+    {artifact_only_id, log} =
+      ExUnit.CaptureLog.with_log(fn ->
         assert %{attest: %{verdictKind: "verified", commitRefs: nil} = attest} =
-                 file.(artifact_only)
+                 result = file.(artifact_only)
 
         assert attest.artifactId == captured.id
         assert attest.contentSha256 == captured.hash
+        refute Map.has_key?(result, :fyi)
+        attest.id
       end)
 
     assert log =~ "verified_artifact_only assignmentId=#{ctx.assignment_id}"
 
+    # Half a pair and a malformed digest still refuse.
     assert %{code: "operational_evidence_invalid"} =
-             file.(put_in(artifact_only, [:params, :content_sha256], String.duplicate("f", 64)))
+             file.(put_in(artifact_only, [:params, :content_sha256], nil))
+
+    assert %{code: "operational_evidence_invalid"} =
+             file.(put_in(artifact_only, [:params, :content_sha256], "not-a-digest"))
+
+    other_digest = String.duplicate("f", 64)
+
+    digest_fyi = [
+      "FYI: the captured bytes of artifact #{captured.id} have sha256 #{captured.hash}; " <>
+        "this verdict cites #{other_digest}; decide for yourself whether that is acceptable"
+    ]
+
+    assert %{attest: %{id: digest_id, contentSha256: ^other_digest}, fyi: ^digest_fyi} =
+             file.(put_in(artifact_only, [:params, :content_sha256], other_digest))
 
     {:ok, _} =
       DB.query(
@@ -641,11 +745,22 @@ defmodule Tightbeam.FileEffectValidationPortTest do
         ]
       )
 
-    assert %{code: "invalid_commit_refs"} = file.(call)
-    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
+    assert %{attest: %{id: files_id, artifactId: nil}, fyi: ^no_refs_fyi} = file.(call)
+
+    assert Map.new(
+             Tightbeam.Assignments.list_attests(ctx.db, ctx.assignment_id),
+             &{&1.id, Map.get(&1, :fyi)}
+           ) == %{
+             empty_id => no_refs_fyi,
+             empty_refs_id => no_refs_fyi,
+             artifact_only_id => nil,
+             digest_id => digest_fyi,
+             files_id => no_refs_fyi
+           }
   end
 
-  test "verified filing binds captured evidence and inline metadata in one transaction", ctx do
+  test "verified filing binds captured evidence, inline metadata, and FYIs in one transaction",
+       ctx do
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -705,12 +820,31 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       Rules.with_snapshot(snapshot, fn -> ctx.handlers["attest"].(candidate) end)
     end
 
-    invalid = put_in(call, [:params, :content_sha256], String.duplicate("0", 64))
-    assert %{code: "operational_evidence_invalid"} = file.(invalid)
+    # A refused filing writes neither the attest nor its inline metadata.
+    malformed = put_in(call, [:params, :content_sha256], "not-a-digest")
+    assert %{code: "operational_evidence_invalid"} = file.(malformed)
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM record_fyis")
     assert Mementos.current(ctx.db, "attest", "missing", "example/evidence") == []
 
-    assert %{attest: filed} = file.(call)
+    # A digest that differs from the captured bytes is filed with its metadata
+    # and FYI in the same transaction.
+    zeros = String.duplicate("0", 64)
+
+    digest_fyi = [
+      "FYI: the captured bytes of artifact #{captured.id} have sha256 #{captured.hash}; " <>
+        "this verdict cites #{zeros}; decide for yourself whether that is acceptable"
+    ]
+
+    assert %{attest: %{contentSha256: ^zeros} = mismatched, fyi: ^digest_fyi} =
+             file.(put_in(call, [:params, :content_sha256], zeros))
+
+    assert Mementos.current(ctx.db, "attest", mismatched.id, "example/evidence") == [
+             "receipt:one"
+           ]
+
+    assert %{attest: filed} = result = file.(call)
+    refute Map.has_key?(result, :fyi)
     assert filed.artifactId == captured.id
     assert filed.contentSha256 == captured.hash
     assert filed.commitRefs == nil
@@ -722,8 +856,13 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     assert {artifact_id, digest} == {captured.id, captured.hash}
 
-    assert [%{artifactId: ^artifact_id, contentSha256: ^digest}] =
-             Tightbeam.Assignments.list_attests(ctx.db, ctx.assignment_id)
+    assert Map.new(
+             Tightbeam.Assignments.list_attests(ctx.db, ctx.assignment_id),
+             &{&1.id, {&1.artifactId, &1.contentSha256, Map.get(&1, :fyi)}}
+           ) == %{
+             mismatched.id => {artifact_id, zeros, digest_fyi},
+             filed.id => {artifact_id, digest, nil}
+           }
 
     assert Mementos.current(ctx.db, "attest", filed.id, "example/evidence") == ["receipt:one"]
 
@@ -813,18 +952,61 @@ defmodule Tightbeam.FileEffectValidationPortTest do
         }
     }
 
-    assert %{code: "operational_evidence_invalid"} = file.(wrong_subject)
+    # Half a review pair still refuses and records nothing.
+    assert %{code: "operational_evidence_invalid"} =
+             file.(put_in(review_call, [:params, :content_sha256], nil))
+
+    assert Tightbeam.Assignments.list_attests(ctx.db, review_id) == []
 
     assert {:ok, [["open", nil]]} =
              DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
                ctx.assignment_id
              ])
 
-    wrong_review = put_in(review_call, [:params, :content_sha256], String.duplicate("0", 64))
-    assert %{code: "operational_evidence_invalid"} = file.(wrong_review)
-    assert Tightbeam.Assignments.list_attests(ctx.db, review_id) == []
-    assert %{attest: review} = file.(review_call)
+    producer_pair =
+      "the producer's latest verified verdict cites artifact #{captured.id} sha256 #{captured.hash}"
+
+    wrong_subject_fyi = [
+      "FYI: this review cites artifact #{reviewer_report.id} sha256 #{reviewer_report.hash}; " <>
+        producer_pair <> "; decide for yourself whether that is acceptable",
+      "FYI: artifact #{reviewer_report.id} was produced by this review card, not by assignment " <>
+        "#{ctx.assignment_id} that it reviews; decide for yourself whether that is acceptable"
+    ]
+
+    assert %{attest: wrong_subject_review, fyi: ^wrong_subject_fyi} = file.(wrong_subject)
+
+    # The review is a recorded reviewed-clean conclusion; the pending holder
+    # completion now closes the producer.
+    assert {:ok, [["closed", closing_after_review]]} =
+             DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
+               ctx.assignment_id
+             ])
+
+    assert closing_after_review == holder_completion.id
+
+    zeros_review = put_in(review_call, [:params, :content_sha256], zeros)
+
+    wrong_review_fyi = [
+      "FYI: this review cites artifact #{captured.id} sha256 #{zeros}; " <>
+        producer_pair <> "; decide for yourself whether that is acceptable",
+      "FYI: artifact #{captured.id} is recorded with sha256 #{captured.hash}; this verdict cites " <>
+        "sha256 #{zeros}; decide for yourself whether that is acceptable"
+    ]
+
+    assert %{attest: wrong_review, fyi: ^wrong_review_fyi} = file.(zeros_review)
+
+    assert %{attest: review} = review_result = file.(review_call)
+    refute Map.has_key?(review_result, :fyi)
     assert {review.artifactId, review.contentSha256} == {captured.id, captured.hash}
+
+    assert Map.new(
+             Tightbeam.Assignments.list_attests(ctx.db, review_id),
+             &{&1.id, Map.get(&1, :fyi)}
+           ) == %{
+             wrong_subject_review.id => wrong_subject_fyi,
+             wrong_review.id => wrong_review_fyi,
+             review.id => nil
+           }
 
     assert {:ok, [["closed", "completed", closing_id, closer]]} =
              DB.query(

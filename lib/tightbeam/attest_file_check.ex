@@ -1,11 +1,19 @@
 defmodule Tightbeam.AttestFileCheck do
   @moduledoc false
 
-  alias Tightbeam.{ArtifactOrigins, Artifacts, DB, Placement}
+  alias Tightbeam.{ArtifactOrigins, Artifacts, DB, PathNotes, Placement}
 
   def check(db, config, %{params: %{attest_id: attest_id}}) do
-    case DB.query(db, "SELECT assignmentId, artifactId FROM attests WHERE id=?1", [attest_id]) do
-      {:ok, [[assignment_id, attached_id]]} ->
+    case DB.query(
+           db,
+           """
+           SELECT a.assignmentId, a.artifactId, a.note, s.host
+           FROM attests a LEFT JOIN sessions s ON s.sessionKey=a.bySession
+           WHERE a.id=?1
+           """,
+           [attest_id]
+         ) do
+      {:ok, [[assignment_id, attached_id, note, filer_host]]} ->
         {:ok, rows} =
           DB.query(
             db,
@@ -21,13 +29,41 @@ defmodule Tightbeam.AttestFileCheck do
           Enum.map(rows, fn [id] ->
             artifact = Artifacts.get(db, id)
             check_artifact(config, artifact)
-          end)
+          end) ++ check_note_paths(db, config, note, filer_host)
 
         %{attestId: attest_id, files: files, summary: summary(files)}
 
       {:ok, []} ->
         %{code: "unknown_attest", message: "unknown attest: #{attest_id}"}
     end
+  end
+
+  # Absolute paths written in the note: a plain path on the filing session's
+  # host, a `host:/path` on that host. Relative and `~/` paths are not checked.
+  defp check_note_paths(_db, _config, nil, _filer_host), do: []
+
+  defp check_note_paths(db, config, note, filer_host) do
+    hosts = Placement.hosts(config.base_dir, db)
+
+    note
+    |> PathNotes.handed_on_paths(Map.keys(hosts), home: false)
+    |> Enum.map(fn %{display: display, host: host, path: path} ->
+      base = %{notePath: display}
+
+      case host || filer_host do
+        nil ->
+          Map.merge(base, %{
+            checkedPath: path,
+            status: "could_not_access",
+            error: "this attest was not filed by a session, so it has no host to check on"
+          })
+
+        host_name ->
+          base
+          |> Map.merge(%{checkedHost: host_name, checkedPath: path})
+          |> Map.merge(stat_on(hosts, host_name, path, config))
+      end
+    end)
   end
 
   defp check_artifact(config, artifact) do
@@ -37,16 +73,8 @@ defmodule Tightbeam.AttestFileCheck do
       {:ok, host_name, path} ->
         base = Map.merge(base, %{checkedHost: host_name, checkedPath: path})
 
-        case Placement.hosts(config.base_dir, config.db)[host_name] do
-          nil ->
-            Map.merge(base, %{status: "could_not_access", error: "unknown host: #{host_name}"})
-
-          %{ssh: nil} ->
-            Map.merge(base, local_file_result(path, Map.get(config, :file_stat, &File.stat/1)))
-
-          %{ssh: destination} ->
-            Map.merge(base, remote_file_result(destination, path, config))
-        end
+        hosts = Placement.hosts(config.base_dir, config.db)
+        Map.merge(base, stat_on(hosts, host_name, path, config))
 
       {:error, reason} ->
         Map.merge(base, %{status: "could_not_access", error: Atom.to_string(reason)})
@@ -60,6 +88,27 @@ defmodule Tightbeam.AttestFileCheck do
 
   defp location(artifact, _config), do: ArtifactOrigins.resolve(artifact)
 
+  defp stat_on(hosts, host_name, path, config) do
+    case hosts[host_name] do
+      nil -> %{status: "could_not_access", error: "unknown host: #{host_name}"}
+      route -> stat(route, path, config)
+    end
+  end
+
+  @doc """
+  Stat one path on a placement host: `%{status: "present" | "absent"}`, or
+  `%{status: "could_not_access", error: reason}` with the system error as
+  reported. Only ENOENT and ENOTDIR are absence. A `~/` path is the home of the
+  user the host is reached as.
+  """
+  def stat(%{ssh: nil}, path, config),
+    do: local_file_result(expand_home(path), Map.get(config, :file_stat, &File.stat/1))
+
+  def stat(%{ssh: destination}, path, config), do: remote_file_result(destination, path, config)
+
+  defp expand_home("~/" <> _ = path), do: Path.expand(path)
+  defp expand_home(path), do: path
+
   defp local_file_result(path, stat) do
     case stat.(path) do
       {:ok, _info} -> %{status: "present"}
@@ -69,41 +118,46 @@ defmodule Tightbeam.AttestFileCheck do
   end
 
   defp remote_file_result(destination, path, config) do
+    runner = Map.get(config, :sh, &system_cmd/1)
+    {output, status} = runner.(["ssh", "-o", "BatchMode=yes", destination, remote_command(path)])
+    remote_result(output, status)
+  rescue
+    error in ErlangError -> %{status: "could_not_access", error: Exception.message(error)}
+  end
+
+  @doc "The remote shell command that stats `path` and prints the outcome as JSON."
+  def remote_command(path) do
     script = """
     import errno, json, os, sys
     try:
-        os.stat(sys.argv[1])
+        os.stat(os.path.expanduser(sys.argv[1]))
         print(json.dumps({"status": "present"}))
     except OSError as error:
         status = "absent" if error.errno in (errno.ENOENT, errno.ENOTDIR) else "could_not_access"
         print(json.dumps({"status": status, "error": error.strerror, "errno": error.errno}))
     """
 
-    command = "python3 -c #{quote_shell(script)} #{quote_shell(path)}"
-    runner = Map.get(config, :sh, &system_cmd/1)
+    "python3 -c #{quote_shell(script)} #{quote_shell(path)}"
+  end
 
-    case runner.(["ssh", "-o", "BatchMode=yes", destination, command]) do
-      {output, 0} ->
-        case JSON.decode(output) do
-          {:ok, %{"status" => "present"}} ->
-            %{status: "present"}
+  @doc "Read the result of `remote_command/1` from the ssh output and exit status."
+  def remote_result(output, 0) do
+    case JSON.decode(output) do
+      {:ok, %{"status" => "present"}} ->
+        %{status: "present"}
 
-          {:ok, %{"status" => "absent"}} ->
-            %{status: "absent"}
+      {:ok, %{"status" => "absent"}} ->
+        %{status: "absent"}
 
-          {:ok, %{"status" => "could_not_access", "error" => error}} ->
-            %{status: "could_not_access", error: error}
+      {:ok, %{"status" => "could_not_access", "error" => error}} ->
+        %{status: "could_not_access", error: error}
 
-          _ ->
-            %{status: "could_not_access", error: output}
-        end
-
-      {output, _status} ->
+      _ ->
         %{status: "could_not_access", error: output}
     end
-  rescue
-    error in ErlangError -> %{status: "could_not_access", error: Exception.message(error)}
   end
+
+  def remote_result(output, _status), do: %{status: "could_not_access", error: output}
 
   defp system_cmd([command | args]), do: System.cmd(command, args, stderr_to_stdout: true)
   defp quote_shell(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
@@ -132,6 +186,7 @@ defmodule Tightbeam.AttestFileCheck do
     Enum.map_join(files, ", ", fn file ->
       case file do
         %{checkedHost: host, checkedPath: path} -> "#{host}:#{path}"
+        %{notePath: path} -> path
         _ -> file.originPath
       end
     end)

@@ -295,7 +295,13 @@ cursor_bundle_installed? =
 
 cursor_bundle_exclusions = if cursor_bundle_installed?, do: [], else: [cursor_bundle: true]
 
-ExUnit.start(assert_receive_timeout: 1_000, exclude: cursor_bundle_exclusions)
+# The real-adapter switch suite (test/real_adapter_switch_e2e_test.exs) calls real
+# models through a separately running, signed-in test instance. It is opt-in only:
+# `--only real_adapter_switch` selects it, and it never runs in an ordinary run.
+ExUnit.start(
+  assert_receive_timeout: 1_000,
+  exclude: [real_adapter_switch: true] ++ cursor_bundle_exclusions
+)
 
 suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
 

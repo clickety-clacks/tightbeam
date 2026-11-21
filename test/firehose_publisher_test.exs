@@ -171,6 +171,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert observed_state_classes() == ["session.spawned"]
 
     handlers = Gateway.handlers(%{db: db})
+    elect_work_item_reminders!(handlers)
 
     call = %{
       verb: "work-item-create",
@@ -330,6 +331,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     handlers = Gateway.handlers(config)
+    elect_work_item_reminders!(handlers)
 
     immediate_wake = %{
       verb: "wake",
@@ -1197,7 +1199,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
       principal: {:session, "operator-raiser"},
       transport_session_key: "operator-raiser",
       session_key: nil,
-      params: %{question: "Ship the candidate?", options: [%{label: "ship"}, %{label: "hold"}]}
+      params:
+        Tightbeam.TestSupport.OperatorAskFixture.link(db, "operator-raiser", %{
+          question: "Ship the candidate?",
+          options: [%{label: "ship"}, %{label: "hold"}]
+        })
     }
 
     assert {:ok, %{status: "open"} = request} = Dispatch.dispatch(db, handlers, ask)
@@ -1736,6 +1742,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     register_testhost(db)
     assert observed_state_classes() == ["session.spawned"]
     handlers = Gateway.handlers(%{db: db})
+    elect_work_item_reminders!(handlers)
 
     call = %{
       verb: "work-item-create",
@@ -1772,6 +1779,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, _} = Dispatch.dispatch(db, handlers, update)
     assert observed_classes() == ["verb.accepted"]
     assert canonical.() == before
+  end
+
+  defp elect_work_item_reminders!(handlers) do
+    law =
+      Path.join(System.tmp_dir!(), "firehose-reminder-law-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(law) end)
+    Tightbeam.TerminalReactionFixture.load_work_items!(law, Map.keys(handlers), false)
   end
 
   defp message_fixture(id, seq, session_key, content) do

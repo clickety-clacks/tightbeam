@@ -7,6 +7,60 @@ defmodule Tightbeam.RowReactions do
   alias Tightbeam.RowReactions.{Cutover, Notice, Snapshot, Store}
   require Logger
 
+  def observe_work_item_in_txn(txn, id, operation, source, before, transition \\ nil) do
+    Cutover.adopt(txn)
+
+    after_row =
+      Snapshot.current(txn, %{"kind" => "work_item_observation", "workItemId" => id}, %{})[
+        "work_item"
+      ]
+
+    if after_row do
+      event = %{
+        "id" => "work-item:#{id}:#{operation}:#{source.kind}:#{source[:generation] || source.id}",
+        "org" => after_row["ownerUserId"],
+        "kind" => "work_item_observation",
+        "workItemId" => id,
+        "operation" => operation,
+        "at" => source[:at] || after_row["createdAt"],
+        "generation" => source[:generation] || source.id,
+        "source" => stringify(Map.take(source, [:kind, :id])),
+        "principal" => observation_principal(source[:principal]),
+        "before" =>
+          Map.merge(before || %{}, %{
+            "workItem" => source[:work_item_before],
+            "sourceRow" => source[:before]
+          }),
+        "after" => after_row,
+        "sourceAfter" => source[:after],
+        "transition" => if(transition, do: JSON.decode!(JSON.encode!(transition)))
+      }
+
+      # Expressions and durable replay must see the same nested key types.
+      event = event |> JSON.encode!() |> JSON.decode!()
+
+      # A repeated observation reads its captured event, rather than inventing
+      # another occurrence or changing the occurrence timestamp.
+      event =
+        case Store.event(txn, event["org"], event["id"]) do
+          {stored, _} -> stored
+          nil -> event
+        end
+
+      admit(txn, event)
+    else
+      []
+    end
+  end
+
+  defp observation_principal({kind, id}) when kind in [:user, :session, :process],
+    do: %{"kind" => Atom.to_string(kind), "id" => id}
+
+  defp observation_principal({:remedy, %{statute: statute, action: action, owner: owner}}),
+    do: %{"kind" => "remedy", "id" => statute, "action" => action, "ownerUserId" => owner}
+
+  defp observation_principal(nil), do: nil
+
   def harness_health_hold_in_txn(
         txn,
         incident_id,
@@ -330,6 +384,8 @@ defmodule Tightbeam.RowReactions do
     case DB.transaction(db, fn txn ->
            if ready?(txn) do
              Cutover.adopt(txn)
+             superseded = Store.resume_unloaded_rail_holds(txn)
+             for event <- superseded, do: reconcile_safely(txn, event)
              for {event, _} <- Store.pending_events(txn), do: reconcile_safely(txn, event)
              RecoverySchedule.reconcile_open_holds_in_txn(txn, System.system_time(:millisecond))
            end
@@ -394,6 +450,7 @@ defmodule Tightbeam.RowReactions do
             SELECT DISTINCT a.org,a.eventId FROM row_reaction_actions a
             JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
             WHERE a.status='pending' AND (json_extract(e.event,'$.terminal.work_item_id')=?1
+              OR json_extract(e.event,'$.workItemId')=?1
               OR EXISTS (SELECT 1 FROM json_each(e.facts,'$.terminal_sources') s
                 WHERE json_extract(s.value,'$.workItemId')=?1))
             """,

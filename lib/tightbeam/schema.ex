@@ -425,6 +425,7 @@ defmodule Tightbeam.Schema do
   # reconciliation. A database carrying both changes needs its own exact stamp,
   # reachable from either predecessor.
   @session_custody_artifact_process_shape "session-custody-artifact-process-attribution-v1-0117"
+  @attest_lifecycle_actor_shape "attest-lifecycle-actor-v1-0117"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -457,6 +458,7 @@ defmodule Tightbeam.Schema do
     @session_custody_shape,
     @artifact_process_attribution_shape,
     @session_custody_artifact_process_shape,
+    @attest_lifecycle_actor_shape,
     @evidence_release_shape,
     @decision_request_row_schema_shape,
     @assignment_source_replacement_shape,
@@ -1825,6 +1827,7 @@ defmodule Tightbeam.Schema do
   def guard_compatible_stamps do
     # The first entry is the target stamp a successful boot must reach.
     [
+      @attest_lifecycle_actor_shape,
       @session_custody_artifact_process_shape,
       @session_custody_shape,
       @artifact_process_attribution_shape,
@@ -1979,6 +1982,7 @@ defmodule Tightbeam.Schema do
             @session_custody_shape,
             @artifact_process_attribution_shape,
             @session_custody_artifact_process_shape,
+            @attest_lifecycle_actor_shape,
             @evidence_release_shape,
             @decision_request_row_schema_shape,
             @assignment_source_replacement_shape,
@@ -2063,6 +2067,8 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
     :ok = ensure_notice_batch_chat_message_format(db)
     :ok = Tightbeam.RowReactions.Store.ensure_schema(db)
+    # FYI lines are additive current-build storage beside accepted records.
+    :ok = Tightbeam.RecordFyis.ensure_schema(db)
     :ok = Tightbeam.HarnessHealth.RecoverySchedule.ensure_schema(db)
     :ok = Tightbeam.HarnessHealth.RecoveryCheck.ensure_schema(db)
     :ok = Tightbeam.HarnessRecoveryNotice.ensure_schema(db)
@@ -2135,6 +2141,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
     :ok = upgrade_session_custody_v1(db)
+    :ok = upgrade_attest_lifecycle_actor(db)
     :ok = Tightbeam.Projection.ensure_submitter_column(db)
     :ok = Tightbeam.RecordEvents.ensure_schema(db)
 
@@ -2221,6 +2228,9 @@ defmodule Tightbeam.Schema do
                [[@session_custody_artifact_process_shape]] ->
                  :ok
 
+               [[@attest_lifecycle_actor_shape]] ->
+                 :ok
+
                rows ->
                  raise ShapeError,
                    message: "incompatible session custody predecessor: #{inspect(rows)}"
@@ -2231,6 +2241,82 @@ defmodule Tightbeam.Schema do
       {:error, error} -> raise error
     end
   end
+
+  # Users and automation file progress, completion and cannot-proceed attests
+  # as well as sessions. The stored CHECK required a session actor on those
+  # rows; it now allows at most one typed actor, the rule verdicts already
+  # follow, and an automation attest keeps both typed actors empty like every
+  # other process act. Relaxing a CHECK leaves every stored row valid, so the
+  # stored definition is rewritten in place rather than the table rebuilt.
+  defp upgrade_attest_lifecycle_actor(db) do
+    case DB.migration_transaction(
+           db,
+           :attest_lifecycle_actor,
+           [],
+           [],
+           fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[@session_custody_artifact_process_shape]] ->
+                 [[previous]] =
+                   Txn.q(
+                     txn,
+                     "SELECT sql FROM sqlite_master WHERE type='table' AND name='attests'"
+                   )
+
+                 current = attest_lifecycle_actor_sql(previous)
+
+                 if current == previous,
+                   do:
+                     raise(ShapeError,
+                       message:
+                         "incompatible attests table: no session-only lifecycle actor clause"
+                     )
+
+                 [[version]] = Txn.q(txn, "PRAGMA schema_version")
+                 :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
+
+                 Txn.q(
+                   txn,
+                   "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='attests'",
+                   [current]
+                 )
+
+                 :ok = Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+                 :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
+
+                 Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                   @attest_lifecycle_actor_shape,
+                   System.system_time(:millisecond),
+                   @session_custody_artifact_process_shape
+                 ])
+
+                 if Txn.changes(txn) != 1,
+                   do: raise(ShapeError, message: "attest lifecycle actor stamp transition lost")
+
+                 :ok
+
+               [[@attest_lifecycle_actor_shape]] ->
+                 :ok
+
+               rows ->
+                 raise ShapeError,
+                   message: "incompatible attest lifecycle actor predecessor: #{inspect(rows)}"
+             end
+           end
+         ) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  def attest_lifecycle_actor_sql(sql),
+    do:
+      String.replace(
+        sql,
+        ~r/bySession IS NOT NULL AND\s+byUser IS NULL AND verdictKind IS NULL/,
+        "verdictKind IS NULL AND (bySession IS NULL OR byUser IS NULL)"
+      )
 
   defp ensure_wake_assignment_index(db) do
     case DB.migration_transaction(db, :wake_assignment_index, [], [], fn txn ->
@@ -2849,6 +2935,7 @@ defmodule Tightbeam.Schema do
                       @session_custody_shape,
                       @artifact_process_attribution_shape,
                       @session_custody_artifact_process_shape,
+                      @attest_lifecycle_actor_shape,
                       @evidence_release_shape
                     ] ->
                  validate_notice_source_payload_in_txn!(txn)
@@ -3804,7 +3891,8 @@ defmodule Tightbeam.Schema do
                  [[@closed_assignment_reconciliation_shape]],
                  [[@session_custody_shape]],
                  [[@artifact_process_attribution_shape]],
-                 [[@session_custody_artifact_process_shape]]
+                 [[@session_custody_artifact_process_shape]],
+                 [[@attest_lifecycle_actor_shape]]
                ],
                do: process_actor_table_sql(object.name, object.sql),
                else: object.sql
@@ -3848,7 +3936,8 @@ defmodule Tightbeam.Schema do
            [[@closed_assignment_reconciliation_shape]],
            [[@session_custody_shape]],
            [[@artifact_process_attribution_shape]],
-           [[@session_custody_artifact_process_shape]]
+           [[@session_custody_artifact_process_shape]],
+           [[@attest_lifecycle_actor_shape]]
          ],
          do: process_actor_table_sql(name, expected),
          else: expected
@@ -3900,6 +3989,7 @@ defmodule Tightbeam.Schema do
                  @session_custody_shape,
                  @artifact_process_attribution_shape,
                  @session_custody_artifact_process_shape,
+                 @attest_lifecycle_actor_shape,
                  @evidence_release_shape,
                  @decision_request_row_schema_shape
                ],
@@ -3917,6 +4007,7 @@ defmodule Tightbeam.Schema do
           @session_custody_shape,
           @artifact_process_attribution_shape,
           @session_custody_artifact_process_shape,
+          @attest_lifecycle_actor_shape,
           @evidence_release_shape,
           @decision_request_row_schema_shape
         ] ->
@@ -4011,6 +4102,7 @@ defmodule Tightbeam.Schema do
           @session_custody_shape,
           @artifact_process_attribution_shape,
           @session_custody_artifact_process_shape,
+          @attest_lifecycle_actor_shape,
           @evidence_release_shape,
           @decision_request_row_schema_shape,
           @assignment_source_replacement_shape,
@@ -4038,6 +4130,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] and
@@ -4911,7 +5004,8 @@ defmodule Tightbeam.Schema do
                     @closed_assignment_reconciliation_shape,
                     @session_custody_shape,
                     @artifact_process_attribution_shape,
-                    @session_custody_artifact_process_shape
+                    @session_custody_artifact_process_shape,
+                    @attest_lifecycle_actor_shape
                   ] ->
                # A stamped successor missing its required columns is corruption, not a
                # second opportunity to migrate an inferred shape.
@@ -5022,7 +5116,8 @@ defmodule Tightbeam.Schema do
                       @closed_assignment_reconciliation_shape,
                       @session_custody_shape,
                       @artifact_process_attribution_shape,
-                      @session_custody_artifact_process_shape
+                      @session_custody_artifact_process_shape,
+                      @attest_lifecycle_actor_shape
                     ] ->
                  :ok
 
@@ -5072,7 +5167,8 @@ defmodule Tightbeam.Schema do
             when shape in [
                    @session_custody_shape,
                    @artifact_process_attribution_shape,
-                   @session_custody_artifact_process_shape
+                   @session_custody_artifact_process_shape,
+                   @attest_lifecycle_actor_shape
                  ] ->
               :current
 
@@ -5222,7 +5318,8 @@ defmodule Tightbeam.Schema do
                     @closed_assignment_reconciliation_shape,
                     @session_custody_shape,
                     @artifact_process_attribution_shape,
-                    @session_custody_artifact_process_shape
+                    @session_custody_artifact_process_shape,
+                    @attest_lifecycle_actor_shape
                   ] ->
                Tightbeam.EvidenceSchemaRelease.validate_in_txn!(txn)
 
@@ -5272,6 +5369,7 @@ defmodule Tightbeam.Schema do
                     @session_custody_shape,
                     @artifact_process_attribution_shape,
                     @session_custody_artifact_process_shape,
+                    @attest_lifecycle_actor_shape,
                     @evidence_release_shape
                   ] ->
                :ok =
@@ -5390,6 +5488,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] do
@@ -5572,6 +5671,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] ->
@@ -5736,6 +5836,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape
            ] ->
         if effort_holder_activity_cancellation_active?(txn) do
@@ -6147,14 +6248,19 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape
            ] ->
         :ok = check_work_item_owner_link_shape(db)
         :ok = check_decision_request_row_schema_shape(db)
 
-        if shape in [@session_custody_shape, @session_custody_artifact_process_shape],
-          do: check_session_custody_shape(db),
-          else: :ok
+        if shape in [
+             @session_custody_shape,
+             @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape
+           ],
+           do: check_session_custody_shape(db),
+           else: :ok
 
       {:ok, [[shape]]}
       when shape in [
@@ -6262,7 +6368,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@session_custody_artifact_process_shape}
+          this build: #{@attest_lifecycle_actor_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -6280,7 +6386,7 @@ defmodule Tightbeam.Schema do
         then #{@launch_preparation_boot_shape}, followed by #{@evidence_release_shape} and
         #{@closed_assignment_reconciliation_shape}, followed by
         #{@artifact_process_attribution_shape} or #{@session_custody_shape},
-        then #{@session_custody_artifact_process_shape}.
+        then #{@session_custody_artifact_process_shape}, then #{@attest_lifecycle_actor_shape}.
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
         """
@@ -6293,7 +6399,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@session_custody_artifact_process_shape}
+          this build: #{@attest_lifecycle_actor_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
@@ -6437,6 +6543,7 @@ defmodule Tightbeam.Schema do
                     @session_custody_shape,
                     @artifact_process_attribution_shape,
                     @session_custody_artifact_process_shape,
+                    @attest_lifecycle_actor_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -6560,6 +6667,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6595,6 +6703,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6724,6 +6833,7 @@ defmodule Tightbeam.Schema do
                     @session_custody_shape,
                     @artifact_process_attribution_shape,
                     @session_custody_artifact_process_shape,
+                    @attest_lifecycle_actor_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -6912,6 +7022,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8041,6 +8152,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8085,6 +8197,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8207,6 +8320,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8475,6 +8589,7 @@ defmodule Tightbeam.Schema do
              @session_custody_shape,
              @artifact_process_attribution_shape,
              @session_custody_artifact_process_shape,
+             @attest_lifecycle_actor_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8507,6 +8622,7 @@ defmodule Tightbeam.Schema do
                     @session_custody_shape,
                     @artifact_process_attribution_shape,
                     @session_custody_artifact_process_shape,
+                    @attest_lifecycle_actor_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8552,6 +8668,7 @@ defmodule Tightbeam.Schema do
                     @session_custody_shape,
                     @artifact_process_attribution_shape,
                     @session_custody_artifact_process_shape,
+                    @attest_lifecycle_actor_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8624,6 +8741,7 @@ defmodule Tightbeam.Schema do
                       @session_custody_shape,
                       @artifact_process_attribution_shape,
                       @session_custody_artifact_process_shape,
+                      @attest_lifecycle_actor_shape,
                       @evidence_release_shape,
                       @decision_request_row_schema_shape,
                       @assignment_source_replacement_shape,
@@ -8686,6 +8804,7 @@ defmodule Tightbeam.Schema do
                     @session_custody_shape,
                     @artifact_process_attribution_shape,
                     @session_custody_artifact_process_shape,
+                    @attest_lifecycle_actor_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8792,7 +8911,8 @@ defmodule Tightbeam.Schema do
             [[shape]]
             when shape in [
                    @artifact_process_attribution_shape,
-                   @session_custody_artifact_process_shape
+                   @session_custody_artifact_process_shape,
+                   @attest_lifecycle_actor_shape
                  ] ->
               validate_artifact_process_schema!(
                 txn,
@@ -9046,6 +9166,7 @@ defmodule Tightbeam.Schema do
                     @session_custody_shape,
                     @artifact_process_attribution_shape,
                     @session_custody_artifact_process_shape,
+                    @attest_lifecycle_actor_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -9100,6 +9221,7 @@ defmodule Tightbeam.Schema do
                     @session_custody_shape,
                     @artifact_process_attribution_shape,
                     @session_custody_artifact_process_shape,
+                    @attest_lifecycle_actor_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape
                   ] ->

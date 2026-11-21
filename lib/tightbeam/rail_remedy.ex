@@ -73,14 +73,10 @@ defmodule Tightbeam.RailRemedy do
   def fire(
         db,
         _handlers,
-        %{name: name, remedy: %{action: "wake"}} = rule,
+        %{remedy: %{action: "wake", accountable_notice: true}} = rule,
         subject,
         call
-      )
-      when name in [
-             "completion-requires-review",
-             "agentic-engineering.completion-requires-review"
-           ] do
+      ) do
     result =
       with {:ok, context} <- binding_context(db, subject, call),
            {:ok, resolved} <- resolve_remedy(rule.remedy, context),

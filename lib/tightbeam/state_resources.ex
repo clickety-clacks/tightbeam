@@ -47,8 +47,10 @@ defmodule Tightbeam.StateResources do
            WHEN t.origin IS NULL THEN NULL
            ELSE 'other'
          END,
-         t.batchMemberCount
+         t.batchMemberCount,
+         #{Tightbeam.HarnessHealth.Hold.turn_columns_sql()}
   FROM turns AS t
+  #{Tightbeam.HarnessHealth.Hold.turn_join_sql()}
   """
 
   @assignment_select """
@@ -260,11 +262,11 @@ defmodule Tightbeam.StateResources do
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "attests" =>
-      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs ts rowVersion),
+      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs fyi ts rowVersion),
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
-      ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt triggerSource batchMemberCount rowVersion),
+      ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt triggerSource batchMemberCount holdSince holdIncidentId holdFailureClass holdRelease rowVersion),
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
@@ -341,12 +343,12 @@ defmodule Tightbeam.StateResources do
     },
     "turns" => %{
       strings:
-        ~w(sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness status owner requestRef error triggerSource),
+        ~w(sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness status owner requestRef error triggerSource holdIncidentId holdFailureClass holdRelease),
       integers:
-        ~w(seq replyAttention adapterGen createdAt startedAt endedAt publishedAt batchMemberCount rowVersion),
+        ~w(seq replyAttention adapterGen createdAt startedAt endedAt publishedAt batchMemberCount holdSince rowVersion),
       booleans: [],
       nullable:
-        ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt triggerSource batchMemberCount)
+        ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt triggerSource batchMemberCount holdIncidentId holdFailureClass)
     },
     "decision requests" => %{
       strings:
@@ -475,6 +477,7 @@ defmodule Tightbeam.StateResources do
     {"work items", "landings"} => {:array, :landing, :preserve},
     {"assignments", "files"} => {:array, :string, :preserve},
     {"attests", "commitRefs"} => {:array, :commit_ref, :preserve},
+    {"attests", "fyi"} => {:array, :string, :preserve},
     {"decision requests", "options"} => {:array, :decision_option, :preserve},
     {"decision requests", "context"} => :json,
     {"sessions", "overrides"} => :session_overrides,
@@ -1418,6 +1421,7 @@ defmodule Tightbeam.StateResources do
           by_harness: by_harness,
           by_provider: by_provider,
           commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
+          fyi: Map.get(Tightbeam.RecordFyis.list_many(db, "attest", [id]), id, []),
           ts: ts
         }
 
@@ -2103,7 +2107,7 @@ defmodule Tightbeam.StateResources do
 
   def attest(row) do
     reject_public_shape_drift!(row, "attests")
-    row |> public() |> closed_projection("attests")
+    row |> public() |> Map.put_new("fyi", []) |> closed_projection("attests")
   end
 
   def wake(nil), do: nil
@@ -2635,9 +2639,15 @@ defmodule Tightbeam.StateResources do
         do: fields,
         else: List.delete(fields, "triggerSource")
 
-    if Map.has_key?(item, "batchMemberCount"),
+    fields =
+      if Map.has_key?(item, "batchMemberCount"),
+        do: fields,
+        else: List.delete(fields, "batchMemberCount")
+
+    # Present only on a queued turn read behind a standing park fence.
+    if Map.has_key?(item, "holdSince"),
       do: fields,
-      else: List.delete(fields, "batchMemberCount")
+      else: fields -- ~w(holdSince holdIncidentId holdFailureClass holdRelease)
   end
 
   defp conditional_fields!("transcript messages", fields, item) do
@@ -3326,7 +3336,10 @@ defmodule Tightbeam.StateResources do
          ended_at,
          published_at,
          trigger_source,
-         batch_member_count
+         batch_member_count,
+         hold_since,
+         hold_incident_id,
+         hold_failure_class
        ]) do
     %{
       seq: seq,
@@ -3356,6 +3369,20 @@ defmodule Tightbeam.StateResources do
       trigger_source: trigger_source,
       batch_member_count: batch_member_count
     }
+    |> put_turn_hold(hold_since, hold_incident_id, hold_failure_class)
+  end
+
+  # A queued turn behind a standing park fence says so. The fields exist only
+  # while held; the release wording is shared with the repair refusal.
+  defp put_turn_hold(row, nil, _incident_id, _failure_class), do: row
+
+  defp put_turn_hold(row, since, incident_id, failure_class) do
+    Map.merge(row, %{
+      hold_since: since,
+      hold_incident_id: incident_id,
+      hold_failure_class: failure_class,
+      hold_release: Tightbeam.HarnessHealth.Hold.release_text(incident_id, failure_class)
+    })
   end
 
   defp message_row([
