@@ -81,7 +81,7 @@ defmodule Tightbeam.HolderProd do
   defp cancel_in_txn(txn, wake_id) do
     unless Wakes.cancel_in_txn(txn, %{
              wake_id: wake_id,
-             requester: %{kind: "process", id: "tightbeam:holder-prod"},
+             requester: %{kind: "process", id: "tightbeam:rail-remedy"},
              reason_kind: "superseded",
              causal_source: %{kind: "wake", id: wake_id},
              outcome: %{kind: "no_replacement"}
@@ -113,7 +113,7 @@ defmodule Tightbeam.HolderProd do
              COALESCE((SELECT MAX(MAX(w.createdAt, COALESCE(w.firedAt,0), COALESCE(w.canceledAt,0)))
                        FROM wakes w WHERE w.sessionKey=a.holderKey
                          AND w.state IN ('fired','canceled')
-                         AND w.consumer='prompt'
+                         AND w.consumer='prompt' AND w.digest=0
                          AND NOT (w.origin='process:tightbeam'
                            AND COALESCE(substr(w.obligationRef,1,length(?2))=?2,0))
                          AND (
@@ -145,7 +145,7 @@ defmodule Tightbeam.HolderProd do
          )
          AND NOT EXISTS (
            SELECT 1 FROM wakes w
-           WHERE w.sessionKey=e.holderKey AND w.state='pending' AND w.consumer='prompt'
+           WHERE w.sessionKey=e.holderKey AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
              AND (w.assignmentId=e.id OR w.assignmentId IS NULL)
              AND (w.creatorSessionKey=e.holderKey OR
                (w.assignmentId=e.id

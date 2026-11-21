@@ -4576,7 +4576,7 @@ defmodule Tightbeam.Wakes do
 
   defp holder_prod_superseded?(
          %{
-           requester: %{kind: "process", id: "tightbeam:holder-prod"},
+           requester: %{kind: "process", id: "tightbeam:rail-remedy"},
            reason_kind: "superseded",
            causal_source: %{kind: "wake", id: wake_id},
            outcome: %{kind: "no_replacement"}
@@ -4774,13 +4774,6 @@ defmodule Tightbeam.Wakes do
       _ ->
         :error
     end
-  end
-
-  defp authorize_cancel(
-         %{requester: %{kind: "process", id: "tightbeam:holder-prod"}} = command,
-         wake
-       ) do
-    if holder_prod_superseded?(command, wake), do: :ok, else: :error
   end
 
   defp authorize_cancel(
