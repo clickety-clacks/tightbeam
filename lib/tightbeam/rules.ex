@@ -1475,10 +1475,25 @@ defmodule Tightbeam.Rules do
 
   defp add_builtin_defaults(entries, true, verbs, law_base, sha, declarations) do
     Enum.reduce(@builtin_default_reactions, entries, fn {name, relative}, acc ->
-      if Enum.any?(acc, &match?({:reaction, %{name: ^name}}, &1)) do
-        acc
-      else
-        acc ++ builtin_default(name, relative, verbs, law_base, sha, declarations)
+      # Names are unique across rules, policies and reactions: a second entry of
+      # any kind with the same name would make the loader drop both, including a
+      # valid live one. Existing law is never disturbed for the default.
+      cond do
+        Enum.any?(acc, &match?({:reaction, %{name: ^name}}, &1)) ->
+          acc
+
+        Enum.any?(acc, &match?({kind, %{name: ^name}} when kind in [:rule, :policy], &1)) ->
+          require Logger
+
+          Logger.warning(
+            "built-in default rule #{name} is not used: the live identity already has a " <>
+              "rule or policy with that name, which is not a reaction"
+          )
+
+          acc
+
+        true ->
+          acc ++ builtin_default(name, relative, verbs, law_base, sha, declarations)
       end
     end)
   end

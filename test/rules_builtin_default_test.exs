@@ -3,7 +3,7 @@ defmodule Tightbeam.RulesBuiltinDefaultTest do
 
   import ExUnit.CaptureLog
 
-  alias Tightbeam.{Identity, Rules}
+  alias Tightbeam.{Gateway, Identity, Rules}
 
   @notice "assignment-terminal-handoff"
   @notice_path "rules/row-reaction-handoff.toml"
@@ -88,6 +88,29 @@ defmodule Tightbeam.RulesBuiltinDefaultTest do
     capture_log(fn ->
       assert [_one] = reactions(ctx.base, true) |> Enum.filter(&(&1.name == @notice))
     end)
+  end
+
+  test "a valid live rule or policy with the same name keeps working and is not displaced", ctx do
+    init_shape!(ctx.base, "0.1.15")
+    File.mkdir_p!(Path.join(ctx.dir, "rules"))
+
+    File.write!(Path.join(ctx.dir, "rules/same-name.toml"), """
+    [[rule]]
+    name = "#{@notice}"
+    verb = "assign"
+    text = "a rule that happens to share the notice's name"
+    deny_when = [{ fact = "target.archetype", op = "eq", value = "never-matches" }]
+    """)
+
+    log =
+      capture_log(fn ->
+        assert [%{name: @notice}] = Gateway.load_law!(%{base_dir: ctx.base}, ["assign"])
+      end)
+
+    assert log =~ "built-in default rule #{@notice} is not used"
+    refute log =~ "duplicate name"
+    assert [] == Enum.filter(Rules.effective_snapshot().reactions, &(&1.name == @notice))
+    assert Rules.status().unavailable_verbs == []
   end
 
   test "without the option the loader adds nothing", ctx do
