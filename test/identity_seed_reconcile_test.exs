@@ -3,11 +3,10 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
 
   import ExUnit.CaptureLog
 
-  alias Tightbeam.{AdminProjection, DB, Identity, Reminders, Rules, Schema}
+  alias Tightbeam.{AdminProjection, DB, Identity, Rules, Schema}
   alias Tightbeam.Identity.SeedReconcile
 
   @notice "assignment-terminal-handoff"
-  @reminder "terminal-child-action-reminder"
   @notice_path "rules/row-reaction-handoff.toml"
   @reminder_path "rules/row-reaction-terminal-action.toml"
   @shapes Path.expand("fixtures/identity-seed-shapes", __DIR__)
@@ -24,32 +23,38 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     %{base: base, db: db, dir: Path.join(base, "identity")}
   end
 
-  test "a fresh install has both finished-child rules and the reminder wording, and reconcile is a no-op",
-       ctx do
+  test "a fresh install has the finished-child notice rule and reconcile is a no-op", ctx do
     assert :initialized = Identity.init!(ctx.base)
     live = Identity.live_revision!(ctx.base)
 
     assert %{added: [], attention: [], candidate: nil} = SeedReconcile.run!(ctx.base, ctx.db)
     assert Identity.live_revision!(ctx.base) == live
-    assert [@notice, @reminder] == loaded_reaction_names(ctx.base)
-
-    # No learned kungfu: the reminder text is the shipped default.
+    assert loaded?(ctx.base)
     refute File.exists?(Path.join(ctx.dir, "kungfu"))
-    assert Reminders.render(ctx.base, "terminal-action", %{child_assignment_id: "a1"}) =~ "a1"
+  end
+
+  test "the notice rule belongs to no kungfu bundle, so retiring one cannot remove it" do
+    assert File.regular?(Path.join(@seed, @notice_path))
+
+    holders =
+      [__DIR__, "..", "priv", "kungfu", "*", "**", "*.toml"]
+      |> Path.join()
+      |> Path.wildcard()
+      |> Enum.filter(&(File.read!(&1) =~ @notice))
+
+    assert holders == []
   end
 
   for shape <- ["0.1.15", "0.1.16"] do
-    test "an install shaped like #{shape} gets every shipped seed rule at startup, once, with no relearn",
+    test "an install shaped like #{shape} gets the notice rule at startup, once, with no relearn",
          ctx do
       init_shape!(ctx.base, unquote(shape))
       prior = Identity.live_revision!(ctx.base)
-      refute @notice in loaded_reaction_names(ctx.base)
+      refute loaded?(ctx.base)
       assert :ok = AdminProjection.bootstrap_served(ctx.db, ctx.base)
 
-      assert %{added: added, attention: [], candidate: %{candidate_revision: revision}} =
+      assert %{added: [@notice], attention: [], candidate: %{candidate_revision: revision}} =
                SeedReconcile.run!(ctx.base, ctx.db)
-
-      assert @notice in added and @reminder in added
 
       # Recorded as one new commit, published, and stamped as served.
       assert Identity.live_revision!(ctx.base) == revision
@@ -62,11 +67,17 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
       assert %{"liveRevision" => ^revision} =
                AdminProjection.stamped_item(ctx.db, "identity", "served")
 
-      for path <- seed_law_paths() do
-        assert live_bytes(ctx.dir, path) == File.read!(Path.join(@seed, path))
-      end
+      assert live_bytes(ctx.dir, @notice_path) == File.read!(Path.join(@seed, @notice_path))
+      assert loaded?(ctx.base)
 
-      assert [@notice, @reminder] == loaded_reaction_names(ctx.base)
+      # Only the notice is delivered: the parent reminder is not an upgrade default.
+      assert {_, status} =
+               System.cmd("git", ["cat-file", "-e", "tightbeam/live:#{@reminder_path}"],
+                 cd: ctx.dir,
+                 stderr_to_stdout: true
+               )
+
+      assert status != 0
 
       # The next boot finds nothing to do.
       assert %{added: [], attention: [], candidate: nil} = SeedReconcile.run!(ctx.base, ctx.db)
@@ -75,49 +86,42 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     end
   end
 
-  test "a 0.1.16 install whose learned engineering bundle already supplies the rules gets no duplicate",
+  test "a rule a learned bundle already supplies is not duplicated, and returns when it is retired",
        ctx do
     init_shape!(ctx.base, "0.1.16")
 
-    # The released bundle put the same named reactions in its own rule files.
-    for path <- [@notice_path, @reminder_path] do
-      destination = Path.join(ctx.dir, "kungfu/engineering/#{path}")
-      File.mkdir_p!(Path.dirname(destination))
-      File.cp!(Path.join(@seed, path), destination)
-    end
+    # An earlier bundle put the same named reaction in its own rule file.
+    destination = Path.join(ctx.dir, "kungfu/engineering/#{@notice_path}")
+    File.mkdir_p!(Path.dirname(destination))
+    File.cp!(Path.join(@seed, @notice_path), destination)
+    commit_and_publish!(ctx.dir, "fixture: bundle supplies the rule")
 
-    commit_and_publish!(ctx.dir, "fixture: bundle supplies the rules")
-
-    assert %{candidate: %{}} = SeedReconcile.run!(ctx.base, ctx.db)
+    assert %{candidate: nil, added: []} = SeedReconcile.run!(ctx.base, ctx.db)
     refute File.exists?(Path.join(ctx.dir, @notice_path))
-    refute File.exists?(Path.join(ctx.dir, @reminder_path))
-    # A duplicated name would silently disable both, so each must still load.
-    assert [@notice, @reminder] == loaded_reaction_names(ctx.base)
+    # A duplicated name would silently disable both, so it must still load once.
+    assert loaded?(ctx.base)
 
-    # Retiring the bundle leaves the shipped default in its place at next start.
     File.rm_rf!(Path.join(ctx.dir, "kungfu"))
     commit_and_publish!(ctx.dir, "fixture: bundle retired")
-    refute @notice in loaded_reaction_names(ctx.base)
-    assert %{added: added} = SeedReconcile.run!(ctx.base, ctx.db)
-    assert added == [@notice, @reminder]
-    assert [@notice, @reminder] == loaded_reaction_names(ctx.base)
+    refute loaded?(ctx.base)
+    assert %{added: [@notice]} = SeedReconcile.run!(ctx.base, ctx.db)
+    assert loaded?(ctx.base)
   end
 
-  test "an operator-edited live rule keeps its bytes and an operator-deleted one comes back", ctx do
+  test "an operator-edited live rule keeps its bytes", ctx do
     assert :initialized = Identity.init!(ctx.base)
     edited = File.read!(Path.join(ctx.dir, @notice_path)) <> "\n# operator edit\n"
     File.write!(Path.join(ctx.dir, @notice_path), edited)
-    File.rm!(Path.join(ctx.dir, @reminder_path))
-    commit_and_publish!(ctx.dir, "operator: edit one rule, drop the other")
+    commit_and_publish!(ctx.dir, "operator: edit the rule")
+    live = Identity.live_revision!(ctx.base)
 
-    assert %{added: [@reminder], attention: [], candidate: %{}} =
-             SeedReconcile.run!(ctx.base, ctx.db)
-
+    assert %{added: [], attention: [], candidate: nil} = SeedReconcile.run!(ctx.base, ctx.db)
+    assert Identity.live_revision!(ctx.base) == live
     assert live_bytes(ctx.dir, @notice_path) == edited
-    assert live_bytes(ctx.dir, @reminder_path) == File.read!(Path.join(@seed, @reminder_path))
   end
 
-  test "an occupied path that lacks a shipped entry is reported loudly and never rewritten", ctx do
+  test "an occupied path that lacks the shipped entry is reported loudly and never rewritten",
+       ctx do
     assert :initialized = Identity.init!(ctx.base)
     renamed = String.replace(File.read!(Path.join(ctx.dir, @notice_path)), @notice, "local-name")
     File.write!(Path.join(ctx.dir, @notice_path), renamed)
@@ -179,13 +183,6 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     refute File.exists?(Path.join(ctx.dir, @notice_path))
   end
 
-  defp seed_law_paths do
-    ~w(rules rails)
-    |> Enum.flat_map(fn kind ->
-      @seed |> Path.join(kind) |> File.ls!() |> Enum.map(&Path.join(kind, &1))
-    end)
-  end
-
   defp init_shape!(base, shape) do
     previous = Application.get_env(:tightbeam, :identity_seed_dir)
     Application.put_env(:tightbeam, :identity_seed_dir, Path.join(@shapes, shape))
@@ -199,15 +196,12 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     end
   end
 
-  defp loaded_reaction_names(base) do
+  # A duplicated name drops both copies, so "loaded" also proves it is defined once.
+  defp loaded?(base) do
     Identity.with_recovery_law!(base, fn law_base, revision ->
       Rules.load!(base, [], law_base: law_base, revision: revision)
-
-      Rules.effective_snapshot().reactions
-      |> Enum.map(& &1.name)
-      |> Enum.filter(&(&1 in [@notice, @reminder]))
+      Enum.any?(Rules.effective_snapshot().reactions, &(&1.name == @notice))
     end)
-    |> Enum.sort_by(&(&1 != @notice))
   end
 
   defp live_bytes(dir, path) do

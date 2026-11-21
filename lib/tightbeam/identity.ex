@@ -1322,12 +1322,19 @@ defmodule Tightbeam.Identity do
 
   @seed_law_kinds ~w(rule policy reaction statute)
 
+  # Seed law files delivered to an existing install at startup. A shipped seed
+  # file is not automatically a default for upgrades: add its path here to make it
+  # one. The parent action reminder is deliberately absent; whether it ships as a
+  # default is a separate product decision.
+  @auto_delivered_seed_law ["rules/row-reaction-handoff.toml"]
+
   @doc """
-  Add the shipped seed law entries the live identity lacks, and report the rest.
+  Add the auto-delivered shipped seed law entries the live identity lacks, and
+  report the rest.
 
   Shipped seed defaults reach a fresh install through `init!/1`; an install that
   predates a default would otherwise need a manual relearn. This runs at startup
-  so an upgrade delivers them. It only ever ADDS. A seed law file is written when
+  so an upgrade delivers the ones listed in `@auto_delivered_seed_law`. It only ever ADDS. A seed law file is written when
   none of its entries (matched by kind and name, in any law file of the live
   identity, so a copy an operator moved or a learned bundle supplies counts) is
   present and its path is free. Anything else is reported in `:attention` and
@@ -1473,7 +1480,7 @@ defmodule Tightbeam.Identity do
       |> MapSet.new()
 
     seed_entries()
-    |> Enum.filter(fn {path, _} -> law_file_path?(path) and String.ends_with?(path, ".toml") end)
+    |> Enum.filter(fn {path, _} -> path in @auto_delivered_seed_law end)
     |> Enum.reduce(%{add: [], blocked: []}, fn {path, bytes}, acc ->
       shipped = law_entry_names(bytes)
       absent = Enum.reject(shipped, &MapSet.member?(live_names, &1))

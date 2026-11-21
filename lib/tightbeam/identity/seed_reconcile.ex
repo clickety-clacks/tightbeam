@@ -4,7 +4,8 @@ defmodule Tightbeam.Identity.SeedReconcile do
 
   A fresh install is seeded from `priv/seed`. An install that predates a shipped
   default has no such entry, and only a manual `tightbeam identity relearn` would
-  add it. At every boot this adds the absent shipped seed law entries to the live
+  add it. At every boot this adds the absent entries of the seed law files that
+  `Identity` lists for delivery (today the finished-child notice) to the live
   identity as one recorded commit and publishes it, the same way the rail-scope
   migration does. It never changes an entry that is present, so an edited live
   copy stays as the operator left it. What it cannot add it reports as a warning
