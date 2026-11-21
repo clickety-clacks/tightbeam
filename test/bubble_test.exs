@@ -746,11 +746,27 @@ defmodule Tightbeam.Productions.BubbleTest do
       assert is_binary(assignment.id)
     end
 
+    child = session(ctx.db, "decision-child", ctx.holder.session_key)
+
+    {_assignment, blocked} =
+      cannot_proceed_assignment!(
+        ctx,
+        child.session_key,
+        ctx.holder.session_key,
+        "decision carried alongside dispatches"
+      )
+
+    queue_decision_wake!(ctx, blocked.decisionWake)
     finish_busy_recipient!(ctx.db, busy)
     [carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
     assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "assignment-carrier")
     assert turn.wake_id == carrier_id
-    assert turn.assignment_id == nil
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq])
+
+    assert [%{delivery_wake_id: ^carrier_id}] =
+             NoticeBatcher.source_refs(ctx.db, blocked.decisionWake.wake_id)
 
     assert :ok =
              Ledger.finish(ctx.db, turn.seq, "failed", "The provider refused the prompt.",
@@ -768,6 +784,13 @@ defmodule Tightbeam.Productions.BubbleTest do
     end
 
     assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+
+    disposer = "session:" <> ctx.holder.session_key
+
+    assert {:ok, [[^disposer]]} =
+             DB.query(ctx.db, "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1", [
+               blocked.cannotProceed.id
+             ])
   end
 
   test "a failed senderless notice to parentless Main surfaces its source once", ctx do

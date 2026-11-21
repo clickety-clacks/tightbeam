@@ -322,7 +322,8 @@ defmodule Tightbeam.Productions.Bubble do
       # including while that recipient is busy. Commit the authority change with
       # admission so restart or publication failure cannot strand it. Replaying
       # an earlier rung must not reclaim authority from a later recipient.
-      if new_source? and
+      # A refusal confirms receipt. Its failure wake carries no decision custody.
+      if new_source? and not cause.refused? and
            (match?({:staged, _}, delivery) or match?({:appended, _, _, _}, delivery)) do
         transfer_cannot_proceed_disposers_for_cause_in_txn(txn, turn.cause_seq, recipient)
       end
@@ -568,11 +569,13 @@ defmodule Tightbeam.Productions.Bubble do
                   "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
                 )
 
-                transfer_cannot_proceed_disposers_to_user_for_cause_in_txn(
-                  txn,
-                  turn.cause_seq,
-                  turn.owner
-                )
+                unless cause.refused? do
+                  transfer_cannot_proceed_disposers_to_user_for_cause_in_txn(
+                    txn,
+                    turn.cause_seq,
+                    turn.owner
+                  )
+                end
 
                 main_key = Org.personal_session_key(turn.owner)
 
