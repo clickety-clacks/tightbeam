@@ -140,9 +140,9 @@ defmodule Tightbeam.ArtifactContentFetchTest do
     id = archived(ctx, home, host, sha256("remote bytes"))
     caller = self()
 
-    runner = fn argv ->
+    runner = fn argv, collector ->
       send(caller, {:remote_read, argv})
-      {"remote bytes", 0}
+      System.cmd("sh", ["-c", "printf %s 'remote bytes'"], into: collector)
     end
 
     assert %{source: "archived_home", verification_status: "match"} =
@@ -151,6 +151,24 @@ defmodule Tightbeam.ArtifactContentFetchTest do
     assert_received {:remote_read, ["ssh" | args]}
     assert destination in args
     assert List.last(args) =~ home
+  end
+
+  test "an archived file just over the inline cap returns its complete digest and home", ctx do
+    home = Path.join(ctx.workspace, "large.bin")
+    limit = 64 * 1024
+    bytes = :binary.copy(<<63>>, limit + 1)
+    File.write!(home, bytes)
+    digest = sha256(bytes)
+    id = archived(ctx, home, Placement.local_host_name(), digest)
+
+    result = fetch(ctx, id, %{artifact_archive_inline_limit_bytes: limit})
+
+    assert result.verification_status == "match"
+    assert result.archived_home == home
+    assert result.content_sha256 == digest
+    assert result.content_size == limit + 1
+    assert result.content_unavailable_reason =~ "too large to return inline"
+    refute Map.has_key?(result, :content_base64)
   end
 
   defp fetch(ctx, id, config \\ %{}) do

@@ -3985,9 +3985,13 @@ defmodule Tightbeam.Wire.RouterTest do
     changed = "changed after it was recorded"
     File.write!(archived.home, changed)
     mismatch = dispatch_cli(ctx, writer.cli_token, body)
-    assert mismatch.status == 400
-    assert %{"error" => details} = JSON.decode!(mismatch.resp_body)
-    assert details["code"] == "artifact_sha_mismatch"
+    assert mismatch.status == 200
+    assert %{"result" => captured} = JSON.decode!(mismatch.resp_body)
+    assert captured["source"] == "stored_content"
+    assert captured["verificationStatus"] == "match"
+    assert captured["contentBase64"] == Base.encode64(bytes)
+    details = captured["archiveVerification"]
+    assert details["verificationStatus"] == "mismatch"
     assert details["message"] =~ "recorded sha does not match current bytes"
     assert details["expectedSha256"] == Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
 

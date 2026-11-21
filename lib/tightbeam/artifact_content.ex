@@ -163,8 +163,35 @@ defmodule Tightbeam.ArtifactContent do
 
   defp fetch_visible(db, %{state: "archived"} = row, config) do
     case ArtifactArchive.read(db, row, config) do
-      {:ok, bytes} ->
-        verified_content(row, bytes, "archived_home")
+      {:ok, archive} ->
+        result = content_result(row, archive.sha256, archive.size, archive.bytes, "archived_home")
+
+        result =
+          if is_nil(archive.bytes) do
+            Map.merge(result, %{
+              archived_home: archive.home,
+              content_size: archive.size,
+              content_unavailable_reason: "archived artifact is too large to return inline"
+            })
+          else
+            result
+          end
+
+        case result do
+          %{code: "artifact_sha_mismatch"} ->
+            case fetch(db, row.artifact_id) do
+              nil ->
+                result
+
+              captured ->
+                row
+                |> verified_capture(captured)
+                |> Map.put(:archive_verification, Map.delete(result, :code))
+            end
+
+          result ->
+            result
+        end
 
       {:error, reason} ->
         case fetch(db, row.artifact_id) do
@@ -175,7 +202,7 @@ defmodule Tightbeam.ArtifactContent do
             }
 
           captured ->
-            verified_content(row, captured.content, "stored_content")
+            verified_capture(row, captured)
         end
     end
   end
@@ -192,8 +219,13 @@ defmodule Tightbeam.ArtifactContent do
     end
   end
 
-  defp verified_content(row, bytes, source) do
-    observed = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+  defp verified_capture(row, captured) do
+    bytes = captured.content
+    digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    content_result(row, digest, byte_size(bytes), bytes, "stored_content")
+  end
+
+  defp content_result(row, observed, size, bytes, source) do
     expected = row.content_sha256
 
     if expected && String.downcase(expected) != observed do
@@ -207,15 +239,16 @@ defmodule Tightbeam.ArtifactContent do
         verification_status: "mismatch"
       }
     else
-      %{
+      result = %{
         artifact_id: row.artifact_id,
         content_sha256: observed,
-        content_size: byte_size(bytes),
-        content_base64: Base.encode64(bytes),
+        content_size: size,
         expected_sha256: expected,
         source: source,
         verification_status: if(expected, do: "match", else: "unverified")
       }
+
+      if is_nil(bytes), do: result, else: Map.put(result, :content_base64, Base.encode64(bytes))
     end
   end
 

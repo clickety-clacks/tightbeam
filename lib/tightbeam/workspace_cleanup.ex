@@ -234,20 +234,26 @@ defmodule Tightbeam.WorkspaceCleanup do
         raise "archive move exited with status #{status}: #{String.trim(output)}"
     end
 
-    {:ok, :ok} =
+    {:ok, missing} =
       DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          "SELECT artifactId,home FROM artifacts WHERE #{@local_archived_home}",
-          [old, Tightbeam.Placement.local_host_name()]
-        )
-        |> Enum.each(fn [id, home] ->
-          Tightbeam.Artifacts.repoint_archive_in_txn(
+        missing =
+          Txn.q(
             txn,
-            id,
-            target <> String.replace_prefix(home, old, "")
+            "SELECT artifactId,home FROM artifacts WHERE #{@local_archived_home}",
+            [old, Tightbeam.Placement.local_host_name()]
           )
-        end)
+          |> Enum.reduce([], fn [id, home], missing ->
+            mapped = target <> String.replace_prefix(home, old, "")
+
+            case File.stat(mapped) do
+              {:ok, _} ->
+                Tightbeam.Artifacts.repoint_archive_in_txn(txn, id, mapped)
+                missing
+
+              {:error, reason} ->
+                [{id, mapped, reason} | missing]
+            end
+          end)
 
         Txn.q(
           txn,
@@ -255,10 +261,24 @@ defmodule Tightbeam.WorkspaceCleanup do
           [old, target, Tightbeam.Placement.local_host_name()]
         )
 
-        :ok
+        missing
       end)
 
-    :ok
+    Enum.each(missing, fn {id, mapped, reason} ->
+      Logger.warning(
+        "archive relocation kept the old home for #{id}: #{mapped} unavailable (#{reason})"
+      )
+    end)
+
+    case missing do
+      [] ->
+        :ok
+
+      missing ->
+        if Enum.all?(missing, fn {_, _, reason} -> reason in [:enoent, :enotdir] end),
+          do: :missing,
+          else: :retry
+    end
   rescue
     error ->
       Logger.warning("archive relocation deferred for #{entry}: #{Exception.message(error)}")

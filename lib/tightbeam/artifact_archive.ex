@@ -4,6 +4,39 @@ defmodule Tightbeam.ArtifactArchive do
   alias Tightbeam.{Placement, WorkspaceCleanup}
   alias Tightbeam.Harness.Support
 
+  defmodule Digest do
+    @moduledoc false
+    defstruct [:hash, :limit, size: 0, chunks: []]
+
+    def new(limit), do: %__MODULE__{hash: :crypto.hash_init(:sha256), limit: limit}
+
+    def append(state, bytes) do
+      size = state.size + byte_size(bytes)
+      chunks = if size <= state.limit, do: [bytes | state.chunks], else: []
+      %{state | hash: :crypto.hash_update(state.hash, bytes), size: size, chunks: chunks}
+    end
+
+    def result(state, home) do
+      %{
+        sha256: Base.encode16(:crypto.hash_final(state.hash), case: :lower),
+        size: state.size,
+        bytes: if(state.size <= state.limit, do: IO.iodata_to_binary(Enum.reverse(state.chunks))),
+        home: home
+      }
+    end
+  end
+
+  defimpl Collectable, for: Digest do
+    def into(state) do
+      {state,
+       fn
+         acc, {:cont, bytes} -> Digest.append(acc, bytes)
+         acc, :done -> acc
+         _acc, :halt -> :ok
+       end}
+    end
+  end
+
   def read(db, row, config) do
     base_dir = config[:base_dir] || Application.get_env(:tightbeam, :base_dir)
     hosts = Placement.hosts(base_dir, db)
@@ -41,14 +74,16 @@ defmodule Tightbeam.ArtifactArchive do
     end
   end
 
-  defp read_home(%{ssh: nil} = host, home, _config) do
-    case read_local(home) do
+  defp read_home(%{ssh: nil} = host, home, config) do
+    limit = inline_limit(config)
+
+    case read_local(home, limit) do
       {:error, :enoent} when is_binary(host.base_dir) ->
         source = default_root(host)
         destination = archive_root(host)
 
         if destination != source and String.starts_with?(home, source <> "/") do
-          read_local(String.replace_prefix(home, source, destination))
+          read_local(String.replace_prefix(home, source, destination), limit)
         else
           {:error, :enoent}
         end
@@ -62,22 +97,47 @@ defmodule Tightbeam.ArtifactArchive do
     quoted = Support.shell_quote(home)
     script = "[ -f #{quoted} ] && [ ! -L #{quoted} ] && exec cat #{quoted}"
     command = Support.catalog_probe_argv(ssh, script)
-    runner = config[:artifact_archive_runner] || (&Support.system_cmd_out/1)
+    runner = config[:artifact_archive_runner] || (&run_remote/2)
+    collect = Digest.new(inline_limit(config))
 
-    case Support.bounded_run(runner, command, 30_000) do
-      {:ok, {bytes, 0}} -> {:ok, bytes}
+    case Support.bounded_run(fn argv -> runner.(argv, collect) end, command, 30_000) do
+      {:ok, {%Digest{} = digest, 0}} -> {:ok, Digest.result(digest, home)}
       {:ok, {_, status}} -> {:error, {:remote_archive_read_failed, status}}
       {:ok, {:error, reason}} -> {:error, reason}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp read_local(path) do
+  defp run_remote([command | args], collect), do: System.cmd(command, args, into: collect)
+
+  defp read_local(path, limit) do
     case File.lstat(path) do
-      {:ok, %{type: :regular}} -> File.read(path)
-      {:ok, _} -> {:error, :archive_home_not_a_regular_file}
+      {:ok, %{type: :regular}} ->
+        case File.open(path, [:read, :raw, :binary], &hash_file(&1, Digest.new(limit), path)) do
+          {:ok, result} -> result
+          error -> error
+        end
+
+      {:ok, _} ->
+        {:error, :archive_home_not_a_regular_file}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp hash_file(file, digest, home) do
+    case :file.read(file, 64 * 1024) do
+      {:ok, bytes} -> hash_file(file, Digest.append(digest, bytes), home)
+      :eof -> {:ok, Digest.result(digest, home)}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp inline_limit(config) do
+    Map.get_lazy(config, :artifact_archive_inline_limit_bytes, fn ->
+      Application.get_env(:tightbeam, :artifact_archive_inline_limit_bytes, 8 * 1024 * 1024)
+    end)
   end
 
   defp archive_root(host), do: host |> WorkspaceCleanup.archive_root() |> Path.expand()
