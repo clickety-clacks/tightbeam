@@ -682,7 +682,9 @@ defmodule Tightbeam.WorkspaceCleanup do
       {:ok, [[0, attempts, next_at, reason]]} ->
         reasons = if is_binary(reason), do: String.split(reason, ", "), else: []
         held? = "uncaptured_work" in reasons
-        reasons = if held?, do: reasons -- ["cleanup_command_failed", "cleanup_incomplete"], else: reasons
+
+        reasons =
+          if held?, do: reasons -- ["cleanup_command_failed", "cleanup_incomplete"], else: reasons
 
         %{
           cleanup: if(held?, do: "held", else: "blocked"),
