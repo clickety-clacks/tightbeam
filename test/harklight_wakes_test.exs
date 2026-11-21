@@ -3502,6 +3502,76 @@ defmodule Tightbeam.HarklightWakesTest do
     end
   end
 
+  for {outcome, diagnostic, table, reason} <- [
+        {:not_found,
+         ~s|server returned HTTP 404: Some("not_found") (request ID Some("masked-request"))|,
+         "harklight_feed_stops", "not_found"},
+        {:closed, "agent feed closed: session_ended", "harklight_feed_stops", "session_ended"},
+        {:ambiguous, "unclassified final diagnostic", "harklight_feed_pauses",
+         "feed_custody_uncertain"}
+      ] do
+    @masked_outcome outcome
+    @masked_diagnostic diagnostic
+    @masked_table table
+    @masked_reason reason
+
+    test "rotation retains #{@masked_outcome} evidence read before the wrapper stops the child",
+         %{db: db} do
+      :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
+
+      fake_harklight_agent!("""
+      printf '%s\n' "$*" >> "$0.calls"
+      printf '%s\n' '{"kind":"caught_up","rev":8}'
+      if [ -e "$0.resume" ]; then exec sleep 30; fi
+      while [ ! -e "$0.fail" ]; do sleep 0.02; done
+      printf '%s\n' '#{@masked_diagnostic}' >&2
+      exec sleep 30
+      """)
+
+      agent = System.find_executable("harklight-agent")
+      manager = start_supervised!({HarklightWakes, db: db, retry_delays: [1]})
+      port = await_listener_port()
+      assert eventually(fn -> MapSet.size(:sys.get_state(manager).starts_in_flight) == 0 end)
+      state = :sys.get_state(manager)
+      worker = state.workers[@handle]
+      token = state.launch_owners[@handle]
+      1 = :erlang.trace(worker, true, [:receive])
+
+      File.touch!(agent <> ".fail")
+      assert_receive {:trace, ^worker, :receive, {^port, {:data, diagnostic}}}, 1_000
+      assert diagnostic =~ @masked_diagnostic
+
+      HarklightWakes.activate(@handle, true)
+      assert_receive {:trace, ^worker, :receive, {^port, {:exit_status, 0}}}, 2_000
+
+      assert eventually(fn ->
+               DB.query(db, "SELECT handle FROM #{@masked_table}") == {:ok, [[@handle]]}
+             end)
+
+      assert {:ok, [[diagnostic]]} = DB.query(db, "SELECT lastError FROM harklight_wake_handles")
+      assert diagnostic =~ @masked_reason
+      held = if @masked_outcome == :ambiguous, do: [[token]], else: []
+      assert {:ok, ^held} = DB.query(db, "SELECT owner FROM harklight_feed_launches")
+      assert {:ok, [[8]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+
+      expected = "listen --follow --session #{@handle} --after 8"
+      File.touch!(agent <> ".resume")
+      HarklightWakes.activate(@handle, true)
+
+      refute eventually(
+               fn ->
+                 String.split(File.read!(agent <> ".calls"), "\n", trim: true) != [expected]
+               end,
+               35
+             )
+
+      assert %{counts: %{listening: 1}} =
+               HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+      assert String.split(File.read!(agent <> ".calls"), "\n", trim: true) == [expected, expected]
+    end
+  end
+
   defp await_listener_port(attempts \\ 100)
   defp await_listener_port(0), do: flunk("listener port did not start")
 
@@ -4947,6 +5017,72 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert File.read!(calls) |> String.split("\n", trim: true) ==
              List.duplicate("listen --follow --session #{@handle} --after 10", 2)
+  end
+
+  test "a refused capture with an independently partial tail holds the launch fence", %{db: db} do
+    :ok = HarklightWakes.capture_feed(db, @handle, 10, [], :live)
+
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER reject_feed_advance BEFORE UPDATE ON harklight_feed_checkpoints
+      BEGIN SELECT RAISE(ABORT, 'refuse feed capture'); END;
+      """)
+
+    chat = JSON.encode!(feed_chat(11, "request", "refused-before-tail"))
+
+    fake_harklight_agent!("""
+    printf '%s\n' "$*" >> "$0.calls"
+    if [ -e "$0.resume" ]; then
+      printf '%s\n' '#{chat}' '{"kind":"caught_up","rev":11}'
+    else
+      printf '%s\n' '{"kind":"caught_up","rev":10}'
+      while [ ! -e "$0.fail" ]; do sleep 0.02; done
+      printf '%s\n%s' '#{chat}' '{"kind":"message","data":'
+    fi
+    exec sleep 30
+    """)
+
+    # The initial caught-up marker writes no checkpoint because the rev is equal.
+    agent = System.find_executable("harklight-agent")
+    manager = start_supervised!({HarklightWakes, db: db, retry_delays: [20]})
+
+    assert eventually(fn ->
+             state = :sys.get_state(manager)
+             Map.has_key?(state.ports, @handle) and MapSet.size(state.starts_in_flight) == 0
+           end)
+
+    token = :sys.get_state(manager).launch_owners[@handle]
+    File.touch!(agent <> ".fail")
+
+    assert eventually(fn ->
+             case DB.query(db, "SELECT diagnostic FROM harklight_feed_pauses") do
+               {:ok, [[diagnostic]]} -> diagnostic =~ "feed_custody_uncertain"
+               _ -> false
+             end
+           end)
+
+    assert {:ok, [[^token]]} = DB.query(db, "SELECT owner FROM harklight_feed_launches")
+    assert {:ok, [[10]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
+    assert :ok = DB.execute(db, "DROP TRIGGER reject_feed_advance")
+
+    expected = "listen --follow --session #{@handle} --after 10"
+    File.touch!(agent <> ".resume")
+    HarklightWakes.activate(@handle, true)
+
+    refute eventually(
+             fn ->
+               String.split(File.read!(agent <> ".calls"), "\n", trim: true) != [expected]
+             end,
+             35
+           )
+
+    assert %{counts: %{listening: 1}} =
+             HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+    assert {:ok, [[11]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
+    assert String.split(File.read!(agent <> ".calls"), "\n", trim: true) == [expected, expected]
   end
 
   test "shared cooldown paces real filtered children and prioritizes an explicit retry", %{

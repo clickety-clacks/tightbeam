@@ -6,6 +6,8 @@ defmodule Tightbeam.HarklightFailures do
   alias Tightbeam.{DB, ErrorDiagnostic}
 
   @request_id ~S/(?:None|Some\(("(?:[^"\\]|\\.)*")\))/
+  @debug_option ~S/(?:None|Some\("(?:[^"\\]|\\.)*"\))/
+  @listen_http ~r/\Aserver returned HTTP (\d{3}): (#{@debug_option}) \(request ID #{@debug_option}\)\z/
   @listen_batch ~r/\Alisten: live updates paused: server returned HTTP 500: Some\("internal_error"\) \(request ID #{@request_id}\)\z/
   @listen_close ~r/\Alisten: live updates paused: internal_error \(Request-Id #{@request_id}\)\z/
   @read_failure ~r/\A([a-z-]+): server returned HTTP 500: Some\("internal_error"\) \(request ID #{@request_id}\)\z/
@@ -145,6 +147,31 @@ defmodule Tightbeam.HarklightFailures do
       [_ | captures] -> {:internal_error, "listen", decode_request_id(captures)}
       nil -> nil
     end
+  end
+
+  def listen_refusal(line) do
+    line = String.trim(line)
+
+    case Regex.run(@listen_http, line) do
+      [_, _, ~s|Some("unsupported")|] -> :unsupported_version
+      [_, <<"4", _::binary>>, _] -> :feed_refused
+      _ -> non_http_listen_refusal(line)
+    end
+  end
+
+  defp non_http_listen_refusal("agent feed closed: " <> reason) when reason != "",
+    do: :feed_refused
+
+  defp non_http_listen_refusal(line)
+       when line in ["invalid agent change or cursor", "invalid agent snapshot"],
+       do: :invalid_response
+
+  defp non_http_listen_refusal(line) do
+    if Regex.match?(
+         ~r/\Aserver sent an unexpected response \(request ID #{@debug_option}\)\z/,
+         line
+       ),
+       do: :invalid_response
   end
 
   def read_error(output, 1, operation) do

@@ -3107,7 +3107,7 @@ defmodule Tightbeam.HarklightWakes do
             executable: executable,
             token: token,
             baseline: nil,
-            pause: nil,
+            diagnostic_evidence: :quiet,
             ready: false,
             state_delays: state_delays
           }
@@ -3156,63 +3156,57 @@ defmodule Tightbeam.HarklightWakes do
         exit(:shutdown)
 
       {^port, {:data, bytes}} ->
-        data = pending <> bytes
-        lines = :binary.split(data, "\n", [:global])
-        remainder = List.last(lines)
+        case consume_feed_lines(manager, handle, pending <> bytes, diagnostics, feed) do
+          {:ok, remainder, diagnostics, feed} ->
+            receive_lines(manager, port, handle, remainder, diagnostics, feed)
 
-        result =
-          lines
-          |> Enum.drop(-1)
-          |> Enum.reduce_while({:ok, diagnostics, feed}, fn line,
-                                                            {:ok, current_diagnostics, feed} ->
-            case receive_listener_line(manager, handle, line, current_diagnostics, feed) do
-              {:ok, next_diagnostics, next_feed} ->
-                {:cont, {:ok, next_diagnostics, next_feed}}
-
-              {:error, reason, next_diagnostics} ->
-                {:halt, {:error, reason, next_diagnostics}}
-            end
-          end)
-
-        case result do
-          {:ok, next_diagnostics, feed} ->
-            receive_lines(manager, port, handle, remainder, next_diagnostics, feed)
-
-          {:error, reason, next_diagnostics} ->
+          {:error, reason, unread, diagnostics, feed} ->
             mode =
               if reason == "listener_fenced",
                 do: :closing,
-                else: {:failed, listener_failure(reason, nil, next_diagnostics)}
+                else: {:failed, listener_failure(reason, nil, diagnostics)}
 
-            stop_and_drain(manager, port, feed, data, next_diagnostics, mode, drain_deadline())
+            stop_and_drain(manager, port, feed, unread, diagnostics, mode, drain_deadline())
         end
 
       {^port, {:exit_status, status}} ->
-        drain = %{
-          pending: pending,
-          diagnostics: diagnostics,
-          pause: feed.pause,
-          unsettled: not is_nil(feed.baseline),
-          mode: :running
-        }
-
+        drain = %{drain_state(feed, diagnostics, :running) | pending: pending}
         send_feed_result(manager, feed.token, drained_result(status, drain))
+    end
+  end
+
+  defp consume_feed_lines(manager, handle, data, diagnostics, feed) do
+    case :binary.split(data, "\n") do
+      [line, rest] ->
+        case receive_listener_line(manager, handle, line, diagnostics, feed) do
+          {:ok, diagnostics, feed} ->
+            consume_feed_lines(manager, handle, rest, diagnostics, feed)
+
+          {:error, reason, diagnostics} ->
+            {:error, reason, data, diagnostics, feed}
+        end
+
+      [remainder] ->
+        {:ok, remainder, diagnostics, feed}
     end
   end
 
   defp stop_and_drain(manager, port, feed, pending, diagnostics, mode, deadline) do
     Tightbeam.HarklightChild.request_stop(port)
+    drain = drain_output(drain_state(feed, diagnostics, mode), pending)
+    drain_port(manager, port, feed.token, drain, deadline)
+  end
 
-    drain = %{
+  defp drain_state(feed, diagnostics, mode) do
+    %{
       pending: "",
       diagnostics: diagnostics,
-      pause: feed.pause,
-      unsettled: not is_nil(feed.baseline),
+      evidence: feed.diagnostic_evidence,
+      baseline: if(feed.baseline, do: elem(feed.baseline, 0)),
+      discarded: false,
       fallback: if(match?({:failed, _}, mode), do: elem(mode, 1)),
       mode: mode
     }
-
-    drain_port(manager, port, feed.token, drain_output(drain, pending), deadline)
   end
 
   defp drain_port(manager, port, token, drain, deadline) do
@@ -3245,56 +3239,77 @@ defmodule Tightbeam.HarklightWakes do
   defp drain_output(drain, bytes) do
     parts = :binary.split(drain.pending <> bytes, "\n", [:global])
     {pending, lines} = List.pop_at(parts, -1)
+    Enum.reduce(lines, %{drain | pending: pending}, &drain_line/2)
+  end
 
-    Enum.reduce(lines, %{drain | pending: pending}, fn line, drain ->
+  defp drain_line(line, drain) do
+    if structured_output_line?(line) do
+      %{drain | discarded: true, baseline: drained_baseline(JSON.decode(line), drain.baseline)}
+    else
       line = String.replace_invalid(line)
 
-      case HarklightFailures.listen_pause(line) do
-        {:internal_error, _, _} = pause ->
-          %{drain | pause: pause}
+      %{
+        drain
+        | evidence: observe_feed_diagnostic(drain.evidence, line),
+          diagnostics: append_diagnostic(drain.diagnostics, line)
+      }
+    end
+  end
 
-        nil ->
-          if structured_output_line?(line),
-            do: %{drain | unsettled: true},
-            else: %{
-              drain
-              | diagnostics: append_diagnostic(drain.diagnostics, line),
-                unsettled: drain.unsettled or String.trim(line) != ""
-            }
-      end
-    end)
+  defp drained_baseline({:ok, %{"kind" => "baseline", "rev" => rev}}, nil)
+       when is_integer(rev) and rev >= 0,
+       do: rev
+
+  defp drained_baseline({:ok, %{"kind" => "baseline_complete", "rev" => rev}}, rev)
+       when is_integer(rev),
+       do: nil
+
+  defp drained_baseline({:ok, %{"kind" => kind}}, baseline)
+       when kind in ["caught_up", "focus", "message", "entry", "advisory"],
+       do: baseline
+
+  defp drained_baseline(_, _), do: :unverified
+
+  # Keep outcome evidence independently of the bounded, redacted log buffer.
+  # The wrapper can mask a natural exit, but cannot turn stderr into silence.
+  defp observe_feed_diagnostic({:terminal, _} = evidence, _line), do: evidence
+
+  defp observe_feed_diagnostic(evidence, line) do
+    case HarklightFailures.listen_pause(line) || HarklightFailures.listen_refusal(line) do
+      nil -> if String.trim(line) == "", do: evidence, else: :ambiguous
+      terminal -> {:terminal, terminal}
+    end
   end
 
   defp drained_result(status, drain) do
-    pause = drain.pause || HarklightFailures.listen_pause(drain.pending)
+    evidence = observe_feed_diagnostic(drain.evidence, String.replace_invalid(drain.pending))
     diagnostics = append_diagnostic(drain.diagnostics, drain.pending)
-    reason = drained_exit_reason(status, diagnostics)
-    failure = listener_failure(reason, status, diagnostics)
     ended? = Tightbeam.HarklightChild.verified_exit?(status)
-    fallback = Map.get(drain, :fallback)
+    reason = listener_exit_reason(status, diagnostics)
+    failure = listener_failure(reason, status, diagnostics)
 
     cond do
-      pause ->
-        {:failed, paused_feed_status(pause), ended?}
+      match?({:terminal, _}, evidence) ->
+        {:failed, terminal_feed_failure(elem(evidence, 1), status, diagnostics), ended?}
 
       not retryable_failure?(failure) ->
         {:failed, failure, ended?}
 
-      fallback && not retryable_failure?(fallback) ->
-        {:failed, fallback, ended?}
+      drain.fallback && not retryable_failure?(drain.fallback) ->
+        {:failed, drain.fallback, ended?}
+
+      drain.mode == :closing ->
+        if status == 0 and quiet_drain?(drain, evidence), do: :clean, else: :uncertain
+
+      drain.fallback ->
+        complete? = is_nil(drain.baseline) and drain.pending == ""
+        known_exit? = status != 0 or evidence == :quiet
+        {:failed, drain.fallback, ended? and complete? and known_exit?}
 
       not ended? ->
         :uncertain
 
-      drain.mode == :closing ->
-        if status == 0 and not drain.unsettled and drain.pending == "",
-          do: :clean,
-          else: :uncertain
-
-      match?({:failed, _}, drain.mode) ->
-        {:failed, elem(drain.mode, 1), true}
-
-      drain.unsettled or structured_output_line?(drain.pending) ->
+      not is_nil(drain.baseline) or structured_output_line?(drain.pending) ->
         {:failed, listener_failure("incomplete_line", status, diagnostics), false}
 
       true ->
@@ -3302,22 +3317,16 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp drained_exit_reason(0, diagnostics) do
-    text = Enum.join(diagnostics, "\n")
+  defp quiet_drain?(drain, evidence),
+    do:
+      evidence == :quiet and not drain.discarded and is_nil(drain.baseline) and
+        drain.pending == ""
 
-    cond do
-      String.contains?(text, ~s|server returned HTTP 403: Some("forbidden")|) ->
-        listener_exit_reason(2, diagnostics)
+  defp terminal_feed_failure({:internal_error, _, _} = pause, _status, _diagnostics),
+    do: paused_feed_status(pause)
 
-      String.contains?(text, ~s|server returned HTTP 404: Some("unsupported")|) ->
-        listener_exit_reason(5, diagnostics)
-
-      true ->
-        listener_exit_reason(1, diagnostics)
-    end
-  end
-
-  defp drained_exit_reason(status, diagnostics), do: listener_exit_reason(status, diagnostics)
+  defp terminal_feed_failure(code, status, diagnostics),
+    do: listener_failure({"listener_stopped", Atom.to_string(code)}, status, diagnostics)
 
   defp send_feed_result(manager, token, result) do
     send(manager, {:feed_result, self(), token, result})
@@ -3348,10 +3357,10 @@ defmodule Tightbeam.HarklightWakes do
         if structured_output_line?(diagnostic_line) do
           {:error, "invalid_listener_line", diagnostics}
         else
-          case HarklightFailures.listen_pause(diagnostic_line) do
-            {:internal_error, _, _} = pause -> {:ok, diagnostics, %{feed | pause: pause}}
-            nil -> {:ok, append_diagnostic(diagnostics, diagnostic_line), feed}
-          end
+          evidence = observe_feed_diagnostic(feed.diagnostic_evidence, diagnostic_line)
+
+          {:ok, append_diagnostic(diagnostics, diagnostic_line),
+           %{feed | diagnostic_evidence: evidence}}
         end
     end
   end
