@@ -99,6 +99,11 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
                ["wake-undelivered:#{seq}"]
              )
 
+    assert {:ok, bubble_notices} =
+             DB.query(db, "SELECT sessionKey,prompt FROM turns WHERE requestRef=?1", [
+               "bubble:#{seq}"
+             ])
+
     case {refusal?, status} do
       {true, "failed"} ->
         assert %{
@@ -107,11 +112,12 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
                  "promptDelivery" => "delivered"
                } = detail
 
-        assert [["opener", content]] = notices
+        assert notices == []
+        assert [["opener", content]] = bubble_notices
         assert content =~ "received the prompt"
         assert content =~ "did not perform work"
         assert Ledger.pending_count(db, "ancestor") == 0
-        assert Ledger.pending_count(db, "opener") == 0
+        assert Ledger.pending_count(db, "opener") == 1
 
         assert Enum.any?(
                  Projection.list_after(db, "holder", nil, 20),
@@ -121,11 +127,13 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
       {false, "delivered"} ->
         refute Map.has_key?(detail, "workOutcome")
         assert notices == []
+        assert bubble_notices == []
 
       {false, "failed"} ->
         refute Map.has_key?(detail, "workOutcome")
         assert [["opener", content]] = notices
         assert content =~ "undelivered"
+        assert [["ancestor", _content]] = bubble_notices
     end
   end
 end)

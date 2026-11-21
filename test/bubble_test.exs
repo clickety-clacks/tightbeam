@@ -725,6 +725,51 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert Ledger.pending_count(ctx.db, ctx.holder.session_key) == 0
   end
 
+  test "a refused multi-assignment carrier wakes each accountable opener once", ctx do
+    busy = hold_recipient!(ctx.db, ctx.holder.session_key)
+    first = session(ctx.db, "first-opener", ctx.main.session_key)
+    second = session(ctx.db, "second-opener", ctx.main.session_key)
+
+    for opener <- [first, second, first] do
+      assignment =
+        Assignments.__handle__(ctx.db, "dispatch", %{
+          verb: "dispatch",
+          origin: "agent:#{opener.session_key}",
+          principal: {:session, opener.session_key},
+          session_key: ctx.holder.session_key,
+          target_role: nil,
+          role_fallback: false,
+          supervision_interval_ms: 1_000,
+          params: %{subject: "carried assignment", brief: "do this work"}
+        })
+
+      assert is_binary(assignment.id)
+    end
+
+    finish_busy_recipient!(ctx.db, busy)
+    [carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "assignment-carrier")
+    assert turn.wake_id == carrier_id
+    assert turn.assignment_id == nil
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed", "The provider refused the prompt.",
+               owner_lease: turn.owner_lease,
+               work_outcome: :did_not_perform
+             )
+
+    for _ <- 1..2, do: assert(:ok = Bubble.recognize_terminal(ctx.db, turn.seq))
+
+    for opener <- [first, second] do
+      assert [[_seq, cause, _wake, _origin, prompt]] = notice_turn(ctx.db, opener.session_key)
+      assert cause == "bubble:#{turn.seq}"
+      assert prompt =~ "did not perform work"
+      assert undelivered_notices(ctx.db, opener.session_key, turn.seq) == []
+    end
+
+    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+  end
+
   test "a failed senderless notice to parentless Main surfaces its source once", ctx do
     wake =
       Tightbeam.Wakes.schedule(ctx.db, %{

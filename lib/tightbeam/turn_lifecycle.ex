@@ -17,15 +17,18 @@ defmodule Tightbeam.TurnLifecycle do
 
   @doc false
   def provider_refusal_in_txn?(%Txn{} = txn, turn_seq) do
-    Txn.q(
-      txn,
-      """
-      SELECT 1 FROM turn_lifecycle_events
-      WHERE turnSeq=?1 AND eventKey='terminal:committed'
-        AND json_extract(detail, '$.reason')='provider_refusal'
-      """,
-      [turn_seq]
-    ) == [[1]]
+    Txn.q(txn, "SELECT 1 WHERE #{provider_refusal_sql("?1")}", [turn_seq]) == [[1]]
+  end
+
+  @doc false
+  def provider_refusal_sql(turn_seq_sql) do
+    """
+    EXISTS (
+      SELECT 1 FROM turn_lifecycle_events event
+      WHERE event.turnSeq=#{turn_seq_sql} AND event.eventKey='terminal:committed'
+        AND json_extract(event.detail, '$.reason')='provider_refusal'
+    )
+    """
   end
 
   @detail_keys %{

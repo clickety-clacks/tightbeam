@@ -5597,31 +5597,55 @@ defmodule Tightbeam.Wakes do
     wake |> Map.put(:delivery_status, status) |> Map.put(:row_version, version)
   end
 
-  @doc "Record a failed turn's outcome in the existing sender or owner transcript, without a turn."
+  @doc "Record a failed carrier's outcome in its sender's existing transcript, without a turn."
   def report_failed_delivery(db, seq) do
     result =
       transaction!(db, fn txn ->
         case Txn.q(
                txn,
                """
-               SELECT t.sessionKey,t.assignmentId
-               FROM turns t JOIN turn_lifecycle_events event ON event.turnSeq=t.seq
-               WHERE t.seq=?1 AND t.status='failed' AND event.eventKey='terminal:committed'
-                 AND json_extract(event.detail, '$.reason')='provider_refusal'
+               SELECT w.wakeId,w.creatorSessionKey,w.origin,t.status,t.error,w.digest,
+                      w.sessionKey,w.assignmentId
+               FROM turns t JOIN wakes w ON w.wakeId=t.wakeId
+               WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
+                 AND NOT #{Tightbeam.TurnLifecycle.provider_refusal_sql("t.seq")}
+                 AND w.consumer='prompt' AND COALESCE(w.targetGate,1)!=0
                """,
                [seq]
              ) do
-          [[holder, assignment_id]] ->
-            {:provider_refusal,
-             List.wrap(record_provider_refusal_in_txn(txn, seq, holder, assignment_id))}
+          [[wake_id, creator, origin, status, error, digest, target, assignment_id]] ->
+            retry_safe? = failed_delivery_retry_owned?(status, error)
+
+            carrier? =
+              Txn.q(txn, "SELECT 1 FROM notice_batches WHERE deliveryWakeId=?1", [wake_id]) != []
+
+            cond do
+              retry_safe? ->
+                :retry_owned
+
+              carrier? ->
+                sources = carrier_failure_sources_in_txn(txn, wake_id)
+                record_sender_failure_in_txn(txn, seq, sources, status)
+
+              digest == 0 ->
+                record_sender_failure_in_txn(
+                  txn,
+                  seq,
+                  [[wake_id, creator, origin, target, assignment_id]],
+                  status
+                )
+
+              true ->
+                :not_applicable
+            end
 
           [] ->
-            report_transport_failure_in_txn(txn, seq)
+            report_failed_dispatch_brief_in_txn(txn, seq)
         end
       end)
 
     case result do
-      {_disposition, notices} ->
+      {:notices, notices} ->
         Enum.each(notices, fn {recipient, owner, marker} ->
           Tightbeam.ConnRegistry.publish_message(
             Tightbeam.ConnRegistry,
@@ -5637,67 +5661,7 @@ defmodule Tightbeam.Wakes do
         :ok
     end
 
-    if match?({:provider_refusal, _}, result), do: :provider_refusal, else: :ok
-  end
-
-  defp record_provider_refusal_in_txn(txn, seq, holder, assignment_id) do
-    # A replay after custody changed must not tell a second owner.
-    notice_id = "s_provider_refusal_#{seq}"
-
-    if Txn.q(txn, "SELECT 1 FROM messages WHERE id=?1", [notice_id]) == [] do
-      recipient =
-        interrupted_redelivery_parent_in_txn(txn, holder, assignment_id) ||
-          failed_source_owner_in_txn(txn, holder)
-
-      content =
-        "Turn #{seq} in #{holder} received the prompt. " <>
-          "The provider refused it and the turn did not perform work."
-
-      append_failed_delivery_notice_in_txn(txn, seq, recipient, content, notice_id)
-    end
-  end
-
-  defp report_transport_failure_in_txn(txn, seq) do
-    case Txn.q(
-           txn,
-           """
-           SELECT w.wakeId,w.creatorSessionKey,w.origin,t.status,t.error,w.digest,
-                  w.sessionKey,w.assignmentId
-           FROM turns t JOIN wakes w ON w.wakeId=t.wakeId
-           WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
-             AND w.consumer='prompt' AND COALESCE(w.targetGate,1)!=0
-           """,
-           [seq]
-         ) do
-      [[wake_id, creator, origin, status, error, digest, target, assignment_id]] ->
-        retry_safe? = failed_delivery_retry_owned?(status, error)
-
-        carrier? =
-          Txn.q(txn, "SELECT 1 FROM notice_batches WHERE deliveryWakeId=?1", [wake_id]) != []
-
-        cond do
-          retry_safe? ->
-            :retry_owned
-
-          carrier? ->
-            sources = carrier_failure_sources_in_txn(txn, wake_id)
-            record_sender_failure_in_txn(txn, seq, sources, status)
-
-          digest == 0 ->
-            record_sender_failure_in_txn(
-              txn,
-              seq,
-              [[wake_id, creator, origin, target, assignment_id]],
-              status
-            )
-
-          true ->
-            :not_applicable
-        end
-
-      [] ->
-        report_failed_dispatch_brief_in_txn(txn, seq)
-    end
+    :ok
   end
 
   defp carrier_failure_sources_in_txn(txn, carrier_wake_id) do
@@ -5736,6 +5700,7 @@ defmodule Tightbeam.Wakes do
            SELECT t.sessionKey,t.assignmentId,t.status,t.error FROM turns t
            WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
              AND t.wakeId IS NULL AND t.assignmentId IS NOT NULL
+             AND NOT #{Tightbeam.TurnLifecycle.provider_refusal_sql("t.seq")}
            """,
            [seq]
          ) do
@@ -5852,14 +5817,13 @@ defmodule Tightbeam.Wakes do
   defp failed_delivery_uncertainty(_status),
     do: " The delivery carrier failed; this notice does not authorize a retry."
 
-  defp append_failed_delivery_notice_in_txn(txn, seq, recipient, content, notice_id \\ nil) do
+  defp append_failed_delivery_notice_in_txn(txn, seq, recipient, content) do
     case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [recipient]) do
       [[owner]] when is_binary(owner) ->
         # Use the existing transcript dedupe key. No new wake, obligation,
         # notification registry, or second failure-prone inference is admitted.
         {disposition, marker} =
           Tightbeam.Projection.append_in_txn(txn, %{
-            id: notice_id,
             session_key: recipient,
             role: "assistant",
             content: content,
