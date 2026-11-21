@@ -13455,10 +13455,13 @@ defmodule Tightbeam.GatewayTest do
 
     on_exit(fn -> Application.put_env(:tightbeam, :kungfu_bundle_root_dir, previous_root) end)
 
+    owner = "fixture-owner"
+    origin = "user:#{owner}"
+    Devices.add_user(ctx.db, owner, true)
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
 
     assert %{state: "published"} =
-             handlers["learn"].(%{origin: "user:flynn", params: %{name: "uncle-enzo"}})
+             handlers["learn"].(%{origin: origin, params: %{name: "uncle-enzo"}})
 
     assert Archetypes.get("agentic-engineering.coder")
     assert Archetypes.get("uncle-enzo.exec")
@@ -13467,8 +13470,8 @@ defmodule Tightbeam.GatewayTest do
       Org.create(ctx.db, %{
         session_key: "agent:unshipped-active",
         display_name: "Unshipped active",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
+        owner_user_id: owner,
+        origin: origin,
         archetype: "agentic-engineering.coder",
         host: "testhost",
         harness: "claude",
@@ -13477,16 +13480,14 @@ defmodule Tightbeam.GatewayTest do
       })
 
     assert %{state: "referenced", references: [reference]} =
-             handlers["unlearn"].(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+             handlers["unlearn"].(%{origin: origin, params: %{name: "agentic-engineering"}})
 
     assert reference.session_key == active.session_key
     assert Enum.map(reference.clear_commands, & &1.verb) == ["retire", "identity-repoint"]
 
     for command <- reference.clear_commands do
       result =
-        handlers[command.verb].(
-          Map.merge(command, %{origin: "user:flynn", principal: {:user, "flynn"}})
-        )
+        handlers[command.verb].(Map.merge(command, %{origin: origin, principal: {:user, owner}}))
 
       refute result[:code], inspect({command, result})
     end
@@ -13494,7 +13495,7 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, active.session_key).archetype == "default"
 
     assert %{state: "published", kungfu: "agentic-engineering"} =
-             handlers["unlearn"].(%{origin: "user:flynn", params: %{name: "agentic-engineering"}})
+             handlers["unlearn"].(%{origin: origin, params: %{name: "agentic-engineering"}})
 
     assert Archetypes.get("agentic-engineering.coder") == nil
     assert Archetypes.get("uncle-enzo.exec")

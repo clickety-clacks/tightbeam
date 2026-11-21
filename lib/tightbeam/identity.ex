@@ -14,7 +14,8 @@ defmodule Tightbeam.Identity do
 
   alias Tightbeam.{Archetypes, Credentials, Harness}
   alias Tightbeam.Harness.Support
-  alias Tightbeam.Identity.Renderer
+  alias Tightbeam.Identity.{Provenance, Renderer}
+  alias Tightbeam.RowReactions.Plan
 
   @upstream "tightbeam/upstream"
   @live "tightbeam/live"
@@ -24,6 +25,7 @@ defmodule Tightbeam.Identity do
   @publish_step "A successful `tightbeam identity edit` publishes everything on main."
   @publish_step_later "Once it does, a successful `tightbeam identity edit` publishes everything on main."
   @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
+  @handoff_seed_path "rules/row-reaction-handoff.toml"
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
   @bundle_setup_path "setup.md"
   @sentinel_keys ~w(name command requires events)
@@ -1551,7 +1553,18 @@ defmodule Tightbeam.Identity do
   end
 
   defp seed_entries_for_import(dir) do
-    Enum.map(seed_entries(), fn {relative, shipped_bytes} ->
+    entries = seed_entries()
+
+    # An org-wide definition already supplies the default even when its filename
+    # differs from the stock seed. A receipt-owned definition only covers its scope.
+    entries =
+      if !path_exists_at?(dir, "main", @handoff_seed_path) and alternate_handoff_default?(dir) do
+        List.keydelete(entries, @handoff_seed_path, 0)
+      else
+        entries
+      end
+
+    Enum.map(entries, fn {relative, shipped_bytes} ->
       bytes =
         if path_exists_at?(dir, "main", relative),
           do: git_show_bytes!(dir, "main", relative),
@@ -1560,6 +1573,31 @@ defmodule Tightbeam.Identity do
       {relative, bytes}
     end)
   end
+
+  defp alternate_handoff_default?(dir) do
+    paths =
+      Path.wildcard(Path.join(dir, "rules/*.toml")) ++
+        Path.wildcard(Path.join(dir, "kungfu/*/rules/*.toml"))
+
+    Enum.any?(paths, fn path ->
+      relative = Path.relative_to(path, dir)
+
+      with {:ok, %{"reaction" => reactions}} <- Toml.decode(File.read!(path)),
+           true <- Provenance.owner_for_path(dir, relative) == :substrate do
+        Enum.any?(List.wrap(reactions), &organization_handoff?/1)
+      else
+        _ -> false
+      end
+    end)
+  end
+
+  defp organization_handoff?(%{"name" => "assignment-terminal-handoff"} = declaration) do
+    declaration |> Plan.compile!(nil) |> Plan.handoff_default?()
+  rescue
+    ArgumentError -> false
+  end
+
+  defp organization_handoff?(_declaration), do: false
 
   defp merge_upstream(dir, message, author, expected_prior, upstream_prior, before_commit) do
     case System.cmd(

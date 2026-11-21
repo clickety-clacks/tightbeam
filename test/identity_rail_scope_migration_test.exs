@@ -871,32 +871,67 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     assert report =~ "other-kungfu and sample-kungfu"
   end
 
-  test "a bundle's own copy of the handoff notice under another filename is kept, not doubled",
+  test "identity import restores the stock default alongside a scoped handoff and unlearn keeps it",
        ctx do
-    init_fixture!(ctx.base_dir, bundle_handoff: "rules/child-notice.toml")
+    base = ctx.base_dir
+    init_fixture!(base, bundle_handoff: "rules/child-notice.toml")
     db = start_db!()
     seed_migration_rows!(db)
 
-    assert RailScopeMigration.run!(ctx.base_dir, db)["status"] == "complete"
-    identity_dir = Path.join(ctx.base_dir, "identity")
+    identity_dir = Path.join(base, "identity")
+    git!(identity_dir, ["switch", "--detach", "main"])
+    git!(identity_dir, ["rm", "kungfu/#{@kungfu}/installed.toml"])
+    git!(identity_dir, ["commit", "-m", "fixture: shipped snapshot without receipt"])
+    git!(identity_dir, ["update-ref", "refs/heads/tightbeam/upstream", "HEAD"])
+    git!(identity_dir, ["switch", "main"])
+    stock = Path.join(identity_dir, "rules/row-reaction-handoff.toml")
+    alternate = "kungfu/#{@kungfu}/rules/child-notice.toml"
 
-    definitions =
-      identity_dir
-      |> Path.join("**/*.toml")
-      |> Path.wildcard()
-      |> Enum.filter(fn path ->
-        path
-        |> File.read!()
-        |> Toml.decode!()
-        |> Map.get("reaction", [])
-        |> List.wrap()
-        |> Enum.any?(&(&1["name"] == "assignment-terminal-handoff"))
-      end)
-      |> Enum.map(&Path.relative_to(&1, identity_dir))
+    assert RailScopeMigration.run!(base, db)["status"] == "complete"
+    assert Provenance.owner_for_path(base, alternate) == {:kungfu, @kungfu}
+    scoped_bytes = File.read!(Path.join(identity_dir, alternate))
+    refute File.exists?(stock)
+    assert_single_rail_definition!(base, "reaction", "r04-work-item-notice")
 
-    assert definitions == ["kungfu/#{@kungfu}/rules/child-notice.toml"]
-    refute File.exists?(Path.join(identity_dir, "rules/row-reaction-handoff.toml"))
-    assert_single_rail_definition!(ctx.base_dir, "reaction", "r04-work-item-notice")
+    assert {:ok, candidate} = Identity.learn!(base, "uncle-enzo", "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    stock_bytes = File.read!(stock)
+    assert File.read!(Path.join(identity_dir, alternate)) == scoped_bytes
+
+    assert {:ok, candidate} = Identity.relearn!(base, "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    assert File.read!(stock) == stock_bytes
+    assert File.read!(Path.join(identity_dir, alternate)) == scoped_bytes
+    assert Provenance.owner_for_path(base, alternate) == {:kungfu, @kungfu}
+
+    assert {:ok, _} = Identity.publish_live!(base, Identity.unlearn!(base, @kungfu, "fixture"))
+    refute File.exists?(Path.join(identity_dir, alternate))
+    assert File.read!(stock) == stock_bytes
+  end
+
+  test "learn and relearn keep an alternate organization handoff as the sole default", ctx do
+    base = ctx.base_dir
+    init_seed_upgrade_fixture!(base)
+    identity_dir = Path.join(base, "identity")
+    override = Path.join(identity_dir, "rules/org-child-notice.toml")
+    stock = Path.join(identity_dir, "rules/row-reaction-handoff.toml")
+    File.cp!(Path.join(@legacy_reaction_fixture_dir, "row-reaction-handoff.toml"), override)
+    commit_fixture!(identity_dir, "fixture: alternate organization handoff")
+
+    assert RailScopeMigration.run!(base, start_db!())["status"] == "complete"
+    assert_single_rail_definition!(base, "reaction", "assignment-terminal-handoff")
+    bytes = File.read!(override)
+
+    assert {:ok, candidate} = Identity.learn!(base, "uncle-enzo", "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    refute File.exists?(stock)
+    assert File.read!(override) == bytes
+
+    assert {:ok, candidate} = Identity.relearn!(base, "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    assert_single_rail_definition!(base, "reaction", "assignment-terminal-handoff")
+    refute File.exists?(stock)
+    assert File.read!(override) == bytes
   end
 
   test "an edited legacy row reaction stops without changing fixture identity", ctx do

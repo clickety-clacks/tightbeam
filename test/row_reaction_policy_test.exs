@@ -2,6 +2,44 @@ defmodule Tightbeam.RowReactionPolicyTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Rules
+  alias Tightbeam.RowReactions.Plan
+
+  test "only one scoped handoff can override the organization default" do
+    declaration = %{
+      "name" => "assignment-terminal-handoff",
+      "family" => "terminal-handoff",
+      "events" => ["assignment"],
+      "when" => true,
+      "effects" => [%{"slot" => "handoff", "kind" => "notice", "when" => true, "value" => %{}}]
+    }
+
+    default = Plan.compile!(Map.put(declaration, "archetypes", ["*"]), nil)
+
+    scoped =
+      Plan.compile!(
+        Map.put(declaration, "archetypes", ["sample.coder"]),
+        nil,
+        {:kungfu, "sample"},
+        ["coder"]
+      )
+
+    event = %{"kind" => "assignment", "id" => "fixture", "org" => "test"}
+    facts = %{"scope_participant_archetypes" => ["sample.coder"]}
+
+    assert [%{rule: "sample.assignment-terminal-handoff", selected: true}] =
+             Plan.evaluate([default, scoped], event, facts)
+
+    assert [%{rule: "assignment-terminal-handoff", selected: true}] =
+             Plan.evaluate([scoped, default], event, %{
+               "scope_participant_archetypes" => ["sample.coder", "default"]
+             })
+
+    competing = Plan.compile!(Map.put(declaration, "name", "other-handoff"), nil)
+
+    assert_raise ArgumentError, ~r/duplicate reaction identity/, fn ->
+      Plan.evaluate([default, scoped, competing], event, facts)
+    end
+  end
 
   test "the base seed elects unaltered organization work-item rails" do
     base =

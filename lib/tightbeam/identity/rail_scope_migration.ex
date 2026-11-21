@@ -986,9 +986,10 @@ defmodule Tightbeam.Identity.RailScopeMigration do
 
           %{acc | stops: [stop | acc.stops]}
 
-        # A bundle that still carries the reaction under its own filename keeps
-        # it; planting the seed copy too would leave two definitions of one name.
-        existing == [] and Map.has_key?(bundle_reactions, name) ->
+        # Keep a scoped handoff already owned by a receipt. Startup supplies
+        # the default for other participants, and import restores the stock seed.
+        name == "assignment-terminal-handoff" and existing == [] and
+            Map.has_key?(bundle_reactions, name) ->
           acc
 
         existing == [] ->
