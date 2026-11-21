@@ -5,6 +5,8 @@ defmodule Tightbeam.HolderProd do
   alias Tightbeam.DB.Txn
 
   @quiet_ms 30 * 60 * 1_000
+  @hour_ms 60 * 60 * 1_000
+  @default_hourly_cap 16
   @marker "assignment-holder-prod-v1:"
 
   # Custody is distinct from assignment creation and reopening. Remember the
@@ -19,6 +21,22 @@ defmodule Tightbeam.HolderProd do
         );
         CREATE INDEX IF NOT EXISTS holder_prod_turn_end
           ON turns(sessionKey, endedAt DESC) WHERE endedAt IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS assignment_holder_prod_attempts (
+          id INTEGER PRIMARY KEY,
+          episodeId TEXT NOT NULL,
+          assignmentId TEXT NOT NULL,
+          holderKey TEXT NOT NULL,
+          repeatNumber INTEGER NOT NULL,
+          admittedAt INTEGER NOT NULL,
+          wakeId TEXT UNIQUE
+        );
+        CREATE INDEX IF NOT EXISTS holder_prod_attempt_episode
+          ON assignment_holder_prod_attempts(episodeId, id DESC);
+        CREATE INDEX IF NOT EXISTS holder_prod_attempt_report_recency
+          ON assignment_holder_prod_attempts(admittedAt) WHERE wakeId IS NULL;
+        CREATE INDEX IF NOT EXISTS holder_prod_wake_delivery
+          ON wakes(firedAt) WHERE deliveredTurnSeq IS NOT NULL
+            AND origin='process:tightbeam' AND substr(obligationRef,1,#{byte_size(@marker)})='#{@marker}';
         """)
       end)
 
@@ -66,17 +84,24 @@ defmodule Tightbeam.HolderProd do
 
   def prepare_in_txn(txn, wake) do
     if own_notice?(wake) do
-      case candidates(txn, wake.assignment_id, System.system_time(:millisecond)) do
-        [[_, holder, _, _, _, episode, id, _, _, 1]]
-        when holder == wake.session_key and episode == wake.obligation_ref and id == wake.wake_id ->
-          true
-
-        _ ->
-          cancel_in_txn(txn, wake.wake_id)
-          false
+      if current_source?(txn, wake) do
+        true
+      else
+        cancel_in_txn(txn, wake.wake_id)
+        false
       end
     else
       true
+    end
+  end
+
+  defp current_source?(txn, wake) do
+    with %{report_only: false} <- settings(),
+         [%{holder: holder, episode: episode, wake: id, possible: true}] <-
+           candidates(txn, wake.assignment_id, System.system_time(:millisecond), false) do
+      holder == wake.session_key and episode == wake.obligation_ref and id == wake.wake_id
+    else
+      _ -> false
     end
   end
 
@@ -96,8 +121,9 @@ defmodule Tightbeam.HolderProd do
   # interval. A turn carrying only holder prods cannot rearm any quiet
   # assignment. Mixed batches still count as ordinary holder activity.
   @candidates """
-  WITH quiet_starts AS MATERIALIZED (
-    SELECT a.id, a.holderKey, a.workItemId, s.ownerUserId,
+  WITH own_starts AS MATERIALIZED (
+    SELECT a.id, a.holderKey, a.workItemId, s.ownerUserId, s.harness, s.host,
+           MAX(a.openedAt, COALESCE(c.changedAt, 0)) AS custodySince,
            MAX(a.openedAt, COALESCE(c.changedAt, 0),
              COALESCE((SELECT MAX(r.ts) FROM assignment_reopenings r WHERE r.assignmentId=a.id), 0),
              COALESCE((SELECT MAX(p.ts) FROM attests p
@@ -106,6 +132,17 @@ defmodule Tightbeam.HolderProd do
                        WHERE p.producedByAssignmentId=a.id AND p.createdBySession=a.holderKey), 0),
              COALESCE((SELECT MAX(p.raisedAt) FROM decision_requests p
                        WHERE p.assignmentId=a.id AND p.raiserSessionKey=a.holderKey), 0),
+             COALESCE((SELECT MAX(w.createdAt) FROM wakes w
+                       WHERE w.assignmentId=a.id AND w.creatorSessionKey=a.holderKey
+                         AND NOT EXISTS(SELECT 1 FROM wake_activity_exclusions x WHERE x.wakeId=w.wakeId)), 0)
+           ) AS ownSince
+    FROM assignments a
+    JOIN sessions s ON s.sessionKey=a.holderKey AND s.state='active'
+    LEFT JOIN assignment_holder_prod_custody c ON c.assignmentId=a.id
+    WHERE a.state='open' /* assignment_filter */
+  ), quiet_starts AS MATERIALIZED (
+    SELECT a.*,
+           MAX(a.ownSince,
              COALESCE((SELECT MAX(cp.settledAt) FROM assignment_cannot_proceed cp
                        JOIN attests p ON p.id=cp.attestId
                        WHERE cp.assignmentId=a.id AND p.bySession=a.holderKey), 0),
@@ -138,16 +175,15 @@ defmodule Tightbeam.HolderProd do
                            ))
                          )), 0)
            ) AS quietSince
-    FROM assignments a
-    JOIN sessions s ON s.sessionKey=a.holderKey AND s.state='active'
-    LEFT JOIN assignment_holder_prod_custody c ON c.assignmentId=a.id
-    WHERE a.state='open' /* assignment_filter */
+    FROM own_starts a
   ), episodes AS (
     SELECT quiet_starts.*, ?2 || id || ':' || holderKey || ':' || quietSince AS episodeId
     FROM quiet_starts
   )
   SELECT e.id, e.holderKey, e.workItemId, e.ownerUserId, e.quietSince, e.episodeId,
-         p.wakeId, p.state, p.deliveredTurnSeq,
+         p.wakeId, p.state, p.deliveredTurnSeq, last.repeatNumber,
+         CASE WHEN last.wakeId IS NULL THEN last.admittedAt
+              WHEN p.deliveredTurnSeq IS NOT NULL THEN p.firedAt END AS lastSentAt,
          NOT EXISTS (
            SELECT 1 FROM turns t
            WHERE t.sessionKey=e.holderKey
@@ -172,57 +208,199 @@ defmodule Tightbeam.HolderProd do
                  AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
                  AND (w.dueAt<=?3 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)))
              AND (p.wakeId IS NULL OR w.wakeId<>p.wakeId)
-         ) AS idle
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM decision_requests d WHERE d.assignmentId=e.id AND d.status='open'
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM harness_park_fences f WHERE f.adapterKey=e.harness || ':shared@' || e.host
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM harness_processes hp
+           WHERE hp.adapterKey=e.harness || ':shared@' || e.host AND hp.resolvedAt IS NULL
+             AND hp.state IN ('park_requested','kill_failed')
+         )
+         AND COALESCE((
+           SELECT t.status IN ('failed','failed_unknown') AND t.endedAt>=e.ownSince
+           FROM turns t
+           WHERE t.sessionKey=e.holderKey AND t.endedAt>=e.custodySince
+             AND (t.assignmentId=e.id OR EXISTS (
+               SELECT 1 FROM wakes w WHERE w.deliveredTurnSeq=t.seq AND w.assignmentId=e.id AND w.digest=0
+             ))
+           ORDER BY t.endedAt DESC,t.seq DESC LIMIT 1
+         ),0)=0 AS possible
   FROM episodes e
-  LEFT JOIN wakes p ON p.assignmentId=e.id AND p.sessionKey=e.holderKey
-    AND p.origin='process:tightbeam' AND p.obligationRef=e.episodeId
+  LEFT JOIN assignment_holder_prod_attempts last ON last.id=(
+    SELECT n.id FROM assignment_holder_prod_attempts n
+    LEFT JOIN wakes w ON w.wakeId=n.wakeId
+    WHERE n.episodeId=e.episodeId AND (
+      (?4=1 AND n.wakeId IS NULL) OR
+      (?4=0 AND (w.state='pending' OR w.deliveredTurnSeq IS NOT NULL))
+    )
+    ORDER BY n.id DESC LIMIT 1
+  )
+  LEFT JOIN wakes p ON p.wakeId=last.wakeId
   """
 
-  def next_deadline_in_txn(txn, at) do
-    candidates(txn, nil, at)
-    |> Enum.flat_map(fn
-      [_, _, _, _, since, _, nil, _, _, 1] -> [since + @quiet_ms]
-      _ -> []
-    end)
-    |> Enum.min(fn -> nil end)
+  def settings do
+    %{
+      cap: Application.get_env(:tightbeam, :holder_prod_hourly_cap, @default_hourly_cap),
+      report_only: Application.get_env(:tightbeam, :holder_prod_report_only, false)
+    }
   end
 
-  def admit_due_in_txn(txn, at, batch \\ 100) do
-    due =
-      for [id, holder, item, owner, since, episode, nil, _, _, 1] <- candidates(txn, nil, at),
-          since + @quiet_ms <= at,
-          do: {since, id, holder, item, owner, episode}
+  def next_deadline_in_txn(txn, at, settings \\ settings()) do
+    candidates = eligible(txn, at, settings)
+    {used, free_at} = budget(txn, at, settings.report_only)
 
-    for {_since, id, holder, item, owner, episode} <- due |> Enum.sort() |> Enum.take(batch) do
-      Wakes.schedule_in_txn(txn, %{
-        session_key: holder,
-        origin: "process:tightbeam",
-        owner_user_id: owner,
-        assignment_id: id,
-        work_item_id: item,
-        activity_assignment_id: nil,
-        due_at: at,
-        class: "fyi",
-        obligation_ref: episode,
-        prompt:
-          "Your assignment #{id} has been quiet for 30 minutes. Continue the work, or if you are legitimately waiting, record a fact, predicate, or timed fallback wait with a short reason."
-      })
+    case Enum.min_by(candidates, & &1.due_at, fn -> nil end) do
+      nil -> nil
+      %{due_at: due_at} when used < settings.cap -> due_at
+      %{due_at: due_at} when is_integer(free_at) -> max(due_at, free_at)
+      _ -> nil
+    end
+  end
+
+  def admit_due_in_txn(txn, at, batch \\ 100, settings \\ settings()) do
+    {used, _free_at} = budget(txn, at, settings.report_only)
+    slots = max(0, min(settings.cap - used, batch))
+
+    if slots > 0 do
+      txn
+      |> eligible(at, settings)
+      |> Enum.filter(&(&1.due_at <= at))
+      |> Enum.sort_by(&{&1.next_repeat, &1.since, &1.id})
+      |> Enum.uniq_by(& &1.holder)
+      |> Enum.take(slots)
+      |> Enum.each(&admit_in_txn(txn, &1, at, settings.report_only))
     end
 
     :ok
   end
 
+  defp eligible(txn, at, settings) do
+    pending = if settings.report_only, do: MapSet.new(), else: pending_holders(txn)
+
+    txn
+    |> candidates(nil, at, settings.report_only)
+    |> Enum.filter(fn candidate ->
+      candidate.possible and candidate.state != "pending" and
+        not MapSet.member?(pending, candidate.holder)
+    end)
+    |> Enum.map(fn candidate ->
+      candidate
+      |> Map.put(:due_at, max(candidate.since, candidate.sent_at || 0) + @quiet_ms)
+      |> Map.put(:next_repeat, (candidate.repeat || -1) + 1)
+    end)
+  end
+
+  defp pending_holders(txn) do
+    txn
+    |> Txn.q("""
+    SELECT n.holderKey FROM wakes w JOIN assignment_holder_prod_attempts n ON n.wakeId=w.wakeId
+    WHERE w.state='pending'
+    UNION
+    SELECT n.holderKey FROM turns t
+    JOIN wakes w ON w.deliveredTurnSeq=t.seq
+    JOIN assignment_holder_prod_attempts n ON n.wakeId=w.wakeId
+    WHERE t.status='queued'
+    """)
+    |> MapSet.new(&hd/1)
+  end
+
+  # Reservations count until delivery or cancellation. Once delivered, the
+  # rolling hour is anchored on actual delivery, so delayed sources cannot burst
+  # past the budget. Report-only uses its own simulated stream.
+  defp budget(txn, at, true) do
+    [[used, earliest]] =
+      Txn.q(
+        txn,
+        """
+        SELECT COUNT(*), MIN(admittedAt) FROM assignment_holder_prod_attempts
+        WHERE wakeId IS NULL AND admittedAt>?1
+        """,
+        [at - @hour_ms]
+      )
+
+    {used, if(is_integer(earliest), do: earliest + @hour_ms)}
+  end
+
+  defp budget(txn, at, false) do
+    [[reserved, sent, earliest]] =
+      Txn.q(
+        txn,
+        """
+        SELECT (SELECT COUNT(*) FROM wakes w
+                JOIN assignment_holder_prod_attempts n ON n.wakeId=w.wakeId
+                WHERE w.state='pending' AND w.deliveredTurnSeq IS NULL),
+               COUNT(*), MIN(firedAt)
+        FROM wakes WHERE firedAt>?1 AND deliveredTurnSeq IS NOT NULL
+          AND origin='process:tightbeam' AND substr(obligationRef,1,#{byte_size(@marker)})='#{@marker}'
+        """,
+        [at - @hour_ms]
+      )
+
+    {reserved + sent, if(is_integer(earliest), do: earliest + @hour_ms)}
+  end
+
+  defp admit_in_txn(txn, candidate, at, report_only) do
+    wake_id =
+      if report_only do
+        Tightbeam.EventLog.lifecycle_in_txn(
+          txn,
+          "holder_prod_would_send",
+          candidate.id,
+          JSON.encode!(%{
+            episodeId: candidate.episode,
+            repeatNumber: candidate.next_repeat,
+            at: at
+          })
+        )
+
+        nil
+      else
+        wake =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: candidate.holder,
+            origin: "process:tightbeam",
+            owner_user_id: candidate.owner,
+            assignment_id: candidate.id,
+            work_item_id: candidate.item,
+            activity_assignment_id: nil,
+            due_at: at,
+            class: "fyi",
+            obligation_ref: candidate.episode,
+            prompt:
+              "Your assignment #{candidate.id} has been quiet for 30 minutes. Continue the work. " <>
+                "If you are waiting, record a fact, predicate, or timed fallback wait with a short reason. " <>
+                "If the work is impossible, attest cannot-proceed. If it is done, attest completion."
+          })
+
+        wake.wake_id
+      end
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_holder_prod_attempts(episodeId, assignmentId, holderKey, repeatNumber, admittedAt, wakeId)
+      VALUES (?1,?2,?3,?4,?5,?6)
+      """,
+      [candidate.episode, candidate.id, candidate.holder, candidate.next_repeat, at, wake_id]
+    )
+  end
+
   def evidence(db, assignment_id, holder) do
     {:ok, result} =
       DB.transaction(db, fn txn ->
-        case candidates(txn, assignment_id, System.system_time(:millisecond)) do
-          [[^assignment_id, ^holder, _, _, since, episode, wake, state, delivered, 1]] ->
+        case candidates(txn, assignment_id, System.system_time(:millisecond), false) do
+          [%{holder: ^holder, possible: true} = p] ->
             %{
               holderSessionKey: holder,
-              quietSince: since,
-              episodeId: episode,
-              wakeId: wake,
-              state: evidence_state(state, delivered)
+              quietSince: p.since,
+              episodeId: p.episode,
+              wakeId: p.wake,
+              repeatNumber: p.repeat,
+              state: evidence_state(p.state, p.delivered)
             }
 
           _ ->
@@ -235,14 +413,43 @@ defmodule Tightbeam.HolderProd do
 
   defp evidence_state(_state, delivered) when is_integer(delivered), do: "delivered"
   defp evidence_state("pending", _delivered), do: "pending"
-  defp evidence_state("canceled", _delivered), do: "canceled"
-  defp evidence_state("fired", _delivered), do: "fired"
   defp evidence_state(nil, _delivered), do: "scheduled"
 
   @single_candidate String.replace(@candidates, "/* assignment_filter */", "AND a.id=?1")
 
-  defp candidates(txn, nil, at), do: Txn.q(txn, @candidates, [nil, @marker, at])
+  defp candidates(txn, assignment_id, at, report_only) do
+    query = if is_nil(assignment_id), do: @candidates, else: @single_candidate
 
-  defp candidates(txn, assignment_id, at),
-    do: Txn.q(txn, @single_candidate, [assignment_id, @marker, at])
+    txn
+    |> Txn.q(query, [assignment_id, @marker, at, if(report_only, do: 1, else: 0)])
+    |> Enum.map(fn [
+                     id,
+                     holder,
+                     item,
+                     owner,
+                     since,
+                     episode,
+                     wake,
+                     state,
+                     delivered,
+                     repeat,
+                     sent_at,
+                     possible
+                   ] ->
+      %{
+        id: id,
+        holder: holder,
+        item: item,
+        owner: owner,
+        since: since,
+        episode: episode,
+        wake: wake,
+        state: state,
+        delivered: delivered,
+        repeat: repeat,
+        sent_at: sent_at,
+        possible: possible == 1
+      }
+    end)
+  end
 end

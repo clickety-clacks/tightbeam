@@ -2908,7 +2908,10 @@ defmodule Tightbeam.Wakes do
   def row_commit_in_txn(%Txn{} = txn, transitions) do
     transitions = List.wrap(transitions) ++ DB.take_row_commits(txn)
 
-    if Enum.any?(transitions, &(Map.get(&1, :domain) in ["assignment", "turn"])) do
+    if Enum.any?(
+         transitions,
+         &(Map.get(&1, :domain) in ["assignment", "turn", "decision_request"])
+       ) do
       Tightbeam.HolderProd.changed_in_txn(txn)
     end
 

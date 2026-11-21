@@ -47,6 +47,8 @@ defmodule Tightbeam.HolderProdTest do
 
       sweep(ctx.db, first_opened + @quiet)
       assert [[first_wake, "holder", "pending"]] = notices(ctx.db)
+      sweep(ctx.db, later_opened + @quiet)
+      assert [[^first_wake, "holder", "pending"]] = notices(ctx.db)
 
       if unquote(mixed) do
         Wakes.schedule(ctx.db, %{
@@ -63,6 +65,11 @@ defmodule Tightbeam.HolderProdTest do
       start_supervised!({LaneStub, :holder_prod_test_lane})
       scheduler = start_scheduler(ctx.db, false)
       assert :ok = Wakes.fire_due(scheduler)
+
+      assert %{fired_at: first_sent} = Wakes.get(ctx.db, first_wake)
+      sweep(ctx.db, first_sent)
+      assert [[^first_wake, "holder", "fired"]] = notices(ctx.db)
+
       finished = finish_prod(ctx.db, first_wake)
 
       if unquote(mixed) do
@@ -75,17 +82,28 @@ defmodule Tightbeam.HolderProdTest do
         assert %{quietSince: ^later_opened, wakeId: nil} =
                  HolderProd.evidence(ctx.db, later_id, "holder")
 
-        sweep(ctx.db, later_opened + @quiet)
+        sweep(ctx.db, finished)
 
         assert [[^first_wake, "holder", "fired"], [second_wake, "holder", "pending"]] =
                  notices(ctx.db)
 
         assert :ok = Wakes.fire_due(scheduler)
-        later_finished = finish_prod(ctx.db, second_wake)
-        sweep(ctx.db, later_finished + @quiet)
+        finish_prod(ctx.db, second_wake)
+        sweep(ctx.db, first_sent + @quiet - 1)
 
         assert [[^first_wake, "holder", "fired"], [^second_wake, "holder", "fired"]] =
                  notices(ctx.db)
+
+        assert %{quietSince: ^first_opened, episodeId: first_episode, repeatNumber: 0} =
+                 HolderProd.evidence(ctx.db, @assignment, "holder")
+
+        assert %{quietSince: ^later_opened, repeatNumber: 0} =
+                 HolderProd.evidence(ctx.db, later_id, "holder")
+
+        sweep(ctx.db, first_sent + @quiet)
+
+        assert %{quietSince: ^first_opened, episodeId: ^first_episode, repeatNumber: 1} =
+                 HolderProd.evidence(ctx.db, @assignment, "holder")
       end
     end
   end
@@ -160,14 +178,14 @@ defmodule Tightbeam.HolderProdTest do
     start_supervised!({LaneStub, :holder_prod_test_lane})
     scheduler = start_scheduler(ctx.db)
     assert :ok = Wakes.fire_due(scheduler)
-    assert %{state: "fired", delivered_turn_seq: seq} = Wakes.get(ctx.db, wake_id)
+    assert %{state: "fired", delivered_turn_seq: seq, fired_at: sent} = Wakes.get(ctx.db, wake_id)
 
     assert %{wakeId: ^wake_id, state: "delivered"} =
              HolderProd.evidence(ctx.db, @assignment, "holder")
 
     assert {:ok, %{seq: ^seq} = turn} = Ledger.claim_next(ctx.db, "holder", "fixture")
     assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: turn.owner_lease)
-    sweep(ctx.db, threshold + 2 * @quiet)
+    sweep(ctx.db, sent + @quiet - 1)
     stop_supervised!(Wakes)
     assert :ok = ctx.db |> start_scheduler() |> Wakes.fire_due()
     assert length(notices(ctx.db)) == 1
