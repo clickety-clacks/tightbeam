@@ -97,9 +97,11 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
   defp names_model?(text, model) do
     model = String.downcase(model)
 
+    # The family is a word inside the model id after its leading vendor word,
+    # for example "opus" in an "<vendor>-opus-5-5" id.
     family =
       case String.split(model, ["-", "_", "."], trim: true) do
-        [vendor, family | _] when vendor in ["claude", "gemini"] -> family
+        [_vendor | rest] -> Enum.find(rest, &Regex.match?(~r/\A[a-z]+\z/, &1))
         _ -> nil
       end
 
