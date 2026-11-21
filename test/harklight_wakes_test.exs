@@ -155,6 +155,13 @@ defmodule Tightbeam.HarklightWakesTest do
     %{state | workers: %{@handle => self()}}
   end
 
+  defp ready_fixture_listener(manager, handle) do
+    case GenServer.call(manager, {:attached, handle}) do
+      :awaiting_listener -> GenServer.call(manager, {:listener_ready, handle})
+      result -> result
+    end
+  end
+
   defp review_failure(state, handle \\ @handle) do
     failure =
       {:harklight_failure, {"listener_stopped", "transport_error"}, "listen",
@@ -244,6 +251,213 @@ defmodule Tightbeam.HarklightWakesTest do
     assert state.workers == %{}
   end
 
+  for {read, prefix} <- [
+        receiver: "SELECT 1 FROM harklight_wake_handles h",
+        follower: "SELECT 1\nFROM harklight_wake_follows f"
+      ],
+      phase <- [:prepare, :recover] do
+    @eligibility_read read
+    @refused_query prefix
+    @recovery_phase phase
+    @tag :reviewfix
+    test "#{read} eligibility refusal retains retry custody during #{phase}", %{
+      db: db,
+      session: session
+    } do
+      if @eligibility_read == :follower do
+        assert {:ok, _} =
+                 DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+                   session.session_key
+                 ])
+      end
+
+      proxy = start_supervised!({RecoveryReadRefusalDB, {db, @refused_query}})
+      state = review_state(proxy)
+
+      state =
+        if @recovery_phase == :prepare do
+          {:reply, :retry, state} =
+            HarklightWakes.handle_call(
+              {:start_decided, @handle, false, :new_request},
+              {self(), make_ref()},
+              state
+            )
+
+          # The refusal was one-shot. Make the receiver eligible for the
+          # subsequent recovery check to prove the retry can be scheduled.
+          assert {:ok, _} =
+                   DB.query(db, "UPDATE sessions SET state='active' WHERE sessionKey=?1", [
+                     session.session_key
+                   ])
+
+          state
+        else
+          state
+        end
+
+      ref = make_ref()
+
+      {:noreply, state} =
+        HarklightWakes.handle_info(
+          {:DOWN, ref, :process, self(), :normal},
+          %{state | refs: %{ref => @handle}}
+        )
+
+      assert Map.has_key?(state.retry_timers, @handle)
+      assert state.workers == %{}
+      assert state.gone_tasks == %{}
+      refute MapSet.member?(state.stopping, @handle)
+
+      assert {:ok, [["unavailable"]]} =
+               DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [@handle])
+    end
+  end
+
+  @tag :reviewfix
+  test "successful attaches with failed listens keep the outage until a quiet stream is ready", %{
+    db: db
+  } do
+    attempts = Path.join(System.tmp_dir!(), "listen-ready-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm(attempts) end)
+    clock = :atomics.new(1, [])
+    wall_now = fn -> :atomics.get(clock, 1) end
+
+    fake_harklight_agent!(
+      """
+      case "$1" in
+        attach)
+          printf '%s\\n' '{"kind":"attached","ready_for_listen":true}'
+          ;;
+        listen)
+          printf '%s\\n' listen >> '#{attempts}'
+          if [ "$(wc -l < '#{attempts}')" -le 3 ]; then
+            printf '%s\\n' '{"kind":"connection_error","reason_code":"transport_error"}'
+            exit 7
+          fi
+          exec sleep 300
+          ;;
+        status)
+          if [ -f '#{attempts}' ] && [ "$(wc -l < '#{attempts}')" -eq 4 ]; then
+            printf '%s\\n' '{"session_handle":"#{@handle}","availability":"listening","listening_support":{"route":"other"}}'
+          else
+            printf '%s\\n' '{"session_handle":"#{@handle}","availability":"not_listening"}'
+          fi
+          ;;
+      esac
+      """,
+      status: true
+    )
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         retry_jitter: false,
+         cooldown_base_ms: 0,
+         retry_delays: [300_000],
+         wall_now: wall_now,
+         outage_notice_delay_ms: 600_000}
+      )
+
+    assert eventually(fn -> Map.has_key?(:sys.get_state(manager).retry_timers, @handle) end)
+    assert {:ok, [[@handle, episode, 0, nil]]} = Tightbeam.HarklightListenerOutage.pending(db)
+
+    for {now, expected_wakes} <- [{599_999, []}, {600_000, [["blocker", 1]]}] do
+      :atomics.put(clock, 1, now)
+      state = :sys.get_state(manager)
+      {timer, token} = Map.fetch!(state.outage_timers, @handle)
+      Process.cancel_timer(timer)
+      send(manager, {:outage_notice, @handle, episode, token})
+      :sys.get_state(manager)
+      assert outage_wakes(db) == expected_wakes
+
+      retry_token = retry_timer_now(manager)
+
+      assert eventually(fn ->
+               case :sys.get_state(manager).retry_timers[@handle] do
+                 {_, next_token} -> next_token != retry_token
+                 _ -> false
+               end
+             end)
+
+      assert {:ok, [[@handle, ^episode, 0, _]]} =
+               Tightbeam.HarklightListenerOutage.pending(db)
+
+      assert outage_wakes(db) == expected_wakes
+    end
+
+    retry_timer_now(manager)
+
+    assert eventually(
+             fn ->
+               outage_wakes(db) == [["blocker", 1], ["fyi", 1]]
+             end,
+             400
+           )
+
+    assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
+    assert File.read!(attempts) == String.duplicate("listen\n", 4)
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_entries")
+  end
+
+  defp retry_timer_now(manager) do
+    {timer, token} = Map.fetch!(:sys.get_state(manager).retry_timers, @handle)
+    Process.cancel_timer(timer)
+    send(manager, {:retry_listener, @handle, token})
+    token
+  end
+
+  @tag :reviewfix
+  test "an expired queued transport retry leaves the last real probe intact", %{db: db} do
+    calls = Path.join(System.tmp_dir!(), "expired-probe-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm(calls) end)
+    clock = :atomics.new(1, [])
+    now = fn -> :atomics.get(clock, 1) end
+
+    fake_harklight_agent!("""
+    if [ "$1" = attach ]; then
+      printf '%s\\n' attach >> '#{calls}'
+      printf '%s\\n' '{"kind":"connection_error","reason_code":"transport_error"}'
+      exit 7
+    fi
+    """)
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         now: now,
+         retry_jitter: false,
+         retry_delays: [300_000],
+         attach_spacing_ms: 0,
+         slow_attach_spacing_ms: 10_000,
+         attach_retry_window_ms: 5_000,
+         attach_retry_delays: [0]}
+      )
+
+    assert eventually(fn ->
+             state = :sys.get_state(manager)
+             state.transport_failures == 1 and :queue.len(state.attach_waiting) == 1
+           end)
+
+    state = :sys.get_state(manager)
+    assert state.failed_handles == %{@handle => 0}
+    assert state.probe_times == %{@handle => 0}
+    {timer, token} = state.attach_gate_timer
+    Process.cancel_timer(timer)
+    :atomics.put(clock, 1, 10_000)
+    send(manager, {:attach_gate, token})
+
+    assert eventually(fn -> Map.has_key?(:sys.get_state(manager).retry_timers, @handle) end)
+    state = :sys.get_state(manager)
+    assert File.read!(calls) == "attach\n"
+    assert state.failed_handles == %{@handle => 0}
+    assert state.probe_times == %{@handle => 0}
+    assert state.transport_failures == 1
+    assert state.cooldown_until == 0
+    assert MapSet.size(state.attach_slots) == 0
+  end
+
   @tag :reviewfix
   test "a hundred simultaneous listen deaths open only the base cooldown", %{db: db} do
     state = review_state(db)
@@ -290,13 +504,13 @@ defmodule Tightbeam.HarklightWakesTest do
     assert outage_wakes(db) == [["blocker", 1]]
 
     {:reply, :ok, state} =
-      HarklightWakes.handle_call({:attached, @handle}, {self(), make_ref()}, state)
+      HarklightWakes.handle_call({:listener_ready, @handle}, {self(), make_ref()}, state)
 
     assert outage_wakes(db) == [["blocker", 1], ["fyi", 1]]
     assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
 
     {:reply, :ok, state} =
-      HarklightWakes.handle_call({:attached, @handle}, {self(), make_ref()}, state)
+      HarklightWakes.handle_call({:listener_ready, @handle}, {self(), make_ref()}, state)
 
     assert outage_wakes(db) == [["blocker", 1], ["fyi", 1]]
     state = review_failure(state)
@@ -305,7 +519,7 @@ defmodule Tightbeam.HarklightWakesTest do
     assert outage_wakes(db) == [["blocker", 2], ["fyi", 1]]
 
     {:reply, :ok, _} =
-      HarklightWakes.handle_call({:attached, @handle}, {self(), make_ref()}, state)
+      HarklightWakes.handle_call({:listener_ready, @handle}, {self(), make_ref()}, state)
 
     assert outage_wakes(db) == [["blocker", 2], ["fyi", 2]]
   end
@@ -316,7 +530,7 @@ defmodule Tightbeam.HarklightWakesTest do
     Process.put(:review_now, 599_999)
 
     {:reply, :ok, state} =
-      HarklightWakes.handle_call({:attached, @handle}, {self(), make_ref()}, state)
+      HarklightWakes.handle_call({:listener_ready, @handle}, {self(), make_ref()}, state)
 
     assert state.outage_timers == %{}
     assert outage_wakes(db) == []
@@ -819,7 +1033,7 @@ defmodule Tightbeam.HarklightWakesTest do
         {HarklightWakes,
          db: db,
          listener: fn manager, handle, _ ->
-           :ok = GenServer.call(manager, {:attached, handle})
+           :ok = ready_fixture_listener(manager, handle)
            send(parent, {:legacy_reader, self()})
 
            receive do
@@ -1519,7 +1733,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _ ->
-      GenServer.call(manager, {:attached, handle})
+      ready_fixture_listener(manager, handle)
       send(test_pid, :successor_listener_restored)
 
       receive do
@@ -2624,7 +2838,7 @@ defmodule Tightbeam.HarklightWakesTest do
     calls = fake_harklight_session_end_agent!()
 
     listener = fn manager, handle, _ ->
-      GenServer.call(manager, {:attached, handle})
+      ready_fixture_listener(manager, handle)
 
       receive do
         :never -> :ok
@@ -2698,7 +2912,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     listener = fn manager, handle, _vendor_id ->
       send(test_pid, :listener_started)
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       :ok = GenServer.call(manager, {:finished, handle, :complete})
       send(test_pid, :listener_completed)
     end
@@ -2765,7 +2979,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       :ok = GenServer.call(manager, {:finished, handle, :complete})
       send(test_pid, :listener_completed)
     end
@@ -2787,7 +3001,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       :ok = GenServer.call(manager, {:finished, handle, "listener_stopped"})
       send(test_pid, :listener_failed)
     end
@@ -2831,7 +3045,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     listener = fn manager, handle, vendor_id ->
       send(parent, {:listener_started, handle, vendor_id})
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
 
       :ok =
         GenServer.call(
@@ -2914,7 +3128,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     listener = fn manager, handle, vendor_id ->
       send(parent, {:listener_started, handle, vendor_id})
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
 
       receive do
         :stop -> :ok
@@ -2997,7 +3211,7 @@ defmodule Tightbeam.HarklightWakesTest do
       parent = self()
 
       listener = fn manager, handle, vendor ->
-        :ok = GenServer.call(manager, {:attached, handle})
+        :ok = ready_fixture_listener(manager, handle)
         for line <- lines, do: :ok = GenServer.call(manager, {:capture, handle, line})
         send(parent, {:restored, self(), handle, vendor})
 
@@ -4082,7 +4296,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     initial_listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       :ok = GenServer.call(manager, {:finished, handle, "listener_stopped"})
       send(test_pid, :initial_failure_recorded)
     end
@@ -4214,7 +4428,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(test_pid, {:listener_running, self()})
 
       receive do
@@ -4271,7 +4485,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(test_pid, {:listener_running, self()})
 
       receive do
@@ -4350,7 +4564,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(test_pid, {:listener_running, self()})
 
       receive do
@@ -4416,7 +4630,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(test_pid, {:listener_running, self()})
 
       receive do
@@ -4486,7 +4700,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(test_pid, {:listener_running, self()})
 
       receive do
@@ -4689,7 +4903,7 @@ defmodule Tightbeam.HarklightWakesTest do
           GenServer.call(manager, {:finished, handle, failure})
 
         :recover ->
-          :ok = GenServer.call(manager, {:attached, handle})
+          :ok = ready_fixture_listener(manager, handle)
           send(parent, :recovered)
           receive do: (:stop -> :ok)
       end
@@ -4749,7 +4963,7 @@ defmodule Tightbeam.HarklightWakesTest do
           GenServer.call(manager, {:finished, handle, failure})
 
         :recover ->
-          :ok = GenServer.call(manager, {:attached, handle})
+          :ok = ready_fixture_listener(manager, handle)
           send(parent, {:many_recovered, handle, self()})
           receive do: (:complete -> GenServer.call(manager, {:finished, handle, :complete}))
       end
@@ -4885,7 +5099,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
       receive do
         :attach ->
-          :ok = GenServer.call(manager, {:attached, handle})
+          :ok = ready_fixture_listener(manager, handle)
           send(test_pid, {:listener_attached, self()})
           receive do: (:drop -> :ok)
 
@@ -4963,7 +5177,7 @@ defmodule Tightbeam.HarklightWakesTest do
     parent = self()
 
     listener = fn manager, handle, _ ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(parent, :reattached)
 
       receive do
@@ -5003,7 +5217,7 @@ defmodule Tightbeam.HarklightWakesTest do
     end
 
     listener = fn manager, handle, _ ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       Agent.update(closed, fn _ -> true end)
       :ok = GenServer.call(manager, {:finished, handle, "listener_stopped"})
       send(parent, :first_failed)
@@ -5062,7 +5276,7 @@ defmodule Tightbeam.HarklightWakesTest do
     end
 
     listener = fn manager, handle, _vendor ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(parent, {:retry_listener_started, self()})
 
       receive do
@@ -5163,7 +5377,7 @@ defmodule Tightbeam.HarklightWakesTest do
           send(parent, :restart_attach_failed)
 
         _ ->
-          :ok = GenServer.call(manager, {:attached, handle})
+          :ok = ready_fixture_listener(manager, handle)
           send(parent, {:listener_started, attempt, self()})
           receive do: (:hold -> :ok)
       end
@@ -5251,7 +5465,7 @@ defmodule Tightbeam.HarklightWakesTest do
       else
         send(parent, {:recovery_waiting, self()})
         receive do: (:attach -> :ok)
-        :ok = GenServer.call(manager, {:attached, handle})
+        :ok = ready_fixture_listener(manager, handle)
         send(parent, :recovery_listener_attached)
         receive do: (:hold -> :ok)
       end
@@ -5350,7 +5564,7 @@ defmodule Tightbeam.HarklightWakesTest do
     end
 
     listener = fn manager, handle, _vendor ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(parent, {:listening, self()})
       receive do: (:hold -> :ok)
     end
@@ -5396,7 +5610,7 @@ defmodule Tightbeam.HarklightWakesTest do
     end
 
     listener = fn manager, handle, _vendor ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(parent, {:listening, self()})
       receive do: (:hold -> :ok)
     end
@@ -5458,7 +5672,7 @@ defmodule Tightbeam.HarklightWakesTest do
     end
 
     listener = fn manager, handle, _vendor ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(parent, :unexpected_retry_listener)
       receive do: (:hold -> :ok)
     end
@@ -5851,7 +6065,7 @@ defmodule Tightbeam.HarklightWakesTest do
     end
 
     listener = fn manager, handle, _vendor ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(parent, :unexpected_retry_listener)
       receive do: (:hold -> :ok)
     end
@@ -5936,7 +6150,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, vendor ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(test_pid, {:started, self(), handle, vendor})
 
       receive do
@@ -6019,7 +6233,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(test_pid, {:listener_running, self()})
 
       receive do
@@ -6056,7 +6270,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(test_pid, {:listener_running, self()})
 
       receive do
@@ -6086,7 +6300,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(test_pid, {:listener_running, self(), vendor_id})
 
       receive do
@@ -6114,7 +6328,7 @@ defmodule Tightbeam.HarklightWakesTest do
     test_pid = self()
 
     listener = fn manager, handle, _vendor_id ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       :ok = GenServer.call(manager, {:finished, handle, :complete})
       send(test_pid, :listener_completed)
     end
@@ -8013,7 +8227,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     listener = fn manager, handle, vendor_id ->
       send(test_pid, {:listener_started, handle, vendor_id})
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
 
       receive do
         :stop -> :ok
@@ -8581,13 +8795,14 @@ defmodule Tightbeam.HarklightWakesTest do
     }
   end
 
-  defp fake_harklight_agent!(body) do
+  defp fake_harklight_agent!(body, opts \\ []) do
     directory =
       Path.join(System.tmp_dir!(), "harklight-agent-test-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(directory)
     executable = Path.join(directory, "harklight-agent")
-    File.write!(executable, "#!/bin/sh\nif [ \"$1\" = status ]; then exit 1; fi\n" <> body)
+    status_guard = if opts[:status], do: "", else: "if [ \"$1\" = status ]; then exit 1; fi\n"
+    File.write!(executable, "#!/bin/sh\n" <> status_guard <> body)
     File.chmod!(executable, 0o755)
 
     previous_path = System.get_env("PATH")
@@ -9765,7 +9980,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
   defp completion_notifying_listener(parent) do
     fn manager, handle, vendor ->
-      :ok = GenServer.call(manager, {:attached, handle})
+      :ok = ready_fixture_listener(manager, handle)
       send(parent, {:restored, handle, vendor})
 
       receive do

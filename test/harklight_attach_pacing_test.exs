@@ -6,16 +6,7 @@ defmodule Tightbeam.HarklightAttachPacingTest do
     Process.put(:pacing_now, 0)
 
     {:ok, state} =
-      HarklightWakes.init(
-        [
-          now: fn -> Process.get(:pacing_now) end,
-          retry_jitter: false,
-          attach_spacing_ms: 250,
-          slow_attach_spacing_ms: 10_000,
-          cooldown_base_ms: 30_000,
-          cooldown_max_ms: 300_000
-        ] ++ opts
-      )
+      HarklightWakes.init([now: fn -> Process.get(:pacing_now) end, retry_jitter: false] ++ opts)
 
     assert_receive :restore
     state
@@ -126,7 +117,7 @@ defmodule Tightbeam.HarklightAttachPacingTest do
   end
 
   test "a shared outage across 150 conversations converges to one probe per five minutes" do
-    state = scheduler(transport_failure_window_ms: 86_400_000) |> workers(150)
+    state = scheduler() |> workers(150)
     waiting = :queue.from_list(for {_, pid} <- state.workers, do: {pid, make_ref()})
 
     {state, probes} =
@@ -139,7 +130,9 @@ defmodule Tightbeam.HarklightAttachPacingTest do
 
     probes = Enum.reverse(probes)
     assert length(Enum.uniq_by(probes, &elem(&1, 0))) == 150
-    assert Enum.take(Enum.map(probes, &elem(&1, 1)), 5) == [0, 10_000, 20_000, 30_000, 60_000]
+
+    assert Enum.take(Enum.map(probes, &elem(&1, 1)), 9) ==
+             [0, 10_000, 20_000, 30_000, 60_000, 120_000, 240_000, 480_000, 780_000]
 
     assert probes
            |> Enum.drop(8)
