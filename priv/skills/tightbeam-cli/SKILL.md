@@ -172,15 +172,18 @@ Choose the wait instrument by what can observe the event:
 
 1. For an in-organization row, subscribe with a condition wake that names the existing fact
    kind and scope (`--when-fact <kind> --when-scope <scope>`), or a dependency wait
-   (`--assignment <assignment-id> --predicate '<JSON>'`). Supply a fallback; three hours
+   (`--assignment <assignment-id> --predicate '<JSON>'`). Use
+   `--wait-reason "<why you are waiting>"` and supply a fallback. Three hours
    (`--fallback-after 3h`) is the usual default. Do not poll the row on a timer. Ask Main
    when no established fact names the event.
 2. For an external system that Tightbeam cannot observe, schedule a timed wake to this
-   session with the exact probe to run. Record each probe result. After three unchanged
+   session with `--wait-reason "<why you are waiting>"` and the exact probe to run. Record
+   each probe result. After three unchanged
    probes, report the stuck boundary to the assignment opener.
 3. For a human answer, use a decision request. Do not schedule a human poll.
-4. To resume your own work, wake this session: `--after-turn` continues as soon as the
-   current turn ends, and `--after <duration>` resumes at a chosen time.
+4. To resume your own work, wake this session with `--wait-reason "<reason>"`.
+   `--after-turn` continues as soon as the current turn ends, and
+   `--after <duration>` resumes at a chosen time.
 
 Before a turn ends with the assignment open, leave one valid liveness receipt: a material
 progress row, a bounded checkpoint, a completion, a cannot-proceed filing, or a concrete continuation
