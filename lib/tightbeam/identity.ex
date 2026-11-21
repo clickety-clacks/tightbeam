@@ -1356,7 +1356,8 @@ defmodule Tightbeam.Identity do
           live,
           %{candidate_revision: main, expected_prior: live},
           names,
-          publish
+          publish,
+          []
         )
 
       :none ->
@@ -1365,7 +1366,13 @@ defmodule Tightbeam.Identity do
         blocked_attention =
           Enum.map(blocked, &"#{&1} is present but does not define the shipped rule")
 
-        {add, differing} = Enum.split_with(add, &(own_path_state(dir, &1) != :differs))
+        {add, differing} =
+          Enum.reduce(add, {[], []}, fn entry, {ok, bad} ->
+            case own_path_state(dir, entry) do
+              :differs -> {ok, bad ++ [entry]}
+              origin -> {ok ++ [Map.put(entry, :origin, origin)], bad}
+            end
+          end)
 
         blocked_attention =
           blocked_attention ++
@@ -1378,7 +1385,7 @@ defmodule Tightbeam.Identity do
              :ok <- reconcile_ready(dir, live) do
           names = Enum.flat_map(add, & &1.names)
           candidate = commit_seed_law!(dir, live, add)
-          result = publish_reconcile(dir, live, candidate, names, publish)
+          result = publish_reconcile(dir, live, candidate, names, publish, add)
           %{result | attention: blocked_attention ++ result.attention}
         else
           [] ->
@@ -1432,12 +1439,12 @@ defmodule Tightbeam.Identity do
       "or run `tightbeam identity relearn` to install them."
   end
 
-  defp publish_reconcile(dir, live, candidate, names, publish) do
+  defp publish_reconcile(dir, live, candidate, names, publish, add) do
     publish.(candidate)
     %{added: names, attention: [], candidate: candidate}
   rescue
     error ->
-      withdraw_candidate!(dir, live, candidate.candidate_revision)
+      withdraw_candidate!(dir, live, candidate.candidate_revision, add)
 
       %{
         added: [],
@@ -1446,20 +1453,49 @@ defmodule Tightbeam.Identity do
       }
   end
 
-  # Put main and live back at `live` and take the candidate's added files out of
-  # the working tree first, so the gateway can never load a rule live lacks. Only
-  # those paths are touched: other working-tree changes are the operator's.
-  defp withdraw_candidate!(dir, live, candidate) do
+  # Undo a candidate that could not be published, without ever discarding
+  # anything that is not ours. A file is removed only if the reconcile created it
+  # (its path was free) and it still holds the committed bytes; an operator's
+  # pre-existing copy goes back to the state it was in (staged stays staged,
+  # untracked becomes untracked again) and a differing file is not touched.
+  # Refs move back only by compare-and-swap, and the working tree is brought in
+  # line first, so a failure leaves a lag the next start finishes (the rule absent
+  # from the tree), never a rule in the tree that live lacks.
+  defp withdraw_candidate!(dir, live, candidate, add) do
+    live_now = git_output!(dir, ["rev-parse", "refs/heads/#{@live}"])
+
+    unless live_now in [candidate, live] do
+      raise "live moved to #{live_now} after the seed-rule commit #{candidate}; not rewinding it"
+    end
+
+    origins = Map.new(add, &{&1.path, &1.origin})
+
     dir
     |> git_output!(["diff", "--name-only", "--diff-filter=A", live, candidate])
     |> String.split("\n", trim: true)
-    |> Enum.each(fn path ->
-      git!(dir, ["rm", "-q", "--cached", "--ignore-unmatch", "--", path])
-      File.rm(Path.join(dir, path))
-    end)
+    |> Enum.each(&withdraw_path!(dir, candidate, &1, Map.get(origins, &1)))
 
-    git!(dir, ["update-ref", "refs/heads/main", live])
-    git!(dir, ["update-ref", "refs/heads/#{@live}", live])
+    if live_now == candidate,
+      do: git!(dir, ["update-ref", "refs/heads/#{@live}", live, candidate])
+
+    git!(dir, ["update-ref", "refs/heads/main", live, candidate])
+  end
+
+  defp withdraw_path!(_dir, _candidate, _path, {:identical, "A "}), do: :ok
+
+  defp withdraw_path!(dir, _candidate, path, {:identical, "??"}),
+    do: git!(dir, ["rm", "-q", "--cached", "--ignore-unmatch", "--", path])
+
+  defp withdraw_path!(dir, candidate, path, _created) do
+    full = Path.join(dir, path)
+    committed = git_show_bytes!(dir, candidate, path)
+
+    if File.read(full) == {:ok, committed} do
+      git!(dir, ["rm", "-q", "--cached", "--ignore-unmatch", "--", path])
+      File.rm!(full)
+    end
+
+    :ok
   end
 
   # An earlier start committed the seed rules on main and stopped before
@@ -1481,19 +1517,37 @@ defmodule Tightbeam.Identity do
   end
 
   # The ref moved but the working tree had not caught up when the start stopped:
-  # the added files show as staged deletions. Restore just those files.
+  # the added files show as staged deletions. Restore just those files, unless
+  # the operator has put a different file there since.
   defp sync_lagging_paths!(dir, live, main) do
-    added =
-      dir
-      |> git_output!(["diff", "--name-only", "--diff-filter=A", live, main])
-      |> String.split("\n", trim: true)
+    dir
+    |> git_output!(["diff", "--name-only", "--diff-filter=A", live, main])
+    |> String.split("\n", trim: true)
+    |> Enum.each(fn path ->
+      lines =
+        dir
+        |> git_output!(["status", "--porcelain", "--untracked-files=all", "--", path])
+        |> String.split("\n", trim: true)
 
-    lagging =
-      Enum.filter(added, fn path ->
-        git_output!(dir, ["status", "--porcelain", "--", path]) |> String.starts_with?("D ")
-      end)
+      full = Path.join(dir, path)
 
-    if lagging != [], do: git!(dir, ["checkout", "main", "--" | lagging])
+      cond do
+        lines == ["D  " <> path] ->
+          git!(dir, ["checkout", "main", "--", path])
+
+        lines == ["D  " <> path, "?? " <> path] and
+            File.read(full) == {:ok, git_show_bytes!(dir, main, path)} ->
+          git!(dir, ["checkout", "main", "--", path])
+
+        lines != [] and Enum.any?(lines, &String.starts_with?(&1, "D ")) ->
+          Logger.warning(
+            "#{path} was replaced by a different file after an interrupted start; left alone"
+          )
+
+        true ->
+          :ok
+      end
+    end)
   end
 
   defp reconcile_ready(dir, live) do
@@ -1524,7 +1578,7 @@ defmodule Tightbeam.Identity do
 
     case {code, File.read(Path.join(dir, path))} do
       {"", {:error, :enoent}} -> :free
-      {code, {:ok, ^shipped}} when code in ["??", "A "] -> :identical
+      {code, {:ok, ^shipped}} when code in ["??", "A "] -> {:identical, code}
       _ -> :differs
     end
   end
@@ -1577,7 +1631,7 @@ defmodule Tightbeam.Identity do
         git!(dir, ["checkout", "main", "--" | paths])
       rescue
         error ->
-          withdraw_candidate!(dir, live, commit)
+          withdraw_candidate!(dir, live, commit, add)
           reraise error, __STACKTRACE__
       end
 

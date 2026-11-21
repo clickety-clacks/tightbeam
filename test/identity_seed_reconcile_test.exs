@@ -362,6 +362,84 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     assert Identity.live_revision!(ctx.base) == prior
   end
 
+  for {label, staged?} <- [{"untracked", false}, {"staged", true}] do
+    test "a failed publication leaves an operator's pre-existing #{label} copy as it was", ctx do
+      init_shape!(ctx.base, "0.1.15")
+      prior = Identity.live_revision!(ctx.base)
+      path = Path.join(ctx.dir, @notice_path)
+      File.mkdir_p!(Path.dirname(path))
+      File.cp!(Path.join(@seed, @notice_path), path)
+      if unquote(staged?), do: git(ctx.dir, ["add", "--", @notice_path])
+      before = git(ctx.dir, ["status", "--porcelain"])
+
+      assert %{candidate: nil, added: [], attention: attention} =
+               Identity.reconcile_seed_law!(ctx.base, fn _ -> raise "publication refused" end)
+
+      assert Enum.any?(attention, &(&1 =~ "publication refused"))
+      assert File.read!(path) == File.read!(Path.join(@seed, @notice_path))
+      assert git(ctx.dir, ["status", "--porcelain"]) == before
+      assert git(ctx.dir, ["rev-parse", "main"]) == prior
+      assert Identity.live_revision!(ctx.base) == prior
+    end
+  end
+
+  test "a rollback never rewinds a live ref someone else moved", ctx do
+    init_shape!(ctx.base, "0.1.15")
+
+    result =
+      Identity.reconcile_seed_law!(ctx.base, fn candidate ->
+        {:ok, _} = Identity.publish_live!(ctx.base, candidate)
+        tree = git(ctx.dir, ["rev-parse", "#{candidate.candidate_revision}^{tree}"])
+
+        other =
+          git(ctx.dir, [
+            "commit-tree",
+            tree,
+            "-p",
+            candidate.candidate_revision,
+            "-m",
+            "someone else"
+          ])
+
+        git(ctx.dir, ["update-ref", "refs/heads/tightbeam/live", other])
+        send(self(), {:other, other})
+        raise "late failure"
+      end)
+
+    assert_received {:other, other}
+    assert %{candidate: nil, added: []} = result
+    assert Enum.any?(result.attention, &(&1 =~ "not rewinding"))
+    assert Identity.live_revision!(ctx.base) == other
+    assert File.exists?(Path.join(ctx.dir, @notice_path))
+  end
+
+  test "a restart after a lag leaves a different file the operator put there", ctx do
+    init_shape!(ctx.base, "0.1.15")
+    assert :crash == catch_throw(Identity.reconcile_seed_law!(ctx.base, fn _ -> throw(:crash) end))
+    committed = git(ctx.dir, ["rev-parse", "main"])
+    path = Path.join(ctx.dir, @notice_path)
+    git(ctx.dir, ["rm", "-q", "--cached", "--", @notice_path])
+    File.write!(path, "# operator's replacement\n")
+
+    capture_log(fn ->
+      assert %{added: [@notice]} = SeedReconcile.run!(ctx.base, ctx.db)
+    end)
+
+    assert File.read!(path) == "# operator's replacement\n"
+    assert Identity.live_revision!(ctx.base) == committed
+  end
+
+  test "a restart after a lag accepts an identical replacement", ctx do
+    init_shape!(ctx.base, "0.1.15")
+    assert :crash == catch_throw(Identity.reconcile_seed_law!(ctx.base, fn _ -> throw(:crash) end))
+    git(ctx.dir, ["rm", "-q", "--cached", "--", @notice_path])
+    # Same bytes, now untracked.
+    assert git(ctx.dir, ["status", "--porcelain"]) =~ "D  #{@notice_path}"
+
+    assert %{added: [@notice]} = SeedReconcile.run!(ctx.base, ctx.db)
+    assert git(ctx.dir, ["status", "--porcelain"]) == ""
+  end
+
   test "a failed stamp repair warns and leaves the published commit, it does not stop start",
        ctx do
     init_shape!(ctx.base, "0.1.15")
