@@ -213,9 +213,13 @@ defmodule Tightbeam.SessionCustodyTransfer do
     )
 
     Enum.each(selected.wakes, fn wake_id ->
-      case Wakes.readdress_pending_in_txn(txn, wake_id, target) do
-        {:ok, _wake} -> :ok
-        {:error, reason} -> raise Refusal, code: "wake_readdress_failed:#{inspect(reason)}"
+      wake = Wakes.get_in_txn(txn, wake_id)
+
+      unless wake.state == "canceled" and Tightbeam.HolderProd.own_notice?(wake) do
+        case Wakes.readdress_pending_in_txn(txn, wake_id, target) do
+          {:ok, _wake} -> :ok
+          {:error, reason} -> raise Refusal, code: "wake_readdress_failed:#{inspect(reason)}"
+        end
       end
     end)
 

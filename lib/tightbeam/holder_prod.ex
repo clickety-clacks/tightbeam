@@ -79,13 +79,15 @@ defmodule Tightbeam.HolderProd do
   end
 
   defp cancel_in_txn(txn, wake_id) do
-    Wakes.cancel_in_txn(txn, %{
-      wake_id: wake_id,
-      requester: %{kind: "process", id: "tightbeam:supervision"},
-      reason_kind: "superseded",
-      causal_source: %{kind: "wake", id: wake_id},
-      outcome: %{kind: "no_replacement"}
-    })
+    unless Wakes.cancel_in_txn(txn, %{
+             wake_id: wake_id,
+             requester: %{kind: "process", id: "tightbeam:holder-prod"},
+             reason_kind: "superseded",
+             causal_source: %{kind: "wake", id: wake_id},
+             outcome: %{kind: "no_replacement"}
+           }) do
+      raise DB.Error, message: "holder prod supersession did not commit: #{wake_id}"
+    end
   end
 
   # Ordinary holder activity and the end of a real path start the quiet
@@ -136,6 +138,7 @@ defmodule Tightbeam.HolderProd do
          NOT EXISTS (
            SELECT 1 FROM turns t
            WHERE t.sessionKey=e.holderKey
+             AND t.status IN ('queued','running')
              AND (t.status='running' OR (t.status='queued' AND (t.assignmentId=e.id OR EXISTS (
                SELECT 1 FROM wakes w WHERE w.deliveredTurnSeq=t.seq AND w.assignmentId=e.id
              ))))
@@ -164,9 +167,13 @@ defmodule Tightbeam.HolderProd do
     |> Enum.min(fn -> nil end)
   end
 
-  def admit_due_in_txn(txn, at) do
-    for [id, holder, item, owner, since, episode, nil, _, _, 1] <- candidates(txn, nil, at),
-        since + @quiet_ms <= at do
+  def admit_due_in_txn(txn, at, batch \\ 100) do
+    due =
+      for [id, holder, item, owner, since, episode, nil, _, _, 1] <- candidates(txn, nil, at),
+          since + @quiet_ms <= at,
+          do: {since, id, holder, item, owner, episode}
+
+    for {_since, id, holder, item, owner, episode} <- due |> Enum.sort() |> Enum.take(batch) do
       Wakes.schedule_in_txn(txn, %{
         session_key: holder,
         origin: "process:tightbeam",

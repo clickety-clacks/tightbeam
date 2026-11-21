@@ -1,8 +1,27 @@
 defmodule Tightbeam.HolderProdTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, DB, HolderProd, Model, Org, SessionCustodyTransfer, Wakes}
+  alias Tightbeam.{
+    Assignments,
+    ConnRegistry,
+    DB,
+    HolderProd,
+    Ledger,
+    Model,
+    Org,
+    SessionCustodyTransfer,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
+
+  defmodule LaneStub do
+    use GenServer
+
+    def start_link(name), do: GenServer.start_link(__MODULE__, :ok, name: name)
+    def init(:ok), do: {:ok, :ok}
+    def handle_call({:ensure_lane, _session_key}, _from, state), do: {:reply, :ok, state}
+  end
 
   @quiet 30 * 60 * 1_000
   @assignment "asg_fixture"
@@ -73,13 +92,20 @@ defmodule Tightbeam.HolderProdTest do
     assert is_binary(episode)
     assert Wakes.get(ctx.db, wake_id).prompt =~ "fact, predicate, or timed fallback"
 
-    # Restarting the scheduler preserves the source and cannot issue another.
-    scheduler =
-      start_supervised!(
-        {Wakes, db: ctx.db, name: nil, holder_prod: true, deliver: fn _ -> :ok end}
-      )
-
+    start_supervised!({ConnRegistry, name: :holder_prod_test_registry})
+    start_supervised!({LaneStub, :holder_prod_test_lane})
+    scheduler = start_scheduler(ctx.db)
     assert :ok = Wakes.fire_due(scheduler)
+    assert %{state: "fired", delivered_turn_seq: seq} = Wakes.get(ctx.db, wake_id)
+
+    assert %{wakeId: ^wake_id, state: "delivered"} =
+             HolderProd.evidence(ctx.db, @assignment, "holder")
+
+    assert {:ok, %{seq: ^seq} = turn} = Ledger.claim_next(ctx.db, "holder", "fixture")
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: turn.owner_lease)
+    sweep(ctx.db, threshold + 2 * @quiet)
+    stop_supervised!(Wakes)
+    assert :ok = ctx.db |> start_scheduler() |> Wakes.fire_due()
     assert length(notices(ctx.db)) == 1
   end
 
@@ -165,6 +191,20 @@ defmodule Tightbeam.HolderProdTest do
     SELECT wakeId,sessionKey,state FROM wakes
     WHERE obligationRef LIKE 'assignment-holder-prod-v1:%' ORDER BY rowid
     """)
+  end
+
+  defp start_scheduler(db) do
+    start_supervised!(
+      {Wakes,
+       db: db,
+       name: nil,
+       holder_prod: true,
+       deliver: fn _ -> :ok end,
+       delivery_opts: [
+         conn_registry: :holder_prod_test_registry,
+         lane_manager: :holder_prod_test_lane
+       ]}
+    )
   end
 
   defp deadline(db) do

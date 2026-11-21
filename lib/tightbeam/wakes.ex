@@ -3696,6 +3696,7 @@ defmodule Tightbeam.Wakes do
 
   defp retryable_prompt_wake?(wake, turn) do
     wake.consumer == "prompt" and not wake.digest and
+      not Tightbeam.HolderProd.own_notice?(wake) and
       not String.starts_with?(turn.request_ref || "", "bubble:")
   end
 
@@ -4575,7 +4576,7 @@ defmodule Tightbeam.Wakes do
 
   defp holder_prod_superseded?(
          %{
-           requester: %{kind: "process", id: "tightbeam:supervision"},
+           requester: %{kind: "process", id: "tightbeam:holder-prod"},
            reason_kind: "superseded",
            causal_source: %{kind: "wake", id: wake_id},
            outcome: %{kind: "no_replacement"}
@@ -4773,6 +4774,13 @@ defmodule Tightbeam.Wakes do
       _ ->
         :error
     end
+  end
+
+  defp authorize_cancel(
+         %{requester: %{kind: "process", id: "tightbeam:holder-prod"}} = command,
+         wake
+       ) do
+    if holder_prod_superseded?(command, wake), do: :ok, else: :error
   end
 
   defp authorize_cancel(
@@ -7016,7 +7024,7 @@ defmodule Tightbeam.Wakes do
     evaluate_conditions(state, :tick)
 
     if state.holder_prod do
-      transaction!(db, &Tightbeam.HolderProd.admit_due_in_txn(&1, now()))
+      transaction!(db, &Tightbeam.HolderProd.admit_due_in_txn(&1, now(), state.batch))
     end
 
     # E's old generations are historical data, not scheduler input. Retire
