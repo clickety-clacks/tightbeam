@@ -6082,7 +6082,11 @@ defmodule Tightbeam.AssignmentsTest do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "fetch me"))
 
     result =
-      handle(ctx, "assignment-get", assignment_get_call({:session, "other-session"}, assignment.id))
+      handle(
+        ctx,
+        "assignment-get",
+        assignment_get_call({:session, "other-session"}, assignment.id)
+      )
 
     assert %{
              holderProd: %{
