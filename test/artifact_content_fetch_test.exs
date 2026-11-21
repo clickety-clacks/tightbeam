@@ -164,19 +164,21 @@ defmodule Tightbeam.ArtifactContentFetchTest do
   end
 
   defp archived(ctx, home, host, sha) do
-    artifact = record(ctx.db, "workspace-only-origin.bin")
+    id = "art_archive_fixture_#{System.unique_integer([:positive])}"
 
     assert {:ok, _} =
              DB.query(
                ctx.db,
                """
-               UPDATE artifacts SET state='archived', home=?2, originHost=?3, contentSha256=?4
-               WHERE artifactId=?1
+               INSERT INTO artifacts(artifactId, kind, title, createdBySession, workItemId,
+                 originPath, contentSha256, state, home, createdAt, updatedAt, originHost)
+               VALUES(?1, 'data', 'Archived fixture', 'content-fixture', 'wi_content_fixture',
+                 'workspace-only-origin.bin', ?4, 'archived', ?2, 1, 1, ?3)
                """,
-               [artifact.artifact_id, home, host, sha]
+               [id, home, host, sha]
              )
 
-    artifact.artifact_id
+    id
   end
 
   defp sha256(bytes), do: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
