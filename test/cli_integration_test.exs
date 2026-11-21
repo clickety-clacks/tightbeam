@@ -756,13 +756,34 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assignment = JSON.decode!(assignment_output)["id"]
     future = Integer.to_string(System.system_time(:millisecond) + 3_600_000)
+    reason = "Waiting for the external deadline"
+
+    {refusal, 1} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-holder",
+          "--assignment",
+          assignment,
+          "--after",
+          "1h",
+          "--prompt",
+          "continue the same assignment"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert refusal =~ "Recording a wait requires a nonblank --wait-reason"
 
     for timing <- [["--after", "1h"], ["--at", future]] do
       {output, 0} =
         System.cmd(
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
-            timing ++ ["--prompt", "continue the same assignment"],
+            timing ++ ["--prompt", "continue the same assignment", "--wait-reason", reason],
           cd: ctx.workdir,
           stderr_to_stdout: true
         )
@@ -771,6 +792,7 @@ defmodule Tightbeam.CliIntegrationTest do
       assert wake.assignment_id == assignment
       assert wake.obligation_ref == assignment
       assert wake.creator_session_key == "cli-holder"
+      assert wake.wait_reason == reason
       assert wake.wait_mode == nil
       assert wake.due_at > wake.created_at
 

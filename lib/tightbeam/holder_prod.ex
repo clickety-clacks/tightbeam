@@ -205,7 +205,7 @@ defmodule Tightbeam.HolderProd do
         class: "fyi",
         obligation_ref: episode,
         prompt:
-          "Your assignment #{id} has been quiet for 30 minutes. Continue the work, or if you are legitimately waiting, record a fact, predicate, or timed fallback wait."
+          "Your assignment #{id} has been quiet for 30 minutes. Continue the work, or if you are legitimately waiting, record a fact, predicate, or timed fallback wait with a short reason."
       })
     end
 
