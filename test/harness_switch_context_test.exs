@@ -627,18 +627,21 @@ defmodule Tightbeam.HarnessSwitchContextTest do
     db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    for {{reason, account?}, index} <-
+    for {{reason, expected_scope}, index} <-
           Enum.with_index([
-            {claude_limit("You've hit your weekly limit"), true},
-            {claude_limit("You've hit your 5-hour limit · resets 4:00pm UTC"), true},
-            {claude_limit("You've hit your usage limit"), true},
-            {claude_limit("You've hit your Haiku weekly limit"), false},
-            {claude_limit("You've hit your weekly limit. Model was not changed."), false},
-            {claude_limit("You have hit your weekly limit for Sonnet"), false},
-            {claude_limit("Rate limit exceeded"), false},
-            {%{"code" => 429}, false}
+            {claude_limit("You've hit your weekly limit"), :account},
+            {claude_limit("You've hit your 5-hour limit · resets 4:00pm UTC"), :account},
+            {claude_limit("You've hit your usage limit"), :account},
+            {claude_limit("You've hit your Haiku weekly limit"), :model},
+            {claude_limit("Rate limit for claude-haiku-5-5"), :model},
+            {claude_limit("Rate limit for claude-haiku-5-5-preview"), :bounded},
+            {claude_limit("You've hit your weekly limit. Model was not changed."), :bounded},
+            {claude_limit("You have hit your weekly limit for Sonnet"), :bounded},
+            {claude_limit("Rate limit exceeded"), :bounded},
+            {%{"code" => 429}, :bounded}
           ]) do
       host = "fixture-host-#{index}"
+      account? = expected_scope == :account
 
       result =
         HarnessHealth.observe_compactor_failure(db, %{
@@ -660,17 +663,10 @@ defmodule Tightbeam.HarnessSwitchContextTest do
       assert HarnessProcess.parked?(db, {:claude, "shared", host}) == account?
       assert HarnessHealth.unavailable?(db, "claude", host) == account?
 
-      if account? do
-        assert {:ok, []} =
-                 DB.query(db, "SELECT id FROM harness_model_rate_limits WHERE host=?1", [host])
-      else
-        expected_model_record? = index == 3
+      assert {:ok, rows} =
+               DB.query(db, "SELECT model FROM harness_model_rate_limits WHERE host=?1", [host])
 
-        assert {:ok, rows} =
-                 DB.query(db, "SELECT model FROM harness_model_rate_limits WHERE host=?1", [host])
-
-        assert rows != [] == expected_model_record?
-      end
+      assert rows == if(expected_scope == :model, do: [["claude-haiku-5-5"]], else: [])
     end
   end
 

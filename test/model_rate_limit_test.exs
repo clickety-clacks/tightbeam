@@ -131,14 +131,20 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimitTest do
   test "compactor model evidence requires an explicit model name and a replay-safe attempt key",
        ctx do
     model = "claude-haiku-5-5"
-    assert ModelRateLimit.model_named?("You've hit your Haiku weekly limit", model)
+    identity = Model.new(model, context: "1m")
+    assert ModelRateLimit.model_named?("You've hit your Haiku weekly limit", identity)
+    assert ModelRateLimit.model_named?("Rate limit for claude-haiku-5-5.", identity)
+    assert ModelRateLimit.model_named?("Rate limit for claude-haiku-5-5[1m].", identity)
+    refute ModelRateLimit.model_named?("Rate limit for claude-haiku-5-5-preview", identity)
+    refute ModelRateLimit.model_named?("Rate limit for claude-haiku-5-5[2m]", identity)
+    refute ModelRateLimit.model_named?("You've hit your other-haiku weekly limit", identity)
 
     refute ModelRateLimit.model_named?(
              "You've hit your weekly limit. Model was not changed.",
-             model
+             identity
            )
 
-    refute ModelRateLimit.model_named?("HTTP 429 Too Many Requests", model)
+    refute ModelRateLimit.model_named?("HTTP 429 Too Many Requests", identity)
 
     input = %{
       harness: "claude",
@@ -166,19 +172,53 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimitTest do
                ["attempt-1"]
              )
 
+    assert_raise MatchError, fn ->
+      ModelRateLimit.record_compactor_attempt(ctx.db, Map.delete(input, :host))
+    end
+  end
+
+  test "a normal success releases a compactor hold recorded with a context variant", ctx do
+    model = "claude-haiku-5-5"
+    context = "1m"
+    ref = Model.to_ref(Model.new(model, context: context))
+    reason = put_in(@model_429["message"], "Rate limit for #{ref}")
+
+    assert %{model_rate_limit: %{status: "recorded", attempt_key: attempt}} =
+             HarnessHealth.observe_compactor_failure(ctx.db, %{
+               context_id: "context-qualified-compaction",
+               harness: "claude",
+               host: "testhost",
+               model: ref,
+               reason: reason,
+               observed_at: System.system_time(:millisecond)
+             })
+
+    assert {:ok, [[^model, ^context, nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT model,modelContext,releasedAt FROM harness_model_rate_limits
+               WHERE compactionAttemptKey=?1
+               """,
+               [attempt]
+             )
+
     session_key = "agent:compactor-rate-limit-release"
-    session(ctx.db, session_key, "claude", model)
+    session(ctx.db, session_key, "claude", ref)
     release_turn = succeed_turn!(ctx.db, session_key)
+
+    assert {:ok, [[^model, ^context]]} =
+             DB.query(ctx.db, "SELECT model,modelContext FROM turns WHERE seq=?1", [release_turn])
 
     assert {:ok, [[^release_turn, "normal-turn"]]} =
              DB.query(
                ctx.db,
-               "SELECT releaseTurnSeq,releaseCause FROM harness_model_rate_limits WHERE compactionAttemptKey='attempt-1'"
+               """
+               SELECT releaseTurnSeq,releaseCause FROM harness_model_rate_limits
+               WHERE compactionAttemptKey=?1
+               """,
+               [attempt]
              )
-
-    assert_raise MatchError, fn ->
-      ModelRateLimit.record_compactor_attempt(ctx.db, Map.delete(input, :host))
-    end
   end
 
   test "the source-identity migration preserves existing turn records", ctx do
@@ -289,7 +329,7 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimitTest do
       host: "testhost",
       harness: harness,
       provider: if(harness == "codex", do: "openai", else: "anthropic"),
-      model: Model.new(model)
+      model: Model.parse_ref(model)
     })
   end
 end

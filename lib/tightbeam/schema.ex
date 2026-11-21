@@ -2186,6 +2186,7 @@ defmodule Tightbeam.Schema do
                  harness TEXT NOT NULL CHECK(length(trim(harness)) > 0),
                  host TEXT NOT NULL CHECK(length(trim(host)) > 0),
                  model TEXT NOT NULL CHECK(length(trim(model)) > 0),
+                 modelContext TEXT,
                  sessionKey TEXT,
                  assignmentId TEXT,
                  turnSeq INTEGER,
@@ -2197,7 +2198,8 @@ defmodule Tightbeam.Schema do
                  releaseCause TEXT CHECK(releaseCause IN ('normal-turn','escalated')),
                  releaseTurnSeq INTEGER,
                  CHECK((compactionAttemptKey IS NULL AND sessionKey IS NOT NULL AND turnSeq IS NOT NULL) OR
-                       (compactionAttemptKey IS NOT NULL AND sessionKey IS NULL AND turnSeq IS NULL)),
+                       (compactionAttemptKey IS NOT NULL AND sessionKey IS NULL AND turnSeq IS NULL
+                        AND assignmentId IS NULL)),
                  CHECK((releasedAt IS NULL AND releaseCause IS NULL) OR
                        (releasedAt IS NOT NULL AND releaseCause IS NOT NULL))
                )

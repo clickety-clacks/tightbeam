@@ -20,6 +20,7 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Model
 
   @ddl """
   CREATE TABLE IF NOT EXISTS harness_model_rate_limits (
@@ -98,30 +99,42 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
   defp names_model?(text, model) do
     model = String.downcase(model)
 
+    [model, family_token(model)]
+    |> Enum.filter(&(is_binary(&1) and String.length(&1) >= 4))
+    |> Enum.any?(&limit_names?(text, &1, "\\b", "\\b"))
+  end
+
+  defp family_token(model) do
     # The family is a word inside the model id after its leading vendor word,
     # for example "opus" in an "<vendor>-opus-5-5" id.
-    family =
-      case String.split(model, ["-", "_", "."], trim: true) do
-        [_vendor | rest] -> Enum.find(rest, &Regex.match?(~r/\A[a-z]+\z/, &1))
-        _ -> nil
-      end
+    case String.split(model, ["-", "_", "."], trim: true) do
+      [_vendor | rest] -> Enum.find(rest, &Regex.match?(~r/\A[a-z]+\z/, &1))
+      _ -> nil
+    end
+  end
 
-    [model, family]
-    |> Enum.filter(&(is_binary(&1) and String.length(&1) >= 4))
-    |> Enum.any?(fn name ->
-      qualifier = Regex.escape(name)
+  defp limit_names?(text, name, left, right) do
+    qualifier = left <> Regex.escape(name) <> right
 
-      Regex.match?(
-        ~r/\b#{qualifier}(?:['’]s)?\s+(?:(?:model|session|hourly|daily|weekly|monthly|usage|rate|request)\s+)*(?:limit|quota)\b|\b(?:limit|quota)(?:\s+(?:reached|exceeded))?\s+(?:for|on)\s+(?:the\s+)?#{qualifier}\b/u,
-        text
-      )
-    end)
+    Regex.match?(
+      ~r/#{qualifier}(?:['’]s)?\s+(?:(?:model|session|hourly|daily|weekly|monthly|usage|rate|request)\s+)*(?:limit|quota)\b|\b(?:limit|quota)(?:\s+(?:reached|exceeded))?\s+(?:for|on)\s+(?:the\s+)?#{qualifier}/u,
+      text
+    )
   end
 
   @doc "True only when provider wording explicitly names the attempted model or its family."
-  @spec model_named?(String.t(), String.t()) :: boolean()
-  def model_named?(message, model) when is_binary(message) and is_binary(model) do
-    names_model?(String.downcase(message), model)
+  @spec model_named?(String.t(), Model.t()) :: boolean()
+  def model_named?(message, %Model{} = model) when is_binary(message) do
+    text = String.downcase(message)
+    family = String.downcase(model.family)
+    ref = model |> Model.to_ref() |> String.downcase()
+
+    # A word boundary alone would also accept the prefix of a longer model ID.
+    # A final period is punctuation unless another identifier segment follows.
+    [ref, family, family_token(family)]
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.uniq()
+    |> Enum.any?(&limit_names?(text, &1, "(?<![\\w./-])", "(?![\\w/\\[-]|\\.\\w)"))
   end
 
   def model_named?(_message, _model), do: false
@@ -135,9 +148,9 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
           txn,
           """
           INSERT INTO harness_model_rate_limits
-            (id,harness,host,model,sessionKey,assignmentId,turnSeq,compactionAttemptKey,
-             observedAt,cause,principal)
-          VALUES (?1,?2,?3,?4,NULL,NULL,NULL,?5,?6,?7,?8)
+            (id,harness,host,model,modelContext,sessionKey,assignmentId,turnSeq,
+             compactionAttemptKey,observedAt,cause,principal)
+          VALUES (?1,?2,?3,?4,?5,NULL,NULL,NULL,?6,?7,?8,?9)
           ON CONFLICT(compactionAttemptKey) WHERE compactionAttemptKey IS NOT NULL DO NOTHING
           """,
           [
@@ -145,6 +158,7 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
             input.harness,
             input.host,
             input.model,
+            Map.get(input, :model_context),
             attempt_key,
             input.observed_at,
             input.cause,
