@@ -154,24 +154,61 @@ defmodule Tightbeam.RowReactions.Store do
     )
   end
 
-  # Returns held legacy pointers to pending once a rail for their family loads.
-  # Only holds this module placed are resumed; every other held action stays held.
+  # Ends the holds this module placed once a rail for their family loads.
+  # A held pointer resumes as pending unless the item saw a transition (an
+  # assignment, routing or disposition change) after the pointer was adopted.
+  # That transition was stored with no election while the rail was absent, so
+  # the pointer is already satisfied: it is canceled, which withdraws its wake.
+  # Every other held action stays held. Returns the events whose canceled
+  # actions still need their withdrawal executed.
   def resume_unloaded_rail_holds(txn) do
-    for [id, family] <-
+    for [id, family, org, event_id, work_item_id, admitted_at] <-
           Txn.q(
             txn,
-            "SELECT id,family FROM row_reaction_actions WHERE status='held' AND lastError LIKE ?1",
+            """
+            SELECT a.id,a.family,a.org,a.eventId,json_extract(e.event,'$.workItemId'),e.admittedAt
+            FROM row_reaction_actions a
+            JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
+            WHERE a.status='held' AND a.lastError LIKE ?1
+            """,
             [@unloaded_marker <> "%"]
           ),
         Rules.reaction_family_loaded?(family) do
-      Txn.q(
-        txn,
-        "UPDATE row_reaction_actions SET status='pending',lastError=NULL,updatedAt=?2 WHERE id=?1 AND status='held'",
-        [id, System.system_time(:millisecond)]
-      )
-    end
+      now = System.system_time(:millisecond)
 
-    :ok
+      if transitioned_since?(txn, org, work_item_id, admitted_at) do
+        Txn.q(
+          txn,
+          "UPDATE row_reaction_actions SET status='canceled',lastError=NULL,updatedAt=?2 WHERE id=?1 AND status='held'",
+          [id, now]
+        )
+
+        event(txn, org, event_id) |> elem(0)
+      else
+        Txn.q(
+          txn,
+          "UPDATE row_reaction_actions SET status='pending',lastError=NULL,updatedAt=?2 WHERE id=?1 AND status='held'",
+          [id, now]
+        )
+
+        nil
+      end
+    end
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp transitioned_since?(_txn, _org, nil, _admitted_at), do: false
+
+  defp transitioned_since?(txn, org, work_item_id, admitted_at) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM row_reaction_events
+      WHERE org=?1 AND admittedAt>?3 AND json_extract(event,'$.workItemId')=?2
+        AND json_extract(event,'$.operation')='transition' LIMIT 1
+      """,
+      [org, work_item_id, admitted_at]
+    ) == [[1]]
   end
 
   defp cancel_unplanned(txn, action, plan, at) do

@@ -203,6 +203,44 @@ defmodule Tightbeam.WorkItemBracketsTest do
     end
   end
 
+  test "a held legacy reminder is withdrawn, not resumed, if its item was assigned meanwhile",
+       ctx do
+    kept = create(ctx, {:user, "flynn"}, %{title: "Still unrouted"})
+    routed = create(ctx, {:user, "flynn"}, %{title: "Assigned while rails absent"})
+    kept_id = routing_wake_id(ctx.db, kept.id)
+    routed_id = routing_wake_id(ctx.db, routed.id)
+    forget_reaction_pointer_ledger(ctx.db, kept.id)
+    forget_reaction_pointer_ledger(ctx.db, routed.id)
+
+    Rules.load!(Path.join(ctx.law_base, "absent"), Map.keys(ctx.handlers))
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+    assert {:ok, _} = disp_assign(ctx, {:user, "flynn"}, "holder", "Work while absent", routed.id)
+
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+
+    for _ <- 1..2 do
+      :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+      # The untouched item keeps its single owed reminder.
+      assert routing_wake_id(ctx.db, kept.id) == kept_id
+      assert Wakes.get(ctx.db, kept_id).state == "pending"
+      assert item_wake_count(ctx.db, kept.id) == 1
+
+      # The assigned item is routed: no reminder fires or repeats for it.
+      assert routing_wake_id(ctx.db, routed.id) == nil
+      assert Wakes.get(ctx.db, routed_id).state == "canceled"
+      assert item_wake_count(ctx.db, routed.id) == 0
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+                 [routed_id]
+               )
+    end
+  end
+
   test "canceled and missing legacy references are never replaced during adoption", ctx do
     for status <- ["canceled", "missing"] do
       item = create(ctx, {:user, "flynn"}, %{title: "Adopt #{status} reminder"})
