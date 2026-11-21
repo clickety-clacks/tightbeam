@@ -150,20 +150,6 @@ defmodule ItemlessSpawnDispatchRuntime do
         )
       end
 
-      # R7: substrate participants never receive the engineering rail's refusal.
-      assert_substrate_staffing_refusal!(
-        db,
-        handlers,
-        spawn_call("unqualified", "session:unqualified", "helper")
-      )
-
-      assert_substrate_staffing_refusal!(
-        db,
-        handlers,
-        spawn_call("default-caller", "session:default-caller", "agentic-engineering.coder")
-        |> Map.update!(:params, &Map.merge(&1, %{harness: "fixture", model: "fixture-model"}))
-      )
-
       count_before = count_sessions(db)
 
       assert {:error, %{code: "qualified_archetype_required", message: message}} =
@@ -175,6 +161,22 @@ defmodule ItemlessSpawnDispatchRuntime do
 
       assert message =~ "agentic-engineering.coder"
       assert count_sessions(db) == count_before
+
+      # This bare helper archetype has no configured staffing rule. The W9
+      # substrate check now accepts its missing item and records the fact.
+      line =
+        "FYI: this production staffing names no work item; decide for yourself whether that is acceptable"
+
+      assert {:ok, %{session_key: unqualified_helper, fyi: [^line]}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 spawn_call("unqualified", "session:unqualified", "helper")
+                 |> put_in([:params, :display_name], "WI3FE unqualified helper")
+               )
+
+      assert count_sessions(db) == count_before + 1
+      assert Tightbeam.StateResources.query_session(db, unqualified_helper).fyi == [line]
 
       # R5 is independent of the caller's archetype.
       for caller <- ["caller", "engineering-caller"] do
@@ -258,18 +260,6 @@ defmodule ItemlessSpawnDispatchRuntime do
 
     assert {:error, %{code: "rule_denied", rule: @staffing_rule, message: @staffing_message}} =
              Dispatch.dispatch(db, handlers, call)
-
-    assert count_sessions(db) == count_before
-  end
-
-  defp assert_substrate_staffing_refusal!(db, handlers, call) do
-    count_before = count_sessions(db)
-
-    assert {:error, %{code: "work_item_required", message: message}} =
-             Dispatch.dispatch(db, handlers, call)
-
-    assert message ==
-             "production staffing requires an exact work item; create or link the item before staffing"
 
     assert count_sessions(db) == count_before
   end
