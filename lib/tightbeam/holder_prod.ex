@@ -139,8 +139,10 @@ defmodule Tightbeam.HolderProd do
            SELECT 1 FROM turns t
            WHERE t.sessionKey=e.holderKey
              AND t.status IN ('queued','running')
-             AND (t.status='running' OR (t.status='queued' AND (t.assignmentId=e.id OR EXISTS (
+             AND (t.status='running' OR (t.status='queued' AND (
+               (t.assignmentId=e.id AND t.seq IS NOT p.deliveredTurnSeq) OR EXISTS (
                SELECT 1 FROM wakes w WHERE w.deliveredTurnSeq=t.seq AND w.assignmentId=e.id
+                 AND w.wakeId IS NOT p.wakeId
              ))))
          )
          AND NOT EXISTS (
@@ -196,8 +198,7 @@ defmodule Tightbeam.HolderProd do
     {:ok, result} =
       DB.transaction(db, fn txn ->
         case candidates(txn, assignment_id, System.system_time(:millisecond)) do
-          [[^assignment_id, ^holder, _, _, since, episode, wake, state, delivered, idle]]
-          when idle == 1 or not is_nil(wake) ->
+          [[^assignment_id, ^holder, _, _, since, episode, wake, state, delivered, 1]] ->
             %{
               holderSessionKey: holder,
               quietSince: since,

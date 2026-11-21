@@ -107,6 +107,10 @@ defmodule Tightbeam.HolderProdTest do
     stop_supervised!(Wakes)
     assert :ok = ctx.db |> start_scheduler() |> Wakes.fire_due()
     assert length(notices(ctx.db)) == 1
+
+    record_wait(ctx.db, "holder", "holder", threshold + @quiet, :fact)
+    refute HolderProd.evidence(ctx.db, @assignment, "holder")
+    assert %{state: "fired", delivered_turn_seq: ^seq} = Wakes.get(ctx.db, wake_id)
   end
 
   for wait <- [:timed, :fact, :predicate, :after_turn] do
