@@ -969,6 +969,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
 
   defp plan_seed_reactions(plan, seed_reactions, reaction_scan) do
     substrate_reactions = substrate_reaction_index(plan)
+    bundle_reactions = reaction_index(plan, &match?({:kungfu, _}, &1))
 
     Enum.reduce(@seed_reactions, plan, fn {name, relative}, acc ->
       existing = Map.get(substrate_reactions, name, [])
@@ -984,6 +985,11 @@ defmodule Tightbeam.Identity.RailScopeMigration do
             )
 
           %{acc | stops: [stop | acc.stops]}
+
+        # A bundle that still carries the reaction under its own filename keeps
+        # it; planting the seed copy too would leave two definitions of one name.
+        existing == [] and Map.has_key?(bundle_reactions, name) ->
+          acc
 
         existing == [] ->
           case Map.fetch(seed_reactions, relative) do
@@ -1874,10 +1880,12 @@ defmodule Tightbeam.Identity.RailScopeMigration do
     end)
   end
 
-  defp substrate_reaction_index(plan) do
+  defp substrate_reaction_index(plan), do: reaction_index(plan, &(&1 == :substrate))
+
+  defp reaction_index(plan, owner?) do
     merged_entries(plan)
     |> Enum.filter(fn {path, _} ->
-      scoped_rail_path?(path) and owner_for_destination(plan, path) == :substrate
+      scoped_rail_path?(path) and owner?.(owner_for_destination(plan, path))
     end)
     |> Enum.reduce(%{}, fn {path, bytes}, index ->
       case Toml.decode(bytes) do

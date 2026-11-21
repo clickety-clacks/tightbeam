@@ -871,6 +871,34 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     assert report =~ "other-kungfu and sample-kungfu"
   end
 
+  test "a bundle's own copy of the handoff notice under another filename is kept, not doubled",
+       ctx do
+    init_fixture!(ctx.base_dir, bundle_handoff: "rules/child-notice.toml")
+    db = start_db!()
+    seed_migration_rows!(db)
+
+    assert RailScopeMigration.run!(ctx.base_dir, db)["status"] == "complete"
+    identity_dir = Path.join(ctx.base_dir, "identity")
+
+    definitions =
+      identity_dir
+      |> Path.join("**/*.toml")
+      |> Path.wildcard()
+      |> Enum.filter(fn path ->
+        path
+        |> File.read!()
+        |> Toml.decode!()
+        |> Map.get("reaction", [])
+        |> List.wrap()
+        |> Enum.any?(&(&1["name"] == "assignment-terminal-handoff"))
+      end)
+      |> Enum.map(&Path.relative_to(&1, identity_dir))
+
+    assert definitions == ["kungfu/#{@kungfu}/rules/child-notice.toml"]
+    refute File.exists?(Path.join(identity_dir, "rules/row-reaction-handoff.toml"))
+    assert_single_rail_definition!(ctx.base_dir, "reaction", "r04-work-item-notice")
+  end
+
   test "an edited legacy row reaction stops without changing fixture identity", ctx do
     init_fixture!(ctx.base_dir, edit_reaction: true)
     db = start_db!()
@@ -929,6 +957,15 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
 
     write_legacy_reaction_copies!(identity_dir)
 
+    bundle_handoff = Keyword.get(opts, :bundle_handoff)
+
+    if bundle_handoff do
+      File.cp!(
+        Path.join(@legacy_reaction_fixture_dir, "row-reaction-handoff.toml"),
+        Path.join(identity_dir, bundle_handoff)
+      )
+    end
+
     if Keyword.get(opts, :edit_reaction, false) do
       File.write!(
         Path.join(identity_dir, "rules/row-reaction-handoff.toml"),
@@ -950,6 +987,8 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
       "rules/row-reaction-terminal-action.toml",
       "kungfu/#{@kungfu}/manifest.toml"
     ]
+
+    paths = if bundle_handoff, do: paths ++ [bundle_handoff], else: paths
 
     File.write!(
       Path.join(identity_dir, "kungfu/#{@kungfu}/installed.toml"),
