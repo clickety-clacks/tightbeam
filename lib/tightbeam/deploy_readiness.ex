@@ -22,7 +22,7 @@ defmodule Tightbeam.DeployReadiness do
 
     spawn =
       request!(call, "spawn", %{
-        "archetype" => "agentic-engineering.reviewer-code",
+        "archetype" => "default",
         "displayName" => "smoke-readiness-#{nonce}",
         "idempotencyKey" => "readiness-spawn-#{nonce}"
       })

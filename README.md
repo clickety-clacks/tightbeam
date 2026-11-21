@@ -496,17 +496,20 @@ configuration at all.
 ### Then learn the working identity
 
 ```sh
-<base_dir>/bin/tightbeam learn agentic-engineering --as-user <userId>
+<base_dir>/bin/tightbeam learn uncle-enzo --as-user <userId>
 ```
 
-`<base_dir>/bin/tightbeam unlearn agentic-engineering --as-user <userId>` is its
+`<base_dir>/bin/tightbeam unlearn uncle-enzo --as-user <userId>` is its
 inverse. Credentials are per provider/harness per machine, while harness homes
 are per machine and harness; learning or unlearning changes neither, so it
 never requires onboarding again.
 
-Engineering intake uses an organization-level orchestrator as the bundle root and
-establishes or reuses each product's PDO and addressed PO. Follow the bundle's intake and shared
-role roster for delivery routing. The neutral root stays neutral before adoption;
+Uncle Enzo is the primary kungfu: its root is an executive who holds your intent
+and talks to you, and its deliverators each own getting one feature or concern
+delivered. `tightbeam kungfu list` shows every shipped bundle. The
+agentic-engineering bundle no longer ships; an organization that learned it
+keeps it until it unlearns it, as described in the 0.1.17 release notes'
+Breaking changes. The neutral root stays neutral before adoption;
 learning a bundle or changing a default does not transfer existing session custody.
 
 ### Then run a real turn

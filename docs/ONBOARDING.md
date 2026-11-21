@@ -34,7 +34,7 @@ Cursor is API-key-only in Tightbeam. There is no subscription login; the CLI
 requires `--api-key` and reads the key from stdin. At launch the harness injects
 `CURSOR_API_KEY` with `AGENT_CLI_CREDENTIAL_STORE=memory` — the uniform
 file-backed-cred + env-injection model. Cursor placement is gateway-local only;
-see `priv/kungfu/agentic-engineering/guidance/harness-support.md`.
+see `priv/skills/tightbeam-harnesses/SKILL.md`.
 
 `--api-key` will not read from a terminal — a key typed at a prompt lands in
 shell scrollback.

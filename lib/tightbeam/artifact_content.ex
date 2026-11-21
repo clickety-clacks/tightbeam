@@ -37,7 +37,7 @@ defmodule Tightbeam.ArtifactContent do
   bytes, and the bytes cannot be mutated or dropped.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{ArtifactArchive, DB}
   alias Tightbeam.DB.Txn
 
   @table_ddl """
@@ -123,12 +123,18 @@ defmodule Tightbeam.ArtifactContent do
   def ensure_schema(db), do: DB.execute(db, @ddl)
   def schema_in_txn(%Txn{} = txn), do: Txn.exec(txn, @ddl)
 
-  @doc "Read captured content for an authenticated artifact reader, without an origin path."
-  def fetch_call(db, %{
-        principal: {kind, id},
-        rest_principal: %{kind: visibility_kind, id: id, is_admin: is_admin} = principal,
-        params: %{artifact_id: artifact_id} = params
-      })
+  @doc "Read archived or captured bytes for an authenticated artifact reader."
+  def fetch_call(db, call, config \\ %{})
+
+  def fetch_call(
+        db,
+        %{
+          principal: {kind, id},
+          rest_principal: %{kind: visibility_kind, id: id, is_admin: is_admin} = principal,
+          params: %{artifact_id: artifact_id} = params
+        },
+        config
+      )
       when ((kind == :user and visibility_kind == "user") or
               (kind == :session and visibility_kind == "session") or
               (kind == :process and visibility_kind == "process")) and
@@ -139,28 +145,126 @@ defmodule Tightbeam.ArtifactContent do
 
            if row != nil and
                 Tightbeam.StateVisibility.core_detail_visible?(txn, "artifacts", row, principal) do
-             case fetch(txn, artifact_id) do
-               nil ->
-                 %{code: "content_not_captured", message: "artifact has no stored content"}
-
-               captured ->
-                 captured
-                 |> Map.delete(:content)
-                 |> Map.put(:content_base64, Base.encode64(captured.content))
-             end
+             {:visible, row}
            else
              %{code: "not_found"}
            end
          end) do
+      {:ok, {:visible, row}} -> fetch_visible(db, row, config)
       {:ok, result} -> result
       {:error, error} -> raise error
     end
   end
 
-  def fetch_call(_db, %{principal: {kind, _}}) when kind in [:user, :session, :process],
+  def fetch_call(_db, %{principal: {kind, _}}, _config) when kind in [:user, :session, :process],
     do: %{code: "invalid", message: "artifact-content-fetch requires only artifactId"}
 
-  def fetch_call(_db, _call), do: %{code: "forbidden"}
+  def fetch_call(_db, _call, _config), do: %{code: "forbidden"}
+
+  defp fetch_visible(db, %{state: "archived"} = row, config) do
+    case fetch(db, row.artifact_id) do
+      nil ->
+        fetch_archive(db, row, config)
+
+      captured ->
+        status =
+          case ArtifactArchive.read(
+                 db,
+                 row,
+                 Map.put(config, :artifact_archive_inline_limit_bytes, 0)
+               ) do
+            {:ok, archive} ->
+              row
+              |> content_result(archive.sha256, archive.size, nil, "archived_home")
+              |> Map.drop([:artifact_id, :code])
+              |> Map.put(:archived_home, archive.home)
+
+            {:error, reason} ->
+              row
+              |> unavailable_archive(reason)
+              |> Map.delete(:code)
+              |> Map.put(:verification_status, "unavailable")
+          end
+
+        row
+        |> verified_capture(captured)
+        |> Map.put(:archive_verification, status)
+    end
+  end
+
+  defp fetch_visible(db, row, _config) do
+    case fetch(db, row.artifact_id) do
+      nil ->
+        %{code: "content_not_captured", message: "artifact has no stored content"}
+
+      captured ->
+        captured
+        |> Map.delete(:content)
+        |> Map.put(:content_base64, Base.encode64(captured.content))
+    end
+  end
+
+  defp fetch_archive(db, row, config) do
+    case ArtifactArchive.read(db, row, config) do
+      {:ok, archive} ->
+        result = content_result(row, archive.sha256, archive.size, archive.bytes, "archived_home")
+
+        if is_nil(archive.bytes) do
+          Map.merge(result, %{
+            archived_home: archive.home,
+            content_size: archive.size,
+            content_unavailable_reason: "archived artifact is too large to return inline"
+          })
+        else
+          result
+        end
+
+      {:error, reason} ->
+        unavailable_archive(row, reason)
+    end
+  end
+
+  defp unavailable_archive(row, reason) do
+    %{
+      code: "archived_content_unavailable",
+      message: "could not read archived home #{row.home}: #{inspect(reason)}",
+      archived_home: row.home,
+      source: "archived_home"
+    }
+  end
+
+  defp verified_capture(row, captured) do
+    bytes = captured.content
+    digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    content_result(row, digest, byte_size(bytes), bytes, "stored_content")
+  end
+
+  defp content_result(row, observed, size, bytes, source) do
+    expected = row.content_sha256
+
+    if expected && String.downcase(expected) != observed do
+      %{
+        code: "artifact_sha_mismatch",
+        message:
+          "recorded sha does not match current bytes (expected #{expected}, observed #{observed})",
+        expected_sha256: expected,
+        observed_sha256: observed,
+        source: source,
+        verification_status: "mismatch"
+      }
+    else
+      result = %{
+        artifact_id: row.artifact_id,
+        content_sha256: observed,
+        content_size: size,
+        expected_sha256: expected,
+        source: source,
+        verification_status: if(expected, do: "match", else: "unverified")
+      }
+
+      if is_nil(bytes), do: result, else: Map.put(result, :content_base64, Base.encode64(bytes))
+    end
+  end
 
   @doc """
   Read captured bytes by artifact ID, or nil when no content was captured.

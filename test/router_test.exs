@@ -3984,9 +3984,27 @@ defmodule Tightbeam.Wire.RouterTest do
              )
 
     archived = Tightbeam.Artifacts.get(ctx.db, artifact.artifact_id)
+    body = %{verb: "artifact-content-fetch", params: %{artifactId: artifact.artifact_id}}
+    changed = "changed after it was recorded"
+    File.write!(archived.home, changed)
+    mismatch = dispatch_cli(ctx, writer.cli_token, body)
+    assert mismatch.status == 200
+    assert %{"result" => captured} = JSON.decode!(mismatch.resp_body)
+    assert captured["source"] == "stored_content"
+    assert captured["verificationStatus"] == "match"
+    assert captured["contentBase64"] == Base.encode64(bytes)
+    details = captured["archiveVerification"]
+    assert details["verificationStatus"] == "mismatch"
+    assert details["message"] =~ "recorded sha does not match current bytes"
+    assert details["expectedSha256"] == Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+
+    assert details["observedSha256"] ==
+             Base.encode16(:crypto.hash(:sha256, changed), case: :lower)
+
+    refute Map.has_key?(details, "contentBase64")
+
     File.rm!(archived.home)
     assert Tightbeam.Artifacts.release(ctx.db, artifact.artifact_id).state == "released"
-    body = %{verb: "artifact-content-fetch", params: %{artifactId: artifact.artifact_id}}
 
     expected = %{
       "artifactId" => artifact.artifact_id,

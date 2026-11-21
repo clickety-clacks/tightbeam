@@ -81,6 +81,10 @@ if config_env() != :test do
     config :tightbeam, key, String.to_integer(value)
   end
 
+  if value = System.get_env("TIGHTBEAM_ARTIFACT_ARCHIVE_INLINE_LIMIT_BYTES") do
+    config :tightbeam, :artifact_archive_inline_limit_bytes, String.to_integer(value)
+  end
+
   if value = System.get_env("TIGHTBEAM_DB_CALL_TIMEOUT_MS") do
     config :tightbeam, :db_call_timeout_ms, String.to_integer(value)
   end

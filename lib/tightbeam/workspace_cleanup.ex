@@ -26,6 +26,11 @@ defmodule Tightbeam.WorkspaceCleanup do
     workspace_archive_reserve_percent: 5
   }
 
+  @local_archived_home """
+  state='archived' AND (originHost=?2 OR originHost IS NULL)
+    AND (home=?1 OR substr(home,1,length(?1)+1)=?1 || '/')
+  """
+
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   def kick do
@@ -127,10 +132,10 @@ defmodule Tightbeam.WorkspaceCleanup do
   def archive_root(host), do: Path.join(host.base_dir, "archive")
 
   defp relocate_archive(config, db, failures, backoff) do
-    source = Path.join(config.base_dir, "archive")
-    destination = archive_root(%{ssh: nil, base_dir: config.base_dir})
+    source = Path.expand(Path.join(config.base_dir, "archive"))
+    destination = Path.expand(archive_root(%{ssh: nil, base_dir: config.base_dir}))
 
-    if Path.expand(source) != Path.expand(destination) do
+    if source != destination do
       if relative_inside(destination, source) != nil or
            relative_inside(source, destination) != nil,
          do: raise(ArgumentError, "archive relocation directories overlap")
@@ -139,7 +144,13 @@ defmodule Tightbeam.WorkspaceCleanup do
       {:ok, rows} =
         DB.query(
           db,
-          "SELECT home FROM artifacts WHERE state='archived' AND (originHost=?2 OR originHost IS NULL) AND substr(home,1,length(?1)+1)=?1 || '/' UNION SELECT archivePath FROM retired_workspace_cleanup WHERE substr(archivePath,1,length(?1)+1)=?1 || '/' AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?2)",
+          """
+          SELECT home FROM artifacts WHERE #{@local_archived_home} AND home<>?1
+          UNION
+          SELECT archivePath FROM retired_workspace_cleanup
+          WHERE substr(archivePath,1,length(?1)+1)=?1 || '/'
+            AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?2)
+          """,
           [source, Tightbeam.Placement.local_host_name()]
         )
 
@@ -232,20 +243,26 @@ defmodule Tightbeam.WorkspaceCleanup do
         raise "archive move exited with status #{status}: #{String.trim(output)}"
     end
 
-    {:ok, :ok} =
+    {:ok, missing} =
       DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          "SELECT artifactId,home FROM artifacts WHERE state='archived' AND (originHost=?2 OR originHost IS NULL) AND (home=?1 OR substr(home,1,length(?1)+1)=?1 || '/')",
-          [old, Tightbeam.Placement.local_host_name()]
-        )
-        |> Enum.each(fn [id, home] ->
-          Tightbeam.Artifacts.repoint_archive_in_txn(
+        missing =
+          Txn.q(
             txn,
-            id,
-            target <> String.replace_prefix(home, old, "")
+            "SELECT artifactId,home FROM artifacts WHERE #{@local_archived_home}",
+            [old, Tightbeam.Placement.local_host_name()]
           )
-        end)
+          |> Enum.reduce([], fn [id, home], missing ->
+            mapped = target <> String.replace_prefix(home, old, "")
+
+            case File.stat(mapped) do
+              {:ok, _} ->
+                Tightbeam.Artifacts.repoint_archive_in_txn(txn, id, mapped)
+                missing
+
+              {:error, reason} ->
+                [{id, mapped, reason} | missing]
+            end
+          end)
 
         Txn.q(
           txn,
@@ -253,10 +270,24 @@ defmodule Tightbeam.WorkspaceCleanup do
           [old, target, Tightbeam.Placement.local_host_name()]
         )
 
-        :ok
+        missing
       end)
 
-    :ok
+    Enum.each(missing, fn {id, mapped, reason} ->
+      Logger.warning(
+        "archive relocation kept the old home for #{id}: #{mapped} unavailable (#{reason})"
+      )
+    end)
+
+    case missing do
+      [] ->
+        :ok
+
+      missing ->
+        if Enum.all?(missing, fn {_, _, reason} -> reason in [:enoent, :enotdir] end),
+          do: :missing,
+          else: :retry
+    end
   rescue
     error ->
       Logger.warning("archive relocation deferred for #{entry}: #{Exception.message(error)}")

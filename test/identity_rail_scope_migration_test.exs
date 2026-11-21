@@ -14,7 +14,7 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
   }
   @seed_reactions %{
     "assignment-terminal-handoff" => "rules/row-reaction-handoff.toml",
-    "terminal-child-action-reminder" => "rules/row-reaction-terminal-action.toml"
+    "r04-work-item-notice" => "rules/row-reaction-work-items.toml"
   }
   @legacy_reaction_fixture_dir Path.expand(
                                  "fixtures/rail-scope-migration/legacy-reactions",
@@ -280,6 +280,14 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
       assert_single_rail_definition!(ctx.base_dir, "reaction", name)
     end
 
+    # The 2-hour reminder no longer ships: its legacy copy goes and is not replanted.
+    refute File.exists?(Path.join(identity_dir, "rules/row-reaction-terminal-action.toml"))
+
+    refute identity_dir
+           |> Path.join("**/*.toml")
+           |> Path.wildcard()
+           |> Enum.any?(&(File.read!(&1) =~ ~s(name = "terminal-child-action-reminder")))
+
     assert Path.join(identity_dir, "kungfu/#{@kungfu}/archetypes/#{@archetype}.toml")
            |> File.exists?()
 
@@ -445,7 +453,7 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     dir = Path.join(ctx.base_dir, "identity")
 
     legacy =
-      "priv/kungfu/agentic-engineering/rules/engineering.toml"
+      "test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml"
       |> File.read!()
       |> String.split("\n# Posture gate")
       |> hd()
@@ -908,6 +916,69 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     assert report =~ "other-kungfu and sample-kungfu"
   end
 
+  test "identity import restores the stock default alongside a scoped handoff and unlearn keeps it",
+       ctx do
+    base = ctx.base_dir
+    init_fixture!(base, bundle_handoff: "rules/child-notice.toml")
+    db = start_db!()
+    seed_migration_rows!(db)
+
+    identity_dir = Path.join(base, "identity")
+    git!(identity_dir, ["switch", "--detach", "main"])
+    git!(identity_dir, ["rm", "kungfu/#{@kungfu}/installed.toml"])
+    git!(identity_dir, ["commit", "-m", "fixture: shipped snapshot without receipt"])
+    git!(identity_dir, ["update-ref", "refs/heads/tightbeam/upstream", "HEAD"])
+    git!(identity_dir, ["switch", "main"])
+    stock = Path.join(identity_dir, "rules/row-reaction-handoff.toml")
+    alternate = "kungfu/#{@kungfu}/rules/child-notice.toml"
+
+    assert RailScopeMigration.run!(base, db)["status"] == "complete"
+    assert Provenance.owner_for_path(base, alternate) == {:kungfu, @kungfu}
+    scoped_bytes = File.read!(Path.join(identity_dir, alternate))
+    refute File.exists?(stock)
+    assert_single_rail_definition!(base, "reaction", "r04-work-item-notice")
+
+    assert {:ok, candidate} = Identity.learn!(base, "uncle-enzo", "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    stock_bytes = File.read!(stock)
+    assert File.read!(Path.join(identity_dir, alternate)) == scoped_bytes
+
+    assert {:ok, candidate} = Identity.relearn!(base, "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    assert File.read!(stock) == stock_bytes
+    assert File.read!(Path.join(identity_dir, alternate)) == scoped_bytes
+    assert Provenance.owner_for_path(base, alternate) == {:kungfu, @kungfu}
+
+    assert {:ok, _} = Identity.publish_live!(base, Identity.unlearn!(base, @kungfu, "fixture"))
+    refute File.exists?(Path.join(identity_dir, alternate))
+    assert File.read!(stock) == stock_bytes
+  end
+
+  test "learn and relearn keep an alternate organization handoff as the sole default", ctx do
+    base = ctx.base_dir
+    init_seed_upgrade_fixture!(base)
+    identity_dir = Path.join(base, "identity")
+    override = Path.join(identity_dir, "rules/org-child-notice.toml")
+    stock = Path.join(identity_dir, "rules/row-reaction-handoff.toml")
+    File.cp!(Path.join(@legacy_reaction_fixture_dir, "row-reaction-handoff.toml"), override)
+    commit_fixture!(identity_dir, "fixture: alternate organization handoff")
+
+    assert RailScopeMigration.run!(base, start_db!())["status"] == "complete"
+    assert_single_rail_definition!(base, "reaction", "assignment-terminal-handoff")
+    bytes = File.read!(override)
+
+    assert {:ok, candidate} = Identity.learn!(base, "uncle-enzo", "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    refute File.exists?(stock)
+    assert File.read!(override) == bytes
+
+    assert {:ok, candidate} = Identity.relearn!(base, "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    assert_single_rail_definition!(base, "reaction", "assignment-terminal-handoff")
+    refute File.exists?(stock)
+    assert File.read!(override) == bytes
+  end
+
   test "an edited legacy row reaction stops without changing fixture identity", ctx do
     init_fixture!(ctx.base_dir, edit_reaction: true)
     db = start_db!()
@@ -966,6 +1037,15 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
 
     write_legacy_reaction_copies!(identity_dir)
 
+    bundle_handoff = Keyword.get(opts, :bundle_handoff)
+
+    if bundle_handoff do
+      File.cp!(
+        Path.join(@legacy_reaction_fixture_dir, "row-reaction-handoff.toml"),
+        Path.join(identity_dir, bundle_handoff)
+      )
+    end
+
     if Keyword.get(opts, :edit_reaction, false) do
       File.write!(
         Path.join(identity_dir, "rules/row-reaction-handoff.toml"),
@@ -979,6 +1059,14 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
       "name = \"#{@kungfu}\"\nroot_archetype = \"#{@archetype}\"\n"
     )
 
+    if bundle_handoff do
+      File.write!(
+        Path.join(identity_dir, "kungfu/#{@kungfu}/manifest.toml"),
+        "purpose = \"Exercise identity migration with a learned kungfu.\"\n",
+        [:append]
+      )
+    end
+
     paths = [
       "archetypes/#{@archetype}.toml",
       "rules/sample.toml",
@@ -987,6 +1075,8 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
       "rules/row-reaction-terminal-action.toml",
       "kungfu/#{@kungfu}/manifest.toml"
     ]
+
+    paths = if bundle_handoff, do: paths ++ [bundle_handoff], else: paths
 
     File.write!(
       Path.join(identity_dir, "kungfu/#{@kungfu}/installed.toml"),
