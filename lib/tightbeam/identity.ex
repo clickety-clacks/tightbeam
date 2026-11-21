@@ -1592,15 +1592,7 @@ defmodule Tightbeam.Identity do
   end
 
   defp organization_handoff?(%{"name" => "assignment-terminal-handoff"} = declaration) do
-    case Plan.compile!(declaration, nil) do
-      %{mode: :event, family: "terminal-handoff", events: events, effects: effects} = plan ->
-        (plan.archetypes == ["*"] or plan.policy_context == "organization") and
-          "assignment" in events and
-          Enum.any?(effects, &match?(%{"slot" => "handoff", "kind" => "notice"}, &1))
-
-      _ ->
-        false
-    end
+    declaration |> Plan.compile!(nil) |> Plan.handoff_default?()
   rescue
     ArgumentError -> false
   end
