@@ -10,7 +10,9 @@ defmodule Tightbeam.ArtifactCapture do
 
       store ->
         capture =
-          if ArtifactOrigins.parse(call.params[:origin_path]) == :non_filesystem do
+          if is_nil(call[:artifact_capture]) and
+               not Map.has_key?(call.params, :content_base64) and
+               ArtifactOrigins.parse(call.params[:origin_path]) == :non_filesystem do
             %{custody: "external_pointer", sha256: call.params[:content_sha256]}
           else
             call[:artifact_capture] || capture_origin(db, store, call, config)
@@ -98,9 +100,12 @@ defmodule Tightbeam.ArtifactCapture do
 
   defp transfer_origin(db, call, config, store, upload) do
     if Map.has_key?(call.params, :content_base64) do
-      case Base.decode64(call.params.content_base64) do
-        {:ok, bytes} -> ArtifactBlobStore.append(store, upload, bytes)
-        :error -> {:error, :invalid_content_base64}
+      with encoded when is_binary(encoded) <- call.params.content_base64,
+           {:ok, bytes} <- Base.decode64(encoded),
+           ^encoded <- Base.encode64(bytes) do
+        ArtifactBlobStore.append(store, upload, bytes)
+      else
+        _ -> {:error, :invalid_content_base64}
       end
     else
       with {:ok, host, path} <- origin_location(db, call),

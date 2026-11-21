@@ -2694,7 +2694,7 @@ fn parse_with_optional_catalog(
                 description: nonempty(flags, "description"),
                 work_item_id: nonempty(flags, "work-item"),
                 content_sha256: nonempty(flags, "sha256"),
-                content_base64: nonempty(flags, "content-base64"),
+                content_base64: flags.get("content-base64").cloned(),
                 produced_by_assignment_id: nonempty(flags, "produced-by-assignment"),
                 allow_unpinned: flags.contains_key("allow-unpinned"),
             })

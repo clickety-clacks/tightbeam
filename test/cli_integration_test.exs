@@ -129,7 +129,7 @@ defmodule Tightbeam.CliIntegrationTest do
         store =
           start_supervised!(
             {Tightbeam.ArtifactBlobStore,
-             root: root, budget_bytes: 140_000, floor_bytes: 0, floor_percent: 0}
+             root: root, budget_bytes: 140_006, floor_bytes: 0, floor_percent: 0}
           )
 
         receiver = self()
@@ -1332,7 +1332,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {capacity, 0} = run.(["artifact-content-capacity"])
 
-    assert %{"usedBytes" => 140_000, "stagedBytes" => 0, "effectiveLimitBytes" => 140_000} =
+    assert %{"usedBytes" => 140_000, "stagedBytes" => 0, "effectiveLimitBytes" => 140_006} =
              JSON.decode!(capacity)
 
     legacy =
@@ -1354,6 +1354,9 @@ defmodule Tightbeam.CliIntegrationTest do
     {directory, 1} = run.(List.replace_at(record, 6, ctx.workdir))
     assert directory =~ "artifact origin is a directory"
 
+    encoded_inline = Base.encode64("inline")
+    inline_sha = Base.encode16(:crypto.hash(:sha256, "inline"), case: :lower)
+
     for origin <- ["https://example.test/report", "tightbeam-transcript:example-session"] do
       {pointer, 0} = run.(List.replace_at(record, 6, origin))
 
@@ -1363,7 +1366,60 @@ defmodule Tightbeam.CliIntegrationTest do
       {unavailable, 1} = run.(["artifact-content-fetch", id])
       assert unavailable =~ "external pointer"
       assert unavailable =~ "external_pointer"
+
+      inline =
+        List.replace_at(record, 6, origin) ++
+          ["--content-base64", encoded_inline, "--sha256", inline_sha]
+
+      {pinned_reference, 0} = run.(inline)
+
+      assert %{"custody" => "pinned", "originPath" => ^origin, "artifactId" => pinned_id} =
+               JSON.decode!(pinned_reference)
+
+      {reference_bytes, 0} = run.(["artifact-content-fetch", pinned_id])
+      assert %{"contentBase64" => ^encoded_inline} = JSON.decode!(reference_bytes)
+
+      {bad_sha, 1} = run.(List.replace_at(inline, -1, String.duplicate("0", 64)))
+      assert bad_sha =~ "content_sha256_mismatch"
     end
+
+    origin = "https://example.test/streamed"
+    {version, 0} = run.(["version"])
+
+    metadata =
+      %{
+        verb: "artifact-record",
+        params: %{
+          kind: "data",
+          title: "Streamed reference",
+          originPath: origin,
+          contentSha256: inline_sha,
+          workItemId: item.id
+        }
+      }
+      |> JSON.encode!()
+      |> Base.url_encode64(padding: false)
+
+    assert {:ok, {{_, 200, _}, _, response}} =
+             :httpc.request(
+               :post,
+               {~c"http://127.0.0.1:#{ctx.port}/agent/dispatch",
+                [
+                  {~c"authorization", ~c"Bearer #{ctx.session.cli_token}"},
+                  {~c"x-tightbeam-cli-version", version |> String.trim() |> String.to_charlist()},
+                  {~c"x-tightbeam-artifact-record", String.to_charlist(metadata)}
+                ], ~c"application/octet-stream", "inline"},
+               [],
+               body_format: :binary
+             )
+
+    assert %{"result" => %{"custody" => "pinned", "originPath" => ^origin}} =
+             JSON.decode!(response)
+
+    {empty, 0} = run.(List.replace_at(record, 6, origin) ++ ["--content-base64", ""])
+    assert %{"custody" => "pinned", "artifactId" => empty_id} = JSON.decode!(empty)
+    {empty_content, 0} = run.(["artifact-content-fetch", empty_id])
+    assert %{"contentBase64" => "", "contentSize" => 0} = JSON.decode!(empty_content)
 
     unreadable = List.replace_at(record, 6, "unknown-fixture:/remote/file")
     {failure, 1} = run.(unreadable ++ ["--allow-unpinned"])
