@@ -13,8 +13,7 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     "tightbeam-probe" => "rails/tightbeam-probe.toml"
   }
   @seed_reactions %{
-    "assignment-terminal-handoff" => "rules/row-reaction-handoff.toml",
-    "terminal-child-action-reminder" => "rules/row-reaction-terminal-action.toml"
+    "assignment-terminal-handoff" => "rules/row-reaction-handoff.toml"
   }
   @legacy_reaction_fixture_dir Path.expand(
                                  "fixtures/rail-scope-migration/legacy-reactions",
@@ -279,6 +278,14 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     for name <- Map.keys(@seed_reactions) do
       assert_single_rail_definition!(ctx.base_dir, "reaction", name)
     end
+
+    # The 2-hour reminder no longer ships: its legacy copy goes and is not replanted.
+    refute File.exists?(Path.join(identity_dir, "rules/row-reaction-terminal-action.toml"))
+
+    refute identity_dir
+           |> Path.join("**/*.toml")
+           |> Path.wildcard()
+           |> Enum.any?(&(File.read!(&1) =~ ~s(name = "terminal-child-action-reminder")))
 
     assert Path.join(identity_dir, "kungfu/#{@kungfu}/archetypes/#{@archetype}.toml")
            |> File.exists?()

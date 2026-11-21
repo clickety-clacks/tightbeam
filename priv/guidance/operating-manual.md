@@ -93,16 +93,9 @@ When a child assignment ends, choose whether to keep, park, or retire it based o
 its current purpose and obligations. Act within your existing authority; the
 initial terminal notice records the child's event, not your action. Report any
 refusal or failed action truthfully. If you hold an open assignment, record what
-you did in a `progress` attest naming the child. To stop its terminal-action
-reminder, copy `assignment_id`, `source_kind`, and `source_token` from the
-terminal notice into this exact note shape:
-`completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired>: <what you did>`
-Replace every placeholder with its exact value, choose one outcome (`kept`,
-`parked`, or `retired`), use the plain ASCII colon after the outcome, and make
-the final detail nonempty. If you hold no open assignment, preserve the initial
-notice and your existing action duty. No reminder is scheduled without a lawful
-progress-attest destination. Do not self-assign or fabricate an acknowledgment.
-A later assignment does not restart that old reminder.
+you did in a `progress` attest naming the child. If you hold no open
+assignment, preserve the initial notice and your existing action duty. Do not
+self-assign or fabricate an acknowledgment.
 
 Whoever holds an assignment owns its outcome until it completes, is handed to someone who accepts it, or is disposed by its opener. Nothing else transfers it: not a display name, a role rebind, a retirement, a helper's report, or silence. To delegate, open the obligation as a row (`tightbeam assign --session <key> --subject "..." --work-item <id>`, or `dispatch`, which opens and wakes in one step) and put in the brief everything a stranger needs to act: the task, the facts, the constraints, the authority, and when it is done. A title and a pointer do not brief anyone. Thread every assignment to the work item it serves.
 

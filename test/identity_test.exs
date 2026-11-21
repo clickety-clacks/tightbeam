@@ -120,8 +120,7 @@ defmodule Tightbeam.IdentityTest do
                "rules/harklight-decision-request-briefing.toml",
                "rules/harness-health-recovery.toml",
                "rules/harness-recovery-main-wake.toml",
-               "rules/row-reaction-handoff.toml",
-               "rules/row-reaction-terminal-action.toml"
+               "rules/row-reaction-handoff.toml"
              ]
 
     assert git!(dir, ["show", "main:rules/harness-health-recovery.toml"]) ==
@@ -1147,7 +1146,7 @@ defmodule Tightbeam.IdentityTest do
     assert refreshed.skills == %{"role-skill" => "skill-main"}
   end
 
-  test "learning engineering keeps the two moved reactions substrate-only", ctx do
+  test "learning engineering keeps the moved handoff reaction substrate-only", ctx do
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
 
@@ -1157,10 +1156,11 @@ defmodule Tightbeam.IdentityTest do
       |> File.read!()
       |> Toml.decode!()
 
-    reactions =
-      ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml)
+    reactions = ~w(row-reaction-handoff.toml)
 
     refute File.exists?(Path.join(dir, "rules/row-reaction-assignment-inactivity.toml"))
+    # The 2-hour reminder is not shipped from 0.1.17.
+    refute File.exists?(Path.join(dir, "rules/row-reaction-terminal-action.toml"))
 
     for name <- reactions do
       assert File.regular?(Path.join(dir, "rules/#{name}"))

@@ -42,6 +42,10 @@ matching elected rule, the command still completes and creates no automatic
 handoff. Explicit command results and intervention messages keep their own
 contracts.
 
+Tightbeam 0.1.17 no longer ships `terminal-child-action-reminder`; the base
+setup and upgrades do not install it. An organization that keeps its own copy of
+`row-reaction-terminal-action.toml` still gets the behavior below.
+
 `terminal-child-action-reminder` in `row-reaction-terminal-action.toml` means:
 two hours after actual delivery of a completed or surrendered handoff, remind
 the responsible parent if it is active, has an open assignment on which it can

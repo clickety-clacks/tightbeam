@@ -259,11 +259,11 @@ if phase == "deliver" do
   rules = Path.join(base, "identity/rules")
   File.mkdir_p!(rules)
 
-  for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
-    File.cp!(
-      Path.join([:code.priv_dir(:tightbeam), "seed/rules", name]),
-      Path.join(rules, name)
-    )
+  for {name, directory} <- [
+        {"row-reaction-handoff.toml", Path.join(:code.priv_dir(:tightbeam), "seed/rules")},
+        {"row-reaction-terminal-action.toml", Path.expand("fixtures/rules", __DIR__)}
+      ] do
+    File.cp!(Path.join(directory, name), Path.join(rules, name))
   end
 
   File.write!(Path.join(base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")

@@ -1006,6 +1006,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
   end
 
+  # 0.1.17 stops shipping the 2-hour reminder, so the shipped manual no longer
+  # tells agents to expect it or to file its note.
   test "the shipped parent directive appears in composed guidance for both harnesses", _ctx do
     base =
       Path.join(
@@ -1020,44 +1022,23 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       |> File.read!()
       |> String.replace(~r/\s+/, " ")
 
-    assert packaged_manual =~ "copy `assignment_id`, `source_kind`, and `source_token`"
-
-    assert packaged_manual =~
-             "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired>: <what you did>"
-
-    assert packaged_manual =~ "use the plain ASCII colon after the outcome"
-    refute packaged_manual =~ "preserve the literal em dash"
-    assert packaged_manual =~ "No reminder is scheduled"
-
-    assert Regex.match?(
-             ~r/No reminder is scheduled without a lawful\s+progress-attest destination/,
-             packaged_manual
-           )
-
-    assert packaged_manual =~ "Do not self-assign or fabricate an acknowledgment"
-
     :initialized = Tightbeam.Identity.init!(base)
     revision = Tightbeam.Identity.live_revision!(base)
 
-    for harness <- [:codex, :claude] do
-      snapshot = Tightbeam.Identity.snapshot_at!(base, revision, "default", harness)
-      guidance = String.replace(snapshot.guidance, ~r/\s+/, " ")
-      assert guidance =~ "copy `assignment_id`, `source_kind`, and `source_token`"
+    views =
+      for harness <- [:codex, :claude] do
+        snapshot = Tightbeam.Identity.snapshot_at!(base, revision, "default", harness)
+        refute Regex.match?(~r/^#include/m, snapshot.guidance)
+        String.replace(snapshot.guidance, ~r/\s+/, " ")
+      end
 
-      assert guidance =~
-               "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired>: <what you did>"
-
-      assert guidance =~ "use the plain ASCII colon after the outcome"
-      refute guidance =~ "preserve the literal em dash"
-      assert guidance =~ "No reminder is scheduled"
-
-      assert Regex.match?(
-               ~r/No reminder is scheduled without a lawful\s+progress-attest destination/,
-               guidance
-             )
-
-      assert guidance =~ "Do not self-assign or fabricate an acknowledgment"
-      refute Regex.match?(~r/^#include/m, snapshot.guidance)
+    for text <- [packaged_manual | views] do
+      assert text =~ "choose whether to keep, park, or retire it"
+      assert text =~ "record what you did in a `progress` attest naming the child"
+      assert text =~ "Do not self-assign or fabricate an acknowledgment"
+      refute text =~ "completion-handoff-action"
+      refute text =~ "terminal-action reminder"
+      refute text =~ "No reminder is scheduled"
     end
   end
 

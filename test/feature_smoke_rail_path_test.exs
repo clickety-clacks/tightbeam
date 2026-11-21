@@ -197,10 +197,13 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       File.write!(Path.join(base, "identity/rules/#{name}.toml"), source)
     end
 
-    for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
+    for path <- [
+          "priv/seed/rules/row-reaction-handoff.toml",
+          "test/support/fixtures/rules/row-reaction-terminal-action.toml"
+        ] do
       File.write!(
-        Path.join([base, "identity/rules", name]),
-        substrate_wildcard_rules(File.read!(Path.join("priv/seed/rules", name)))
+        Path.join([base, "identity/rules", Path.basename(path)]),
+        substrate_wildcard_rules(File.read!(path))
       )
     end
 
