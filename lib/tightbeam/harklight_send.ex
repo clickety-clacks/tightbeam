@@ -75,9 +75,15 @@ defmodule Tightbeam.HarklightSend do
         }
 
       {:error, code, reason} ->
-        failure("send", code, "The message was not sent. " <> reason <> standing_ask(code), "refused", %{
-          decision_request_id: input.decision_request_id
-        })
+        failure(
+          "send",
+          code,
+          "The message was not sent. " <> reason <> standing_ask(code),
+          "refused",
+          %{
+            decision_request_id: input.decision_request_id
+          }
+        )
     end
   end
 
@@ -88,7 +94,8 @@ defmodule Tightbeam.HarklightSend do
        do: ""
 
   defp standing_ask(_code),
-    do: " The decision request itself already stands as a proper ask; this refusal does not block it."
+    do:
+      " The decision request itself already stands as a proper ask; this refusal does not block it."
 
   defp send_with_operation(db, call, input, op_id, runner, opts) do
     case invoke(runner, prepare_args(input, op_id), "prepared", op_id) do
