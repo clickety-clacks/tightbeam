@@ -1482,6 +1482,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "abort",
     "admin",
     "all",
+    "acknowledge-loss",
     "after-turn",
     "replace-queued",
     "api-key",
@@ -3021,7 +3022,12 @@ fn parse_with_optional_catalog(
             closed_command_flags(
                 "retire",
                 flags,
-                &["session", "key", "keep-open-descendants", "acknowledge-loss"],
+                &[
+                    "session",
+                    "key",
+                    "keep-open-descendants",
+                    "acknowledge-loss",
+                ],
             )?;
             let session_key = nonempty(flags, "session");
             if parsed.positional.get(1).is_some()
@@ -8219,7 +8225,7 @@ mod tests {
         for (args, expected) in [
             (
                 strings(&["retire", "s", "--as-user", "sample-user"]),
-                "usage: tightbeam retire --session <key> [--keep-open-descendants] [--key <idempotencyKey>]",
+                "usage: tightbeam retire --session <key> [--keep-open-descendants] [--acknowledge-loss] [--key <idempotencyKey>]",
             ),
             (
                 strings(&["retire", "--role", "r", "--as-user", "sample-user"]),
