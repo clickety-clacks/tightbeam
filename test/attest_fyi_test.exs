@@ -94,16 +94,35 @@ defmodule Tightbeam.AttestFyiTest do
     }
   end
 
+  test "a code review verdict without commit refs carries an FYI when filed", ctx do
+    expected = [fyi("this code review verdict carries no commit refs")]
+
+    for {verdict, params} <- [{"reviewed-clean", []}, {"changes-requested", [commit_refs: []]}] do
+      result =
+        attest(ctx, ctx.reviewer, ctx.review, "verdict", [verdict_kind: verdict] ++ params)
+
+      assert result.attest.verdictKind == verdict
+      assert result.fyi == expected
+      assert result.attest.fyi == expected
+      assert read_back(ctx, ctx.review, result.attest.id).fyi == expected
+    end
+
+    assert_neutral(expected)
+  end
+
   test "a code completion whose clean review omits a verified commit is recorded with an FYI",
        ctx do
     a = String.duplicate("a", 40)
     b = String.duplicate("b", 40)
 
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             attest(ctx, ctx.reviewer, ctx.review, "verdict",
-               verdict_kind: "reviewed-clean",
-               commit_refs: refs([a])
-             )
+    review =
+      attest(ctx, ctx.reviewer, ctx.review, "verdict",
+        verdict_kind: "reviewed-clean",
+        commit_refs: refs([a])
+      )
+
+    assert review.attest.verdictKind == "reviewed-clean"
+    refute Map.has_key?(review, :fyi)
 
     verified =
       attest(ctx, ctx.holder, ctx.code, "verdict",
