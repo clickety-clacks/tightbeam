@@ -4815,6 +4815,10 @@ defmodule Tightbeam.Gateway do
 
               Tightbeam.Wakes.preserve_failed_intent_for_terminal_in_txn(txn, turn.seq)
 
+              # The marker above reaches only this session's own chat. Whoever
+              # is accountable for the turn hears the same sentence, once.
+              Tightbeam.TurnFailureNotice.schedule_in_txn(txn, turn.seq, error_sentence(reason))
+
               HarnessHealth.observe_turn_failure_in_txn(
                 txn,
                 active_session,

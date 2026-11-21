@@ -22,6 +22,7 @@ defmodule Tightbeam.HarnessHealth do
     Gateway,
     Harness,
     HarnessProcess,
+    HarnessHealth.ModelRateLimit,
     Id,
     Ledger,
     Org,
@@ -1125,19 +1126,24 @@ defmodule Tightbeam.HarnessHealth do
             do: "authoritative-provider",
             else: "terminal-failure"
 
+        observation = %{
+          correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
+          harness: to_string(session.harness),
+          host: session.host,
+          failure_class: failure_class,
+          evidence_kind: evidence_kind,
+          session_key: turn.session_key,
+          assignment_id: assignment_id,
+          observed_at: observed_at,
+          cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
+          principal: turn.origin || "process:tightbeam"
+        }
+
         result =
-          observe_in_txn(txn, %{
-            correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
-            harness: to_string(session.harness),
-            host: session.host,
-            failure_class: failure_class,
-            evidence_kind: evidence_kind,
-            session_key: turn.session_key,
-            assignment_id: assignment_id,
-            observed_at: observed_at,
-            cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
-            principal: turn.origin || "process:tightbeam"
-          })
+          case harness_scope_in_txn(txn, session, turn, observation, reason) do
+            :harness -> observe_in_txn(txn, observation)
+            :model -> {:model_scoped, nil}
+          end
 
         unless pre_request_refusal? do
           redelivery_failure_class =
@@ -1157,6 +1163,102 @@ defmodule Tightbeam.HarnessHealth do
 
         after_harness_health_commit(result)
     end
+  end
+
+  # A request-rate limit on one model is that model's, not the harness's: it is
+  # recorded against harness, host and model and never opens a harness incident
+  # or park fence. Plan and usage limits, authoritative provider evidence and
+  # turns with no known model keep the harness path. A model-scoped limit seen
+  # on a second model inside the window is account-wide after all; both
+  # observations then enter the harness evidence so the ordinary rule decides.
+  defp harness_scope_in_txn(_txn, _session, _turn, %{failure_class: class}, _reason)
+       when class != "rate-limit-dead",
+       do: :harness
+
+  defp harness_scope_in_txn(_txn, _session, _turn, %{evidence_kind: "authoritative-provider"}, _),
+    do: :harness
+
+  defp harness_scope_in_txn(txn, session, turn, observation, reason) do
+    model = turn_model_in_txn(txn, turn.seq)
+
+    case ModelRateLimit.scope(evidence_text(reason), model) do
+      :account ->
+        :harness
+
+      {:model, model} ->
+        others =
+          ModelRateLimit.record_in_txn(
+            txn,
+            %{
+              harness: observation.harness,
+              host: session.host,
+              model: model,
+              session_key: turn.session_key,
+              assignment_id: observation.assignment_id,
+              turn_seq: turn.seq,
+              observed_at: observation.observed_at,
+              cause: observation.cause,
+              principal: principal_text(observation.principal)
+            },
+            @evidence_window_ms
+          )
+
+        if others == [] do
+          EventLog.lifecycle_in_txn(
+            txn,
+            "harness_health_model_rate_limit",
+            turn.session_key,
+            JSON.encode!(%{
+              harness: observation.harness,
+              host: session.host,
+              model: model,
+              turnSeq: turn.seq,
+              correlationId: observation.correlation_id
+            })
+          )
+
+          :model
+        else
+          Enum.each(others, fn other ->
+            observe_in_txn(txn, %{
+              observation
+              | correlation_id: "harness-turn:#{other.turn_seq}:rate-limit-dead",
+                session_key: other.session_key,
+                assignment_id: other.assignment_id,
+                observed_at: other.observed_at,
+                cause: other.cause,
+                principal: other.principal
+            })
+          end)
+
+          ModelRateLimit.escalate_in_txn(
+            txn,
+            [current_model_record_id(txn, turn.seq) | Enum.map(others, & &1.id)],
+            observation.observed_at
+          )
+
+          :harness
+        end
+    end
+  end
+
+  defp turn_model_in_txn(txn, turn_seq) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COALESCE(t.model,s.model) FROM turns t
+           JOIN sessions s ON s.sessionKey=t.sessionKey WHERE t.seq=?1
+           """,
+           [turn_seq]
+         ) do
+      [[model]] -> model
+      [] -> nil
+    end
+  end
+
+  defp current_model_record_id(txn, turn_seq) do
+    [[id]] = Txn.q(txn, "SELECT id FROM harness_model_rate_limits WHERE turnSeq=?1", [turn_seq])
+    id
   end
 
   defp pre_request_model_selection_refusal?(:session, reason, diagnostic) do
@@ -1269,6 +1371,9 @@ defmodule Tightbeam.HarnessHealth do
   @spec resolve_normal_turn_in_txn(Txn.t(), map(), map()) :: :ok
   def resolve_normal_turn_in_txn(%Txn{} = txn, session, turn) do
     harness = to_string(session.harness)
+
+    # A normal answer on a model releases that model's own rate-limit records.
+    ModelRateLimit.release_in_txn(txn, harness, session.host, turn.seq)
 
     Txn.q(
       txn,

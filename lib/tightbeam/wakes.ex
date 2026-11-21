@@ -3413,6 +3413,15 @@ defmodule Tightbeam.Wakes do
                 AND incident.state='open'
             )
           )
+          -- Another model answering is no evidence for a model-scoped limit;
+          -- only that model's own success (which releases it) or the source
+          -- session itself, for example after a retune, redelivers.
+          AND (
+            a.sessionKey=?3 OR NOT EXISTS (
+              SELECT 1 FROM harness_model_rate_limits held
+              WHERE held.turnSeq=a.sourceTurnSeq AND held.releasedAt IS NULL
+            )
+          )
           AND NOT EXISTS (
             SELECT 1 FROM wake_retry_attempts retry
             WHERE retry.sourceTurnSeq=a.sourceTurnSeq AND retry.retryWakeId IS NOT NULL

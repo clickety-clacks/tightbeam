@@ -685,6 +685,8 @@ defmodule Tightbeam.SessionLane do
 
   defp crash_outcome(reason, seq) do
     record = fn txn ->
+      Tightbeam.TurnFailureNotice.schedule_in_txn(txn, seq)
+
       Tightbeam.HarnessHealth.observe_terminal_in_txn(
         txn,
         seq,
