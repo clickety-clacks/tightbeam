@@ -82,8 +82,7 @@ defmodule Tightbeam.Productions.Bubble do
         recognize(db, seq, turn.status, turn)
 
       %{refused?: true, notice?: false} = turn when not restored? ->
-        unless ConditionFacts.standing?(db, "user-alerted", turn.owner),
-          do: climb_refusal(db, turn)
+        climb_refusal(db, turn)
 
       %{notice?: false, status: status} = turn when status in @bubbling_terminals ->
         unless ConditionFacts.standing?(db, "user-alerted", turn.owner) do
@@ -801,8 +800,10 @@ defmodule Tightbeam.Productions.Bubble do
               nil
 
             {kind, cause_seq} ->
+              # A refusal completes this delivery attempt. An earlier transport
+              # failure must not consume this turn's refusal notice.
               cause_seq =
-                if kind == :cause and status in @bubbling_terminals,
+                if kind == :cause and status in @bubbling_terminals and refused != 1,
                   do: TurnFailureNotice.cause_seq(db, seq, session_key, message_id, wake_id),
                   else: cause_seq
 
