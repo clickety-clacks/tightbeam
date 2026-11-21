@@ -72,6 +72,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Productions.BubbleSweeper,
     Tightbeam.HarnessProcess,
     Tightbeam.HarnessHealth,
+    Tightbeam.HarnessHealth.CompactionObservation,
     Tightbeam.Toplines
   ]
 

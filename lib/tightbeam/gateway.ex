@@ -129,6 +129,9 @@ defmodule Tightbeam.Gateway do
   @harness_handoff_content_limit 1_200
   @harness_handoff_attachment_limit 4
   @harness_handoff_metadata_limit 120
+  @harness_switch_compactor_attempt_ms 45_000
+  @harness_switch_compactor_open_ms 15_000
+  @harness_switch_compactor_checkout_ms 10_000
   @harness_switch_compactor_timeout_ms 30_000
   @harness_switch_compactor_close_timeout_ms 5_000
 
@@ -4047,102 +4050,141 @@ defmodule Tightbeam.Gateway do
 
   @doc false
   def harness_switch_compactor_call(coordinator, host, cwd, compactor, input, instructions) do
-    with :codex_acp <- Map.get(compactor, :route),
-         harness_module when is_atom(harness_module) <- Map.get(compactor, :harness),
-         harness <- Harness.module!(harness_module),
-         model when is_binary(model) <- Map.get(compactor, :model),
-         {:ok, adapter, _generation} <-
-           AdapterCoordinator.adapter_for_turn(coordinator, {harness.id(), "shared", host}) do
+    harness_switch_compactor_call(
+      coordinator,
+      host,
+      cwd,
+      compactor,
+      input,
+      instructions,
+      @harness_switch_compactor_attempt_ms
+    )
+  end
+
+  @doc false
+  def harness_switch_compactor_call(
+        coordinator,
+        host,
+        cwd,
+        compactor,
+        input,
+        instructions,
+        timeout
+      )
+      when is_integer(timeout) and timeout in 1..@harness_switch_compactor_attempt_ms do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    with true <- HarnessSwitchContext.supported_compactor_route?(compactor),
+         harness <- compactor.harness,
+         model when is_binary(model) <- compactor.model,
+         key <- {harness.id(), "shared", host},
+         {:ok, adapter, _generation} <- compactor_checkout(coordinator, key, deadline) do
       selected_model =
         Model.new(model,
           effort: Map.get(compactor, :effort),
           context: Map.get(compactor, :context)
         )
 
-      case Adapter.new_session(adapter, selected_model, cwd, [], instructions) do
+      open_deadline =
+        min(System.monotonic_time(:millisecond) + @harness_switch_compactor_open_ms, deadline)
+
+      case Adapter.new_compactor_session(
+             adapter,
+             selected_model,
+             cwd,
+             instructions,
+             open_deadline
+           ) do
         {:ok, acp_session_id} ->
+          prompt_timeout =
+            min(@harness_switch_compactor_timeout_ms, compactor_remaining(deadline) - 17_000)
+
           prompt_result =
-            compactor_adapter_call(fn ->
-              Adapter.prompt(adapter, acp_session_id, input,
-                timeout: @harness_switch_compactor_timeout_ms
-              )
-            end)
+            if prompt_timeout > 0 do
+              Adapter.prompt(adapter, acp_session_id, input, timeout: prompt_timeout)
+            else
+              {:error, :timeout}
+            end
+
+          close_timeout =
+            min(
+              @harness_switch_compactor_close_timeout_ms,
+              max(1, compactor_remaining(deadline) - 5_000)
+            )
 
           close_result =
-            compactor_adapter_call(fn ->
-              Adapter.close_session(adapter, acp_session_id,
-                request_timeout: @harness_switch_compactor_close_timeout_ms
-              )
-            end)
+            Adapter.close_session(adapter, acp_session_id, request_timeout: close_timeout)
 
-          compactor_result(prompt_result, close_result, selected_model, input)
+          compactor_result(prompt_result, close_result, compactor, selected_model, input)
 
         {:error, reason} ->
           {:error, {:session_create_failed, reason}}
       end
     else
+      {:error, _} = error -> error
       _ -> {:error, :route_unavailable}
     end
-  rescue
-    _error -> {:error, :route_unavailable}
-  catch
-    :exit, _reason -> {:error, :route_unavailable}
   end
 
-  defp compactor_adapter_call(fun) do
-    fun.()
-  rescue
-    _error -> {:error, :route_unavailable}
-  catch
-    :exit, _reason -> {:error, :route_unavailable}
+  defp compactor_checkout(coordinator, key, deadline) do
+    timeout = min(@harness_switch_compactor_checkout_ms, compactor_remaining(deadline))
+    AdapterCoordinator.adapter_for_compaction(coordinator, key, timeout)
   end
+
+  defp compactor_remaining(deadline), do: max(0, deadline - System.monotonic_time(:millisecond))
 
   defp compactor_result(
          {:ok, %{stop_reason: "end_turn", text: text}},
          :ok,
+         compactor,
          selected_model,
          input
        )
        when is_binary(text) and byte_size(text) > 0 do
     {:ok, text,
      %{
-       route: "codex_acp",
+       route: Atom.to_string(compactor.route),
        model: Model.to_ref(selected_model),
        input_bytes: byte_size(input),
        output_bytes: byte_size(text)
      }}
   end
 
-  defp compactor_result(prompt_result, _close_result, _model, _input)
+  defp compactor_result(prompt_result, close_result, _compactor, _model, _input)
        when prompt_result in [
               {:error, :timeout},
               {:error, :prompt_timeout},
               {:error, {:acp_request_not_dispatched, :prompt_timeout}}
             ],
-       do: {:error, :timeout}
+       do: compactor_timeout(close_result)
 
   defp compactor_result(
          {:error, {:prompt_interrupted, {:cancel_unacknowledged, _session_id}}},
-         _close_result,
+         close_result,
+         _compactor,
          _model,
          _input
        ),
-       do: {:error, :timeout}
+       do: compactor_timeout(close_result)
 
-  defp compactor_result({:error, reason}, _close_result, _model, _input),
+  defp compactor_result({:error, reason}, _close_result, _compactor, _model, _input),
     do: {:error, {:prompt_failed, reason}}
 
   defp compactor_result(
          {:ok, %{stop_reason: "end_turn", text: text}},
          {:error, reason},
+         _compactor,
          _model,
          _input
        )
        when is_binary(text) and byte_size(text) > 0,
        do: {:error, {:session_close_failed, reason}}
 
-  defp compactor_result(_prompt_result, _close_result, _model, _input),
+  defp compactor_result(_prompt_result, _close_result, _compactor, _model, _input),
     do: {:error, :incomplete_or_unusable_response}
+
+  defp compactor_timeout(:ok), do: {:error, :timeout}
+  defp compactor_timeout({:error, reason}), do: {:error, {:timeout_cleanup_failed, reason}}
 
   defp turn_human_messages(db, turn, session_key) do
     rows =
