@@ -107,7 +107,9 @@ defmodule Tightbeam.RowReactions.Plan do
     }
   end
 
-  def handoff_default?(%{owner: :substrate, archetypes: archetypes, policy_context: context} = rail) do
+  def handoff_default?(
+        %{owner: :substrate, archetypes: archetypes, policy_context: context} = rail
+      ) do
     (archetypes == ["*"] or context == "organization") and terminal_handoff?(rail)
   end
 
