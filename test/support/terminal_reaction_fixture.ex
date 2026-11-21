@@ -9,7 +9,7 @@ defmodule Tightbeam.TerminalReactionFixture do
       File.read!(
         Path.join(
           :code.priv_dir(:tightbeam),
-          "kungfu/agentic-engineering/rules/row-reaction-work-items.toml"
+          "seed/rules/row-reaction-work-items.toml"
         )
       )
 
@@ -28,15 +28,18 @@ defmodule Tightbeam.TerminalReactionFixture do
     rules = Path.join(law, "identity/rules")
     File.mkdir_p!(rules)
 
+    # The attest notice and the 2-hour reminder are no longer shipped; orgs
+    # that keep them still run them, so their fixture copies stay covered.
     rule_sources = [
-      {"row-reaction-work-items.toml", "kungfu/agentic-engineering/rules"},
-      {"row-reaction-attest-notice.toml", "kungfu/agentic-engineering/rules"},
-      {"row-reaction-handoff.toml", "seed/rules"},
-      {"row-reaction-terminal-action.toml", "seed/rules"}
+      {"row-reaction-work-items.toml", Path.join(:code.priv_dir(:tightbeam), "seed/rules")},
+      {"row-reaction-attest-notice.toml",
+       Path.expand("fixtures/kungfu/agentic-engineering/rules", __DIR__)},
+      {"row-reaction-handoff.toml", Path.join(:code.priv_dir(:tightbeam), "seed/rules")},
+      {"row-reaction-terminal-action.toml", Path.expand("fixtures/rules", __DIR__)}
     ]
 
     for {name, directory} <- rule_sources do
-      source = Path.join([:code.priv_dir(:tightbeam), directory, name])
+      source = Path.join(directory, name)
       contents = File.read!(source)
 
       contents =

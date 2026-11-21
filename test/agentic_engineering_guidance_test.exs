@@ -1,7 +1,7 @@
 defmodule Tightbeam.AgenticEngineeringGuidanceTest do
   use ExUnit.Case, async: true
 
-  @guidance Path.expand("../priv/kungfu/agentic-engineering/guidance", __DIR__)
+  @guidance Path.expand("support/fixtures/kungfu/agentic-engineering/guidance", __DIR__)
 
   test "code review names unasked additions and requires delivery owner acceptance" do
     text = File.read!(Path.join(@guidance, "reviewer-code.md"))

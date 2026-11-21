@@ -368,6 +368,8 @@ Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
+# The engineering bundle is no longer shipped; learn it from the test fixture root.
+Application.put_env(:tightbeam, :kungfu_bundle_root_dir, Path.expand("fixtures/kungfu", __DIR__))
 alias Tightbeam.{Boot, DB, Harness}
 
 if phase == "prepare" do

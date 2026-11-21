@@ -1143,7 +1143,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       handler = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})["wake"]
 
       shipped =
-        File.read!("priv/kungfu/agentic-engineering/rules/verification.toml")
+        File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/verification.toml")
         |> Tightbeam.TestRailScopeFixtures.wildcard_substrate(["rule", "policy"])
 
       File.write!(Path.join(ctx.base, "identity/rules/verification.toml"), shipped)
@@ -1197,7 +1197,10 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     shipped =
       File.read!(
-        Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__)
+        Path.expand(
+          "support/fixtures/kungfu/agentic-engineering/rules/verification.toml",
+          __DIR__
+        )
       )
       |> Tightbeam.TestRailScopeFixtures.wildcard_substrate(["rule", "policy"])
 

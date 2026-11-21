@@ -627,6 +627,14 @@ isolated test gateway.
 Do not repeat the earlier cold-install custody matrix. This is the
 upgrade-preservation check that matrix did not cover.
 
+## 0.1.16 to 0.1.17: the engineering kungfu no longer ships
+
+0.1.17 stops shipping the `agentic-engineering` kungfu and makes Uncle Enzo the
+primary kungfu. An organization that learned the engineering bundle keeps it
+through the upgrade, and its sessions keep working. To remove it afterwards,
+follow the steps in the Breaking changes of
+[the 0.1.17 release notes](releases/0.1.17.md).
+
 ## Release upgrade sequence
 
 For release packages, the stage/select sequence above is the supported cycle.

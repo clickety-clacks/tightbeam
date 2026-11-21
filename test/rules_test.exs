@@ -85,7 +85,10 @@ defmodule Tightbeam.RulesTest do
   test "retired wait effort-relief policy is skipped without disabling sibling rules", ctx do
     shipped =
       File.read!(
-        Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__)
+        Path.expand(
+          "support/fixtures/kungfu/agentic-engineering/rules/verification.toml",
+          __DIR__
+        )
       )
 
     put_raw(ctx, shipped)
@@ -1147,7 +1150,9 @@ defmodule Tightbeam.RulesTest do
 
   test "completion gate loader exception preserves unrelated remedy-link validation",
        ctx do
-    shipped = File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+    shipped =
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
+
     put_raw(ctx, shipped)
     loaded_rules = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
@@ -1351,7 +1356,7 @@ defmodule Tightbeam.RulesTest do
     put_raw(
       ctx,
       File.read!(
-        Path.expand("../priv/kungfu/agentic-engineering/rules/engineering.toml", __DIR__)
+        Path.expand("support/fixtures/kungfu/agentic-engineering/rules/engineering.toml", __DIR__)
       )
     )
 
@@ -1533,7 +1538,11 @@ defmodule Tightbeam.RulesTest do
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
 
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    put_raw(
+      ctx,
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     review_call =
@@ -1578,7 +1587,11 @@ defmodule Tightbeam.RulesTest do
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
 
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    put_raw(
+      ctx,
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     cases = [
@@ -1651,7 +1664,11 @@ defmodule Tightbeam.RulesTest do
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
     attach_work_item(ctx, producer.id, "review-notice")
 
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    put_raw(
+      ctx,
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     stub_commit_ref_validation()
     refs = fixture_commit_refs()
@@ -1750,7 +1767,11 @@ defmodule Tightbeam.RulesTest do
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
 
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    put_raw(
+      ctx,
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     for effect_kind <- ["release", "live_mutation"] do
@@ -1793,7 +1814,12 @@ defmodule Tightbeam.RulesTest do
 
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
     attach_work_item(ctx, producer.id, "review-change-reopen")
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+
+    put_raw(
+      ctx,
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     stub_commit_ref_validation()
     refs = fixture_commit_refs()
@@ -1933,7 +1959,12 @@ defmodule Tightbeam.RulesTest do
 
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
     review = assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+
+    put_raw(
+      ctx,
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     stub_commit_ref_validation()
     refs = integrated_commit_refs()
@@ -1989,7 +2020,11 @@ defmodule Tightbeam.RulesTest do
       {"", 0}
     end)
 
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    put_raw(
+      ctx,
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     holder = session(ctx.db, "same-source-completion-holder", "flynn", archetype: "coder")
@@ -2085,7 +2120,11 @@ defmodule Tightbeam.RulesTest do
                })
              )
 
-    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    put_raw(
+      ctx,
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
+    )
+
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     coder_completion =
@@ -5904,7 +5943,7 @@ defmodule Tightbeam.RulesTest do
   defp load_ac6a_rules(ctx) do
     put_raw(
       ctx,
-      File.read!("priv/kungfu/agentic-engineering/rules/ac6a.toml"),
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/ac6a.toml"),
       "ac6a.toml"
     )
 

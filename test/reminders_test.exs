@@ -7,7 +7,7 @@ defmodule Tightbeam.RemindersTest do
     base = Path.join(root, "org")
     source = Path.join(root, "source")
     File.mkdir_p!(root)
-    File.cp_r!(Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering"), source)
+    File.cp_r!(Path.expand("test/support/fixtures/kungfu/agentic-engineering"), source)
     prior = Application.get_env(:tightbeam, :identity_source_dir)
     Application.put_env(:tightbeam, :identity_source_dir, source)
 
