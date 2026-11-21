@@ -324,6 +324,6 @@ defmodule Tightbeam.HarklightFollows do
   end
 
   defp unresolved_reason(id) do
-    "Message #{id} is unresolved. Wait until it is settled before following. Its sender can run `tightbeam harklight-settle --message #{id}`, or let the next gateway start recover it. Run `tightbeam harklight-follow --message #{id}` again once settled. Tightbeam will not wait or retry automatically."
+    "Message #{id} is unresolved. Its sender can run `tightbeam harklight-settle --message #{id}`. Run `tightbeam harklight-follow --message #{id}` again once settled."
   end
 end

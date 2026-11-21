@@ -3,7 +3,7 @@ defmodule Tightbeam.HarklightReceipts do
 
   use GenServer
 
-  alias Tightbeam.{DB, Id}
+  alias Tightbeam.{DB, HarklightFailures, Id}
   alias Tightbeam.DB.Txn
 
   @retry_delay 5_000
@@ -200,14 +200,16 @@ defmodule Tightbeam.HarklightReceipts do
     case DB.query(
            db,
            """
-           SELECT argv,opId,journalId FROM harklight_handoff_receipts
-           WHERE completedAt IS NULL ORDER BY turnSeq,wakeId
+           SELECT argv,opId,journalId FROM harklight_handoff_receipts r
+           WHERE r.completedAt IS NULL
+             AND NOT EXISTS (SELECT 1 FROM harklight_operation_pauses p WHERE p.opId=r.opId)
+           ORDER BY r.turnSeq,r.wakeId
            """
          ) do
       {:ok, rows} ->
         Enum.reduce(rows, false, fn [argv, op, journal], pending ->
           result = process_receipt(db, opts, JSON.decode!(argv), op, journal)
-          pending or result != :ok
+          pending or result not in [:ok, :paused]
         end)
 
       {:error, _reason} ->
@@ -215,14 +217,46 @@ defmodule Tightbeam.HarklightReceipts do
     end
   end
 
+  def settle_paused(db, session_key, op, opts) do
+    :global.trans({{__MODULE__, db, op}, self()}, fn ->
+      case DB.query(
+             db,
+             """
+             SELECT r.journalId,p.diagnostic FROM harklight_handoff_receipts r
+             JOIN harklight_operation_pauses p ON p.opId=r.opId
+             JOIN turns t ON t.seq=r.turnSeq
+             WHERE r.opId=?1 AND t.sessionKey=?2 AND r.completedAt IS NULL
+             """,
+             [op, session_key]
+           ) do
+        {:ok, [[journal, diagnostic]]} ->
+          with {:ok, runner} <- runner(opts),
+               result <-
+                 run_operation(runner, ["retry", "--op-id", op, "--journal-id", journal], op),
+               :ok <- settle_exact_receipt(db, op, result) do
+            :ok
+          else
+            {:error, reason} when is_binary(reason) -> {:error, reason}
+            _ -> {:error, diagnostic}
+          end
+
+        {:ok, []} ->
+          :unknown
+
+        {:error, _reason} ->
+          {:error, "Tightbeam could not read the saved Harklight operation."}
+      end
+    end)
+  end
+
   defp process_receipt(db, opts, argv, op, journal) do
     with {:ok, runner} <- runner(opts),
          {:ok, journal} <- bind_journal(db, runner, op, journal) do
-      result = run(runner, ["retry", "--op-id", op, "--journal-id", journal])
+      result = run_operation(runner, ["retry", "--op-id", op, "--journal-id", journal], op)
 
       case result do
         {[%{"kind" => "operation_absent", "op_id" => ^op, "journal_id" => ^journal}], 1} ->
-          settle_result(db, op, run(runner, argv ++ ["--op-id", op]))
+          settle_result(db, op, run_operation(runner, argv ++ ["--op-id", op], op))
 
         _ ->
           settle_result(db, op, result)
@@ -249,7 +283,15 @@ defmodule Tightbeam.HarklightReceipts do
     end
   end
 
-  defp settle_result(
+  defp settle_result(db, op, result) do
+    case settle_exact_receipt(db, op, result) do
+      {:error, reason} when is_binary(reason) -> :paused
+      {:error, :pending} -> retry_refused_receipt(db, op, result)
+      other -> other
+    end
+  end
+
+  defp settle_exact_receipt(
          db,
          op,
          {[
@@ -268,7 +310,13 @@ defmodule Tightbeam.HarklightReceipts do
     ])
   end
 
-  defp settle_result(
+  defp settle_exact_receipt(db, op, {:internal_error, operation, request_id}) do
+    {:error, HarklightFailures.hold_operation(db, operation, op, request_id)}
+  end
+
+  defp settle_exact_receipt(_db, _op, _result), do: {:error, :pending}
+
+  defp retry_refused_receipt(
          db,
          op,
          {[%{"kind" => "refused", "operation" => "receipt", "op_id" => op}], exit}
@@ -287,7 +335,7 @@ defmodule Tightbeam.HarklightReceipts do
     {:error, :pending}
   end
 
-  defp settle_result(_db, _op, _result), do: {:error, :pending}
+  defp retry_refused_receipt(_db, _op, _result), do: {:error, :pending}
 
   defp persist(db, sql, params) do
     with {:ok, _} <- DB.query(db, sql, params), do: :ok
@@ -303,6 +351,16 @@ defmodule Tightbeam.HarklightReceipts do
           nil -> {:error, :pending}
           exe -> {:ok, fn argv -> System.cmd(exe, argv, stderr_to_stdout: true) end}
         end
+    end
+  end
+
+  defp run_operation(runner, argv, op) do
+    case run(runner, argv) do
+      {frames, status} = result ->
+        HarklightFailures.write_error(frames, status, op, ["receipt"]) || result
+
+      error ->
+        error
     end
   end
 

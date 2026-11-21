@@ -1,7 +1,16 @@
 defmodule Tightbeam.HarklightSend do
   @moduledoc false
 
-  alias Tightbeam.{DB, HarklightLifecycle, HarklightWakes, Id, Org, Placement}
+  alias Tightbeam.{
+    DB,
+    HarklightFailures,
+    HarklightLifecycle,
+    HarklightReceipts,
+    HarklightWakes,
+    Id,
+    Org,
+    Placement
+  }
 
   @uuid4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
   @decision_request_id ~r/\Adr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
@@ -88,6 +97,14 @@ defmodule Tightbeam.HarklightSend do
            invoke(runner, prepare_args(input, targets, op_id), "prepared", op_id) do
       prepare_and_execute(db, call, input, targets, prepared, op_id, journal_id, runner, opts)
     else
+      {:internal_error, operation, request_id} ->
+        failure(
+          "send",
+          "internal_error",
+          HarklightFailures.log_error(operation, request_id),
+          "failed"
+        )
+
       {:error, code, reason, outcome} ->
         failure("send", code, "The message was not sent. " <> reason, outcome, %{op_id: op_id})
 
@@ -179,6 +196,17 @@ defmodule Tightbeam.HarklightSend do
           HarklightLifecycle.process_terminals(db, opts)
           failure(command, code, reason, outcome, identity)
 
+        {:internal_error, operation, request_id} ->
+          reason = HarklightFailures.hold_operation(db, operation, op_id, request_id)
+
+          failure(
+            command,
+            "internal_error",
+            "#{unknown_reason(op_id)} #{reason}",
+            "outcome_unknown",
+            identity
+          )
+
         {:error, code, reason, _outcome} ->
           failure(
             command,
@@ -231,13 +259,7 @@ defmodule Tightbeam.HarklightSend do
       cond do
         is_nil(call.params[:message_id]) and
             (not is_binary(op_id) or not match?(%{op_id: ^op_id}, send_record)) ->
-          failure(
-            "settle",
-            "harklight_operation_unknown",
-            "Tightbeam has no send record for this operation ID.",
-            "refused",
-            %{op_id: op_id}
-          )
+          settle_receipt(db, call.session_key, op_id, opts)
 
         is_nil(send_record) and is_nil(change_record) ->
           settle_unrecorded(call, message, op_id, opts)
@@ -252,10 +274,31 @@ defmodule Tightbeam.HarklightSend do
           )
 
         true ->
-          recover_one(db, message, opts)
+          recover_one(db, message, opts, :explicit)
       end
     else
       {:error, code} -> failure("settle", code, early_reason(code), "failed")
+    end
+  end
+
+  defp settle_receipt(db, session_key, op_id, opts) do
+    case HarklightReceipts.settle_paused(db, session_key, op_id, opts) do
+      :ok ->
+        %{command: "settle", outcome: "committed", settled_command: "receipt", op_id: op_id}
+
+      {:error, reason} ->
+        failure("settle", "harklight_receipt_unresolved", reason, "outcome_unknown", %{
+          op_id: op_id
+        })
+
+      :unknown ->
+        failure(
+          "settle",
+          "harklight_operation_unknown",
+          "Tightbeam has no send or paused handoff receipt for this operation ID.",
+          "refused",
+          %{op_id: op_id}
+        )
     end
   end
 
@@ -288,6 +331,14 @@ defmodule Tightbeam.HarklightSend do
           Map.merge(%{message_id: message, op_id: op_id}, no_subscription_effect())
           |> Map.merge(%{command: "settle", outcome: "committed"})
 
+        {:internal_error, operation, request_id} ->
+          reason = HarklightFailures.log_error(operation, request_id, op_id)
+
+          failure("settle", "internal_error", reason, "outcome_unknown", %{
+            message_id: message,
+            op_id: op_id
+          })
+
         {:error, code, reason, outcome} ->
           failure("settle", code, reason, outcome, %{message_id: message, op_id: op_id})
       end
@@ -313,16 +364,16 @@ defmodule Tightbeam.HarklightSend do
       note: HarklightLifecycle.no_subscription_effect_note()
     }
 
-  defp recover_one(db, message, opts) do
+  defp recover_one(db, message, opts, mode \\ :automatic) do
     send_record = HarklightLifecycle.lookup(db, message)
     change_record = HarklightLifecycle.lookup_change(db, message)
 
     cond do
       match?(%{state: "pending"}, send_record) ->
-        recover_send(db, message, opts, send_record)
+        recover_send(db, message, opts, send_record, mode)
 
       match?(%{state: "pending"}, change_record) ->
-        recover_change(db, message, opts, send_record, change_record)
+        recover_change(db, message, opts, send_record, change_record, mode)
 
       not is_nil(change_record) ->
         already_settled_change(send_record, change_record)
@@ -332,7 +383,7 @@ defmodule Tightbeam.HarklightSend do
     end
   end
 
-  defp recover_send(db, message, opts, %{op_id: op_id}) do
+  defp recover_send(db, message, opts, %{op_id: op_id}, mode) do
     :global.trans({{__MODULE__, db, op_id}, self()}, fn ->
       case HarklightLifecycle.lookup(db, message) do
         %{state: "pending"} = record ->
@@ -342,7 +393,8 @@ defmodule Tightbeam.HarklightSend do
             transport_session_key: record.session_key
           }
 
-          with :ok <- origin!(db, call),
+          with :ok <- allow_send_recovery(db, op_id, mode),
+               :ok <- origin!(db, call),
                {:ok, runner} <- runner(opts),
                %{"protocol" => 2, "journal_id" => journal_id} when is_binary(journal_id) <-
                  record.request do
@@ -365,6 +417,15 @@ defmodule Tightbeam.HarklightSend do
               opts
             )
           else
+            {:held, diagnostic} ->
+              failure(
+                "settle",
+                "internal_error",
+                "#{unknown_reason(op_id)} #{diagnostic}",
+                "outcome_unknown",
+                identity(record) |> Map.put(:op_id, op_id)
+              )
+
             {:error, code} ->
               failure(
                 "settle",
@@ -391,7 +452,17 @@ defmodule Tightbeam.HarklightSend do
     end)
   end
 
-  defp recover_change(db, message, opts, send_record, %{op_id: op_id} = pending) do
+  defp allow_send_recovery(_db, _op_id, :explicit), do: :ok
+
+  defp allow_send_recovery(db, op_id, :automatic) do
+    case HarklightFailures.operation_pause(db, op_id) do
+      {:ok, nil} -> :ok
+      {:ok, diagnostic} -> {:held, diagnostic}
+      {:error, _reason} -> {:error, "harklight_recovery_state_unavailable"}
+    end
+  end
+
+  defp recover_change(db, message, opts, send_record, %{op_id: op_id} = pending, mode) do
     target = change_target_for_settle(send_record, pending)
 
     :global.trans({{__MODULE__, db, "change", message}, self()}, fn ->
@@ -403,10 +474,18 @@ defmodule Tightbeam.HarklightSend do
             transport_session_key: change.session_key
           }
 
-          with :ok <- origin!(db, call), {:ok, runner} <- runner(opts) do
+          with :ok <- allow_send_recovery(db, op_id, mode),
+               :ok <- origin!(db, call),
+               {:ok, runner} <- runner(opts) do
             response = retry_change(runner, change)
             finish_change(db, target, op_id, change.command, response, "settle")
           else
+            {:held, diagnostic} ->
+              failure("settle", "internal_error", diagnostic, "outcome_unknown", %{
+                op_id: op_id,
+                message_id: message
+              })
+
             {:error, code} ->
               failure(
                 "settle",
@@ -521,6 +600,15 @@ defmodule Tightbeam.HarklightSend do
           failure(command, code, early_reason(code), "failed", identity(record))
       end
     else
+      {:internal_error, operation, request_id} ->
+        failure(
+          command,
+          "internal_error",
+          HarklightFailures.log_error(operation, request_id),
+          "failed",
+          %{message_id: message}
+        )
+
       {:error, {:refused, code}} ->
         failure(command, code, early_reason(code), "refused", %{message_id: message})
 
@@ -577,6 +665,18 @@ defmodule Tightbeam.HarklightSend do
               identity
             )
         end
+
+      {:internal_error, operation, request_id} ->
+        reason = HarklightFailures.hold_operation(db, operation, op_id, request_id)
+
+        failure(
+          result_command,
+          "internal_error",
+          "The #{original_command} may have applied. Tightbeam saved the exact request and operation ID. Run tightbeam harklight-settle --message #{record.message_id} to settle that operation. " <>
+            reason,
+          "outcome_unknown",
+          identity
+        )
 
       {:error, code, reason, outcome} ->
         if outcome == "outcome_unknown" do
@@ -760,8 +860,9 @@ defmodule Tightbeam.HarklightSend do
             {:error, "harklight_message_lookup_failed"}
         end
 
-      _ ->
-        {:error, "harklight_message_lookup_failed"}
+      {output, status} ->
+        HarklightFailures.read_error(output, status, "message-get") ||
+          {:error, "harklight_message_lookup_failed"}
     end
   rescue
     _ -> {:error, "harklight_message_lookup_failed"}
@@ -872,14 +973,14 @@ defmodule Tightbeam.HarklightSend do
       failure(
         command,
         "harklight_send_unresolved",
-        "Send #{id} is unresolved. Run tightbeam harklight-settle --op-id #{id}, or leave it for recovery at the next gateway start.",
+        "Send #{id} is unresolved. Run tightbeam harklight-settle --op-id #{id} to recover the original send.",
         "refused",
         if(command == "send", do: %{}, else: %{message_id: id})
       )
 
   defp unknown_reason(id),
     do:
-      "The send is unresolved and no subscription is open yet. Run tightbeam harklight-settle --op-id #{id} to recover the original send, or leave it for recovery at the next gateway start."
+      "The send is unresolved and no subscription is open yet. Run tightbeam harklight-settle --op-id #{id} to recover the original send."
 
   defp early_reason("harklight_cli_missing"),
     do: "Harklight Agent could not be run, so nothing was sent."
@@ -1369,7 +1470,18 @@ defmodule Tightbeam.HarklightSend do
   end
 
   defp invoke_response(output, status, expected, op_id, operations, journal_id) do
-    case result_frames(output) do
+    frames = result_frames(output)
+
+    if expected == "committed" do
+      HarklightFailures.write_error(frames, status, op_id, operations) ||
+        interpret_response(frames, output, status, expected, op_id, operations, journal_id)
+    else
+      interpret_response(frames, output, status, expected, op_id, operations, journal_id)
+    end
+  end
+
+  defp interpret_response(frames, output, status, expected, op_id, operations, journal_id) do
+    case frames do
       [%{"kind" => "committed", "operation" => operation, "op_id" => ^op_id} = frame]
       when expected == "committed" and status == 0 ->
         if operation in operations,

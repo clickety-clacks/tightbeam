@@ -979,6 +979,7 @@ COMMANDS:
   harklight-settle (--message <id> [--op-id <key>] | --op-id <key>)
       Settle one unresolved Harklight operation using its saved request and original operation ID.
       For an unresolved send without a server item ID, use its returned opId.
+      Use --op-id for a paused handoff receipt from your own dispatched turn.
       For a message Tightbeam has no record for, --op-id <key> names the Harklight
       operation to retry; the retry has no wake or subscription effect.
   harklight-listener-restore --handle <handle>
@@ -987,6 +988,7 @@ COMMANDS:
       Follow a message or conversation sent through Tightbeam.
   harklight-retry (--all | --message <id> | --session <handle>)
       Retry the bounded listener start for unavailable unanswered conversations.
+      Use --session to resume a paused feed from its last saved checkpoint.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
       --type fyi|request [--kind blocker|success]
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
