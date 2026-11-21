@@ -134,6 +134,49 @@ fn doctor_reports_banked_oauth_corruption_after_ps_failure() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn doctor_reports_ps_enumeration_timeout_as_structured_data_and_fails() {
+    let root = test_root("ps-timeout");
+    let path = root.join("path");
+    let base_dir = root.join("org");
+    fs::create_dir_all(&path).unwrap();
+
+    executable(&path.join("codex"), "#!/bin/sh\nexit 0\n");
+    executable(&path.join("uname"), "#!/bin/sh\nprintf 'test-host\\n'\n");
+    // Never answers within the probe's enumeration budget, however fast the host is.
+    // `exec` makes the probe's kill reach the sleeping process itself.
+    executable(&path.join("ps"), "#!/bin/sh\nexec /bin/sleep 30\n");
+    bank_captured_hollow_anthropic(&base_dir);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+        .args(["doctor", "--json", "--base-dir", base_dir.to_str().unwrap()])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "a ps timeout passed doctor");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("doctor printed no report ({error}): {output:?}"));
+    assert_eq!(
+        report["credential_health"]["anthropic"]["status"],
+        "corrupt"
+    );
+    let notes = report["epistemics"]["notes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note == "probe: ps enumeration timed out"),
+        "notes: {notes:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("banked OAuth credential for anthropic is CORRUPT")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn doctor_reports_ordinary_ps_failure_as_structured_data_and_fails() {
     let root = test_root("ps-failure");
     let path = root.join("path");

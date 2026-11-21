@@ -7,7 +7,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   identity repository so it survives a refused boot without becoming served law.
   """
 
-  alias Tightbeam.{DB, Identity}
+  alias Tightbeam.{AdminProjection, DB, Identity}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Identity.{Provenance, TomlEdit}
 
@@ -183,6 +183,21 @@ defmodule Tightbeam.Identity.RailScopeMigration do
                  if plan.identity_changed? do
                    candidate_revision = apply_identity_plan!(dir, plan, revision)
                    :ok = publish_identity!(base_dir, revision, candidate_revision)
+
+                   # Bootstrap only seeds absent rows. Advance the existing served
+                   # stamp with the same snapshot and allocator as publication, in
+                   # this transaction so a failed migration rolls both back.
+                   identity = AdminProjection.served_identity_entry(txn, base_dir)
+
+                   AdminProjection.allocate_in_txn(
+                     txn,
+                     "identity",
+                     "served",
+                     System.system_time(:millisecond),
+                     fingerprint: AdminProjection.fingerprint(identity.item),
+                     item: JSON.encode!(identity.item)
+                   )
+
                    candidate_revision
                  else
                    revision
@@ -604,6 +619,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
            ), changes}
       end
 
+    rail = declare_legacy_accountable_notice(key, rail)
     context = migration_context(key, rail)
 
     {rail, condition_changes} =
@@ -614,6 +630,19 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   end
 
   defp migrate_rail(other, _key, _path, _owner, _owned, _name_map, changes), do: {other, changes}
+
+  # Earlier releases gave the substrate a built-in exemption for the completion
+  # review rail, found by its name. The exemption is now data the rail declares,
+  # so a rail learned before the change gets the declaration here; without it the
+  # rail would no longer load. Only this migration knows the legacy name.
+  defp declare_legacy_accountable_notice(
+         "rule",
+         %{"name" => "completion-requires-review", "remedy" => %{"action" => "wake"} = remedy} =
+           rail
+       ),
+       do: %{rail | "remedy" => Map.put_new(remedy, "accountable_notice", true)}
+
+  defp declare_legacy_accountable_notice(_key, rail), do: rail
 
   defp migration_context("rule", rail) do
     verbs = List.wrap(Map.get(rail, "verb")) ++ List.wrap(Map.get(rail, "verbs"))

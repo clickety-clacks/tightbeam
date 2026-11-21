@@ -446,6 +446,11 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert :ok = HarnessProcess.reconcile(ctx.db)
     refute HarnessProcess.fenced?(ctx.db, key)
+    retry_key = {:claude, "shared", "retry-testhost"}
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, retry_key)
+    assert HarnessProcess.fenced?(ctx.db, retry_key)
+    assert {:ok, _released} = HarnessProcess.reconcile_failed_parks(ctx.db)
+    refute HarnessProcess.fenced?(ctx.db, retry_key)
   end
 
   defp scenario(16, ctx) do

@@ -41,7 +41,11 @@ defmodule Tightbeam.SessionLane do
     reservation_owner_ref: nil,
     settlement_waiters: [],
     settlement_rechecking: false,
-    deferred_drain: false
+    deferred_drain: false,
+    # Set when the last start attempt found a standing park fence, so a
+    # diagnostic read can say why a queued turn is not starting. Cleared on a
+    # start attempt that finds none.
+    held: nil
   ]
 
   @doc """
@@ -195,10 +199,22 @@ defmodule Tightbeam.SessionLane do
   end
 
   # Both acceptance and execution share the lane mailbox with terminal handling.
+  # A failure inside either callback belongs to the caller that supplied it:
+  # it is raised again here, in the caller, while the lane and its running
+  # turn carry on.
   def change_at_boundary(session_key, apply, defer) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{pid, _}] -> GenServer.call(pid, {:change_at_boundary, apply, defer}, :infinity)
-      [] -> :no_lane
+      [{pid, _}] ->
+        case GenServer.call(pid, {:change_at_boundary, apply, defer}, :infinity) do
+          {:change_callback_failed, kind, reason, stacktrace} ->
+            :erlang.raise(kind, reason, stacktrace)
+
+          result ->
+            result
+        end
+
+      [] ->
+        :no_lane
     end
   end
 
@@ -255,6 +271,7 @@ defmodule Tightbeam.SessionLane do
        reservationPresent: not is_nil(state.reservation_token),
        settlementRechecking: state.settlement_rechecking,
        deferredDrain: state.deferred_drain,
+       held: state.held,
        taskPresent: not is_nil(state.task_ref),
        taskAlive: is_pid(state.task_pid) and Process.alive?(state.task_pid)
      }, state}
@@ -500,9 +517,21 @@ defmodule Tightbeam.SessionLane do
 
   def handle_call({:change_at_boundary, apply, defer}, _from, state) do
     result =
-      if not is_nil(state.task_ref) or Ledger.running?(state.db, state.session_key),
-        do: defer.(),
-        else: apply.()
+      try do
+        if not is_nil(state.task_ref) or Ledger.running?(state.db, state.session_key),
+          do: defer.(),
+          else: apply.()
+      catch
+        # The callbacks are the caller's code. Letting their exit stop the
+        # lane would kill the turn it is running and lose the caller's reply.
+        kind, reason ->
+          Logger.error(
+            "session configuration change failed inside lane #{state.session_key}: " <>
+              Exception.format_banner(kind, reason, __STACKTRACE__)
+          )
+
+          {:change_callback_failed, kind, reason, __STACKTRACE__}
+      end
 
     {:reply, result, state}
   end
@@ -697,9 +726,21 @@ defmodule Tightbeam.SessionLane do
 
   defp claim_and_start(state) do
     if harness_parked?(state) do
-      state
+      %{state | held: held_by_fence(state)}
     else
-      claim_next(state)
+      claim_next(%{state | held: nil})
+    end
+  end
+
+  defp held_by_fence(state) do
+    with {:ok, [[harness, host]]} <-
+           DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [
+             state.session_key
+           ]),
+         %{} = hold <- Tightbeam.HarnessHealth.Hold.for_host(state.db, harness, host) do
+      Map.take(hold, [:incident_id, :failure_class, :since, :release])
+    else
+      _ -> %{incident_id: nil, failure_class: nil, since: nil, release: nil}
     end
   end
 

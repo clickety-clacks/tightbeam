@@ -240,7 +240,10 @@ defmodule Tightbeam.SpinupTest do
 
     sh = fn command ->
       send(parent, {:command, command})
-      {"", 0}
+
+      if String.contains?(List.last(command), "cat "),
+        do: {JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()}), 0},
+        else: {"", 0}
     end
 
     assert :ok =
@@ -249,7 +252,7 @@ defmodule Tightbeam.SpinupTest do
                sh: sh
              )
 
-    commands = receive_commands(4)
+    commands = receive_commands(5)
 
     assert ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker.example", "true"] =
              hd(commands)
@@ -426,6 +429,23 @@ defmodule Tightbeam.SpinupTest do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "#!/bin/sh\nexit 0\n")
     File.chmod!(path, 0o755)
+
+    manifest =
+      Path.join([
+        base_dir,
+        "adapters",
+        "node_modules",
+        Tightbeam.Harness.Claude.install_package(),
+        "package.json"
+      ])
+
+    File.mkdir_p!(Path.dirname(manifest))
+
+    File.write!(
+      manifest,
+      JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()})
+    )
+
     path
   end
 

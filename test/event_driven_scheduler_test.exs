@@ -107,6 +107,41 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     )
   end
 
+  defp trace_due_timer(pid) do
+    parent = self()
+
+    debug = fn
+      previous, {:noreply, %{timer: timer, deadline: due}}, _name when is_reference(timer) ->
+        if timer != previous, do: send(parent, {:timer_armed, pid, due, timer})
+        timer
+
+      previous, {:in, {:timeout, timer, :due}}, _name ->
+        send(parent, {:due_timer_received, pid, timer})
+        previous
+
+      previous, _event, _name ->
+        previous
+    end
+
+    :ok = :sys.install(pid, {:deadline_test, debug, nil}, 30_000)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: :sys.remove(pid, :deadline_test, 30_000)
+    end)
+  end
+
+  defp await_due_timer(pid, due) do
+    # Capture arming in the scheduler, so an observer that resumes after expiry
+    # can use buffered evidence even though the live timer has already changed.
+    assert_receive {:timer_armed, ^pid, ^due, timer}, 30_000
+    assert is_reference(timer)
+    assert_receive {:due_timer_received, ^pid, ^timer}, 30_000
+    # Order state inspection behind the timeout handler. The observation bounds
+    # do not relax either test's real delivery-lateness assertions.
+    :sys.get_state(pid, 30_000)
+    :sys.remove(pid, :deadline_test, 30_000)
+  end
+
   defp wake(db, due_at, extra \\ %{}) do
     Wakes.schedule(
       db,
@@ -282,13 +317,15 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert :sys.get_state(pid).timer == nil
   end
 
-  @tag timeout: 20_000
+  @tag timeout: 60_000
   test "a wake inserted after boot fires at its ten second deadline without a tick", ctx do
     pid = scheduler(ctx)
+    trace_due_timer(pid)
     later = wake(ctx.db, System.system_time(:millisecond) + 60_000, %{consumer: "test"})
     due = System.system_time(:millisecond) + 10_000
     scheduled = wake(ctx.db, due, %{consumer: "test"})
-    assert_receive {:delivered, id, fired_at}, 11_000
+    await_due_timer(pid, due)
+    assert_received {:delivered, id, fired_at}
     assert id == scheduled.wake_id
     assert fired_at >= due
     assert fired_at - due < 1_000
@@ -322,9 +359,11 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "recipient", "testhost")
     pid = scheduler(ctx)
-    # Let startup recovery and the one-time backfill finish before inserting.
-    Process.sleep(300)
-    assert :sys.get_state(pid).timer == nil
+    # Run the backfill explicitly, then cross a scheduler mailbox barrier. Startup
+    # recovery was already queued by init; no elapsed-time guess is needed.
+    send(pid, :backfill_wake_delivery)
+    assert :sys.get_state(pid, 30_000).timer == nil
+    trace_due_timer(pid)
 
     evidence =
       Tightbeam.NoticeSubmission.prewrite_evidence(
@@ -343,8 +382,10 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
              end)
 
     due = Wakes.get(ctx.db, successor).due_at
-    assert :sys.get_state(pid).deadline == due
-    Process.sleep(1_500)
+    await_due_timer(pid, due)
+    # Prompt recognition can queue another pass to form and deliver the carrier.
+    # Observe that committed state, rather than guessing how long both passes take.
+    assert await_state(ctx.db, successor, "fired", System.monotonic_time(:millisecond) + 30_000)
 
     assert [%{delivery_wake_id: carrier, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, successor)

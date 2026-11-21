@@ -82,19 +82,39 @@ defmodule GuardRemoteUrl do
             end
           end
 
-          if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
-               Enum.any?(command, &String.contains?(&1, "cat")),
-             do: {"", 42},
-             else: {"", 0}
+          cond do
+            Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+                Enum.any?(command, &String.contains?(&1, "cat")) ->
+              {"", 42}
+
+            Enum.any?(
+              command,
+              &String.contains?(&1, "/@agentclientprotocol/claude-agent-acp/package.json")
+            ) ->
+              {JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()}), 0}
+
+            true ->
+              {"", 0}
+          end
         end
 
         sh_out = fn command ->
           assert_synthetic_command!(command)
 
-          if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
-               Enum.any?(command, &String.contains?(&1, "cat")),
-             do: {"", 42},
-             else: {"", 0}
+          cond do
+            Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+                Enum.any?(command, &String.contains?(&1, "cat")) ->
+              {"", 42}
+
+            Enum.any?(
+              command,
+              &String.contains?(&1, "/@agentclientprotocol/claude-agent-acp/package.json")
+            ) ->
+              {JSON.encode!(%{"version" => Tightbeam.Harness.Claude.adapter_version()}), 0}
+
+            true ->
+              {"", 0}
+          end
         end
 
         config =

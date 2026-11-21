@@ -145,18 +145,23 @@ defmodule Tightbeam.QueuedMessageSuppression do
         [wake.session_key, kind, sender, prod_id, requested_at]
       )
 
-    Enum.each(candidates, fn [source_id, created_at] ->
-      case Wakes.cancel_in_txn(txn, %{
-             wake_id: source_id,
-             requester: %{kind: "process", id: "tightbeam:assignments"},
-             reason_kind: "superseded",
-             causal_source: %{kind: "wake", id: wake.wake_id},
-             outcome: %{kind: "replacement", replacement_wake_id: wake.wake_id}
-           }) do
-        true -> record_prod_replacement(txn, source_id, created_at, wake, kind, sender, prod_id)
-        _ -> raise DB.Error, message: "prod replacement refused for wake #{source_id}"
-      end
-    end)
+    pending_ids =
+      Enum.map(candidates, fn [source_id, created_at] ->
+        case Wakes.cancel_in_txn(txn, %{
+               wake_id: source_id,
+               requester: %{kind: "process", id: "tightbeam:assignments"},
+               reason_kind: "superseded",
+               causal_source: %{kind: "wake", id: wake.wake_id},
+               outcome: %{kind: "replacement", replacement_wake_id: wake.wake_id}
+             }) do
+          true ->
+            record_prod_replacement(txn, source_id, created_at, wake, kind, sender, prod_id)
+            source_id
+
+          _ ->
+            raise DB.Error, message: "prod replacement refused for wake #{source_id}"
+        end
+      end)
 
     queued =
       Txn.q(
@@ -175,13 +180,17 @@ defmodule Tightbeam.QueuedMessageSuppression do
         [wake.session_key, kind, sender, prod_id, requested_at]
       )
 
-    Enum.each(queued, fn [seq, source_id, created_at] ->
-      if Ledger.cancel_queued_in_txn(txn, seq, "sender_requested_replacement") do
-        record_prod_replacement(txn, source_id, created_at, wake, kind, sender, prod_id)
-      end
-    end)
+    queued_ids =
+      Enum.flat_map(queued, fn [seq, source_id, created_at] ->
+        if Ledger.cancel_queued_in_txn(txn, seq, "sender_requested_replacement") do
+          record_prod_replacement(txn, source_id, created_at, wake, kind, sender, prod_id)
+          [source_id]
+        else
+          []
+        end
+      end)
 
-    :ok
+    Enum.uniq(pending_ids ++ queued_ids)
   end
 
   defp record_prod_replacement(txn, source_id, created_at, wake, kind, sender, prod_id) do

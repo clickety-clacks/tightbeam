@@ -52,7 +52,8 @@ defmodule Tightbeam.Wire.RouterTest do
     effortGeneration expecterSessionKey expecterUserId id kind lineageRung options
     ownerUserId parkWakeId question raiserId raiserSessionKey raisedAt rationale
     ruledAt ruledBy ruledViaSessionKey rulingFactId statuteName status withdrawnAt
-    withdrawnBy withdrawnReason
+    withdrawnBy withdrawnReason project projectAttribution projectUnresolvedReason
+    workItemId associationStatus
   )
 
   defmodule NudgeSink do
@@ -64,12 +65,49 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   @tag prod_id_replacement: true
-  test "wake prod id crosses the wire parameter boundary" do
+  test "wake prod id crosses the wire parameter boundary", ctx do
     assert %{prod_id: "page", prompt: "revised"} =
              Router.atomize_params_for_test("wake", %{
                "prodId" => "page",
                "prompt" => "revised"
              })
+
+    target = create_session(ctx.db, "prod-target", ctx.device.user_id)
+    config = %{base_dir: ctx.base_dir, db: ctx.db, port: 0}
+    handlers = Gateway.handlers(config)
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+    ctx = %{ctx | opts: opts}
+
+    params = %{
+      prompt: "first",
+      at: System.system_time(:millisecond) + 60_000,
+      prodId: "page",
+      idempotencyKey: "prod-first"
+    }
+
+    send_wake = fn params ->
+      response =
+        dispatch_cli(ctx, "tbc_test", %{
+          verb: "wake",
+          asProcess: "bridge",
+          sessionKey: target.session_key,
+          params: params
+        })
+
+      assert response.status == 200
+      JSON.decode!(response.resp_body)["result"]
+    end
+
+    first = send_wake.(params)
+    assert first["replacedWakeIds"] == []
+    second_params = %{params | prompt: "second", idempotencyKey: "prod-second"}
+    second = send_wake.(second_params)
+    assert second["replacedWakeIds"] == [first["wakeId"]]
+    assert send_wake.(second_params) == second
+    third = send_wake.(%{params | prompt: "third", idempotencyKey: "prod-third"})
+    assert third["replacedWakeIds"] == [second["wakeId"]]
+    ordinary = send_wake.(Map.drop(params, [:prodId, :idempotencyKey]))
+    refute Map.has_key?(ordinary, "replacedWakeIds")
   end
 
   test "unknown keys cannot create atoms or borrow another verb's parameters" do
@@ -107,6 +145,12 @@ defmodule Tightbeam.Wire.RouterTest do
              "acceptedAt" => 123,
              "sessionKey" => "source"
            }) == %{accepted_at: 123, session_key: "source"}
+  end
+
+  test "harklight send atomizes the answer UI path without changing its value" do
+    assert Router.atomize_params_for_test("harklight-send", %{
+             "answerUi" => "/tmp/cover assets/answer-ui.json"
+           }) == %{answer_ui: "/tmp/cover assets/answer-ui.json"}
   end
 
   test "changes route refuses missing upgrade or unsupported protocol before authentication" do
@@ -1094,7 +1138,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(reviewed.resp_body)["result"]["review"]["outcome"] == "confirmed_other"
   end
 
-  test "repair-assignment crosses the agent wire with opener auth, no-incident refusal, and replay",
+  test "repair-assignment crosses the agent wire across owners with no-incident refusal and replay",
        ctx do
     owner = ctx.device.user_id
     holder = create_session(ctx.db, "repair-wire-holder", owner)
@@ -1129,11 +1173,23 @@ defmodule Tightbeam.Wire.RouterTest do
                [assignment.id]
              )
 
-    unauthorized = dispatch_cli(ctx, "tbc_test", %{request | asUser: "not-the-opener"})
-    assert unauthorized.status == 403
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "not_authorized"
+    cross_owner =
+      request
+      |> Map.put(:asUser, "not-the-opener")
+      |> put_in([:params, :idempotencyKey], "repair-wire-cross-owner")
+      |> then(&dispatch_cli(ctx, "tbc_test", &1))
 
-    assert {:ok, [[0]]} =
+    assert cross_owner.status == 400
+    assert JSON.decode!(cross_owner.resp_body)["error"]["code"] == "no_open_incident"
+
+    assert {:ok, [["user:not-the-opener"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT principal FROM assignment_repair_attempts WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId=?1",
@@ -1155,7 +1211,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert replay.status == 400
     assert JSON.decode!(replay.resp_body) == JSON.decode!(refused.resp_body)
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[2]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId=?1",
@@ -1260,7 +1316,11 @@ defmodule Tightbeam.Wire.RouterTest do
     ask =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
-        params: %{question: "ship 0.1.8?", options: [%{label: "ship"}, %{label: "hold"}]}
+        params:
+          linked_operator_params(ctx, %{
+            question: "ship 0.1.8?",
+            options: [%{label: "ship"}, %{label: "hold"}]
+          })
       })
 
     assert ask.status == 200
@@ -1338,7 +1398,14 @@ defmodule Tightbeam.Wire.RouterTest do
     assert Map.keys(Map.take(listed_row, parity_fields)) |> Enum.sort() ==
              Enum.sort(parity_fields)
 
-    assert exact_row["context"] == %{"note" => nil, "supersedes" => nil}
+    assert exact_row["context"] == %{
+             "note" => nil,
+             "supersedes" => nil,
+             "project" => "Fixture product",
+             "workItemId" => asked["context"]["workItemId"]
+           }
+
+    assert is_binary(exact_row["context"]["workItemId"])
     assert is_binary(exact_row["actionKey"])
 
     assert exact_row["rulingAttribution"] == %{
@@ -1377,7 +1444,11 @@ defmodule Tightbeam.Wire.RouterTest do
     ask2 =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
-        params: %{question: "cut 0.1.9?", options: [%{label: "cut"}, %{label: "wait"}]}
+        params:
+          linked_operator_params(ctx, %{
+            question: "cut 0.1.9?",
+            options: [%{label: "cut"}, %{label: "wait"}]
+          })
       })
 
     assert is_binary(dr2 = JSON.decode!(ask2.resp_body)["result"]["id"])
@@ -1410,7 +1481,11 @@ defmodule Tightbeam.Wire.RouterTest do
     superseded_ask =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
-        params: %{question: "old superseded question?", options: [%{label: "a"}, %{label: "b"}]}
+        params:
+          linked_operator_params(ctx, %{
+            question: "old superseded question?",
+            options: [%{label: "a"}, %{label: "b"}]
+          })
       })
 
     superseded_id = JSON.decode!(superseded_ask.resp_body)["result"]["id"]
@@ -1418,11 +1493,12 @@ defmodule Tightbeam.Wire.RouterTest do
     replacement =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
-        params: %{
-          question: "replacement question?",
-          options: [%{label: "a"}, %{label: "b"}],
-          supersedes: superseded_id
-        }
+        params:
+          linked_operator_params(ctx, %{
+            question: "replacement question?",
+            options: [%{label: "a"}, %{label: "b"}],
+            supersedes: superseded_id
+          })
       })
 
     assert replacement.status == 200
@@ -1462,7 +1538,11 @@ defmodule Tightbeam.Wire.RouterTest do
     ask3 =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
-        params: %{question: "who rules?", options: [%{label: "a"}, %{label: "b"}]}
+        params:
+          linked_operator_params(ctx, %{
+            question: "who rules?",
+            options: [%{label: "a"}, %{label: "b"}]
+          })
       })
 
     assert is_binary(dr3 = JSON.decode!(ask3.resp_body)["result"]["id"])
@@ -1495,10 +1575,11 @@ defmodule Tightbeam.Wire.RouterTest do
       asked =
         dispatch_cli(ctx, raiser.cli_token, %{
           verb: "operator-ask",
-          params: %{
-            question: "Actor #{expected_actor} #{inspect(selector)}",
-            options: [%{label: "a"}]
-          }
+          params:
+            linked_operator_params(ctx, %{
+              question: "Actor #{expected_actor} #{inspect(selector)}",
+              options: [%{label: "a"}]
+            })
         })
 
       request_id = JSON.decode!(asked.resp_body)["result"]["id"]
@@ -1557,7 +1638,11 @@ defmodule Tightbeam.Wire.RouterTest do
     open_ask =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
-        params: %{question: "q-open?", options: [%{label: "a"}, %{label: "b"}]}
+        params:
+          linked_operator_params(ctx, %{
+            question: "q-open?",
+            options: [%{label: "a"}, %{label: "b"}]
+          })
       })
 
     assert is_binary(open_id = JSON.decode!(open_ask.resp_body)["result"]["id"])
@@ -1565,7 +1650,11 @@ defmodule Tightbeam.Wire.RouterTest do
     ruled_ask =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
-        params: %{question: "q-ruled?", options: [%{label: "a"}, %{label: "b"}]}
+        params:
+          linked_operator_params(ctx, %{
+            question: "q-ruled?",
+            options: [%{label: "a"}, %{label: "b"}]
+          })
       })
 
     assert is_binary(ruled_id = JSON.decode!(ruled_ask.resp_body)["result"]["id"])
@@ -4028,20 +4117,22 @@ defmodule Tightbeam.Wire.RouterTest do
     assert session_opened.status == 200, session_opened.resp_body
     session_assignment = JSON.decode!(session_opened.resp_body)["result"]
 
+    # R01 notifies an opener for blockers, while ordinary unlinked verdicts stay quiet.
     process_notice =
       invoke.(
         "attest",
         %{
           assignmentId: session_assignment["id"],
           kind: "verdict",
-          verdictKind: "waiting",
-          note: "Process notification"
+          verdictKind: "blocked",
+          note: "Process blocker"
         },
         nil
       )
 
     assert process_notice["attest"]["byUser"] == nil
     assert process_notice["attest"]["bySession"] == nil
+    assert process_notice["attest"]["verdictKind"] == "blocked"
 
     assert {:ok, [["process:automation", nil]]} =
              DB.query(
@@ -5282,5 +5373,21 @@ defmodule Tightbeam.Wire.RouterTest do
   defp load_terminal_reactions!(ctx) do
     handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
     Tightbeam.TerminalReactionFixture.load!(ctx.base_dir, Map.keys(handlers))
+  end
+
+  # Operator asks must name their product and the work they serve.
+  defp linked_operator_params(ctx, params) do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:#{ctx.device.user_id}",
+        principal: {:user, ctx.device.user_id},
+        session_key: nil,
+        params: %{title: "Operator ask fixture"}
+      })
+
+    params
+    |> Map.put(:project, "Fixture product")
+    |> Map.put(:work_item_id, item.id)
   end
 end
