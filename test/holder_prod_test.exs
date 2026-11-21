@@ -18,6 +18,9 @@ defmodule Tightbeam.HolderProdTest do
 
   alias Tightbeam.DB.Txn
 
+  @quiet 30 * 60 * 1_000
+  @assignment "asg_fixture"
+
   defmodule LaneStub do
     use GenServer
 
@@ -83,9 +86,6 @@ defmodule Tightbeam.HolderProdTest do
 
     refute Map.has_key?(assignment_readback(ctx.db), :holderProd)
   end
-
-  @quiet 30 * 60 * 1_000
-  @assignment "asg_fixture"
 
   for mixed <- [false, true] do
     test "staggered assignments #{if mixed, do: "respect mixed batches", else: "ignore prod-only turns"}",
