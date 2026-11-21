@@ -5071,6 +5071,8 @@ defmodule Tightbeam.Assignments do
         verification
       )
 
+    call = note_ignored_review_verdicts_in_txn(txn, assignment, call, verification, review)
+
     review_pending? = Map.get(call, :review_pending, false)
 
     independent_clean_review? =
@@ -5133,6 +5135,40 @@ defmodule Tightbeam.Assignments do
   end
 
   defp applicable_code_completion_in_txn(_txn, _assignment, call), do: {:ok, call}
+
+  defp note_ignored_review_verdicts_in_txn(txn, assignment, call, verification, review) do
+    ignored =
+      Txn.q(
+        txn,
+        """
+        SELECT DISTINCT r.id,v.verdictKind
+        FROM attests v
+        JOIN assignments r ON r.id=v.assignmentId
+        WHERE r.reviewsAssignmentId=?1
+          AND v.kind='verdict'
+          AND v.bySession=r.holderKey
+          AND v.verdictKind NOT IN ('reviewed-clean','changes-requested')
+        ORDER BY r.id,v.verdictKind
+        """,
+        [assignment.id]
+      )
+
+    if ignored == [] do
+      call
+    else
+      verification_status = if verification, do: verification.kind, else: "absent"
+      review_status = if review, do: review.kind, else: "absent"
+      verdicts = Enum.map_join(ignored, ", ", fn [id, kind] -> "#{id}: #{kind}" end)
+
+      RecordFyis.note(
+        call,
+        "holder verification conclusion: #{verification_status}; " <>
+          "counted review conclusion: #{review_status}; " <>
+          "linked review verdicts ignored for their kind: #{verdicts}; " <>
+          "counted review kinds are reviewed-clean and changes-requested"
+      )
+    end
+  end
 
   defp missing_verification_fact(%{kind: kind}) when kind != "verified",
     do: "the holder's latest verification verdict on this code assignment is #{kind}"
