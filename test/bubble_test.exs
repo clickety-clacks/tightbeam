@@ -793,6 +793,33 @@ defmodule Tightbeam.Productions.BubbleTest do
              ])
   end
 
+  test "a skipped refusal admission advances the existing Bubble lineage", ctx do
+    assert :appended =
+             Tightbeam.Gateway.deliver_prompt(ctx.holder.session_key, "user:flynn", "do work",
+               db: ctx.db
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "refusal")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed", "The provider refused the prompt.",
+               owner_lease: turn.owner_lease,
+               work_outcome: :did_not_perform
+             )
+
+    supervisor = ctx.supervisor.session_key
+    proxy = start_supervised!({MissingTargetDB, {ctx.db, supervisor, self()}})
+
+    assert :ok = Bubble.recognize_terminal(proxy, turn.seq)
+    assert_receive {:real_missing_target_delivery, ^supervisor}
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+
+    assert notice_turn(ctx.db, supervisor) == []
+    assert [[_seq, cause, _wake, _origin, prompt]] = notice_turn(ctx.db, ctx.main.session_key)
+    assert cause == "bubble:#{turn.seq}"
+    assert prompt =~ "did not perform work"
+  end
+
   test "a failed senderless notice to parentless Main surfaces its source once", ctx do
     wake =
       Tightbeam.Wakes.schedule(ctx.db, %{

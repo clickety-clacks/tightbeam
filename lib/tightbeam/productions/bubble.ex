@@ -196,14 +196,14 @@ defmodule Tightbeam.Productions.Bubble do
         else
           case {refusal_openers_in_txn(txn, turn), ancestor} do
             {[], {:ok, recipient}} ->
-              [deliver_bubble_notice_in_txn(txn, recipient, turn, cause)]
+              [admit_bubble_notice_in_txn(txn, recipient, turn, cause)]
 
             {[], :exhausted} ->
               :exhausted
 
             {openers, _} ->
               Enum.map(openers, fn [recipient, assignment_id] ->
-                deliver_bubble_notice_in_txn(
+                admit_bubble_notice_in_txn(
                   txn,
                   recipient,
                   turn,
@@ -219,10 +219,7 @@ defmodule Tightbeam.Productions.Bubble do
         terminal_alerts(db, [turn])
 
       deliveries ->
-        Enum.each(deliveries, fn
-          result when result in [:skipped, :duplicate] -> :ok
-          delivery -> Gateway.complete_delivery(db, delivery)
-        end)
+        finish_bubble_admissions(db, deliveries)
     end
   end
 
@@ -260,29 +257,37 @@ defmodule Tightbeam.Productions.Bubble do
         end
       end)
 
-    # A selected recipient cannot disappear between sibling admissions in
-    # this transaction. A missing row yields real skipped deliveries for the
-    # whole group, with no notice turn to continue the climb later.
     {:ok, results} =
       DB.transaction(db, fn txn ->
         Enum.map(causes, fn {turn, cause} ->
-          {turn, deliver_bubble_notice_in_txn(txn, recipient, turn, cause)}
+          admit_bubble_notice_in_txn(txn, recipient, turn, cause)
         end)
       end)
 
-    skipped =
-      for {turn, :skipped} <- results,
-          do: %{turn | session_key: recipient, notice?: true}
+    finish_bubble_admissions(db, results)
+  end
 
-    # Recover before external publication can interrupt this invocation.
-    if skipped != [], do: climb(db, skipped)
+  defp admit_bubble_notice_in_txn(txn, recipient, turn, cause) do
+    {recipient, turn, deliver_bubble_notice_in_txn(txn, recipient, turn, cause)}
+  end
 
-    Enum.each(results, fn
-      {_turn, result} when result in [:skipped, :duplicate] -> :ok
-      {_turn, delivery} -> Gateway.complete_delivery(db, delivery)
+  defp finish_bubble_admissions(db, results) do
+    # A skipped recipient has no turn to continue the climb. Recover before
+    # external publication can interrupt this invocation.
+    results
+    |> Enum.group_by(&elem(&1, 0))
+    |> Enum.each(fn {recipient, admissions} ->
+      skipped =
+        for {^recipient, turn, :skipped} <- admissions,
+            do: %{turn | session_key: recipient, notice?: true}
+
+      if skipped != [], do: climb(db, skipped)
     end)
 
-    :ok
+    Enum.each(results, fn
+      {_recipient, _turn, result} when result in [:skipped, :duplicate] -> :ok
+      {_recipient, _turn, delivery} -> Gateway.complete_delivery(db, delivery)
+    end)
   end
 
   defp deliver_bubble_notice_in_txn(txn, recipient, turn, cause) do
