@@ -613,6 +613,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             body,
             choices,
             clear_choices,
+            session,
         } => {
             let mut params = vec![
                 string_field("messageId", message),
@@ -627,20 +628,33 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(body) = body {
                 params.push(string_field("body", body));
             }
+            if let Some(session) = session {
+                params.push(string_field("handle", session));
+            }
             Ok(request(identity, "harklight-revise", vec![], params))
         }
-        Command::HarklightRetract { identity, message } => Ok(request(
+        Command::HarklightRetract {
             identity,
-            "harklight-retract",
-            vec![],
-            vec![string_field("messageId", message)],
-        )),
-        Command::HarklightSettle { identity, message } => Ok(request(
+            message,
+            session,
+        } => {
+            let mut params = vec![string_field("messageId", message)];
+            if let Some(session) = session {
+                params.push(string_field("handle", session));
+            }
+            Ok(request(identity, "harklight-retract", vec![], params))
+        }
+        Command::HarklightSettle {
             identity,
-            "harklight-settle",
-            vec![],
-            vec![string_field("messageId", message)],
-        )),
+            message,
+            op_id,
+        } => {
+            let mut params = vec![string_field("messageId", message)];
+            if let Some(op_id) = op_id {
+                params.push(string_field("opId", op_id));
+            }
+            Ok(request(identity, "harklight-settle", vec![], params))
+        }
         Command::HarklightCover { identity, session } => Ok(request(
             identity,
             "harklight-cover",
@@ -1049,7 +1063,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             question,
             note,
             options,
+            project,
             assignment_id,
+            work_item_id,
             deadline_ms,
             supersedes,
         } => {
@@ -1067,8 +1083,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     serde_json::to_string(&options).expect("operator option labels serialize")
                 ));
             }
+            if let Some(value) = project {
+                params.push(string_field("project", value));
+            }
+            // assignment_id and work_item_id are the names rule facts read.
             if let Some(value) = assignment_id {
-                params.push(string_field("assignment", value));
+                params.push(string_field("assignment_id", value));
+            }
+            if let Some(value) = work_item_id {
+                params.push(string_field("work_item_id", value));
             }
             if let Some(value) = deadline_ms {
                 params.push(format!("\"deadline\":{value}"));
@@ -1128,17 +1151,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 vec![],
                 params,
             ))
-        }
-        Command::HarklightBriefing {
-            identity,
-            request_id,
-            rearm_to_session,
-        } => {
-            let mut params = vec![string_field("requestId", request_id)];
-            if let Some(session) = rearm_to_session {
-                params.push(string_field("rearmToSession", session));
-            }
-            Ok(request(identity, "harklight-briefing", vec![], params))
         }
         Command::DecisionRequest {
             identity,
@@ -4130,10 +4142,9 @@ fn local_harklight_identity_refusal(
             Some("harklight-send requires the authenticated session or one of its roles")
         }
         Command::HarklightBriefingsCatchup { identity, .. }
-        | Command::HarklightBriefing { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
         {
-            Some("Harklight briefing commands require an active admin-owned session")
+            Some("harklight-briefings-catchup requires an active admin-owned session")
         }
         Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
@@ -4167,7 +4178,6 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
         | Command::HarklightBriefingsCatchup { identity, .. }
-        | Command::HarklightBriefing { identity, .. }
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
@@ -4486,6 +4496,48 @@ mod tests {
                 assert_eq!(body["params"]["baseRevision"], 2);
                 assert_eq!(body["params"]["clearChoices"], true);
             }
+        }
+    }
+
+    #[test]
+    fn harklight_change_commands_send_session_and_op_id_when_given() {
+        for (args, verb, key, value) in [
+            (
+                vec!["harklight-retract", "--message", "m", "--session", "h"],
+                "harklight-retract",
+                "handle",
+                "h",
+            ),
+            (
+                vec![
+                    "harklight-revise",
+                    "--message",
+                    "m",
+                    "--base-revision",
+                    "2",
+                    "--title",
+                    "new",
+                    "--session",
+                    "h",
+                ],
+                "harklight-revise",
+                "handle",
+                "h",
+            ),
+            (
+                vec!["harklight-settle", "--message", "m", "--op-id", "k"],
+                "harklight-settle",
+                "opId",
+                "k",
+            ),
+        ] {
+            let command =
+                crate::args::parse(args.into_iter().map(str::to_owned).collect()).unwrap();
+            let request = build_request(&command).unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+            assert_eq!(body["verb"], verb);
+            assert_eq!(body["params"]["messageId"], "m");
+            assert_eq!(body["params"][key], value);
         }
     }
 
@@ -5097,23 +5149,6 @@ mod tests {
 
         let explicit_user = parse(&["add-user", "guest", "--as-user", "flynn"]);
         assert!(!requires_session_discovery(&explicit_user));
-    }
-
-    #[test]
-    fn exact_harklight_briefing_maps_only_the_named_request_and_target() {
-        let request = "dr_12345678-1234-4123-8123-123456789abc";
-        assert_eq!(
-            body(&[
-                "harklight-briefing",
-                "--request",
-                request,
-                "--rearm-to-session",
-                "agent:owner",
-            ]),
-            format!(
-                r#"{{"verb":"harklight-briefing","params":{{"requestId":"{request}","rearmToSession":"agent:owner"}}}}"#
-            )
-        );
     }
 
     #[test]
@@ -5823,6 +5858,8 @@ mod tests {
                 "release train",
                 "--options",
                 "accept,wait",
+                "--project",
+                "Tightbeam",
                 "--assignment",
                 "asg_1",
                 "--deadline",
@@ -5832,7 +5869,33 @@ mod tests {
                 "--as",
                 "parent",
             ]),
-            r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","note":"release train","options":[{"label":"accept"},{"label":"wait"}],"assignment":"asg_1","deadline":7200000,"supersedes":"dr_old"}}"#
+            r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","note":"release train","options":[{"label":"accept"},{"label":"wait"}],"project":"Tightbeam","assignment_id":"asg_1","deadline":7200000,"supersedes":"dr_old"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "operator-ask",
+                "--question",
+                "ship window?",
+                "--project",
+                "Tightbeam",
+                "--work-item",
+                "wi_1",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","project":"Tightbeam","work_item_id":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "operator-ask",
+                "--question",
+                "continue?",
+                "--note",
+                "context",
+                "--assignment",
+                "asg_1"
+            ]),
+            r#"{"verb":"operator-ask","params":{"question":"continue?","note":"context","assignment_id":"asg_1"}}"#
         );
         assert_eq!(
             body(&[

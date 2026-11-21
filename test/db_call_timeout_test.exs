@@ -149,18 +149,52 @@ defmodule Tightbeam.DBCallTimeoutTest do
   test "a slow migration stays alive and reports progress before it finishes" do
     Application.put_env(:tightbeam, :db_call_timeout_ms, 20)
     db = start_supervised!({DB, path: ":memory:", name: nil})
+    caller = self()
+    gate = make_ref()
+    filter_id = :"migration_progress_#{System.unique_integer([:positive])}"
+    progress = "database startup call migration_transaction: still waiting"
+
+    # Observe the real caller's progress log before releasing the migration.
+    # A fixed callback sleep races the caller entering its five-second wait:
+    # scheduler delay after send_request can consume any fixed margin.
+    :ok =
+      :logger.add_primary_filter(
+        filter_id,
+        {fn event, _ ->
+           case event do
+             %{meta: %{pid: ^caller}, msg: {:string, message}} ->
+               if String.starts_with?(IO.iodata_to_binary(message), progress) do
+                 send(caller, {:migration_progress, gate, System.monotonic_time(:millisecond)})
+                 send(db, {:finish_migration, gate})
+               end
+
+             _ ->
+               :ok
+           end
+
+           event
+         end, nil}
+      )
+
+    on_exit(fn -> :logger.remove_primary_filter(filter_id) end)
+    started = System.monotonic_time(:millisecond)
 
     log =
       capture_log(fn ->
         assert {:ok, :finished} =
                  DB.migration_transaction(db, :slow_step, [], [], fn _txn ->
-                   Process.sleep(5_100)
-                   :finished
+                   receive do: ({:finish_migration, ^gate} -> :finished)
                  end)
       end)
 
+    assert_received {:migration_progress, ^gate, progress_emitted_at}
+    assert progress_emitted_at - started >= 5_000
     assert log =~ "database startup call migration_transaction: still waiting"
     assert log =~ "database startup call migration_transaction: finished"
+    {progress_at, _} = :binary.match(log, progress)
+    {finished_at, _} = :binary.match(log, "database startup call migration_transaction: finished")
+    assert progress_at < finished_at
+    assert DB.call_timeout() == 20
   end
 
   test "startup wait covers ordinary boot calls without changing the runtime timeout" do

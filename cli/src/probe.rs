@@ -793,6 +793,19 @@ fn darwin_enumeration_error(failure: &CommandFailure) -> String {
     format!("probe: ps enumeration {}", failure_suffix(failure))
 }
 
+/// The facts doctor reports when the first macOS process enumeration produced no list.
+fn darwin_enumeration_failed_facts(failure: &CommandFailure) -> RawFacts {
+    let failure = darwin_enumeration_error(failure);
+    RawFacts {
+        platform: "macos",
+        pids_scanned: 0,
+        pids_env_unreadable: None,
+        processes: Vec::new(),
+        notes: vec![failure.clone()],
+        collection_failure: Some(failure),
+    }
+}
+
 fn collect_darwin(
     io: &impl ProbeIo,
     own_pid: u32,
@@ -1542,21 +1555,14 @@ pub fn run(
                 let failure = raw.collection_failure.clone();
                 (raw, failure)
             }
-            Err(failed @ CommandFailure::Failed(_)) => {
-                let failure = darwin_enumeration_error(&failed);
-                (
-                    RawFacts {
-                        platform: "macos",
-                        pids_scanned: 0,
-                        pids_env_unreadable: None,
-                        processes: Vec::new(),
-                        notes: vec![failure.clone()],
-                        collection_failure: Some(failure.clone()),
-                    },
-                    Some(failure),
-                )
+            // A timed-out enumeration degrades the same way as a failed one: the
+            // report still carries the credential, event-path and sentinel facts that
+            // do not depend on the process list, and doctor still exits nonzero.
+            Err(failed) => {
+                let raw = darwin_enumeration_failed_facts(&failed);
+                let failure = raw.collection_failure.clone();
+                (raw, failure)
             }
-            Err(failure) => return Err(darwin_enumeration_error(&failure)),
         },
         _ => return Err("probe: unsupported platform".to_owned()),
     };
@@ -2688,6 +2694,23 @@ mod tests {
                 failure
             );
             assert_eq!(darwin_enumeration_error(&failure), expected);
+        }
+    }
+
+    #[test]
+    fn darwin_enumeration_timeout_degrades_like_failure() {
+        for (failure, expected) in [
+            (CommandFailure::Timeout, "probe: ps enumeration timed out"),
+            (
+                CommandFailure::Failed("exit status: 1".to_owned()),
+                "probe: ps enumeration failed (exit status: 1)",
+            ),
+        ] {
+            let raw = darwin_enumeration_failed_facts(&failure);
+            assert_eq!(raw.platform, "macos");
+            assert!(raw.processes.is_empty());
+            assert_eq!(raw.notes, vec![expected]);
+            assert_eq!(raw.collection_failure.as_deref(), Some(expected));
         }
     }
 

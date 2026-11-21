@@ -1483,8 +1483,9 @@ defmodule Tightbeam.Wakes do
         LEFT JOIN users owner ON owner.userId=CASE
           WHEN a.openedBySession IS NOT NULL THEN parent.ownerUserId
         ELSE COALESCE(a.openedByUser, w.ownerUserId) END
-        WHERE a.id=?1 AND a.state='closed' AND a.closedBySession=a.holderKey
-          AND a.closedByUser IS NULL AND t.bySession=a.holderKey AND t.byUser IS NULL
+        WHERE a.id=?1 AND a.state='closed'
+          AND a.closedBySession IS t.bySession AND a.closedByUser IS t.byUser
+          AND a.closedByProcess IS NULL
           AND t.ts=a.closedAt
           AND ((a.outcome='completed' AND t.kind='completion')
             OR (a.outcome='surrendered' AND t.kind='surrender'))
@@ -3561,7 +3562,8 @@ defmodule Tightbeam.Wakes do
        when (is_integer(marker) and is_nil(cycle_release_correlation)) or
               (is_tuple(marker) and tuple_size(marker) == 2 and elem(marker, 0) == :cycle_release and
                  is_binary(elem(marker, 1)) and elem(marker, 1) == cycle_release_correlation) do
-    if Ledger.enqueueable_in_txn?(txn, session_key) do
+    if health_redelivery_assignment_open_in_txn?(txn, assignment_id) and
+         Ledger.enqueueable_in_txn?(txn, session_key) do
       case Ledger.enqueue_in_txn(txn, %{
              session_key: session_key,
              message_id: message_id,
@@ -3644,6 +3646,12 @@ defmodule Tightbeam.Wakes do
       """,
       [idempotency_key, restoration_turn_seq, redelivery_turn_seq]
     )
+  end
+
+  defp health_redelivery_assignment_open_in_txn?(_txn, nil), do: true
+
+  defp health_redelivery_assignment_open_in_txn?(txn, assignment_id) do
+    Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1 AND state='open'", [assignment_id]) != []
   end
 
   defp health_redelivery_key(session_key, source_turn_seq) do

@@ -766,8 +766,9 @@ defmodule Tightbeam.RulesTest do
     assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
   end
 
-  test "zero rules still require code completion evidence",
+  test "zero rules still check code completion evidence and record each missing fact as an FYI",
        ctx do
+    :ok = DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1)")
     holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -778,24 +779,27 @@ defmodule Tightbeam.RulesTest do
         kind: "completion"
       })
 
-    assert {:error, %{code: "inapplicable_code_evidence"}} =
+    expected_fyi = [
+      fyi_line("this code assignment has no verified verdict from its holder"),
+      fyi_line("this code assignment has no review conclusion")
+    ]
+
+    assert {:ok, %{attest: %{kind: "completion", id: attest_id} = attest, fyi: ^expected_fyi}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert {:ok, [["open", nil]]} =
+    assert attest.fyi == expected_fyi
+
+    assert {:ok, [["closed", ^attest_id]]} =
              DB.query(
                ctx.db,
                "SELECT state,closingAttestId FROM assignments WHERE id=?1",
                [assignment.id]
              )
 
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
-               [assignment.id]
-             )
+    assert [%{id: ^attest_id, kind: "completion", fyi: ^expected_fyi}] =
+             Assignments.list_attests(ctx.db, assignment.id)
 
-    assert [%{kind: "denied", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
+    refute Enum.any?(EventLog.events_after(ctx.db, 0, 10), &(&1.kind == "denied"))
   end
 
   test "a declared denial precedes required owner data without changing domain state", ctx do
@@ -1161,11 +1165,28 @@ defmodule Tightbeam.RulesTest do
     assert loaded.external_producer
     assert loaded.remedy.action == "wake"
     assert loaded.remedy.produces == "reviewed-clean"
+    assert loaded.remedy.accountable_notice
     refute Map.has_key?(loaded.remedy.params, :reviews)
 
-    put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
+    # The exception is the rule's own declaration, never its name: the same rule
+    # without the declaration needs the linked-review binding, and the same
+    # declaration under another name keeps the exception.
+    put_raw(ctx, String.replace(shipped, "accountable_notice = true\n", ""))
 
     assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end)
+
+    put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
+    assert [renamed] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    assert renamed.remedy.accountable_notice
+
+    put_raw(
+      ctx,
+      String.replace(shipped, "accountable_notice = true", "accountable_notice = \"yes\"")
+    )
+
+    assert_unavailable(ctx, ~r/accountable_notice must be a boolean/, fn ->
       Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     end)
 
@@ -1186,6 +1207,7 @@ defmodule Tightbeam.RulesTest do
     assigned =
       shipped
       |> String.replace(~s(action = "wake"), ~s(action = "assign"))
+      |> String.replace("accountable_notice = true\n", "")
       |> String.replace(~s(target_session = "{holder_key}"), ~s(target_role = "reviewer-code"))
       |> String.replace(~r/^prompt = .*$/m, ~s(subject = "review {assignment_id}"))
 
@@ -1291,7 +1313,7 @@ defmodule Tightbeam.RulesTest do
              )
   end
 
-  test "a clean independent review naming other commits qualifies code completion", ctx do
+  test "uncovered producer commits are named in the completion FYI", ctx do
     :ok =
       DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('other',1)")
 
@@ -1305,6 +1327,7 @@ defmodule Tightbeam.RulesTest do
       assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
 
     producer_refs = fixture_commit_refs()
+    missing_commit = hd(producer_refs)["commit"]
 
     review_refs = [
       %{
@@ -1342,8 +1365,22 @@ defmodule Tightbeam.RulesTest do
 
     assert :ok = Rules.evaluate(ctx.db, completion)
 
-    assert {:ok, %{assignment: %{state: "closed"}}} =
+    expected_fyi = [
+      fyi_line(
+        "the latest independent clean review does not list verified commit #{missing_commit}"
+      )
+    ]
+
+    assert {:ok, %{attest: %{id: attest_id, fyi: ^expected_fyi}, fyi: ^expected_fyi}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert {:ok, [["closed", ^attest_id]]} =
+             DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
+               producer.id
+             ])
+
+    assert [%{fyi: ^expected_fyi}] =
+             Enum.filter(Assignments.list_attests(ctx.db, producer.id), &(&1.id == attest_id))
   end
 
   test "artifact kinds fact resolves holder-recorded kinds only (A6)", ctx do
@@ -1736,7 +1773,8 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "changes-requested wakes and reopens the author card, then clean review closes it", ctx do
+  test "changes-requested wakes and reopens the author card, then fresh completion and clean review close it",
+       ctx do
     holder = engineering_session(ctx.db, "review-change-author", "flynn", archetype: "coder")
 
     reviewer =
@@ -1852,6 +1890,16 @@ defmodule Tightbeam.RulesTest do
                wake.prompt =~ "requested changes"
            end)
 
+    # Reopening invalidates the earlier completion. Record the repaired work
+    # before a clean review can close this new round.
+    assert %{attest: %{verdictKind: "verified"}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+
+    assert {:ok, %{assignment: %{state: "open"}, attest: fresh_completion}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call)
+
+    assert fresh_completion.id != completion_attest.id
+
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
              commit_ref_verdict(
                ctx,
@@ -1868,7 +1916,7 @@ defmodule Tightbeam.RulesTest do
                [producer.id]
              )
 
-    assert closing_attest_id == completion_attest.id
+    assert closing_attest_id == fresh_completion.id
   end
 
   test "completion accepts a closed linked review of the exact integrated heads", ctx do
@@ -2187,7 +2235,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{question: "Choose a route?"})
+        operator_ask_call(ctx.db, raiser.session_key, %{question: "Choose a route?"})
       )
 
     # Besides the routed notice, main's deadline-lapse reminder waits for Main.
@@ -2257,7 +2305,7 @@ defmodule Tightbeam.RulesTest do
     other_request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(other_raiser.session_key, %{question: "Choose another route?"})
+        operator_ask_call(ctx.db, other_raiser.session_key, %{question: "Choose another route?"})
       )
 
     assert {:ok, [["decision-request-filed"]]} =
@@ -2297,7 +2345,7 @@ defmodule Tightbeam.RulesTest do
     old =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{question: "original decision?"})
+        operator_ask_call(ctx.db, raiser.session_key, %{question: "original decision?"})
       )
 
     put_raw(ctx, """
@@ -2320,7 +2368,7 @@ defmodule Tightbeam.RulesTest do
     assert %{code: "not_open"} =
              Escalation.operator_ask(
                ctx.db,
-               operator_ask_call(raiser.session_key, %{
+               operator_ask_call(ctx.db, raiser.session_key, %{
                  question: "refused replacement?",
                  supersedes: old.id,
                  assignment: closed_assignment.id
@@ -2828,7 +2876,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(ctx.db, "filing-remedy-raiser", "flynn")
     recipient = session(ctx.db, "filing-remedy-recipient", "flynn")
-    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(ctx, raiser.session_key, "flynn")
 
     put_raw(ctx, """
     [[rule]]
@@ -2851,7 +2899,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Review the filing?",
           assignment: bound.id
         })
@@ -2960,7 +3008,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Assign a reviewer?",
           assignment: bound.id
         })
@@ -3013,7 +3061,7 @@ defmodule Tightbeam.RulesTest do
              DB.query(ctx.db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
 
     raiser = session(ctx.db, "filing-spawn-raiser", "flynn")
-    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(ctx, raiser.session_key, "flynn")
 
     for bin <- ["claude-agent-acp"] do
       adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", bin])
@@ -3084,7 +3132,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Start a producer?",
           assignment: bound.id
         })
@@ -3186,7 +3234,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{question: "Unbound review?"})
+        operator_ask_call(ctx.db, raiser.session_key, %{question: "Unbound review?"})
       )
 
     assert Enum.any?(1..100, fn _ ->
@@ -3229,7 +3277,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(ctx.db, "filing-held-raiser", "flynn")
     recipient = session(ctx.db, "filing-held-recipient", "flynn")
-    bound = assignment(ctx, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(ctx, raiser.session_key, "flynn")
 
     put_raw(ctx, """
     [[rule]]
@@ -3259,7 +3307,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Wake after ruling?",
           assignment: bound.id
         })
@@ -3347,7 +3395,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(ctx.db, "filing-denied-raiser", "fixture-owner")
     session(ctx.db, "filing-denied-recipient", "fixture-owner")
-    bound = assignment(ctx, raiser.session_key, {:user, "fixture-owner"})
+    bound = operator_assignment(ctx, raiser.session_key, "fixture-owner")
 
     put_raw(ctx, """
     [[rule]]
@@ -3377,7 +3425,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         ctx.db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Deny the producer wake?",
           assignment: bound.id
         })
@@ -3454,7 +3502,7 @@ defmodule Tightbeam.RulesTest do
 
     raiser = session(db, "filing-restart-raiser", "flynn")
     recipient = session(db, "filing-restart-recipient", "flynn")
-    bound = assignment(%{ctx | db: db}, raiser.session_key, {:user, "flynn"})
+    bound = operator_assignment(%{ctx | db: db}, raiser.session_key, "flynn")
 
     put_raw(ctx, """
     [[rule]]
@@ -3484,7 +3532,7 @@ defmodule Tightbeam.RulesTest do
     request =
       Escalation.operator_ask(
         db,
-        operator_ask_call(raiser.session_key, %{
+        operator_ask_call(ctx.db, raiser.session_key, %{
           question: "Resume after restart?",
           assignment: bound.id
         })
@@ -5285,78 +5333,120 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "producer verification binds its own artifact revision and reports the expected hash",
+  test "producer verification binds its own artifact revision and states each binding difference as an FYI",
        ctx do
     holder = session(ctx.db, "artifact-producer", "flynn", archetype: "coder")
     other = session(ctx.db, "artifact-other", "flynn", archetype: "coder")
     hash = String.duplicate("a", 64)
+    other_hash = String.duplicate("b", 64)
 
     for files <- [nil, ["lib/example.ex"]] do
       producer = assignment(ctx, holder.session_key, {:user, "flynn"}, files: files)
       item = "producer-revision-#{System.unique_integer([:positive])}"
       attach_work_item(ctx, producer.id, item)
       artifact = record_revision_artifact(ctx, holder.session_key, producer.id, item, hash)
+      artifact_id = artifact.artifact_id
 
       call =
         p3_call("attest", {:session, holder.session_key}, %{
           assignment_id: producer.id,
           kind: "verdict",
           verdict_kind: "verified",
-          artifact_id: artifact.artifact_id,
+          artifact_id: artifact_id,
           content_sha256: hash,
           commit_refs: fixture_commit_refs()
         })
 
-      assert {:error, %{code: "invalid_commit_refs"}} =
-               Dispatch.dispatch(ctx.db, ctx.handlers, put_in(call.params.commit_refs, nil))
+      # A half pair and an unknown artifact still refuse and record nothing.
+      assert {:error, %{code: "invalid_revision_binding", message: half_pair}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, put_in(call.params.content_sha256, nil))
 
-      assert {:error, %{code: "invalid_revision_binding", message: message}} =
-               Dispatch.dispatch(
-                 ctx.db,
-                 ctx.handlers,
-                 put_in(call.params.content_sha256, String.duplicate("b", 64))
-               )
-
-      assert message =~ "expected sha256 #{hash}"
-      assert message =~ artifact.artifact_id
-
-      assert {:error, %{code: "invalid_revision_binding"}} =
-               Dispatch.dispatch(ctx.db, ctx.handlers, %{
-                 call
-                 | principal: {:session, other.session_key}
-               })
+      assert half_pair =~ "artifact and sha256 must be supplied together"
 
       assert {:error, %{code: "invalid_revision_binding"}} =
                Dispatch.dispatch(
                  ctx.db,
                  ctx.handlers,
-                 call
-                 |> put_in([:params, :verdict_kind], "reviewed-clean")
-                 |> put_in([:params, :commit_refs], nil)
+                 put_in(call.params.artifact_id, "art_missing")
                )
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT count(*) FROM attests WHERE assignmentId=?1", [
+                 producer.id
+               ])
+
+      # Each well-formed binding difference is recorded with an FYI naming both sides.
+      differences = [
+        {put_in(call.params.commit_refs, nil),
+         [fyi_line("this verified verdict carries no commit refs")]},
+        {put_in(call.params.content_sha256, other_hash),
+         [
+           fyi_line(
+             "artifact #{artifact_id} is recorded with sha256 #{hash}; " <>
+               "this verdict cites sha256 #{other_hash}"
+           )
+         ]},
+        {%{call | principal: {:session, other.session_key}},
+         [
+           fyi_line(
+             "artifact #{artifact_id} was produced by this assignment; this verdict is filed by " <>
+               "#{other.session_key}, not its holder #{holder.session_key}"
+           )
+         ]},
+        {call
+         |> put_in([:params, :verdict_kind], "reviewed-clean")
+         |> put_in([:params, :commit_refs], nil),
+         [
+           fyi_line(
+             "artifact #{artifact_id} was produced by this assignment; it is bound here to a " <>
+               "reviewed-clean verdict, not a holder verified verdict"
+           )
+         ]}
+      ]
+
+      recorded =
+        Map.new(differences, fn {candidate, expected_fyi} ->
+          assert {:ok, %{attest: %{id: id, fyi: ^expected_fyi}, fyi: ^expected_fyi}} =
+                   Dispatch.dispatch(ctx.db, ctx.handlers, candidate)
+
+          {id, expected_fyi}
+        end)
 
       unrelated = assignment(ctx, holder.session_key, {:user, "flynn"}, work_item_id: item)
 
-      assert {:error, %{code: "invalid_revision_binding"}} =
+      unrelated_fyi = [
+        fyi_line(
+          "artifact #{artifact_id} was produced by assignment #{producer.id}, " <>
+            "not by this assignment or the assignment this card reviews"
+        )
+      ]
+
+      assert {:ok, %{attest: %{id: unrelated_attest_id}, fyi: ^unrelated_fyi}} =
                Dispatch.dispatch(
                  ctx.db,
                  ctx.handlers,
                  put_in(call.params.assignment_id, unrelated.id)
                )
 
-      assert {:ok, %{attest: verified}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
-      assert verified.artifactId == artifact.artifact_id
+      assert [%{id: ^unrelated_attest_id, fyi: ^unrelated_fyi}] =
+               Assignments.list_attests(ctx.db, unrelated.id)
+
+      assert {:ok, %{attest: verified} = result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+      assert verified.artifactId == artifact_id
       assert verified.contentSha256 == hash
       assert verified.commitRefs == fixture_commit_refs()
+      refute Map.has_key?(result, :fyi)
+      refute Map.has_key?(verified, :fyi)
 
-      assert {:ok, [[1]]} =
-               DB.query(ctx.db, "SELECT count(*) FROM attests WHERE assignmentId=?1", [
-                 producer.id
-               ])
+      assert Map.new(
+               Assignments.list_attests(ctx.db, producer.id),
+               &{&1.id, Map.get(&1, :fyi)}
+             ) == Map.put(recorded, verified.id, nil)
     end
   end
 
-  test "artifact revisions bind their producer, review verdict, and predicate candidate", ctx do
+  test "artifact revisions bind their producer, review verdict, and predicate candidate, stating mismatches as FYIs",
+       ctx do
     producer_holder = session(ctx.db, "revision-producer", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "revision-reviewer", "flynn", archetype: "reviewer")
     foreign_holder = session(ctx.db, "revision-foreign", "kay", archetype: "coder")
@@ -5419,21 +5509,54 @@ defmodule Tightbeam.RulesTest do
     assert %{code: "invalid_revision_binding"} =
              revision_verdict(ctx, reviewer.session_key, review.id, artifact.artifact_id, nil)
 
-    assert %{code: "invalid_revision_binding", message: message} =
+    # A card held under another owner user cannot bind this owner's artifact.
+    assert %{code: "invalid_revision_binding"} =
+             revision_verdict(
+               ctx,
+               foreign_holder.session_key,
+               foreign.id,
+               artifact.artifact_id,
+               hash,
+               "verified"
+             )
+
+    assert Assignments.list_attests(ctx.db, foreign.id) == []
+
+    other_hash = String.duplicate("b", 64)
+
+    hash_fyi = [
+      fyi_line(
+        "artifact #{artifact.artifact_id} is recorded with sha256 #{hash}; " <>
+          "this verdict cites sha256 #{other_hash}"
+      )
+    ]
+
+    assert %{attest: %{id: mismatched_id, contentSha256: ^other_hash}, fyi: ^hash_fyi} =
              revision_verdict(
                ctx,
                reviewer.session_key,
                review.id,
                artifact.artifact_id,
-               String.duplicate("b", 64)
+               other_hash
              )
 
-    assert message =~ "expected sha256 #{hash}"
+    assert [%{fyi: ^hash_fyi}] =
+             Enum.filter(Assignments.list_attests(ctx.db, review.id), &(&1.id == mismatched_id))
+
+    # The review citing another hash does not satisfy the revision predicate.
+    assert {:ok, %{matched: false}} = Rules.evaluate_predicate(ctx.db, predicate)
 
     unrelated = assignment(ctx, producer_holder.session_key, {:user, "flynn"})
     wrong_review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: unrelated.id)
 
-    assert %{code: "invalid_revision_binding"} =
+    producer_fyi = [
+      fyi_line(
+        "artifact #{artifact.artifact_id} was produced by assignment #{producer.id}, " <>
+          "not by this assignment or the assignment this card reviews"
+      )
+    ]
+
+    assert %{attest: %{id: wrong_review_attest_id}, fyi: ^producer_fyi} =
              revision_verdict(
                ctx,
                reviewer.session_key,
@@ -5441,6 +5564,12 @@ defmodule Tightbeam.RulesTest do
                artifact.artifact_id,
                hash
              )
+
+    assert [%{id: ^wrong_review_attest_id, fyi: ^producer_fyi}] =
+             Assignments.list_attests(ctx.db, wrong_review.id)
+
+    # A review of another assignment does not satisfy the producer's predicate.
+    assert {:ok, %{matched: false}} = Rules.evaluate_predicate(ctx.db, predicate)
 
     valid =
       revision_verdict(
@@ -5454,6 +5583,7 @@ defmodule Tightbeam.RulesTest do
 
     assert valid.attest.artifactId == artifact.artifact_id
     assert valid.attest.contentSha256 == hash
+    refute Map.has_key?(valid, :fyi)
     assert {:ok, %{matched: true}} = Rules.evaluate_predicate(ctx.db, predicate)
 
     revision_verdict(
@@ -5517,6 +5647,8 @@ defmodule Tightbeam.RulesTest do
     %{verb: "post", origin: origin, session_key: nil, params: %{}}
   end
 
+  defp fyi_line(fact), do: "FYI: " <> fact <> "; decide for yourself whether that is acceptable"
+
   defp p3_call(verb, principal, params) do
     origin =
       case principal do
@@ -5537,14 +5669,28 @@ defmodule Tightbeam.RulesTest do
     }
   end
 
-  defp operator_ask_call(session_key, params) do
+  defp operator_ask_call(db, session_key, params) do
     %{
       verb: "operator-ask",
       origin: "agent:#{session_key}",
       principal: {:session, session_key},
       transport_session_key: session_key,
-      params: params
+      params: Tightbeam.TestSupport.OperatorAskFixture.link(db, session_key, params)
     }
+  end
+
+  defp operator_assignment(ctx, holder_key, owner) do
+    Tightbeam.TestSupport.OperatorAskFixture.ensure_work_item!(ctx.db, owner)
+
+    work_item_id = Tightbeam.TestSupport.OperatorAskFixture.work_item(owner)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE work_items SET deliveryOwnerSessionKey=?1 WHERE id=?2", [
+        holder_key,
+        work_item_id
+      ])
+
+    assignment(ctx, holder_key, {:user, owner}, work_item_id: work_item_id)
   end
 
   defp assignment(ctx, holder_key, opener, opts \\ []) do

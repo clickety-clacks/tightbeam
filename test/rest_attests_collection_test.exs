@@ -11,7 +11,7 @@ defmodule Tightbeam.RestAttestsCollectionTest do
 
   @attest_fields ~w(
     id assignmentId kind verdictKind note bySession byUser producer producerCommand
-    byHarness byProvider commitRefs ts rowVersion
+    byHarness byProvider commitRefs fyi ts rowVersion
   )
 
   setup do
@@ -274,6 +274,30 @@ defmodule Tightbeam.RestAttestsCollectionTest do
     assert {:au4_visibility, "attests"} in detail_events
     assert {:serializer, "attests", :attest} in detail_events
     assert Enum.count(detail_events, &match?({:serializer, "attests", _}, &1)) == 1
+  end
+
+  test "collection and detail items return the FYI lines stored with each attest", ctx do
+    line =
+      "FYI: this verified verdict carries no commit refs; decide for yourself whether that is acceptable"
+
+    insert_attest(ctx, "test_attest_fyi_with", ctx.opener_assignment.id, 100)
+    insert_attest(ctx, "test_attest_fyi_without", ctx.opener_assignment.id, 110)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.RecordFyis.put_in_txn(txn, "attest", "test_attest_fyi_with", [line])
+             end)
+
+    collection = get(ctx, "/api/attests?assignmentId=#{ctx.opener_assignment.id}")
+    assert collection.status == 200, collection.resp_body
+    items = Map.new(JSON.decode!(collection.resp_body)["items"], &{&1["id"], &1})
+    assert items["test_attest_fyi_with"]["fyi"] == [line]
+    assert items["test_attest_fyi_without"]["fyi"] == []
+
+    detail = get(ctx, "/api/attests/test_attest_fyi_with")
+    assert detail.status == 200, detail.resp_body
+    assert JSON.decode!(detail.resp_body)["item"]["fyi"] == [line]
+    assert JSON.decode!(detail.resp_body)["item"] == items["test_attest_fyi_with"]
   end
 
   test "top-level tuple pagination uses the complete tuple across tied and deleted rows", ctx do
