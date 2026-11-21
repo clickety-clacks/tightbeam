@@ -1,6 +1,6 @@
 defmodule Tightbeam.KungfuPackageTest do
   # Swaps the global shipped-bundle root, so it cannot run beside other tests.
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{Identity, Reminders}
 
