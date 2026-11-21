@@ -3,7 +3,7 @@ defmodule Tightbeam.ArtifactBlobStoreTest do
 
   alias Tightbeam.ArtifactBlobStore, as: Store
 
-  setup do
+  setup test do
     root = Path.join(System.tmp_dir!(), "artifact-blobs-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(root) end)
 
@@ -11,7 +11,7 @@ defmodule Tightbeam.ArtifactBlobStoreTest do
       start_supervised!(
         {Store,
          root: root,
-         budget_bytes: 4,
+         budget_bytes: test[:budget_bytes] || 4,
          floor_bytes: 100,
          floor_percent: 10,
          disk_space: fn _ -> {:ok, 2_000, 1_000} end}
@@ -29,7 +29,7 @@ defmodule Tightbeam.ArtifactBlobStoreTest do
 
     assert :ok = Store.append(ctx.store, first, "ur")
     assert {:ok, %{custody: "pinned", sha256: sha, size: 4}} = Store.finish(ctx.store, first)
-    assert {:ok, "four"} = Store.read(ctx.root, sha)
+    assert {:ok, %{bytes: "four"}} = Store.inspect_blob(ctx.root, sha, 4)
 
     {:ok, duplicate} = Store.begin_upload(ctx.store)
     assert :ok = Store.append(ctx.store, duplicate, "four")
@@ -49,7 +49,24 @@ defmodule Tightbeam.ArtifactBlobStoreTest do
     {:ok, fallback} = Store.begin_upload(ctx.store, allow_unpinned: true)
     assert :ok = Store.append(ctx.store, fallback, "larger")
     assert {:ok, %{custody: "unpinned", sha256: sha}} = Store.finish(ctx.store, fallback)
-    assert {:error, :enoent} = Store.read(ctx.root, sha)
+    assert {:error, :enoent} = Store.inspect_blob(ctx.root, sha, 4)
+  end
+
+  @tag budget_bytes: 8
+  test "a corrupt blob is quarantined and replaced by the intact upload", ctx do
+    {:ok, first} = Store.begin_upload(ctx.store)
+    assert :ok = Store.append(ctx.store, first, "four")
+    assert {:ok, %{sha256: sha}} = Store.finish(ctx.store, first)
+    assert {:ok, %{home: blob_path}} = Store.inspect_blob(ctx.root, sha, 4)
+    File.write!(blob_path, "bad!")
+
+    {:ok, repair} = Store.begin_upload(ctx.store)
+    assert :ok = Store.append(ctx.store, repair, "four")
+    assert {:ok, %{custody: "pinned", sha256: ^sha}} = Store.finish(ctx.store, repair)
+    assert {:ok, %{bytes: "four", sha256: ^sha}} = Store.inspect_blob(ctx.root, sha, 4)
+    assert [quarantine] = Path.wildcard(Path.join(ctx.root, "quarantine/*"))
+    assert File.read!(quarantine) == "bad!"
+    assert {:ok, %{used_bytes: 8}} = Store.capacity(ctx.store)
   end
 
   test "an expected hash mismatch refuses even if the caller allowed an unpinned row", ctx do

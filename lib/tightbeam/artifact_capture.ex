@@ -9,7 +9,14 @@ defmodule Tightbeam.ArtifactCapture do
         Tightbeam.Artifacts.record(db, call)
 
       store ->
-        case call[:artifact_capture] || capture_origin(db, store, call, config) do
+        capture =
+          if ArtifactOrigins.parse(call.params[:origin_path]) == :non_filesystem do
+            %{custody: "external_pointer", sha256: call.params[:content_sha256]}
+          else
+            call[:artifact_capture] || capture_origin(db, store, call, config)
+          end
+
+        case capture do
           %{custody: _} = capture ->
             result = Tightbeam.Artifacts.record(db, Map.put(call, :artifact_capture, capture))
 

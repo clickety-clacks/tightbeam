@@ -432,7 +432,9 @@ defmodule Tightbeam.Wire.Router do
         with {:ok, json} <- Base.url_decode64(metadata, padding: false),
              {:ok, %{"verb" => "artifact-record", "params" => params} = body}
              when is_map(params) <- JSON.decode(json),
-             false <- Map.has_key?(params, "contentBase64") do
+             false <- Map.has_key?(params, "contentBase64"),
+             origin when origin in [:relative, :absolute] <-
+               Tightbeam.ArtifactOrigins.parse(params["originPath"]) do
           fun.(body, Plug.Conn.put_private(conn, :artifact_body_upload, true))
         else
           _ -> error(conn, 400, "invalid_artifact_upload", "expected artifact record metadata")

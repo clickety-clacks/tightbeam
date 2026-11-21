@@ -110,7 +110,8 @@ defmodule Tightbeam.ArtifactArchive do
 
   defp run_remote([command | args], collect), do: System.cmd(command, args, into: collect)
 
-  defp read_local(path, limit) do
+  @doc false
+  def read_local(path, limit) do
     case File.lstat(path) do
       {:ok, %{type: :regular}} ->
         case File.open(path, [:read, :raw, :binary], &hash_file(&1, Digest.new(limit), path)) do
@@ -134,7 +135,8 @@ defmodule Tightbeam.ArtifactArchive do
     end
   end
 
-  defp inline_limit(config) do
+  @doc false
+  def inline_limit(config) do
     Map.get_lazy(config, :artifact_archive_inline_limit_bytes, fn ->
       Application.get_env(:tightbeam, :artifact_archive_inline_limit_bytes, 8 * 1024 * 1024)
     end)

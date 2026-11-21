@@ -1,6 +1,6 @@
 defmodule Tightbeam.FileEffectEvidence do
   @moduledoc false
-  alias Tightbeam.{ArtifactContent, Artifacts, DB.Txn, Mementos}
+  alias Tightbeam.{ArtifactEvidence, Artifacts, DB.Txn, Mementos}
 
   # The caller supplies the selected declaration and policy revision, then
   # validates and writes the inline value inside the attest transaction.
@@ -17,7 +17,7 @@ defmodule Tightbeam.FileEffectEvidence do
              [id]
            ) do
         [[holder, item, nil, "open"]] when call.principal == {:session, holder} ->
-          %{id: id, holder: holder, item: item}
+          %{id: id, holder: holder, item: item, call: call}
 
         _ ->
           invalid!("assignment.producer", "requires the holder of an open producing assignment")
@@ -26,7 +26,7 @@ defmodule Tightbeam.FileEffectEvidence do
     {_, bytes} = captured!(txn, artifact_id, hash, "manifest", assignment, :producer)
 
     manifest =
-      case JSON.decode(bytes) do
+      case is_binary(bytes) && JSON.decode(bytes) do
         {:ok, value} when is_map(value) -> value
         _ -> invalid!("manifest", "requires a JSON object")
       end
@@ -127,12 +127,11 @@ defmodule Tightbeam.FileEffectEvidence do
 
     artifact = Artifacts.get_in_txn(txn, artifact_id)
     unless artifact, do: unavailable!(artifact_id, field)
-    content = ArtifactContent.fetch(txn, artifact_id)
+    content = ArtifactEvidence.get(assignment.call, artifact)
     unless content, do: unavailable!(artifact_id, field)
-    actual = :crypto.hash(:sha256, content.content) |> Base.encode16(case: :lower)
     exact!(artifact.content_sha256, hash, field <> ".artifact.contentSha256")
-    exact!(content.content_sha256, hash, field <> ".captured.contentSha256")
-    exact!(actual, hash, field <> ".captured.bytes")
+    exact!(content.digest, hash, field <> ".captured.contentSha256")
+    exact!(content.actual, hash, field <> ".captured.bytes")
     exact!(artifact.work_item_id, assignment.item, field <> ".workItemId")
 
     case Txn.q(txn, "SELECT holderKey,reviewsAssignmentId FROM assignments WHERE id=?1", [
@@ -160,7 +159,7 @@ defmodule Tightbeam.FileEffectEvidence do
         )
     end
 
-    {artifact, content.content}
+    {artifact, content.bytes}
   end
 
   defp text!(value, _field) when is_binary(value) and byte_size(value) > 0, do: value

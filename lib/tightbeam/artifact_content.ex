@@ -168,10 +168,20 @@ defmodule Tightbeam.ArtifactContent do
   def fetch_call(_db, _call, _config), do: %{code: "forbidden"}
 
   defp fetch_visible(_db, %{custody: "pinned"} = row, config) do
-    case ArtifactBlobStore.read(config.artifact_blob_root, row.content_sha256) do
-      {:ok, bytes} ->
-        digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
-        content_result(row, digest, byte_size(bytes), bytes, "pinned_copy")
+    limit = ArtifactArchive.inline_limit(config)
+
+    case ArtifactBlobStore.inspect_blob(config.artifact_blob_root, row.content_sha256, limit) do
+      {:ok, blob} ->
+        result = content_result(row, blob.sha256, blob.size, blob.bytes, "pinned_copy")
+
+        if blob.size > limit do
+          Map.merge(result, %{
+            content_size: blob.size,
+            content_unavailable_reason: "pinned artifact is too large to return inline"
+          })
+        else
+          result
+        end
 
       {:error, reason} ->
         %{
@@ -179,6 +189,10 @@ defmodule Tightbeam.ArtifactContent do
           message: "could not read pinned copy: #{inspect(reason)}"
         }
     end
+  end
+
+  defp fetch_visible(_db, %{custody: "external_pointer"}, _config) do
+    %{code: "content_not_captured", message: "artifact is an external pointer"}
   end
 
   defp fetch_visible(db, %{state: "archived"} = row, config) do
@@ -351,43 +365,6 @@ defmodule Tightbeam.ArtifactContent do
          ) do
       {:ok, [[digest, size, bytes]]} ->
         %{artifact_id: artifact_id, content_sha256: digest, content_size: size, content: bytes}
-
-      {:ok, []} ->
-        fetch_pinned(db, artifact_id)
-
-      {:error, error} ->
-        raise error
-    end
-  end
-
-  defp fetch_pinned(db, artifact_id) do
-    case DB.query(
-           db,
-           """
-           SELECT a.contentSha256 FROM artifacts a
-           JOIN artifact_custody c ON c.artifactId=a.artifactId
-           WHERE a.artifactId=?1 AND c.status='pinned'
-           """,
-           [artifact_id]
-         ) do
-      {:ok, [[digest]]} ->
-        base_dir =
-          Application.get_env(:tightbeam, :base_dir, Path.join(System.user_home!(), ".tightbeam"))
-
-        root = ArtifactBlobStore.options(base_dir)[:root]
-
-        case ArtifactBlobStore.read(root, digest) do
-          {:ok, bytes} ->
-            %{
-              artifact_id: artifact_id,
-              content_sha256: digest,
-              content_size: byte_size(bytes),
-              content: bytes
-            }
-
-          {:error, _reason} ->
-            nil
-        end
 
       {:ok, []} ->
         nil

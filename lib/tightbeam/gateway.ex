@@ -1697,6 +1697,10 @@ defmodule Tightbeam.Gateway do
           "attest",
           call
           |> Map.put(:on_assignment_change, assignment_change)
+          |> Map.put(
+            :artifact_evidence_config,
+            Map.take(config, [:artifact_blob_root, :artifact_archive_inline_limit_bytes])
+          )
           |> Map.put(:wake_scheduler, Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
         )
       end,

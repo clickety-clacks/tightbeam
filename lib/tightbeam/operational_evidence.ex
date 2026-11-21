@@ -1,7 +1,7 @@
 defmodule Tightbeam.OperationalEvidence do
   @moduledoc false
 
-  alias Tightbeam.{ArtifactContent, Artifacts, Mementos}
+  alias Tightbeam.{ArtifactEvidence, Artifacts, Mementos}
   alias Tightbeam.DB.Txn
 
   # Eligibility and the applicable evidence route belong to the loaded policy.
@@ -60,7 +60,7 @@ defmodule Tightbeam.OperationalEvidence do
         do: [],
         else: ["artifact #{artifact_id} was recorded " <> Enum.join(attribution, " ")]
 
-    content = ArtifactContent.fetch(txn, artifact_id)
+    content = ArtifactEvidence.get(call, artifact)
 
     # Spec rows A13 and A15: missing captured content and differing digests
     # are recorded as facts.
@@ -73,9 +73,7 @@ defmodule Tightbeam.OperationalEvidence do
                  "compared with its bytes"
              ], nil}
 
-        %{content: bytes} ->
-          actual = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
-
+        %{actual: actual} ->
           if digest == actual,
             do: {facts, actual},
             else:

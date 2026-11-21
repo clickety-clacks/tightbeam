@@ -2020,6 +2020,7 @@ defmodule Tightbeam.Assignments do
          {:ok, call} <- commit_ref_filing_allowed(db, call),
          {:ok, call} <- prepare_attest_commit_refs(db, call) do
       assignment_id = call.params[:assignment_id]
+      call = Tightbeam.ArtifactEvidence.prepare(db, call)
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
 
       snapshot = Rules.effective_snapshot()

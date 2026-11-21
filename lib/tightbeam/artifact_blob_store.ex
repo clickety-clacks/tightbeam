@@ -1,6 +1,9 @@
 defmodule Tightbeam.ArtifactBlobStore do
   @moduledoc false
   use GenServer
+  require Logger
+
+  alias Tightbeam.ArtifactArchive
 
   @gib 1024 * 1024 * 1024
   @default_budget 64 * @gib
@@ -43,7 +46,8 @@ defmodule Tightbeam.ArtifactBlobStore do
   def abort(store, upload), do: GenServer.call(store, {:abort, upload})
   def capacity(store), do: GenServer.call(store, :capacity)
 
-  def read(root, digest), do: File.read(blob_path(root, digest))
+  def inspect_blob(root, digest, limit),
+    do: ArtifactArchive.read_local(blob_path(root, digest), limit)
 
   @impl true
   def init(opts) do
@@ -57,9 +61,8 @@ defmodule Tightbeam.ArtifactBlobStore do
     end
 
     used =
-      root
-      |> Path.join("blobs/*/*")
-      |> Path.wildcard()
+      ["blobs/*/*", "quarantine/*"]
+      |> Enum.flat_map(&Path.wildcard(Path.join(root, &1)))
       |> Enum.sum_by(fn path -> File.stat!(path).size end)
 
     {:ok,
@@ -190,18 +193,28 @@ defmodule Tightbeam.ArtifactBlobStore do
       entry.expected && entry.expected != digest ->
         {{:error, {:sha_mismatch, entry.expected, digest}}, state, entry}
 
-      File.regular?(blob_path(state.root, digest)) ->
-        {{:ok, pin(entry, digest)}, state, entry}
-
-      entry.out_of_space ->
-        no_capacity(state, entry, digest)
-
       true ->
-        publish(state, entry, digest)
+        case inspect_blob(state.root, digest, 0) do
+          {:ok, %{sha256: ^digest, size: size}} when size == entry.size ->
+            {{:ok, pin(entry, digest)}, state, entry}
+
+          {:ok, _different} ->
+            if entry.out_of_space,
+              do: no_capacity(state, entry, digest),
+              else: publish(state, entry, digest, :replace)
+
+          {:error, :enoent} ->
+            if entry.out_of_space,
+              do: no_capacity(state, entry, digest),
+              else: publish(state, entry, digest, :new)
+
+          {:error, reason} ->
+            {{:error, reason}, state, entry}
+        end
     end
   end
 
-  defp publish(state, entry, digest) do
+  defp publish(state, entry, digest, mode) do
     path = blob_path(state.root, digest)
 
     with {:ok, capacity} <- measure_capacity(state),
@@ -209,7 +222,7 @@ defmodule Tightbeam.ArtifactBlobStore do
          {:ok, entry} <- open_stage(state, entry) do
       with :ok <- :file.sync(entry.file),
            :ok <- File.mkdir_p(Path.dirname(path)),
-           :ok <- File.rename(entry.path, path) do
+           :ok <- install_blob(state.root, entry.path, path, mode) do
         {{:ok, pin(entry, digest)}, %{state | used: state.used + entry.staged},
          %{entry | path: nil}}
       else
@@ -220,6 +233,30 @@ defmodule Tightbeam.ArtifactBlobStore do
       false -> no_capacity(state, entry, digest)
       {:error, :enospc} -> no_capacity(state, entry, digest)
       {:error, reason} -> {{:error, reason}, state, entry}
+    end
+  end
+
+  defp install_blob(_root, stage, path, :new), do: File.rename(stage, path)
+
+  defp install_blob(root, stage, path, :replace) do
+    directory = Path.join(root, "quarantine")
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+    quarantine = Path.join(directory, Path.basename(path) <> "-" <> suffix)
+
+    with :ok <- File.mkdir_p(directory),
+         :ok <- File.ln(path, quarantine) do
+      case File.rename(stage, path) do
+        :ok ->
+          Logger.warning(
+            "replaced corrupt artifact blob #{Path.basename(path)}; kept at #{quarantine}"
+          )
+
+          :ok
+
+        error ->
+          File.rm(quarantine)
+          error
+      end
     end
   end
 

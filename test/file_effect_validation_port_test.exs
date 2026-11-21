@@ -89,11 +89,13 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     manifest = capture(ctx, manifest(ctx, before, after_file, observation) |> JSON.encode!())
     pointer = "file-evidence/v1:#{manifest.id}:#{manifest.hash}"
 
+    prepared = Tightbeam.ArtifactEvidence.prepare(ctx.db, proof_call(ctx, manifest, pointer))
+
     assert {:ok, result} =
              DB.transaction(ctx.db, fn txn ->
                FileEffectEvidence.validate!(
                  txn,
-                 proof_call(ctx, manifest, pointer),
+                 prepared,
                  "example/evidence",
                  "revision"
                )
@@ -119,11 +121,14 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     changed_pointer = "file-evidence/v1:#{changed.id}:#{changed.hash}"
 
+    prepared =
+      Tightbeam.ArtifactEvidence.prepare(ctx.db, proof_call(ctx, changed, changed_pointer))
+
     assert {:error, %Mementos.Refusal{code: "file_effect_evidence_invalid", message: message}} =
              DB.transaction(ctx.db, fn txn ->
                FileEffectEvidence.validate!(
                  txn,
-                 proof_call(ctx, changed, changed_pointer),
+                 prepared,
                  "example/evidence",
                  "revision"
                )
@@ -140,11 +145,17 @@ defmodule Tightbeam.FileEffectValidationPortTest do
 
     uncaptured_pointer = "file-evidence/v1:#{uncaptured_manifest.id}:#{uncaptured_manifest.hash}"
 
+    prepared =
+      Tightbeam.ArtifactEvidence.prepare(
+        ctx.db,
+        proof_call(ctx, uncaptured_manifest, uncaptured_pointer)
+      )
+
     assert {:error, %Mementos.Refusal{code: "file_effect_evidence_unavailable", message: message}} =
              DB.transaction(ctx.db, fn txn ->
                FileEffectEvidence.validate!(
                  txn,
-                 proof_call(ctx, uncaptured_manifest, uncaptured_pointer),
+                 prepared,
                  "example/evidence",
                  "revision"
                )
@@ -167,6 +178,8 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     }
 
     validate = fn candidate ->
+      candidate = candidate |> put_in([:params, :verdict_kind], "verified")
+      candidate = Tightbeam.ArtifactEvidence.prepare(ctx.db, candidate)
       DB.transaction(ctx.db, fn txn -> OperationalEvidence.validate!(txn, candidate) end)
     end
 
@@ -248,6 +261,8 @@ defmodule Tightbeam.FileEffectValidationPortTest do
     snapshot = Rules.effective_snapshot() |> Map.put(:policies, [policy])
 
     prepare = fn candidate ->
+      candidate = Tightbeam.ArtifactEvidence.prepare(ctx.db, candidate)
+
       DB.transaction(ctx.db, fn txn ->
         Rules.with_snapshot(snapshot, fn -> AttestEvidence.prepare_in_txn!(txn, candidate) end)
       end)
@@ -287,6 +302,8 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       "FYI: the artifact on this verdict was not checked as operational evidence because " <>
         "declared files are present for this assignment; decide for yourself whether that is acceptable"
     ]
+
+    call = Tightbeam.ArtifactEvidence.prepare(ctx.db, call)
 
     assert {:ok, overbroad_prepared} =
              DB.transaction(ctx.db, fn txn ->
@@ -340,6 +357,8 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       put_in(call, [:params, :mementos], [
         {"example/evidence", ["file-evidence/v1:#{captured.id}:#{captured.hash}"]}
       ])
+
+    manifest_call = Tightbeam.ArtifactEvidence.prepare(ctx.db, manifest_call)
 
     assert {:ok, legacy_prepared} =
              DB.transaction(ctx.db, fn txn ->
@@ -411,12 +430,15 @@ defmodule Tightbeam.FileEffectValidationPortTest do
         kind: "verdict",
         verdict_kind: "verified",
         artifact_id: manifest.id,
+        verdict_kind: "verified",
         content_sha256: manifest.hash,
         mementos: [{"example/evidence", [pointer, "observation:disk-only"]}]
       }
     }
 
     prepare = fn candidate, selected ->
+      candidate = Tightbeam.ArtifactEvidence.prepare(ctx.db, candidate)
+
       DB.transaction(ctx.db, fn txn ->
         Rules.with_snapshot(selected, fn -> AttestEvidence.prepare_in_txn!(txn, candidate) end)
       end)
@@ -1166,6 +1188,7 @@ defmodule Tightbeam.FileEffectValidationPortTest do
       params: %{
         assignment_id: ctx.assignment_id,
         artifact_id: manifest.id,
+        verdict_kind: "verified",
         content_sha256: manifest.hash
       },
       memento_writes: [{"example/evidence", [pointer]}]

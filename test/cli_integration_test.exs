@@ -1294,6 +1294,25 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert Base.decode64!(encoded) == bytes
 
+    config = %{
+      db: ctx.db,
+      artifact_blob_root: Path.join(ctx.base_dir, "artifact-blobs"),
+      artifact_archive_inline_limit_bytes: byte_size(bytes) - 1
+    }
+
+    limited =
+      Gateway.handlers(config)["artifact-content-fetch"].(%{
+        principal: {:session, ctx.session.session_key},
+        rest_principal: %{kind: "session", id: ctx.session.session_key, is_admin: false},
+        params: %{artifact_id: pinned["artifactId"]}
+      })
+
+    assert limited.verification_status == "match"
+    assert limited.content_size == byte_size(bytes)
+    assert limited.content_sha256 == pinned["contentSha256"]
+    assert limited.content_unavailable_reason =~ "too large to return inline"
+    refute Map.has_key?(limited, :content_base64)
+
     {mismatch, 1} = run.(record ++ ["--sha256", pinned["contentSha256"], "--allow-unpinned"])
     assert mismatch =~ "content_sha256_mismatch"
     {full, 1} = run.(record)
@@ -1334,6 +1353,21 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {directory, 1} = run.(List.replace_at(record, 6, ctx.workdir))
     assert directory =~ "artifact origin is a directory"
+
+    for origin <- ["https://example.test/report", "tightbeam-transcript:example-session"] do
+      {pointer, 0} = run.(List.replace_at(record, 6, origin))
+
+      assert %{"custody" => "external_pointer", "originPath" => ^origin, "artifactId" => id} =
+               JSON.decode!(pointer)
+
+      {unavailable, 1} = run.(["artifact-content-fetch", id])
+      assert unavailable =~ "external pointer"
+      assert unavailable =~ "external_pointer"
+    end
+
+    unreadable = List.replace_at(record, 6, "unknown-fixture:/remote/file")
+    {failure, 1} = run.(unreadable ++ ["--allow-unpinned"])
+    assert failure =~ "unknown_artifact_host"
   end
 
   test "real CLI writes and reads declared record metadata", ctx do

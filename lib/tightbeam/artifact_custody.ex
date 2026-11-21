@@ -8,7 +8,7 @@ defmodule Tightbeam.ArtifactCustody do
     DB.execute(db, """
     CREATE TABLE IF NOT EXISTS artifact_custody (
       artifactId TEXT PRIMARY KEY REFERENCES artifacts(artifactId),
-      status TEXT NOT NULL CHECK (status IN ('pinned','unpinned'))
+      status TEXT NOT NULL CHECK (status IN ('pinned','unpinned','external_pointer'))
     );
     """)
   end
