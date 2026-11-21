@@ -873,6 +873,9 @@ defmodule Tightbeam.SessionLane do
           {"failed", error_text(reason), nil, nil, nil}
       end
 
+    # Alert routing settles on prompt receipt. The turn itself records work failure.
+    receipt_status = if refused?, do: "delivered", else: terminal
+
     transaction =
       DB.transaction_then(
         state.db,
@@ -890,7 +893,7 @@ defmodule Tightbeam.SessionLane do
               HarnessHealth.settle_other_route_in_txn(
                 txn,
                 seq,
-                terminal,
+                receipt_status,
                 System.system_time(:millisecond)
               )
 
@@ -936,7 +939,7 @@ defmodule Tightbeam.SessionLane do
                   HarnessHealth.settle_other_route_in_txn(
                     txn,
                     seq,
-                    terminal,
+                    receipt_status,
                     System.system_time(:millisecond)
                   )
 

@@ -15,6 +15,19 @@ defmodule Tightbeam.TurnLifecycle do
 
   @max_detail_bytes 2_048
 
+  @doc false
+  def provider_refusal_in_txn?(%Txn{} = txn, turn_seq) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM turn_lifecycle_events
+      WHERE turnSeq=?1 AND eventKey='terminal:committed'
+        AND json_extract(detail, '$.reason')='provider_refusal'
+      """,
+      [turn_seq]
+    ) == [[1]]
+  end
+
   @detail_keys %{
     "claimed" => ~w(v owner),
     "prompt_dispatched" => ~w(v),

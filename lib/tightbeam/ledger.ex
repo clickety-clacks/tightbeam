@@ -961,7 +961,10 @@ defmodule Tightbeam.Ledger do
       Publisher.turn_in_txn(txn, "turn.ended", seq)
       [[session_key]] = Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq = ?1", [seq])
       Org.sync_mechanical_status_in_txn(txn, session_key)
-      Tightbeam.HarnessRecoveryNotice.settle_turn_in_txn(txn, seq, terminal, now)
+
+      Tightbeam.HarnessRecoveryNotice.settle_turn_in_txn(txn, seq, terminal, now,
+        prompt_received: opts[:work_outcome] == :did_not_perform
+      )
     end
 
     won
@@ -1580,7 +1583,12 @@ defmodule Tightbeam.Ledger do
       detail: detail
     })
 
-    Tightbeam.Wakes.preserve_harklight_discussions_in_txn(txn, seq, terminal)
+    Tightbeam.Wakes.preserve_harklight_discussions_in_txn(
+      txn,
+      seq,
+      terminal,
+      opts[:work_outcome]
+    )
   end
 
   @doc "Conservation audit: non-terminal rows older than max_age_ms. Must be []."

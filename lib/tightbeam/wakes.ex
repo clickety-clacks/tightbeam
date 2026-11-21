@@ -3151,7 +3151,7 @@ defmodule Tightbeam.Wakes do
   # never replay the other notices in that batch on the discussion's authority.
   # The existing wake retry lineage supplies persistence and exponential backoff.
   @doc false
-  def preserve_harklight_discussions_in_txn(%Txn{} = txn, turn_seq, terminal) do
+  def preserve_harklight_discussions_in_txn(%Txn{} = txn, turn_seq, terminal, work_outcome) do
     sources =
       Txn.q(
         txn,
@@ -3174,17 +3174,23 @@ defmodule Tightbeam.Wakes do
       )
 
     Enum.each(sources, fn [wake_id, ended_at] ->
-      if terminal == "delivered" do
-        settle_retry_attempt_in_txn(txn, wake_id, turn_seq, "acted", ended_at)
-      else
-        wake = get_in_txn(txn, wake_id)
+      cond do
+        work_outcome == :did_not_perform ->
+          # The provider replied. Close any existing attempt without replaying the prompt.
+          settle_retry_attempt_in_txn(txn, wake_id, turn_seq, "failed", ended_at)
 
-        schedule_retry_in_txn(
-          txn,
-          wake,
-          %{seq: turn_seq, prompt: wake.prompt, ended_at: ended_at},
-          "harklight-discussion-unreceived"
-        )
+        terminal == "delivered" ->
+          settle_retry_attempt_in_txn(txn, wake_id, turn_seq, "acted", ended_at)
+
+        true ->
+          wake = get_in_txn(txn, wake_id)
+
+          schedule_retry_in_txn(
+            txn,
+            wake,
+            %{seq: turn_seq, prompt: wake.prompt, ended_at: ended_at},
+            "harklight-discussion-unreceived"
+          )
       end
     end)
 

@@ -2841,6 +2841,22 @@ defmodule Tightbeam.HarklightWakesTest do
     end
   end
 
+  test "a refused discussion was received and never creates a retry",
+       %{db: db, session: session} do
+    assert :ok = HarklightWakes.capture_line(db, @handle, event(1, "discussion", "declined"))
+    assert {:ok, [[root]]} = DB.query(db, "SELECT wakeId FROM wakes")
+    turn = deliver_discussion_turn!(db, root, session.session_key)
+
+    assert :ok =
+             Tightbeam.Ledger.finish(db, turn.seq, "failed", "The provider refused the prompt.",
+               owner_lease: turn.owner_lease,
+               work_outcome: :did_not_perform
+             )
+
+    assert {:ok, [[^root]]} = DB.query(db, "SELECT wakeId FROM wakes")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wake_retry_attempts")
+  end
+
   test "repeated discussion failure keeps backoff and never marks an active session gone", %{
     db: db,
     session: session
