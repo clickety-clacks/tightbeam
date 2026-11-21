@@ -1991,6 +1991,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     case Harness.module!(state.harness).classify_subagent_event(update) do
       {:subagent_start, %{subagent_ref: child_sid}} when is_binary(child_sid) ->
+        state = mark_non_refusal_output(state, root_sid)
         {root_sid, put_in(state.subagent_roots[child_sid], root_sid)}
 
       _other ->

@@ -12383,6 +12383,17 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  @tag timeout: 180_000, cold_gateway: true, tmp_dir: true
+  test "a refusal-only turn commits the provider response and one accountable owner notice", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_provider_refusal.exs",
+      "guarded-gateway-provider-refusal: ok"
+    )
+  end
+
   @tag timeout: 180_000, cold_gateway: true, gateway_mcp_fallback: true, tmp_dir: true
   test "one fake-adapter turn uses the MCP fallback and publishes the golden frame order", %{
     tmp_dir: tmp
