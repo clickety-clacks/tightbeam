@@ -1010,6 +1010,43 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       assert detail =~ "unpushed_commits=2"
     end
 
+    for {change, filename, detail_field} <- [
+          {:staged, "tracked.txt", "modified"},
+          {:unstaged, "tracked.txt", "modified"},
+          {:untracked, "-new file.txt", "untracked"}
+        ] do
+      test "#{change} file edited after acknowledgement is held again", ctx do
+        repo = init_pushed_repo(ctx, "repo")
+        filename = unquote(filename)
+        path = Path.join(repo, filename)
+        field = unquote(detail_field)
+        File.write!(path, <<0, "original edit">>)
+        if unquote(change) == :staged, do: git!(repo, ["add", "--", filename])
+        retire(ctx)
+        key = ctx.session.session_key
+
+        assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+        assert {:ok, [%{"detail" => original}]} =
+                 WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+
+        File.write!(path, <<0, "a changed edit">>)
+        if unquote(change) == :staged, do: git!(repo, ["add", "--", filename])
+
+        assert %{status: "incomplete", removed_count: 0} =
+                 WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+        assert File.read!(path) == <<0, "a changed edit">>
+        assert [%{"detail" => changed}] = WorkspaceCleanup.held_losses(ctx.db, key)
+        assert original =~ "#{field}=1"
+        assert changed =~ "#{field}=1"
+        assert original != changed
+
+        assert {:ok, [_]} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+        assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      end
+    end
+
     test "a bare repository and a clone that pushes to it inside the workdir are both held",
          ctx do
       origin = Path.join(ctx.workspace, "origin.git")
@@ -1030,6 +1067,89 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       assert held["app"]["detail"] =~ "workdir_remotes=origin"
       assert held["origin.git"]["detail"] =~ "bare=1"
       assert File.dir?(origin)
+    end
+
+    test "a bare clone reports detached commits and stashes made in an external linked worktree",
+         ctx do
+      source = init_pushed_repo(ctx, "source")
+      bare = Path.join(ctx.workspace, "bare.git")
+      remote = Path.join(ctx.base, "remote-source.git")
+      git!(source, ["clone", "-q", "--bare", remote, bare])
+      git!(bare, ["fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*"])
+
+      outside = Path.join(ctx.base, "bare-linked-worktree")
+      git!(bare, ["worktree", "add", "-q", "--detach", outside])
+      commit(outside, "detached.txt", "only on a detached HEAD")
+      stash_change(outside)
+      retire(ctx)
+      key = ctx.session.session_key
+
+      assert %{status: "incomplete", removed_count: 0} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      assert [%{"path" => "bare.git", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, key)
+
+      assert detail =~ "unpushed_refs=detached:"
+      assert detail =~ "stash_entries=stash@{0}"
+      assert File.dir?(bare)
+    end
+
+    test "an absolute local remote resolves symlinks and dot segments before reachability", ctx do
+      origin = Path.join(ctx.workspace, "origin.git")
+      {_, 0} = System.cmd("git", ["init", "-q", "--bare", origin])
+      symlink = Path.join(ctx.base, "origin-link")
+      File.ln_s!(origin, symlink)
+
+      dot_segments =
+        ctx.base <>
+          "/../" <>
+          Path.basename(ctx.base) <>
+          "/" <>
+          Path.relative_to(origin, ctx.base)
+
+      for {name, alias_path} <- [{"dot-segments", dot_segments}, {"symlink", symlink}] do
+        repo = init_repo(ctx.workspace, name)
+        git!(repo, ["remote", "add", "origin", alias_path])
+        commit(repo, "work.txt", "pushed to #{name}")
+        git!(repo, ["push", "-q", "origin", "HEAD:refs/heads/#{name}"])
+      end
+
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      held = Map.new(WorkspaceCleanup.held_losses(ctx.db, key), &{&1["path"], &1["detail"]})
+      assert held["dot-segments"] =~ "workdir_remotes=origin"
+      assert held["dot-segments"] =~ "unpushed_commits=1"
+      assert held["symlink"] =~ "workdir_remotes=origin"
+      assert held["symlink"] =~ "unpushed_commits=1"
+    end
+
+    test "structured loss details include every unpushed ref and stash entry", ctx do
+      repo = init_pushed_repo(ctx, "repo")
+      commit(repo, "feature.txt", "unpushed")
+
+      for n <- 0..11 do
+        git!(repo, ["branch", "feature-#{n}"])
+        File.write!(Path.join(repo, "tracked.txt"), "stashed change #{n}")
+        git!(repo, ["stash"])
+      end
+
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert [%{"detail" => detail}] = WorkspaceCleanup.held_losses(ctx.db, key)
+      assert [_, refs] = Regex.run(~r/unpushed_refs=(\S+)/, detail)
+      assert [_, stashes] = Regex.run(~r/stash_entries=(\S+)/, detail)
+      assert Enum.count(String.split(refs, ",")) == 13
+
+      assert Enum.sort(String.split(stashes, ",")) ==
+               Enum.sort(for n <- 0..11, do: "stash@{#{n}}")
+
+      for n <- 0..11 do
+        assert "heads/feature-#{n}" in String.split(refs, ",")
+      end
     end
 
     test "retire on a retired session lists held work and --acknowledge-loss releases it", ctx do

@@ -1204,9 +1204,58 @@ defmodule Tightbeam.WorkspaceCleanup do
       return 1
     )
 
+    git_in_repo() {
+      git -c safe.directory='*' -C "$repo" "$@"
+    }
+
     git_count() {
-      out=$(git -c safe.directory='*' -C "$repo" "$@" 2>/dev/null) || { echo unknown; return; }
+      out=$(git_in_repo "$@" 2>/dev/null) || { echo unknown; return; }
       if [ -z "$out" ]; then echo 0; else printf '%s\n' "$out" | awk 'END { print NR }'; fi
+    }
+
+    hash_untracked() (
+      cd "$repo" || return 1
+      # The producer reports a listing failure even when xargs exits successfully.
+      { git -c safe.directory='*' ls-files -z --others --exclude-standard || printf 'unknown\\n' >&3; } |
+        xargs -0 sh -c '
+          for path do
+            printf "%s\\000" "$path"
+            if [ -L "$path" ]; then
+              printf "symlink\\000"
+              readlink "./$path" || exit 1
+            elif [ -f "$path" ]; then
+              printf "file\\000"
+              git hash-object --no-filters -- "$path" || exit 1
+            elif [ -d "$path" ]; then
+              # Git can list an embedded repository as one directory entry.
+              # The repository scan checks that directory separately.
+              printf "directory"
+            else
+              exit 1
+            fi
+            printf "\\000"
+          done
+        ' sh
+    )
+
+    repo_state_bytes() {
+      printf '%s\\000' "$head_oid" "$detached"
+      git_in_repo for-each-ref || return 1
+      printf '%s\\000' "$stash_entries"
+      if [ "$bare" -eq 0 ]; then
+        git_in_repo status --porcelain -z --untracked-files=no || return 1
+        # Hash HEAD-to-index and index-to-worktree separately, including when one
+        # change would cancel the other in a single HEAD-to-worktree diff.
+        git_in_repo diff --cached --binary --no-ext-diff --no-textconv -- || return 1
+        git_in_repo diff --binary --no-ext-diff --no-textconv -- || return 1
+        hash_untracked || return 1
+      fi
+    }
+
+    hash_repo_state() {
+      # Keep the byte stream out of shell variables. Send failures around the
+      # pipeline on fd 3 so a hash of partial input can never authorize removal.
+      { { repo_state_bytes || printf 'unknown\\n' >&3; } | git hash-object --stdin; } 3>&1
     }
 
     # A remote counts as durable unless its URL is a local path inside the
@@ -1215,15 +1264,18 @@ defmodule Tightbeam.WorkspaceCleanup do
       url=$1
       case "$url" in
         file://*) url=${url#file://} ;;
+        /*) ;;
         *://*) return 1 ;;
         *:*) return 1 ;;
       esac
       case "$url" in
         /*) abs=$url ;;
-        *) abs=$(CDPATH= cd -P "$repo" 2>/dev/null && CDPATH= cd -P "$url" 2>/dev/null && pwd -P) || return 0 ;;
+        *) abs=$repo/$url ;;
       esac
+      [ -e "$abs" ] || return 0
+      abs=$(realpath "$abs" 2>/dev/null) || return 0
       case "$abs" in
-        "$root"|"$root"/*|"$scan_root_real"|"$scan_root_real"/*) return 0 ;;
+        "$scan_root_real"|"$scan_root_real"/*) return 0 ;;
       esac
       return 1
     }
@@ -1251,64 +1303,63 @@ defmodule Tightbeam.WorkspaceCleanup do
           durable="$durable --remotes=$remote"
         fi
       done
-      head_ref=
-      detached=
-      if [ "$bare" -eq 0 ]; then
-        git -c safe.directory='*' -C "$repo" rev-parse -q --verify HEAD >/dev/null 2>&1 && head_ref=HEAD
-        # Detached HEADs of every linked worktree, including ones outside the workdir.
-        detached=$(git -c safe.directory='*' -C "$repo" worktree list --porcelain 2>/dev/null |
-          awk '/^HEAD / { head = $2 } /^detached/ { print head }')
+      head_oid=$(git_in_repo rev-parse -q --verify HEAD 2>/dev/null) || head_oid=
+      worktrees=$(git_in_repo worktree list --porcelain 2>/dev/null) || {
+        emit_loss git "$rel" "Git worktree list unavailable; repository state unknown"
+        return 0
+      }
+      # Include detached HEADs of all linked worktrees, including those outside
+      # the workdir. Git's bare worktree record omits HEAD itself.
+      detached=$(printf '%s\\n' "$worktrees" | awk '/^HEAD / { head = $2 } /^detached/ { print head }')
+      if [ "$bare" -eq 1 ] && [ -n "$head_oid" ] && ! git_in_repo symbolic-ref -q HEAD >/dev/null 2>&1; then
+        detached="$head_oid $detached"
       fi
+      detached=$(printf '%s\\n' $detached | sort -u)
       not_args=
       [ -z "$durable" ] || not_args="--not $durable"
       # Every local branch tip (with or without an upstream), every tag and every
       # detached HEAD is tested for reachability from the durable remote refs.
-      unpushed=$(git -c safe.directory='*' -C "$repo" rev-list --count --branches --tags $head_ref $detached $not_args 2>/dev/null) || unpushed=unknown
+      unpushed=$(git_in_repo rev-list --count --branches --tags $head_oid $detached $not_args 2>/dev/null) || unpushed=unknown
       unpushed_refs=
-      unpushed_n=0
       if [ "$unpushed" != 0 ]; then
-        for ref in $(git -c safe.directory='*' -C "$repo" for-each-ref --format='%(refname)' refs/heads refs/tags 2>/dev/null) $detached; do
-          if [ -n "$(git -c safe.directory='*' -C "$repo" rev-list -n 1 "$ref" $not_args 2>/dev/null)" ]; then
-            unpushed_n=$((unpushed_n + 1))
-            if [ "$unpushed_n" -le 10 ]; then
-              case "$ref" in
-                refs/*) label=${ref#refs/} ;;
-                *) label=detached:$ref ;;
-              esac
-              unpushed_refs="${unpushed_refs:+$unpushed_refs,}$label"
-            fi
+        for ref in $(git_in_repo for-each-ref --format='%(refname)' refs/heads refs/tags 2>/dev/null) $detached; do
+          if [ -n "$(git_in_repo rev-list -n 1 "$ref" $not_args 2>/dev/null)" ]; then
+            case "$ref" in
+              refs/*) label=${ref#refs/} ;;
+              *) label=detached:$ref ;;
+            esac
+            unpushed_refs="${unpushed_refs:+$unpushed_refs,}$label"
           fi
         done
-        [ "$unpushed_n" -le 10 ] || unpushed_refs="$unpushed_refs,+$((unpushed_n - 10))more"
       fi
+      # Git requires a worktree argument for stash list even though the list
+      # only reads the shared stash reflog, which a bare repo can also have.
+      if stash_entries=$(git_in_repo --work-tree="$repo" stash list --format='%H %gd' 2>/dev/null); then
+        stashes=$(printf '%s\\n' "$stash_entries" | awk 'NF { count++ } END { print count + 0 }')
+      else
+        stashes=unknown
+      fi
+      modified=0
+      untracked=0
       if [ "$bare" -eq 0 ]; then
-        stashes=$(git_count stash list)
         modified=$(git_count status --porcelain --untracked-files=no)
         untracked=$(git_count ls-files --others --exclude-standard)
-      else
-        stashes=0
-        modified=0
-        untracked=0
       fi
       if [ "$unpushed" = 0 ] && [ "$stashes" = 0 ] && [ "$modified" = 0 ] && [ "$untracked" = 0 ]; then
         return 0
       fi
-      repo_state=$({
-        git -c safe.directory='*' -C "$repo" rev-parse -q --verify HEAD
-        git -c safe.directory='*' -C "$repo" for-each-ref
-        printf '%s\n' "$detached"
-        if [ "$bare" -eq 0 ]; then
-          git -c safe.directory='*' -C "$repo" stash list
-          git -c safe.directory='*' -C "$repo" status --porcelain
-          git -c safe.directory='*' -C "$repo" ls-files --others --exclude-standard
-        fi
-      } 2>/dev/null | git hash-object --stdin 2>/dev/null) || repo_state=unknown
-      [ -n "$repo_state" ] || repo_state=unknown
-      is_acknowledged git "$rel@$repo_state" && return 0
+      repo_state=unknown
+      if [ "$stashes" != unknown ]; then
+        repo_state=$(hash_repo_state 2>/dev/null) || repo_state=unknown
+      fi
+      case "$repo_state" in
+        ""|*unknown*) repo_state=unknown ;;
+        *) is_acknowledged git "$rel@$repo_state" && return 0 ;;
+      esac
       detail="unpushed_commits=$unpushed stashes=$stashes modified=$modified untracked=$untracked"
       [ -z "$unpushed_refs" ] || detail="$detail unpushed_refs=$unpushed_refs"
       if [ "$stashes" != 0 ] && [ "$stashes" != unknown ]; then
-        stash_names=$(git -c safe.directory='*' -C "$repo" stash list --format=%gd 2>/dev/null | head -10 | paste -sd, -)
+        stash_names=$(printf '%s\\n' "$stash_entries" | awk '{print $2}' | paste -sd, -)
         [ -z "$stash_names" ] || detail="$detail stash_entries=$stash_names"
       fi
       [ "$bare" -eq 0 ] || detail="$detail bare=1"
