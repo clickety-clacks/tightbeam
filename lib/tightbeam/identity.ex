@@ -1257,6 +1257,7 @@ defmodule Tightbeam.Identity do
       source_notice: source_notice(dir, source, live),
       missing_installed_kungfu: missing,
       missing_installed_kungfu_notice: format_missing_installed_kungfu_notice(missing),
+      missing_seed_law_notice: missing_seed_law_notice(base_dir, live),
       state: if(conflicts == [], do: :ready, else: :relearn_conflicted),
       conflicting_paths: conflicts
     }
@@ -1317,6 +1318,188 @@ defmodule Tightbeam.Identity do
     end
   rescue
     _error -> ["#{path} (live rule entries could not be inspected)"]
+  end
+
+  @seed_law_kinds ~w(rule policy reaction statute)
+
+  @doc """
+  Add the shipped seed law entries the live identity lacks, and report the rest.
+
+  Shipped seed defaults reach a fresh install through `init!/1`; an install that
+  predates a default would otherwise need a manual relearn. This runs at startup
+  so an upgrade delivers them. It only ever ADDS. A seed law file is written when
+  none of its entries (matched by kind and name, in any law file of the live
+  identity, so a copy an operator moved or a learned bundle supplies counts) is
+  present and its path is free. Anything else is reported in `:attention` and
+  never touched: an operator-edited live file keeps its bytes.
+
+  `publish` receives the new main commit (`candidate_result/3` shape) and must
+  publish it or raise; a raise puts main and live back where they were. Returns
+  `%{added: [name], attention: [message], candidate: map | nil}`.
+  """
+  @spec reconcile_seed_law!(String.t(), (map() -> any())) :: map()
+  def reconcile_seed_law!(base_dir, publish) when is_function(publish, 1) do
+    dir = identity_dir(base_dir)
+    live = git_output!(dir, ["rev-parse", @live])
+    %{add: add, blocked: blocked} = seed_law_gaps_at(dir, live)
+    blocked_attention = Enum.map(blocked, &"#{&1} is already present but lacks shipped entries")
+
+    with [_ | _] <- add,
+         :ok <- reconcile_ready(dir, live) do
+      candidate = commit_seed_law!(dir, live, add)
+
+      try do
+        publish.(candidate)
+        %{added: Enum.flat_map(add, & &1.names), attention: blocked_attention, candidate: candidate}
+      rescue
+        error ->
+          git!(dir, ["reset", "--hard", live])
+          git!(dir, ["update-ref", "refs/heads/#{@live}", live])
+
+          %{
+            added: [],
+            attention: blocked_attention ++ ["publishing shipped seed rules failed: " <> Exception.message(error)],
+            candidate: nil
+          }
+      end
+    else
+      [] ->
+        %{added: [], attention: blocked_attention, candidate: nil}
+
+      {:not_ready, reason} ->
+        names = Enum.flat_map(add, & &1.names)
+
+        %{
+          added: [],
+          attention:
+            blocked_attention ++
+              ["shipped seed rules not yet in the live identity: #{Enum.join(names, ", ")} (#{reason})"],
+          candidate: nil
+        }
+    end
+  rescue
+    error ->
+      %{added: [], attention: ["seed rule reconciliation unavailable: " <> Exception.message(error)], candidate: nil}
+  end
+
+  @doc "Notice for a gap the startup reconcile could not close, or nil."
+  def format_seed_law_attention([]), do: nil
+
+  def format_seed_law_attention(messages) do
+    "Shipped default rules are missing from the live identity: " <>
+      Enum.join(messages, "; ") <>
+      ". Publish or discard pending identity changes (`tightbeam identity status`) and restart, " <>
+      "or run `tightbeam identity relearn` to install them."
+  end
+
+  defp reconcile_ready(dir, live) do
+    cond do
+      git_output!(dir, ["branch", "--show-current"]) != "main" ->
+        {:not_ready, "identity working branch is not main"}
+
+      merge_pending?(dir) ->
+        {:not_ready, "an identity relearn merge is in progress"}
+
+      git_output!(dir, ["status", "--porcelain"]) != "" ->
+        {:not_ready, "identity working tree has uncommitted changes"}
+
+      git_output!(dir, ["rev-parse", "main"]) != live ->
+        {:not_ready, "main has unpublished identity changes"}
+
+      grandfather_receipt_pending?(dir) ->
+        {:not_ready, "the agentic-engineering grandfather receipt mint is pending"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp commit_seed_law!(dir, live, add) do
+    paths = Enum.map(add, & &1.path)
+
+    try do
+      Enum.each(add, fn %{path: path, bytes: bytes} ->
+        destination = Path.join(dir, path)
+        File.mkdir_p!(Path.dirname(destination))
+        File.write!(destination, bytes)
+      end)
+
+      fingerprint = validate_candidate_tree!(dir, live)
+      names = Enum.flat_map(add, & &1.names)
+      git!(dir, ["add", "-A", "--" | paths])
+
+      git!(
+        dir,
+        ["commit", "-m", "identity: add shipped seed rules: #{Enum.join(names, ", ")}"],
+        "tightbeam"
+      )
+
+      candidate_result(dir, live, fingerprint)
+    rescue
+      error ->
+        # The tree was clean before the write, so this restores it exactly.
+        git!(dir, ["reset", "--hard", live])
+        Enum.each(paths, &File.rm(Path.join(dir, &1)))
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  @doc "Shipped seed law entries missing from the live identity, as notice text, or nil."
+  def missing_seed_law_notice(base_dir, revision \\ nil) do
+    dir = identity_dir(base_dir)
+    revision = revision || live_revision!(base_dir)
+    %{add: add, blocked: blocked} = seed_law_gaps_at(dir, revision)
+
+    format_seed_law_attention(
+      Enum.flat_map(add, & &1.names) ++
+        Enum.map(blocked, &"#{&1} lacks shipped entries")
+    )
+  rescue
+    _error -> nil
+  end
+
+  # `add`: absent seed files that can be written whole. `blocked`: seed files
+  # whose entries are missing but whose path is occupied or only partly absent.
+  defp seed_law_gaps_at(dir, revision) do
+    paths =
+      dir
+      |> git_output!(["ls-tree", "-r", "--name-only", revision])
+      |> String.split("\n", trim: true)
+
+    live_names =
+      paths
+      |> Enum.filter(&(law_file_path?(&1) and String.ends_with?(&1, ".toml")))
+      |> Enum.flat_map(&law_entry_names(git_show_bytes!(dir, revision, &1)))
+      |> MapSet.new()
+
+    seed_entries()
+    |> Enum.filter(fn {path, _} -> law_file_path?(path) and String.ends_with?(path, ".toml") end)
+    |> Enum.reduce(%{add: [], blocked: []}, fn {path, bytes}, acc ->
+      shipped = law_entry_names(bytes)
+      absent = Enum.reject(shipped, &MapSet.member?(live_names, &1))
+
+      cond do
+        absent == [] ->
+          acc
+
+        path in paths or length(absent) != length(shipped) ->
+          %{acc | blocked: acc.blocked ++ [path]}
+
+        true ->
+          entry = %{path: path, bytes: bytes, names: Enum.map(absent, fn {_, name} -> name end)}
+          %{acc | add: acc.add ++ [entry]}
+      end
+    end)
+  end
+
+  defp law_entry_names(bytes) do
+    decoded = Toml.decode!(bytes)
+
+    for kind <- @seed_law_kinds,
+        entry <- Map.get(decoded, kind, []),
+        name = Map.get(entry, "name"),
+        is_binary(name),
+        do: {kind, name}
   end
 
   defp law_file_path?(path) do

@@ -188,6 +188,7 @@ defmodule Tightbeam.Gateway do
 
     :ok = Schema.ensure_all(db)
     _ = Tightbeam.Identity.RailScopeMigration.run!(config.base_dir, db)
+    _ = Tightbeam.Identity.SeedReconcile.run!(config.base_dir, db)
     warn_missing_installed_kungfu(config.base_dir)
     load_law!(config)
     :ok = AdminProjection.bootstrap_served(db, config.base_dir)

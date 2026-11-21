@@ -1,4 +1,4 @@
-# Terminal policy is elected with the engineering bundle.
+# Shipped default for every install: tell the parent when a child assignment finishes or is blocked.
 [[reaction]]
 name = "assignment-terminal-handoff"
 archetypes = ["*"]
