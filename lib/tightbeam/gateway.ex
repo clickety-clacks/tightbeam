@@ -12169,7 +12169,10 @@ defmodule Tightbeam.Gateway do
     prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
 
     cond do
-      prior && prior.session_key == call.session_key ->
+      p[:dry_run] == true ->
+        retire_preview(config, db, owner, call)
+
+      prior && prior.session_key == call.session_key && p[:acknowledge_loss] != true ->
         retired_keys = retired_subtree_keys(db, call.session_key)
 
         kept_descendants =
@@ -12192,7 +12195,7 @@ defmodule Tightbeam.Gateway do
             }
 
           %{owner_user_id: ^owner} = session ->
-            if session.state == "active" do
+            if session.state == "active" and p[:acknowledge_loss] != true do
               principal = retirement_principal_ref(call.principal)
               retirement_request_id = "rtr_" <> Tightbeam.Id.uuid4()
 
@@ -12283,6 +12286,8 @@ defmodule Tightbeam.Gateway do
                 %{
                   deleted_session_key: session.session_key,
                   retired_session_keys: Enum.map(result.retired, & &1.session_key),
+                  retired_sessions:
+                    Enum.map(result.retired, &retired_workspace_entry(config, db, &1.session_key)),
                   deferred: result.deferred
                 }
                 |> maybe_put_kept_descendants(result.kept_descendants)
@@ -12293,21 +12298,126 @@ defmodule Tightbeam.Gateway do
                 end)
               end
             else
-              retire_replay_observation(
-                db,
-                call,
-                %{
-                  deleted_session_key: session.session_key,
-                  retired_session_keys: [],
-                  deferred: []
-                }
-              )
+              retired_workspace_response(db, call, session, p[:acknowledge_loss] == true)
             end
 
           _ ->
             %{code: "not_found"}
         end
     end
+  end
+
+  # Retiring an already-retired session reports the work its workspace
+  # cleanup is holding back, and `acknowledge_loss` lets that cleanup delete it.
+  defp retired_workspace_response(db, call, session, acknowledge?) do
+    keys = [session.session_key | retired_subtree_keys(db, session.session_key)] |> Enum.uniq()
+
+    held =
+      Enum.flat_map(keys, fn key ->
+        db
+        |> WorkspaceCleanup.held_losses(key)
+        |> Enum.map(
+          &Map.merge(&1, %{"session_key" => key, "display_name" => retired_display_name(db, key)})
+        )
+      end)
+
+    cond do
+      acknowledge? and held == [] ->
+        %{code: "invalid", message: "no held workspace losses to acknowledge"}
+
+      acknowledge? ->
+        by = retirement_principal_ref(call.principal)
+        Enum.each(keys, &WorkspaceCleanup.acknowledge(db, &1, by))
+        workspace_response(db, call, session, %{acknowledged_losses: held})
+
+      held != [] ->
+        workspace_response(db, call, session, %{held_losses: held})
+
+      true ->
+        workspace_response(db, call, session, %{})
+    end
+  end
+
+  # Retire returns before any workspace is touched: cleanup is queued and runs
+  # one session at a time. Each entry says where the workdir is and how its
+  # cleanup stands (queued, held, blocked, completed).
+  defp retired_workspace_entry(config, db, key) do
+    session = Org.get(db, key)
+
+    workdir =
+      try do
+        Tightbeam.Placement.workdir_path(config, session)
+      rescue
+        _ -> nil
+      end
+
+    Map.merge(
+      %{
+        session_key: key,
+        display_name: session && session.display_name,
+        host: session && session.host,
+        workdir: workdir
+      },
+      WorkspaceCleanup.status(db, key) || %{cleanup: "queued", reasons: []}
+    )
+  end
+
+  defp retired_display_name(db, key) do
+    case Org.get(db, key) do
+      %{display_name: name} -> name
+      _ -> nil
+    end
+  end
+
+  # Read-only. Shows the blast radius of a retire: every session it would
+  # remove (with what its workspace scan finds on its own host), every
+  # session it would keep, and whether it would refuse without
+  # --keep-open-descendants. Nothing is written.
+  defp retire_preview(config, db, owner, call) do
+    case Org.get(db, call.session_key) do
+      %{owner_user_id: ^owner, is_built_in: true} ->
+        %{
+          code: "denied",
+          message:
+            "main sessions are permanent — they are the fallback for roles and user references"
+        }
+
+      %{owner_user_id: ^owner, state: "active"} ->
+        {:ok, plan} =
+          DB.transaction(db, fn txn ->
+            retirement_plan_in_txn(txn, call.session_key, owner, true)
+          end)
+
+        scans =
+          WorkspaceCleanup.preview(config, db, Enum.map(plan.retired, & &1.session_key))
+
+        %{
+          dry_run: true,
+          session_key: call.session_key,
+          would_retire: scans,
+          would_keep: Enum.map(plan.kept, &session_details/1),
+          would_keep_protected_roots: Enum.map(plan.frontiers, &protected_descendant_details/1),
+          requires_keep_open_descendants: plan.frontiers != [],
+          sessions_with_held_work: Enum.count(scans, &(&1.losses != []))
+        }
+
+      %{owner_user_id: ^owner} = session ->
+        retired_workspace_response(db, call, session, false)
+
+      _ ->
+        %{code: "not_found"}
+    end
+  end
+
+  defp workspace_response(db, call, session, extra) do
+    retire_replay_observation(
+      db,
+      call,
+      Map.merge(
+        %{deleted_session_key: session.session_key, retired_session_keys: [], deferred: []},
+        extra
+      )
+    )
   end
 
   defp retire_withdraw_result(db, call) do
@@ -12428,6 +12538,7 @@ defmodule Tightbeam.Gateway do
           end)
 
         retired = Enum.reject(active_subtree, &MapSet.member?(kept_keys, &1.session_key))
+        kept = Enum.filter(active_subtree, &MapSet.member?(kept_keys, &1.session_key))
 
         if protected != [] and not keep_open_descendants? do
           %{
@@ -12445,6 +12556,7 @@ defmodule Tightbeam.Gateway do
             owner: owner,
             keep_open_descendants: keep_open_descendants?,
             retired: retired,
+            kept: kept,
             frontiers: frontiers,
             accountable_parent: accountable_parent
           }

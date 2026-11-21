@@ -287,6 +287,8 @@ pub enum Command {
         session_key: String,
         idempotency_key: Option<String>,
         keep_open_descendants: bool,
+        acknowledge_loss: bool,
+        dry_run: bool,
     },
     RetireWithdraw {
         identity: Identity,
@@ -1053,10 +1055,22 @@ COMMANDS:
       default read principal and records sends as process:<name>. Session
       credentials need no identity flag and record sends as their own agent.
 
-  retire --session <key> [--keep-open-descendants] [--key <idempotencyKey>]
+  retire --session <key> [--keep-open-descendants] [--acknowledge-loss] [--dry-run] [--key <idempotencyKey>]
   retire-withdraw --session <key> --reason <text>
       End a session deliberately. Open work or role bindings below it refuse by default;
       --keep-open-descendants preserves those sessions under an active parent.
+      A retire removes the named session and every active descendant under it that holds no
+      open assignment or role, even with --keep-open-descendants. --dry-run changes nothing and
+      lists every session that would be retired (key, name, and what its workspace scan finds),
+      every session that would be kept, and whether --keep-open-descendants is required.
+      Removing a retired session's workspace is held while it holds git work no durable
+      remote has: commits on no remote ref (a remote whose URL is inside the workdir does not
+      count), stashes, uncommitted or untracked changes, in work trees and bare repositories.
+      Other files that are not recorded artifacts are NOT held: they are deleted, so record
+      them first (artifact-record --content-base64, about 100 KB per argument) or copy them to
+      shared storage. Run `retire --session <key>` again on the retired session to list what is
+      held (held_losses); push, capture or copy it, or pass --acknowledge-loss to let the cleanup
+      delete exactly that listed state (new work added later is held again).
 
   tune --session <key> (--harness <harness> [--model <model>] |
        --model <model> | --effort <level> | --fast on|off | --host <host>)
@@ -1476,6 +1490,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "abort",
     "admin",
     "all",
+    "acknowledge-loss",
     "after-turn",
     "replace-queued",
     "api-key",
@@ -3015,7 +3030,13 @@ fn parse_with_optional_catalog(
             closed_command_flags(
                 "retire",
                 flags,
-                &["session", "key", "keep-open-descendants"],
+                &[
+                    "session",
+                    "key",
+                    "keep-open-descendants",
+                    "acknowledge-loss",
+                    "dry-run",
+                ],
             )?;
             let session_key = nonempty(flags, "session");
             if parsed.positional.get(1).is_some()
@@ -3023,13 +3044,15 @@ fn parse_with_optional_catalog(
                 || nonempty(flags, "role").is_some()
                 || nonempty(flags, "user").is_some()
             {
-                return Err("usage: tightbeam retire --session <key> [--keep-open-descendants] [--key <idempotencyKey>]".to_owned());
+                return Err("usage: tightbeam retire --session <key> [--keep-open-descendants] [--acknowledge-loss] [--dry-run] [--key <idempotencyKey>]".to_owned());
             }
             Ok(Command::Retire {
                 identity: identity(flags)?,
                 session_key: session_key.expect("checked above"),
                 idempotency_key: nonempty(flags, "key"),
                 keep_open_descendants: flags.contains_key("keep-open-descendants"),
+                acknowledge_loss: flags.contains_key("acknowledge-loss"),
+                dry_run: flags.contains_key("dry-run"),
             })
         }
         "retire-withdraw" => {
@@ -8212,7 +8235,7 @@ mod tests {
         for (args, expected) in [
             (
                 strings(&["retire", "s", "--as-user", "sample-user"]),
-                "usage: tightbeam retire --session <key> [--keep-open-descendants] [--key <idempotencyKey>]",
+                "usage: tightbeam retire --session <key> [--keep-open-descendants] [--acknowledge-loss] [--dry-run] [--key <idempotencyKey>]",
             ),
             (
                 strings(&["retire", "--role", "r", "--as-user", "sample-user"]),
@@ -8245,6 +8268,8 @@ mod tests {
                 session_key: "agent:parent".to_owned(),
                 idempotency_key: Some("retire-1".to_owned()),
                 keep_open_descendants: true,
+                acknowledge_loss: false,
+                dry_run: false,
             })
         );
     }
@@ -9122,6 +9147,8 @@ mod tests {
                     session_key: "agent:x".to_owned(),
                     idempotency_key: Some("retire-k".to_owned()),
                     keep_open_descendants: false,
+                    acknowledge_loss: false,
+                    dry_run: false,
                 },
             ),
             (
