@@ -57,7 +57,16 @@ defmodule Tightbeam.RulesBuiltinDefaultTest do
   test "an edited live copy wins and is not overridden", ctx do
     assert :initialized = Identity.init!(ctx.base)
     path = Path.join(ctx.dir, @notice_path)
-    File.write!(path, String.replace(File.read!(path), ~s(family = "terminal-handoff"), ~s(family = "operator-family")))
+
+    File.write!(
+      path,
+      String.replace(
+        File.read!(path),
+        ~s(family = "terminal-handoff"),
+        ~s(family = "operator-family")
+      )
+    )
+
     before = File.read!(path)
 
     log =

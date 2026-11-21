@@ -6404,6 +6404,7 @@ defmodule Tightbeam.Gateway do
       Identity.with_recovery_law!(config.base_dir, fn law_base, revision ->
         Archetypes.load!(law_base)
         Rails.load!(law_base)
+
         Rules.load!(config.base_dir, verbs,
           law_base: law_base,
           revision: revision,
