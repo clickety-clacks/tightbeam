@@ -12,7 +12,7 @@ Talk to whoever the work needs, not whoever sits above you. When two pieces of w
 
 ## Watch for events instead of asking for wakes
 
-When you care about something happening, such as another agent's work finishing, a release being cut or a check passing, agree with the agent doing it that it will record a named fact when it happens. Then wait on that fact (`wake --when-fact <kind> --when-scope <scope> --fallback-after <duration>`). The producer records the fact once, and every agent waiting on it wakes. Nobody has to remember a list of agents to tell.
+When you care about something happening, such as another agent's work finishing, a release being cut or a check passing, agree with the agent doing it that it will record a named fact when it happens. Then wait on that fact (`wake --when-fact <kind> --when-scope <scope> --fallback-after <duration> --wait-reason "<reason>"`). The producer records the fact once, and every agent waiting on it wakes. Nobody has to remember a list of agents to tell.
 
 
 ## Say what you're waiting for

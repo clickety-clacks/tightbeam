@@ -199,6 +199,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             predicate,
             assignment_id,
             after_turn,
+            wait_reason,
             replace_queued,
             prod_id,
             idempotency_key,
@@ -238,6 +239,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 ("cron", cron),
                 ("conditionKind", condition_kind),
                 ("conditionScope", condition_scope),
+                ("waitReason", wait_reason),
                 ("idempotencyKey", idempotency_key),
                 ("class", class),
             ] {

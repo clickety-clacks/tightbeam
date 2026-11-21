@@ -14,7 +14,7 @@ The same fact runs the other way. After compaction or a restart, re-derive your 
 
 ## 2. The system wakes whoever must act
 
-You run only when woken, and so does everyone else. A wake is durable: delivered now, at a time (`--after 30m`, `--at <epochMs>`), or when a named fact arrives (`--when-fact <kind> --when-scope <scope> --fallback-after <duration>`). Deferred work is a wake to yourself with a prompt that tells the future you what to do. Where a record or fact will announce the thing you are waiting for, wait on it instead of polling; where nothing will (an external system with no record), a bounded recheck tied to that delivery action is fine. This is not a reason to schedule routine self-checks or revive dormant work. Never wait inside a turn: end it and let a wake bring you back. While your turn is open, nothing sent to you is delivered, so a coordinator waiting in-turn blocks everyone who needs it. Nobody idles to stay visible.
+You run only when woken, and so does everyone else. A wake is durable: delivered now, at a time (`--after 30m`, `--at <epochMs>`), or when a named fact arrives (`--when-fact <kind> --when-scope <scope> --fallback-after <duration> --wait-reason "<reason>"`). Deferred work is a wake to yourself with a prompt that tells the future you what to do. Where a record or fact will announce the thing you are waiting for, wait on it instead of polling; where nothing will (an external system with no record), a bounded recheck tied to that delivery action is fine. This is not a reason to schedule routine self-checks or revive dormant work. Never wait inside a turn: end it and let a wake bring you back. While your turn is open, nothing sent to you is delivered, so a coordinator waiting in-turn blocks everyone who needs it. Nobody idles to stay visible.
 
 Tightbeam itself wakes sessions from records. Opening an assignment with `tightbeam dispatch`, or `assign` plus a wake, delivers the brief to its holder. Completing or revoking an assignment sends a notice to whoever is accountable for it now, usually its opener. A `cannot-proceed` attest keeps your custody and files one decision request to your opener; the block stands until its release fact is recorded or the opener disposes of the assignment, so an ordinary answer does not clear it (the manual skill has the details). A ruling on a decision request wakes whoever raised it, or the current accountable owner if custody moved. A rule that refuses a command names itself and, where it has a remedy, wakes the session that can supply what is missing. A failed turn is carried to a parent who can act. So after you delegate, do not set a timer or self-wake to check on the work: Tightbeam tells you when the assignment finishes or is blocked. Keep timers for what no record announces, such as an outside system or a time the user named.
 
@@ -22,7 +22,7 @@ Your wakes therefore cover only what no row already delivers. Send one when a fa
 
 When a recipient is held by a harness incident, parked, its lane is down, or it is not admitting turns, Tightbeam tells the sender once that the message has not been read yet and why. The original message stays queued. If the notice to the sender cannot be delivered, that notice stays queued too; no elapsed-time threshold is involved.
 
-Advance actionable work immediately; before you end a turn with it unfinished, leave its next step on the record: `tightbeam wake --session <your-key> --assignment <id> --after-turn --prompt "<next action>"`. When the next step waits on another row, name the resolver (`--predicate`). Default dependency fallbacks to three hours (`--fallback-after 3h`, or `--after 3h` when no record or fact can notify you) to detect missing or overdue notification, not to make repeated early status checks. Scheduling is not progress; only a recorded effect is.
+Advance actionable work immediately; before you end a turn with it unfinished, leave its next step on the record: `tightbeam wake --session <your-key> --assignment <id> --after-turn --wait-reason "<reason>" --prompt "<next action>"`. When the next step waits on another row, name the resolver (`--predicate`). Default dependency fallbacks to three hours (`--fallback-after 3h`, or `--after 3h` when no record or fact can notify you) to detect missing or overdue notification, not to make repeated early status checks. Scheduling is not progress; only a recorded effect is.
 
 ### Orchestration patterns
 
@@ -33,7 +33,7 @@ One observer can serve many watchers:
 
 ```sh
 tightbeam fact-producer-claim --producer observer --kind build.ready --live-for 1h
-tightbeam wake --session "$WATCHER" --when-fact build.ready --when-scope "$SCOPE" --fallback-after 3h --prompt "Read the build result"
+tightbeam wake --session "$WATCHER" --when-fact build.ready --when-scope "$SCOPE" --fallback-after 3h --wait-reason "Waiting for the build result" --prompt "Read the build result"
 tightbeam condition --kind build.ready --scope "$SCOPE"
 ```
 

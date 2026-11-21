@@ -106,6 +106,9 @@ defmodule Tightbeam.HolderProd do
                        WHERE p.producedByAssignmentId=a.id AND p.createdBySession=a.holderKey), 0),
              COALESCE((SELECT MAX(p.raisedAt) FROM decision_requests p
                        WHERE p.assignmentId=a.id AND p.raiserSessionKey=a.holderKey), 0),
+             COALESCE((SELECT MAX(cp.settledAt) FROM assignment_cannot_proceed cp
+                       JOIN attests p ON p.id=cp.attestId
+                       WHERE cp.assignmentId=a.id AND p.bySession=a.holderKey), 0),
              COALESCE((SELECT t.endedAt FROM turns t
                        WHERE t.sessionKey=a.holderKey AND t.endedAt IS NOT NULL
                          AND (t.startedAt IS NOT NULL OR t.assignmentId=a.id)
@@ -155,6 +158,10 @@ defmodule Tightbeam.HolderProd do
                  AND w.digest=0
                  AND w.wakeId IS NOT p.wakeId
              ))))
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM assignment_cannot_proceed cp JOIN attests p ON p.id=cp.attestId
+           WHERE cp.assignmentId=e.id AND cp.state='standing' AND p.bySession=e.holderKey
          )
          AND NOT EXISTS (
            SELECT 1 FROM wakes w

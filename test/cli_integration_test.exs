@@ -684,7 +684,8 @@ defmodule Tightbeam.CliIntegrationTest do
         System.cmd(
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
-            timing_args ++ ["--prompt", prompt],
+            timing_args ++
+            ["--prompt", prompt, "--wait-reason", "Waiting on the fixture checkpoint"],
           cd: ctx.workdir
         )
 
@@ -985,6 +986,8 @@ defmodule Tightbeam.CliIntegrationTest do
     fact_wake =
       schedule_assignment_wake.(
         [
+          "--wait-reason",
+          "Waiting for the build",
           "--when-fact",
           "build-finished",
           "--when-scope",
@@ -1010,7 +1013,12 @@ defmodule Tightbeam.CliIntegrationTest do
 
     after_prompt = "D3 manual: continue the named assignment"
 
-    after_wake = schedule_assignment_wake.(["--after-turn"], after_prompt)
+    after_wake =
+      schedule_assignment_wake.(
+        ["--after-turn", "--wait-reason", "Waiting for this turn to end"],
+        after_prompt
+      )
+
     after_id = after_wake.wake_id
     assert after_wake.assignment_id == assignment
     assert after_wake.obligation_ref == assignment
@@ -1034,7 +1042,14 @@ defmodule Tightbeam.CliIntegrationTest do
 
     dependency =
       schedule_assignment_wake.(
-        ["--predicate", JSON.encode!(predicate), "--fallback-after", "1h"],
+        [
+          "--predicate",
+          JSON.encode!(predicate),
+          "--fallback-after",
+          "1h",
+          "--wait-reason",
+          "Waiting for the resolver disposition"
+        ],
         dependency_prompt
       )
 

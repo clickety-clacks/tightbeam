@@ -253,6 +253,7 @@ defmodule Tightbeam.SubagentMarkersTest do
       session_key: session.session_key,
       params: %{
         prompt: "continue after child",
+        wait_reason: "Waiting for the child to stop",
         after_ms: Keyword.fetch!(opts, :after_ms),
         condition_kind: "subagent_stop",
         condition_scope: tool_call_id,

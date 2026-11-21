@@ -5,11 +5,13 @@ defmodule Tightbeam.HolderProdTest do
     Assignments,
     ConnRegistry,
     DB,
+    Gateway,
     HolderProd,
     Ledger,
     Model,
     Org,
     SessionCustodyTransfer,
+    StateResources,
     Wakes
   }
 
@@ -195,6 +197,89 @@ defmodule Tightbeam.HolderProdTest do
       sweep(ctx.db, at)
       assert [[_, "holder", "pending"]] = notices(ctx.db)
     end
+  end
+
+  test "new fact and timed waits require a reason and read it back after scheduling", ctx do
+    for trigger <- [
+          %{condition_kind: "fixture-ready", after_ms: @quiet},
+          %{after_ms: @quiet, assignment_id: @assignment}
+        ] do
+      for {reason, code} <- [
+            {nil, "missing_reason"},
+            {"  ", "missing_reason"},
+            {"first\nsecond", "invalid_wait_reason"},
+            {String.duplicate("a", 141), "wait_reason_too_long"}
+          ] do
+        params = if is_nil(reason), do: trigger, else: Map.put(trigger, :wait_reason, reason)
+        assert %{code: ^code} = gateway_wake(ctx.db, "holder", params)
+      end
+
+      reason = String.duplicate("é", 140)
+
+      assert %{wake_id: wake_id, wait_reason: ^reason} =
+               gateway_wake(ctx.db, "holder", Map.put(trigger, :wait_reason, reason))
+
+      assert Wakes.get(ctx.db, wake_id).wait_reason == reason
+
+      assert StateResources.wake(StateResources.query_wake(ctx.db, wake_id))["waitReason"] ==
+               reason
+    end
+  end
+
+  test "ordinary notices need no reason and a historical reasonless wait still suppresses", ctx do
+    assert %{wake_id: notice_id} = gateway_wake(ctx.db, "other", %{after_ms: @quiet})
+
+    refute Map.has_key?(
+             StateResources.wake(StateResources.query_wake(ctx.db, notice_id)),
+             "waitReason"
+           )
+
+    record_wait(ctx.db, "holder", "holder", ctx.opened + 2 * @quiet, :fact)
+
+    assert [[nil]] =
+             sql!(ctx.db, """
+             SELECT r.reason FROM wakes w LEFT JOIN wake_wait_reasons r ON r.wakeId=w.wakeId
+             WHERE w.conditionKind='assignment-landed'
+             """)
+
+    sweep(ctx.db, ctx.opened + @quiet)
+    assert notices(ctx.db) == []
+
+    reason = "Waiting for the external deadline"
+
+    assert %{wake_id: _, wait_reason: ^reason} =
+             gateway_wake(ctx.db, "holder", %{after_ms: @quiet, wait_reason: reason})
+  end
+
+  test "a wait attestation keeps its short note as the reason and covers its holder", ctx do
+    attest = fn note ->
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "session:holder",
+        principal: {:session, "holder"},
+        params: %{assignment_id: @assignment, kind: "cannot-proceed", note: note}
+      })
+    end
+
+    assert %{code: "missing_reason"} = attest.(nil)
+    assert %{code: "missing_reason"} = attest.("  ")
+    assert %{code: "wait_reason_too_long"} = attest.(String.duplicate("a", 141))
+    assert %{code: "invalid_wait_reason"} = attest.("first\nsecond")
+    reason = String.duplicate("a", 140)
+    assert %{cannotProceed: %{reason: ^reason}} = attest.(reason)
+
+    sweep(ctx.db, ctx.opened + 2 * @quiet)
+    assert notices(ctx.db) == []
+  end
+
+  defp gateway_wake(db, target, params) do
+    Gateway.handlers(%{db: db})["wake"].(%{
+      verb: "wake",
+      origin: "session:holder",
+      principal: {:session, "holder"},
+      session_key: target,
+      params: Map.put(params, :prompt, "Fixture follow-through")
+    })
   end
 
   test "a linked queued turn and an unrelated running turn cover the holder", ctx do

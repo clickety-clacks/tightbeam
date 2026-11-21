@@ -613,6 +613,8 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
           "wake",
           "--session",
           "sub-a",
+          "--wait-reason",
+          "Waiting for landing to settle",
           "--when-fact",
           "landing.settled",
           "--when-scope",

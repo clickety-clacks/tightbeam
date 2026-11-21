@@ -337,7 +337,7 @@ defmodule Tightbeam.StateResources do
     },
     "wakes" => %{
       strings:
-        ~w(wakeId sessionKey targetRole origin prompt consumer state reresolve reresolveSeed conditionKind conditionScope firedBy creatorSessionKey workItemId assignmentId class classElection deliveryRule deliveryStatus),
+        ~w(wakeId sessionKey targetRole origin prompt consumer state reresolve reresolveSeed conditionKind conditionScope firedBy creatorSessionKey workItemId assignmentId class classElection deliveryRule deliveryStatus waitReason),
       integers:
         ~w(dueAt createdAt firedAt reresolveRung conditionAfterId canceledAt targetGate rowVersion),
       booleans: ~w(rumination digest summon),
@@ -2694,6 +2694,9 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  defp conditional_fields!("wakes", fields, %{"waitReason" => reason}) when is_binary(reason),
+    do: fields ++ ["waitReason"]
+
   defp conditional_fields!(_resource, fields, _item), do: fields
 
   defp exact_item_keys!(resource, item, fields) do
@@ -3746,6 +3749,9 @@ defmodule Tightbeam.StateResources do
 
     if keys != [] and Enum.all?(keys, &is_binary/1) do
       expected = Map.fetch!(@item_field_order, resource)
+
+      expected =
+        if resource == "wakes", do: conditional_fields!(resource, expected, row), else: expected
 
       unless Enum.sort(keys) == Enum.sort(expected) do
         raise ArgumentError, "#{resource} public item has an extra or missing field"

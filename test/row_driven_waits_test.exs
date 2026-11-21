@@ -596,6 +596,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: System.system_time(:millisecond),
                  assignment_id: "A",
                  after_turn: true,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -613,6 +614,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: System.system_time(:millisecond),
                  assignment_id: "A",
                  after_turn: true,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -767,6 +769,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       session_key: "holder",
       params: %{
         prompt: "Continue only if still useful.",
+        wait_reason: "Waiting for the resolver",
         after_ms: 60_000,
         assignment_id: "A",
         predicate: predicate("R"),
@@ -1046,6 +1049,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_after(),
                  assignment_id: "A",
                  predicate: declaration,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1070,6 +1074,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  prompt: "do not persist",
                  assignment_id: "A",
                  predicate: predicate("R"),
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1086,6 +1091,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_after(),
                  assignment_id: "B",
                  predicate: predicate("R"),
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1105,6 +1111,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_after(),
                  assignment_id: "A",
                  predicate: invalid_resolver,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1221,6 +1228,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       due_at: due_after(),
       assignment_id: "A",
       predicate: predicate("R"),
+      wait_reason: "Waiting on the fixture resolver",
       registrant_session_key: "supervisor",
       owner_user_id: "owner-a"
     }
@@ -1434,6 +1442,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  prompt: "Resume #{assignment_id} exactly.",
                  assignment_id: assignment_id,
                  after_turn: true,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1504,6 +1513,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_at,
                  assignment_id: "A",
                  predicate: predicate,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })

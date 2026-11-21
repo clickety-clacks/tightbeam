@@ -1689,7 +1689,7 @@ defmodule Tightbeam.Assignments do
           "assignmentId=#{assignment_id}. The legacy --when-fact #{kind} path is for a " <>
           "completion attestation only.",
       example:
-        "tightbeam wake --session <session> --when-fact #{kind} --when-scope #{assignment_id} --fallback-after 2h --prompt \"re-read this card\""
+        "tightbeam wake --session <session> --when-fact #{kind} --when-scope #{assignment_id} --fallback-after 2h --wait-reason \"Waiting for assignment completion\" --prompt \"re-read this card\""
     }
   end
 
@@ -3218,6 +3218,18 @@ defmodule Tightbeam.Assignments do
   end
 
   defp insert_and_apply_lifecycle_attest(txn, call, assignment, holder) do
+    case validate_new_wait_attest(call.params) do
+      :ok -> record_lifecycle_attest(txn, call, assignment, holder)
+      {:error, refusal} -> refusal
+    end
+  end
+
+  defp validate_new_wait_attest(%{kind: "cannot-proceed"} = params),
+    do: Tightbeam.WaitReason.validate(params[:note], "--note")
+
+  defp validate_new_wait_attest(_params), do: :ok
+
+  defp record_lifecycle_attest(txn, call, assignment, holder) do
     admitted =
       call
       |> Map.put_new(:verb, "attest")
