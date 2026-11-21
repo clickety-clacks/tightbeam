@@ -4,30 +4,57 @@ defmodule Tightbeam.HarklightListenerOutage do
   alias Tightbeam.DB.Txn
 
   def ensure_schema(db) do
-    DB.execute(db, """
-    CREATE TABLE IF NOT EXISTS harklight_listener_outages (
-      handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
-      episode TEXT NOT NULL,
-      startedAt INTEGER NOT NULL,
-      noticeWakeId TEXT,
-      error TEXT NOT NULL,
-      operation TEXT,
-      diagnostic TEXT
-    );
-    """)
+    with :ok <-
+           DB.execute(db, """
+           CREATE TABLE IF NOT EXISTS harklight_listener_outages (
+             handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
+             episode TEXT NOT NULL,
+             startedAt INTEGER NOT NULL,
+             noticeWakeId TEXT,
+             error TEXT NOT NULL,
+             operation TEXT,
+             diagnostic TEXT,
+             checkpoint INTEGER NOT NULL DEFAULT -1
+           );
+           """),
+         {:ok, columns} <- DB.query(db, "PRAGMA table_info(harklight_listener_outages)") do
+      if Enum.any?(columns, fn [_, name | _] -> name == "checkpoint" end),
+        do: :ok,
+        else:
+          DB.execute(
+            db,
+            "ALTER TABLE harklight_listener_outages ADD COLUMN checkpoint INTEGER NOT NULL DEFAULT -1"
+          )
+    end
   end
 
   def start(db, handle, {error, operation, diagnostic}, now) do
     DB.transaction(db, fn txn ->
-      case Txn.q(txn, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]) do
-        [[state]] when state != "complete" ->
+      case Txn.q(
+             txn,
+             """
+             SELECT h.state,COALESCE(c.rev,-1) FROM harklight_wake_handles h
+             LEFT JOIN harklight_feed_checkpoints c ON c.handle=h.handle
+             WHERE h.handle=?1
+               AND NOT EXISTS(SELECT 1 FROM harklight_feed_pauses p WHERE p.handle=h.handle)
+               AND NOT EXISTS(SELECT 1 FROM harklight_feed_stops s WHERE s.handle=h.handle)
+             """,
+             [handle]
+           ) do
+        [[state, checkpoint]] when state != "complete" ->
           Txn.q(
             txn,
             """
-            INSERT INTO harklight_listener_outages(handle,episode,startedAt,error,operation,diagnostic)
-            VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(handle) DO NOTHING
+            INSERT INTO harklight_listener_outages(handle,episode,startedAt,error,operation,diagnostic,checkpoint)
+            VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(handle) DO NOTHING
             """,
-            [handle, Tightbeam.Id.uuid4(), now, error, operation, diagnostic]
+            [handle, Tightbeam.Id.uuid4(), now, error, operation, diagnostic, checkpoint]
+          )
+
+          Txn.q(
+            txn,
+            "UPDATE harklight_wake_handles SET state='unavailable',lastError=?2,updatedAt=?3 WHERE handle=?1",
+            [handle, if(diagnostic, do: error <> ": " <> diagnostic, else: error), now]
           )
 
           hd(
@@ -109,6 +136,20 @@ defmodule Tightbeam.HarklightListenerOutage do
     DB.transaction(db, &finish_in_txn(&1, handle, resumed?, now))
   end
 
+  def captured_in_txn(txn, handle, rev, now) do
+    case Txn.q(txn, "SELECT checkpoint FROM harklight_listener_outages WHERE handle=?1", [handle]) do
+      [[checkpoint]] when rev > checkpoint ->
+        finish_in_txn(txn, handle, true, now)
+        true
+
+      [[_checkpoint]] ->
+        false
+
+      [] ->
+        true
+    end
+  end
+
   def finish_in_txn(txn, handle, resumed?, now) do
     case Txn.q(
            txn,
@@ -124,7 +165,7 @@ defmodule Tightbeam.HarklightListenerOutage do
               origin: "process:tightbeam",
               class: "fyi",
               due_at: now,
-              prompt: "Harklight updates have caught up for conversation #{handle}."
+              prompt: "Tightbeam is receiving Harklight updates again for conversation #{handle}."
             })
 
           Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
