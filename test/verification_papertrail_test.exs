@@ -465,7 +465,9 @@ defmodule Tightbeam.VerificationPapertrailTest do
   end
 
   test "learn delivers the verification statutes and they load beside engineering's (§7)", ctx do
-    shipped = File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/verification.toml")
+    shipped =
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/verification.toml")
+
     learn_engineering_rules!(ctx)
     delivered = delivered_rule_path!(ctx.base_dir, "rules/verification.toml")
 

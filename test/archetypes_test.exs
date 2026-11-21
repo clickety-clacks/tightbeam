@@ -223,7 +223,8 @@ defmodule Tightbeam.ArchetypesTest do
 
         primary =
           if Map.get(manifest, "primary", false),
-            do: "Primary: when more than one bundle fits the user's goal, offer this one first.\n",
+            do:
+              "Primary: when more than one bundle fits the user's goal, offer this one first.\n",
             else: ""
 
         "### `#{name}`\n#{primary}Purpose: #{Map.fetch!(manifest, "purpose")}\nPhrases:\n#{phrases}"
@@ -424,9 +425,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     for skill <- ~w(reviewing-code reviewing-specs) do
       refute File.dir?(
-               Path.expand(
-                 "test/support/fixtures/kungfu/agentic-engineering/skills/#{skill}"
-               )
+               Path.expand("test/support/fixtures/kungfu/agentic-engineering/skills/#{skill}")
              )
     end
 

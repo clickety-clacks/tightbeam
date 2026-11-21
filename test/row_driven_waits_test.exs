@@ -1197,7 +1197,10 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     shipped =
       File.read!(
-        Path.expand("support/fixtures/kungfu/agentic-engineering/rules/verification.toml", __DIR__)
+        Path.expand(
+          "support/fixtures/kungfu/agentic-engineering/rules/verification.toml",
+          __DIR__
+        )
       )
       |> Tightbeam.TestRailScopeFixtures.wildcard_substrate(["rule", "policy"])
 

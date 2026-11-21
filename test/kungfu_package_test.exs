@@ -52,7 +52,10 @@ defmodule Tightbeam.KungfuPackageTest do
     refute "agentic-engineering" in Identity.available_bundle_names()
 
     bundles = Identity.available_bundles()
-    assert [%{name: "uncle-enzo", primary: true, root_archetype: "uncle-enzo.exec"} | rest] = bundles
+
+    assert [%{name: "uncle-enzo", primary: true, root_archetype: "uncle-enzo.exec"} | rest] =
+             bundles
+
     refute Enum.any?(rest, & &1.primary)
     assert Enum.map(rest, & &1.name) == Enum.sort(Enum.map(rest, & &1.name))
 
@@ -101,7 +104,8 @@ defmodule Tightbeam.KungfuPackageTest do
   end
 
   test "the test bundle root is the shipped bundles plus the retired engineering fixture" do
-    assert Enum.sort(File.ls!(@fixture)) == Enum.sort(["agentic-engineering" | File.ls!(@shipped)])
+    assert Enum.sort(File.ls!(@fixture)) ==
+             Enum.sort(["agentic-engineering" | File.ls!(@shipped)])
 
     for name <- File.ls!(@shipped) do
       link = Path.join(@fixture, name)

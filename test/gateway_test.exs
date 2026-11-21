@@ -13446,7 +13446,13 @@ defmodule Tightbeam.GatewayTest do
 
     # The upgraded build ships only priv/kungfu; the org keeps what it learned.
     previous_root = Application.get_env(:tightbeam, :kungfu_bundle_root_dir)
-    Application.put_env(:tightbeam, :kungfu_bundle_root_dir, Path.expand("../priv/kungfu", __DIR__))
+
+    Application.put_env(
+      :tightbeam,
+      :kungfu_bundle_root_dir,
+      Path.expand("../priv/kungfu", __DIR__)
+    )
+
     on_exit(fn -> Application.put_env(:tightbeam, :kungfu_bundle_root_dir, previous_root) end)
 
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))

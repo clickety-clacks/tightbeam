@@ -472,7 +472,8 @@ defmodule Tightbeam.Identity do
 
         primary =
           if bundle.primary,
-            do: "Primary: when more than one bundle fits the user's goal, offer this one first.\n",
+            do:
+              "Primary: when more than one bundle fits the user's goal, offer this one first.\n",
             else: ""
 
         "### `#{bundle.name}`\n#{primary}Purpose: #{bundle.purpose}\nPhrases:\n#{phrases}"
