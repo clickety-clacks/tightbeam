@@ -23,6 +23,9 @@ defmodule Tightbeam.HolderProdTest do
     def handle_call({:ensure_lane, _session_key}, _from, state), do: {:reply, :ok, state}
   end
 
+  @quiet 30 * 60 * 1_000
+  @assignment "asg_fixture"
+
   for mixed <- [false, true] do
     test "staggered assignments #{if mixed, do: "respect mixed batches", else: "ignore prod-only turns"}",
          ctx do
@@ -84,9 +87,6 @@ defmodule Tightbeam.HolderProdTest do
       end
     end
   end
-
-  @quiet 30 * 60 * 1_000
-  @assignment "asg_fixture"
 
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})

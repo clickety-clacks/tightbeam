@@ -16,7 +16,9 @@ defmodule Tightbeam.HolderProd do
         CREATE TABLE IF NOT EXISTS assignment_holder_prod_custody (
           assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
           changedAt INTEGER NOT NULL
-        )
+        );
+        CREATE INDEX IF NOT EXISTS holder_prod_turn_end
+          ON turns(sessionKey, endedAt DESC) WHERE endedAt IS NOT NULL;
         """)
       end)
 
@@ -94,7 +96,7 @@ defmodule Tightbeam.HolderProd do
   # interval. A turn carrying only holder prods cannot rearm any quiet
   # assignment. Mixed batches still count as ordinary holder activity.
   @candidates """
-  WITH quiet_starts AS (
+  WITH quiet_starts AS MATERIALIZED (
     SELECT a.id, a.holderKey, a.workItemId, s.ownerUserId,
            MAX(a.openedAt, COALESCE(c.changedAt, 0),
              COALESCE((SELECT MAX(r.ts) FROM assignment_reopenings r WHERE r.assignmentId=a.id), 0),
@@ -104,8 +106,9 @@ defmodule Tightbeam.HolderProd do
                        WHERE p.producedByAssignmentId=a.id AND p.createdBySession=a.holderKey), 0),
              COALESCE((SELECT MAX(p.raisedAt) FROM decision_requests p
                        WHERE p.assignmentId=a.id AND p.raiserSessionKey=a.holderKey), 0),
-             COALESCE((SELECT MAX(t.endedAt) FROM turns t
-                       WHERE t.sessionKey=a.holderKey AND (t.startedAt IS NOT NULL OR t.assignmentId=a.id)
+             COALESCE((SELECT t.endedAt FROM turns t
+                       WHERE t.sessionKey=a.holderKey AND t.endedAt IS NOT NULL
+                         AND (t.startedAt IS NOT NULL OR t.assignmentId=a.id)
                          AND (
                            NOT EXISTS (
                              SELECT 1 FROM wakes p WHERE p.deliveredTurnSeq=t.seq AND p.digest=0
@@ -115,7 +118,8 @@ defmodule Tightbeam.HolderProd do
                                AND NOT (w.origin='process:tightbeam'
                                  AND COALESCE(substr(w.obligationRef,1,length(?2))=?2,0))
                            )
-                         )), 0),
+                         )
+                       ORDER BY t.endedAt DESC LIMIT 1), 0),
              COALESCE((SELECT MAX(MAX(w.createdAt, COALESCE(w.firedAt,0), COALESCE(w.canceledAt,0)))
                        FROM wakes w WHERE w.sessionKey=a.holderKey
                          AND w.state IN ('fired','canceled')
