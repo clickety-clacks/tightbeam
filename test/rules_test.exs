@@ -5524,7 +5524,10 @@ defmodule Tightbeam.RulesTest do
 
     other_hash = String.duplicate("b", 64)
 
+    missing_refs_fyi = fyi_line("this code review verdict carries no commit refs")
+
     hash_fyi = [
+      missing_refs_fyi,
       fyi_line(
         "artifact #{artifact.artifact_id} is recorded with sha256 #{hash}; " <>
           "this verdict cites sha256 #{other_hash}"
@@ -5550,6 +5553,7 @@ defmodule Tightbeam.RulesTest do
     wrong_review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: unrelated.id)
 
     producer_fyi = [
+      missing_refs_fyi,
       fyi_line(
         "artifact #{artifact.artifact_id} was produced by assignment #{producer.id}, " <>
           "not by this assignment or the assignment this card reviews"
@@ -5583,7 +5587,7 @@ defmodule Tightbeam.RulesTest do
 
     assert valid.attest.artifactId == artifact.artifact_id
     assert valid.attest.contentSha256 == hash
-    refute Map.has_key?(valid, :fyi)
+    assert valid.fyi == [missing_refs_fyi]
     assert {:ok, %{matched: true}} = Rules.evaluate_predicate(ctx.db, predicate)
 
     revision_verdict(
