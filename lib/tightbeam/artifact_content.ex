@@ -162,48 +162,33 @@ defmodule Tightbeam.ArtifactContent do
   def fetch_call(_db, _call, _config), do: %{code: "forbidden"}
 
   defp fetch_visible(db, %{state: "archived"} = row, config) do
-    case ArtifactArchive.read(db, row, config) do
-      {:ok, archive} ->
-        result = content_result(row, archive.sha256, archive.size, archive.bytes, "archived_home")
+    case fetch(db, row.artifact_id) do
+      nil ->
+        fetch_archive(db, row, config)
 
-        result =
-          if is_nil(archive.bytes) do
-            Map.merge(result, %{
-              archived_home: archive.home,
-              content_size: archive.size,
-              content_unavailable_reason: "archived artifact is too large to return inline"
-            })
-          else
-            result
+      captured ->
+        status =
+          case ArtifactArchive.read(
+                 db,
+                 row,
+                 Map.put(config, :artifact_archive_inline_limit_bytes, 0)
+               ) do
+            {:ok, archive} ->
+              row
+              |> content_result(archive.sha256, archive.size, nil, "archived_home")
+              |> Map.drop([:artifact_id, :code])
+              |> Map.put(:archived_home, archive.home)
+
+            {:error, reason} ->
+              row
+              |> unavailable_archive(reason)
+              |> Map.delete(:code)
+              |> Map.put(:verification_status, "unavailable")
           end
 
-        case result do
-          %{code: "artifact_sha_mismatch"} ->
-            case fetch(db, row.artifact_id) do
-              nil ->
-                result
-
-              captured ->
-                row
-                |> verified_capture(captured)
-                |> Map.put(:archive_verification, Map.delete(result, :code))
-            end
-
-          result ->
-            result
-        end
-
-      {:error, reason} ->
-        case fetch(db, row.artifact_id) do
-          nil ->
-            %{
-              code: "archived_content_unavailable",
-              message: "could not read archived home #{row.home}: #{inspect(reason)}"
-            }
-
-          captured ->
-            verified_capture(row, captured)
-        end
+        row
+        |> verified_capture(captured)
+        |> Map.put(:archive_verification, status)
     end
   end
 
@@ -217,6 +202,35 @@ defmodule Tightbeam.ArtifactContent do
         |> Map.delete(:content)
         |> Map.put(:content_base64, Base.encode64(captured.content))
     end
+  end
+
+  defp fetch_archive(db, row, config) do
+    case ArtifactArchive.read(db, row, config) do
+      {:ok, archive} ->
+        result = content_result(row, archive.sha256, archive.size, archive.bytes, "archived_home")
+
+        if is_nil(archive.bytes) do
+          Map.merge(result, %{
+            archived_home: archive.home,
+            content_size: archive.size,
+            content_unavailable_reason: "archived artifact is too large to return inline"
+          })
+        else
+          result
+        end
+
+      {:error, reason} ->
+        unavailable_archive(row, reason)
+    end
+  end
+
+  defp unavailable_archive(row, reason) do
+    %{
+      code: "archived_content_unavailable",
+      message: "could not read archived home #{row.home}: #{inspect(reason)}",
+      archived_home: row.home,
+      source: "archived_home"
+    }
   end
 
   defp verified_capture(row, captured) do

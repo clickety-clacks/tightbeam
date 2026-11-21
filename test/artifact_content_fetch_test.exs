@@ -171,6 +171,37 @@ defmodule Tightbeam.ArtifactContentFetchTest do
     refute Map.has_key?(result, :content_base64)
   end
 
+  test "captured bytes above the inline cap are returned for every archived home status", ctx do
+    home = Path.join(ctx.workspace, "captured.bin")
+    limit = 64 * 1024
+    bytes = :binary.copy(<<63>>, limit + 1)
+    digest = sha256(bytes)
+    id = archived(ctx, home, Placement.local_host_name(), digest)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               ArtifactContent.store_in_txn(txn, id, digest, bytes, 1)
+             end)
+
+    encoded = Base.encode64(bytes)
+
+    for {contents, status} <- [{bytes, "match"}, {"changed", "mismatch"}, {nil, "unavailable"}] do
+      if contents, do: File.write!(home, contents), else: File.rm!(home)
+      result = fetch(ctx, id, %{artifact_archive_inline_limit_bytes: limit})
+
+      assert %{
+               source: "stored_content",
+               verification_status: "match",
+               content_base64: ^encoded,
+               content_sha256: ^digest,
+               archive_verification: %{archived_home: ^home, verification_status: ^status}
+             } = result
+
+      refute Map.has_key?(result, :content_unavailable_reason)
+      refute Map.has_key?(result.archive_verification, :content_base64)
+    end
+  end
+
   defp fetch(ctx, id, config \\ %{}) do
     handler = Tightbeam.Gateway.handlers(Map.merge(%{db: ctx.db, base_dir: ctx.root}, config))
 
