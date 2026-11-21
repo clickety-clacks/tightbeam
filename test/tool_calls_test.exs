@@ -684,7 +684,7 @@ defmodule Tightbeam.ToolCallsTest do
 
   test "fresh setup applies the feature-local migration without changing the root stamp", ctx do
     {:ok, [[root_shape]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp", [])
-    assert root_shape == "attest-lifecycle-actor-v1-0117"
+    assert root_shape == "holder-role-provenance-v1-0118"
 
     {:ok, [[0, "tool-call-transition-v1-011"]]} =
       DB.query(ctx.db, "SELECT id, shape FROM tool_call_transition_migration", [])
@@ -819,7 +819,7 @@ defmodule Tightbeam.ToolCallsTest do
     message_rows_sql =
       "SELECT " <> Enum.join(message_columns, ", ") <> " FROM messages ORDER BY seq"
 
-    assert {:ok, [["attest-lifecycle-actor-v1-0117", _]]} =
+    assert {:ok, [["holder-role-provenance-v1-0118", _]]} =
              DB.query(ctx.db, "SELECT shape,stampedAt FROM schema_stamp", [])
 
     {:ok, [[message_high_water_after]]} =
