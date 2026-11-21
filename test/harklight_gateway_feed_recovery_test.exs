@@ -12,11 +12,12 @@ defmodule Tightbeam.HarklightGatewayFeedRecoveryTest do
 
       try do
         {:os_pid, old_pid} = Port.info(first, :os_pid)
-        await_file(first, Path.join(tmp, "prepare-ready"))
+        first_state = await_file(first, Path.join(tmp, "prepare-ready"))
 
         if @scenario == "clean" do
-          assert_exit(first, 0)
+          assert_exit(first, 0, first_state)
         else
+          assert first_state == :ready
           assert {"", 0} = System.cmd("kill", ["-KILL", Integer.to_string(old_pid)])
           assert_exit(first, 137)
         end
@@ -26,8 +27,8 @@ defmodule Tightbeam.HarklightGatewayFeedRecoveryTest do
         try do
           assert {:os_pid, new_pid} = Port.info(second, :os_pid)
           refute old_pid == new_pid
-          await_file(second, Path.join(tmp, "restart-ready"))
-          assert_exit(second, 0)
+          state = await_file(second, Path.join(tmp, "restart-ready"))
+          assert_exit(second, 0, state)
         after
           stop_fixture(second)
         end
@@ -57,7 +58,9 @@ defmodule Tightbeam.HarklightGatewayFeedRecoveryTest do
   end
 
   defp await_file(port, path, deadline, output) do
-    unless File.regular?(path) do
+    if File.regular?(path) do
+      :ready
+    else
       assert System.monotonic_time(:millisecond) < deadline,
              "gateway did not reach #{Path.basename(path)}\n#{Enum.reverse(output)}"
 
@@ -66,12 +69,17 @@ defmodule Tightbeam.HarklightGatewayFeedRecoveryTest do
           await_file(port, path, deadline, [bytes | output])
 
         {^port, {:exit_status, status}} ->
-          flunk("gateway exited #{status}\n#{Enum.reverse(output)}")
+          if status == 0 and File.regular?(path),
+            do: {:exited, status},
+            else: flunk("gateway exited #{status}\n#{Enum.reverse(output)}")
       after
         20 -> await_file(port, path, deadline, output)
       end
     end
   end
+
+  defp assert_exit(_port, expected, {:exited, status}), do: assert(status == expected)
+  defp assert_exit(port, expected, :ready), do: assert_exit(port, expected)
 
   defp assert_exit(port, expected) do
     receive do
