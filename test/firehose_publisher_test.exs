@@ -1143,6 +1143,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
     holder = Org.personal_session_key("flynn")
     handlers = Gateway.handlers(%{db: db, wake_scheduler: scheduler})
 
+    assert {:ok, item} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "work-item-create",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{title: "Preserve recorded FYIs"}
+             })
+
     call = %{
       verb: "assign",
       origin: "user:flynn",
@@ -1150,7 +1159,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
       session_key: holder,
       target_role: nil,
       role_fallback: false,
-      params: %{subject: "plain evidence", effect_kind: "evidence"}
+      params: %{subject: "plain evidence", effect_kind: "evidence", work_item_id: item.id}
     }
 
     assert {:ok, plain} = Dispatch.dispatch(db, handlers, call)
@@ -1161,7 +1170,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
                handlers,
                put_in(call.params, %{
                  subject: "inner review",
-                 reviews_assignment_id: plain.id
+                 reviews_assignment_id: plain.id,
+                 work_item_id: item.id
                })
              )
 
@@ -1171,7 +1181,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
                handlers,
                put_in(call.params, %{
                  subject: "outer review",
-                 reviews_assignment_id: inner.id
+                 reviews_assignment_id: inner.id,
+                 work_item_id: item.id
                })
              )
 
