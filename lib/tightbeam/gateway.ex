@@ -1051,7 +1051,7 @@ defmodule Tightbeam.Gateway do
       {"artifact-content-capacity", []} => fn _call ->
         Tightbeam.ArtifactContent.capacity(config)
       end,
-      {"artifact-content-promote", []} => fn call ->
+      {"artifact-content-promote", ["artifact.custody_pinned"]} => fn call ->
         Tightbeam.ArtifactContent.promote_call(db, call, config)
       end,
       {"artifact-get", []} => fn call ->
@@ -1821,7 +1821,7 @@ defmodule Tightbeam.Gateway do
     |> compile_handler_specs!()
   end
 
-  @direct_state_classes ~w(message.created transition.recorded tool_call.started tool_call.ended wake.fired turn.started turn.ended artifact.archived artifact.released artifact.custody_pinned decision_request.consumed decision_request.superseded decision_request.updated)
+  @direct_state_classes ~w(message.created transition.recorded tool_call.started tool_call.ended wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated)
 
   @doc false
   @spec compile_handler_specs!(map()) ::
