@@ -234,7 +234,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     turn.seq
   end
 
-  defp fail_assigned_turn!(db, session_key, assignment_id) do
+  defp fail_assigned_turn!(db, session_key, assignment_id, opts \\ []) do
     {:ok, seq} =
       Ledger.enqueue(db, %{
         session_key: session_key,
@@ -247,7 +247,13 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert {:ok, %{seq: ^seq} = turn} = Ledger.claim_next(db, session_key, "assigned-cause")
 
     assert :ok =
-             Ledger.finish(db, seq, "failed", "assigned failure", owner_lease: turn.owner_lease)
+             Ledger.finish(
+               db,
+               seq,
+               "failed",
+               "assigned failure",
+               Keyword.put(opts, :owner_lease, turn.owner_lease)
+             )
 
     seq
   end
@@ -923,6 +929,14 @@ defmodule Tightbeam.Productions.BubbleTest do
   end
 
   test "a refused multi-assignment carrier wakes each accountable opener once", ctx do
+    assert_refused_assignment_carrier(ctx, false)
+  end
+
+  test "a refused health redelivery wakes the original carrier's assignment openers", ctx do
+    assert_refused_assignment_carrier(ctx, true)
+  end
+
+  defp assert_refused_assignment_carrier(ctx, health_redelivery?) do
     busy = hold_recipient!(ctx.db, ctx.holder.session_key)
     first = session(ctx.db, "first-opener", ctx.main.session_key)
     second = session(ctx.db, "second-opener", ctx.main.session_key)
@@ -954,6 +968,14 @@ defmodule Tightbeam.Productions.BubbleTest do
       )
 
     queue_decision_wake!(ctx, blocked.decisionWake)
+
+    carried_cause =
+      if health_redelivery? do
+        cause = fail_turn!(ctx.db, child.session_key)
+        assert :ok = Bubble.recognize_terminal(ctx.db, cause)
+        cause
+      end
+
     finish_busy_recipient!(ctx.db, busy)
     [carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
     assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "assignment-carrier")
@@ -964,6 +986,52 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     assert [%{delivery_wake_id: ^carrier_id}] =
              NoticeBatcher.source_refs(ctx.db, blocked.decisionWake.wake_id)
+
+    turn =
+      if health_redelivery? do
+        assert [%{delivery_wake_id: ^carrier_id}] =
+                 NoticeBatcher.source_refs(
+                   ctx.db,
+                   "bubble:#{carried_cause}:#{ctx.holder.session_key}"
+                 )
+
+        assert :ok =
+                 Ledger.finish(ctx.db, turn.seq, "failed", "rate limited",
+                   owner_lease: turn.owner_lease
+                 )
+
+        restoration = hold_recipient!(ctx.db, ctx.holder.session_key)
+        finish_busy_recipient!(ctx.db, restoration)
+
+        assert {:ok, 1} =
+                 DB.transaction(ctx.db, fn txn ->
+                   Tightbeam.Wakes.record_health_redelivery_source_in_txn(
+                     txn,
+                     turn.seq,
+                     "rate-limit-dead"
+                   )
+
+                   Tightbeam.Wakes.redeliver_pending_health_intents_in_txn(
+                     txn,
+                     ctx.holder,
+                     restoration
+                   )
+                 end)
+
+        assert {:ok, retried} =
+                 Ledger.claim_next(ctx.db, ctx.holder.session_key, "health-redelivery")
+
+        assert retried.seq != turn.seq
+
+        assert {:ok, [[nil, nil]]} =
+                 DB.query(ctx.db, "SELECT assignmentId,wakeId FROM turns WHERE seq=?1", [
+                   retried.seq
+                 ])
+
+        retried
+      else
+        turn
+      end
 
     assert :ok =
              Ledger.finish(ctx.db, turn.seq, "failed", "The provider refused the prompt.",
@@ -980,9 +1048,60 @@ defmodule Tightbeam.Productions.BubbleTest do
       assert undelivered_notices(ctx.db, opener.session_key, turn.seq) == []
     end
 
-    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+    if health_redelivery? do
+      assert [[_seq, cause, _wake, _origin, _prompt]] =
+               notice_turn(ctx.db, ctx.supervisor.session_key)
+
+      assert cause == "bubble:#{carried_cause}"
+    else
+      assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+    end
 
     disposer = "session:" <> ctx.holder.session_key
+
+    assert {:ok, [[^disposer]]} =
+             DB.query(ctx.db, "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1", [
+               blocked.cannotProceed.id
+             ])
+  end
+
+  test "exhausting a refusal notice leaves cannot-proceed custody with its disposer", ctx do
+    {assignment, blocked} =
+      cannot_proceed_assignment!(
+        ctx,
+        ctx.holder.session_key,
+        ctx.main.session_key,
+        "refusal leaves disposition with opener"
+      )
+
+    _ = deliver_ready_carriers!(ctx, ctx.main.session_key)
+    assert {:ok, decision} = Ledger.claim_next(ctx.db, ctx.main.session_key, "decision")
+    finish_busy_recipient!(ctx.db, decision)
+
+    cause_seq =
+      fail_assigned_turn!(ctx.db, ctx.holder.session_key, assignment,
+        work_outcome: :did_not_perform
+      )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
+    _ = deliver_ready_carriers!(ctx, ctx.main.session_key)
+    assert {:ok, notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "refusal-notice")
+    cause_ref = "bubble:#{cause_seq}"
+
+    assert [[notice_seq, ^cause_ref, _wake, _origin, _prompt]] =
+             notice_turn(ctx.db, ctx.main.session_key)
+
+    assert notice_seq == notice.seq
+
+    assert :ok =
+             Ledger.finish(ctx.db, notice.seq, "failed", "notice unavailable",
+               owner_lease: notice.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, notice.seq)
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
+
+    disposer = "session:" <> ctx.main.session_key
 
     assert {:ok, [[^disposer]]} =
              DB.query(ctx.db, "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1", [
