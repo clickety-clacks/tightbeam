@@ -14,7 +14,9 @@ defmodule Tightbeam.RulesBuiltinDefaultTest do
     base = Path.join(System.tmp_dir!(), "builtin-default-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base)
     on_exit(fn -> File.rm_rf!(base) end)
-    %{base: base, dir: Path.join(base, "identity")}
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    %{base: base, dir: Path.join(base, "identity"), db: db}
   end
 
   test "the notice rule belongs to no kungfu bundle, so retiring one cannot remove it" do
@@ -117,7 +119,7 @@ defmodule Tightbeam.RulesBuiltinDefaultTest do
 
       log =
         capture_log(fn ->
-          Gateway.load_law!(%{base_dir: ctx.base}, ["assign", "attest"])
+          Gateway.load_law!(%{base_dir: ctx.base, db: ctx.db}, ["assign", "attest"])
         end)
 
       assert log =~ "built-in default rule #{@notice} is not used"
