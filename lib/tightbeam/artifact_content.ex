@@ -37,7 +37,7 @@ defmodule Tightbeam.ArtifactContent do
   bytes, and the bytes cannot be mutated or dropped.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{ArtifactArchive, DB}
   alias Tightbeam.DB.Txn
 
   @table_ddl """
@@ -123,12 +123,18 @@ defmodule Tightbeam.ArtifactContent do
   def ensure_schema(db), do: DB.execute(db, @ddl)
   def schema_in_txn(%Txn{} = txn), do: Txn.exec(txn, @ddl)
 
-  @doc "Read captured content for an authenticated artifact reader, without an origin path."
-  def fetch_call(db, %{
-        principal: {kind, id},
-        rest_principal: %{kind: visibility_kind, id: id, is_admin: is_admin} = principal,
-        params: %{artifact_id: artifact_id} = params
-      })
+  @doc "Read archived or captured bytes for an authenticated artifact reader."
+  def fetch_call(db, call, config \\ %{})
+
+  def fetch_call(
+        db,
+        %{
+          principal: {kind, id},
+          rest_principal: %{kind: visibility_kind, id: id, is_admin: is_admin} = principal,
+          params: %{artifact_id: artifact_id} = params
+        },
+        config
+      )
       when ((kind == :user and visibility_kind == "user") or
               (kind == :session and visibility_kind == "session") or
               (kind == :process and visibility_kind == "process")) and
@@ -139,28 +145,79 @@ defmodule Tightbeam.ArtifactContent do
 
            if row != nil and
                 Tightbeam.StateVisibility.core_detail_visible?(txn, "artifacts", row, principal) do
-             case fetch(txn, artifact_id) do
-               nil ->
-                 %{code: "content_not_captured", message: "artifact has no stored content"}
-
-               captured ->
-                 captured
-                 |> Map.delete(:content)
-                 |> Map.put(:content_base64, Base.encode64(captured.content))
-             end
+             {:visible, row}
            else
              %{code: "not_found"}
            end
          end) do
+      {:ok, {:visible, row}} -> fetch_visible(db, row, config)
       {:ok, result} -> result
       {:error, error} -> raise error
     end
   end
 
-  def fetch_call(_db, %{principal: {kind, _}}) when kind in [:user, :session, :process],
+  def fetch_call(_db, %{principal: {kind, _}}, _config) when kind in [:user, :session, :process],
     do: %{code: "invalid", message: "artifact-content-fetch requires only artifactId"}
 
-  def fetch_call(_db, _call), do: %{code: "forbidden"}
+  def fetch_call(_db, _call, _config), do: %{code: "forbidden"}
+
+  defp fetch_visible(db, %{state: "archived"} = row, config) do
+    case ArtifactArchive.read(db, row, config) do
+      {:ok, bytes} ->
+        verified_content(row, bytes, "archived_home")
+
+      {:error, reason} ->
+        case fetch(db, row.artifact_id) do
+          nil ->
+            %{
+              code: "archived_content_unavailable",
+              message: "could not read archived home #{row.home}: #{inspect(reason)}"
+            }
+
+          captured ->
+            verified_content(row, captured.content, "stored_content")
+        end
+    end
+  end
+
+  defp fetch_visible(db, row, _config) do
+    case fetch(db, row.artifact_id) do
+      nil ->
+        %{code: "content_not_captured", message: "artifact has no stored content"}
+
+      captured ->
+        captured
+        |> Map.delete(:content)
+        |> Map.put(:content_base64, Base.encode64(captured.content))
+    end
+  end
+
+  defp verified_content(row, bytes, source) do
+    observed = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    expected = row.content_sha256
+
+    if expected && String.downcase(expected) != observed do
+      %{
+        code: "artifact_sha_mismatch",
+        message:
+          "recorded sha does not match current bytes (expected #{expected}, observed #{observed})",
+        expected_sha256: expected,
+        observed_sha256: observed,
+        source: source,
+        verification_status: "mismatch"
+      }
+    else
+      %{
+        artifact_id: row.artifact_id,
+        content_sha256: observed,
+        content_size: byte_size(bytes),
+        content_base64: Base.encode64(bytes),
+        expected_sha256: expected,
+        source: source,
+        verification_status: if(expected, do: "match", else: "unverified")
+      }
+    end
+  end
 
   @doc """
   Read captured bytes by artifact ID, or nil when no content was captured.

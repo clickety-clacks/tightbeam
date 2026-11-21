@@ -17,6 +17,10 @@ defmodule Tightbeam.WorkspaceCleanup do
     "ServerAliveCountMax=2"
   ]
   @default_runner_timeout_ms 900_000
+  @local_archived_home """
+  state='archived' AND (originHost=?2 OR originHost IS NULL)
+    AND (home=?1 OR substr(home,1,length(?1)+1)=?1 || '/')
+  """
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -119,10 +123,10 @@ defmodule Tightbeam.WorkspaceCleanup do
   def archive_root(host), do: Path.join(host.base_dir, "archive")
 
   defp relocate_archive(config, db, failures, backoff) do
-    source = Path.join(config.base_dir, "archive")
-    destination = archive_root(%{ssh: nil, base_dir: config.base_dir})
+    source = Path.expand(Path.join(config.base_dir, "archive"))
+    destination = Path.expand(archive_root(%{ssh: nil, base_dir: config.base_dir}))
 
-    if Path.expand(source) != Path.expand(destination) do
+    if source != destination do
       if relative_inside(destination, source) != nil or
            relative_inside(source, destination) != nil,
          do: raise(ArgumentError, "archive relocation directories overlap")
@@ -131,7 +135,13 @@ defmodule Tightbeam.WorkspaceCleanup do
       {:ok, rows} =
         DB.query(
           db,
-          "SELECT home FROM artifacts WHERE state='archived' AND (originHost=?2 OR originHost IS NULL) AND substr(home,1,length(?1)+1)=?1 || '/' UNION SELECT archivePath FROM retired_workspace_cleanup WHERE substr(archivePath,1,length(?1)+1)=?1 || '/' AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?2)",
+          """
+          SELECT home FROM artifacts WHERE #{@local_archived_home} AND home<>?1
+          UNION
+          SELECT archivePath FROM retired_workspace_cleanup
+          WHERE substr(archivePath,1,length(?1)+1)=?1 || '/'
+            AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?2)
+          """,
           [source, Tightbeam.Placement.local_host_name()]
         )
 
@@ -228,7 +238,7 @@ defmodule Tightbeam.WorkspaceCleanup do
       DB.transaction(db, fn txn ->
         Txn.q(
           txn,
-          "SELECT artifactId,home FROM artifacts WHERE state='archived' AND (originHost=?2 OR originHost IS NULL) AND (home=?1 OR substr(home,1,length(?1)+1)=?1 || '/')",
+          "SELECT artifactId,home FROM artifacts WHERE #{@local_archived_home}",
           [old, Tightbeam.Placement.local_host_name()]
         )
         |> Enum.each(fn [id, home] ->

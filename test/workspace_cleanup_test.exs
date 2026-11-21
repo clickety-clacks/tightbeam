@@ -228,12 +228,14 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     kept = Path.join(ctx.workspace, "kept")
     File.write!(kept, "older archive")
     artifact = artifact(ctx, kept)
+    duplicate = artifact(ctx, kept)
     retire(ctx)
 
     assert %{status: "completed"} =
              WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
 
     old_home = Artifacts.get(ctx.db, artifact.artifact_id).home
+    assert Artifacts.get(ctx.db, duplicate.artifact_id).home == old_home
     archive = Path.join(ctx.base, "configured-archive")
     Application.put_env(:tightbeam, :archive_dir, archive)
     on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
@@ -266,6 +268,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     :sys.get_state(worker)
     moved = Artifacts.get(ctx.db, artifact.artifact_id)
     assert String.starts_with?(moved.home, archive <> "/")
+    assert Artifacts.get(ctx.db, duplicate.artifact_id).home == moved.home
     assert File.read!(moved.home) == "older archive"
     refute File.exists?(old_home)
     send(worker, :drain)

@@ -1,7 +1,7 @@
 defmodule Tightbeam.ArtifactContentFetchTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ArtifactContent, Artifacts, DB, Schema}
+  alias Tightbeam.{ArtifactContent, Artifacts, DB, Placement, Schema}
 
   setup do
     root = Path.join(System.tmp_dir!(), "artifact-fetch-#{System.unique_integer([:positive])}")
@@ -72,6 +72,114 @@ defmodule Tightbeam.ArtifactContentFetchTest do
 
     assert handler.(%{params: call.params}) == %{code: "forbidden"}
   end
+
+  test "an archived home is hashed and returned with its verification status", ctx do
+    bytes = <<0, 255, 128, 10>>
+    home = Path.join(ctx.workspace, "report.bin")
+    File.write!(home, bytes)
+    digest = sha256(bytes)
+
+    checked = archived(ctx, home, Placement.local_host_name(), digest)
+    unchecked = archived(ctx, home, Placement.local_host_name(), nil)
+
+    assert fetch(ctx, checked) == %{
+             artifact_id: checked,
+             content_base64: Base.encode64(bytes),
+             content_size: byte_size(bytes),
+             content_sha256: digest,
+             expected_sha256: digest,
+             source: "archived_home",
+             verification_status: "match"
+           }
+
+    assert %{
+             content_sha256: ^digest,
+             expected_sha256: nil,
+             source: "archived_home",
+             verification_status: "unverified"
+           } = fetch(ctx, unchecked)
+
+    File.write!(home, "later bytes")
+    observed = sha256("later bytes")
+    result = fetch(ctx, checked)
+
+    assert %{
+             code: "artifact_sha_mismatch",
+             expected_sha256: ^digest,
+             observed_sha256: ^observed,
+             verification_status: "mismatch"
+           } = result
+
+    assert result.message =~ "recorded sha does not match current bytes"
+    refute Map.has_key?(result, :content_base64)
+    assert Artifacts.get(ctx.db, checked).content_sha256 == digest
+    assert ArtifactContent.fetch(ctx.db, unchecked) == nil
+  end
+
+  test "a legacy local pointer resolves after the archive moved and before its row is repointed",
+       ctx do
+    new_root = Path.join(ctx.root, "relocated")
+    Application.put_env(:tightbeam, :archive_dir, new_root)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    File.mkdir_p!(Path.join(new_root, "session"))
+    File.write!(Path.join(new_root, "session/file"), "archived")
+    old_home = Path.join(ctx.root, "archive/session/file")
+    id = archived(ctx, old_home, nil, sha256("archived"))
+
+    assert %{source: "archived_home", verification_status: "match"} = fetch(ctx, id)
+    assert Artifacts.get(ctx.db, id).home == old_home
+    assert ArtifactContent.fetch(ctx.db, id) == nil
+  end
+
+  test "a remote home is read via its registered host without consulting the origin", ctx do
+    host = "archive-fixture"
+    destination = "fixture@archive-fixture"
+    base = "/fixture/base"
+    assert {:ok, _} = Placement.register_host(ctx.db, host, %{base_dir: base, ssh: destination})
+    home = base <> "/archive/session/file with spaces"
+    id = archived(ctx, home, host, sha256("remote bytes"))
+    caller = self()
+
+    runner = fn argv ->
+      send(caller, {:remote_read, argv})
+      {"remote bytes", 0}
+    end
+
+    assert %{source: "archived_home", verification_status: "match"} =
+             fetch(ctx, id, %{artifact_archive_runner: runner})
+
+    assert_received {:remote_read, ["ssh" | args]}
+    assert destination in args
+    assert List.last(args) =~ home
+  end
+
+  defp fetch(ctx, id, config \\ %{}) do
+    handler = Tightbeam.Gateway.handlers(Map.merge(%{db: ctx.db, base_dir: ctx.root}, config))
+
+    handler["artifact-content-fetch"].(%{
+      principal: {:session, "content-fixture"},
+      rest_principal: %{kind: "session", id: "content-fixture", is_admin: false},
+      params: %{artifact_id: id}
+    })
+  end
+
+  defp archived(ctx, home, host, sha) do
+    artifact = record(ctx.db, "workspace-only-origin.bin")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE artifacts SET state='archived', home=?2, originHost=?3, contentSha256=?4
+               WHERE artifactId=?1
+               """,
+               [artifact.artifact_id, home, host, sha]
+             )
+
+    artifact.artifact_id
+  end
+
+  defp sha256(bytes), do: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
 
   defp record(db, origin) do
     Artifacts.record(db, %{
