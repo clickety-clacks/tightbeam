@@ -142,6 +142,7 @@ defmodule Tightbeam.HolderProd do
              AND (t.status='running' OR (t.status='queued' AND (
                (t.assignmentId=e.id AND t.seq IS NOT p.deliveredTurnSeq) OR EXISTS (
                SELECT 1 FROM wakes w WHERE w.deliveredTurnSeq=t.seq AND w.assignmentId=e.id
+                 AND w.digest=0
                  AND w.wakeId IS NOT p.wakeId
              ))))
          )
