@@ -2067,6 +2067,8 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
     :ok = ensure_notice_batch_chat_message_format(db)
     :ok = Tightbeam.RowReactions.Store.ensure_schema(db)
+    # FYI lines are additive current-build storage beside accepted records.
+    :ok = Tightbeam.RecordFyis.ensure_schema(db)
     :ok = Tightbeam.HarnessHealth.RecoverySchedule.ensure_schema(db)
     :ok = Tightbeam.HarnessHealth.RecoveryCheck.ensure_schema(db)
     :ok = Tightbeam.HarnessRecoveryNotice.ensure_schema(db)

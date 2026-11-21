@@ -116,20 +116,45 @@ defmodule Tightbeam.JobTraceTest do
                commit_refs: commit_refs
              })
 
-    assert %{code: "invalid_commit_refs"} =
+    # Refs on attests the completion checks do not read are recorded with an
+    # FYI naming who does read them.
+    verdict_refs_fyi = [
+      fyi_line(
+        "commit refs are recorded on this reviewed-clean verdict attest; Tightbeam's completion " <>
+          "and review-coverage checks do not read them, and the work item's commit refs include them"
+      )
+    ]
+
+    assert %{
+             attest:
+               %{verdictKind: "reviewed-clean", commitRefs: ^commit_refs, fyi: ^verdict_refs_fyi} =
+                 misplaced_verdict,
+             fyi: ^verdict_refs_fyi
+           } =
              attest(db, {:session, "holder"}, "asg_bad", "verdict", %{
                verdict_kind: "reviewed-clean",
-               commit_refs: commit_refs
-             })
-
-    assert %{code: "invalid_commit_refs"} =
-             attest(db, {:session, "reviewer"}, "asg_review", "completion", %{
                commit_refs: commit_refs
              })
 
     assert %{attest: %{verdictKind: "changes-requested"}} =
              attest(db, {:session, "reviewer"}, "asg_review", "verdict", %{
                verdict_kind: "changes-requested"
+             })
+
+    completion_refs_fyi = [
+      fyi_line(
+        "commit refs are recorded on this completion attest; Tightbeam's completion and " <>
+          "review-coverage checks do not read them, and the work item's commit refs and this " <>
+          "assignment's closing commit refs include them"
+      )
+    ]
+
+    assert %{
+             attest: %{kind: "completion", commitRefs: ^commit_refs} = review_completion,
+             fyi: ^completion_refs_fyi
+           } =
+             attest(db, {:session, "reviewer"}, "asg_review", "completion", %{
+               commit_refs: commit_refs
              })
 
     :ok = DB.execute(db, "UPDATE attests SET ts = 100")
@@ -147,20 +172,27 @@ defmodule Tightbeam.JobTraceTest do
       }
     ]
 
-    assert %{code: "inapplicable_code_evidence"} =
+    # A code completion without holder verification or review is recorded with
+    # one FYI per missing fact.
+    code_completion_fyi = [
+      fyi_line("this code assignment has no verified verdict from its holder"),
+      fyi_line("this code assignment has no review conclusion")
+    ]
+
+    assert %{attest: %{kind: "completion"} = bad_completion, fyi: ^code_completion_fyi} =
              attest(db, {:session, "holder"}, "asg_bad", "completion", %{
                commit_refs: unavailable_refs
              })
 
-    # Completion stores an event report even when its personal recipient is absent.
-    notice_digest =
-      :crypto.hash(
-        :sha256,
-        JSON.encode!(["terminal-child-owner-notification", "attest", completion.id])
-      )
-      |> Base.encode16(case: :lower)
+    assert Map.new(Assignments.list_attests(db, "asg_bad"), &{&1.id, Map.get(&1, :fyi)}) == %{
+             misplaced_verdict.id => verdict_refs_fyi,
+             bad_completion.id => code_completion_fyi
+           }
 
-    notice_id = "w_terminal_" <> notice_digest
+    # Completion stores an event report even when its personal recipient is absent.
+    notice_id = terminal_notice_id(completion.id)
+    # The FYI-recorded code completion closes asg_bad and stores its own report.
+    bad_notice_id = terminal_notice_id(bad_completion.id)
 
     personal = Org.personal_session_key("owner")
 
@@ -202,7 +234,7 @@ defmodule Tightbeam.JobTraceTest do
 
     source_cancellations =
       trace(db, {:user, "owner"}, "wi_trace").timeline
-      |> Enum.filter(&(&1.type == "wake_canceled" and &1.id != notice_id))
+      |> Enum.filter(&(&1.type == "wake_canceled" and &1.id not in [notice_id, bad_notice_id]))
 
     assert source_cancellations == []
 
@@ -224,7 +256,8 @@ defmodule Tightbeam.JobTraceTest do
 
     assert Enum.map(trace.assignments, & &1.id) == ["asg_bad", "asg_direct", "asg_review"]
     assert trace.workItem.state == "open"
-    assert %{state: "open"} = Enum.find(trace.assignments, &(&1.id == "asg_bad"))
+    assert %{state: "closed"} = Enum.find(trace.assignments, &(&1.id == "asg_bad"))
+    assert %{state: "closed"} = Enum.find(trace.assignments, &(&1.id == "asg_review"))
 
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
@@ -272,6 +305,37 @@ defmodule Tightbeam.JobTraceTest do
                false
            end)
 
+    # Attests recorded with FYIs appear in the trace with their commit refs.
+    assert Enum.any?(trace.timeline, fn
+             %{
+               type: "attest",
+               id: id,
+               assignmentId: "asg_bad",
+               verdict: "reviewed-clean",
+               commitRefs: ^commit_refs
+             } ->
+               id == misplaced_verdict.id
+
+             _ ->
+               false
+           end)
+
+    assert Enum.any?(trace.timeline, fn
+             %{type: "attest", id: id, assignmentId: "asg_review", commitRefs: ^commit_refs} ->
+               id == review_completion.id
+
+             _ ->
+               false
+           end)
+
+    assert Enum.any?(trace.timeline, fn
+             %{type: "attest", id: id, assignmentId: "asg_bad", commitRefs: ^unavailable_refs} ->
+               id == bad_completion.id
+
+             _ ->
+               false
+           end)
+
     assert Enum.any?(trace.timeline, fn
              %{type: "wake_fired", id: "w_condition", matchedFactAt: 90} -> true
              _ -> false
@@ -284,44 +348,49 @@ defmodule Tightbeam.JobTraceTest do
 
     # The unavailable recipient is recorded by the real delivery attempt.
     # The trace keeps the exact immutable completion notice identity.
-    assert {:ok, [[canceled_at, wake_rowid]]} =
-             DB.query(
-               db,
-               "SELECT canceledAt, rowid FROM wakes WHERE wakeId=?1 AND assignmentId='asg_direct' AND state='canceled'",
-               [notice_id]
-             )
+    expected_cancellation = fn assignment_id, id, closing ->
+      assert {:ok, [[canceled_at, wake_rowid]]} =
+               DB.query(
+                 db,
+                 "SELECT canceledAt, rowid FROM wakes WHERE wakeId=?1 AND assignmentId=?2 AND state='canceled'",
+                 [id, assignment_id]
+               )
 
-    assert is_integer(canceled_at) and canceled_at >= completion.ts
+      assert is_integer(canceled_at) and canceled_at >= closing.ts
+
+      %{
+        assignmentId: assignment_id,
+        at: canceled_at,
+        id: id,
+        reason: nil,
+        seqTiebreak: wake_rowid,
+        type: "wake_canceled",
+        provenanceStatus: "proven",
+        schedulingOrigin: "process:tightbeam",
+        requesterKind: "process",
+        requesterId: "tightbeam:wake-scheduler",
+        reasonKind: "target_unresolvable",
+        causalSourceKind: "scheduler_delivery",
+        causalSourceId: id,
+        outcomeKind: "no_replacement",
+        replacementWakeId: nil,
+        dispositionKind: nil,
+        dispositionId: nil,
+        primaryWorkKind: nil,
+        primaryWorkId: nil,
+        workImpactKind: "no_linked_work",
+        livenessTriggerKind: nil,
+        livenessTriggerId: nil,
+        actionNeeded: false
+      }
+    end
 
     # Exact equality also excludes private prompt, attest and transcript fields.
     expected_cancellations =
       (source_cancellations ++
          [
-           %{
-             assignmentId: "asg_direct",
-             at: canceled_at,
-             id: notice_id,
-             reason: nil,
-             seqTiebreak: wake_rowid,
-             type: "wake_canceled",
-             provenanceStatus: "proven",
-             schedulingOrigin: "process:tightbeam",
-             requesterKind: "process",
-             requesterId: "tightbeam:wake-scheduler",
-             reasonKind: "target_unresolvable",
-             causalSourceKind: "scheduler_delivery",
-             causalSourceId: notice_id,
-             outcomeKind: "no_replacement",
-             replacementWakeId: nil,
-             dispositionKind: nil,
-             dispositionId: nil,
-             primaryWorkKind: nil,
-             primaryWorkId: nil,
-             workImpactKind: "no_linked_work",
-             livenessTriggerKind: nil,
-             livenessTriggerId: nil,
-             actionNeeded: false
-           }
+           expected_cancellation.("asg_direct", notice_id, completion),
+           expected_cancellation.("asg_bad", bad_notice_id, bad_completion)
          ])
       |> Enum.sort_by(&{&1.at, &1.seqTiebreak})
 
@@ -341,6 +410,8 @@ defmodule Tightbeam.JobTraceTest do
              "wake_scheduled",
              "wake_fired",
              "decision_request",
+             "attest",
+             "attest",
              "attest",
              "attest",
              "attest",
@@ -573,6 +644,19 @@ defmodule Tightbeam.JobTraceTest do
     {output, 0} = System.cmd("git", ["-C", path | args], stderr_to_stdout: true)
     String.trim(output)
   end
+
+  defp terminal_notice_id(attest_id) do
+    digest =
+      :crypto.hash(
+        :sha256,
+        JSON.encode!(["terminal-child-owner-notification", "attest", attest_id])
+      )
+      |> Base.encode16(case: :lower)
+
+    "w_terminal_" <> digest
+  end
+
+  defp fyi_line(fact), do: "FYI: " <> fact <> "; decide for yourself whether that is acceptable"
 
   defp origin({:user, user}), do: "user:#{user}"
   defp origin({:session, session}), do: "agent:#{session}"
