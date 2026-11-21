@@ -2058,6 +2058,188 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert Enum.count(facts["attests"], &is_map(&1["disposition"])) == 1
   end
 
+  @identity_shapes Path.expand("fixtures/identity-seed-shapes", __DIR__)
+
+  # The path an install takes from its identity as an earlier release (or a
+  # fresh install) left it to a delivered notice, with no relearn and no other
+  # step. `:migration` is the normal boot (the rail-scope migration, then the law
+  # load); `:built_in_only` skips the migration so the live identity lacks the
+  # rule and the loader's built-in default supplies it.
+  for shape <- ["fresh", "0.1.15", "0.1.16"],
+      outcome <- ["completed", "revoked"],
+      startup <- [:migration, :built_in_only] do
+    test "a #{shape} install notifies the parent when a child assignment is #{outcome} (#{startup})",
+         ctx do
+      base = Path.join(System.tmp_dir!(), "boot-notice-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf!(base) end)
+      File.mkdir_p!(base)
+      init_identity_shape!(base, unquote(shape))
+
+      if unquote(startup) == :migration,
+        do: Tightbeam.Identity.RailScopeMigration.run!(base, ctx.db)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+        end)
+
+      if unquote(startup) == :built_in_only and unquote(shape) != "fresh",
+        do: assert(log =~ "built-in default rule assignment-terminal-handoff is in use")
+
+      if unquote(outcome) == "completed" do
+        {_parent, _child, root} = completed_child(ctx)
+        assert root.prompt =~ ~s(outcome="completed")
+      else
+        item = create_work_item(ctx, "withdrawn child")
+
+        child =
+          handle(
+            ctx,
+            "assign",
+            assign_call({:session, "notice-parent"}, "holder", "child task", item.id,
+              effect_kind: "coordination"
+            )
+          )
+
+        assert %{outcome: "revoked"} =
+                 Assignments.__handle__(
+                   ctx.db,
+                   "revoke-assignment",
+                   call("revoke-assignment", {:session, "notice-parent"}, nil, %{
+                     assignment_id: child.id,
+                     reason: "withdrawn"
+                   })
+                 )
+
+        assert [notice] = terminal_notices(ctx.db)
+        assert notice.prompt =~ ~s(outcome="revoked")
+        assert notice.session_key == "notice-parent"
+      end
+    end
+  end
+
+  @handoff "assignment-terminal-handoff"
+  @handoff_seed "rules/row-reaction-handoff.toml"
+  @bundle "scoped-notices"
+  @bundle_rule "kungfu/#{@bundle}/rules/child-notice.toml"
+  @bundle_archetype "kungfu/#{@bundle}/archetypes/worker.toml"
+  @qualified_archetype "#{@bundle}.worker"
+
+  for global <- [:builtin, :seed, :custom],
+      {scope, scoped_sessions} <- [
+        {:inside, ["notice-parent", "holder"]},
+        {:cross_scope, ["notice-parent"]},
+        {:outside, []}
+      ] do
+    test "a #{scope} completion delivers one handoff with the #{global} global rule", ctx do
+      base = scoped_handoff_identity!(unquote(global))
+
+      for key <- unquote(scoped_sessions) do
+        assert {:ok, _} =
+                 DB.query(ctx.db, "UPDATE sessions SET archetype=?1 WHERE sessionKey=?2", [
+                   @qualified_archetype,
+                   key
+                 ])
+      end
+
+      Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+
+      assert %{name: scoped_rule, owner: {:kungfu, @bundle}, archetypes: [@qualified_archetype]} =
+               Enum.find(
+                 Rules.effective_snapshot().reactions,
+                 &(&1.short_name == @handoff and
+                     &1.owner == {:kungfu, @bundle})
+               )
+
+      assert scoped_rule == "#{@bundle}.#{@handoff}"
+      {_parent, _child, notice} = completed_child(ctx)
+      assert notice.session_key == "notice-parent"
+      expected_rule = if unquote(scope) == :inside, do: scoped_rule, else: @handoff
+
+      expected_source =
+        case {unquote(scope), unquote(global)} do
+          {:inside, _} -> @bundle_rule
+          {_, :custom} -> "rules/custom-handoff.toml"
+          _ -> @handoff_seed
+        end
+
+      assert {:ok, [[^expected_rule, ^expected_source]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT json_extract(plan,'$.rule'), json_extract(plan,'$.provenance.source')
+                 FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1
+                 """,
+                 [notice.wake_id]
+               )
+
+      assert :ok = Wakes.fire_due(ctx.scheduler)
+      assert_delivered_carrier(ctx.db, notice.wake_id)
+    end
+  end
+
+  test "unrelated authored reactions still fail duplicate handoff identity validation", ctx do
+    base = scoped_handoff_identity!(:builtin)
+    path = Path.join([base, "identity", "rules", "other-reaction.toml"])
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, String.replace(handoff_seed_bytes(), @handoff, "other-reaction"))
+    Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+
+    assert_raise ArgumentError, "duplicate reaction identity or name", fn ->
+      event = %{"kind" => "assignment", "org" => "test", "id" => "test"}
+      Rules.reaction_plans(event, %{"sessions" => []})
+    end
+  end
+
+  defp scoped_handoff_identity!(global) do
+    base = Path.join(System.tmp_dir!(), "scoped-handoff-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(base) end)
+    init_identity_shape!(base, if(global == :seed, do: "fresh", else: "0.1.15"))
+    root = Path.join(base, "identity")
+    seed = handoff_seed_bytes()
+
+    for {path, bytes} <- [
+          {@bundle_rule, String.replace(seed, ~s(["*"]), ~s(["#{@qualified_archetype}"]))},
+          {@bundle_archetype, ~s(name = "worker"\nskills = []\nwhere = ["*"]\n)},
+          {"kungfu/#{@bundle}/installed.toml",
+           ~s(name = "#{@bundle}"\npaths = ["#{@bundle_rule}", "#{@bundle_archetype}"]\n)}
+        ] do
+      destination = Path.join(root, path)
+      File.mkdir_p!(Path.dirname(destination))
+      File.write!(destination, bytes)
+    end
+
+    if global == :custom do
+      path = Path.join(root, "rules/custom-handoff.toml")
+      File.mkdir_p!(Path.dirname(path))
+
+      File.write!(
+        path,
+        String.replace(seed, "[[reaction]]", ~s([[reaction]]\nenglish = "Custom handoff"))
+      )
+    end
+
+    base
+  end
+
+  defp handoff_seed_bytes,
+    do: File.read!(Application.app_dir(:tightbeam, Path.join("priv/seed", @handoff_seed)))
+
+  defp init_identity_shape!(base, "fresh"), do: :initialized = Tightbeam.Identity.init!(base)
+
+  defp init_identity_shape!(base, shape) do
+    previous = Application.get_env(:tightbeam, :identity_seed_dir)
+    Application.put_env(:tightbeam, :identity_seed_dir, Path.join(@identity_shapes, shape))
+
+    try do
+      :initialized = Tightbeam.Identity.init!(base)
+    after
+      if previous,
+        do: Application.put_env(:tightbeam, :identity_seed_dir, previous),
+        else: Application.delete_env(:tightbeam, :identity_seed_dir)
+    end
+  end
+
   defp forget_reaction_ledger!(db) do
     # Simulate the declared pre-cutover population: the original wake, source
     # occurrence and delivery receipts remain, with no reaction ledger yet.

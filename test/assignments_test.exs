@@ -3,7 +3,7 @@ defmodule Tightbeam.AssignmentsTest do
   alias Tightbeam.Model
 
   @session_identity_shape "session-identity-v1-0114"
-  @current_shape "attest-lifecycle-actor-v1-0117"
+  @current_shape "holder-role-provenance-v1-0118"
 
   alias Tightbeam.{
     Assignments,
@@ -5351,6 +5351,37 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'once'")
   end
 
+  test "session targets snapshot only one proven role and role queries use that history", ctx do
+    Roles.create!(ctx.db, "builder", "flynn", ctx.holder.session_key)
+
+    role_stamped =
+      handle(ctx, "assign", assign_call({:session, "holder"}, "one proven role"))
+
+    assert role_stamped.holderKey == "holder"
+    assert role_stamped.holderRole == "builder"
+
+    Roles.create!(ctx.db, "deployer", "flynn", ctx.holder.session_key)
+
+    ambiguous =
+      handle(ctx, "assign", assign_call({:session, "holder"}, "ambiguous roles"))
+
+    assert ambiguous.holderKey == "holder"
+    assert ambiguous.holderRole == nil
+
+    role_query =
+      query_call({:user, "flynn"}, "open", "other-session")
+      |> Map.put(:target_role, "builder")
+
+    assert %{assignments: [%{id: stamped_id}]} = handle(ctx, "assignments", role_query)
+    assert stamped_id == role_stamped.id
+
+    assert %{assignments: session_history} =
+             handle(ctx, "assignments", query_call({:user, "flynn"}, "open", "holder"))
+
+    assert Enum.map(session_history, & &1.id) |> Enum.sort() ==
+             Enum.sort([role_stamped.id, ambiguous.id])
+  end
+
   test "raw dispatch precheck and assignment mutation have no inactivity timer dependency", ctx do
     baseline = assignment_count(ctx.db)
 
@@ -5729,7 +5760,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert assignment_count(ctx.db) == assignment_count_before_unrelated + 1
   end
 
-  test "assign and dispatch refuse a foreign caller even after exact fired rumination", ctx do
+  test "ownerless staffing records FYIs regardless of caller rumination", ctx do
     work_item = create_work_item(ctx, "Foreign caller cannot gain authority by ruminating")
     baseline = assignment_count(ctx.db)
 
@@ -5742,14 +5773,14 @@ defmodule Tightbeam.AssignmentsTest do
             {:session, "other-session"},
             "foreign production",
             "Rumination is not authorization.",
-            nil,
+            "ownerless-#{state}-#{verb}",
             work_item.id
           )
           |> Map.put(:verb, verb)
           |> put_in([:params, :effect_kind], "code")
 
-        assert {:error, %{code: "delivery_owner_missing"}} =
-                 Dispatch.dispatch(ctx.db, ctx.handlers, call)
+        assert {:ok, %{fyi: [line]}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+        assert line == ownerless_fyi(work_item.id)
 
         forged =
           Map.put(call, :__tb_ownerless_fired_rumination_precheck__, {
@@ -5759,16 +5790,15 @@ defmodule Tightbeam.AssignmentsTest do
             "other-session"
           })
 
-        assert {:error, %{code: "delivery_owner_missing"}} =
-                 Dispatch.dispatch(ctx.db, ctx.handlers, forged)
+        assert {:ok, %{fyi: [^line]}} = Dispatch.dispatch(ctx.db, ctx.handlers, forged)
 
         if state == "fired" do
-          assert %{code: "delivery_owner_missing"} = handle(ctx, verb, forged)
+          assert {:ok, %{fyi: [^line]}} = Dispatch.dispatch(ctx.db, ctx.handlers, forged)
         end
       end
     end
 
-    assert assignment_count(ctx.db) == baseline
+    assert assignment_count(ctx.db) == baseline + 4
 
     # Core-only authentic same-user controls remain admitted for both verbs.
     session(ctx.db, "dispatcher", "flynn")
@@ -5825,7 +5855,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert assignment_count(ctx.db) == baseline + 1
   end
 
-  test "unowned dispatch rejects canceled and mismatched routing brackets", ctx do
+  test "ownerless dispatch accepts a canceled bracket and preserves a mismatched wake", ctx do
     canceled_item = create_work_item(ctx, "Canceled routing bracket")
     mismatched_item = seed_unrouted_work_item(ctx, "Mismatched routing bracket")
     mismatched_source_item = create_work_item(ctx, "Mismatched routing source")
@@ -5874,25 +5904,32 @@ defmodule Tightbeam.AssignmentsTest do
 
     baseline = assignment_count(ctx.db)
 
-    for item <- [canceled_item, mismatched_item] do
-      assert {:error, %{code: "delivery_owner_missing"}} =
-               Dispatch.dispatch(
-                 ctx.db,
-                 ctx.handlers,
-                 dispatch_call(
-                   {:session, "holder"},
-                   "invalid routing bracket",
-                   "Do not dispatch.",
-                   nil,
-                   item.id
-                 )
-               )
+    call_for = fn item ->
+      dispatch_call(
+        {:session, "holder"},
+        "ownerless routing bracket",
+        "Open ownerless staffing with an FYI.",
+        nil,
+        item.id
+      )
     end
 
-    assert assignment_count(ctx.db) == baseline
+    assert {:ok, %{fyi: [line]}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, call_for.(canceled_item))
+
+    assert line == ownerless_fyi(canceled_item.id)
+
+    # An item pointing at another item's wake is malformed live state. The
+    # existing typed cancellation must refuse rather than cancel that wake.
+    assert_raise WorkItems.CancellationRefused, fn ->
+      handle(ctx, "dispatch", call_for.(mismatched_item))
+    end
+
+    assert Wakes.get(ctx.db, mismatched_source_wake_id).state == "pending"
+    assert assignment_count(ctx.db) == baseline + 1
   end
 
-  test "rumination alone cannot authorize unowned dispatch without a routing bracket", ctx do
+  test "ownerless dispatch records FYIs for rumination without a routing bracket", ctx do
     pending_item = seed_unrouted_work_item(ctx, "Pending rumination without bracket")
     wrong_item = seed_unrouted_work_item(ctx, "Wrong-item rumination target")
     wrong_item_source = seed_unrouted_work_item(ctx, "Wrong-item rumination source")
@@ -5914,7 +5951,7 @@ defmodule Tightbeam.AssignmentsTest do
           {wrong_item, "wrong-item fired rumination"},
           {wrong_caller_item, "wrong-caller fired rumination"}
         ] do
-      assert {:error, %{code: "delivery_owner_missing"}} =
+      assert {:ok, %{fyi: [line]}} =
                Dispatch.dispatch(
                  ctx.db,
                  ctx.handlers,
@@ -5926,12 +5963,14 @@ defmodule Tightbeam.AssignmentsTest do
                    item.id
                  )
                )
+
+      assert line == ownerless_fyi(item.id)
     end
 
-    assert assignment_count(ctx.db) == baseline
+    assert assignment_count(ctx.db) == baseline + 4
   end
 
-  test "raw DB-seeded unowned dispatch refuses a missing bracket and forged receipt", ctx do
+  test "raw ownerless dispatch records the same FYI on replay with a forged receipt", ctx do
     work_item = seed_unrouted_work_item(ctx, "Raw unowned item")
     caller = "holder"
 
@@ -5940,14 +5979,14 @@ defmodule Tightbeam.AssignmentsTest do
         {:session, caller},
         "raw ownerless dispatch",
         "A raw item has no routing bracket.",
-        nil,
+        "raw-ownerless-replay",
         work_item.id
       )
 
     baseline = assignment_count(ctx.db)
 
-    assert {:error, %{code: "delivery_owner_missing"}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert {:ok, %{id: id, fyi: [line]}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert line == ownerless_fyi(work_item.id)
 
     forged =
       Map.put(call, :__tb_ownerless_fired_rumination_precheck__, {
@@ -5957,10 +5996,10 @@ defmodule Tightbeam.AssignmentsTest do
         caller
       })
 
-    assert {:error, %{code: "delivery_owner_missing"}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, forged)
+    assert {:ok, %{id: ^id, fyi: [^line]}} = Dispatch.dispatch(ctx.db, ctx.handlers, forged)
+    assert handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, id)).fyi == [line]
 
-    assert assignment_count(ctx.db) == baseline
+    assert assignment_count(ctx.db) == baseline + 1
   end
 
   test "review and file declarations are assign-only inputs", ctx do
@@ -6188,7 +6227,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert Enum.find(legacy, &(&1.id == review.id)).effectKind == "review"
   end
 
-  test "Proof 1: a conflicting review-assignment create is refused with review_item_conflict",
+  test "Proof 1: a review card on another work item is opened with an FYI naming both items",
        ctx do
     first_item = create_work_item(ctx, "Reviewed item")
     second_item = create_work_item(ctx, "Conflicting item")
@@ -6200,19 +6239,45 @@ defmodule Tightbeam.AssignmentsTest do
       assign_call({:user, "flynn"}, "conflicting review", nil, second_item.id)
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
 
-    assert %{
-             code: "review_item_conflict",
-             message: "a review assignment must belong to the item it reviews"
-           } = handle(ctx, "assign", conflict)
+    line =
+      "FYI: this review card is on work item #{second_item.id}; assignment #{reviewed.id} " <>
+        "it reviews is on work item #{first_item.id}; decide for yourself whether that is acceptable"
 
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM assignments WHERE subject = 'conflicting review'"
-             )
+    assert %{id: review_id, workItemId: item_id, reviewsAssignmentId: reviews_id, fyi: [^line]} =
+             handle(ctx, "assign", conflict)
+
+    assert item_id == second_item.id
+    assert reviews_id == reviewed.id
+
+    assert %{fyi: [^line]} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, review_id))
+
+    assert [line] ==
+             Assignments.list(ctx.db, %{state: "all"})
+             |> Enum.find(&(&1.id == review_id))
+             |> Map.fetch!(:fyi)
+
+    rest_row =
+      Tightbeam.StateResources.query_assignment(ctx.db, review_id, %{principal: {:user, "flynn"}})
+
+    assert %{fyi: [^line]} = rest_row
+    assert [^line] = Tightbeam.StateResources.assignment(rest_row)["fyi"]
+
+    assert %{fyi: []} =
+             Tightbeam.StateResources.query_assignment(ctx.db, reviewed.id, %{
+               principal: {:user, "flynn"}
+             })
+
+    # A review card on the reviewed card's own item carries no FYI.
+    aligned =
+      assign_call({:user, "flynn"}, "aligned review", nil, first_item.id)
+      |> put_in([:params, :reviews_assignment_id], reviewed.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    refute Map.has_key?(aligned, :fyi)
   end
 
-  test "Proof 2: a review assignment cannot itself be reviewed",
+  test "Proof 2: a review of a review card is opened with an FYI and traced on the item",
        ctx do
     item = create_work_item(ctx, "Review boundary")
     reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "base", nil, item.id))
@@ -6229,14 +6294,15 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert first_review.workItemId == nil
     assert Assignments.resolved_work_item_id(ctx.db, first_review.id) == item.id
+    refute Map.has_key?(first_review, :fyi)
 
-    assert %{
-             code: "review_of_review",
-             message: "a review assignment cannot itself be reviewed"
-           } = nested_review
+    line =
+      "FYI: assignment #{first_review.id} that this card reviews is itself a review card; " <>
+        "decide for yourself whether that is acceptable"
 
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'second review'")
+    assert %{reviewsAssignmentId: reviews_id, workItemId: nil, fyi: [^line]} = nested_review
+    assert reviews_id == first_review.id
+    assert Assignments.resolved_work_item_id(ctx.db, nested_review.id) == item.id
 
     trace =
       Tightbeam.WorkItems.__handle__(ctx.db, "work-item-trace", %{
@@ -6250,7 +6316,9 @@ defmodule Tightbeam.AssignmentsTest do
     traced_ids = Enum.map(trace.assignments, & &1.id)
 
     assert Enum.count(traced_ids, &(&1 == first_review.id)) == 1
-    assert Enum.sort(traced_ids) == Enum.sort([reviewed.id, first_review.id])
+
+    assert Enum.sort(traced_ids) ==
+             Enum.sort([reviewed.id, first_review.id, nested_review.id])
   end
 
   test "Proof 3: an assignment with neither key resolves to NONE", ctx do
@@ -8416,6 +8484,178 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{files: [%{status: "absent"}]} = check.()
   end
 
+  test "filing an attest or artifact that cites paths never checks them", ctx do
+    item = create_work_item(ctx, "paths in filing")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+
+    register_hosts(ctx.db, %{
+      "lab2" => %{ssh: "unreachable.invalid", base_dir: "/b", cli_bin: nil}
+    })
+
+    parent = self()
+
+    # Any stat would block forever here, so a filing that waited on one would
+    # never return.
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        sh: fn command ->
+          send(parent, {:probe, command})
+          receive do: (:never -> {"", 0})
+        end,
+        file_stat: fn path ->
+          send(parent, {:checked, path})
+          receive do: (:never -> {:ok, %{}})
+        end
+      })
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in([:params, :note], "log at lab2:/w/log.txt and /w/log.txt, not an artifact")
+      |> then(&handlers["attest"].(&1))
+
+    # The path is accepted as text: no artifact is needed to cite it, and the
+    # result carries no path note.
+    assert attested.attest.note == "log at lab2:/w/log.txt and /w/log.txt, not an artifact"
+    refute inspect(attested) =~ "verified present"
+    refute inspect(attested) =~ "check before relying on it"
+
+    recorded =
+      handlers["artifact-record"].(%{
+        principal: {:session, "holder"},
+        session_key: "holder",
+        params: %{
+          kind: "report",
+          title: "remote log",
+          origin_path: "lab2:/w/log.txt",
+          work_item_id: item.id
+        }
+      })
+
+    assert recorded.origin_path == "lab2:/w/log.txt"
+    refute_received {:probe, _}
+    refute_received {:checked, _}
+  end
+
+  test "check-attest also checks absolute paths written in the attest note", ctx do
+    item = create_work_item(ctx, "note paths")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "notes", nil, item.id))
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        file_stat: fn path ->
+          send(parent, {:checked, path})
+
+          case path do
+            "/w/log.txt" -> {:ok, %{}}
+            _ -> {:error, :enoent}
+          end
+        end
+      })
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in(
+        [:params, :note],
+        ~s(log /w/log.txt, notes "/w/run notes.md"; also /w/log.txt, rel/x.md and ~/y.md)
+      )
+      |> then(&handlers["attest"].(&1))
+
+    assert {:ok, result} =
+             Dispatch.dispatch(
+               ctx.db,
+               handlers,
+               call("check-attest", {:session, "holder"}, nil, %{attest_id: attested.attest.id})
+             )
+
+    # The filer's host checks plain paths; relative and home paths are not
+    # checked, and a repeated path is checked once.
+    assert Enum.map(result.files, &{&1.notePath, &1.checkedHost, &1.checkedPath, &1.status}) == [
+             {"/w/log.txt", "lab1", "/w/log.txt", "present"},
+             {"/w/run notes.md", "lab1", "/w/run notes.md", "absent"}
+           ]
+
+    assert result.summary == "absent: lab1:/w/run notes.md"
+    assert_received {:checked, "/w/log.txt"}
+    assert_received {:checked, "/w/run notes.md"}
+    refute_received {:checked, _}
+  end
+
+  test "check-attest checks a host-qualified note path on that host", ctx do
+    item = create_work_item(ctx, "host note paths")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "notes", nil, item.id))
+    seed_file_artifact(ctx.db, item.id, "art_present", assignment.id, "lab1:/files/present")
+
+    register_hosts(ctx.db, %{
+      "lab2" => %{ssh: "lab2.test", base_dir: "/b", cli_bin: nil}
+    })
+
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        sh: fn ["ssh", "-o", "BatchMode=yes", destination, command] ->
+          send(parent, {:remote, destination, command})
+          {"ssh: connect to host lab2.test port 22: Connection refused\r\n", 255}
+        end,
+        file_stat: fn _path -> {:ok, %{}} end
+      })
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in([:params, :note], "remote log at lab2:/w/log.txt")
+      |> then(&handlers["attest"].(&1))
+
+    result =
+      handlers["check-attest"].(%{params: %{attest_id: attested.attest.id}})
+
+    assert [
+             %{artifactId: "art_present", status: "present"},
+             %{
+               notePath: "lab2:/w/log.txt",
+               checkedHost: "lab2",
+               checkedPath: "/w/log.txt",
+               status: "could_not_access",
+               error: "ssh: connect to host lab2.test port 22: Connection refused\r\n"
+             }
+           ] = result.files
+
+    assert result.summary == "could not access: lab2:/w/log.txt"
+    assert_received {:remote, "lab2.test", command}
+    assert command =~ "'/w/log.txt'"
+  end
+
+  test "check-attest checks real note paths on the filer's host", ctx do
+    item = create_work_item(ctx, "real note paths")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "notes", nil, item.id))
+    dir = Path.join(Application.fetch_env!(:tightbeam, :base_dir), "note-paths")
+    File.mkdir_p!(dir)
+    present = Path.join(dir, "log.txt")
+    absent = Path.join(dir, "run notes.md")
+    File.write!(present, "log")
+    File.rm(absent)
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in([:params, :note], ~s(see #{present} and "#{absent}"))
+      |> then(&handle(ctx, "attest", &1))
+
+    check = fn ->
+      Gateway.handlers(%{db: ctx.db, base_dir: Application.fetch_env!(:tightbeam, :base_dir)})[
+        "check-attest"
+      ].(%{params: %{attest_id: attested.attest.id}})
+    end
+
+    assert %{files: [%{status: "present"}, %{status: "absent"}], summary: summary} = check.()
+    assert summary == "absent: lab1:#{absent}"
+  end
+
   test "accepted handler rolls back when its event append fails", ctx do
     {:ok, _} = DB.query(ctx.db, "DROP TABLE events")
 
@@ -9193,4 +9433,8 @@ defmodule Tightbeam.AssignmentsTest do
       MapSet.member?(wake_ids, wake_id)
     end)
   end
+
+  defp ownerless_fyi(id),
+    do:
+      "FYI: work item #{id} has no recorded delivery owner; decide for yourself whether that is acceptable"
 end

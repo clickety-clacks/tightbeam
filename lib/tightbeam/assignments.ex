@@ -1015,14 +1015,19 @@ defmodule Tightbeam.Assignments do
     count
   end
 
-  @doc "List assignments using optional holder_key and state filters."
+  @doc "List assignments using optional holder_key, holder_role, and state filters."
   @spec list(DB.server(), map()) :: [map()]
   def list(db, filters) do
     state = Map.get(filters, :state, "open")
-    holder = Map.get(filters, :holder_key)
+    holder_key = Map.get(filters, :holder_key)
+    holder_role = Map.get(filters, :holder_role)
 
     {clauses, params} =
-      [{state != "all", "state", state}, {not is_nil(holder), "holderKey", holder}]
+      [
+        {state != "all", "state", state},
+        {not is_nil(holder_key), "holderKey", holder_key},
+        {not is_nil(holder_role), "holderRole", holder_role}
+      ]
       |> Enum.filter(&elem(&1, 0))
       |> Enum.with_index(1)
       |> Enum.map_reduce([], fn {{_present, column, value}, index}, values ->
@@ -1050,12 +1055,19 @@ defmodule Tightbeam.Assignments do
 
     files = Enum.group_by(file_rows, &hd/1, &List.last/1)
     corrections = Tightbeam.AssignmentCommitRefCorrections.list_many(db, ids)
+    fyis = RecordFyis.list_many(db, "assignment", ids)
 
     Enum.map(assignments, fn assignment ->
       assignment
       |> Map.put(:files, Map.get(files, assignment.id, []))
       |> Map.put(:commitRefCorrections, Map.get(corrections, assignment.id, []))
       |> then(&Mementos.attach(db, "assignment", &1))
+      |> then(fn assignment ->
+        case Map.get(fyis, assignment.id) do
+          nil -> assignment
+          fyi -> Map.put(assignment, :fyi, fyi)
+        end
+      end)
     end)
   end
 
@@ -1618,6 +1630,11 @@ defmodule Tightbeam.Assignments do
                 :ok ->
                   :proceed
 
+                # Staffing-owner facts are stated as FYIs when the assignment
+                # is created; they do not stop the dispatch here.
+                {:ok, _facts} ->
+                  :proceed
+
                 %{code: _} = error ->
                   {:refuse, error}
               end
@@ -1871,6 +1888,7 @@ defmodule Tightbeam.Assignments do
         {:accepted_in_txn, event_id, {:created, assignment, delivery, effects}} ->
           close_memento_effects(db, call, effects)
           assignment = finalize_created_assignment(call, assignment, delivery)
+
           {:accepted_in_txn, event_id, %{assignment: assignment}}
 
         {:created, assignment, delivery, effects} ->
@@ -1993,7 +2011,7 @@ defmodule Tightbeam.Assignments do
         end
 
       id ->
-        {:replayed, fetch_assignment!(txn, id)}
+        {:replayed, RecordFyis.attach(txn, "assignment", fetch_assignment!(txn, id))}
     end
   end
 
@@ -2199,9 +2217,14 @@ defmodule Tightbeam.Assignments do
   defp assignments_result(db, call) do
     with :ok <- principal_allowed(call.principal, "assignments"),
          :ok <- valid_state(call.params[:state]) do
+      holder_filter =
+        case call[:target_role] do
+          role when is_binary(role) -> %{holder_role: role}
+          nil -> %{holder_key: call.session_key}
+        end
+
       %{
-        assignments:
-          list(db, %{holder_key: call.session_key, state: call.params[:state] || "open"})
+        assignments: list(db, Map.put(holder_filter, :state, call.params[:state] || "open"))
       }
     end
   end
@@ -2218,6 +2241,7 @@ defmodule Tightbeam.Assignments do
           result =
             assignment(row)
             |> then(&Mementos.attach(db, "assignment", &1))
+            |> then(&RecordFyis.attach(db, "assignment", &1))
             |> Map.put(:reopenings, list_reopenings(db, assignment_id))
             |> Map.put(
               :commitRefCorrections,
@@ -2432,43 +2456,68 @@ defmodule Tightbeam.Assignments do
         # F7 amendment: dispatch persists workItemId exactly as assign does.
         work_item_id = call.params[:work_item_id]
 
-        case Tightbeam.DeliveryResponsibilities.check_staffing_owner_in_txn(
-               txn,
-               call,
-               target_session_key: call.session_key,
-               target_archetype: target_archetype
-             ) do
-          :ok -> :ok
-          %{code: _} = error -> throw({:delivery_owner_error, error})
-        end
+        staffing_facts =
+          case Tightbeam.DeliveryResponsibilities.check_staffing_owner_in_txn(
+                 txn,
+                 call,
+                 target_session_key: call.session_key,
+                 target_archetype: target_archetype
+               ) do
+            :ok -> []
+            {:ok, facts} -> facts
+            %{code: _} = error -> throw({:delivery_owner_error, error})
+          end
 
         reviews_assignment_id =
           if verb == "assign", do: call.params[:reviews_assignment_id], else: nil
 
-        if reviews_assignment_id do
-          case Txn.q(
-                 txn,
-                 "SELECT reviewsAssignmentId FROM assignments WHERE id = ?1",
-                 [reviews_assignment_id]
-               ) do
-            [] ->
-              raise UnknownReviewTarget, assignment_id: reviews_assignment_id
+        review_facts =
+          if reviews_assignment_id do
+            review_of_review_facts =
+              case Txn.q(
+                     txn,
+                     "SELECT reviewsAssignmentId FROM assignments WHERE id = ?1",
+                     [reviews_assignment_id]
+                   ) do
+                [] ->
+                  raise UnknownReviewTarget, assignment_id: reviews_assignment_id
 
-            [[nil]] ->
-              :ok
+                [[nil]] ->
+                  []
 
-            [[_reviews_assignment_id]] ->
-              throw(:review_of_review)
+                [[_reviews_assignment_id]] ->
+                  [
+                    "assignment #{reviews_assignment_id} that this card reviews is itself a review card"
+                  ]
+              end
+
+            reviewed_item_id =
+              resolve_work_item_id_in_txn(txn, reviews_assignment_id, MapSet.new())
+
+            item_facts =
+              cond do
+                is_nil(work_item_id) or work_item_id == reviewed_item_id ->
+                  []
+
+                is_nil(reviewed_item_id) ->
+                  [
+                    "this review card is on work item #{work_item_id}; " <>
+                      "assignment #{reviews_assignment_id} it reviews is on no work item"
+                  ]
+
+                true ->
+                  [
+                    "this review card is on work item #{work_item_id}; " <>
+                      "assignment #{reviews_assignment_id} it reviews is on work item #{reviewed_item_id}"
+                  ]
+              end
+
+            review_of_review_facts ++ item_facts
+          else
+            []
           end
-        end
 
-        if reviews_assignment_id do
-          reviewed_item_id = resolve_work_item_id_in_txn(txn, reviews_assignment_id, MapSet.new())
-
-          if not is_nil(work_item_id) and work_item_id != reviewed_item_id do
-            throw(:review_item_conflict)
-          end
-        end
+        fyi = Enum.map(Enum.uniq(staffing_facts ++ review_facts), &RecordFyis.line/1)
 
         {subject, succeeds_assignment_id} = prepare_successor_in_txn!(txn, call)
 
@@ -2489,6 +2538,7 @@ defmodule Tightbeam.Assignments do
         now = now()
         {opened_user, opened_session} = opener(call.principal)
         {parent_id, parent_explanation} = opening_parent_in_txn(txn, call)
+        holder_role = historical_holder_role_in_txn(txn, call)
 
         Txn.q(
           txn,
@@ -2503,7 +2553,7 @@ defmodule Tightbeam.Assignments do
             id,
             subject,
             call.session_key,
-            call.target_role,
+            holder_role,
             if(call.role_fallback, do: 1, else: 0),
             opened_user,
             opened_session,
@@ -2578,7 +2628,9 @@ defmodule Tightbeam.Assignments do
           )
         end
 
+        :ok = RecordFyis.put_in_txn(txn, "assignment", id, fyi)
         assignment = fetch_assignment!(txn, id)
+        assignment = if fyi == [], do: assignment, else: Map.put(assignment, :fyi, fyi)
 
         assignment =
           if parent_explanation,
@@ -2605,20 +2657,44 @@ defmodule Tightbeam.Assignments do
     {:work_item_not_open, work_item_id} ->
       error("work_item_not_open", "work item #{work_item_id} is not open")
 
-    :review_item_conflict ->
-      error(
-        "review_item_conflict",
-        "a review assignment must belong to the item it reviews"
-      )
-
-    :review_of_review ->
-      error("review_of_review", "a review assignment cannot itself be reviewed")
-
     {:successor_error, error} ->
       error
 
     {:delivery_owner_error, error} ->
       error
+  end
+
+  defp historical_holder_role_in_txn(_txn, %{target_role: role}) when is_binary(role), do: role
+
+  defp historical_holder_role_in_txn(txn, %{session_key: session_key}) do
+    case Txn.q(
+           txn,
+           "SELECT name FROM roles WHERE boundSessionKey = ?1 ORDER BY name LIMIT 2",
+           [session_key]
+         ) do
+      [[role]] -> role
+      _ -> nil
+    end
+  end
+
+  @doc false
+  @spec backfill_holder_roles_in_txn(Txn.t()) :: non_neg_integer()
+  def backfill_holder_roles_in_txn(%Txn{} = txn) do
+    Txn.q(
+      txn,
+      """
+      UPDATE assignments
+      SET holderRole = (
+        SELECT roles.name FROM roles WHERE roles.boundSessionKey = assignments.holderKey
+      )
+      WHERE holderRole IS NULL
+        AND (
+          SELECT COUNT(*) FROM roles WHERE roles.boundSessionKey = assignments.holderKey
+        ) = 1
+      """
+    )
+
+    Txn.changes(txn)
   end
 
   defp prepare_successor_in_txn!(txn, call) do
@@ -4807,15 +4883,25 @@ defmodule Tightbeam.Assignments do
       )
 
     case rows do
-      [row] -> assignment(row) |> then(&Mementos.attach(db, "assignment", &1))
-      [] -> nil
+      [row] ->
+        assignment(row)
+        |> then(&Mementos.attach(db, "assignment", &1))
+        |> then(&RecordFyis.attach(db, "assignment", &1))
+
+      [] ->
+        nil
     end
   end
 
   defp fetch_assignment(txn, id) do
     case Txn.q(txn, "SELECT #{columns()} FROM assignments WHERE id = ?1", [id]) do
-      [row] -> assignment(row) |> then(&Mementos.attach(txn, "assignment", &1))
-      [] -> nil
+      [row] ->
+        assignment(row)
+        |> then(&Mementos.attach(txn, "assignment", &1))
+        |> then(&RecordFyis.attach(txn, "assignment", &1))
+
+      [] ->
+        nil
     end
   end
 
@@ -5071,6 +5157,8 @@ defmodule Tightbeam.Assignments do
         verification
       )
 
+    call = note_ignored_review_verdicts_in_txn(txn, assignment, call, verification, review)
+
     review_pending? = Map.get(call, :review_pending, false)
 
     independent_clean_review? =
@@ -5133,6 +5221,40 @@ defmodule Tightbeam.Assignments do
   end
 
   defp applicable_code_completion_in_txn(_txn, _assignment, call), do: {:ok, call}
+
+  defp note_ignored_review_verdicts_in_txn(txn, assignment, call, verification, review) do
+    ignored =
+      Txn.q(
+        txn,
+        """
+        SELECT DISTINCT r.id,v.verdictKind
+        FROM attests v
+        JOIN assignments r ON r.id=v.assignmentId
+        WHERE r.reviewsAssignmentId=?1
+          AND v.kind='verdict'
+          AND v.bySession=r.holderKey
+          AND v.verdictKind NOT IN ('reviewed-clean','changes-requested')
+        ORDER BY r.id,v.verdictKind
+        """,
+        [assignment.id]
+      )
+
+    if ignored == [] do
+      call
+    else
+      verification_status = if verification, do: verification.kind, else: "absent"
+      review_status = if review, do: review.kind, else: "absent"
+      verdicts = Enum.map_join(ignored, ", ", fn [id, kind] -> "#{id}: #{kind}" end)
+
+      RecordFyis.note(
+        call,
+        "holder verification conclusion: #{verification_status}; " <>
+          "counted review conclusion: #{review_status}; " <>
+          "linked review verdicts ignored for their kind: #{verdicts}; " <>
+          "counted review kinds are reviewed-clean and changes-requested"
+      )
+    end
+  end
 
   defp missing_verification_fact(%{kind: kind}) when kind != "verified",
     do: "the holder's latest verification verdict on this code assignment is #{kind}"

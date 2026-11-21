@@ -693,7 +693,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
               # A main-line database before the 0.1.16 merge: session custody
               # applied, artifact process attribution not yet.
               "session-custody-v1-0116",
-              "attest-lifecycle-actor-v1-0117"
+              "holder-role-provenance-v1-0118"
             ]
           )
 

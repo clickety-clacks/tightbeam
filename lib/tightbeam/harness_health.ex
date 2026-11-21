@@ -27,6 +27,7 @@ defmodule Tightbeam.HarnessHealth do
     Org,
     Wire.Payloads,
     Projection,
+    RecordFyis,
     Wakes
   }
 
@@ -1657,8 +1658,27 @@ defmodule Tightbeam.HarnessHealth do
         [description_digest]
       )
 
-    if recurrence > 1 and outcome != "promotion_required",
-      do: raise(ArgumentError, "invalid_review_outcome")
+    promotion_case_id = promotion_case_id(txn, description_digest, recurrence)
+
+    # A recurring description with an open promotion case may still be
+    # reviewed with another outcome; the case stays linked and open, and the
+    # recurrence is stated as an FYI. With no open case this stays a refusal.
+    fyi =
+      cond do
+        recurrence > 1 and outcome != "promotion_required" and is_nil(promotion_case_id) ->
+          raise ArgumentError, "invalid_review_outcome"
+
+        recurrence > 1 and outcome != "promotion_required" ->
+          [
+            RecordFyis.line(
+              "incidents with this description have recurred #{recurrence} times and " <>
+                "promotion case #{promotion_case_id} is open; this review records #{outcome}"
+            )
+          ]
+
+        true ->
+          []
+      end
 
     if recurrence <= 1 and outcome == "promotion_required",
       do: raise(ArgumentError, "promotion_required")
@@ -1667,8 +1687,6 @@ defmodule Tightbeam.HarnessHealth do
       do: raise(ArgumentError, "invalid_review_outcome")
 
     cause = required_review_cause!(input)
-
-    promotion_case_id = promotion_case_id(txn, description_digest, recurrence)
 
     if recurrence > 1 and is_nil(promotion_case_id),
       do: raise(ArgumentError, "promotion_required")
@@ -1715,7 +1733,9 @@ defmodule Tightbeam.HarnessHealth do
       ["hhore_" <> Id.uuid4(), incident_id, reviewer, JSON.encode!(event), now(input)]
     )
 
+    :ok = RecordFyis.put_in_txn(txn, "harness_health_review", incident_id, fyi)
     result = %{incidentId: incident_id, state: "closed", outcome: outcome}
+    result = if fyi == [], do: result, else: Map.put(result, :fyi, fyi)
 
     store_other_idempotency(
       txn,
@@ -1834,6 +1854,7 @@ defmodule Tightbeam.HarnessHealth do
                 namedClass: named_class,
                 reviewAttestId: provenance.existing_review_attest_id || review_attest_id
               }
+              |> then(&promotion_fyi(txn, promotion_id, &1, provenance.fyi))
 
             [["closed", _named, _ref, _sha, _artifact, _attest, _first]] ->
               raise ArgumentError, "promotion_closed"
@@ -1883,12 +1904,21 @@ defmodule Tightbeam.HarnessHealth do
                 ]
               )
 
+              :ok =
+                RecordFyis.put_in_txn(
+                  txn,
+                  "harness_health_promotion",
+                  promotion_id,
+                  provenance.fyi
+                )
+
               %{
                 promotionId: promotion_id,
                 state: "closed",
                 namedClass: named_class,
                 reviewAttestId: review_attest_id
               }
+              |> then(&promotion_fyi(txn, promotion_id, &1, provenance.fyi))
 
             [] ->
               raise ArgumentError, "promotion_not_found"
@@ -1939,26 +1969,23 @@ defmodule Tightbeam.HarnessHealth do
       stored_review_attest_id
     ] = promotion
 
+    # H1: the closed row stores the spec artifact's path and hash and the
+    # cited reviewed-clean verdict, so those must exist and be well formed.
     spec =
       case Txn.q(
              txn,
              "SELECT kind,originPath,contentSha256,workItemId FROM artifacts WHERE artifactId=?1",
              [spec_artifact_id]
            ) do
-        [["spec", ref, sha, work_item_id]]
+        [[kind, ref, sha, work_item_id]]
         when is_binary(ref) and is_binary(sha) and is_binary(work_item_id) ->
           if sha256_digest?(sha),
-            do: %{spec_ref: ref, spec_sha256: sha, work_item_id: work_item_id},
+            do: %{kind: kind, spec_ref: ref, spec_sha256: sha, work_item_id: work_item_id},
             else: raise(ArgumentError, "invalid_promotion_close")
 
         _ ->
           raise ArgumentError, "invalid_promotion_close"
       end
-
-    unless Txn.q(txn, "SELECT specRefName,specRefSha256 FROM work_items WHERE id=?1", [
-             spec.work_item_id
-           ]) == [[spec.spec_ref, spec.spec_sha256]],
-           do: raise(ArgumentError, "invalid_promotion_close")
 
     review =
       case Txn.q(
@@ -1966,9 +1993,9 @@ defmodule Tightbeam.HarnessHealth do
              "SELECT kind,contentSha256,workItemId FROM artifacts WHERE artifactId=?1",
              [review_artifact_id]
            ) do
-        [["report", sha, work_item_id]] when is_binary(sha) and is_binary(work_item_id) ->
+        [[kind, sha, work_item_id]] when is_binary(sha) and is_binary(work_item_id) ->
           if sha256_digest?(sha),
-            do: %{content_sha256: sha, work_item_id: work_item_id},
+            do: %{kind: kind, content_sha256: sha, work_item_id: work_item_id},
             else: raise(ArgumentError, "invalid_promotion_close")
 
         _ ->
@@ -2005,19 +2032,11 @@ defmodule Tightbeam.HarnessHealth do
           raise ArgumentError, "invalid_promotion_close"
       end
 
-    unless attest.content_sha256 == review.content_sha256 and
-             commit_ref_matches?(attest.commit_refs, candidate_commit),
+    unless Regex.match?(~r/\A[0-9a-f]{40}\z/, candidate_commit) and
+             review_assignment_id != promotion_id,
            do: raise(ArgumentError, "invalid_promotion_close")
 
-    candidate_work_item_id = review_work_item_id(txn, review_assignment_id)
-
-    unless review_assignment_id != promotion_id and
-             is_binary(candidate_work_item_id) and
-             review.work_item_id == candidate_work_item_id and
-             spec.work_item_id == candidate_work_item_id and
-             review_bound_to_candidate?(txn, review_assignment_id, attest.reviewer_session),
-           do: raise(ArgumentError, "invalid_promotion_close")
-
+    # H4: the promotion's own two incidents must agree with its stored digest.
     unless is_binary(first_incident) and is_binary(second_incident) and
              first_incident != second_incident and
              Txn.q(
@@ -2027,23 +2046,27 @@ defmodule Tightbeam.HarnessHealth do
              ) == [[2]],
            do: raise(ArgumentError, "invalid_promotion_close")
 
-    source_sessions =
-      Txn.q(
-        txn,
-        "SELECT DISTINCT sessionKey FROM harness_health_observations WHERE id IN ((SELECT openObservationId FROM harness_health_incidents WHERE id=?1),(SELECT openObservationId FROM harness_health_incidents WHERE id=?2)) AND sessionKey IS NOT NULL",
-        [first_incident, second_incident]
-      )
-      |> List.flatten()
-
-    unless attest.reviewer_session not in source_sessions and
-             attest.reviewer_session != principal_session(input),
-           do: raise(ArgumentError, "invalid_promotion_close")
-
-    if input[:spec_ref] && input.spec_ref != spec.spec_ref,
-      do: raise(ArgumentError, "invalid_promotion_close")
-
-    if input[:spec_sha256] && input.spec_sha256 != spec.spec_sha256,
-      do: raise(ArgumentError, "invalid_promotion_close")
+    # H2 and H3: comparisons between the cited records are stated as FYIs.
+    facts =
+      promotion_record_facts(spec, spec_artifact_id, review, review_artifact_id, input) ++
+        promotion_review_facts(
+          txn,
+          attest,
+          review,
+          review_attest_id,
+          review_artifact_id,
+          review_assignment_id,
+          candidate_commit,
+          spec,
+          spec_artifact_id
+        ) ++
+        promotion_reviewer_facts(
+          txn,
+          attest.reviewer_session,
+          first_incident,
+          second_incident,
+          input
+        )
 
     existing_review_attest_id =
       if promotion_state == "closed" do
@@ -2059,43 +2082,191 @@ defmodule Tightbeam.HarnessHealth do
       end
 
     spec
+    |> Map.take([:spec_ref, :spec_sha256, :work_item_id])
     |> Map.put(:reviewer_session, attest.reviewer_session)
     |> Map.put(:reviewer_user, attest.reviewer_user)
     |> Map.put(:review_artifact_sha256, review.content_sha256)
     |> Map.put(:existing_review_attest_id, existing_review_attest_id)
+    |> Map.put(:fyi, facts |> Enum.uniq() |> Enum.map(&RecordFyis.line/1))
   end
 
-  defp review_bound_to_candidate?(txn, assignment_id, reviewer_session) do
+  # A close returns the FYIs recorded with the promotion's close, followed by
+  # any this request's own comparisons found that are not already among them.
+  defp promotion_fyi(txn, promotion_id, result, current) do
+    recorded =
+      txn
+      |> RecordFyis.list_many("harness_health_promotion", [promotion_id])
+      |> Map.get(promotion_id, [])
+
+    case Enum.uniq(recorded ++ current) do
+      [] -> result
+      fyi -> Map.put(result, :fyi, fyi)
+    end
+  end
+
+  defp promotion_record_facts(spec, spec_artifact_id, review, review_artifact_id, input) do
+    [
+      if(spec.kind != "spec",
+        do: "spec artifact #{spec_artifact_id} is recorded with kind #{spec.kind}, not spec"
+      ),
+      if(review.kind != "report",
+        do:
+          "review artifact #{review_artifact_id} is recorded with kind #{review.kind}, not report"
+      ),
+      if(input[:spec_ref] && input.spec_ref != spec.spec_ref,
+        do:
+          "this close names spec #{input.spec_ref}; spec artifact #{spec_artifact_id} is #{spec.spec_ref}"
+      ),
+      if(input[:spec_sha256] && input.spec_sha256 != spec.spec_sha256,
+        do:
+          "this close names spec sha256 #{input.spec_sha256}; " <>
+            "spec artifact #{spec_artifact_id} is sha256 #{spec.spec_sha256}"
+      )
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp promotion_review_facts(
+         txn,
+         attest,
+         review,
+         review_attest_id,
+         review_artifact_id,
+         review_assignment_id,
+         candidate_commit,
+         spec,
+         spec_artifact_id
+       ) do
+    binding =
+      case Txn.q(txn, "SELECT specRefName,specRefSha256 FROM work_items WHERE id=?1", [
+             spec.work_item_id
+           ]) do
+        [[ref, sha]] when ref == spec.spec_ref and sha == spec.spec_sha256 ->
+          nil
+
+        [[nil, nil]] ->
+          "work item #{spec.work_item_id} binds no spec; " <>
+            "spec artifact #{spec_artifact_id} is #{spec.spec_ref} sha256 #{spec.spec_sha256}"
+
+        [[ref, sha]] ->
+          "work item #{spec.work_item_id} binds spec #{ref} sha256 #{sha}; " <>
+            "spec artifact #{spec_artifact_id} is #{spec.spec_ref} sha256 #{spec.spec_sha256}"
+      end
+
+    review_work_item_id = review_work_item_id(txn, review_assignment_id)
+
+    [
+      binding,
+      if(attest.content_sha256 != review.content_sha256,
+        do:
+          "review attest #{review_attest_id} cites sha256 #{attest.content_sha256}; " <>
+            "review artifact #{review_artifact_id} is sha256 #{review.content_sha256}"
+      ),
+      if(not commit_ref_matches?(attest.commit_refs, candidate_commit),
+        do:
+          "review attest #{review_attest_id} lists commits #{listed_commits(attest.commit_refs)}; " <>
+            "the candidate commit is #{candidate_commit}"
+      ),
+      cond do
+        is_nil(review_work_item_id) ->
+          "review assignment #{review_assignment_id} records no work item"
+
+        review.work_item_id != review_work_item_id ->
+          "review artifact #{review_artifact_id} is on work item #{review.work_item_id}; " <>
+            "review assignment #{review_assignment_id} is on work item #{review_work_item_id}"
+
+        true ->
+          nil
+      end,
+      if(is_binary(review_work_item_id) and spec.work_item_id != review_work_item_id,
+        do:
+          "spec artifact #{spec_artifact_id} is on work item #{spec.work_item_id}; " <>
+            "review assignment #{review_assignment_id} is on work item #{review_work_item_id}"
+      )
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Kernel.++(review_binding_facts(txn, review_assignment_id, attest, review_attest_id))
+  end
+
+  defp listed_commits(encoded) do
+    case is_binary(encoded) && JSON.decode(encoded) do
+      {:ok, [_ | _] = refs} ->
+        refs
+        |> Enum.map(fn ref -> if is_map(ref), do: ref["commit"], else: nil end)
+        |> Enum.reject(&is_nil/1)
+        |> case do
+          [] -> "none"
+          commits -> Enum.join(commits, ", ")
+        end
+
+      _ ->
+        "none"
+    end
+  end
+
+  # The review card is bound to the candidate when the verdict's author holds
+  # it, it reviews an assignment on its own work item, and that assignment is
+  # not itself a review card held by the reviewer.
+  defp review_binding_facts(txn, review_assignment_id, attest, review_attest_id) do
+    reviewer = attest.reviewer_session
+
     case Txn.q(
            txn,
            """
-           SELECT review.holderKey,review.state,review.workItemId,review.reviewsAssignmentId,
+           SELECT review.holderKey,review.workItemId,
                   candidate.id,candidate.holderKey,candidate.workItemId,candidate.reviewsAssignmentId
            FROM assignments review
-           JOIN assignments candidate ON candidate.id=review.reviewsAssignmentId
+           LEFT JOIN assignments candidate ON candidate.id=review.reviewsAssignmentId
            WHERE review.id=?1
            """,
-           [assignment_id]
+           [review_assignment_id]
          ) do
-      [
-        [
-          ^reviewer_session,
-          state,
-          review_work_item_id,
-          _parent,
-          _candidate_id,
-          candidate_holder,
-          candidate_work_item_id,
-          nil
-        ]
-      ]
-      when state in ["open", "closed"] and review_work_item_id == candidate_work_item_id and
-             candidate_holder != reviewer_session ->
-        true
+      [[_holder, _work_item, nil, _candidate_holder, _candidate_item, _candidate_reviews]] ->
+        ["review assignment #{review_assignment_id} does not review another assignment"]
 
-      _ ->
-        false
+      [[holder, work_item, candidate, candidate_holder, candidate_item, candidate_reviews]] ->
+        [
+          if(holder != reviewer,
+            do:
+              "review attest #{review_attest_id} was filed by session #{reviewer}; " <>
+                "review assignment #{review_assignment_id} is held by session #{holder}"
+          ),
+          if(work_item != candidate_item,
+            do:
+              "review assignment #{review_assignment_id} is on work item #{inspect_item(work_item)}; " <>
+                "assignment #{candidate} it reviews is on work item #{inspect_item(candidate_item)}"
+          ),
+          if(is_binary(candidate_reviews),
+            do:
+              "assignment #{candidate} that review assignment #{review_assignment_id} reviews is itself a review card"
+          ),
+          if(candidate_holder == reviewer,
+            do: "reviewer session #{reviewer} is also the candidate holder"
+          )
+        ]
+        |> Enum.reject(&is_nil/1)
     end
+  end
+
+  defp inspect_item(nil), do: "none"
+  defp inspect_item(work_item_id), do: work_item_id
+
+  defp promotion_reviewer_facts(txn, reviewer, first_incident, second_incident, input) do
+    source_facts =
+      for incident_id <- Enum.uniq([first_incident, second_incident]),
+          Txn.q(
+            txn,
+            "SELECT 1 FROM harness_health_observations WHERE id=(SELECT openObservationId FROM harness_health_incidents WHERE id=?1) AND sessionKey=?2",
+            [incident_id, reviewer]
+          ) == [[1]],
+          do: "reviewer session #{reviewer} is also the source session of incident #{incident_id}"
+
+    caller_facts =
+      if reviewer == principal_session(Map.get(input, :principal)),
+        do: ["reviewer session #{reviewer} is also the caller"],
+        else: []
+
+    source_facts ++ caller_facts
   end
 
   defp review_work_item_id(txn, assignment_id) do

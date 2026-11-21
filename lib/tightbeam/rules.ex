@@ -434,6 +434,11 @@ defmodule Tightbeam.Rules do
             []
         end
       end)
+      |> add_builtin_defaults(
+        Keyword.get(opts, :builtin_defaults, false),
+        law_base,
+        identity_manifest_sha
+      )
       |> Enum.map(fn
         {:rule, rule} ->
           # Keep runtime effects in the real base. A recovery snapshot is removed
@@ -1463,13 +1468,100 @@ defmodule Tightbeam.Rules do
 
   defp field(map, key), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
 
+  # Rules every install gets whether or not its identity defines them. Each is
+  # read from the release (`priv/seed`), never from the identity repository, and is
+  # used only when the loaded law defines no entry with that compiled name. A
+  # receipt-owned reaction has a qualified name and keeps its own scope.
+  # Add a default here by naming the reaction and its seed file.
+  @builtin_default_reactions [
+    {"assignment-terminal-handoff", "rules/row-reaction-handoff.toml"}
+  ]
+
+  defp add_builtin_defaults(entries, false, _law_base, _sha), do: entries
+
+  defp add_builtin_defaults(entries, true, law_base, sha) do
+    Enum.reduce(@builtin_default_reactions, entries, fn {name, relative}, acc ->
+      # Names are unique across rules, policies and reactions: a second entry of
+      # any kind with the same name would make the loader drop both, including a
+      # valid live one. Existing law is never disturbed for the default.
+      cond do
+        Enum.any?(acc, &match?({:reaction, %{name: ^name}}, &1)) ->
+          acc
+
+        Enum.any?(acc, &match?({kind, %{name: ^name}} when kind in [:rule, :policy], &1)) ->
+          require Logger
+
+          Logger.warning(
+            "built-in default rule #{name} is not used: the live identity already has a " <>
+              "rule or policy with that name, which is not a reaction"
+          )
+
+          acc
+
+        true ->
+          acc ++ builtin_default(name, relative, law_base, sha)
+      end
+    end)
+  end
+
+  defp builtin_default(name, relative, law_base, sha) do
+    require Logger
+    shipped = Application.app_dir(:tightbeam, Path.join("priv/seed", relative))
+    # Use the canonical identity-relative location for reporting. The bytes
+    # come from the release, so an identity receipt cannot own this copy.
+    virtual = Path.join([law_base, "identity", relative])
+    bytes = File.read!(shipped)
+
+    [{:reaction, %{name: ^name}}] =
+      loaded =
+      Tightbeam.RowReactions.Loader.compile!(
+        Toml.decode!(bytes),
+        virtual,
+        law_base,
+        sha,
+        bytes,
+        :substrate
+      )
+
+    Logger.info(
+      "built-in default rule #{name} is in use: the live identity does not define it; " <>
+        "`tightbeam identity relearn` installs an editable copy"
+    )
+
+    loaded
+  rescue
+    error ->
+      Logger.warning("built-in default rule #{name} unavailable: #{Exception.message(error)}")
+      []
+  end
+
   defp rule_paths(base_dir) do
     root = Path.join(base_dir, "identity")
 
     (Path.wildcard(Path.join([root, "rules", "*.toml"])) ++
        Path.wildcard(Path.join([root, "kungfu", "*", "rules", "*.toml"])))
+    |> Enum.filter(&rule_file_path?(Path.relative_to(&1, root)))
     |> Enum.uniq()
     |> Enum.sort()
+  end
+
+  @doc """
+  Whether an identity-relative path is a rule file the loader reads.
+
+  The one definition, so a caller that lists a Git revision agrees with the
+  loader: `rules/*.toml` and `kungfu/<name>/rules/*.toml`, never a dot-prefixed
+  segment (as `Path.wildcard/1` never matches one).
+  """
+  @spec rule_file_path?(String.t()) :: boolean()
+  def rule_file_path?(relative) do
+    visible = &(not String.starts_with?(&1, "."))
+
+    String.ends_with?(relative, ".toml") and
+      case Path.split(relative) do
+        ["rules", file] -> visible.(file)
+        ["kungfu", name, "rules", file] -> visible.(name) and visible.(file)
+        _ -> false
+      end
   end
 
   defp owned_archetypes(_base_dir, :substrate), do: MapSet.new()
