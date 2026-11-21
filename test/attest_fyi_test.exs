@@ -94,16 +94,35 @@ defmodule Tightbeam.AttestFyiTest do
     }
   end
 
+  test "a code review verdict without commit refs carries an FYI when filed", ctx do
+    expected = [fyi("this code review verdict carries no commit refs")]
+
+    for {verdict, params} <- [{"reviewed-clean", []}, {"changes-requested", [commit_refs: []]}] do
+      result =
+        attest(ctx, ctx.reviewer, ctx.review, "verdict", [verdict_kind: verdict] ++ params)
+
+      assert result.attest.verdictKind == verdict
+      assert result.fyi == expected
+      assert result.attest.fyi == expected
+      assert read_back(ctx, ctx.review, result.attest.id).fyi == expected
+    end
+
+    assert_neutral(expected)
+  end
+
   test "a code completion whose clean review omits a verified commit is recorded with an FYI",
        ctx do
     a = String.duplicate("a", 40)
     b = String.duplicate("b", 40)
 
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             attest(ctx, ctx.reviewer, ctx.review, "verdict",
-               verdict_kind: "reviewed-clean",
-               commit_refs: refs([a])
-             )
+    review =
+      attest(ctx, ctx.reviewer, ctx.review, "verdict",
+        verdict_kind: "reviewed-clean",
+        commit_refs: refs([a])
+      )
+
+    assert review.attest.verdictKind == "reviewed-clean"
+    refute Map.has_key?(review, :fyi)
 
     verified =
       attest(ctx, ctx.holder, ctx.code, "verdict",
@@ -141,6 +160,62 @@ defmodule Tightbeam.AttestFyiTest do
     assert completion.assignment.state == "closed"
     assert read_back(ctx, ctx.code, completion.attest.id).fyi == expected
     assert_neutral(expected)
+  end
+
+  test "a counted review without holder verification names only the missing verification", ctx do
+    attest(ctx, ctx.reviewer, ctx.review, "verdict", verdict_kind: "reviewed-clean")
+
+    completion = attest(ctx, ctx.holder, ctx.code, "completion")
+    assert completion.fyi == [fyi("this code assignment has no verified verdict from its holder")]
+    assert completion.assignment.state == "closed"
+    assert_neutral(completion.fyi)
+  end
+
+  test "a verified completion names ignored review kinds and the counted vocabulary", ctx do
+    a = String.duplicate("a", 40)
+    attest(ctx, ctx.holder, ctx.code, "verdict", verdict_kind: "verified", commit_refs: refs([a]))
+
+    for kind <- ["clean", "findings", "clean"] do
+      assert %{attest: %{verdictKind: ^kind}} =
+               attest(ctx, ctx.reviewer, ctx.review, "verdict", verdict_kind: kind)
+    end
+
+    # An unrelated card's verdict is outside the linked-review diagnostic.
+    attest(ctx, ctx.holder, ctx.evidence, "verdict", verdict_kind: "unrelated")
+
+    completion = attest(ctx, ctx.holder, ctx.code, "completion")
+
+    expected = [
+      fyi(
+        "holder verification conclusion: verified; counted review conclusion: absent; " <>
+          "linked review verdicts ignored for their kind: #{ctx.review}: clean, " <>
+          "#{ctx.review}: findings; counted review kinds are reviewed-clean and changes-requested"
+      ),
+      fyi("this code assignment has no review conclusion")
+    ]
+
+    assert completion.fyi == expected
+    assert completion.attest.fyi == expected
+    assert completion.assignment.state == "closed"
+    assert read_back(ctx, ctx.code, completion.attest.id).fyi == expected
+    assert_neutral(expected)
+  end
+
+  test "ignored review diagnostics distinguish absent verification and a counted review", ctx do
+    attest(ctx, ctx.reviewer, ctx.review, "verdict", verdict_kind: "clean")
+    attest(ctx, ctx.reviewer, ctx.review, "verdict", verdict_kind: "reviewed-clean")
+
+    completion = attest(ctx, ctx.holder, ctx.code, "completion")
+    assert [diagnostic, missing_verification] = completion.fyi
+    assert diagnostic =~ "holder verification conclusion: absent"
+    assert diagnostic =~ "counted review conclusion: reviewed-clean"
+    assert diagnostic =~ "#{ctx.review}: clean"
+
+    assert missing_verification ==
+             fyi("this code assignment has no verified verdict from its holder")
+
+    assert completion.assignment.state == "closed"
+    assert_neutral(completion.fyi)
   end
 
   test "a code completion with full evidence carries no FYI", ctx do

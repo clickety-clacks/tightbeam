@@ -2365,13 +2365,14 @@ defmodule Tightbeam.RulesTest do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     before_wake_ids = MapSet.new(Wakes.list_pending(ctx.db), & &1.wake_id)
 
-    assert %{code: "not_open"} =
+    # A linked assignment that does not exist still refuses the ask.
+    assert %{code: "not_found"} =
              Escalation.operator_ask(
                ctx.db,
                operator_ask_call(ctx.db, raiser.session_key, %{
                  question: "refused replacement?",
                  supersedes: old.id,
-                 assignment: closed_assignment.id
+                 assignment: closed_assignment.id <> "-missing"
                })
              )
 
@@ -2473,13 +2474,6 @@ defmodule Tightbeam.RulesTest do
         session_key: target.session_key
       })
 
-    assert %{code: "work_item_required"} =
-             Assignments.__handle__(
-               ctx.db,
-               "assign",
-               update_in(call.params, &Map.delete(&1, :work_item_id))
-             )
-
     assert %{id: _assignment_id} = Assignments.__handle__(ctx.db, "assign", call)
 
     assert [wake] =
@@ -2493,6 +2487,18 @@ defmodule Tightbeam.RulesTest do
              |> Enum.find(&(&1.kind == "rule_notice" and &1.subject == wake.wake_id))
 
     assert detail =~ ~s("principal":"remedy:assignment-remedy")
+
+    # A remedy assignment that names no work item is opened with an FYI.
+    assert %{workItemId: nil, fyi: [line]} =
+             Assignments.__handle__(
+               ctx.db,
+               "assign",
+               update_in(call.params, &Map.delete(&1, :work_item_id))
+             )
+
+    assert line ==
+             "FYI: this production staffing names no work item; " <>
+               "decide for yourself whether that is acceptable"
   end
 
   test "row-commit queue facts are scoped to the queued session and caller", ctx do
@@ -5524,7 +5530,10 @@ defmodule Tightbeam.RulesTest do
 
     other_hash = String.duplicate("b", 64)
 
+    missing_refs_fyi = fyi_line("this code review verdict carries no commit refs")
+
     hash_fyi = [
+      missing_refs_fyi,
       fyi_line(
         "artifact #{artifact.artifact_id} is recorded with sha256 #{hash}; " <>
           "this verdict cites sha256 #{other_hash}"
@@ -5550,6 +5559,7 @@ defmodule Tightbeam.RulesTest do
     wrong_review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: unrelated.id)
 
     producer_fyi = [
+      missing_refs_fyi,
       fyi_line(
         "artifact #{artifact.artifact_id} was produced by assignment #{producer.id}, " <>
           "not by this assignment or the assignment this card reviews"
@@ -5583,7 +5593,7 @@ defmodule Tightbeam.RulesTest do
 
     assert valid.attest.artifactId == artifact.artifact_id
     assert valid.attest.contentSha256 == hash
-    refute Map.has_key?(valid, :fyi)
+    assert valid.fyi == [missing_refs_fyi]
     assert {:ok, %{matched: true}} = Rules.evaluate_predicate(ctx.db, predicate)
 
     revision_verdict(

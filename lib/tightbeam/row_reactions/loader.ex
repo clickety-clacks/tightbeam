@@ -2,14 +2,14 @@ defmodule Tightbeam.RowReactions.Loader do
   @moduledoc false
   alias Tightbeam.RowReactions.Plan
 
-  def compile!(manifest, path, law_base, revision, bytes) do
+  def compile!(manifest, path, law_base, revision, bytes, owner \\ nil) do
     case Map.fetch(manifest, "reaction") do
       :error ->
         []
 
       {:ok, rails} when is_list(rails) and rails != [] ->
         relative = Path.relative_to(path, Path.join(law_base, "identity"))
-        owner = Tightbeam.Identity.Provenance.owner_for_path(law_base, relative)
+        owner = owner || Tightbeam.Identity.Provenance.owner_for_path(law_base, relative)
 
         provenance = %{
           "source" => relative,

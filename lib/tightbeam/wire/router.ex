@@ -4266,7 +4266,7 @@ defmodule Tightbeam.Wire.Router do
     do: session_key
 
   defp artifact_caller_session(verb, nil, {:session, session_key})
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-cover harklight-retry harklight-follow),
+       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-cover harklight-retry harklight-follow harklight-briefings-catchup),
        do: session_key
 
   defp artifact_caller_session(_verb, session_key, _principal), do: session_key
@@ -4839,7 +4839,7 @@ defmodule Tightbeam.Wire.Router do
     "reopen-assignment" => ~w(assignment_id reason)a,
     "repair-assignment" =>
       ~w(action assignment_id context effort idempotency_key model outcome turn_seq)a,
-    "retire" => ~w(idempotency_key keep_open_descendants session_key)a,
+    "retire" => ~w(acknowledge_loss dry_run idempotency_key keep_open_descendants session_key)a,
     "retire-withdraw" => ~w(reason session_key)a,
     "return" => ~w(idempotency_key reason request request_id)a,
     "revoke-assignment" => ~w(assignment_id reason)a,

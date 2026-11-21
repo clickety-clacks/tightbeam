@@ -2019,7 +2019,8 @@ defmodule Tightbeam.Gateway do
       with {:ok, session} <- repair_holder(db, assignment),
            :ok <- refuse_held(db, assignment),
            {:ok, incident} <- repair_incident(db, assignment, session, call.params[:action]) do
-        {execute_assignment_repair(config, db, call, assignment, session, incident), incident}
+        {execute_assignment_repair(config, db, call, assignment, session, incident)
+         |> with_repair_fyi(incident), incident}
       else
         {:error, code, message} -> {%{ok: false, code: code, message: message}, nil}
       end
@@ -2138,11 +2139,22 @@ defmodule Tightbeam.Gateway do
       [[id, failure_class] | _] ->
         guidance = HarnessHealth.get(db, id).repair
 
+        # A repair other than the incident's recommended one runs as
+        # requested; the difference is stated as an FYI with its result.
         if action == guidance.action do
           {:ok, %{id: id, failure_class: failure_class, action: action}}
         else
-          {:error, "wrong_repair",
-           "#{failure_class} requires repair action #{guidance.action}, not #{inspect(action)}"}
+          {:ok,
+           %{
+             id: id,
+             failure_class: failure_class,
+             action: action,
+             fyi: [
+               Tightbeam.RecordFyis.line(
+                 "incident #{id} recommends #{guidance.action}; this repair requests #{action}"
+               )
+             ]
+           }}
         end
 
       [] when action == "relaunch" ->
@@ -2348,6 +2360,10 @@ defmodule Tightbeam.Gateway do
         end
     end
   end
+
+  defp with_repair_fyi(%{code: _} = result, _incident), do: result
+  defp with_repair_fyi(result, %{fyi: fyi}), do: Map.put(result, :fyi, fyi)
+  defp with_repair_fyi(result, _incident), do: result
 
   # The public message stays the inspected classification; the reason's own
   # structure and any carried node ride in the diagnostic.
@@ -3750,7 +3766,15 @@ defmodule Tightbeam.Gateway do
       |> Map.merge(published_identity(session.model))
       |> Map.put(:capabilities, StateResources.session(session)["capabilities"])
 
-    Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
+    item = Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
+
+    case Map.get(
+           Tightbeam.RecordFyis.list_many(db, "session", [session.session_key]),
+           session.session_key
+         ) do
+      nil -> item
+      fyi -> Map.put(item, :fyi, fyi)
+    end
   end
 
   # A catalog entry for a reader who has to pick one — an operator reading a
@@ -6409,7 +6433,12 @@ defmodule Tightbeam.Gateway do
       Identity.with_recovery_law!(config.base_dir, fn law_base, revision ->
         Archetypes.load!(law_base)
         Rails.load!(law_base)
-        Rules.load!(config.base_dir, verbs, law_base: law_base, revision: revision)
+
+        Rules.load!(config.base_dir, verbs,
+          law_base: law_base,
+          revision: revision,
+          builtin_defaults: true
+        )
       end)
 
     Tightbeam.RowReactions.recover(Map.get(config, :db, Tightbeam.DB))
@@ -9416,8 +9445,20 @@ defmodule Tightbeam.Gateway do
                     )
 
                   case staffing do
-                    :ok ->
+                    %{code: _} = denial ->
+                      {:delivery_owner_denied, denial}
+
+                    staffing ->
                       session = Org.create_in_txn(txn, input)
+
+                      # Staffing-owner facts are stated as FYIs on the spawned session.
+                      :ok =
+                        Tightbeam.RecordFyis.put_in_txn(
+                          txn,
+                          "session",
+                          session.session_key,
+                          staffing_fyi(staffing)
+                        )
 
                       if is_nil(caller.caller_session) and
                            String.starts_with?(call.origin, "user:") and
@@ -9474,9 +9515,6 @@ defmodule Tightbeam.Gateway do
                       )
 
                       {:created, session}
-
-                    %{code: _} = denial ->
-                      {:delivery_owner_denied, denial}
                   end
                 end
               else
@@ -9604,23 +9642,33 @@ defmodule Tightbeam.Gateway do
   defp finish_spawn(db, _call, caller, session) do
     stream = Payloads.stream_session(session)
     broadcast(db, caller.owner_user_id, Payloads.stream_created(stream))
-    spawn_result(session, stream)
+    spawned_session_result(db, session, stream)
   end
 
   defp spawn_replay(db, session_key) do
     session = Org.get(db, session_key)
-    spawn_result(session, Payloads.stream_session(session))
+    spawned_session_result(db, session, Payloads.stream_session(session))
   end
 
-  defp spawn_result(session, stream) do
-    %{
+  defp spawned_session_result(db, session, stream) do
+    result = %{
       stream: stream,
       session_key: session.session_key,
       handle: session.handle,
       requested: published_identity(session.model),
       running_status: "not reported by #{session.harness}"
     }
+
+    fyis = Tightbeam.RecordFyis.list_many(db, "session", [session.session_key])
+
+    case Map.get(fyis, session.session_key) do
+      nil -> result
+      fyi -> Map.put(result, :fyi, fyi)
+    end
   end
+
+  defp staffing_fyi({:ok, facts}), do: Enum.map(facts, &Tightbeam.RecordFyis.line/1)
+  defp staffing_fyi(:ok), do: []
 
   defp held_spawn_name_refusal(_db, nil), do: nil
 
@@ -12121,7 +12169,10 @@ defmodule Tightbeam.Gateway do
     prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
 
     cond do
-      prior && prior.session_key == call.session_key ->
+      p[:dry_run] == true ->
+        retire_preview(config, db, owner, call)
+
+      prior && prior.session_key == call.session_key && p[:acknowledge_loss] != true ->
         retired_keys = retired_subtree_keys(db, call.session_key)
 
         kept_descendants =
@@ -12144,7 +12195,7 @@ defmodule Tightbeam.Gateway do
             }
 
           %{owner_user_id: ^owner} = session ->
-            if session.state == "active" do
+            if session.state == "active" and p[:acknowledge_loss] != true do
               principal = retirement_principal_ref(call.principal)
               retirement_request_id = "rtr_" <> Tightbeam.Id.uuid4()
 
@@ -12235,6 +12286,8 @@ defmodule Tightbeam.Gateway do
                 %{
                   deleted_session_key: session.session_key,
                   retired_session_keys: Enum.map(result.retired, & &1.session_key),
+                  retired_sessions:
+                    Enum.map(result.retired, &retired_workspace_entry(config, db, &1.session_key)),
                   deferred: result.deferred
                 }
                 |> maybe_put_kept_descendants(result.kept_descendants)
@@ -12245,21 +12298,126 @@ defmodule Tightbeam.Gateway do
                 end)
               end
             else
-              retire_replay_observation(
-                db,
-                call,
-                %{
-                  deleted_session_key: session.session_key,
-                  retired_session_keys: [],
-                  deferred: []
-                }
-              )
+              retired_workspace_response(db, call, session, p[:acknowledge_loss] == true)
             end
 
           _ ->
             %{code: "not_found"}
         end
     end
+  end
+
+  # Retiring an already-retired session reports the work its workspace
+  # cleanup is holding back, and `acknowledge_loss` lets that cleanup delete it.
+  defp retired_workspace_response(db, call, session, acknowledge?) do
+    keys = [session.session_key | retired_subtree_keys(db, session.session_key)] |> Enum.uniq()
+
+    held =
+      Enum.flat_map(keys, fn key ->
+        db
+        |> WorkspaceCleanup.held_losses(key)
+        |> Enum.map(
+          &Map.merge(&1, %{"session_key" => key, "display_name" => retired_display_name(db, key)})
+        )
+      end)
+
+    cond do
+      acknowledge? and held == [] ->
+        %{code: "invalid", message: "no held workspace losses to acknowledge"}
+
+      acknowledge? ->
+        by = retirement_principal_ref(call.principal)
+        Enum.each(keys, &WorkspaceCleanup.acknowledge(db, &1, by))
+        workspace_response(db, call, session, %{acknowledged_losses: held})
+
+      held != [] ->
+        workspace_response(db, call, session, %{held_losses: held})
+
+      true ->
+        workspace_response(db, call, session, %{})
+    end
+  end
+
+  # Retire returns before any workspace is touched: cleanup is queued and runs
+  # one session at a time. Each entry says where the workdir is and how its
+  # cleanup stands (queued, held, blocked, completed).
+  defp retired_workspace_entry(config, db, key) do
+    session = Org.get(db, key)
+
+    workdir =
+      try do
+        Tightbeam.Placement.workdir_path(config, session)
+      rescue
+        _ -> nil
+      end
+
+    Map.merge(
+      %{
+        session_key: key,
+        display_name: session && session.display_name,
+        host: session && session.host,
+        workdir: workdir
+      },
+      WorkspaceCleanup.status(db, key) || %{cleanup: "queued", reasons: []}
+    )
+  end
+
+  defp retired_display_name(db, key) do
+    case Org.get(db, key) do
+      %{display_name: name} -> name
+      _ -> nil
+    end
+  end
+
+  # Read-only. Shows the blast radius of a retire: every session it would
+  # remove (with what its workspace scan finds on its own host), every
+  # session it would keep, and whether it would refuse without
+  # --keep-open-descendants. Nothing is written.
+  defp retire_preview(config, db, owner, call) do
+    case Org.get(db, call.session_key) do
+      %{owner_user_id: ^owner, is_built_in: true} ->
+        %{
+          code: "denied",
+          message:
+            "main sessions are permanent — they are the fallback for roles and user references"
+        }
+
+      %{owner_user_id: ^owner, state: "active"} ->
+        {:ok, plan} =
+          DB.transaction(db, fn txn ->
+            retirement_plan_in_txn(txn, call.session_key, owner, true)
+          end)
+
+        scans =
+          WorkspaceCleanup.preview(config, db, Enum.map(plan.retired, & &1.session_key))
+
+        %{
+          dry_run: true,
+          session_key: call.session_key,
+          would_retire: scans,
+          would_keep: Enum.map(plan.kept, &session_details/1),
+          would_keep_protected_roots: Enum.map(plan.frontiers, &protected_descendant_details/1),
+          requires_keep_open_descendants: plan.frontiers != [],
+          sessions_with_held_work: Enum.count(scans, &(&1.losses != []))
+        }
+
+      %{owner_user_id: ^owner} = session ->
+        retired_workspace_response(db, call, session, false)
+
+      _ ->
+        %{code: "not_found"}
+    end
+  end
+
+  defp workspace_response(db, call, session, extra) do
+    retire_replay_observation(
+      db,
+      call,
+      Map.merge(
+        %{deleted_session_key: session.session_key, retired_session_keys: [], deferred: []},
+        extra
+      )
+    )
   end
 
   defp retire_withdraw_result(db, call) do
@@ -12380,6 +12538,7 @@ defmodule Tightbeam.Gateway do
           end)
 
         retired = Enum.reject(active_subtree, &MapSet.member?(kept_keys, &1.session_key))
+        kept = Enum.filter(active_subtree, &MapSet.member?(kept_keys, &1.session_key))
 
         if protected != [] and not keep_open_descendants? do
           %{
@@ -12397,6 +12556,7 @@ defmodule Tightbeam.Gateway do
             owner: owner,
             keep_open_descendants: keep_open_descendants?,
             retired: retired,
+            kept: kept,
             frontiers: frontiers,
             accountable_parent: accountable_parent
           }

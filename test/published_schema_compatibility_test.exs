@@ -34,7 +34,7 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["attest-lifecycle-actor-v1-0117"]]} =
+    assert {:ok, [["holder-role-provenance-v1-0118"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert actor_schema(db) == before
@@ -95,7 +95,7 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["attest-lifecycle-actor-v1-0117"]]} =
+    assert {:ok, [["holder-role-provenance-v1-0118"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert release_rows(db) == rows_before

@@ -9,7 +9,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, RecordFyis, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Publisher}
 
@@ -2243,16 +2243,21 @@ defmodule Tightbeam.Escalation do
 
   @doc "Fetch one decision request by its complete id without changing visibility policy."
   @spec raw_by_id(DB.server(), String.t() | nil) :: map() | nil
-  def raw_by_id(db, id), do: get_raw(db, id)
+  def raw_by_id(db, id), do: attach_operator_fyis(db, get_raw(db, id))
 
   @doc false
   @spec raw_by_id_in_txn(Txn.t(), String.t() | nil) :: map() | nil
   def raw_by_id_in_txn(txn, id) do
     case Txn.q(txn, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id]) do
-      [row] -> request_from_row(row)
+      [row] -> attach_operator_fyis(txn, request_from_row(row))
       [] -> nil
     end
   end
+
+  defp attach_operator_fyis(db, %{kind: "operator"} = request),
+    do: RecordFyis.attach(db, "decision_request", request)
+
+  defp attach_operator_fyis(_db, request), do: request
 
   @doc false
   @spec publish_decision_transition_in_txn(Txn.t(), map() | nil, map()) :: map()
@@ -2499,17 +2504,28 @@ defmodule Tightbeam.Escalation do
       nil ->
         result =
           with :ok <- filing_session_owner_in_txn(txn, session_key, owner_user_id),
-               {:ok, work_item_id} <- operator_association_in_txn(txn, ask, owner_user_id),
+               {:ok, work_item_id, facts} <- operator_association_in_txn(txn, ask, owner_user_id),
                :ok <- superseded_request_in_txn(txn, ask.supersedes, owner_user_id, raiser_id) do
-            insert_operator_request_in_txn(
-              txn,
-              session_key,
-              owner_user_id,
-              raiser_id,
-              action_key,
-              %{ask | work_item_id: work_item_id},
-              opts
-            )
+            request =
+              insert_operator_request_in_txn(
+                txn,
+                session_key,
+                owner_user_id,
+                raiser_id,
+                action_key,
+                %{ask | work_item_id: work_item_id},
+                opts
+              )
+
+            :ok =
+              RecordFyis.put_in_txn(
+                txn,
+                "decision_request",
+                request.id,
+                Enum.map(facts, &RecordFyis.line/1)
+              )
+
+            request
           else
             reason -> reason
           end
@@ -2517,11 +2533,13 @@ defmodule Tightbeam.Escalation do
         if not match?(%{code: _}, result),
           do: Publisher.maybe_accepted_in_txn(txn, call, result)
 
-        result
+        if match?(%{code: _}, result),
+          do: result,
+          else: RecordFyis.attach(txn, "decision_request", result)
 
       request ->
         Publisher.maybe_observed_accepted_in_txn(txn, call)
-        request
+        RecordFyis.attach(txn, "decision_request", request)
     end
   end
 
@@ -3279,25 +3297,26 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  # Resolves the work item an operator request is filed for. An assignment must
-  # be open, as before; a named work item must exist under the same owner; and
+  # Resolves the work item an operator request is filed for. A request linked to
+  # a closed assignment is filed with an FYI (its ruling takes the existing
+  # route for a ruling on a closed assignment); a named work item must exist under the same owner; and
   # when both are named they must agree. Returns the work item to record, which
   # for an assignment-only ask must be the assignment's existing work item.
   defp operator_association_in_txn(txn, ask, owner_user_id) do
-    with {:ok, assignment_work_item_id} <-
+    with {:ok, assignment_work_item_id, facts} <-
            linked_assignment_in_txn(txn, ask.assignment_id, owner_user_id),
          :ok <- linked_work_item_in_txn(txn, ask.work_item_id, owner_user_id),
          :ok <- linked_work_item_in_txn(txn, assignment_work_item_id, owner_user_id),
          :ok <- resolved_operator_work_item(ask.work_item_id || assignment_work_item_id) do
       cond do
         is_nil(ask.assignment_id) ->
-          {:ok, ask.work_item_id}
+          {:ok, ask.work_item_id, facts}
 
         is_nil(ask.work_item_id) ->
-          {:ok, assignment_work_item_id}
+          {:ok, assignment_work_item_id, facts}
 
         ask.work_item_id == assignment_work_item_id ->
-          {:ok, ask.work_item_id}
+          {:ok, ask.work_item_id, facts}
 
         true ->
           error(
@@ -3315,7 +3334,7 @@ defmodule Tightbeam.Escalation do
 
   defp resolved_operator_work_item(_id), do: :ok
 
-  defp linked_assignment_in_txn(_txn, nil, _owner_user_id), do: {:ok, nil}
+  defp linked_assignment_in_txn(_txn, nil, _owner_user_id), do: {:ok, nil, []}
 
   defp linked_assignment_in_txn(txn, assignment_id, owner_user_id) do
     case Txn.q(
@@ -3329,14 +3348,14 @@ defmodule Tightbeam.Escalation do
           "linked assignment not found; add --assignment or --work-item naming existing work"
         )
 
-      [[state, _owner, _work_item_id]] when state != "open" ->
-        error("not_open", "linked assignment is not open")
-
-      [["open", ^owner_user_id, work_item_id]] ->
-        {:ok, work_item_id}
-
-      [["open", _other_owner, _work_item_id]] ->
+      [[_state, other_owner, _work_item_id]] when other_owner != owner_user_id ->
         error("not_owner", "linked assignment belongs to another owner")
+
+      [["open", _owner, work_item_id]] ->
+        {:ok, work_item_id, []}
+
+      [[_state, _owner, work_item_id]] ->
+        {:ok, work_item_id, ["linked assignment #{assignment_id} is closed"]}
     end
   end
 
@@ -3857,11 +3876,24 @@ defmodule Tightbeam.Escalation do
       [] ->
         assignment_work_items = assignment_work_items_in_txn(txn, parsed)
 
+        fyis =
+          RecordFyis.list_many(
+            txn,
+            "decision_request",
+            for(%{kind: "operator", id: id} <- parsed, do: id)
+          )
+
         Enum.map(parsed, fn
           %{kind: "operator"} = request ->
-            request
-            |> operator_projection(surface)
-            |> with_project_attribution(request, assignment_work_items)
+            projection =
+              request
+              |> operator_projection(surface)
+              |> with_project_attribution(request, assignment_work_items)
+
+            case Map.get(fyis, request.id) do
+              nil -> projection
+              fyi -> Map.put(projection, :fyi, fyi)
+            end
 
           request ->
             projected =

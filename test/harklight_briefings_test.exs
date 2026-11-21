@@ -8,7 +8,9 @@ defmodule Tightbeam.HarklightBriefingsTest do
     Gateway,
     HarklightBriefings,
     HarklightFollows,
+    HarklightSend,
     HarklightWakes,
+    Id,
     Model,
     Org,
     Placement,
@@ -71,6 +73,87 @@ defmodule Tightbeam.HarklightBriefingsTest do
     assert briefing_wake_count(ctx.db) == 3
     assert %{ok: true, listed: 3, admitted: 3} = catchup(ctx, 10)
     assert briefing_wake_count(ctx.db) == 3
+  end
+
+  test "a refused linked briefing send says the request itself already stands as a proper ask",
+       ctx do
+    load_briefing_rule(ctx, ctx.consumer.session_key)
+    request = open_request(ctx, "Choose one route?")
+
+    request_id = request.id
+
+    assert %{
+             outcome: "refused",
+             code: "harklight_briefing_route_unavailable",
+             reason: reason,
+             decision_request_id: ^request_id
+           } =
+             HarklightSend.send_request(ctx.db, briefing_send_call(ctx.call, request_id),
+               runner: fn _ -> flunk("reservation refusal must precede the Harklight send") end
+             )
+
+    assert reason =~ "The message was not sent."
+    assert reason =~ "The decision request itself already stands as a proper ask"
+    assert reason =~ "does not block it"
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request.id])
+  end
+
+  test "a missing linked request gets no assurance that the ask stands", ctx do
+    request_id = "dr_" <> Id.uuid4()
+
+    assert %{
+             outcome: "refused",
+             code: "decision_request_not_found",
+             reason: "The message was not sent. decision request does not exist",
+             decision_request_id: ^request_id
+           } =
+             HarklightSend.send_request(ctx.db, briefing_send_call(ctx.call, request_id),
+               runner: fn _ -> flunk("a missing request must prevent the Harklight send") end
+             )
+  end
+
+  for stage <- ["prepare", "execute"] do
+    test "a linked send refused during #{stage} says the request still stands", ctx do
+      load_briefing_rule(ctx, ctx.consumer.session_key)
+      request = open_request(ctx, "Choose one route?")
+      call = briefing_send_call(session_call(ctx.consumer.session_key), request.id)
+      refusal = "Harklight refused during #{unquote(stage)}"
+      refusal_flag = "--" <> unquote(stage)
+
+      runner = fn
+        ["send", ^refusal_flag, "--op-id", op_id | _] ->
+          {JSON.encode!(%{kind: "refused", op_id: op_id, reason: refusal}), 2}
+
+        ["send", "--prepare", "--op-id", op_id | _] ->
+          prepared = %{
+            kind: "prepared",
+            op_id: op_id,
+            files: [],
+            request: %{
+              type: "send",
+              op_id: op_id,
+              session_handle: "a1424ed8-763c-4b13-9a0d-55a70cd65b17",
+              route: "other",
+              message: %{
+                sender_id: call.params.sender_id,
+                title: call.params.title,
+                message_id: "decision-briefing-thread"
+              }
+            }
+          }
+
+          {JSON.encode!(prepared), 0}
+      end
+
+      assert %{outcome: "refused", code: "harklight_refused", reason: reason} =
+               HarklightSend.send_request(ctx.db, call, runner: runner)
+
+      assert reason =~ refusal
+      assert reason =~ "The decision request itself already stands as a proper ask"
+      assert reason =~ "does not block it"
+    end
   end
 
   test "a filed request wake is reused and its compiler reserves one durable send identity",
@@ -283,6 +366,20 @@ defmodule Tightbeam.HarklightBriefingsTest do
     HarklightBriefings.catchup(ctx.db, Map.put(ctx.call, :params, %{limit: limit}),
       authorized: true
     )
+  end
+
+  defp briefing_send_call(call, request_id) do
+    %{
+      call
+      | params: %{
+          harklight_session: "new",
+          sender_id: "briefing-sender",
+          title: "Decision briefing",
+          message_type: "request",
+          reply: true,
+          decision_request_id: request_id
+        }
+    }
   end
 
   defp open_request(ctx, question) do

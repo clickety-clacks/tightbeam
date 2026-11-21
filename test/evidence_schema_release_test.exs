@@ -3,7 +3,7 @@ defmodule Tightbeam.EvidenceSchemaReleaseTest do
 
   alias Tightbeam.{DB, Schema}
 
-  @successor "attest-lifecycle-actor-v1-0117"
+  @successor "holder-role-provenance-v1-0118"
 
   test "fresh and repeated boot retain the exact release successor and evidence objects" do
     db = start_supervised!({DB, path: ":memory:", name: nil})

@@ -14,7 +14,7 @@ defmodule Tightbeam.AttestEvidence do
         {"verified", assignment} when not is_nil(assignment) ->
           prepare_verified!(txn, call, assignment)
 
-        {"reviewed-clean", nil} ->
+        {kind, nil} when kind in ["reviewed-clean", "changes-requested"] ->
           prepare_review!(txn, call)
 
         _ ->
@@ -32,12 +32,25 @@ defmodule Tightbeam.AttestEvidence do
       [[source_id]] when is_binary(source_id) ->
         case producing_assignment(txn, source_id) do
           nil -> call
-          source -> bind_review_evidence!(txn, call, source_id, source)
+          source -> prepare_linked_review!(txn, call, source_id, source)
         end
 
       _ ->
         call
     end
+  end
+
+  defp prepare_linked_review!(txn, call, source_id, source) do
+    call =
+      if source.effect_kind == "code" and call.params[:commit_refs] in [nil, []] do
+        RecordFyis.note(call, "this code review verdict carries no commit refs")
+      else
+        call
+      end
+
+    if call.params[:verdict_kind] == "reviewed-clean",
+      do: bind_review_evidence!(txn, call, source_id, source),
+      else: call
   end
 
   defp bind_review_evidence!(txn, call, source_id, source) do
