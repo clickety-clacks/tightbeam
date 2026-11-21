@@ -666,7 +666,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert content =~ "delivery turn #{turn.seq} is failed_unknown"
     assert content =~ "prior effects must be reconciled"
     refute content =~ "private dispatch brief"
-    refute content =~ "adapter_unavailable"
+    assert content =~ "Reason: adapter_unavailable"
 
     # The opener is accountable for the assignment; the holder's parent is not
     # told a second time through this path.
@@ -720,6 +720,8 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
     assert [content] = undelivered_notices(ctx.db, successor.session_key, turn.seq)
     assert content =~ "Wake #{wake.wake_id} undelivered"
+    assert content =~ "Reason: adapter_unavailable"
+    assert Ledger.pending_count(ctx.db, successor.session_key) == 0
     assert undelivered_notices(ctx.db, opener.session_key, turn.seq) == []
     assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "fired"
     assert Ledger.pending_count(ctx.db, ctx.holder.session_key) == 0

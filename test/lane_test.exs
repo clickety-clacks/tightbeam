@@ -1086,7 +1086,7 @@ defmodule Tightbeam.LaneTest do
 
   test "a placement refusal reaches the turn publisher by name, not as task_crash", ctx do
     parent = self()
-    seq = enqueue!(ctx.db, "k2", "vanished host")
+    seq = enqueue!(ctx.db, "k2", "[assignment: asg_placement]\n\nvanished host")
 
     assert {:ok, []} =
              DB.query(ctx.db, "UPDATE sessions SET spawnedBy=NULL WHERE sessionKey='k2'")
@@ -1150,12 +1150,17 @@ defmodule Tightbeam.LaneTest do
     assert stored_error == expected
     assert_receive {:recognized, :ok}
 
-    assert {:ok, [["k1", prompt]]} =
-             DB.query(ctx.db, "SELECT sessionKey,prompt FROM turns WHERE requestRef=?1", [
-               "bubble:#{seq}"
-             ])
+    assert {:ok, [["k1", content]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,content FROM messages WHERE clientMessageId=?1",
+               [
+                 "wake-undelivered:#{seq}"
+               ]
+             )
 
-    assert prompt =~ expected
+    assert content =~ "Reason: " <> expected
+    assert Ledger.pending_count(ctx.db, "k1") == 0
   end
 
   defp eventually(fun, tries \\ 60) do

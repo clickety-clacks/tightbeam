@@ -117,8 +117,17 @@ defmodule Tightbeam.TurnFailureNoticeTest do
   end
 
   test "a new failed delivery after an earlier one is its own notice", ctx do
-    first = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: ctx.assignment)
-    second = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: ctx.assignment)
+    first =
+      failed_turn!(ctx.db, ctx.reviewer.session_key,
+        assignment_id: ctx.assignment,
+        error: @limit_429
+      )
+
+    second =
+      failed_turn!(ctx.db, ctx.reviewer.session_key,
+        assignment_id: ctx.assignment,
+        error: @limit_429
+      )
 
     assert :ok = Bubble.recognize_terminal(ctx.db, first)
     assert :ok = Bubble.recognize_terminal(ctx.db, second)
@@ -165,11 +174,11 @@ defmodule Tightbeam.TurnFailureNoticeTest do
         other.session_key
       ])
 
-    seq = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: asg, error: "boom")
+    seq = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: asg, error: @limit_429)
     assert :ok = Bubble.recognize_terminal(ctx.db, seq)
     assert [{recipient, prompt}] = notices(ctx.db)
     assert recipient == ctx.lane.session_key
-    assert prompt =~ "boom"
+    assert prompt =~ @limit_429
   end
 
   defp notices(db) do

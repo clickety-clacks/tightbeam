@@ -226,17 +226,21 @@ defmodule Tightbeam.Productions.Bubble do
     wake_id = "bubble:#{turn.cause_seq}:#{recipient}"
     question_id = "w_health_redelivery_parent_#{turn.cause_seq}"
 
-    if DB.Txn.q(
-         txn,
-         """
-         SELECT 1 FROM wakes WHERE wakeId=?1 OR (wakeId=?2 AND sessionKey=?3)
-         UNION ALL SELECT 1 FROM turns WHERE wakeId=?1 LIMIT 1
-         """,
-         [wake_id, question_id, recipient]
-       ) == [] do
-      admit_bubble_notice_in_txn(txn, recipient, turn, cause, wake_id)
-    else
+    admitted? =
+      DB.Txn.q(
+        txn,
+        """
+        SELECT 1 FROM wakes WHERE wakeId=?1 OR (wakeId=?2 AND sessionKey=?3)
+        UNION ALL SELECT 1 FROM turns WHERE wakeId=?1 LIMIT 1
+        """,
+        [wake_id, question_id, recipient]
+      ) != []
+
+    if admitted? or
+         Wakes.failed_dispatch_receipt_in_txn?(txn, turn.cause_seq, recipient, cause.error) do
       :duplicate
+    else
+      admit_bubble_notice_in_txn(txn, recipient, turn, cause, wake_id)
     end
   end
 

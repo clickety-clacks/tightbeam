@@ -5631,14 +5631,15 @@ defmodule Tightbeam.Wakes do
 
               carrier? ->
                 sources = carrier_failure_sources_in_txn(txn, wake_id)
-                record_sender_failure_in_txn(txn, seq, sources, status)
+                record_sender_failure_in_txn(txn, seq, sources, status, error)
 
               digest == 0 ->
                 record_sender_failure_in_txn(
                   txn,
                   seq,
                   [[wake_id, creator, origin, target, assignment_id]],
-                  status
+                  status,
+                  error
                 )
 
               true ->
@@ -5703,13 +5704,13 @@ defmodule Tightbeam.Wakes do
     case Txn.q(
            txn,
            """
-           SELECT t.sessionKey,t.assignmentId,t.status,t.error FROM turns t
+           SELECT t.sessionKey,t.assignmentId,t.status,t.error,t.origin,t.prompt FROM turns t
            WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
              AND t.wakeId IS NULL AND t.assignmentId IS NOT NULL
            """,
            [seq]
          ) do
-      [[holder, assignment_id, status, error]] ->
+      [[holder, assignment_id, status, error, origin, prompt]] ->
         recipient = interrupted_redelivery_parent_in_txn(txn, holder, assignment_id)
 
         cond do
@@ -5717,9 +5718,17 @@ defmodule Tightbeam.Wakes do
             :retry_owned
 
           is_binary(recipient) ->
+            brief = String.replace_prefix(prompt, "[from #{origin}]\n\n", "")
+
+            reason =
+              if dispatch_brief?(brief, assignment_id),
+                do: failed_dispatch_reason(error),
+                else: ""
+
             content =
               "Assignment #{assignment_id} brief to #{holder} undelivered: " <>
-                "delivery turn #{seq} is #{status}." <> failed_delivery_uncertainty(status)
+                "delivery turn #{seq} is #{status}." <>
+                failed_delivery_uncertainty(status) <> reason
 
             {:notices,
              List.wrap(append_failed_delivery_notice_in_txn(txn, seq, recipient, content))}
@@ -5733,7 +5742,7 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp record_sender_failure_in_txn(txn, seq, sources, status) do
+  defp record_sender_failure_in_txn(txn, seq, sources, status, error) do
     notices =
       sources
       |> Enum.reduce(%{}, fn [wake_id, creator, origin, target, assignment_id], recipients ->
@@ -5750,10 +5759,10 @@ defmodule Tightbeam.Wakes do
                  creator,
                  origin
                ) do
-            recipient when is_binary(recipient) ->
-              {recipient, :sender}
+            {recipient, kind} when is_binary(recipient) ->
+              {recipient, kind}
 
-            nil ->
+            _ ->
               # A bubble notice's own failure continues its climb instead.
               if String.starts_with?(wake_id, "bubble:"),
                 do: {nil, nil},
@@ -5782,9 +5791,14 @@ defmodule Tightbeam.Wakes do
               ""
           end
 
+        dispatch_reason =
+          if Enum.any?(sources, &match?({_, :dispatch}, &1)),
+            do: failed_dispatch_reason(error),
+            else: ""
+
         content =
           "Wake #{source_names} undelivered: delivery turn #{seq} is #{status}." <>
-            owner_context <> failed_delivery_uncertainty(status)
+            owner_context <> failed_delivery_uncertainty(status) <> dispatch_reason
 
         List.wrap(append_failed_delivery_notice_in_txn(txn, seq, recipient, content))
       end)
@@ -5798,14 +5812,35 @@ defmodule Tightbeam.Wakes do
     dispatch? =
       is_binary(assignment_id) and
         case Txn.q(txn, "SELECT prompt FROM wakes WHERE wakeId=?1", [wake_id]) do
-          [[prompt]] -> String.starts_with?(prompt, "[assignment: #{assignment_id}]\n\n")
+          [[prompt]] -> dispatch_brief?(prompt, assignment_id)
           _ -> false
         end
 
     if dispatch?,
-      do: interrupted_redelivery_parent_in_txn(txn, target, assignment_id),
-      else: sender_failure_recipient(creator, origin)
+      do: {interrupted_redelivery_parent_in_txn(txn, target, assignment_id), :dispatch},
+      else: {sender_failure_recipient(creator, origin), :sender}
   end
+
+  defp dispatch_brief?(prompt, assignment_id),
+    do: String.starts_with?(prompt, "[assignment: #{assignment_id}]\n\n")
+
+  @doc false
+  def failed_dispatch_receipt_in_txn?(%Txn{} = txn, seq, recipient, error) do
+    suffix = failed_dispatch_reason(error)
+
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM messages
+      WHERE sessionKey=?1 AND deviceId='process:tightbeam' AND clientMessageId=?2
+        AND substr(content,-length(?3))=?3
+      """,
+      [recipient, "wake-undelivered:#{seq}", suffix]
+    ) != []
+  end
+
+  defp failed_dispatch_reason(error),
+    do: "\nReason: " <> Tightbeam.Gateway.recorded_turn_failure_sentence(error)
 
   defp failed_source_owner_in_txn(txn, target) do
     # The existing terminal failure route alerts the user's personal stream
@@ -5845,13 +5880,21 @@ defmodule Tightbeam.Wakes do
 
         if disposition in [:appended, :duplicate],
           do: {recipient, owner, marker},
-          else: raise("wake undelivered notice conflicts with delivery turn #{seq}")
+          else: historical_failed_delivery_receipt!(seq, content, marker)
 
       _ ->
         # There is no lawful transcript to write. The durable carrier and
         # authorized source projection still expose the incomplete outcome.
         nil
     end
+  end
+
+  # A sweeper replay can encounter the immutable status-only receipt from an
+  # older build. Leave it in place so the terminal route can supply its reason.
+  defp historical_failed_delivery_receipt!(seq, content, %{content: prior}) do
+    if String.starts_with?(content, prior <> "\nReason: "),
+      do: nil,
+      else: raise("wake undelivered notice conflicts with delivery turn #{seq}")
   end
 
   defp sender_failure_recipient(creator, _origin) when is_binary(creator), do: creator
