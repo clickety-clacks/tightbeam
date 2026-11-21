@@ -807,6 +807,547 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert reason =~ "cleanup_command_failed"
   end
 
+  describe "uncaptured work is held, never silently removed" do
+    test "a commit on no remote ref holds removal and is named with its remedy path", ctx do
+      repo = init_repo(ctx.workspace, "tb/repo")
+      commit(repo, "work.txt", "unpushed")
+      File.write!(Path.join(ctx.workspace, "scratch"), "discard")
+      retire(ctx)
+
+      report = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert report.status == "incomplete"
+      assert Enum.any?(report.blockers, &(&1.reason == "uncaptured_work"))
+      assert report.removed_count == 0
+      assert File.read!(Path.join(repo, "work.txt")) == "unpushed"
+      assert File.exists?(Path.join(ctx.workspace, "scratch"))
+
+      assert [%{"kind" => "git", "path" => "tb/repo", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+
+      assert detail =~ "unpushed_commits=1"
+      assert WorkspaceCleanup.health(ctx.db).count == 1
+    end
+
+    test "stashes, uncommitted changes and untracked files each hold removal", ctx do
+      for {name, prepare} <- [
+            {"stash", &stash_change/1},
+            {"dirty", &dirty_change/1},
+            {"untracked", &untracked_file/1}
+          ] do
+        repo = init_pushed_repo(ctx, name)
+        prepare.(repo)
+      end
+
+      retire(ctx)
+      report = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+      assert report.status == "incomplete"
+
+      held = WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+      assert Enum.map(held, & &1["path"]) == ["dirty", "stash", "untracked"]
+      assert Enum.at(held, 0)["detail"] =~ "modified=1"
+      assert Enum.at(held, 1)["detail"] =~ "stashes=1"
+      assert Enum.at(held, 2)["detail"] =~ "untracked=1"
+      assert File.dir?(ctx.workspace)
+    end
+
+    test "a local branch with no upstream carrying an unpushed commit holds removal and is named",
+         ctx do
+      repo = init_pushed_repo(ctx, "branches")
+      git!(repo, ["checkout", "-q", "-b", "feature-no-upstream"])
+      commit(repo, "feature.txt", "only on this branch")
+      git!(repo, ["checkout", "-q", "-"])
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert [%{"path" => "branches", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+
+      assert detail =~ "unpushed_commits=1"
+      assert detail =~ "unpushed_refs=heads/feature-no-upstream"
+    end
+
+    test "branches whose commits are all reachable from a remote ref do not hold removal", ctx do
+      repo = init_pushed_repo(ctx, "reachable")
+      git!(repo, ["branch", "no-upstream-but-pushed"])
+      git!(repo, ["tag", "pushed-tag"])
+      retire(ctx)
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      refute File.exists?(ctx.workspace)
+    end
+
+    test "a detached HEAD in a linked worktree outside the workdir holds removal", ctx do
+      repo = init_pushed_repo(ctx, "main-repo")
+      outside = Path.join(ctx.base, "linked-worktree")
+      git!(repo, ["worktree", "add", "-q", "--detach", outside])
+      commit(outside, "detached.txt", "only on a detached HEAD")
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert [%{"path" => "main-repo", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+
+      assert detail =~ "unpushed_refs=detached:"
+    end
+
+    test "a clean checkout with every commit on a remote ref is removed without ceremony", ctx do
+      init_pushed_repo(ctx, "clean")
+      File.write!(Path.join(ctx.workspace, "clean/ignored.log"), "ignored")
+      File.write!(Path.join(ctx.workspace, "clean/.gitignore"), "ignored.log\n")
+      {_, 0} = System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "add", ".gitignore"])
+
+      {_, 0} =
+        System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "commit", "-qm", "ignore"])
+
+      {_, 0} =
+        System.cmd("git", [
+          "-C",
+          Path.join(ctx.workspace, "clean"),
+          "push",
+          "-q",
+          "origin",
+          "HEAD"
+        ])
+
+      retire(ctx)
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      refute File.exists?(ctx.workspace)
+      assert WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key) == []
+    end
+
+    test "an in-workspace artifact with no stored content is archived, not lost", ctx do
+      kept = Path.join(ctx.workspace, "reports/evidence.md")
+      File.mkdir_p!(Path.dirname(kept))
+      File.write!(kept, "evidence")
+      artifact = artifact(ctx, kept)
+      retire(ctx)
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      archived = Artifacts.get(ctx.db, artifact.artifact_id)
+      assert archived.state == "archived"
+      assert File.read!(archived.home) == "evidence"
+    end
+
+    test "held work leaves recorded artifacts in place until the loss is acknowledged", ctx do
+      kept = Path.join(ctx.workspace, "reports/evidence.md")
+      File.mkdir_p!(Path.dirname(kept))
+      File.write!(kept, "evidence")
+      artifact = artifact(ctx, kept)
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "unpushed")
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+      assert File.read!(kept) == "evidence"
+    end
+
+    test "acknowledgement records what was accepted and permits only that removal", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "unpushed")
+      retire(ctx)
+      key = ctx.session.session_key
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      assert {:ok, [%{"path" => "repo"}]} =
+               WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+
+      assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      refute File.exists?(ctx.workspace)
+
+      {:ok, [[stored]]} =
+        DB.query(ctx.db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [key])
+
+      assert %{"acknowledged" => [%{"key" => "git:repo@" <> _, "by" => "user:owner", "at" => at}]} =
+               JSON.decode!(stored)
+
+      assert is_integer(at)
+      assert {:error, :nothing_held} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+    end
+
+    test "work that appears after an acknowledgement is held again", ctx do
+      first = init_repo(ctx.workspace, "first")
+      commit(first, "a.txt", "a")
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert {:ok, _} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+      second = init_repo(ctx.workspace, "second")
+      commit(second, "b.txt", "b")
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert File.exists?(Path.join(second, "b.txt"))
+      assert [%{"path" => "second"}] = WorkspaceCleanup.held_losses(ctx.db, key)
+    end
+
+    test "new work in an acknowledged repository is held again", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "a.txt", "a")
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert {:ok, _} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+      commit(repo, "b.txt", "b")
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert File.read!(Path.join(repo, "b.txt")) == "b"
+      assert [%{"path" => "repo", "detail" => detail}] = WorkspaceCleanup.held_losses(ctx.db, key)
+      assert detail =~ "unpushed_commits=2"
+    end
+
+    for {change, filename, detail_field} <- [
+          {:staged, "tracked.txt", "modified"},
+          {:unstaged, "tracked.txt", "modified"},
+          {:untracked, "-new file.txt", "untracked"}
+        ] do
+      test "#{change} file edited after acknowledgement is held again", ctx do
+        repo = init_pushed_repo(ctx, "repo")
+        filename = unquote(filename)
+        path = Path.join(repo, filename)
+        field = unquote(detail_field)
+        File.write!(path, <<0, "original edit">>)
+        if unquote(change) == :staged, do: git!(repo, ["add", "--", filename])
+        retire(ctx)
+        key = ctx.session.session_key
+
+        assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+        assert {:ok, [%{"detail" => original}]} =
+                 WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+
+        File.write!(path, <<0, "a changed edit">>)
+        if unquote(change) == :staged, do: git!(repo, ["add", "--", filename])
+
+        assert %{status: "incomplete", removed_count: 0} =
+                 WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+        assert File.read!(path) == <<0, "a changed edit">>
+        assert [%{"detail" => changed}] = WorkspaceCleanup.held_losses(ctx.db, key)
+        assert original =~ "#{field}=1"
+        assert changed =~ "#{field}=1"
+        assert original != changed
+
+        assert {:ok, [_]} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+        assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      end
+    end
+
+    test "a bare repository and a clone that pushes to it inside the workdir are both held",
+         ctx do
+      origin = Path.join(ctx.workspace, "origin.git")
+      {_, 0} = System.cmd("git", ["init", "-q", "--bare", origin])
+      app = init_repo(ctx.workspace, "app")
+      git!(app, ["remote", "add", "origin", origin])
+      commit(app, "work.txt", "pushed only to a local bare remote")
+      git!(app, ["push", "-q", "origin", "HEAD"])
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      held =
+        Map.new(WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key), &{&1["path"], &1})
+
+      assert Map.keys(held) |> Enum.sort() == ["app", "origin.git"]
+      assert held["app"]["detail"] =~ "workdir_remotes=origin"
+      assert held["origin.git"]["detail"] =~ "bare=1"
+      assert File.dir?(origin)
+    end
+
+    test "a bare clone reports detached commits and stashes made in an external linked worktree",
+         ctx do
+      source = init_pushed_repo(ctx, "source")
+      bare = Path.join(ctx.workspace, "bare.git")
+      remote = Path.join(ctx.base, "remote-source.git")
+      git!(source, ["clone", "-q", "--bare", remote, bare])
+      git!(bare, ["fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*"])
+
+      outside = Path.join(ctx.base, "bare-linked-worktree")
+      git!(bare, ["worktree", "add", "-q", "--detach", outside])
+      commit(outside, "detached.txt", "only on a detached HEAD")
+      stash_change(outside)
+      retire(ctx)
+      key = ctx.session.session_key
+
+      assert %{status: "incomplete", removed_count: 0} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      assert [%{"path" => "bare.git", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, key)
+
+      assert detail =~ "unpushed_refs=detached:"
+      assert detail =~ "stash_entries=stash@{0}"
+      assert File.dir?(bare)
+    end
+
+    test "an absolute local remote resolves symlinks and dot segments before reachability", ctx do
+      origin = Path.join(ctx.workspace, "origin.git")
+      {_, 0} = System.cmd("git", ["init", "-q", "--bare", origin])
+      symlink = Path.join(ctx.base, "origin-link")
+      File.ln_s!(origin, symlink)
+
+      dot_segments =
+        ctx.base <>
+          "/../" <>
+          Path.basename(ctx.base) <>
+          "/" <>
+          Path.relative_to(origin, ctx.base)
+
+      for {name, alias_path} <- [{"dot-segments", dot_segments}, {"symlink", symlink}] do
+        repo = init_repo(ctx.workspace, name)
+        git!(repo, ["remote", "add", "origin", alias_path])
+        commit(repo, "work.txt", "pushed to #{name}")
+        git!(repo, ["push", "-q", "origin", "HEAD:refs/heads/#{name}"])
+      end
+
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      held = Map.new(WorkspaceCleanup.held_losses(ctx.db, key), &{&1["path"], &1["detail"]})
+      assert held["dot-segments"] =~ "workdir_remotes=origin"
+      assert held["dot-segments"] =~ "unpushed_commits=1"
+      assert held["symlink"] =~ "workdir_remotes=origin"
+      assert held["symlink"] =~ "unpushed_commits=1"
+    end
+
+    test "structured loss details include every unpushed ref and stash entry", ctx do
+      repo = init_pushed_repo(ctx, "repo")
+      commit(repo, "feature.txt", "unpushed")
+
+      for n <- 0..11 do
+        git!(repo, ["branch", "feature-#{n}"])
+        File.write!(Path.join(repo, "tracked.txt"), "stashed change #{n}")
+        git!(repo, ["stash"])
+      end
+
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert [%{"detail" => detail}] = WorkspaceCleanup.held_losses(ctx.db, key)
+      assert [_, refs] = Regex.run(~r/unpushed_refs=(\S+)/, detail)
+      assert [_, stashes] = Regex.run(~r/stash_entries=(\S+)/, detail)
+      assert Enum.count(String.split(refs, ",")) == 13
+
+      assert Enum.sort(String.split(stashes, ",")) ==
+               Enum.sort(for n <- 0..11, do: "stash@{#{n}}")
+
+      for n <- 0..11 do
+        assert "heads/feature-#{n}" in String.split(refs, ",")
+      end
+    end
+
+    test "retire on a retired session lists held work and --acknowledge-loss releases it", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "unpushed")
+      key = ctx.session.session_key
+
+      retire_call = fn params ->
+        Gateway.handlers(ctx.config)["retire"].(%{
+          origin: "user:owner",
+          principal: {:user, "owner"},
+          session_key: key,
+          params: params
+        })
+      end
+
+      assert %{code: "invalid"} = retire_call.(%{acknowledge_loss: true})
+      retire(ctx)
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      assert %{held_losses: [%{"path" => "repo", "session_key" => ^key}]} = retire_call.(%{})
+      assert File.exists?(Path.join(repo, "work.txt"))
+
+      assert %{acknowledged_losses: [%{"path" => "repo"}]} =
+               retire_call.(%{acknowledge_loss: true})
+
+      assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      refute File.exists?(ctx.workspace)
+    end
+  end
+
+  describe "a retire removes the whole subtree, so each session is checked" do
+    test "a closed child's unpushed commit is held and the result lists the child", ctx do
+      {child, child_workspace} = child_session(ctx, "closed-child", ctx.session.session_key)
+      child_repo = init_repo(child_workspace, "repo")
+      commit(child_repo, "work.txt", "child work")
+      root_key = ctx.session.session_key
+
+      result = retire_call(ctx, root_key, %{keep_open_descendants: true})
+
+      assert result.retired_session_keys |> Enum.sort() ==
+               Enum.sort([root_key, child.session_key])
+
+      names = Map.new(result.retired_sessions, &{&1.session_key, &1.display_name})
+      assert names == %{root_key => "Example", child.session_key => "Closed child"}
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, root_key)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, child.session_key)
+
+      assert File.read!(Path.join(child_repo, "work.txt")) == "child work"
+
+      assert %{held_losses: [held]} = retire_call(ctx, root_key, %{})
+      assert %{"session_key" => key, "display_name" => "Closed child", "path" => "repo"} = held
+      assert key == child.session_key
+    end
+
+    test "a protected descendant is kept with its subtree and its workspace is untouched", ctx do
+      ensure_main_session(ctx.db, "owner")
+      {holder, holder_workspace} = child_session(ctx, "holder", ctx.session.session_key)
+      {grandchild, _} = child_session(ctx, "grandchild", holder.session_key)
+      repo = init_repo(holder_workspace, "repo")
+      commit(repo, "work.txt", "holder work")
+
+      {:ok, []} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt) VALUES ('open-one','Ship',?1,?2,1)",
+          [holder.session_key, ctx.session.session_key]
+        )
+
+      assert %{code: "open_descendants"} = retire_call(ctx, ctx.session.session_key, %{})
+      result = retire_call(ctx, ctx.session.session_key, %{keep_open_descendants: true})
+
+      assert result.retired_session_keys == [ctx.session.session_key]
+      assert Org.get(ctx.db, holder.session_key).state == "active"
+      assert Org.get(ctx.db, grandchild.session_key).state == "active"
+      assert File.read!(Path.join(repo, "work.txt")) == "holder work"
+    end
+
+    test "the preview lists every session and its scan and changes nothing", ctx do
+      ensure_main_session(ctx.db, "owner")
+      {child, child_workspace} = child_session(ctx, "closed-child", ctx.session.session_key)
+      {holder, _} = child_session(ctx, "holder", ctx.session.session_key)
+      repo = init_repo(child_workspace, "repo")
+      commit(repo, "work.txt", "child work")
+
+      {:ok, []} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt) VALUES ('open-one','Ship',?1,?2,1)",
+          [holder.session_key, ctx.session.session_key]
+        )
+
+      before = DB.query(ctx.db, "SELECT sessionKey,state FROM sessions ORDER BY sessionKey")
+      cleanup_rows = "SELECT COUNT(*) FROM retired_workspace_cleanup"
+      {:ok, [[0]]} = DB.query(ctx.db, cleanup_rows)
+
+      preview = retire_call(ctx, ctx.session.session_key, %{dry_run: true})
+
+      assert %{dry_run: true, requires_keep_open_descendants: true, sessions_with_held_work: 1} =
+               preview
+
+      by_key = Map.new(preview.would_retire, &{&1.session_key, &1})
+
+      assert Map.keys(by_key) |> Enum.sort() ==
+               Enum.sort([ctx.session.session_key, child.session_key])
+
+      assert %{scan: "ok", losses: []} = by_key[ctx.session.session_key]
+
+      assert %{scan: "ok", display_name: "Closed child", losses: [%{kind: "git", path: "repo"}]} =
+               by_key[child.session_key]
+
+      assert [%{session_key: kept}] = preview.would_keep
+      assert kept == holder.session_key
+
+      assert before ==
+               DB.query(ctx.db, "SELECT sessionKey,state FROM sessions ORDER BY sessionKey")
+
+      assert {:ok, [[0]]} = DB.query(ctx.db, cleanup_rows)
+      assert File.read!(Path.join(repo, "work.txt")) == "child work"
+      assert Org.get(ctx.db, ctx.session.session_key).state == "active"
+    end
+  end
+
+  defp child_session(ctx, slug, parent_key) do
+    child =
+      Org.create(ctx.db, %{
+        session_key: slug,
+        display_name: slug |> String.replace("-", " ") |> String.capitalize(),
+        kind: "custom",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        spawned_by: parent_key,
+        archetype: "default",
+        host: Placement.local_host_name(),
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("example")
+      })
+
+    workspace = Placement.workdir_path(ctx.config, child)
+    File.mkdir_p!(workspace)
+    {child, workspace}
+  end
+
+  defp retire_call(ctx, key, params) do
+    Gateway.handlers(ctx.config)["retire"].(%{
+      origin: "user:owner",
+      principal: {:user, "owner"},
+      session_key: key,
+      params: params
+    })
+  end
+
+  defp git!(repo, args) do
+    {_, 0} =
+      System.cmd(
+        "git",
+        ["-c", "user.name=t", "-c", "user.email=t@example.com", "-C", repo | args],
+        stderr_to_stdout: true
+      )
+  end
+
+  defp init_repo(workspace, name) do
+    repo = Path.join(workspace, name)
+    File.mkdir_p!(repo)
+    git!(repo, ["init", "-q"])
+    repo
+  end
+
+  defp commit(repo, file, content) do
+    File.write!(Path.join(repo, file), content)
+    git!(repo, ["add", file])
+    git!(repo, ["commit", "-qm", "add " <> file])
+  end
+
+  # A checkout whose only commit is on a remote ref, like a clean clone.
+  defp init_pushed_repo(ctx, name) do
+    remote = Path.join(ctx.base, "remote-#{name}.git")
+    {_, 0} = System.cmd("git", ["init", "-q", "--bare", remote])
+    repo = init_repo(ctx.workspace, name)
+    commit(repo, "tracked.txt", "tracked")
+    git!(repo, ["remote", "add", "origin", remote])
+    git!(repo, ["push", "-q", "origin", "HEAD"])
+    repo
+  end
+
+  defp stash_change(repo) do
+    File.write!(Path.join(repo, "tracked.txt"), "changed")
+    git!(repo, ["stash"])
+  end
+
+  defp dirty_change(repo), do: File.write!(Path.join(repo, "tracked.txt"), "changed")
+  defp untracked_file(repo), do: File.write!(Path.join(repo, "new.txt"), "new")
+
   defp retire(ctx) do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [

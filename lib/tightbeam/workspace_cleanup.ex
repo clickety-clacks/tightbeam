@@ -323,6 +323,9 @@ defmodule Tightbeam.WorkspaceCleanup do
 
         destination = Path.join(root, archive_name(key))
 
+        acknowledged =
+          stored_report(db, key) |> Map.get("acknowledged", []) |> Enum.map(& &1["key"])
+
         {:ok, [[destination]]} =
           DB.query(
             db,
@@ -337,6 +340,7 @@ defmodule Tightbeam.WorkspaceCleanup do
           hosts: hosts,
           workspace: workspace,
           archive_path: destination,
+          acknowledged_losses: acknowledged,
           runner: Map.get(config, :workspace_cleanup_runner),
           runner_timeout_ms:
             Map.get(config, :workspace_cleanup_timeout_ms, @default_runner_timeout_ms)
@@ -351,7 +355,7 @@ defmodule Tightbeam.WorkspaceCleanup do
     {:ok, [[attempts]]} =
       DB.query(db, "SELECT attempts FROM retired_workspace_cleanup WHERE sessionKey=?1", [key])
 
-    summary = report_summary(report)
+    summary = report_summary(report, stored_report(db, key))
 
     reason =
       report.blockers |> Enum.map(& &1.reason) |> Enum.uniq() |> Enum.sort() |> Enum.join(", ")
@@ -481,7 +485,8 @@ defmodule Tightbeam.WorkspaceCleanup do
            plan.keep,
            Keyword.get(opts, :archive_path),
            Keyword.get(opts, :runner),
-           Keyword.get(opts, :runner_timeout_ms, @default_runner_timeout_ms)
+           Keyword.get(opts, :runner_timeout_ms, @default_runner_timeout_ms),
+           Keyword.get(opts, :acknowledged_losses, [])
          ) do
       {:ok, execution} ->
         if execution.status == "completed" and Keyword.get(opts, :archive_path) do
@@ -538,11 +543,216 @@ defmodule Tightbeam.WorkspaceCleanup do
     |> Map.merge(%{removed_count_complete: false, result_confirmed: false})
   end
 
-  defp report_summary(report),
-    do: %{
+  # The stored report carries the operator's loss acknowledgements across
+  # cleanup runs; a run never drops them.
+  defp report_summary(report, stored \\ %{}) do
+    losses = report |> Map.get(:losses, []) |> Enum.map(&Map.take(&1, [:kind, :path, :detail]))
+
+    summary = %{
       removed_count: report.removed_count,
       blockers: report.blockers |> Enum.map(& &1.reason) |> Enum.uniq()
     }
+
+    summary = if losses == [], do: summary, else: Map.put(summary, :losses, losses)
+
+    case Map.get(stored, "acknowledged", []) do
+      [] -> summary
+      acknowledged -> Map.put(summary, :acknowledged, acknowledged)
+    end
+  end
+
+  defp stored_report(db, key) do
+    with {:ok, [[json]]} when is_binary(json) <-
+           DB.query(db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [key]),
+         {:ok, %{} = report} <- JSON.decode(json) do
+      report
+    else
+      _ -> %{}
+    end
+  end
+
+  @doc """
+  Read-only preview for sessions that are still active: scans each session's
+  workspace on its own host for work a retirement would hold back, without
+  changing anything. Returns one entry per key with `scan: "ok"` and the
+  losses, or `scan: "unavailable"` and a reason when the host cannot be read.
+  """
+  def preview(config, db, session_keys) do
+    timeout = Map.get(config, :workspace_cleanup_scan_timeout_ms, 60_000)
+
+    session_keys
+    |> Task.async_stream(&preview_one(config, db, &1, timeout),
+      max_concurrency: 4,
+      timeout: timeout + 10_000,
+      on_timeout: :kill_task,
+      ordered: true
+    )
+    |> Enum.zip(session_keys)
+    |> Enum.map(fn
+      {{:ok, entry}, _key} -> entry
+      {{:exit, reason}, key} -> preview_entry(db, key, {:unavailable, inspect(reason)})
+    end)
+  end
+
+  defp preview_one(config, db, key, timeout) do
+    result =
+      try do
+        session = Tightbeam.Org.get(db, key)
+        hosts = Tightbeam.Placement.hosts(config.base_dir, db)
+        host = Map.fetch!(hosts, session.host)
+        workspace = Tightbeam.Placement.workdir_path(config, session)
+
+        with {:ok, {:ok, keep}} <-
+               DB.transaction(db, fn txn ->
+                 protection_plan(txn, session.host, host, hosts, workspace)
+               end),
+             {:ok, execution} <-
+               execute(
+                 host,
+                 workspace,
+                 keep,
+                 nil,
+                 Map.get(config, :workspace_cleanup_runner),
+                 timeout,
+                 [],
+                 true
+               ) do
+          if execution.result_confirmed and
+               Enum.all?(execution.blockers, &(&1.reason == "artifact_missing")),
+             do: {:ok, execution.losses},
+             else: {:unavailable, inspect(Enum.map(execution.blockers, & &1.reason))}
+        else
+          {:ok, {:error, blocker}} -> {:unavailable, inspect(blocker)}
+          {:error, blocker} -> {:unavailable, inspect(blocker)}
+          other -> {:unavailable, inspect(other)}
+        end
+      rescue
+        error -> {:unavailable, Exception.message(error)}
+      catch
+        kind, reason -> {:unavailable, "#{kind}: #{inspect(reason)}"}
+      end
+
+    preview_entry(db, key, result)
+  end
+
+  defp preview_entry(db, key, {:ok, losses}) do
+    %{
+      session_key: key,
+      display_name: display_name(db, key),
+      scan: "ok",
+      losses: Enum.map(losses, &Map.take(&1, [:kind, :path, :detail]))
+    }
+  end
+
+  defp preview_entry(db, key, {:unavailable, reason}) do
+    %{
+      session_key: key,
+      display_name: display_name(db, key),
+      scan: "unavailable",
+      detail: reason,
+      losses: []
+    }
+  end
+
+  defp display_name(db, key) do
+    case Tightbeam.Org.get(db, key) do
+      %{display_name: name} -> name
+      _ -> nil
+    end
+  end
+
+  @doc """
+  Where a retired session's workspace cleanup stands, from its queue row and
+  stored report: `queued` (not yet attempted), `completed`, `held` (work is
+  waiting for acknowledgement), or `blocked` (attempts fail; `reasons` names
+  why). Returns `nil` when the session has no cleanup row.
+  """
+  def status(db, key) do
+    case DB.query(
+           db,
+           "SELECT completed, attempts, nextAt, reason FROM retired_workspace_cleanup WHERE sessionKey=?1",
+           [key]
+         ) do
+      {:ok, [[1, _attempts, _next, _reason]]} ->
+        %{cleanup: "completed", reasons: []}
+
+      {:ok, [[0, 0, _next, _reason]]} ->
+        %{cleanup: "queued", reasons: []}
+
+      {:ok, [[0, attempts, next_at, reason]]} ->
+        reasons = if is_binary(reason), do: String.split(reason, ", "), else: []
+        held? = "uncaptured_work" in reasons
+
+        reasons =
+          if held?, do: reasons -- ["cleanup_command_failed", "cleanup_incomplete"], else: reasons
+
+        %{
+          cleanup: if(held?, do: "held", else: "blocked"),
+          reasons: reasons,
+          attempts: attempts,
+          next_attempt_at: next_at
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
+  The losses a retired session's last cleanup run held back, as
+  `%{kind, path, detail}` maps; `[]` when nothing is held.
+  """
+  def held_losses(db, key) do
+    case stored_report(db, key) do
+      %{"losses" => losses, "blockers" => blockers} when is_list(losses) ->
+        if "uncaptured_work" in blockers, do: losses, else: []
+
+      _ ->
+        []
+    end
+  end
+
+  @doc """
+  Acknowledges the losses currently held for a retired session so the next
+  cleanup run may delete them. Returns `{:ok, acknowledged_losses}` or
+  `{:error, :nothing_held}`. Acknowledgements are stored by loss key
+  (`kind:path`) with who and when, in the cleanup report.
+  """
+  def acknowledge(db, key, by) do
+    case held_losses(db, key) do
+      [] ->
+        {:error, :nothing_held}
+
+      losses ->
+        now = System.system_time(:millisecond)
+        stored = stored_report(db, key)
+
+        entries =
+          Enum.map(losses, fn loss ->
+            %{"key" => loss_key(loss), "by" => by, "at" => now, "detail" => loss["detail"]}
+          end)
+
+        keys = Enum.map(entries, & &1["key"])
+        previous = stored |> Map.get("acknowledged", []) |> Enum.reject(&(&1["key"] in keys))
+
+        {:ok, _} =
+          DB.query(
+            db,
+            "UPDATE retired_workspace_cleanup SET report=?2, nextAt=0 WHERE sessionKey=?1 AND completed=0",
+            [key, JSON.encode!(Map.put(stored, "acknowledged", previous ++ entries))]
+          )
+
+        EventLog.lifecycle(
+          db,
+          "retired_workspace_loss_acknowledged",
+          key,
+          JSON.encode!(%{by: by, acknowledged: Enum.map(entries, & &1["key"])})
+        )
+
+        kick()
+        {:ok, losses}
+    end
+  end
 
   defp record_report(db, report) do
     kind =
@@ -729,7 +939,16 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
-  defp execute(host, workspace, keep, archive_path, runner, timeout_ms) do
+  defp execute(
+         host,
+         workspace,
+         keep,
+         archive_path,
+         runner,
+         timeout_ms,
+         acknowledged,
+         scan_only \\ false
+       ) do
     cond do
       contains_line_break?(workspace) ->
         {:error, %{reason: "workspace_path_unrepresentable"}}
@@ -738,7 +957,15 @@ defmodule Tightbeam.WorkspaceCleanup do
         {:error, %{reason: "cleanup_runner_timeout_invalid"}}
 
       true ->
-        script = cleanup_script(Path.expand(workspace), archive_path, timeout_ms)
+        script =
+          cleanup_script(
+            Path.expand(workspace),
+            archive_path,
+            timeout_ms,
+            acknowledged,
+            scan_only
+          )
+
         manifest = if keep.paths == [], do: "", else: Enum.join(keep.paths, "\n") <> "\n"
 
         invocation =
@@ -796,7 +1023,7 @@ defmodule Tightbeam.WorkspaceCleanup do
   end
 
   defp execution_report({output, status}) when is_binary(output) and is_integer(status) do
-    {removed, errors, done, diagnostics} = parse_output(output)
+    {removed, errors, done, diagnostics, losses} = parse_output(output)
 
     command_errors =
       if status == 0, do: [], else: [%{reason: "cleanup_command_failed", exit: status}]
@@ -817,6 +1044,7 @@ defmodule Tightbeam.WorkspaceCleanup do
       removed_count: removed,
       removed_count_complete: done in [0, 1],
       blockers: blockers,
+      losses: losses,
       diagnostics: diagnostics,
       command_exit: status,
       result_confirmed: done in [0, 1]
@@ -833,33 +1061,64 @@ defmodule Tightbeam.WorkspaceCleanup do
     do: failed_report([], "cleanup_runner_result_invalid", inspect(other))
 
   defp parse_output(output) do
-    Enum.reduce(String.split(output, "\n", trim: true), {0, [], nil, []}, fn line,
-                                                                             {removed, errors,
-                                                                              done, diagnostics} ->
-      case String.split(line, "\t") do
-        ["R"] ->
-          {removed + 1, errors, done, diagnostics}
+    {removed, errors, done, diagnostics, losses} =
+      Enum.reduce(String.split(output, "\n", trim: true), {0, [], nil, [], []}, fn line, acc ->
+        {removed, errors, done, diagnostics, losses} = acc
 
-        ["E", reason, hex] ->
-          path =
+        case String.split(line, "\t") do
+          ["R"] ->
+            {removed + 1, errors, done, diagnostics, losses}
+
+          ["E", reason, hex] ->
+            path =
+              case decode_path(hex) do
+                {:ok, decoded} -> decoded
+                :error -> nil
+              end
+
+            {removed, [%{reason: reason, path: path} | errors], done, diagnostics, losses}
+
+          ["L", kind, hex, detail] ->
             case decode_path(hex) do
-              {:ok, decoded} -> decoded
-              :error -> nil
+              {:ok, path} ->
+                loss = %{kind: kind, path: path, detail: detail}
+                {removed, errors, done, diagnostics, [loss | losses]}
+
+              :error ->
+                {removed, errors, done, [line | diagnostics], losses}
             end
 
-          {removed, [%{reason: reason, path: path} | errors], done, diagnostics}
+          ["DONE", "0"] ->
+            {removed, errors, 0, diagnostics, losses}
 
-        ["DONE", "0"] ->
-          {removed, errors, 0, diagnostics}
+          ["DONE", "1"] ->
+            {removed, errors, 1, diagnostics, losses}
 
-        ["DONE", "1"] ->
-          {removed, errors, 1, diagnostics}
+          _ ->
+            {removed, errors, done, [line | diagnostics], losses}
+        end
+      end)
 
-        _ ->
-          {removed, errors, done, [line | diagnostics]}
-      end
-    end)
+    {removed, errors, done, diagnostics, Enum.sort_by(losses, &loss_key/1)}
   end
+
+  # The acknowledgement key binds the loss to the scanned state, so work that
+  # changes after it was acknowledged is held again.
+  @doc false
+  def loss_key(%{kind: kind, path: path} = loss),
+    do: kind <> ":" <> path <> "@" <> loss_state(Map.get(loss, :detail))
+
+  def loss_key(%{"kind" => kind, "path" => path} = loss),
+    do: kind <> ":" <> path <> "@" <> loss_state(Map.get(loss, "detail"))
+
+  defp loss_state(detail) when is_binary(detail) do
+    case Regex.run(~r/ state=(\S+)$/, detail) do
+      [_, state] -> state
+      _ -> ""
+    end
+  end
+
+  defp loss_state(_), do: ""
 
   defp decode_path(hex) do
     case Base.decode16(hex, case: :mixed) do
@@ -873,14 +1132,17 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
-  defp cleanup_script(root, archive_path, timeout_ms) do
+  defp cleanup_script(root, archive_path, timeout_ms, acknowledged, scan_only) do
     """
     #{move_script(timeout_ms)}
     umask 077
     root=#{shell_quote(root)}
     workspace_root=$root
     archive=#{shell_quote(archive_path || "")}
+    ack_list=#{shell_quote(Enum.join(acknowledged, "\n"))}
     keep_list=$(cat)
+    loss_hold=0
+    scan_only=#{if scan_only, do: 1, else: 0}
     had_error=0
     unsafe_route=0
     present_keep_list=
@@ -914,6 +1176,222 @@ defmodule Tightbeam.WorkspaceCleanup do
         *"\n$1"/*) return 0 ;;
         *) return 1 ;;
       esac
+    }
+
+    emit_loss() {
+      encoded=$(emit_path "$2")
+      printf 'L\\t%s\\t%s\\t%s\\n' "$1" "$encoded" "$3"
+    }
+
+    is_acknowledged() {
+      case "\n$ack_list\n" in
+        *"\n$1:$2\n"*) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+
+    under_protected() (
+      saved_ifs=$IFS
+      IFS='
+    '
+      set -f
+      for keep in $keep_list; do
+        [ "$keep" = . ] && return 0
+        case "$1" in
+          "$keep"|"$keep"/*) return 0 ;;
+        esac
+      done
+      return 1
+    )
+
+    git_in_repo() {
+      git -c safe.directory='*' -C "$repo" "$@"
+    }
+
+    git_count() {
+      out=$(git_in_repo "$@" 2>/dev/null) || { echo unknown; return; }
+      if [ -z "$out" ]; then echo 0; else printf '%s\n' "$out" | awk 'END { print NR }'; fi
+    }
+
+    hash_untracked() (
+      cd "$repo" || return 1
+      # The producer reports a listing failure even when xargs exits successfully.
+      { git -c safe.directory='*' ls-files -z --others --exclude-standard || printf 'unknown\\n' >&3; } |
+        xargs -0 sh -c '
+          for path do
+            printf "%s\\000" "$path"
+            if [ -L "$path" ]; then
+              printf "symlink\\000"
+              readlink "./$path" || exit 1
+            elif [ -f "$path" ]; then
+              printf "file\\000"
+              git hash-object --no-filters -- "$path" || exit 1
+            elif [ -d "$path" ]; then
+              # Git can list an embedded repository as one directory entry.
+              # The repository scan checks that directory separately.
+              printf "directory"
+            else
+              exit 1
+            fi
+            printf "\\000"
+          done
+        ' sh
+    )
+
+    repo_state_bytes() {
+      printf '%s\\000' "$head_oid" "$detached"
+      git_in_repo for-each-ref || return 1
+      printf '%s\\000' "$stash_entries"
+      if [ "$bare" -eq 0 ]; then
+        git_in_repo status --porcelain -z --untracked-files=no || return 1
+        # Hash HEAD-to-index and index-to-worktree separately, including when one
+        # change would cancel the other in a single HEAD-to-worktree diff.
+        git_in_repo diff --cached --binary --no-ext-diff --no-textconv -- || return 1
+        git_in_repo diff --binary --no-ext-diff --no-textconv -- || return 1
+        hash_untracked || return 1
+      fi
+    }
+
+    hash_repo_state() {
+      # Keep the byte stream out of shell variables. Send failures around the
+      # pipeline on fd 3 so a hash of partial input can never authorize removal.
+      { { repo_state_bytes || printf 'unknown\\n' >&3; } | git hash-object --stdin; } 3>&1
+    }
+
+    # A remote counts as durable unless its URL is a local path inside the
+    # workdir being removed (or a local path that cannot be resolved).
+    remote_is_inside() {
+      url=$1
+      case "$url" in
+        file://*) url=${url#file://} ;;
+        /*) ;;
+        *://*) return 1 ;;
+        *:*) return 1 ;;
+      esac
+      case "$url" in
+        /*) abs=$url ;;
+        *) abs=$repo/$url ;;
+      esac
+      [ -e "$abs" ] || return 0
+      abs=$(realpath "$abs" 2>/dev/null) || return 0
+      case "$abs" in
+        "$scan_root_real"|"$scan_root_real"/*) return 0 ;;
+      esac
+      return 1
+    }
+
+    # Prints one L line when the repository holds work that no durable remote has.
+    # The line carries a digest of the repository state; an acknowledgement is
+    # bound to that digest, so changed work needs a fresh acknowledgement.
+    scan_one_repo() {
+      repo=$1
+      rel=$2
+      bare=$3
+      under_protected "$rel" && return 0
+      export GIT_CEILING_DIRECTORIES=${repo%/*}
+      if ! command -v git >/dev/null 2>&1; then
+        is_acknowledged git "$rel@" || emit_loss git "$rel" "git unavailable; repository state unknown"
+        return 0
+      fi
+      durable=
+      local_remotes=
+      for remote in $(git -c safe.directory='*' -C "$repo" remote 2>/dev/null); do
+        url=$(git -c safe.directory='*' -C "$repo" remote get-url "$remote" 2>/dev/null) || url=
+        if remote_is_inside "$url"; then
+          local_remotes="${local_remotes:+$local_remotes,}$remote"
+        else
+          durable="$durable --remotes=$remote"
+        fi
+      done
+      head_oid=$(git_in_repo rev-parse -q --verify HEAD 2>/dev/null) || head_oid=
+      worktrees=$(git_in_repo worktree list --porcelain 2>/dev/null) || {
+        emit_loss git "$rel" "Git worktree list unavailable; repository state unknown"
+        return 0
+      }
+      # Include detached HEADs of all linked worktrees, including those outside
+      # the workdir. Git's bare worktree record omits HEAD itself.
+      detached=$(printf '%s\\n' "$worktrees" | awk '/^HEAD / { head = $2 } /^detached/ { print head }')
+      if [ "$bare" -eq 1 ] && [ -n "$head_oid" ] && ! git_in_repo symbolic-ref -q HEAD >/dev/null 2>&1; then
+        detached="$head_oid $detached"
+      fi
+      detached=$(printf '%s\\n' $detached | sort -u)
+      not_args=
+      [ -z "$durable" ] || not_args="--not $durable"
+      # Every local branch tip (with or without an upstream), every tag and every
+      # detached HEAD is tested for reachability from the durable remote refs.
+      unpushed=$(git_in_repo rev-list --count --branches --tags $head_oid $detached $not_args 2>/dev/null) || unpushed=unknown
+      unpushed_refs=
+      if [ "$unpushed" != 0 ]; then
+        for ref in $(git_in_repo for-each-ref --format='%(refname)' refs/heads refs/tags 2>/dev/null) $detached; do
+          if [ -n "$(git_in_repo rev-list -n 1 "$ref" $not_args 2>/dev/null)" ]; then
+            case "$ref" in
+              refs/*) label=${ref#refs/} ;;
+              *) label=detached:$ref ;;
+            esac
+            unpushed_refs="${unpushed_refs:+$unpushed_refs,}$label"
+          fi
+        done
+      fi
+      # Git requires a worktree argument for stash list even though the list
+      # only reads the shared stash reflog, which a bare repo can also have.
+      if stash_entries=$(git_in_repo --work-tree="$repo" stash list --format='%H %gd' 2>/dev/null); then
+        stashes=$(printf '%s\\n' "$stash_entries" | awk 'NF { count++ } END { print count + 0 }')
+      else
+        stashes=unknown
+      fi
+      modified=0
+      untracked=0
+      if [ "$bare" -eq 0 ]; then
+        modified=$(git_count status --porcelain --untracked-files=no)
+        untracked=$(git_count ls-files --others --exclude-standard)
+      fi
+      if [ "$unpushed" = 0 ] && [ "$stashes" = 0 ] && [ "$modified" = 0 ] && [ "$untracked" = 0 ]; then
+        return 0
+      fi
+      repo_state=unknown
+      if [ "$stashes" != unknown ]; then
+        repo_state=$(hash_repo_state 2>/dev/null) || repo_state=unknown
+      fi
+      case "$repo_state" in
+        ""|*unknown*) repo_state=unknown ;;
+        *) is_acknowledged git "$rel@$repo_state" && return 0 ;;
+      esac
+      detail="unpushed_commits=$unpushed stashes=$stashes modified=$modified untracked=$untracked"
+      [ -z "$unpushed_refs" ] || detail="$detail unpushed_refs=$unpushed_refs"
+      if [ "$stashes" != 0 ] && [ "$stashes" != unknown ]; then
+        stash_names=$(printf '%s\\n' "$stash_entries" | awk '{print $2}' | paste -sd, -)
+        [ -z "$stash_names" ] || detail="$detail stash_entries=$stash_names"
+      fi
+      [ "$bare" -eq 0 ] || detail="$detail bare=1"
+      [ -z "$local_remotes" ] || detail="$detail workdir_remotes=$local_remotes"
+      emit_loss git "$rel" "$detail state=$repo_state"
+    }
+
+    # Read-only. Prints one L line per unacknowledged loss: git work trees and
+    # bare repositories carrying commits on no durable remote ref, stashes,
+    # uncommitted changes or untracked files. Other files that are not
+    # recorded artifacts are still removed, as before.
+    scan_losses() {
+      export GIT_OPTIONAL_LOCKS=0
+      scan_root_real=$(CDPATH= cd -P "$root" 2>/dev/null && pwd -P) || scan_root_real=$root
+      while IFS= read -r gitpath; do
+        [ -n "$gitpath" ] || continue
+        repo=${gitpath%/.git}
+        if [ "$repo" = "$root" ]; then rel=.; else rel=${repo#"$root"/}; fi
+        scan_one_repo "$repo" "$rel" 0
+      done <<GITPATHS
+    $(find "$root" -name .git \\( -type d -o -type f \\) -prune -print 2>/dev/null)
+    GITPATHS
+      while IFS= read -r headpath; do
+        [ -n "$headpath" ] || continue
+        dir=${headpath%/HEAD}
+        [ -d "$dir/objects" ] && [ -d "$dir/refs" ] || continue
+        [ "$(git -c safe.directory='*' -C "$dir" rev-parse --is-bare-repository 2>/dev/null)" = true ] || continue
+        if [ "$dir" = "$root" ]; then rel=.; else rel=${dir#"$root"/}; fi
+        scan_one_repo "$dir" "$rel" 1
+      done <<BAREPATHS
+    $(find "$root" -name .git -prune -o -type f -name HEAD -print 2>/dev/null)
+    BAREPATHS
     }
 
     exact_keep_path() (
@@ -1085,7 +1563,32 @@ defmodule Tightbeam.WorkspaceCleanup do
         IFS=$saved_ifs
         keep_list=$present_keep_list
 
-        if [ "$unsafe_route" -eq 0 ] && ! is_protected .; then
+        if [ "$unsafe_route" -eq 0 ]; then
+          scan_output=$(scan_losses)
+          [ -z "$scan_output" ] || printf '%s\n' "$scan_output"
+          if [ "$scan_only" -eq 1 ]; then
+            printf 'DONE\t0\n'
+            exit 0
+          fi
+          loss_output=$(printf '%s\n' "$scan_output" | grep '^L' || :)
+          if [ -n "$loss_output" ]; then
+            saved_ifs=$IFS
+            IFS='
+    '
+            set -f
+            for loss_line in $loss_output; do
+              loss_kind=$(printf '%s' "$loss_line" | cut -f2)
+              loss_hex=$(printf '%s' "$loss_line" | cut -f3)
+              printf 'E\tuncaptured_work\t%s\n' "$(emit_path "$loss_kind:")$loss_hex"
+            done
+            set +f
+            IFS=$saved_ifs
+            loss_hold=1
+            had_error=1
+          fi
+        fi
+
+        if [ "$unsafe_route" -eq 0 ] && [ "$loss_hold" -eq 0 ] && ! is_protected .; then
           if cleanup_dir ""; then :; else had_error=1; fi
         fi
 
