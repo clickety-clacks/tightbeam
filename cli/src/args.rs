@@ -173,10 +173,18 @@ pub enum Command {
         content_sha256: Option<String>,
         content_base64: Option<String>,
         produced_by_assignment_id: Option<String>,
+        allow_unpinned: bool,
     },
     ArtifactContentFetch {
         identity: Identity,
         artifact_id: String,
+    },
+    ArtifactContentPromote {
+        identity: Identity,
+        artifact_id: String,
+    },
+    ArtifactContentCapacity {
+        identity: Identity,
     },
     Artifacts {
         identity: Identity,
@@ -958,8 +966,8 @@ COMMANDS:
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
-                  [--produced-by-assignment <assignmentId>] [--content-base64 <bytes>]
-      Record a deliberate artifact pointer for the calling session.
+                  [--produced-by-assignment <assignmentId>] [--content-base64 <bytes>] [--allow-unpinned]
+      Pin a file's bytes. At capacity, --allow-unpinned explicitly records a pointer instead.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
   harklight-revise --message <id> --base-revision <n> --title <text>
@@ -998,8 +1006,12 @@ COMMANDS:
       Reconcile all of your open decision requests, stage every disposition, and
       admit at most the requested number of uncovered briefings (default: stage only).
   artifact-content-fetch <artifactId>
-      Fetch captured or archived bytes as contentBase64 with contentSha256 and contentSize.
+      Fetch pinned, captured, or archived bytes as contentBase64 with contentSha256 and contentSize.
       Archived reads report their source and hash status. The original path is never read.
+  artifact-content-promote <artifactId>
+      Copy a verified legacy capture into the pinned store.
+  artifact-content-capacity
+      Read the store's used, staged, free, and effective limit bytes.
   memento-set --record <kind>:<id> --name <name> (--value <value>... | --clear)
       Set a declared record value and retain its history.
   mementos --record <kind>:<id> [--history] [--name <name>]
@@ -1491,6 +1503,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "admin",
     "all",
     "acknowledge-loss",
+    "allow-unpinned",
     "after-turn",
     "replace-queued",
     "api-key",
@@ -2683,6 +2696,24 @@ fn parse_with_optional_catalog(
                 content_sha256: nonempty(flags, "sha256"),
                 content_base64: nonempty(flags, "content-base64"),
                 produced_by_assignment_id: nonempty(flags, "produced-by-assignment"),
+                allow_unpinned: flags.contains_key("allow-unpinned"),
+            })
+        }
+        "artifact-content-promote" => {
+            if parsed.positional.len() != 2 || parsed.positional[1].is_empty() {
+                return Err("usage: tightbeam artifact-content-promote <artifactId>".to_owned());
+            }
+            Ok(Command::ArtifactContentPromote {
+                identity: identity(flags)?,
+                artifact_id: parsed.positional[1].clone(),
+            })
+        }
+        "artifact-content-capacity" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam artifact-content-capacity".to_owned());
+            }
+            Ok(Command::ArtifactContentCapacity {
+                identity: identity(flags)?,
             })
         }
         "tool-call-observed" => {

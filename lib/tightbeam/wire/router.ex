@@ -90,6 +90,8 @@ defmodule Tightbeam.Wire.Router do
                    "fact-producer-claim",
                    "fact-producers",
                    "artifact-content-fetch",
+                   "artifact-content-capacity",
+                   "artifact-content-promote",
                    "assignment-commitref-correct",
                    "harness-health-observe-other",
                    "harness-health-resolve-other",
@@ -341,7 +343,7 @@ defmodule Tightbeam.Wire.Router do
 
   post "/agent/dispatch" do
     with {:ok, auth} <- agent_dispatch_auth(conn) do
-      with_json(conn, fn body, conn ->
+      with_agent_body(conn, fn body, conn ->
         cond do
           body["verb"] == "post" and auth == :org ->
             dispatch_rest_post(conn, auth, body)
@@ -382,24 +384,27 @@ defmodule Tightbeam.Wire.Router do
 
               call =
                 case {verb, principal} do
-                  {"artifact-content-fetch", {:session, session_key}} ->
+                  {verb, {:session, session_key}}
+                  when verb in ["artifact-content-fetch", "artifact-content-promote"] ->
                     Map.put(call, :rest_principal, %{
                       kind: "session",
                       id: session_key,
                       is_admin: false
                     })
 
-                  {"artifact-content-fetch", {:process, name}} ->
+                  {verb, {:process, name}}
+                  when verb in ["artifact-content-fetch", "artifact-content-promote"] ->
                     Map.put(call, :rest_principal, %{kind: "process", id: name, is_admin: true})
 
-                  {"artifact-content-fetch", {:user, user_id}} ->
+                  {verb, {:user, user_id}}
+                  when verb in ["artifact-content-fetch", "artifact-content-promote"] ->
                     Map.put(call, :rest_principal, state_principal_view({:user, user_id}, conn))
 
                   _ ->
                     call
                 end
 
-              dispatch_response(conn, call, 200, &%{"result" => &1})
+              dispatch_with_artifact_upload(conn, call)
             else
               {:error, status, code, message} ->
                 error(conn, status, code, message)
@@ -415,6 +420,51 @@ defmodule Tightbeam.Wire.Router do
 
       {:error, status, code, message, diagnostic} ->
         error(conn, status, code, message, diagnostic)
+    end
+  end
+
+  defp with_agent_body(conn, fun) do
+    case Plug.Conn.get_req_header(conn, "x-tightbeam-artifact-record") do
+      [] ->
+        with_json(conn, fun)
+
+      [metadata] ->
+        with {:ok, json} <- Base.url_decode64(metadata, padding: false),
+             {:ok, %{"verb" => "artifact-record", "params" => params} = body}
+             when is_map(params) <- JSON.decode(json),
+             false <- Map.has_key?(params, "contentBase64") do
+          fun.(body, Plug.Conn.put_private(conn, :artifact_body_upload, true))
+        else
+          _ -> error(conn, 400, "invalid_artifact_upload", "expected artifact record metadata")
+        end
+
+      _ ->
+        error(conn, 400, "invalid_artifact_upload", "expected one artifact metadata header")
+    end
+  end
+
+  defp dispatch_with_artifact_upload(conn, call) do
+    if conn.private[:artifact_body_upload] do
+      case deps(conn)[:artifact_blob_store] do
+        nil ->
+          error(conn, 503, "artifact_store_unavailable")
+
+        store ->
+          case Tightbeam.ArtifactCapture.upload(conn, store, call.params) do
+            {%{custody: _} = capture, conn} ->
+              dispatch_response(
+                conn,
+                Map.put(call, :artifact_capture, capture),
+                200,
+                &%{"result" => &1}
+              )
+
+            {%{code: _} = result, conn} ->
+              dispatch_error(conn, call, 400, result)
+          end
+      end
+    else
+      dispatch_response(conn, call, 200, &%{"result" => &1})
     end
   end
 
@@ -4166,6 +4216,8 @@ defmodule Tightbeam.Wire.Router do
   @non_target_verbs @non_target_verbs ++
                       [
                         "artifact-content-fetch",
+                        "artifact-content-promote",
+                        "artifact-content-capacity",
                         "assignment-commitref-correct",
                         "harness-health-observe-other",
                         "harness-health-resolve-other",
@@ -4770,9 +4822,11 @@ defmodule Tightbeam.Wire.Router do
     "add-user" => ~w(is_admin user_id)a,
     "answer" => ~w(answer idempotency_key reason request request_id)a,
     "artifact-content-fetch" => ~w(artifact_id)a,
+    "artifact-content-promote" => ~w(artifact_id)a,
+    "artifact-content-capacity" => [],
     "artifact-get" => ~w(artifact_id)a,
     "artifact-record" =>
-      ~w(content_base64 content_sha256 description kind origin_path produced_by_assignment_id title work_item_id)a,
+      ~w(allow_unpinned content_base64 content_sha256 description kind origin_path produced_by_assignment_id title work_item_id)a,
     "artifacts" => ~w(session_key work_item_id kind)a,
     "memento-set" => ~w(record name values clear)a,
     "mementos" => ~w(record history name limit cursor)a,
@@ -4984,10 +5038,11 @@ defmodule Tightbeam.Wire.Router do
 
   defp dispatch_error(
          conn,
-         %{verb: "artifact-content-fetch"},
+         %{verb: verb},
          status,
-         %{code: "artifact_sha_mismatch"} = result
-       ) do
+         result
+       )
+       when verb in ["artifact-record", "artifact-content-fetch", "artifact-content-promote"] do
     json(conn, status, %{"error" => Map.delete(result, :ok)})
   end
 

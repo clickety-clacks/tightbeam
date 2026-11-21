@@ -37,7 +37,7 @@ defmodule Tightbeam.ArtifactContent do
   bytes, and the bytes cannot be mutated or dropped.
   """
 
-  alias Tightbeam.{ArtifactArchive, DB}
+  alias Tightbeam.{ArtifactArchive, ArtifactBlobStore, ArtifactCapture, Artifacts, DB}
   alias Tightbeam.DB.Txn
 
   @table_ddl """
@@ -150,9 +150,15 @@ defmodule Tightbeam.ArtifactContent do
              %{code: "not_found"}
            end
          end) do
-      {:ok, {:visible, row}} -> fetch_visible(db, row, config)
-      {:ok, result} -> result
-      {:error, error} -> raise error
+      {:ok, {:visible, row}} ->
+        result = fetch_visible(db, row, config)
+        if row[:custody], do: Map.put(result, :custody, row.custody), else: result
+
+      {:ok, result} ->
+        result
+
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -160,6 +166,20 @@ defmodule Tightbeam.ArtifactContent do
     do: %{code: "invalid", message: "artifact-content-fetch requires only artifactId"}
 
   def fetch_call(_db, _call, _config), do: %{code: "forbidden"}
+
+  defp fetch_visible(_db, %{custody: "pinned"} = row, config) do
+    case ArtifactBlobStore.read(config.artifact_blob_root, row.content_sha256) do
+      {:ok, bytes} ->
+        digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+        content_result(row, digest, byte_size(bytes), bytes, "pinned_copy")
+
+      {:error, reason} ->
+        %{
+          code: "artifact_pin_unavailable",
+          message: "could not read pinned copy: #{inspect(reason)}"
+        }
+    end
+  end
 
   defp fetch_visible(db, %{state: "archived"} = row, config) do
     case fetch(db, row.artifact_id) do
@@ -195,7 +215,12 @@ defmodule Tightbeam.ArtifactContent do
   defp fetch_visible(db, row, _config) do
     case fetch(db, row.artifact_id) do
       nil ->
-        %{code: "content_not_captured", message: "artifact has no stored content"}
+        message =
+          if row[:custody] == "unpinned",
+            do: "artifact was recorded unpinned",
+            else: "artifact has no stored content"
+
+        %{code: "content_not_captured", message: message}
 
       captured ->
         captured
@@ -203,6 +228,51 @@ defmodule Tightbeam.ArtifactContent do
         |> Map.put(:content_base64, Base.encode64(captured.content))
     end
   end
+
+  def capacity(%{artifact_blob_store: store}) do
+    case ArtifactBlobStore.capacity(store) do
+      {:ok, result} -> result
+      {:error, reason} -> %{code: "artifact_capacity_unavailable", message: inspect(reason)}
+    end
+  end
+
+  def capacity(_config), do: %{code: "artifact_store_unavailable"}
+
+  def promote_call(db, %{rest_principal: principal, params: %{artifact_id: id}}, %{
+        artifact_blob_store: store
+      }) do
+    {:ok, selected} =
+      DB.transaction(db, fn txn ->
+        row = Artifacts.get_in_txn(txn, id)
+
+        if row && Tightbeam.StateVisibility.core_detail_visible?(txn, "artifacts", row, principal) do
+          captured = if row[:custody] != "pinned", do: fetch(txn, id)
+          {row, captured}
+        end
+      end)
+
+    case selected do
+      {%{custody: "pinned"} = row, _} ->
+        row
+
+      {%{content_sha256: digest}, %{content_sha256: digest} = captured} ->
+        case ArtifactCapture.promote(store, captured) do
+          %{custody: "pinned"} -> Artifacts.promote_capture(db, id, digest)
+          error -> error
+        end
+
+      {_row, _capture} ->
+        %{
+          code: "content_not_captured",
+          message: "promotion requires a stored capture matching the recorded SHA-256"
+        }
+
+      nil ->
+        %{code: "not_found"}
+    end
+  end
+
+  def promote_call(_db, _call, _config), do: %{code: "artifact_store_unavailable"}
 
   defp fetch_archive(db, row, config) do
     case ArtifactArchive.read(db, row, config) do
@@ -281,6 +351,43 @@ defmodule Tightbeam.ArtifactContent do
          ) do
       {:ok, [[digest, size, bytes]]} ->
         %{artifact_id: artifact_id, content_sha256: digest, content_size: size, content: bytes}
+
+      {:ok, []} ->
+        fetch_pinned(db, artifact_id)
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
+  defp fetch_pinned(db, artifact_id) do
+    case DB.query(
+           db,
+           """
+           SELECT a.contentSha256 FROM artifacts a
+           JOIN artifact_custody c ON c.artifactId=a.artifactId
+           WHERE a.artifactId=?1 AND c.status='pinned'
+           """,
+           [artifact_id]
+         ) do
+      {:ok, [[digest]]} ->
+        base_dir =
+          Application.get_env(:tightbeam, :base_dir, Path.join(System.user_home!(), ".tightbeam"))
+
+        root = ArtifactBlobStore.options(base_dir)[:root]
+
+        case ArtifactBlobStore.read(root, digest) do
+          {:ok, bytes} ->
+            %{
+              artifact_id: artifact_id,
+              content_sha256: digest,
+              content_size: byte_size(bytes),
+              content: bytes
+            }
+
+          {:error, _reason} ->
+            nil
+        end
 
       {:ok, []} ->
         nil
