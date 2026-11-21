@@ -1553,6 +1553,19 @@ defmodule Tightbeam.Ledger do
         evidence -> Map.put(detail, :prewrite, evidence)
       end
 
+    detail =
+      case Map.get(opts, :work_outcome) do
+        nil ->
+          detail
+
+        :did_not_perform ->
+          Map.merge(detail, %{
+            workOutcome: "did_not_perform",
+            reason: "provider_refusal",
+            promptDelivery: "delivered"
+          })
+      end
+
     Tightbeam.Ephemeral.retire_turn_in_txn(txn, seq)
     Tightbeam.PathNotes.terminal_in_txn(txn, seq)
 

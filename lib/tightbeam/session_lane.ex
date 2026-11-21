@@ -811,7 +811,13 @@ defmodule Tightbeam.SessionLane do
         _ -> nil
       end
 
+    refused? = match?({:error, %{work_outcome: :did_not_perform}}, outcome)
     terminal_opts = [owner_lease: state.current_owner_lease]
+
+    terminal_opts =
+      if refused?,
+        do: Keyword.put(terminal_opts, :work_outcome, :did_not_perform),
+        else: terminal_opts
 
     terminal_opts =
       if prewrite_evidence,
@@ -899,6 +905,8 @@ defmodule Tightbeam.SessionLane do
         end
       )
 
+    required_record? = refused? or not is_nil(prewrite_evidence)
+
     case transaction do
       {:ok, {won, recorded}} ->
         finish_result(state, seq, terminal, error, publish, after_commit, won, recorded)
@@ -920,7 +928,7 @@ defmodule Tightbeam.SessionLane do
                   do: Tightbeam.ReminderDelivery.delivered_in_txn(txn, seq)
 
                 recorded =
-                  if not is_nil(prewrite_evidence) and is_function(in_txn, 1),
+                  if required_record? and is_function(in_txn, 1),
                     do: in_txn.(txn),
                     else: nil
 
@@ -951,7 +959,7 @@ defmodule Tightbeam.SessionLane do
               terminal,
               error,
               publish,
-              if(prewrite_evidence, do: after_commit, else: nil),
+              if(required_record?, do: after_commit, else: nil),
               won,
               recorded
             )

@@ -18,7 +18,7 @@ defmodule Tightbeam.TurnLifecycle do
   @detail_keys %{
     "claimed" => ~w(v owner),
     "prompt_dispatched" => ~w(v),
-    "terminal_committed" => ~w(v status prewrite)
+    "terminal_committed" => ~w(v status prewrite workOutcome reason promptDelivery)
   }
 
   @ddl """
@@ -357,6 +357,18 @@ defmodule Tightbeam.TurnLifecycle do
          (normalized["status"] != "failed" or
             not Tightbeam.NoticeSubmission.valid_evidence?(normalized["prewrite"])),
        do: raise(ArgumentError, "terminal prewrite evidence is not a qualified refusal")
+
+    if Enum.any?(~w(workOutcome reason promptDelivery), &Map.has_key?(normalized, &1)) and
+         not match?(
+           %{
+             "status" => "failed",
+             "workOutcome" => "did_not_perform",
+             "reason" => "provider_refusal",
+             "promptDelivery" => "delivered"
+           },
+           normalized
+         ),
+       do: raise(ArgumentError, "invalid provider refusal outcome")
 
     encoded = JSON.encode!(normalized)
 

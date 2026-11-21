@@ -4564,9 +4564,8 @@ defmodule Tightbeam.Gateway do
         })
       )
 
-      terminal_publish = fn terminal ->
-        state = if terminal == "delivered", do: "delivered", else: "failed"
-        publish_turn_state(db, turn.session_key, correlation, state, nil)
+      terminal_publish = fn terminal, error ->
+        publish_turn_state(db, turn.session_key, correlation, terminal, error)
         publish_session_indicator(db, turn.session_key, session.owner_user_id)
 
         broadcast(
@@ -4693,6 +4692,7 @@ defmodule Tightbeam.Gateway do
                  active_session
                ) do
           attention_tier = elected_attention(db, turn.seq)
+          refused? = match?(%{work_outcome: :did_not_perform}, result)
 
           # The lane's terminal CAS owns success publication. Recovery can
           # terminalize this turn while its adapter result is in flight; a
@@ -4707,7 +4707,8 @@ defmodule Tightbeam.Gateway do
             )
 
             health_publication =
-              HarnessHealth.resolve_normal_turn_in_txn(txn, active_session, turn)
+              unless refused?,
+                do: HarnessHealth.resolve_normal_turn_in_txn(txn, active_session, turn)
 
             fn ->
               Enum.each(replies, &publish_message(db, turn.session_key, &1))
@@ -4715,7 +4716,28 @@ defmodule Tightbeam.Gateway do
             end
           end
 
-          {:ok, %{terminal_publish: terminal_publish, record_in_txn: record_in_txn}}
+          if refused? do
+            reason = "The provider refused the prompt."
+
+            failure_publish = fn terminal ->
+              append_turn_failed_marker(db, turn.session_key, reason)
+              terminal_publish.(terminal, reason)
+            end
+
+            {:error,
+             %{
+               work_outcome: :did_not_perform,
+               reason: reason,
+               terminal_publish: failure_publish,
+               record_in_txn: record_in_txn
+             }}
+          else
+            {:ok,
+             %{
+               terminal_publish: fn terminal -> terminal_publish.(terminal, nil) end,
+               record_in_txn: record_in_txn
+             }}
+          end
         else
           {:error, failure} ->
             {failed_stage, reason, active_session} = turn_failure_context(failure, session)

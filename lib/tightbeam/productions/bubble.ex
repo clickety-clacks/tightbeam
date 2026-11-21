@@ -55,16 +55,16 @@ defmodule Tightbeam.Productions.Bubble do
   @doc "Recognize a terminal turn and carry an ordinary failure to an active parent."
   @spec recognize_terminal(DB.server(), integer()) :: :ok | {:error, term()}
   def recognize_terminal(db, seq) do
-    Tightbeam.Wakes.report_failed_delivery(db, seq)
+    refusal_notified? = Wakes.report_failed_delivery(db, seq) == :provider_refusal
     # Repairs source follow-through the delivery step's post-commit attempt
     # missed, such as across a restart. An error lets the sweeper retry the
     # turn; recognition below is idempotent, so it still runs every time.
     sources = Wakes.reconcile_turn_delivered_sources(db, seq)
-    recognize_bubble(db, seq)
+    recognize_bubble(db, seq, refusal_notified?)
     sources
   end
 
-  defp recognize_bubble(db, seq) do
+  defp recognize_bubble(db, seq, refusal_notified?) do
     if NoticeAuthority.restored_turn?(db, seq) do
       :ok
     else
@@ -73,6 +73,9 @@ defmodule Tightbeam.Productions.Bubble do
       # an interrupted wire publication cannot suppress an unfinished sibling.
       admitted =
         turn_contexts(db, seq)
+        # The owner already has the refusal through the failed-turn notice.
+        # A refusal on a bubble carrier can still advance its original cause.
+        |> Enum.reject(&(refusal_notified? and not &1.notice?))
         |> Enum.filter(fn turn ->
           turn.status == "delivered" or bubble_production_matches?(db, turn.status, turn)
         end)

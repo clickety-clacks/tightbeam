@@ -631,6 +631,60 @@ defmodule Tightbeam.Productions.BubbleTest do
     Enum.map(rows, &hd/1)
   end
 
+  test "a refused turn records one owner notice and does not bubble as a transport failure",
+       ctx do
+    opener = session(ctx.db, "dispatch-opener", ctx.main.session_key)
+
+    assignment =
+      Assignments.__handle__(ctx.db, "dispatch", %{
+        verb: "dispatch",
+        origin: "agent:#{opener.session_key}",
+        principal: {:session, opener.session_key},
+        session_key: ctx.holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "dispatch subject", brief: "private dispatch brief"}
+      })
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "dispatch-brief")
+    assert turn.assignment_id == assignment.id
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed", "The provider refused the prompt.",
+               owner_lease: turn.owner_lease,
+               work_outcome: :did_not_perform
+             )
+
+    for _ <- 1..2, do: assert(:ok = Bubble.recognize_terminal(ctx.db, turn.seq))
+
+    assert [content] = undelivered_notices(ctx.db, opener.session_key, turn.seq)
+    assert content =~ "received the prompt"
+    assert content =~ "did not perform work"
+    assert undelivered_notices(ctx.db, ctx.supervisor.session_key, turn.seq) == []
+    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+    assert Ledger.pending_count(ctx.db, opener.session_key) == 0
+
+    assert {:ok, [["failed", ended_at, detail]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT t.status,t.endedAt,event.detail
+               FROM turns t JOIN turn_lifecycle_events event ON event.turnSeq=t.seq
+               WHERE t.seq=?1 AND event.eventKey='terminal:committed'
+               """,
+               [turn.seq]
+             )
+
+    assert is_integer(ended_at)
+
+    assert %{
+             "workOutcome" => "did_not_perform",
+             "reason" => "provider_refusal",
+             "promptDelivery" => "delivered"
+           } = JSON.decode!(detail)
+  end
+
   test "a failed direct dispatch brief tells the assignment's accountable opener", ctx do
     opener = session(ctx.db, "dispatch-opener", ctx.main.session_key)
 
