@@ -22,7 +22,7 @@ Nothing loads this document for you. Read it when you start or have lost context
 
 ## Hand each ask to a deliverator
 
-Turn each ask into a work item that carries the user's words and every constraint they stated. Hand it to a deliverator with `work-item-handoff`, naming it as delivery owner. Spawn a new deliverator when no current one fits. A large ask may need more than one deliverator, one per feature or concern.
+Turn each ask into a work item that carries the user's words and every constraint they stated. Hand it to a deliverator with `work-item-handoff`, naming it as delivery owner. Spawn a new deliverator when no current one fits. A large ask may need more than one deliverator, one per feature or concern. Never hand it to an arbitrary deliverator simply because it's free.
 
 When the user changes what they want, send each affected deliverator a complete replacement brief. Don't let a deliverator reinterpret an ask on its own.
 
