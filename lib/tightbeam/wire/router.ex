@@ -4266,7 +4266,7 @@ defmodule Tightbeam.Wire.Router do
     do: session_key
 
   defp artifact_caller_session(verb, nil, {:session, session_key})
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-cover harklight-retry harklight-follow),
+       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-cover harklight-retry harklight-follow harklight-briefings-catchup),
        do: session_key
 
   defp artifact_caller_session(_verb, session_key, _principal), do: session_key
