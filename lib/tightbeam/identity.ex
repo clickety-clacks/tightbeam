@@ -1357,7 +1357,12 @@ defmodule Tightbeam.Identity do
 
       try do
         publish.(candidate)
-        %{added: Enum.flat_map(add, & &1.names), attention: blocked_attention, candidate: candidate}
+
+        %{
+          added: Enum.flat_map(add, & &1.names),
+          attention: blocked_attention,
+          candidate: candidate
+        }
       rescue
         error ->
           git!(dir, ["reset", "--hard", live])
@@ -1365,7 +1370,9 @@ defmodule Tightbeam.Identity do
 
           %{
             added: [],
-            attention: blocked_attention ++ ["publishing shipped seed rules failed: " <> Exception.message(error)],
+            attention:
+              blocked_attention ++
+                ["publishing shipped seed rules failed: " <> Exception.message(error)],
             candidate: nil
           }
       end
@@ -1380,13 +1387,19 @@ defmodule Tightbeam.Identity do
           added: [],
           attention:
             blocked_attention ++
-              ["shipped seed rules not yet in the live identity: #{Enum.join(names, ", ")} (#{reason})"],
+              [
+                "shipped seed rules not yet in the live identity: #{Enum.join(names, ", ")} (#{reason})"
+              ],
           candidate: nil
         }
     end
   rescue
     error ->
-      %{added: [], attention: ["seed rule reconciliation unavailable: " <> Exception.message(error)], candidate: nil}
+      %{
+        added: [],
+        attention: ["seed rule reconciliation unavailable: " <> Exception.message(error)],
+        candidate: nil
+      }
   end
 
   @doc "Notice for a gap the startup reconcile could not close, or nil."
