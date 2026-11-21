@@ -2683,7 +2683,7 @@ fn parse_with_optional_catalog(
         }
         "artifact-record" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--content-base64 <bytes>] [--produced-by-assignment <assignmentId>]".to_owned());
+                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--content-base64 <bytes>] [--produced-by-assignment <assignmentId>] [--allow-unpinned]".to_owned());
             }
             Ok(Command::ArtifactRecord {
                 identity: identity(flags)?,
@@ -7138,6 +7138,8 @@ mod tests {
                 "assignments",
                 "artifact-record",
                 "artifact-content-fetch",
+                "artifact-content-promote",
+                "artifact-content-capacity",
                 "artifacts",
                 "attest",
                 "attests",
@@ -7268,6 +7270,12 @@ mod tests {
             "sentinel unsubscribe <id>",
             "sentinel enable <sentinel>",
             "sentinel disable <sentinel>",
+            "[--allow-unpinned]",
+            "At capacity, --allow-unpinned explicitly records a pointer instead.",
+            "artifact-content-promote <artifactId>",
+            "Copy a verified legacy capture into the pinned store.",
+            "artifact-content-capacity",
+            "Read the store's used, staged, free, and effective limit bytes.",
             "host-env-set [--host <host>] --sentinel <sentinel> NAME=VALUE",
             "host-env-list [--host <host>] --sentinel <sentinel>",
             "host-env-unset [--host <host>] --sentinel <sentinel> NAME",
