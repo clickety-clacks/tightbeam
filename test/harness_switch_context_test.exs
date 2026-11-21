@@ -1,7 +1,22 @@
 defmodule Tightbeam.HarnessSwitchContextTest do
   use ExUnit.Case, async: true
 
-  alias Tightbeam.HarnessSwitchContext
+  alias Tightbeam.{HarnessHealth, HarnessProcess, HarnessSwitchContext}
+
+  defmodule CatalogFixture do
+    use GenServer
+
+    def start_link(state), do: GenServer.start_link(__MODULE__, state)
+
+    @impl true
+    def init(state), do: {:ok, state}
+
+    @impl true
+    def handle_call({:get, {host, harness}}, _from, {owner, inventories} = state) do
+      send(owner, {:catalog_lookup, host, harness})
+      {:reply, Map.get(inventories, harness, {[], {:unavailable, :missing}}), state}
+    end
+  end
 
   @source_price_url "https://developers.openai.com/api/docs/models/gpt-6-sol"
   @compactor_price_url "https://developers.openai.com/api/docs/models/gpt-6-luna"
@@ -60,7 +75,13 @@ defmodule Tightbeam.HarnessSwitchContextTest do
 
   test "the elected runtime route names its model and exact source price applicability" do
     config = Application.fetch_env!(:tightbeam, :harness_switch_context)
-    compactor = config.compactor
+    assert Application.get_env(:tightbeam, :harness_switch_context_enabled)
+    assert [compactor, claude] = config.compactors
+    assert claude.route == :acp
+    assert claude.harness == Tightbeam.Harness.Claude
+    assert claude.model == "claude-haiku-5-5"
+    assert [claude_price] = claude.source_applicability
+    assert claude_price.compactor_input_usd_per_million == 0.5
 
     assert compactor.route == :codex_acp
     assert compactor.harness in Tightbeam.Harness.all()
@@ -76,7 +97,7 @@ defmodule Tightbeam.HarnessSwitchContextTest do
     assert source.compactor_model == compactor.model
     assert source.source_context_tier == source.compactor_context_tier
     assert source.source_processing_tier == source.compactor_processing_tier
-    assert source.checked_on == "2026-11-11"
+    assert source.checked_on == "2026-11-21"
   end
 
   test "an over-budget nil-default Sol source uses the configured cheaper route and fits" do
@@ -164,10 +185,12 @@ defmodule Tightbeam.HarnessSwitchContextTest do
       )
 
     assert no_route.outcome == "fallback"
-    assert no_route.fallback_reason =~ "not configured"
-    assert no_route.prompt =~ "Summary unavailable"
+    assert no_route.fallback_reason =~ "no qualified harness was available"
     assert String.downcase(no_route.prompt) =~ "retrieve transcript fixture-session"
-    assert no_route.prompt =~ "Fallback: compactor not configured"
+
+    assert no_route.prompt =~
+             "Compaction could not start because no qualified harness was available."
+
     assert no_route.included_message_ids == []
     assert no_route.omitted_message_ids == ["fixture-message-1"]
     assert no_route.budget.handoff_within_allowance
@@ -186,8 +209,13 @@ defmodule Tightbeam.HarnessSwitchContextTest do
       )
 
     assert failed.outcome == "fallback"
-    assert failed.fallback_reason == "compactor request timed out"
-    assert failed.prompt =~ "Fallback: compactor request timed out"
+
+    assert failed.fallback_reason =~
+             "Compaction failed on every available harness: codex (request timed out)."
+
+    assert failed.prompt =~
+             "Compaction failed on every available harness: codex (request timed out)."
+
     assert count(failed.prompt, "WID19B_CURRENT_INPUT=next-request") == 1
   end
 
@@ -249,7 +277,9 @@ defmodule Tightbeam.HarnessSwitchContextTest do
     assert result.prompt =~
              "omitted processed coverage in that window 1 recent processed message ID(s)"
 
-    assert result.prompt =~ "Fallback reason: compactor not configured"
+    assert result.prompt =~
+             "Fallback reason: Compaction could not start because no qualified harness was available"
+
     assert result.prompt =~ "retrieve originals from the source transcript"
   end
 
@@ -271,7 +301,11 @@ defmodule Tightbeam.HarnessSwitchContextTest do
       )
 
     assert insufficient.outcome == "fallback"
-    assert insufficient.fallback_reason =~ "input exceeded its context capacity"
+
+    assert Enum.any?(
+             insufficient.compaction_evidence.unavailable,
+             &(&1.reason == "input exceeded its context capacity")
+           )
 
     blank =
       HarnessSwitchContext.build_handoff(
@@ -286,7 +320,7 @@ defmodule Tightbeam.HarnessSwitchContextTest do
       )
 
     assert blank.outcome == "fallback"
-    assert blank.fallback_reason == "compactor returned empty output"
+    assert blank.fallback_reason =~ "codex (returned empty output)"
 
     oversized =
       HarnessSwitchContext.build_handoff(
@@ -355,38 +389,48 @@ defmodule Tightbeam.HarnessSwitchContextTest do
       )
 
     assert unlisted.outcome == "fallback"
-    assert unlisted.fallback_reason =~ "not listed for this source model and tier"
+
+    assert Enum.any?(
+             unlisted.compaction_evidence.unavailable,
+             &(&1.reason =~ "not listed for this source model and tier")
+           )
+
     assert equal_price.outcome == "fallback"
-    assert equal_price.fallback_reason =~ "rates are not strictly cheaper"
+
+    assert Enum.any?(
+             equal_price.compaction_evidence.unavailable,
+             &(&1.reason =~ "rates are not strictly cheaper")
+           )
+
     refute_receive :unexpected_call
   end
 
-  test "runtime compactor input capacity comes from its exact host harness model catalog entry" do
-    test_pid = self()
+  test "runtime qualification uses host catalog capacity and credential for its provider" do
+    host = Tightbeam.Placement.local_host_name()
+    owner = self()
 
-    config = %{
-      harness_switch_context: %{
-        compactor:
-          compactor(fn _input, _instructions ->
-            send(test_pid, :unexpected_call)
-          end)
-      },
-      harness_switch_catalog_entry: fn host, harness, model ->
-        send(test_pid, {:catalog_lookup, host, harness, model})
-        %{max_input_tokens: 272_000}
-      end,
-      harness_switch_compactor_call: fn _compactor, _input, _instructions ->
-        {:ok, "compacted", %{route: "codex_acp"}}
-      end
+    entry = %{
+      family: "gpt-6-luna",
+      context: nil,
+      efforts: ["low"],
+      provider: :openai,
+      max_input_tokens: 272_000
     }
 
-    compactor = HarnessSwitchContext.compactor_for_switch(config, %{host: "test-host"})
+    {db, plan} =
+      runtime_plan({[entry], :fresh}, fn ^host, :openai ->
+        send(owner, :credential_checked)
+        :onboarded
+      end)
 
-    assert compactor.context_tokens == 272_000
-    assert is_function(compactor.call, 2)
+    result = compact_history(plan)
 
-    assert_receive {:catalog_lookup, "test-host", "codex",
-                    %Tightbeam.Model{family: "gpt-6-luna", effort: "low", context: nil}}
+    assert result.outcome == "compacted"
+    assert result.compaction_evidence.configured_context_tokens == 272_000
+    assert_receive {:catalog_lookup, ^host, "codex"}
+    assert_receive :credential_checked
+    assert_receive {:compactor_called, "gpt-6-luna"}
+    assert Process.alive?(db)
   end
 
   test "destination allowance tracks the captured instructions, tools, and actual current input" do
@@ -426,37 +470,277 @@ defmodule Tightbeam.HarnessSwitchContextTest do
     assert destination_allowance(config, session, payload, "next longer") == baseline - 7
   end
 
-  test "missing exact compactor catalog capacity prevents the call and stays on bounded fallback" do
-    test_pid = self()
+  test "missing or unavailable host catalog yields no attempts" do
+    {_db, plan} =
+      runtime_plan({[], {:unavailable, :missing}}, fn _, _ ->
+        flunk("an unavailable catalog has no route credential")
+      end)
 
-    config = %{
-      harness_switch_context: %{
-        compactor: compactor(fn _input, _instructions -> send(test_pid, :unexpected_call) end)
-      },
-      harness_switch_catalog_entry: fn _host, _harness, _model -> nil end,
-      harness_switch_compactor_call: fn _compactor, _input, _instructions ->
-        send(test_pid, :unexpected_call)
-        {:ok, "must not run", %{route: "codex_acp"}}
-      end
+    result = compact_history(plan)
+    assert result.outcome == "fallback"
+    assert [%{reason: "catalog_route_unavailable"}] = result.compaction_evidence.unavailable
+    assert result.compaction_evidence.attempts == []
+    refute_receive {:compactor_called, _}
+  end
+
+  test "a catalog model without an onboarded credential yields no attempts" do
+    {_, plan} =
+      runtime_plan({[catalog_entry("gpt-6-luna", :openai)], :fresh}, fn _, :openai ->
+        {:needs_onboarding, :revoked}
+      end)
+
+    result = compact_history(plan)
+
+    assert [%{reason: "credential_unavailable"}] = result.compaction_evidence.unavailable
+    assert result.compaction_evidence.attempts == []
+    refute_receive {:compactor_called, _}
+  end
+
+  test "a real health fence steers candidates, and account quota is committed before failover" do
+    host = Tightbeam.Placement.local_host_name()
+    now = System.system_time(:millisecond)
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    catalog = %{
+      "codex" => {[catalog_entry("gpt-6-luna", :openai)], :fresh},
+      "claude" => {[catalog_entry("claude-haiku-5-5", :anthropic)], :fresh}
     }
 
-    compactor = HarnessSwitchContext.compactor_for_switch(config, %{host: "test-host"})
+    settings = Application.fetch_env!(:tightbeam, :harness_switch_context)
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(db, {:claude, "shared", host})
 
-    assert is_nil(compactor.context_tokens)
+    plan =
+      runtime_plan(db, catalog, settings, fn _, _ -> :onboarded end, fn
+        %{model: "gpt-6-luna"}, _, _ ->
+          {:error, {:prompt_failed, %{"data" => %{"codexErrorInfo" => "usageLimitExceeded"}}}}
 
-    result =
-      HarnessSwitchContext.build_handoff(
-        snapshot(),
-        fixture_entries(String.duplicate("historical source detail ", 80)),
-        "WID19B_CURRENT_INPUT=preserve",
-        [],
-        budget(850),
-        compactor
+        %{model: "claude-haiku-5-5"}, _, _ ->
+          assert HarnessProcess.parked?(db, {:codex, "shared", host})
+          {:ok, "summary after quota", %{}}
+      end)
+
+    result = compact_history(plan)
+    assert result.outcome == "compacted"
+
+    assert [
+             %{health: %{observation_id: observation_id, incident_id: incident_id}},
+             %{harness: "claude"}
+           ] =
+             result.compaction_evidence.attempts
+
+    incident = HarnessHealth.get(db, incident_id)
+    assert incident.harness == "codex"
+    assert [%{id: ^observation_id, session_key: nil, assignment_id: nil}] = incident.observations
+
+    assert %{status: "recorded"} =
+             HarnessHealth.observe_compactor_failure(db, %{
+               context_id: "other-switch",
+               harness: "codex",
+               host: host,
+               model: "gpt-6-luna",
+               reason: {:session_create_failed, :timeout},
+               observed_at: now
+             })
+
+    assert %{since: ^now, failure_class: "adapter_unavailable"} =
+             HarnessHealth.compactor_observation(db, "codex", host, now)
+
+    assert HarnessHealth.compactor_observation(db, "codex", host, now + 120_001) == nil
+  end
+
+  test "a model-named Claude weekly limit steers later switches and fails over without parking Claude" do
+    host = Tightbeam.Placement.local_host_name()
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    catalog = %{
+      "codex" => {[catalog_entry("gpt-6-luna", :openai)], :fresh},
+      "claude" => {[catalog_entry("claude-haiku-5-5", :anthropic)], :fresh}
+    }
+
+    [codex, claude] = Application.fetch_env!(:tightbeam, :harness_switch_context).compactors
+    [row] = codex.source_applicability
+
+    codex = %{
+      codex
+      | source_applicability: [
+          %{row | compactor_input_usd_per_million: 0.6, compactor_output_usd_per_million: 3.0}
+        ]
+    }
+
+    plan =
+      runtime_plan(db, catalog, %{compactors: [claude, codex]}, fn _, _ -> :onboarded end, fn
+        %{model: "claude-haiku-5-5"}, _, _ ->
+          {:error, claude_limit("You have hit your Haiku weekly limit")}
+
+        %{model: "gpt-6-luna"}, _, _ ->
+          refute HarnessProcess.parked?(db, {:claude, "shared", host})
+          refute HarnessHealth.unavailable?(db, "claude", host)
+
+          assert %{model: "claude-haiku-5-5", failure_class: "rate-limit-dead"} =
+                   HarnessHealth.compactor_observation(
+                     db,
+                     "claude",
+                     host,
+                     System.system_time(:millisecond)
+                   )
+
+          {:ok, "summary after model quota", %{}}
+      end)
+
+    assert %{
+             outcome: "compacted",
+             compaction_evidence: %{
+               attempts: [
+                 %{harness: "claude", health: %{status: "recorded"}},
+                 %{harness: "codex"}
+               ]
+             }
+           } = compact_history(plan)
+
+    assert %{
+             compaction_evidence: %{
+               steered_order: [
+                 %{harness: "codex"},
+                 %{harness: "claude", fences: [%{type: "recent_compactor_failure"}]}
+               ],
+               attempts: [%{harness: "codex"}]
+             }
+           } = compact_history(plan)
+  end
+
+  test "only proven Claude account quota opens a shared incident and park" do
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    for {{reason, account?}, index} <-
+          Enum.with_index([
+            {claude_limit("You've hit your weekly limit"), true},
+            {claude_limit("You've hit your 5-hour limit · resets 4:00pm UTC"), true},
+            {claude_limit("You've hit your usage limit"), true},
+            {claude_limit("You've hit your weekly limit. Model was not changed."), false},
+            {claude_limit("You have hit your weekly limit for Sonnet"), false},
+            {claude_limit("Rate limit exceeded"), false},
+            {%{"code" => 429}, false}
+          ]) do
+      host = "fixture-host-#{index}"
+
+      result =
+        HarnessHealth.observe_compactor_failure(db, %{
+          context_id: "fixture-context-#{index}",
+          harness: "claude",
+          host: host,
+          model: "claude-haiku-5-5",
+          reason: reason,
+          observed_at: System.system_time(:millisecond)
+        })
+
+      if account? do
+        assert %{status: :opened, incident_id: id} = result
+        assert HarnessHealth.get(db, id).failureClass == "rate-limit-dead"
+      else
+        assert %{status: "recorded", failure_class: "rate-limit-dead"} = result
+      end
+
+      assert HarnessProcess.parked?(db, {:claude, "shared", host}) == account?
+      assert HarnessHealth.unavailable?(db, "claude", host) == account?
+    end
+  end
+
+  defp claude_limit(message),
+    do: %{"message" => message, "data" => %{"errorKind" => "rate_limit"}}
+
+  test "an otherwise qualified configured Fable or Astra route never runs" do
+    [codex, claude] =
+      configured_compactors(
+        fn _, _ -> flunk("Astra cannot compact") end,
+        fn _, _ -> flunk("Fable cannot compact") end
       )
 
+    routes =
+      Enum.map([{codex, "gpt-6-astra-2"}, {claude, "claude-fable-5-2"}], fn {route, model} ->
+        [source] = route.source_applicability
+        %{route | model: model, source_applicability: [%{source | compactor_model: model}]}
+      end)
+
+    result = compact_history(routes)
     assert result.outcome == "fallback"
-    assert result.fallback_reason =~ "capacity"
-    refute_receive :unexpected_call
+    assert result.compaction_evidence.attempts == []
+
+    assert Enum.map(result.compaction_evidence.unavailable, & &1.reason) ==
+             ["model_not_permitted", "model_not_permitted"]
+  end
+
+  test "advisory steering retains fenced candidates and stops at the first fitting summary" do
+    owner = self()
+
+    [codex, claude] =
+      configured_compactors(
+        &send(owner, {:unexpected_codex, &1, &2}),
+        fn _, _ -> {:ok, "qualified Claude summary", %{}} end
+      )
+
+    plan =
+      synthetic_plan([codex, claude], fn
+        %{harness: Tightbeam.Harness.Codex} -> [%{reason: "existing fence"}]
+        %{harness: Tightbeam.Harness.Claude} -> []
+      end)
+
+    result = compact_history(plan)
+    assert result.outcome == "compacted"
+    assert result.compactor_model == "claude-haiku-5-5"
+    assert Enum.map(result.compaction_evidence.base_order, & &1.harness) == ["codex", "claude"]
+    assert Enum.map(result.compaction_evidence.steered_order, & &1.harness) == ["claude", "codex"]
+    assert [%{harness: "claude"}] = result.compaction_evidence.attempts
+    refute_receive {:unexpected_codex, _, _}
+  end
+
+  test "failure is recorded before the fenced alternate is tried and the excerpt names every failure" do
+    owner = self()
+
+    [codex, claude] =
+      configured_compactors(
+        fn _, _ -> {:error, :timeout} end,
+        fn _, _ ->
+          assert_received {:recorded, "gpt-6-luna", :timeout}
+          {:error, :provider_refused}
+        end
+      )
+
+    plan =
+      [codex, claude]
+      |> synthetic_plan(fn _ -> [%{reason: "existing fence"}] end)
+      |> Map.put(:failure, fn _snapshot, route, reason ->
+        send(owner, {:recorded, route.model, reason})
+        %{observation_id: "fixture-observation"}
+      end)
+
+    result = compact_history(plan)
+
+    assert result.outcome == "fallback"
+
+    assert result.compaction_evidence.attempts == [
+             %{
+               harness: "codex",
+               model: "gpt-6-luna",
+               reason: "request timed out",
+               health: %{observation_id: "fixture-observation"}
+             },
+             %{
+               harness: "claude",
+               model: "claude-haiku-5-5",
+               reason: "provider_refused",
+               health: %{observation_id: "fixture-observation"}
+             }
+           ]
+
+    assert result.prompt =~
+             "Compaction failed on every available harness: codex (request timed out), claude (provider_refused)."
+
+    assert result.prompt =~ "There is no room to carry a transcript excerpt."
+    assert result.prompt =~ "Retrieve the full history from the source transcript."
+    assert count(result.prompt, "current input marker") == 1
   end
 
   test "a listed source outside its recorded context tier falls back without a call" do
@@ -473,7 +757,12 @@ defmodule Tightbeam.HarnessSwitchContextTest do
       )
 
     assert result.outcome == "fallback"
-    assert result.fallback_reason =~ "not listed for this source model and tier"
+
+    assert Enum.any?(
+             result.compaction_evidence.unavailable,
+             &(&1.reason =~ "not listed for this source model and tier")
+           )
+
     refute_receive :unexpected_call
   end
 
@@ -602,6 +891,79 @@ defmodule Tightbeam.HarnessSwitchContextTest do
         call: call
       },
       Keyword.take(opts, [:context_tokens]) |> Enum.into(%{})
+    )
+  end
+
+  defp runtime_plan(catalog_inventory, credential_status) do
+    owner = self()
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    plan =
+      runtime_plan(
+        db,
+        %{"codex" => catalog_inventory},
+        %{compactor: compactor(nil)},
+        credential_status,
+        fn compactor, _, _ ->
+          send(owner, {:compactor_called, compactor.model})
+          {:ok, "compacted", %{route: "codex_acp"}}
+        end
+      )
+
+    {db, plan}
+  end
+
+  defp runtime_plan(db, inventories, settings, credential_status, call) do
+    catalog = start_supervised!({CatalogFixture, {self(), inventories}})
+
+    config = %{
+      base_dir: System.tmp_dir!(),
+      model_catalog: catalog,
+      harness_switch_context: settings,
+      harness_switch_credential_status: credential_status,
+      harness_switch_compactor_call: call
+    }
+
+    HarnessSwitchContext.compactor_plan(db, config, %{host: Tightbeam.Placement.local_host_name()})
+  end
+
+  defp catalog_entry(model, provider) do
+    %{
+      family: model,
+      context: nil,
+      efforts: ["low"],
+      provider: provider,
+      max_input_tokens: 272_000
+    }
+  end
+
+  defp configured_compactors(codex_call, claude_call) do
+    [codex, claude] = Application.fetch_env!(:tightbeam, :harness_switch_context).compactors
+
+    [
+      Map.merge(codex, %{context_tokens: 272_000, call: codex_call}),
+      Map.merge(claude, %{context_tokens: 1_000_000, call: claude_call})
+    ]
+  end
+
+  defp synthetic_plan(routes, fences) do
+    %{
+      routes: routes,
+      resolve: &{:ok, &1},
+      fences: fn _, route -> fences.(route) end,
+      failure: fn _, _, _ -> nil end
+    }
+  end
+
+  defp compact_history(plan) do
+    HarnessSwitchContext.build_handoff(
+      snapshot(),
+      fixture_entries(String.duplicate("historical source detail ", 180)),
+      "current input marker",
+      [],
+      budget(2_500),
+      plan
     )
   end
 

@@ -171,9 +171,19 @@ defmodule Tightbeam.Harness.Claude do
 
     case Map.fetch(session, :cwd) do
       {:ok, cwd} ->
-        Map.put(meta, :claudeCode, %{
-          options: %{settings: %{claudeMdExcludes: ancestor_instruction_paths(cwd)}}
-        })
+        options = %{settings: %{claudeMdExcludes: ancestor_instruction_paths(cwd)}}
+
+        options =
+          case Map.get(session, :compactor_model) do
+            %Model{} = model ->
+              # The pinned ACP forwards these SDK options to this session only.
+              Map.merge(options, %{model: Model.to_ref(model), tools: []})
+
+            nil ->
+              options
+          end
+
+        Map.put(meta, :claudeCode, %{options: options})
 
       :error ->
         meta

@@ -33,6 +33,7 @@ defmodule Tightbeam.HarnessHealth do
   }
 
   alias Tightbeam.DB.Txn
+  alias Tightbeam.HarnessHealth.CompactionObservation
 
   @failure_classes ~w(
     auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
@@ -1440,6 +1441,103 @@ defmodule Tightbeam.HarnessHealth do
       prior -> duplicate_or_refuse!(txn, prior, input, input.evidence_kind)
     end
   end
+
+  @doc "Record a failed temporary compaction on its actual route before trying another."
+  def observe_compactor_failure(db, %{
+        context_id: context_id,
+        harness: harness,
+        host: host,
+        model: model,
+        reason: reason,
+        observed_at: observed_at
+      }) do
+    attempt = JSON.encode!([context_id, harness])
+    reason = reason |> ErrorDiagnostic.classified() |> compactor_failure_reason()
+
+    case compactor_failure_class(reason) do
+      nil ->
+        nil
+
+      failure_class ->
+        if authoritative_compactor_quota?(harness, reason) do
+          {status, record} =
+            observe(db, %{
+              correlation_id: "switch-compaction:" <> attempt,
+              harness: harness,
+              host: host,
+              failure_class: failure_class,
+              evidence_kind: "authoritative-provider",
+              observed_at: observed_at,
+              cause: "compactor #{model}: account quota exhausted",
+              principal: "process:tightbeam"
+            })
+
+          %{
+            status: status,
+            incident_id: Map.get(record, :id),
+            observation_id: Map.fetch!(record, :observationId)
+          }
+        else
+          CompactionObservation.record(
+            db,
+            attempt,
+            harness,
+            host,
+            model,
+            failure_class,
+            observed_at
+          )
+        end
+    end
+  end
+
+  @doc "Recent steering evidence from a temporary compactor, independent of lane admission."
+  def compactor_observation(db, harness, host, observed_at) do
+    CompactionObservation.recent(db, harness, host, observed_at - @evidence_window_ms)
+  end
+
+  defp compactor_failure_reason({stage, reason})
+       when stage in [
+              :session_create_failed,
+              :prompt_failed,
+              :session_close_failed,
+              :mode_apply_failed,
+              :model_apply_failed
+            ],
+       do: compactor_failure_reason(reason)
+
+  defp compactor_failure_reason({:session_prepare_failed, reason, _id, _cleanup}),
+    do: compactor_failure_reason(reason)
+
+  defp compactor_failure_reason({:timeout_cleanup_failed, _}), do: :timeout
+
+  defp compactor_failure_reason(reason), do: reason
+
+  defp compactor_failure_class(:timeout), do: "adapter_unavailable"
+  defp compactor_failure_class({:adapter_unavailable, _}), do: "adapter_unavailable"
+  defp compactor_failure_class(:route_unavailable), do: "adapter_unavailable"
+
+  defp compactor_failure_class(%{"code" => 429}), do: "rate-limit-dead"
+  defp compactor_failure_class(%{code: 429}), do: "rate-limit-dead"
+  defp compactor_failure_class({:http_status, 429}), do: "rate-limit-dead"
+  defp compactor_failure_class(reason), do: classify_turn_failure(reason)
+
+  defp authoritative_compactor_quota?(harness, reason) do
+    authoritative_provider_turn_failure?(%{harness: harness}, reason) or
+      (harness == Tightbeam.Harness.Claude.wire_name() and claude_account_quota?(reason))
+  end
+
+  # Match only the provider's model-free account messages and optional reset
+  # suffix. Extra wording can carry model scope even after an account-like prefix.
+  defp claude_account_quota?(%{"data" => %{"errorKind" => "rate_limit"}, "message" => message})
+       when is_binary(message) do
+    Regex.match?(
+      ~r/\Ayou(?:['’]ve| have) hit your (?:weekly|[0-9]+-hour|usage) limit[.!]?(?: · resets (?:[A-Za-z]{3} [0-9]{1,2}(?:,| at)? )?[0-9]{1,2}(?::[0-9]{2})?(?:am|pm) (?:UTC|\([A-Za-z0-9_+\/-]+\)))?\z/iu,
+      String.trim(message)
+    )
+  end
+
+  defp claude_account_quota?(_), do: false
 
   @doc "Resolve one class-specific open incident on normal-turn success."
   @spec resolve(DB.server(), map()) ::
