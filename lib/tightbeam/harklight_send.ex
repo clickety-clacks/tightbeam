@@ -52,7 +52,9 @@ defmodule Tightbeam.HarklightSend do
   end
 
   defp send_with_association(db, call, input, runner, opts) do
-    case Tightbeam.HarklightBriefings.reserve_send(db, call, input.decision_request_id) do
+    request_id = input.decision_request_id
+
+    case Tightbeam.HarklightBriefings.reserve_send(db, call, request_id) do
       {:ok, %{action: :start, op_id: op_id}} ->
         send_with_operation(db, call, input, op_id, runner, opts)
 
@@ -78,24 +80,32 @@ defmodule Tightbeam.HarklightSend do
         failure(
           "send",
           code,
-          "The message was not sent. " <> reason <> standing_ask(code),
+          "The message was not sent. " <> reason,
           "refused",
           %{
-            decision_request_id: input.decision_request_id
+            decision_request_id: request_id
           }
         )
     end
+    |> explain_linked_refusal(db, request_id)
   end
 
-  # A refused briefing send never blocks the ask: the filed decision request is
-  # itself a proper ask. A closed or unknown request has nothing left to stand.
-  defp standing_ask(code)
-       when code in ["decision_request_not_open", "invalid_harklight_decision_request"],
-       do: ""
+  defp explain_linked_refusal(%{outcome: "refused", reason: reason} = result, db, request_id) do
+    case DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [request_id]) do
+      {:ok, [["open"]]} ->
+        %{
+          result
+          | reason:
+              reason <>
+                " The decision request itself already stands as a proper ask. This refusal does not block it."
+        }
 
-  defp standing_ask(_code),
-    do:
-      " The decision request itself already stands as a proper ask; this refusal does not block it."
+      _ ->
+        result
+    end
+  end
+
+  defp explain_linked_refusal(result, _db, _request_id), do: result
 
   defp send_with_operation(db, call, input, op_id, runner, opts) do
     case invoke(runner, prepare_args(input, op_id), "prepared", op_id) do
