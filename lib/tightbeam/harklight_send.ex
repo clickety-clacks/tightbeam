@@ -75,11 +75,20 @@ defmodule Tightbeam.HarklightSend do
         }
 
       {:error, code, reason} ->
-        failure("send", code, "The message was not sent. " <> reason, "refused", %{
+        failure("send", code, "The message was not sent. " <> reason <> standing_ask(code), "refused", %{
           decision_request_id: input.decision_request_id
         })
     end
   end
+
+  # A refused briefing send never blocks the ask: the filed decision request is
+  # itself a proper ask. A closed or unknown request has nothing left to stand.
+  defp standing_ask(code)
+       when code in ["decision_request_not_open", "invalid_harklight_decision_request"],
+       do: ""
+
+  defp standing_ask(_code),
+    do: " The decision request itself already stands as a proper ask; this refusal does not block it."
 
   defp send_with_operation(db, call, input, op_id, runner, opts) do
     case invoke(runner, prepare_args(input, op_id), "prepared", op_id) do

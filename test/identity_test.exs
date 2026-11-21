@@ -155,7 +155,7 @@ defmodule Tightbeam.IdentityTest do
              %{
                name: "harklight-decision-briefings",
                purpose:
-                 "Route decision requests through a configurable investigator, preserve its Harklight conversation, and reconcile staged catchup without duplicate briefings.",
+                 "An example template to configure, not a built-in conversion: Tightbeam ships only the decision-request-filed rule hook. It routes decision requests through a configurable investigator, preserves its Harklight conversation, and reconciles staged catchup without duplicate briefings. A filed decision request is already a proper ask; a Harklight briefing is optional and a refused briefing send does not block it.",
                phrases: [],
                root_archetype: "harklight-decision-briefings.orchestrator"
              },

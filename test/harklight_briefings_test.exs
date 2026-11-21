@@ -73,6 +73,31 @@ defmodule Tightbeam.HarklightBriefingsTest do
     assert briefing_wake_count(ctx.db) == 3
   end
 
+  test "a refused linked briefing send says the request itself already stands as a proper ask",
+       ctx do
+    load_briefing_rule(ctx, ctx.consumer.session_key)
+    request = open_request(ctx, "Choose one route?")
+
+    refused =
+      Tightbeam.HarklightSend.send_request(ctx.db, %{
+        ctx.call
+        | params: %{
+            harklight_session: "new",
+            sender_id: "briefing-sender",
+            title: "Decision briefing",
+            message_type: "request",
+            decision_request_id: request.id
+          }
+      })
+
+    assert %{outcome: "refused", reason: reason, decision_request_id: id} = refused
+    assert id == request.id
+    assert reason =~ "The message was not sent."
+    assert reason =~ "The decision request itself already stands as a proper ask"
+    assert reason =~ "does not block it"
+    assert {:ok, [["open"]]} = DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request.id])
+  end
+
   test "a filed request wake is reused and its compiler reserves one durable send identity",
        ctx do
     load_briefing_rule(ctx, ctx.consumer.session_key)

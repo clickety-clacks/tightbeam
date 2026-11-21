@@ -38,3 +38,5 @@ or fixed agent graph. Verify that the remedy reaches an accountable owner throug
 supported routes; a notification must not be described as staffing, transfer or
 fulfillment. Reuse existing dependency and completion mechanisms before proposing new
 markers or gates.
+
+Hooks on decision requests: filing a decision request commits the `decision-request-filed` condition fact (edge `row-commit`); a rule with verb `condition` may react to it. Tightbeam ships that hook and only an example template to configure (`harklight-decision-briefings`), not a built-in conversion. The request itself is already a proper ask, so a rule built on the hook may add a briefing but never makes a missing or refused briefing a failure that blocks the ask.
