@@ -63,6 +63,12 @@ defmodule Tightbeam.TurnFailureNoticeTest do
     assert :ok = Bubble.recognize_terminal(ctx.db, first)
     assert {:retry, retry_wake_id} = preserve_failed_intent!(ctx.db, first)
 
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE assignments SET currentOpenerSessionKey=?1 WHERE id=?2", [
+               ctx.main.session_key,
+               ctx.assignment
+             ])
+
     retried =
       failed_turn!(ctx.db, ctx.reviewer.session_key,
         assignment_id: ctx.assignment,
@@ -142,10 +148,21 @@ defmodule Tightbeam.TurnFailureNoticeTest do
     assert prompt =~ "adapter died"
   end
 
+  test "a parentless worker's failure reaches the owner's active main session", ctx do
+    worker = session(ctx.db, "agent:parentless", nil)
+    seq = failed_turn!(ctx.db, worker.session_key, error: "adapter died")
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, seq)
+    assert [{recipient, prompt}] = notices(ctx.db)
+    assert recipient == ctx.main.session_key
+    assert prompt =~ "adapter died"
+  end
+
   test "an existing interrupted-outcome question owns the notice", ctx do
     seq =
       failed_turn!(ctx.db, ctx.reviewer.session_key,
         assignment_id: ctx.assignment,
+        prompt: "[assignment: #{ctx.assignment}]\n\nreview the change",
         error: "interrupted: outcome unknown"
       )
 
@@ -160,6 +177,17 @@ defmodule Tightbeam.TurnFailureNoticeTest do
 
     assert :ok = Bubble.recognize_terminal(ctx.db, seq)
     assert notices(ctx.db) == []
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT 1 FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+               [
+                 ctx.lane.session_key,
+                 "wake-undelivered:#{seq}"
+               ]
+             )
+
     wake = Wakes.get(ctx.db, "w_health_redelivery_parent_#{seq}")
     assert wake.session_key == ctx.lane.session_key
     assert wake.prompt =~ "Reason: interrupted: outcome unknown"
@@ -174,10 +202,15 @@ defmodule Tightbeam.TurnFailureNoticeTest do
         other.session_key
       ])
 
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               ctx.lane.session_key
+             ])
+
     seq = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: asg, error: @limit_429)
     assert :ok = Bubble.recognize_terminal(ctx.db, seq)
     assert [{recipient, prompt}] = notices(ctx.db)
-    assert recipient == ctx.lane.session_key
+    assert recipient == ctx.main.session_key
     assert prompt =~ @limit_429
   end
 
@@ -211,7 +244,7 @@ defmodule Tightbeam.TurnFailureNoticeTest do
         session_key: session_key,
         message_id: "notice-#{unique}",
         origin: "agent:lane",
-        prompt: "review the change",
+        prompt: Keyword.get(opts, :prompt, "review the change"),
         wake_id: Keyword.get(opts, :wake_id),
         assignment_id: Keyword.get(opts, :assignment_id),
         request_ref: nil

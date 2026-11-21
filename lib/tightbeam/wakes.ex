@@ -3311,40 +3311,12 @@ defmodule Tightbeam.Wakes do
   end
 
   defp interrupted_redelivery_parent_in_txn(txn, source_session_key, assignment_id) do
-    assignment_parent =
-      if is_binary(assignment_id) do
-        case Txn.q(
-               txn,
-               """
-               SELECT parent.sessionKey
-               FROM assignments assignment
-               JOIN sessions parent ON parent.sessionKey=COALESCE(assignment.currentOpenerSessionKey,assignment.openedBySession)
-               WHERE assignment.id=?1 AND parent.state='active'
-                 AND parent.sessionKey!=?2
-               """,
-               [assignment_id, source_session_key]
-             ) do
-          [[parent_session_key]] -> parent_session_key
-          _ -> nil
-        end
-      end
-
-    assignment_parent ||
-      case Txn.q(
-             txn,
-             """
-             SELECT parent.sessionKey
-             FROM sessions source
-             JOIN sessions parent
-               ON parent.sessionKey=#{Tightbeam.Org.current_parent_sql("source")}
-             WHERE source.sessionKey=?1 AND parent.state='active'
-               AND parent.sessionKey!=source.sessionKey
-             """,
-             [source_session_key]
-           ) do
-        [[parent_session_key]] -> parent_session_key
-        _ -> nil
-      end
+    # Without an opener or ancestor the existing health policy retries on
+    # recovery. The owner's stream can still receive the initial failure notice.
+    case Tightbeam.TurnFailureNotice.recipient(txn, source_session_key, assignment_id, false) do
+      {recipient, _route} -> recipient
+      nil -> nil
+    end
   end
 
   defp ask_interrupted_redelivery_parent_in_txn(
@@ -5631,15 +5603,14 @@ defmodule Tightbeam.Wakes do
 
               carrier? ->
                 sources = carrier_failure_sources_in_txn(txn, wake_id)
-                record_sender_failure_in_txn(txn, seq, sources, status, error)
+                record_sender_failure_in_txn(txn, seq, sources, status)
 
               digest == 0 ->
                 record_sender_failure_in_txn(
                   txn,
                   seq,
                   [[wake_id, creator, origin, target, assignment_id]],
-                  status,
-                  error
+                  status
                 )
 
               true ->
@@ -5711,30 +5682,24 @@ defmodule Tightbeam.Wakes do
            [seq]
          ) do
       [[holder, assignment_id, status, error, origin, prompt]] ->
-        recipient = interrupted_redelivery_parent_in_txn(txn, holder, assignment_id)
+        brief = String.replace_prefix(prompt, "[from #{origin}]\n\n", "")
 
-        cond do
-          failed_delivery_retry_owned?(status, error) ->
-            :retry_owned
+        with true <- dispatch_brief?(brief, assignment_id),
+             false <- failed_delivery_retry_owned?(status, error),
+             {recipient, _route} <-
+               Tightbeam.TurnFailureNotice.recipient(txn, holder, assignment_id),
+             {cause, original_error} <-
+               Tightbeam.TurnFailureNotice.original_cause_in_txn(txn, seq),
+             false <- Tightbeam.TurnFailureNotice.initial_admitted?(txn, cause, original_error) do
+          content =
+            "Assignment #{assignment_id} brief to #{holder} undelivered: " <>
+              "delivery turn #{seq} is #{status}." <>
+              failed_delivery_uncertainty(status) <> failed_dispatch_reason(original_error)
 
-          is_binary(recipient) ->
-            brief = String.replace_prefix(prompt, "[from #{origin}]\n\n", "")
-
-            reason =
-              if dispatch_brief?(brief, assignment_id),
-                do: failed_dispatch_reason(error),
-                else: ""
-
-            content =
-              "Assignment #{assignment_id} brief to #{holder} undelivered: " <>
-                "delivery turn #{seq} is #{status}." <>
-                failed_delivery_uncertainty(status) <> reason
-
-            {:notices,
-             List.wrap(append_failed_delivery_notice_in_txn(txn, seq, recipient, content))}
-
-          true ->
-            :not_applicable
+          {:notices,
+           List.wrap(append_failed_delivery_notice_in_txn(txn, cause, recipient, content))}
+        else
+          _ -> :not_applicable
         end
 
       [] ->
@@ -5742,7 +5707,15 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp record_sender_failure_in_txn(txn, seq, sources, status, error) do
+  defp record_sender_failure_in_txn(txn, seq, sources, status) do
+    {cause, original_error} = Tightbeam.TurnFailureNotice.original_cause_in_txn(txn, seq)
+
+    dispatch_recipient =
+      case Txn.q(txn, "SELECT sessionKey,assignmentId FROM turns WHERE seq=?1", [seq]) do
+        [[holder, assignment_id]] ->
+          Tightbeam.TurnFailureNotice.recipient(txn, holder, assignment_id)
+      end
+
     notices =
       sources
       |> Enum.reduce(%{}, fn [wake_id, creator, origin, target, assignment_id], recipients ->
@@ -5751,30 +5724,33 @@ defmodule Tightbeam.Wakes do
         # A source with no sending session (a system notice) is surfaced once to
         # its recipient's accountable owner instead; it is never replayed.
         {recipient, told_as} =
-          case failed_source_recipient_in_txn(
-                 txn,
-                 wake_id,
-                 target,
-                 assignment_id,
-                 creator,
-                 origin
-               ) do
-            {recipient, kind} when is_binary(recipient) ->
-              {recipient, kind}
+          case failed_source_recipient_in_txn(txn, wake_id, assignment_id, creator, origin) do
+            :dispatch ->
+              case dispatch_recipient do
+                {recipient, _route} -> {recipient, :dispatch}
+                nil -> {nil, nil}
+              end
+
+            {recipient, :sender} when is_binary(recipient) ->
+              {recipient, :sender}
 
             _ ->
               # A bubble notice's own failure continues its climb instead.
               if String.starts_with?(wake_id, "bubble:"),
                 do: {nil, nil},
-                else:
-                  {interrupted_redelivery_parent_in_txn(txn, target, assignment_id) ||
-                     failed_source_owner_in_txn(txn, target), {:owner, target}}
+                else: {notice_owner_recipient(dispatch_recipient, txn, target), {:owner, target}}
           end
 
-        if is_binary(recipient) do
-          Map.update(recipients, recipient, [{wake_id, told_as}], &[{wake_id, told_as} | &1])
-        else
-          recipients
+        cond do
+          not is_binary(recipient) ->
+            recipients
+
+          initial_failure_receipt?(told_as) and
+              Tightbeam.TurnFailureNotice.initial_admitted?(txn, cause, original_error) ->
+            recipients
+
+          true ->
+            Map.update(recipients, recipient, [{wake_id, told_as}], &[{wake_id, told_as} | &1])
         end
       end)
       |> Enum.flat_map(fn {recipient, sources} ->
@@ -5791,22 +5767,21 @@ defmodule Tightbeam.Wakes do
               ""
           end
 
-        dispatch_reason =
-          if Enum.any?(sources, &match?({_, :dispatch}, &1)),
-            do: failed_dispatch_reason(error),
-            else: ""
+        initial? = Enum.any?(sources, fn {_wake_id, route} -> initial_failure_receipt?(route) end)
+        reason = if initial?, do: failed_dispatch_reason(original_error), else: ""
+        receipt_id = if initial?, do: cause, else: seq
 
         content =
           "Wake #{source_names} undelivered: delivery turn #{seq} is #{status}." <>
-            owner_context <> failed_delivery_uncertainty(status) <> dispatch_reason
+            owner_context <> failed_delivery_uncertainty(status) <> reason
 
-        List.wrap(append_failed_delivery_notice_in_txn(txn, seq, recipient, content))
+        List.wrap(append_failed_delivery_notice_in_txn(txn, receipt_id, recipient, content))
       end)
 
     {:notices, notices}
   end
 
-  defp failed_source_recipient_in_txn(txn, wake_id, target, assignment_id, creator, origin) do
+  defp failed_source_recipient_in_txn(txn, wake_id, assignment_id, creator, origin) do
     # Dispatch stages this canonical brief when its holder is busy. Assignment
     # attribution alone also occurs on ordinary wakes, whose sender stays owed.
     dispatch? =
@@ -5817,37 +5792,30 @@ defmodule Tightbeam.Wakes do
         end
 
     if dispatch?,
-      do: {interrupted_redelivery_parent_in_txn(txn, target, assignment_id), :dispatch},
+      do: :dispatch,
       else: {sender_failure_recipient(creator, origin), :sender}
   end
 
   defp dispatch_brief?(prompt, assignment_id),
     do: String.starts_with?(prompt, "[assignment: #{assignment_id}]\n\n")
 
-  @doc false
-  def failed_dispatch_receipt_in_txn?(%Txn{} = txn, seq, recipient, error) do
-    suffix = failed_dispatch_reason(error)
-
-    Txn.q(
-      txn,
-      """
-      SELECT 1 FROM messages
-      WHERE sessionKey=?1 AND deviceId='process:tightbeam' AND clientMessageId=?2
-        AND substr(content,-length(?3))=?3
-      """,
-      [recipient, "wake-undelivered:#{seq}", suffix]
-    ) != []
-  end
-
   defp failed_dispatch_reason(error),
     do: "\nReason: " <> Tightbeam.Gateway.recorded_turn_failure_sentence(error)
 
-  defp failed_source_owner_in_txn(txn, target) do
-    # The existing terminal failure route alerts the user's personal stream
-    # when there is no active ancestor. A parentless Main can be that stream.
-    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target]) do
-      [[owner]] when is_binary(owner) -> Tightbeam.Org.personal_session_key(owner)
-      _ -> nil
+  defp initial_failure_receipt?(:dispatch), do: true
+  defp initial_failure_receipt?({:owner, _target}), do: true
+  defp initial_failure_receipt?(_route), do: false
+
+  defp notice_owner_recipient({recipient, _route}, _txn, _target), do: recipient
+
+  defp notice_owner_recipient(nil, txn, target) do
+    # A parentless Main still gets its own senderless source receipt as a
+    # transcript entry. Canonical routing never queues another turn to itself.
+    case Txn.q(txn, "SELECT sessionKey FROM sessions WHERE sessionKey=?1 AND kind='main'", [
+           target
+         ]) do
+      [[main]] -> main
+      [] -> nil
     end
   end
 

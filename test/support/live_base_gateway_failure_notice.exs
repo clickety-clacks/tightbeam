@@ -33,6 +33,7 @@ defmodule GuardFailureNotice do
       for {key, model, parent} <- [
             {"agent:lane", "claude-opus-5-5", nil},
             {"agent:opener", "claude-opus-5-5", nil},
+            {"agent:retired-opener", "claude-opus-5-5", nil},
             {"agent:reviewer", "claude-fable-5-2", "agent:lane"}
           ] do
         Org.create(db, %{
@@ -50,6 +51,12 @@ defmodule GuardFailureNotice do
         })
       end
 
+      {:ok, []} =
+        DB.query(
+          db,
+          "UPDATE sessions SET state='retired' WHERE sessionKey='agent:retired-opener'"
+        )
+
       {:ok, lane} = GenServer.start_link(GuardFailureNoticeDoorbell, self())
       {:ok, adapter} = AdapterStub.start_link(self())
       {:ok, coordinator} = CoordinatorStub.start_link({adapter, self()})
@@ -60,7 +67,13 @@ defmodule GuardFailureNotice do
 
         runner = Keyword.fetch!(lane_opts, :runner)
 
-        for {opener, index} <- Enum.with_index(["agent:lane", "agent:opener"], 1) do
+        cases = [
+          {"agent:lane", "agent:lane"},
+          {"agent:opener", "agent:opener"},
+          {"agent:retired-opener", "agent:lane"}
+        ]
+
+        for {{opener, expected_recipient}, index} <- Enum.with_index(cases, 1) do
           assignment = "asg_first_turn_#{index}"
 
           {:ok, []} =
@@ -139,9 +152,17 @@ defmodule GuardFailureNotice do
                      ["bubble:#{turn.seq}:%", "turn #{turn.seq} on assignment"]
                    )
 
-          recipients = if opener == "agent:lane", do: [opener], else: ["agent:lane", opener]
-          assert Enum.sort(Enum.map(notices, &hd/1)) == recipients
-          assert Enum.all?(notices, fn [_recipient, prompt] -> prompt =~ sentence end)
+          assert [[^expected_recipient, prompt]] = notices
+          assert prompt =~ sentence
+
+          if expected_recipient != "agent:lane" do
+            assert {:ok, []} =
+                     DB.query(
+                       db,
+                       "SELECT 1 FROM turns WHERE sessionKey='agent:lane' AND requestRef=?1",
+                       ["bubble:#{turn.seq}"]
+                     )
+          end
 
           assert %{model: "claude-fable-5-2", session_key: "agent:reviewer"} =
                    ModelRateLimit.for_turn(db, turn.seq)

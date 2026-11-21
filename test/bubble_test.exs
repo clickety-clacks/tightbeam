@@ -671,6 +671,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     # The opener is accountable for the assignment; the holder's parent is not
     # told a second time through this path.
     assert undelivered_notices(ctx.db, ctx.supervisor.session_key, turn.seq) == []
+    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
     assert Ledger.pending_count(ctx.db, opener.session_key) == 0
   end
 
@@ -1629,27 +1630,27 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     {:appended, busy_message} =
       Tightbeam.Projection.append(ctx.db, %{
-        session_key: ctx.supervisor.session_key,
+        session_key: ctx.main.session_key,
         role: "user",
         content: "busy supervisor turn",
-        sender: "session:#{ctx.supervisor.session_key}"
+        sender: "session:#{ctx.main.session_key}"
       })
 
     {:ok, busy_seq} =
       Ledger.enqueue(ctx.db, %{
-        session_key: ctx.supervisor.session_key,
+        session_key: ctx.main.session_key,
         message_id: busy_message.id,
-        origin: "session:#{ctx.supervisor.session_key}",
+        origin: "session:#{ctx.main.session_key}",
         prompt: "busy supervisor turn"
       })
 
     assert {:ok, %{seq: ^busy_seq, owner_lease: busy_lease}} =
-             Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "busy-supervisor")
+             Ledger.claim_next(ctx.db, ctx.main.session_key, "busy-supervisor")
 
     cause_seq = fail_assigned_turn!(ctx.db, ctx.holder.session_key, assignment_id)
     assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
 
-    bubble_wake_id = "bubble:#{cause_seq}:#{ctx.supervisor.session_key}"
+    bubble_wake_id = "bubble:#{cause_seq}:#{ctx.main.session_key}"
 
     assert {:ok, [["pending", ^assignment_id]]} =
              DB.query(ctx.db, "SELECT state,assignmentId FROM wakes WHERE wakeId=?1", [
@@ -1666,7 +1667,7 @@ defmodule Tightbeam.Productions.BubbleTest do
              )
 
     assert :ok = Ledger.finish(ctx.db, busy_seq, "delivered", nil, owner_lease: busy_lease)
-    _carriers = deliver_ready_carriers!(ctx, ctx.supervisor.session_key)
+    _carriers = deliver_ready_carriers!(ctx, ctx.main.session_key)
 
     assert [%{batch_state: "delivered", delivery_wake_id: _}] =
              NoticeBatcher.source_refs(ctx.db, bubble_wake_id)
@@ -2219,17 +2220,7 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     cause_seq = fail_assigned_turn!(ctx.db, ctx.holder.session_key, assignment.id)
     assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
-    _ = deliver_ready_carriers!(ctx, ctx.supervisor.session_key)
-
-    assert {:ok, supervisor_notice} =
-             Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "assigned-cause")
-
-    assert :ok =
-             Ledger.finish(ctx.db, supervisor_notice.seq, "failed", "assigned failure",
-               owner_lease: supervisor_notice.owner_lease
-             )
-
-    assert :ok = Bubble.recognize_terminal(ctx.db, supervisor_notice.seq)
+    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
     _ = deliver_ready_carriers!(ctx, ctx.main.session_key)
 
     assert {:ok, main_notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "assigned-cause")

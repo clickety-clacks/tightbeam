@@ -66,37 +66,40 @@ defmodule Tightbeam.Productions.Bubble do
   end
 
   defp recognize_bubble(db, seq) do
+    restored? = NoticeAuthority.restored_turn?(db, seq)
     contexts = turn_contexts(db, seq)
 
-    unless NoticeAuthority.restored_turn?(db, seq) do
-      # All ordinary causes share this recipient's next rung. If it is
-      # exhausted, their dispositions and owner alerts must commit together.
-      admitted =
-        Enum.filter(contexts, fn turn ->
-          turn.status == "delivered" or bubble_production_matches?(db, turn.status, turn)
-        end)
-
-      ordinary = Enum.filter(admitted, &ordinary_cause?/1)
-
-      Enum.reduce(admitted, false, fn turn, climbed? ->
-        if ordinary_cause?(turn) do
-          if not climbed?, do: climb(db, ordinary)
-          true
-        else
-          recognize(db, seq, turn.status, turn)
-          climbed?
-        end
+    climbing =
+      Enum.filter(contexts, fn turn ->
+        turn.notice? and not restored? and bubble_production_matches?(db, turn.status, turn)
       end)
-    end
 
-    # Placement refusals and runner failures reach the same recognizer. Give
-    # Bubble first claim on the recipient; the same wake key guards the opener
-    # route when Bubble was gated or used a different recipient.
+    if climbing != [], do: climb(db, climbing)
+
     Enum.each(contexts, fn
+      %{status: "delivered"} = turn when not restored? ->
+        recognize(db, seq, turn.status, turn)
+
       %{notice?: false, status: status} = turn when status in @bubbling_terminals ->
-        with recipient when is_binary(recipient) <- TurnFailureNotice.recipient(db, seq),
-             false <- ConditionFacts.standing?(db, "user-alerted", turn.owner) do
-          enqueue_notices(db, [Map.put(turn, :accountable_fallback?, true)], recipient)
+        unless ConditionFacts.standing?(db, "user-alerted", turn.owner) do
+          available? = not restored? and bubble_production_matches?(db, status, turn)
+
+          case TurnFailureNotice.for_turn(db, seq) do
+            :decision_carrier ->
+              if available?, do: climb(db, [turn])
+
+            {recipient, route} ->
+              turn =
+                Map.merge(turn, %{
+                  initial?: true,
+                  accountable_fallback?: route != "ancestor" or not available?
+                })
+
+              enqueue_notices(db, [turn], recipient)
+
+            nil ->
+              if available?, do: climb(db, [turn])
+          end
         end
 
       _ ->
@@ -105,8 +108,6 @@ defmodule Tightbeam.Productions.Bubble do
 
     :ok
   end
-
-  defp ordinary_cause?(turn), do: turn.status != "delivered"
 
   defp recognize(db, seq, "delivered", turn) do
     # Retraction is observed, not declared: a delivered turn is proof the
@@ -209,7 +210,10 @@ defmodule Tightbeam.Productions.Bubble do
 
     skipped =
       for {turn, :skipped} <- results,
-          do: %{turn | session_key: recipient, notice?: true}
+          do:
+            turn
+            |> Map.merge(%{session_key: recipient, notice?: true})
+            |> Map.drop([:initial?, :accountable_fallback?])
 
     # Recover before external publication can interrupt this invocation.
     if skipped != [], do: climb(db, skipped)
@@ -224,24 +228,24 @@ defmodule Tightbeam.Productions.Bubble do
 
   defp deliver_bubble_notice_in_txn(txn, recipient, turn, cause) do
     wake_id = "bubble:#{turn.cause_seq}:#{recipient}"
-    question_id = "w_health_redelivery_parent_#{turn.cause_seq}"
 
     admitted? =
-      DB.Txn.q(
-        txn,
-        """
-        SELECT 1 FROM wakes WHERE wakeId=?1 OR (wakeId=?2 AND sessionKey=?3)
-        UNION ALL SELECT 1 FROM turns WHERE wakeId=?1 LIMIT 1
-        """,
-        [wake_id, question_id, recipient]
-      ) != []
+      if Map.get(turn, :initial?, false) do
+        TurnFailureNotice.initial_admitted?(txn, turn.cause_seq, cause.error)
+      else
+        DB.Txn.q(
+          txn,
+          """
+          SELECT 1 FROM wakes WHERE wakeId=?1
+          UNION ALL SELECT 1 FROM turns WHERE wakeId=?1 LIMIT 1
+          """,
+          [wake_id]
+        ) != []
+      end
 
-    if admitted? or
-         Wakes.failed_dispatch_receipt_in_txn?(txn, turn.cause_seq, recipient, cause.error) do
-      :duplicate
-    else
-      admit_bubble_notice_in_txn(txn, recipient, turn, cause, wake_id)
-    end
+    if admitted?,
+      do: :duplicate,
+      else: admit_bubble_notice_in_txn(txn, recipient, turn, cause, wake_id)
   end
 
   defp admit_bubble_notice_in_txn(txn, recipient, turn, cause, wake_id) do
@@ -282,7 +286,7 @@ defmodule Tightbeam.Productions.Bubble do
       # including while that recipient is busy. Commit the authority change with
       # admission so restart or publication failure cannot strand it. Replaying
       # an earlier rung must not reclaim authority from a later recipient.
-      # The additional opener notice is informational about the original cause.
+      # A notice routed directly to the accountable opener is informational.
       if not fallback? and
            (match?({:staged, _}, delivery) or match?({:appended, _, _, _}, delivery)) do
         transfer_cannot_proceed_disposers_for_cause_in_txn(txn, turn.cause_seq, recipient)
