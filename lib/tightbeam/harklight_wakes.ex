@@ -1356,15 +1356,7 @@ defmodule Tightbeam.HarklightWakes do
       |> Enum.filter(&(&1.state == "waiting"))
       |> Enum.map(& &1.message_id)
 
-    reasons = Map.put(reasons, :waiting_messages, waiting)
-
-    case Map.get(reasons, :open_requests) do
-      count when is_integer(count) and count > length(waiting) ->
-        Map.put(reasons, :unmatched_harklight_open_requests, count - length(waiting))
-
-      _ ->
-        reasons
-    end
+    Map.put(reasons, :waiting_messages, waiting)
   end
 
   defp selector_name(:all), do: "all"
@@ -1626,9 +1618,9 @@ defmodule Tightbeam.HarklightWakes do
   defp retryable_failure?({:harklight_failure, error, _, _}), do: retryable_failure?(error)
 
   defp retryable_failure?(error),
-    do: error not in ~w(origin_unavailable origin_host_mismatch listener_unsupported
+    do: error not in ~w(origin_unavailable origin_host_mismatch
       event_identity_invalid event_identity_mismatch event_order_invalid invalid_listener_line
-      unexpected_listener_line)
+      unexpected_feed_record)
 
   defp transient_origin_failure?({:harklight_failure, {_error, code}, operation, _diagnostic})
        when operation == "listen" and code in ["transport_error", "timeout"],
@@ -3189,6 +3181,8 @@ defmodule Tightbeam.HarklightWakes do
 
   defp registered_migrated_item(_txn, _handle, _item_id, _item), do: :unregistered
 
+  # Replays a previously stored event without translating its durable identity.
+  # Only capture_feed/5 accepts records from a running Agent.
   def capture_line(db, handle, line) do
     with {:ok, event} <- JSON.decode(line),
          true <- is_map(event) do
@@ -3199,14 +3193,8 @@ defmodule Tightbeam.HarklightWakes do
         %{"kind" => "message", "item_id" => item_id} when is_binary(item_id) ->
           capture_event(db, handle, line, event)
 
-        %{"kind" => "idle", "open_requests" => 0} ->
-          :ok
-
-        %{"kind" => "unsupported"} ->
-          {:error, "listener_unsupported"}
-
         _ ->
-          {:error, "unexpected_listener_line"}
+          {:error, "unexpected_feed_record"}
       end
     else
       _ -> {:error, "invalid_listener_line"}
