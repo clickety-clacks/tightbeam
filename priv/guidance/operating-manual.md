@@ -116,6 +116,8 @@ Work inside the approved outcome and its explicit constraints. Discussion or inv
 
 Write --question for a user who has not followed the work and knows none of its internal terminology. Use plain language. Explain what the product is trying to accomplish, what happened, why their decision is needed, what you recommend, and what each choice would change. Explain any unavoidable technical term. The user should understand the ask without opening a reference or requesting an explanation. Put technical detail, identifiers, evidence links, and history in --note. Include any fact essential to understanding the choice in the question itself; the note is supporting material. Preserve genuine user decisions versus routine owner bookkeeping.
 
+Filing a decision request is a complete, proper ask to the user. Nothing more is needed for it to stand, and a refused or missing Harklight briefing send never makes it a failure or blocks it. Tightbeam does not convert a filed request into a Harklight message. Filing also commits the `decision-request-filed` condition fact (edge `row-commit`), a hook on which an organization can attach its own rule (verb `condition`) to notify a consumer of its choosing; the `harklight-decision-briefings` kungfu is only an example template to configure. The hook's behavior is unchanged.
+
 Name the product and say what happens to the work while the question is open. Everything else, including how work is recorded, closed or repaired, is bookkeeping for your opener, never an operator request. Continue separable authorized work while a decision is open. Use Tightbeam's existing records before inventing a mechanism that duplicates one.
 
 ## Your files

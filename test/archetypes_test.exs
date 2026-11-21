@@ -289,6 +289,16 @@ defmodule Tightbeam.ArchetypesTest do
     refute manual =~ "worktree-session"
   end
 
+  test "the operating manual says a filed decision request is a complete ask with an attachable hook" do
+    manual = Archetypes.builtin_fragments()["operating-manual.md"]
+
+    assert manual =~ "Filing a decision request is a complete, proper ask to the user."
+    assert manual =~ "never makes it a failure or blocks it"
+    assert manual =~ "Tightbeam does not convert a filed request into a Harklight message."
+    assert manual =~ "`decision-request-filed` condition fact (edge `row-commit`)"
+    assert manual =~ "an organization can attach its own rule"
+  end
+
   @tag timeout: 180_000
   test "assignment custody is single-homed and landing remains with delivery owners", ctx do
     heading = "## 3. Obligations have one holder, and a holder keeps them until they are disposed"
