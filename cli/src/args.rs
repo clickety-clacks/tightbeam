@@ -201,6 +201,16 @@ pub enum Command {
         vendor_session_id: Option<String>,
         supersedes: Vec<String>,
         decision_request_id: Option<String>,
+        progress: Option<u32>,
+        progress_stage: Option<String>,
+        progress_note: Option<String>,
+    },
+    HarklightProgress {
+        identity: Identity,
+        message: String,
+        percent: u32,
+        stage: String,
+        note: Option<String>,
     },
     HarklightBriefingsCatchup {
         identity: Identity,
@@ -215,20 +225,18 @@ pub enum Command {
         choices: Vec<String>,
         clear_choices: bool,
         session: Option<String>,
+        in_reply_to: Option<String>,
     },
     HarklightRetract {
         identity: Identity,
         message: String,
         session: Option<String>,
+        in_reply_to: Option<String>,
     },
     HarklightSettle {
         identity: Identity,
-        message: String,
+        message: Option<String>,
         op_id: Option<String>,
-    },
-    HarklightCover {
-        identity: Identity,
-        session: String,
     },
     HarklightListenerRestore {
         identity: Identity,
@@ -963,29 +971,34 @@ COMMANDS:
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
   harklight-revise --message <id> --base-revision <n> --title <text>
-      [--body <text>] [--choices-json <array>] [--clear-choices] [--session <handle>]
-  harklight-retract --message <id> [--session <handle>]
+      [--body <text>] [--choices-json <array>] [--clear-choices] [--session <handle>] [--in-reply-to <entry-id>]
+  harklight-retract --message <id> [--session <handle>] [--in-reply-to <entry-id>]
       For a message Tightbeam has no send record for, --session <handle> names its
       Harklight session and the change is passed to Harklight with no wake or
       subscription effect. Harklight decides whether the change is allowed.
-  harklight-settle --message <id> [--op-id <key>]
+  harklight-progress --message <id> --percent <0..100> --stage <label> [--note <text>]
+      Update the same Progress message through the existing revise journal.
+  harklight-settle (--message <id> [--op-id <key>] | --op-id <key>)
       Settle one unresolved Harklight operation using its saved request and original operation ID.
+      For an unresolved send without a server item ID, use its returned opId.
+      Use --op-id for a paused handoff receipt from your own dispatched turn.
       For a message Tightbeam has no record for, --op-id <key> names the Harklight
       operation to retry; the retry has no wake or subscription effect.
-  harklight-cover --session <handle>
-      Explicitly move your conversation to the shared origin listener.
   harklight-listener-restore --handle <handle>
       Restore this session's Gateway-managed listener on its existing delivery route.
   harklight-follow (--message <id> | --handle <handle>)
       Follow a message or conversation sent through Tightbeam.
   harklight-retry (--all | --message <id> | --session <handle>)
       Retry the bounded listener start for unavailable unanswered conversations.
+      Use --session to resume a paused feed from its last saved checkpoint.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
       --type fyi|request [--kind blocker|success]
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
       [--reply] [--supersedes <id>]...
       [--body <text>] [--choices-json <array>] [--files-json <array>] [--answer-ui <path>]
       [--vendor-session-id <id>] [--decision-request-id <dr_id>]
+      [--progress <0..100> --progress-stage <label> [--progress-note <text>]]
+      Progress defaults to FYI and excludes choices, reply and answer-ui.
       FYI is acknowledged with Seen; request needs a choice, --reply, or --answer-ui. Importance is
       your view; Harklight's ranking decides the priority the recipient sees.
       Correct and resend only after a definite refusal;
@@ -2748,10 +2761,44 @@ fn parse_with_optional_catalog(
                             | "answer-ui"
                             | "vendor-session-id"
                             | "supersedes"
+                            | "progress"
+                            | "progress-stage"
+                            | "progress-note"
                     )
                 })
             {
                 return Err("usage: tightbeam harklight-send --session new|<handle> --sender-id <id> --title <text> --type fyi|request [--kind blocker|success] [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>] [--reply] [--body <text>] [--choices-json <array>] [--files-json <array>] [--answer-ui <path>] [--vendor-session-id <id>] [--decision-request-id <dr_id>]".to_owned());
+            }
+            let progress = flags
+                .get("progress")
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| *n <= 100)
+                        .ok_or("--progress must be an integer from 0 to 100")
+                })
+                .transpose()?;
+            let progress_stage = flags.get("progress-stage").cloned();
+            let progress_note = flags.get("progress-note").cloned();
+            if progress.is_some() {
+                if progress_stage
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+                {
+                    return Err("--progress-stage requires a nonblank label".to_owned());
+                }
+                if flags.get("type").is_some_and(|t| t != "fyi")
+                    || ["choices-json", "reply", "answer-ui"]
+                        .iter()
+                        .any(|f| flags.contains_key(*f))
+                {
+                    return Err(
+                        "Progress requires FYI without choices, reply or answer-ui".to_owned()
+                    );
+                }
+            } else if progress_stage.is_some() || progress_note.is_some() {
+                return Err("--progress-stage and --progress-note require --progress".to_owned());
             }
             let answer_ui = flags.get("answer-ui").cloned();
             if flags.contains_key("answer-ui") && answer_ui.as_deref().is_none_or(str::is_empty) {
@@ -2762,6 +2809,7 @@ fn parse_with_optional_catalog(
             }
             let message_type = match nonempty(flags, "type") {
                 Some(value) => value,
+                None if progress.is_some() => "fyi".to_owned(),
                 None if answer_ui.is_some() => {
                     return Err("--answer-ui requires --type request; add --type request or remove --answer-ui".to_owned());
                 }
@@ -2830,6 +2878,38 @@ fn parse_with_optional_catalog(
                     .cloned()
                     .unwrap_or_default(),
                 decision_request_id,
+                progress,
+                progress_stage,
+                progress_note,
+            })
+        }
+        "harklight-progress" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "as" | "as-user" | "as-process" | "message" | "percent" | "stage" | "note"
+                    )
+                })
+            {
+                return Err("invalid Harklight Progress command flags".to_owned());
+            }
+            let percent = flags
+                .get("percent")
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|n| *n <= 100)
+                .ok_or("--percent must be an integer from 0 to 100")?;
+            let stage = flags
+                .get("stage")
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .ok_or("--stage requires a nonblank label")?;
+            Ok(Command::HarklightProgress {
+                identity: identity(flags)?,
+                message: nonempty(flags, "message").ok_or("--message is required")?,
+                percent,
+                stage,
+                note: flags.get("note").cloned(),
             })
         }
         "harklight-revise" | "harklight-retract" | "harklight-settle" => {
@@ -2838,7 +2918,8 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| {
                     !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "message")
-                        && !(command != "harklight-settle" && flag == "session")
+                        && !(command != "harklight-settle"
+                            && matches!(flag.as_str(), "session" | "in-reply-to"))
                         && !(command == "harklight-settle" && flag == "op-id")
                         && !(revise
                             && matches!(
@@ -2854,19 +2935,31 @@ fn parse_with_optional_catalog(
                 return Err("invalid Harklight command flags".to_owned());
             }
             let identity = identity(flags)?;
-            let message = nonempty(flags, "message").ok_or("--message is required")?;
+            let message = nonempty(flags, "message");
+            let in_reply_to = nonempty(flags, "in-reply-to");
+            if flags.contains_key("in-reply-to") && in_reply_to.is_none() {
+                return Err("--in-reply-to needs an entry ID".to_owned());
+            }
             match command {
                 "harklight-retract" => Ok(Command::HarklightRetract {
                     identity,
-                    message,
+                    message: message.ok_or("--message is required")?,
                     session: nonempty(flags, "session"),
+                    in_reply_to,
                 }),
-                "harklight-settle" => Ok(Command::HarklightSettle {
-                    identity,
-                    message,
-                    op_id: nonempty(flags, "op-id"),
-                }),
+                "harklight-settle" => {
+                    let op_id = nonempty(flags, "op-id");
+                    if message.is_none() && op_id.is_none() {
+                        return Err("--message or --op-id is required".to_owned());
+                    }
+                    Ok(Command::HarklightSettle {
+                        identity,
+                        message,
+                        op_id,
+                    })
+                }
                 _ => {
+                    let message = message.ok_or("--message is required")?;
                     let base_revision = nonempty(flags, "base-revision")
                         .ok_or("--base-revision is required")?
                         .parse::<i64>()
@@ -2890,22 +2983,10 @@ fn parse_with_optional_catalog(
                         choices,
                         clear_choices,
                         session: nonempty(flags, "session"),
+                        in_reply_to,
                     })
                 }
             }
-        }
-        "harklight-cover" => {
-            if parsed.positional.len() != 1
-                || flags.keys().any(|flag| {
-                    !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "session")
-                })
-            {
-                return Err("usage: tightbeam harklight-cover --session <handle>".to_owned());
-            }
-            Ok(Command::HarklightCover {
-                identity: identity(flags)?,
-                session: nonempty(flags, "session").ok_or("--session is required")?,
-            })
         }
         "harklight-listener-restore" => {
             if parsed.positional.len() != 1
@@ -4939,6 +5020,71 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
 #[cfg(test)]
 mod tests {
     #[test]
+    fn progress_inputs_preserve_values_and_refuse_conflicts() {
+        for percent in ["0", "100"] {
+            assert!(
+                matches!(parse(strings(&["harklight-progress", "--message", "m", "--percent", percent,
+                "--stage", " arbitrary stage ", "--note", " exact\n "])),
+                Ok(Command::HarklightProgress { stage, note: Some(note), .. })
+                if stage == " arbitrary stage " && note == " exact\n ")
+            );
+            assert!(
+                matches!(parse(strings(&["harklight-send", "--session", "new", "--sender-id", "s",
+                "--title", "t", "--progress", percent, "--progress-stage", "custom"])),
+                Ok(Command::HarklightSend { message_type, .. }) if message_type == "fyi")
+            );
+        }
+        for percent in ["101", "-1", "1.5", ""] {
+            assert!(
+                parse(strings(&[
+                    "harklight-progress",
+                    "--message",
+                    "m",
+                    "--percent",
+                    percent,
+                    "--stage",
+                    "s"
+                ]))
+                .is_err()
+            );
+        }
+        for extra in [
+            vec!["--type", "request"],
+            vec!["--reply"],
+            vec!["--choices-json", "[]"],
+            vec!["--answer-ui", "x"],
+        ] {
+            let mut args = vec![
+                "harklight-send",
+                "--session",
+                "new",
+                "--sender-id",
+                "s",
+                "--title",
+                "t",
+                "--progress",
+                "0",
+                "--progress-stage",
+                "s",
+            ];
+            args.extend(extra);
+            assert!(parse(strings(&args)).is_err());
+        }
+        assert!(
+            parse(strings(&[
+                "harklight-progress",
+                "--message",
+                "m",
+                "--percent",
+                "0",
+                "--stage",
+                " "
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn revoke_requires_exactly_one_reason_before_dispatch() {
         for args in [
             strings(&["revoke-assignment", "asg_test"]),
@@ -5120,6 +5266,9 @@ mod tests {
                 vendor_session_id: None,
                 supersedes: vec![],
                 decision_request_id: None,
+                progress: None,
+                progress_stage: None,
+                progress_note: None,
             })
         );
 
@@ -7131,11 +7280,11 @@ mod tests {
                 "harness-process",
                 "harklight-briefings-catchup",
                 "harklight-send",
+                "harklight-progress",
                 "harklight-revise",
                 "harklight-retract",
                 "harklight-settle",
                 "harklight-follow",
-                "harklight-cover",
                 "harklight-listener-restore",
                 "harklight-retry",
                 "harness-health-observe-other",

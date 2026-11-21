@@ -398,7 +398,7 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     end
   end
 
-  test "Harklight attachment keeps its existing worker-owned refusal retry", %{db: db} do
+  test "Harklight feed keeps its worker-owned readiness retry", %{db: db} do
     manager = start_supervised!({Tightbeam.HarklightWakes, db: db})
     worker = self()
     :sys.get_state(manager)
@@ -406,8 +406,8 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     overload!(db)
 
     try do
-      assert {:error, "attachment_state_unavailable"} =
-               GenServer.call(manager, {:attached, "attachment"}, 500)
+      assert {:error, "feed_state_unavailable"} =
+               GenServer.call(manager, {:feed_ready, "attachment"}, 500)
 
       assert MapSet.new() == GenServer.call(manager, {:unlistened_handles, []}, 500)
     after

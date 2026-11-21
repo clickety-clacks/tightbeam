@@ -18,38 +18,7 @@ defmodule Tightbeam.HarklightFollows do
          {:ok, resolved} <- resolve(db, kind, target),
          :ok <- origin_handle(db, resolved),
          {:ok, resolved} <- settled(resolved, kind, target) do
-      case runner(opts) do
-        {:ok, runner} ->
-          case status(runner, resolved.handle) do
-            {:ok, true} ->
-              refusal(kind, resolved, "The Harklight conversation is already finished.")
-
-            {:ok, false} ->
-              record(db, call.session_key, kind, resolved, opts)
-
-            {:error, reason} ->
-              result(
-                kind,
-                "failed",
-                "none",
-                resolved.message_id,
-                resolved.handle,
-                resolved.sender_id,
-                reason
-              )
-          end
-
-        {:error, reason} ->
-          result(
-            kind,
-            "failed",
-            "none",
-            resolved.message_id,
-            resolved.handle,
-            resolved.sender_id,
-            "Harklight status could not be read: #{reason}. Retry the follow command when status is available."
-          )
-      end
+      record(db, call.session_key, kind, resolved, opts)
     else
       {:error, {:unresolved, id, sender_id, handle}} ->
         result("message", "refused", "none", id, handle, sender_id, unresolved_reason(id))
@@ -300,89 +269,6 @@ defmodule Tightbeam.HarklightFollows do
     own ++ follows
   end
 
-  defp status(runner, handle) do
-    try do
-      {output, exit_status} = runner.(["status", "--session", handle])
-
-      if exit_status == 0 do
-        case output
-             |> String.split("\n", trim: true)
-             |> Enum.find_value(fn line ->
-               case JSON.decode(line) do
-                 {:ok, %{"session_handle" => ^handle} = value} -> value
-                 _ -> nil
-               end
-             end)
-             |> status_counts() do
-          {:ok, counts} ->
-            open_chats = Map.get(counts, :open_chats, counts.open_requests)
-
-            {:ok,
-             open_chats == 0 and counts.pending_undelivered == 0 and
-               counts.pending_delivered_unacted == 0}
-
-          :error ->
-            {:error,
-             "Harklight status did not provide the counts needed to determine whether the conversation is finished."}
-        end
-      else
-        detail = String.trim(output)
-
-        {:error,
-         if(detail == "",
-           do:
-             "Harklight status could not be read. Retry the follow command when status is available.",
-           else:
-             "Harklight status could not be read: #{detail}. Retry the follow command when status is available."
-         )}
-      end
-    rescue
-      error ->
-        {:error,
-         "Harklight status could not be read: #{Exception.message(error)}. Retry the follow command when status is available."}
-    end
-  end
-
-  defp status_counts(
-         %{
-           "open_requests" => open_requests,
-           "pending_undelivered" => pending_undelivered,
-           "pending_delivered_unacted" => pending_delivered_unacted
-         } = value
-       )
-       when is_integer(open_requests) and open_requests >= 0 and is_integer(pending_undelivered) and
-              pending_undelivered >= 0 and is_integer(pending_delivered_unacted) and
-              pending_delivered_unacted >= 0 do
-    case Map.get(value, "open_chats", open_requests) do
-      open_chats when is_integer(open_chats) and open_chats >= 0 ->
-        {:ok,
-         %{
-           open_requests: open_requests,
-           open_chats: open_chats,
-           pending_undelivered: pending_undelivered,
-           pending_delivered_unacted: pending_delivered_unacted
-         }}
-
-      _ ->
-        :error
-    end
-  end
-
-  defp status_counts(_), do: :error
-
-  defp runner(opts) do
-    case Keyword.get(opts, :runner) do
-      fun when is_function(fun, 1) ->
-        {:ok, fun}
-
-      nil ->
-        case System.find_executable("harklight-agent") do
-          nil -> {:error, "Harklight Agent could not be run to read conversation status."}
-          executable -> {:ok, fn args -> System.cmd(executable, args, stderr_to_stdout: true) end}
-        end
-    end
-  end
-
   defp origin!(db, call) do
     org = if is_binary(call[:session_key]), do: Org.get(db, call.session_key), else: nil
 
@@ -438,6 +324,6 @@ defmodule Tightbeam.HarklightFollows do
   end
 
   defp unresolved_reason(id) do
-    "Message #{id} is unresolved. Wait until it is settled before following. Its sender can run `tightbeam harklight-settle --message #{id}`, or let the next gateway start recover it. Run `tightbeam harklight-follow --message #{id}` again once settled. Tightbeam will not wait or retry automatically."
+    "Message #{id} is unresolved. Its sender can run `tightbeam harklight-settle --message #{id}`. Run `tightbeam harklight-follow --message #{id}` again once settled."
   end
 end

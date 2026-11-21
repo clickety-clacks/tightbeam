@@ -110,6 +110,10 @@ defmodule Tightbeam.HarklightLifecycle do
           payload: payload,
           request: prepared["request"],
           command: prepared["command"],
+          journal_id: prepared["journal_id"],
+          item_id: prepared["item_id"],
+          in_reply_to: prepared["in_reply_to"],
+          handle: prepared["handle"],
           message_id: prepared["message_id"],
           state: outcome || "pending"
         }
@@ -217,7 +221,13 @@ defmodule Tightbeam.HarklightLifecycle do
     prepared = JSON.decode!(payload)
     request = prepared["request"] || prepared
     message = request["message"] || %{}
-    warnings = JSON.decode!(result)["supersedes_warnings"] || []
+    response = JSON.decode!(result)
+    warnings = response["supersedes_warnings"] || []
+    replacement_id = get_in(response, ["message", "item_id"]) || message["message_id"]
+
+    targets =
+      Map.new(request["supersedes_targets"] || [], fn [reference, item] -> {reference, item} end)
+
     ids = Enum.uniq(message["supersedes"] || [])
 
     # Targets left out of the request because their own send is unresolved.
@@ -227,16 +237,20 @@ defmodule Tightbeam.HarklightLifecycle do
           message_id: id,
           effect: "unchanged",
           reason:
-            "unresolved: that send's outcome is unknown, so it was not superseded; run tightbeam harklight-settle --message #{id}, then supersede it again if needed"
+            "unresolved: that send's outcome is unknown, so it was not superseded; run tightbeam harklight-settle --op-id #{id}, then supersede it again if needed"
         }
       end
 
     {effects, pending} =
       Enum.map_reduce(ids, [], fn id, pending ->
-        warning = Enum.find(warnings, &(&1["message_id"] == id))
+        item_id = Map.get(targets, id, id)
+        warning = Enum.find(warnings, &((&1["item_id"] || &1["message_id"]) == item_id))
         old = lookup_in_txn(txn, id)
 
         cond do
+          is_nil(item_id) ->
+            {%{message_id: id, effect: "unchanged", reason: "unknown"}, pending}
+
           warning ->
             {%{message_id: id, effect: "unchanged", reason: warning["reason"]}, pending}
 
@@ -249,7 +263,7 @@ defmodule Tightbeam.HarklightLifecycle do
                 txn,
                 old,
                 op_id,
-                message["message_id"],
+                replacement_id,
                 session,
                 "superseded"
               )
@@ -257,13 +271,13 @@ defmodule Tightbeam.HarklightLifecycle do
             {%{message_id: id, effect: "other_session"}, pending ++ entries}
 
           true ->
-            entries = end_in_txn(txn, old, op_id, message["message_id"], "pending")
+            entries = end_in_txn(txn, old, op_id, replacement_id, "not_needed")
 
             {%{
                message_id: id,
                effect: "ended",
-               acknowledgment: "pending",
-               subscription_state: "open"
+               acknowledgment: "not_needed",
+               subscription_state: "ended"
              }, pending ++ entries}
         end
       end)
@@ -475,13 +489,6 @@ defmodule Tightbeam.HarklightLifecycle do
     entry = JSON.decode!(line)["entry"]
 
     if entry["kind"] == "terminal" and entry["terminal_state"] == "superseded" do
-      ended =
-        Txn.q(
-          txn,
-          "SELECT acknowledgment FROM harklight_subscription_ends WHERE senderId=?1 AND messageId=?2 AND replacementId IS NOT NULL",
-          [sender, message]
-        )
-
       pending =
         Txn.q(
           txn,
@@ -498,20 +505,6 @@ defmodule Tightbeam.HarklightLifecycle do
 
         true
       else
-        if ended == [["pending"]] do
-          Txn.q(
-            txn,
-            "UPDATE harklight_subscription_ends SET ackEventId=?3 WHERE senderId=?1 AND messageId=?2 AND ackEventId IS NULL",
-            [sender, message, event_id]
-          )
-
-          Txn.q(
-            txn,
-            "INSERT INTO harklight_held_terminals(handle,eventId,senderId,messageId,rawLine) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(handle,eventId) DO NOTHING",
-            [handle, event_id, sender, message, line]
-          )
-        end
-
         false
       end
     else
@@ -552,7 +545,7 @@ defmodule Tightbeam.HarklightLifecycle do
             txn,
             """
             SELECT 1 FROM harklight_held_terminals t
-            WHERE t.handle=?1 AND CAST(t.eventId AS INTEGER)<?2
+            WHERE t.handle=?1 AND json_extract(t.rawLine, '$.feed_cursor')<?2
               AND NOT EXISTS (SELECT 1 FROM harklight_subscription_ends e WHERE e.senderId=t.senderId AND e.messageId=t.messageId)
               AND NOT EXISTS (SELECT 1 FROM harklight_wake_entries e WHERE e.handle=t.handle AND e.eventId=t.eventId)
               AND NOT EXISTS (SELECT 1 FROM harklight_wake_suppressed_entries e WHERE e.handle=t.handle AND e.eventId=t.eventId)
@@ -588,64 +581,21 @@ defmodule Tightbeam.HarklightLifecycle do
     ]) != []
   end
 
-  def process_terminals(db, opts \\ []) do
+  def process_terminals(db, _opts \\ []) do
     {:ok, rows} =
       DB.query(
         db,
         """
         SELECT t.handle,t.eventId,t.rawLine FROM harklight_held_terminals t
         LEFT JOIN harklight_subscription_ends e ON e.senderId=t.senderId AND e.messageId=t.messageId
-        WHERE (e.messageId IS NULL OR (e.acknowledgment='pending' AND e.ackEventId IS NULL))
+        WHERE (e.messageId IS NULL OR e.replacementId IS NOT NULL)
           AND NOT EXISTS (SELECT 1 FROM harklight_wake_entries w WHERE w.handle=t.handle AND w.eventId=t.eventId)
           AND NOT EXISTS (SELECT 1 FROM harklight_wake_suppressed_entries w WHERE w.handle=t.handle AND w.eventId=t.eventId)
-        ORDER BY CAST(t.eventId AS INTEGER)
+        ORDER BY json_extract(t.rawLine, '$.feed_cursor')
         """
       )
 
     Enum.each(rows, fn [handle, _event, line] -> HarklightWakes.capture_line(db, handle, line) end)
-
-    acknowledge_pending(db, opts)
-  end
-
-  def acknowledge_pending(db, opts \\ []) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT senderId,messageId,handle,ackEventId FROM harklight_subscription_ends WHERE acknowledgment='pending' AND ackEventId IS NOT NULL"
-      )
-
-    Enum.each(rows, fn [sender, message, handle, event] ->
-      # Serialize the check and ack with other ack attempts. The external ack
-      # itself is idempotent; a crash before recording it resumes at startup.
-      :global.trans({{__MODULE__, db, handle, event}, self()}, fn ->
-        case DB.query(
-               db,
-               "SELECT acknowledgment FROM harklight_subscription_ends WHERE senderId=?1 AND messageId=?2",
-               [sender, message]
-             ) do
-          {:ok, [["pending"]]} ->
-            result = Tightbeam.HarklightSend.ack(handle, event, opts)
-
-            {state, status, reason} =
-              case result do
-                :ok -> {"ended", "acknowledged", nil}
-                {:error, reason} -> {"open", "failed", reason}
-              end
-
-            case DB.query(
-                   db,
-                   "UPDATE harklight_subscription_ends SET state=?3,acknowledgment=?4,reason=?5 WHERE senderId=?1 AND messageId=?2",
-                   [sender, message, state, status, reason]
-                 ) do
-              {:ok, _} when status == "acknowledged" -> HarklightWakes.h8a_acknowledged(handle)
-              _ -> :ok
-            end
-
-          _ ->
-            :ok
-        end
-      end)
-    end)
 
     :ok
   end
@@ -708,585 +658,6 @@ defmodule Tightbeam.HarklightLifecycle do
       _ ->
         []
     end
-  end
-
-  # The Agent's read and status commands are the existing source for pending
-  # entries and delivery receipts. Any refusal, malformed output, or local
-  # record that changes while those reads run leaves the handle active.
-  # R(H) gates listener starts, independently of answer authorship or results.
-  # Recheck local evidence after status so a registered request or pending send
-  # cannot be skipped using an earlier snapshot.
-  def closed_for_start?(db, handle, opts \\ []) do
-    match?({:closed, _}, listener_start_decision(db, handle, opts))
-  rescue
-    _ -> false
-  end
-
-  @doc false
-  def listener_start_decision(db, handle, opts \\ []) do
-    case completion_snapshot(db, handle) do
-      {:ok, initial} ->
-        cond do
-          initial.requests == [] ->
-            {:start, %{eligibility_undecidable: true, reason: "no_tightbeam_request_record"}}
-
-          initial.pending_sends != [] ->
-            {:start, %{pending_send_count: length(initial.pending_sends)}}
-
-          true ->
-            with {:ok, runner} <- read_runner(opts),
-                 {:ok, output} <- run_status(runner, handle),
-                 {:ok, status} when is_map(status) <- JSON.decode(output),
-                 true <- status["session_handle"] == handle,
-                 open_requests when is_integer(open_requests) and open_requests >= 0 <-
-                   status["open_requests"],
-                 pending_undelivered
-                 when is_integer(pending_undelivered) and pending_undelivered >= 0 <-
-                   status["pending_undelivered"] do
-              status_evidence = %{
-                open_requests: open_requests,
-                pending_undelivered: pending_undelivered
-              }
-
-              cond do
-                open_requests > 0 or pending_undelivered > 0 ->
-                  {:start, status_evidence}
-
-                true ->
-                  case DB.transaction(db, fn txn ->
-                         case completion_snapshot_in_txn(txn, handle) do
-                           {:ok, current} ->
-                             cond do
-                               current.session_key != initial.session_key ->
-                                 :changed
-
-                               current.requests != initial.requests ->
-                                 :changed
-
-                               current.pending_sends != [] ->
-                                 :changed
-
-                               current.entries != initial.entries ->
-                                 :changed
-
-                               locally_delivered_and_unheld?(
-                                 txn,
-                                 handle,
-                                 current.entries,
-                                 current.session_key
-                               ) ->
-                                 :closed
-
-                               true ->
-                                 :undelivered_work
-                             end
-
-                           _ ->
-                             :changed
-                         end
-                       end) do
-                    {:ok, :closed} ->
-                      {:closed, status_evidence}
-
-                    {:ok, :undelivered_work} ->
-                      {:start, %{undelivered_work: true}}
-
-                    _ ->
-                      {:start,
-                       %{
-                         eligibility_undecidable: true,
-                         reason: "local_state_changed_during_check"
-                       }}
-                  end
-              end
-            else
-              _ ->
-                {:start, %{eligibility_undecidable: true, reason: "harklight_status_unavailable"}}
-            end
-        end
-
-      _ ->
-        {:start, %{eligibility_undecidable: true, reason: "tightbeam_state_unavailable"}}
-    end
-  rescue
-    _ -> {:start, %{eligibility_undecidable: true, reason: "start_decision_failed"}}
-  end
-
-  def completion_evidence(db, handle, opts \\ []) do
-    :global.trans({{__MODULE__, db, :answer_completion}, self()}, fn ->
-      read_completion_evidence(db, handle, opts)
-    end)
-  rescue
-    _ -> :active
-  end
-
-  def complete_answered(db, handle, opts \\ []) do
-    with {:ok, evidence} <- completion_evidence(db, handle, opts),
-         {:ok, true} <-
-           DB.transaction(db, fn txn -> complete_answered_in_txn(txn, handle, evidence) end) do
-      :completed
-    else
-      _ -> :active
-    end
-  rescue
-    _ -> :active
-  end
-
-  def complete_answered_in_txn(txn, handle, evidence) do
-    snapshot = evidence.snapshot
-    events = evidence.events
-    status = evidence.status
-
-    with [["active"]] <-
-           Txn.q(txn, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]),
-         {:ok, current} <- completion_snapshot_in_txn(txn, handle),
-         true <- current.session_key == snapshot.session_key,
-         true <- current.requests == snapshot.requests,
-         true <- current.pending_sends == snapshot.pending_sends and current.pending_sends == [],
-         true <- current.entries == snapshot.entries,
-         true <- current.answers != MapSet.new(),
-         true <- status.open_requests == 0,
-         true <- status.pending_undelivered == 0,
-         true <- status.pending_delivered_unacted <= length(events),
-         true <- Enum.all?(events, &delivered_chat_after_answer?(&1, handle, current)),
-         true <-
-           locally_delivered_and_unheld?(txn, handle, current.entries, current.session_key) do
-      Txn.q(
-        txn,
-        "UPDATE harklight_wake_handles SET state='complete',lastError=NULL,updatedAt=?2 WHERE handle=?1 AND state='active'",
-        [handle, System.system_time(:millisecond)]
-      )
-
-      if Txn.changes(txn) == 1 do
-        complete_in_txn(txn, handle)
-        true
-      else
-        false
-      end
-    else
-      _ -> false
-    end
-  rescue
-    _ -> false
-  end
-
-  defp read_completion_evidence(db, handle, opts) do
-    with {:ok, [["active"]]} <-
-           DB.query(db, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]),
-         {:ok, initial} <- completion_snapshot(db, handle),
-         true <- initial.answers != MapSet.new(),
-         {:ok, runner} <- read_runner(opts),
-         {:ok, read_output} <- run_read(runner, handle),
-         {:ok, events} <- parse_read_events(read_output),
-         {:ok, before_status} <- completion_snapshot(db, handle),
-         true <- before_status.answers != MapSet.new(),
-         true <- before_status.pending_sends == [],
-         {:ok, status_output} <- run_status(runner, handle),
-         {:ok, status} <- parse_status(status_output, handle),
-         true <- status.open_requests == 0,
-         true <- status.pending_undelivered == 0,
-         true <- Enum.all?(events, &delivered_chat_after_answer?(&1, handle, before_status)),
-         true <- status.pending_delivered_unacted <= length(events) do
-      {:ok, %{snapshot: before_status, events: events, status: status}}
-    else
-      _ -> :active
-    end
-  rescue
-    _ -> :active
-  end
-
-  defp completion_snapshot(db, handle) do
-    case DB.transaction(db, fn txn -> completion_snapshot_in_txn(txn, handle) end) do
-      {:ok, {:ok, snapshot}} -> {:ok, snapshot}
-      _ -> :error
-    end
-  end
-
-  defp completion_snapshot_in_txn(txn, handle) do
-    case Txn.q(
-           txn,
-           "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1",
-           [handle]
-         ) do
-      [[session_key, state]] when state in ["active", "unavailable"] ->
-        request_rows =
-          Txn.q(
-            txn,
-            "SELECT senderId,messageId FROM harklight_wake_requests WHERE handle=?1 ORDER BY senderId,messageId",
-            [handle]
-          )
-
-        pending_send_rows =
-          Txn.q(
-            txn,
-            "SELECT opId,payload FROM harklight_send_operations WHERE sessionKey=?1 AND state='pending' AND COALESCE(json_extract(payload,'$.operation_kind'),'send')<>'change' ORDER BY opId",
-            [session_key]
-          )
-
-        with {:ok, pending_sends} <- pending_sends_for_handle(pending_send_rows, handle),
-             {:ok, entries} <- completion_entries(txn, handle) do
-          answers =
-            entries
-            |> Enum.filter(fn entry ->
-              entry.entry_kind == "terminal" and
-                get_in(entry.line, ["entry", "terminal_state"]) == "answered"
-            end)
-            |> Enum.map(&{&1.sender_id, &1.message_id})
-            |> MapSet.new()
-
-          {:ok,
-           %{
-             session_key: session_key,
-             requests: request_rows,
-             pending_sends: pending_sends,
-             entries: entries,
-             answers: answers
-           }}
-        else
-          _ -> :error
-        end
-
-      _ ->
-        :error
-    end
-  rescue
-    _ -> :error
-  end
-
-  defp pending_sends_for_handle(rows, handle) do
-    Enum.reduce_while(rows, {:ok, []}, fn [op_id, payload], {:ok, found} ->
-      with {:ok, prepared} when is_map(prepared) <- JSON.decode(payload),
-           request when is_map(request) <- prepared["request"] || prepared,
-           session_handle when is_binary(session_handle) <- request["session_handle"] do
-        if session_handle == handle,
-          do: {:cont, {:ok, [op_id | found]}},
-          else: {:cont, {:ok, found}}
-      else
-        _ -> {:halt, :error}
-      end
-    end)
-    |> case do
-      {:ok, ids} -> {:ok, Enum.sort(ids)}
-      _ -> :error
-    end
-  end
-
-  defp completion_entries(txn, handle) do
-    rows =
-      Txn.q(
-        txn,
-        "SELECT eventId,senderId,messageId,entryKind,entryAuthor,rawLine,wakeId FROM harklight_wake_entries WHERE handle=?1 ORDER BY eventId",
-        [handle]
-      )
-
-    Enum.reduce_while(rows, {:ok, []}, fn
-      [event_id, sender_id, message_id, entry_kind, entry_author, raw_line, wake_id],
-      {:ok, entries} ->
-        with {:ok, line} when is_map(line) <- JSON.decode(raw_line),
-             true <- line["session_handle"] == handle,
-             true <- line["event_id"] == event_id,
-             true <- get_in(line, ["request", "sender_id"]) == sender_id,
-             true <- get_in(line, ["request", "message_id"]) == message_id,
-             true <- get_in(line, ["entry", "kind"]) == entry_kind,
-             true <- get_in(line, ["entry", "author"]) == entry_author do
-          entry = %{
-            event_id: event_id,
-            sender_id: sender_id,
-            message_id: message_id,
-            entry_kind: entry_kind,
-            entry_author: entry_author,
-            wake_id: wake_id,
-            line: line
-          }
-
-          {:cont, {:ok, [entry | entries]}}
-        else
-          _ -> {:halt, :error}
-        end
-    end)
-    |> case do
-      {:ok, entries} -> {:ok, Enum.reverse(entries)}
-      _ -> :error
-    end
-  rescue
-    _ -> :error
-  end
-
-  defp read_runner(opts) do
-    case Keyword.get(opts, :runner) do
-      runner when is_function(runner, 1) ->
-        {:ok, runner}
-
-      nil ->
-        case System.find_executable("harklight-agent") do
-          nil -> :error
-          executable -> {:ok, fn args -> read_command(executable, args) end}
-        end
-    end
-  end
-
-  defp run_read(runner, handle), do: run_read_command(runner, ["read", "--session", handle])
-
-  defp run_status(runner, handle),
-    do: run_read_command(runner, ["status", "--session", handle])
-
-  @doc false
-  def listener_available?(executable, handle) do
-    runner = fn args -> read_command(executable, args) end
-
-    with {:ok, output} <- run_status(runner, handle),
-         {:ok,
-          %{
-            "session_handle" => ^handle,
-            "availability" => "listening",
-            "listening_support" => %{"route" => "other"} = support
-          }} <- JSON.decode(output) do
-      support["origin_listener"] != true
-    else
-      _ -> false
-    end
-  end
-
-  # Each read has a deadline; a timeout is unknown evidence, so R admits the
-  # ordinary listener start and E cannot complete the handle. No recheck is armed.
-  @read_timeout_ms 5_000
-  defp run_read_command(runner, args) do
-    task =
-      Task.async(fn ->
-        try do
-          runner.(args)
-        rescue
-          _ -> :error
-        catch
-          _, _ -> :error
-        end
-      end)
-
-    case Task.yield(task, @read_timeout_ms) || Task.shutdown(task, 100) do
-      {:ok, {output, 0}} when is_binary(output) -> {:ok, output}
-      _ -> :error
-    end
-  rescue
-    _ -> :error
-  end
-
-  defp read_command(executable, args) do
-    # The read task owns this port. On cancellation kill only its child, as the
-    # listener path does; closing stdin alone need not end a blocked CLI.
-    Process.flag(:trap_exit, true)
-
-    port =
-      Port.open(
-        {:spawn_executable, executable},
-        [:binary, :exit_status, :stderr_to_stdout, :hide, {:args, args}]
-      )
-
-    try do
-      receive_read(port, [])
-    after
-      case Port.info(port, :os_pid) do
-        {:os_pid, pid} ->
-          System.cmd("/bin/kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
-          if Port.info(port), do: Port.close(port)
-
-        _ ->
-          :ok
-      end
-    end
-  end
-
-  defp receive_read(port, output) do
-    receive do
-      {^port, {:data, bytes}} ->
-        receive_read(port, [bytes | output])
-
-      {^port, {:exit_status, status}} ->
-        {output |> Enum.reverse() |> IO.iodata_to_binary(), status}
-
-      {:EXIT, _, reason} ->
-        exit(reason)
-    end
-  end
-
-  defp parse_read_events(output) do
-    output = String.trim_trailing(output, "\n")
-
-    if output == "" do
-      {:ok, []}
-    else
-      output
-      |> String.split("\n", trim: false)
-      |> Enum.reduce_while({:ok, []}, fn line, {:ok, events} ->
-        case JSON.decode(line) do
-          {:ok, event} when is_map(event) -> {:cont, {:ok, [event | events]}}
-          _ -> {:halt, :error}
-        end
-      end)
-      |> case do
-        {:ok, events} -> {:ok, Enum.reverse(events)}
-        _ -> :error
-      end
-    end
-  rescue
-    _ -> :error
-  end
-
-  defp parse_status(output, handle) do
-    with {:ok, status} when is_map(status) <- JSON.decode(output),
-         true <- status["session_handle"] == handle,
-         open_requests when is_integer(open_requests) and open_requests >= 0 <-
-           status["open_requests"],
-         pending_undelivered when is_integer(pending_undelivered) and pending_undelivered >= 0 <-
-           status["pending_undelivered"],
-         pending_delivered_unacted
-         when is_integer(pending_delivered_unacted) and pending_delivered_unacted >= 0 <-
-           status["pending_delivered_unacted"] do
-      {:ok,
-       %{
-         open_requests: open_requests,
-         pending_undelivered: pending_undelivered,
-         pending_delivered_unacted: pending_delivered_unacted
-       }}
-    else
-      _ -> :error
-    end
-  rescue
-    _ -> :error
-  end
-
-  defp delivered_chat_after_answer?(event, handle, snapshot) do
-    event_id = event["event_id"]
-    sender_id = get_in(event, ["request", "sender_id"])
-    message_id = get_in(event, ["request", "message_id"])
-
-    captured =
-      Enum.find(snapshot.entries, fn entry ->
-        entry.event_id == event_id and entry.sender_id == sender_id and
-          entry.message_id == message_id
-      end)
-
-    event["kind"] == "event" and event["session_handle"] == handle and
-      is_binary(event_id) and event["delivered"] == true and event["channel"] == "chat" and
-      get_in(event, ["entry", "kind"]) == "discussion" and not is_nil(captured) and
-      MapSet.member?(snapshot.answers, {sender_id, message_id})
-  rescue
-    _ -> false
-  end
-
-  defp locally_delivered_and_unheld?(txn, handle, entries, origin_session) do
-    [[current_receiver]] =
-      Txn.q(
-        txn,
-        "SELECT COALESCE(currentReceiverSessionKey,sessionKey) FROM harklight_wake_handles WHERE handle=?1",
-        [handle]
-      )
-
-    held =
-      Txn.q(
-        txn,
-        """
-        SELECT 1 FROM harklight_held_terminals t
-        LEFT JOIN harklight_subscription_ends e ON e.senderId=t.senderId AND e.messageId=t.messageId
-        WHERE t.handle=?1
-          AND (e.messageId IS NULL OR e.acknowledgment IN ('pending','failed'))
-        LIMIT 1
-        """,
-        [handle]
-      ) != []
-
-    pending_ack =
-      Txn.q(
-        txn,
-        "SELECT 1 FROM harklight_subscription_ends WHERE handle=?1 AND acknowledgment IN ('pending','failed') AND ackEventId IS NOT NULL LIMIT 1",
-        [handle]
-      ) != []
-
-    not held and not pending_ack and
-      Enum.all?(entries, fn entry ->
-        deliveries =
-          Txn.q(
-            txn,
-            "SELECT sessionKey,COALESCE(currentRecipientSessionKey,sessionKey),wakeId FROM harklight_wake_deliveries WHERE handle=?1 AND eventId=?2 ORDER BY sessionKey",
-            [handle, entry.event_id]
-          )
-
-        # Before per-recipient delivery rows existed, wakeId was the sole
-        # persisted delivery. It remains the origin's receipt for those entries.
-        deliveries =
-          if deliveries == [] do
-            case Txn.q(txn, "SELECT sessionKey FROM wakes WHERE wakeId=?1", [entry.wake_id]) do
-              [[session_key]] -> [[origin_session, session_key, entry.wake_id]]
-              _ -> []
-            end
-          else
-            deliveries
-          end
-
-        # Historical entries retain the origin's delivery row. Entries captured
-        # after transfer use the named current receiver as their own row.
-        Enum.any?(deliveries, fn [origin, recipient, _wake_id] ->
-          origin == origin_session or
-            (origin == current_receiver and recipient == current_receiver)
-        end) and
-          Enum.all?(deliveries, fn [_origin, recipient, wake_id] ->
-            delivered_to_recipient?(txn, recipient, wake_id)
-          end)
-      end)
-  rescue
-    _ -> false
-  end
-
-  # A failed prompt turn may hand the same text to a retry wake for the same
-  # recipient. Follow that lineage to its latest attempt and credit the entry
-  # only when that attempt's turn, or its health redelivery, delivered it.
-  defp delivered_to_recipient?(txn, session_key, wake_id, seen \\ MapSet.new()) do
-    if MapSet.member?(seen, wake_id) do
-      false
-    else
-      case Txn.q(txn, "SELECT retryWakeId FROM wake_retry_attempts WHERE wakeId=?1", [wake_id]) do
-        [[retry_wake_id]] when is_binary(retry_wake_id) ->
-          same_recipient? =
-            Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 AND sessionKey=?2", [
-              retry_wake_id,
-              session_key
-            ]) != []
-
-          same_recipient? and
-            delivered_to_recipient?(txn, session_key, retry_wake_id, MapSet.put(seen, wake_id))
-
-        _ ->
-          wake = Txn.q(txn, "SELECT sessionKey,state FROM wakes WHERE wakeId=?1", [wake_id])
-
-          Enum.any?(wake, fn [wake_session, state] ->
-            wake_session == session_key and state != "canceled"
-          end) and
-            Enum.any?(NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id), fn
-              [_, "delivered", _] ->
-                true
-
-              [seq, status, _] when status in ["failed", "failed_unknown"] ->
-                health_redelivered?(txn, session_key, seq)
-
-              _ ->
-                false
-            end) and
-            not NoticeBatcher.pending?(txn, wake_id)
-      end
-    end
-  end
-
-  # Other failure classes redeliver the same message on a new turn that carries
-  # no wakeId. Credit the failed turn once that redelivery turn delivered.
-  defp health_redelivered?(txn, session_key, source_turn_seq) do
-    Txn.q(
-      txn,
-      """
-      SELECT 1 FROM health_redelivery_attempts a
-      JOIN turns t ON t.seq=COALESCE(a.redeliveryTurnSeq,a.cycleReleaseTurnSeq)
-      WHERE a.sessionKey=?1 AND a.sourceTurnSeq=?2 AND t.status='delivered'
-      """,
-      [session_key, source_turn_seq]
-    ) != []
   end
 
   def complete_in_txn(txn, handle) do

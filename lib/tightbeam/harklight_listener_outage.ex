@@ -73,7 +73,7 @@ defmodule Tightbeam.HarklightListenerOutage do
                 else: base <> "_" <> episode
 
             detail =
-              if operation in ["attach", "listen"] and is_binary(diagnostic),
+              if operation == "listen" and is_binary(diagnostic),
                 do: " #{String.upcase(operation)} failure: #{diagnostic}.",
                 else: ""
 
@@ -124,7 +124,7 @@ defmodule Tightbeam.HarklightListenerOutage do
               origin: "process:tightbeam",
               class: "fyi",
               due_at: now,
-              prompt: "Harklight listening has resumed for conversation #{handle}."
+              prompt: "Harklight updates have caught up for conversation #{handle}."
             })
 
           Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
