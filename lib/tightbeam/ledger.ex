@@ -221,6 +221,7 @@ defmodule Tightbeam.Ledger do
       end
 
       QueuedMessageSuppression.replace_own_queued_in_txn(txn, seq, attrs)
+      Tightbeam.PathNotes.enqueued_in_txn(txn, seq)
 
       if transition =
            turn_row_commit_transition_in_txn(
@@ -1553,6 +1554,7 @@ defmodule Tightbeam.Ledger do
       end
 
     Tightbeam.Ephemeral.retire_turn_in_txn(txn, seq)
+    Tightbeam.PathNotes.terminal_in_txn(txn, seq)
 
     TurnLifecycle.append_in_txn(txn, seq, %{
       event_key: "terminal:committed",

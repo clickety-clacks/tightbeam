@@ -8416,6 +8416,178 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{files: [%{status: "absent"}]} = check.()
   end
 
+  test "filing an attest or artifact that cites paths never checks them", ctx do
+    item = create_work_item(ctx, "paths in filing")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "files", nil, item.id))
+
+    register_hosts(ctx.db, %{
+      "lab2" => %{ssh: "unreachable.invalid", base_dir: "/b", cli_bin: nil}
+    })
+
+    parent = self()
+
+    # Any stat would block forever here, so a filing that waited on one would
+    # never return.
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        sh: fn command ->
+          send(parent, {:probe, command})
+          receive do: (:never -> {"", 0})
+        end,
+        file_stat: fn path ->
+          send(parent, {:checked, path})
+          receive do: (:never -> {:ok, %{}})
+        end
+      })
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in([:params, :note], "log at lab2:/w/log.txt and /w/log.txt, not an artifact")
+      |> then(&handlers["attest"].(&1))
+
+    # The path is accepted as text: no artifact is needed to cite it, and the
+    # result carries no path note.
+    assert attested.attest.note == "log at lab2:/w/log.txt and /w/log.txt, not an artifact"
+    refute inspect(attested) =~ "verified present"
+    refute inspect(attested) =~ "check before relying on it"
+
+    recorded =
+      handlers["artifact-record"].(%{
+        principal: {:session, "holder"},
+        session_key: "holder",
+        params: %{
+          kind: "report",
+          title: "remote log",
+          origin_path: "lab2:/w/log.txt",
+          work_item_id: item.id
+        }
+      })
+
+    assert recorded.origin_path == "lab2:/w/log.txt"
+    refute_received {:probe, _}
+    refute_received {:checked, _}
+  end
+
+  test "check-attest also checks absolute paths written in the attest note", ctx do
+    item = create_work_item(ctx, "note paths")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "notes", nil, item.id))
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        file_stat: fn path ->
+          send(parent, {:checked, path})
+
+          case path do
+            "/w/log.txt" -> {:ok, %{}}
+            _ -> {:error, :enoent}
+          end
+        end
+      })
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in(
+        [:params, :note],
+        ~s(log /w/log.txt, notes "/w/run notes.md"; also /w/log.txt, rel/x.md and ~/y.md)
+      )
+      |> then(&handlers["attest"].(&1))
+
+    assert {:ok, result} =
+             Dispatch.dispatch(
+               ctx.db,
+               handlers,
+               call("check-attest", {:session, "holder"}, nil, %{attest_id: attested.attest.id})
+             )
+
+    # The filer's host checks plain paths; relative and home paths are not
+    # checked, and a repeated path is checked once.
+    assert Enum.map(result.files, &{&1.notePath, &1.checkedHost, &1.checkedPath, &1.status}) == [
+             {"/w/log.txt", "lab1", "/w/log.txt", "present"},
+             {"/w/run notes.md", "lab1", "/w/run notes.md", "absent"}
+           ]
+
+    assert result.summary == "absent: lab1:/w/run notes.md"
+    assert_received {:checked, "/w/log.txt"}
+    assert_received {:checked, "/w/run notes.md"}
+    refute_received {:checked, _}
+  end
+
+  test "check-attest checks a host-qualified note path on that host", ctx do
+    item = create_work_item(ctx, "host note paths")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "notes", nil, item.id))
+    seed_file_artifact(ctx.db, item.id, "art_present", assignment.id, "lab1:/files/present")
+
+    register_hosts(ctx.db, %{
+      "lab2" => %{ssh: "lab2.test", base_dir: "/b", cli_bin: nil}
+    })
+
+    parent = self()
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        sh: fn ["ssh", "-o", "BatchMode=yes", destination, command] ->
+          send(parent, {:remote, destination, command})
+          {"ssh: connect to host lab2.test port 22: Connection refused\r\n", 255}
+        end,
+        file_stat: fn _path -> {:ok, %{}} end
+      })
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in([:params, :note], "remote log at lab2:/w/log.txt")
+      |> then(&handlers["attest"].(&1))
+
+    result =
+      handlers["check-attest"].(%{params: %{attest_id: attested.attest.id}})
+
+    assert [
+             %{artifactId: "art_present", status: "present"},
+             %{
+               notePath: "lab2:/w/log.txt",
+               checkedHost: "lab2",
+               checkedPath: "/w/log.txt",
+               status: "could_not_access",
+               error: "ssh: connect to host lab2.test port 22: Connection refused\r\n"
+             }
+           ] = result.files
+
+    assert result.summary == "could not access: lab2:/w/log.txt"
+    assert_received {:remote, "lab2.test", command}
+    assert command =~ "'/w/log.txt'"
+  end
+
+  test "check-attest checks real note paths on the filer's host", ctx do
+    item = create_work_item(ctx, "real note paths")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "notes", nil, item.id))
+    dir = Path.join(Application.fetch_env!(:tightbeam, :base_dir), "note-paths")
+    File.mkdir_p!(dir)
+    present = Path.join(dir, "log.txt")
+    absent = Path.join(dir, "run notes.md")
+    File.write!(present, "log")
+    File.rm(absent)
+
+    attested =
+      attest_call({:session, "holder"}, assignment.id, "progress")
+      |> put_in([:params, :note], ~s(see #{present} and "#{absent}"))
+      |> then(&handle(ctx, "attest", &1))
+
+    check = fn ->
+      Gateway.handlers(%{db: ctx.db, base_dir: Application.fetch_env!(:tightbeam, :base_dir)})[
+        "check-attest"
+      ].(%{params: %{attest_id: attested.attest.id}})
+    end
+
+    assert %{files: [%{status: "present"}, %{status: "absent"}], summary: summary} = check.()
+    assert summary == "absent: lab1:#{absent}"
+  end
+
   test "accepted handler rolls back when its event append fails", ctx do
     {:ok, _} = DB.query(ctx.db, "DROP TABLE events")
 
