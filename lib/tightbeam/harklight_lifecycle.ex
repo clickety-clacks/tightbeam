@@ -112,6 +112,7 @@ defmodule Tightbeam.HarklightLifecycle do
           command: prepared["command"],
           journal_id: prepared["journal_id"],
           item_id: prepared["item_id"],
+          in_reply_to: prepared["in_reply_to"],
           handle: prepared["handle"],
           message_id: prepared["message_id"],
           state: outcome || "pending"

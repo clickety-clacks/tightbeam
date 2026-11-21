@@ -115,10 +115,18 @@ defmodule GuardReceiptTurn do
         executable,
         """
         #!/bin/sh
-        printf '%s\\n' "$*" >> "$0.calls"
+        case "$1" in
+          journal-id) printf '%s\n' '{"kind":"journal","journal_id":"receipt-journal"}'; exit 0 ;;
+          retry)
+            printf '{"kind":"operation_absent","op_id":"%s","journal_id":"receipt-journal"}\n' "$3"
+            exit 1
+            ;;
+        esac
+        printf '%s\n' "$*" >> "$0.calls"
+        for arg in "$@"; do operation="$arg"; done
         : > "$0.started"
         while [ ! -f "$0.release" ]; do sleep 0.01; done
-        printf '%s\n' '{"kind":"committed","operation":"receipt","response":{"status":"recorded"}}'
+        printf '{"kind":"committed","operation":"receipt","op_id":"%s","response":{"status":"recorded"}}\n' "$operation"
         : > "$0.finished"
         exit 0
         """
@@ -144,6 +152,7 @@ defmodule GuardReceiptTurn do
         # GuardRuntimeFixture runs this scenario in a short-lived isolated VM.
         # Keep the stand-in first on PATH until that process exits.
         System.put_env("PATH", bin <> ":" <> System.fetch_env!("PATH"))
+        {:ok, _receipt_worker} = Tightbeam.HarklightReceipts.start_link(db: db)
 
         {Tightbeam.LaneManager, lane_opts} =
           Gateway.children(config)
@@ -174,8 +183,8 @@ defmodule GuardReceiptTurn do
         assert_receive {:prompt_started, ^adapter}, 60_000
         await_file!(started)
 
-        assert File.read!(calls) ==
-                 "receipt --item-id request --entry-id #{@event_id} --agent #{session.display_name}\n"
+        assert File.read!(calls) =~
+                 "receipt --item-id request --entry-id #{@event_id} --agent #{session.display_name} --op-id "
 
         refute File.exists?(release)
 

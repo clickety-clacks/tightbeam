@@ -489,7 +489,14 @@ defmodule Tightbeam.HarklightSend do
       op_id = Id.uuid4()
       request = args ++ ["--op-id", op_id]
       stored_command = if command == "progress", do: "revise", else: command
-      context = %{journal_id: journal_id, item_id: item_id, handle: record.handle}
+      in_reply_to = call.params[:in_reply_to]
+
+      context = %{
+        journal_id: journal_id,
+        item_id: item_id,
+        handle: record.handle,
+        in_reply_to: in_reply_to
+      }
 
       case HarklightWakes.prepare_change(
              db,
@@ -506,7 +513,7 @@ defmodule Tightbeam.HarklightSend do
             record,
             op_id,
             stored_command,
-            invoke_change(runner, request, op_id, item_id, command),
+            invoke_change(runner, request, op_id, item_id, command, in_reply_to),
             command
           )
 
@@ -772,9 +779,22 @@ defmodule Tightbeam.HarklightSend do
     _ -> {:error, "harklight_journal_unavailable"}
   end
 
-  defp retry_change(runner, %{journal_id: id, op_id: key, item_id: item, request: [command | _]})
+  defp retry_change(runner, %{
+         journal_id: id,
+         op_id: key,
+         item_id: item,
+         in_reply_to: in_reply_to,
+         request: [command | _]
+       })
        when is_binary(id) and is_binary(item) do
-    invoke_change(runner, ["retry", "--op-id", key, "--journal-id", id], key, item, command)
+    invoke_change(
+      runner,
+      ["retry", "--op-id", key, "--journal-id", id],
+      key,
+      item,
+      command,
+      in_reply_to
+    )
   end
 
   defp retry_change(_runner, _change) do
@@ -782,7 +802,7 @@ defmodule Tightbeam.HarklightSend do
      "The saved change has no Agent 0.2 journal identity.", "outcome_unknown"}
   end
 
-  defp invoke_change(runner, args, op_id, item_id, command) do
+  defp invoke_change(runner, args, op_id, item_id, command, in_reply_to) do
     case invoke(runner, args, "committed", op_id,
            operations: [command],
            change: true,
@@ -792,7 +812,11 @@ defmodule Tightbeam.HarklightSend do
        %{"response" => %{"message" => %{"item_id" => ^item_id, "revision" => revision}}} =
            frame}
       when is_integer(revision) and revision > 0 ->
-        {:ok, frame}
+        if acted_entry?(frame["response"]["entry"], item_id, in_reply_to),
+          do: {:ok, frame},
+          else:
+            {:error, "harklight_result_mismatch",
+             "The expected acted chat entry was not returned.", "outcome_unknown"}
 
       {:ok, _frame} ->
         {:error, "harklight_result_mismatch", "The returned message did not match.",
@@ -802,6 +826,23 @@ defmodule Tightbeam.HarklightSend do
         error
     end
   end
+
+  defp acted_entry?(_entry, _item_id, nil), do: true
+
+  defp acted_entry?(
+         %{
+           "item_id" => item_id,
+           "entry_id" => entry_id,
+           "author" => "person",
+           "kind" => "reply",
+           "delivery" => %{"acted" => true}
+         },
+         item_id,
+         entry_id
+       ),
+       do: true
+
+  defp acted_entry?(_entry, _item_id, _entry_id), do: false
 
   defp identity(nil), do: %{}
   defp identity(record), do: Map.take(record, [:op_id, :handle, :sender_id, :message_id])

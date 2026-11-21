@@ -41,6 +41,28 @@ defmodule Tightbeam.HarklightWakesTest do
       do: {:reply, GenServer.call(state.db, request, :infinity), state}
   end
 
+  defmodule RefusingHarklightDB do
+    use GenServer
+
+    def start_link({db, test}), do: GenServer.start_link(__MODULE__, {db, test, []})
+    def init(state), do: {:ok, state}
+
+    def handle_call({:refuse, sql}, _from, {db, test, pending}),
+      do: {:reply, :ok, {db, test, pending ++ [sql]}}
+
+    def handle_call({:query, sql, _} = request, _from, {db, test, [next | rest]} = state) do
+      if String.contains?(sql, next) do
+        send(test, {:refused_sql, next})
+        {:reply, {:error, %DB.Overloaded{}}, {db, test, rest}}
+      else
+        {:reply, GenServer.call(db, request, :infinity), state}
+      end
+    end
+
+    def handle_call(request, _from, {db, _, _} = state),
+      do: {:reply, GenServer.call(db, request, :infinity), state}
+  end
+
   @handle "7d737f62-bbd7-4c51-978d-f6ff5b4d8146"
   @send_op "0bdb87a0-3a09-4f61-bff4-9a4a704324c8"
   @payload ~s({"type":"send","message":{"sender_id":"sender","message_id":"request"}})
@@ -112,6 +134,209 @@ defmodule Tightbeam.HarklightWakesTest do
              )
 
     %{db: db, call: call, session: session, main: main}
+  end
+
+  test "a dispatched handoff resumes the same receipt after restart and refused DB writes", %{
+    db: db,
+    session: session
+  } do
+    assert :ok =
+             HarklightWakes.capture_feed(db, @handle, 1, [feed_chat(1, "request", "chat")], :live)
+
+    assert {:ok, [[wake]]} = DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries")
+    turn = deliver_discussion_turn!(db, wake, session.session_key)
+    assert :ok = Ledger.stamp_adapter(db, turn.seq, 1)
+
+    proxy = start_supervised!({RefusingHarklightDB, {db, self()}})
+    test_pid = self()
+    accepted = start_supervised!({Agent, fn -> nil end})
+
+    runner = fn
+      ["journal-id"] ->
+        frame(%{kind: "journal", journal_id: "receipt-journal"})
+
+      ["retry", "--op-id", op, "--journal-id", "receipt-journal"] ->
+        if Agent.get(accepted, & &1) == op do
+          send(test_pid, {:receipt_replayed, op})
+          receipt_result(op)
+        else
+          {JSON.encode!(%{kind: "operation_absent", op_id: op, journal_id: "receipt-journal"}), 1}
+        end
+
+      [
+        "receipt",
+        "--item-id",
+        "request",
+        "--entry-id",
+        "chat",
+        "--agent",
+        "Origin",
+        "--op-id",
+        op
+      ] ->
+        Agent.update(accepted, fn _ -> op end)
+        send(test_pid, {:receipt_attempted, op})
+        {JSON.encode!(%{kind: "outcome_unknown", op_id: op}), 7}
+    end
+
+    opts = [db: proxy, runner: runner, retry_delay: 200]
+    start_supervised!({Tightbeam.HarklightReceipts, opts})
+    refute_receive {:receipt_attempted, _}, 30
+    assert {:ok, []} = DB.query(db, "SELECT opId FROM harklight_handoff_receipts")
+    assert :ok = stop_supervised(Tightbeam.HarklightReceipts)
+
+    # Dispatch proof can survive a crash before the notification is sent.
+    record_prompt_dispatched!(db, turn)
+    refused = "SELECT argv,opId,journalId FROM harklight_handoff_receipts"
+    assert :ok = GenServer.call(proxy, {:refuse, refused})
+    start_supervised!({Tightbeam.HarklightReceipts, opts})
+    assert_receive {:refused_sql, ^refused}
+    assert_receive {:receipt_attempted, op}, 1_000
+
+    assert {:ok, [[^op, "receipt-journal", nil]]} =
+             DB.query(db, "SELECT opId,journalId,completedAt FROM harklight_handoff_receipts")
+
+    assert :ok = stop_supervised(Tightbeam.HarklightReceipts)
+
+    refused = "UPDATE harklight_handoff_receipts SET completedAt"
+    assert :ok = GenServer.call(proxy, {:refuse, refused})
+    start_supervised!({Tightbeam.HarklightReceipts, opts})
+    assert_receive {:receipt_replayed, ^op}, 1_000
+    assert_receive {:refused_sql, ^refused}
+    assert_receive {:receipt_replayed, ^op}, 1_000
+
+    assert eventually(fn ->
+             DB.query(
+               db,
+               "SELECT count(*) FROM harklight_handoff_receipts WHERE completedAt IS NOT NULL"
+             ) ==
+               {:ok, [[1]]}
+           end)
+
+    refute_receive {:receipt_attempted, _}, 30
+  end
+
+  test "a definite receipt refusal retains the target and permits a new attempt", %{
+    db: db,
+    session: session
+  } do
+    assert :ok =
+             HarklightWakes.capture_feed(db, @handle, 1, [feed_chat(1, "request", "chat")], :live)
+
+    assert {:ok, [[wake]]} = DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries")
+    turn = deliver_discussion_turn!(db, wake, session.session_key)
+    assert :ok = Ledger.stamp_adapter(db, turn.seq, 1)
+    record_prompt_dispatched!(db, turn)
+
+    test_pid = self()
+    attempts = :atomics.new(1, [])
+
+    runner = fn
+      ["journal-id"] ->
+        frame(%{kind: "journal", journal_id: "receipt-journal"})
+
+      ["retry", "--op-id", op, "--journal-id", journal] ->
+        {JSON.encode!(%{kind: "operation_absent", op_id: op, journal_id: journal}), 1}
+
+      [
+        "receipt",
+        "--item-id",
+        "request",
+        "--entry-id",
+        "chat",
+        "--agent",
+        "Origin",
+        "--op-id",
+        op
+      ] ->
+        send(test_pid, {:receipt_attempt, op})
+
+        if :atomics.add_get(attempts, 1, 1) == 1 do
+          {JSON.encode!(%{kind: "refused", operation: "receipt", op_id: op, error: "forbidden"}),
+           2}
+        else
+          receipt_result(op)
+        end
+    end
+
+    start_supervised!({Tightbeam.HarklightReceipts, db: db, runner: runner, retry_delay: 10})
+    assert_receive {:receipt_attempt, first}, 1_000
+    assert_receive {:receipt_attempt, second}, 1_000
+    assert first != second
+
+    assert eventually(fn ->
+             DB.query(
+               db,
+               "SELECT opId FROM harklight_handoff_receipts WHERE completedAt IS NOT NULL"
+             ) ==
+               {:ok, [[second]]}
+           end)
+  end
+
+  test "a refused follower eligibility read does not end an open feed", %{
+    db: db,
+    session: session,
+    main: main
+  } do
+    follower = follower_session(db, main, "agent:feed:eligible")
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO harklight_wake_follows(followId,sessionKey,kind,handle,messageId,state,createdAt)
+               VALUES('follower',?1,'conversation',?2,'','open',1)
+               """,
+               [follower.session_key, @handle]
+             )
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE sessions SET host='other' WHERE sessionKey=?1", [
+               session.session_key
+             ])
+
+    commands = fake_harklight_session_end_agent!()
+    proxy = start_supervised!({RefusingHarklightDB, {db, self()}})
+    prepare = "SELECT sessionKey,host,vendorSessionId,state"
+    eligibility = "FROM harklight_wake_handles h"
+    assert :ok = GenServer.call(proxy, {:refuse, prepare})
+    assert :ok = GenServer.call(proxy, {:refuse, eligibility})
+    test_pid = self()
+
+    listener = fn manager, handle, _vendor ->
+      :ok = GenServer.call(manager, {:feed_ready, handle})
+      send(test_pid, :follower_feed_started)
+      receive do: (:stop -> :ok)
+    end
+
+    start_supervised!({HarklightWakes, db: proxy, listener: listener})
+    assert_receive {:refused_sql, ^prepare}, 1_000
+    assert_receive {:refused_sql, ^eligibility}, 1_000
+    assert_receive :follower_feed_started, 1_000
+    refute File.exists?(commands)
+
+    assert {:ok, [["active", nil]]} =
+             DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+  end
+
+  test "feed death keeps retry custody when the recovery read is refused", %{db: db} do
+    proxy = start_supervised!({RefusingHarklightDB, {db, self()}})
+    test_pid = self()
+
+    listener = fn manager, handle, _vendor ->
+      :ok = GenServer.call(manager, {:feed_ready, handle})
+      send(test_pid, {:feed_started, self()})
+      receive do: (:exit_feed -> :ok)
+    end
+
+    start_supervised!({HarklightWakes, db: proxy, listener: listener, retry_delays: [10]})
+    assert_receive {:feed_started, original}, 1_000
+    refused = "SELECT sessionKey,host,state FROM harklight_wake_handles WHERE handle"
+    assert :ok = GenServer.call(proxy, {:refuse, refused})
+    send(original, :exit_feed)
+    assert_receive {:refused_sql, ^refused}, 1_000
+    assert_receive {:feed_started, restarted}, 1_000
+    assert original != restarted
   end
 
   test "Agent 0.2 filtered subprocess reopens from Tightbeam's checkpoint", %{db: db} do
@@ -296,11 +521,11 @@ defmodule Tightbeam.HarklightWakesTest do
     end
 
     assert :ok =
-             HarklightWakes.receipt_for_dispatched_turn(
+             receipt_for_test(
                db,
                turn.seq,
                session.session_key,
-               "Agent",
+               "Origin",
                runner: runner
              )
 
@@ -309,11 +534,11 @@ defmodule Tightbeam.HarklightWakesTest do
     record_prompt_dispatched!(db, turn)
 
     assert :ok =
-             HarklightWakes.receipt_for_dispatched_turn(
+             receipt_for_test(
                db,
                turn.seq,
                session.session_key,
-               "Agent",
+               "Origin",
                runner: runner
              )
 
@@ -325,10 +550,10 @@ defmodule Tightbeam.HarklightWakesTest do
                        "--entry-id",
                        "chat-1",
                        "--agent",
-                       "Agent"
+                       "Origin"
                      ]}
 
-    assert_received {:receipt, ["receipt", "--item-id", "server-item", "--agent", "Agent"]}
+    assert_received {:receipt, ["receipt", "--item-id", "server-item", "--agent", "Origin"]}
     refute_received {:receipt, _}
   end
 
@@ -795,11 +1020,11 @@ defmodule Tightbeam.HarklightWakesTest do
     record_prompt_dispatched!(db, turn)
 
     assert :ok =
-             HarklightWakes.receipt_for_dispatched_turn(
+             receipt_for_test(
                db,
                turn.seq,
                main.session_key,
-               "Successor",
+               main.display_name,
                runner: fn args ->
                  send(self(), {:receipt, args})
                  receipt_success()
@@ -814,7 +1039,7 @@ defmodule Tightbeam.HarklightWakesTest do
                        "--entry-id",
                        "1",
                        "--agent",
-                       "Successor",
+                       "Main",
                        "--rerouted"
                      ]}
 
@@ -5352,7 +5577,10 @@ defmodule Tightbeam.HarklightWakesTest do
     db: db,
     call: call
   } do
-    assert_change_recovery(db, call, "retract", %{message_id: "request"})
+    assert_change_recovery(db, call, "retract", %{
+      message_id: "request",
+      in_reply_to: "chat-entry"
+    })
   end
 
   test "settlement distinguishes an absent operation from an unavailable journal", %{
@@ -6625,7 +6853,7 @@ defmodule Tightbeam.HarklightWakesTest do
     end
 
     assert :ok =
-             HarklightWakes.receipt_for_dispatched_turn(
+             receipt_for_test(
                db,
                owner_turn.seq,
                session.session_key,
@@ -6638,7 +6866,7 @@ defmodule Tightbeam.HarklightWakesTest do
     record_prompt_dispatched!(db, owner_turn)
 
     assert :ok =
-             HarklightWakes.receipt_for_dispatched_turn(
+             receipt_for_test(
                db,
                owner_turn.seq,
                session.session_key,
@@ -6656,7 +6884,7 @@ defmodule Tightbeam.HarklightWakesTest do
     record_prompt_dispatched!(db, follower_turn)
 
     assert :ok =
-             HarklightWakes.receipt_for_dispatched_turn(
+             receipt_for_test(
                db,
                follower_turn.seq,
                follower.session_key,
@@ -6709,7 +6937,7 @@ defmodule Tightbeam.HarklightWakesTest do
       assert :ok = Ledger.stamp_adapter(db, turn.seq, 1)
 
       assert :ok =
-               HarklightWakes.receipt_for_dispatched_turn(
+               receipt_for_test(
                  db,
                  turn.seq,
                  session.session_key,
@@ -6721,7 +6949,7 @@ defmodule Tightbeam.HarklightWakesTest do
       record_prompt_dispatched!(db, turn)
 
       assert :ok =
-               HarklightWakes.receipt_for_dispatched_turn(
+               receipt_for_test(
                  db,
                  turn.seq,
                  "agent:unrelated",
@@ -6732,7 +6960,7 @@ defmodule Tightbeam.HarklightWakesTest do
       refute_receive {:retry_receipt, _}
 
       assert :ok =
-               HarklightWakes.receipt_for_dispatched_turn(
+               receipt_for_test(
                  db,
                  turn.seq,
                  session.session_key,
@@ -6740,8 +6968,18 @@ defmodule Tightbeam.HarklightWakesTest do
                  runner: runner
                )
 
-      assert_receive {:retry_receipt,
-                      ["receipt", "--item-id", "request", "--entry-id", "1", "--agent", "Origin"]}
+      if attempt == 1 do
+        assert_receive {:retry_receipt,
+                        [
+                          "receipt",
+                          "--item-id",
+                          "request",
+                          "--entry-id",
+                          "1",
+                          "--agent",
+                          "Origin"
+                        ]}
+      end
 
       refute_receive {:retry_receipt, _}
 
@@ -6882,6 +7120,38 @@ defmodule Tightbeam.HarklightWakesTest do
     :ok
   end
 
+  defp receipt_for_test(db, seq, session_key, _name, opts) do
+    case DB.query(db, "SELECT 1 FROM turns WHERE seq=?1 AND sessionKey=?2", [seq, session_key]) do
+      {:ok, [[1]]} ->
+        caller_runner = Keyword.fetch!(opts, :runner)
+
+        runner = fn
+          ["journal-id"] ->
+            frame(%{kind: "journal", journal_id: "fixture-journal"})
+
+          ["retry", "--op-id", op, "--journal-id", journal] ->
+            {JSON.encode!(%{kind: "operation_absent", op_id: op, journal_id: journal}), 1}
+
+          ["receipt" | _] = args ->
+            {argv, ["--op-id", op]} = Enum.split(args, -2)
+            {reply, 0} = caller_runner.(argv)
+            frame(Map.put(JSON.decode!(reply), "op_id", op))
+        end
+
+        assert {:ok, false} =
+                 Tightbeam.HarklightReceipts.drain(db, MapSet.new([seq]), runner: runner)
+
+      {:ok, []} ->
+        :ok
+    end
+
+    :ok
+  end
+
+  defp receipt_result(op) do
+    frame(%{kind: "committed", operation: "receipt", op_id: op, response: %{status: "recorded"}})
+  end
+
   defp receipt_success do
     {JSON.encode!(%{
        "kind" => "committed",
@@ -6914,11 +7184,16 @@ defmodule Tightbeam.HarklightWakesTest do
 
         if entry = params[:in_reply_to] do
           assert ["--in-reply-to", entry] in Enum.chunk_every(args, 2, 1, :discard)
+          assert decoded["in_reply_to"] == entry
         end
 
         send(parent, {:external_change_request, command, args})
 
-        {JSON.encode!(%{kind: "outcome_unknown", op_id: op_id}), 7}
+        if params[:in_reply_to] do
+          change_committed(command, op_id, "server-item", 2)
+        else
+          {JSON.encode!(%{kind: "outcome_unknown", op_id: op_id}), 7}
+        end
 
       args ->
         change_setup_reply(args)
@@ -6942,6 +7217,23 @@ defmodule Tightbeam.HarklightWakesTest do
     assert %{outcome: "refused", code: "harklight_operation_unresolved"} =
              HarklightSend.change_request(db, request_call, command, runner: no_op)
 
+    if params[:in_reply_to] do
+      assert %{outcome: "outcome_unknown", code: "harklight_result_mismatch", op_id: ^op_id} =
+               HarklightSend.settle(db, settle_call,
+                 runner: fn ["retry", "--op-id", ^op_id, "--journal-id", "journal-test"] ->
+                   correlated_change_frame(command, op_id, "different-entry")
+                 end
+               )
+
+      assert %{op_id: ^op_id, state: "pending"} = HarklightLifecycle.lookup_change(db, "request")
+
+      assert {:ok, []} =
+               DB.query(
+                 db,
+                 "SELECT state FROM harklight_subscription_ends WHERE messageId='request'"
+               )
+    end
+
     settled =
       HarklightSend.settle(db, settle_call,
         runner: fn args ->
@@ -6950,12 +7242,10 @@ defmodule Tightbeam.HarklightWakesTest do
           assert %{op_id: ^op_id, request: ^saved_request, state: "pending"} =
                    HarklightLifecycle.lookup_change(db, "request")
 
-          frame(%{
-            kind: "committed",
-            operation: command,
-            op_id: op_id,
-            response: %{message: %{item_id: "server-item", revision: 2}}
-          })
+          case params[:in_reply_to] do
+            nil -> change_committed(command, op_id, "server-item", 2)
+            entry -> correlated_change_frame(command, op_id, entry)
+          end
         end
       )
 
@@ -6982,6 +7272,25 @@ defmodule Tightbeam.HarklightWakesTest do
                "SELECT count(*) FROM harklight_send_operations WHERE json_extract(payload,'$.operation_kind')='change' AND json_extract(payload,'$.message_id')=?1",
                ["request"]
              )
+  end
+
+  defp correlated_change_frame(command, op, entry) do
+    frame(%{
+      kind: "committed",
+      operation: command,
+      op_id: op,
+      response: %{
+        rev: 12,
+        message: %{item_id: "server-item", revision: 2},
+        entry: %{
+          item_id: "server-item",
+          entry_id: entry,
+          author: "person",
+          kind: "reply",
+          delivery: %{acted: true}
+        }
+      }
+    })
   end
 
   defp change_committed(operation, key, item, revision) do
