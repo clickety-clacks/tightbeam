@@ -2125,6 +2125,112 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     end
   end
 
+  @handoff "assignment-terminal-handoff"
+  @handoff_seed "rules/row-reaction-handoff.toml"
+  @bundle "scoped-notices"
+  @bundle_rule "kungfu/#{@bundle}/rules/child-notice.toml"
+  @bundle_archetype "kungfu/#{@bundle}/archetypes/worker.toml"
+  @qualified_archetype "#{@bundle}.worker"
+
+  for global <- [:builtin, :seed, :custom],
+      {scope, scoped_sessions} <- [
+        {:inside, ["notice-parent", "holder"]},
+        {:cross_scope, ["notice-parent"]},
+        {:outside, []}
+      ] do
+    test "a #{scope} completion delivers one handoff with the #{global} global rule", ctx do
+      base = scoped_handoff_identity!(unquote(global))
+
+      for key <- unquote(scoped_sessions) do
+        assert {:ok, _} =
+                 DB.query(ctx.db, "UPDATE sessions SET archetype=?1 WHERE sessionKey=?2", [
+                   @qualified_archetype,
+                   key
+                 ])
+      end
+
+      Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+
+      assert %{name: scoped_rule, owner: {:kungfu, @bundle}, archetypes: [@qualified_archetype]} =
+               Enum.find(
+                 Rules.effective_snapshot().reactions,
+                 &(&1.short_name == @handoff and
+                     &1.owner == {:kungfu, @bundle})
+               )
+
+      assert scoped_rule == "#{@bundle}.#{@handoff}"
+      {_parent, _child, notice} = completed_child(ctx)
+      assert notice.session_key == "notice-parent"
+      expected_rule = if unquote(scope) == :inside, do: scoped_rule, else: @handoff
+
+      expected_source =
+        case {unquote(scope), unquote(global)} do
+          {:inside, _} -> @bundle_rule
+          {_, :custom} -> "rules/custom-handoff.toml"
+          _ -> @handoff_seed
+        end
+
+      assert {:ok, [[^expected_rule, ^expected_source]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT json_extract(plan,'$.rule'), json_extract(plan,'$.provenance.source')
+                 FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1
+                 """,
+                 [notice.wake_id]
+               )
+
+      assert :ok = Wakes.fire_due(ctx.scheduler)
+      assert_delivered_carrier(ctx.db, notice.wake_id)
+    end
+  end
+
+  test "unrelated authored reactions still fail duplicate handoff identity validation", ctx do
+    base = scoped_handoff_identity!(:builtin)
+    path = Path.join([base, "identity", "rules", "other-reaction.toml"])
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, String.replace(handoff_seed_bytes(), @handoff, "other-reaction"))
+    Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+
+    assert_raise ArgumentError, "duplicate reaction identity or name", fn ->
+      Rules.reaction_plans(%{"kind" => "assignment", "org" => "test", "id" => "test"}, %{})
+    end
+  end
+
+  defp scoped_handoff_identity!(global) do
+    base = Path.join(System.tmp_dir!(), "scoped-handoff-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(base) end)
+    init_identity_shape!(base, if(global == :seed, do: "fresh", else: "0.1.15"))
+    root = Path.join(base, "identity")
+    seed = handoff_seed_bytes()
+
+    for {path, bytes} <- [
+          {@bundle_rule, String.replace(seed, ~s(["*"]), ~s(["#{@qualified_archetype}"]))},
+          {@bundle_archetype, ~s(name = "worker"\nskills = []\nwhere = ["*"]\n)},
+          {"kungfu/#{@bundle}/installed.toml",
+           ~s(name = "#{@bundle}"\npaths = ["#{@bundle_rule}", "#{@bundle_archetype}"]\n)}
+        ] do
+      destination = Path.join(root, path)
+      File.mkdir_p!(Path.dirname(destination))
+      File.write!(destination, bytes)
+    end
+
+    if global == :custom do
+      path = Path.join(root, "rules/custom-handoff.toml")
+      File.mkdir_p!(Path.dirname(path))
+
+      File.write!(
+        path,
+        String.replace(seed, "[[reaction]]", ~s([[reaction]]\nenglish = "Custom handoff"))
+      )
+    end
+
+    base
+  end
+
+  defp handoff_seed_bytes,
+    do: File.read!(Application.app_dir(:tightbeam, Path.join("priv/seed", @handoff_seed)))
+
   defp init_identity_shape!(base, "fresh"), do: :initialized = Tightbeam.Identity.init!(base)
 
   defp init_identity_shape!(base, shape) do

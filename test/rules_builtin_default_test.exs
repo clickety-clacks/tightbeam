@@ -81,7 +81,7 @@ defmodule Tightbeam.RulesBuiltinDefaultTest do
     assert File.read!(path) == before
   end
 
-  test "a copy a learned bundle supplies also wins, and the rule is defined once", ctx do
+  test "an unreceipted alternate-path copy remains an organization-wide override", ctx do
     init_shape!(ctx.base, "0.1.16")
     destination = Path.join(ctx.dir, "kungfu/engineering/#{@notice_path}")
     File.mkdir_p!(Path.dirname(destination))
