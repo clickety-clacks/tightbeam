@@ -1460,8 +1460,28 @@ defmodule Tightbeam.Rules do
 
     (Path.wildcard(Path.join([root, "rules", "*.toml"])) ++
        Path.wildcard(Path.join([root, "kungfu", "*", "rules", "*.toml"])))
+    |> Enum.filter(&rule_file_path?(Path.relative_to(&1, root)))
     |> Enum.uniq()
     |> Enum.sort()
+  end
+
+  @doc """
+  Whether an identity-relative path is a rule file the loader reads.
+
+  The one definition, so a caller that lists a Git revision agrees with the
+  loader: `rules/*.toml` and `kungfu/<name>/rules/*.toml`, never a dot-prefixed
+  segment (as `Path.wildcard/1` never matches one).
+  """
+  @spec rule_file_path?(String.t()) :: boolean()
+  def rule_file_path?(relative) do
+    visible = &(not String.starts_with?(&1, "."))
+
+    String.ends_with?(relative, ".toml") and
+      case Path.split(relative) do
+        ["rules", file] -> visible.(file)
+        ["kungfu", name, "rules", file] -> visible.(name) and visible.(file)
+        _ -> false
+      end
   end
 
   defp owned_archetypes(_base_dir, :substrate), do: MapSet.new()

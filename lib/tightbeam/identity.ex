@@ -1574,18 +1574,8 @@ defmodule Tightbeam.Identity do
     dir
     |> git_output!(["ls-tree", "-r", "--name-only", revision, "--", "rules", "kungfu"])
     |> String.split("\n", trim: true)
-    |> Enum.filter(fn path ->
-      String.ends_with?(path, ".toml") and
-        # `Path.wildcard/1`, which the loader uses, never matches a leading dot.
-        case Path.split(path) do
-          ["rules", file] -> visible?(file)
-          ["kungfu", name, "rules", file] -> visible?(name) and visible?(file)
-          _ -> false
-        end
-    end)
+    |> Enum.filter(&Tightbeam.Rules.rule_file_path?/1)
   end
-
-  defp visible?(segment), do: not String.starts_with?(segment, ".")
 
   defp reaction_names(bytes) do
     for entry <- Map.get(Toml.decode!(bytes), "reaction", []),

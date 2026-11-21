@@ -179,8 +179,11 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "kungfu/.hidden/rules/parked.toml"))
     commit_and_publish!(ctx.dir, "fixture: unread copies and a bad file")
 
+    # The loader itself ignores every one of those copies.
+    refute loaded?(ctx.base)
     assert %{added: [@notice]} = SeedReconcile.run!(ctx.base, ctx.db)
     assert File.exists?(Path.join(ctx.dir, @notice_path))
+    assert loaded?(ctx.base)
   end
 
   test "a start that stopped after committing on main finishes the publication", ctx do
@@ -258,6 +261,7 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     init_shape!(ctx.base, "0.1.15")
     prior = Identity.live_revision!(ctx.base)
     leftover = Path.join(ctx.dir, @notice_path)
+    File.mkdir_p!(Path.dirname(leftover))
     File.cp!(Path.join(@seed, @notice_path), leftover)
     git(ctx.dir, ["add", "--", @notice_path])
     assert git(ctx.dir, ["status", "--porcelain"]) != ""
@@ -274,6 +278,7 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
   test "uncommitted operator changes are never removed by the add", ctx do
     init_shape!(ctx.base, "0.1.15")
     File.write!(Path.join(ctx.dir, "guidance/local.md"), "operator draft\n")
+    File.mkdir_p!(Path.join(ctx.dir, "rules"))
     File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, @notice_path))
 
     capture_log(fn ->
