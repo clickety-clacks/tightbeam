@@ -436,10 +436,8 @@ defmodule Tightbeam.Rules do
       end)
       |> add_builtin_defaults(
         Keyword.get(opts, :builtin_defaults, false),
-        verbs,
         law_base,
-        identity_manifest_sha,
-        declarations
+        identity_manifest_sha
       )
       |> Enum.map(fn
         {:rule, rule} ->
@@ -1464,16 +1462,16 @@ defmodule Tightbeam.Rules do
 
   # Rules every install gets whether or not its identity defines them. Each is
   # read from the release (`priv/seed`), never from the identity repository, and is
-  # used only when the loaded law defines no reaction of that name: a live entry
-  # (an edited or pre-existing copy) always wins, and nothing is written anywhere.
+  # used only when the loaded law defines no entry with that compiled name. A
+  # receipt-owned reaction has a qualified name and keeps its own scope.
   # Add a default here by naming the reaction and its seed file.
   @builtin_default_reactions [
     {"assignment-terminal-handoff", "rules/row-reaction-handoff.toml"}
   ]
 
-  defp add_builtin_defaults(entries, false, _verbs, _law_base, _sha, _declarations), do: entries
+  defp add_builtin_defaults(entries, false, _law_base, _sha), do: entries
 
-  defp add_builtin_defaults(entries, true, verbs, law_base, sha, declarations) do
+  defp add_builtin_defaults(entries, true, law_base, sha) do
     Enum.reduce(@builtin_default_reactions, entries, fn {name, relative}, acc ->
       # Names are unique across rules, policies and reactions: a second entry of
       # any kind with the same name would make the loader drop both, including a
@@ -1493,21 +1491,29 @@ defmodule Tightbeam.Rules do
           acc
 
         true ->
-          acc ++ builtin_default(name, relative, verbs, law_base, sha, declarations)
+          acc ++ builtin_default(name, relative, law_base, sha)
       end
     end)
   end
 
-  defp builtin_default(name, relative, verbs, law_base, sha, declarations) do
+  defp builtin_default(name, relative, law_base, sha) do
     require Logger
     shipped = Application.app_dir(:tightbeam, Path.join("priv/seed", relative))
-    # The identity-relative location it would have there, for provenance only.
+    # Use the canonical identity-relative location for reporting. The bytes
+    # come from the release, so an identity receipt cannot own this copy.
     virtual = Path.join([law_base, "identity", relative])
+    bytes = File.read!(shipped)
 
-    loaded =
-      Tightbeam.Mementos.with_declarations(declarations, fn ->
-        load_file!(virtual, verbs, law_base, sha, File.read!(shipped))
-      end)
+    [{:reaction, %{name: ^name}}] =
+      loaded =
+      Tightbeam.RowReactions.Loader.compile!(
+        Toml.decode!(bytes),
+        virtual,
+        law_base,
+        sha,
+        bytes,
+        :substrate
+      )
 
     Logger.info(
       "built-in default rule #{name} is in use: the live identity does not define it; " <>
@@ -1965,8 +1971,8 @@ defmodule Tightbeam.Rules do
     _ -> true
   end
 
-  defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha, contents \\ nil) do
-    contents = contents || File.read!(path)
+  defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
+    contents = File.read!(path)
     relative = Path.relative_to(path, Path.join(base_dir, "identity"))
     owner = Tightbeam.Identity.Provenance.owner_for_path(base_dir, relative)
     owned_archetypes = owned_archetypes(base_dir, owner)

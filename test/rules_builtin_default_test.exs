@@ -81,15 +81,48 @@ defmodule Tightbeam.RulesBuiltinDefaultTest do
     assert File.read!(path) == before
   end
 
-  test "an unreceipted alternate-path copy remains an organization-wide override", ctx do
-    init_shape!(ctx.base, "0.1.16")
-    destination = Path.join(ctx.dir, "kungfu/engineering/#{@notice_path}")
-    File.mkdir_p!(Path.dirname(destination))
-    File.cp!(Path.join(@seed, @notice_path), destination)
+  for rule_path <- ["kungfu/sample/rules/child-notice.toml", @notice_path] do
+    test "the substrate fallback coexists with a qualified receipt-owned handoff at #{rule_path}",
+         ctx do
+      init_shape!(ctx.base, "0.1.16")
+      rule_path = unquote(rule_path)
+      archetype_path = "kungfu/sample/archetypes/worker.toml"
+      destination = Path.join(ctx.dir, rule_path)
+      File.mkdir_p!(Path.dirname(destination))
+      File.mkdir_p!(Path.dirname(Path.join(ctx.dir, archetype_path)))
 
-    capture_log(fn ->
-      assert [_one] = reactions(ctx.base, true) |> Enum.filter(&(&1.name == @notice))
-    end)
+      File.write!(
+        destination,
+        Path.join(@seed, @notice_path)
+        |> File.read!()
+        |> String.replace(~s(archetypes = ["*"]), ~s(archetypes = ["sample.worker"]))
+      )
+
+      File.write!(Path.join(ctx.dir, archetype_path), ~s(name = "worker"\nwhere = ["*"]\n))
+
+      File.write!(
+        Path.join(ctx.dir, "kungfu/sample/installed.toml"),
+        ~s(name = "sample"\npaths = ["#{rule_path}", "#{archetype_path}"]\n)
+      )
+
+      assert [%{owner: {:kungfu, "sample"}}] = handoffs(ctx.base, false)
+      before = repo_state(ctx.dir)
+
+      log =
+        capture_log(fn ->
+          assert [
+                   %{name: @notice, owner: :substrate, archetypes: ["*"]},
+                   %{
+                     name: "sample." <> @notice,
+                     owner: {:kungfu, "sample"},
+                     archetypes: ["sample.worker"]
+                   }
+                 ] = Enum.sort_by(handoffs(ctx.base, true), & &1.name)
+        end)
+
+      assert log =~ "built-in default rule #{@notice} is in use"
+      assert repo_state(ctx.dir) == before
+    end
   end
 
   for {kind, body} <- [
@@ -166,6 +199,9 @@ defmodule Tightbeam.RulesBuiltinDefaultTest do
   end
 
   defp reaction_names(base, builtin?), do: Enum.map(reactions(base, builtin?), & &1.name)
+
+  defp handoffs(base, builtin?),
+    do: Enum.filter(reactions(base, builtin?), &(&1.short_name == @notice))
 
   defp reactions(base, builtin?) do
     Identity.with_recovery_law!(base, fn law_base, revision ->
