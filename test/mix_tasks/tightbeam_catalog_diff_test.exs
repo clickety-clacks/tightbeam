@@ -205,7 +205,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
       )
 
     assert_raise Mix.Error,
-                 ~r/working_set_not_installed:.*agentic-engineering.*tightbeam learn agentic-engineering/,
+                 ~r/working_set_not_installed:.*agentic-engineering.*no longer ships/,
                  fn -> Diff.evaluate(inventories(["known"]), missing) end
   end
 

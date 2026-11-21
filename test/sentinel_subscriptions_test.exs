@@ -526,7 +526,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
 
   test "both candidate watchers traverse the real CLI and gateway subscription routes", ctx do
     for {bundle, watcher} <- [{"sentinels", "matrix"}, {"agentic-engineering", "landing-watch"}] do
-      shipped = Path.expand("../priv/kungfu/#{bundle}", __DIR__)
+      shipped = Path.expand("support/fixtures/kungfu/#{bundle}", __DIR__)
       destination = Path.join(ctx.bundles, bundle)
       File.mkdir_p!(Path.join(destination, "sentinels"))
 
@@ -718,7 +718,8 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     assert {:ok, [[3]]} =
              DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
 
-    landing = Path.expand("../priv/kungfu/agentic-engineering/sentinels/landing-watch", __DIR__)
+    landing =
+      Path.expand("support/fixtures/kungfu/agentic-engineering/sentinels/landing-watch", __DIR__)
 
     {output, code} =
       System.cmd("python3", [landing, "--once"],

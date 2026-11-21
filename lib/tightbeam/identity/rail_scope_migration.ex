@@ -13,10 +13,15 @@ defmodule Tightbeam.Identity.RailScopeMigration do
 
   @report_name "rail-scope-migration-report.json"
   @migration_id "rail-scope-v1"
+  # One reaction name per seed file: the file is planted once and carries all
+  # of its reactions.
   @seed_reactions %{
     "assignment-terminal-handoff" => "rules/row-reaction-handoff.toml",
-    "terminal-child-action-reminder" => "rules/row-reaction-terminal-action.toml"
+    "r04-work-item-notice" => "rules/row-reaction-work-items.toml"
   }
+  # Shipped in 0.1.16 and no longer shipped: an unedited legacy copy is removed
+  # and not replanted, while pending rows keep their substrate rule name.
+  @retired_seed_reactions ["terminal-child-action-reminder"]
   @seed_rails %{
     "github-auth" => "rails/github-auth.toml",
     "tightbeam-probe" => "rails/tightbeam-probe.toml"
@@ -270,7 +275,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
       archetypes: archetypes,
       name_map: name_map,
       rail_map: %{},
-      reaction_names: Map.keys(@seed_reactions),
+      reaction_names: Map.keys(@seed_reactions) ++ @retired_seed_reactions,
       writes: %{},
       removals: reaction_scan.removed_paths,
       skip_paths: reaction_scan.candidate_paths,
@@ -964,6 +969,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
 
   defp plan_seed_reactions(plan, seed_reactions, reaction_scan) do
     substrate_reactions = substrate_reaction_index(plan)
+    bundle_reactions = reaction_index(plan, &match?({:kungfu, _}, &1))
 
     Enum.reduce(@seed_reactions, plan, fn {name, relative}, acc ->
       existing = Map.get(substrate_reactions, name, [])
@@ -979,6 +985,12 @@ defmodule Tightbeam.Identity.RailScopeMigration do
             )
 
           %{acc | stops: [stop | acc.stops]}
+
+        # Keep a scoped handoff already owned by a receipt. Startup supplies
+        # the default for other participants, and import restores the stock seed.
+        name == "assignment-terminal-handoff" and existing == [] and
+            Map.has_key?(bundle_reactions, name) ->
+          acc
 
         existing == [] ->
           case Map.fetch(seed_reactions, relative) do
@@ -1877,10 +1889,12 @@ defmodule Tightbeam.Identity.RailScopeMigration do
     end)
   end
 
-  defp substrate_reaction_index(plan) do
+  defp substrate_reaction_index(plan), do: reaction_index(plan, &(&1 == :substrate))
+
+  defp reaction_index(plan, owner?) do
     merged_entries(plan)
     |> Enum.filter(fn {path, _} ->
-      scoped_rail_path?(path) and owner_for_destination(plan, path) == :substrate
+      scoped_rail_path?(path) and owner?.(owner_for_destination(plan, path))
     end)
     |> Enum.reduce(%{}, fn {path, bytes}, index ->
       case Toml.decode(bytes) do

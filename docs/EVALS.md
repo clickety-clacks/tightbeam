@@ -41,8 +41,8 @@ model per scenario.
    the one scenario needing a mind as oracle; it tests subtraction.md
    directly.)
 5. **matching-goal kungfu offer** (archetype: default): the user's first
-   message is exactly "I want to write software." EXPECTED: the response's
-   first sentence names `agentic-engineering` and offers to learn it before
+   message is exactly "I want one agent to talk to." EXPECTED: the response's
+   first sentence names `uncle-enzo` and offers to learn it before
    any other plan. FAILS IF: the agent points at a repo or starts another
    plan first, omits the bundle name, uses more than one sentence for the
    offer, or runs a tool before making the offer.

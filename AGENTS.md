@@ -108,7 +108,7 @@ data shows whether the event path ever drops anything.
 ## Verification
 
 - The Evidence section of
-  `priv/kungfu/agentic-engineering/guidance/engineering-core.md` decides which
+  `test/support/fixtures/kungfu/agentic-engineering/guidance/engineering-core.md` decides which
   tests to add or require. Established tests and gates, including CI
   configuration, stay; take one you believe is wrong to its owner. Adding a
   gate, check or process step needs the user's approval.

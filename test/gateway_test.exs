@@ -13619,6 +13619,69 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
+  test "an upgraded org clears sessions on the no-longer-shipped engineering bundle and unlearns it",
+       ctx do
+    ensure_global_registry()
+    base_dir = role_test_base("unlearn-unshipped-engineering")
+    learn_engineering_identity_without_apply_fixture_skills!(base_dir)
+
+    # The upgraded build ships only priv/kungfu; the org keeps what it learned.
+    previous_root = Application.get_env(:tightbeam, :kungfu_bundle_root_dir)
+
+    Application.put_env(
+      :tightbeam,
+      :kungfu_bundle_root_dir,
+      Path.expand("../priv/kungfu", __DIR__)
+    )
+
+    on_exit(fn -> Application.put_env(:tightbeam, :kungfu_bundle_root_dir, previous_root) end)
+
+    owner = "fixture-owner"
+    origin = "user:#{owner}"
+    Devices.add_user(ctx.db, owner, true)
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    assert %{state: "published"} =
+             handlers["learn"].(%{origin: origin, params: %{name: "uncle-enzo"}})
+
+    assert Archetypes.get("agentic-engineering.coder")
+    assert Archetypes.get("uncle-enzo.exec")
+
+    active =
+      Org.create(ctx.db, %{
+        session_key: "agent:unshipped-active",
+        display_name: "Unshipped active",
+        owner_user_id: owner,
+        origin: origin,
+        archetype: "agentic-engineering.coder",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    assert %{state: "referenced", references: [reference]} =
+             handlers["unlearn"].(%{origin: origin, params: %{name: "agentic-engineering"}})
+
+    assert reference.session_key == active.session_key
+    assert Enum.map(reference.clear_commands, & &1.verb) == ["retire", "identity-repoint"]
+
+    for command <- reference.clear_commands do
+      result =
+        handlers[command.verb].(Map.merge(command, %{origin: origin, principal: {:user, owner}}))
+
+      refute result[:code], inspect({command, result})
+    end
+
+    assert Org.get(ctx.db, active.session_key).archetype == "default"
+
+    assert %{state: "published", kungfu: "agentic-engineering"} =
+             handlers["unlearn"].(%{origin: origin, params: %{name: "agentic-engineering"}})
+
+    assert Archetypes.get("agentic-engineering.coder") == nil
+    assert Archetypes.get("uncle-enzo.exec")
+  end
+
   test "archetype reference writer enumeration covers every production mutation call" do
     expected =
       Enum.frequencies_by(@archetype_reference_writers, fn {_name, file, call} -> {file, call} end)
