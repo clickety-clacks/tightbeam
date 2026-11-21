@@ -12116,6 +12116,9 @@ defmodule Tightbeam.Gateway do
     prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
 
     cond do
+      p[:dry_run] == true ->
+        retire_preview(config, db, owner, call)
+
       prior && prior.session_key == call.session_key ->
         retired_keys = retired_subtree_keys(db, call.session_key)
 
@@ -12230,6 +12233,13 @@ defmodule Tightbeam.Gateway do
                 %{
                   deleted_session_key: session.session_key,
                   retired_session_keys: Enum.map(result.retired, & &1.session_key),
+                  retired_sessions:
+                    Enum.map(result.retired, fn retired ->
+                      %{
+                        session_key: retired.session_key,
+                        display_name: retired_display_name(db, retired.session_key)
+                      }
+                    end),
                   deferred: result.deferred
                 }
                 |> maybe_put_kept_descendants(result.kept_descendants)
@@ -12258,7 +12268,9 @@ defmodule Tightbeam.Gateway do
       Enum.flat_map(keys, fn key ->
         db
         |> WorkspaceCleanup.held_losses(key)
-        |> Enum.map(&Map.put(&1, "session_key", key))
+        |> Enum.map(
+          &Map.merge(&1, %{"session_key" => key, "display_name" => retired_display_name(db, key)})
+        )
       end)
 
     cond do
@@ -12275,6 +12287,54 @@ defmodule Tightbeam.Gateway do
 
       true ->
         workspace_response(db, call, session, %{})
+    end
+  end
+
+  defp retired_display_name(db, key) do
+    case Org.get(db, key) do
+      %{display_name: name} -> name
+      _ -> nil
+    end
+  end
+
+  # Read-only. Shows the blast radius of a retire: every session it would
+  # remove (with what its workspace scan finds on its own host), every
+  # session it would keep, and whether it would refuse without
+  # --keep-open-descendants. Nothing is written.
+  defp retire_preview(config, db, owner, call) do
+    case Org.get(db, call.session_key) do
+      %{owner_user_id: ^owner, is_built_in: true} ->
+        %{
+          code: "denied",
+          message:
+            "main sessions are permanent — they are the fallback for roles and user references"
+        }
+
+      %{owner_user_id: ^owner, state: "active"} ->
+        {:ok, plan} =
+          DB.transaction(db, fn txn ->
+            retirement_plan_in_txn(txn, call.session_key, owner, true)
+          end)
+
+        scans =
+          WorkspaceCleanup.preview(config, db, Enum.map(plan.retired, & &1.session_key))
+
+        %{
+          dry_run: true,
+          session_key: call.session_key,
+          would_retire: scans,
+          would_keep: Enum.map(plan.kept, &session_details/1),
+          would_keep_protected_roots:
+            Enum.map(plan.frontiers, &protected_descendant_details/1),
+          requires_keep_open_descendants: plan.frontiers != [],
+          sessions_with_held_work: Enum.count(scans, &(&1.losses != []))
+        }
+
+      %{owner_user_id: ^owner} = session ->
+        retired_workspace_response(db, call, session, false)
+
+      _ ->
+        %{code: "not_found"}
     end
   end
 
@@ -12407,6 +12467,7 @@ defmodule Tightbeam.Gateway do
           end)
 
         retired = Enum.reject(active_subtree, &MapSet.member?(kept_keys, &1.session_key))
+        kept = Enum.filter(active_subtree, &MapSet.member?(kept_keys, &1.session_key))
 
         if protected != [] and not keep_open_descendants? do
           %{
@@ -12424,6 +12485,7 @@ defmodule Tightbeam.Gateway do
             owner: owner,
             keep_open_descendants: keep_open_descendants?,
             retired: retired,
+            kept: kept,
             frontiers: frontiers,
             accountable_parent: accountable_parent
           }

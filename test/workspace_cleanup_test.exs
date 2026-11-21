@@ -978,6 +978,123 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     end
   end
 
+  describe "a retire removes the whole subtree, so each session is checked" do
+    test "a closed child's unpushed commit is held and the result lists the child", ctx do
+      {child, child_workspace} = child_session(ctx, "closed-child", ctx.session.session_key)
+      child_repo = init_repo(child_workspace, "repo")
+      commit(child_repo, "work.txt", "child work")
+      root_key = ctx.session.session_key
+
+      result = retire_call(ctx, root_key, %{keep_open_descendants: true})
+
+      assert result.retired_session_keys |> Enum.sort() ==
+               Enum.sort([root_key, child.session_key])
+
+      names = Map.new(result.retired_sessions, &{&1.session_key, &1.display_name})
+      assert names == %{root_key => "Example", child.session_key => "Closed child"}
+
+      assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, root_key)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, child.session_key)
+
+      assert File.read!(Path.join(child_repo, "work.txt")) == "child work"
+
+      assert %{held_losses: [held]} = retire_call(ctx, root_key, %{})
+      assert %{"session_key" => key, "display_name" => "Closed child", "path" => "repo"} = held
+      assert key == child.session_key
+    end
+
+    test "a protected descendant is kept with its subtree and its workspace is untouched", ctx do
+      {holder, holder_workspace} = child_session(ctx, "holder", ctx.session.session_key)
+      {grandchild, _} = child_session(ctx, "grandchild", holder.session_key)
+      repo = init_repo(holder_workspace, "repo")
+      commit(repo, "work.txt", "holder work")
+
+      {:ok, []} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt) VALUES ('open-one','Ship',?1,?2,1)",
+          [holder.session_key, ctx.session.session_key]
+        )
+
+      assert %{code: "open_descendants"} = retire_call(ctx, ctx.session.session_key, %{})
+      result = retire_call(ctx, ctx.session.session_key, %{keep_open_descendants: true})
+
+      assert result.retired_session_keys == [ctx.session.session_key]
+      assert Org.get(ctx.db, holder.session_key).state == "active"
+      assert Org.get(ctx.db, grandchild.session_key).state == "active"
+      assert File.read!(Path.join(repo, "work.txt")) == "holder work"
+    end
+
+    test "the preview lists every session and its scan and changes nothing", ctx do
+      {child, child_workspace} = child_session(ctx, "closed-child", ctx.session.session_key)
+      {holder, _} = child_session(ctx, "holder", ctx.session.session_key)
+      repo = init_repo(child_workspace, "repo")
+      commit(repo, "work.txt", "child work")
+
+      {:ok, []} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt) VALUES ('open-one','Ship',?1,?2,1)",
+          [holder.session_key, ctx.session.session_key]
+        )
+
+      before = DB.query(ctx.db, "SELECT sessionKey,state FROM sessions ORDER BY sessionKey")
+      cleanup_rows = "SELECT COUNT(*) FROM retired_workspace_cleanup"
+      {:ok, [[0]]} = DB.query(ctx.db, cleanup_rows)
+
+      preview = retire_call(ctx, ctx.session.session_key, %{dry_run: true})
+
+      assert %{dry_run: true, requires_keep_open_descendants: true, sessions_with_held_work: 1} =
+               preview
+
+      by_key = Map.new(preview.would_retire, &{&1.session_key, &1})
+      assert Map.keys(by_key) |> Enum.sort() == Enum.sort([ctx.session.session_key, child.session_key])
+      assert %{scan: "ok", losses: []} = by_key[ctx.session.session_key]
+
+      assert %{scan: "ok", display_name: "Closed child", losses: [%{kind: "git", path: "repo"}]} =
+               by_key[child.session_key]
+
+      assert [%{session_key: kept}] = preview.would_keep
+      assert kept == holder.session_key
+      assert before == DB.query(ctx.db, "SELECT sessionKey,state FROM sessions ORDER BY sessionKey")
+      assert {:ok, [[0]]} = DB.query(ctx.db, cleanup_rows)
+      assert File.read!(Path.join(repo, "work.txt")) == "child work"
+      assert Org.get(ctx.db, ctx.session.session_key).state == "active"
+    end
+  end
+
+  defp child_session(ctx, slug, parent_key) do
+    child =
+      Org.create(ctx.db, %{
+        session_key: slug,
+        display_name: slug |> String.replace("-", " ") |> String.capitalize(),
+        kind: "custom",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        spawned_by: parent_key,
+        archetype: "default",
+        host: Placement.local_host_name(),
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("example")
+      })
+
+    workspace = Placement.workdir_path(ctx.config, child)
+    File.mkdir_p!(workspace)
+    {child, workspace}
+  end
+
+  defp retire_call(ctx, key, params) do
+    Gateway.handlers(ctx.config)["retire"].(%{
+      origin: "user:owner",
+      principal: {:user, "owner"},
+      session_key: key,
+      params: params
+    })
+  end
+
   defp git!(repo, args) do
     {_, 0} =
       System.cmd(

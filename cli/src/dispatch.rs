@@ -784,6 +784,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             idempotency_key,
             keep_open_descendants,
             acknowledge_loss,
+            dry_run,
         } => {
             let mut params = Vec::new();
             if let Some(value) = idempotency_key.as_ref() {
@@ -794,6 +795,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if *acknowledge_loss {
                 params.push("\"acknowledgeLoss\":true".to_owned());
+            }
+            if *dry_run {
+                params.push("\"dryRun\":true".to_owned());
             }
             Ok(request(
                 identity,
@@ -6797,6 +6801,17 @@ mod tests {
                     "flynn",
                 ][..],
                 r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"acknowledgeLoss":true}}"#,
+            ),
+            (
+                &[
+                    "retire",
+                    "--session",
+                    "agent:r",
+                    "--dry-run",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"dryRun":true}}"#,
             ),
             (
                 &[

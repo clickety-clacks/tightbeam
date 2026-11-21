@@ -572,6 +572,96 @@ defmodule Tightbeam.WorkspaceCleanup do
   end
 
   @doc """
+  Read-only preview for sessions that are still active: scans each session's
+  workspace on its own host for work a retirement would hold back, without
+  changing anything. Returns one entry per key with `scan: "ok"` and the
+  losses, or `scan: "unavailable"` and a reason when the host cannot be read.
+  """
+  def preview(config, db, session_keys) do
+    timeout = Map.get(config, :workspace_cleanup_scan_timeout_ms, 60_000)
+
+    session_keys
+    |> Task.async_stream(&preview_one(config, db, &1, timeout),
+      max_concurrency: 4,
+      timeout: timeout + 10_000,
+      on_timeout: :kill_task,
+      ordered: true
+    )
+    |> Enum.zip(session_keys)
+    |> Enum.map(fn
+      {{:ok, entry}, _key} -> entry
+      {{:exit, reason}, key} -> preview_entry(db, key, {:unavailable, inspect(reason)})
+    end)
+  end
+
+  defp preview_one(config, db, key, timeout) do
+    result =
+      try do
+        session = Tightbeam.Org.get(db, key)
+        hosts = Tightbeam.Placement.hosts(config.base_dir, db)
+        host = Map.fetch!(hosts, session.host)
+        workspace = Tightbeam.Placement.workdir_path(config, session)
+
+        with {:ok, {:ok, keep}} <-
+               DB.transaction(db, fn txn ->
+                 protection_plan(txn, session.host, host, hosts, workspace)
+               end),
+             {:ok, execution} <-
+               execute(
+                 host,
+                 workspace,
+                 keep,
+                 nil,
+                 Map.get(config, :workspace_cleanup_runner),
+                 timeout,
+                 [],
+                 true
+               ) do
+          if execution.result_confirmed and
+               Enum.all?(execution.blockers, &(&1.reason == "artifact_missing")),
+             do: {:ok, execution.losses},
+             else: {:unavailable, inspect(Enum.map(execution.blockers, & &1.reason))}
+        else
+          {:ok, {:error, blocker}} -> {:unavailable, inspect(blocker)}
+          {:error, blocker} -> {:unavailable, inspect(blocker)}
+          other -> {:unavailable, inspect(other)}
+        end
+      rescue
+        error -> {:unavailable, Exception.message(error)}
+      catch
+        kind, reason -> {:unavailable, "#{kind}: #{inspect(reason)}"}
+      end
+
+    preview_entry(db, key, result)
+  end
+
+  defp preview_entry(db, key, {:ok, losses}) do
+    %{
+      session_key: key,
+      display_name: display_name(db, key),
+      scan: "ok",
+      losses: Enum.map(losses, &Map.take(&1, [:kind, :path, :detail]))
+    }
+  end
+
+  defp preview_entry(db, key, {:unavailable, reason}) do
+    %{
+      session_key: key,
+      display_name: display_name(db, key),
+      scan: "unavailable",
+      detail: reason,
+      losses: []
+    }
+  end
+
+  defp display_name(db, key) do
+    case Tightbeam.Org.get(db, key) do
+      %{display_name: name} -> name
+      _ -> nil
+    end
+  end
+
+  @doc """
   The losses a retired session's last cleanup run held back, as
   `%{kind, path, detail}` maps; `[]` when nothing is held.
   """
@@ -812,7 +902,7 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
-  defp execute(host, workspace, keep, archive_path, runner, timeout_ms, acknowledged) do
+  defp execute(host, workspace, keep, archive_path, runner, timeout_ms, acknowledged, scan_only \\ false) do
     cond do
       contains_line_break?(workspace) ->
         {:error, %{reason: "workspace_path_unrepresentable"}}
@@ -821,7 +911,8 @@ defmodule Tightbeam.WorkspaceCleanup do
         {:error, %{reason: "cleanup_runner_timeout_invalid"}}
 
       true ->
-        script = cleanup_script(Path.expand(workspace), archive_path, timeout_ms, acknowledged)
+        script =
+          cleanup_script(Path.expand(workspace), archive_path, timeout_ms, acknowledged, scan_only)
         manifest = if keep.paths == [], do: "", else: Enum.join(keep.paths, "\n") <> "\n"
 
         invocation =
@@ -974,7 +1065,7 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
-  defp cleanup_script(root, archive_path, timeout_ms, acknowledged) do
+  defp cleanup_script(root, archive_path, timeout_ms, acknowledged, scan_only) do
     """
     #{move_script(timeout_ms)}
     umask 077
@@ -984,6 +1075,7 @@ defmodule Tightbeam.WorkspaceCleanup do
     ack_list=#{shell_quote(Enum.join(acknowledged, "\n"))}
     keep_list=$(cat)
     loss_hold=0
+    scan_only=#{if scan_only, do: 1, else: 0}
     had_error=0
     unsafe_route=0
     present_keep_list=
@@ -1251,6 +1343,10 @@ defmodule Tightbeam.WorkspaceCleanup do
         if [ "$unsafe_route" -eq 0 ]; then
           scan_output=$(scan_losses)
           [ -z "$scan_output" ] || printf '%s\n' "$scan_output"
+          if [ "$scan_only" -eq 1 ]; then
+            printf 'DONE\t0\n'
+            exit 0
+          fi
           loss_output=$(printf '%s\n' "$scan_output" | grep '^L' || :)
           if [ -n "$loss_output" ]; then
             saved_ifs=$IFS
