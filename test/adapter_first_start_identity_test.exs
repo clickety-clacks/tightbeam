@@ -7,7 +7,9 @@ defmodule Tightbeam.AdapterFirstStartIdentityTest do
 
   @helper Path.expand("../cli/target/release/tightbeam", __DIR__)
 
-  test "first unanswered identity check permits readiness and later proves identity", %{tmp_dir: tmp} do
+  test "first unanswered identity check permits readiness and later proves identity", %{
+    tmp_dir: tmp
+  } do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = HarnessProcess.ensure_schema(db)
     :ok = EventLog.ensure_schema(db)
@@ -28,7 +30,9 @@ defmodule Tightbeam.AdapterFirstStartIdentityTest do
 
     parent = self()
 
-    Application.put_env(:tightbeam, :harness_process_command_runner_for_test, fn exe, args, _timeout ->
+    Application.put_env(:tightbeam, :harness_process_command_runner_for_test, fn exe,
+                                                                                 args,
+                                                                                 _timeout ->
       if List.first(args) == "harness-check" do
         case :atomics.add_get(checks, 1, 1) do
           1 ->
@@ -57,12 +61,21 @@ defmodule Tightbeam.AdapterFirstStartIdentityTest do
 
     opts =
       HarnessProcess.prepare_launch(
-        [cmd: [System.find_executable("node"), script], process_helper: @helper,
-         process_identity_dir: tmp, home: tmp, cwd: tmp, harness: :claude],
-        db, {:claude, "shared", "fixture-host"}
+        [
+          cmd: [System.find_executable("node"), script],
+          process_helper: @helper,
+          process_identity_dir: tmp,
+          home: tmp,
+          cwd: tmp,
+          harness: :claude
+        ],
+        db,
+        {:claude, "shared", "fixture-host"}
       )
 
-    {:ok, adapter} = Adapter.start_link(Keyword.merge(opts, db: db, on_ready: fn -> send(parent, :ready) end))
+    {:ok, adapter} =
+      Adapter.start_link(Keyword.merge(opts, db: db, on_ready: fn -> send(parent, :ready) end))
+
     on_exit(fn -> if Process.alive?(adapter), do: GenServer.stop(adapter) end)
     assert_receive :ready, 7_000
     assert {:pending, _} = Adapter.launch_identity_status(adapter)
@@ -77,7 +90,14 @@ defmodule Tightbeam.AdapterFirstStartIdentityTest do
 
   defp eventually(fun, attempts \\ 100)
   defp eventually(fun, 0), do: fun.()
+
   defp eventually(fun, attempts) do
-    if fun.(), do: true, else: (Process.sleep(100); eventually(fun, attempts - 1))
+    if fun.(),
+      do: true,
+      else:
+        (
+          Process.sleep(100)
+          eventually(fun, attempts - 1)
+        )
   end
 end

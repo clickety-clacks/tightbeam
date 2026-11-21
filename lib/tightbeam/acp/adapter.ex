@@ -506,44 +506,44 @@ defmodule Tightbeam.Acp.Adapter do
 
     launch_identity_status =
       case Keyword.fetch(opts, :harness_process_launch_id) do
-      {:ok, launch_id} ->
-        db = Keyword.get(opts, :db, Tightbeam.DB)
+        {:ok, launch_id} ->
+          db = Keyword.get(opts, :db, Tightbeam.DB)
 
-        case Tightbeam.HarnessProcess.capture_identity(db, launch_id, 5_000, conn) do
-          :ok ->
-            :ok
+          case Tightbeam.HarnessProcess.capture_identity(db, launch_id, 5_000, conn) do
+            :ok ->
+              :ok
 
-          {:pending, _reason} = pending ->
-            parent = self()
+            {:pending, _reason} = pending ->
+              parent = self()
 
-            {:ok, _task} =
-              Task.start_link(fn ->
-                Process.sleep(250)
-                result = capture_launch_identity(db, launch_id, conn, 500)
-                send(parent, {:launch_identity_result, launch_id, result})
-              end)
+              {:ok, _task} =
+                Task.start_link(fn ->
+                  Process.sleep(250)
+                  result = capture_launch_identity(db, launch_id, conn, 500)
+                  send(parent, {:launch_identity_result, launch_id, result})
+                end)
 
-            pending
+              pending
 
-          {:error, reason} ->
-            row = Enum.find(Tightbeam.HarnessProcess.list(db), &(&1.launch_id == launch_id))
-            receipt = Conn.launch_exit(conn, 100)
+            {:error, reason} ->
+              row = Enum.find(Tightbeam.HarnessProcess.list(db), &(&1.launch_id == launch_id))
+              receipt = Conn.launch_exit(conn, 100)
 
-            _ =
-              Tightbeam.HarnessProcess.settle(
-                db,
-                launch_id,
-                row.adapter_key,
-                "adapter-boot",
-                receipt
-              )
+              _ =
+                Tightbeam.HarnessProcess.settle(
+                  db,
+                  launch_id,
+                  row.adapter_key,
+                  "adapter-boot",
+                  receipt
+                )
 
-            raise "harness process identity unavailable: #{inspect(reason)}"
-        end
+              raise "harness process identity unavailable: #{inspect(reason)}"
+          end
 
-      :error ->
-        nil
-    end
+        :error ->
+          nil
+      end
 
     state = %__MODULE__{
       db: Keyword.get(opts, :db, Tightbeam.DB),
@@ -1078,6 +1078,7 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp session_call(:conn, _from, state), do: {:reply, state.conn, state}
+
   defp session_call(:launch_identity_status, _from, state),
     do: {:reply, state.launch_identity_status, state}
 
@@ -1529,8 +1530,18 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_info({:launch_identity_result, launch_id, {:error, reason}}, state) do
     row = Enum.find(Tightbeam.HarnessProcess.list(state.db), &(&1.launch_id == launch_id))
     receipt = Conn.launch_exit(state.conn, 100)
-    _ = Tightbeam.HarnessProcess.settle(state.db, launch_id, row.adapter_key, "adapter-boot", receipt)
-    {:stop, {:launch_identity_failed, reason}, %{state | launch_identity_status: {:error, reason}}}
+
+    _ =
+      Tightbeam.HarnessProcess.settle(
+        state.db,
+        launch_id,
+        row.adapter_key,
+        "adapter-boot",
+        receipt
+      )
+
+    {:stop, {:launch_identity_failed, reason},
+     %{state | launch_identity_status: {:error, reason}}}
   end
 
   def handle_info({:session_operation_done, key, pid, reply, updates}, state) do
