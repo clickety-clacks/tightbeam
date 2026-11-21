@@ -82,9 +82,9 @@ defmodule Tightbeam.HolderProd do
     :ok
   end
 
-  def prepare_in_txn(txn, wake) do
+  def prepare_in_txn(txn, wake, at) do
     if own_notice?(wake) do
-      if current_source?(txn, wake) do
+      if current_source?(txn, wake, at) do
         true
       else
         cancel_in_txn(txn, wake.wake_id)
@@ -95,10 +95,10 @@ defmodule Tightbeam.HolderProd do
     end
   end
 
-  defp current_source?(txn, wake) do
+  defp current_source?(txn, wake, at) do
     with %{report_only: false} <- settings(),
          [%{holder: holder, episode: episode, wake: id, possible: true}] <-
-           candidates(txn, wake.assignment_id, System.system_time(:millisecond), false) do
+           candidates(txn, wake.assignment_id, at, false) do
       holder == wake.session_key and episode == wake.obligation_ref and id == wake.wake_id
     else
       _ -> false
@@ -205,8 +205,8 @@ defmodule Tightbeam.HolderProd do
              AND (w.assignmentId=e.id OR w.assignmentId IS NULL)
              AND (w.creatorSessionKey=e.holderKey OR
                (w.assignmentId=e.id
-                 AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
-                 AND (w.dueAt<=?3 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)))
+                 AND (w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL OR
+                      (w.waitMode IS NULL AND w.conditionKind IS NULL AND w.dueAt<=?3))))
              AND (p.wakeId IS NULL OR w.wakeId<>p.wakeId)
          )
          AND NOT EXISTS (
@@ -265,17 +265,21 @@ defmodule Tightbeam.HolderProd do
     {used, _free_at} = budget(txn, at, settings.report_only)
     slots = max(0, min(settings.cap - used, batch))
 
-    if slots > 0 do
-      txn
-      |> eligible(at, settings)
-      |> Enum.filter(&(&1.due_at <= at))
-      |> Enum.sort_by(&{&1.next_repeat, &1.since, &1.id})
-      |> Enum.uniq_by(& &1.holder)
-      |> Enum.take(slots)
-      |> Enum.each(&admit_in_txn(txn, &1, at, settings.report_only))
-    end
+    selected =
+      if slots > 0 do
+        txn
+        |> eligible(at, settings)
+        |> Enum.filter(&(&1.due_at <= at))
+        |> Enum.sort_by(&{&1.next_repeat, &1.since, &1.id})
+        |> Enum.uniq_by(& &1.holder)
+        |> Enum.take(slots)
+      else
+        []
+      end
 
-    :ok
+    Enum.each(selected, &admit_in_txn(txn, &1, at, settings.report_only))
+
+    if settings.report_only, do: {:would_send, length(selected)}, else: :ok
   end
 
   defp eligible(txn, at, settings) do

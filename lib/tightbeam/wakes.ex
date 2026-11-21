@@ -7039,7 +7039,13 @@ defmodule Tightbeam.Wakes do
     evaluate_conditions(state, :tick)
 
     if state.holder_prod do
-      transaction!(db, &Tightbeam.HolderProd.admit_due_in_txn(&1, now(), state.batch))
+      case transaction!(db, &Tightbeam.HolderProd.admit_due_in_txn(&1, now(), state.batch)) do
+        {:would_send, count} when count > 0 ->
+          Logger.info("holder_prod_would_send count=#{count}")
+
+        _ ->
+          :ok
+      end
     end
 
     # E's old generations are historical data, not scheduler input. Retire

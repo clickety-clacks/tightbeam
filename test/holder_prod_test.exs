@@ -284,10 +284,83 @@ defmodule Tightbeam.HolderProdTest do
     assert %{code: "wait_reason_too_long"} = attest.(String.duplicate("a", 141))
     assert %{code: "invalid_wait_reason"} = attest.("first\nsecond")
     reason = String.duplicate("a", 140)
-    assert %{cannotProceed: %{reason: ^reason}} = attest.(reason)
+
+    assert %{cannotProceed: %{reason: ^reason}, decisionWake: %{wake_id: decision_wake}} =
+             attest.(reason)
+
+    assert %{replayed: true, cannotProceed: %{decisionWakeId: ^decision_wake}} = attest.(reason)
+    assert %{session_key: "other", state: "pending"} = Wakes.get(ctx.db, decision_wake)
+
+    start_supervised!({ConnRegistry, name: :holder_prod_test_registry})
+    start_supervised!({LaneStub, :holder_prod_test_lane})
+    assert :ok = ctx.db |> start_scheduler(false) |> Wakes.fire_due()
+
+    assert %{session_key: "other", state: "fired", delivered_turn_seq: seq} =
+             Wakes.get(ctx.db, decision_wake)
+
+    assert is_integer(seq)
 
     sweep(ctx.db, ctx.opened + 2 * @quiet)
     assert notices(ctx.db) == []
+    IO.puts("Holder nudge cannot-proceed proof opener_deliveries=1 follow_up_nudges=0")
+  end
+
+  test "an admitted nudge is superseded if its harness becomes fenced before delivery", ctx do
+    at = ctx.opened + @quiet
+    sweep(ctx.db, at)
+    assert [[wake_id, "holder", "pending"]] = notices(ctx.db)
+
+    sql!(
+      ctx.db,
+      """
+      INSERT INTO harness_park_fences(adapterKey,requestedAt,generation)
+      VALUES ('codex:shared@test-host',?1,1)
+      """,
+      [at]
+    )
+
+    start_supervised!({ConnRegistry, name: :holder_prod_test_registry})
+    start_supervised!({LaneStub, :holder_prod_test_lane})
+    scheduler = start_scheduler(ctx.db, false)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert [[^wake_id, "holder", "canceled"]] = notices(ctx.db)
+    assert %{delivered_turn_seq: nil} = Wakes.get(ctx.db, wake_id)
+    assert deadline(ctx.db) == nil
+
+    assert :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, {"codex", "shared", "test-host"})
+    assert deadline(ctx.db) == at
+    sweep(ctx.db, at)
+
+    assert [[^wake_id, "holder", "canceled"], [new_wake, "holder", "pending"]] = notices(ctx.db)
+
+    assert %{wakeId: ^new_wake, repeatNumber: 0} =
+             HolderProd.evidence(ctx.db, @assignment, "holder")
+  end
+
+  test "report-only durably meters would-send events without leaving a wake", ctx do
+    settings = %{cap: 1, report_only: true}
+    at = ctx.opened + @quiet
+
+    for {due, count} <- [{at, 1}, {at + @quiet, 0}, {at + 2 * @quiet, 1}] do
+      assert {:ok, {:would_send, ^count}} =
+               DB.transaction(ctx.db, &HolderProd.admit_due_in_txn(&1, due, 100, settings))
+    end
+
+    assert [] = notices(ctx.db)
+    assert %{wakeId: nil, state: "scheduled"} = HolderProd.evidence(ctx.db, @assignment, "holder")
+
+    assert [[first], [second]] =
+             sql!(
+               ctx.db,
+               """
+               SELECT detail FROM lifecycle_events
+               WHERE kind='holder_prod_would_send' AND subject=?1 ORDER BY id
+               """,
+               [@assignment]
+             )
+
+    assert %{"repeatNumber" => 0, "episodeId" => episode, "at" => ^at} = JSON.decode!(first)
+    assert %{"repeatNumber" => 1, "episodeId" => ^episode} = JSON.decode!(second)
   end
 
   defp gateway_wake(db, target, params) do
