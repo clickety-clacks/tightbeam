@@ -728,23 +728,53 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert Ledger.pending_count(ctx.db, ctx.holder.session_key) == 0
   end
 
-  test "a failed mixed carrier reaches the dispatch opener and gives its ordinary sender a receipt",
+  test "a failed mixed carrier reports each dispatch assignment once and receipts its ordinary sender",
        ctx do
     opener = session(ctx.db, "mixed-dispatch-opener", ctx.main.session_key)
+    second_opener = session(ctx.db, "second-dispatch-opener", ctx.main.session_key)
     sender = session(ctx.db, "mixed-ordinary-sender", ctx.main.session_key)
     busy = hold_recipient!(ctx.db, ctx.holder.session_key)
 
-    dispatch =
-      Assignments.__handle__(ctx.db, "dispatch", %{
-        verb: "dispatch",
-        origin: "agent:#{opener.session_key}",
-        principal: {:session, opener.session_key},
+    [dispatch, second_dispatch] =
+      for recipient <- [opener, second_opener] do
+        Assignments.__handle__(ctx.db, "dispatch", %{
+          verb: "dispatch",
+          origin: "agent:#{recipient.session_key}",
+          principal: {:session, recipient.session_key},
+          session_key: ctx.holder.session_key,
+          target_role: nil,
+          role_fallback: false,
+          supervision_interval_ms: 1_000,
+          params: %{subject: "dispatch subject", brief: "private dispatch brief"}
+        })
+      end
+
+    [dispatch_wake, second_dispatch_wake] =
+      for assigned <- [dispatch, second_dispatch] do
+        Enum.find(Tightbeam.Wakes.list_for_session(ctx.db, ctx.holder.session_key), fn wake ->
+          wake.assignment_id == assigned.id
+        end)
+      end
+
+    duplicate =
+      Tightbeam.Wakes.schedule(ctx.db, %{
         session_key: ctx.holder.session_key,
-        target_role: nil,
-        role_fallback: false,
-        supervision_interval_ms: 1_000,
-        params: %{subject: "dispatch subject", brief: "private dispatch brief"}
+        creator_session_key: opener.session_key,
+        origin: dispatch_wake.origin,
+        prompt: dispatch_wake.prompt,
+        assignment_id: dispatch.id,
+        due_at: 0
       })
+
+    assert :queued =
+             Tightbeam.Gateway.deliver_prompt(
+               ctx.holder.session_key,
+               duplicate.origin,
+               duplicate.prompt,
+               db: ctx.db,
+               wake_id: duplicate.wake_id,
+               fire_wake_in_txn: true
+             )
 
     other =
       Assignments.__handle__(ctx.db, "assign", %{
@@ -778,10 +808,6 @@ defmodule Tightbeam.Productions.BubbleTest do
                fire_wake_in_txn: true
              )
 
-    [dispatch_wake] =
-      Tightbeam.Wakes.list_for_session(ctx.db, ctx.holder.session_key)
-      |> Enum.filter(&(&1.assignment_id == dispatch.id))
-
     finish_busy_recipient!(ctx.db, busy)
     [carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
 
@@ -801,28 +827,43 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
     assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
 
-    assert {:ok, [[opener_receipt]]} =
+    opener_key = opener.session_key
+    second_opener_key = second_opener.session_key
+    sender_key = sender.session_key
+    first_receipt_id = "wake-undelivered:#{turn.seq}:#{dispatch.id}"
+    second_receipt_id = "wake-undelivered:#{turn.seq}:#{second_dispatch.id}"
+    ordinary_receipt_id = "wake-undelivered:#{turn.seq}"
+
+    assert {:ok,
+            [
+              [^opener_key, ^first_receipt_id, opener_receipt],
+              [^second_opener_key, ^second_receipt_id, second_receipt],
+              [^sender_key, ^ordinary_receipt_id, ordinary_receipt]
+            ]} =
              DB.query(
                ctx.db,
-               "SELECT content FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
-               [
-                 opener.session_key,
-                 "wake-undelivered:#{turn.seq}:#{dispatch.id}"
-               ]
+               "SELECT sessionKey,clientMessageId,content FROM messages " <>
+                 "WHERE clientMessageId=?1 OR clientMessageId LIKE ?2 ORDER BY rowid",
+               [ordinary_receipt_id, ordinary_receipt_id <> ":%"]
              )
 
     assert opener_receipt =~ dispatch_wake.wake_id
+    assert opener_receipt =~ duplicate.wake_id
     assert opener_receipt =~ "Reason: " <> reason
+    refute opener_receipt =~ second_dispatch_wake.wake_id
     refute opener_receipt =~ ordinary.wake_id
-    assert undelivered_notices(ctx.db, opener.session_key, turn.seq) == []
 
-    assert [ordinary_receipt] = undelivered_notices(ctx.db, sender.session_key, turn.seq)
+    assert second_receipt =~ second_dispatch_wake.wake_id
+    assert second_receipt =~ "Reason: " <> reason
+    refute second_receipt =~ duplicate.wake_id
+
     assert ordinary_receipt =~ ordinary.wake_id
     refute ordinary_receipt =~ dispatch_wake.wake_id
     refute ordinary_receipt =~ reason
 
     assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
     assert Ledger.pending_count(ctx.db, opener.session_key) == 0
+    assert Ledger.pending_count(ctx.db, second_opener.session_key) == 0
   end
 
   test "a failed senderless notice to parentless Main surfaces its source once", ctx do

@@ -5723,6 +5723,11 @@ defmodule Tightbeam.Wakes do
 
     mixed? = mixed_dispatch_sources?(txn, sources)
 
+    source_order =
+      sources
+      |> Enum.with_index()
+      |> Map.new(fn {[wake_id | _], order} -> {wake_id, order} end)
+
     notices =
       sources
       |> Enum.reduce(%{}, fn [wake_id, creator, origin, target, assignment_id], recipients ->
@@ -5769,6 +5774,10 @@ defmodule Tightbeam.Wakes do
             key = {recipient, member_assignment}
             Map.update(recipients, key, [{wake_id, told_as}], &[{wake_id, told_as} | &1])
         end
+      end)
+      |> Enum.sort_by(fn {_recipient, members} ->
+        {first_wake_id, _route} = List.last(members)
+        Map.fetch!(source_order, first_wake_id)
       end)
       |> Enum.flat_map(fn {{recipient, member_assignment}, sources} ->
         sources = Enum.reverse(sources)
