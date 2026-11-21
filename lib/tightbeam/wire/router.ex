@@ -4982,6 +4982,15 @@ defmodule Tightbeam.Wire.Router do
     json(conn, status, %{"error" => Map.delete(result, :ok)})
   end
 
+  defp dispatch_error(
+         conn,
+         %{verb: "artifact-content-fetch"},
+         status,
+         %{code: "artifact_sha_mismatch"} = result
+       ) do
+    json(conn, status, %{"error" => Map.delete(result, :ok)})
+  end
+
   defp dispatch_error(conn, _call, status, %{code: code} = result)
        when code in [
               "decision_request_integrity_invalid",

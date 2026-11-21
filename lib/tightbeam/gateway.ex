@@ -1031,7 +1031,7 @@ defmodule Tightbeam.Gateway do
         Artifacts.record(db, Map.put(call, :artifact_base_dir, config[:base_dir]))
       end,
       {"artifact-content-fetch", []} => fn call ->
-        Tightbeam.ArtifactContent.fetch_call(db, call)
+        Tightbeam.ArtifactContent.fetch_call(db, call, config)
       end,
       {"artifact-get", []} => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
