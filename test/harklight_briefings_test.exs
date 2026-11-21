@@ -86,6 +86,7 @@ defmodule Tightbeam.HarklightBriefingsTest do
             sender_id: "briefing-sender",
             title: "Decision briefing",
             message_type: "request",
+            reply: true,
             decision_request_id: request.id
           }
       })
