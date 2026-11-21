@@ -1252,13 +1252,34 @@ defmodule Tightbeam.WorkspaceCleanup do
         fi
       done
       head_ref=
+      detached=
       if [ "$bare" -eq 0 ]; then
         git -c safe.directory='*' -C "$repo" rev-parse -q --verify HEAD >/dev/null 2>&1 && head_ref=HEAD
+        # Detached HEADs of every linked worktree, including ones outside the workdir.
+        detached=$(git -c safe.directory='*' -C "$repo" worktree list --porcelain 2>/dev/null |
+          awk '/^HEAD / { head = $2 } /^detached/ { print head }')
       fi
-      if [ -n "$durable" ]; then
-        unpushed=$(git -c safe.directory='*' -C "$repo" rev-list --count --branches --tags $head_ref --not $durable 2>/dev/null) || unpushed=unknown
-      else
-        unpushed=$(git -c safe.directory='*' -C "$repo" rev-list --count --branches --tags $head_ref 2>/dev/null) || unpushed=unknown
+      not_args=
+      [ -z "$durable" ] || not_args="--not $durable"
+      # Every local branch tip (with or without an upstream), every tag and every
+      # detached HEAD is tested for reachability from the durable remote refs.
+      unpushed=$(git -c safe.directory='*' -C "$repo" rev-list --count --branches --tags $head_ref $detached $not_args 2>/dev/null) || unpushed=unknown
+      unpushed_refs=
+      unpushed_n=0
+      if [ "$unpushed" != 0 ]; then
+        for ref in $(git -c safe.directory='*' -C "$repo" for-each-ref --format='%(refname)' refs/heads refs/tags 2>/dev/null) $detached; do
+          if [ -n "$(git -c safe.directory='*' -C "$repo" rev-list -n 1 "$ref" $not_args 2>/dev/null)" ]; then
+            unpushed_n=$((unpushed_n + 1))
+            if [ "$unpushed_n" -le 10 ]; then
+              case "$ref" in
+                refs/*) label=${ref#refs/} ;;
+                *) label=detached:$ref ;;
+              esac
+              unpushed_refs="${unpushed_refs:+$unpushed_refs,}$label"
+            fi
+          fi
+        done
+        [ "$unpushed_n" -le 10 ] || unpushed_refs="$unpushed_refs,+$((unpushed_n - 10))more"
       fi
       if [ "$bare" -eq 0 ]; then
         stashes=$(git_count stash list)
@@ -1275,6 +1296,7 @@ defmodule Tightbeam.WorkspaceCleanup do
       repo_state=$({
         git -c safe.directory='*' -C "$repo" rev-parse -q --verify HEAD
         git -c safe.directory='*' -C "$repo" for-each-ref
+        printf '%s\n' "$detached"
         if [ "$bare" -eq 0 ]; then
           git -c safe.directory='*' -C "$repo" stash list
           git -c safe.directory='*' -C "$repo" status --porcelain
@@ -1284,6 +1306,11 @@ defmodule Tightbeam.WorkspaceCleanup do
       [ -n "$repo_state" ] || repo_state=unknown
       is_acknowledged git "$rel@$repo_state" && return 0
       detail="unpushed_commits=$unpushed stashes=$stashes modified=$modified untracked=$untracked"
+      [ -z "$unpushed_refs" ] || detail="$detail unpushed_refs=$unpushed_refs"
+      if [ "$stashes" != 0 ] && [ "$stashes" != unknown ]; then
+        stash_names=$(git -c safe.directory='*' -C "$repo" stash list --format=%gd 2>/dev/null | head -10 | paste -sd, -)
+        [ -z "$stash_names" ] || detail="$detail stash_entries=$stash_names"
+      fi
       [ "$bare" -eq 0 ] || detail="$detail bare=1"
       [ -z "$local_remotes" ] || detail="$detail workdir_remotes=$local_remotes"
       emit_loss git "$rel" "$detail state=$repo_state"

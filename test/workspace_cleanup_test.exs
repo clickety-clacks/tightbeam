@@ -851,6 +851,52 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       assert File.dir?(ctx.workspace)
     end
 
+    test "a local branch with no upstream carrying an unpushed commit holds removal and is named",
+         ctx do
+      repo = init_pushed_repo(ctx, "branches")
+      git!(repo, ["checkout", "-q", "-b", "feature-no-upstream"])
+      commit(repo, "feature.txt", "only on this branch")
+      git!(repo, ["checkout", "-q", "-"])
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert [%{"path" => "branches", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+
+      assert detail =~ "unpushed_commits=1"
+      assert detail =~ "unpushed_refs=heads/feature-no-upstream"
+    end
+
+    test "branches whose commits are all reachable from a remote ref do not hold removal", ctx do
+      repo = init_pushed_repo(ctx, "reachable")
+      git!(repo, ["branch", "no-upstream-but-pushed"])
+      git!(repo, ["tag", "pushed-tag"])
+      retire(ctx)
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      refute File.exists?(ctx.workspace)
+    end
+
+    test "a detached HEAD in a linked worktree outside the workdir holds removal", ctx do
+      repo = init_pushed_repo(ctx, "main-repo")
+      outside = Path.join(ctx.base, "linked-worktree")
+      git!(repo, ["worktree", "add", "-q", "--detach", outside])
+      commit(outside, "detached.txt", "only on a detached HEAD")
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert [%{"path" => "main-repo", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+
+      assert detail =~ "unpushed_refs=detached:"
+    end
+
     test "a clean checkout with every commit on a remote ref is removed without ceremony", ctx do
       init_pushed_repo(ctx, "clean")
       File.write!(Path.join(ctx.workspace, "clean/ignored.log"), "ignored")
