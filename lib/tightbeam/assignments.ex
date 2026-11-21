@@ -2242,6 +2242,12 @@ defmodule Tightbeam.Assignments do
             assignment(row)
             |> then(&Mementos.attach(db, "assignment", &1))
             |> then(&RecordFyis.attach(db, "assignment", &1))
+            |> then(fn assignment ->
+              case Tightbeam.HolderProd.evidence(db, assignment.id, assignment.holderKey) do
+                nil -> assignment
+                evidence -> Map.put(assignment, :holderProd, evidence)
+              end
+            end)
             |> Map.put(:reopenings, list_reopenings(db, assignment_id))
             |> Map.put(
               :commitRefCorrections,

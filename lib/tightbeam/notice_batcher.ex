@@ -1274,8 +1274,12 @@ defmodule Tightbeam.NoticeBatcher do
       [] ->
         case Wakes.get_in_txn(txn, wake_id) do
           %{state: "pending"} = wake ->
-            update_source_lane_in_txn(txn, wake)
-            true
+            if Tightbeam.HolderProd.prepare_in_txn(txn, wake) do
+              update_source_lane_in_txn(txn, wake)
+              true
+            else
+              false
+            end
 
           _ ->
             false

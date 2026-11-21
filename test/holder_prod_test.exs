@@ -1,0 +1,210 @@
+defmodule Tightbeam.HolderProdTest do
+  use Tightbeam.TestCase, async: false
+
+  alias Tightbeam.{Assignments, DB, HolderProd, Model, Org, SessionCustodyTransfer, Wakes}
+  alias Tightbeam.DB.Txn
+
+  @quiet 30 * 60 * 1_000
+  @assignment "asg_fixture"
+
+  setup do
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = ensure_all_schemas(db)
+    sql!(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('fixture-owner',0,1)")
+
+    for key <- ["holder", "other", "successor"] do
+      Org.create(db, %{
+        session_key: key,
+        display_name: key,
+        owner_user_id: "fixture-owner",
+        origin: "user:fixture-owner",
+        archetype: "default",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("fixture"),
+        host: "test-host"
+      })
+    end
+
+    opened = System.system_time(:millisecond) - @quiet
+
+    sql!(
+      db,
+      """
+      INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt,state)
+      VALUES (?1,'fixture work','holder','other',?2,'open')
+      """,
+      [@assignment, opened]
+    )
+
+    %{db: db, opened: opened}
+  end
+
+  test "only one source is admitted at the threshold and its evidence is assignment-scoped",
+       ctx do
+    threshold = ctx.opened + @quiet
+    assert deadline(ctx.db) == threshold
+    sweep(ctx.db, threshold - 1)
+    assert notices(ctx.db) == []
+
+    sweep(ctx.db, threshold)
+    sweep(ctx.db, threshold + @quiet)
+    assert [[wake_id, "holder", "pending"]] = notices(ctx.db)
+    assert deadline(ctx.db) == nil
+
+    result =
+      Assignments.__handle__(ctx.db, "assignment-get", %{
+        principal: {:user, "fixture-owner"},
+        params: %{assignment_id: @assignment}
+      })
+
+    assert %{
+             id: @assignment,
+             holderProd: %{
+               holderSessionKey: "holder",
+               quietSince: since,
+               episodeId: episode,
+               wakeId: ^wake_id,
+               state: "pending"
+             }
+           } = result
+
+    assert since == ctx.opened
+    assert is_binary(episode)
+    assert Wakes.get(ctx.db, wake_id).prompt =~ "fact, predicate, or timed fallback"
+
+    # Restarting the scheduler preserves the source and cannot issue another.
+    scheduler =
+      start_supervised!(
+        {Wakes, db: ctx.db, name: nil, holder_prod: true, deliver: fn _ -> :ok end}
+      )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert length(notices(ctx.db)) == 1
+  end
+
+  for wait <- [:timed, :fact, :predicate, :after_turn] do
+    test "a holder's own #{wait} wait suppresses the prod", ctx do
+      at = ctx.opened + @quiet
+      record_wait(ctx.db, "holder", "holder", at + @quiet, unquote(wait))
+
+      assert deadline(ctx.db) == nil
+      sweep(ctx.db, at)
+      assert notices(ctx.db) == []
+      refute HolderProd.evidence(ctx.db, @assignment, "holder")
+    end
+
+    test "another session's #{wait} wait does not cover the assignment", ctx do
+      at = ctx.opened + @quiet
+      record_wait(ctx.db, "other", "other", at + @quiet, unquote(wait))
+      record_wait(ctx.db, "other", "holder", at + @quiet, unquote(wait))
+
+      assert deadline(ctx.db) == at
+      sweep(ctx.db, at)
+      assert [[_, "holder", "pending"]] = notices(ctx.db)
+    end
+  end
+
+  test "a linked queued turn and an unrelated running turn cover the holder", ctx do
+    at = ctx.opened + @quiet
+
+    sql!(
+      ctx.db,
+      """
+      INSERT INTO turns(sessionKey,messageId,origin,prompt,assignmentId,status,createdAt,startedAt)
+      VALUES ('holder','queued','user:fixture-owner','queued',?1,'queued',?2,NULL),
+             ('holder','running','user:fixture-owner','running',NULL,'running',?2,?2)
+      """,
+      [@assignment, at]
+    )
+
+    sweep(ctx.db, at)
+    assert notices(ctx.db) == []
+
+    for message <- ["queued", "running"] do
+      sql!(ctx.db, "UPDATE turns SET status='delivered',endedAt=?2 WHERE messageId=?1", [
+        message,
+        at + 1
+      ])
+    end
+
+    sweep(ctx.db, at + @quiet)
+    assert notices(ctx.db) == []
+    sweep(ctx.db, at + @quiet + 1)
+    assert [[_, "holder", "pending"]] = notices(ctx.db)
+  end
+
+  test "custody transfer disarms the old pending source and starts a fresh interval", ctx do
+    sweep(ctx.db, ctx.opened + @quiet)
+    assert [[previous, "holder", "pending"]] = notices(ctx.db)
+
+    assert %{"appliedAt" => transferred} =
+             SessionCustodyTransfer.handle(ctx.db, %{
+               principal: {:user, "fixture-owner"},
+               params: %{
+                 from_session_key: "holder",
+                 to_session_key: "successor",
+                 idempotency_key: "fixture-transfer"
+               }
+             })
+
+    assert %{state: "canceled"} = Wakes.get(ctx.db, previous)
+    refute HolderProd.evidence(ctx.db, @assignment, "holder")
+
+    assert %{holderSessionKey: "successor", quietSince: ^transferred, wakeId: nil} =
+             HolderProd.evidence(ctx.db, @assignment, "successor")
+
+    sweep(ctx.db, transferred + @quiet - 1)
+    assert [[^previous, "holder", "canceled"]] = notices(ctx.db)
+    sweep(ctx.db, transferred + @quiet)
+    assert [[^previous, "holder", "canceled"], [_, "successor", "pending"]] = notices(ctx.db)
+  end
+
+  defp notices(db) do
+    sql!(db, """
+    SELECT wakeId,sessionKey,state FROM wakes
+    WHERE obligationRef LIKE 'assignment-holder-prod-v1:%' ORDER BY rowid
+    """)
+  end
+
+  defp deadline(db) do
+    {:ok, deadline} =
+      DB.transaction(db, &HolderProd.next_deadline_in_txn(&1, System.system_time(:millisecond)))
+
+    deadline
+  end
+
+  defp sweep(db, at) do
+    assert {:ok, :ok} = DB.transaction(db, &HolderProd.admit_due_in_txn(&1, at))
+  end
+
+  defp record_wait(db, creator, recipient, due_at, wait) do
+    options =
+      case wait do
+        :timed -> %{}
+        :fact -> %{condition_kind: "assignment-landed", condition_scope: @assignment}
+        :predicate -> %{wait_mode: "dependency", predicate: %{"conditions" => []}}
+        :after_turn -> %{wait_mode: "after-turn", originating_turn_seq: 1}
+      end
+
+    assert {:ok, _wake} =
+             DB.transaction(db, fn %Txn{} = txn ->
+               Wakes.schedule_in_txn(
+                 txn,
+                 Map.merge(options, %{
+                   origin: "session:" <> creator,
+                   creator_session_key: creator,
+                   session_key: recipient,
+                   assignment_id: @assignment,
+                   due_at: due_at,
+                   prompt: "fixture wait"
+                 })
+               )
+             end)
+  end
+
+  defp sql!(db, query, bindings \\ []) do
+    {:ok, rows} = DB.query(db, query, bindings)
+    rows
+  end
+end

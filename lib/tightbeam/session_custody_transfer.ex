@@ -182,6 +182,8 @@ defmodule Tightbeam.SessionCustodyTransfer do
       [target, source]
     )
 
+    Tightbeam.HolderProd.custody_changed_in_txn(txn, selected.holders, at)
+
     update_ids!(
       txn,
       selected.openers,

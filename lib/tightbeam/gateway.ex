@@ -349,6 +349,7 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.ListenerLifecycle, []},
          {Tightbeam.Wakes,
           db: db,
+          holder_prod: true,
           deliver: deliver,
           delivery_opts: delivery_config,
           internal_consumers: %{

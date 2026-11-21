@@ -1104,6 +1104,7 @@ defmodule Tightbeam.Wakes do
   @doc false
   def assignment_closed_in_txn(%Txn{} = txn, assignment_id) do
     Tightbeam.Retirements.blocker_changed_in_txn(txn, "assignment", assignment_id)
+    Tightbeam.HolderProd.cancel_pending_in_txn(txn, assignment_id)
 
     case Txn.q(txn, "SELECT holderKey FROM assignments WHERE id=?1 AND state='closed'", [
            assignment_id
@@ -2891,6 +2892,10 @@ defmodule Tightbeam.Wakes do
   def row_commit_in_txn(%Txn{} = txn, transitions) do
     transitions = List.wrap(transitions) ++ DB.take_row_commits(txn)
 
+    if Enum.any?(transitions, &(Map.get(&1, :domain) in ["assignment", "turn"])) do
+      Tightbeam.HolderProd.changed_in_txn(txn)
+    end
+
     if not wait_recognition_ready?(txn) and
          Enum.any?(transitions, &filing_transition?/1) do
       raise RuleEvaluationUnavailable
@@ -4545,6 +4550,9 @@ defmodule Tightbeam.Wakes do
       sender_replaced_own_prod?(txn, command, wake) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
+      holder_prod_superseded?(command, wake) ->
+        {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
+
       scheduler_delivery_without_source?(command, wake) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
@@ -4564,6 +4572,19 @@ defmodule Tightbeam.Wakes do
        do: true
 
   defp sender_withdrew_own_notice?(_command), do: false
+
+  defp holder_prod_superseded?(
+         %{
+           requester: %{kind: "process", id: "tightbeam:supervision"},
+           reason_kind: "superseded",
+           causal_source: %{kind: "wake", id: wake_id},
+           outcome: %{kind: "no_replacement"}
+         },
+         %{wake_id: wake_id} = wake
+       ),
+       do: Tightbeam.HolderProd.own_notice?(wake)
+
+  defp holder_prod_superseded?(_command, _wake), do: false
 
   # A sender's prod revision replaces its message, not the assignment or work
   # item mentioned by that message. A closed link must not block withdrawal.
@@ -5529,6 +5550,7 @@ defmodule Tightbeam.Wakes do
       end
 
       publish_change_in_txn(txn, "wake.canceled", wake.wake_id)
+      Tightbeam.HolderProd.changed_in_txn(txn)
       cancellation_result(cancellation)
     else
       false
@@ -6700,6 +6722,7 @@ defmodule Tightbeam.Wakes do
       scanned_through: -1,
       batch: Keyword.get(opts, :batch, 100),
       delivery_opts: Keyword.get(opts, :delivery_opts, []),
+      holder_prod: Keyword.get(opts, :holder_prod, false),
       internal_consumers: Keyword.get(opts, :internal_consumers, %{})
     }
 
@@ -6745,6 +6768,11 @@ defmodule Tightbeam.Wakes do
   def handle_cast(:wake_ready, state) do
     {:noreply, queue_due(state)}
   end
+
+  def handle_cast(:holder_prod_changed, %{holder_prod: true} = state),
+    do: {:noreply, arm_due_timer(state)}
+
+  def handle_cast(:holder_prod_changed, state), do: {:noreply, state}
 
   def handle_cast({:schedule_changed, due_at}, state) do
     cond do
@@ -6986,6 +7014,10 @@ defmodule Tightbeam.Wakes do
     Tightbeam.CronWake.fire_due(db, now())
     recognize_due_dependency_waits(db)
     evaluate_conditions(state, :tick)
+
+    if state.holder_prod do
+      transaction!(db, &Tightbeam.HolderProd.admit_due_in_txn(&1, now()))
+    end
 
     # E's old generations are historical data, not scheduler input. Retire
     # their pending wake rows without consulting effort_checkin_generations so
@@ -8119,7 +8151,18 @@ defmodule Tightbeam.Wakes do
       |> Enum.map(&max(&1, pass_at || 0))
       |> Enum.min(fn -> nil end)
 
-    due_at = [next, retry_at] |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
+    holder_prod_at =
+      if state.holder_prod do
+        DB.background_pass(
+          fn -> transaction!(state.db, &Tightbeam.HolderProd.next_deadline_in_txn(&1, now())) end,
+          now() + 1_000
+        )
+      end
+
+    holder_prod_at =
+      if holder_prod_at && pass_at, do: max(holder_prod_at, pass_at), else: holder_prod_at
+
+    due_at = [next, retry_at, holder_prod_at] |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
     set_due_timer(state, due_at)
   end
 
