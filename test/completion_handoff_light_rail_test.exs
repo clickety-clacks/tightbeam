@@ -2193,7 +2193,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
 
     assert_raise ArgumentError, "duplicate reaction identity or name", fn ->
-      Rules.reaction_plans(%{"kind" => "assignment", "org" => "test", "id" => "test"}, %{})
+      event = %{"kind" => "assignment", "org" => "test", "id" => "test"}
+      Rules.reaction_plans(event, %{"sessions" => []})
     end
   end
 
