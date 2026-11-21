@@ -48,13 +48,16 @@ defmodule Tightbeam.HarklightWakesTest do
     def start_link({db, test}), do: GenServer.start_link(__MODULE__, {db, test, []})
     def init(state), do: {:ok, state}
 
-    def handle_call({:refuse, sql}, _from, {db, test, pending}),
-      do: {:reply, :ok, {db, test, pending ++ [sql]}}
+    def handle_call({:refuse, sql}, from, state),
+      do: handle_call({:refuse, sql, %DB.Overloaded{}}, from, state)
 
-    def handle_call({:query, sql, _} = request, _from, {db, test, [next | rest]} = state) do
+    def handle_call({:refuse, sql, error}, _from, {db, test, pending}),
+      do: {:reply, :ok, {db, test, pending ++ [{sql, error}]}}
+
+    def handle_call({:query, sql, _} = request, _from, {db, test, [{next, error} | rest]} = state) do
       if String.contains?(sql, next) do
         send(test, {:refused_sql, next})
-        {:reply, {:error, %DB.Overloaded{}}, {db, test, rest}}
+        {:reply, {:error, error}, {db, test, rest}}
       else
         {:reply, GenServer.call(db, request, :infinity), state}
       end
@@ -177,7 +180,7 @@ defmodule Tightbeam.HarklightWakesTest do
       ] ->
         Agent.update(accepted, fn _ -> op end)
         send(test_pid, {:receipt_attempted, op})
-        {JSON.encode!(%{kind: "outcome_unknown", op_id: op}), 7}
+        frame(%{kind: "outcome_unknown", operation: "receipt", op_id: op, status: 503}, 7)
     end
 
     opts = [db: proxy, runner: runner, retry_delay: 200]
@@ -217,12 +220,21 @@ defmodule Tightbeam.HarklightWakesTest do
     refute_receive {:receipt_attempted, _}, 30
   end
 
-  test "Round 26 holds a dispatched receipt through restart until exact settlement", %{
-    db: db,
-    call: call,
-    session: session,
-    main: main
-  } do
+  for {failure, pause_recorded} <- [{"overload", true}, {"refused pause write", false}] do
+    test "Round 26 holds a dispatched receipt through restart after #{failure}", context do
+      assert_guarded_receipt(context, unquote(pause_recorded))
+    end
+  end
+
+  defp assert_guarded_receipt(
+         %{
+           db: db,
+           call: call,
+           session: session,
+           main: main
+         },
+         pause_recorded
+       ) do
     :ok = HarklightWakes.capture_feed(db, @handle, 1, [feed_chat(1, "request", "chat")], :live)
     assert {:ok, [[wake]]} = DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries")
     turn = deliver_discussion_turn!(db, wake, session.session_key)
@@ -236,6 +248,7 @@ defmodule Tightbeam.HarklightWakesTest do
         frame(%{kind: "journal", journal_id: "receipt-journal"})
 
       ["retry", "--op-id", op, "--journal-id", "receipt-journal"] ->
+        send(parent, {:receipt_retry, op})
         frame(%{kind: "operation_absent", op_id: op, journal_id: "receipt-journal"}, 1)
 
       ["receipt" | _] = args ->
@@ -246,22 +259,30 @@ defmodule Tightbeam.HarklightWakesTest do
 
     proxy = start_supervised!({RefusingHarklightDB, {db, self()}})
     refuse = "INSERT INTO harklight_operation_pauses"
-    assert :ok = GenServer.call(proxy, {:refuse, refuse})
+
+    error =
+      if pause_recorded,
+        do: %DB.Overloaded{},
+        else: %DB.Error{message: "database or disk is full"}
+
+    assert :ok = GenServer.call(proxy, {:refuse, refuse, error})
     opts = [db: proxy, runner: runner, retry_delay: 10]
     start_supervised!({HarklightReceipts, opts})
     assert_receive {:receipt_dispatched, op}
+    assert_received {:receipt_retry, ^op}
     assert_receive {:refused_sql, ^refuse}
 
-    assert eventually(fn ->
-             match?(
-               {:ok, [[_]]},
-               DB.query(db, "SELECT diagnostic FROM harklight_operation_pauses")
-             )
-           end)
+    assert eventually(fn -> :sys.get_state(HarklightReceipts).task == nil end)
+    assert {:ok, [[count]]} = DB.query(db, "SELECT count(*) FROM harklight_operation_pauses")
+    assert count == if(pause_recorded, do: 1, else: 0)
 
+    :ok = HarklightReceipts.dispatched(turn.seq)
+    refute_receive {:receipt_retry, ^op}, 100
+    assert {:ok, [[^op]]} = DB.query(db, "SELECT opId FROM harklight_operation_guards")
+    previous = Process.whereis(HarklightReceipts)
     assert :ok = stop_supervised(HarklightReceipts)
     no_op = fn args -> flunk("automatic receipt recovery invoked #{inspect(args)}") end
-    start_supervised!({HarklightReceipts, Keyword.put(opts, :runner, no_op)})
+    assert previous != start_supervised!({HarklightReceipts, Keyword.put(opts, :runner, no_op)})
 
     assert {:ok, false} = HarklightReceipts.drain(db, :all, runner: no_op)
     refute_receive {:receipt_dispatched, _}
@@ -271,6 +292,18 @@ defmodule Tightbeam.HarklightWakesTest do
 
     settle_call = %{call | params: %{op_id: op}}
     assert :unknown = HarklightReceipts.settle_paused(db, main.session_key, op, runner: no_op)
+
+    assert %{outcome: "outcome_unknown", op_id: ^op} =
+             HarklightSend.settle(db, settle_call,
+               runner: fn ["retry", "--op-id", ^op, "--journal-id", "receipt-journal"] ->
+                 frame(
+                   %{kind: "outcome_unknown", operation: "receipt", op_id: op, status: 503},
+                   7
+                 )
+               end
+             )
+
+    assert {:ok, false} = HarklightReceipts.drain(db, :all, runner: no_op)
 
     assert %{outcome: "committed", settled_command: "receipt", op_id: ^op} =
              HarklightSend.settle(db, settle_call,
@@ -5518,6 +5551,78 @@ defmodule Tightbeam.HarklightWakesTest do
       assert %{state: "committed", message_id: "replacement"} = HarklightLifecycle.lookup(db, op)
       refute_received {:committed_response, _, _}
     end
+  end
+
+  test "Round 26 guards a send when its pause write fails and the caller exits", %{
+    db: db,
+    call: call
+  } do
+    parent = self()
+    proxy = start_supervised!({RefusingHarklightDB, {db, parent}})
+    refuse = "INSERT INTO harklight_operation_pauses"
+
+    assert :ok =
+             GenServer.call(
+               proxy,
+               {:refuse, refuse, %DB.Error{message: "database or disk is full"}}
+             )
+
+    normal_runner = lifecycle_runner(db)
+
+    runner = fn
+      ["send", "--execute", "--op-id", op] = args ->
+        send(parent, {:committed_response, op, normal_runner.(args)})
+        projection_failure("send", op, "refused-pause-request")
+
+      args ->
+        normal_runner.(args)
+    end
+
+    params = %{
+      harklight_session: @handle,
+      message_type: "fyi",
+      title: "Update",
+      sender_id: "sender"
+    }
+
+    caller =
+      Task.async(fn ->
+        HarklightSend.send_request(proxy, %{call | params: params}, runner: runner)
+      end)
+
+    assert %{code: "internal_error", outcome: "outcome_unknown", op_id: op, reason: reason} =
+             Task.await(caller)
+
+    assert eventually(fn -> not Process.alive?(caller.pid) end)
+    assert_received {:refused_sql, ^refuse}
+    assert_received {:committed_response, ^op, committed}
+    assert reason =~ "could not record the recovery pause"
+    assert reason =~ "refused-pause-request"
+    assert {:ok, []} = DB.query(db, "SELECT opId FROM harklight_operation_pauses")
+
+    no_automatic_retry = fn args -> send(parent, {:unexpected_automatic_retry, args}) end
+    assert :ok = HarklightSend.recover_pending(db, runner: no_automatic_retry)
+    refute_received {:unexpected_automatic_retry, _}
+    assert {:ok, [[^op]]} = DB.query(db, "SELECT opId FROM harklight_operation_guards")
+
+    settle = %{call | params: %{op_id: op}}
+
+    assert %{outcome: "outcome_unknown", op_id: ^op} =
+             HarklightSend.settle(db, settle,
+               runner: fn ["retry", "--op-id", ^op, "--journal-id", "lifecycle-journal"] ->
+                 frame(%{kind: "outcome_unknown", operation: "send", op_id: op, status: 503}, 7)
+               end
+             )
+
+    assert :ok = HarklightSend.recover_pending(db, runner: no_automatic_retry)
+    refute_received {:unexpected_automatic_retry, _}
+
+    assert %{outcome: "committed", message_id: "replacement", op_id: ^op} =
+             HarklightSend.settle(db, settle,
+               runner: fn ["retry", "--op-id", ^op, "--journal-id", "lifecycle-journal"] ->
+                 committed
+               end
+             )
   end
 
   test "a supersede naming an outcome_unknown send applies the valid targets and warns for it", %{

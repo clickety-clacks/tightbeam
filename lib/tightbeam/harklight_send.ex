@@ -124,15 +124,8 @@ defmodule Tightbeam.HarklightSend do
          payload = send_payload(request, files, input.decision_request_id, input.unresolved),
          %{state: "pending"} <- HarklightWakes.prepare_send(db, call, op_id, payload) do
       :global.trans({{__MODULE__, db, op_id}, self()}, fn ->
-        with :ok <- HarklightWakes.mark_send_attempt(db, call, op_id, payload) do
-          response =
-            if prepared["kind"] == "committed",
-              do: {:ok, prepared},
-              else:
-                invoke(runner, ["send", "--execute", "--op-id", op_id], "committed", op_id,
-                  change: true
-                )
-
+        with :ok <- HarklightWakes.mark_send_attempt(db, call, op_id, payload),
+             {:ok, response} <- execute_prepared(db, runner, op_id, prepared) do
           finish_send(db, call, op_id, payload, request, response, "send", opts)
         else
           {:error, reason} -> failure("send", reason, early_reason(reason), "failed", identity)
@@ -142,6 +135,15 @@ defmodule Tightbeam.HarklightSend do
       %{code: code} -> failure("send", code, early_reason(code), "failed", identity)
       {:error, code} -> failure("send", code, early_reason(code), "failed", identity)
     end
+  end
+
+  defp execute_prepared(_db, _runner, _op_id, %{"kind" => "committed"} = result),
+    do: {:ok, {:ok, result}}
+
+  defp execute_prepared(db, runner, op_id, _prepared) do
+    HarklightFailures.guarded_attempt(db, op_id, :automatic, fn ->
+      invoke(runner, ["send", "--execute", "--op-id", op_id], "committed", op_id, change: true)
+    end)
   end
 
   defp send_payload(request, files, decision_request_id, unresolved) do
@@ -197,7 +199,7 @@ defmodule Tightbeam.HarklightSend do
           failure(command, code, reason, outcome, identity)
 
         {:internal_error, operation, request_id} ->
-          reason = HarklightFailures.hold_operation(db, operation, op_id, request_id)
+          {_pause, reason} = HarklightFailures.hold_operation(db, operation, op_id, request_id)
 
           failure(
             command,
@@ -397,22 +399,22 @@ defmodule Tightbeam.HarklightSend do
                :ok <- origin!(db, call),
                {:ok, runner} <- runner(opts),
                %{"protocol" => 2, "journal_id" => journal_id} when is_binary(journal_id) <-
-                 record.request do
+                 record.request,
+               {:ok, response} <-
+                 HarklightFailures.guarded_attempt(db, op_id, mode, fn ->
+                   invoke(
+                     runner,
+                     ["retry", "--op-id", op_id, "--journal-id", journal_id],
+                     "committed",
+                     op_id, operations: ["send"], journal_id: journal_id, change: true)
+                 end) do
             finish_send(
               db,
               call,
               op_id,
               record.payload,
               record.request,
-              invoke(
-                runner,
-                ["retry", "--op-id", op_id, "--journal-id", journal_id],
-                "committed",
-                op_id,
-                operations: ["send"],
-                journal_id: journal_id,
-                change: true
-              ),
+              response,
               "settle",
               opts
             )
@@ -476,8 +478,11 @@ defmodule Tightbeam.HarklightSend do
 
           with :ok <- allow_send_recovery(db, op_id, mode),
                :ok <- origin!(db, call),
-               {:ok, runner} <- runner(opts) do
-            response = retry_change(runner, change)
+               {:ok, runner} <- runner(opts),
+               {:ok, response} <-
+                 HarklightFailures.guarded_attempt(db, op_id, mode, fn ->
+                   retry_change(runner, change)
+                 end) do
             finish_change(db, target, op_id, change.command, response, "settle")
           else
             {:held, diagnostic} ->
@@ -587,14 +592,21 @@ defmodule Tightbeam.HarklightSend do
              context
            ) do
         %{state: "pending"} ->
-          finish_change(
-            db,
-            record,
-            op_id,
-            stored_command,
-            invoke_change(runner, request, op_id, item_id, command, in_reply_to),
-            command
-          )
+          case HarklightFailures.guarded_attempt(db, op_id, :automatic, fn ->
+                 invoke_change(runner, request, op_id, item_id, command, in_reply_to)
+               end) do
+            {:ok, response} ->
+              finish_change(db, record, op_id, stored_command, response, command)
+
+            {:error, code} ->
+              failure(
+                command,
+                code,
+                early_reason(code),
+                "failed",
+                Map.put(identity(record), :op_id, op_id)
+              )
+          end
 
         %{code: code} ->
           failure(command, code, early_reason(code), "failed", identity(record))
@@ -667,7 +679,7 @@ defmodule Tightbeam.HarklightSend do
         end
 
       {:internal_error, operation, request_id} ->
-        reason = HarklightFailures.hold_operation(db, operation, op_id, request_id)
+        {_pause, reason} = HarklightFailures.hold_operation(db, operation, op_id, request_id)
 
         failure(
           result_command,

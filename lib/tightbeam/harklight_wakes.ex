@@ -718,6 +718,7 @@ defmodule Tightbeam.HarklightWakes do
         AND COALESCE(json_extract(s.payload,'$.operation_kind'),'send')<>'change'
         AND NOT EXISTS (SELECT 1 FROM harklight_command_results r WHERE r.opId=s.opId)
         AND NOT EXISTS (SELECT 1 FROM harklight_operation_pauses p WHERE p.opId=s.opId)
+        AND NOT EXISTS (SELECT 1 FROM harklight_operation_guards g WHERE g.opId=s.opId)
       ORDER BY s.attemptedAt,s.opId
       """
     )

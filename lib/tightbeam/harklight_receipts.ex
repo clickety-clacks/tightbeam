@@ -203,13 +203,14 @@ defmodule Tightbeam.HarklightReceipts do
            SELECT argv,opId,journalId FROM harklight_handoff_receipts r
            WHERE r.completedAt IS NULL
              AND NOT EXISTS (SELECT 1 FROM harklight_operation_pauses p WHERE p.opId=r.opId)
+             AND NOT EXISTS (SELECT 1 FROM harklight_operation_guards g WHERE g.opId=r.opId)
            ORDER BY r.turnSeq,r.wakeId
            """
          ) do
       {:ok, rows} ->
         Enum.reduce(rows, false, fn [argv, op, journal], pending ->
           result = process_receipt(db, opts, JSON.decode!(argv), op, journal)
-          pending or result not in [:ok, :paused]
+          pending or result not in [:ok, :paused, :guarded]
         end)
 
       {:error, _reason} ->
@@ -223,21 +224,25 @@ defmodule Tightbeam.HarklightReceipts do
              db,
              """
              SELECT r.journalId,p.diagnostic FROM harklight_handoff_receipts r
-             JOIN harklight_operation_pauses p ON p.opId=r.opId
+             LEFT JOIN harklight_operation_pauses p ON p.opId=r.opId
+             LEFT JOIN harklight_operation_guards g ON g.opId=r.opId
              JOIN turns t ON t.seq=r.turnSeq
              WHERE r.opId=?1 AND t.sessionKey=?2 AND r.completedAt IS NULL
+               AND (p.opId IS NOT NULL OR g.opId IS NOT NULL)
              """,
              [op, session_key]
            ) do
         {:ok, [[journal, diagnostic]]} ->
           with {:ok, runner} <- runner(opts),
-               result <-
-                 run_operation(runner, ["retry", "--op-id", op, "--journal-id", journal], op),
+               {:ok, result} <-
+                 HarklightFailures.guarded_attempt(db, op, :explicit, fn ->
+                   retry_receipt(runner, op, journal)
+                 end),
                :ok <- settle_exact_receipt(db, op, result) do
             :ok
           else
-            {:error, reason} when is_binary(reason) -> {:error, reason}
-            _ -> {:error, diagnostic}
+            {pause, reason} when pause in [:paused, :pause_unrecorded] -> {:error, reason}
+            _ -> {:error, diagnostic || HarklightFailures.guard_diagnostic(op)}
           end
 
         {:ok, []} ->
@@ -250,18 +255,29 @@ defmodule Tightbeam.HarklightReceipts do
   end
 
   defp process_receipt(db, opts, argv, op, journal) do
-    with {:ok, runner} <- runner(opts),
-         {:ok, journal} <- bind_journal(db, runner, op, journal) do
-      result = run_operation(runner, ["retry", "--op-id", op, "--journal-id", journal], op)
+    :global.trans({{__MODULE__, db, op}, self()}, fn ->
+      with {:ok, runner} <- runner(opts),
+           {:ok, journal} <- bind_journal(db, runner, op, journal),
+           {:ok, result} <-
+             HarklightFailures.guarded_attempt(db, op, :automatic, fn ->
+               case retry_receipt(runner, op, journal) do
+                 {[%{"kind" => "operation_absent", "op_id" => ^op, "journal_id" => ^journal}], 1} ->
+                   run_operation(runner, argv ++ ["--op-id", op], op)
 
-      case result do
-        {[%{"kind" => "operation_absent", "op_id" => ^op, "journal_id" => ^journal}], 1} ->
-          settle_result(db, op, run_operation(runner, argv ++ ["--op-id", op], op))
-
-        _ ->
-          settle_result(db, op, result)
+                 result ->
+                   result
+               end
+             end) do
+        settle_result(db, op, result)
+      else
+        {:error, "harklight_recovery_held"} -> :guarded
+        error -> error
       end
-    end
+    end)
+  end
+
+  defp retry_receipt(runner, op, journal) do
+    run_operation(runner, ["retry", "--op-id", op, "--journal-id", journal], op)
   end
 
   defp bind_journal(_db, _runner, _op, id) when is_binary(id), do: {:ok, id}
@@ -285,7 +301,8 @@ defmodule Tightbeam.HarklightReceipts do
 
   defp settle_result(db, op, result) do
     case settle_exact_receipt(db, op, result) do
-      {:error, reason} when is_binary(reason) -> :paused
+      {:paused, _diagnostic} -> :paused
+      {:pause_unrecorded, _diagnostic} -> :guarded
       {:error, :pending} -> retry_refused_receipt(db, op, result)
       other -> other
     end
@@ -311,7 +328,7 @@ defmodule Tightbeam.HarklightReceipts do
   end
 
   defp settle_exact_receipt(db, op, {:internal_error, operation, request_id}) do
-    {:error, HarklightFailures.hold_operation(db, operation, op, request_id)}
+    HarklightFailures.hold_operation(db, operation, op, request_id)
   end
 
   defp settle_exact_receipt(_db, _op, _result), do: {:error, :pending}

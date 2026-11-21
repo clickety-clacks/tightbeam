@@ -16,6 +16,9 @@ defmodule Tightbeam.HarklightFailures do
       opId TEXT PRIMARY KEY,
       diagnostic TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS harklight_operation_guards (
+      opId TEXT PRIMARY KEY
+    );
     """)
   end
 
@@ -31,12 +34,58 @@ defmodule Tightbeam.HarklightFailures do
     end)
   end
 
+  # Establish custody before an Agent invocation that can write. A crash or
+  # a failed pause write leaves this guard in place and requires explicit
+  # settlement. Ordinary retryable results release a newly acquired guard.
+  def guarded_attempt(db, op_id, mode, invoke) do
+    case DB.query(
+           db,
+           """
+           INSERT INTO harklight_operation_guards(opId) VALUES(?1)
+           ON CONFLICT(opId) DO NOTHING RETURNING opId
+           """,
+           [op_id]
+         ) do
+      {:ok, [[^op_id]]} ->
+        result = invoke.()
+
+        unless match?({:internal_error, _, _}, result) do
+          case DB.query(db, "DELETE FROM harklight_operation_guards WHERE opId=?1", [op_id]) do
+            {:ok, _} -> :ok
+            {:error, _} -> Logger.error(guard_diagnostic(op_id))
+          end
+        end
+
+        {:ok, result}
+
+      {:ok, []} when mode == :explicit ->
+        {:ok, invoke.()}
+
+      {:ok, []} ->
+        {:error, "harklight_recovery_held"}
+
+      {:error, _} ->
+        {:error, "harklight_recovery_guard_unavailable"}
+    end
+  end
+
+  def guard_diagnostic(op_id) do
+    "Harklight operation #{safe_field(op_id)} has no recorded attempt disposition. Settle the saved operation explicitly."
+  end
+
   def hold_operation(db, operation, op_id, request_id) do
     diagnostic = log_error(operation, request_id, op_id)
 
     case persist_pause(db, op_id, diagnostic) do
-      :ok -> diagnostic
-      {:error, _} -> "#{diagnostic} Tightbeam could not record the recovery pause."
+      :ok ->
+        {:paused, diagnostic}
+
+      {:error, _} ->
+        reason =
+          "#{diagnostic} Tightbeam could not record the recovery pause. The attempt guard requires explicit settlement."
+
+        Logger.error(reason)
+        {:pause_unrecorded, reason}
     end
   end
 
