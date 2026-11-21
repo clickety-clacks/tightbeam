@@ -820,53 +820,6 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert prompt =~ "did not perform work"
   end
 
-  test "replay continues a committed skipped refusal fallback beside an admitted sibling", ctx do
-    assert :appended =
-             Tightbeam.Gateway.deliver_prompt(ctx.holder.session_key, "user:flynn", "do work",
-               db: ctx.db
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "refusal")
-
-    assert :ok =
-             Ledger.finish(ctx.db, turn.seq, "failed", "The provider refused the prompt.",
-               owner_lease: turn.owner_lease,
-               work_outcome: :did_not_perform
-             )
-
-    sibling = session(ctx.db, "admitted-opener", ctx.main.session_key).session_key
-    skipped = ctx.supervisor.session_key
-    cause = "bubble:#{turn.seq}"
-
-    # The initial admission already committed, but no fallback transaction ran.
-    assert {:ok, :ok} =
-             DB.transaction(ctx.db, fn txn ->
-               assert {:appended, ^sibling, _, _} =
-                        Tightbeam.Gateway.deliver_prompt_in_txn(
-                          txn,
-                          sibling,
-                          "process:tightbeam",
-                          "sibling was notified",
-                          wake_id: "#{cause}:#{sibling}",
-                          request_ref: cause
-                        )
-
-               Tightbeam.EventLog.lifecycle_in_txn(
-                 txn,
-                 "turn_undeliverable",
-                 "#{cause}:#{skipped}",
-                 "reason=no_session_row target=#{skipped}"
-               )
-             end)
-
-    assert notice_turn(ctx.db, ctx.main.session_key) == []
-    for _ <- 1..2, do: assert(:ok = Bubble.recognize_terminal(ctx.db, turn.seq))
-
-    assert [[_, ^cause, _, _, _]] = notice_turn(ctx.db, sibling)
-    assert [[_, ^cause, _, _, _]] = notice_turn(ctx.db, ctx.main.session_key)
-    assert notice_turn(ctx.db, skipped) == []
-  end
-
   test "a failed senderless notice to parentless Main surfaces its source once", ctx do
     wake =
       Tightbeam.Wakes.schedule(ctx.db, %{

@@ -184,22 +184,15 @@ defmodule Tightbeam.Productions.Bubble do
           DB.Txn.q(
             txn,
             """
-            SELECT NULL FROM wakes WHERE wakeId>=?1 AND wakeId<?2
-            UNION
-            SELECT NULL FROM turns WHERE wakeId>=?1 AND wakeId<?2
-            UNION
-            SELECT substr(event.subject, length(?1)+1) FROM lifecycle_events event
-            WHERE event.subject>=?1 AND event.subject<?2 AND event.kind='turn_undeliverable'
-              AND NOT EXISTS (SELECT 1 FROM wakes WHERE wakeId=event.subject)
-              AND NOT EXISTS (SELECT 1 FROM turns WHERE wakeId=event.subject)
+            SELECT 1 FROM wakes WHERE wakeId>=?1 AND wakeId<?2
+            UNION ALL
+            SELECT 1 FROM turns WHERE wakeId>=?1 AND wakeId<?2 LIMIT 1
             """,
             [prefix, "bubble:#{turn.cause_seq};"]
           )
 
         if prior != [] do
-          # Gateway records skipped admissions in the same transaction. Resume
-          # their climbs even if a sibling wake already committed.
-          for [recipient] <- prior, is_binary(recipient), do: {recipient, turn, :skipped}
+          []
         else
           case {refusal_openers_in_txn(txn, turn), ancestor} do
             {[], {:ok, recipient}} ->
