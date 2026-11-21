@@ -12738,6 +12738,18 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  # A first assignment turn that fails reaches its opener: one notice with the
+  # exact marker sentence, through the real runner and terminal record. A
+  # model's request-rate 429 is recorded against that model, not the harness.
+  @tag cold_gateway: true, tmp_dir: true
+  test "a failed first assignment turn notifies its opener once with the verbatim reason", ctx do
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_failure_notice.exs",
+      "guarded-gateway-failure-notice: ok"
+    )
+  end
+
   # A session-setup failure the adapter carries keeps its
   # legacy reason for turns.error, the marker and health, while the
   # harness_turn_error record keeps the harness's own code, message and data.

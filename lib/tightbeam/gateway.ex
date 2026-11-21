@@ -13019,6 +13019,18 @@ defmodule Tightbeam.Gateway do
 
   defp error_sentence(reason), do: inspect(reason)
 
+  @doc false
+  def recorded_turn_failure_sentence(error) when is_binary(error) do
+    case JSON.decode(error) do
+      {:ok, reason} when is_map(reason) -> error_sentence(reason)
+      _ -> error
+    end
+  rescue
+    _ -> error
+  end
+
+  def recorded_turn_failure_sentence(nil), do: "reason unrecorded"
+
   defp append_turn_failed_marker(db, session_key, reason),
     do: append_turn_failed_marker(db, session_key, reason, false)
 

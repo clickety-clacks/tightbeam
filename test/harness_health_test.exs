@@ -2981,7 +2981,8 @@ defmodule Tightbeam.HarnessHealthTest do
         "interrupted-dispatched-source",
         "original dispatched prompt",
         :interrupted_outcome_unknown,
-        assignment_id: dispatched.assignment
+        assignment_id: dispatched.assignment,
+        stored_error: "interrupted: adapter exited before reporting its result"
       )
 
     parented_source =
@@ -2991,7 +2992,8 @@ defmodule Tightbeam.HarnessHealthTest do
         "interrupted-parented-source",
         "original parented prompt",
         :interrupted_outcome_unknown,
-        assignment_id: parented.assignment
+        assignment_id: parented.assignment,
+        stored_error: "interrupted: adapter exited before reporting its result"
       )
 
     main_session = ctx.main_session
@@ -3015,7 +3017,11 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert Enum.all?(wake_rows, fn [session_key, prompt] ->
              session_key == ctx.main_session and
-               String.contains?(prompt, "Should the original message be redelivered?")
+               String.contains?(prompt, "Should the original message be redelivered?") and
+               String.contains?(
+                 prompt,
+                 "Reason: interrupted: adapter exited before reporting its result"
+               )
            end)
 
     assert Enum.any?(wake_rows, fn [_session_key, prompt] ->
@@ -4969,10 +4975,11 @@ defmodule Tightbeam.HarnessHealthTest do
                         txn,
                         source_seq,
                         terminal,
-                        if(terminal == "failed_unknown",
-                          do: "interrupted: outcome unknown",
-                          else: "HTTP 401"
-                        ),
+                        Keyword.get_lazy(opts, :stored_error, fn ->
+                          if terminal == "failed_unknown",
+                            do: "interrupted: outcome unknown",
+                            else: "HTTP 401"
+                        end),
                         owner_lease: turn.owner_lease
                       )
 

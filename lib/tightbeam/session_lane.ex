@@ -1166,10 +1166,20 @@ defmodule Tightbeam.SessionLane do
   defp ambiguous,
     do: {:error, %{code: "turn_status_ambiguous", message: "turn liveness is ambiguous"}}
 
-  defp error_text(reason) when is_binary(reason), do: reason
-  defp error_text(%{code: code} = reason) when is_binary(code), do: JSON.encode!(reason)
-  defp error_text(%{"code" => code} = reason) when is_binary(code), do: JSON.encode!(reason)
-  defp error_text(reason), do: inspect(reason)
+  @doc false
+  def error_text(reason) when is_binary(reason), do: reason
+  def error_text(%{code: code} = reason) when is_binary(code), do: JSON.encode!(reason)
+  def error_text(%{"code" => code} = reason) when is_binary(code), do: JSON.encode!(reason)
+
+  # ACP reasons carry structured message and detail fields even when their code
+  # is numeric. Keep those fields readable by the terminal recognizer.
+  def error_text(%{"message" => message} = reason) when is_binary(message) do
+    JSON.encode!(reason)
+  rescue
+    _ -> inspect(reason)
+  end
+
+  def error_text(reason), do: inspect(reason)
 
   defp split_terminal_recorded({:terminal_recorded, recorded, route_publication}),
     do: {recorded, route_publication}
