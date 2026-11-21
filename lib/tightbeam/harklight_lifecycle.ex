@@ -247,6 +247,9 @@ defmodule Tightbeam.HarklightLifecycle do
         old = lookup_in_txn(txn, id)
 
         cond do
+          is_nil(item_id) ->
+            {%{message_id: id, effect: "unchanged", reason: "unknown"}, pending}
+
           warning ->
             {%{message_id: id, effect: "unchanged", reason: warning["reason"]}, pending}
 

@@ -482,6 +482,22 @@ defmodule Tightbeam.HarklightWakesTest do
     assert_received {:retried_op, ^key}
   end
 
+  test "a missing migrated Progress item preserves the definite Agent refusal", %{
+    db: db,
+    call: call
+  } do
+    call = %{call | params: %{message_id: "request", percent: 42, stage: "Review"}}
+
+    runner = fn ["message-get", "--sender-id", "sender", "--message-id", "request"] ->
+      missing_legacy_item()
+    end
+
+    assert %{outcome: "refused", code: "not_found", wake_effect: "none"} =
+             HarklightSend.change_request(db, call, "progress", runner: runner)
+
+    assert HarklightLifecycle.lookup_change(db, "request") == nil
+  end
+
   test "custody successor receives future replies on the original handle", %{
     db: db,
     session: session,
@@ -5887,6 +5903,55 @@ defmodule Tightbeam.HarklightWakesTest do
     assert prompt =~ "superseded"
   end
 
+  test "a missing migrated supersede target warns while the remaining targets proceed", %{
+    db: db,
+    call: call
+  } do
+    assert %{state: "registered"} = bind_extra(db, call, "missing")
+    send_fixture = lifecycle_runner(db, warnings: [%{message_id: "external", reason: "closed"}])
+
+    runner = fn
+      ["message-get", "--sender-id", "sender", "--message-id", "missing"] ->
+        missing_legacy_item()
+
+      ["send", "--prepare" | fields] = args ->
+        assert Enum.take(fields, -4) == [
+                 "--supersedes",
+                 "server-item",
+                 "--supersedes",
+                 "external"
+               ]
+
+        send_fixture.(args)
+
+      ["message-get" | _] = args ->
+        change_setup_reply(args)
+
+      args ->
+        send_fixture.(args)
+    end
+
+    call = %{
+      call
+      | params: %{
+          harklight_session: @handle,
+          sender_id: "sender",
+          title: "Replacement",
+          message_type: "fyi",
+          supersedes: ["missing", "request", "external", "missing"]
+        }
+    }
+
+    assert %{
+             outcome: "committed",
+             supersedes: [
+               %{message_id: "missing", effect: "unchanged", reason: "unknown"},
+               %{message_id: "request", effect: "ended"},
+               %{message_id: "external", effect: "unchanged", reason: "closed"}
+             ]
+           } = HarklightSend.send_request(db, call, runner: runner)
+  end
+
   test "a prepare failure has no invented message ID and shows unchanged supersede effects", %{
     db: db,
     call: call
@@ -6958,6 +7023,13 @@ defmodule Tightbeam.HarklightWakesTest do
   end
 
   defp frame(value), do: {JSON.encode!(value) <> "\n", 0}
+
+  defp missing_legacy_item do
+    {reply, 0} =
+      frame(%{kind: "refused", operation: "message-get", status: 404, error: "not_found"})
+
+    {reply <> ~s|server returned HTTP 404: Some("not_found") (request ID None)\n|, 2}
+  end
 
   defp bind_extra(db, call, message) do
     op = Tightbeam.Id.uuid4()

@@ -744,8 +744,8 @@ defmodule Tightbeam.HarklightSend do
         end
 
       {output, status} when status in [2, 5] ->
-        case JSON.decode(output) do
-          {:ok, %{"kind" => "refused", "operation" => "message-get", "error" => token}}
+        case result_frames(output) do
+          [%{"kind" => "refused", "operation" => "message-get", "error" => token}]
           when is_binary(token) ->
             {:error, {:refused, token}}
 
@@ -1098,7 +1098,7 @@ defmodule Tightbeam.HarklightSend do
 
     args = Enum.reduce(input.choices, args, fn choice, acc -> acc ++ ["--choice", choice] end)
     args = Enum.reduce(input.files, args, fn file, acc -> acc ++ ["--file", file] end)
-    Enum.reduce(targets, args, fn [_ref, id], acc -> acc ++ ["--supersedes", id] end)
+    Enum.reduce(server_supersedes(targets), args, fn id, acc -> acc ++ ["--supersedes", id] end)
   end
 
   defp resolve_supersedes(db, runner, input) do
@@ -1112,6 +1112,7 @@ defmodule Tightbeam.HarklightSend do
              else: {:ok, id}
            ) do
         {:ok, item_id} -> {:cont, {:ok, [[id, item_id] | targets]}}
+        {:error, {:refused, "not_found"}} -> {:cont, {:ok, [[id, nil] | targets]}}
         error -> {:halt, error}
       end
     end)
@@ -1120,6 +1121,8 @@ defmodule Tightbeam.HarklightSend do
       error -> error
     end
   end
+
+  defp server_supersedes(targets), do: for([_reference, id] <- targets, is_binary(id), do: id)
 
   defp prepared_request(
          %{
@@ -1137,7 +1140,7 @@ defmodule Tightbeam.HarklightSend do
        when is_map(message) and is_list(files) do
     if is_binary(handle) and Regex.match?(@uuid4, handle) and
          (input.session == "new" or handle == input.session) and sender == input.sender and
-         (prepared["supersedes"] || []) == Enum.map(targets, &List.last/1) and
+         (prepared["supersedes"] || []) == server_supersedes(targets) and
          (prepared["supersedes_local"] || []) == [] and
          Enum.map(files, & &1["name"]) == Enum.map(input.files, &Path.basename/1) and
          message["title"] == input.title and message["body"] == input.body and
@@ -1313,18 +1316,19 @@ defmodule Tightbeam.HarklightSend do
   defp retry_journal_id(["retry", "--op-id", _key, "--journal-id", id]), do: id
   defp retry_journal_id(_args), do: nil
 
-  defp invoke_response(output, status, expected, op_id, operations, journal_id) do
-    frames =
-      output
-      |> String.split("\n", trim: true)
-      |> Enum.flat_map(fn line ->
-        case JSON.decode(line) do
-          {:ok, %{"kind" => _} = frame} -> [frame]
-          _ -> []
-        end
-      end)
+  defp result_frames(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(fn line ->
+      case JSON.decode(line) do
+        {:ok, %{"kind" => _} = frame} -> [frame]
+        _ -> []
+      end
+    end)
+  end
 
-    case frames do
+  defp invoke_response(output, status, expected, op_id, operations, journal_id) do
+    case result_frames(output) do
       [%{"kind" => "committed", "operation" => operation, "op_id" => ^op_id} = frame]
       when expected == "committed" and status == 0 ->
         if operation in operations,
