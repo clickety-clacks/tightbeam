@@ -7038,7 +7038,7 @@ defmodule Tightbeam.Wakes do
     recognize_due_dependency_waits(db)
     evaluate_conditions(state, :tick)
 
-    if state.holder_prod do
+    if Map.get(state, :holder_prod, false) do
       case transaction!(db, &Tightbeam.HolderProd.admit_due_in_txn(&1, now(), state.batch)) do
         {:would_send, count} when count > 0 ->
           Logger.info("holder_prod_would_send count=#{count}")
@@ -8194,7 +8194,7 @@ defmodule Tightbeam.Wakes do
       |> Enum.min(fn -> nil end)
 
     holder_prod_at =
-      if state.holder_prod do
+      if Map.get(state, :holder_prod, false) do
         DB.background_pass(
           fn -> transaction!(state.db, &Tightbeam.HolderProd.next_deadline_in_txn(&1, now())) end,
           now() + 1_000

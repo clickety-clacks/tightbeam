@@ -846,7 +846,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
         :ok =
           DB.execute(
             db,
-            "DROP INDEX wakes_delivered_turn; DROP INDEX IF EXISTS wakes_delivered_obligation; ALTER TABLE wakes DROP COLUMN deliveredTurnSeq; DROP TABLE wake_delivery_backfill"
+            "DROP INDEX IF EXISTS holder_prod_wake_delivery; DROP INDEX wakes_delivered_turn; DROP INDEX IF EXISTS wakes_delivered_obligation; ALTER TABLE wakes DROP COLUMN deliveredTurnSeq; DROP TABLE wake_delivery_backfill"
           )
 
         assert {:ok, source_before} =
