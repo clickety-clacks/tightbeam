@@ -662,6 +662,41 @@ defmodule Tightbeam.WorkspaceCleanup do
   end
 
   @doc """
+  Where a retired session's workspace cleanup stands, from its queue row and
+  stored report: `queued` (not yet attempted), `completed`, `held` (work is
+  waiting for acknowledgement), or `blocked` (attempts fail; `reasons` names
+  why). Returns `nil` when the session has no cleanup row.
+  """
+  def status(db, key) do
+    case DB.query(
+           db,
+           "SELECT completed, attempts, nextAt, reason FROM retired_workspace_cleanup WHERE sessionKey=?1",
+           [key]
+         ) do
+      {:ok, [[1, _attempts, _next, _reason]]} ->
+        %{cleanup: "completed", reasons: []}
+
+      {:ok, [[0, 0, _next, _reason]]} ->
+        %{cleanup: "queued", reasons: []}
+
+      {:ok, [[0, attempts, next_at, reason]]} ->
+        reasons = if is_binary(reason), do: String.split(reason, ", "), else: []
+        held? = "uncaptured_work" in reasons
+        reasons = if held?, do: reasons -- ["cleanup_command_failed", "cleanup_incomplete"], else: reasons
+
+        %{
+          cleanup: if(held?, do: "held", else: "blocked"),
+          reasons: reasons,
+          attempts: attempts,
+          next_attempt_at: next_at
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
   The losses a retired session's last cleanup run held back, as
   `%{kind, path, detail}` maps; `[]` when nothing is held.
   """
@@ -902,7 +937,16 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
-  defp execute(host, workspace, keep, archive_path, runner, timeout_ms, acknowledged, scan_only \\ false) do
+  defp execute(
+         host,
+         workspace,
+         keep,
+         archive_path,
+         runner,
+         timeout_ms,
+         acknowledged,
+         scan_only \\ false
+       ) do
     cond do
       contains_line_break?(workspace) ->
         {:error, %{reason: "workspace_path_unrepresentable"}}
@@ -912,7 +956,14 @@ defmodule Tightbeam.WorkspaceCleanup do
 
       true ->
         script =
-          cleanup_script(Path.expand(workspace), archive_path, timeout_ms, acknowledged, scan_only)
+          cleanup_script(
+            Path.expand(workspace),
+            archive_path,
+            timeout_ms,
+            acknowledged,
+            scan_only
+          )
+
         manifest = if keep.paths == [], do: "", else: Enum.join(keep.paths, "\n") <> "\n"
 
         invocation =
@@ -1148,6 +1199,7 @@ defmodule Tightbeam.WorkspaceCleanup do
     # removed, as before.
     scan_losses() {
       while IFS= read -r gitpath; do
+        [ -n "$gitpath" ] || continue
         repo=${gitpath%/.git}
         if [ "$repo" = "$root" ]; then rel=.; else rel=${repo#"$root"/}; fi
         under_protected "$rel" && continue

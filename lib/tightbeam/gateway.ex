@@ -12234,12 +12234,7 @@ defmodule Tightbeam.Gateway do
                   deleted_session_key: session.session_key,
                   retired_session_keys: Enum.map(result.retired, & &1.session_key),
                   retired_sessions:
-                    Enum.map(result.retired, fn retired ->
-                      %{
-                        session_key: retired.session_key,
-                        display_name: retired_display_name(db, retired.session_key)
-                      }
-                    end),
+                    Enum.map(result.retired, &retired_workspace_entry(config, db, &1.session_key)),
                   deferred: result.deferred
                 }
                 |> maybe_put_kept_descendants(result.kept_descendants)
@@ -12290,6 +12285,30 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # Retire returns before any workspace is touched: cleanup is queued and runs
+  # one session at a time. Each entry says where the workdir is and how its
+  # cleanup stands (queued, held, blocked, completed).
+  defp retired_workspace_entry(config, db, key) do
+    session = Org.get(db, key)
+
+    workdir =
+      try do
+        Tightbeam.Placement.workdir_path(config, session)
+      rescue
+        _ -> nil
+      end
+
+    Map.merge(
+      %{
+        session_key: key,
+        display_name: session && session.display_name,
+        host: session && session.host,
+        workdir: workdir
+      },
+      WorkspaceCleanup.status(db, key) || %{cleanup: "queued", reasons: []}
+    )
+  end
+
   defp retired_display_name(db, key) do
     case Org.get(db, key) do
       %{display_name: name} -> name
@@ -12324,8 +12343,7 @@ defmodule Tightbeam.Gateway do
           session_key: call.session_key,
           would_retire: scans,
           would_keep: Enum.map(plan.kept, &session_details/1),
-          would_keep_protected_roots:
-            Enum.map(plan.frontiers, &protected_descendant_details/1),
+          would_keep_protected_roots: Enum.map(plan.frontiers, &protected_descendant_details/1),
           requires_keep_open_descendants: plan.frontiers != [],
           sessions_with_held_work: Enum.count(scans, &(&1.losses != []))
         }

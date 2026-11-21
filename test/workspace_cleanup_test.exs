@@ -993,7 +993,8 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       names = Map.new(result.retired_sessions, &{&1.session_key, &1.display_name})
       assert names == %{root_key => "Example", child.session_key => "Closed child"}
 
-      assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, root_key)
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, root_key)
 
       assert %{status: "incomplete"} =
                WorkspaceCleanup.process_session(ctx.config, ctx.db, child.session_key)
@@ -1006,6 +1007,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     end
 
     test "a protected descendant is kept with its subtree and its workspace is untouched", ctx do
+      ensure_main_session(ctx.db, "owner")
       {holder, holder_workspace} = child_session(ctx, "holder", ctx.session.session_key)
       {grandchild, _} = child_session(ctx, "grandchild", holder.session_key)
       repo = init_repo(holder_workspace, "repo")
@@ -1028,6 +1030,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     end
 
     test "the preview lists every session and its scan and changes nothing", ctx do
+      ensure_main_session(ctx.db, "owner")
       {child, child_workspace} = child_session(ctx, "closed-child", ctx.session.session_key)
       {holder, _} = child_session(ctx, "holder", ctx.session.session_key)
       repo = init_repo(child_workspace, "repo")
@@ -1050,7 +1053,10 @@ defmodule Tightbeam.WorkspaceCleanupTest do
                preview
 
       by_key = Map.new(preview.would_retire, &{&1.session_key, &1})
-      assert Map.keys(by_key) |> Enum.sort() == Enum.sort([ctx.session.session_key, child.session_key])
+
+      assert Map.keys(by_key) |> Enum.sort() ==
+               Enum.sort([ctx.session.session_key, child.session_key])
+
       assert %{scan: "ok", losses: []} = by_key[ctx.session.session_key]
 
       assert %{scan: "ok", display_name: "Closed child", losses: [%{kind: "git", path: "repo"}]} =
@@ -1058,7 +1064,10 @@ defmodule Tightbeam.WorkspaceCleanupTest do
 
       assert [%{session_key: kept}] = preview.would_keep
       assert kept == holder.session_key
-      assert before == DB.query(ctx.db, "SELECT sessionKey,state FROM sessions ORDER BY sessionKey")
+
+      assert before ==
+               DB.query(ctx.db, "SELECT sessionKey,state FROM sessions ORDER BY sessionKey")
+
       assert {:ok, [[0]]} = DB.query(ctx.db, cleanup_rows)
       assert File.read!(Path.join(repo, "work.txt")) == "child work"
       assert Org.get(ctx.db, ctx.session.session_key).state == "active"
