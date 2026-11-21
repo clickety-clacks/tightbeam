@@ -1503,7 +1503,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       end
     end
 
-    test "retire on a retired session lists held work and --acknowledge-loss releases it", ctx do
+    test "retire --acknowledge-loss releases a stuck hold through the real worker", ctx do
       repo = init_repo(ctx.workspace, "repo")
       commit(repo, "work.txt", "unpushed")
       key = ctx.session.session_key
@@ -1519,16 +1519,80 @@ defmodule Tightbeam.WorkspaceCleanupTest do
 
       assert %{code: "invalid"} = retire_call.(%{acknowledge_loss: true})
       retire(ctx)
-      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      for _ <- 1..3 do
+        assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      end
+
+      assert %{cleanup: "held", blocker_state: "stuck", next_attempt_at: nil} =
+               WorkspaceCleanup.status(ctx.db, key)
 
       assert %{held_losses: [%{"path" => "repo", "session_key" => ^key}]} = retire_call.(%{})
       assert File.exists?(Path.join(repo, "work.txt"))
 
+      worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+
       assert %{acknowledged_losses: [%{"path" => "repo"}]} =
                retire_call.(%{acknowledge_loss: true})
 
-      assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      :sys.get_state(worker)
+
+      assert [%{cleanup: "completed", archive_path: nil, attempts: 4}] =
+               WorkspaceCleanup.statuses(ctx.db, "owner", ctx.config)
+
       refute File.exists?(ctx.workspace)
+    end
+
+    test "cleanup write-back preserves consent and retry recorded during a scan", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "original")
+      key = ctx.session.session_key
+      retire(ctx)
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      parent = self()
+
+      config =
+        Map.put(ctx.config, :workspace_cleanup_runner, fn invocation, script, manifest ->
+          send(parent, {:scanning, self()})
+
+          receive do
+            :continue -> WorkspaceCleanup.system_runner(invocation, script, manifest)
+          end
+        end)
+
+      scan = Task.async(fn -> WorkspaceCleanup.process_session(config, ctx.db, key) end)
+      assert_receive {:scanning, runner}, 5_000
+
+      assert {:ok, [%{"path" => "repo"}]} =
+               WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+
+      assert %{ok: true} = WorkspaceCleanup.retry(ctx.db, key, "user:owner")
+      File.write!(Path.join(repo, "work.txt"), "changed during scan")
+      send(runner, :continue)
+      assert %{status: "incomplete"} = Task.await(scan, 10_000)
+
+      assert %{cleanup: "queued", next_attempt_at: 0} = WorkspaceCleanup.status(ctx.db, key)
+
+      assert {:ok, [[stored]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1",
+                 [
+                   key
+                 ]
+               )
+
+      assert %{
+               "acknowledged" => [%{"key" => "git:repo@" <> _, "by" => "user:owner"}],
+               "retry_requested" => %{"by" => "user:owner"}
+             } = saved = JSON.decode!(stored)
+
+      refute Map.has_key?(saved, "retry_outcome")
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert %{cleanup: "held"} = WorkspaceCleanup.status(ctx.db, key)
+      assert File.read!(Path.join(repo, "work.txt")) == "changed during scan"
     end
   end
 
