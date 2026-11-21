@@ -13,8 +13,11 @@ defmodule Tightbeam.Identity.RailScopeMigration do
 
   @report_name "rail-scope-migration-report.json"
   @migration_id "rail-scope-v1"
+  # One reaction name per seed file: the file is planted once and carries all
+  # of its reactions.
   @seed_reactions %{
-    "assignment-terminal-handoff" => "rules/row-reaction-handoff.toml"
+    "assignment-terminal-handoff" => "rules/row-reaction-handoff.toml",
+    "r04-work-item-notice" => "rules/row-reaction-work-items.toml"
   }
   # Shipped in 0.1.16 and no longer shipped: an unedited legacy copy is removed
   # and not replanted, while pending rows keep their substrate rule name.

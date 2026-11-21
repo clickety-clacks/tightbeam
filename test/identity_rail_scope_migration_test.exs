@@ -13,7 +13,8 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     "tightbeam-probe" => "rails/tightbeam-probe.toml"
   }
   @seed_reactions %{
-    "assignment-terminal-handoff" => "rules/row-reaction-handoff.toml"
+    "assignment-terminal-handoff" => "rules/row-reaction-handoff.toml",
+    "r04-work-item-notice" => "rules/row-reaction-work-items.toml"
   }
   @legacy_reaction_fixture_dir Path.expand(
                                  "fixtures/rail-scope-migration/legacy-reactions",

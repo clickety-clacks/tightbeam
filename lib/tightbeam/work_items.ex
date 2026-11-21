@@ -5,7 +5,7 @@ defmodule Tightbeam.WorkItems do
   Committed creation, assignment, disposition and delivery observations feed
   elected row-reaction rails. Those rails choose routing and slate reminders;
   typed reference effects keep their saved wake identities in the source
-  transaction. The default engineering rails preserve the two lifecycle
+  transaction. The base-seed rails preserve the two lifecycle
   brackets and rearm only after actual delivery.
 
   The owner is a user. Terminal dispositions (icebox/close/fail/reopen) are

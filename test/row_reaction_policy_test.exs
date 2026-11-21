@@ -3,16 +3,17 @@ defmodule Tightbeam.RowReactionPolicyTest do
 
   alias Tightbeam.Rules
 
-  test "learned engineering composition elects unaltered organization work-item rails" do
+  test "the base seed elects unaltered organization work-item rails" do
     base =
       Path.join(System.tmp_dir!(), "work-item-election-#{System.unique_integer([:positive])}")
 
     on_exit(fn -> File.rm_rf!(base) end)
-    assert {:ok, _} = Tightbeam.Identity.learn!(base, "agentic-engineering", "test")
-    path = "kungfu/agentic-engineering/rules/row-reaction-work-items.toml"
+    assert :initialized = Tightbeam.Identity.init!(base)
 
-    assert File.read!(Path.join([base, "identity", path])) ==
-             File.read!(Path.join(:code.priv_dir(:tightbeam), path))
+    assert File.read!(Path.join([base, "identity", "rules/row-reaction-work-items.toml"])) ==
+             File.read!(
+               Path.join(:code.priv_dir(:tightbeam), "seed/rules/row-reaction-work-items.toml")
+             )
 
     Rules.load!(base, Map.keys(Tightbeam.Gateway.handlers(%{db: :unused_election_database})))
 
@@ -45,7 +46,7 @@ defmodule Tightbeam.RowReactionPolicyTest do
         %{"sessionKey" => "personal", "archetype" => "default", "state" => "active"},
         %{
           "sessionKey" => "delivery",
-          "archetype" => "agentic-engineering.pdo",
+          "archetype" => "uncle-enzo.deliverator",
           "state" => "active"
         }
       ]
@@ -58,7 +59,7 @@ defmodule Tightbeam.RowReactionPolicyTest do
     assert [
              %{
                family: "r05-work-item",
-               provenance: %{"bundle" => "agentic-engineering"},
+               provenance: %{"bundle" => "substrate"},
                value: %{"session_key" => "delivery"}
              }
            ] = selected
