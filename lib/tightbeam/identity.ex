@@ -1351,11 +1351,19 @@ defmodule Tightbeam.Identity do
 
     case interrupted_reconcile(dir, live) do
       {:publish, main, names} ->
-        publish_reconcile(dir, live, %{candidate_revision: main, expected_prior: live}, names, publish)
+        publish_reconcile(
+          dir,
+          live,
+          %{candidate_revision: main, expected_prior: live},
+          names,
+          publish
+        )
 
       :none ->
         %{add: add, blocked: blocked} = seed_law_gaps_at(dir, live)
-        blocked_attention = Enum.map(blocked, &"#{&1} is present but does not define the shipped rule")
+
+        blocked_attention =
+          Enum.map(blocked, &"#{&1} is present but does not define the shipped rule")
 
         with [_ | _] <- add,
              :ok <- reconcile_ready(dir, live) do
@@ -1374,7 +1382,9 @@ defmodule Tightbeam.Identity do
               added: [],
               attention:
                 blocked_attention ++
-                  ["shipped seed rules not yet in the live identity: #{Enum.join(names, ", ")} (#{reason})"],
+                  [
+                    "shipped seed rules not yet in the live identity: #{Enum.join(names, ", ")} (#{reason})"
+                  ],
               candidate: nil
             }
         end
@@ -1394,7 +1404,10 @@ defmodule Tightbeam.Identity do
     live = git_output!(dir, ["rev-parse", @live])
 
     if git_output!(dir, ["rev-parse", "main"]) == live and
-         String.starts_with?(git_output!(dir, ["log", "-1", "--format=%s", live]), @reconcile_subject),
+         String.starts_with?(
+           git_output!(dir, ["log", "-1", "--format=%s", live]),
+           @reconcile_subject
+         ),
        do: live
   rescue
     _error -> nil

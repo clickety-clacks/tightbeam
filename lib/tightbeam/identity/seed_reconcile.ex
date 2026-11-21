@@ -58,8 +58,11 @@ defmodule Tightbeam.Identity.SeedReconcile do
   defp publish!(base_dir, db, candidate) do
     case DB.transaction(db, fn txn ->
            case Identity.publish_live!(base_dir, candidate) do
-             {:ok, _revision} -> stamp!(txn, base_dir)
-             {:error, error} -> raise ArgumentError, "identity publication failed: #{inspect(error)}"
+             {:ok, _revision} ->
+               stamp!(txn, base_dir)
+
+             {:error, error} ->
+               raise ArgumentError, "identity publication failed: #{inspect(error)}"
            end
          end) do
       {:ok, :ok} -> :ok

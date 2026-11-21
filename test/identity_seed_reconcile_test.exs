@@ -169,6 +169,7 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
        ctx do
     init_shape!(ctx.base, "0.1.15")
     File.mkdir_p!(Path.join(ctx.dir, "rules/nested"))
+    File.mkdir_p!(Path.join(ctx.dir, "rails"))
     File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "rules/nested/unread.toml"))
     File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "rails/unread.toml"))
     File.write!(Path.join(ctx.dir, "rules/broken.toml"), "[[rule]\nname = broken")
@@ -184,7 +185,9 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     assert :ok = AdminProjection.bootstrap_served(ctx.db, ctx.base)
 
     # The process dies after the commit and before anything is published.
-    assert :crash == catch_throw(Identity.reconcile_seed_law!(ctx.base, fn _ -> throw(:crash) end))
+    assert :crash ==
+             catch_throw(Identity.reconcile_seed_law!(ctx.base, fn _ -> throw(:crash) end))
+
     committed = git(ctx.dir, ["rev-parse", "main"])
     refute committed == prior
     assert Identity.live_revision!(ctx.base) == prior
@@ -217,7 +220,9 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
 
     live = Identity.live_revision!(ctx.base)
     refute live == prior
-    assert %{"liveRevision" => ^prior} = AdminProjection.stamped_item(ctx.db, "identity", "served")
+
+    assert %{"liveRevision" => ^prior} =
+             AdminProjection.stamped_item(ctx.db, "identity", "served")
 
     assert %{added: [], candidate: nil} = SeedReconcile.run!(ctx.base, ctx.db)
     assert %{"liveRevision" => ^live} = AdminProjection.stamped_item(ctx.db, "identity", "served")
