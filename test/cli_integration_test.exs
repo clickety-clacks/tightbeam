@@ -54,7 +54,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, binary: binary}
   end
 
-  setup %{binary: binary} do
+  setup %{binary: binary} = context do
     db = :"cli_integration_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -113,8 +113,18 @@ defmodule Tightbeam.CliIntegrationTest do
 
     Roles.create!(db, "cli-worker", "flynn", worker.session_key)
 
+    progress_state =
+      if context[:progress_fixture],
+        do:
+          start_supervised!(
+            {Agent, fn -> %{calls: [], unknown: false, refusal: nil, mismatch: false} end}
+          )
+
+    progress_runner = if progress_state, do: fn args -> progress_helper(progress_state, args) end
+
     gateway_config = %{
       db: db,
+      harklight_send_runner: progress_runner,
       base_dir: base_dir,
       cwd: base_dir,
       default_harness: :claude,
@@ -176,6 +186,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     %{
       base_dir: base_dir,
+      progress_state: progress_state,
       binary: binary,
       db: db,
       handlers: handlers,
@@ -185,6 +196,263 @@ defmodule Tightbeam.CliIntegrationTest do
       workdir: workdir,
       outside: outside
     }
+  end
+
+  @tag :progress_fixture
+  test "real CLI authenticates Progress, persists exact revise operation and settles uncertainty",
+       ctx do
+    args = [
+      "harklight-send",
+      "--session",
+      "new",
+      "--sender-id",
+      "adapter",
+      "--title",
+      "Work",
+      "--body",
+      "Keep body",
+      "--files-json",
+      ~s(["/fixture/report.txt"]),
+      "--progress",
+      "0",
+      "--progress-stage",
+      " custom ",
+      "--progress-note",
+      " exact\n "
+    ]
+
+    assert {output, 0} = progress_cli(ctx, args)
+    sent = JSON.decode!(output)
+    assert sent["outcome"] == "committed"
+    assert sent["senderId"] == "adapter"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "harklight-send",
+                      session_key: "cli-holder",
+                      principal: {:session, "cli-holder"}
+                    }}
+
+    record = Tightbeam.HarklightLifecycle.lookup(ctx.db, sent["messageId"])
+    assert record.request["message"]["body"] == "Keep body"
+    assert record.request["files"] == ["/fixture/report.txt"]
+    Agent.update(ctx.progress_state, &%{&1 | unknown: true})
+
+    update = [
+      "harklight-progress",
+      "--message",
+      sent["messageId"],
+      "--percent",
+      "100",
+      "--stage",
+      "review",
+      "--note",
+      " exact\n "
+    ]
+
+    {output, _} = progress_cli(ctx, update)
+    assert output =~ "outcome_unknown"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "harklight-progress",
+                      session_key: "cli-holder",
+                      principal: {:session, "cli-holder"}
+                    }}
+
+    change = Tightbeam.HarklightLifecycle.lookup_change(ctx.db, sent["messageId"])
+    assert change.command == "revise"
+    assert change.state == "pending"
+
+    assert change.request == [
+             "progress",
+             "--session",
+             record.handle,
+             "--request",
+             sent["messageId"],
+             "--percent",
+             "100",
+             "--stage",
+             "review",
+             "--note",
+             " exact\n ",
+             "--op-id",
+             change.op_id
+           ]
+
+    {blocked, _} = progress_cli(ctx, update)
+    assert blocked =~ "harklight_operation_unresolved"
+    Agent.update(ctx.progress_state, &%{&1 | unknown: false})
+    assert {settled, 0} = progress_cli(ctx, ["harklight-settle", "--message", sent["messageId"]])
+    result = JSON.decode!(settled)
+    assert result["outcome"] == "committed"
+    assert result["settledCommand"] == "revise"
+    assert result["wakeEffect"] == "kept"
+    assert result["revision"] == 2
+    calls = Agent.get(ctx.progress_state, &Enum.reverse(&1.calls))
+    assert Enum.count(calls, &(&1 == change.request)) == 2
+    assert ["retry", "--op-id", change.op_id] in calls
+
+    assert Tightbeam.HarklightLifecycle.lookup_change(ctx.db, sent["messageId"]).state ==
+             "committed"
+  end
+
+  @tag :progress_fixture
+  test "real CLI Progress refusals stay definite and malformed prepare never executes", ctx do
+    create = [
+      "harklight-send",
+      "--session",
+      "new",
+      "--sender-id",
+      "adapter",
+      "--title",
+      "Work",
+      "--progress",
+      "100",
+      "--progress-stage",
+      "s"
+    ]
+
+    for reason <- [
+          "stale_revision current_revision=7",
+          "request_closed",
+          "not in session journal"
+        ] do
+      assert {sent, 0} = progress_cli(ctx, create)
+      id = JSON.decode!(sent)["messageId"]
+      Agent.update(ctx.progress_state, &%{&1 | refusal: reason})
+
+      {output, _} =
+        progress_cli(ctx, [
+          "harklight-progress",
+          "--message",
+          id,
+          "--percent",
+          "0",
+          "--stage",
+          "other"
+        ])
+
+      assert output =~ reason
+      assert Tightbeam.HarklightLifecycle.lookup_change(ctx.db, id).state == "refused"
+      Agent.update(ctx.progress_state, &%{&1 | refusal: nil})
+    end
+
+    Agent.update(ctx.progress_state, &%{&1 | mismatch: true})
+    {output, _} = progress_cli(ctx, create)
+    assert output =~ "harklight_prepared_mismatch"
+    assert ["send", "--prepare" | _] = Agent.get(ctx.progress_state, &hd(&1.calls))
+  end
+
+  defp progress_cli(ctx, args) do
+    System.cmd(ctx.binary, args,
+      cd: ctx.workdir,
+      env: [
+        {"TIGHTBEAM_URL", nil},
+        {"TIGHTBEAM_TOKEN", nil},
+        {"TIGHTBEAM_BASE_DIR", ctx.base_dir}
+      ],
+      stderr_to_stdout: true
+    )
+  end
+
+  # Adapter boundary fixture only: segment construction and file revision preservation
+  # belong to the real Agent and require separate compatible-helper evidence.
+  defp progress_helper(state, args) do
+    Agent.update(state, &%{&1 | calls: [args | &1.calls]})
+    # --prepare and --execute are flags, unlike the value options.
+    flags =
+      args
+      |> Enum.reject(&(&1 in ["--prepare", "--execute", "--controller"]))
+      |> Enum.drop(1)
+      |> Enum.chunk_every(2)
+      |> Map.new(fn [k, v] -> {k, v} end)
+
+    op = flags["--op-id"]
+    current = Agent.get(state, & &1)
+
+    cond do
+      Enum.take(args, 2) == ["send", "--prepare"] ->
+        at = "2026-11-18T00:00:00Z"
+        n = String.to_integer(flags["--progress"])
+        stage = flags["--progress-stage"]
+        note = flags["--progress-note"]
+
+        progress = %{
+          "percent" => n,
+          "stage" => stage,
+          "note" => note,
+          "updated_at" => at,
+          "segments" => [
+            %{
+              "stage" => stage,
+              "width" => n,
+              "note" => note,
+              "visit_at" => at,
+              "reported_percent" => n,
+              "delta" => n
+            }
+          ]
+        }
+
+        message = %{
+          "sender_id" => flags["--sender-id"],
+          "message_id" => Tightbeam.Id.uuid4(),
+          "title" => flags["--title"],
+          "body" => flags["--body"],
+          "message_type" => "fyi",
+          "created_at" => 1,
+          "answer_ui" => %{
+            "schema" => "attention-client.actions/1",
+            "actions" => [
+              %{
+                "id" => "seen",
+                "label" => "Seen",
+                "kind" => "value",
+                "value" => %{"acknowledgment" => "seen"}
+              }
+            ]
+          },
+          "progress" => if(current.mismatch, do: %{}, else: progress)
+        }
+
+        request = %{
+          "type" => "send",
+          "op_id" => op,
+          "session_handle" => Tightbeam.Id.uuid4(),
+          "route" => "other",
+          "message" => message,
+          "files" => if(flags["--file"], do: [flags["--file"]], else: [])
+        }
+
+        Agent.update(state, &Map.put(&1, :request, request))
+        {JSON.encode!(%{kind: "prepared", op_id: op, request: request, files: []}), 0}
+
+      hd(args) == "send" ->
+        {JSON.encode!(%{
+           kind: "committed",
+           operation: "send",
+           op_id: op,
+           response: %{session_handle: current.request["session_handle"]}
+         }), 0}
+
+      hd(args) == "retry" ->
+        {"no recorded operation with key #{op}", 1}
+
+      current.refusal ->
+        {JSON.encode!(%{kind: "refused", op_id: op, reason: current.refusal}), 2}
+
+      current.unknown ->
+        {JSON.encode!(%{kind: "outcome_unknown", op_id: op, reason: "response lost"}), 7}
+
+      true ->
+        {JSON.encode!(%{
+           kind: "committed",
+           operation: "revise",
+           op_id: op,
+           response: %{revision: 2}
+         }), 0}
+    end
   end
 
   test "session-connect composes explicit organization identity with automatic session identity",
@@ -3385,6 +3653,8 @@ defmodule Tightbeam.CliIntegrationTest do
          "--title",
          "Updated title"
        ]},
+      {"harklight-progress",
+       ["harklight-progress", "--message", "message-example", "--percent", "1", "--stage", "s"]},
       {"harklight-retract", ["harklight-retract", "--message", "message-example"]},
       {"harklight-settle", ["harklight-settle", "--message", "message-example"]},
       {"harklight-follow", ["harklight-follow", "--message", "message-example"]}
@@ -3504,6 +3774,9 @@ defmodule Tightbeam.CliIntegrationTest do
          "--title",
          "Updated title"
        ], "invalid Harklight command flags"},
+      {"harklight-progress",
+       ["harklight-progress", "--message", "message-example", "--percent", "1", "--stage", "s"],
+       "invalid Harklight command flags"},
       {"harklight-retract", ["harklight-retract", "--message", "message-example"],
        "invalid Harklight command flags"},
       {"harklight-settle", ["harklight-settle", "--message", "message-example"],

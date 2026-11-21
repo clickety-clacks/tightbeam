@@ -559,6 +559,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vendor_session_id,
             supersedes,
             decision_request_id,
+            progress,
+            progress_stage,
+            progress_note,
         } => {
             let mut params = vec![
                 format!(
@@ -603,7 +606,33 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = decision_request_id {
                 params.push(string_field("decisionRequestId", value));
             }
+            if let Some(value) = progress {
+                params.push(format!("\"progress\":{value}"));
+            }
+            if let Some(value) = progress_stage {
+                params.push(string_field("progressStage", value));
+            }
+            if let Some(value) = progress_note {
+                params.push(string_field("progressNote", value));
+            }
             Ok(request(identity, "harklight-send", vec![], params))
+        }
+        Command::HarklightProgress {
+            identity,
+            message,
+            percent,
+            stage,
+            note,
+        } => {
+            let mut params = vec![
+                string_field("messageId", message),
+                format!("\"percent\":{percent}"),
+                string_field("stage", stage),
+            ];
+            if let Some(value) = note {
+                params.push(string_field("note", value));
+            }
+            Ok(request(identity, "harklight-progress", vec![], params))
         }
         Command::HarklightRevise {
             identity,
@@ -4146,7 +4175,8 @@ fn local_harklight_identity_refusal(
         {
             Some("harklight-briefings-catchup requires an active admin-owned session")
         }
-        Command::HarklightRevise { identity, .. }
+        Command::HarklightProgress { identity, .. }
+        | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightListenerRestore { identity, .. }
@@ -4178,6 +4208,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
         | Command::HarklightBriefingsCatchup { identity, .. }
+        | Command::HarklightProgress { identity, .. }
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
