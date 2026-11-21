@@ -522,7 +522,52 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     File.write!(rule_path, String.replace(rule_bytes, "sample rule", "organization rule text"))
     commit_fixture!(dir, "fixture: org edits after learn")
 
-    RailScopeMigration.run!(ctx.base_dir, db)
+    # Make an unguarded commit repack in the foreground so even a failing
+    # regression test can clean up without racing the writer.
+    git!(dir, ["config", "--local", "maintenance.auto", "true"])
+    git!(dir, ["config", "--local", "maintenance.gc.enabled", "true"])
+    git!(dir, ["config", "--local", "maintenance.autoDetach", "false"])
+    git!(dir, ["config", "--local", "gc.autoDetach", "false"])
+    git!(dir, ["config", "--local", "gc.auto", "1"])
+
+    object_source = Path.join(ctx.base_dir, "loose-object")
+
+    for contents <- ~w(32 119 334) do
+      File.write!(object_source, contents)
+      git!(dir, ["hash-object", "-w", object_source])
+    end
+
+    local_config = git!(dir, ["config", "--local", "--list"])
+    trace_path = Path.join(ctx.base_dir, "upstream-migration-trace.jsonl")
+    previous_trace = System.get_env("GIT_TRACE2_EVENT")
+    System.put_env("GIT_TRACE2_EVENT", trace_path)
+
+    try do
+      RailScopeMigration.run!(ctx.base_dir, db)
+    after
+      if previous_trace,
+        do: System.put_env("GIT_TRACE2_EVENT", previous_trace),
+        else: System.delete_env("GIT_TRACE2_EVENT")
+    end
+
+    events =
+      trace_path
+      |> File.stream!()
+      |> Enum.map(&JSON.decode!/1)
+
+    assert Enum.any?(events, fn event ->
+             event["event"] == "start" and
+               "identity: namespace upstream rail baseline" in event["argv"]
+           end)
+
+    maintenance =
+      for %{"event" => "cmd_name", "name" => name} <- events,
+          name in ~w(maintenance gc repack),
+          do: name
+
+    assert maintenance == []
+    assert git!(dir, ["config", "--local", "--list"]) == local_config
+
     upstream = git!(dir, ["rev-parse", "tightbeam/upstream"])
     assert git!(dir, ["merge-base", "main", upstream]) == upstream
     assert git!(dir, ["ls-tree", "--name-only", upstream, "--", "archetypes/pdo.toml"]) == ""

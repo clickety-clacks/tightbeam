@@ -1239,7 +1239,15 @@ defmodule Tightbeam.Identity.RailScopeMigration do
     try do
       write_identity_plan!(scratch, plan)
       git!(scratch, ["add", "-A"])
-      git!(scratch, ["commit", "-m", "identity: namespace upstream rail baseline"], "tightbeam")
+
+      args =
+        Identity.without_auto_maintenance([
+          "commit",
+          "-m",
+          "identity: namespace upstream rail baseline"
+        ])
+
+      git!(scratch, args, "tightbeam")
       git_output!(scratch, ["rev-parse", "HEAD"])
     after
       git!(dir, ["worktree", "remove", "--force", scratch])

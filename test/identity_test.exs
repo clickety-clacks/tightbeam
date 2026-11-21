@@ -26,6 +26,72 @@ defmodule Tightbeam.IdentityTest do
     %{base: runtime, root: base, source: source}
   end
 
+  test "identity writes start no Git maintenance even when the caller requests it", ctx do
+    trace = Path.join(ctx.root, "git-trace.jsonl")
+    control_trace = Path.join(ctx.root, "git-control-trace.jsonl")
+    System.put_env("GIT_TRACE2_EVENT", trace)
+
+    # The caller's own Git config asks for automatic, background-capable
+    # maintenance. Identity writes must not start any, on any Git version.
+    config = [
+      {"maintenance.auto", "true"},
+      {"maintenance.autoDetach", "true"},
+      {"gc.autoDetach", "true"},
+      {"maintenance.gc.enabled", "true"},
+      {"gc.auto", "1"}
+    ]
+
+    index = String.to_integer(System.get_env("GIT_CONFIG_COUNT", "0"))
+    System.put_env("GIT_CONFIG_COUNT", Integer.to_string(index + length(config)))
+
+    for {{key, value}, offset} <- Enum.with_index(config, index) do
+      System.put_env("GIT_CONFIG_KEY_#{offset}", key)
+      System.put_env("GIT_CONFIG_VALUE_#{offset}", value)
+    end
+
+    # Control: this environment really makes this Git run a repack after a
+    # commit. Without it, an empty trace below would prove nothing. The control
+    # runs maintenance in the foreground so it cannot outlive the test.
+    control = Path.join(ctx.root, "control")
+    File.mkdir_p!(control)
+    git!(control, ["init", "-b", "main"])
+    write_loose_objects!(ctx, control)
+    File.write!(Path.join(control, "file"), "control")
+    git!(control, ["add", "file"])
+
+    {_, 0} =
+      System.cmd(
+        "git",
+        ["-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false", "commit", "-m", "c"],
+        cd: control,
+        stderr_to_stdout: true,
+        env: [
+          {"GIT_TRACE2_EVENT", control_trace},
+          {"GIT_AUTHOR_NAME", "control"},
+          {"GIT_AUTHOR_EMAIL", "test@tightbeam.invalid"},
+          {"GIT_COMMITTER_NAME", "control"},
+          {"GIT_COMMITTER_EMAIL", "test@tightbeam.invalid"}
+        ]
+      )
+
+    assert "repack" in git_commands(control_trace)
+
+    # Boundary 1: initialization has returned, including its seed commit.
+    assert :initialized = Identity.init!(ctx.base)
+    init_commands = git_commands(trace)
+    assert "commit" in init_commands
+    assert maintenance_commands(init_commands) == []
+
+    # Boundary 2: learning has returned, with loose objects that make this Git
+    # want a repack on every identity commit and merge.
+    write_loose_objects!(ctx, Path.join(ctx.base, "identity"))
+    learn_test_bundle!(ctx)
+    learn_commands = git_commands(trace)
+    assert length(learn_commands) > length(init_commands)
+    assert "commit" in Enum.drop(learn_commands, length(init_commands))
+    assert maintenance_commands(learn_commands) == []
+  end
+
   test "an unlearned bundle probe does not emit expected git fatal stderr", ctx do
     assert :initialized = Identity.init!(ctx.base)
     probe = "Tightbeam.Identity.public_kungfu(#{inspect(ctx.base)}, \"unlearned-bundle\")"
@@ -1487,6 +1553,29 @@ defmodule Tightbeam.IdentityTest do
     assert {:ok, revision} = Identity.publish_live!(base, candidate)
     revision
   end
+
+  # Git's auto-GC samples objects/17. These real SHA-1 blobs land there and
+  # exceed the gc.auto=1 sample threshold, so a commit wants a repack.
+  defp write_loose_objects!(ctx, dir) do
+    for contents <- ~w(32 119 334) do
+      path = Path.join(ctx.root, "loose-object")
+      File.write!(path, contents)
+      git!(dir, ["hash-object", "-w", path])
+    end
+  end
+
+  # Every Git process Trace2 saw, in start order, by command name.
+  defp git_commands(trace) do
+    trace
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.map(&JSON.decode!/1)
+    |> Enum.filter(&(&1["event"] == "cmd_name"))
+    |> Enum.map(& &1["name"])
+  end
+
+  defp maintenance_commands(commands),
+    do: Enum.filter(commands, &(&1 in ~w(maintenance gc repack)))
 
   defp learn_test_bundle!(ctx) do
     Identity.init!(ctx.base)

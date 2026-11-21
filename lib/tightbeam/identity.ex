@@ -1496,7 +1496,14 @@ defmodule Tightbeam.Identity do
   defp merge_upstream(dir, message, author, expected_prior, upstream_prior, before_commit) do
     case System.cmd(
            "git",
-           ["merge", "--no-ff", "--no-commit", @upstream, "-m", message],
+           without_auto_maintenance([
+             "merge",
+             "--no-ff",
+             "--no-commit",
+             @upstream,
+             "-m",
+             message
+           ]),
            cd: dir,
            stderr_to_stdout: true,
            env: git_env(author)
@@ -2255,10 +2262,27 @@ defmodule Tightbeam.Identity do
   end
 
   defp git!(dir, args, author \\ nil) do
-    case System.cmd("git", args, cd: dir, stderr_to_stdout: true, env: git_env(author)) do
+    case System.cmd("git", without_auto_maintenance(args),
+           cd: dir,
+           stderr_to_stdout: true,
+           env: git_env(author)
+         ) do
       {_output, 0} -> :ok
       {output, status} -> raise "git #{Enum.join(args, " ")} failed (#{status}): #{output}"
     end
+  end
+
+  # Git launches automatic maintenance after commits and merges. By default it
+  # detaches, so a worker can keep writing into an initialization candidate
+  # after we rename it, or into a temporary identity after its owner starts
+  # removing it. Waiting for it instead would put an unbounded child on the
+  # identity write path (and, for initialization, under its lock) after Git has
+  # already committed. So identity writes start no maintenance at all; the
+  # identity repository stays small and is not part of any caller's own Git
+  # maintenance policy.
+  @doc false
+  def without_auto_maintenance(args) do
+    ["-c", "maintenance.auto=false", "-c", "gc.auto=0" | args]
   end
 
   defp git_env(nil), do: []
