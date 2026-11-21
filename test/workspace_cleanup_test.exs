@@ -856,8 +856,20 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       File.write!(Path.join(ctx.workspace, "clean/ignored.log"), "ignored")
       File.write!(Path.join(ctx.workspace, "clean/.gitignore"), "ignored.log\n")
       {_, 0} = System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "add", ".gitignore"])
-      {_, 0} = System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "commit", "-qm", "ignore"])
-      {_, 0} = System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "push", "-q", "origin", "HEAD"])
+
+      {_, 0} =
+        System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "commit", "-qm", "ignore"])
+
+      {_, 0} =
+        System.cmd("git", [
+          "-C",
+          Path.join(ctx.workspace, "clean"),
+          "push",
+          "-q",
+          "origin",
+          "HEAD"
+        ])
+
       retire(ctx)
 
       assert %{status: "completed"} =
@@ -905,7 +917,9 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       key = ctx.session.session_key
 
       assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
-      assert {:ok, [%{"path" => "repo"}]} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+
+      assert {:ok, [%{"path" => "repo"}]} =
+               WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
 
       assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
       refute File.exists?(ctx.workspace)
