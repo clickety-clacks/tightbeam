@@ -9,7 +9,7 @@ defmodule Tightbeam.HarklightFeedCustody do
            """
            INSERT INTO harklight_feed_launches(handle,owner) VALUES(?1,?2)
            ON CONFLICT(handle) DO UPDATE SET owner=excluded.owner
-           WHERE harklight_feed_launches.owner=?2 OR ?3=1
+           WHERE ?3=1
            RETURNING handle
            """,
            [handle, owner, if(explicit?, do: 1, else: 0)]

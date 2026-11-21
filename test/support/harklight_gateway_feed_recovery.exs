@@ -85,6 +85,10 @@ if phase == "prepare" do
   fi
   printf '%s\n' '{"kind":"caught_up","rev":8}'
   while [ ! -f '#{root}/fail' ]; do sleep 0.05; done
+  if [ '#{scenario}' = 'drain-baseline' ]; then
+    printf '%s\n' '{"kind":"baseline","rev":9}'
+    exec sleep 300
+  fi
   printf '%s\n' 'listen: live updates paused: internal_error (Request-Id Some("fixture-original-id"))' >&2
   exit 1
   """)
@@ -171,60 +175,104 @@ if phase == "prepare" do
 
   assert [[_]] = rows.(launch)
 
-  if scenario == "clean" do
-    :ok = Application.stop(:tightbeam)
-    File.touch!(Path.join(root, "prepare-ready"))
-  else
-    :ok =
-      DB.execute(DB, """
-      CREATE TRIGGER reject_pause BEFORE INSERT ON harklight_feed_pauses
-      BEGIN SELECT RAISE(ABORT, 'refuse pause projection'); END;
-      """)
+  case scenario do
+    "clean" ->
+      :ok = Application.stop(:tightbeam)
+      File.touch!(Path.join(root, "prepare-ready"))
 
-    File.mkdir_p!(refused_file)
-    File.touch!(Path.join(root, "fail"))
+    "drain-pause" ->
+      worker = :sys.get_state(HarklightWakes).workers[handle]
+      true = :erlang.suspend_process(worker)
+      shutdown = Task.async(fn -> Application.stop(:tightbeam) end)
 
-    await.(fn -> Map.has_key?(:sys.get_state(HarklightWakes).pending_failures, handle) end)
-    {status, observed_at, true} = :sys.get_state(HarklightWakes).pending_failures[handle]
-    assert inspect(status) =~ "fixture-original-id"
-    File.write!(recovery_time, Integer.to_string(observed_at))
-    refute File.exists?(intent)
+      try do
+        await.(fn ->
+          {:messages, messages} = Process.info(worker, :messages)
+          Enum.any?(messages, &match?({:close_feed, _, _, _}, &1))
+        end)
 
-    case scenario do
-      "journal-first" ->
-        File.rmdir!(refused_file)
-        await.(fn -> File.regular?(intent) end)
+        File.touch!(Path.join(root, "fail"))
 
-        assert {:failure, ^status, ^observed_at, true} =
-                 intent |> File.read!() |> :erlang.binary_to_term([:safe])
+        await.(fn ->
+          {:messages, messages} = Process.info(worker, :messages)
+          Enum.any?(messages, &match?({_, {:exit_status, 1}}, &1))
+        end)
+      after
+        :erlang.resume_process(worker)
+      end
 
-      "sqlite-first" ->
-        :ok = DB.execute(DB, "DROP TRIGGER reject_pause")
-        await.(fn -> pause_rows.() != [] end)
-        refute File.exists?(intent)
+      :ok = Task.await(shutdown)
+      File.touch!(Path.join(root, "prepare-ready"))
 
-      "neither-store" ->
-        :ok
-    end
+    "drain-baseline" ->
+      state = :sys.get_state(HarklightWakes)
+      worker = state.workers[handle]
+      port = state.ports[handle]
+      1 = :erlang.trace(worker, true, [:receive])
+      File.touch!(Path.join(root, "fail"))
 
-    if scenario == "sqlite-first" do
-      assert [[_]] = pause_rows.()
-      assert rows.(launch) == []
-    else
-      assert pause_rows.() == []
-      assert [[_]] = rows.(launch)
-    end
+      receive do
+        {:trace, ^worker, :receive, {^port, {:data, bytes}}} ->
+          assert bytes =~ ~s("kind":"baseline")
+      after
+        3_000 -> flunk("worker did not receive the open baseline")
+      end
 
-    assert rows.(checkpoint) == [[8]]
-    File.touch!(Path.join(root, "prepare-ready"))
-    Process.sleep(:infinity)
+      1 = :erlang.trace(worker, false, [:receive])
+      :ok = Application.stop(:tightbeam)
+      File.touch!(Path.join(root, "prepare-ready"))
+
+    _ ->
+      :ok =
+        DB.execute(DB, """
+        CREATE TRIGGER reject_pause BEFORE INSERT ON harklight_feed_pauses
+        BEGIN SELECT RAISE(ABORT, 'refuse pause projection'); END;
+        """)
+
+      File.mkdir_p!(refused_file)
+      File.touch!(Path.join(root, "fail"))
+
+      await.(fn -> Map.has_key?(:sys.get_state(HarklightWakes).pending_failures, handle) end)
+      {status, observed_at, true} = :sys.get_state(HarklightWakes).pending_failures[handle]
+      assert inspect(status) =~ "fixture-original-id"
+      File.write!(recovery_time, Integer.to_string(observed_at))
+      refute File.exists?(intent)
+
+      case scenario do
+        "journal-first" ->
+          File.rmdir!(refused_file)
+          await.(fn -> File.regular?(intent) end)
+
+          assert {:failure, ^status, ^observed_at, true} =
+                   intent |> File.read!() |> :erlang.binary_to_term([:safe])
+
+        "sqlite-first" ->
+          :ok = DB.execute(DB, "DROP TRIGGER reject_pause")
+          await.(fn -> pause_rows.() != [] end)
+          refute File.exists?(intent)
+
+        "neither-store" ->
+          :ok
+      end
+
+      if scenario == "sqlite-first" do
+        assert [[_]] = pause_rows.()
+        assert rows.(launch) == []
+      else
+        assert pause_rows.() == []
+        assert [[_]] = rows.(launch)
+      end
+
+      assert rows.(checkpoint) == [[8]]
+      File.touch!(Path.join(root, "prepare-ready"))
+      Process.sleep(:infinity)
   end
 else
   if scenario == "clean" do
     await.(fn -> calls.() == [expected, expected] end)
     assert pause_rows.() == []
   else
-    if scenario != "sqlite-first" do
+    if scenario in ["journal-first", "neither-store"] do
       HarklightWakes.activate(handle)
       await.(fn -> Map.has_key?(:sys.get_state(HarklightWakes).retry_timers, handle) end)
       assert pause_rows.() == []
@@ -233,15 +281,20 @@ else
       await.(fn -> pause_rows.() != [] end)
     end
 
+    await.(fn -> pause_rows.() != [] end)
     assert calls.() == [expected]
     assert rows.(checkpoint) == [[8]]
     [[diagnostic]] = pause_rows.()
 
-    if scenario in ["journal-first", "sqlite-first"] do
+    if scenario in ["journal-first", "sqlite-first", "drain-pause"] do
       assert diagnostic =~ "internal_error"
       assert diagnostic =~ "fixture-original-id"
-      at = recovery_time |> File.read!() |> String.to_integer()
-      assert rows.("SELECT updatedAt FROM harklight_wake_handles") == [[at]]
+
+      if scenario != "drain-pause" do
+        at = recovery_time |> File.read!() |> String.to_integer()
+        assert rows.("SELECT updatedAt FROM harklight_wake_handles") == [[at]]
+      end
+
       assert rows.(launch) == []
     else
       assert diagnostic =~ "feed_custody_uncertain"

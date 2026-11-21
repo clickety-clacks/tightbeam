@@ -3408,6 +3408,100 @@ defmodule Tightbeam.HarklightWakesTest do
     refute new_port == port
   end
 
+  for {kind, exit_code, diagnostic, table, reason} <- [
+        {:pause, 1,
+         ~s|listen: live updates paused: internal_error (Request-Id Some("rotation-request"))|,
+         "harklight_feed_pauses", "rotation-request"},
+        {:refusal, 2, ~s|server returned HTTP 403: Some("forbidden") (request ID None)|,
+         "harklight_feed_stops", "feed_refused"},
+        {:unfinished_baseline, 0, ~s|{"kind":"baseline","rev":9}|, "harklight_feed_pauses",
+         "feed_custody_uncertain"}
+      ] do
+    @drain_exit exit_code
+    @drain_diagnostic diagnostic
+    @drain_table table
+    @drain_reason reason
+
+    test "listener rotation accounts for an overlapping #{kind}", %{db: db} do
+      :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
+
+      fake_harklight_agent!("""
+      printf '%s\n' "$*" >> "$0.calls"
+      printf '%s\n' '{"kind":"caught_up","rev":8}'
+      if [ -e "$0.resume" ]; then exec sleep 30; fi
+      while [ ! -e "$0.fail" ]; do sleep 0.02; done
+      printf '%s\n' '#{@drain_diagnostic}' >&2
+      if [ '#{@drain_exit}' = '0' ]; then exec sleep 30; fi
+      exit #{@drain_exit}
+      """)
+
+      agent = System.find_executable("harklight-agent")
+      manager = start_supervised!({HarklightWakes, db: db, retry_delays: [1]})
+      port = await_listener_port()
+      assert eventually(fn -> MapSet.size(:sys.get_state(manager).starts_in_flight) == 0 end)
+      worker = :sys.get_state(manager).workers[@handle]
+      send(manager, {:feed_result, worker, "stale-launch", :clean})
+      :sys.get_state(manager)
+      assert {:ok, [[@handle]]} = DB.query(db, "SELECT handle FROM harklight_feed_launches")
+      true = :erlang.suspend_process(worker)
+
+      try do
+        HarklightWakes.activate(@handle, true)
+
+        assert eventually(fn ->
+                 {:messages, messages} = Process.info(worker, :messages)
+                 Enum.any?(messages, &match?({:close_feed, ^manager, _, _}, &1))
+               end)
+
+        File.touch!(agent <> ".fail")
+
+        assert eventually(fn ->
+                 {:messages, messages} = Process.info(worker, :messages)
+
+                 if @drain_exit == 0 do
+                   Enum.any?(messages, fn
+                     {^port, {:data, bytes}} -> bytes =~ ~s("kind":"baseline")
+                     _ -> false
+                   end)
+                 else
+                   Enum.any?(messages, &match?({^port, {:exit_status, @drain_exit}}, &1))
+                 end
+               end)
+      after
+        :erlang.resume_process(worker)
+      end
+
+      assert eventually(fn ->
+               DB.query(db, "SELECT handle FROM #{@drain_table}") == {:ok, [[@handle]]}
+             end)
+
+      assert {:ok, [[8]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+      assert {:ok, [[diagnostic]]} = DB.query(db, "SELECT lastError FROM harklight_wake_handles")
+      assert diagnostic =~ @drain_reason
+      held = if @drain_exit == 0, do: [[@handle]], else: []
+      assert {:ok, ^held} = DB.query(db, "SELECT handle FROM harklight_feed_launches")
+
+      expected = "listen --follow --session #{@handle} --after 8"
+      File.touch!(agent <> ".resume")
+      HarklightWakes.activate(@handle, true)
+
+      refute eventually(
+               fn ->
+                 File.read!(agent <> ".calls") |> String.split("\n", trim: true) != [expected]
+               end,
+               35
+             )
+
+      assert %{counts: %{listening: 1}} =
+               HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+      assert File.read!(agent <> ".calls") |> String.split("\n", trim: true) == [
+               expected,
+               expected
+             ]
+    end
+  end
+
   defp await_listener_port(attempts \\ 100)
   defp await_listener_port(0), do: flunk("listener port did not start")
 

@@ -3,7 +3,14 @@ defmodule Tightbeam.HarklightGatewayFeedRecoveryTest do
 
   @moduletag tmp_dir: true
 
-  for scenario <- ["journal-first", "sqlite-first", "neither-store", "clean"] do
+  for scenario <- [
+        "journal-first",
+        "sqlite-first",
+        "neither-store",
+        "clean",
+        "drain-pause",
+        "drain-baseline"
+      ] do
     @scenario scenario
     @tag timeout: 120_000
     test "filtered feed custody across full gateway replacement with #{scenario}", %{tmp_dir: tmp} do
@@ -14,7 +21,7 @@ defmodule Tightbeam.HarklightGatewayFeedRecoveryTest do
         {:os_pid, old_pid} = Port.info(first, :os_pid)
         first_state = await_file(first, Path.join(tmp, "prepare-ready"))
 
-        if @scenario == "clean" do
+        if @scenario in ["clean", "drain-pause", "drain-baseline"] do
           assert_exit(first, 0, first_state)
         else
           assert first_state == :ready
