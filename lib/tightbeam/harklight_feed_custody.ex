@@ -1,5 +1,42 @@
 defmodule Tightbeam.HarklightFeedCustody do
   @moduledoc false
+  alias Tightbeam.DB
+  alias Tightbeam.DB.Txn
+
+  def arm_launch(db, handle, owner, explicit?) do
+    case DB.query(
+           db,
+           """
+           INSERT INTO harklight_feed_launches(handle,owner) VALUES(?1,?2)
+           ON CONFLICT(handle) DO UPDATE SET owner=excluded.owner
+           WHERE harklight_feed_launches.owner=?2 OR ?3=1
+           RETURNING handle
+           """,
+           [handle, owner, if(explicit?, do: 1, else: 0)]
+         ) do
+      {:ok, [[^handle]]} -> :ok
+      _ -> {:error, :feed_launch_unavailable}
+    end
+  end
+
+  def launch_owner(db, handle) do
+    case DB.query(db, "SELECT owner FROM harklight_feed_launches WHERE handle=?1", [handle]) do
+      {:ok, [[owner]]} -> {:ok, owner}
+      {:ok, []} -> {:ok, nil}
+      error -> error
+    end
+  end
+
+  def release_launch(db, handle, owner) do
+    DB.query(db, "DELETE FROM harklight_feed_launches WHERE handle=?1 AND owner=?2", [
+      handle,
+      owner
+    ])
+  end
+
+  def release_launch_in_txn(txn, handle) do
+    Txn.q(txn, "DELETE FROM harklight_feed_launches WHERE handle=?1", [handle])
+  end
 
   # Keep an observed failure outside the feed manager until its SQLite
   # projection commits. If the filesystem also refuses the record, the
@@ -7,10 +44,14 @@ defmodule Tightbeam.HarklightFeedCustody do
   def remember(directory, handle, evidence) do
     key = {__MODULE__, directory, handle}
     :persistent_term.put(key, evidence)
+  end
 
-    case write(directory, handle, evidence) do
-      :ok -> :persistent_term.erase(key)
-      {:error, _} -> :ok
+  def retry_write(directory, handle) do
+    key = {__MODULE__, directory, handle}
+
+    with evidence when not is_nil(evidence) <- :persistent_term.get(key, nil),
+         :ok <- write(directory, handle, evidence) do
+      :persistent_term.erase(key)
     end
 
     :ok
@@ -50,8 +91,9 @@ defmodule Tightbeam.HarklightFeedCustody do
 
   defp decode(bytes) do
     case :erlang.binary_to_term(bytes, [:safe]) do
-      {:failure, status, observed_at} when is_integer(observed_at) ->
-        {:ok, {status, observed_at}}
+      {:failure, status, observed_at, ended?}
+      when is_integer(observed_at) and is_boolean(ended?) ->
+        {:ok, {status, observed_at, ended?}}
 
       _ ->
         {:error, :invalid_feed_custody}
@@ -60,10 +102,10 @@ defmodule Tightbeam.HarklightFeedCustody do
     ArgumentError -> {:error, :invalid_feed_custody}
   end
 
-  defp write(directory, handle, {status, observed_at}) do
+  defp write(directory, handle, {status, observed_at, ended?}) do
     target = path(directory, handle)
     temporary = target <> ".tmp"
-    bytes = :erlang.term_to_binary({:failure, status, observed_at})
+    bytes = :erlang.term_to_binary({:failure, status, observed_at, ended?})
 
     result =
       with :ok <- File.mkdir_p(directory),

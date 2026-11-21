@@ -28,47 +28,45 @@ defmodule Tightbeam.HarklightListenerOutage do
     end
   end
 
-  def start(db, handle, {error, operation, diagnostic}, now) do
-    DB.transaction(db, fn txn ->
-      case Txn.q(
-             txn,
-             """
-             SELECT h.state,COALESCE(c.rev,-1) FROM harklight_wake_handles h
-             LEFT JOIN harklight_feed_checkpoints c ON c.handle=h.handle
-             WHERE h.handle=?1
-               AND NOT EXISTS(SELECT 1 FROM harklight_feed_pauses p WHERE p.handle=h.handle)
-               AND NOT EXISTS(SELECT 1 FROM harklight_feed_stops s WHERE s.handle=h.handle)
-             """,
-             [handle]
-           ) do
-        [[state, checkpoint]] when state != "complete" ->
+  def start_in_txn(txn, handle, {error, operation, diagnostic}, now) do
+    case Txn.q(
+           txn,
+           """
+           SELECT h.state,COALESCE(c.rev,-1) FROM harklight_wake_handles h
+           LEFT JOIN harklight_feed_checkpoints c ON c.handle=h.handle
+           WHERE h.handle=?1
+             AND NOT EXISTS(SELECT 1 FROM harklight_feed_pauses p WHERE p.handle=h.handle)
+             AND NOT EXISTS(SELECT 1 FROM harklight_feed_stops s WHERE s.handle=h.handle)
+           """,
+           [handle]
+         ) do
+      [[state, checkpoint]] when state != "complete" ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO harklight_listener_outages(handle,episode,startedAt,error,operation,diagnostic,checkpoint)
+          VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(handle) DO NOTHING
+          """,
+          [handle, Tightbeam.Id.uuid4(), now, error, operation, diagnostic, checkpoint]
+        )
+
+        Txn.q(
+          txn,
+          "UPDATE harklight_wake_handles SET state='unavailable',lastError=?2,updatedAt=?3 WHERE handle=?1",
+          [handle, if(diagnostic, do: error <> ": " <> diagnostic, else: error), now]
+        )
+
+        hd(
           Txn.q(
             txn,
-            """
-            INSERT INTO harklight_listener_outages(handle,episode,startedAt,error,operation,diagnostic,checkpoint)
-            VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(handle) DO NOTHING
-            """,
-            [handle, Tightbeam.Id.uuid4(), now, error, operation, diagnostic, checkpoint]
+            "SELECT handle,episode,startedAt,noticeWakeId FROM harklight_listener_outages WHERE handle=?1",
+            [handle]
           )
+        )
 
-          Txn.q(
-            txn,
-            "UPDATE harklight_wake_handles SET state='unavailable',lastError=?2,updatedAt=?3 WHERE handle=?1",
-            [handle, if(diagnostic, do: error <> ": " <> diagnostic, else: error), now]
-          )
-
-          hd(
-            Txn.q(
-              txn,
-              "SELECT handle,episode,startedAt,noticeWakeId FROM harklight_listener_outages WHERE handle=?1",
-              [handle]
-            )
-          )
-
-        _ ->
-          nil
-      end
-    end)
+      _ ->
+        nil
+    end
   end
 
   def pending(db),

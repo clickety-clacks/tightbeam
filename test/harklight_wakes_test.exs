@@ -4573,7 +4573,8 @@ defmodule Tightbeam.HarklightWakesTest do
     send(original, :drop)
 
     assert eventually(fn ->
-             :sys.get_state(manager).pending_failures[@handle] == {"listener_terminated", issued}
+             :sys.get_state(manager).pending_failures[@handle] ==
+               {"listener_terminated", issued, true}
            end)
 
     assert {:ok, [["active", nil]]} =
@@ -4581,14 +4582,14 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
 
-    assert {:ok, {"listener_terminated", ^issued}} =
+    assert {:ok, {"listener_terminated", ^issued, true}} =
              Tightbeam.HarklightFeedCustody.pending(:sys.get_state(manager).custody_dir, @handle)
 
     replacing = replace_feed_manager(manager)
 
     assert eventually(fn ->
              :sys.get_state(replacing).pending_failures[@handle] ==
-               {"listener_terminated", issued}
+               {"listener_terminated", issued, true}
            end)
 
     HarklightWakes.activate(@handle, true)
@@ -4699,7 +4700,7 @@ defmodule Tightbeam.HarklightWakesTest do
       File.touch!(agent_path <> ".fail")
 
       assert eventually(fn ->
-               match?({_status, ^issued}, :sys.get_state(manager).pending_failures[@handle])
+               match?({_status, ^issued, true}, :sys.get_state(manager).pending_failures[@handle])
              end)
 
       expected = "listen --follow --session #{@handle} --after 8"
@@ -4711,7 +4712,7 @@ defmodule Tightbeam.HarklightWakesTest do
       refute eventually(
                fn ->
                  match?(
-                   {_status, time} when time != issued,
+                   {_status, time, true} when time != issued,
                    :sys.get_state(manager).pending_failures[@handle]
                  )
                end,
@@ -4721,7 +4722,10 @@ defmodule Tightbeam.HarklightWakesTest do
       replacement = replace_feed_manager(manager)
 
       assert eventually(fn ->
-               match?({_status, ^issued}, :sys.get_state(replacement).pending_failures[@handle])
+               match?(
+                 {_status, ^issued, true},
+                 :sys.get_state(replacement).pending_failures[@handle]
+               )
              end)
 
       HarklightWakes.activate(@handle, true)
@@ -5049,12 +5053,14 @@ defmodule Tightbeam.HarklightWakesTest do
     now = System.system_time(:millisecond)
 
     assert {:ok, [@handle, episode, ^now, nil]} =
-             Tightbeam.HarklightListenerOutage.start(
-               db,
-               @handle,
-               {"listener_terminated", nil, nil},
-               now
-             )
+             DB.transaction(db, fn txn ->
+               Tightbeam.HarklightListenerOutage.start_in_txn(
+                 txn,
+                 @handle,
+                 {"listener_terminated", nil, nil},
+                 now
+               )
+             end)
 
     assert {:ok, :notified} =
              Tightbeam.HarklightListenerOutage.notify(db, @handle, episode, now, 0)
