@@ -5970,15 +5970,18 @@ defmodule Tightbeam.HarklightWakesTest do
 
     start_supervised!({HarklightWakes, db: db, listener: listener, retry_delays: [1]})
     assert_receive :attempt
+
+    assert eventually(fn ->
+             case DB.query(db, "SELECT lastError FROM harklight_wake_handles WHERE handle=?1", [
+                    @handle
+                  ]) do
+               {:ok, [[error]]} when is_binary(error) -> error =~ "reason_code=forbidden"
+               _ -> false
+             end
+           end)
+
     refute_receive :attempt, 30
     refute File.exists?(calls)
-
-    assert {:ok, [[error]]} =
-             DB.query(db, "SELECT lastError FROM harklight_wake_handles WHERE handle=?1", [
-               @handle
-             ])
-
-    assert error =~ "reason_code=forbidden"
   end
 
   test "a failed gone command leaves retirement nonblocking", %{db: db, session: session} do
