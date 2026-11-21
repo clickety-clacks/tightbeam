@@ -107,27 +107,6 @@ defmodule Tightbeam.RowReactions.Plan do
     }
   end
 
-  def handoff_default?(
-        %{owner: :substrate, archetypes: archetypes, policy_context: context} = rail
-      ) do
-    (archetypes == ["*"] or context == "organization") and terminal_handoff?(rail)
-  end
-
-  def handoff_default?(_rail), do: false
-
-  defp terminal_handoff?(%{
-         mode: :event,
-         short_name: "assignment-terminal-handoff",
-         family: "terminal-handoff",
-         events: events,
-         effects: effects
-       }) do
-    "assignment" in events and
-      Enum.any?(effects, &match?(%{"slot" => "handoff", "kind" => "notice"}, &1))
-  end
-
-  defp terminal_handoff?(_rail), do: false
-
   # A nonmatching rail still supplies its typed withdrawal parameters. They
   # cannot admit work; they describe how an already pending output is canceled.
   def evaluate(rails, event, facts) do
@@ -174,32 +153,12 @@ defmodule Tightbeam.RowReactions.Plan do
         end
       end)
 
-    plans = select_handoff(plans, event)
     unique!(Enum.map(plans, & &1.identity))
 
     Enum.map(plans, fn plan ->
       plan |> Map.delete(:context) |> Map.delete(:rail)
     end)
   end
-
-  # A receipt-owned notice can override the organization default for its own
-  # participants. Every other collision still goes to the uniqueness check.
-  defp select_handoff(plans, %{"kind" => "assignment"}) do
-    handoffs =
-      Enum.filter(plans, fn plan ->
-        plan.slot == "handoff" and plan.kind == "notice" and terminal_handoff?(plan.rail)
-      end)
-
-    case Enum.split_with(handoffs, &handoff_default?(&1.rail)) do
-      {[default], [%{rail: %{owner: {:kungfu, _}}, selected: selected} = scoped]} ->
-        List.delete(plans, if(selected, do: default, else: scoped))
-
-      _ ->
-        plans
-    end
-  end
-
-  defp select_handoff(plans, _event), do: plans
 
   defp validate_archetypes!(rail, owner, owned_archetypes) do
     names = Map.get(rail, "archetypes", [])

@@ -1011,7 +1011,11 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
 
     File.write!(
       Path.join(identity_dir, "kungfu/#{@kungfu}/manifest.toml"),
-      "name = \"#{@kungfu}\"\nroot_archetype = \"#{@archetype}\"\n"
+      """
+      name = "#{@kungfu}"
+      root_archetype = "#{@archetype}"
+      purpose = "Exercise identity migration with a learned kungfu."
+      """
     )
 
     paths = [
