@@ -10,6 +10,8 @@ Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
 Application.put_env(:tightbeam, :base_dir, base)
+# The engineering bundle is no longer shipped; learn it from the test fixture root.
+Application.put_env(:tightbeam, :kungfu_bundle_root_dir, Path.expand("fixtures/kungfu", __DIR__))
 Tightbeam.IdentityPublicationFixture.Diagnostics.record(:runtime_ready)
 
 if System.get_env("DD36_IDENTITY_PUBLICATION_CONTROLLED_STALL") == "1" do
