@@ -1257,7 +1257,6 @@ defmodule Tightbeam.Identity do
       source_notice: source_notice(dir, source, live),
       missing_installed_kungfu: missing,
       missing_installed_kungfu_notice: format_missing_installed_kungfu_notice(missing),
-      missing_seed_law_notice: missing_seed_law_notice(base_dir, live),
       state: if(conflicts == [], do: :ready, else: :relearn_conflicted),
       conflicting_paths: conflicts
     }
@@ -1320,78 +1319,65 @@ defmodule Tightbeam.Identity do
     _error -> ["#{path} (live rule entries could not be inspected)"]
   end
 
-  @seed_law_kinds ~w(rule policy reaction statute)
-
-  # Seed law files delivered to an existing install at startup. A shipped seed
+  # Seed rule files delivered to an existing install at startup. A shipped seed
   # file is not automatically a default for upgrades: add its path here to make it
   # one. The parent action reminder is deliberately absent; whether it ships as a
   # default is a separate product decision.
   @auto_delivered_seed_law ["rules/row-reaction-handoff.toml"]
+  @reconcile_subject "identity: add shipped seed rules: "
 
   @doc """
-  Add the auto-delivered shipped seed law entries the live identity lacks, and
+  Add the auto-delivered shipped seed reactions the live identity lacks, and
   report the rest.
 
   Shipped seed defaults reach a fresh install through `init!/1`; an install that
   predates a default would otherwise need a manual relearn. This runs at startup
-  so an upgrade delivers the ones listed in `@auto_delivered_seed_law`. It only ever ADDS. A seed law file is written when
-  none of its entries (matched by kind and name, in any law file of the live
-  identity, so a copy an operator moved or a learned bundle supplies counts) is
-  present and its path is free. Anything else is reported in `:attention` and
-  never touched: an operator-edited live file keeps its bytes.
+  so an upgrade delivers the files listed in `@auto_delivered_seed_law`. It only
+  ever ADDS. A seed file is written when none of its reactions is defined in a rule
+  file the loader reads (`rules/*.toml`, `kungfu/*/rules/*.toml`) and its path is
+  free, so an operator-edited copy, a moved copy, or one a learned bundle supplies
+  is left alone. Anything else is reported in `:attention` and never touched.
 
-  `publish` receives the new main commit (`candidate_result/3` shape) and must
-  publish it or raise; a raise puts main and live back where they were. Returns
+  `publish` receives the new main commit and must publish it or raise; a raise
+  puts main and live back where they were. A commit left by an interrupted
+  earlier run (main one commit ahead of live, with this subject) is published
+  rather than mistaken for operator work. Returns
   `%{added: [name], attention: [message], candidate: map | nil}`.
   """
   @spec reconcile_seed_law!(String.t(), (map() -> any())) :: map()
   def reconcile_seed_law!(base_dir, publish) when is_function(publish, 1) do
     dir = identity_dir(base_dir)
     live = git_output!(dir, ["rev-parse", @live])
-    %{add: add, blocked: blocked} = seed_law_gaps_at(dir, live)
-    blocked_attention = Enum.map(blocked, &"#{&1} is already present but lacks shipped entries")
 
-    with [_ | _] <- add,
-         :ok <- reconcile_ready(dir, live) do
-      candidate = commit_seed_law!(dir, live, add)
+    case interrupted_reconcile(dir, live) do
+      {:publish, main, names} ->
+        publish_reconcile(dir, live, %{candidate_revision: main, expected_prior: live}, names, publish)
 
-      try do
-        publish.(candidate)
+      :none ->
+        %{add: add, blocked: blocked} = seed_law_gaps_at(dir, live)
+        blocked_attention = Enum.map(blocked, &"#{&1} is present but does not define the shipped rule")
 
-        %{
-          added: Enum.flat_map(add, & &1.names),
-          attention: blocked_attention,
-          candidate: candidate
-        }
-      rescue
-        error ->
-          git!(dir, ["reset", "--hard", live])
-          git!(dir, ["update-ref", "refs/heads/#{@live}", live])
+        with [_ | _] <- add,
+             :ok <- reconcile_ready(dir, live) do
+          names = Enum.flat_map(add, & &1.names)
+          candidate = commit_seed_law!(dir, live, add)
+          result = publish_reconcile(dir, live, candidate, names, publish)
+          %{result | attention: blocked_attention ++ result.attention}
+        else
+          [] ->
+            %{added: [], attention: blocked_attention, candidate: nil}
 
-          %{
-            added: [],
-            attention:
-              blocked_attention ++
-                ["publishing shipped seed rules failed: " <> Exception.message(error)],
-            candidate: nil
-          }
-      end
-    else
-      [] ->
-        %{added: [], attention: blocked_attention, candidate: nil}
+          {:not_ready, reason} ->
+            names = Enum.flat_map(add, & &1.names)
 
-      {:not_ready, reason} ->
-        names = Enum.flat_map(add, & &1.names)
-
-        %{
-          added: [],
-          attention:
-            blocked_attention ++
-              [
-                "shipped seed rules not yet in the live identity: #{Enum.join(names, ", ")} (#{reason})"
-              ],
-          candidate: nil
-        }
+            %{
+              added: [],
+              attention:
+                blocked_attention ++
+                  ["shipped seed rules not yet in the live identity: #{Enum.join(names, ", ")} (#{reason})"],
+              candidate: nil
+            }
+        end
     end
   rescue
     error ->
@@ -1402,6 +1388,18 @@ defmodule Tightbeam.Identity do
       }
   end
 
+  @doc "The revision when live is exactly a startup seed-rule commit, else nil."
+  def seed_reconcile_revision(base_dir) do
+    dir = identity_dir(base_dir)
+    live = git_output!(dir, ["rev-parse", @live])
+
+    if git_output!(dir, ["rev-parse", "main"]) == live and
+         String.starts_with?(git_output!(dir, ["log", "-1", "--format=%s", live]), @reconcile_subject),
+       do: live
+  rescue
+    _error -> nil
+  end
+
   @doc "Notice for a gap the startup reconcile could not close, or nil."
   def format_seed_law_attention([]), do: nil
 
@@ -1410,6 +1408,42 @@ defmodule Tightbeam.Identity do
       Enum.join(messages, "; ") <>
       ". Publish or discard pending identity changes (`tightbeam identity status`) and restart, " <>
       "or run `tightbeam identity relearn` to install them."
+  end
+
+  defp publish_reconcile(dir, live, candidate, names, publish) do
+    publish.(candidate)
+    %{added: names, attention: [], candidate: candidate}
+  rescue
+    error ->
+      restore_clean_main!(dir, live)
+
+      %{
+        added: [],
+        attention: ["publishing shipped seed rules failed: " <> Exception.message(error)],
+        candidate: nil
+      }
+  end
+
+  defp restore_clean_main!(dir, live) do
+    git!(dir, ["reset", "--hard", live])
+    git!(dir, ["update-ref", "refs/heads/#{@live}", live])
+  end
+
+  # An earlier start committed the seed rules on main and stopped before
+  # publishing them (or before the stamp moved).
+  defp interrupted_reconcile(dir, live) do
+    main = git_output!(dir, ["rev-parse", "main"])
+    subject = git_output!(dir, ["log", "-1", "--format=%s", main])
+
+    if main != live and String.starts_with?(subject, @reconcile_subject) and
+         git_output!(dir, ["rev-parse", "main^"]) == live and
+         git_output!(dir, ["branch", "--show-current"]) == "main" and
+         not merge_pending?(dir) and git_output!(dir, ["status", "--porcelain"]) == "" do
+      names = subject |> String.replace_prefix(@reconcile_subject, "") |> String.split(", ")
+      {:publish, main, names}
+    else
+      :none
+    end
   end
 
   defp reconcile_ready(dir, live) do
@@ -1425,9 +1459,6 @@ defmodule Tightbeam.Identity do
 
       git_output!(dir, ["rev-parse", "main"]) != live ->
         {:not_ready, "main has unpublished identity changes"}
-
-      grandfather_receipt_pending?(dir) ->
-        {:not_ready, "the agentic-engineering grandfather receipt mint is pending"}
 
       true ->
         :ok
@@ -1447,79 +1478,68 @@ defmodule Tightbeam.Identity do
       fingerprint = validate_candidate_tree!(dir, live)
       names = Enum.flat_map(add, & &1.names)
       git!(dir, ["add", "-A", "--" | paths])
-
-      git!(
-        dir,
-        ["commit", "-m", "identity: add shipped seed rules: #{Enum.join(names, ", ")}"],
-        "tightbeam"
-      )
-
+      git!(dir, ["commit", "-m", @reconcile_subject <> Enum.join(names, ", ")], "tightbeam")
       candidate_result(dir, live, fingerprint)
     rescue
       error ->
-        # The tree was clean before the write, so this restores it exactly.
-        git!(dir, ["reset", "--hard", live])
+        # The tree was clean before the write: remove our files first, so a
+        # failing git cannot leave one that the gateway would load.
         Enum.each(paths, &File.rm(Path.join(dir, &1)))
+        git!(dir, ["reset", "--hard", live])
         reraise error, __STACKTRACE__
     end
   end
 
-  @doc "Shipped seed law entries missing from the live identity, as notice text, or nil."
-  def missing_seed_law_notice(base_dir, revision \\ nil) do
-    dir = identity_dir(base_dir)
-    revision = revision || live_revision!(base_dir)
-    %{add: add, blocked: blocked} = seed_law_gaps_at(dir, revision)
-
-    format_seed_law_attention(
-      Enum.flat_map(add, & &1.names) ++
-        Enum.map(blocked, &"#{&1} lacks shipped entries")
-    )
-  rescue
-    _error -> nil
-  end
-
   # `add`: absent seed files that can be written whole. `blocked`: seed files
-  # whose entries are missing but whose path is occupied or only partly absent.
+  # whose reactions are missing but whose path is occupied.
   defp seed_law_gaps_at(dir, revision) do
-    paths =
-      dir
-      |> git_output!(["ls-tree", "-r", "--name-only", revision])
-      |> String.split("\n", trim: true)
+    loaded = loader_rule_paths(dir, revision)
 
-    live_names =
-      paths
-      |> Enum.filter(&(law_file_path?(&1) and String.ends_with?(&1, ".toml")))
-      |> Enum.flat_map(&law_entry_names(git_show_bytes!(dir, revision, &1)))
+    defined =
+      loaded
+      |> Enum.flat_map(fn path ->
+        try do
+          reaction_names(git_show_bytes!(dir, revision, path))
+        rescue
+          # The loader skips a file it cannot parse, so it defines nothing.
+          _ -> []
+        end
+      end)
       |> MapSet.new()
 
     seed_entries()
     |> Enum.filter(fn {path, _} -> path in @auto_delivered_seed_law end)
     |> Enum.reduce(%{add: [], blocked: []}, fn {path, bytes}, acc ->
-      shipped = law_entry_names(bytes)
-      absent = Enum.reject(shipped, &MapSet.member?(live_names, &1))
+      absent = bytes |> reaction_names() |> Enum.reject(&MapSet.member?(defined, &1))
 
       cond do
-        absent == [] ->
-          acc
-
-        path in paths or length(absent) != length(shipped) ->
-          %{acc | blocked: acc.blocked ++ [path]}
-
-        true ->
-          entry = %{path: path, bytes: bytes, names: Enum.map(absent, fn {_, name} -> name end)}
-          %{acc | add: acc.add ++ [entry]}
+        absent == [] -> acc
+        path_exists_at?(dir, revision, path) -> %{acc | blocked: acc.blocked ++ [path]}
+        true -> %{acc | add: acc.add ++ [%{path: path, bytes: bytes, names: absent}]}
       end
     end)
   end
 
-  defp law_entry_names(bytes) do
-    decoded = Toml.decode!(bytes)
+  # The files `Tightbeam.Rules` reads for rules and reactions.
+  defp loader_rule_paths(dir, revision) do
+    dir
+    |> git_output!(["ls-tree", "-r", "--name-only", revision, "--", "rules", "kungfu"])
+    |> String.split("\n", trim: true)
+    |> Enum.filter(fn path ->
+      String.ends_with?(path, ".toml") and
+        case Path.split(path) do
+          ["rules", _file] -> true
+          ["kungfu", _name, "rules", _file] -> true
+          _ -> false
+        end
+    end)
+  end
 
-    for kind <- @seed_law_kinds,
-        entry <- Map.get(decoded, kind, []),
+  defp reaction_names(bytes) do
+    for entry <- Map.get(Toml.decode!(bytes), "reaction", []),
         name = Map.get(entry, "name"),
         is_binary(name),
-        do: {kind, name}
+        do: name
   end
 
   defp law_file_path?(path) do

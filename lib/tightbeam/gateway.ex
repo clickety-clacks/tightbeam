@@ -187,9 +187,7 @@ defmodule Tightbeam.Gateway do
     File.mkdir_p!(config.base_dir)
 
     :ok = Schema.ensure_all(db)
-    _ = Tightbeam.Identity.RailScopeMigration.run!(config.base_dir, db)
-    _ = Tightbeam.Identity.SeedReconcile.run!(config.base_dir, db)
-    warn_missing_installed_kungfu(config.base_dir)
+    :ok = run_identity_startup!(config.base_dir, db)
     load_law!(config)
     :ok = AdminProjection.bootstrap_served(db, config.base_dir)
     :ok = TerminalCredentialFailure.reconcile_all(db)
@@ -6475,6 +6473,17 @@ defmodule Tightbeam.Gateway do
     |> Map.merge(Rules.status())
     |> Map.put(:sessions, sessions)
     |> maybe_put_guidance(guidance)
+  end
+
+  # Identity work every boot does after the schema exists, in this order: the
+  # one-time rail-scope migration, then delivery of shipped seed defaults the live
+  # identity lacks, then the missing-kungfu warning. Law loads after it.
+  @doc false
+  def run_identity_startup!(base_dir, db) do
+    _ = Tightbeam.Identity.RailScopeMigration.run!(base_dir, db)
+    _ = Tightbeam.Identity.SeedReconcile.run!(base_dir, db)
+    warn_missing_installed_kungfu(base_dir)
+    :ok
   end
 
   @doc false

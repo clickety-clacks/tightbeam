@@ -27,38 +27,57 @@ defmodule Tightbeam.Identity.SeedReconcile do
       )
     end
 
+    if result.candidate == nil, do: restamp_if_interrupted!(base_dir, db)
+
     if notice = Identity.format_seed_law_attention(result.attention), do: Logger.warning(notice)
 
     result
   end
 
-  # Publication and the served-identity stamp move together, so a failure rolls
-  # both back and boot never serves a revision the stamp does not describe.
+  # Publication and the served-identity stamp move together. A stop between the
+  # Git ref moving and the stamp committing leaves live at our commit with a stale
+  # stamp, and bootstrap only inserts absent stamps, so finish it here.
+  defp restamp_if_interrupted!(base_dir, db) do
+    with live when is_binary(live) <- Identity.seed_reconcile_revision(base_dir),
+         false <- stamp_current?(db, live) do
+      {:ok, :ok} = DB.transaction(db, fn txn -> stamp!(txn, base_dir) end)
+      Logger.info("advanced the served identity stamp to the seed-rule revision #{live}")
+    end
+
+    :ok
+  end
+
+  defp stamp_current?(db, live) do
+    match?(%{"liveRevision" => ^live}, AdminProjection.stamped_item(db, "identity", "served"))
+  rescue
+    _error -> false
+  end
+
+  # A failure rolls the stamp back with the publication and boot never serves a
+  # revision the stamp does not describe.
   defp publish!(base_dir, db, candidate) do
-    {:ok, _revision} =
-      case DB.transaction(db, fn txn ->
-             case Identity.publish_live!(base_dir, candidate) do
-               {:ok, revision} ->
-                 identity = AdminProjection.served_identity_entry(txn, base_dir)
+    case DB.transaction(db, fn txn ->
+           case Identity.publish_live!(base_dir, candidate) do
+             {:ok, _revision} -> stamp!(txn, base_dir)
+             {:error, error} -> raise ArgumentError, "identity publication failed: #{inspect(error)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
 
-                 AdminProjection.allocate_in_txn(
-                   txn,
-                   "identity",
-                   "served",
-                   System.system_time(:millisecond),
-                   fingerprint: AdminProjection.fingerprint(identity.item),
-                   item: JSON.encode!(identity.item)
-                 )
+  defp stamp!(txn, base_dir) do
+    identity = AdminProjection.served_identity_entry(txn, base_dir)
 
-                 revision
-
-               {:error, error} ->
-                 raise ArgumentError, "identity publication failed: #{inspect(error)}"
-             end
-           end) do
-        {:ok, revision} -> {:ok, revision}
-        {:error, error} -> raise error
-      end
+    AdminProjection.allocate_in_txn(
+      txn,
+      "identity",
+      "served",
+      System.system_time(:millisecond),
+      fingerprint: AdminProjection.fingerprint(identity.item),
+      item: JSON.encode!(identity.item)
+    )
 
     :ok
   end

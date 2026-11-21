@@ -82,7 +82,6 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
       # The next boot finds nothing to do.
       assert %{added: [], attention: [], candidate: nil} = SeedReconcile.run!(ctx.base, ctx.db)
       assert Identity.live_revision!(ctx.base) == revision
-      assert Identity.status(ctx.base).missing_seed_law_notice == nil
     end
   end
 
@@ -141,7 +140,6 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     assert log =~ "tightbeam identity relearn"
     assert Identity.live_revision!(ctx.base) == live
     assert live_bytes(ctx.dir, @notice_path) == renamed
-    assert Identity.status(ctx.base).missing_seed_law_notice =~ @notice_path
   end
 
   test "unpublished identity changes on main stop the add and the warning names the command",
@@ -165,7 +163,64 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     assert message =~ @notice and message =~ "unpublished"
     assert log =~ "tightbeam identity relearn"
     assert Identity.live_revision!(ctx.base) == live
-    assert Identity.status(ctx.base).missing_seed_law_notice =~ @notice
+  end
+
+  test "a copy in a file the loader never reads does not count, and an unrelated bad file does not stop the add",
+       ctx do
+    init_shape!(ctx.base, "0.1.15")
+    File.mkdir_p!(Path.join(ctx.dir, "rules/nested"))
+    File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "rules/nested/unread.toml"))
+    File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "rails/unread.toml"))
+    File.write!(Path.join(ctx.dir, "rules/broken.toml"), "[[rule]\nname = broken")
+    commit_and_publish!(ctx.dir, "fixture: unread copies and a bad file")
+
+    assert %{added: [@notice]} = SeedReconcile.run!(ctx.base, ctx.db)
+    assert File.exists?(Path.join(ctx.dir, @notice_path))
+  end
+
+  test "a start that stopped after committing on main finishes the publication", ctx do
+    init_shape!(ctx.base, "0.1.15")
+    prior = Identity.live_revision!(ctx.base)
+    assert :ok = AdminProjection.bootstrap_served(ctx.db, ctx.base)
+
+    # The process dies after the commit and before anything is published.
+    assert :crash == catch_throw(Identity.reconcile_seed_law!(ctx.base, fn _ -> throw(:crash) end))
+    committed = git(ctx.dir, ["rev-parse", "main"])
+    refute committed == prior
+    assert Identity.live_revision!(ctx.base) == prior
+
+    assert %{added: [@notice], attention: [], candidate: %{candidate_revision: ^committed}} =
+             SeedReconcile.run!(ctx.base, ctx.db)
+
+    assert Identity.live_revision!(ctx.base) == committed
+    assert git(ctx.dir, ["rev-parse", "main"]) == committed
+
+    assert %{"liveRevision" => ^committed} =
+             AdminProjection.stamped_item(ctx.db, "identity", "served")
+
+    assert loaded?(ctx.base)
+  end
+
+  test "a start that stopped after live moved but before the stamp committed restamps", ctx do
+    init_shape!(ctx.base, "0.1.15")
+    assert :ok = AdminProjection.bootstrap_served(ctx.db, ctx.base)
+    prior = Identity.live_revision!(ctx.base)
+
+    # Live moves (the Git ref), the stamp does not: the later boot finds the rule present.
+    assert :crash ==
+             catch_throw(
+               Identity.reconcile_seed_law!(ctx.base, fn candidate ->
+                 {:ok, _} = Identity.publish_live!(ctx.base, candidate)
+                 throw(:crash)
+               end)
+             )
+
+    live = Identity.live_revision!(ctx.base)
+    refute live == prior
+    assert %{"liveRevision" => ^prior} = AdminProjection.stamped_item(ctx.db, "identity", "served")
+
+    assert %{added: [], candidate: nil} = SeedReconcile.run!(ctx.base, ctx.db)
+    assert %{"liveRevision" => ^live} = AdminProjection.stamped_item(ctx.db, "identity", "served")
   end
 
   test "a failed publication puts main and live back", ctx do

@@ -2065,6 +2065,69 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert Enum.count(facts["attests"], &is_map(&1["disposition"])) == 1
   end
 
+  @identity_shapes Path.expand("fixtures/identity-seed-shapes", __DIR__)
+
+  # The whole path an operator's install takes: its identity as an earlier
+  # release (or a fresh install) left it, the normal startup identity work, then
+  # the law loaded from the live revision. No manual relearn anywhere.
+  for shape <- ["fresh", "0.1.15", "0.1.16"], outcome <- ["completed", "revoked"] do
+    test "a #{shape} install notifies the parent when a child assignment is #{outcome} after normal startup",
+         ctx do
+      base = Path.join(System.tmp_dir!(), "boot-notice-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf!(base) end)
+      File.mkdir_p!(base)
+      init_identity_shape!(base, unquote(shape))
+
+      assert :ok = Gateway.run_identity_startup!(base, ctx.db)
+      Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+
+      if unquote(outcome) == "completed" do
+        {_parent, _child, root} = completed_child(ctx)
+        assert root.prompt =~ ~s(outcome="completed")
+      else
+        item = create_work_item(ctx, "withdrawn child")
+
+        child =
+          handle(
+            ctx,
+            "assign",
+            assign_call({:session, "notice-parent"}, "holder", "child task", item.id,
+              effect_kind: "coordination"
+            )
+          )
+
+        assert %{outcome: "revoked"} =
+                 Assignments.__handle__(
+                   ctx.db,
+                   "revoke-assignment",
+                   call("revoke-assignment", {:session, "notice-parent"}, nil, %{
+                     assignment_id: child.id,
+                     reason: "withdrawn"
+                   })
+                 )
+
+        assert [notice] = terminal_notices(ctx.db)
+        assert notice.prompt =~ ~s(outcome="revoked")
+        assert notice.session_key == "notice-parent"
+      end
+    end
+  end
+
+  defp init_identity_shape!(base, "fresh"), do: :initialized = Tightbeam.Identity.init!(base)
+
+  defp init_identity_shape!(base, shape) do
+    previous = Application.get_env(:tightbeam, :identity_seed_dir)
+    Application.put_env(:tightbeam, :identity_seed_dir, Path.join(@identity_shapes, shape))
+
+    try do
+      :initialized = Tightbeam.Identity.init!(base)
+    after
+      if previous,
+        do: Application.put_env(:tightbeam, :identity_seed_dir, previous),
+        else: Application.delete_env(:tightbeam, :identity_seed_dir)
+    end
+  end
+
   defp forget_reaction_ledger!(db) do
     # Simulate the declared pre-cutover population: the original wake, source
     # occurrence and delivery receipts remain, with no reaction ledger yet.
