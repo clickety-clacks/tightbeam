@@ -157,7 +157,7 @@ defmodule Tightbeam.TurnFailureNotice do
     Txn.q(
       txn,
       """
-      SELECT 1 FROM wakes WHERE wakeId=?1 AND sessionKey=?2
+      SELECT 1 FROM wakes WHERE wakeId=?1 AND sessionKey=?2 AND assignmentId=?4
       UNION ALL
       SELECT 1 FROM sessions recipient
       WHERE EXISTS (
@@ -166,7 +166,12 @@ defmodule Tightbeam.TurnFailureNotice do
       )
       LIMIT 1
       """,
-      ["w_health_redelivery_parent_#{seq}", recipient, "wake-undelivered:#{seq}:#{assignment_id}"]
+      [
+        "w_health_redelivery_parent_#{seq}",
+        recipient,
+        "wake-undelivered:#{seq}:#{assignment_id}",
+        assignment_id
+      ]
     ) != []
   end
 

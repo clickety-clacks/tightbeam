@@ -728,10 +728,25 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert Ledger.pending_count(ctx.db, ctx.holder.session_key) == 0
   end
 
-  test "a failed mixed carrier reports each dispatch assignment once and receipts its ordinary sender",
-       ctx do
+  for scenario <- [
+        :distinct_openers,
+        :shared_opener_scoped_question,
+        :shared_opener_unscoped_question
+      ] do
+    @tag mixed_failure_case: scenario
+    test "a failed mixed carrier reports each dispatch assignment once (#{scenario})", ctx do
+      assert_mixed_dispatch_failure(ctx, ctx.mixed_failure_case)
+    end
+  end
+
+  defp assert_mixed_dispatch_failure(ctx, scenario) do
     opener = session(ctx.db, "mixed-dispatch-opener", ctx.main.session_key)
-    second_opener = session(ctx.db, "second-dispatch-opener", ctx.main.session_key)
+
+    second_opener =
+      if scenario == :distinct_openers,
+        do: session(ctx.db, "second-dispatch-opener", ctx.main.session_key),
+        else: opener
+
     sender = session(ctx.db, "mixed-ordinary-sender", ctx.main.session_key)
     busy = hold_recipient!(ctx.db, ctx.holder.session_key)
 
@@ -808,6 +823,24 @@ defmodule Tightbeam.Productions.BubbleTest do
                fire_wake_in_txn: true
              )
 
+    senderless =
+      Tightbeam.Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        origin: "process:tightbeam",
+        prompt: "private system message",
+        due_at: 0
+      })
+
+    assert :queued =
+             Tightbeam.Gateway.deliver_prompt(
+               ctx.holder.session_key,
+               senderless.origin,
+               senderless.prompt,
+               db: ctx.db,
+               wake_id: senderless.wake_id,
+               fire_wake_in_txn: true
+             )
+
     finish_busy_recipient!(ctx.db, busy)
     [carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
 
@@ -824,6 +857,19 @@ defmodule Tightbeam.Productions.BubbleTest do
                owner_lease: turn.owner_lease
              )
 
+    scoped_question? = scenario == :shared_opener_scoped_question
+
+    if scenario != :distinct_openers do
+      Tightbeam.Wakes.schedule(ctx.db, %{
+        wake_id: "w_health_redelivery_parent_#{turn.seq}",
+        session_key: opener.session_key,
+        assignment_id: if(scoped_question?, do: dispatch.id),
+        origin: "health-redelivery-parent",
+        prompt: "Existing retry question",
+        due_at: 0
+      })
+    end
+
     assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
     assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
 
@@ -834,12 +880,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     second_receipt_id = "wake-undelivered:#{turn.seq}:#{second_dispatch.id}"
     ordinary_receipt_id = "wake-undelivered:#{turn.seq}"
 
-    assert {:ok,
-            [
-              [^opener_key, ^first_receipt_id, opener_receipt],
-              [^second_opener_key, ^second_receipt_id, second_receipt],
-              [^sender_key, ^ordinary_receipt_id, ordinary_receipt]
-            ]} =
+    assert {:ok, receipts} =
              DB.query(
                ctx.db,
                "SELECT sessionKey,clientMessageId,content FROM messages " <>
@@ -847,11 +888,26 @@ defmodule Tightbeam.Productions.BubbleTest do
                [ordinary_receipt_id, ordinary_receipt_id <> ":%"]
              )
 
-    assert opener_receipt =~ dispatch_wake.wake_id
-    assert opener_receipt =~ duplicate.wake_id
-    assert opener_receipt =~ "Reason: " <> reason
-    refute opener_receipt =~ second_dispatch_wake.wake_id
-    refute opener_receipt =~ ordinary.wake_id
+    if scoped_question? do
+      assert Enum.map(receipts, &Enum.take(&1, 2)) == [
+               [second_opener_key, second_receipt_id],
+               [sender_key, ordinary_receipt_id]
+             ]
+    else
+      assert [[^opener_key, ^first_receipt_id, opener_receipt] | _] = receipts
+      assert length(receipts) == 3
+      assert opener_receipt =~ dispatch_wake.wake_id
+      assert opener_receipt =~ duplicate.wake_id
+      assert opener_receipt =~ "Reason: " <> reason
+      refute opener_receipt =~ second_dispatch_wake.wake_id
+      refute opener_receipt =~ ordinary.wake_id
+      refute opener_receipt =~ senderless.wake_id
+    end
+
+    assert [
+             [^second_opener_key, ^second_receipt_id, second_receipt],
+             [^sender_key, ^ordinary_receipt_id, ordinary_receipt]
+           ] = Enum.take(receipts, -2)
 
     assert second_receipt =~ second_dispatch_wake.wake_id
     assert second_receipt =~ "Reason: " <> reason

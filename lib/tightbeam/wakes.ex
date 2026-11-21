@@ -3293,6 +3293,7 @@ defmodule Tightbeam.Wakes do
             parent_session_key,
             session_key,
             source_turn_seq,
+            assignment_id,
             message_id,
             origin,
             prompt,
@@ -3324,6 +3325,7 @@ defmodule Tightbeam.Wakes do
          parent_session_key,
          source_session_key,
          source_turn_seq,
+         assignment_id,
          message_id,
          origin,
          original_prompt,
@@ -3344,6 +3346,7 @@ defmodule Tightbeam.Wakes do
     schedule_in_txn(txn, %{
       wake_id: wake_id,
       session_key: parent_session_key,
+      assignment_id: assignment_id,
       origin: "health-redelivery-parent",
       prompt: prompt,
       due_at: now(),
@@ -5745,8 +5748,10 @@ defmodule Tightbeam.Wakes do
               {recipient, :sender}
 
             _ ->
-              # A bubble notice's own failure continues its climb instead.
-              if String.starts_with?(wake_id, "bubble:"),
+              # Mixed dispatch members already own their actionable notices.
+              # A senderless member adds no receipt. A bubble notice's own
+              # failure continues its climb instead.
+              if mixed? or String.starts_with?(wake_id, "bubble:"),
                 do: {nil, nil},
                 else: {notice_owner_recipient(dispatch_recipient, txn, target), {:owner, target}}
           end
