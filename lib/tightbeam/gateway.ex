@@ -239,10 +239,9 @@ defmodule Tightbeam.Gateway do
     defaults = defaults(config, db)
     # Bubble recognition stays outside the lane transaction; it can enqueue
     # turns and therefore must not run synchronously inside LaneManager.
-    on_terminal = fn session_key, seq ->
+    on_terminal = fn _session_key, seq ->
       Tightbeam.HarnessHealth.reconcile_delivered_turn(db, seq)
       Tightbeam.Productions.BubbleSweeper.recognize(seq)
-      Tightbeam.HarklightWakes.origin_turn_ended(session_key)
     end
 
     handler_table =
@@ -363,13 +362,10 @@ defmodule Tightbeam.Gateway do
           identity_staleness_check: fn -> emit_identity_staleness_alarm(db) end,
           identity_staleness_interval_ms: @identity_staleness_interval_ms,
           name: Tightbeam.WakeScheduler},
+         {Tightbeam.HarklightReceipts, db: db},
          {Tightbeam.HarklightWakes,
           db: db,
           send_runner: Map.get(config, :harklight_send_runner),
-          child_opts: [base_dir: config.base_dir, cli_path: Path.join(cli_bin, "tightbeam")]},
-         {Tightbeam.HarklightOriginListener,
-          db: db,
-          runner: Map.get(config, :harklight_send_runner),
           child_opts: [base_dir: config.base_dir, cli_path: Path.join(cli_bin, "tightbeam")]},
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
@@ -1039,6 +1035,11 @@ defmodule Tightbeam.Gateway do
       {"harklight-send", []} => fn call ->
         HarklightSend.send_request(db, call, runner: Map.get(config, :harklight_send_runner))
       end,
+      {"harklight-progress", []} => fn call ->
+        HarklightSend.change_request(db, call, "progress",
+          runner: Map.get(config, :harklight_send_runner)
+        )
+      end,
       {"harklight-revise", []} => fn call ->
         HarklightSend.change_request(db, call, "revise",
           runner: Map.get(config, :harklight_send_runner)
@@ -1051,9 +1052,6 @@ defmodule Tightbeam.Gateway do
       end,
       {"harklight-settle", []} => fn call ->
         HarklightSend.settle(db, call, runner: Map.get(config, :harklight_send_runner))
-      end,
-      {"harklight-cover", []} => fn call ->
-        Tightbeam.HarklightOriginListener.cover(call)
       end,
       {"harklight-listener-restore", []} => fn call ->
         HarklightWakes.restore_listener(db, call, call.params[:handle])
@@ -4647,43 +4645,28 @@ defmodule Tightbeam.Gateway do
                    harness_session_id,
                    Tightbeam.PathNotes.annotate(prepared_prompt, path_plan),
                    trace_dispatch: fn request_id ->
-                     case Tightbeam.TurnLifecycle.append(db, turn.seq, %{
-                            event_key: "prompt:dispatched",
-                            producer_event_id:
-                              "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
-                            kind: "prompt_dispatched",
-                            stage: "prompt",
-                            outcome: "dispatched",
-                            cause: "acp:port-write",
-                            principal: "process:tightbeam",
-                            owner_lease: turn.owner_lease,
-                            adapter_gen: prompt_generation,
-                            acp_request_id: request_id,
-                            detail: %{v: 1}
-                          }) do
-                       result when result in [:ok, :duplicate] ->
-                         case Task.start(fn ->
-                                Tightbeam.HarklightWakes.ack2_for_dispatched_turn(
-                                  db,
-                                  turn.seq,
-                                  turn.session_key,
-                                  active_session.display_name
-                                )
-                              end) do
-                           {:ok, _pid} ->
-                             :ok
+                     result =
+                       DB.owed_work(fn ->
+                         Tightbeam.TurnLifecycle.append(db, turn.seq, %{
+                           event_key: "prompt:dispatched",
+                           producer_event_id:
+                             "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
+                           kind: "prompt_dispatched",
+                           stage: "prompt",
+                           outcome: "dispatched",
+                           cause: "acp:port-write",
+                           principal: "process:tightbeam",
+                           owner_lease: turn.owner_lease,
+                           adapter_gen: prompt_generation,
+                           acp_request_id: request_id,
+                           detail: %{v: 1, harklight_receipt_agent: active_session.display_name}
+                         })
+                       end)
 
-                           {:error, reason} ->
-                             Logger.error(
-                               "Harklight ACK2 task could not start for dispatched turn #{turn.seq}: #{inspect(reason)}"
-                             )
-                         end
+                     if result in [:ok, :duplicate],
+                       do: Tightbeam.HarklightReceipts.dispatched(turn.seq)
 
-                         result
-
-                       result ->
-                         result
-                     end
+                     result
                    end,
                    progress:
                      progress_fun(db, turn.session_key, session.owner_user_id, correlation),

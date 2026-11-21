@@ -175,7 +175,10 @@ defmodule Tightbeam.HarklightBriefingsTest do
       | params: %{
           harklight_session: "new",
           sender_id: "briefing-sender",
-          title: "Decision briefing"
+          title: "Decision briefing",
+          message_type: "request",
+          reply: true,
+          decision_request_id: request.id
         }
     }
 
@@ -200,42 +203,71 @@ defmodule Tightbeam.HarklightBriefingsTest do
     handle = "a1424ed8-763c-4b13-9a0d-55a70cd65b17"
     message_id = "decision-briefing-thread"
 
-    payload =
-      Elixir.JSON.encode!(%{
-        "request" => %{
-          "message" => %{
-            "sender_id" => "briefing-sender",
-            "message_id" => message_id,
-            "title" => "Decision briefing",
-            "supersedes" => []
-          }
-        },
-        "files" => [],
-        "decision_request_id" => request.id
-      })
+    prepared = %{
+      "sender" => "briefing-sender",
+      "session" => handle,
+      "message" => %{
+        "title" => "Decision briefing",
+        "message_type" => "request",
+        "answer_ui" => %{
+          "schema" => "attention-client.actions/1",
+          "actions" => [%{"id" => "reply", "label" => "Reply", "kind" => "text"}]
+        }
+      },
+      "files" => [],
+      "supersedes_local" => []
+    }
 
-    assert %{state: "pending"} =
-             HarklightWakes.prepare_send(ctx.db, send_call, first_op, payload)
+    runner = fn
+      ["journal-id"] ->
+        {JSON.encode!(%{kind: "journal", journal_id: "briefing-journal"}), 0}
 
-    result =
-      JSON.encode!(%{
-        "kind" => "committed",
-        "operation" => "send",
-        "op_id" => first_op,
-        "response" => %{"session_handle" => handle, "revision" => 1}
-      })
+      [
+        "send",
+        "--prepare",
+        "--op-id",
+        ^first_op,
+        "--session",
+        "new",
+        "--sender-id",
+        "briefing-sender",
+        "--title",
+        "Decision briefing",
+        "--type",
+        "request",
+        "--reply"
+      ] ->
+        {JSON.encode!(%{
+           kind: "prepared",
+           operation: "send",
+           op_id: first_op,
+           request_id: first_op,
+           session_handle: handle,
+           prepared: prepared
+         }), 0}
 
-    assert %{state: "registered"} =
-             HarklightWakes.bind_send(
-               ctx.db,
-               send_call,
-               first_op,
-               payload,
-               result,
-               handle,
-               "briefing-sender",
-               message_id
-             )
+      ["send", "--execute", "--op-id", ^first_op] ->
+        {JSON.encode!(%{
+           kind: "committed",
+           operation: "send",
+           op_id: first_op,
+           request_id: first_op,
+           item_id: message_id,
+           prepared: prepared,
+           response: %{
+             rev: 2,
+             message: %{
+               item_id: message_id,
+               sender: "briefing-sender",
+               session: handle,
+               revision: 1
+             }
+           }
+         }), 0}
+    end
+
+    assert %{outcome: "committed", message_id: ^message_id, op_id: ^first_op} =
+             HarklightSend.send_request(ctx.db, send_call, runner: runner)
 
     assert {:ok, %{action: :existing, op_id: ^first_op, message_id: ^message_id}} =
              HarklightBriefings.reserve_send(ctx.db, send_call, request.id)
@@ -252,47 +284,34 @@ defmodule Tightbeam.HarklightBriefingsTest do
         params: %{handle: handle}
     }
 
-    status_runner = fn ["status", "--session", session_handle] ->
-      {JSON.encode!(%{
-         "session_handle" => session_handle,
-         "open_requests" => 1,
-         "open_chats" => 1,
-         "pending_undelivered" => 0,
-         "pending_delivered_unacted" => 0
-       }), 0}
-    end
-
     assert %{outcome: "committed"} =
-             HarklightFollows.follow(ctx.db, follow_call,
-               runner: status_runner,
-               activate: false
-             )
+             HarklightFollows.follow(ctx.db, follow_call, activate: false)
 
-    chat_entry =
-      JSON.encode!(%{
-        "kind" => "event",
-        "session_handle" => handle,
-        "event_id" => "1",
-        "feed_cursor" => 1,
-        "request" => %{"sender_id" => "briefing-sender", "message_id" => message_id},
+    chat_entry = %{
+      "kind" => "entry",
+      "rev" => 3,
+      "data" => %{
+        "entry_id" => "chat-1",
+        "item_id" => message_id,
         "request_revision" => 1,
-        "delivered" => false,
-        "acted" => false,
-        "entry" => %{
-          "kind" => "discussion",
-          "author" => "person",
-          "content" => "I choose accept."
-        }
-      })
+        "kind" => "reply",
+        "author" => "person",
+        "text" => "I choose accept."
+      }
+    }
 
-    assert :ok = HarklightWakes.capture_line(ctx.db, handle, chat_entry)
+    assert :ok = HarklightWakes.capture_feed(ctx.db, handle, 3, [chat_entry], :live)
 
-    chat_wake_id = "w_harklight_#{handle}_" <> String.pad_leading("1", 20, "0")
-
-    assert {:ok, [[prompt, ^session_key]]} =
-             DB.query(ctx.db, "SELECT prompt,sessionKey FROM wakes WHERE wakeId=?1", [
-               chat_wake_id
-             ])
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT w.prompt FROM wakes w
+               JOIN harklight_wake_deliveries d ON d.wakeId=w.wakeId
+               WHERE d.sessionKey=?1
+               """,
+               [session_key]
+             )
 
     assert prompt =~ request.id
     assert prompt =~ "same session and thread"
