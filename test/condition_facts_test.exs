@@ -910,6 +910,7 @@ defmodule Tightbeam.ConditionFactsTest do
       session_key: ctx.session.session_key,
       params: %{
         prompt: "re-adjudicate",
+        wait_reason: "Waiting for deployment confirmation",
         after_ms: 60_000,
         condition_kind: "deploy-succeeded",
         condition_scope: "prod",
@@ -1146,6 +1147,7 @@ defmodule Tightbeam.ConditionFactsTest do
                          prompt: "Continue from the synthetic condition.",
                          due_at: System.system_time(:millisecond) + 60_000,
                          assignment_id: target.session_key,
+                         wait_reason: "Waiting on the fixture resolver",
                          registrant_session_key: target.session_key,
                          owner_user_id: target.owner_user_id,
                          predicate: %{

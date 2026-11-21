@@ -352,6 +352,7 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.ListenerLifecycle, []},
          {Tightbeam.Wakes,
           db: db,
+          holder_prod: true,
           deliver: deliver,
           delivery_opts: delivery_config,
           internal_consumers: %{
@@ -8463,6 +8464,7 @@ defmodule Tightbeam.Gateway do
 
         if is_map(wake) and is_binary(wake[:wake_id]) do
           wake_response(wake)
+          |> maybe_add_wait_reason(wake)
           |> maybe_add_replaced_wake_ids(wake)
           |> maybe_add_producer_warning(wake)
           |> maybe_add_after_fact_hint(db, p)
@@ -8644,6 +8646,7 @@ defmodule Tightbeam.Gateway do
           replacement_assignment_id: replacement_assignment_id,
           predicate: p[:predicate],
           after_turn: p[:after_turn] == true,
+          wait_reason: p[:wait_reason],
           registrant_session_key: creator_session_key(call[:principal]),
           owner_user_id: wait_owner_user_id_in_txn(txn, call[:principal])
         })
@@ -8836,15 +8839,28 @@ defmodule Tightbeam.Gateway do
        ) do
     p = call.params
     assignment_id = wake_assignment_id_in_txn(txn, call)
+    continuation = dated_continuation_assignment_id_in_txn(txn, call, session_key)
+    future? = due_at > System.system_time(:millisecond)
 
-    # Immediate assignment pointers and recurring crons are references, not holder work.
-    # Keep the assignment on each wake without counting its creation as activity.
-    activity_assignment_id =
-      if immediate_assignment_pointer_request?(p) or is_binary(p[:cron]),
-        do: nil,
-        else: assignment_id
+    explicit_timed_wait? =
+      Map.has_key?(p, :wait_reason) and future? and call.principal == {:session, session_key} and
+        is_nil(p[:cron]) and p[:replace_queued] != true
 
-    wake =
+    wait? =
+      is_binary(condition_kind) or (future? and is_binary(continuation)) or explicit_timed_wait?
+
+    with :ok <-
+           if(wait?,
+             do: Tightbeam.WaitReason.validate(p[:wait_reason], "--wait-reason"),
+             else: :ok
+           ) do
+      # Immediate assignment pointers and recurring crons are references, not holder work.
+      # Keep the assignment on each wake without counting its creation as activity.
+      activity_assignment_id =
+        if immediate_assignment_pointer_request?(p) or is_binary(p[:cron]),
+          do: nil,
+          else: assignment_id
+
       Wakes.schedule_in_txn(txn, %{
         session_key: session_key,
         target_role: Map.get(call, :target_role),
@@ -8855,6 +8871,7 @@ defmodule Tightbeam.Gateway do
         due_at: due_at,
         condition_kind: condition_kind,
         condition_scope: condition_scope,
+        wait_reason: if(wait?, do: p[:wait_reason]),
         creator_session_key: creator_session_key(call[:principal]),
         # A class is the sender's election. An explicit time is also the
         # sender's election and inhibits batching without discarding the class.
@@ -8866,8 +8883,7 @@ defmodule Tightbeam.Gateway do
         reresolve: p[:reresolve],
         reresolve_seed: p[:reresolve_seed],
         reresolve_rung: p[:reresolve_rung],
-        dated_continuation_assignment_id:
-          dated_continuation_assignment_id_in_txn(txn, call, session_key),
+        dated_continuation_assignment_id: continuation,
         # Typed waits validate the assignment through register_wait_in_txn/2.
         # Internal process and bound remedy wakes continue to use their carriers.
         assignment_id: assignment_id,
@@ -8875,8 +8891,7 @@ defmodule Tightbeam.Gateway do
         prod_sender: prod_sender(call[:principal]),
         activity_assignment_id: activity_assignment_id
       })
-
-    wake
+    end
   end
 
   defp replacement_assignment_id_in_txn(txn, call, session_key) do
@@ -9004,6 +9019,11 @@ defmodule Tightbeam.Gateway do
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
   end
+
+  defp maybe_add_wait_reason(response, %{wait_reason: reason}) when is_binary(reason),
+    do: Map.put(response, :wait_reason, reason)
+
+  defp maybe_add_wait_reason(response, _wake), do: response
 
   defp maybe_add_after_fact_hint(response, db, params) do
     if is_integer(params[:after_ms]) and params.after_ms > 0 and is_nil(params[:at]) and

@@ -234,6 +234,7 @@ defmodule Tightbeam.Wire.SeamTest do
                  params: %{
                    prompt: "wait for the resolver",
                    afterMs: 60_000,
+                   waitReason: "Waiting for the resolver disposition",
                    assignmentId: holder_assignment,
                    predicate: predicate,
                    nudge: false
