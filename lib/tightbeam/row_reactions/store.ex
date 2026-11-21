@@ -120,18 +120,105 @@ defmodule Tightbeam.RowReactions.Store do
             [action["id"], JSON.encode!(plan), digest(plan.value), at]
           )
 
-        plan ->
-          withdrawn = Map.put(action["plan"], "withdraw", plan && plan.withdraw)
+        nil ->
+          if hold_for_unloaded_rail?(action) do
+            hold_unloaded_rail(txn, action, at)
+          else
+            cancel_unplanned(txn, action, nil, at)
+          end
 
-          Txn.q(
-            txn,
-            "UPDATE row_reaction_actions SET plan=?2,status='canceled',updatedAt=?3 WHERE id=?1 AND status='pending'",
-            [action["id"], JSON.encode!(withdrawn), at]
-          )
+        plan ->
+          cancel_unplanned(txn, action, plan, at)
       end
     end
 
     actions(txn, event["org"], event["id"])
+  end
+
+  # Adopted legacy work-item pointers predate the rails that now own them. While
+  # no loaded rail declares their family, the pointer is held, not canceled, so
+  # a first boot ahead of the rail files cannot drop reminders that are owed.
+  @legacy_source "work-item-references/v1"
+  @unloaded_marker "rail-not-loaded:"
+
+  defp hold_for_unloaded_rail?(action) do
+    get_in(action, ["plan", "provenance", "source"]) == @legacy_source and
+      not Rules.reaction_family_loaded?(action["plan"]["family"])
+  end
+
+  defp hold_unloaded_rail(txn, action, at) do
+    Txn.q(
+      txn,
+      "UPDATE row_reaction_actions SET status='held',lastError=?2,updatedAt=?3 WHERE id=?1 AND status='pending'",
+      [action["id"], @unloaded_marker <> action["plan"]["family"], at]
+    )
+  end
+
+  # Ends the holds this module placed once a rail for their family loads.
+  # A held pointer resumes as pending unless the item saw a transition (an
+  # assignment, routing or disposition change) after the pointer was adopted.
+  # That transition was stored with no election while the rail was absent, so
+  # the pointer is already satisfied: it is canceled, which withdraws its wake.
+  # Every other held action stays held. Returns the events whose canceled
+  # actions still need their withdrawal executed.
+  def resume_unloaded_rail_holds(txn) do
+    for [id, family, org, event_id, work_item_id, admitted_at] <-
+          Txn.q(
+            txn,
+            """
+            SELECT a.id,a.family,a.org,a.eventId,json_extract(e.event,'$.workItemId'),e.admittedAt
+            FROM row_reaction_actions a
+            JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
+            WHERE a.status='held' AND a.lastError LIKE ?1
+            """,
+            [@unloaded_marker <> "%"]
+          ),
+        Rules.reaction_family_loaded?(family) do
+      now = System.system_time(:millisecond)
+
+      if transitioned_since?(txn, org, work_item_id, admitted_at) do
+        Txn.q(
+          txn,
+          "UPDATE row_reaction_actions SET status='canceled',lastError=NULL,updatedAt=?2 WHERE id=?1 AND status='held'",
+          [id, now]
+        )
+
+        event(txn, org, event_id) |> elem(0)
+      else
+        Txn.q(
+          txn,
+          "UPDATE row_reaction_actions SET status='pending',lastError=NULL,updatedAt=?2 WHERE id=?1 AND status='held'",
+          [id, now]
+        )
+
+        nil
+      end
+    end
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp transitioned_since?(_txn, _org, nil, _admitted_at), do: false
+
+  defp transitioned_since?(txn, org, work_item_id, admitted_at) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM row_reaction_events
+      WHERE org=?1 AND admittedAt>?3 AND json_extract(event,'$.workItemId')=?2
+        AND json_extract(event,'$.operation')='transition' LIMIT 1
+      """,
+      [org, work_item_id, admitted_at]
+    ) == [[1]]
+  end
+
+  defp cancel_unplanned(txn, action, plan, at) do
+    withdrawn = Map.put(action["plan"], "withdraw", plan && plan.withdraw)
+
+    Txn.q(
+      txn,
+      "UPDATE row_reaction_actions SET plan=?2,status='canceled',updatedAt=?3 WHERE id=?1 AND status='pending'",
+      [action["id"], JSON.encode!(withdrawn), at]
+    )
   end
 
   def event(txn, org, id) do

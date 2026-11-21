@@ -255,6 +255,48 @@ defmodule Tightbeam.RailRemedyTest do
     assert {{:error, %{reason: "remedy_fired", producer: nil}}, []} = complete.(unrouted)
   end
 
+  test "real remedy assignment preserves work-item attribution with and without reminder rails",
+       ctx do
+    for reminders <- [false, true] do
+      if reminders,
+        do:
+          Tightbeam.TerminalReactionFixture.load_work_items!(
+            ctx.base_dir,
+            Map.keys(ctx.handlers),
+            false
+          )
+
+      item = work_item(ctx, "Remedy linked item #{reminders}")
+      original = assignment(ctx, "Remedy linked assignment", item.id)
+      assert original.id
+      put_rules(ctx, review_gate() <> "\nwork_item = \"{work_item_id}\"\n")
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+      assert {:error, %{reason: "remedy_fired", producer: review_id}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(original.id))
+
+      assert assignment_row(ctx.db, review_id).workItemId == item.id
+
+      assert {:ok, [[encoded]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT event FROM row_reaction_events WHERE json_extract(event,'$.sourceAfter.id')=?1 AND json_extract(event,'$.principal.kind')='remedy'",
+                 [review_id]
+               )
+
+      event = JSON.decode!(encoded)
+
+      assert event["principal"] == %{
+               "kind" => "remedy",
+               "id" => "completion-needs-review",
+               "action" => "assign",
+               "ownerUserId" => @user_id
+             }
+
+      assert event["sourceAfter"]["workItemId"] == item.id
+    end
+  end
+
   test "absent fact assigns under the remedy principal and actor closes after linked review",
        ctx do
     assignment = assignment(ctx, "original", "policy")
@@ -734,7 +776,12 @@ defmodule Tightbeam.RailRemedyTest do
 
   test "assignment completion and revocation dispose pending remedy custody", ctx do
     put_rules(ctx, wake_gate())
-    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    Tightbeam.TerminalReactionFixture.load_work_items!(
+      ctx.base_dir,
+      Map.keys(ctx.handlers),
+      false
+    )
 
     completed_work = work_item(ctx, "complete remedy custody")
     completed = assignment(ctx, "complete with pending remedy", completed_work.id)

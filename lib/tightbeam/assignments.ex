@@ -641,7 +641,21 @@ defmodule Tightbeam.Assignments do
 
       # Incomplete notice cancellation must see the real remaining-work bracket.
       # Both the bracket and notice still roll back with this terminal transition.
-      Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
+      Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id, %{
+        kind: "revocation",
+        id: revocation_id,
+        at: ts,
+        principal:
+          cond do
+            is_binary(revoked_by_user) -> {:user, revoked_by_user}
+            is_binary(revoked_by_session) -> {:session, revoked_by_session}
+            is_binary(revoked_by_process) -> {:process, revoked_by_process}
+            true -> {:process, principal}
+          end,
+        before: reaction_before,
+        after: Tightbeam.RowReactions.Snapshot.assignment(txn, assignment_id)
+      })
+
       admit_revocation_notice!(txn, assignment_id, revocation_id, reaction_before)
 
       append_substrate(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
@@ -2581,6 +2595,12 @@ defmodule Tightbeam.Assignments do
 
           bracket_transition = %{
             causal_source: %{kind: "assignment_transition", id: id},
+            observation: %{
+              principal: call.principal,
+              at: now,
+              before: nil,
+              after: Tightbeam.RowReactions.Snapshot.assignment(txn, id)
+            },
             outcome: bracket_outcome
           }
 
@@ -3218,7 +3238,15 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     closed_assignment = fetch_assignment!(txn, assignment.id)
-    Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
+
+    Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId, %{
+      kind: "attest",
+      id: attest.id,
+      at: attest.ts,
+      principal: call.principal,
+      before: reaction_before,
+      after: Tightbeam.RowReactions.Snapshot.assignment(txn, assignment.id)
+    })
 
     case Wakes.admit_terminal_notification_in_txn(txn, assignment.id, reaction_before) do
       {:ok, _wake} ->
@@ -4019,7 +4047,16 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     revoked_assignment = fetch_assignment!(txn, assignment_id)
-    Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
+
+    Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId, %{
+      kind: "revocation",
+      id: revocation_id,
+      at: closed_at,
+      principal: call.principal,
+      before: reaction_before,
+      after: Tightbeam.RowReactions.Snapshot.assignment(txn, assignment_id)
+    })
+
     admit_revocation_notice!(txn, assignment_id, revocation_id, reaction_before)
     liveness_trigger = disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
 
@@ -4415,6 +4452,13 @@ defmodule Tightbeam.Assignments do
 
       Tightbeam.WorkItems.cancel_brackets_in_txn(txn, reopened.workItemId, %{
         causal_source: %{kind: "assignment_transition", id: assignment_id},
+        observation: %{
+          principal: call.principal,
+          at: reopened_at,
+          generation: "#{assignment_id}:reopen:#{current_reopening_id(txn, assignment_id)}",
+          before: assignment,
+          after: Tightbeam.RowReactions.Snapshot.assignment(txn, assignment_id)
+        },
         outcome: bracket_outcome
       })
     end

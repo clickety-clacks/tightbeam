@@ -17,11 +17,18 @@ defmodule Tightbeam.RecognitionRetryTest do
 
   defmodule ScheduleRefusal do
     use GenServer
-    def start_link(db), do: GenServer.start_link(__MODULE__, db)
-    def init(db), do: {:ok, %{db: db, refused: false}}
+    def start_link(args), do: GenServer.start_link(__MODULE__, args)
+    def init({db, parent}), do: {:ok, %{db: db, parent: parent, refused: false}}
 
-    def handle_call({:query, "SELECT MIN(nextAt)" <> _, _}, _from, %{refused: false} = state),
-      do: {:reply, {:error, %DB.Overloaded{}}, %{state | refused: true}}
+    def handle_call({:query, "SELECT MIN(nextAt)" <> _, _}, _from, %{refused: false} = state) do
+      send(state.parent, {:deadline_query_failed, System.monotonic_time(:millisecond)})
+      {:reply, {:error, %DB.Overloaded{}}, %{state | refused: true}}
+    end
+
+    def handle_call({:query, "SELECT MIN(nextAt)" <> _, _} = request, _from, state) do
+      send(state.parent, {:deadline_query_retried, System.monotonic_time(:millisecond)})
+      {:reply, GenServer.call(state.db, request), state}
+    end
 
     def handle_call(request, _from, state), do: {:reply, GenServer.call(state.db, request), state}
   end
@@ -313,12 +320,16 @@ defmodule Tightbeam.RecognitionRetryTest do
   } do
     parent = self()
 
+    # Finish the boot scheduling pass before inserting due work, so it cannot
+    # recognize the row before the deliberately failed deadline query.
+    assert %{timer: nil, due_at: nil} = :sys.get_state(retry, :infinity)
+
     {:ok, _} =
       DB.transaction(db, fn txn ->
         pending =
           Tightbeam.Recognition.record(
             txn,
-            fn _ -> send(parent, :query_retried) end,
+            fn _ -> send(parent, {:query_retried, System.monotonic_time(:millisecond)}) end,
             :value,
             [],
             []
@@ -327,19 +338,51 @@ defmodule Tightbeam.RecognitionRetryTest do
         Txn.q(txn, "UPDATE pending_recognition SET nextAt=0 WHERE id=?1", [pending.id])
       end)
 
-    proxy = start_supervised!({ScheduleRefusal, db})
+    proxy = start_supervised!({ScheduleRefusal, {db, parent}})
     :sys.replace_state(retry, &%{&1 | db: proxy})
 
+    # A private trace session observes the real timer call in this worker only;
+    # it neither changes other tests' tracing nor requires us to run before expiry.
+    trace = :trace.session_create(:recognition_retry_timer, self(), [])
+    :trace.function(trace, {:erlang, :send_after, 3}, [{:_, [], [{:return_trace}]}], [])
+    :trace.process(trace, retry, true, [:call, :receive])
+
     on_exit(fn ->
-      if Process.alive?(retry), do: :sys.replace_state(retry, &%{&1 | db: db})
+      :trace.session_destroy(trace)
+      if Process.alive?(retry), do: :sys.replace_state(retry, &%{&1 | db: db}, :infinity)
     end)
 
     GenServer.cast(retry, :reschedule)
-    :sys.get_state(retry)
-    assert_receive :query_retried, 1_800
-    :sys.get_state(retry)
+
+    # Observation is bounded by ExUnit's test timeout. Keep the actual 1,800 ms
+    # contract on producer timestamps, so a late observer cannot hide a late retry.
+    failed_at = receive do: ({:deadline_query_failed, at} -> at)
+
+    interval =
+      receive do
+        {:trace, ^retry, :call, {:erlang, :send_after, [interval, ^retry, :reschedule]}} ->
+          interval
+      end
+
+    assert interval == 1_000
+
+    timer =
+      receive do
+        {:trace, ^retry, :return_from, {:erlang, :send_after, 3}, timer} -> timer
+      end
+
+    assert is_reference(timer)
+    receive do: ({:trace, ^retry, :receive, :reschedule} -> :ok)
+    retried_at = receive do: ({:deadline_query_retried, at} -> at)
+    assert retried_at >= failed_at
+    assert retried_at - failed_at <= 1_800
+    recognized_at = receive do: ({:query_retried, at} -> at)
+    assert recognized_at >= retried_at
+    assert recognized_at - failed_at <= 1_800
+
+    :sys.get_state(retry, :infinity)
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
-    :sys.replace_state(retry, &%{&1 | db: db})
+    :sys.replace_state(retry, &%{&1 | db: db}, :infinity)
   end
 
   test "successful inline recognition does not request timer recomputation", %{

@@ -1815,7 +1815,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert {:ok, [[action_id, "pending", "undelivered"]]} =
              DB.query(
                ctx.db,
-               "SELECT id,status,json_extract(result,'$.delivery') FROM row_reaction_actions"
+               "SELECT id,status,json_extract(result,'$.delivery') FROM row_reaction_actions WHERE family='terminal-handoff'"
              )
 
     for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
@@ -1844,7 +1844,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert {:ok, [[^action_id, "pending", retry_id, intent_id]]} =
              DB.query(
                ctx.db,
-               "SELECT id,status,json_extract(result,'$.wake_id'),json_extract(result,'$.intent_wake_id') FROM row_reaction_actions"
+               "SELECT id,status,json_extract(result,'$.wake_id'),json_extract(result,'$.intent_wake_id') FROM row_reaction_actions WHERE family='terminal-handoff'"
              )
 
     assert intent_id == failed.wake_id
@@ -1937,7 +1937,13 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
              handle(ctx, "attest", attest_call({:session, "holder"}, child.id, "completion"))
 
     [failed] = terminal_notices(ctx.db)
-    assert {:ok, [["pending"]]} = DB.query(ctx.db, "SELECT status FROM row_reaction_actions")
+
+    assert {:ok, [["pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM row_reaction_actions WHERE family='terminal-handoff'"
+             )
+
     path = Path.join(ctx.law, "identity/rules/row-reaction-handoff.toml")
 
     File.write!(
@@ -1951,7 +1957,13 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     Rules.load!(ctx.law, Map.keys(ctx.handlers))
     assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-    assert {:ok, [["canceled"]]} = DB.query(ctx.db, "SELECT status FROM row_reaction_actions")
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM row_reaction_actions WHERE family='terminal-handoff'"
+             )
+
     assert [^failed] = terminal_notices(ctx.db)
     assert turn_count(ctx.db, failed.wake_id) == 0
   end

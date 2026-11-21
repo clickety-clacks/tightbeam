@@ -302,6 +302,20 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   end
 
   test "real reopen returns the canonical REST assignment and summary notice", ctx do
+    law =
+      Path.join(
+        System.tmp_dir!(),
+        "rest-reopen-reminder-law-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(law) end)
+
+    Tightbeam.TerminalReactionFixture.load_work_items!(
+      law,
+      Map.keys(Gateway.handlers(%{db: ctx.db})),
+      false
+    )
+
     call = %{
       verb: "revoke-assignment",
       origin: "user:flynn",
