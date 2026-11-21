@@ -92,8 +92,10 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
     assert workflow =~ "install_approved_sha:"
     assert workflow =~ "soak_outcome:"
     assert workflow =~ "soaked_sha:"
+
     assert workflow =~
              ~s(sh scripts/validate_release_tag.sh "$RELEASE_TAG" "$CANDIDATE_SHA" --selected-candidate)
+
     assert workflow =~ "release-candidate-proof-" <> <<36>> <> "{{ inputs.candidate_sha }}"
     assert workflow =~ "release-candidate-stage-" <> <<36>> <> "{{ inputs.candidate_sha }}"
     assert workflow =~ "verify_release_candidate_stage.py verify"
