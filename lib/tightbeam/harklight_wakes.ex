@@ -3269,6 +3269,7 @@ defmodule Tightbeam.HarklightWakes do
     pause = drain.pause || HarklightFailures.listen_pause(drain.pending)
     diagnostics = append_diagnostic(drain.diagnostics, drain.pending)
     reason = drained_exit_reason(status, diagnostics)
+    failure = listener_failure(reason, status, diagnostics)
     ended? = Tightbeam.HarklightChild.verified_exit?(status)
     fallback = Map.get(drain, :fallback)
 
@@ -3276,8 +3277,8 @@ defmodule Tightbeam.HarklightWakes do
       pause ->
         {:failed, paused_feed_status(pause), ended?}
 
-      not retryable_failure?(reason) ->
-        {:failed, listener_failure(reason, status, diagnostics), ended?}
+      not retryable_failure?(failure) ->
+        {:failed, failure, ended?}
 
       fallback && not retryable_failure?(fallback) ->
         {:failed, fallback, ended?}
@@ -3297,7 +3298,7 @@ defmodule Tightbeam.HarklightWakes do
         {:failed, listener_failure("incomplete_line", status, diagnostics), false}
 
       true ->
-        {:failed, listener_failure(reason, status, diagnostics), true}
+        {:failed, failure, true}
     end
   end
 
