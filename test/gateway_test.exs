@@ -2827,7 +2827,7 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
   end
 
-  test "retirement removes unregistered local files and preserves registered file and directory paths",
+  test "retirement archives unregistered local files and preserves registered file and directory paths",
        ctx do
     ensure_global_registry()
 
@@ -2857,7 +2857,8 @@ defmodule Tightbeam.GatewayTest do
     File.write!(artifact_path, "banana")
     File.write!(checkout_file, "ref: refs/heads/main")
     File.write!(checkout_build, "generated")
-    File.write!(unregistered_file, "remove me")
+    File.write!(unregistered_file, "keep this scratch work")
+    File.write!(Path.join(Path.dirname(unregistered_file), ".DS_Store"), "regenerable")
 
     {:ok, _} =
       DB.query(
@@ -2950,7 +2951,9 @@ defmodule Tightbeam.GatewayTest do
              )
            ) == "generated"
 
-    refute File.exists?(unregistered_file)
+    assert [%{archive_path: archive}] = result.retired_sessions
+    assert File.read!(Path.join(archive, "scratch.txt")) == "keep this scratch work"
+    refute File.exists?(Path.join(archive, ".DS_Store"))
 
     unchanged = Artifacts.get(ctx.db, artifact.artifact_id)
     assert unchanged.state == "archived"
@@ -2986,7 +2989,8 @@ defmodule Tightbeam.GatewayTest do
     File.write!(report_path, "remote report")
     File.write!(checkout_file, "ref: refs/heads/main")
     File.write!(checkout_output, "preserve the registered directory subtree")
-    File.write!(unregistered_file, "remove me")
+    File.write!(unregistered_file, "keep this scratch work")
+    File.write!(Path.join(Path.dirname(unregistered_file), ".DS_Store"), "regenerable")
 
     report = remote_artifact(ctx.db, fixture, "report", "reports/remote.md")
     checkout = remote_artifact(ctx.db, fixture, "checkout", "registered-checkout")
@@ -3027,7 +3031,9 @@ defmodule Tightbeam.GatewayTest do
              Path.join(Artifacts.get(ctx.db, checkout.artifact_id).home, "target/build.bin")
            ) == "preserve the registered directory subtree"
 
-    refute File.exists?(unregistered_file)
+    assert [%{archive_path: archive}] = result.retired_sessions
+    assert File.read!(Path.join(archive, "scratch.txt")) == "keep this scratch work"
+    refute File.exists?(Path.join(archive, ".DS_Store"))
     assert Artifacts.get(ctx.db, report.artifact_id).state == "archived"
     assert Artifacts.get(ctx.db, checkout.artifact_id).state == "archived"
     assert cleanup.removed_count > 0
@@ -3180,12 +3186,16 @@ defmodule Tightbeam.GatewayTest do
     ensure_global_registry()
     fixture = remote_cleanup_fixture(ctx.db, "retry")
     protected_path = Path.join(fixture.workspace, "z-protected/keep.md")
-    first_removed = Path.join(fixture.workspace, "a-scratch.txt")
-    injected_failure = Path.join(fixture.workspace, "z-failure.txt")
+    first_removed = Path.join(fixture.workspace, "a/.cache/first")
+    injected_failure = Path.join(fixture.workspace, "z/.cache/z-failure.txt")
+    scratch = Path.join(fixture.workspace, "scratch.txt")
     outside = Path.join(fixture.base_dir, "outside/keep.md")
     File.mkdir_p!(Path.dirname(protected_path))
     File.mkdir_p!(Path.dirname(outside))
     File.write!(protected_path, "registered content")
+    File.mkdir_p!(Path.dirname(first_removed))
+    File.mkdir_p!(Path.dirname(injected_failure))
+    File.write!(scratch, "preserve through retry")
     File.write!(first_removed, "removed during the partial attempt")
     File.write!(injected_failure, "removed on retry")
     File.write!(outside, "must remain outside the root")
@@ -3236,13 +3246,19 @@ defmodule Tightbeam.GatewayTest do
     assert partial.removed_count > 0
     refute File.exists?(first_removed)
     assert File.exists?(injected_failure)
+    assert File.read!(scratch) == "preserve through retry"
     assert File.read!(protected_path) == "registered content"
 
     retry = handler.(call)
     assert retry.retired_session_keys == [fixture.session.session_key]
     assert [%{status: "completed"} = completed] = retry.workspace_cleanup
     refute File.exists?(fixture.workspace)
-    assert File.read!(Artifacts.get(ctx.db, artifact.artifact_id).home) == "registered content"
+    artifact_home = Artifacts.get(ctx.db, artifact.artifact_id).home
+    assert File.read!(artifact_home) == "registered content"
+    archive = Path.dirname(Path.dirname(artifact_home))
+    assert File.read!(Path.join(archive, "scratch.txt")) == "preserve through retry"
+    assert [%{archive_path: ^archive}] = retry.retired_sessions
+    refute File.exists?(Path.join(archive, "z/.cache"))
     refute File.exists?(injected_failure)
     assert File.read!(outside) == "must remain outside the root"
     assert Artifacts.get(ctx.db, artifact.artifact_id).state == "archived"
@@ -16954,6 +16970,11 @@ defmodule Tightbeam.GatewayTest do
 
   # Exercise background cleanup explicitly after the retirement request returns.
   defp retirement_cleanup_handler(config) do
+    config =
+      config
+      |> Map.put_new(:workspace_archive_reserve_bytes, 0)
+      |> Map.put_new(:workspace_archive_reserve_percent, 0)
+
     handler = Gateway.handlers(config)["retire"]
 
     fn call ->
