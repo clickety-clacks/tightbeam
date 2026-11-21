@@ -10,6 +10,8 @@ dir = Path.join(base, "identity")
 
 # Synthetic local/upstream divergence only; no copied organization or provider.
 Application.put_env(:tightbeam, :identity_source_dir, source)
+# The engineering bundle is no longer shipped; offer it from the test fixture root.
+Application.put_env(:tightbeam, :kungfu_bundle_root_dir, Path.expand("fixtures/kungfu", __DIR__))
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
 Application.put_env(:tightbeam, :autostart, false)

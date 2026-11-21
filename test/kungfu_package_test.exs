@@ -63,7 +63,8 @@ defmodule Tightbeam.KungfuPackageTest do
       Identity.learn!(ctx.base, "agentic-engineering", "test")
     end
 
-    assert :initialized = Identity.init!(ctx.base)
+    # The refused learn above already seeded the neutral identity.
+    assert :noop = Identity.init!(ctx.base)
     guidance = Identity.snapshot!(ctx.base, "default", :codex).guidance
 
     [_, offers] = String.split(guidance, "## Available kungfu bundles in this Tightbeam build")
