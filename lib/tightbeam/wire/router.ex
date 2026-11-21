@@ -4835,7 +4835,7 @@ defmodule Tightbeam.Wire.Router do
     "reopen-assignment" => ~w(assignment_id reason)a,
     "repair-assignment" =>
       ~w(action assignment_id context effort idempotency_key model outcome turn_seq)a,
-    "retire" => ~w(idempotency_key keep_open_descendants session_key)a,
+    "retire" => ~w(acknowledge_loss idempotency_key keep_open_descendants session_key)a,
     "retire-withdraw" => ~w(reason session_key)a,
     "return" => ~w(idempotency_key reason request request_id)a,
     "revoke-assignment" => ~w(assignment_id reason)a,

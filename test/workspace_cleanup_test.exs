@@ -807,6 +807,204 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert reason =~ "cleanup_command_failed"
   end
 
+  describe "uncaptured work is held, never silently removed" do
+    test "a commit on no remote ref holds removal and is named with its remedy path", ctx do
+      repo = init_repo(ctx.workspace, "tb/repo")
+      commit(repo, "work.txt", "unpushed")
+      File.write!(Path.join(ctx.workspace, "scratch"), "discard")
+      retire(ctx)
+
+      report = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert report.status == "incomplete"
+      assert Enum.any?(report.blockers, &(&1.reason == "uncaptured_work"))
+      assert report.removed_count == 0
+      assert File.read!(Path.join(repo, "work.txt")) == "unpushed"
+      assert File.exists?(Path.join(ctx.workspace, "scratch"))
+
+      assert [%{"kind" => "git", "path" => "tb/repo", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+
+      assert detail =~ "unpushed_commits=1"
+      assert WorkspaceCleanup.health(ctx.db).count == 1
+    end
+
+    test "stashes, uncommitted changes and untracked files each hold removal", ctx do
+      for {name, prepare} <- [
+            {"stash", &stash_change/1},
+            {"dirty", &dirty_change/1},
+            {"untracked", &untracked_file/1}
+          ] do
+        repo = init_pushed_repo(ctx, name)
+        prepare.(repo)
+      end
+
+      retire(ctx)
+      report = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+      assert report.status == "incomplete"
+
+      held = WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+      assert Enum.map(held, & &1["path"]) == ["dirty", "stash", "untracked"]
+      assert Enum.at(held, 0)["detail"] =~ "modified=1"
+      assert Enum.at(held, 1)["detail"] =~ "stashes=1"
+      assert Enum.at(held, 2)["detail"] =~ "untracked=1"
+      assert File.dir?(ctx.workspace)
+    end
+
+    test "a clean checkout with every commit on a remote ref is removed without ceremony", ctx do
+      init_pushed_repo(ctx, "clean")
+      File.write!(Path.join(ctx.workspace, "clean/ignored.log"), "ignored")
+      File.write!(Path.join(ctx.workspace, "clean/.gitignore"), "ignored.log\n")
+      {_, 0} = System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "add", ".gitignore"])
+      {_, 0} = System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "commit", "-qm", "ignore"])
+      {_, 0} = System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "push", "-q", "origin", "HEAD"])
+      retire(ctx)
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      refute File.exists?(ctx.workspace)
+      assert WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key) == []
+    end
+
+    test "an in-workspace artifact with no stored content is archived, not lost", ctx do
+      kept = Path.join(ctx.workspace, "reports/evidence.md")
+      File.mkdir_p!(Path.dirname(kept))
+      File.write!(kept, "evidence")
+      artifact = artifact(ctx, kept)
+      retire(ctx)
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      archived = Artifacts.get(ctx.db, artifact.artifact_id)
+      assert archived.state == "archived"
+      assert File.read!(archived.home) == "evidence"
+    end
+
+    test "held work leaves recorded artifacts in place until the loss is acknowledged", ctx do
+      kept = Path.join(ctx.workspace, "reports/evidence.md")
+      File.mkdir_p!(Path.dirname(kept))
+      File.write!(kept, "evidence")
+      artifact = artifact(ctx, kept)
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "unpushed")
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+      assert File.read!(kept) == "evidence"
+    end
+
+    test "acknowledgement records what was accepted and permits only that removal", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "unpushed")
+      retire(ctx)
+      key = ctx.session.session_key
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert {:ok, [%{"path" => "repo"}]} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+
+      assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      refute File.exists?(ctx.workspace)
+
+      {:ok, [[stored]]} =
+        DB.query(ctx.db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [key])
+
+      assert %{"acknowledged" => [%{"key" => "git:repo", "by" => "user:owner", "at" => at}]} =
+               JSON.decode!(stored)
+
+      assert is_integer(at)
+      assert {:error, :nothing_held} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+    end
+
+    test "work that appears after an acknowledgement is held again", ctx do
+      first = init_repo(ctx.workspace, "first")
+      commit(first, "a.txt", "a")
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert {:ok, _} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+      second = init_repo(ctx.workspace, "second")
+      commit(second, "b.txt", "b")
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert File.exists?(Path.join(second, "b.txt"))
+      assert [%{"path" => "second"}] = WorkspaceCleanup.held_losses(ctx.db, key)
+    end
+
+    test "retire on a retired session lists held work and --acknowledge-loss releases it", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "unpushed")
+      key = ctx.session.session_key
+
+      retire_call = fn params ->
+        Gateway.handlers(ctx.config)["retire"].(%{
+          origin: "user:owner",
+          principal: {:user, "owner"},
+          session_key: key,
+          params: params
+        })
+      end
+
+      assert %{code: "invalid"} = retire_call.(%{acknowledge_loss: true})
+      retire(ctx)
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      assert %{held_losses: [%{"path" => "repo", "session_key" => ^key}]} = retire_call.(%{})
+      assert File.exists?(Path.join(repo, "work.txt"))
+
+      assert %{acknowledged_losses: [%{"path" => "repo"}]} =
+               retire_call.(%{acknowledge_loss: true})
+
+      assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      refute File.exists?(ctx.workspace)
+    end
+  end
+
+  defp git!(repo, args) do
+    {_, 0} =
+      System.cmd(
+        "git",
+        ["-c", "user.name=t", "-c", "user.email=t@example.com", "-C", repo | args],
+        stderr_to_stdout: true
+      )
+  end
+
+  defp init_repo(workspace, name) do
+    repo = Path.join(workspace, name)
+    File.mkdir_p!(repo)
+    git!(repo, ["init", "-q"])
+    repo
+  end
+
+  defp commit(repo, file, content) do
+    File.write!(Path.join(repo, file), content)
+    git!(repo, ["add", file])
+    git!(repo, ["commit", "-qm", "add " <> file])
+  end
+
+  # A checkout whose only commit is on a remote ref, like a clean clone.
+  defp init_pushed_repo(ctx, name) do
+    remote = Path.join(ctx.base, "remote-#{name}.git")
+    {_, 0} = System.cmd("git", ["init", "-q", "--bare", remote])
+    repo = init_repo(ctx.workspace, name)
+    commit(repo, "tracked.txt", "tracked")
+    git!(repo, ["remote", "add", "origin", remote])
+    git!(repo, ["push", "-q", "origin", "HEAD"])
+    repo
+  end
+
+  defp stash_change(repo) do
+    File.write!(Path.join(repo, "tracked.txt"), "changed")
+    git!(repo, ["stash"])
+  end
+
+  defp dirty_change(repo), do: File.write!(Path.join(repo, "tracked.txt"), "changed")
+  defp untracked_file(repo), do: File.write!(Path.join(repo, "new.txt"), "new")
+
   defp retire(ctx) do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [

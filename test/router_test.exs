@@ -135,6 +135,9 @@ defmodule Tightbeam.Wire.RouterTest do
              "keepOpenDescendants" => true,
              "idempotencyKey" => "retry-retire"
            }) == %{keep_open_descendants: true, idempotency_key: "retry-retire"}
+
+    assert Router.atomize_params_for_test("retire", %{"acknowledgeLoss" => true}) ==
+             %{acknowledge_loss: true}
   end
 
   test "onboard and health parameters preserve accepted aliases" do

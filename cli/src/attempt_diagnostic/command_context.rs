@@ -783,6 +783,7 @@ mod tests {
                 session_key: "PRIVATE_TARGET".into(),
                 idempotency_key: key.map(str::to_owned),
                 keep_open_descendants: false,
+                acknowledge_loss: false,
             };
             let context = CommandContext::for_command(&command).unwrap();
             assert_eq!(effect(context, "POST", "/agent/dispatch"), expected);

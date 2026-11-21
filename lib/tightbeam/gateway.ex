@@ -12139,7 +12139,7 @@ defmodule Tightbeam.Gateway do
             }
 
           %{owner_user_id: ^owner} = session ->
-            if session.state == "active" do
+            if session.state == "active" and p[:acknowledge_loss] != true do
               principal = retirement_principal_ref(call.principal)
               retirement_request_id = "rtr_" <> Tightbeam.Id.uuid4()
 
@@ -12240,21 +12240,53 @@ defmodule Tightbeam.Gateway do
                 end)
               end
             else
-              retire_replay_observation(
-                db,
-                call,
-                %{
-                  deleted_session_key: session.session_key,
-                  retired_session_keys: [],
-                  deferred: []
-                }
-              )
+              retired_workspace_response(db, call, session, p[:acknowledge_loss] == true)
             end
 
           _ ->
             %{code: "not_found"}
         end
     end
+  end
+
+  # Retiring an already-retired session reports the work its workspace
+  # cleanup is holding back, and `acknowledge_loss` lets that cleanup delete it.
+  defp retired_workspace_response(db, call, session, acknowledge?) do
+    keys = [session.session_key | retired_subtree_keys(db, session.session_key)] |> Enum.uniq()
+
+    held =
+      Enum.flat_map(keys, fn key ->
+        db
+        |> WorkspaceCleanup.held_losses(key)
+        |> Enum.map(&Map.put(&1, "session_key", key))
+      end)
+
+    cond do
+      acknowledge? and held == [] ->
+        %{code: "invalid", message: "no held workspace losses to acknowledge"}
+
+      acknowledge? ->
+        by = retirement_principal_ref(call.principal)
+        Enum.each(keys, &WorkspaceCleanup.acknowledge(db, &1, by))
+        workspace_response(db, call, session, %{acknowledged_losses: held})
+
+      held != [] ->
+        workspace_response(db, call, session, %{held_losses: held})
+
+      true ->
+        workspace_response(db, call, session, %{})
+    end
+  end
+
+  defp workspace_response(db, call, session, extra) do
+    retire_replay_observation(
+      db,
+      call,
+      Map.merge(
+        %{deleted_session_key: session.session_key, retired_session_keys: [], deferred: []},
+        extra
+      )
+    )
   end
 
   defp retire_withdraw_result(db, call) do
