@@ -26,9 +26,24 @@ defmodule Tightbeam.AdapterFirstStartIdentityTest do
     checks = :atomics.new(1, [])
     previous = Application.get_env(:tightbeam, :harness_process_command_runner_for_test)
 
+    parent = self()
+
     Application.put_env(:tightbeam, :harness_process_command_runner_for_test, fn exe, args, _timeout ->
-      if List.first(args) == "harness-check" and :atomics.add_get(checks, 1, 1) == 1 do
-        {:error, :timeout}
+      if List.first(args) == "harness-check" do
+        case :atomics.add_get(checks, 1, 1) do
+          1 ->
+            {:error, :timeout}
+
+          2 ->
+            send(parent, {:retry_started, self()})
+
+            receive do
+              :release_retry -> System.cmd(exe, args, stderr_to_stdout: true)
+            end
+
+          _ ->
+            System.cmd(exe, args, stderr_to_stdout: true)
+        end
       else
         System.cmd(exe, args, stderr_to_stdout: true)
       end
@@ -47,13 +62,14 @@ defmodule Tightbeam.AdapterFirstStartIdentityTest do
         db, {:claude, "shared", "fixture-host"}
       )
 
-    parent = self()
     {:ok, adapter} = Adapter.start_link(Keyword.merge(opts, db: db, on_ready: fn -> send(parent, :ready) end))
     on_exit(fn -> if Process.alive?(adapter), do: GenServer.stop(adapter) end)
     assert_receive :ready, 7_000
     assert {:pending, _} = Adapter.launch_identity_status(adapter)
     assert [%{state: "launching", last_error: nil}] = HarnessProcess.list(db)
 
+    assert_receive {:retry_started, retry}, 2_000
+    send(retry, :release_retry)
     assert eventually(fn -> Adapter.launch_identity_status(adapter) == :ok end)
     assert [%{state: "running", last_error: nil}] = HarnessProcess.list(db)
     assert :atomics.get(checks, 1) >= 2
