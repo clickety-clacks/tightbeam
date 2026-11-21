@@ -223,6 +223,28 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     assert %{"liveRevision" => ^live} = AdminProjection.stamped_item(ctx.db, "identity", "served")
   end
 
+  test "the add does not depend on the reminder file, so removing it from the seed cannot break it",
+       ctx do
+    init_shape!(ctx.base, "0.1.16")
+    seed = Path.join(ctx.base, "seed-without-reminder")
+    File.cp_r!(@seed, seed)
+    File.rm!(Path.join(seed, @reminder_path))
+    previous = Application.get_env(:tightbeam, :identity_seed_dir)
+    Application.put_env(:tightbeam, :identity_seed_dir, seed)
+
+    try do
+      assert %{added: [@notice], attention: [], candidate: %{}} =
+               SeedReconcile.run!(ctx.base, ctx.db)
+    after
+      if previous,
+        do: Application.put_env(:tightbeam, :identity_seed_dir, previous),
+        else: Application.delete_env(:tightbeam, :identity_seed_dir)
+    end
+
+    assert loaded?(ctx.base)
+    refute File.exists?(Path.join(ctx.dir, @reminder_path))
+  end
+
   test "a failed publication puts main and live back", ctx do
     init_shape!(ctx.base, "0.1.15")
     prior = Identity.live_revision!(ctx.base)
