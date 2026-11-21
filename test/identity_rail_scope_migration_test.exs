@@ -1011,12 +1011,16 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
 
     File.write!(
       Path.join(identity_dir, "kungfu/#{@kungfu}/manifest.toml"),
-      """
-      name = "#{@kungfu}"
-      root_archetype = "#{@archetype}"
-      purpose = "Exercise identity migration with a learned kungfu."
-      """
+      "name = \"#{@kungfu}\"\nroot_archetype = \"#{@archetype}\"\n"
     )
+
+    if bundle_handoff do
+      File.write!(
+        Path.join(identity_dir, "kungfu/#{@kungfu}/manifest.toml"),
+        "purpose = \"Exercise identity migration with a learned kungfu.\"\n",
+        [:append]
+      )
+    end
 
     paths = [
       "archetypes/#{@archetype}.toml",
