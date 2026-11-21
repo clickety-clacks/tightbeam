@@ -19,6 +19,7 @@ defmodule Tightbeam.HarklightWakes do
   }
 
   alias Tightbeam.DB.Txn
+  alias Tightbeam.HarklightFeedCustody, as: FeedCustody
   alias Tightbeam.HarklightListenerOutage, as: Outage
 
   @feed_state_retry_delays [250, 500, 1_000, 2_000, 5_000, 10_000, 30_000]
@@ -1331,15 +1332,21 @@ defmodule Tightbeam.HarklightWakes do
     state_delays =
       Keyword.get(opts, :feed_state_retry_delays, @feed_state_retry_delays)
 
+    child_opts =
+      Keyword.get(opts, :child_opts, Application.get_env(:tightbeam, :harklight_child_opts, []))
+
+    custody_dir =
+      Keyword.get_lazy(opts, :feed_custody_dir, fn ->
+        child_opts
+        |> Keyword.get_lazy(:base_dir, &Tightbeam.BaseDir.resolve/0)
+        |> Path.join("harklight-feed-custody")
+      end)
+
     {:ok,
      %{
        db: Keyword.get(opts, :db, DB),
-       child_opts:
-         Keyword.get(
-           opts,
-           :child_opts,
-           Application.get_env(:tightbeam, :harklight_child_opts, [])
-         ),
+       child_opts: child_opts,
+       custody_dir: custody_dir,
        listener:
          Keyword.get(opts, :listener, fn manager, handle, _vendor_id ->
            run_listener(manager, handle, state_delays)
@@ -1386,10 +1393,11 @@ defmodule Tightbeam.HarklightWakes do
            DB.query(
              state.db,
              """
-             SELECT h.handle FROM harklight_wake_handles h
+             SELECT h.handle, (s.handle IS NOT NULL OR p.handle IS NOT NULL)
+             FROM harklight_wake_handles h
              LEFT JOIN harklight_feed_stops s ON s.handle=h.handle
              LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
-             WHERE h.state IN ('active','unavailable') AND s.handle IS NULL AND p.handle IS NULL
+             WHERE h.state IN ('active','unavailable')
              ORDER BY h.createdAt,h.handle
              """
            ),
@@ -1397,7 +1405,10 @@ defmodule Tightbeam.HarklightWakes do
       state = Enum.reduce(outages, state, &arm_outage(&2, &1))
 
       state =
-        Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle, :startup) end)
+        Enum.reduce(rows, state, fn [handle, stopped], acc ->
+          mode = if stopped == 1, do: :fenced, else: :startup
+          start_worker(acc, handle, mode)
+        end)
 
       Task.start(fn ->
         Tightbeam.HarklightSend.recover_pending(state.db, runner: state.send_runner)
@@ -1646,17 +1657,21 @@ defmodule Tightbeam.HarklightWakes do
   defp observe_feed_failure(state, handle, status) do
     state = observe_transport_failure(state, handle, status)
 
-    pending = {status, state.wall_now.()}
+    previous = Map.get(state.pending_failures, handle)
 
-    pending_failures =
-      if retryable_failure?(status),
-        do: Map.put_new(state.pending_failures, handle, pending),
-        else: Map.put(state.pending_failures, handle, pending)
+    evidence =
+      case previous do
+        {^status, _} -> previous
+        {_, _} -> if retryable_failure?(status), do: previous, else: {status, state.wall_now.()}
+        nil -> {status, state.wall_now.()}
+      end
+
+    if evidence != previous, do: FeedCustody.remember(state.custody_dir, handle, evidence)
 
     state = %{
       state
       | failures: Map.put(state.failures, handle, status),
-        pending_failures: pending_failures
+        pending_failures: Map.put(state.pending_failures, handle, evidence)
     }
 
     persist_feed_failure(state, handle)
@@ -1696,7 +1711,7 @@ defmodule Tightbeam.HarklightWakes do
         result =
           if retryable_failure?(status),
             do: Outage.start(state.db, handle, failure_details(status), at),
-            else: mark_finished(state.db, handle, status)
+            else: mark_finished(state.db, handle, status, at)
 
         case result do
           {:ok, [_, _, _, _] = row} -> state |> clear_pending_failure(handle) |> arm_outage(row)
@@ -1710,8 +1725,12 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp clear_pending_failure(state, handle),
-    do: %{state | pending_failures: Map.delete(state.pending_failures, handle)}
+  defp clear_pending_failure(state, handle) do
+    case FeedCustody.forget(state.custody_dir, handle) do
+      :ok -> %{state | pending_failures: Map.delete(state.pending_failures, handle)}
+      {:error, _} -> state
+    end
+  end
 
   defp arm_outage(state, [_handle, _episode, _started, notice]) when is_binary(notice), do: state
 
@@ -2030,7 +2049,33 @@ defmodule Tightbeam.HarklightWakes do
 
   defp stop_worker(state, handle) do
     state = cancel_retry(state, handle)
-    state = %{state | admission_queue: List.keydelete(state.admission_queue, handle, 0)}
+
+    state =
+      complete_retry_waiter(
+        state,
+        handle,
+        {:failed, "listener receiver is no longer eligible",
+         retry_waiter_started_for(state, handle)}
+      )
+
+    deferred =
+      Enum.reduce(
+        [handle, {handle, :retry}, {handle, :startup}, {handle, :new_request}],
+        state.deferred,
+        &MapSet.delete(&2, &1)
+      )
+
+    state = %{
+      state
+      | admission_queue: List.keydelete(state.admission_queue, handle, 0),
+        manual_starts: MapSet.delete(state.manual_starts, handle),
+        deferred: deferred
+    }
+
+    state =
+      if Map.has_key?(state.pending_failures, handle),
+        do: schedule_listener_retry(state, handle, @feed_read_retry_delay, :recover),
+        else: state
 
     case Map.fetch(state.workers, handle) do
       {:ok, worker} ->
@@ -2421,19 +2466,18 @@ defmodule Tightbeam.HarklightWakes do
     })
   end
 
-  defp mark_finished(db, handle, status) do
-    case DB.transaction(db, fn txn -> mark_finished_in_txn(txn, handle, status) end) do
+  defp mark_finished(db, handle, status, now \\ System.system_time(:millisecond)) do
+    case DB.transaction(db, fn txn -> mark_finished_in_txn(txn, handle, status, now) end) do
       {:ok, result} -> result
       {:error, _} -> {:error, "listener_state_unavailable"}
     end
   end
 
-  defp mark_finished_in_txn(txn, handle, status) do
+  defp mark_finished_in_txn(txn, handle, status, now) do
     case Txn.q(txn, "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1", [
            handle
          ]) do
       [[session_key, current_state]] when current_state in ["active", "unavailable"] ->
-        now = System.system_time(:millisecond)
         completed = status == :complete
         next_state = if completed, do: "complete", else: "unavailable"
 
@@ -2644,10 +2688,34 @@ defmodule Tightbeam.HarklightWakes do
         state
 
       true ->
+        restore_feed_custody(state, handle, mode)
+    end
+  end
+
+  defp restore_feed_custody(state, handle, mode) do
+    case FeedCustody.pending(state.custody_dir, handle) do
+      :clear when mode == :fenced ->
+        state
+
+      :clear ->
         queue = List.keydelete(state.admission_queue, handle, 0)
         request = {handle, mode}
         queue = if mode == :retry, do: [request | queue], else: queue ++ [request]
         admit_feed(%{state | admission_queue: queue})
+
+      {:ok, {status, _at} = evidence} ->
+        state = %{
+          state
+          | failures: Map.put(state.failures, handle, status),
+            pending_failures: Map.put(state.pending_failures, handle, evidence)
+        }
+
+        if mode in [:retry, :fenced],
+          do: schedule_listener_retry(state, handle, 0, mode),
+          else: recover_worker(state, handle)
+
+      {:error, _} ->
+        schedule_listener_retry(state, handle, @feed_read_retry_delay, mode)
     end
   end
 

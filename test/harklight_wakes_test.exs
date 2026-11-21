@@ -76,6 +76,19 @@ defmodule Tightbeam.HarklightWakesTest do
     db = :"harklight_wakes_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = ensure_all_schemas(db)
+    custody = Path.join(System.tmp_dir!(), "#{db}-feed-custody")
+    old_recovery_opts = Application.get_env(:tightbeam, :harklight_recovery_options, [])
+
+    Application.put_env(
+      :tightbeam,
+      :harklight_recovery_options,
+      Keyword.put(old_recovery_opts, :feed_custody_dir, custody)
+    )
+
+    on_exit(fn ->
+      Application.put_env(:tightbeam, :harklight_recovery_options, old_recovery_opts)
+      File.rm_rf(custody)
+    end)
 
     {:ok, _} =
       DB.query(
@@ -4567,7 +4580,20 @@ defmodule Tightbeam.HarklightWakesTest do
              DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
 
     assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
-    refute_receive {:feed, _}, 300
+
+    assert {:ok, {"listener_terminated", ^issued}} =
+             Tightbeam.HarklightFeedCustody.pending(:sys.get_state(manager).custody_dir, @handle)
+
+    replacing = replace_feed_manager(manager)
+
+    assert eventually(fn ->
+             :sys.get_state(replacing).pending_failures[@handle] ==
+               {"listener_terminated", issued}
+           end)
+
+    HarklightWakes.activate(@handle, true)
+    refute_receive {:feed, _}, 350
+    assert {:ok, [[8]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
 
     :atomics.put(clock, 1, issued + 600_000)
     :ok = DB.execute(db, "DROP TRIGGER reject_outage")
@@ -4601,6 +4627,132 @@ defmodule Tightbeam.HarklightWakesTest do
                db,
                "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_notice_recovery_%'"
              )
+  end
+
+  for {name, table, exit_code, diagnostic, reason} <- [
+        {"pause", "harklight_feed_pauses", 1,
+         ~s|listen: live updates paused: internal_error (Request-Id Some("original-request"))|,
+         "original-request"},
+        {"stop", "harklight_feed_stops", 2,
+         ~s|server returned HTTP 403: Some("forbidden") (request ID None)|, "feed_refused"}
+      ],
+      local_store <- [:available, :refused] do
+    @failure_table table
+    @failure_exit exit_code
+    @failure_diagnostic diagnostic
+    @failure_reason reason
+    @local_store local_store
+
+    test "refused feed #{name} survives manager replacement with local store #{local_store}", %{
+      db: db
+    } do
+      :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
+
+      :ok =
+        DB.execute(db, """
+        CREATE TRIGGER reject_feed_failure BEFORE INSERT ON #{@failure_table}
+        BEGIN SELECT RAISE(ABORT, 'refuse feed failure projection'); END;
+        """)
+
+      clock = :atomics.new(1, [])
+      issued = System.system_time(:millisecond)
+      :atomics.put(clock, 1, issued)
+      custody = Path.join(System.tmp_dir!(), "#{db}-recovery-intent")
+      on_exit(fn -> File.rm_rf(custody) end)
+
+      if @local_store == :refused do
+        # Let the first child start, then make the journal directory refuse
+        # both writing and reading before the failure is observed.
+        File.mkdir_p!(custody)
+      end
+
+      fake_harklight_agent!("""
+      printf '%s\n' "$*" >> "$0.calls"
+      if [ ! -e "$0.resume" ]; then
+        while [ ! -e "$0.fail" ]; do sleep 0.05; done
+        printf '%s\n' '#{@failure_diagnostic}' >&2
+        exit #{@failure_exit}
+      fi
+      [ "$*" = 'listen --follow --session #{@handle} --after 8' ] || exit 2
+      printf '%s\n' '{"kind":"caught_up","rev":8}'
+      exec sleep 30
+      """)
+
+      agent_path = System.find_executable("harklight-agent")
+      calls = fn -> File.read!(agent_path <> ".calls") |> String.split("\n", trim: true) end
+
+      opts = [
+        db: db,
+        feed_custody_dir: custody,
+        retry_delays: [1],
+        wall_now: fn -> :atomics.get(clock, 1) end
+      ]
+
+      manager = start_supervised!({HarklightWakes, opts})
+      assert eventually(fn -> File.exists?(agent_path <> ".calls") end)
+
+      if @local_store == :refused do
+        File.rmdir!(custody)
+        File.write!(custody, "fixture refusing custody directory")
+      end
+
+      File.touch!(agent_path <> ".fail")
+
+      assert eventually(fn ->
+               match?({_status, ^issued}, :sys.get_state(manager).pending_failures[@handle])
+             end)
+
+      expected = "listen --follow --session #{@handle} --after 8"
+      assert calls.() == [expected]
+      assert {:ok, []} = DB.query(db, "SELECT handle FROM #{@failure_table}")
+
+      :atomics.put(clock, 1, issued + 600_000)
+
+      refute eventually(
+               fn ->
+                 match?(
+                   {_status, time} when time != issued,
+                   :sys.get_state(manager).pending_failures[@handle]
+                 )
+               end,
+               35
+             )
+
+      replacement = replace_feed_manager(manager)
+
+      assert eventually(fn ->
+               match?({_status, ^issued}, :sys.get_state(replacement).pending_failures[@handle])
+             end)
+
+      HarklightWakes.activate(@handle, true)
+      assert {:ok, [[8]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+      refute eventually(fn -> length(calls.()) > 1 end, 35)
+      assert {:ok, []} = DB.query(db, "SELECT handle FROM #{@failure_table}")
+
+      if @local_store == :refused, do: File.rm!(custody)
+      :ok = DB.execute(db, "DROP TRIGGER reject_feed_failure")
+
+      assert eventually(fn ->
+               match?({:ok, [[@handle]]}, DB.query(db, "SELECT handle FROM #{@failure_table}"))
+             end)
+
+      assert {:ok, [["unavailable", error, ^issued]]} =
+               DB.query(db, "SELECT state,lastError,updatedAt FROM harklight_wake_handles")
+
+      assert error =~ @failure_reason
+      assert {:ok, [[8]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+
+      HarklightWakes.activate(@handle, true)
+      refute eventually(fn -> length(calls.()) > 1 end, 35)
+
+      File.touch!(agent_path <> ".resume")
+
+      assert %{counts: %{listening: 1}} =
+               HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+
+      assert calls.() == [expected, expected]
+      assert {:ok, []} = DB.query(db, "SELECT handle FROM #{@failure_table}")
+    end
   end
 
   for {code, status, diagnostic, attempts} <- [
@@ -4803,6 +4955,93 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:listening, %{}} = Task.await(first, 2_000)
     assert_receive :ready_after_deferral
     assert {:ok, []} = DB.query(db, "SELECT handle FROM harklight_feed_stops")
+  end
+
+  for disposition <- [:paused, :stopped] do
+    @disposition disposition
+    test "canceling a queued explicit retry revokes authorization for a #{@disposition} feed", %{
+      db: db,
+      session: session
+    } do
+      :ok = DB.execute(db, "UPDATE harklight_wake_handles SET state='unavailable'")
+
+      table =
+        if @disposition == :paused do
+          :ok =
+            DB.execute(db, """
+            INSERT INTO harklight_feed_pauses(handle,diagnostic)
+            SELECT handle,'original pause' FROM harklight_wake_handles
+            """)
+
+          "harklight_feed_pauses"
+        else
+          :ok =
+            DB.execute(db, """
+            INSERT INTO harklight_feed_stops(handle) SELECT handle FROM harklight_wake_handles
+            """)
+
+          "harklight_feed_stops"
+        end
+
+      fake_harklight_session_end_agent!()
+      parent = self()
+
+      listener = fn manager, handle, _ ->
+        :ok = GenServer.call(manager, {:feed_ready, handle})
+        send(parent, :feed_open)
+        receive do: (:hold -> :ok)
+      end
+
+      manager = start_supervised!({HarklightWakes, db: db, listener: listener})
+
+      :sys.replace_state(
+        manager,
+        &%{&1 | cooldown_until: System.monotonic_time(:millisecond) + 60_000}
+      )
+
+      retry = Task.async(fn -> GenServer.call(manager, {:retry_handle, @handle}, :infinity) end)
+
+      assert eventually(fn ->
+               state = :sys.get_state(manager)
+               state.admission_queue == [{@handle, :retry}] and state.workers == %{}
+             end)
+
+      Org.set_host(db, session.session_key, "other-host")
+      assert {:failed, "listener receiver is no longer eligible", _} = Task.await(retry, 2_000)
+
+      state = :sys.get_state(manager)
+      assert state.admission_queue == []
+      refute Map.has_key?(state.retry_waiters, @handle)
+      refute MapSet.member?(state.manual_starts, @handle)
+
+      :sys.replace_state(manager, fn state ->
+        {timer, _token} = state.admission_timer
+        Process.cancel_timer(timer)
+        %{state | cooldown_until: nil, admission_timer: nil}
+      end)
+
+      Org.set_host(db, session.session_key, Placement.local_host_name())
+      HarklightWakes.activate(@handle, true)
+      refute_receive :feed_open, 350
+      assert {:ok, [[@handle]]} = DB.query(db, "SELECT handle FROM #{table}")
+
+      assert {:listening, %{}} = GenServer.call(manager, {:retry_handle, @handle}, :infinity)
+      assert_receive :feed_open
+      assert {:ok, []} = DB.query(db, "SELECT handle FROM #{table}")
+    end
+  end
+
+  defp replace_feed_manager(manager) do
+    monitor = Process.monitor(manager)
+    Process.exit(manager, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^manager, :killed}, 1_000
+
+    assert eventually(fn ->
+             current = Process.whereis(HarklightWakes)
+             is_pid(current) and current != manager
+           end)
+
+    Process.whereis(HarklightWakes)
   end
 
   test "a live focus frame proves recovery after an empty catch-up", %{db: db} do
