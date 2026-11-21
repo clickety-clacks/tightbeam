@@ -2280,7 +2280,8 @@ defmodule Tightbeam.Identity do
   # already committed. So identity writes start no maintenance at all; the
   # identity repository stays small and is not part of any caller's own Git
   # maintenance policy.
-  defp without_auto_maintenance(args) do
+  @doc false
+  def without_auto_maintenance(args) do
     ["-c", "maintenance.auto=false", "-c", "gc.auto=0" | args]
   end
 
