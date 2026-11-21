@@ -1,7 +1,7 @@
 defmodule Tightbeam.HarnessSwitchContextTest do
   use ExUnit.Case, async: true
 
-  alias Tightbeam.{HarnessHealth, HarnessProcess, HarnessSwitchContext}
+  alias Tightbeam.{DB, HarnessHealth, HarnessProcess, HarnessSwitchContext}
 
   defmodule CatalogFixture do
     use GenServer
@@ -599,6 +599,19 @@ defmodule Tightbeam.HarnessSwitchContextTest do
              }
            } = compact_history(plan)
 
+    assert {:ok, [["claude", ^host, "claude-haiku-5-5", nil, nil, nil, attempt_key]]} =
+             DB.query(
+               db,
+               """
+               SELECT harness,host,model,sessionKey,turnSeq,assignmentId,compactionAttemptKey
+               FROM harness_model_rate_limits
+               WHERE harness='claude' AND host=?1
+               """,
+               [host]
+             )
+
+    assert attempt_key == "[\"hsc-fixture-context\",\"claude\"]"
+
     assert %{
              compaction_evidence: %{
                steered_order: [
@@ -619,6 +632,7 @@ defmodule Tightbeam.HarnessSwitchContextTest do
             {claude_limit("You've hit your weekly limit"), true},
             {claude_limit("You've hit your 5-hour limit · resets 4:00pm UTC"), true},
             {claude_limit("You've hit your usage limit"), true},
+            {claude_limit("You've hit your Haiku weekly limit"), false},
             {claude_limit("You've hit your weekly limit. Model was not changed."), false},
             {claude_limit("You have hit your weekly limit for Sonnet"), false},
             {claude_limit("Rate limit exceeded"), false},
@@ -645,6 +659,18 @@ defmodule Tightbeam.HarnessSwitchContextTest do
 
       assert HarnessProcess.parked?(db, {:claude, "shared", host}) == account?
       assert HarnessHealth.unavailable?(db, "claude", host) == account?
+
+      if account? do
+        assert {:ok, []} =
+                 DB.query(db, "SELECT id FROM harness_model_rate_limits WHERE host=?1", [host])
+      else
+        expected_model_record? = index == 3
+
+        assert {:ok, rows} =
+                 DB.query(db, "SELECT model FROM harness_model_rate_limits WHERE host=?1", [host])
+
+        assert rows != [] == expected_model_record?
+      end
     end
   end
 

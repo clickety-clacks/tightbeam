@@ -128,6 +128,98 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimitTest do
     assert :account = ModelRateLimit.scope(@model_429["message"], nil)
   end
 
+  test "compactor model evidence requires an explicit model name and a replay-safe attempt key",
+       ctx do
+    model = "claude-haiku-5-5"
+    assert ModelRateLimit.model_named?("You've hit your Haiku weekly limit", model)
+
+    refute ModelRateLimit.model_named?(
+             "You've hit your weekly limit. Model was not changed.",
+             model
+           )
+
+    refute ModelRateLimit.model_named?("HTTP 429 Too Many Requests", model)
+
+    input = %{
+      harness: "claude",
+      host: "testhost",
+      model: model,
+      compaction_attempt_key: "attempt-1",
+      observed_at: System.system_time(:millisecond),
+      cause: "compaction model limit",
+      principal: "process:tightbeam"
+    }
+
+    assert %{status: "recorded", attempt_key: "attempt-1"} =
+             ModelRateLimit.record_compactor_attempt(ctx.db, input)
+
+    assert %{status: "duplicate", attempt_key: "attempt-1"} =
+             ModelRateLimit.record_compactor_attempt(ctx.db, input)
+
+    assert {:ok, [["claude", "testhost", ^model, nil, nil, "attempt-1"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT harness,host,model,sessionKey,turnSeq,compactionAttemptKey
+               FROM harness_model_rate_limits WHERE compactionAttemptKey=?1
+               """,
+               ["attempt-1"]
+             )
+
+    session_key = "agent:compactor-rate-limit-release"
+    session(ctx.db, session_key, "claude", model)
+    release_turn = succeed_turn!(ctx.db, session_key)
+
+    assert {:ok, [[^release_turn, "normal-turn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT releaseTurnSeq,releaseCause FROM harness_model_rate_limits WHERE compactionAttemptKey='attempt-1'"
+             )
+
+    assert_raise MatchError, fn ->
+      ModelRateLimit.record_compactor_attempt(ctx.db, Map.delete(input, :host))
+    end
+  end
+
+  test "the source-identity migration preserves existing turn records", ctx do
+    :ok =
+      DB.execute(ctx.db, """
+      DROP INDEX harness_model_rate_limits_held;
+      DROP TABLE harness_model_rate_limits;
+      CREATE TABLE harness_model_rate_limits (
+        id TEXT PRIMARY KEY,
+        harness TEXT NOT NULL,
+        host TEXT NOT NULL,
+        model TEXT NOT NULL,
+        sessionKey TEXT NOT NULL,
+        assignmentId TEXT,
+        turnSeq INTEGER NOT NULL UNIQUE,
+        observedAt INTEGER NOT NULL,
+        cause TEXT NOT NULL,
+        principal TEXT NOT NULL,
+        releasedAt INTEGER,
+        releaseCause TEXT CHECK(releaseCause IN ('normal-turn','escalated')),
+        releaseTurnSeq INTEGER,
+        CHECK((releasedAt IS NULL AND releaseCause IS NULL) OR
+              (releasedAt IS NOT NULL AND releaseCause IS NOT NULL))
+      );
+      CREATE INDEX harness_model_rate_limits_held
+        ON harness_model_rate_limits(harness,host,model,releasedAt);
+      INSERT INTO harness_model_rate_limits
+        (id,harness,host,model,sessionKey,assignmentId,turnSeq,observedAt,cause,principal)
+      VALUES ('legacy-row','claude','testhost','claude-haiku-5-5','agent:model-limit:opus',NULL,
+              901,10,'legacy limit','process:tightbeam');
+      """)
+
+    :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+    assert {:ok, [["legacy-row", "agent:model-limit:opus", 901, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,sessionKey,turnSeq,compactionAttemptKey FROM harness_model_rate_limits WHERE id='legacy-row'"
+             )
+  end
+
   defp queued(db, key) do
     {:ok, [[count]]} =
       DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'", [key])

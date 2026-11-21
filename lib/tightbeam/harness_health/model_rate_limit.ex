@@ -118,31 +118,78 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
     end)
   end
 
-  @doc "Record one model-scoped limit."
-  @spec record_in_txn(Txn.t(), map()) :: :ok
-  def record_in_txn(%Txn{} = txn, input) do
-    Txn.q(
-      txn,
-      """
-      INSERT OR IGNORE INTO harness_model_rate_limits
-        (id,harness,host,model,sessionKey,assignmentId,turnSeq,observedAt,cause,principal)
-      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-      """,
-      [
-        "hmrl_" <> Tightbeam.Id.uuid4(),
-        input.harness,
-        input.host,
-        input.model,
-        input.session_key,
-        input.assignment_id,
-        input.turn_seq,
-        input.observed_at,
-        input.cause,
-        input.principal
-      ]
-    )
+  @doc "True only when provider wording explicitly names the attempted model or its family."
+  @spec model_named?(String.t(), String.t()) :: boolean()
+  def model_named?(message, model) when is_binary(message) and is_binary(model) do
+    names_model?(String.downcase(message), model)
+  end
 
-    :ok
+  def model_named?(_message, _model), do: false
+
+  @doc "Record one model-scoped limit."
+  @spec record_in_txn(Txn.t(), map()) :: :ok | :recorded | :duplicate
+  def record_in_txn(%Txn{} = txn, input) do
+    case Map.fetch(input, :compaction_attempt_key) do
+      {:ok, attempt_key} ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO harness_model_rate_limits
+            (id,harness,host,model,sessionKey,assignmentId,turnSeq,compactionAttemptKey,
+             observedAt,cause,principal)
+          VALUES (?1,?2,?3,?4,NULL,NULL,NULL,?5,?6,?7,?8)
+          ON CONFLICT(compactionAttemptKey) WHERE compactionAttemptKey IS NOT NULL DO NOTHING
+          """,
+          [
+            "hmrl_" <> Tightbeam.Id.uuid4(),
+            input.harness,
+            input.host,
+            input.model,
+            attempt_key,
+            input.observed_at,
+            input.cause,
+            input.principal
+          ]
+        )
+
+        if Txn.changes(txn) == 1, do: :recorded, else: :duplicate
+
+      :error ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO harness_model_rate_limits
+            (id,harness,host,model,sessionKey,assignmentId,turnSeq,compactionAttemptKey,
+             observedAt,cause,principal)
+          VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?9,?10)
+          ON CONFLICT(turnSeq) WHERE turnSeq IS NOT NULL DO NOTHING
+          """,
+          [
+            "hmrl_" <> Tightbeam.Id.uuid4(),
+            input.harness,
+            input.host,
+            input.model,
+            input.session_key,
+            input.assignment_id,
+            input.turn_seq,
+            input.observed_at,
+            input.cause,
+            input.principal
+          ]
+        )
+
+        :ok
+    end
+  end
+
+  @doc "Record a positively model-named compactor limit with its attempt identity."
+  def record_compactor_attempt(db \\ DB, input) do
+    {:ok, status} =
+      DB.transaction(db, fn txn ->
+        record_in_txn(txn, input)
+      end)
+
+    %{status: Atom.to_string(status), attempt_key: input.compaction_attempt_key}
   end
 
   @doc "Release every held record for the model a normal turn just answered on."
