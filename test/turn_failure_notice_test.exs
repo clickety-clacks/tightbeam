@@ -1,7 +1,9 @@
 defmodule Tightbeam.TurnFailureNoticeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Ledger, Model, Org, TurnFailureNotice, Wakes}
+  alias Tightbeam.{ConnRegistry, DB, Ledger, Model, Org, Wakes}
+
+  alias Tightbeam.Productions.Bubble
 
   @limit_429 "API error: 429 This request would exceed your account's rate limit. " <>
                "Please try again later · model not changed"
@@ -11,6 +13,7 @@ defmodule Tightbeam.TurnFailureNoticeTest do
     def start_link(name), do: GenServer.start_link(__MODULE__, :ok, name: name)
     def init(state), do: {:ok, state}
     def handle_call({:ensure_lane, _key}, _from, state), do: {:reply, :ok, state}
+    def handle_cast({:ensure_lane, _key}, state), do: {:noreply, state}
   end
 
   setup do
@@ -39,23 +42,6 @@ defmodule Tightbeam.TurnFailureNoticeTest do
     %{db: db, main: main, lane: lane, reviewer: reviewer, assignment: assignment}
   end
 
-  test "a failed first turn tells the assignment's opener the verbatim reason", ctx do
-    seq = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: ctx.assignment)
-
-    assert {:scheduled, wake_id} = notify!(ctx.db, seq, @limit_429)
-
-    wake = Wakes.get(ctx.db, wake_id)
-    assert wake.session_key == ctx.lane.session_key
-    assert wake.consumer == "prompt"
-    assert wake.class == "blocker"
-    assert wake.prompt =~ "Reason: " <> @limit_429 <> "\n"
-    assert wake.prompt =~ "assignment #{ctx.assignment}"
-    assert wake.prompt =~ ctx.reviewer.session_key
-    assert wake.prompt =~ "model fable"
-
-    assert notices(ctx.db) == [ctx.lane.session_key]
-  end
-
   test "automatic retries of one failed delivery notify once, not per attempt", ctx do
     wake =
       Wakes.schedule(ctx.db, %{
@@ -74,7 +60,7 @@ defmodule Tightbeam.TurnFailureNoticeTest do
         error: @limit_429
       )
 
-    assert {:scheduled, notice} = notify!(ctx.db, first, @limit_429)
+    assert :ok = Bubble.recognize_terminal(ctx.db, first)
     assert {:retry, retry_wake_id} = preserve_failed_intent!(ctx.db, first)
 
     retried =
@@ -84,52 +70,90 @@ defmodule Tightbeam.TurnFailureNoticeTest do
         error: @limit_429
       )
 
-    assert :duplicate = notify!(ctx.db, retried, @limit_429)
-    # The same terminal committing twice cannot double-notify either.
-    assert :duplicate = notify!(ctx.db, first, @limit_429)
+    assert :ok = Bubble.recognize_terminal(ctx.db, retried)
+    assert :ok = Bubble.recognize_terminal(ctx.db, first)
+    assert [{recipient, prompt}] = notices(ctx.db)
+    assert recipient == ctx.lane.session_key
+    assert prompt =~ @limit_429
+  end
 
-    assert notices(ctx.db) == [ctx.lane.session_key]
-    assert Wakes.get(ctx.db, notice).session_key == ctx.lane.session_key
+  test "health redelivery of a failed batch carrier retains its notice identity", ctx do
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.reviewer.session_key,
+        origin: "process:tightbeam",
+        prompt: "a sealed batch",
+        due_at: 1,
+        digest: true
+      })
+
+    first =
+      failed_turn!(ctx.db, ctx.reviewer.session_key,
+        assignment_id: ctx.assignment,
+        wake_id: wake.wake_id,
+        error: @limit_429
+      )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, first)
+
+    assert {:ok, 1} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.record_health_redelivery_source_in_txn(txn, first, "rate-limit-dead")
+               Wakes.redeliver_pending_health_intents_in_txn(txn, ctx.reviewer, %{seq: first + 1})
+             end)
+
+    assert {:ok, retried} = Ledger.claim_next(ctx.db, ctx.reviewer.session_key, "notice-test")
+    assert retried.wake_id == nil
+
+    assert :ok =
+             Ledger.finish(ctx.db, retried.seq, "failed", @limit_429,
+               owner_lease: retried.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, retried.seq)
+    assert [{recipient, prompt}] = notices(ctx.db)
+    assert recipient == ctx.lane.session_key
+    assert prompt =~ @limit_429
   end
 
   test "a new failed delivery after an earlier one is its own notice", ctx do
     first = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: ctx.assignment)
     second = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: ctx.assignment)
 
-    assert {:scheduled, a} = notify!(ctx.db, first, "first reason")
-    assert {:scheduled, b} = notify!(ctx.db, second, "second reason")
-    assert a != b
+    assert :ok = Bubble.recognize_terminal(ctx.db, first)
+    assert :ok = Bubble.recognize_terminal(ctx.db, second)
     assert length(notices(ctx.db)) == 2
   end
 
   test "a failed turn with no assignment goes to the session's current parent", ctx do
-    seq = failed_turn!(ctx.db, ctx.reviewer.session_key)
-
-    assert {:scheduled, wake_id} = notify!(ctx.db, seq, "adapter died")
-    assert Wakes.get(ctx.db, wake_id).session_key == ctx.lane.session_key
+    seq = failed_turn!(ctx.db, ctx.reviewer.session_key, error: "adapter died")
+    assert :ok = Bubble.recognize_terminal(ctx.db, seq)
+    assert [{recipient, prompt}] = notices(ctx.db)
+    assert recipient == ctx.lane.session_key
+    assert prompt =~ "adapter died"
   end
 
-  test "the recorded error is the reason when the caller has no sentence", ctx do
-    seq = failed_turn!(ctx.db, ctx.reviewer.session_key, error: "turn task crashed: boom")
+  test "an existing interrupted-outcome question owns the notice", ctx do
+    seq =
+      failed_turn!(ctx.db, ctx.reviewer.session_key,
+        assignment_id: ctx.assignment,
+        error: "interrupted: outcome unknown"
+      )
 
-    assert {:scheduled, wake_id} = notify!(ctx.db, seq, nil)
-    assert Wakes.get(ctx.db, wake_id).prompt =~ "Reason: turn task crashed: boom\n"
-  end
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.record_health_redelivery_source_in_txn(
+                 txn,
+                 seq,
+                 "interrupted-outcome-unknown"
+               )
+             end)
 
-  test "nobody else accountable, a delivered turn, or an interrupted turn sends nothing", ctx do
-    orphan = session(ctx.db, "agent:orphan", nil)
-    self_opened = assignment!(ctx.db, "asg_self", orphan.session_key, orphan.session_key)
-    seq = failed_turn!(ctx.db, orphan.session_key, assignment_id: self_opened)
-    assert :none = notify!(ctx.db, seq, "boom")
-
-    delivered = failed_turn!(ctx.db, ctx.reviewer.session_key, status: "delivered", error: nil)
-    assert :none = notify!(ctx.db, delivered, nil)
-
-    # interrupted-outcome-unknown already asks the parent whether to redeliver.
-    interrupted = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: ctx.assignment)
-    assert :none = notify!(ctx.db, interrupted, "interrupted: outcome unknown")
-
+    assert :ok = Bubble.recognize_terminal(ctx.db, seq)
     assert notices(ctx.db) == []
+    wake = Wakes.get(ctx.db, "w_health_redelivery_parent_#{seq}")
+    assert wake.session_key == ctx.lane.session_key
+    assert wake.prompt =~ "Reason: interrupted: outcome unknown"
   end
 
   test "a retired opener falls back to the session's current parent", ctx do
@@ -141,24 +165,28 @@ defmodule Tightbeam.TurnFailureNoticeTest do
         other.session_key
       ])
 
-    seq = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: asg)
-    assert {:scheduled, wake_id} = notify!(ctx.db, seq, "boom")
-    assert Wakes.get(ctx.db, wake_id).session_key == ctx.lane.session_key
-  end
-
-  defp notify!(db, seq, sentence) do
-    {:ok, result} = DB.transaction(db, &TurnFailureNotice.schedule_in_txn(&1, seq, sentence))
-    result
+    seq = failed_turn!(ctx.db, ctx.reviewer.session_key, assignment_id: asg, error: "boom")
+    assert :ok = Bubble.recognize_terminal(ctx.db, seq)
+    assert [{recipient, prompt}] = notices(ctx.db)
+    assert recipient == ctx.lane.session_key
+    assert prompt =~ "boom"
   end
 
   defp notices(db) do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT sessionKey FROM wakes WHERE wakeId LIKE 'w_turn_failure_%' ORDER BY createdAt,wakeId"
+        """
+        SELECT sessionKey,prompt FROM turns
+        WHERE wakeId LIKE 'bubble:%' OR wakeId LIKE 'w_turn_failure_%'
+        UNION ALL
+        SELECT sessionKey,prompt FROM wakes
+        WHERE (wakeId LIKE 'bubble:%' OR wakeId LIKE 'w_turn_failure_%')
+          AND NOT EXISTS (SELECT 1 FROM turns WHERE turns.wakeId=wakes.wakeId)
+        """
       )
 
-    List.flatten(rows)
+    Enum.map(rows, &List.to_tuple/1)
   end
 
   defp preserve_failed_intent!(db, seq) do
@@ -166,7 +194,7 @@ defmodule Tightbeam.TurnFailureNoticeTest do
     result
   end
 
-  defp failed_turn!(db, session_key, opts \\ []) do
+  defp failed_turn!(db, session_key, opts) do
     unique = System.unique_integer([:positive])
 
     {:ok, seq} =

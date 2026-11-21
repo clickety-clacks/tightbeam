@@ -32,7 +32,8 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimitTest do
       for {name, model} <- [
             fable_1: "claude-fable-5-2",
             fable_2: "claude-fable-5-2",
-            sonnet: "claude-sonnet-5-5"
+            sonnet: "claude-sonnet-5-5",
+            opus: "claude-opus-5-5"
           ],
           into: %{} do
         key = "agent:model-limit:#{name}"
@@ -75,42 +76,38 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimitTest do
   end
 
   test "an account-wide limit from two sessions still fences the harness", ctx do
-    fail_turn!(ctx.db, ctx.sessions.fable_1, @weekly_limit)
-    fail_turn!(ctx.db, ctx.sessions.sonnet, @weekly_limit)
+    failure = fn model ->
+      put_in(@weekly_limit["data"]["model"], model)
+    end
+
+    fail_turn!(ctx.db, ctx.sessions.fable_1, failure.("claude-fable-5-2"))
+    fail_turn!(ctx.db, ctx.sessions.sonnet, failure.("claude-sonnet-5-5"))
 
     assert [["rate-limit-dead"]] = open_incidents(ctx.db)
     assert HarnessProcess.parked?(ctx.db, @adapter_key)
     assert ModelRateLimit.held(ctx.db, "claude", "testhost") == []
   end
 
-  test "a 429 that reaches a second model inside the window is account-wide", ctx do
-    fable = fail_turn!(ctx.db, ctx.sessions.fable_1, @model_429)
+  test "explicit quotas on different models leave a third model running", ctx do
+    fable = put_in(@model_429["message"], "You've hit your Fable weekly limit")
+
+    sonnet =
+      @model_429
+      |> put_in(["message"], "Internal error")
+      |> put_in(["data", "message"], "You've hit your Sonnet weekly limit")
+
+    first = fail_turn!(ctx.db, ctx.sessions.fable_1, fable)
+    second = fail_turn!(ctx.db, ctx.sessions.sonnet, sonnet)
+
     assert open_incidents(ctx.db) == []
+    refute HarnessProcess.parked?(ctx.db, @adapter_key)
+    refute ConditionFacts.harness_unavailable?(ctx.db, "claude", "testhost")
+    succeed_turn!(ctx.db, ctx.sessions.opus)
 
-    sonnet = fail_turn!(ctx.db, ctx.sessions.sonnet, @model_429)
-
-    assert [["rate-limit-dead"]] = open_incidents(ctx.db)
-    assert HarnessProcess.parked?(ctx.db, @adapter_key)
-
-    {:ok, rows} =
-      DB.query(
-        ctx.db,
-        """
-        SELECT o.correlationId FROM harness_health_observations o
-        JOIN harness_health_incidents i ON i.id=o.incidentId
-        WHERE i.state='open' ORDER BY o.correlationId
-        """
-      )
-
-    assert Enum.sort(List.flatten(rows)) ==
-             Enum.sort([
-               "harness-turn:#{fable}:rate-limit-dead",
-               "harness-turn:#{sonnet}:rate-limit-dead"
-             ])
-
-    assert ModelRateLimit.held(ctx.db, "claude", "testhost") == []
-    assert %{release_cause: "escalated"} = ModelRateLimit.for_turn(ctx.db, fable)
-    assert %{release_cause: "escalated"} = ModelRateLimit.for_turn(ctx.db, sonnet)
+    assert [
+             %{model: "claude-fable-5-2", turn_seq: ^first, released_at: nil},
+             %{model: "claude-sonnet-5-5", turn_seq: ^second, released_at: nil}
+           ] = ModelRateLimit.held(ctx.db, "claude", "testhost")
   end
 
   test "scope separates request-rate limits from plan limits" do

@@ -1165,12 +1165,8 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
-  # A request-rate limit on one model is that model's, not the harness's: it is
-  # recorded against harness, host and model and never opens a harness incident
-  # or park fence. Plan and usage limits, authoritative provider evidence and
-  # turns with no known model keep the harness path. A model-scoped limit seen
-  # on a second model inside the window is account-wide after all; both
-  # observations then enter the harness evidence so the ordinary rule decides.
+  # Model observations never feed harness-wide evidence, even when several
+  # separate models are limited. Account and authoritative signals still do.
   defp harness_scope_in_txn(_txn, _session, _turn, %{failure_class: class}, _reason)
        when class != "rate-limit-dead",
        do: :harness
@@ -1181,66 +1177,56 @@ defmodule Tightbeam.HarnessHealth do
   defp harness_scope_in_txn(txn, session, turn, observation, reason) do
     model = turn_model_in_txn(txn, turn.seq)
 
-    case ModelRateLimit.scope(evidence_text(reason), model) do
+    case ModelRateLimit.scope(evidence_text(reason), rate_limit_message(reason), model) do
       :account ->
         :harness
 
       {:model, model} ->
-        others =
-          ModelRateLimit.record_in_txn(
-            txn,
-            %{
-              harness: observation.harness,
-              host: session.host,
-              model: model,
-              session_key: turn.session_key,
-              assignment_id: observation.assignment_id,
-              turn_seq: turn.seq,
-              observed_at: observation.observed_at,
-              cause: observation.cause,
-              principal: principal_text(observation.principal)
-            },
-            @evidence_window_ms
-          )
+        ModelRateLimit.record_in_txn(txn, %{
+          harness: observation.harness,
+          host: session.host,
+          model: model,
+          session_key: turn.session_key,
+          assignment_id: observation.assignment_id,
+          turn_seq: turn.seq,
+          observed_at: observation.observed_at,
+          cause: observation.cause,
+          principal: principal_text(observation.principal)
+        })
 
-        if others == [] do
-          EventLog.lifecycle_in_txn(
-            txn,
-            "harness_health_model_rate_limit",
-            turn.session_key,
-            JSON.encode!(%{
-              harness: observation.harness,
-              host: session.host,
-              model: model,
-              turnSeq: turn.seq,
-              correlationId: observation.correlation_id
-            })
-          )
+        EventLog.lifecycle_in_txn(
+          txn,
+          "harness_health_model_rate_limit",
+          turn.session_key,
+          JSON.encode!(%{
+            harness: observation.harness,
+            host: session.host,
+            model: model,
+            turnSeq: turn.seq,
+            correlationId: observation.correlation_id
+          })
+        )
 
-          :model
-        else
-          Enum.each(others, fn other ->
-            observe_in_txn(txn, %{
-              observation
-              | correlation_id: "harness-turn:#{other.turn_seq}:rate-limit-dead",
-                session_key: other.session_key,
-                assignment_id: other.assignment_id,
-                observed_at: other.observed_at,
-                cause: other.cause,
-                principal: other.principal
-            })
-          end)
-
-          ModelRateLimit.escalate_in_txn(
-            txn,
-            [current_model_record_id(txn, turn.seq) | Enum.map(others, & &1.id)],
-            observation.observed_at
-          )
-
-          :harness
-        end
+        :model
     end
   end
+
+  defp rate_limit_message(reason) when is_binary(reason), do: reason
+
+  defp rate_limit_message(reason) when is_map(reason) do
+    data = reason["data"] || reason[:data]
+
+    [reason["message"] || reason[:message] | rate_limit_details(data)]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join(" ")
+  end
+
+  defp rate_limit_message(_reason), do: ""
+
+  defp rate_limit_details(data) when is_map(data),
+    do: [data["message"] || data[:message], data["details"] || data[:details]]
+
+  defp rate_limit_details(data), do: [data]
 
   defp turn_model_in_txn(txn, turn_seq) do
     case Txn.q(
@@ -1254,11 +1240,6 @@ defmodule Tightbeam.HarnessHealth do
       [[model]] -> model
       [] -> nil
     end
-  end
-
-  defp current_model_record_id(txn, turn_seq) do
-    [[id]] = Txn.q(txn, "SELECT id FROM harness_model_rate_limits WHERE turnSeq=?1", [turn_seq])
-    id
   end
 
   defp pre_request_model_selection_refusal?(:session, reason, diagnostic) do

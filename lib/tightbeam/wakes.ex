@@ -3208,7 +3208,7 @@ defmodule Tightbeam.Wakes do
            txn,
            """
            SELECT t.sessionKey,t.messageId,t.wakeId,t.origin,t.prompt,t.roleRef,t.roleFallback,
-                  t.assignmentId,t.jobRef,t.requestRef,s.harness,s.host
+                  t.assignmentId,t.jobRef,t.requestRef,s.harness,s.host,t.error
            FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
            WHERE t.seq=?1 AND t.messageId IS NOT NULL
              AND (t.status='failed' OR
@@ -3229,7 +3229,8 @@ defmodule Tightbeam.Wakes do
           job_ref,
           request_ref,
           source_harness,
-          source_host
+          source_host,
+          error
         ]
       ]
       when is_binary(source_harness) and is_binary(source_host) ->
@@ -3294,7 +3295,8 @@ defmodule Tightbeam.Wakes do
             source_turn_seq,
             message_id,
             origin,
-            prompt
+            prompt,
+            error
           )
         end
 
@@ -3352,7 +3354,8 @@ defmodule Tightbeam.Wakes do
          source_turn_seq,
          message_id,
          origin,
-         original_prompt
+         original_prompt,
+         error
        ) do
     wake_id = "w_health_redelivery_parent_#{source_turn_seq}"
 
@@ -3361,6 +3364,7 @@ defmodule Tightbeam.Wakes do
         "interrupted-outcome-unknown. No automatic retry was queued. " <>
         "Should the original message be redelivered?\n" <>
         "Source turn: #{source_turn_seq}; message: #{message_id}; sender: #{origin}.\n" <>
+        "Reason: #{Tightbeam.Gateway.recorded_turn_failure_sentence(error)}\n" <>
         "Original message:\n#{original_prompt}\n" <>
         "If you want it retried, use the ordinary dispatch path for that session; " <>
         "otherwise leave the failed turn unchanged."

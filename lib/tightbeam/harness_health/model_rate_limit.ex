@@ -11,12 +11,10 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
 
   Plan and usage limits ("You've hit your weekly limit", usage limits, quota)
   stay account-wide and keep the harness path. So does a limit on a turn with
-  no known model. A request-rate limit that reaches a second, different model
-  on the same harness and host inside the evidence window is not model-specific
-  either: the caller escalates it to the harness path.
+  no known model. Several distinct model limits do not imply an account limit.
 
   A held record is released by the next normal turn on the same harness, host
-  and model, or by escalation. The record adds no admission gate: the failed
+  and model. The record adds no admission gate: the failed
   turn, its automatic retry and the opener's failed-turn notice are unchanged.
   """
 
@@ -75,24 +73,27 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
   @doc """
   The scope of a `rate-limit-dead` failure on a turn that ran on `model`.
 
-  Returns `{:model, model}` for a request-rate limit, or for any limit whose
-  text names the turn's model or model family; `:account` otherwise.
+  A request-rate limit or a limit explicitly scoped to the turn's model
+  returns `{:model, model}`. Plan and usage evidence returns `:account`.
   """
   @spec scope(String.t(), String.t() | nil) :: {:model, String.t()} | :account
-  def scope(_evidence, model) when not is_binary(model) or model == "", do: :account
+  def scope(evidence, model), do: scope(evidence, evidence, model)
 
-  def scope(evidence, model) when is_binary(evidence) do
+  @doc false
+  def scope(_evidence, _message, model) when not is_binary(model) or model == "", do: :account
+
+  def scope(evidence, message, model) when is_binary(evidence) and is_binary(message) do
     text = String.downcase(evidence)
 
     cond do
-      names_model?(text, model) -> {:model, model}
+      names_model?(String.downcase(message), model) -> {:model, model}
       Enum.any?(@account_wide_markers, &String.contains?(text, &1)) -> :account
       Regex.match?(@plan_reset, text) -> :account
       true -> {:model, model}
     end
   end
 
-  def scope(_evidence, _model), do: :account
+  def scope(_evidence, _message, _model), do: :account
 
   defp names_model?(text, model) do
     model = String.downcase(model)
@@ -105,18 +106,21 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
         _ -> nil
       end
 
-    String.contains?(text, model) or
-      (is_binary(family) and String.length(family) >= 4 and
-         Regex.match?(~r/\b#{Regex.escape(family)}\b/, text))
+    [model, family]
+    |> Enum.filter(&(is_binary(&1) and String.length(&1) >= 4))
+    |> Enum.any?(fn name ->
+      qualifier = Regex.escape(name)
+
+      Regex.match?(
+        ~r/\b#{qualifier}(?:['’]s)?\s+(?:(?:model|session|hourly|daily|weekly|monthly|usage|rate|request)\s+)*(?:limit|quota)\b|\b(?:limit|quota)(?:\s+(?:reached|exceeded))?\s+(?:for|on)\s+(?:the\s+)?#{qualifier}\b/u,
+        text
+      )
+    end)
   end
 
-  @doc """
-  Record one model-scoped limit and return the held records of OTHER models on
-  the same harness and host inside the window ending at `observed_at`.
-  A non-empty result means the limit is not model-specific.
-  """
-  @spec record_in_txn(Txn.t(), map(), non_neg_integer()) :: [map()]
-  def record_in_txn(%Txn{} = txn, input, window_ms) do
+  @doc "Record one model-scoped limit."
+  @spec record_in_txn(Txn.t(), map()) :: :ok
+  def record_in_txn(%Txn{} = txn, input) do
     Txn.q(
       txn,
       """
@@ -138,38 +142,7 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
       ]
     )
 
-    Txn.q(
-      txn,
-      select_sql() <>
-        """
-         WHERE harness=?1 AND host=?2 AND model!=?3 AND releasedAt IS NULL
-           AND observedAt BETWEEN ?4 AND ?5
-         ORDER BY observedAt,turnSeq
-        """,
-      [
-        input.harness,
-        input.host,
-        input.model,
-        max(0, input.observed_at - window_ms),
-        input.observed_at
-      ]
-    )
-    |> Enum.map(&row/1)
-  end
-
-  @doc "Release the records an escalation moved onto the harness path."
-  @spec escalate_in_txn(Txn.t(), [String.t()], integer()) :: :ok
-  def escalate_in_txn(%Txn{} = txn, ids, at) do
-    Enum.each(ids, fn id ->
-      Txn.q(
-        txn,
-        """
-        UPDATE harness_model_rate_limits SET releasedAt=?2,releaseCause='escalated'
-        WHERE id=?1 AND releasedAt IS NULL
-        """,
-        [id, at]
-      )
-    end)
+    :ok
   end
 
   @doc "Release every held record for the model a normal turn just answered on."

@@ -1086,7 +1086,24 @@ defmodule Tightbeam.LaneTest do
 
   test "a placement refusal reaches the turn publisher by name, not as task_crash", ctx do
     parent = self()
-    seq = enqueue!(ctx.db, "k1", "vanished host")
+    seq = enqueue!(ctx.db, "k2", "vanished host")
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=NULL WHERE sessionKey='k2'")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments (id,subject,holderKey,openedBySession,openedAt,state)
+               VALUES ('asg_placement','review','k2','k1',1,'open')
+               """
+             )
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE turns SET assignmentId='asg_placement' WHERE seq=?1", [seq])
+
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
 
     expected =
       "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
@@ -1106,16 +1123,22 @@ defmodule Tightbeam.LaneTest do
         end,
         interval: 60_000,
         terminal_publisher: fn payload -> send(parent, {:turn_payload, payload}) end,
+        on_terminal: fn _session, terminal_seq ->
+          send(
+            parent,
+            {:recognized, Tightbeam.Productions.Bubble.recognize_terminal(ctx.db, terminal_seq)}
+          )
+        end,
         name: :placement_refusal_lane_manager
       )
 
-    :ok = LaneManager.ensure_lane(:placement_refusal_lane_manager, "k1")
+    :ok = LaneManager.ensure_lane(:placement_refusal_lane_manager, "k2")
 
     assert_receive {:turn_payload,
                     %{
                       status: "failed",
                       error: error,
-                      session_key: "k1"
+                      session_key: "k2"
                     }}
 
     assert error == expected
@@ -1125,6 +1148,14 @@ defmodule Tightbeam.LaneTest do
 
     assert status == "failed"
     assert stored_error == expected
+    assert_receive {:recognized, :ok}
+
+    assert {:ok, [["k1", prompt]]} =
+             DB.query(ctx.db, "SELECT sessionKey,prompt FROM turns WHERE requestRef=?1", [
+               "bubble:#{seq}"
+             ])
+
+    assert prompt =~ expected
   end
 
   defp eventually(fun, tries \\ 60) do

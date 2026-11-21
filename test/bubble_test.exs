@@ -935,7 +935,7 @@ defmodule Tightbeam.Productions.BubbleTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
   end
 
-  test "an open incident suppresses only its affected harness", ctx do
+  test "an open incident uses the failure fallback only for its affected harness", ctx do
     assert {:opened, _incident} =
              HarnessHealth.observe(ctx.db, %{
                correlation_id: "bubble-rate-limit",
@@ -952,7 +952,12 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     affected_seq = fail_turn!(ctx.db, ctx.holder.session_key)
     :ok = Bubble.recognize_terminal(ctx.db, affected_seq)
-    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+    affected_ref = "bubble:#{affected_seq}"
+
+    assert [[_, ^affected_ref, _, _, affected_prompt]] =
+             notice_turn(ctx.db, ctx.supervisor.session_key)
+
+    assert affected_prompt =~ "You are accountable for this turn"
 
     healthy =
       Org.create(ctx.db, %{
@@ -970,10 +975,10 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     healthy_seq = fail_turn!(ctx.db, healthy.session_key)
     :ok = Bubble.recognize_terminal(ctx.db, healthy_seq)
-    healthy_ref = "bubble:#{healthy_seq}"
-
-    assert [[_, ^healthy_ref, _, _, _]] =
-             notice_turn(ctx.db, ctx.supervisor.session_key)
+    healthy_wake_id = "bubble:#{healthy_seq}:#{ctx.supervisor.session_key}"
+    healthy_wake = Tightbeam.Wakes.get(ctx.db, healthy_wake_id)
+    assert healthy_wake.session_key == ctx.supervisor.session_key
+    assert healthy_wake.prompt =~ "You are the nearest ancestor"
   end
 
   test "a canceled cause turn never bubbles — cancellation is a decision", ctx do
