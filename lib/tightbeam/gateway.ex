@@ -12178,7 +12178,12 @@ defmodule Tightbeam.Gateway do
         kept_descendants =
           retirement_move_replay(db, call.session_key, owner, p[:idempotency_key])
 
-        %{deleted_session_key: call.session_key, retired_session_keys: retired_keys, deferred: []}
+        %{
+          deleted_session_key: call.session_key,
+          retired_session_keys: retired_keys,
+          retired_sessions: Enum.map(retired_keys, &retired_workspace_entry(config, db, &1)),
+          deferred: []
+        }
         |> maybe_put_kept_descendants(kept_descendants)
         |> then(&retire_replay_observation(db, call, &1))
 
@@ -12298,7 +12303,7 @@ defmodule Tightbeam.Gateway do
                 end)
               end
             else
-              retired_workspace_response(db, call, session, p[:acknowledge_loss] == true)
+              retired_workspace_response(config, db, call, session, p[:acknowledge_loss] == true)
             end
 
           _ ->
@@ -12309,7 +12314,7 @@ defmodule Tightbeam.Gateway do
 
   # Retiring an already-retired session reports the work its workspace
   # cleanup is holding back, and `acknowledge_loss` lets that cleanup delete it.
-  defp retired_workspace_response(db, call, session, acknowledge?) do
+  defp retired_workspace_response(config, db, call, session, acknowledge?) do
     keys = [session.session_key | retired_subtree_keys(db, session.session_key)] |> Enum.uniq()
 
     held =
@@ -12328,13 +12333,13 @@ defmodule Tightbeam.Gateway do
       acknowledge? ->
         by = retirement_principal_ref(call.principal)
         Enum.each(keys, &WorkspaceCleanup.acknowledge(db, &1, by))
-        workspace_response(db, call, session, %{acknowledged_losses: held})
+        workspace_response(config, db, call, session, keys, %{acknowledged_losses: held})
 
       held != [] ->
-        workspace_response(db, call, session, %{held_losses: held})
+        workspace_response(config, db, call, session, keys, %{held_losses: held})
 
       true ->
-        workspace_response(db, call, session, %{})
+        workspace_response(config, db, call, session, keys, %{})
     end
   end
 
@@ -12351,15 +12356,21 @@ defmodule Tightbeam.Gateway do
         _ -> nil
       end
 
-    Map.merge(
-      %{
-        session_key: key,
-        display_name: session && session.display_name,
-        host: session && session.host,
-        workdir: workdir
-      },
-      WorkspaceCleanup.status(db, key) || %{cleanup: "queued", reasons: []}
-    )
+    status = WorkspaceCleanup.status(db, key) || %{cleanup: "queued", reasons: []}
+
+    archive_path =
+      if status.cleanup == "completed",
+        do: status[:archive_path],
+        else: status[:archive_path] || WorkspaceCleanup.projected_archive(config, db, session)
+
+    Map.merge(status, %{
+      session_key: key,
+      display_name: session && session.display_name,
+      host: session && session.host,
+      workdir: workdir,
+      archive_host: session && session.host,
+      archive_path: archive_path
+    })
   end
 
   defp retired_display_name(db, key) do
@@ -12402,19 +12413,24 @@ defmodule Tightbeam.Gateway do
         }
 
       %{owner_user_id: ^owner} = session ->
-        retired_workspace_response(db, call, session, false)
+        retired_workspace_response(config, db, call, session, false)
 
       _ ->
         %{code: "not_found"}
     end
   end
 
-  defp workspace_response(db, call, session, extra) do
+  defp workspace_response(config, db, call, session, keys, extra) do
     retire_replay_observation(
       db,
       call,
       Map.merge(
-        %{deleted_session_key: session.session_key, retired_session_keys: [], deferred: []},
+        %{
+          deleted_session_key: session.session_key,
+          retired_session_keys: [],
+          retired_sessions: Enum.map(keys, &retired_workspace_entry(config, db, &1)),
+          deferred: []
+        },
         extra
       )
     )

@@ -71,6 +71,16 @@ if config_env() != :test do
     config :tightbeam, :archive_dir, value
   end
 
+  for {variable, key} <- [
+        {"TIGHTBEAM_WORKSPACE_ARCHIVE_MAX_ENTRIES", :workspace_archive_max_entries},
+        {"TIGHTBEAM_WORKSPACE_ARCHIVE_MAX_BYTES", :workspace_archive_max_bytes},
+        {"TIGHTBEAM_WORKSPACE_ARCHIVE_RESERVE_BYTES", :workspace_archive_reserve_bytes},
+        {"TIGHTBEAM_WORKSPACE_ARCHIVE_RESERVE_PERCENT", :workspace_archive_reserve_percent}
+      ],
+      value = System.get_env(variable) do
+    config :tightbeam, key, String.to_integer(value)
+  end
+
   if value = System.get_env("TIGHTBEAM_DB_CALL_TIMEOUT_MS") do
     config :tightbeam, :db_call_timeout_ms, String.to_integer(value)
   end
