@@ -434,6 +434,13 @@ defmodule Tightbeam.Rules do
             []
         end
       end)
+      |> add_builtin_defaults(
+        Keyword.get(opts, :builtin_defaults, false),
+        verbs,
+        law_base,
+        identity_manifest_sha,
+        declarations
+      )
       |> Enum.map(fn
         {:rule, rule} ->
           # Keep runtime effects in the real base. A recovery snapshot is removed
@@ -1455,6 +1462,50 @@ defmodule Tightbeam.Rules do
 
   defp field(map, key), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
 
+  # Rules every install gets whether or not its identity defines them. Each is
+  # read from the release (`priv/seed`), never from the identity repository, and is
+  # used only when the loaded law defines no reaction of that name: a live entry
+  # (an edited or pre-existing copy) always wins, and nothing is written anywhere.
+  # Add a default here by naming the reaction and its seed file.
+  @builtin_default_reactions [
+    {"assignment-terminal-handoff", "rules/row-reaction-handoff.toml"}
+  ]
+
+  defp add_builtin_defaults(entries, false, _verbs, _law_base, _sha, _declarations), do: entries
+
+  defp add_builtin_defaults(entries, true, verbs, law_base, sha, declarations) do
+    Enum.reduce(@builtin_default_reactions, entries, fn {name, relative}, acc ->
+      if Enum.any?(acc, &match?({:reaction, %{name: ^name}}, &1)) do
+        acc
+      else
+        acc ++ builtin_default(name, relative, verbs, law_base, sha, declarations)
+      end
+    end)
+  end
+
+  defp builtin_default(name, relative, verbs, law_base, sha, declarations) do
+    require Logger
+    shipped = Application.app_dir(:tightbeam, Path.join("priv/seed", relative))
+    # The identity-relative location it would have there, for provenance only.
+    virtual = Path.join([law_base, "identity", relative])
+
+    loaded =
+      Tightbeam.Mementos.with_declarations(declarations, fn ->
+        load_file!(virtual, verbs, law_base, sha, File.read!(shipped))
+      end)
+
+    Logger.info(
+      "built-in default rule #{name} is in use: the live identity does not define it; " <>
+        "`tightbeam identity relearn` installs an editable copy"
+    )
+
+    loaded
+  rescue
+    error ->
+      Logger.warning("built-in default rule #{name} unavailable: #{Exception.message(error)}")
+      []
+  end
+
   defp rule_paths(base_dir) do
     root = Path.join(base_dir, "identity")
 
@@ -1899,8 +1950,8 @@ defmodule Tightbeam.Rules do
     _ -> true
   end
 
-  defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
-    contents = File.read!(path)
+  defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha, contents \\ nil) do
+    contents = contents || File.read!(path)
     relative = Path.relative_to(path, Path.join(base_dir, "identity"))
     owner = Tightbeam.Identity.Provenance.owner_for_path(base_dir, relative)
     owned_archetypes = owned_archetypes(base_dir, owner)

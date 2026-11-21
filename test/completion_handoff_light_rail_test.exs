@@ -2067,19 +2067,31 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
   @identity_shapes Path.expand("fixtures/identity-seed-shapes", __DIR__)
 
-  # The whole path an operator's install takes: its identity as an earlier
-  # release (or a fresh install) left it, the normal startup identity work, then
-  # the law loaded from the live revision. No manual relearn anywhere.
-  for shape <- ["fresh", "0.1.15", "0.1.16"], outcome <- ["completed", "revoked"] do
-    test "a #{shape} install notifies the parent when a child assignment is #{outcome} after normal startup",
+  # The path an install takes from its identity as an earlier release (or a
+  # fresh install) left it to a delivered notice, with no relearn and no other
+  # step. `:migration` is the normal boot (the rail-scope migration, then the law
+  # load); `:built_in_only` skips the migration so the live identity lacks the
+  # rule and the loader's built-in default supplies it.
+  for shape <- ["fresh", "0.1.15", "0.1.16"],
+      outcome <- ["completed", "revoked"],
+      startup <- [:migration, :built_in_only] do
+    test "a #{shape} install notifies the parent when a child assignment is #{outcome} (#{startup})",
          ctx do
       base = Path.join(System.tmp_dir!(), "boot-notice-#{System.unique_integer([:positive])}")
       on_exit(fn -> File.rm_rf!(base) end)
       File.mkdir_p!(base)
       init_identity_shape!(base, unquote(shape))
 
-      assert :ok = Gateway.run_identity_startup!(base, ctx.db)
-      Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+      if unquote(startup) == :migration,
+        do: Tightbeam.Identity.RailScopeMigration.run!(base, ctx.db)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+        end)
+
+      if unquote(startup) == :built_in_only and unquote(shape) != "fresh",
+        do: assert(log =~ "built-in default rule assignment-terminal-handoff is in use")
 
       if unquote(outcome) == "completed" do
         {_parent, _child, root} = completed_child(ctx)
