@@ -5598,12 +5598,17 @@ defmodule Tightbeam.Wakes do
               Txn.q(txn, "SELECT 1 FROM notice_batches WHERE deliveryWakeId=?1", [wake_id]) != []
 
             cond do
-              retry_safe? ->
-                :retry_owned
-
               carrier? ->
                 sources = carrier_failure_sources_in_txn(txn, wake_id)
-                record_sender_failure_in_txn(txn, seq, sources, status)
+
+                if retry_safe? and not mixed_dispatch_sources?(txn, sources) do
+                  :retry_owned
+                else
+                  record_sender_failure_in_txn(txn, seq, sources, status)
+                end
+
+              retry_safe? ->
+                :retry_owned
 
               digest == 0 ->
                 record_sender_failure_in_txn(
@@ -5716,17 +5721,17 @@ defmodule Tightbeam.Wakes do
           Tightbeam.TurnFailureNotice.recipient(txn, holder, assignment_id)
       end
 
+    mixed? = mixed_dispatch_sources?(txn, sources)
+
     notices =
       sources
       |> Enum.reduce(%{}, fn [wake_id, creator, origin, target, assignment_id], recipients ->
-        # Stored creator identity is the sender, not the receiver's ancestry.
-        # A substrate marker is readable even if that sender session retired.
-        # A source with no sending session (a system notice) is surfaced once to
-        # its recipient's accountable owner instead; it is never replayed.
+        # Ordinary senders are owed the status of their own messages, separately
+        # from the actionable notice that an assignment turn failed.
         {recipient, told_as} =
           case failed_source_recipient_in_txn(txn, wake_id, assignment_id, creator, origin) do
             :dispatch ->
-              case dispatch_recipient do
+              case Tightbeam.TurnFailureNotice.recipient(txn, target, assignment_id) do
                 {recipient, _route} -> {recipient, :dispatch}
                 nil -> {nil, nil}
               end
@@ -5741,19 +5746,31 @@ defmodule Tightbeam.Wakes do
                 else: {notice_owner_recipient(dispatch_recipient, txn, target), {:owner, target}}
           end
 
+        member_assignment = if mixed? and told_as == :dispatch, do: assignment_id
+
         cond do
           not is_binary(recipient) ->
             recipients
 
-          initial_failure_receipt?(told_as) and
+          is_binary(member_assignment) and
+              Tightbeam.TurnFailureNotice.member_admitted?(
+                txn,
+                cause,
+                member_assignment,
+                recipient
+              ) ->
+            recipients
+
+          is_nil(member_assignment) and initial_failure_receipt?(told_as) and
               Tightbeam.TurnFailureNotice.initial_admitted?(txn, cause, original_error) ->
             recipients
 
           true ->
-            Map.update(recipients, recipient, [{wake_id, told_as}], &[{wake_id, told_as} | &1])
+            key = {recipient, member_assignment}
+            Map.update(recipients, key, [{wake_id, told_as}], &[{wake_id, told_as} | &1])
         end
       end)
-      |> Enum.flat_map(fn {recipient, sources} ->
+      |> Enum.flat_map(fn {{recipient, member_assignment}, sources} ->
         sources = Enum.reverse(sources)
         source_names = sources |> Enum.map(&elem(&1, 0)) |> Enum.join(", ")
 
@@ -5769,7 +5786,13 @@ defmodule Tightbeam.Wakes do
 
         initial? = Enum.any?(sources, fn {_wake_id, route} -> initial_failure_receipt?(route) end)
         reason = if initial?, do: failed_dispatch_reason(original_error), else: ""
-        receipt_id = if initial?, do: cause, else: seq
+
+        receipt_id =
+          cond do
+            member_assignment -> "#{cause}:#{member_assignment}"
+            initial? -> cause
+            true -> seq
+          end
 
         content =
           "Wake #{source_names} undelivered: delivery turn #{seq} is #{status}." <>
@@ -5780,6 +5803,14 @@ defmodule Tightbeam.Wakes do
 
     {:notices, notices}
   end
+
+  defp mixed_dispatch_sources?(txn, [_, _ | _] = sources) do
+    Enum.any?(sources, fn [wake_id, creator, origin, _target, assignment_id] ->
+      failed_source_recipient_in_txn(txn, wake_id, assignment_id, creator, origin) == :dispatch
+    end)
+  end
+
+  defp mixed_dispatch_sources?(_txn, _sources), do: false
 
   defp failed_source_recipient_in_txn(txn, wake_id, assignment_id, creator, origin) do
     # Dispatch stages this canonical brief when its holder is busy. Assignment

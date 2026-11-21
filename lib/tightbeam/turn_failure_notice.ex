@@ -135,7 +135,8 @@ defmodule Tightbeam.TurnFailureNotice do
       SELECT 1 FROM sessions recipient
       WHERE EXISTS (
         SELECT 1 FROM messages
-        WHERE sessionKey=recipient.sessionKey AND deviceId='process:tightbeam' AND clientMessageId=?4
+        WHERE sessionKey=recipient.sessionKey AND deviceId='process:tightbeam'
+          AND (clientMessageId=?4 OR (clientMessageId>=?6 AND clientMessageId<?7))
           AND substr(content,-length(?5))=?5
       )
       LIMIT 1
@@ -145,8 +146,27 @@ defmodule Tightbeam.TurnFailureNotice do
         prefix,
         "bubble:#{seq};",
         "wake-undelivered:#{seq}",
-        suffix
+        suffix,
+        "wake-undelivered:#{seq}:",
+        "wake-undelivered:#{seq};"
       ]
+    ) != []
+  end
+
+  def member_admitted?(txn, seq, assignment_id, recipient) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM wakes WHERE wakeId=?1 AND sessionKey=?2
+      UNION ALL
+      SELECT 1 FROM sessions recipient
+      WHERE EXISTS (
+        SELECT 1 FROM messages
+        WHERE sessionKey=recipient.sessionKey AND deviceId='process:tightbeam' AND clientMessageId=?3
+      )
+      LIMIT 1
+      """,
+      ["w_health_redelivery_parent_#{seq}", recipient, "wake-undelivered:#{seq}:#{assignment_id}"]
     ) != []
   end
 

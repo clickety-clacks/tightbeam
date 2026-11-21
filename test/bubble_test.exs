@@ -728,6 +728,103 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert Ledger.pending_count(ctx.db, ctx.holder.session_key) == 0
   end
 
+  test "a failed mixed carrier reaches the dispatch opener and gives its ordinary sender a receipt",
+       ctx do
+    opener = session(ctx.db, "mixed-dispatch-opener", ctx.main.session_key)
+    sender = session(ctx.db, "mixed-ordinary-sender", ctx.main.session_key)
+    busy = hold_recipient!(ctx.db, ctx.holder.session_key)
+
+    dispatch =
+      Assignments.__handle__(ctx.db, "dispatch", %{
+        verb: "dispatch",
+        origin: "agent:#{opener.session_key}",
+        principal: {:session, opener.session_key},
+        session_key: ctx.holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "dispatch subject", brief: "private dispatch brief"}
+      })
+
+    other =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{sender.session_key}",
+        principal: {:session, sender.session_key},
+        session_key: ctx.holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "ordinary wake context"}
+      })
+
+    ordinary =
+      Tightbeam.Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        creator_session_key: sender.session_key,
+        origin: "agent:#{sender.session_key}",
+        prompt: "private ordinary message",
+        assignment_id: other.id,
+        due_at: 0
+      })
+
+    assert :queued =
+             Tightbeam.Gateway.deliver_prompt(
+               ctx.holder.session_key,
+               ordinary.origin,
+               ordinary.prompt,
+               db: ctx.db,
+               wake_id: ordinary.wake_id,
+               fire_wake_in_txn: true
+             )
+
+    [dispatch_wake] =
+      Tightbeam.Wakes.list_for_session(ctx.db, ctx.holder.session_key)
+      |> Enum.filter(&(&1.assignment_id == dispatch.id))
+
+    finish_busy_recipient!(ctx.db, busy)
+    [carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "mixed-dispatch")
+    assert turn.wake_id == carrier_id
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq])
+
+    reason = "adapter became unavailable"
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed_unknown", reason,
+               owner_lease: turn.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+
+    assert {:ok, [[opener_receipt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT content FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+               [
+                 opener.session_key,
+                 "wake-undelivered:#{turn.seq}:#{dispatch.id}"
+               ]
+             )
+
+    assert opener_receipt =~ dispatch_wake.wake_id
+    assert opener_receipt =~ "Reason: " <> reason
+    refute opener_receipt =~ ordinary.wake_id
+    assert undelivered_notices(ctx.db, opener.session_key, turn.seq) == []
+
+    assert [ordinary_receipt] = undelivered_notices(ctx.db, sender.session_key, turn.seq)
+    assert ordinary_receipt =~ ordinary.wake_id
+    refute ordinary_receipt =~ dispatch_wake.wake_id
+    refute ordinary_receipt =~ reason
+
+    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+    assert Ledger.pending_count(ctx.db, opener.session_key) == 0
+  end
+
   test "a failed senderless notice to parentless Main surfaces its source once", ctx do
     wake =
       Tightbeam.Wakes.schedule(ctx.db, %{
