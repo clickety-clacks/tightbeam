@@ -6,6 +6,7 @@ defmodule Tightbeam.HarklightWakesTest do
     Ephemeral,
     HarklightFollows,
     HarklightLifecycle,
+    HarklightReceipts,
     HarklightSend,
     HarklightWakes,
     Ledger,
@@ -214,6 +215,149 @@ defmodule Tightbeam.HarklightWakesTest do
            end)
 
     refute_receive {:receipt_attempted, _}, 30
+  end
+
+  for lineage <- [:restoration, :cycle_release] do
+    @receipt_lineage lineage
+
+    test "health redelivery through #{@receipt_lineage} owes handoff only after dispatch",
+         %{db: db, call: call, main: main} do
+      receiver = follower_session(db, main, "agent:follower:health-receipt")
+
+      assert %{outcome: "committed"} =
+               follow_for_test(
+                 db,
+                 follow_call(call, receiver, %{handle: @handle}),
+                 runner: lifecycle_runner(db)
+               )
+
+      {wake, original, replacement} =
+        health_receipt_redelivery!(db, receiver, @receipt_lineage)
+
+      assert {:ok, false} =
+               HarklightReceipts.drain(db, MapSet.new([original.seq, replacement]),
+                 runner: fn argv -> send(self(), {:early_receipt, argv}) end
+               )
+
+      refute_received {:early_receipt, _}
+      assert {:ok, []} = DB.query(db, "SELECT opId FROM harklight_handoff_receipts")
+
+      assert {:ok, %{seq: ^replacement, wake_id: nil} = turn} =
+               Ledger.claim_next(db, receiver.session_key, "replacement-receipt")
+
+      assert :ok = Ledger.stamp_adapter(db, replacement, 1)
+      record_prompt_dispatched!(db, turn, "Replacement display")
+
+      assert :ok =
+               Ledger.finish(db, replacement, "delivered", nil, owner_lease: turn.owner_lease)
+
+      test_pid = self()
+      accepted = start_supervised!({Agent, fn -> nil end})
+
+      runner = fn
+        ["journal-id"] ->
+          frame(%{kind: "journal", journal_id: "fixture-journal"})
+
+        ["retry", "--op-id", op, "--journal-id", "fixture-journal"] ->
+          if Agent.get(accepted, & &1) == op do
+            send(test_pid, {:health_receipt_replayed, op})
+            receipt_result(op)
+          else
+            {JSON.encode!(%{kind: "operation_absent", op_id: op, journal_id: "fixture-journal"}),
+             1}
+          end
+
+        ["receipt" | _] = argv ->
+          op = List.last(argv)
+          Agent.update(accepted, fn _ -> op end)
+          send(test_pid, {:health_receipt_attempt, argv})
+          {JSON.encode!(%{kind: "outcome_unknown", op_id: op}), 7}
+      end
+
+      opts = [db: db, runner: runner, retry_delay: 30_000]
+
+      if @receipt_lineage == :restoration do
+        # Exercise discovery by the replacement's live dispatch notification.
+        assert {:ok, true} =
+                 HarklightReceipts.drain(db, MapSet.new([replacement]), runner: runner)
+      else
+        # Startup also recovers a successful replacement whose notification was lost.
+        start_supervised!({HarklightReceipts, opts})
+      end
+
+      assert_receive {:health_receipt_attempt,
+                      [
+                        "receipt",
+                        "--item-id",
+                        "request",
+                        "--entry-id",
+                        "health-chat",
+                        "--agent",
+                        "Replacement display",
+                        "--rerouted",
+                        "--op-id",
+                        op
+                      ]},
+                     1_000
+
+      assert {:ok, [[^wake, ^replacement, ^op, "fixture-journal", nil]]} =
+               DB.query(
+                 db,
+                 "SELECT wakeId,turnSeq,opId,journalId,completedAt FROM harklight_handoff_receipts"
+               )
+
+      if @receipt_lineage == :cycle_release, do: assert(:ok = stop_supervised(HarklightReceipts))
+      start_supervised!({HarklightReceipts, opts})
+      assert_receive {:health_receipt_replayed, ^op}, 1_000
+
+      assert eventually(fn ->
+               DB.query(
+                 db,
+                 "SELECT opId FROM harklight_handoff_receipts WHERE completedAt IS NOT NULL"
+               ) == {:ok, [[op]]}
+             end)
+
+      refute_received {:health_receipt_attempt, _}
+    end
+  end
+
+  test "original and replacement dispatch proofs create one health redelivery receipt",
+       %{db: db, session: session} do
+    {wake, original, replacement} = health_receipt_redelivery!(db, session, :restoration, true)
+
+    assert {:ok, %{seq: ^replacement, wake_id: nil} = turn} =
+             Ledger.claim_next(db, session.session_key, "duplicate-receipt")
+
+    assert :ok = Ledger.stamp_adapter(db, replacement, 1)
+    record_prompt_dispatched!(db, turn, "Replacement display")
+
+    runner =
+      receipt_fixture_runner(fn args ->
+        send(self(), {:unique_receipt, args})
+        receipt_success()
+      end)
+
+    assert {:ok, false} = HarklightReceipts.drain(db, :all, runner: runner)
+
+    assert_received {:unique_receipt,
+                     [
+                       "receipt",
+                       "--item-id",
+                       "request",
+                       "--entry-id",
+                       "health-chat",
+                       "--agent",
+                       "Original display"
+                     ]}
+
+    assert {:ok, false} =
+             HarklightReceipts.drain(db, MapSet.new([original.seq, replacement]), runner: runner)
+
+    assert {:ok, [[^wake, seq]]} =
+             DB.query(db, "SELECT wakeId,turnSeq FROM harklight_handoff_receipts")
+
+    assert seq == original.seq
+    refute_received {:unique_receipt, _}
   end
 
   test "a definite receipt refusal retains the target and permits a new attempt", %{
@@ -7036,7 +7180,123 @@ defmodule Tightbeam.HarklightWakesTest do
     turn
   end
 
-  defp record_prompt_dispatched!(db, turn) do
+  defp health_receipt_redelivery!(db, receiver, lineage, original_dispatched \\ false) do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
+    assert :ok =
+             HarklightWakes.capture_feed(
+               db,
+               @handle,
+               1,
+               [feed_chat(1, "request", "health-chat")],
+               :live
+             )
+
+    assert {:ok, [[wake]]} =
+             DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries WHERE sessionKey=?1", [
+               receiver.session_key
+             ])
+
+    Wakes.schedule(db, %{
+      session_key: receiver.session_key,
+      origin: "agent:peer",
+      prompt: "Mixed carrier fixture",
+      due_at: 1,
+      class: "fyi"
+    })
+
+    Tightbeam.NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000)
+    assert {:ok, original} = Ledger.claim_next(db, receiver.session_key, "original-receipt")
+    assert original.wake_id != wake
+    assert original.prompt =~ "Mixed carrier fixture"
+
+    if original_dispatched do
+      assert :ok = Ledger.stamp_adapter(db, original.seq, 1)
+      record_prompt_dispatched!(db, original, "Original display")
+    end
+
+    assert :ok = Ledger.finish(db, original.seq, "failed", nil, owner_lease: original.owner_lease)
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Wakes.record_health_redelivery_source_in_txn(txn, original.seq, "unclassified")
+             end)
+
+    if lineage == :cycle_release, do: mark_receipt_cycle_release!(db, receiver, original.seq)
+
+    assert {:ok, healthy} =
+             Ledger.enqueue(db, %{
+               session_key: receiver.session_key,
+               message_id: "normal-restoration-turn",
+               origin: "agent:peer",
+               prompt: "Normal restoration"
+             })
+
+    assert {:ok, %{seq: ^healthy} = restoration} =
+             Ledger.claim_next(db, receiver.session_key, "restoration-test")
+
+    assert :ok =
+             Ledger.finish(db, healthy, "delivered", nil, owner_lease: restoration.owner_lease)
+
+    assert {:ok, 1} =
+             DB.transaction(db, fn txn ->
+               Wakes.redeliver_pending_health_intents_in_txn(txn, receiver, restoration)
+             end)
+
+    assert {:ok, [[normal, cycle]]} =
+             DB.query(
+               db,
+               "SELECT redeliveryTurnSeq,cycleReleaseTurnSeq FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+               [original.seq]
+             )
+
+    replacement =
+      case {lineage, normal, cycle} do
+        {:restoration, seq, nil} when is_integer(seq) -> seq
+        {:cycle_release, nil, seq} when is_integer(seq) -> seq
+      end
+
+    assert {:ok, [["queued", nil]]} =
+             DB.query(db, "SELECT status,wakeId FROM turns WHERE seq=?1", [replacement])
+
+    {wake, original, replacement}
+  end
+
+  defp mark_receipt_cycle_release!(db, receiver, original) do
+    observation = %{
+      correlation_id: "fixture-health-open",
+      harness: to_string(receiver.harness),
+      host: receiver.host,
+      failure_class: "auth-dead",
+      evidence_kind: "authoritative-provider",
+      session_key: receiver.session_key,
+      observed_at: System.system_time(:millisecond),
+      cause: "Test provider refusal",
+      principal: "process:tightbeam"
+    }
+
+    assert {:opened, _} = Tightbeam.HarnessHealth.observe(db, observation)
+    correlation = "fixture-health-resolution"
+
+    assert {:resolved, _} =
+             Tightbeam.HarnessHealth.resolve(db, %{
+               observation
+               | correlation_id: correlation,
+                 cause: "Test provider recovery"
+             })
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE health_redelivery_attempts SET cycleReleaseCorrelation=?2 WHERE sourceTurnSeq=?1",
+               [original, correlation]
+             )
+  end
+
+  defp record_prompt_dispatched!(db, turn, name \\ nil) do
+    detail = if name, do: %{v: 1, harklight_receipt_agent: name}, else: %{v: 1}
+
     assert :ok =
              TurnLifecycle.append(db, turn.seq, %{
                event_key: "prompt:dispatched",
@@ -7049,7 +7309,7 @@ defmodule Tightbeam.HarklightWakesTest do
                owner_lease: turn.owner_lease,
                adapter_gen: 1,
                acp_request_id: turn.seq,
-               detail: %{v: 1}
+               detail: detail
              })
   end
 
@@ -7123,29 +7383,29 @@ defmodule Tightbeam.HarklightWakesTest do
   defp receipt_for_test(db, seq, session_key, _name, opts) do
     case DB.query(db, "SELECT 1 FROM turns WHERE seq=?1 AND sessionKey=?2", [seq, session_key]) do
       {:ok, [[1]]} ->
-        caller_runner = Keyword.fetch!(opts, :runner)
-
-        runner = fn
-          ["journal-id"] ->
-            frame(%{kind: "journal", journal_id: "fixture-journal"})
-
-          ["retry", "--op-id", op, "--journal-id", journal] ->
-            {JSON.encode!(%{kind: "operation_absent", op_id: op, journal_id: journal}), 1}
-
-          ["receipt" | _] = args ->
-            {argv, ["--op-id", op]} = Enum.split(args, -2)
-            {reply, 0} = caller_runner.(argv)
-            frame(Map.put(JSON.decode!(reply), "op_id", op))
-        end
-
-        assert {:ok, false} =
-                 Tightbeam.HarklightReceipts.drain(db, MapSet.new([seq]), runner: runner)
+        runner = opts |> Keyword.fetch!(:runner) |> receipt_fixture_runner()
+        assert {:ok, false} = HarklightReceipts.drain(db, MapSet.new([seq]), runner: runner)
 
       {:ok, []} ->
         :ok
     end
 
     :ok
+  end
+
+  defp receipt_fixture_runner(caller_runner) do
+    fn
+      ["journal-id"] ->
+        frame(%{kind: "journal", journal_id: "fixture-journal"})
+
+      ["retry", "--op-id", op, "--journal-id", journal] ->
+        {JSON.encode!(%{kind: "operation_absent", op_id: op, journal_id: journal}), 1}
+
+      ["receipt" | _] = args ->
+        {argv, ["--op-id", op]} = Enum.split(args, -2)
+        {reply, 0} = caller_runner.(argv)
+        frame(Map.put(JSON.decode!(reply), "op_id", op))
+    end
   end
 
   defp receipt_result(op) do

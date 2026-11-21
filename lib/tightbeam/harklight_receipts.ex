@@ -94,27 +94,50 @@ defmodule Tightbeam.HarklightReceipts do
     end
   end
 
-  defp discover(db, :all), do: discover_turns(db, "w.deliveredTurnSeq IS NOT NULL", [])
+  defp discover(db, :all), do: discover_turns(db, "IS NOT NULL", [])
 
   defp discover(db, turns) do
     Enum.reduce_while(turns, :ok, fn seq, :ok ->
-      case discover_turns(db, "w.deliveredTurnSeq=?1", [seq]) do
+      case discover_turns(db, "=?1", [seq]) do
         :ok -> {:cont, :ok}
         error -> {:halt, error}
       end
     end)
   end
 
+  # Health recovery carries the original prompt into a new turn without a
+  # wake. Use the source turn to find the wakes and the replacement to prove
+  # dispatch and attribute the receipt.
   defp discover_turns(db, selector, params) do
     case DB.transaction(db, fn txn ->
            rows =
              Txn.q(
                txn,
                """
+               WITH delivered_wakes(wakeId,turnSeq) AS (
+                 SELECT w.wakeId,w.deliveredTurnSeq
+                 FROM wakes w WHERE w.deliveredTurnSeq #{selector}
+
+                 UNION ALL
+
+                 SELECT w.wakeId,replacement.seq
+                 FROM health_redelivery_attempts attempt
+                 JOIN turns replacement
+                   ON (replacement.seq=attempt.redeliveryTurnSeq OR
+                       replacement.seq=attempt.cycleReleaseTurnSeq)
+                   AND replacement.sessionKey=attempt.sessionKey
+                   AND replacement.messageId=attempt.sourceMessageId
+                 JOIN turns source
+                   ON source.seq=attempt.sourceTurnSeq
+                   AND source.sessionKey=attempt.sessionKey
+                   AND source.messageId=attempt.sourceMessageId
+                 JOIN wakes w ON w.deliveredTurnSeq=source.seq
+                 WHERE replacement.seq #{selector}
+               )
                SELECT DISTINCT d.wakeId,t.seq,e.rawLine,h.sessionKey,t.sessionKey,
                  COALESCE(json_extract(event.detail,'$.harklight_receipt_agent'),s.displayName)
-               FROM wakes w
-               JOIN turns t ON t.seq=w.deliveredTurnSeq
+               FROM delivered_wakes w
+               JOIN turns t ON t.seq=w.turnSeq
                JOIN sessions s ON s.sessionKey=t.sessionKey
                JOIN turn_lifecycle_events event ON event.turnSeq=t.seq AND event.kind='prompt_dispatched'
                LEFT JOIN wake_retry_attempts retry ON retry.wakeId=w.wakeId
@@ -122,7 +145,7 @@ defmodule Tightbeam.HarklightReceipts do
                JOIN harklight_wake_entries e ON e.handle=d.handle AND e.eventId=d.eventId
                JOIN harklight_wake_handles h ON h.handle=e.handle
                LEFT JOIN harklight_handoff_receipts receipt ON receipt.wakeId=d.wakeId
-               WHERE #{selector} AND receipt.wakeId IS NULL
+               WHERE receipt.wakeId IS NULL
                  AND e.entryKind IN ('discussion','terminal') AND e.entryAuthor='person'
                  AND json_extract(e.rawLine,'$.kind') IN ('entry','message')
                ORDER BY t.seq,e.feedCursor,d.wakeId
