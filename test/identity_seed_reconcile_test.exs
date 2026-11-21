@@ -287,37 +287,73 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     assert loaded?(ctx.base)
   end
 
-  test "an uncommitted operator draft stops the add and no unrecorded rule reaches law loading",
-       ctx do
+  test "operator drafts, staged or not, neither block the add nor get swept into it", ctx do
     init_shape!(ctx.base, "0.1.15")
-    File.write!(Path.join(ctx.dir, "guidance/local.md"), "operator draft\n")
+    prior = Identity.live_revision!(ctx.base)
+    File.write!(Path.join(ctx.dir, "guidance/staged.md"), "staged draft\n")
+    git(ctx.dir, ["add", "--", "guidance/staged.md"])
+    File.write!(Path.join(ctx.dir, "guidance/local.md"), "unstaged draft\n")
 
-    capture_log(fn ->
-      assert %{candidate: nil, added: [], attention: [message]} =
-               SeedReconcile.run!(ctx.base, ctx.db)
+    assert %{added: [@notice], attention: [], candidate: %{candidate_revision: revision}} =
+             SeedReconcile.run!(ctx.base, ctx.db)
 
-      send(self(), {:message, message})
-    end)
-
-    assert_received {:message, message}
-    assert message =~ "uncommitted"
-    assert File.read!(Path.join(ctx.dir, "guidance/local.md")) == "operator draft\n"
-    refute File.exists?(Path.join(ctx.dir, @notice_path))
-    refute loaded?(ctx.base)
+    assert Identity.live_revision!(ctx.base) == revision
+    assert git(ctx.dir, ["diff", "--name-only", prior, revision]) == @notice_path
+    assert git(ctx.dir, ["status", "--porcelain"]) == "A  guidance/staged.md\n?? guidance/local.md"
+    assert File.read!(Path.join(ctx.dir, "guidance/staged.md")) == "staged draft\n"
+    assert File.read!(Path.join(ctx.dir, "guidance/local.md")) == "unstaged draft\n"
+    assert loaded?(ctx.base)
   end
 
-  test "an operator-staged copy at the shipped path is left staged", ctx do
+  test "a byte-identical copy the operator staged is finished by the same commit", ctx do
     init_shape!(ctx.base, "0.1.15")
     File.mkdir_p!(Path.join(ctx.dir, "rules"))
     File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, @notice_path))
     git(ctx.dir, ["add", "--", @notice_path])
 
+    assert %{added: [@notice], attention: [], candidate: %{candidate_revision: revision}} =
+             SeedReconcile.run!(ctx.base, ctx.db)
+
+    assert Identity.live_revision!(ctx.base) == revision
+    assert git(ctx.dir, ["status", "--porcelain"]) == ""
+    assert loaded?(ctx.base)
+  end
+
+  test "a copy that differs from the shipped file is left alone with a warning", ctx do
+    init_shape!(ctx.base, "0.1.15")
+    prior = Identity.live_revision!(ctx.base)
+    path = Path.join(ctx.dir, @notice_path)
+    File.mkdir_p!(Path.dirname(path))
+
+    # Untracked and edited.
+    File.write!(path, "# operator's own draft\n")
+
+    log =
+      capture_log(fn ->
+        assert %{candidate: nil, added: [], attention: [message]} =
+                 SeedReconcile.run!(ctx.base, ctx.db)
+
+        send(self(), {:message, message})
+      end)
+
+    assert_received {:message, message}
+    assert message =~ "differs"
+    assert log =~ "differs"
+    assert File.read!(path) == "# operator's own draft\n"
+    assert Identity.live_revision!(ctx.base) == prior
+
+    # Staged edit, working tree restored to the shipped bytes ("AM").
+    File.write!(path, "# edited then staged\n")
+    git(ctx.dir, ["add", "--", @notice_path])
+    File.cp!(Path.join(@seed, @notice_path), path)
+    assert git(ctx.dir, ["status", "--porcelain"]) == "AM #{@notice_path}"
+
     capture_log(fn ->
       assert %{candidate: nil, added: []} = SeedReconcile.run!(ctx.base, ctx.db)
     end)
 
-    assert git(ctx.dir, ["status", "--porcelain"]) == "A  #{@notice_path}"
-    assert File.exists?(Path.join(ctx.dir, @notice_path))
+    assert git(ctx.dir, ["show", ":#{@notice_path}"]) == "# edited then staged"
+    assert Identity.live_revision!(ctx.base) == prior
   end
 
   test "a failed stamp repair warns and leaves the published commit, it does not stop start",

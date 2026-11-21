@@ -1365,6 +1365,15 @@ defmodule Tightbeam.Identity do
         blocked_attention =
           Enum.map(blocked, &"#{&1} is present but does not define the shipped rule")
 
+        {add, differing} = Enum.split_with(add, &(own_path_state(dir, &1) != :differs))
+
+        blocked_attention =
+          blocked_attention ++
+            Enum.map(
+              differing,
+              &"#{&1.path} exists in the working tree and differs from the shipped file; left alone"
+            )
+
         with [_ | _] <- add,
              :ok <- reconcile_ready(dir, live) do
           names = Enum.flat_map(add, & &1.names)
@@ -1495,9 +1504,6 @@ defmodule Tightbeam.Identity do
       merge_pending?(dir) ->
         {:not_ready, "an identity relearn merge is in progress"}
 
-      git_output!(dir, ["status", "--porcelain"]) != "" ->
-        {:not_ready, "identity working tree has uncommitted changes"}
-
       git_output!(dir, ["rev-parse", "main"]) != live ->
         {:not_ready, "main has unpublished identity changes"}
 
@@ -1506,8 +1512,26 @@ defmodule Tightbeam.Identity do
     end
   end
 
+  # The add never sweeps in, blocks on, or removes operator changes: it touches
+  # only its own path, and only when that path is free or already holds exactly
+  # the shipped bytes (untracked, or staged as a new file), where committing the
+  # shipped default is harmless. Anything else at the path is the operator's.
+  defp own_path_state(dir, %{path: path, bytes: shipped}) do
+    code =
+      dir
+      |> git_output!(["status", "--porcelain", "--untracked-files=all", "--", path])
+      |> String.slice(0, 2)
+
+    case {code, File.read(Path.join(dir, path))} do
+      {"", {:error, :enoent}} -> :free
+      {code, {:ok, ^shipped}} when code in ["??", "A "] -> :identical
+      _ -> :differs
+    end
+  end
+
   # The commit is built outside the served working tree (a scratch index and
-  # export), so no start can leave an unrecorded rule where the gateway loads law.
+  # export), so it holds exactly the added files whatever else the operator has
+  # staged, and no start can leave an unrecorded rule where the gateway loads law.
   # Only after the commit exists does main move, and then just the added files are
   # brought into the working tree.
   defp commit_seed_law!(dir, live, add) do
