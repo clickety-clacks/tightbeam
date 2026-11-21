@@ -1075,7 +1075,7 @@ defmodule Tightbeam.WorkspaceCleanup do
         is_acknowledged git "$rel" ||
           emit_loss git "$rel" "unpushed_commits=$unpushed stashes=$stashes modified=$modified untracked=$untracked"
       done <<GITPATHS
-    $(find "$root" -name .git \( -type d -o -type f \) -prune -print 2>/dev/null)
+    $(find "$root" -name .git \\( -type d -o -type f \\) -prune -print 2>/dev/null)
     GITPATHS
     }
 
