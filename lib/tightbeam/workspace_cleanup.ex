@@ -17,6 +17,7 @@ defmodule Tightbeam.WorkspaceCleanup do
     "ServerAliveCountMax=2"
   ]
   @default_runner_timeout_ms 900_000
+  @default_stuck_attempts 3
   @external_resource Path.join(__DIR__, "workspace_inventory.py")
   @inventory_script File.read!(@external_resource)
   @archive_limits %{
@@ -63,7 +64,7 @@ defmodule Tightbeam.WorkspaceCleanup do
         {:ok, rows} =
           DB.query(
             state.db,
-            "SELECT sessionKey,nextAt FROM retired_workspace_cleanup WHERE completed=0 ORDER BY nextAt,sessionKey LIMIT 1"
+            "SELECT sessionKey,nextAt FROM retired_workspace_cleanup WHERE completed=0 AND COALESCE(reason,'') NOT LIKE 'stuck:%' ORDER BY nextAt,sessionKey LIMIT 1"
           )
 
         case rows do
@@ -375,6 +376,8 @@ defmodule Tightbeam.WorkspaceCleanup do
   end
 
   def process_session(config, db, key) do
+    previous = stored_report(db, key)
+
     report =
       try do
         session = Tightbeam.Org.get(db, key)
@@ -421,10 +424,32 @@ defmodule Tightbeam.WorkspaceCleanup do
     {:ok, [[attempts]]} =
       DB.query(db, "SELECT attempts FROM retired_workspace_cleanup WHERE sessionKey=?1", [key])
 
-    summary = report_summary(report, stored_report(db, key))
+    summary = report_summary(report, previous)
+
+    {summary, stuck?} =
+      if report.status == "completed",
+        do: {summary, false},
+        else: track_blocker_streak(summary, previous, config)
+
+    requested_retry = previous["retry_requested"]
+
+    retry_outcome =
+      if requested_retry &&
+           get_in(previous, ["retry_outcome", "requested_at"]) != requested_retry["at"] do
+        %{
+          "requested_at" => requested_retry["at"],
+          "completed" => report.status == "completed",
+          "status" => if(stuck?, do: "stuck", else: report.status),
+          "blockers" => Map.get(summary, :blocker_details, [])
+        }
+      end
+
+    summary = if retry_outcome, do: Map.put(summary, :retry_outcome, retry_outcome), else: summary
 
     reason =
       report.blockers |> Enum.map(& &1.reason) |> Enum.uniq() |> Enum.sort() |> Enum.join(", ")
+
+    reason = if stuck? and reason != "", do: "stuck: " <> reason, else: reason
 
     {:ok, _} =
       DB.query(
@@ -440,14 +465,25 @@ defmodule Tightbeam.WorkspaceCleanup do
         ]
       )
 
+    if retry_outcome do
+      EventLog.lifecycle(
+        db,
+        "retired_workspace_cleanup_retry_outcome",
+        key,
+        JSON.encode!(Map.put(retry_outcome, "session_key", key))
+      )
+    end
+
     if report.status != "completed",
       do: Logger.warning("workspace cleanup incomplete #{key}: #{inspect(report.blockers)}")
 
     report
   end
 
-  def health(db \\ DB, owner \\ nil) do
-    {:ok, rows} =
+  def health(db \\ DB, owner \\ nil, config \\ nil) do
+    rows = statuses(db, owner, config)
+
+    {:ok, grouped} =
       DB.query(
         db,
         "SELECT completed,COALESCE(reason,'cleanup pending'),COUNT(*) FROM retired_workspace_cleanup c LEFT JOIN sessions s ON s.sessionKey=c.sessionKey WHERE (completed=0 OR reason IS NOT NULL) AND (?1 IS NULL OR s.ownerUserId=?1) GROUP BY completed,reason ORDER BY completed,reason",
@@ -456,11 +492,16 @@ defmodule Tightbeam.WorkspaceCleanup do
 
     %{
       count:
-        Enum.reduce(rows, 0, fn [done, _, n], count ->
-          if done == 0, do: count + n, else: count
+        Enum.reduce(grouped, 0, fn [done, _, count], total ->
+          if done == 0, do: total + count, else: total
         end),
+      by_state:
+        rows
+        |> Enum.reject(&(&1.cleanup == "completed"))
+        |> Enum.frequencies_by(& &1.cleanup),
+      sessions: Enum.map(rows, &Map.drop(&1, [:unrecorded, :losses])),
       reasons:
-        Enum.map(rows, fn [done, reason, count] ->
+        Enum.map(grouped, fn [done, reason, count] ->
           %{completed: done == 1, reason: reason, count: count}
         end)
     }
@@ -621,6 +662,16 @@ defmodule Tightbeam.WorkspaceCleanup do
       blockers: report.blockers |> Enum.map(& &1.reason) |> Enum.uniq()
     }
 
+    summary =
+      if report.status == "completed" or report.blockers == [],
+        do: summary,
+        else:
+          Map.put(
+            summary,
+            :blocker_details,
+            Enum.map(report.blockers, &Map.take(&1, [:reason, :path, :detail, :exit]))
+          )
+
     summary = if losses == [], do: summary, else: Map.put(summary, :losses, losses)
 
     summary =
@@ -628,9 +679,23 @@ defmodule Tightbeam.WorkspaceCleanup do
       |> Map.put(:archive_created, Map.get(report, :archive_created, false))
       |> Map.put(:unrecorded, Map.get(report, :unrecorded, []))
 
-    case Map.get(stored, "acknowledged", []) do
-      [] -> summary
-      acknowledged -> Map.put(summary, :acknowledged, acknowledged)
+    summary =
+      case Map.get(stored, "acknowledged", []) do
+        [] -> summary
+        acknowledged -> Map.put(summary, :acknowledged, acknowledged)
+      end
+
+    case Map.get(stored, "retry_requested") do
+      nil ->
+        summary
+
+      retry_requested ->
+        summary = Map.put(summary, :retry_requested, retry_requested)
+
+        case Map.get(stored, "retry_outcome") do
+          nil -> summary
+          retry_outcome -> Map.put(summary, :retry_outcome, retry_outcome)
+        end
     end
   end
 
@@ -752,32 +817,59 @@ defmodule Tightbeam.WorkspaceCleanup do
            "SELECT completed, attempts, nextAt, reason, archivePath, report FROM retired_workspace_cleanup WHERE sessionKey=?1",
            [key]
          ) do
-      {:ok, [[1, _attempts, _next, _reason, path, report]]} ->
+      {:ok, [[1, attempts, _next, _reason, path, report]]} ->
         report = decoded_report(report)
         archived = Map.get_lazy(report, "archive_created", fn -> recorded_archive?(db, path) end)
 
         %{
           cleanup: "completed",
-          reasons: [],
+          reasons: Map.get(report, "blockers", []),
+          blockers: Map.get(report, "blocker_details", []),
+          operator_action: nil,
           archive_path: if(archived, do: path),
-          unrecorded: Map.get(report, "unrecorded", [])
+          unrecorded: Map.get(report, "unrecorded", []),
+          losses: Map.get(report, "losses", []),
+          attempts: attempts,
+          next_attempt_at: nil
         }
 
-      {:ok, [[0, 0, _next, _reason, path, _report]]} ->
-        %{cleanup: "queued", reasons: [], archive_path: path}
+      {:ok, [[0, attempts, next_at, nil, path, raw_report]]} ->
+        report = decoded_report(raw_report)
+
+        %{
+          cleanup: "queued",
+          reasons: [],
+          blockers: [],
+          archive_path: path,
+          unrecorded: Map.get(report, "unrecorded", []),
+          losses: Map.get(report, "losses", []),
+          attempts: attempts,
+          next_attempt_at: next_at
+        }
 
       {:ok, [[0, attempts, next_at, reason, path, report]]} ->
-        reasons = if is_binary(reason), do: String.split(reason, ", "), else: []
-        held? = "uncaptured_work" in reasons
+        report = decoded_report(report)
 
         reasons =
-          if held?, do: reasons -- ["cleanup_command_failed", "cleanup_incomplete"], else: reasons
+          Map.get(
+            report,
+            "blockers",
+            if(is_binary(reason), do: String.split(reason, ", "), else: [])
+          )
+
+        held? = "uncaptured_work" in reasons
+        stuck? = Map.get(report, "stuck", false) or String.starts_with?(reason || "", "stuck:")
 
         %{
           cleanup: if(held?, do: "held", else: "blocked"),
+          blocker_state: if(stuck?, do: "stuck"),
           reasons: reasons,
+          blockers: Map.get(report, "blocker_details", []),
+          operator_action: Map.get(report, "operator_action"),
+          operator_actions: Map.get(report, "operator_actions", []),
           archive_path: path,
-          unrecorded: Map.get(decoded_report(report), "unrecorded", []),
+          unrecorded: Map.get(report, "unrecorded", []),
+          losses: Map.get(report, "losses", []),
           attempts: attempts,
           next_attempt_at: next_at
         }
@@ -785,6 +877,142 @@ defmodule Tightbeam.WorkspaceCleanup do
       _ ->
         nil
     end
+  end
+
+  @doc "Lists cleanup status rows visible to an owner, or all rows for an admin."
+  def statuses(db, owner \\ nil, config \\ nil) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT c.sessionKey,s.displayName,s.host FROM retired_workspace_cleanup c JOIN sessions s ON s.sessionKey=c.sessionKey WHERE (?1 IS NULL OR s.ownerUserId=?1) ORDER BY c.nextAt,c.sessionKey",
+        [owner]
+      )
+
+    Enum.map(rows, fn [key, name, host] ->
+      row = status(db, key) || %{}
+      session = Tightbeam.Org.get(db, key)
+
+      archive_path =
+        row[:archive_path] || if(config && session, do: projected_archive(config, db, session))
+
+      row
+      |> Map.put(:archive_path, archive_path)
+      |> Map.merge(%{session_key: key, display_name: name, workdir_host: host})
+    end)
+  rescue
+    error -> {:error, Exception.message(error)}
+  end
+
+  @doc "Requeues an unfinished cleanup. All cleanup safeguards run again."
+  def retry(db, key, by \\ "unknown") do
+    case DB.query(
+           db,
+           "SELECT completed,report FROM retired_workspace_cleanup WHERE sessionKey=?1",
+           [key]
+         ) do
+      {:ok, [[0, raw_report]]} ->
+        requested_at = System.system_time(:millisecond)
+
+        report =
+          raw_report
+          |> decoded_report()
+          |> Map.drop(["stuck", "blocker_streak", "blocker_signature"])
+          |> Map.put("retry_requested", %{"by" => by, "at" => requested_at})
+
+        case DB.query(
+               db,
+               "UPDATE retired_workspace_cleanup SET nextAt=0,reason=NULL,report=?2 WHERE sessionKey=?1 AND completed=0",
+               [key, JSON.encode!(report)]
+             ) do
+          {:ok, _} ->
+            EventLog.lifecycle(
+              db,
+              "retired_workspace_cleanup_retry_requested",
+              key,
+              JSON.encode!(%{by: by, requested_at: requested_at})
+            )
+
+            kick()
+            %{ok: true, session_key: key, cleanup: "queued"}
+
+          {:error, error} ->
+            %{code: "cleanup_retry_failed", message: Exception.message(error)}
+        end
+
+      {:ok, [[1, _]]} ->
+        %{code: "cleanup_already_completed", message: "workspace cleanup is already completed"}
+
+      {:ok, []} ->
+        %{code: "cleanup_not_found", message: "no retired workspace cleanup row for session"}
+
+      {:error, error} ->
+        %{code: "cleanup_retry_failed", message: Exception.message(error)}
+    end
+  end
+
+  defp track_blocker_streak(summary, previous, config) do
+    blockers = Map.get(summary, :blocker_details, [])
+    reasons = Enum.map(blockers, & &1.reason) |> Enum.uniq() |> Enum.sort()
+
+    signature =
+      blockers
+      |> Enum.map(&[&1.reason, Map.get(&1, :path)])
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    old_signature = Map.get(previous, "blocker_signature")
+    old_streak = Map.get(previous, "blocker_streak", 0)
+
+    streak =
+      if signature != [] and signature == old_signature,
+        do: old_streak + 1,
+        else: if(signature == [], do: 0, else: 1)
+
+    threshold = stuck_attempt_limit(config)
+
+    stuck? = "mount_boundary" in reasons or (signature != [] and streak >= threshold)
+    actions = blocker_operator_actions(reasons)
+
+    {summary
+     |> Map.put(:blocker_signature, signature)
+     |> Map.put(:blocker_streak, streak)
+     |> Map.put(:stuck, stuck?)
+     |> Map.put(:operator_actions, actions)
+     |> Map.put(:operator_action, Enum.join(actions, " ")), stuck?}
+  end
+
+  defp blocker_operator_actions(reasons) do
+    Enum.map(reasons, fn
+      "uncaptured_work" ->
+        "Capture or copy the listed work, or acknowledge the exact inventory, then retry."
+
+      "mount_boundary" ->
+        "Move or remove the nested mount, then retry the cleanup."
+
+      reason when reason in ["entry_remove_failed", "directory_remove_failed"] ->
+        "Resolve filesystem permissions or open-file errors at the reported paths, then retry."
+
+      _reason ->
+        "Resolve the reported filesystem or cleanup error, then retry."
+    end)
+    |> Enum.uniq()
+  end
+
+  defp stuck_attempt_limit(config) do
+    limit =
+      Map.get(
+        config || %{},
+        :workspace_cleanup_stuck_attempts,
+        Application.get_env(
+          :tightbeam,
+          :workspace_cleanup_stuck_attempts,
+          @default_stuck_attempts
+        )
+      )
+
+    if is_integer(limit) and limit > 0,
+      do: limit,
+      else: raise(ArgumentError, "workspace_cleanup_stuck_attempts must be a positive integer")
   end
 
   defp decoded_report(raw) when is_binary(raw) do

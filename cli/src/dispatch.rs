@@ -490,6 +490,17 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("artifactId", artifact_id)],
         )),
+        Command::WorkspaceCleanup {
+            identity,
+            action,
+            session_key,
+        } => {
+            let mut params = vec![string_field("action", action)];
+            if let Some(session_key) = session_key {
+                params.push(string_field("sessionKey", session_key));
+            }
+            Ok(request(identity, "workspace-cleanup", vec![], params))
+        }
         Command::ArtifactRecord {
             identity,
             kind,
@@ -519,15 +530,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "artifact-record", vec![], params))
         }
-        Command::ArtifactContentFetch {
-            identity,
-            artifact_id,
-        } => Ok(request(
-            identity,
-            "artifact-content-fetch",
-            vec![],
-            vec![string_field("artifactId", artifact_id)],
-        )),
         Command::Artifacts {
             identity,
             work_item_id,
@@ -4183,6 +4185,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessHealthRetry { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::ArtifactContentFetch { identity, .. }
+        | Command::WorkspaceCleanup { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
         | Command::HarklightBriefingsCatchup { identity, .. }
@@ -4854,6 +4857,40 @@ mod tests {
                 "verb": "artifact-content-fetch",
                 "asUser": "flynn",
                 "params": {"artifactId": "art_fixture"}
+            })
+        );
+    }
+
+    #[test]
+    fn workspace_cleanup_commands_send_action_and_optional_session_scope() {
+        let status = build_request(&parse(&[
+            "workspace-cleanup",
+            "status",
+            "--as-user",
+            "owner",
+        ]))
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status.body_json).unwrap(),
+            serde_json::json!({
+                "verb": "workspace-cleanup",
+                "asUser": "owner",
+                "params": {"action": "status"}
+            })
+        );
+
+        let retry = build_request(&parse(&[
+            "workspace-cleanup",
+            "retry",
+            "--session",
+            "retired-key",
+        ]))
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&retry.body_json).unwrap(),
+            serde_json::json!({
+                "verb": "workspace-cleanup",
+                "params": {"action": "retry", "sessionKey": "retired-key"}
             })
         );
     }

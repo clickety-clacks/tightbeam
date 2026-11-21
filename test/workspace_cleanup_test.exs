@@ -179,6 +179,197 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     end
   end
 
+  test "owner retry reruns holds without deleting over-budget unrecorded files", ctx do
+    File.write!(Path.join(ctx.workspace, "scratch"), "keep me")
+    retire(ctx)
+
+    config =
+      ctx.config
+      |> Map.put(:workspace_archive_max_entries, 0)
+      |> Map.put(:workspace_cleanup_stuck_attempts, 2)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{cleanup: "held"} = WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    assert %{ok: true, cleanup: "queued"} =
+             WorkspaceCleanup.retry(ctx.db, ctx.session.session_key)
+
+    assert %{cleanup: "queued"} = WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert File.read!(Path.join(ctx.workspace, "scratch")) == "keep me"
+
+    assert %{cleanup: "held", blocker_state: "stuck"} =
+             WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    {:ok, [[stored]]} =
+      DB.query(ctx.db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [
+        ctx.session.session_key
+      ])
+
+    report = JSON.decode!(stored)
+    assert report["retry_requested"]["by"] == "unknown"
+    assert report["retry_outcome"]["status"] == "incomplete"
+
+    {:ok, [[event]]} =
+      DB.query(
+        ctx.db,
+        "SELECT detail FROM lifecycle_events WHERE kind='retired_workspace_cleanup_retry_outcome' AND subject=?1",
+        [ctx.session.session_key]
+      )
+
+    assert JSON.decode!(event)["status"] == "incomplete"
+  end
+
+  test "cleanup status is owner scoped and retry rejects a different owner", ctx do
+    retire(ctx)
+    handler = Gateway.handlers(ctx.config)["workspace-cleanup"]
+    owner_call = %{origin: "user:owner", principal: {:user, "owner"}, params: %{action: "status"}}
+
+    assert %{
+             cleanups: [
+               %{
+                 session_key: "cleanup-example",
+                 cleanup: "queued",
+                 workdir_host: host,
+                 archive_path: archive
+               }
+             ]
+           } =
+             handler.(owner_call)
+
+    assert is_binary(host)
+    assert is_binary(archive)
+
+    foreign_retry = %{
+      origin: "user:another-owner",
+      principal: {:user, "another-owner"},
+      params: %{action: "retry", session_key: ctx.session.session_key}
+    }
+
+    assert %{code: "forbidden"} = handler.(foreign_retry)
+
+    owner_retry = %{owner_call | params: %{action: "retry", session_key: ctx.session.session_key}}
+    assert %{ok: true, cleanup: "queued"} = handler.(owner_retry)
+
+    assert {:ok, [[stored]]} =
+             DB.query(
+               ctx.db,
+               "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [ctx.session.session_key]
+             )
+
+    assert JSON.decode!(stored)["retry_requested"]["by"] == "user:owner"
+  end
+
+  test "unchanged operational blockers become stuck after the configured attempts", ctx do
+    retire(ctx)
+
+    runner = fn _argv, _script, _input ->
+      {"E\tentry_remove_failed\t" <> Base.encode16("nested", case: :lower) <> "\nDONE\t1\n", 0}
+    end
+
+    config =
+      ctx.config
+      |> Map.put(:workspace_cleanup_runner, runner)
+      |> Map.put(:workspace_cleanup_stuck_attempts, 2)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{cleanup: "blocked", blocker_state: nil} =
+             WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{
+             cleanup: "blocked",
+             blocker_state: "stuck",
+             operator_action: action,
+             blockers: [%{"reason" => "entry_remove_failed", "path" => "nested"}]
+           } =
+             WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    assert action =~ "reported paths"
+    assert WorkspaceCleanup.health(ctx.db).by_state["blocked"] == 1
+  end
+
+  test "mount boundary is marked stuck on its first failed attempt", ctx do
+    retire(ctx)
+
+    config =
+      Map.put(ctx.config, :workspace_cleanup_runner, fn _argv, _script, _input ->
+        {"E\tmount_boundary\t" <> Base.encode16("nested", case: :lower) <> "\nDONE\t1\n", 0}
+      end)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{cleanup: "blocked", blocker_state: "stuck", reasons: ["mount_boundary"]} =
+             WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+  end
+
+  test "stuck cleanup rows do not block the next queued session", ctx do
+    retire(ctx)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE retired_workspace_cleanup SET reason='stuck: mount_boundary',nextAt=0 WHERE sessionKey=?1",
+        [ctx.session.session_key]
+      )
+
+    next =
+      Org.create(ctx.db, %{
+        session_key: "cleanup-next",
+        display_name: "Next cleanup",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        host: Placement.local_host_name(),
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("example")
+      })
+
+    next_workspace = Placement.workdir_path(ctx.config, next)
+    File.mkdir_p!(next_workspace)
+    File.write!(Path.join(next_workspace, "scratch"), "archive this")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        next.session_key
+      ])
+
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+    send(worker, :drain)
+    :sys.get_state(worker)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT completed FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [
+                 next.session_key
+               ]
+             )
+
+    assert {:ok, [[0, "stuck: mount_boundary"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT completed,reason FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [ctx.session.session_key]
+             )
+  end
+
   test "the recorded backlog migration runs once and includes retirements with no attempt", ctx do
     :ok =
       DB.execute(
@@ -1190,6 +1381,8 @@ defmodule Tightbeam.WorkspaceCleanupTest do
 
         File.write!(path, <<0, "a changed edit">>)
         if unquote(change) == :staged, do: git!(repo, ["add", "--", filename])
+
+        assert %{ok: true, cleanup: "queued"} = WorkspaceCleanup.retry(ctx.db, key)
 
         assert %{status: "incomplete", removed_count: 0} =
                  WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
