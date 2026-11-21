@@ -9,6 +9,7 @@ defmodule Tightbeam.HolderProdTest do
     HolderProd,
     Ledger,
     Model,
+    NoticeBatcher,
     Org,
     SessionCustodyTransfer,
     StateResources,
@@ -23,6 +24,64 @@ defmodule Tightbeam.HolderProdTest do
     def start_link(name), do: GenServer.start_link(__MODULE__, :ok, name: name)
     def init(:ok), do: {:ok, :ok}
     def handle_call({:ensure_lane, _session_key}, _from, state), do: {:reply, :ok, state}
+  end
+
+  test "assignment readback follows each attempt in the same episode until eligibility changes",
+       ctx do
+    start_supervised!({ConnRegistry, name: :holder_prod_test_registry})
+    start_supervised!({LaneStub, :holder_prod_test_lane})
+
+    delivery_opts = [
+      conn_registry: :holder_prod_test_registry,
+      lane_manager: :holder_prod_test_lane
+    ]
+
+    at = ctx.opened + @quiet
+
+    assert %{id: @assignment, holderProd: %{episodeId: episode, state: "scheduled"}} =
+             assignment_readback(ctx.db)
+
+    for number <- 0..2 do
+      due = at + number * @quiet
+      sweep(ctx.db, due)
+
+      assert %{
+               id: @assignment,
+               holderProd: %{
+                 holderSessionKey: "holder",
+                 episodeId: ^episode,
+                 wakeId: current_wake,
+                 repeatNumber: ^number,
+                 state: "pending"
+               }
+             } = assignment_readback(ctx.db)
+
+      assert [carrier] = NoticeBatcher.recover(ctx.db, due, delivery_opts, "holder")
+      assert carrier != current_wake
+      finish_prod(ctx.db, current_wake)
+
+      assert %{
+               holderProd: %{
+                 episodeId: ^episode,
+                 wakeId: ^current_wake,
+                 repeatNumber: ^number,
+                 state: "delivered"
+               }
+             } = assignment_readback(ctx.db)
+
+      assert length(Enum.uniq_by(notices(ctx.db), &hd/1)) == number + 1
+    end
+
+    assert %{wake_id: _} =
+             gateway_wake(ctx.db, "holder", %{
+               assignment_id: @assignment,
+               condition_kind: "fixture-ready",
+               condition_scope: @assignment,
+               after_ms: 12 * @quiet,
+               wait_reason: "Waiting for fixture readiness"
+             })
+
+    refute Map.has_key?(assignment_readback(ctx.db), :holderProd)
   end
 
   @quiet 30 * 60 * 1_000
@@ -329,6 +388,10 @@ defmodule Tightbeam.HolderProdTest do
 
     assert :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, {"codex", "shared", "test-host"})
     assert deadline(ctx.db) == at
+
+    assert %{holderProd: %{wakeId: ^wake_id, repeatNumber: 0, state: "canceled"}} =
+             assignment_readback(ctx.db)
+
     sweep(ctx.db, at)
 
     assert [[^wake_id, "holder", "canceled"], [new_wake, "holder", "pending"]] = notices(ctx.db)
@@ -422,10 +485,21 @@ defmodule Tightbeam.HolderProdTest do
     assert %{holderSessionKey: "successor", quietSince: ^transferred, wakeId: nil} =
              HolderProd.evidence(ctx.db, @assignment, "successor")
 
+    assert %{
+             holderProd: %{holderSessionKey: "successor", wakeId: nil, repeatNumber: nil}
+           } = assignment_readback(ctx.db)
+
     sweep(ctx.db, transferred + @quiet - 1)
     assert [[^previous, "holder", "canceled"]] = notices(ctx.db)
     sweep(ctx.db, transferred + @quiet)
     assert [[^previous, "holder", "canceled"], [_, "successor", "pending"]] = notices(ctx.db)
+  end
+
+  defp assignment_readback(db) do
+    Assignments.__handle__(db, "assignment-get", %{
+      principal: {:user, "fixture-owner"},
+      params: %{assignment_id: @assignment}
+    })
   end
 
   defp notices(db) do

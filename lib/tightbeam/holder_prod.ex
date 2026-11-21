@@ -181,7 +181,7 @@ defmodule Tightbeam.HolderProd do
     FROM quiet_starts
   )
   SELECT e.id, e.holderKey, e.workItemId, e.ownerUserId, e.quietSince, e.episodeId,
-         p.wakeId, p.state, p.deliveredTurnSeq, last.repeatNumber,
+         p.wakeId, p.state, last.repeatNumber,
          CASE WHEN last.wakeId IS NULL THEN last.admittedAt
               WHEN p.deliveredTurnSeq IS NOT NULL THEN p.firedAt END AS lastSentAt,
          NOT EXISTS (
@@ -395,16 +395,18 @@ defmodule Tightbeam.HolderProd do
 
   def evidence(db, assignment_id, holder) do
     {:ok, result} =
-      DB.transaction(db, fn txn ->
+      DB.read_transaction(db, fn txn ->
         case candidates(txn, assignment_id, System.system_time(:millisecond), false) do
           [%{holder: ^holder, possible: true} = p] ->
+            {wake_id, repeat, state} = evidence_attempt(txn, p.episode)
+
             %{
               holderSessionKey: holder,
               quietSince: p.since,
               episodeId: p.episode,
-              wakeId: p.wake,
-              repeatNumber: p.repeat,
-              state: evidence_state(p.state, p.delivered)
+              wakeId: wake_id,
+              repeatNumber: repeat,
+              state: state
             }
 
           _ ->
@@ -415,9 +417,25 @@ defmodule Tightbeam.HolderProd do
     result
   end
 
-  defp evidence_state(_state, delivered) when is_integer(delivered), do: "delivered"
-  defp evidence_state("pending", _delivered), do: "pending"
-  defp evidence_state(nil, _delivered), do: "scheduled"
+  # Failed or canceled attempts remain observable. Admission ignores them when
+  # calculating spacing, since they never delivered a nudge.
+  defp evidence_attempt(txn, episode) do
+    case Txn.q(
+           txn,
+           """
+           SELECT w.wakeId, n.repeatNumber,
+                  CASE WHEN w.deliveredTurnSeq IS NOT NULL THEN 'delivered'
+                       WHEN w.state='fired' THEN 'undelivered' ELSE w.state END
+           FROM assignment_holder_prod_attempts n JOIN wakes w ON w.wakeId=n.wakeId
+           WHERE n.episodeId=?1
+           ORDER BY (w.state='pending') DESC, n.id DESC LIMIT 1
+           """,
+           [episode]
+         ) do
+      [[wake_id, repeat, state]] -> {wake_id, repeat, state}
+      [] -> {nil, nil, "scheduled"}
+    end
+  end
 
   @single_candidate String.replace(@candidates, "/* assignment_filter */", "AND a.id=?1")
 
@@ -435,7 +453,6 @@ defmodule Tightbeam.HolderProd do
                      episode,
                      wake,
                      state,
-                     delivered,
                      repeat,
                      sent_at,
                      possible
@@ -449,7 +466,6 @@ defmodule Tightbeam.HolderProd do
         episode: episode,
         wake: wake,
         state: state,
-        delivered: delivered,
         repeat: repeat,
         sent_at: sent_at,
         possible: possible == 1
