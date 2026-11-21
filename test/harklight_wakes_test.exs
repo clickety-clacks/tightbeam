@@ -4260,6 +4260,7 @@ defmodule Tightbeam.HarklightWakesTest do
       printf '%s\\n' '#{handled}'
       printf '%s\\n' '#{in_gap}'
       printf '%s\\n' '#{in_gap}'
+      printf '%s\\n' '{"kind":"caught_up","rev":2}'
       while [ ! -e '#{release}' ]; do sleep 0.01; done
       exit 0
     fi
