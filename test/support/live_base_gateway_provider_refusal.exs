@@ -100,9 +100,16 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
              )
 
     assert {:ok, bubble_notices} =
-             DB.query(db, "SELECT sessionKey,prompt FROM turns WHERE requestRef=?1", [
-               "bubble:#{seq}"
-             ])
+             DB.query(
+               db,
+               """
+               SELECT sessionKey,prompt FROM turns WHERE wakeId LIKE ?1
+               UNION ALL
+               SELECT sessionKey,prompt FROM wakes
+               WHERE wakeId LIKE ?1 AND NOT EXISTS (SELECT 1 FROM turns WHERE turns.wakeId=wakes.wakeId)
+               """,
+               ["bubble:#{seq}:%"]
+             )
 
     case {refusal?, status} do
       {true, "failed"} ->
@@ -131,9 +138,9 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
 
       {false, "failed"} ->
         refute Map.has_key?(detail, "workOutcome")
-        assert [["opener", content]] = notices
-        assert content =~ "undelivered"
-        assert [["ancestor", _content]] = bubble_notices
+        assert notices == []
+        assert [["opener", content]] = bubble_notices
+        assert content =~ "could not run"
     end
   end
 end)
