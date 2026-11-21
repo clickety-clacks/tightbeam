@@ -1063,12 +1063,14 @@ COMMANDS:
       open assignment or role, even with --keep-open-descendants. --dry-run changes nothing and
       lists every session that would be retired (key, name, and what its workspace scan finds),
       every session that would be kept, and whether --keep-open-descendants is required.
-      Removing a retired session's workspace is held while it holds uncaptured work (git
-      work trees with unpushed commits, stashes or uncommitted changes; loose files that are
-      not recorded artifacts). Run `retire --session <key>` again on the retired session to
-      list what is held (held_losses), save it (push; artifact-record --content-base64, about
-      100 KB per argument; or copy to shared storage), or pass --acknowledge-loss to let the
-      cleanup delete exactly that listed work.
+      Removing a retired session's workspace is held while it holds git work no durable
+      remote has: commits on no remote ref (a remote whose URL is inside the workdir does not
+      count), stashes, uncommitted or untracked changes, in work trees and bare repositories.
+      Other files that are not recorded artifacts are NOT held: they are deleted, so record
+      them first (artifact-record --content-base64, about 100 KB per argument) or copy them to
+      shared storage. Run `retire --session <key>` again on the retired session to list what is
+      held (held_losses); push, capture or copy it, or pass --acknowledge-loss to let the cleanup
+      delete exactly that listed state (new work added later is held again).
 
   tune --session <key> (--harness <harness> [--model <model>] |
        --model <model> | --effort <level> | --fast on|off | --host <host>)

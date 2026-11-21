@@ -927,7 +927,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       {:ok, [[stored]]} =
         DB.query(ctx.db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [key])
 
-      assert %{"acknowledged" => [%{"key" => "git:repo", "by" => "user:owner", "at" => at}]} =
+      assert %{"acknowledged" => [%{"key" => "git:repo@" <> _, "by" => "user:owner", "at" => at}]} =
                JSON.decode!(stored)
 
       assert is_integer(at)
@@ -947,6 +947,43 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
       assert File.exists?(Path.join(second, "b.txt"))
       assert [%{"path" => "second"}] = WorkspaceCleanup.held_losses(ctx.db, key)
+    end
+
+    test "new work in an acknowledged repository is held again", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "a.txt", "a")
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert {:ok, _} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+      commit(repo, "b.txt", "b")
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert File.read!(Path.join(repo, "b.txt")) == "b"
+      assert [%{"path" => "repo", "detail" => detail}] = WorkspaceCleanup.held_losses(ctx.db, key)
+      assert detail =~ "unpushed_commits=2"
+    end
+
+    test "a bare repository and a clone that pushes to it inside the workdir are both held",
+         ctx do
+      origin = Path.join(ctx.workspace, "origin.git")
+      {_, 0} = System.cmd("git", ["init", "-q", "--bare", origin])
+      app = init_repo(ctx.workspace, "app")
+      git!(app, ["remote", "add", "origin", origin])
+      commit(app, "work.txt", "pushed only to a local bare remote")
+      git!(app, ["push", "-q", "origin", "HEAD"])
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      held =
+        Map.new(WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key), &{&1["path"], &1})
+
+      assert Map.keys(held) |> Enum.sort() == ["app", "origin.git"]
+      assert held["app"]["detail"] =~ "workdir_remotes=origin"
+      assert held["origin.git"]["detail"] =~ "bare=1"
+      assert File.dir?(origin)
     end
 
     test "retire on a retired session lists held work and --acknowledge-loss releases it", ctx do

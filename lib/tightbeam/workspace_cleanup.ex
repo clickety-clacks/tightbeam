@@ -1102,9 +1102,23 @@ defmodule Tightbeam.WorkspaceCleanup do
     {removed, errors, done, diagnostics, Enum.sort_by(losses, &loss_key/1)}
   end
 
+  # The acknowledgement key binds the loss to the scanned state, so work that
+  # changes after it was acknowledged is held again.
   @doc false
-  def loss_key(%{kind: kind, path: path}), do: kind <> ":" <> path
-  def loss_key(%{"kind" => kind, "path" => path}), do: kind <> ":" <> path
+  def loss_key(%{kind: kind, path: path} = loss),
+    do: kind <> ":" <> path <> "@" <> loss_state(Map.get(loss, :detail))
+
+  def loss_key(%{"kind" => kind, "path" => path} = loss),
+    do: kind <> ":" <> path <> "@" <> loss_state(Map.get(loss, "detail"))
+
+  defp loss_state(detail) when is_binary(detail) do
+    case Regex.run(~r/ state=(\S+)$/, detail) do
+      [_, state] -> state
+      _ -> ""
+    end
+  end
+
+  defp loss_state(_), do: ""
 
   defp decode_path(hex) do
     case Base.decode16(hex, case: :mixed) do
@@ -1195,34 +1209,111 @@ defmodule Tightbeam.WorkspaceCleanup do
       if [ -z "$out" ]; then echo 0; else printf '%s\n' "$out" | awk 'END { print NR }'; fi
     }
 
-    # Read-only. Prints one L line per unacknowledged loss: git work trees
-    # carrying commits on no remote ref, stashes, uncommitted changes or
-    # untracked files. Other files that are not recorded artifacts are still
-    # removed, as before.
+    # A remote counts as durable unless its URL is a local path inside the
+    # workdir being removed (or a local path that cannot be resolved).
+    remote_is_inside() {
+      url=$1
+      case "$url" in
+        file://*) url=${url#file://} ;;
+        *://*) return 1 ;;
+        *:*) return 1 ;;
+      esac
+      case "$url" in
+        /*) abs=$url ;;
+        *) abs=$(CDPATH= cd -P "$repo" 2>/dev/null && CDPATH= cd -P "$url" 2>/dev/null && pwd -P) || return 0 ;;
+      esac
+      case "$abs" in
+        "$root"|"$root"/*|"$scan_root_real"|"$scan_root_real"/*) return 0 ;;
+      esac
+      return 1
+    }
+
+    # Prints one L line when the repository holds work that no durable remote has.
+    # The line carries a digest of the repository state; an acknowledgement is
+    # bound to that digest, so changed work needs a fresh acknowledgement.
+    scan_one_repo() {
+      repo=$1
+      rel=$2
+      bare=$3
+      under_protected "$rel" && return 0
+      export GIT_CEILING_DIRECTORIES=${repo%/*}
+      if ! command -v git >/dev/null 2>&1; then
+        is_acknowledged git "$rel@" || emit_loss git "$rel" "git unavailable; repository state unknown"
+        return 0
+      fi
+      durable=
+      local_remotes=
+      for remote in $(git -c safe.directory='*' -C "$repo" remote 2>/dev/null); do
+        url=$(git -c safe.directory='*' -C "$repo" remote get-url "$remote" 2>/dev/null) || url=
+        if remote_is_inside "$url"; then
+          local_remotes="${local_remotes:+$local_remotes,}$remote"
+        else
+          durable="$durable --remotes=$remote"
+        fi
+      done
+      head_ref=
+      if [ "$bare" -eq 0 ]; then
+        git -c safe.directory='*' -C "$repo" rev-parse -q --verify HEAD >/dev/null 2>&1 && head_ref=HEAD
+      fi
+      if [ -n "$durable" ]; then
+        unpushed=$(git -c safe.directory='*' -C "$repo" rev-list --count --branches --tags $head_ref --not $durable 2>/dev/null) || unpushed=unknown
+      else
+        unpushed=$(git -c safe.directory='*' -C "$repo" rev-list --count --branches --tags $head_ref 2>/dev/null) || unpushed=unknown
+      fi
+      if [ "$bare" -eq 0 ]; then
+        stashes=$(git_count stash list)
+        modified=$(git_count status --porcelain --untracked-files=no)
+        untracked=$(git_count ls-files --others --exclude-standard)
+      else
+        stashes=0
+        modified=0
+        untracked=0
+      fi
+      if [ "$unpushed" = 0 ] && [ "$stashes" = 0 ] && [ "$modified" = 0 ] && [ "$untracked" = 0 ]; then
+        return 0
+      fi
+      repo_state=$({
+        git -c safe.directory='*' -C "$repo" rev-parse -q --verify HEAD
+        git -c safe.directory='*' -C "$repo" for-each-ref
+        if [ "$bare" -eq 0 ]; then
+          git -c safe.directory='*' -C "$repo" stash list
+          git -c safe.directory='*' -C "$repo" status --porcelain
+          git -c safe.directory='*' -C "$repo" ls-files --others --exclude-standard
+        fi
+      } 2>/dev/null | git hash-object --stdin 2>/dev/null) || repo_state=unknown
+      [ -n "$repo_state" ] || repo_state=unknown
+      is_acknowledged git "$rel@$repo_state" && return 0
+      detail="unpushed_commits=$unpushed stashes=$stashes modified=$modified untracked=$untracked"
+      [ "$bare" -eq 0 ] || detail="$detail bare=1"
+      [ -z "$local_remotes" ] || detail="$detail workdir_remotes=$local_remotes"
+      emit_loss git "$rel" "$detail state=$repo_state"
+    }
+
+    # Read-only. Prints one L line per unacknowledged loss: git work trees and
+    # bare repositories carrying commits on no durable remote ref, stashes,
+    # uncommitted changes or untracked files. Other files that are not
+    # recorded artifacts are still removed, as before.
     scan_losses() {
+      export GIT_OPTIONAL_LOCKS=0
+      scan_root_real=$(CDPATH= cd -P "$root" 2>/dev/null && pwd -P) || scan_root_real=$root
       while IFS= read -r gitpath; do
         [ -n "$gitpath" ] || continue
         repo=${gitpath%/.git}
         if [ "$repo" = "$root" ]; then rel=.; else rel=${repo#"$root"/}; fi
-        under_protected "$rel" && continue
-        if ! command -v git >/dev/null 2>&1; then
-          is_acknowledged git "$rel" || emit_loss git "$rel" "git unavailable; repository state unknown"
-          continue
-        fi
-        head_ref=
-        git -c safe.directory='*' -C "$repo" rev-parse -q --verify HEAD >/dev/null 2>&1 && head_ref=HEAD
-        unpushed=$(git -c safe.directory='*' -C "$repo" rev-list --count --branches --tags $head_ref --not --remotes 2>/dev/null) || unpushed=unknown
-        stashes=$(git_count stash list)
-        modified=$(git_count status --porcelain --untracked-files=no)
-        untracked=$(git_count ls-files --others --exclude-standard)
-        if [ "$unpushed" = 0 ] && [ "$stashes" = 0 ] && [ "$modified" = 0 ] && [ "$untracked" = 0 ]; then
-          continue
-        fi
-        is_acknowledged git "$rel" ||
-          emit_loss git "$rel" "unpushed_commits=$unpushed stashes=$stashes modified=$modified untracked=$untracked"
+        scan_one_repo "$repo" "$rel" 0
       done <<GITPATHS
     $(find "$root" -name .git \\( -type d -o -type f \\) -prune -print 2>/dev/null)
     GITPATHS
+      while IFS= read -r headpath; do
+        [ -n "$headpath" ] || continue
+        dir=${headpath%/HEAD}
+        [ -d "$dir/objects" ] && [ -d "$dir/refs" ] || continue
+        [ "$(git -c safe.directory='*' -C "$dir" rev-parse --is-bare-repository 2>/dev/null)" = true ] || continue
+        if [ "$dir" = "$root" ]; then rel=.; else rel=${dir#"$root"/}; fi
+        scan_one_repo "$dir" "$rel" 1
+      done <<BAREPATHS
+    $(find "$root" -name .git -prune -o -type f -name HEAD -print 2>/dev/null)
+    BAREPATHS
     }
 
     exact_keep_path() (

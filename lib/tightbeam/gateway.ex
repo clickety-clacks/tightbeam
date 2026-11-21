@@ -12119,7 +12119,7 @@ defmodule Tightbeam.Gateway do
       p[:dry_run] == true ->
         retire_preview(config, db, owner, call)
 
-      prior && prior.session_key == call.session_key ->
+      prior && prior.session_key == call.session_key && p[:acknowledge_loss] != true ->
         retired_keys = retired_subtree_keys(db, call.session_key)
 
         kept_descendants =
