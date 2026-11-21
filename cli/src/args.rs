@@ -996,8 +996,8 @@ COMMANDS:
       Reconcile all of your open decision requests, stage every disposition, and
       admit at most the requested number of uncovered briefings (default: stage only).
   artifact-content-fetch <artifactId>
-      Fetch captured bytes as contentBase64 with contentSha256 and contentSize.
-      Reads stored custody only, never the origin path; uncaptured content is reported unavailable.
+      Fetch captured or archived bytes as contentBase64 with contentSha256 and contentSize.
+      Archived reads report their source and hash status. The original path is never read.
   memento-set --record <kind>:<id> --name <name> (--value <value>... | --clear)
       Set a declared record value and retain its history.
   mementos --record <kind>:<id> [--history] [--name <name>]

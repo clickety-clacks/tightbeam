@@ -228,12 +228,14 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     kept = Path.join(ctx.workspace, "kept")
     File.write!(kept, "older archive")
     artifact = artifact(ctx, kept)
+    duplicate = artifact(ctx, kept)
     retire(ctx)
 
     assert %{status: "completed"} =
              WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
 
     old_home = Artifacts.get(ctx.db, artifact.artifact_id).home
+    assert Artifacts.get(ctx.db, duplicate.artifact_id).home == old_home
     archive = Path.join(ctx.base, "configured-archive")
     Application.put_env(:tightbeam, :archive_dir, archive)
     on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
@@ -266,11 +268,50 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     :sys.get_state(worker)
     moved = Artifacts.get(ctx.db, artifact.artifact_id)
     assert String.starts_with?(moved.home, archive <> "/")
+    assert Artifacts.get(ctx.db, duplicate.artifact_id).home == moved.home
     assert File.read!(moved.home) == "older archive"
     refute File.exists?(old_home)
     send(worker, :drain)
     :sys.get_state(worker)
     assert Artifacts.get(ctx.db, artifact.artifact_id).home == moved.home
+  end
+
+  test "relocation recovery repoints present files and keeps a missing descendant's old home",
+       ctx do
+    present = Path.join(ctx.workspace, "present")
+    missing = Path.join(ctx.workspace, "missing")
+    File.write!(present, "present bytes")
+    File.write!(missing, "missing bytes")
+    present_id = artifact(ctx, present).artifact_id
+    missing_id = artifact(ctx, missing).artifact_id
+    retire(ctx)
+
+    assert %{status: "completed"} =
+             WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+    present_home = Artifacts.get(ctx.db, present_id).home
+    missing_home = Artifacts.get(ctx.db, missing_id).home
+    old_entry = Path.dirname(present_home)
+    destination = Path.join(ctx.base, "relocated")
+    target_entry = Path.join(destination, Path.basename(old_entry))
+    File.mkdir_p!(destination)
+    File.rename!(old_entry, target_entry)
+    File.rm!(Path.join(target_entry, "missing"))
+    Application.put_env(:tightbeam, :archive_dir, destination)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(worker, :drain)
+        :sys.get_state(worker)
+      end)
+
+    assert Artifacts.get(ctx.db, present_id).home == Path.join(target_entry, "present")
+    assert Artifacts.get(ctx.db, missing_id).home == missing_home
+    assert log =~ "archive relocation kept the old home for #{missing_id}"
+    assert log =~ Path.join(target_entry, "missing")
   end
 
   test "one failed workspace does not prevent the next cleanup and retries when due", ctx do
