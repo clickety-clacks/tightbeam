@@ -99,6 +99,27 @@ defmodule Tightbeam.RowReactions.Plan do
     }
   end
 
+  @doc false
+  def handoff_default?(%{owner: :substrate, archetypes: archetypes} = rail) do
+    (archetypes == ["*"] or Map.get(rail, :policy_context) == "organization") and
+      terminal_handoff?(rail)
+  end
+
+  def handoff_default?(_rail), do: false
+
+  defp terminal_handoff?(%{
+         mode: :event,
+         short_name: "assignment-terminal-handoff",
+         family: "terminal-handoff",
+         events: events,
+         effects: effects
+       }) do
+    "assignment" in events and
+      Enum.any?(effects, &match?(%{"slot" => "handoff", "kind" => "notice"}, &1))
+  end
+
+  defp terminal_handoff?(_rail), do: false
+
   # A nonmatching rail still supplies its typed withdrawal parameters. They
   # cannot admit work; they describe how an already pending output is canceled.
   def evaluate(rails, event, facts) do
@@ -145,12 +166,45 @@ defmodule Tightbeam.RowReactions.Plan do
         end
       end)
 
+    plans = select_terminal_handoff(plans, event)
     unique!(Enum.map(plans, & &1.identity))
 
     Enum.map(plans, fn plan ->
       plan |> Map.delete(:context) |> Map.delete(:rail)
     end)
   end
+
+  # The canonical organization-wide handoff may be the built-in, the stock
+  # seed, or an operator edit. A matching bundle uses the same action identity,
+  # so the election must happen after scope matching and before admission.
+  defp select_terminal_handoff(plans, %{"kind" => "assignment", "org" => org, "id" => id}) do
+    identity = [org, "terminal-handoff", id, "handoff"]
+    handoffs = Enum.filter(plans, &(&1.identity == identity))
+
+    with {[_global], [_ | _] = candidates} <- Enum.split_with(handoffs, &global_handoff?/1),
+         true <- Enum.all?(candidates, &bundle_handoff?/1) do
+      case Enum.filter(candidates, & &1.selected) do
+        [] -> plans -- candidates
+        [winner] -> plans -- (handoffs -- [winner])
+        _ -> plans
+      end
+    else
+      _ -> plans
+    end
+  end
+
+  defp select_terminal_handoff(plans, _event), do: plans
+
+  defp global_handoff?(%{kind: "notice", rail: rail}), do: handoff_default?(rail)
+  defp global_handoff?(_plan), do: false
+
+  defp bundle_handoff?(%{
+         kind: "notice",
+         rail: %{owner: {:kungfu, _}, short_name: "assignment-terminal-handoff"}
+       }),
+       do: true
+
+  defp bundle_handoff?(_plan), do: false
 
   defp validate_archetypes!(rail, owner, owned_archetypes) do
     names = Map.get(rail, "archetypes", [])
