@@ -595,6 +595,14 @@ defmodule Tightbeam.Rules do
   end
 
   @doc false
+  def reaction_family_loaded?(family) when is_binary(family) do
+    Enum.any?(
+      Map.get(effective_snapshot(), :reactions, []),
+      &(&1.mode == :event and &1.family == family)
+    )
+  end
+
+  @doc false
   def reaction_policy(family) when is_binary(family) do
     policies =
       Map.get(effective_snapshot(), :reactions, [])

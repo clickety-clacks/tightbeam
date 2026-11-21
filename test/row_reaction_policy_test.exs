@@ -3,6 +3,79 @@ defmodule Tightbeam.RowReactionPolicyTest do
 
   alias Tightbeam.Rules
 
+  test "learned engineering composition elects unaltered organization work-item rails" do
+    base =
+      Path.join(System.tmp_dir!(), "work-item-election-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    assert {:ok, _} = Tightbeam.Identity.learn!(base, "agentic-engineering", "test")
+    path = "kungfu/agentic-engineering/rules/row-reaction-work-items.toml"
+
+    assert File.read!(Path.join([base, "identity", path])) ==
+             File.read!(Path.join(:code.priv_dir(:tightbeam), path))
+
+    Rules.load!(base, Map.keys(Tightbeam.Gateway.handlers(%{db: :unused_election_database})))
+
+    item = %{
+      "id" => "wi_fixture",
+      "state" => "open",
+      "title" => "Election",
+      "ownerUserId" => "owner",
+      "deliveryOwnerSessionKey" => "delivery",
+      "routingWakeId" => nil,
+      "slateWakeId" => nil
+    }
+
+    event = %{
+      "id" => "fixture-close",
+      "org" => "owner",
+      "kind" => "work_item_observation",
+      "workItemId" => item["id"],
+      "operation" => "assignment_closed",
+      "at" => 10,
+      "before" => %{"deliveredWakeId" => nil},
+      "after" => item
+    }
+
+    facts = %{
+      "work_item" => item,
+      "open_assignment_count" => 0,
+      "personal_session_key" => "personal",
+      "sessions" => [
+        %{"sessionKey" => "personal", "archetype" => "default", "state" => "active"},
+        %{
+          "sessionKey" => "delivery",
+          "archetype" => "agentic-engineering.pdo",
+          "state" => "active"
+        }
+      ]
+    }
+
+    plans = Rules.reaction_plans(event, facts)
+    assert length(plans) == 4
+    selected = Enum.filter(plans, & &1.selected)
+
+    assert [
+             %{
+               family: "r05-work-item",
+               provenance: %{"bundle" => "agentic-engineering"},
+               value: %{"session_key" => "delivery"}
+             }
+           ] = selected
+
+    item = Map.put(item, "slateWakeId", "legacy-slate")
+
+    withdrawal =
+      event
+      |> Map.put("id", "fixture-assign")
+      |> Map.put("operation", "transition")
+      |> Map.put("after", item)
+
+    assert [%{family: "r05-work-item-withdraw", selected: true}] =
+             Rules.reaction_plans(withdrawal, Map.put(facts, "work_item", item))
+             |> Enum.filter(& &1.selected)
+  end
+
   test "a settings-only reaction rail does not create a row action" do
     assert [] = Rules.reaction_plans(%{"kind" => "assignment"}, %{})
   end

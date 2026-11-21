@@ -435,6 +435,9 @@ defmodule Tightbeam.DeliveryResponsibilities do
                 AND w.sessionKey=?3 AND w.state IN ('pending','fired')
             ) OR EXISTS (
               SELECT 1 FROM assignments a WHERE a.workItemId=wi.id
+            ) OR (
+              wi.routingWakeId IS NULL AND wi.createdContextKnown=1
+              AND (wi.createdByUser IS NOT NULL OR wi.createdBySession IS NOT NULL)
             )
           )
         LIMIT 1

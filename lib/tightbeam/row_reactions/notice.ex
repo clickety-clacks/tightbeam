@@ -2,9 +2,9 @@ defmodule Tightbeam.RowReactions.Notice do
   @moduledoc false
   alias Tightbeam.{HarnessRecoveryNotice, NoticeBatcher, Wakes}
   alias Tightbeam.DB.Txn
-  alias Tightbeam.RowReactions.Store
+  alias Tightbeam.RowReactions.{Reference, Store}
 
-  @keys ~w(wake_id session_key owner_user_id origin prompt due_at target_gate creator_session_key assignment_id work_item_id obligation_ref condition_kind condition_scope)a
+  @keys ~w(wake_id session_key owner_user_id origin prompt due_at target_gate creator_session_key assignment_id work_item_id obligation_ref condition_kind condition_scope sender_scheduled)a
 
   def synchronize(txn, %{"status" => "pending", "result" => %{"wake_id" => id}} = action, at) do
     case Wakes.get_in_txn(txn, id) do
@@ -44,7 +44,24 @@ defmodule Tightbeam.RowReactions.Notice do
   def synchronize(_txn, _action, _at), do: :ok
 
   def execute(txn, %{"status" => "canceled", "result" => %{"wake_id" => id}} = action, at),
-    do: withdraw(txn, id, action["plan"]["withdraw"], at)
+    do: withdraw_action(txn, id, action, at)
+
+  def execute(
+        txn,
+        %{"status" => "pending", "plan" => %{"kind" => "cancel_notice", "value" => value}} =
+          action,
+        at
+      ) do
+    id = value["wake_id"]
+
+    if is_binary(id) do
+      withdraw(txn, id, value["withdraw"], at)
+      Reference.clear(txn, value["reference"], id)
+    end
+
+    Store.record(txn, action, "accepted", %{"canceled_wake_id" => id}, at)
+    :ok
+  end
 
   def execute(_txn, %{"status" => state}, _at) when state != "pending", do: :ok
 
@@ -140,6 +157,7 @@ defmodule Tightbeam.RowReactions.Notice do
           end
 
         id = wake.wake_id
+        Reference.put(txn, value["reference"], id)
         input = Map.put(input, :wake_id, id)
 
         result =
@@ -175,6 +193,11 @@ defmodule Tightbeam.RowReactions.Notice do
     end
 
     :ok
+  end
+
+  defp withdraw_action(txn, id, action, at) do
+    withdraw(txn, id, action["plan"]["withdraw"], at)
+    Reference.clear(txn, get_in(action, ["plan", "value", "reference"]), id)
   end
 
   def replay_in_txn(txn, action) do
@@ -231,6 +254,12 @@ defmodule Tightbeam.RowReactions.Notice do
     end
   end
 
+  defmodule WithdrawalRefused do
+    defexception [:wake_id, message: "reaction withdrawal refused"]
+  end
+
+  defp raise_withdrawal_refusal(_, id), do: raise(WithdrawalRefused, wake_id: id)
+
   defp withdraw(txn, id, withdrawal, at) do
     case Wakes.get_in_txn(txn, id) do
       %{state: "canceled"} ->
@@ -266,7 +295,15 @@ defmodule Tightbeam.RowReactions.Notice do
                 "disposition_id" => source
               }
             } ->
-              %{kind: "disposition", disposition_kind: kind, disposition_id: source}
+              base = %{kind: "disposition", disposition_kind: kind, disposition_id: source}
+
+              case get_in(withdrawal, ["outcome", "liveness_trigger"]) do
+                %{"kind" => trigger_kind, "id" => trigger_id} ->
+                  Map.put(base, :liveness_trigger, %{kind: trigger_kind, id: trigger_id})
+
+                nil ->
+                  base
+              end
 
             _ ->
               {:ok, outcome} = Wakes.public_cancellation_outcome_in_txn(txn, command)
@@ -274,7 +311,7 @@ defmodule Tightbeam.RowReactions.Notice do
           end
 
         unless Wakes.cancel_in_txn(txn, Map.put(command, :outcome, outcome), fn -> at end),
-          do: raise(ArgumentError, "reaction withdrawal refused")
+          do: raise_withdrawal_refusal(withdrawal, id)
 
       nil ->
         raise ArgumentError, "reaction output is missing"
