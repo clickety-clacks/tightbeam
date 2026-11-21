@@ -132,6 +132,14 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.call(server, {:adapter_for, key}, :infinity)
   end
 
+  @doc "Use the ordinary checkout rules with the temporary compactor's remaining time."
+  def adapter_for_compaction(server, key, timeout) do
+    GenServer.call(server, {:adapter_for, key}, timeout)
+  catch
+    :exit, {:timeout, _} -> {:error, :timeout}
+    :exit, _reason -> {:error, :route_unavailable}
+  end
+
   @doc """
   Start or return an adapter using context already captured by the caller.
 

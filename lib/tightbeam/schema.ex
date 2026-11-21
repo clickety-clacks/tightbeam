@@ -72,6 +72,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Productions.BubbleSweeper,
     Tightbeam.HarnessProcess,
     Tightbeam.HarnessHealth,
+    Tightbeam.HarnessHealth.CompactionObservation,
     Tightbeam.Toplines
   ]
 
@@ -2073,6 +2074,8 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.RowReactions.Store.ensure_schema(db)
     # FYI lines are additive current-build storage beside accepted records.
     :ok = Tightbeam.RecordFyis.ensure_schema(db)
+    # Model-scoped rate-limit records are additive storage beside harness health.
+    :ok = Tightbeam.HarnessHealth.ModelRateLimit.ensure_schema(db)
     :ok = Tightbeam.HarnessHealth.RecoverySchedule.ensure_schema(db)
     :ok = Tightbeam.HarnessHealth.RecoveryCheck.ensure_schema(db)
     :ok = Tightbeam.HarnessRecoveryNotice.ensure_schema(db)
@@ -6702,6 +6705,9 @@ defmodule Tightbeam.Schema do
   # Switch-context storage has no historical predecessor. Install it in the
   # later schema pass so a refused R1 stamp leaves the old schema untouched.
   defp bootstrap_module(_db, Tightbeam.HarnessSwitchContext, _current?), do: :ok
+
+  defp bootstrap_module(_db, Tightbeam.HarnessHealth.CompactionObservation, _current?),
+    do: :ok
 
   # Runtime-change storage (0.1.16) has no historical predecessor either; a
   # refused R1 stamp must leave the old schema untouched.

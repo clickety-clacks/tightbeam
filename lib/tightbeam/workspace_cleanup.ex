@@ -17,6 +17,15 @@ defmodule Tightbeam.WorkspaceCleanup do
     "ServerAliveCountMax=2"
   ]
   @default_runner_timeout_ms 900_000
+  @external_resource Path.join(__DIR__, "workspace_inventory.py")
+  @inventory_script File.read!(@external_resource)
+  @archive_limits %{
+    workspace_archive_max_entries: 5_000,
+    workspace_archive_max_bytes: 200 * 1024 * 1024,
+    workspace_archive_reserve_bytes: 50 * 1024 * 1024 * 1024,
+    workspace_archive_reserve_percent: 5
+  }
+
   @local_archived_home """
   state='archived' AND (originHost=?2 OR originHost IS NULL)
     AND (home=?1 OR substr(home,1,length(?1)+1)=?1 || '/')
@@ -295,6 +304,32 @@ defmodule Tightbeam.WorkspaceCleanup do
 
   defp archive_name(key), do: Base.url_encode64(key, padding: false)
 
+  def archive_destination(host, key),
+    do: Path.join(Path.expand(archive_root(host)), archive_name(key))
+
+  def projected_archive(config, db, session) do
+    hosts = Tightbeam.Placement.hosts(config.base_dir, db)
+    archive_destination(Map.fetch!(hosts, session.host), session.session_key)
+  rescue
+    _ -> nil
+  end
+
+  defp archive_limits(config) do
+    Enum.map(
+      [
+        :workspace_archive_max_entries,
+        :workspace_archive_max_bytes,
+        :workspace_archive_reserve_bytes,
+        :workspace_archive_reserve_percent
+      ],
+      fn key ->
+        limit = Map.get(config, key, Application.get_env(:tightbeam, key, @archive_limits[key]))
+        if not (is_integer(limit) and limit >= 0), do: raise(ArgumentError, "invalid #{key}")
+        limit
+      end
+    )
+  end
+
   defp move_script(timeout_ms \\ @default_runner_timeout_ms) do
     """
     cleanup_deadline=$(($(date +%s) + #{max(div(timeout_ms, 1000) - 1, 1)}))
@@ -351,7 +386,7 @@ defmodule Tightbeam.WorkspaceCleanup do
         if relative_inside(root, workspace) != nil or relative_inside(workspace, root) != nil,
           do: raise(ArgumentError, "archive directory overlaps workspace")
 
-        destination = Path.join(root, archive_name(key))
+        destination = archive_destination(host, key)
 
         acknowledged =
           stored_report(db, key) |> Map.get("acknowledged", []) |> Enum.map(& &1["key"])
@@ -371,6 +406,7 @@ defmodule Tightbeam.WorkspaceCleanup do
           workspace: workspace,
           archive_path: destination,
           acknowledged_losses: acknowledged,
+          archive_limits: archive_limits(config),
           runner: Map.get(config, :workspace_cleanup_runner),
           runner_timeout_ms:
             Map.get(config, :workspace_cleanup_timeout_ms, @default_runner_timeout_ms)
@@ -516,7 +552,9 @@ defmodule Tightbeam.WorkspaceCleanup do
            Keyword.get(opts, :archive_path),
            Keyword.get(opts, :runner),
            Keyword.get(opts, :runner_timeout_ms, @default_runner_timeout_ms),
-           Keyword.get(opts, :acknowledged_losses, [])
+           Keyword.get(opts, :acknowledged_losses, []),
+           Keyword.get(opts, :archive_limits, archive_limits(%{})),
+           false
          ) do
       {:ok, execution} ->
         if execution.status == "completed" and Keyword.get(opts, :archive_path) do
@@ -585,6 +623,11 @@ defmodule Tightbeam.WorkspaceCleanup do
 
     summary = if losses == [], do: summary, else: Map.put(summary, :losses, losses)
 
+    summary =
+      summary
+      |> Map.put(:archive_created, Map.get(report, :archive_created, false))
+      |> Map.put(:unrecorded, Map.get(report, :unrecorded, []))
+
     case Map.get(stored, "acknowledged", []) do
       [] -> summary
       acknowledged -> Map.put(summary, :acknowledged, acknowledged)
@@ -641,15 +684,18 @@ defmodule Tightbeam.WorkspaceCleanup do
                  host,
                  workspace,
                  keep,
-                 nil,
+                 archive_destination(host, key),
                  Map.get(config, :workspace_cleanup_runner),
                  timeout,
                  [],
+                 archive_limits(config),
                  true
                ) do
           if execution.result_confirmed and
                Enum.all?(execution.blockers, &(&1.reason == "artifact_missing")),
-             do: {:ok, execution.losses},
+             do:
+               {:ok, execution.losses, execution.unrecorded, session.host,
+                archive_destination(host, key)},
              else: {:unavailable, inspect(Enum.map(execution.blockers, & &1.reason))}
         else
           {:ok, {:error, blocker}} -> {:unavailable, inspect(blocker)}
@@ -665,11 +711,14 @@ defmodule Tightbeam.WorkspaceCleanup do
     preview_entry(db, key, result)
   end
 
-  defp preview_entry(db, key, {:ok, losses}) do
+  defp preview_entry(db, key, {:ok, losses, unrecorded, host, destination}) do
     %{
       session_key: key,
       display_name: display_name(db, key),
       scan: "ok",
+      archive_host: host,
+      archive_path: destination,
+      unrecorded: unrecorded,
       losses: Enum.map(losses, &Map.take(&1, [:kind, :path, :detail]))
     }
   end
@@ -700,16 +749,24 @@ defmodule Tightbeam.WorkspaceCleanup do
   def status(db, key) do
     case DB.query(
            db,
-           "SELECT completed, attempts, nextAt, reason FROM retired_workspace_cleanup WHERE sessionKey=?1",
+           "SELECT completed, attempts, nextAt, reason, archivePath, report FROM retired_workspace_cleanup WHERE sessionKey=?1",
            [key]
          ) do
-      {:ok, [[1, _attempts, _next, _reason]]} ->
-        %{cleanup: "completed", reasons: []}
+      {:ok, [[1, _attempts, _next, _reason, path, report]]} ->
+        report = decoded_report(report)
+        archived = Map.get_lazy(report, "archive_created", fn -> recorded_archive?(db, path) end)
 
-      {:ok, [[0, 0, _next, _reason]]} ->
-        %{cleanup: "queued", reasons: []}
+        %{
+          cleanup: "completed",
+          reasons: [],
+          archive_path: if(archived, do: path),
+          unrecorded: Map.get(report, "unrecorded", [])
+        }
 
-      {:ok, [[0, attempts, next_at, reason]]} ->
+      {:ok, [[0, 0, _next, _reason, path, _report]]} ->
+        %{cleanup: "queued", reasons: [], archive_path: path}
+
+      {:ok, [[0, attempts, next_at, reason, path, report]]} ->
         reasons = if is_binary(reason), do: String.split(reason, ", "), else: []
         held? = "uncaptured_work" in reasons
 
@@ -719,6 +776,8 @@ defmodule Tightbeam.WorkspaceCleanup do
         %{
           cleanup: if(held?, do: "held", else: "blocked"),
           reasons: reasons,
+          archive_path: path,
+          unrecorded: Map.get(decoded_report(report), "unrecorded", []),
           attempts: attempts,
           next_attempt_at: next_at
         }
@@ -726,6 +785,28 @@ defmodule Tightbeam.WorkspaceCleanup do
       _ ->
         nil
     end
+  end
+
+  defp decoded_report(raw) when is_binary(raw) do
+    case JSON.decode(raw) do
+      {:ok, %{} = report} -> report
+      _ -> %{}
+    end
+  end
+
+  defp decoded_report(_raw), do: %{}
+
+  defp recorded_archive?(_db, nil), do: false
+
+  defp recorded_archive?(db, path) do
+    match?(
+      {:ok, [[1]]},
+      DB.query(
+        db,
+        "SELECT 1 FROM artifacts WHERE state='archived' AND substr(home,1,length(?1)+1)=?1||'/' LIMIT 1",
+        [path]
+      )
+    )
   end
 
   @doc """
@@ -977,7 +1058,8 @@ defmodule Tightbeam.WorkspaceCleanup do
          runner,
          timeout_ms,
          acknowledged,
-         scan_only \\ false
+         limits,
+         scan_only
        ) do
     cond do
       contains_line_break?(workspace) ->
@@ -993,6 +1075,7 @@ defmodule Tightbeam.WorkspaceCleanup do
             archive_path,
             timeout_ms,
             acknowledged,
+            limits,
             scan_only
           )
 
@@ -1075,6 +1158,8 @@ defmodule Tightbeam.WorkspaceCleanup do
       removed_count_complete: done in [0, 1],
       blockers: blockers,
       losses: losses,
+      unrecorded: inventory_report(output),
+      archive_created: "A" in String.split(output, "\n"),
       diagnostics: diagnostics,
       command_exit: status,
       result_confirmed: done in [0, 1]
@@ -1118,6 +1203,12 @@ defmodule Tightbeam.WorkspaceCleanup do
                 {removed, errors, done, [line | diagnostics], losses}
             end
 
+          ["A"] ->
+            acc
+
+          ["U", _, _, _, _] ->
+            acc
+
           ["DONE", "0"] ->
             {removed, errors, 0, diagnostics, losses}
 
@@ -1130,6 +1221,16 @@ defmodule Tightbeam.WorkspaceCleanup do
       end)
 
     {removed, errors, done, diagnostics, Enum.sort_by(losses, &loss_key/1)}
+  end
+
+  defp inventory_report(output) do
+    for line <- String.split(output, "\n"),
+        ["U", hex, entries, bytes, disposition] <- [String.split(line, "\t")],
+        {:ok, path} <- [decode_path(hex)],
+        {entries, ""} <- [Integer.parse(entries)],
+        {bytes, ""} <- [Integer.parse(bytes)] do
+      %{path: path, entries: entries, bytes: bytes, disposition: disposition}
+    end
   end
 
   # The acknowledgement key binds the loss to the scanned state, so work that
@@ -1162,7 +1263,7 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
-  defp cleanup_script(root, archive_path, timeout_ms, acknowledged, scan_only) do
+  defp cleanup_script(root, archive_path, timeout_ms, acknowledged, limits, scan_only) do
     """
     #{move_script(timeout_ms)}
     umask 077
@@ -1172,10 +1273,12 @@ defmodule Tightbeam.WorkspaceCleanup do
     ack_list=#{shell_quote(Enum.join(acknowledged, "\n"))}
     keep_list=$(cat)
     loss_hold=0
+    archive_recovery=0
     scan_only=#{if scan_only, do: 1, else: 0}
     had_error=0
     unsafe_route=0
     present_keep_list=
+    retained_dirs=
 
     emit_path() {
       printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n'
@@ -1196,6 +1299,13 @@ defmodule Tightbeam.WorkspaceCleanup do
 
     is_protected() {
       case "\n$keep_list\n" in
+        *"\n$1\n"*) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+
+    is_retained_directory() {
+      case "\n$retained_dirs\n" in
         *"\n$1\n"*) return 0 ;;
         *) return 1 ;;
       esac
@@ -1399,8 +1509,7 @@ defmodule Tightbeam.WorkspaceCleanup do
 
     # Read-only. Prints one L line per unacknowledged loss: git work trees and
     # bare repositories carrying commits on no durable remote ref, stashes,
-    # uncommitted changes or untracked files. Other files that are not
-    # recorded artifacts are still removed, as before.
+    # uncommitted changes or untracked files.
     scan_losses() {
       export GIT_OPTIONAL_LOCKS=0
       scan_root_real=$(CDPATH= cd -P "$root" 2>/dev/null && pwd -P) || scan_root_real=$root
@@ -1422,6 +1531,11 @@ defmodule Tightbeam.WorkspaceCleanup do
       done <<BAREPATHS
     $(find "$root" -name .git -prune -o -type f -name HEAD -print 2>/dev/null)
     BAREPATHS
+    }
+
+    scan_unrecorded() {
+      printf '%s\\000%s' "$keep_list" "$ack_list" |
+        python3 -c #{shell_quote(@inventory_script)} "$root" "$archive" #{Enum.join(limits, " ")}
     }
 
     exact_keep_path() (
@@ -1494,7 +1608,7 @@ defmodule Tightbeam.WorkspaceCleanup do
 
         if is_protected "$child_rel"; then
           continue
-        elif has_protected_descendant "$child_rel"; then
+        elif has_protected_descendant "$child_rel" || is_retained_directory "$child_rel"; then
           if [ -L "$name" ]; then
             emit_error symlink_route "$child_rel"
             local_failed=1
@@ -1545,6 +1659,7 @@ defmodule Tightbeam.WorkspaceCleanup do
 
     if [ ! -e "$root" ] && [ ! -L "$root" ] && [ -n "$archive" ] && [ -d "$archive" ]; then
       root=$archive
+      archive_recovery=1
     fi
 
     if [ ! -e "$root" ] && [ ! -L "$root" ]; then
@@ -1593,12 +1708,31 @@ defmodule Tightbeam.WorkspaceCleanup do
         IFS=$saved_ifs
         keep_list=$present_keep_list
 
-        if [ "$unsafe_route" -eq 0 ]; then
+        if [ "$unsafe_route" -eq 0 ] && [ "$archive_recovery" -eq 0 ]; then
           scan_output=$(scan_losses)
+          if inventory_output=$(scan_unrecorded); then
+            inventory_keep=$(printf '%s\\n' "$inventory_output" | sed -n 's/^K[[:space:]]//p')
+            retained_dirs=$(printf '%s\\n' "$inventory_output" | sed -n 's/^D[[:space:]]//p')
+          else
+            emit_error unrecorded_inventory_unavailable .
+            had_error=1
+            loss_hold=1
+          fi
+          inventory_report=$(printf '%s\\n' "$inventory_output" | grep -v '^[KD]' || :)
+          if [ -n "$inventory_report" ]; then
+            scan_output=$(printf '%s\\n%s' "$scan_output" "$inventory_report")
+          fi
+          if [ -n "$inventory_keep" ] && [ "$loss_hold" -eq 0 ]; then
+            keep_list=$(printf '%s\\n%s' "$keep_list" "$inventory_keep")
+          fi
           [ -z "$scan_output" ] || printf '%s\n' "$scan_output"
           if [ "$scan_only" -eq 1 ]; then
-            printf 'DONE\t0\n'
-            exit 0
+            if [ "$had_error" -eq 0 ]; then
+              printf 'DONE\t0\n'
+              exit 0
+            fi
+            printf 'DONE\t1\n'
+            exit 2
           fi
           loss_output=$(printf '%s\n' "$scan_output" | grep '^L' || :)
           if [ -n "$loss_output" ]; then
@@ -1618,11 +1752,11 @@ defmodule Tightbeam.WorkspaceCleanup do
           fi
         fi
 
-        if [ "$unsafe_route" -eq 0 ] && [ "$loss_hold" -eq 0 ] && ! is_protected .; then
+        if [ "$archive_recovery" -eq 0 ] && [ "$unsafe_route" -eq 0 ] && [ "$loss_hold" -eq 0 ] && ! is_protected .; then
           if cleanup_dir ""; then :; else had_error=1; fi
         fi
 
-        if [ -z "$keep_list" ] && [ "$had_error" -eq 0 ]; then
+        if [ "$archive_recovery" -eq 0 ] && [ -z "$keep_list" ] && [ -z "$retained_dirs" ] && [ "$had_error" -eq 0 ]; then
           if [ ! -L "$root" ] && [ "$(stat_identity "$root")" = "$root_id" ] &&
              rmdir "$root" 2>/dev/null; then
             emit_removed .
@@ -1634,9 +1768,10 @@ defmodule Tightbeam.WorkspaceCleanup do
       fi
     fi
 
-    if [ "$had_error" -eq 0 ] && [ -n "$keep_list" ] && [ -n "$archive" ]; then
+    if [ "$had_error" -eq 0 ] && [ -n "$archive" ] &&
+       { [ -n "$keep_list" ] || [ -n "$retained_dirs" ] || [ "$archive_recovery" -eq 1 ]; }; then
       if move_workspace "$workspace_root" "$archive"; then
-        :
+        printf 'A\\n'
       else
         emit_error archive_move_failed "$archive"
         had_error=1

@@ -82,6 +82,11 @@ defmodule Tightbeam.R1SchemaMigrationTest do
 
     assert rows(
              db,
+             "SELECT name FROM sqlite_master WHERE name LIKE 'harness_compaction_observations%'"
+           ) == []
+
+    assert rows(
+             db,
              "SELECT name FROM sqlite_master WHERE name LIKE 'harness_switch_context%' ORDER BY name"
            ) == []
 
