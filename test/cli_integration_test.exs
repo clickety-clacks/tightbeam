@@ -1000,6 +1000,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert fact_wake.condition_kind == "build-finished"
     assert fact_wake.condition_scope == "build-1"
+    assert fact_wake.wait_reason == "Waiting for the build"
 
     {:ok, _} =
       Ledger.enqueue(ctx.db, %{
@@ -1025,6 +1026,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert after_wake.creator_session_key == "cli-holder"
     assert after_wake.originating_turn_seq == turn.seq
     assert after_wake.wait_mode == "after-turn"
+    assert after_wake.wait_reason == "Waiting for this turn to end"
     assert after_wake.prompt == after_prompt
 
     assert {:ok, [[0]]} =
@@ -1057,6 +1059,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert dependency.assignment_id == assignment
     assert dependency.obligation_ref == assignment
     assert dependency.creator_session_key == "cli-holder"
+    assert dependency.wait_reason == "Waiting for the resolver disposition"
     assert dependency.originating_turn_seq == turn.seq
     assert dependency.verification_assignment_id == nil
     assert dependency.verification_state == nil

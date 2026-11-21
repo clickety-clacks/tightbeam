@@ -777,7 +777,11 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       }
     }
 
+    assert %{code: "missing_reason"} =
+             handler.(update_in(call.params, &Map.delete(&1, :wait_reason)))
+
     response = handler.(call)
+    assert response.wait_reason == "Waiting for the resolver"
     assert response.recognition_path == nil
     refute response.eligible
     assert Wakes.get(ctx.db, response.wake_id).owner_user_id == "owner-a"
@@ -1158,6 +1162,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
       params = %{
         prompt: "Continue the holder's work.",
+        wait_reason: "Waiting on fixture follow-through",
         after_ms: 60_000,
         assignment_id: "A",
         nudge: false

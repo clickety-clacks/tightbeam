@@ -3150,8 +3150,8 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_kind(call.params[:kind]),
-                 :ok <- valid_note(call.params[:note]),
                  :ok <- valid_cannot_proceed_reason(call.params),
+                 :ok <- valid_note(call.params[:note]),
                  :ok <- absent_verdict_kind(call.params[:verdict_kind]),
                  :ok <- valid_release_tuple_for_kind(call.params),
                  {:ok, call} <- applicable_code_completion_in_txn(txn, assignment, call) do

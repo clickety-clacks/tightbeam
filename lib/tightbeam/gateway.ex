@@ -8812,43 +8812,13 @@ defmodule Tightbeam.Gateway do
              do: Tightbeam.WaitReason.validate(p[:wait_reason], "--wait-reason"),
              else: :ok
            ) do
-      record_validated_wake_in_txn(
-        txn,
-        call,
-        session_key,
-        due_at,
-        condition_kind,
-        condition_scope,
-        replacement_assignment_id,
-        assignment_id,
-        continuation,
-        if(wait?, do: p[:wait_reason])
-      )
-    end
-  end
+      # Immediate assignment pointers and recurring crons are references, not holder work.
+      # Keep the assignment on each wake without counting its creation as activity.
+      activity_assignment_id =
+        if immediate_assignment_pointer_request?(p) or is_binary(p[:cron]),
+          do: nil,
+          else: assignment_id
 
-  defp record_validated_wake_in_txn(
-         txn,
-         call,
-         session_key,
-         due_at,
-         condition_kind,
-         condition_scope,
-         replacement_assignment_id,
-         assignment_id,
-         continuation,
-         reason
-       ) do
-    p = call.params
-
-    # Immediate assignment pointers and recurring crons are references, not holder work.
-    # Keep the assignment on each wake without counting its creation as activity.
-    activity_assignment_id =
-      if immediate_assignment_pointer_request?(p) or is_binary(p[:cron]),
-        do: nil,
-        else: assignment_id
-
-    wake =
       Wakes.schedule_in_txn(txn, %{
         session_key: session_key,
         target_role: Map.get(call, :target_role),
@@ -8859,7 +8829,7 @@ defmodule Tightbeam.Gateway do
         due_at: due_at,
         condition_kind: condition_kind,
         condition_scope: condition_scope,
-        wait_reason: reason,
+        wait_reason: if(wait?, do: p[:wait_reason]),
         creator_session_key: creator_session_key(call[:principal]),
         # A class is the sender's election. An explicit time is also the
         # sender's election and inhibits batching without discarding the class.
@@ -8879,8 +8849,7 @@ defmodule Tightbeam.Gateway do
         prod_sender: prod_sender(call[:principal]),
         activity_assignment_id: activity_assignment_id
       })
-
-    wake
+    end
   end
 
   defp replacement_assignment_id_in_txn(txn, call, session_key) do
