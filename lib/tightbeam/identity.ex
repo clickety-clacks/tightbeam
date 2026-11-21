@@ -1467,7 +1467,7 @@ defmodule Tightbeam.Identity do
       merge_pending?(dir) ->
         {:not_ready, "an identity relearn merge is in progress"}
 
-      git_output!(dir, ["status", "--porcelain"]) != "" ->
+      not clean_or_own_leftovers?(dir) ->
         {:not_ready, "identity working tree has uncommitted changes"}
 
       git_output!(dir, ["rev-parse", "main"]) != live ->
@@ -1476,6 +1476,36 @@ defmodule Tightbeam.Identity do
       true ->
         :ok
     end
+  end
+
+  # A start that stopped after writing a seed file and before committing it
+  # leaves exactly that file, byte for byte, uncommitted. Remove only that; any
+  # other change is the operator's and keeps the add from running.
+  defp clean_or_own_leftovers?(dir) do
+    entries =
+      dir
+      |> git_output!(["status", "--porcelain", "--untracked-files=all"])
+      |> String.split("\n", trim: true)
+      |> Enum.map(fn line -> {String.slice(line, 0, 2), String.slice(line, 3..-1//1)} end)
+
+    shipped = Map.new(seed_entries())
+
+    own? =
+      Enum.all?(entries, fn {code, path} ->
+        code in ["??", "A "] and path in @auto_delivered_seed_law and
+          File.read(Path.join(dir, path)) == {:ok, Map.get(shipped, path)}
+      end)
+
+    if entries != [] and own? do
+      Enum.each(entries, fn {_code, path} ->
+        git!(dir, ["rm", "-q", "-f", "--cached", "--ignore-unmatch", "--", path])
+        File.rm!(Path.join(dir, path))
+      end)
+
+      Logger.warning("removed an uncommitted shipped seed rule left by an interrupted start")
+    end
+
+    entries == [] or own?
   end
 
   defp commit_seed_law!(dir, live, add) do
@@ -1497,7 +1527,13 @@ defmodule Tightbeam.Identity do
       error ->
         # The tree was clean before the write: remove our files first, so a
         # failing git cannot leave one that the gateway would load.
-        Enum.each(paths, &File.rm(Path.join(dir, &1)))
+        Enum.each(paths, fn path ->
+          case File.rm(Path.join(dir, path)) do
+            result when result == :ok or result == {:error, :enoent} -> :ok
+            {:error, reason} -> Logger.error("cannot remove #{path} after a failed add: #{reason}")
+          end
+        end)
+
         git!(dir, ["reset", "--hard", live])
         reraise error, __STACKTRACE__
     end
@@ -1540,13 +1576,16 @@ defmodule Tightbeam.Identity do
     |> String.split("\n", trim: true)
     |> Enum.filter(fn path ->
       String.ends_with?(path, ".toml") and
+        # `Path.wildcard/1`, which the loader uses, never matches a leading dot.
         case Path.split(path) do
-          ["rules", _file] -> true
-          ["kungfu", _name, "rules", _file] -> true
+          ["rules", file] -> visible?(file)
+          ["kungfu", name, "rules", file] -> visible?(name) and visible?(file)
           _ -> false
         end
     end)
   end
+
+  defp visible?(segment), do: not String.starts_with?(segment, ".")
 
   defp reaction_names(bytes) do
     for entry <- Map.get(Toml.decode!(bytes), "reaction", []),

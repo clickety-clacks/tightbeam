@@ -40,11 +40,23 @@ defmodule Tightbeam.Identity.SeedReconcile do
   defp restamp_if_interrupted!(base_dir, db) do
     with live when is_binary(live) <- Identity.seed_reconcile_revision(base_dir),
          false <- stamp_current?(db, live) do
-      {:ok, :ok} = DB.transaction(db, fn txn -> stamp!(txn, base_dir) end)
-      Logger.info("advanced the served identity stamp to the seed-rule revision #{live}")
+      case DB.transaction(db, fn txn -> stamp!(txn, base_dir) end) do
+        {:ok, :ok} ->
+          Logger.info("advanced the served identity stamp to the seed-rule revision #{live}")
+
+        {:error, error} ->
+          # The commit stays published; the next start tries the stamp again.
+          Logger.warning(
+            "could not advance the served identity stamp to #{live}: #{Exception.message(error)}"
+          )
+      end
     end
 
     :ok
+  rescue
+    error ->
+      Logger.warning("could not check the served identity stamp: #{Exception.message(error)}")
+      :ok
   end
 
   defp stamp_current?(db, live) do

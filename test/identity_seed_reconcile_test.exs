@@ -165,7 +165,7 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     assert Identity.live_revision!(ctx.base) == live
   end
 
-  test "a copy in a file the loader never reads does not count, and an unrelated bad file does not stop the add",
+  test "a copy in a file the loader never reads (nested, rails, hidden) does not count, and an unrelated bad file does not stop the add",
        ctx do
     init_shape!(ctx.base, "0.1.15")
     File.mkdir_p!(Path.join(ctx.dir, "rules/nested"))
@@ -173,6 +173,10 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "rules/nested/unread.toml"))
     File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "rails/unread.toml"))
     File.write!(Path.join(ctx.dir, "rules/broken.toml"), "[[rule]\nname = broken")
+    # The loader's wildcard never matches a leading dot, so parked copies are unread too.
+    File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "rules/.disabled.toml"))
+    File.mkdir_p!(Path.join(ctx.dir, "kungfu/.hidden/rules"))
+    File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "kungfu/.hidden/rules/parked.toml"))
     commit_and_publish!(ctx.dir, "fixture: unread copies and a bad file")
 
     assert %{added: [@notice]} = SeedReconcile.run!(ctx.base, ctx.db)
@@ -248,6 +252,65 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
 
     assert loaded?(ctx.base)
     refute File.exists?(Path.join(ctx.dir, @reminder_path))
+  end
+
+  test "a start that stopped after writing the file and before committing it recovers", ctx do
+    init_shape!(ctx.base, "0.1.15")
+    prior = Identity.live_revision!(ctx.base)
+    leftover = Path.join(ctx.dir, @notice_path)
+    File.cp!(Path.join(@seed, @notice_path), leftover)
+    git(ctx.dir, ["add", "--", @notice_path])
+    assert git(ctx.dir, ["status", "--porcelain"]) != ""
+
+    assert %{added: [@notice], attention: [], candidate: %{candidate_revision: revision}} =
+             SeedReconcile.run!(ctx.base, ctx.db)
+
+    assert git(ctx.dir, ["rev-parse", "HEAD^"]) == prior
+    assert Identity.live_revision!(ctx.base) == revision
+    assert git(ctx.dir, ["status", "--porcelain"]) == ""
+    assert loaded?(ctx.base)
+  end
+
+  test "uncommitted operator changes are never removed by the add", ctx do
+    init_shape!(ctx.base, "0.1.15")
+    File.write!(Path.join(ctx.dir, "guidance/local.md"), "operator draft\n")
+    File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, @notice_path))
+
+    capture_log(fn ->
+      assert %{candidate: nil, added: [], attention: [message]} =
+               SeedReconcile.run!(ctx.base, ctx.db)
+
+      send(self(), {:message, message})
+    end)
+
+    assert_received {:message, message}
+    assert message =~ "uncommitted"
+    assert File.read!(Path.join(ctx.dir, "guidance/local.md")) == "operator draft\n"
+  end
+
+  test "a failed stamp repair warns and leaves the published commit, it does not stop start",
+       ctx do
+    init_shape!(ctx.base, "0.1.15")
+    assert :ok = AdminProjection.bootstrap_served(ctx.db, ctx.base)
+
+    assert :crash ==
+             catch_throw(
+               Identity.reconcile_seed_law!(ctx.base, fn candidate ->
+                 {:ok, _} = Identity.publish_live!(ctx.base, candidate)
+                 throw(:crash)
+               end)
+             )
+
+    live = Identity.live_revision!(ctx.base)
+    assert {:ok, _} = DB.query(ctx.db, "DROP TABLE admin_projection_versions")
+
+    log =
+      capture_log(fn ->
+        assert %{candidate: nil, added: []} = SeedReconcile.run!(ctx.base, ctx.db)
+      end)
+
+    assert log =~ "served identity stamp"
+    assert Identity.live_revision!(ctx.base) == live
   end
 
   test "a failed publication puts main and live back", ctx do
