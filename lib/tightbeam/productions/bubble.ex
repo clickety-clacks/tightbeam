@@ -267,7 +267,7 @@ defmodule Tightbeam.Productions.Bubble do
         SELECT assignmentId FROM turns WHERE seq=?1 AND assignmentId IS NOT NULL
         UNION
         SELECT assignmentId FROM wakes
-        WHERE deliveredTurnSeq=?3 AND digest=0 AND assignmentId IS NOT NULL
+        WHERE deliveredTurnSeq=?1 AND digest=0 AND assignmentId IS NOT NULL
           AND wakeId NOT GLOB 'bubble:*'
       )
       SELECT parent.sessionKey, CASE WHEN COUNT(*)=1 THEN MIN(a.id) END
@@ -276,7 +276,7 @@ defmodule Tightbeam.Productions.Bubble do
       WHERE parent.state='active' AND parent.sessionKey!=?2
       GROUP BY parent.sessionKey ORDER BY parent.sessionKey
       """,
-      [turn.cause_seq, turn.session_key, turn.assignment_source_seq]
+      [turn.cause_seq, turn.session_key]
     )
   end
 
@@ -743,10 +743,8 @@ defmodule Tightbeam.Productions.Bubble do
         """
         SELECT t.sessionKey, t.requestRef, s.ownerUserId, t.status, s.harness, s.host,
                t.wakeId, t.messageId,
-               (t.status='failed' AND #{TurnLifecycle.provider_refusal_sql("t.seq")}),
-               redelivery.sourceTurnSeq, redelivery.sourceWakeId
+               (t.status='failed' AND #{TurnLifecycle.provider_refusal_sql("t.seq")})
         FROM turns AS t JOIN sessions AS s ON s.sessionKey = t.sessionKey
-        LEFT JOIN health_redelivery_attempts redelivery ON redelivery.redeliveryTurnSeq=t.seq
         WHERE t.seq = ?1
         """,
         [seq]
@@ -763,29 +761,16 @@ defmodule Tightbeam.Productions.Bubble do
           current_host,
           wake_id,
           message_id,
-          refused,
-          source_turn_seq,
-          redelivery_wake_id
+          refused
         ]
       ] ->
-        # Health redelivery copies the carrier prompt without its wake ID. Read
-        # members from the recorded source while keeping this turn's cause ID.
-        assignment_source_seq = source_turn_seq || seq
-
         request_refs =
           if is_nil(request_ref) do
             source_wake_id =
               wake_id ||
-                cond do
-                  refused == 1 ->
-                    redelivery_wake_id
-
-                  status in @climbing_notice_terminals ->
-                    TurnFailureNotice.source_wake_id(db, seq, session_key, message_id)
-
-                  true ->
-                    nil
-                end
+                if(status in @climbing_notice_terminals,
+                  do: TurnFailureNotice.source_wake_id(db, seq, session_key, message_id)
+                )
 
             carrier_request_refs(db, source_wake_id)
           else
@@ -797,8 +782,7 @@ defmodule Tightbeam.Productions.Bubble do
             request_refs == [] ->
               [nil]
 
-            refused == 1 and is_nil(request_ref) and
-                carries_assignment_source?(db, assignment_source_seq) ->
+            refused == 1 and is_nil(request_ref) and carries_assignment_source?(db, seq) ->
               [nil | request_refs]
 
             true ->
@@ -840,7 +824,6 @@ defmodule Tightbeam.Productions.Bubble do
                 owner: owner,
                 status: status,
                 cause_seq: cause_seq,
-                assignment_source_seq: assignment_source_seq,
                 notice?: kind == :notice,
                 refused?: refused == 1,
                 harness: harness,
