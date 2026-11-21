@@ -1030,6 +1030,23 @@ defmodule Tightbeam.HarklightLifecycle do
   defp run_status(runner, handle),
     do: run_read_command(runner, ["status", "--session", handle])
 
+  @doc false
+  def listener_available?(executable, handle) do
+    runner = fn args -> read_command(executable, args) end
+
+    with {:ok, output} <- run_status(runner, handle),
+         {:ok,
+          %{
+            "session_handle" => ^handle,
+            "availability" => "listening",
+            "listening_support" => %{"route" => "other"} = support
+          }} <- JSON.decode(output) do
+      support["origin_listener"] != true
+    else
+      _ -> false
+    end
+  end
+
   # Each read has a deadline; a timeout is unknown evidence, so R admits the
   # ordinary listener start and E cannot complete the handle. No recheck is armed.
   @read_timeout_ms 5_000
