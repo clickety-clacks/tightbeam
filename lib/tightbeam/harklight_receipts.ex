@@ -223,7 +223,7 @@ defmodule Tightbeam.HarklightReceipts do
       case DB.query(
              db,
              """
-             SELECT r.journalId,p.diagnostic FROM harklight_handoff_receipts r
+             SELECT r.argv,r.journalId,p.diagnostic FROM harklight_handoff_receipts r
              LEFT JOIN harklight_operation_pauses p ON p.opId=r.opId
              LEFT JOIN harklight_operation_guards g ON g.opId=r.opId
              JOIN turns t ON t.seq=r.turnSeq
@@ -232,11 +232,11 @@ defmodule Tightbeam.HarklightReceipts do
              """,
              [op, session_key]
            ) do
-        {:ok, [[journal, diagnostic]]} ->
+        {:ok, [[argv, journal, diagnostic]]} ->
           with {:ok, runner} <- runner(opts),
                {:ok, result} <-
                  HarklightFailures.guarded_attempt(db, op, :explicit, fn ->
-                   retry_receipt(runner, op, journal)
+                   recover_receipt(runner, JSON.decode!(argv), op, journal)
                  end),
                :ok <- settle_exact_receipt(db, op, result) do
             :ok
@@ -260,13 +260,7 @@ defmodule Tightbeam.HarklightReceipts do
            {:ok, journal} <- bind_journal(db, runner, op, journal),
            {:ok, result} <-
              HarklightFailures.guarded_attempt(db, op, :automatic, fn ->
-               case retry_receipt(runner, op, journal) do
-                 {[%{"kind" => "operation_absent", "op_id" => ^op, "journal_id" => ^journal}], 1} ->
-                   run_operation(runner, argv ++ ["--op-id", op], op)
-
-                 result ->
-                   result
-               end
+               recover_receipt(runner, argv, op, journal)
              end) do
         settle_result(db, op, result)
       else
@@ -276,9 +270,17 @@ defmodule Tightbeam.HarklightReceipts do
     end)
   end
 
-  defp retry_receipt(runner, op, journal) do
-    run_operation(runner, ["retry", "--op-id", op, "--journal-id", journal], op)
+  defp recover_receipt(runner, argv, op, journal) when is_binary(journal) and journal != "" do
+    case run_operation(runner, ["retry", "--op-id", op, "--journal-id", journal], op) do
+      {[%{"kind" => "operation_absent", "op_id" => ^op, "journal_id" => ^journal}], 1} ->
+        run_operation(runner, argv ++ ["--op-id", op], op)
+
+      result ->
+        result
+    end
   end
+
+  defp recover_receipt(_runner, _argv, _op, _journal), do: {:error, :pending}
 
   defp bind_journal(_db, _runner, _op, id) when is_binary(id), do: {:ok, id}
 

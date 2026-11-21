@@ -318,6 +318,121 @@ defmodule Tightbeam.HarklightWakesTest do
     assert is_integer(completed)
   end
 
+  test "explicit receipt settlement starts the saved write after a pre-journal worker death", %{
+    db: db,
+    call: call,
+    session: session
+  } do
+    :ok = HarklightWakes.capture_feed(db, @handle, 1, [feed_chat(1, "request", "chat")], :live)
+    assert {:ok, [[wake]]} = DB.query(db, "SELECT wakeId FROM harklight_wake_deliveries")
+    turn = deliver_discussion_turn!(db, wake, session.session_key)
+    assert :ok = Ledger.stamp_adapter(db, turn.seq, 1)
+    record_prompt_dispatched!(db, turn)
+
+    parent = self()
+    journal = "receipt-journal"
+
+    interrupted_runner = fn
+      ["journal-id"] ->
+        frame(%{kind: "journal", journal_id: journal})
+
+      ["retry", "--op-id", op, "--journal-id", ^journal] ->
+        send(parent, {:before_agent_journal, self(), op})
+
+        receive do
+          :continue -> flunk("receipt worker should have died before journaling")
+        end
+    end
+
+    manager = start_supervised!({HarklightReceipts, db: db, runner: interrupted_runner})
+    assert_receive {:before_agent_journal, worker, op}
+    assert {:ok, [[^op]]} = DB.query(db, "SELECT opId FROM harklight_operation_guards")
+
+    monitor = Process.monitor(worker)
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
+
+    assert eventually(fn ->
+             case Process.whereis(HarklightReceipts) do
+               pid when is_pid(pid) and pid != manager -> true
+               _ -> false
+             end
+           end)
+
+    :ok = HarklightReceipts.dispatched(turn.seq)
+    refute_receive {:before_agent_journal, _, ^op}, 100
+
+    assert {:ok, [[^op, ^journal, nil]]} =
+             DB.query(db, "SELECT opId,journalId,completedAt FROM harklight_handoff_receipts")
+
+    absent = %{kind: "operation_absent", op_id: op, journal_id: journal}
+    settle = %{call | params: %{op_id: op}}
+
+    for response <- [
+          frame(%{absent | journal_id: "different-journal"}, 1),
+          frame(%{absent | op_id: "different-operation"}, 1),
+          frame(Map.delete(absent, :journal_id), 1),
+          frame(%{absent | kind: "operation_unresolved"}, 7),
+          frame(absent, 7)
+        ] do
+      runner = fn
+        ["retry", "--op-id", ^op, "--journal-id", ^journal] ->
+          response
+
+        args ->
+          send(parent, {:unexpected_recovery_call, args})
+          response
+      end
+
+      assert %{code: "harklight_receipt_unresolved", outcome: "outcome_unknown", op_id: ^op} =
+               HarklightSend.settle(db, settle, runner: runner)
+
+      refute_received {:unexpected_recovery_call, _}
+      assert {:ok, [[^op]]} = DB.query(db, "SELECT opId FROM harklight_operation_guards")
+    end
+
+    assert %{outcome: "outcome_unknown", op_id: ^op, reason: reason} =
+             HarklightSend.settle(db, settle,
+               runner: fn
+                 ["retry", "--op-id", ^op, "--journal-id", ^journal] ->
+                   frame(absent, 1)
+
+                 [
+                   "receipt",
+                   "--item-id",
+                   "request",
+                   "--entry-id",
+                   "chat",
+                   "--agent",
+                   "Origin",
+                   "--op-id",
+                   ^op
+                 ] = args ->
+                   send(parent, {:saved_receipt, args})
+                   projection_failure("receipt", op, "explicit-receipt-projection")
+               end
+             )
+
+    assert_received {:saved_receipt, _}
+    assert reason =~ "explicit-receipt-projection"
+    assert {:ok, [[^op]]} = DB.query(db, "SELECT opId FROM harklight_operation_pauses")
+
+    :ok = HarklightReceipts.dispatched(turn.seq)
+    refute_receive {:before_agent_journal, _, ^op}, 100
+
+    assert %{outcome: "committed", settled_command: "receipt", op_id: ^op} =
+             HarklightSend.settle(db, settle,
+               runner: fn ["retry", "--op-id", ^op, "--journal-id", ^journal] ->
+                 receipt_result(op)
+               end
+             )
+
+    assert {:ok, [[^op, ^journal, completed]]} =
+             DB.query(db, "SELECT opId,journalId,completedAt FROM harklight_handoff_receipts")
+
+    assert is_integer(completed)
+  end
+
   for lineage <- [:restoration, :cycle_release] do
     @receipt_lineage lineage
 
