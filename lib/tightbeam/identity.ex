@@ -1529,8 +1529,11 @@ defmodule Tightbeam.Identity do
         # failing git cannot leave one that the gateway would load.
         Enum.each(paths, fn path ->
           case File.rm(Path.join(dir, path)) do
-            result when result == :ok or result == {:error, :enoent} -> :ok
-            {:error, reason} -> Logger.error("cannot remove #{path} after a failed add: #{reason}")
+            result when result == :ok or result == {:error, :enoent} ->
+              :ok
+
+            {:error, reason} ->
+              Logger.error("cannot remove #{path} after a failed add: #{reason}")
           end
         end)
 

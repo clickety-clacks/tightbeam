@@ -176,7 +176,12 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     # The loader's wildcard never matches a leading dot, so parked copies are unread too.
     File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "rules/.disabled.toml"))
     File.mkdir_p!(Path.join(ctx.dir, "kungfu/.hidden/rules"))
-    File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, "kungfu/.hidden/rules/parked.toml"))
+
+    File.cp!(
+      Path.join(@seed, @notice_path),
+      Path.join(ctx.dir, "kungfu/.hidden/rules/parked.toml")
+    )
+
     commit_and_publish!(ctx.dir, "fixture: unread copies and a bad file")
 
     # The loader itself ignores every one of those copies.
