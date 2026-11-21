@@ -1428,7 +1428,7 @@ defmodule Tightbeam.Identity do
     %{added: names, attention: [], candidate: candidate}
   rescue
     error ->
-      restore_clean_main!(dir, live)
+      withdraw_candidate!(dir, live, candidate.candidate_revision)
 
       %{
         added: [],
@@ -1437,26 +1437,54 @@ defmodule Tightbeam.Identity do
       }
   end
 
-  defp restore_clean_main!(dir, live) do
-    git!(dir, ["reset", "--hard", live])
+  # Put main and live back at `live` and take the candidate's added files out of
+  # the working tree first, so the gateway can never load a rule live lacks. Only
+  # those paths are touched: other working-tree changes are the operator's.
+  defp withdraw_candidate!(dir, live, candidate) do
+    dir
+    |> git_output!(["diff", "--name-only", "--diff-filter=A", live, candidate])
+    |> String.split("\n", trim: true)
+    |> Enum.each(fn path ->
+      git!(dir, ["rm", "-q", "--cached", "--ignore-unmatch", "--", path])
+      File.rm(Path.join(dir, path))
+    end)
+
+    git!(dir, ["update-ref", "refs/heads/main", live])
     git!(dir, ["update-ref", "refs/heads/#{@live}", live])
   end
 
   # An earlier start committed the seed rules on main and stopped before
-  # publishing them (or before the stamp moved).
+  # publishing them (or before the stamp moved). Publishing moves only a ref, so
+  # unrelated working-tree changes do not stop it.
   defp interrupted_reconcile(dir, live) do
     main = git_output!(dir, ["rev-parse", "main"])
     subject = git_output!(dir, ["log", "-1", "--format=%s", main])
 
     if main != live and String.starts_with?(subject, @reconcile_subject) and
          git_output!(dir, ["rev-parse", "main^"]) == live and
-         git_output!(dir, ["branch", "--show-current"]) == "main" and
-         not merge_pending?(dir) and git_output!(dir, ["status", "--porcelain"]) == "" do
+         git_output!(dir, ["branch", "--show-current"]) == "main" and not merge_pending?(dir) do
+      sync_lagging_paths!(dir, live, main)
       names = subject |> String.replace_prefix(@reconcile_subject, "") |> String.split(", ")
       {:publish, main, names}
     else
       :none
     end
+  end
+
+  # The ref moved but the working tree had not caught up when the start stopped:
+  # the added files show as staged deletions. Restore just those files.
+  defp sync_lagging_paths!(dir, live, main) do
+    added =
+      dir
+      |> git_output!(["diff", "--name-only", "--diff-filter=A", live, main])
+      |> String.split("\n", trim: true)
+
+    lagging =
+      Enum.filter(added, fn path ->
+        git_output!(dir, ["status", "--porcelain", "--", path]) |> String.starts_with?("D ")
+      end)
+
+    if lagging != [], do: git!(dir, ["checkout", "main", "--" | lagging])
   end
 
   defp reconcile_ready(dir, live) do
@@ -1467,7 +1495,7 @@ defmodule Tightbeam.Identity do
       merge_pending?(dir) ->
         {:not_ready, "an identity relearn merge is in progress"}
 
-      not clean_or_own_leftovers?(dir) ->
+      git_output!(dir, ["status", "--porcelain"]) != "" ->
         {:not_ready, "identity working tree has uncommitted changes"}
 
       git_output!(dir, ["rev-parse", "main"]) != live ->
@@ -1478,67 +1506,62 @@ defmodule Tightbeam.Identity do
     end
   end
 
-  # A start that stopped after writing a seed file and before committing it
-  # leaves exactly that file, byte for byte, uncommitted. Remove only that; any
-  # other change is the operator's and keeps the add from running.
-  defp clean_or_own_leftovers?(dir) do
-    entries =
-      dir
-      |> git_output!(["status", "--porcelain", "--untracked-files=all"])
-      |> String.split("\n", trim: true)
-      |> Enum.map(fn line -> {String.slice(line, 0, 2), String.slice(line, 3..-1//1)} end)
-
-    shipped = Map.new(seed_entries())
-
-    own? =
-      Enum.all?(entries, fn {code, path} ->
-        code in ["??", "A "] and path in @auto_delivered_seed_law and
-          File.read(Path.join(dir, path)) == {:ok, Map.get(shipped, path)}
-      end)
-
-    if entries != [] and own? do
-      Enum.each(entries, fn {_code, path} ->
-        git!(dir, ["rm", "-q", "-f", "--cached", "--ignore-unmatch", "--", path])
-        File.rm!(Path.join(dir, path))
-      end)
-
-      Logger.warning("removed an uncommitted shipped seed rule left by an interrupted start")
-    end
-
-    entries == [] or own?
-  end
-
+  # The commit is built outside the served working tree (a scratch index and
+  # export), so no start can leave an unrecorded rule where the gateway loads law.
+  # Only after the commit exists does main move, and then just the added files are
+  # brought into the working tree.
   defp commit_seed_law!(dir, live, add) do
+    scratch = Path.join(System.tmp_dir!(), "seed-add-#{System.unique_integer([:positive])}")
+    index = Path.join(scratch, "index")
+    tree_dir = Path.join(scratch, "tree")
+    env = [{"GIT_INDEX_FILE", index}]
     paths = Enum.map(add, & &1.path)
 
     try do
-      Enum.each(add, fn %{path: path, bytes: bytes} ->
-        destination = Path.join(dir, path)
-        File.mkdir_p!(Path.dirname(destination))
-        File.write!(destination, bytes)
+      File.mkdir_p!(tree_dir)
+      git_env_output!(dir, ["read-tree", live], env)
+
+      add
+      |> Enum.with_index()
+      |> Enum.each(fn {%{path: path, bytes: bytes}, i} ->
+        blob = Path.join(scratch, "blob-#{i}")
+        File.write!(blob, bytes)
+        oid = git_env_output!(dir, ["hash-object", "-w", blob], env)
+        git_env_output!(dir, ["update-index", "--add", "--cacheinfo", "100644,#{oid},#{path}"], env)
       end)
 
-      fingerprint = validate_candidate_tree!(dir, live)
+      tree = git_env_output!(dir, ["write-tree"], env)
+      git_env_output!(dir, ["checkout-index", "--all", "--prefix=#{tree_dir}/"], env)
+      fingerprint = validate_candidate_tree!(tree_dir, live)
       names = Enum.flat_map(add, & &1.names)
-      git!(dir, ["add", "-A", "--" | paths])
-      git!(dir, ["commit", "-m", @reconcile_subject <> Enum.join(names, ", ")], "tightbeam")
-      candidate_result(dir, live, fingerprint)
-    rescue
-      error ->
-        # The tree was clean before the write: remove our files first, so a
-        # failing git cannot leave one that the gateway would load.
-        Enum.each(paths, fn path ->
-          case File.rm(Path.join(dir, path)) do
-            result when result == :ok or result == {:error, :enoent} ->
-              :ok
 
-            {:error, reason} ->
-              Logger.error("cannot remove #{path} after a failed add: #{reason}")
-          end
-        end)
+      commit =
+        git_env_output!(
+          dir,
+          ["commit-tree", tree, "-p", live, "-m", @reconcile_subject <> Enum.join(names, ", ")],
+          git_env("tightbeam")
+        )
 
-        git!(dir, ["reset", "--hard", live])
-        reraise error, __STACKTRACE__
+      git!(dir, ["update-ref", "refs/heads/main", commit, live])
+
+      try do
+        git!(dir, ["checkout", "main", "--" | paths])
+      rescue
+        error ->
+          withdraw_candidate!(dir, live, commit)
+          reraise error, __STACKTRACE__
+      end
+
+      %{candidate_revision: commit, expected_prior: live, tree_fingerprint: fingerprint}
+    after
+      File.rm_rf(scratch)
+    end
+  end
+
+  defp git_env_output!(dir, args, env) do
+    case System.cmd("git", args, cd: dir, stderr_to_stdout: true, env: env) do
+      {output, 0} -> String.trim_trailing(output)
+      {output, status} -> raise "git #{Enum.join(args, " ")} failed (#{status}): #{output}"
     end
   end
 

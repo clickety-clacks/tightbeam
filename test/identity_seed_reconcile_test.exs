@@ -262,29 +262,35 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     refute File.exists?(Path.join(ctx.dir, @reminder_path))
   end
 
-  test "a start that stopped after writing the file and before committing it recovers", ctx do
+  test "a start that stopped between moving main and updating the working tree recovers, keeping operator drafts",
+       ctx do
     init_shape!(ctx.base, "0.1.15")
     prior = Identity.live_revision!(ctx.base)
-    leftover = Path.join(ctx.dir, @notice_path)
-    File.mkdir_p!(Path.dirname(leftover))
-    File.cp!(Path.join(@seed, @notice_path), leftover)
-    git(ctx.dir, ["add", "--", @notice_path])
-    assert git(ctx.dir, ["status", "--porcelain"]) != ""
+    assert :crash == catch_throw(Identity.reconcile_seed_law!(ctx.base, fn _ -> throw(:crash) end))
+    committed = git(ctx.dir, ["rev-parse", "main"])
 
-    assert %{added: [@notice], attention: [], candidate: %{candidate_revision: revision}} =
+    # The ref moved; the file never reached the working tree or index.
+    git(ctx.dir, ["rm", "-q", "--cached", "--", @notice_path])
+    File.rm!(Path.join(ctx.dir, @notice_path))
+    assert git(ctx.dir, ["status", "--porcelain"]) =~ "D  #{@notice_path}"
+    File.write!(Path.join(ctx.dir, "guidance/local.md"), "operator draft\n")
+    # While the file is missing the loader cannot see an unrecorded rule.
+    refute loaded?(ctx.base)
+
+    assert %{added: [@notice], attention: [], candidate: %{candidate_revision: ^committed}} =
              SeedReconcile.run!(ctx.base, ctx.db)
 
     assert git(ctx.dir, ["rev-parse", "HEAD^"]) == prior
-    assert Identity.live_revision!(ctx.base) == revision
-    assert git(ctx.dir, ["status", "--porcelain"]) == ""
+    assert Identity.live_revision!(ctx.base) == committed
+    assert git(ctx.dir, ["status", "--porcelain"]) == "?? guidance/local.md"
+    assert File.read!(Path.join(ctx.dir, "guidance/local.md")) == "operator draft\n"
     assert loaded?(ctx.base)
   end
 
-  test "uncommitted operator changes are never removed by the add", ctx do
+  test "an uncommitted operator draft stops the add and no unrecorded rule reaches law loading",
+       ctx do
     init_shape!(ctx.base, "0.1.15")
     File.write!(Path.join(ctx.dir, "guidance/local.md"), "operator draft\n")
-    File.mkdir_p!(Path.join(ctx.dir, "rules"))
-    File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, @notice_path))
 
     capture_log(fn ->
       assert %{candidate: nil, added: [], attention: [message]} =
@@ -296,6 +302,22 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
     assert_received {:message, message}
     assert message =~ "uncommitted"
     assert File.read!(Path.join(ctx.dir, "guidance/local.md")) == "operator draft\n"
+    refute File.exists?(Path.join(ctx.dir, @notice_path))
+    refute loaded?(ctx.base)
+  end
+
+  test "an operator-staged copy at the shipped path is left staged", ctx do
+    init_shape!(ctx.base, "0.1.15")
+    File.mkdir_p!(Path.join(ctx.dir, "rules"))
+    File.cp!(Path.join(@seed, @notice_path), Path.join(ctx.dir, @notice_path))
+    git(ctx.dir, ["add", "--", @notice_path])
+
+    capture_log(fn ->
+      assert %{candidate: nil, added: []} = SeedReconcile.run!(ctx.base, ctx.db)
+    end)
+
+    assert git(ctx.dir, ["status", "--porcelain"]) == "A  #{@notice_path}"
+    assert File.exists?(Path.join(ctx.dir, @notice_path))
   end
 
   test "a failed stamp repair warns and leaves the published commit, it does not stop start",
