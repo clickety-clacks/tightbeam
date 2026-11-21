@@ -3818,6 +3818,10 @@ defmodule Tightbeam.Wire.Router do
 
   defp allowed_agent_verb(verb, {:device, _device}) when verb in @read_marker_verbs, do: :ok
 
+  # The Chat server signs in with the org CLI token plus `asUser` for both human
+  # send and read markers; the handler still requires that `asUser` names a user.
+  defp allowed_agent_verb(verb, :org) when verb in @read_marker_verbs, do: :ok
+
   defp allowed_agent_verb(_verb, {:device, _device}),
     do: {:error, 401, "auth_failed", nil}
 
