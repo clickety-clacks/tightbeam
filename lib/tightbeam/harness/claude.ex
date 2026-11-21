@@ -135,7 +135,9 @@ defmodule Tightbeam.Harness.Claude do
       |> Map.put_new(:patch_adapter, &Tightbeam.Harness.ClaudeFoldedPrompt.local/1)
       |> Map.put_new(:remote_patch, &Tightbeam.Harness.ClaudeFoldedPrompt.remote(target, &1, &2))
 
-    Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
+    Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target),
+      verify_version: @adapter_version
+    )
   end
 
   @impl true

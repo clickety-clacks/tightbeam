@@ -23,7 +23,7 @@ defmodule Tightbeam.SchemaShapeTest do
     Wakes
   }
 
-  @shape "session-custody-artifact-process-attribution-v1-0117"
+  @shape "attest-lifecycle-actor-v1-0117"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @owner_link_history_ddl """
   CREATE TABLE work_item_delivery_scope_events (

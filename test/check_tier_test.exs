@@ -41,7 +41,7 @@ defmodule Tightbeam.CheckTierTest do
       ["bad1", assignment.id, "verdict", nil, nil, "reviewer", nil, 1],
       ["bad3", assignment.id, "verdict", "tests-passed", nil, "reviewer", "other", 1],
       ["bad4", assignment.id, "progress", "tests-passed", nil, "holder", nil, 1],
-      ["bad5", assignment.id, "progress", nil, nil, nil, "flynn", 1]
+      ["bad5", assignment.id, "progress", nil, nil, "holder", "flynn", 1]
     ]
 
     Enum.each(invalid, fn params ->
@@ -103,6 +103,16 @@ defmodule Tightbeam.CheckTierTest do
     assert progress.attest.verdictKind == nil
     assert progress.attest.byUser == nil
     assert progress.attest.bySession == "holder"
+
+    user_progress = attest(ctx, {:user, "flynn"}, assignment.id, "progress")
+    assert user_progress.attest.verdictKind == nil
+    assert user_progress.attest.byUser == "flynn"
+    assert user_progress.attest.bySession == nil
+
+    process_progress = attest(ctx, {:process, "test-process"}, assignment.id, "progress")
+    assert process_progress.attest.verdictKind == nil
+    assert process_progress.attest.byUser == nil
+    assert process_progress.attest.bySession == nil
   end
 
   test "producer-card verdict path accepts sessions and users, validates last, and never closes",

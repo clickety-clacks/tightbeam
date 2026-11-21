@@ -1,4 +1,5 @@
 """Deterministic contract checks for exact-candidate CI (stdlib only)."""
+import ast
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,26 @@ import unittest
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml'
+
+
+def equal(left, right):
+    # Actions ignores case when comparing strings. Keep returned operands
+    # unchanged: AND/OR routing returns runner labels, not folded strings.
+    if isinstance(left, str) and isinstance(right, str):
+        return left.casefold() == right.casefold()
+    return left == right
+
+
+class ActionsComparisons(ast.NodeTransformer):
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) != 1 or not isinstance(node.ops[0], (ast.Eq, ast.NotEq)):
+            raise ValueError('unsupported comparison')
+        comparison = ast.Call(func=ast.Name(id='_equal', ctx=ast.Load()),
+                              args=[node.left, node.comparators[0]], keywords=[])
+        if isinstance(node.ops[0], ast.NotEq):
+            return ast.UnaryOp(op=ast.Not(), operand=comparison)
+        return comparison
 
 
 def evaluate(expression, context):
@@ -31,7 +52,10 @@ def evaluate(expression, context):
         words.get(token) or (repr(token[1:-1]) if token.startswith("'")
                              else repr(context[token]))
         for token in tokens)
-    return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p),
+    tree = ast.fix_missing_locations(ActionsComparisons().visit(ast.parse(code, mode='eval')))
+    return eval(compile(tree, '<actions-expression>', 'eval'), {
+                       '__builtins__': {}, '_equal': equal,
+                       '_starts': lambda s, p: s.startswith(p),
                        '_format': lambda f, *a: f.format(*a), '_json': json.loads})
 
 
@@ -42,6 +66,13 @@ class ExactHeadCI(unittest.TestCase):
         cls.jobs = dict(re.findall(
             r'^  (test|release):\n(.*?)(?=^  [\w-]+:\n|\Z)',
             cls.text, re.M | re.S))
+
+    def test_expression_string_comparisons_follow_actions_case_semantics(self):
+        # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions
+        self.assertTrue(evaluate("'Main' == 'main'", {}))
+        self.assertFalse(evaluate("'MAIN' != 'main'", {}))
+        self.assertEqual(evaluate("'Main' == 'main' && 'MacOS-Label' || 'fallback'", {}),
+                         'MacOS-Label')
 
     def test_dispatch_keeps_019_and_tag_triggers(self):
         self.assertIn('branches: ["0.1.*"]', self.text)
@@ -232,15 +263,35 @@ class ExactHeadCI(unittest.TestCase):
             self.assertTrue(evaluate(condition, {
                 'github.event_name': event, 'inputs.docs_validation': 'off'}), event)
 
-    def test_pull_request_suites_stay_off_the_release_pools(self):
-        # The few self-hosted runners carry release work; pull request,
-        # merge-queue and manual suites run on hosted runners beside them.
+    def test_runner_routing_by_event_ref_and_platform(self):
+        # Evaluate the actual workflow expression: only macOS pushes and
+        # manual main suites use the existing self-hosted pool. The main-ref
+        # comparison follows Actions' case-insensitive string equality.
         job = self.jobs['test']
-        self.assertIn(
-            "    runs-on: ${{ matrix.name == 'macos' && github.event_name == 'push' && "
-            "fromJSON('[\"self-hosted\", \"tb-macos\"]') || matrix.os }}", job)
+        routing = re.search(r'(?m)^    runs-on: \$\{\{ (.*) \}\}$', job).group(1)
         self.assertEqual(re.findall(r'(?m)^          - os: (\S+)$', job),
                          ['ubuntu-24.04', 'macos-latest'])
+        refs = ('refs/heads/main', 'refs/heads/Main', 'refs/heads/MAIN',
+                'refs/heads/main-fix', 'refs/heads/0.1.16',
+                'refs/tags/v0.1.16', 'refs/pull/12/merge',
+                'refs/heads/gh-readonly-queue/main/pr-12-' + 'a' * 40)
+        for platform, hosted in (('linux', 'ubuntu-24.04'), ('macos', 'macos-latest')):
+            for event in ('push', 'workflow_dispatch', 'pull_request', 'merge_group'):
+                for ref in refs:
+                    # Fork and same-repository PRs must both stay hosted.
+                    for fork in (False, True) if event == 'pull_request' else (False,):
+                        with self.subTest(platform=platform, event=event, ref=ref, fork=fork):
+                            expected = hosted
+                            if platform == 'macos' and (
+                                    event == 'push' or
+                                    (event == 'workflow_dispatch' and
+                                     ref.casefold() == 'refs/heads/main')):
+                                expected = ['self-hosted', 'tb-macos']
+                            self.assertEqual(evaluate(routing, {
+                                'matrix.name': platform, 'matrix.os': hosted,
+                                'github.event_name': event, 'github.ref': ref,
+                                'github.event.pull_request.head.repo.fork': fork,
+                            }), expected)
 
     def test_self_hosted_mac_checks_disk_before_the_suite(self):
         job = self.jobs['test']

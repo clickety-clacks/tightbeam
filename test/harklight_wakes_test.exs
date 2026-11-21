@@ -1521,6 +1521,26 @@ defmodule Tightbeam.HarklightWakesTest do
         "remove --choices-json and --reply"
       },
       {Map.put(valid, :reply, false), "harklight_request_needs_answer_controls", "--reply"},
+      {
+        Map.put(valid, :answer_ui, "/tmp/answer-ui.json"),
+        "harklight_answer_ui_has_answer_controls",
+        "remove --reply"
+      },
+      {
+        Map.merge(valid, %{reply: false, choices: ["Cover A"], answer_ui: "/tmp/answer-ui.json"}),
+        "harklight_answer_ui_has_answer_controls",
+        "remove --choices-json"
+      },
+      {
+        Map.merge(valid, %{message_type: "fyi", reply: false, answer_ui: "/tmp/answer-ui.json"}),
+        "harklight_answer_ui_requires_request",
+        "--type request"
+      },
+      {
+        Map.put(valid, :answer_ui, ""),
+        "harklight_answer_ui_invalid",
+        "non-empty path"
+      },
       {Map.put(valid, :message_kind, "update"), "harklight_kind_invalid", "blocker or success"},
       {
         Map.put(valid, :importance, "urgent"),
@@ -1628,6 +1648,149 @@ defmodule Tightbeam.HarklightWakesTest do
            } = HarklightSend.send_request(db, send_call, runner: runner)
 
     assert session == call.session_key
+  end
+
+  test "answer UI path and image files pass through unchanged and V2 refusal reason is preserved",
+       %{db: db, call: call} do
+    answer_ui = "/tmp/cover assets/answer-ui.json"
+    files = ["/tmp/cover-a.jpg", "/tmp/cover-b.jpg"]
+    refusal_reason = "answer_ui names cover-c.jpg, which is absent from --files-json"
+
+    runner = fn args ->
+      case Enum.take(args, 2) do
+        ["send", "--prepare"] ->
+          pair_args = Enum.chunk_every(args, 2, 1, :discard)
+          assert Enum.member?(pair_args, ["--answer-ui", answer_ui])
+          assert ["--file", "/tmp/cover-a.jpg"] in pair_args
+          assert ["--file", "/tmp/cover-b.jpg"] in pair_args
+          refute "--reply" in args
+          refute "--choice" in args
+
+          op = Enum.at(args, 3)
+          hashes = [String.duplicate("a", 64), String.duplicate("b", 64)]
+
+          frame(%{
+            kind: "prepared",
+            op_id: op,
+            request: %{
+              type: "send",
+              op_id: op,
+              session_handle: @handle,
+              message: %{
+                sender_id: "sender",
+                message_id: "answer-ui-message",
+                title: "Choose a cover",
+                body: nil,
+                supersedes: []
+              },
+              files:
+                Enum.zip(files, hashes)
+                |> Enum.map(fn {path, hash} ->
+                  %{name: Path.basename(path), upload_pending: true, size: 4, sha256: hash}
+                end)
+            },
+            files:
+              Enum.zip(files, hashes)
+              |> Enum.map(fn {path, hash} ->
+                %{name: Path.basename(path), size_bytes: 4, sha256: hash}
+              end)
+          })
+
+        ["send", "--execute"] ->
+          op = List.last(args)
+          {JSON.encode!(%{kind: "refused", op_id: op, reason: refusal_reason}) <> "\n", 2}
+
+        other ->
+          flunk("unexpected Agent CLI invocation: #{inspect(other)}")
+      end
+    end
+
+    result =
+      HarklightSend.send_request(
+        db,
+        %{
+          call
+          | params: %{
+              harklight_session: @handle,
+              message_type: "request",
+              answer_ui: answer_ui,
+              sender_id: "sender",
+              title: "Choose a cover",
+              files: files
+            }
+        },
+        runner: runner
+      )
+
+    assert %{outcome: "refused", reason: ^refusal_reason, wake_effect: "none"} = result
+  end
+
+  test "answer UI prepared content is retained when the send commits", %{db: db, call: call} do
+    document = %{"schema" => "attention-client.ui/1", "opaque" => 18_446_744_073_709_551_617}
+
+    runner = fn args ->
+      op = if "--prepare" in args, do: Enum.at(args, 3), else: List.last(args)
+
+      case Enum.take(args, 2) do
+        ["send", "--prepare"] ->
+          assert ["--answer-ui", "/tmp/answer-ui.json"] in Enum.chunk_every(args, 2, 1, :discard)
+
+          frame(%{
+            kind: "prepared",
+            op_id: op,
+            files: [],
+            request: %{
+              type: "send",
+              op_id: op,
+              session_handle: @handle,
+              message: %{
+                sender_id: "sender",
+                message_id: "ui-committed",
+                title: "Choose",
+                answer_ui: document
+              }
+            }
+          })
+
+        ["send", "--execute"] ->
+          assert {:ok, [[payload]]} =
+                   DB.query(db, "SELECT payload FROM harklight_send_operations WHERE opId=?1", [
+                     op
+                   ])
+
+          assert JSON.decode!(payload)["request"]["message"]["answer_ui"] == document
+
+          frame(%{
+            kind: "committed",
+            operation: "send",
+            op_id: op,
+            response: %{
+              session_handle: @handle,
+              sender_id: "sender",
+              message_id: "ui-committed",
+              revision: 1
+            }
+          })
+      end
+    end
+
+    result =
+      HarklightSend.send_request(
+        db,
+        %{
+          call
+          | params: %{
+              harklight_session: @handle,
+              message_type: "request",
+              answer_ui: "/tmp/answer-ui.json",
+              sender_id: "sender",
+              title: "Choose"
+            }
+        },
+        runner: runner
+      )
+
+    assert %{outcome: "committed", state: "registered", message_id: "ui-committed"} = result
   end
 
   test "uncertain result stays unregistered and same-operation retry can bind it", %{
@@ -4090,6 +4253,14 @@ defmodule Tightbeam.HarklightWakesTest do
     assert eventually(fn -> not Process.alive?(worker) end)
   end
 
+  # Listener start first reads Harklight status through the Agent CLI, which
+  # HarklightLifecycle bounds with a 5s read deadline, and starts the listener
+  # on whatever that read yields. The start can therefore legitimately take as
+  # long as that deadline plus the read task's shutdown grace; ExUnit's default
+  # 1s assert_receive window is below the product's own bound. Wait for the
+  # event itself and bound only a hang, using twice the product deadline.
+  @listener_start_bound_ms 10_000
+
   test "another active follow receiver keeps a retired origin not-gone", %{
     db: db,
     call: call,
@@ -4121,7 +4292,8 @@ defmodule Tightbeam.HarklightWakesTest do
     end
 
     start_supervised!({HarklightWakes, db: db, listener: listener})
-    assert_receive {:listener_running, worker}
+    assert_receive {:listener_running, worker}, @listener_start_bound_ms
+    worker_down = Process.monitor(worker)
 
     {:ok, _} =
       DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
@@ -4156,11 +4328,15 @@ defmodule Tightbeam.HarklightWakesTest do
     assert retired_last.state == "retired"
     :sys.get_state(HarklightWakes)
 
-    assert eventually(fn ->
-             File.read(calls) == {:ok, "session end --session #{@handle} --gone\n"}
-           end)
+    # The gone call is a subprocess started outside the manager, so its output
+    # file is the only observation of it; poll that against the same bound
+    # rather than eventually/1's default 2s window.
+    assert eventually(
+             fn -> File.read(calls) == {:ok, "session end --session #{@handle} --gone\n"} end,
+             div(@listener_start_bound_ms, 10)
+           )
 
-    assert eventually(fn -> not Process.alive?(worker) end)
+    assert_receive {:DOWN, ^worker_down, :process, ^worker, _reason}, @listener_start_bound_ms
   end
 
   test "a first transient attach failure waits for recovery before marking gone", %{db: db} do
@@ -6025,6 +6201,74 @@ defmodule Tightbeam.HarklightWakesTest do
     assert :ok = HarklightSend.recover_pending(db, runner: no_op)
   end
 
+  test "a supersede naming an outcome_unknown send applies the valid targets and warns for it", %{
+    db: db,
+    call: call
+  } do
+    params = fn supersedes ->
+      %{
+        harklight_session: @handle,
+        message_type: "request",
+        reply: true,
+        sender_id: "sender",
+        title: "Replacement",
+        supersedes: supersedes
+      }
+    end
+
+    assert %{outcome: "outcome_unknown", message_id: "replacement"} =
+             HarklightSend.send_request(db, %{call | params: params.([])},
+               runner: lifecycle_runner(db, unknown: true)
+             )
+
+    # A supersede whose only target is the unresolved send is still refused.
+    no_op = fn _ -> flunk("a supersede of only an unresolved send ran Harklight") end
+
+    assert %{outcome: "refused", code: "harklight_send_unresolved"} =
+             HarklightSend.send_request(db, %{call | params: params.(["replacement"])},
+               runner: no_op
+             )
+
+    parent = self()
+    base = lifecycle_runner(db, message_id: "second-replacement")
+
+    runner = fn args ->
+      send(parent, {:harklight_args, args})
+      base.(args)
+    end
+
+    result =
+      HarklightSend.send_request(
+        db,
+        %{call | params: params.(["request", "replacement", "replacement"])},
+        runner: runner
+      )
+
+    assert %{
+             outcome: "committed",
+             message_id: "second-replacement",
+             wake_effect: "subscribed"
+           } = result
+
+    assert_received {:harklight_args, ["send", "--prepare" | prepare_args]}
+
+    assert Enum.chunk_every(prepare_args, 2, 1, :discard)
+           |> Enum.member?(["--supersedes", "request"])
+
+    refute "replacement" in prepare_args
+
+    assert [
+             %{message_id: "request", effect: "ended"},
+             %{message_id: "replacement", effect: "unchanged", reason: reason}
+           ] = result.supersedes
+
+    assert reason =~ "harklight-settle --message replacement"
+
+    # The unresolved send is untouched and can still be settled.
+    assert %{state: "pending"} = HarklightLifecycle.lookup(db, "replacement")
+    assert %{state: "committed"} = HarklightLifecycle.lookup(db, "second-replacement")
+  end
+
   test "refused send keeps its minted ID and is not recovered again", %{db: db, call: call} do
     runner = lifecycle_runner(db, refused: true)
 
@@ -6150,6 +6394,219 @@ defmodule Tightbeam.HarklightWakesTest do
              HarklightSend.change_request(db, revised, "revise",
                runner: fn _ -> {"request is at revision 2", 2} end
              )
+  end
+
+  describe "a message Tightbeam has no send record for" do
+    @other_handle "9b2c1f64-0d58-4e0b-8a8e-6a1f3f3a9c11"
+    @loose_op "5f0c7a52-3e0b-4b8d-9d5a-2f6c1d3b7e90"
+
+    defp committed_runner(parent, operation) do
+      fn args ->
+        send(parent, {:harklight_args, args})
+
+        frame(%{
+          kind: "committed",
+          operation: operation,
+          op_id: List.last(args),
+          response: %{revision: 3}
+        })
+      end
+    end
+
+    defp assert_no_local_effects(db) do
+      for table <- ~w(harklight_subscription_ends harklight_wake_follows) do
+        assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM #{table}")
+      end
+    end
+
+    test "revise reaches Harklight and reports no subscription effect", %{db: db, call: call} do
+      revised = %{
+        call
+        | params: %{
+            message_id: "raw-message",
+            base_revision: 2,
+            title: "Updated",
+            handle: @other_handle
+          }
+      }
+
+      result =
+        HarklightSend.change_request(db, revised, "revise",
+          runner: committed_runner(self(), "revise")
+        )
+
+      assert %{
+               outcome: "committed",
+               message_id: "raw-message",
+               revision: 3,
+               wake_effect: "none",
+               subscription_effect: "none",
+               note: "no subscription effect" <> _
+             } = result
+
+      assert_received {:harklight_args,
+                       ["revise", "--session", @other_handle, "--request", "raw-message" | _]}
+
+      assert_no_local_effects(db)
+    end
+
+    test "retract reaches Harklight and reports no subscription effect", %{db: db, call: call} do
+      retracted = %{call | params: %{message_id: "raw-message", handle: @other_handle}}
+
+      result =
+        HarklightSend.change_request(db, retracted, "retract",
+          runner: committed_runner(self(), "withdraw")
+        )
+
+      assert %{
+               outcome: "committed",
+               message_id: "raw-message",
+               wake_effect: "none",
+               subscription_effect: "none",
+               note: "no subscription effect" <> _
+             } = result
+
+      assert_received {:harklight_args,
+                       [
+                         "retract",
+                         "--session",
+                         @other_handle,
+                         "--request",
+                         "raw-message",
+                         "--op-id",
+                         _
+                       ]}
+
+      assert_no_local_effects(db)
+    end
+
+    test "settle retries the named operation and reports no subscription effect", %{
+      db: db,
+      call: call
+    } do
+      settled = %{call | params: %{message_id: "raw-message", op_id: @loose_op}}
+
+      result = HarklightSend.settle(db, settled, runner: committed_runner(self(), "retry"))
+
+      assert %{
+               command: "settle",
+               outcome: "committed",
+               op_id: @loose_op,
+               wake_effect: "none",
+               subscription_effect: "none",
+               note: "no subscription effect" <> _
+             } = result
+
+      assert_received {:harklight_args, ["retry", "--op-id", @loose_op]}
+      assert_no_local_effects(db)
+    end
+
+    test "an unrecorded uncertain retract can be settled from its saved request", %{
+      db: db,
+      call: call
+    } do
+      retracted = %{call | params: %{message_id: "raw-message", handle: @other_handle}}
+
+      assert %{outcome: "outcome_unknown"} =
+               HarklightSend.change_request(db, retracted, "retract",
+                 runner: fn args ->
+                   {JSON.encode!(%{kind: "outcome_unknown", op_id: List.last(args)}), 7}
+                 end
+               )
+
+      assert %{outcome: "committed", wake_effect: "none", subscription_effect: "none"} =
+               HarklightSend.settle(db, %{call | params: %{message_id: "raw-message"}},
+                 runner: committed_runner(self(), "withdraw")
+               )
+
+      assert_received {:harklight_args, ["retry", "--op-id", _]}
+      assert_no_local_effects(db)
+    end
+
+    test "Harklight's refusal is passed back, not replaced by a local check", %{
+      db: db,
+      call: call
+    } do
+      retracted = %{call | params: %{message_id: "raw-message", handle: @other_handle}}
+
+      assert %{outcome: "refused", code: "harklight_refused", reason: "not your message"} =
+               HarklightSend.change_request(db, retracted, "retract",
+                 runner: fn _ -> {"not your message", 2} end
+               )
+    end
+
+    test "a missing or malformed flag is refused by name without running Harklight", %{
+      db: db,
+      call: call
+    } do
+      no_op = fn _ -> flunk("Harklight ran without the identifier it needs") end
+
+      for command <- ["retract", "revise"] do
+        params = %{message_id: "raw-message", base_revision: 1, title: "T"}
+        params = if command == "retract", do: Map.take(params, [:message_id]), else: params
+
+        assert %{outcome: "refused", code: "harklight_session_required", reason: reason} =
+                 HarklightSend.change_request(db, %{call | params: params}, command,
+                   runner: no_op
+                 )
+
+        assert reason =~ "--session"
+
+        assert %{outcome: "refused", code: "harklight_session_invalid"} =
+                 HarklightSend.change_request(
+                   db,
+                   %{call | params: Map.put(params, :handle, "--not-a-handle")},
+                   command,
+                   runner: no_op
+                 )
+      end
+
+      assert %{outcome: "refused", code: "harklight_op_id_required", reason: reason} =
+               HarklightSend.settle(db, %{call | params: %{message_id: "raw-message"}},
+                 runner: no_op
+               )
+
+      assert reason =~ "--op-id"
+
+      assert %{outcome: "refused", code: "harklight_op_id_invalid"} =
+               HarklightSend.settle(
+                 db,
+                 %{call | params: %{message_id: "raw-message", op_id: "nope"}},
+                 runner: no_op
+               )
+    end
+
+    test "a flag that contradicts the local record is refused", %{db: db, call: call} do
+      no_op = fn _ -> flunk("Harklight ran despite a contradicting flag") end
+
+      assert %{outcome: "refused", code: "harklight_session_mismatch"} =
+               HarklightSend.change_request(
+                 db,
+                 %{call | params: %{message_id: "request", handle: @other_handle}},
+                 "retract",
+                 runner: no_op
+               )
+
+      assert %{outcome: "refused", code: "harklight_op_id_mismatch"} =
+               HarklightSend.settle(
+                 db,
+                 %{call | params: %{message_id: "request", op_id: @loose_op}},
+                 runner: no_op
+               )
+    end
+
+    test "the recorded session handle may be repeated without effect on a recorded message", %{
+      db: db,
+      call: call
+    } do
+      assert %{outcome: "committed", wake_effect: "ended"} =
+               HarklightSend.change_request(
+                 db,
+                 %{call | params: %{message_id: "request", handle: @handle}},
+                 "retract",
+                 runner: committed_runner(self(), "withdraw")
+               )
+    end
   end
 
   test "uncertain revise is settled with its original operation ID and saved request", %{
@@ -8006,7 +8463,7 @@ defmodule Tightbeam.HarklightWakesTest do
               session_handle: @handle,
               message: %{
                 sender_id: "sender",
-                message_id: "replacement",
+                message_id: opts[:message_id] || "replacement",
                 title: "Replacement",
                 supersedes: supersedes
               }

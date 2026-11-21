@@ -2,7 +2,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @moduledoc false
   import ExUnit.Assertions
   alias Tightbeam.{DB, NoticeBatcher, Schema}
-  @shape "session-custody-artifact-process-attribution-v1-0117"
+  @shape "attest-lifecycle-actor-v1-0117"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -731,7 +731,30 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
   # A synthetic predecessor must remove the current custody additions before
   # assigning an older stamp. Historical rows and origin fields are retained.
+  def downgrade_attest_lifecycle!(db) do
+    assert {:ok, :ok} =
+             DB.migration_transaction(db, :test_attest_lifecycle_predecessor, [], [], fn txn ->
+               [[sql]] = DB.Txn.q(txn, "SELECT sql FROM sqlite_master WHERE name='attests'")
+
+               old =
+                 String.replace(
+                   sql,
+                   "verdictKind IS NULL AND (bySession IS NULL OR byUser IS NULL)",
+                   "bySession IS NOT NULL AND byUser IS NULL AND verdictKind IS NULL"
+                 )
+
+               assert old != sql
+               [[version]] = DB.Txn.q(txn, "PRAGMA schema_version")
+               :ok = DB.Txn.exec(txn, "PRAGMA writable_schema = ON")
+               DB.Txn.q(txn, "UPDATE sqlite_master SET sql=?1 WHERE name='attests'", [old])
+               :ok = DB.Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+               :ok = DB.Txn.exec(txn, "PRAGMA writable_schema = RESET")
+               :ok
+             end)
+  end
+
   def downgrade_custody!(db) do
+    downgrade_attest_lifecycle!(db)
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[0]]} =

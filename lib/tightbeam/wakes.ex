@@ -1483,8 +1483,9 @@ defmodule Tightbeam.Wakes do
         LEFT JOIN users owner ON owner.userId=CASE
           WHEN a.openedBySession IS NOT NULL THEN parent.ownerUserId
         ELSE COALESCE(a.openedByUser, w.ownerUserId) END
-        WHERE a.id=?1 AND a.state='closed' AND a.closedBySession=a.holderKey
-          AND a.closedByUser IS NULL AND t.bySession=a.holderKey AND t.byUser IS NULL
+        WHERE a.id=?1 AND a.state='closed'
+          AND a.closedBySession IS t.bySession AND a.closedByUser IS t.byUser
+          AND a.closedByProcess IS NULL
           AND t.ts=a.closedAt
           AND ((a.outcome='completed' AND t.kind='completion')
             OR (a.outcome='surrendered' AND t.kind='surrender'))
@@ -1764,14 +1765,20 @@ defmodule Tightbeam.Wakes do
       )
     end
 
-    if is_binary(Map.get(input, :prod_id)) do
-      Tightbeam.QueuedMessageSuppression.replace_prod_in_txn(
-        txn,
-        wake,
-        Map.fetch!(input, :prod_sender),
-        input.prod_id
-      )
-    end
+    wake =
+      if is_binary(Map.get(input, :prod_id)) do
+        replaced_ids =
+          Tightbeam.QueuedMessageSuppression.replace_prod_in_txn(
+            txn,
+            wake,
+            Map.fetch!(input, :prod_sender),
+            input.prod_id
+          )
+
+        Map.put(wake, :replaced_wake_ids, replaced_ids)
+      else
+        wake
+      end
 
     if is_binary(condition_kind) do
       EventLog.lifecycle_in_txn(
@@ -2759,29 +2766,63 @@ defmodule Tightbeam.Wakes do
     case Txn.q(
            txn,
            """
-           SELECT w.verificationState,a.state,a.holderKey
-           FROM wakes w JOIN assignments a ON a.id=w.verificationAssignmentId
-           WHERE w.wakeId=?1 AND w.verificationAssignmentId=?2
+           SELECT w.verificationState,w.verificationAssignmentId,verifier.state,verifier.holderKey,
+                  w.assignmentId,parent.state,parent.holderKey,w.firedAt
+           FROM wakes w
+           JOIN assignments verifier ON verifier.id=w.verificationAssignmentId
+           LEFT JOIN assignments parent ON parent.id=w.assignmentId
+           WHERE w.wakeId=?1
            """,
-           [attrs.wait_id, attrs.assignment_id]
+           [attrs.wait_id]
          ) do
-      [[state, "open", holder_key]] when holder_key == attrs.by_session ->
-        case {attrs.verdict_kind, state} do
-          {"wait-verified", "provisional"} ->
-            :ok
+      [
+        [
+          state,
+          verifier_id,
+          verifier_state,
+          verifier_holder,
+          parent_id,
+          parent_state,
+          parent_holder,
+          fired_at
+        ]
+      ] ->
+        verifier_holds_verdict =
+          attrs.assignment_id == verifier_id and verifier_state == "open" and
+            verifier_holder == attrs.by_session
 
-          {"wait-challenged", state} when state in ~w(provisional confirmed) ->
-            :ok
+        parent_holds_verdict =
+          attrs.assignment_id == parent_id and parent_state == "open" and
+            parent_holder == attrs.by_session and verifier_state == "closed" and
+            not is_nil(fired_at)
 
-          _ ->
-            wait_error("invalid_wait_verdict", "wait verification transition is already terminal")
+        if verifier_holds_verdict or parent_holds_verdict do
+          verification_verdict_transition(state, attrs.verdict_kind)
+        else
+          wait_error(
+            "invalid_wait_verdict",
+            "wait verdict requires the named open verifier and holder, or the current holder of the open wait assignment after the verifier closes and the wait fires"
+          )
         end
 
       _ ->
         wait_error(
           "invalid_wait_verdict",
-          "wait verdict requires the named open verifier assignment and its recorded holder"
+          "wait verdict requires the named open verifier and holder, or the current holder of the open wait assignment after the verifier closes and the wait fires"
         )
+    end
+  end
+
+  defp verification_verdict_transition(state, verdict_kind) do
+    case {verdict_kind, state} do
+      {"wait-verified", "provisional"} ->
+        :ok
+
+      {"wait-challenged", state} when state in ~w(provisional confirmed) ->
+        :ok
+
+      _ ->
+        wait_error("invalid_wait_verdict", "wait verification transition is already terminal")
     end
   end
 
@@ -3521,7 +3562,8 @@ defmodule Tightbeam.Wakes do
        when (is_integer(marker) and is_nil(cycle_release_correlation)) or
               (is_tuple(marker) and tuple_size(marker) == 2 and elem(marker, 0) == :cycle_release and
                  is_binary(elem(marker, 1)) and elem(marker, 1) == cycle_release_correlation) do
-    if Ledger.enqueueable_in_txn?(txn, session_key) do
+    if health_redelivery_assignment_open_in_txn?(txn, assignment_id) and
+         Ledger.enqueueable_in_txn?(txn, session_key) do
       case Ledger.enqueue_in_txn(txn, %{
              session_key: session_key,
              message_id: message_id,
@@ -3604,6 +3646,12 @@ defmodule Tightbeam.Wakes do
       """,
       [idempotency_key, restoration_turn_seq, redelivery_turn_seq]
     )
+  end
+
+  defp health_redelivery_assignment_open_in_txn?(_txn, nil), do: true
+
+  defp health_redelivery_assignment_open_in_txn?(txn, assignment_id) do
+    Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1 AND state='open'", [assignment_id]) != []
   end
 
   defp health_redelivery_key(session_key, source_turn_seq) do
@@ -5550,19 +5598,16 @@ defmodule Tightbeam.Wakes do
         case Txn.q(
                txn,
                """
-               SELECT w.wakeId,w.creatorSessionKey,w.origin,t.status,t.error,w.digest
+               SELECT w.wakeId,w.creatorSessionKey,w.origin,t.status,t.error,w.digest,
+                      w.sessionKey,w.assignmentId
                FROM turns t JOIN wakes w ON w.wakeId=t.wakeId
                WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
                  AND w.consumer='prompt' AND COALESCE(w.targetGate,1)!=0
                """,
                [seq]
              ) do
-          [[wake_id, creator, origin, status, error, digest]] ->
-            # This is the same closed classification used by supervision. Its
-            # rate-limit retry may not yet have run: the two recognizers are async.
-            retry_safe? =
-              status == "failed" and
-                Tightbeam.HarnessHealth.classify_turn_failure(error) == "rate-limit-dead"
+          [[wake_id, creator, origin, status, error, digest, target, assignment_id]] ->
+            retry_safe? = failed_delivery_retry_owned?(status, error)
 
             carrier? =
               Txn.q(txn, "SELECT 1 FROM notice_batches WHERE deliveryWakeId=?1", [wake_id]) != []
@@ -5579,7 +5624,7 @@ defmodule Tightbeam.Wakes do
                 record_sender_failure_in_txn(
                   txn,
                   seq,
-                  [[wake_id, creator, origin]],
+                  [[wake_id, creator, origin, target, assignment_id]],
                   status
                 )
 
@@ -5588,7 +5633,7 @@ defmodule Tightbeam.Wakes do
             end
 
           [] ->
-            :not_applicable
+            report_failed_dispatch_brief_in_txn(txn, seq)
         end
       end)
 
@@ -5616,7 +5661,8 @@ defmodule Tightbeam.Wakes do
     Txn.q(
       txn,
       """
-      SELECT source.wakeId,source.creatorSessionKey,source.origin
+      SELECT source.wakeId,source.creatorSessionKey,source.origin,source.sessionKey,
+             source.assignmentId
       FROM notice_batches batch
       JOIN notice_batch_members member
         ON member.batchId=batch.batchId AND member.state='included'
@@ -5630,63 +5676,169 @@ defmodule Tightbeam.Wakes do
     )
   end
 
+  # This is the same closed classification used by supervision. Its
+  # rate-limit retry may not yet have run: the two recognizers are async.
+  defp failed_delivery_retry_owned?(status, error) do
+    status == "failed" and
+      Tightbeam.HarnessHealth.classify_turn_failure(error) == "rate-limit-dead"
+  end
+
+  # An assignment brief delivered straight into an idle holder's queue is a
+  # turn with no wake row (a busy holder's brief is staged as a wake and takes
+  # the source path above). Tell whoever is accountable for the assignment now.
+  defp report_failed_dispatch_brief_in_txn(txn, seq) do
+    case Txn.q(
+           txn,
+           """
+           SELECT t.sessionKey,t.assignmentId,t.status,t.error FROM turns t
+           WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
+             AND t.wakeId IS NULL AND t.assignmentId IS NOT NULL
+           """,
+           [seq]
+         ) do
+      [[holder, assignment_id, status, error]] ->
+        recipient = interrupted_redelivery_parent_in_txn(txn, holder, assignment_id)
+
+        cond do
+          failed_delivery_retry_owned?(status, error) ->
+            :retry_owned
+
+          is_binary(recipient) ->
+            content =
+              "Assignment #{assignment_id} brief to #{holder} undelivered: " <>
+                "delivery turn #{seq} is #{status}." <> failed_delivery_uncertainty(status)
+
+            {:notices,
+             List.wrap(append_failed_delivery_notice_in_txn(txn, seq, recipient, content))}
+
+          true ->
+            :not_applicable
+        end
+
+      [] ->
+        :not_applicable
+    end
+  end
+
   defp record_sender_failure_in_txn(txn, seq, sources, status) do
     notices =
       sources
-      |> Enum.reduce(%{}, fn [wake_id, creator, origin], recipients ->
+      |> Enum.reduce(%{}, fn [wake_id, creator, origin, target, assignment_id], recipients ->
         # Stored creator identity is the sender, not the receiver's ancestry.
         # A substrate marker is readable even if that sender session retired.
-        recipient = sender_failure_recipient(creator, origin)
+        # A source with no sending session (a system notice) is surfaced once to
+        # its recipient's accountable owner instead; it is never replayed.
+        {recipient, told_as} =
+          case failed_source_recipient_in_txn(
+                 txn,
+                 wake_id,
+                 target,
+                 assignment_id,
+                 creator,
+                 origin
+               ) do
+            recipient when is_binary(recipient) ->
+              {recipient, :sender}
+
+            nil ->
+              # A bubble notice's own failure continues its climb instead.
+              if String.starts_with?(wake_id, "bubble:"),
+                do: {nil, nil},
+                else:
+                  {interrupted_redelivery_parent_in_txn(txn, target, assignment_id) ||
+                     failed_source_owner_in_txn(txn, target), {:owner, target}}
+          end
 
         if is_binary(recipient) do
-          Map.update(recipients, recipient, [wake_id], &[wake_id | &1])
+          Map.update(recipients, recipient, [{wake_id, told_as}], &[{wake_id, told_as} | &1])
         else
           recipients
         end
       end)
-      |> Enum.flat_map(fn {recipient, wake_ids} ->
-        case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [recipient]) do
-          [[owner]] when is_binary(owner) ->
-            uncertainty =
-              if status == "failed_unknown",
-                do:
-                  " Delivery outcome is unknown; prior effects must be reconciled before retry.",
-                else: " The delivery carrier failed; this notice does not authorize a retry."
+      |> Enum.flat_map(fn {recipient, sources} ->
+        sources = Enum.reverse(sources)
+        source_names = sources |> Enum.map(&elem(&1, 0)) |> Enum.join(", ")
 
-            source_names = wake_ids |> Enum.reverse() |> Enum.join(", ")
+        owner_context =
+          case Enum.find(sources, &match?({_, {:owner, _}}, &1)) do
+            {_wake_id, {:owner, target}} ->
+              " It was addressed to #{target} and has no sending session to tell; " <>
+                "you are told as #{target}'s accountable owner."
 
-            # Use the existing transcript dedupe key. No new wake, obligation,
-            # notification registry, or second failure-prone inference is admitted.
-            {disposition, marker} =
-              Tightbeam.Projection.append_in_txn(txn, %{
-                session_key: recipient,
-                role: "assistant",
-                content:
-                  "Wake #{source_names} undelivered: delivery turn #{seq} is #{status}." <>
-                    uncertainty,
-                sender: "process:tightbeam",
-                message_type: "substrate",
-                attention_tier: Tightbeam.Projection.attention_tier(:high),
-                device_id: "process:tightbeam",
-                client_message_id: "wake-undelivered:#{seq}"
-              })
+            nil ->
+              ""
+          end
 
-            if disposition == :appended do
-              Tightbeam.Firehose.Publisher.message_in_txn(txn, recipient, marker, owner)
-            end
+        content =
+          "Wake #{source_names} undelivered: delivery turn #{seq} is #{status}." <>
+            owner_context <> failed_delivery_uncertainty(status)
 
-            if disposition in [:appended, :duplicate],
-              do: [{recipient, owner, marker}],
-              else: raise("wake undelivered notice conflicts with delivery turn #{seq}")
-
-          _ ->
-            # There is no lawful transcript to write. The durable carrier and
-            # authorized source projection still expose the incomplete outcome.
-            []
-        end
+        List.wrap(append_failed_delivery_notice_in_txn(txn, seq, recipient, content))
       end)
 
     {:notices, notices}
+  end
+
+  defp failed_source_recipient_in_txn(txn, wake_id, target, assignment_id, creator, origin) do
+    # Dispatch stages this canonical brief when its holder is busy. Assignment
+    # attribution alone also occurs on ordinary wakes, whose sender stays owed.
+    dispatch? =
+      is_binary(assignment_id) and
+        case Txn.q(txn, "SELECT prompt FROM wakes WHERE wakeId=?1", [wake_id]) do
+          [[prompt]] -> String.starts_with?(prompt, "[assignment: #{assignment_id}]\n\n")
+          _ -> false
+        end
+
+    if dispatch?,
+      do: interrupted_redelivery_parent_in_txn(txn, target, assignment_id),
+      else: sender_failure_recipient(creator, origin)
+  end
+
+  defp failed_source_owner_in_txn(txn, target) do
+    # The existing terminal failure route alerts the user's personal stream
+    # when there is no active ancestor. A parentless Main can be that stream.
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target]) do
+      [[owner]] when is_binary(owner) -> Tightbeam.Org.personal_session_key(owner)
+      _ -> nil
+    end
+  end
+
+  defp failed_delivery_uncertainty("failed_unknown"),
+    do: " Delivery outcome is unknown; prior effects must be reconciled before retry."
+
+  defp failed_delivery_uncertainty(_status),
+    do: " The delivery carrier failed; this notice does not authorize a retry."
+
+  defp append_failed_delivery_notice_in_txn(txn, seq, recipient, content) do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [recipient]) do
+      [[owner]] when is_binary(owner) ->
+        # Use the existing transcript dedupe key. No new wake, obligation,
+        # notification registry, or second failure-prone inference is admitted.
+        {disposition, marker} =
+          Tightbeam.Projection.append_in_txn(txn, %{
+            session_key: recipient,
+            role: "assistant",
+            content: content,
+            sender: "process:tightbeam",
+            message_type: "substrate",
+            attention_tier: Tightbeam.Projection.attention_tier(:high),
+            device_id: "process:tightbeam",
+            client_message_id: "wake-undelivered:#{seq}"
+          })
+
+        if disposition == :appended do
+          Tightbeam.Firehose.Publisher.message_in_txn(txn, recipient, marker, owner)
+        end
+
+        if disposition in [:appended, :duplicate],
+          do: {recipient, owner, marker},
+          else: raise("wake undelivered notice conflicts with delivery turn #{seq}")
+
+      _ ->
+        # There is no lawful transcript to write. The durable carrier and
+        # authorized source projection still expose the incomplete outcome.
+        nil
+    end
   end
 
   defp sender_failure_recipient(creator, _origin) when is_binary(creator), do: creator

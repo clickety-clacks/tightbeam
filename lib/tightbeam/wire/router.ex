@@ -32,6 +32,8 @@ defmodule Tightbeam.Wire.Router do
     the in-memory observation window Artifacts reads for its evidence class.
   - GET  /api/streams          — device auth; owner-only catalog (even admins).
   - POST /api/streams          — spawn verb (displayName + idempotencyKey).
+  - GET  /api/session-message-sequences — roster visibility; all session keys and
+    latest global transcript sequences (0 when empty), sorted by key, unpaged.
   - GET  /api/trackable-sessions — static {sessions: []} (client probe).
   - PATCH  /api/streams/:key   — tune(rename). DELETE /api/streams/:key —
     retire (absent session + idempotencyKey still dispatches; else 404).
@@ -82,6 +84,7 @@ defmodule Tightbeam.Wire.Router do
                  [
                    "assess_attachments",
                    "session-custody-transfer",
+                   "assignment-opener-accept",
                    "fact-demand",
                    "sentinel-demand",
                    "fact-producer-claim",
@@ -602,6 +605,10 @@ defmodule Tightbeam.Wire.Router do
       Map.fetch!(@core_detail_specs, :decision_requests),
       decision_request_id
     )
+  end
+
+  get "/api/session-message-sequences" do
+    session_message_sequences(conn)
   end
 
   get "/api/sessions" do
@@ -1282,6 +1289,20 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp observer_principal, do: %{kind: "observer", id: "observer", is_admin: false}
+
+  defp session_message_sequences(conn) do
+    with {:ok, auth} <- core_detail_auth(conn, "sessions"),
+         {:ok, query} <- observer_read_query(conn, "sessions"),
+         {:ok, principal} <- observer_read_route_principal(auth, query, conn),
+         true <- Enum.all?(Map.keys(query), &(&1 == "asUser")) do
+      json(conn, 200, %{
+        "items" => StateResources.query_session_message_sequences(db(conn), principal)
+      })
+    else
+      false -> error(conn, 400, "invalid_filter")
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
 
   defp session_index(conn) do
     with {:ok, auth} <-
@@ -4697,6 +4718,9 @@ defmodule Tightbeam.Wire.Router do
   # handler reads, so the link silently never landed.
   @param_aliases %{
     "assign" => %{reviews: :reviews_assignment_id},
+    # Rules and obligation facts read assignment_id and work_item_id; the CLI
+    # has always sent operator-ask's link as "assignment".
+    "operator-ask" => %{assignment: :assignment_id, work_item: :work_item_id},
     "tune" => %{
       reasoning_level: :reasoningLevel,
       fast_mode: :fastMode
@@ -4706,11 +4730,11 @@ defmodule Tightbeam.Wire.Router do
   @param_keys %{
     "harklight-send" => ~w(
         harklight_session sender_id title message_type message_kind importance stake by_when reply
-        body choices files vendor_session_id supersedes decision_request_id
+        body choices files answer_ui vendor_session_id supersedes decision_request_id
       )a,
-    "harklight-revise" => ~w(message_id base_revision title body choices clear_choices)a,
-    "harklight-retract" => ~w(message_id)a,
-    "harklight-settle" => ~w(message_id)a,
+    "harklight-revise" => ~w(message_id base_revision title body choices clear_choices handle)a,
+    "harklight-retract" => ~w(message_id handle)a,
+    "harklight-settle" => ~w(message_id op_id)a,
     "harklight-listener-restore" => ~w(handle)a,
     "harklight-follow" => ~w(message_id handle)a,
     "harklight-cover" => ~w(handle)a,
@@ -4804,7 +4828,7 @@ defmodule Tightbeam.Wire.Router do
     "onboard" =>
       ~w(provider phase kind machine lease_id reason source code callback_url owner_user_id)a,
     "operator-ask" =>
-      ~w(assignment assignment_id choices context deadline idempotency_key note options owner_user_id question supersedes work_item_id)a,
+      ~w(assignment assignment_id choices context deadline idempotency_key note options owner_user_id project question supersedes work_item work_item_id)a,
     "operator-rule" => ~w(decision idempotency_key rationale reason request request_id response)a,
     "operator-withdraw" => ~w(idempotency_key reason request request_id)a,
     "register-host" => ~w(adapter_bin_dir base_dir cli_bin name ssh)a,
@@ -4835,6 +4859,7 @@ defmodule Tightbeam.Wire.Router do
     "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
     "session-custody-transfer" =>
       ~w(from_session_key idempotency_key parent_session_key to_session_key)a,
+    "assignment-opener-accept" => ~w(assignment_id to_session_key)a,
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
     "spawn" =>
       ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id owner_user_id)a,

@@ -98,6 +98,11 @@ defmodule Tightbeam.Wire.RequestObservation do
   # Called after Plug's real route match, before auth/dispatch. No concrete URL
   # or parameter is retained in a diagnostic operation label.
   def matched(conn) do
+    case conn.private[:plug_route] do
+      {template, _dispatch} -> RequestContext.caller(conn.method <> " " <> template)
+      _ -> :ok
+    end
+
     case Process.get(@key) do
       nil -> :ok
       observation -> Process.put(@key, %{observation | conn: conn})

@@ -31,6 +31,52 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     %{base_dir: base_dir}
   end
 
+  test "migration publication produces a staleness notice for a session on the prior revision",
+       ctx do
+    init_fixture!(ctx.base_dir)
+    db = start_db!()
+    seed_migration_rows!(db)
+    Tightbeam.Devices.add_user(db, "sample-owner", true)
+    ensure_main_session(db, "sample-owner")
+    prior = Identity.live_revision!(ctx.base_dir)
+    Tightbeam.Org.set_identity_revision(db, "session-fixture", prior)
+    :ok = Tightbeam.AdminProjection.bootstrap_served(db, ctx.base_dir)
+
+    report = RailScopeMigration.run!(ctx.base_dir, db)
+    revision = report["result_revision"]
+    refute revision == prior
+    # Boot's later bootstrap must not hide the migration's publication.
+    :ok = Tightbeam.AdminProjection.bootstrap_served(db, ctx.base_dir)
+
+    {:ok, seq} =
+      Tightbeam.Ledger.enqueue(db, %{
+        session_key: "session-fixture",
+        message_id: "migration-staleness-turn",
+        origin: "user:sample-owner",
+        prompt: "fixture"
+      })
+
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE turns SET status='delivered', startedAt=?2, endedAt=?2 WHERE seq=?1",
+               [seq, now]
+             )
+
+    assert {:scheduled, 1, ^revision} =
+             Tightbeam.Gateway.identity_staleness_alarm_for_test(db, now)
+
+    target = Tightbeam.Org.personal_session_key("sample-owner")
+
+    assert {:ok, [[^target, prompt]]} =
+             DB.query(db, "SELECT sessionKey,prompt FROM wakes WHERE origin='process:tightbeam'")
+
+    assert prompt =~ revision
+    assert :already_notified = Tightbeam.Gateway.identity_staleness_alarm_for_test(db, now)
+  end
+
   @briefing_source "rules/briefings.toml"
   @briefing_namespaced_source "kungfu/harklight-decision-briefings/rules/briefings.toml"
   @briefing_destination "rules/harklight-decision-request-briefing.toml"
@@ -84,7 +130,10 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
         principal: {:session, "briefing-compiler"},
         session_key: "briefing-compiler",
         transport_session_key: "briefing-compiler",
-        params: %{question: "Which option?"}
+        params:
+          Tightbeam.TestSupport.OperatorAskFixture.link(db, "briefing-compiler", %{
+            question: "Which option?"
+          })
       })
 
     assert is_binary(request.id)
@@ -388,6 +437,36 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
       |> String.replace("value = '#{@archetype}'", "value = '#{@kungfu}.#{@archetype}'")
 
     assert File.read!(Path.join(dir, "rules/topology.toml")) == expected
+  end
+
+  test "a learned completion review rail gains its accountable-notice declaration", ctx do
+    init_fixture!(ctx.base_dir)
+    db = start_db!()
+    dir = Path.join(ctx.base_dir, "identity")
+
+    legacy =
+      "priv/kungfu/agentic-engineering/rules/engineering.toml"
+      |> File.read!()
+      |> String.split("\n# Posture gate")
+      |> hd()
+      |> String.replace(~r/^archetypes = .*\n/m, "")
+      |> String.replace("accountable_notice = true\n", "")
+
+    refute legacy =~ "accountable_notice"
+    File.write!(Path.join(dir, "rules/engineering.toml"), legacy)
+    commit_fixture!(dir, "fixture: learned 0.1.16 completion review rail")
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, db)
+
+    migrated = File.read!(Path.join(dir, "rules/engineering.toml"))
+    assert migrated =~ "accountable_notice = true"
+
+    # The migrated copy loads and keeps the rail's behaviour.
+    handlers = Tightbeam.Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+    on_exit(fn -> Tightbeam.Rules.load!("/missing-accountable-notice-reset", []) end)
+
+    assert rules = Tightbeam.Rules.load!(ctx.base_dir, Map.keys(handlers))
+    assert [rule] = Enum.filter(rules, &(&1.short_name == "completion-requires-review"))
+    assert rule.remedy.accountable_notice
   end
 
   test "migrated relearn preserves substrate namesakes and merges org kungfu edits", ctx do

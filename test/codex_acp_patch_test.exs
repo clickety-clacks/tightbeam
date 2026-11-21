@@ -278,13 +278,22 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
         "test -x #{Support.shell_quote(binary)}"
       )
 
+    manifest =
+      Path.join([base, "adapters", "node_modules", Claude.install_package(), "package.json"])
+
+    version_read =
+      Support.catalog_probe_argv(
+        claude_target.host_config.ssh,
+        "cat #{Support.shell_quote(manifest)}"
+      )
+
     patch =
       catch_throw(ClaudeFoldedPrompt.remote(claude_target, binary, "adapters present"))
 
     claude_target = %{
       claude_target
       | sh: fn argv ->
-          assert argv in [check, patch]
+          assert argv in [check, version_read, patch]
           send(parent, {:remote_command, argv})
           script = argv |> Enum.drop(6) |> Enum.join(" ")
           System.cmd("sh", ["-c", script], stderr_to_stdout: true)
@@ -300,7 +309,9 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
       assert_receive {:remote_command, first}
       assert first == check
       assert_receive {:remote_command, second}
-      assert second == patch
+      assert second == version_read
+      assert_receive {:remote_command, third}
+      assert third == patch
       refute_receive {:remote_command, _}
       assert File.read!(bundle) == ClaudeFoldedPrompt.patch(source)
       assert File.stat!(bundle).mode == mode

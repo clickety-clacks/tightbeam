@@ -2502,6 +2502,324 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  # These response shapes are exercised by the adapter's model-invalid-params
+  # and model-refusal fixtures in acp_adapter_test.exs.
+  for {name, reason, diagnostic} <- [
+        {"fresh invalid params", %{"code" => -32_602, "message" => "Invalid params"},
+         %{"phase" => "model", "kind" => "jsonrpc_error"}},
+        {"fresh invalid model option",
+         %{"code" => -32_000, "message" => "Invalid value for config option model"},
+         %{"phase" => "model", "kind" => "jsonrpc_error"}},
+        {"wrapped invalid params",
+         {:model_apply_failed, %{"code" => -32_602, "message" => "Invalid params"}}, nil},
+        {"wrapped invalid model option",
+         {:model_apply_failed,
+          %{"code" => -32_000, "message" => "Invalid value for config option model"}}, nil},
+        {"double quoted model name",
+         %{"code" => -32_603, "message" => ~s(Model "future-model" not found)}, nil},
+        {"typed atom-key model unavailable",
+         %{code: "model_unavailable", message: "Selected configuration rejected"}, nil},
+        {"typed string-key model unavailable",
+         %{"code" => "model_unavailable", "message" => "Selected configuration rejected"}, nil},
+        {"wrapped typed atom-key model unavailable",
+         {:model_apply_failed,
+          %{code: "model_unavailable", message: "Selected configuration rejected"}}, nil},
+        {"wrapped typed string-key model unavailable",
+         {:model_apply_failed,
+          %{"code" => "model_unavailable", "message" => "Selected configuration rejected"}}, nil}
+      ] do
+    test "model selection refusal is not replayed: #{name}", ctx do
+      [failed, _second, healthy] = ctx.sessions
+
+      source =
+        fail_health_turn!(
+          ctx.db,
+          failed.session,
+          "selection-refusal",
+          "original prompt",
+          Tightbeam.ErrorDiagnostic.diagnosed(
+            unquote(Macro.escape(reason)),
+            unquote(Macro.escape(diagnostic))
+          ),
+          stage: :session
+        )
+
+      restore_health_turn!(ctx.db, healthy.session, "selection-restoration")
+
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [
+                 source.message_id
+               ])
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+                 [source.seq]
+               )
+    end
+  end
+
+  for {name, reason} <- [
+        {"model phase", %{code: -32_000, message: "Sign in to continue"}},
+        {"model wrapper",
+         {:model_apply_failed, %{"code" => -32_000, "message" => "Sign in to continue"}}}
+      ] do
+    test "authentication-required response remains recoverable: #{name}", ctx do
+      [failed, _second, healthy] = ctx.sessions
+
+      source =
+        fail_health_turn!(
+          ctx.db,
+          failed.session,
+          "authentication-required",
+          "recover this prompt",
+          Tightbeam.ErrorDiagnostic.diagnosed(
+            unquote(Macro.escape(reason)),
+            %{"phase" => "model", "kind" => "jsonrpc_error"}
+          ),
+          stage: :session
+        )
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+                 [source.seq]
+               )
+
+      restore_health_turn!(ctx.db, healthy.session, "authentication-restoration")
+      restore_health_turn!(ctx.db, healthy.session, "second-authentication-restoration")
+
+      assert {:ok, [[2]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [
+                 source.message_id
+               ])
+    end
+  end
+
+  test "transport and rate limits during model application still recover once", ctx do
+    [failed, _second, healthy] = ctx.sessions
+
+    for {reason, kind} <- [
+          {{:adapter_unavailable, :noproc}, "exit"},
+          {:timeout, "timeout"},
+          {@captured_claude_rate_limit, "jsonrpc_error"},
+          {%{"status" => 429, "message" => "Too many requests"}, "http_response"}
+        ] do
+      message_id = "model-application-outage-#{kind}-#{System.unique_integer([:positive])}"
+
+      source =
+        fail_health_turn!(
+          ctx.db,
+          failed.session,
+          message_id,
+          "recover this prompt",
+          Tightbeam.ErrorDiagnostic.diagnosed(
+            {:model_apply_failed, reason},
+            %{"phase" => "model", "kind" => kind}
+          ),
+          stage: :session
+        )
+
+      restore_health_turn!(ctx.db, healthy.session, "outage-restoration-#{message_id}")
+      restore_health_turn!(ctx.db, healthy.session, "second-restoration-#{message_id}")
+
+      assert {:ok, [[2]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [message_id])
+
+      {:ok, redelivery} = Ledger.claim_next(ctx.db, failed.session, "recovery-test")
+      assert redelivery.message_id == source.message_id
+
+      assert :ok =
+               Ledger.finish(ctx.db, redelivery.seq, "delivered", nil,
+                 owner_lease: redelivery.owner_lease
+               )
+    end
+  end
+
+  test "quoted model-not-found refusal is attempted once after route recovery", ctx do
+    [failed, _second, healthy] = ctx.sessions
+
+    source =
+      fail_health_turn!(
+        ctx.db,
+        failed.session,
+        "quoted-model-refusal",
+        "do not replay this prompt",
+        %{"code" => -32_603, "message" => "Model 'claude-haiku-55' not found"},
+        stage: :session,
+        assignment_id: failed.assignment
+      )
+
+    restore_health_turn!(ctx.db, healthy.session, "quoted-model-restoration")
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [source.message_id])
+  end
+
+  test "pre-request model refusal is not recorded or redelivered after route recovery", ctx do
+    [failed, second, healthy] = ctx.sessions
+
+    sources =
+      for {ref, message_id, reason} <- [
+            {failed, "pi-model-refusal",
+             %{"code" => -32_603, "message" => "pi set_model failed: Model not found"}},
+            {failed, "mapped-model-refusal", {:model_apply_failed, :model_unavailable}},
+            {second, "second-mapped-model-refusal", {:model_apply_failed, :model_unavailable}}
+          ] do
+        fail_health_turn!(
+          ctx.db,
+          ref.session,
+          message_id,
+          "do not replay this prompt",
+          reason,
+          stage: :session,
+          assignment_id: ref.assignment
+        )
+      end
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq IN (?1,?2,?3)",
+               Enum.map(sources, & &1.seq)
+             )
+
+    assert [incident] = HarnessHealth.active(ctx.db)
+    assert incident.failureClass == "model_unavailable"
+    assert incident.repair.action == "tune"
+
+    assert ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "testhost",
+             "model_unavailable"
+           )
+
+    assert HarnessHealth.get(ctx.db, incident.id).observations
+           |> Enum.map(& &1.correlation_id)
+           |> MapSet.new() ==
+             sources
+             |> Enum.drop(1)
+             |> Enum.map(&"harness-turn:#{&1.seq}:model_unavailable")
+             |> MapSet.new()
+
+    _restoration = restore_health_turn!(ctx.db, healthy.session, "pi-route-restoration")
+
+    refute ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "testhost",
+             "model_unavailable"
+           )
+
+    assert {:ok, [[3]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
+                 "('pi-model-refusal','mapped-model-refusal','second-mapped-model-refusal') " <>
+                 "AND status='failed'"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
+                 "('pi-model-refusal','mapped-model-refusal','second-mapped-model-refusal') " <>
+                 "AND status='queued'"
+             )
+  end
+
+  test "closed assignment source is skipped while open assignment recovery proceeds", ctx do
+    [closed, open, healthy] = ctx.sessions
+    auth_refusal = %{"status" => 401, "error" => "unauthorized"}
+
+    closed_source =
+      fail_health_turn!(
+        ctx.db,
+        closed.session,
+        "closed-assignment-source",
+        "closed assignment prompt",
+        auth_refusal,
+        assignment_id: closed.assignment
+      )
+
+    open_source =
+      fail_health_turn!(
+        ctx.db,
+        open.session,
+        "open-assignment-source",
+        "open assignment prompt",
+        auth_refusal,
+        assignment_id: open.assignment
+      )
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 "INSERT INTO assignment_revocations " <>
+                   "(id,assignmentId,revokedAt,revokedBySession,reason) " <>
+                   "VALUES ('rev_health_closed',?1,100,?2,'closed source fixture')",
+                 [closed.assignment, closed.session]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 "INSERT INTO assignment_revocation_generations " <>
+                   "(revocationId,assignmentId,reopeningId) " <>
+                   "VALUES ('rev_health_closed',?1,NULL)",
+                 [closed.assignment]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 "UPDATE assignments SET state='closed',outcome='revoked',closedAt=100," <>
+                   "closedBySession=?2 WHERE id=?1",
+                 [closed.assignment, closed.session]
+               )
+
+               :ok
+             end)
+
+    restoration = restore_health_turn!(ctx.db, healthy.session, "closed-source-restoration")
+
+    assert {:ok, [[nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT restorationTurnSeq,redeliveryTurnSeq FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq=?1",
+               [closed_source.seq]
+             )
+
+    assert {:ok, [[restoration_seq, redelivery_seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT restorationTurnSeq,redeliveryTurnSeq FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq=?1",
+               [open_source.seq]
+             )
+
+    assert restoration_seq == restoration.seq
+    assert is_integer(redelivery_seq)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns " <>
+                 "WHERE messageId='closed-assignment-source' AND status='queued'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns " <>
+                 "WHERE messageId='open-assignment-source' AND status='queued'"
+             )
+  end
+
   test "unclassified and compaction failures redeliver once on same-harness success", ctx do
     [first, second, healthy | _] = ctx.sessions
 
@@ -4629,6 +4947,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
   defp fail_health_turn!(db, session_key, message_id, prompt, reason, opts \\ []) do
     terminal = Keyword.get(opts, :terminal, "failed")
+    failed_stage = Keyword.get(opts, :stage, :prompt)
 
     {:ok, source_seq} =
       Ledger.enqueue(db, %{
@@ -4670,7 +4989,7 @@ defmodule Tightbeam.HarnessHealthTest do
                    txn,
                    session,
                    turn,
-                   :prompt,
+                   failed_stage,
                    reason
                  )
                end
