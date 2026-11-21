@@ -549,6 +549,108 @@ defmodule Tightbeam.HarnessSwitchContextTest do
     assert HarnessHealth.compactor_observation(db, "codex", host, now + 120_001) == nil
   end
 
+  test "a model-named Claude weekly limit steers later switches and fails over without parking Claude" do
+    host = Tightbeam.Placement.local_host_name()
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    catalog = %{
+      "codex" => {[catalog_entry("gpt-6-luna", :openai)], :fresh},
+      "claude" => {[catalog_entry("claude-haiku-5-5", :anthropic)], :fresh}
+    }
+
+    [codex, claude] = Application.fetch_env!(:tightbeam, :harness_switch_context).compactors
+    [row] = codex.source_applicability
+
+    codex = %{
+      codex
+      | source_applicability: [
+          %{row | compactor_input_usd_per_million: 0.6, compactor_output_usd_per_million: 3.0}
+        ]
+    }
+
+    plan =
+      runtime_plan(db, catalog, %{compactors: [claude, codex]}, fn _, _ -> :onboarded end, fn
+        %{model: "claude-haiku-5-5"}, _, _ ->
+          {:error, claude_limit("You have hit your Haiku weekly limit")}
+
+        %{model: "gpt-6-luna"}, _, _ ->
+          refute HarnessProcess.parked?(db, {:claude, "shared", host})
+          refute HarnessHealth.unavailable?(db, "claude", host)
+
+          assert %{model: "claude-haiku-5-5", failure_class: "rate-limit-dead"} =
+                   HarnessHealth.compactor_observation(
+                     db,
+                     "claude",
+                     host,
+                     System.system_time(:millisecond)
+                   )
+
+          {:ok, "summary after model quota", %{}}
+      end)
+
+    assert %{
+             outcome: "compacted",
+             compaction_evidence: %{
+               attempts: [
+                 %{harness: "claude", health: %{status: "recorded"}},
+                 %{harness: "codex"}
+               ]
+             }
+           } = compact_history(plan)
+
+    assert %{
+             compaction_evidence: %{
+               steered_order: [
+                 %{harness: "codex"},
+                 %{harness: "claude", fences: [%{type: "recent_compactor_failure"}]}
+               ],
+               attempts: [%{harness: "codex"}]
+             }
+           } = compact_history(plan)
+  end
+
+  test "only proven Claude account quota opens a shared incident and park" do
+    db = start_supervised!({Tightbeam.DB, path: ":memory:", name: nil})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    for {{reason, account?}, index} <-
+          Enum.with_index([
+            {claude_limit("You've hit your weekly limit"), true},
+            {claude_limit("You've hit your 5-hour limit · resets 4:00pm UTC"), true},
+            {claude_limit("You've hit your usage limit"), true},
+            {claude_limit("You've hit your weekly limit. Model was not changed."), false},
+            {claude_limit("You have hit your weekly limit for Sonnet"), false},
+            {claude_limit("Rate limit exceeded"), false},
+            {%{"code" => 429}, false}
+          ]) do
+      host = "fixture-host-#{index}"
+
+      result =
+        HarnessHealth.observe_compactor_failure(db, %{
+          context_id: "fixture-context-#{index}",
+          harness: "claude",
+          host: host,
+          model: "claude-haiku-5-5",
+          reason: reason,
+          observed_at: System.system_time(:millisecond)
+        })
+
+      if account? do
+        assert %{status: :opened, incident_id: id} = result
+        assert HarnessHealth.get(db, id).failureClass == "rate-limit-dead"
+      else
+        assert %{status: "recorded", failure_class: "rate-limit-dead"} = result
+      end
+
+      assert HarnessProcess.parked?(db, {:claude, "shared", host}) == account?
+      assert HarnessHealth.unavailable?(db, "claude", host) == account?
+    end
+  end
+
+  defp claude_limit(message),
+    do: %{"message" => message, "data" => %{"errorKind" => "rate_limit"}}
+
   test "an otherwise qualified configured Fable or Astra route never runs" do
     [codex, claude] =
       configured_compactors(

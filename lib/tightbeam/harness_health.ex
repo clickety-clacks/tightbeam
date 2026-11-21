@@ -1431,18 +1431,27 @@ defmodule Tightbeam.HarnessHealth do
   defp compactor_failure_class({:adapter_unavailable, _}), do: "adapter_unavailable"
   defp compactor_failure_class(:route_unavailable), do: "adapter_unavailable"
 
+  defp compactor_failure_class(%{"code" => 429}), do: "rate-limit-dead"
+  defp compactor_failure_class(%{code: 429}), do: "rate-limit-dead"
+  defp compactor_failure_class({:http_status, 429}), do: "rate-limit-dead"
   defp compactor_failure_class(reason), do: classify_turn_failure(reason)
 
   defp authoritative_compactor_quota?(harness, reason) do
     authoritative_provider_turn_failure?(%{harness: harness}, reason) or
-      (harness == Tightbeam.Harness.Claude.wire_name() and
-         match?(%{"data" => %{"errorKind" => "rate_limit"}}, reason) and
-         match?(%{"message" => message} when is_binary(message), reason) and
-         Regex.match?(
-           ~r/usage limit|session limit|weekly limit|quota exceeded/i,
-           reason["message"]
-         ))
+      (harness == Tightbeam.Harness.Claude.wire_name() and claude_account_quota?(reason))
   end
+
+  # Match only the provider's model-free account messages and optional reset
+  # suffix. Extra wording can carry model scope even after an account-like prefix.
+  defp claude_account_quota?(%{"data" => %{"errorKind" => "rate_limit"}, "message" => message})
+       when is_binary(message) do
+    Regex.match?(
+      ~r/\Ayou(?:['’]ve| have) hit your (?:weekly|[0-9]+-hour|usage) limit[.!]?(?: · resets (?:[A-Za-z]{3} [0-9]{1,2}(?:,| at)? )?[0-9]{1,2}(?::[0-9]{2})?(?:am|pm) (?:UTC|\([A-Za-z0-9_+\/-]+\)))?\z/iu,
+      String.trim(message)
+    )
+  end
+
+  defp claude_account_quota?(_), do: false
 
   @doc "Resolve one class-specific open incident on normal-turn success."
   @spec resolve(DB.server(), map()) ::
