@@ -27,7 +27,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
   )
   @attest_fields ~w(
     id assignmentId kind verdictKind note bySession byUser producer producerCommand
-    byHarness byProvider commitRefs ts rowVersion
+    byHarness byProvider commitRefs fyi ts rowVersion
   )
   @harness_process_fields ~w(id host harness pid state createdAt resolvedAt)
 
