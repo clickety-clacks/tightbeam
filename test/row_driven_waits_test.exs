@@ -596,6 +596,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: System.system_time(:millisecond),
                  assignment_id: "A",
                  after_turn: true,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -613,6 +614,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: System.system_time(:millisecond),
                  assignment_id: "A",
                  after_turn: true,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -767,6 +769,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       session_key: "holder",
       params: %{
         prompt: "Continue only if still useful.",
+        wait_reason: "Waiting for the resolver",
         after_ms: 60_000,
         assignment_id: "A",
         predicate: predicate("R"),
@@ -774,7 +777,11 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       }
     }
 
+    assert %{code: "missing_reason"} =
+             handler.(update_in(call.params, &Map.delete(&1, :wait_reason)))
+
     response = handler.(call)
+    assert response.wait_reason == "Waiting for the resolver"
     assert response.recognition_path == nil
     refute response.eligible
     assert Wakes.get(ctx.db, response.wake_id).owner_user_id == "owner-a"
@@ -1046,6 +1053,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_after(),
                  assignment_id: "A",
                  predicate: declaration,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1070,6 +1078,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  prompt: "do not persist",
                  assignment_id: "A",
                  predicate: predicate("R"),
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1086,6 +1095,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_after(),
                  assignment_id: "B",
                  predicate: predicate("R"),
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1105,6 +1115,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_after(),
                  assignment_id: "A",
                  predicate: invalid_resolver,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1151,6 +1162,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
       params = %{
         prompt: "Continue the holder's work.",
+        wait_reason: "Waiting on fixture follow-through",
         after_ms: 60_000,
         assignment_id: "A",
         nudge: false
@@ -1221,6 +1233,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       due_at: due_after(),
       assignment_id: "A",
       predicate: predicate("R"),
+      wait_reason: "Waiting on the fixture resolver",
       registrant_session_key: "supervisor",
       owner_user_id: "owner-a"
     }
@@ -1434,6 +1447,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  prompt: "Resume #{assignment_id} exactly.",
                  assignment_id: assignment_id,
                  after_turn: true,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1504,6 +1518,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_at,
                  assignment_id: "A",
                  predicate: predicate,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })

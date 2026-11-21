@@ -2152,6 +2152,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_holder_role_v1(db)
     :ok = Tightbeam.Projection.ensure_submitter_column(db)
     :ok = Tightbeam.RecordEvents.ensure_schema(db)
+    :ok = Tightbeam.HolderProd.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok

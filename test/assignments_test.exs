@@ -6081,13 +6081,28 @@ defmodule Tightbeam.AssignmentsTest do
        ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "fetch me"))
 
-    # `assignment-get` carries every field `assign` returned, plus an empty
-    # `reopenings` and canonical correction lists for a card with no repair history.
-    assert handle(
-             ctx,
-             "assignment-get",
-             assignment_get_call({:session, "other-session"}, assignment.id)
-           ) ==
+    result =
+      handle(
+        ctx,
+        "assignment-get",
+        assignment_get_call({:session, "other-session"}, assignment.id)
+      )
+
+    assert %{
+             holderProd: %{
+               holderSessionKey: "holder",
+               state: "scheduled",
+               quietSince: quiet_since,
+               episodeId: episode,
+               wakeId: nil,
+               repeatNumber: nil
+             }
+           } = result
+
+    assert quiet_since == assignment.openedAt
+    assert is_binary(episode)
+
+    assert Map.delete(result, :holderProd) ==
              assignment
              |> Map.put(:reopenings, [])
              |> Map.put(:commitRefCorrections, [])

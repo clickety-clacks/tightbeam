@@ -684,7 +684,8 @@ defmodule Tightbeam.CliIntegrationTest do
         System.cmd(
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
-            timing_args ++ ["--prompt", prompt],
+            timing_args ++
+            ["--prompt", prompt, "--wait-reason", "Waiting on the fixture checkpoint"],
           cd: ctx.workdir
         )
 
@@ -755,13 +756,34 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assignment = JSON.decode!(assignment_output)["id"]
     future = Integer.to_string(System.system_time(:millisecond) + 3_600_000)
+    reason = "Waiting for the external deadline"
+
+    {refusal, 1} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-holder",
+          "--assignment",
+          assignment,
+          "--after",
+          "1h",
+          "--prompt",
+          "continue the same assignment"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert refusal =~ "Recording a wait requires a nonblank --wait-reason"
 
     for timing <- [["--after", "1h"], ["--at", future]] do
       {output, 0} =
         System.cmd(
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
-            timing ++ ["--prompt", "continue the same assignment"],
+            timing ++ ["--prompt", "continue the same assignment", "--wait-reason", reason],
           cd: ctx.workdir,
           stderr_to_stdout: true
         )
@@ -770,6 +792,7 @@ defmodule Tightbeam.CliIntegrationTest do
       assert wake.assignment_id == assignment
       assert wake.obligation_ref == assignment
       assert wake.creator_session_key == "cli-holder"
+      assert wake.wait_reason == reason
       assert wake.wait_mode == nil
       assert wake.due_at > wake.created_at
 
@@ -985,6 +1008,8 @@ defmodule Tightbeam.CliIntegrationTest do
     fact_wake =
       schedule_assignment_wake.(
         [
+          "--wait-reason",
+          "Waiting for the build",
           "--when-fact",
           "build-finished",
           "--when-scope",
@@ -997,6 +1022,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert fact_wake.condition_kind == "build-finished"
     assert fact_wake.condition_scope == "build-1"
+    assert fact_wake.wait_reason == "Waiting for the build"
 
     {:ok, _} =
       Ledger.enqueue(ctx.db, %{
@@ -1010,13 +1036,19 @@ defmodule Tightbeam.CliIntegrationTest do
 
     after_prompt = "D3 manual: continue the named assignment"
 
-    after_wake = schedule_assignment_wake.(["--after-turn"], after_prompt)
+    after_wake =
+      schedule_assignment_wake.(
+        ["--after-turn", "--wait-reason", "Waiting for this turn to end"],
+        after_prompt
+      )
+
     after_id = after_wake.wake_id
     assert after_wake.assignment_id == assignment
     assert after_wake.obligation_ref == assignment
     assert after_wake.creator_session_key == "cli-holder"
     assert after_wake.originating_turn_seq == turn.seq
     assert after_wake.wait_mode == "after-turn"
+    assert after_wake.wait_reason == "Waiting for this turn to end"
     assert after_wake.prompt == after_prompt
 
     assert {:ok, [[0]]} =
@@ -1034,7 +1066,14 @@ defmodule Tightbeam.CliIntegrationTest do
 
     dependency =
       schedule_assignment_wake.(
-        ["--predicate", JSON.encode!(predicate), "--fallback-after", "1h"],
+        [
+          "--predicate",
+          JSON.encode!(predicate),
+          "--fallback-after",
+          "1h",
+          "--wait-reason",
+          "Waiting for the resolver disposition"
+        ],
         dependency_prompt
       )
 
@@ -1042,6 +1081,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert dependency.assignment_id == assignment
     assert dependency.obligation_ref == assignment
     assert dependency.creator_session_key == "cli-holder"
+    assert dependency.wait_reason == "Waiting for the resolver disposition"
     assert dependency.originating_turn_seq == turn.seq
     assert dependency.verification_assignment_id == nil
     assert dependency.verification_state == nil

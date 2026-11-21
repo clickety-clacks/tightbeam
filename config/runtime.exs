@@ -45,6 +45,20 @@ if config_env() != :test do
     config :tightbeam, :wake_tick_ms, String.to_integer(value)
   end
 
+  if value = System.get_env("TIGHTBEAM_HOLDER_PROD_HOURLY_CAP") do
+    case Integer.parse(value) do
+      {cap, ""} when cap > 0 -> config :tightbeam, :holder_prod_hourly_cap, cap
+      _ -> raise ArgumentError, "TIGHTBEAM_HOLDER_PROD_HOURLY_CAP must be a positive integer"
+    end
+  end
+
+  case System.get_env("TIGHTBEAM_HOLDER_PROD_REPORT_ONLY") do
+    nil -> :ok
+    "false" -> :ok
+    "true" -> config :tightbeam, :holder_prod_report_only, true
+    _ -> raise ArgumentError, "TIGHTBEAM_HOLDER_PROD_REPORT_ONLY must be true or false"
+  end
+
   if value = System.get_env("TIGHTBEAM_PROD_LIMIT") do
     config :tightbeam, :prod_limit, String.to_integer(value)
   end

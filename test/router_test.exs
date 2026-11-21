@@ -3097,10 +3097,15 @@ defmodule Tightbeam.Wire.RouterTest do
       params =
         Router.atomize_params_for_test(
           "wake",
-          Map.merge(wait, %{"assignmentId" => "asg_named", "requestRef" => "dr_forged"})
+          Map.merge(wait, %{
+            "assignmentId" => "asg_named",
+            "requestRef" => "dr_forged",
+            "waitReason" => "Waiting for the fixture"
+          })
         )
 
       assert params.assignment_id == "asg_named"
+      assert params.wait_reason == "Waiting for the fixture"
       refute Map.has_key?(params, :request_ref)
     end
 

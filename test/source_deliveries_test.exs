@@ -177,6 +177,7 @@ defmodule Tightbeam.SourceDeliveriesTest do
     :ok =
       DB.execute(ctx.db, """
       DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
+      DROP INDEX IF EXISTS holder_prod_wake_delivery;
       DROP INDEX wakes_delivered_turn;
       DROP INDEX IF EXISTS wakes_delivered_obligation;
       ALTER TABLE wakes DROP COLUMN deliveredTurnSeq;
