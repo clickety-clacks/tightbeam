@@ -46,7 +46,7 @@ if phase == "conflict" do
         ~w(manifest.toml capabilities.md intake.md preferred-models.md setup.md sentinels/landing-watch) do
     dest = Path.join(source, file)
     File.mkdir_p!(Path.dirname(dest))
-    File.cp!(Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/#{file}"), dest)
+    File.cp!(Path.expand("fixtures/kungfu/agentic-engineering/#{file}", __DIR__), dest)
   end
 
   {:ok, db} = DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])

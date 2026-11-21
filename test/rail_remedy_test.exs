@@ -1755,7 +1755,7 @@ defmodule Tightbeam.RailRemedyTest do
 
   defp load_completion_gate(ctx) do
     shipped =
-      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
       |> Tightbeam.TestRailScopeFixtures.wildcard_substrate(["rule", "policy"])
 
     File.write!(Path.join(ctx.base_dir, "identity/rules/completion.toml"), shipped)

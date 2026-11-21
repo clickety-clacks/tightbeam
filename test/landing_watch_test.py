@@ -15,7 +15,7 @@ import tempfile
 import unittest
 
 
-PROGRAM = Path(__file__).resolve().parents[1] / 'priv/kungfu/agentic-engineering/sentinels/landing-watch'
+PROGRAM = Path(__file__).resolve().parents[1] / 'test/support/fixtures/kungfu/agentic-engineering/sentinels/landing-watch'
 
 
 def load_program():

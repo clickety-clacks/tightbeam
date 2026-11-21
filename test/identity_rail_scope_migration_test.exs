@@ -445,7 +445,7 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     dir = Path.join(ctx.base_dir, "identity")
 
     legacy =
-      "priv/kungfu/agentic-engineering/rules/engineering.toml"
+      "test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml"
       |> File.read!()
       |> String.split("\n# Posture gate")
       |> hd()

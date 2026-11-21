@@ -505,12 +505,12 @@ defmodule Tightbeam.ConformanceSupport do
   defp case_blocker(_phase, fixture), do: fixture["blocking_phase"]
 
   def shipped_statutes(root) do
-    path = Path.expand("../../priv/kungfu/agentic-engineering/rails/engineering.toml", root)
+    path = Path.expand("../../test/support/fixtures/kungfu/agentic-engineering/rails/engineering.toml", root)
     path |> decode_toml!() |> Map.fetch!("statute")
   end
 
   def compiled_shipped_entries(root, harness \\ :codex, seed_files \\ []) do
-    source = Path.expand("../../priv/kungfu/agentic-engineering/rails/engineering.toml", root)
+    source = Path.expand("../../test/support/fixtures/kungfu/agentic-engineering/rails/engineering.toml", root)
     base = temp_dir!("conformance-rails")
     rails_dir = Path.join(base, "identity/rails")
     File.mkdir_p!(rails_dir)

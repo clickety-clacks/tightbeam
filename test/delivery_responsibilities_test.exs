@@ -1197,7 +1197,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     File.mkdir_p!(rules_dir)
 
     File.cp!(
-      Path.expand("../priv/kungfu/agentic-engineering/rules/delivery.toml", __DIR__),
+      Path.expand("support/fixtures/kungfu/agentic-engineering/rules/delivery.toml", __DIR__),
       Path.join(rules_dir, "delivery.toml")
     )
 

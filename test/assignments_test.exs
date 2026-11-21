@@ -7347,7 +7347,7 @@ defmodule Tightbeam.AssignmentsTest do
     File.mkdir_p!(rules_dir)
 
     completion_rules =
-      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
       |> String.split("\n# Posture gate", parts: 2)
       |> hd()
 
@@ -7462,7 +7462,7 @@ defmodule Tightbeam.AssignmentsTest do
     File.mkdir_p!(rules_dir)
 
     completion_rules =
-      File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+      File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
       |> String.split("\n# Posture gate", parts: 2)
       |> hd()
 

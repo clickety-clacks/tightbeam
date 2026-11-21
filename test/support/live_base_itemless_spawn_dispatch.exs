@@ -35,8 +35,12 @@ defmodule ItemlessSpawnDispatchRuntime do
   @staffing_rule "agentic-engineering.engineering-spawn-staffing-needs-work-item"
   @staffing_message "#{@staffing_rule}: Worker staffing requires a known work item. Create or link the work item before retrying."
 
+  # The engineering bundle is no longer shipped; learn it from the test fixture root.
+  @fixture_kungfu Path.expand("fixtures/kungfu", __DIR__)
+
   def run do
     Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: initial_config, base: base} ->
+      Application.put_env(:tightbeam, :kungfu_bundle_root_dir, @fixture_kungfu)
       {:ok, candidate} = Identity.learn!(base, "agentic-engineering", "test")
       {:ok, _revision} = Identity.publish_live!(base, candidate)
 
@@ -186,16 +190,15 @@ defmodule ItemlessSpawnDispatchRuntime do
   defp report_loaded_rule_set!(base) do
     shipped = Application.app_dir(:tightbeam, "priv")
 
-    expected =
-      (Path.wildcard(Path.join([shipped, "seed", "rules", "*.toml"])) ++
-         Path.wildcard(Path.join([shipped, "kungfu", "agentic-engineering", "rules", "*.toml"])))
-      |> Enum.map(fn path ->
-        relative = Path.relative_to(path, shipped)
+    seed =
+      Path.wildcard(Path.join([shipped, "seed", "rules", "*.toml"]))
+      |> Enum.map(&("identity/" <> Path.relative_to(&1, Path.join(shipped, "seed"))))
 
-        String.replace_prefix(relative, "seed/", "identity/")
-        |> String.replace_prefix("kungfu/", "identity/kungfu/")
-      end)
-      |> Enum.sort()
+    engineering =
+      Path.wildcard(Path.join([@fixture_kungfu, "agentic-engineering", "rules", "*.toml"]))
+      |> Enum.map(&("identity/kungfu/" <> Path.relative_to(&1, @fixture_kungfu)))
+
+    expected = Enum.sort(seed ++ engineering)
 
     files =
       (Path.wildcard(Path.join([base, "identity", "rules", "*.toml"])) ++

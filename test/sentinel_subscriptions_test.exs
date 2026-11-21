@@ -718,7 +718,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     assert {:ok, [[3]]} =
              DB.query(ctx.db, "SELECT count(*) FROM sentinel_subscription_wake_matches")
 
-    landing = Path.expand("../priv/kungfu/agentic-engineering/sentinels/landing-watch", __DIR__)
+    landing = Path.expand("support/fixtures/kungfu/agentic-engineering/sentinels/landing-watch", __DIR__)
 
     {output, code} =
       System.cmd("python3", [landing, "--once"],

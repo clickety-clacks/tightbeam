@@ -139,6 +139,19 @@ defmodule Tightbeam.IdentityTest do
 
     assert Identity.available_bundles() == [
              %{
+               name: "uncle-enzo",
+               purpose:
+                 "Run your organization with executives who hold your intent and talk to you, and deliverators who own getting each feature or concern delivered.",
+               phrases: [
+                 "I want one agent to talk to, and I don't want it buried in status traffic.",
+                 "My coordinators spend more time messaging each other than shipping.",
+                 "I want each feature to have one owner who sees it through.",
+                 "I want my agents to coordinate with each other directly."
+               ],
+               root_archetype: "uncle-enzo.exec",
+               primary: true
+             },
+             %{
                name: "agentic-engineering",
                purpose:
                  "Give your organization a disciplined way to turn product ideas and bug reports into shipped software, with tracked work, independent review, and verification.",
@@ -150,33 +163,24 @@ defmodule Tightbeam.IdentityTest do
                  "The same bug keeps coming back and nobody finds the cause.",
                  "I want to know a change was actually tested, not just claimed."
                ],
-               root_archetype: "agentic-engineering.orchestrator"
+               root_archetype: "agentic-engineering.orchestrator",
+               primary: false
              },
              %{
                name: "harklight-decision-briefings",
                purpose:
                  "Route decision requests through a configurable investigator, preserve its Harklight conversation, and reconcile staged catchup without duplicate briefings.",
                phrases: [],
-               root_archetype: "harklight-decision-briefings.orchestrator"
+               root_archetype: "harklight-decision-briefings.orchestrator",
+               primary: false
              },
              %{
                name: "sentinels",
                purpose:
                  "Share generic event subscription tools and a read-only Matrix event watcher.",
                phrases: [],
-               root_archetype: "default"
-             },
-             %{
-               name: "uncle-enzo",
-               purpose:
-                 "Run your organization with executives who hold your intent and talk to you, and deliverators who own getting each feature or concern delivered.",
-               phrases: [
-                 "I want one agent to talk to, and I don't want it buried in status traffic.",
-                 "My coordinators spend more time messaging each other than shipping.",
-                 "I want each feature to have one owner who sees it through.",
-                 "I want my agents to coordinate with each other directly."
-               ],
-               root_archetype: "uncle-enzo.exec"
+               root_archetype: "default",
+               primary: false
              }
            ]
   end
@@ -311,7 +315,7 @@ defmodule Tightbeam.IdentityTest do
     Application.put_env(
       :tightbeam,
       :identity_source_dir,
-      Path.expand("../priv/kungfu/agentic-engineering", __DIR__)
+      Path.expand("support/fixtures/kungfu/agentic-engineering", __DIR__)
     )
 
     assert :initialized = Identity.init!(ctx.base)
@@ -414,7 +418,7 @@ defmodule Tightbeam.IdentityTest do
 
   test "shipped engineering bundle keeps completion review without receipt admission",
        ctx do
-    shipped = Path.expand("priv/kungfu/agentic-engineering")
+    shipped = Path.expand("test/support/fixtures/kungfu/agentic-engineering")
     Application.put_env(:tightbeam, :identity_source_dir, shipped)
     base = Path.join(ctx.root, "shipped-runtime")
 
@@ -1436,7 +1440,7 @@ defmodule Tightbeam.IdentityTest do
 
     for doc <- ~w(capabilities.md intake.md preferred-models.md manifest.toml) do
       File.cp!(
-        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/#{doc}"),
+        Path.expand("test/support/fixtures/kungfu/agentic-engineering/#{doc}"),
         Path.join(source, doc)
       )
     end
@@ -1445,7 +1449,7 @@ defmodule Tightbeam.IdentityTest do
 
     for file <- ~w(setup.md sentinels/landing-watch) do
       File.cp!(
-        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/#{file}"),
+        Path.expand("test/support/fixtures/kungfu/agentic-engineering/#{file}"),
         Path.join(source, file)
       )
     end

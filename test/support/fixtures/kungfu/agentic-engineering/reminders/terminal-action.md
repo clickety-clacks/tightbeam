@@ -1,0 +1,5 @@
+A parent action is still due for child assignment {child_assignment_id} (finish occurrence {source_kind}/{source_token}). Child session {child_session} is {child_session_state}. Your last recorded activity: {your_last_activity}. Child finished: {child_finished}.
+
+If there is work to do, act now. If the work is done, complete the assignment. If truly waiting, wake on the record that will announce it: a child result, decision, PR checks, reply, or fact; use a timed wake only when no record announces it. If a decision is needed, ask for one. Do not file progress unless something materially changed.
+
+Choose keep or retire based on current purpose and obligations, and act within your existing authority. After taking that action, record what you did on an open assignment with this note: completion-handoff-action {child_assignment_id} {source_kind} {source_token} kept|retired: <what you did>. A retired note discharges this reminder only when the child session is actually retired. Report a refusal or failed action truthfully. Notice {notice_id}.

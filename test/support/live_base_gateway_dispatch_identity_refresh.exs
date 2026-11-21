@@ -13,8 +13,13 @@ defmodule GuardDispatchIdentityRefresh do
   alias Tightbeam.{DB, Gateway, Identity, Ledger, Model, NoticeBatcher, Org, Placement, Wakes}
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
 
+  # The engineering bundle is no longer shipped; learn it from the test fixture root.
+  @fixture_kungfu Path.expand("fixtures/kungfu", __DIR__)
+
   def run do
     Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
+      Application.put_env(:tightbeam, :kungfu_bundle_root_dir, @fixture_kungfu)
+
       assert {:ok, candidate} = Identity.learn!(base, "agentic-engineering", "test")
       assert {:ok, _revision} = Identity.publish_live!(base, candidate)
       Tightbeam.Archetypes.load!(base)

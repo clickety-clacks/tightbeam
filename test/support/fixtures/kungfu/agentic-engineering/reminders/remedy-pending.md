@@ -1,0 +1,1 @@
+Remedy {rule} remains pending for {subject}.

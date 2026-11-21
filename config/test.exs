@@ -25,6 +25,13 @@ config :tightbeam, :fixture_harness, true
 config :tightbeam, :test_suite_tmp, suite_tmp
 config :tightbeam, :port, 0
 
+# Shipped bundles plus the agentic-engineering bundle that 0.1.16 and earlier
+# shipped. It is no longer packaged, but organizations that learned it keep it,
+# so tests still learn it from this fixture root.
+config :tightbeam,
+       :kungfu_bundle_root_dir,
+       Path.expand("../test/support/fixtures/kungfu", __DIR__)
+
 # The child lifetime wrapper must be the CLI from this same checkout.
 config :tightbeam, :harklight_child_opts,
   base_dir: Path.join(suite_tmp, "harklight"),

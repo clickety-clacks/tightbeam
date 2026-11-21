@@ -42,7 +42,7 @@ defmodule Tightbeam.Reminders do
 
     :tightbeam
     |> :code.priv_dir()
-    |> Path.join("kungfu/agentic-engineering/reminders/#{kind}.md")
+    |> Path.join("reminders/#{kind}.md")
     |> File.read!()
   end
 

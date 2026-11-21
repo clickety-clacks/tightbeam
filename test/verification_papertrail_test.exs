@@ -2,7 +2,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   # verification-papertrail-v1 acceptance: A1 (remedy wakes name each missing
   # record), A2 (the papertrail stands), A3 (rewakes and escalation on the
   # ladder's terms), A5 (a non-engineering org is never prodded). The shipped
-  # statutes live in priv/kungfu/agentic-engineering/rules/verification.toml and
+  # statutes live in test/support/fixtures/kungfu/agentic-engineering/rules/verification.toml and
   # are exercised here exactly as relearn delivers them.
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
@@ -465,7 +465,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   end
 
   test "learn delivers the verification statutes and they load beside engineering's (§7)", ctx do
-    shipped = File.read!("priv/kungfu/agentic-engineering/rules/verification.toml")
+    shipped = File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/verification.toml")
     learn_engineering_rules!(ctx)
     delivered = delivered_rule_path!(ctx.base_dir, "rules/verification.toml")
 

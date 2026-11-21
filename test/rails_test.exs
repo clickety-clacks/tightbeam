@@ -195,7 +195,7 @@ defmodule Tightbeam.RailsTest do
       "name = \"agentic-engineering\"\npaths = #{inspect(paths)}\n"
     )
 
-    source = Path.expand("../priv/kungfu/agentic-engineering/rails/engineering.toml", __DIR__)
+    source = Path.expand("support/fixtures/kungfu/agentic-engineering/rails/engineering.toml", __DIR__)
     File.cp!(source, Path.join(ctx.rails_dir, "engineering.toml"))
 
     assert statutes = Rails.load!(ctx.base_dir)

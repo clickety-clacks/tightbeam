@@ -469,7 +469,13 @@ defmodule Tightbeam.Identity do
       available_bundles()
       |> Enum.map_join("\n\n", fn bundle ->
         phrases = Enum.map_join(bundle.phrases, "\n", &"- #{&1}")
-        "### `#{bundle.name}`\nPurpose: #{bundle.purpose}\nPhrases:\n#{phrases}"
+
+        primary =
+          if bundle.primary,
+            do: "Primary: when more than one bundle fits the user's goal, offer this one first.\n",
+            else: ""
+
+        "### `#{bundle.name}`\n#{primary}Purpose: #{bundle.purpose}\nPhrases:\n#{phrases}"
       end)
 
     """
@@ -740,22 +746,32 @@ defmodule Tightbeam.Identity do
     require_clean_main!(dir)
     expected_prior = git_output!(dir, ["rev-parse", @live])
 
+    # A path another learned bundle also claims stays; that bundle still owns it.
+    claimed_elsewhere =
+      dir
+      |> learned_bundle_names()
+      |> List.delete(name)
+      |> Enum.flat_map(&read_receipt!(dir, "main", &1).paths)
+      |> MapSet.new()
+
+    removable = Enum.reject(receipt.paths, &MapSet.member?(claimed_elsewhere, &1))
+
     originals =
-      receipt.paths
+      removable
       |> Enum.filter(&File.regular?(Path.join(dir, &1)))
       |> Map.new(fn relative ->
         path = Path.join(dir, relative)
         {relative, File.read!(path)}
       end)
 
-    Enum.each(receipt.paths, &File.rm(Path.join(dir, &1)))
+    Enum.each(removable, &File.rm(Path.join(dir, &1)))
     receipt_path = receipt_path(name)
     receipt_bytes = File.read!(Path.join(dir, receipt_path))
     File.rm!(Path.join(dir, receipt_path))
 
     fingerprint =
       try do
-        remove_empty_parent_dirs!(dir, [receipt_path | receipt.paths])
+        remove_empty_parent_dirs!(dir, [receipt_path | removable])
         validate_candidate_tree!(dir, expected_prior)
       rescue
         error ->
@@ -808,13 +824,17 @@ defmodule Tightbeam.Identity do
     |> Enum.sort()
   end
 
-  @doc "Kungfu bundles shipped with this Tightbeam build and their offer metadata."
+  @doc """
+  Kungfu bundles shipped with this Tightbeam build and their offer metadata, in
+  offer order: a bundle whose manifest sets `primary = true` first, then by name.
+  """
   @spec available_bundles() :: [
           %{
             name: String.t(),
             purpose: String.t(),
             phrases: [String.t()],
-            root_archetype: String.t()
+            root_archetype: String.t(),
+            primary: boolean()
           }
         ]
   def available_bundles do
@@ -830,9 +850,11 @@ defmodule Tightbeam.Identity do
         name: name,
         purpose: manifest.purpose,
         phrases: manifest.phrases,
-        root_archetype: manifest.root_archetype
+        root_archetype: manifest.root_archetype,
+        primary: manifest.primary
       }
     end)
+    |> Enum.sort_by(&{not &1.primary, &1.name})
   end
 
   defp bundle_manifest!(content, path) do
@@ -858,9 +880,16 @@ defmodule Tightbeam.Identity do
           phrases
       end
 
+    primary = Map.get(manifest, "primary", false)
+
+    unless is_boolean(primary) do
+      raise ArgumentError, "kungfu manifest primary must be true or false: #{path}"
+    end
+
     %{
       purpose: purpose,
       phrases: phrases,
+      primary: primary,
       root_archetype: Map.fetch!(manifest, "root_archetype"),
       sentinels: sentinel_declarations!(Map.get(manifest, "sentinels", []), path),
       events: outside_events!(Map.get(manifest, "events", []), path)
@@ -1459,20 +1488,29 @@ defmodule Tightbeam.Identity do
   end
 
   defp import_upstream!(dir, bundle_names, message) do
+    {shipped, retained} = Enum.split_with(bundle_names, &(&1 in available_bundle_names()))
+    retained_files = Enum.flat_map(retained, &retained_bundle_files(dir, &1))
+
+    # Retained files come first, so a shipped bundle's bytes win on a shared path.
     entries =
       seed_entries_for_import(dir) ++
-        Enum.flat_map(bundle_names, fn name ->
+        Enum.map(retained_files, fn {relative, bytes, _executable?} -> {relative, bytes} end) ++
+        Enum.flat_map(shipped, fn name ->
           bundle = bundle_dir(name)
           refuse_seed_owned_bundle_paths!(name, bundle)
           bundle_entries(name, bundle)
         end)
 
     executables =
-      Enum.flat_map(bundle_names, fn name ->
-        name
-        |> bundle_sentinel_commands!(bundle_dir(name))
-        |> Enum.map(&Path.join(["kungfu", name, &1]))
-      end)
+      Enum.flat_map(retained_files, fn
+        {relative, _bytes, true} -> [relative]
+        {_relative, _bytes, false} -> []
+      end) ++
+        Enum.flat_map(shipped, fn name ->
+          name
+          |> bundle_sentinel_commands!(bundle_dir(name))
+          |> Enum.map(&Path.join(["kungfu", name, &1]))
+        end)
 
     git!(dir, ["switch", @upstream])
     replace_with_entries!(dir, entries)
@@ -1480,6 +1518,35 @@ defmodule Tightbeam.Identity do
     git!(dir, ["add", "-A"])
     git!(dir, ["commit", "--allow-empty", "-m", message], "tightbeam")
     git!(dir, ["switch", "main"])
+  end
+
+  # A learned bundle that this build no longer ships keeps the bytes it was last
+  # imported with: its receipt paths as they stand on the upstream branch. The
+  # organization keeps the bundle until it unlearns it, and local edits on main
+  # stay local edits.
+  defp retained_bundle_files(dir, name) do
+    paths = read_receipt!(dir, "main", name).paths
+    retained_upstream_files(dir, paths)
+  end
+
+  defp retained_upstream_files(_dir, []), do: []
+
+  defp retained_upstream_files(dir, paths) do
+    modes =
+      dir
+      |> git_output!(["ls-tree", "-r", @upstream, "--" | paths])
+      |> String.split("\n", trim: true)
+      |> Map.new(fn line ->
+        [meta, path] = String.split(line, "\t", parts: 2)
+        [mode | _] = String.split(meta, " ")
+        {path, mode}
+      end)
+
+    paths
+    |> Enum.filter(&Map.has_key?(modes, &1))
+    |> Enum.map(fn path ->
+      {path, git_show_bytes!(dir, @upstream, path), Map.fetch!(modes, path) == "100755"}
+    end)
   end
 
   defp seed_entries_for_import(dir) do
@@ -1641,7 +1708,10 @@ defmodule Tightbeam.Identity do
   defp refresh_receipts_for_merge!(_dir, _subject), do: :ok
 
   defp refresh_receipts!(dir, names) do
-    Enum.each(names, fn name ->
+    # A retained bundle's receipt stays as it is; there is no shipped source to compare.
+    names
+    |> Enum.filter(&(&1 in available_bundle_names()))
+    |> Enum.each(fn name ->
       write_receipt!(dir, current_bundle_receipt(dir, name))
     end)
   end
@@ -1714,7 +1784,9 @@ defmodule Tightbeam.Identity do
       |> String.split("\n", trim: true)
       |> List.first()
 
-    root != nil and
+    # The mint lists the shipped bundle's files. A build that no longer ships it
+    # leaves those files in place as organization files instead.
+    "agentic-engineering" in available_bundle_names() and root != nil and
       git_output!(dir, ["show", "-s", "--format=%s", root]) ==
         "learn: agentic-engineering" and
       receipt_at(dir, "main", "agentic-engineering") == :error and

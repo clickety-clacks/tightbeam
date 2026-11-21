@@ -145,7 +145,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     delivery_rule = "kungfu/#{kungfu}/rules/delivery.toml"
 
     File.cp!(
-      "priv/kungfu/agentic-engineering/rules/delivery.toml",
+      "test/support/fixtures/kungfu/agentic-engineering/rules/delivery.toml",
       Path.join(kungfu_rules_dir, "delivery.toml")
     )
 
@@ -505,7 +505,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
         # The fixture's rest already carries the posture gate the shipped file
         # ends with; take only the shipped completion rule.
         shipped_completion =
-          File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+          File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
           |> String.split("\n# Posture gate", parts: 2)
           |> hd()
           |> substrate_wildcard_rules()
