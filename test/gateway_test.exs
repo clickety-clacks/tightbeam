@@ -11876,6 +11876,104 @@ defmodule Tightbeam.GatewayTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [message_id])
   end
 
+  test "REST retry of a held REST post keeps one message and reports the carrier turn once it exists",
+       ctx do
+    Roles.create!(ctx.db, "rest-recipient", "flynn", "k1")
+
+    {:appended, current_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        content: "current running work",
+        sender: "session:k1"
+      })
+
+    {:ok, current_seq} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: current_message.id,
+        origin: "session:k1",
+        prompt: "current running work"
+      })
+
+    assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
+             Tightbeam.Ledger.claim_next(ctx.db, "k1", "rest-held-retry-test")
+
+    Wakes.schedule(ctx.db, %{
+      session_key: "k1",
+      target_role: "rest-recipient",
+      origin: "user:flynn",
+      prompt: "earlier source",
+      due_at: 0,
+      class: "blocker"
+    })
+
+    body = %{
+      verb: "post",
+      asUser: "flynn",
+      sessionKey: "k1",
+      params: %{clientMessageId: "c_held", deviceId: "chat_test", content: "held text"}
+    }
+
+    first = rest_post(ctx, "tbc_test", body)
+    assert first.status == 200
+
+    assert %{
+             "result" => %{
+               "outcome" => "recorded",
+               "sessionKey" => "k1",
+               "deviceId" => "chat_test",
+               "clientMessageId" => "c_held",
+               "messageId" => message_id,
+               "turnSeq" => nil
+             }
+           } = JSON.decode!(first.resp_body)
+
+    early_retry = rest_post(ctx, "tbc_test", body)
+    assert early_retry.status == 200
+
+    assert %{
+             "result" => %{
+               "outcome" => "duplicate",
+               "sessionKey" => "k1",
+               "deviceId" => "chat_test",
+               "clientMessageId" => "c_held",
+               "messageId" => ^message_id,
+               "turnSeq" => nil
+             }
+           } = JSON.decode!(early_retry.resp_body)
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId='c_held'")
+
+    assert :ok =
+             Tightbeam.Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
+
+    [carrier_id] =
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000,
+        conn_registry: ctx.registry,
+        lane_manager: ctx.lane
+      )
+
+    assert {:ok, [[carrier_turn_seq]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [carrier_id])
+
+    late_retry = rest_post(ctx, "tbc_test", body)
+
+    assert %{
+             "result" => %{
+               "outcome" => "duplicate",
+               "messageId" => ^message_id,
+               "turnSeq" => ^carrier_turn_seq
+             }
+           } = JSON.decode!(late_retry.resp_body)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [message_id])
+  end
+
   test "REST retry does not pull a staged socket post out of the ready-time batch", ctx do
     Roles.create!(ctx.db, "rest-recipient", "flynn", "k1")
 

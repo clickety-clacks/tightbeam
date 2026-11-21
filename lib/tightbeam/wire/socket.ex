@@ -35,8 +35,8 @@ defmodule Tightbeam.Wire.Socket do
   - Keepalive: WebSock ping/pong with a pong deadline (Process.send_after);
     silence past the deadline closes the socket. Defaults: ping every 30s,
     pong timeout 90s.
-  - Rate limits are GLOBAL per deviceId and live in ConnRegistry (a
-    per-process window would reset on reconnect): typing 2/s, pair 5/min.
+  - Pairing is rate-limited GLOBAL per deviceId in ConnRegistry (a
+    per-process window would reset on reconnect): pair 5/min.
 
   Inbound frames (server.ts message handler, same semantics):
   - pair_request: protocolVersion must be 1; pair via Devices; reply
@@ -48,8 +48,6 @@ defmodule Tightbeam.Wire.Socket do
   - message: id must start with "c_" (else invalid_message); session ownership
     enforced (not_found); then verb "post" through Dispatch. dedupe: :duplicate → ack again;
     :conflict → invalid_message and NO ack.
-  - stream_read: write read state, echo stream_read_state.
-  - typing: rate-limited, otherwise dropped silently (not fanned out in v1).
   - anything else: invalid_message.
   """
 
@@ -212,12 +210,11 @@ defmodule Tightbeam.Wire.Socket do
     push(Payloads.wire_error("auth_failed", "not authenticated"), state)
   end
 
-  defp route(%{"type" => type} = msg, state)
-       when type in ["message", "stream_read", "typing"] do
+  defp route(%{"type" => "message"} = msg, state) do
     if MapSet.member?(state.subscriptions, "chat") do
       route_chat(msg, state)
     else
-      push(Payloads.wire_error("invalid_message", "unsupported type: #{type}"), state)
+      push(Payloads.wire_error("invalid_message", "unsupported type: message"), state)
     end
   end
 
@@ -229,26 +226,6 @@ defmodule Tightbeam.Wire.Socket do
   end
 
   defp route_chat(%{"type" => "message"} = msg, state), do: client_message(msg, state)
-
-  defp route_chat(%{"type" => "stream_read"} = msg, state) do
-    session_key = string(msg["sessionKey"])
-    last = string(msg["lastReadMessageId"])
-    :ok = Projection.set_read_state(db(state), state.user_id, session_key, last)
-    push(Payloads.stream_read_state(session_key, last), state)
-  end
-
-  defp route_chat(%{"type" => "typing"}, state) do
-    _ =
-      ConnRegistry.within_rate_limit(
-        conn_registry(state),
-        state.device_id,
-        :typing,
-        typing_limit(state),
-        1_000
-      )
-
-    {:ok, state}
-  end
 
   defp pair(msg, state) do
     device_id = string(msg["deviceId"])
@@ -314,7 +291,6 @@ defmodule Tightbeam.Wire.Socket do
           replay_truncated: false,
           history_reset: false,
           session_keys: [session.session_key],
-          stream_read_states: %{},
           stream_tail_states: %{},
           features: ["tightbeam"],
           dm_scope: nil
@@ -445,8 +421,6 @@ defmodule Tightbeam.Wire.Socket do
 
     replay = Enum.reverse(reversed)
 
-    read_states = if chat?, do: Projection.read_states(db(state), device.user_id), else: %{}
-
     tail_states =
       Map.new(keys, fn key -> {key, Projection.tail(db(state), key)} end)
       |> Enum.reject(fn {_key, value} -> is_nil(value) end)
@@ -468,7 +442,6 @@ defmodule Tightbeam.Wire.Socket do
         replay_truncated: MapSet.size(pending) > 0,
         history_reset: false,
         session_keys: keys,
-        stream_read_states: read_states,
         stream_tail_states: tail_states,
         features: ["tightbeam"],
         dm_scope: if(device.is_admin, do: "admin", else: nil)
@@ -726,7 +699,6 @@ defmodule Tightbeam.Wire.Socket do
   defp string(value), do: to_string(value)
   defp db(state), do: Map.get(state.deps, :db, Tightbeam.DB)
   defp conn_registry(state), do: Map.get(state.deps, :conn_registry, Tightbeam.ConnRegistry)
-  defp typing_limit(state), do: Map.get(state.deps, :typing_per_sec, 2)
   defp pair_limit(state), do: Map.get(state.deps, :pair_per_min, 5)
   defp cancel_timer(nil), do: :ok
   defp cancel_timer(timer), do: Process.cancel_timer(timer, async: true, info: false)

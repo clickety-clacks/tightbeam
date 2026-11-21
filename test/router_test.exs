@@ -3850,10 +3850,10 @@ defmodule Tightbeam.Wire.RouterTest do
 
     cli_ctx = %{ctx | opts: opts}
 
-    for token <- [ctx.opts[:cli_token], session.cli_token],
-        verb <- ["read-marker-set", "read-marker-clear"] do
+    # An agent session credential never sets a user's read marker.
+    for verb <- ["read-marker-set", "read-marker-clear"] do
       denied =
-        dispatch_cli(cli_ctx, token, %{
+        dispatch_cli(cli_ctx, session.cli_token, %{
           verb: verb,
           asUser: owner,
           params: %{scopeKey: scope_key, marker: 8}
@@ -3862,6 +3862,40 @@ defmodule Tightbeam.Wire.RouterTest do
       assert denied.status == 400
       assert JSON.decode!(denied.resp_body)["error"]["code"] == "invalid_message"
     end
+
+    # The org CLI token must name the user it acts as.
+    unnamed =
+      dispatch_cli(cli_ctx, ctx.opts[:cli_token], %{
+        verb: "read-marker-set",
+        params: %{scopeKey: scope_key, marker: 8}
+      })
+
+    assert unnamed.status >= 400
+    assert get_marker.().status == 200
+    assert JSON.decode!(get_marker.().resp_body)["item"]["marker"] == nil
+
+    # The Chat server's single REST sign-in: the org CLI token plus `asUser`,
+    # with no paired device.
+    org_set =
+      dispatch_cli(cli_ctx, ctx.opts[:cli_token], %{
+        verb: "read-marker-set",
+        asUser: owner,
+        params: %{scopeKey: scope_key, marker: 21}
+      })
+
+    assert org_set.status == 200, org_set.resp_body
+    assert JSON.decode!(org_set.resp_body)["result"]["userId"] == owner
+    assert JSON.decode!(get_marker.().resp_body)["item"]["marker"] == 21
+
+    org_clear =
+      dispatch_cli(cli_ctx, ctx.opts[:cli_token], %{
+        verb: "read-marker-clear",
+        asUser: owner,
+        params: %{scopeKey: scope_key}
+      })
+
+    assert org_clear.status == 200, org_clear.resp_body
+    assert JSON.decode!(get_marker.().resp_body)["item"]["marker"] == nil
   end
 
   test "artifact verbs are agent verbs and recording binds the authenticated session caller",
