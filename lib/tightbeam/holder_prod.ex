@@ -91,8 +91,8 @@ defmodule Tightbeam.HolderProd do
   end
 
   # Ordinary holder activity and the end of a real path start the quiet
-  # interval. The gateway's own notice and the turn it creates never rearm
-  # the same assignment on their own.
+  # interval. A turn carrying only holder prods cannot rearm any quiet
+  # assignment. Mixed batches still count as ordinary holder activity.
   @candidates """
   WITH quiet_starts AS (
     SELECT a.id, a.holderKey, a.workItemId, s.ownerUserId,
@@ -106,9 +106,15 @@ defmodule Tightbeam.HolderProd do
                        WHERE p.assignmentId=a.id AND p.raiserSessionKey=a.holderKey), 0),
              COALESCE((SELECT MAX(t.endedAt) FROM turns t
                        WHERE t.sessionKey=a.holderKey AND (t.startedAt IS NOT NULL OR t.assignmentId=a.id)
-                         AND NOT EXISTS (
-                           SELECT 1 FROM wakes p WHERE p.deliveredTurnSeq=t.seq
-                             AND p.assignmentId=a.id AND substr(p.obligationRef,1,length(?2))=?2
+                         AND (
+                           NOT EXISTS (
+                             SELECT 1 FROM wakes p WHERE p.deliveredTurnSeq=t.seq AND p.digest=0
+                               AND p.origin='process:tightbeam' AND substr(p.obligationRef,1,length(?2))=?2
+                           ) OR EXISTS (
+                             SELECT 1 FROM wakes w WHERE w.deliveredTurnSeq=t.seq AND w.digest=0
+                               AND NOT (w.origin='process:tightbeam'
+                                 AND COALESCE(substr(w.obligationRef,1,length(?2))=?2,0))
+                           )
                          )), 0),
              COALESCE((SELECT MAX(MAX(w.createdAt, COALESCE(w.firedAt,0), COALESCE(w.canceledAt,0)))
                        FROM wakes w WHERE w.sessionKey=a.holderKey

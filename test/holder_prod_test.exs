@@ -23,6 +23,68 @@ defmodule Tightbeam.HolderProdTest do
     def handle_call({:ensure_lane, _session_key}, _from, state), do: {:reply, :ok, state}
   end
 
+  for mixed <- [false, true] do
+    test "staggered assignments #{if mixed, do: "respect mixed batches", else: "ignore prod-only turns"}",
+         ctx do
+      later_id = "asg_later"
+      later_opened = ctx.opened - 60_000
+      first_opened = later_opened - 60_000
+      sql!(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [@assignment, first_opened])
+
+      sql!(
+        ctx.db,
+        """
+        INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt,state)
+        VALUES (?1,'second fixture assignment','holder','other',?2,'open')
+        """,
+        [later_id, later_opened]
+      )
+
+      sweep(ctx.db, first_opened + @quiet)
+      assert [[first_wake, "holder", "pending"]] = notices(ctx.db)
+
+      if unquote(mixed) do
+        Wakes.schedule(ctx.db, %{
+          session_key: "holder",
+          creator_session_key: "other",
+          origin: "session:other",
+          due_at: System.system_time(:millisecond),
+          prompt: "ordinary assignment context",
+          class: "fyi"
+        })
+      end
+
+      start_supervised!({ConnRegistry, name: :holder_prod_test_registry})
+      start_supervised!({LaneStub, :holder_prod_test_lane})
+      scheduler = start_scheduler(ctx.db, false)
+      assert :ok = Wakes.fire_due(scheduler)
+      finished = finish_prod(ctx.db, first_wake)
+
+      if unquote(mixed) do
+        assert %{quietSince: ^finished, wakeId: nil} =
+                 HolderProd.evidence(ctx.db, later_id, "holder")
+
+        sweep(ctx.db, finished + @quiet - 1)
+        assert [[^first_wake, "holder", "fired"]] = notices(ctx.db)
+      else
+        assert %{quietSince: ^later_opened, wakeId: nil} =
+                 HolderProd.evidence(ctx.db, later_id, "holder")
+
+        sweep(ctx.db, later_opened + @quiet)
+
+        assert [[^first_wake, "holder", "fired"], [second_wake, "holder", "pending"]] =
+                 notices(ctx.db)
+
+        assert :ok = Wakes.fire_due(scheduler)
+        later_finished = finish_prod(ctx.db, second_wake)
+        sweep(ctx.db, later_finished + @quiet)
+
+        assert [[^first_wake, "holder", "fired"], [^second_wake, "holder", "fired"]] =
+                 notices(ctx.db)
+      end
+    end
+  end
+
   @quiet 30 * 60 * 1_000
   @assignment "asg_fixture"
 
@@ -197,12 +259,20 @@ defmodule Tightbeam.HolderProdTest do
     """)
   end
 
-  defp start_scheduler(db) do
+  defp finish_prod(db, wake_id) do
+    assert %{state: "fired", delivered_turn_seq: seq} = Wakes.get(db, wake_id)
+    assert {:ok, %{seq: ^seq} = turn} = Ledger.claim_next(db, "holder", "fixture")
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: turn.owner_lease)
+    assert [[ended]] = sql!(db, "SELECT endedAt FROM turns WHERE seq=?1", [seq])
+    ended
+  end
+
+  defp start_scheduler(db, enabled \\ true) do
     start_supervised!(
       {Wakes,
        db: db,
        name: nil,
-       holder_prod: true,
+       holder_prod: enabled,
        deliver: fn _ -> :ok end,
        delivery_opts: [
          conn_registry: :holder_prod_test_registry,
