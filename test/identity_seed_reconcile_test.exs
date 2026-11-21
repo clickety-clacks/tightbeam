@@ -266,7 +266,10 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
        ctx do
     init_shape!(ctx.base, "0.1.15")
     prior = Identity.live_revision!(ctx.base)
-    assert :crash == catch_throw(Identity.reconcile_seed_law!(ctx.base, fn _ -> throw(:crash) end))
+
+    assert :crash ==
+             catch_throw(Identity.reconcile_seed_law!(ctx.base, fn _ -> throw(:crash) end))
+
     committed = git(ctx.dir, ["rev-parse", "main"])
 
     # The ref moved; the file never reached the working tree or index.
@@ -299,7 +302,10 @@ defmodule Tightbeam.Identity.SeedReconcileTest do
 
     assert Identity.live_revision!(ctx.base) == revision
     assert git(ctx.dir, ["diff", "--name-only", prior, revision]) == @notice_path
-    assert git(ctx.dir, ["status", "--porcelain"]) == "A  guidance/staged.md\n?? guidance/local.md"
+
+    assert git(ctx.dir, ["status", "--porcelain"]) ==
+             "A  guidance/staged.md\n?? guidance/local.md"
+
     assert File.read!(Path.join(ctx.dir, "guidance/staged.md")) == "staged draft\n"
     assert File.read!(Path.join(ctx.dir, "guidance/local.md")) == "unstaged draft\n"
     assert loaded?(ctx.base)

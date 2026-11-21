@@ -1551,7 +1551,12 @@ defmodule Tightbeam.Identity do
         blob = Path.join(scratch, "blob-#{i}")
         File.write!(blob, bytes)
         oid = git_env_output!(dir, ["hash-object", "-w", blob], env)
-        git_env_output!(dir, ["update-index", "--add", "--cacheinfo", "100644,#{oid},#{path}"], env)
+
+        git_env_output!(
+          dir,
+          ["update-index", "--add", "--cacheinfo", "100644,#{oid},#{path}"],
+          env
+        )
       end)
 
       tree = git_env_output!(dir, ["write-tree"], env)
