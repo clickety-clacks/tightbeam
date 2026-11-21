@@ -6704,6 +6704,9 @@ defmodule Tightbeam.Schema do
   # later schema pass so a refused R1 stamp leaves the old schema untouched.
   defp bootstrap_module(_db, Tightbeam.HarnessSwitchContext, _current?), do: :ok
 
+  defp bootstrap_module(_db, Tightbeam.HarnessHealth.CompactionObservation, _current?),
+    do: :ok
+
   # Runtime-change storage (0.1.16) has no historical predecessor either; a
   # refused R1 stamp must leave the old schema untouched.
   defp bootstrap_module(_db, Tightbeam.RuntimeChanges, _current?), do: :ok
