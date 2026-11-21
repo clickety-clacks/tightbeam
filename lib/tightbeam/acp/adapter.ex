@@ -127,6 +127,16 @@ defmodule Tightbeam.Acp.Adapter do
   def new_candidate_session(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 30_000)
 
+  @doc "Prepare a temporary summary session with a bounded ACP request budget."
+  def new_compactor_session(adapter, model, cwd, guidance, deadline) do
+    remaining = max(1, deadline - System.monotonic_time(:millisecond))
+
+    case call(adapter, {:new_candidate_session, model, cwd, [], guidance, deadline}, remaining) do
+      {:error, {:adapter_unavailable, "timeout"}} -> {:error, :timeout}
+      reply -> reply
+    end
+  end
+
   # The turn path keeps each failure's diagnostic carrier. The gateway renders
   # `ErrorDiagnostic.classified/1` of it as the text the health and supervision
   # classifiers read, exactly as before diagnostics existed, and records the
@@ -808,6 +818,20 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp session_call(
+         {:new_candidate_session, model, cwd, mcp_servers, guidance, deadline},
+         _from,
+         state
+       ) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining > 0 do
+      new_session_reply(state, model, cwd, mcp_servers, guidance, deadline, :compactor)
+    else
+      {:reply, {:error, :timeout}, state}
+    end
+  end
+
+  defp session_call(
          {:new_session, model, cwd, mcp_servers, guidance, request_timeout},
          _from,
          state
@@ -1075,18 +1099,35 @@ defmodule Tightbeam.Acp.Adapter do
          request_timeout,
          report_cleanup?
        ) do
+    session = %{cwd: cwd}
+
+    session =
+      if report_cleanup? == :compactor,
+        do: Map.put(session, :compactor_model, model),
+        else: session
+
+    create_timeout =
+      if report_cleanup? == :compactor,
+        do: max(1, request_timeout - System.monotonic_time(:millisecond) - 5_000),
+        else: request_timeout
+
     case Conn.request(
            state.conn,
            "session/new",
            %{
              cwd: cwd,
              mcpServers: mcp_servers,
-             _meta: Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
+             _meta: Harness.module!(state.harness).session_config(session, guidance).meta
            },
-           timeout: request_timeout,
+           timeout: create_timeout,
            diagnostic: true
          ) do
       {:ok, %{"sessionId" => sid} = result} when is_binary(sid) ->
+        request_timeout =
+          if report_cleanup? == :compactor,
+            do: max(1, div(request_timeout - System.monotonic_time(:millisecond), 5)),
+            else: request_timeout
+
         # The apply below resolves wire-by-name candidates from the cached
         # option list, so the session/new options must be remembered first.
         state = %{state | context_usage: Map.delete(state.context_usage, sid)}
@@ -1113,7 +1154,7 @@ defmodule Tightbeam.Acp.Adapter do
             state = %{state | config_options: Map.delete(state.config_options, sid)}
 
             if report_cleanup? do
-              cleanup = close_failed_new_session(state, sid)
+              cleanup = close_failed_new_session(state, sid, request_timeout)
               {:reply, {:error, {:session_prepare_failed, error, sid, cleanup}}, state}
             else
               {:reply, {:error, error}, state}
@@ -1128,8 +1169,11 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp close_failed_new_session(state, sid) do
-    case Conn.request(state.conn, "session/close", %{sessionId: sid}, diagnostic: true) do
+  defp close_failed_new_session(state, sid, timeout) do
+    case Conn.request(state.conn, "session/close", %{sessionId: sid},
+           timeout: timeout,
+           diagnostic: true
+         ) do
       {:ok, _result} -> %{status: "verified", reason: nil}
       {:error, reason} -> %{status: "unverified", reason: reason}
     end

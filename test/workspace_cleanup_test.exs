@@ -39,6 +39,8 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       db: db,
       base_dir: base,
       wake_tick_ms: 1_000,
+      workspace_archive_reserve_bytes: 0,
+      workspace_archive_reserve_percent: 0,
       workspace_cleanup_runner: &WorkspaceCleanup.system_runner/3
     }
 
@@ -83,7 +85,8 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     :sys.get_state(worker)
   end
 
-  test "a workspace with no artifacts disappears and completed work is not queued again", ctx do
+  test "a workspace with unrecorded work is archived and completed work is not queued again",
+       ctx do
     File.write!(Path.join(ctx.workspace, "scratch"), "discard")
     retire(ctx)
 
@@ -91,12 +94,17 @@ defmodule Tightbeam.WorkspaceCleanupTest do
              WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
 
     refute File.exists?(ctx.workspace)
+
+    assert %{cleanup: "completed", archive_path: archive} =
+             WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    assert File.read!(Path.join(archive, "scratch")) == "discard"
     assert WorkspaceCleanup.health(ctx.db).count == 0
     assert :ok = Schema.ensure_all(ctx.db)
     assert WorkspaceCleanup.health(ctx.db).count == 0
   end
 
-  test "cleanup ignores unrelated and unplaceable references and archives only declared files",
+  test "cleanup archives unrecorded and declared files without following unrelated references",
        ctx do
     kept = Path.join(ctx.workspace, "reports/kept.md")
     File.mkdir_p!(Path.dirname(kept))
@@ -125,7 +133,9 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert archived.state == "archived"
     assert File.read!(archived.home) == "preserve"
     assert File.ls!(Path.dirname(archived.home)) == ["kept.md"]
-    refute File.exists?(Path.join(Path.dirname(Path.dirname(archived.home)), "scratch"))
+
+    assert File.read!(Path.join(Path.dirname(Path.dirname(archived.home)), "scratch")) ==
+             "discard"
   end
 
   test "configured archive crosses filesystems and resumes after the move before repointing",
@@ -137,6 +147,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
     kept = Path.join(ctx.workspace, "kept")
     File.write!(kept, "preserve across devices")
+    File.write!(Path.join(ctx.workspace, "scratch"), "unrecorded across devices")
     artifact = artifact(ctx, kept)
     retire(ctx)
     # A failed database update must leave the move recoverable on the next attempt.
@@ -159,6 +170,9 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     home = Artifacts.get(ctx.db, artifact.artifact_id).home
     assert String.starts_with?(home, archive <> "/")
     assert File.read!(home) == "preserve across devices"
+    assert File.read!(Path.join(Path.dirname(home), "scratch")) == "unrecorded across devices"
+    assert %{archive_path: location} = WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+    assert location == Path.dirname(home)
 
     if archive_parent == "/dev/shm" do
       assert File.stat!(ctx.base).major_device != File.stat!(archive).major_device
@@ -364,7 +378,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert WorkspaceCleanup.health(ctx.db).count == 0
   end
 
-  test "a missing artifact does not stop deletion of unrelated files", ctx do
+  test "a missing artifact does not stop archiving other files", ctx do
     missing = Path.join(ctx.workspace, "missing")
     artifact(ctx, missing)
     present = Path.join(ctx.workspace, "present")
@@ -380,7 +394,9 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert Enum.any?(blockers, &(&1.reason == "artifact_missing"))
     refute File.exists?(scratch)
     refute File.exists?(ctx.workspace)
-    assert File.read!(Artifacts.get(ctx.db, kept.artifact_id).home) == "keep"
+    archived = Artifacts.get(ctx.db, kept.artifact_id)
+    assert File.read!(archived.home) == "keep"
+    assert File.read!(Path.join(Path.dirname(archived.home), "scratch")) == "discard"
 
     assert %{count: 0, reasons: [%{completed: true, reason: "artifact_missing", count: 1}]} =
              WorkspaceCleanup.health(ctx.db)
@@ -767,8 +783,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
 
   test "all missing artifacts leave no workspace or empty archive", ctx do
     artifact = artifact(ctx, Path.join(ctx.workspace, "nested/lost"))
-    File.mkdir_p!(Path.join(ctx.workspace, "nested"))
-    File.write!(Path.join(ctx.workspace, "scratch"), "discard")
+    File.write!(Path.join(ctx.workspace, ".DS_Store"), "regenerable")
     retire(ctx)
 
     assert %{status: "completed", blockers: [%{reason: "artifact_missing"}]} =
@@ -791,19 +806,33 @@ defmodule Tightbeam.WorkspaceCleanupTest do
              WorkspaceCleanup.health(ctx.db)
   end
 
-  test "removal reports store counts without paths", ctx do
-    for n <- 1..1000, do: File.write!(Path.join(ctx.workspace, "scratch-#{n}"), "discard")
+  test "archive reports store grouped scope totals for unrecorded files", ctx do
+    reports = Path.join(ctx.workspace, "reports")
+    File.mkdir_p!(reports)
+    for n <- 1..1000, do: File.write!(Path.join(reports, "scratch-#{n}"), "keep")
     retire(ctx)
     report = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
     assert report.status == "completed"
-    assert report.removed_count == 1001
+    assert report.removed_count == 0
 
     {:ok, [[stored]]} =
       DB.query(ctx.db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [
         ctx.session.session_key
       ])
 
-    assert JSON.decode!(stored) == %{"removed_count" => 1001, "blockers" => []}
+    assert JSON.decode!(stored) == %{
+             "removed_count" => 0,
+             "blockers" => [],
+             "archive_created" => true,
+             "unrecorded" => [
+               %{
+                 "path" => "reports",
+                 "entries" => 1001,
+                 "bytes" => 4000,
+                 "disposition" => "archive"
+               }
+             ]
+           }
 
     {:ok, [[event]]} =
       DB.query(
@@ -813,6 +842,94 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       )
 
     assert JSON.decode!(event) == JSON.decode!(stored)
+  end
+
+  test "archives unrecorded files and symlinks but leaves generated data out", ctx do
+    project = Path.join(ctx.workspace, "project")
+    File.mkdir_p!(Path.join(project, "target"))
+    File.mkdir_p!(Path.join(project, "empty"))
+    File.write!(Path.join(project, "Cargo.toml"), "[package]")
+    File.write!(Path.join(project, "target/generated"), "cache")
+    File.write!(Path.join(project, "notes.txt"), "notes")
+    File.ln_s!("missing-target", Path.join(project, "link"))
+    File.write!(Path.join(ctx.workspace, ".tightbeam-session"), "synthetic metadata")
+    retire(ctx)
+    key = ctx.session.session_key
+
+    assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+    assert %{archive_path: archive} = WorkspaceCleanup.status(ctx.db, key)
+    assert File.read!(Path.join(archive, "project/notes.txt")) == "notes"
+    assert File.read_link!(Path.join(archive, "project/link")) == "missing-target"
+    assert File.dir?(Path.join(archive, "project/empty"))
+    refute File.dir?(Path.join(archive, "project/target"))
+    refute File.exists?(Path.join(archive, ".tightbeam-session"))
+  end
+
+  for {name, key, value, reason} <- [
+        {"entry limit", :workspace_archive_max_entries, 1, "archive_budget_exceeded"},
+        {"byte limit", :workspace_archive_max_bytes, 3, "archive_budget_exceeded"},
+        {"destination reserve", :workspace_archive_reserve_bytes, 10_000_000_000_000_000,
+         "archive_reserve"}
+      ] do
+    test "#{name} holds each scope and binds acknowledgement to its contents", ctx do
+      dir = Path.join(ctx.workspace, "notes")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "a")
+      File.write!(path, "work")
+      File.write!(Path.join(ctx.workspace, ".DS_Store"), "cache")
+      config = Map.put(ctx.config, unquote(key), unquote(value))
+      key = ctx.session.session_key
+
+      call = fn params ->
+        Gateway.handlers(config)["retire"].(%{
+          origin: "user:owner",
+          principal: {:user, "owner"},
+          session_key: key,
+          params: params
+        })
+      end
+
+      assert %{
+               would_retire: [
+                 %{
+                   archive_path: expected,
+                   unrecorded: [
+                     %{path: "notes", entries: 2, bytes: 4, disposition: "held"}
+                   ]
+                 }
+               ]
+             } = call.(%{dry_run: true})
+
+      assert Org.get(ctx.db, key).state == "active"
+      assert File.read!(path) == "work"
+      assert %{retired_sessions: [%{archive_path: ^expected}]} = call.(%{})
+
+      assert %{status: "incomplete", removed_count: 0} =
+               WorkspaceCleanup.process_session(config, ctx.db, key)
+
+      assert %{
+               held_losses: [%{"detail" => detail}],
+               retired_sessions: [
+                 %{archive_path: ^expected, unrecorded: [%{"entries" => 2, "bytes" => 4}]}
+               ]
+             } = call.(%{})
+
+      assert detail =~ unquote(reason)
+      assert File.exists?(Path.join(ctx.workspace, ".DS_Store"))
+
+      assert %{acknowledged_losses: [_]} = call.(%{acknowledge_loss: true})
+      File.write!(path, "more")
+
+      assert %{status: "incomplete", removed_count: 0} =
+               WorkspaceCleanup.process_session(config, ctx.db, key)
+
+      assert File.read!(path) == "more"
+
+      assert %{acknowledged_losses: [_]} = call.(%{acknowledge_loss: true})
+      assert %{status: "completed"} = WorkspaceCleanup.process_session(config, ctx.db, key)
+      assert %{retired_sessions: [%{archive_path: nil, cleanup: "completed"}]} = call.(%{})
+      refute File.exists?(ctx.workspace)
+    end
   end
 
   test "repeated failures grow the retry interval and doctor groups reasons", ctx do

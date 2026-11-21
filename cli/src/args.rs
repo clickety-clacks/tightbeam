@@ -1070,11 +1070,15 @@ COMMANDS:
       Removing a retired session's workspace is held while it holds git work no durable
       remote has: commits on no remote ref (a remote whose URL is inside the workdir does not
       count), stashes, uncommitted or untracked changes, in work trees and bare repositories.
-      Other files that are not recorded artifacts are NOT held: they are deleted, so record
-      them first (artifact-record --content-base64, about 100 KB per argument) or copy them to
-      shared storage. Run `retire --session <key>` again on the retired session to list what is
-      held (held_losses); push, capture or copy it, or pass --acknowledge-loss to let the cleanup
-      delete exactly that listed state (new work added later is held again).
+      The Git scan uses locally fetched remote-tracking refs. Run git fetch --prune first: missing
+      refs can cause a hold, and stale refs can hide work after remote deletion or rewriting.
+      Create a branch or tag for any reflog-only commit you want reviewed by the scan.
+      Unrecorded work outside Git is archived within the configured limits and free-space
+      reserve. Regenerable caches and build outputs can be removed. Over-budget work stays
+      in place, with held paths, counts, and sizes. The result gives each session's archive
+      location. Run `retire --session <key>` again to read the held state. Preserve it with
+      artifact-record or a copy to shared storage, or pass --acknowledge-loss to accept
+      removal of the listed contents. Changed work holds again.
 
   tune --session <key> (--harness <harness> [--model <model>] |
        --model <model> | --effort <level> | --fast on|off | --host <host>)

@@ -12,7 +12,16 @@ defmodule Tightbeam.HarnessSwitchContext do
   attributed transcript suffix until a supported evidence path exists.
   """
 
-  alias Tightbeam.{DB, Harness, Model, ModelCatalog}
+  alias Tightbeam.{
+    Credentials,
+    DB,
+    Harness,
+    HarnessHealth,
+    Model,
+    ModelCatalog,
+    Placement
+  }
+
   alias Tightbeam.DB.Txn
 
   @table "harness_switch_contexts"
@@ -307,6 +316,7 @@ defmodule Tightbeam.HarnessSwitchContext do
           {fallback, ids} =
             fallback_section(snapshot, entries, all_ids, budget.available_history_tokens, reason)
 
+          reason = if ids == [], do: fallback_without_excerpt(reason), else: reason
           {fallback, "fallback", evidence, reason, ids}
       end
 
@@ -348,8 +358,8 @@ defmodule Tightbeam.HarnessSwitchContext do
       serialized_context_bytes_upper: budget.serialized_context_bytes_upper,
       included_message_ids: included_ids,
       omitted_message_ids: ids_not_in(all_ids, included_ids),
-      compactor_model: compaction_evidence && compaction_evidence.model,
-      compactor_usage: compaction_evidence && compaction_evidence.usage,
+      compactor_model: compaction_evidence && Map.get(compaction_evidence, :model),
+      compactor_usage: compaction_evidence && Map.get(compaction_evidence, :usage),
       compaction_evidence: compaction_evidence,
       fallback_reason: fallback_reason,
       compaction: compaction_evidence
@@ -397,7 +407,7 @@ defmodule Tightbeam.HarnessSwitchContext do
                 context.destination_payload_evidence
               )
 
-            compactor = compactor_for_switch(config, session)
+            compactor = compactor_plan(db, config, session)
 
             result =
               build_handoff(
@@ -775,29 +785,118 @@ defmodule Tightbeam.HarnessSwitchContext do
     %{status: "unverified", estimator: @token_estimator, available_history_tokens: nil}
   end
 
-  defp compact_or_fallback(historical, snapshot, entries, all_ids, available, budget, compactor) do
-    with {:ok, source_evidence} <- compactor_eligible(compactor, snapshot),
-         {:ok, compactor_input_capacity} <- compactor_input_capacity(compactor),
-         :ok <-
-           if(byte_size(historical) <= compactor_input_capacity,
-             do: :ok,
-             else: {:error, :input_exceeds_compactor_capacity}
-           ),
-         {:ok, generated, usage} <- call_compactor(compactor, historical),
+  defp compact_or_fallback(historical, snapshot, entries, all_ids, available, budget, plan) do
+    plan = normalize_compactor_plan(plan)
+
+    {eligible, unavailable} =
+      Enum.reduce(plan.routes, {[], []}, fn route, {eligible, unavailable} ->
+        case qualify_compactor(route, historical, snapshot, plan) do
+          {:ok, route} ->
+            {[route | eligible], unavailable}
+
+          {:error, reason} ->
+            {eligible, [attempt_label(route, fallback_reason(reason)) | unavailable]}
+        end
+      end)
+
+    base =
+      eligible
+      |> Enum.reverse()
+      |> Enum.sort_by(& &1.price)
+      |> Enum.uniq_by(& &1.harness)
+      |> Enum.map(fn route ->
+        Map.put(route, :fences, plan.fences.(snapshot, route))
+      end)
+
+    {unfenced, fenced} = Enum.split_with(base, &(&1.fences == []))
+    ordered = unfenced ++ fenced
+
+    evidence = %{
+      base_order: Enum.map(base, &route_evidence/1),
+      steered_order: Enum.map(ordered, &route_evidence/1),
+      unavailable: Enum.reverse(unavailable)
+    }
+
+    {result, attempts} =
+      Enum.reduce_while(ordered, {nil, []}, fn route, {nil, attempts} ->
+        case compact(historical, snapshot, entries, all_ids, available, budget, route) do
+          {:ok, text, summary} ->
+            {:halt, {{text, summary}, [attempt_label(route, "summary produced") | attempts]}}
+
+          {:error, reason} ->
+            attempt =
+              route
+              |> attempt_label(fallback_reason(reason))
+              |> Map.put(:health, plan.failure.(snapshot, route, reason))
+
+            {:cont, {nil, [attempt | attempts]}}
+        end
+      end)
+
+    attempts = Enum.reverse(attempts)
+    evidence = Map.put(evidence, :attempts, attempts)
+
+    case result do
+      {text, summary} -> {:compacted, text, Map.merge(evidence, summary)}
+      nil -> {:fallback, excerpt_reason(attempts), evidence}
+    end
+  end
+
+  defp qualify_compactor(route, input, snapshot, plan) do
+    with {:ok, source} <- compactor_eligible(route, snapshot),
+         {:ok, route} <- plan.resolve.(route),
+         {:ok, capacity} <- compactor_input_capacity(route),
+         true <- byte_size(input) <= capacity do
+      input_rate = numeric_rate(get(source, :compactor_input_usd_per_million))
+      output_rate = numeric_rate(get(source, :compactor_output_usd_per_million))
+      price = input_rate * byte_size(input) + output_rate * get(route, :max_output_tokens)
+
+      {:ok, Map.merge(route, %{source_evidence: source, input_capacity: capacity, price: price})}
+    else
+      false -> {:error, :input_exceeds_compactor_capacity}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp route_evidence(route) do
+    %{harness: route.harness.wire_name(), model: route.model, fences: route.fences}
+  end
+
+  defp attempt_label(route, reason) do
+    harness = registered_compactor_harness(route)
+
+    %{
+      harness: if(harness, do: harness.wire_name(), else: "unknown"),
+      model: get(route, :model),
+      reason: reason
+    }
+  end
+
+  defp excerpt_reason([]) do
+    "Compaction could not start because no qualified harness was available. " <>
+      "Using the available transcript excerpt. Retrieve the full history from the source transcript"
+  end
+
+  defp excerpt_reason(attempts) do
+    failures = Enum.map_join(attempts, ", ", &"#{&1.harness} (#{&1.reason})")
+
+    "Compaction failed on every available harness: #{failures}. " <>
+      "Using the available transcript excerpt. Retrieve the full history from the source transcript"
+  end
+
+  defp compact(historical, snapshot, entries, all_ids, available, budget, compactor) do
+    with {:ok, generated, usage} <- call_compactor(compactor, historical),
          :ok <- valid_compactor_output(generated),
          generated_text <- generated_section(snapshot, generated, entries, all_ids, compactor),
-         :ok <-
-           if(byte_size(generated_text) <= available,
-             do: :ok,
-             else: {:error, :compacted_output_over_budget}
-           ) do
-      {:compacted, generated_text,
+         true <- byte_size(generated_text) <= available do
+      {:ok, generated_text,
        %{
-         route: Atom.to_string(get(compactor, :route)),
-         model: get(compactor, :model),
+         harness: compactor.harness.wire_name(),
+         route: Atom.to_string(compactor.route),
+         model: compactor.model,
          usage: usage,
-         source_applicability: source_evidence,
-         input_capacity_upper: compactor_input_capacity,
+         source_applicability: compactor.source_evidence,
+         input_capacity_upper: compactor.input_capacity,
          configured_context_tokens: get(compactor, :context_tokens),
          configured_output_reserve_tokens: get(compactor, :max_output_tokens),
          configured_protocol_overhead_bytes_upper: get(compactor, :protocol_overhead_bytes_upper),
@@ -810,13 +909,14 @@ defmodule Tightbeam.HarnessSwitchContext do
          capacity_evidence: budget
        }}
     else
-      {:error, reason} -> {:fallback, "compactor #{fallback_reason(reason)}", nil}
-      _ -> {:fallback, "compactor result was unusable", nil}
+      false -> {:error, :compacted_output_over_budget}
+      {:error, _} = error -> error
+      _ -> {:error, :incomplete_or_unusable_response}
     end
   rescue
-    _error -> {:fallback, "compactor failed", nil}
+    _error -> {:error, :request_failed}
   catch
-    :exit, _reason -> {:fallback, "compactor failed", nil}
+    :exit, _reason -> {:error, :request_failed}
   end
 
   defp valid_compactor_output(value) when is_binary(value) do
@@ -839,11 +939,14 @@ defmodule Tightbeam.HarnessSwitchContext do
       end)
 
     cond do
-      get(compactor, :route) != :codex_acp or is_nil(registered_compactor_harness(compactor)) ->
+      not supported_compactor_route?(compactor) ->
         {:error, :route_not_supported}
 
       not is_binary(model) ->
         {:error, :route_not_configured}
+
+      Regex.match?(~r/(?:^|[-_])(?:fable|astra)(?:$|[-_0-9.\[])/i, model) ->
+        {:error, :model_not_permitted}
 
       is_nil(row) ->
         {:error, :source_price_not_applicable}
@@ -869,27 +972,39 @@ defmodule Tightbeam.HarnessSwitchContext do
 
       true ->
         {:ok,
-         Map.take(row, [
-           :source_model,
-           :source_model_contexts,
-           :compactor_model,
-           :source_context_tier,
-           :compactor_context_tier,
-           :source_processing_tier,
-           :compactor_processing_tier,
-           :source_input_usd_per_million,
-           :source_output_usd_per_million,
-           :compactor_input_usd_per_million,
-           :compactor_output_usd_per_million,
-           :source_price_url,
-           :compactor_price_url,
-           :price_unit,
-           :checked_on
-         ])}
+         Map.new(
+           [
+             :source_model,
+             :source_model_contexts,
+             :compactor_model,
+             :source_context_tier,
+             :compactor_context_tier,
+             :source_processing_tier,
+             :compactor_processing_tier,
+             :source_input_usd_per_million,
+             :source_output_usd_per_million,
+             :compactor_input_usd_per_million,
+             :compactor_output_usd_per_million,
+             :source_price_url,
+             :compactor_price_url,
+             :price_unit,
+             :checked_on
+           ],
+           &{&1, get(row, &1)}
+         )}
     end
   end
 
   defp compactor_eligible(_compactor, _snapshot), do: {:error, :route_not_configured}
+
+  @doc false
+  def supported_compactor_route?(compactor) do
+    case {get(compactor, :route), registered_compactor_harness(compactor)} do
+      {:codex_acp, Harness.Codex} -> true
+      {:acp, harness} when not is_nil(harness) -> true
+      _ -> false
+    end
+  end
 
   defp registered_compactor_harness(compactor) do
     configured = get(compactor, :harness)
@@ -997,8 +1112,12 @@ defmodule Tightbeam.HarnessSwitchContext do
 
   defp historical_section(snapshot, entries, omitted_ids, fallback_reason) do
     status =
-      "Summary unavailable: #{snapshot.summary_reason || @summary_reason}. " <>
-        "No structured current-work record was available at this source boundary.\n"
+      if fallback_reason do
+        "Summary unavailable.\n"
+      else
+        "Summary unavailable: #{snapshot.summary_reason || @summary_reason}. " <>
+          "No structured current-work record was available at this source boundary.\n"
+      end
 
     fallback = if fallback_reason, do: "Fallback reason: #{fallback_reason}.\n", else: ""
 
@@ -1035,6 +1154,9 @@ defmodule Tightbeam.HarnessSwitchContext do
 
     included_ids = Enum.map(selected, & &1.id)
     omitted_ids = ids_not_in(all_ids, included_ids)
+
+    reason = if selected == [], do: fallback_without_excerpt(reason), else: reason
+
     section = historical_section(snapshot, selected, omitted_ids, reason)
 
     if byte_size(section) <= available do
@@ -1047,15 +1169,26 @@ defmodule Tightbeam.HarnessSwitchContext do
   defp fallback_section(snapshot, _entries, _all_ids, _available, reason),
     do: {minimal_notice(snapshot, reason), []}
 
+  defp fallback_without_excerpt(reason) do
+    String.replace(
+      reason,
+      "Using the available transcript excerpt.",
+      "There is no room to carry a transcript excerpt."
+    )
+  end
+
   defp fit_minimal_notice(snapshot, reason, available) do
     candidates = [
+      reason <>
+        ". Retrieve transcript #{snapshot.session_key}; snapshot #{snapshot.context_id}.\n",
+      reason <> ".\n",
       minimal_notice(snapshot, reason),
       "History omitted; retrieve transcript #{snapshot.session_key}; snapshot #{snapshot.context_id}.\n",
       "History omitted; retrieve transcript #{snapshot.session_key}.\n",
       "History omitted.\n"
     ]
 
-    limit = min(available, @minimal_notice_limit)
+    limit = available
     Enum.find(candidates, "", &(byte_size(&1) <= limit))
   end
 
@@ -1263,7 +1396,7 @@ defmodule Tightbeam.HarnessSwitchContext do
   end
 
   @doc false
-  def compactor_for_switch(config, session) do
+  def compactor_plan(db, config, session) do
     settings =
       get(
         config,
@@ -1271,43 +1404,124 @@ defmodule Tightbeam.HarnessSwitchContext do
         Application.get_env(:tightbeam, :harness_switch_context, %{})
       )
 
-    case get(settings, :compactor) do
-      compactor when is_map(compactor) ->
-        compactor
-        |> put_compactor_catalog_capacity(config, session)
-        |> attach_gateway_call(config)
+    routes =
+      case get(settings, :compactor, get(settings, :compactors)) do
+        routes when is_list(routes) -> Enum.filter(routes, &is_map/1)
+        route when is_map(route) -> [route]
+        _ -> []
+      end
 
-      _ ->
-        nil
+    %{
+      routes: routes,
+      resolve: fn route -> resolve_compactor(route, config, session, db) end,
+      fences: fn snapshot, route -> compactor_fences(db, snapshot, session, route) end,
+      failure: fn snapshot, route, reason ->
+        record_compactor_failure(db, snapshot, session, route, reason)
+      end
+    }
+  end
+
+  defp normalize_compactor_plan(%{routes: _} = plan), do: plan
+
+  defp normalize_compactor_plan(routes) do
+    %{
+      routes: Enum.filter(List.wrap(routes), &is_map/1),
+      resolve: &{:ok, &1},
+      fences: fn _snapshot, _route -> [] end,
+      failure: fn _snapshot, _route, _reason -> nil end
+    }
+  end
+
+  defp resolve_compactor(route, config, session, db) do
+    harness = registered_compactor_harness(route)
+
+    model =
+      Model.new(get(route, :model), effort: get(route, :effort), context: get(route, :context))
+
+    catalog = get(config, :model_catalog, ModelCatalog)
+    host = session.host
+    credential_status = get(config, :harness_switch_credential_status, &compactor_credential/2)
+
+    with :ok <- compactor_placement(config, db, host, harness),
+         {:ok, selection} <- ModelCatalog.route(host, harness.wire_name(), model, catalog),
+         :onboarded <- credential_status.(host, selection.entry.provider),
+         limit when is_integer(limit) and limit > 0 <- positive_input_limit(selection.entry) do
+      {:ok,
+       route
+       |> Map.put(:context_tokens, limit)
+       |> Map.put(:route, get(route, :route))
+       |> Map.put(:harness, harness)
+       |> Map.put(:model, model.family)
+       |> Map.put(:effort, model.effort)
+       |> Map.put(:context, model.context)
+       |> attach_gateway_call(config)}
+    else
+      {:error, :placement_unavailable} = error -> error
+      {:error, _} -> {:error, :catalog_route_unavailable}
+      nil -> {:error, :capacity_unknown}
+      _ -> {:error, :credential_unavailable}
     end
   end
 
-  defp put_compactor_catalog_capacity(compactor, config, session) do
-    model =
-      case get(compactor, :model) do
-        value when is_binary(value) ->
-          Model.new(value,
-            effort: get(compactor, :effort),
-            context: get(compactor, :context)
-          )
+  defp compactor_placement(config, db, host, harness) do
+    hosts = Placement.hosts(config.base_dir, db)
 
-        _ ->
-          nil
+    if Map.has_key?(hosts, host) and
+         (harness.id() != :cursor or host == Placement.local_host_name()),
+       do: :ok,
+       else: {:error, :placement_unavailable}
+  end
+
+  defp compactor_credential(host, provider) do
+    server = Credentials.server(host)
+
+    if GenServer.whereis(server), do: Credentials.status(provider, server), else: :unavailable
+  catch
+    :exit, _reason -> :unavailable
+  end
+
+  defp compactor_fences(db, _snapshot, session, route) do
+    harness = route.harness.wire_name()
+
+    standing =
+      case HarnessHealth.Hold.for_host(db, harness, session.host) do
+        %{} = hold ->
+          [Map.take(hold, [:incident_id, :failure_class, :since]) |> Map.put(:type, "park")]
+
+        nil ->
+          if HarnessHealth.unavailable?(db, harness, session.host),
+            do: [%{type: "health_incident"}],
+            else: []
       end
 
-    capacity =
-      with harness when not is_nil(harness) <- registered_compactor_harness(compactor),
-           %Model{} = model <- model,
-           catalog = get(config, :model_catalog, ModelCatalog),
-           entry when is_map(entry) <-
-             catalog_entry(session.host, harness.wire_name(), model, catalog, config),
-           limit when is_integer(limit) and limit > 0 <- positive_input_limit(entry) do
-        limit
-      else
-        _ -> nil
-      end
+    recent =
+      HarnessHealth.compactor_observation(
+        db,
+        harness,
+        session.host,
+        System.system_time(:millisecond)
+      )
 
-    Map.put(compactor, :context_tokens, capacity)
+    standing ++ List.wrap(recent)
+  rescue
+    _error -> []
+  catch
+    :exit, _reason -> []
+  end
+
+  defp record_compactor_failure(db, snapshot, session, route, reason) do
+    HarnessHealth.observe_compactor_failure(db, %{
+      context_id: snapshot.context_id,
+      harness: route.harness.wire_name(),
+      host: session.host,
+      model: Model.to_ref(Model.new(route.model, context: get(route, :context))),
+      reason: reason,
+      observed_at: System.system_time(:millisecond)
+    })
+  rescue
+    _error -> %{status: "record_failed"}
+  catch
+    :exit, _reason -> %{status: "record_failed"}
   end
 
   defp attach_gateway_call(compactor, config) do
@@ -1387,8 +1601,20 @@ defmodule Tightbeam.HarnessSwitchContext do
   defp fallback_reason(:capacity_unknown), do: "route capacity is unverified"
   defp fallback_reason({:http_status, status}), do: "returned HTTP #{status}"
   defp fallback_reason(:timeout), do: "request timed out"
+  defp fallback_reason({:park_fenced, _}), do: "adapter checkout was refused by an active park"
 
-  defp fallback_reason({:timeout_cleanup_failed, _cancel_result, _close_result}),
+  defp fallback_reason({:session_create_failed, reason}),
+    do: "session creation failed (" <> fallback_reason(reason) <> ")"
+
+  defp fallback_reason({:session_close_failed, reason}),
+    do: "session cleanup failed (" <> fallback_reason(reason) <> ")"
+
+  defp fallback_reason({:prompt_failed, reason}), do: fallback_reason(reason)
+  defp fallback_reason({:diagnosed, reason, _}), do: fallback_reason(reason)
+  defp fallback_reason({:session_prepare_failed, reason, _, _}), do: fallback_reason(reason)
+  defp fallback_reason({:adapter_unavailable, _}), do: "adapter was unavailable"
+
+  defp fallback_reason({:timeout_cleanup_failed, _close_result}),
     do: "request timed out and temporary session cleanup failed"
 
   defp fallback_reason(:request_failed), do: "request failed"
@@ -1407,5 +1633,14 @@ defmodule Tightbeam.HarnessSwitchContext do
     do: "output did not fit destination allowance"
 
   defp fallback_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
-  defp fallback_reason(_reason), do: "compactor failed"
+
+  defp fallback_reason(reason) do
+    case Tightbeam.HarnessHealth.classify_turn_failure(reason) do
+      "rate-limit-dead" -> "provider quota or rate limit exhausted"
+      "auth-dead" -> "provider refused authentication"
+      "adapter_unavailable" -> "adapter was unavailable"
+      "model_unavailable" -> "configured model was unavailable"
+      _ -> "request failed"
+    end
+  end
 end
