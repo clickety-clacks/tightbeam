@@ -24,7 +24,15 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{ArtifactContent, ArtifactOrigins, DB, ErrorDiagnostic, TurnObservations}
+  alias Tightbeam.{
+    ArtifactContent,
+    ArtifactCustody,
+    ArtifactOrigins,
+    DB,
+    ErrorDiagnostic,
+    TurnObservations
+  }
+
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -219,7 +227,7 @@ defmodule Tightbeam.Artifacts do
     case Txn.q(
            txn,
            """
-           SELECT #{selected}, f.rowVersion FROM artifacts a
+           SELECT #{selected}, #{ArtifactCustody.column("a")}, f.rowVersion FROM artifacts a
            LEFT JOIN artifact_version_floors f ON f.artifactId=a.artifactId
            WHERE a.artifactId=?1
            """,
@@ -242,7 +250,7 @@ defmodule Tightbeam.Artifacts do
     SELECT a.artifactId, a.kind, a.title, a.description, a.createdBySession,
            a.createdByProcess, a.workItemId, a.parentSession, a.originPath, a.contentSha256,
            a.recordedMessageId, a.recordedTurnEvidence, a.state, a.home,
-           a.createdAt, a.updatedAt, f.rowVersion
+           a.createdAt, a.updatedAt, #{ArtifactCustody.column("a")}, f.rowVersion
     FROM artifacts AS a
     LEFT JOIN work_items AS wi ON wi.id = a.workItemId
     LEFT JOIN artifact_version_floors AS f ON f.artifactId = a.artifactId
@@ -305,6 +313,7 @@ defmodule Tightbeam.Artifacts do
          home,
          created_at,
          updated_at,
+         custody,
          row_version
        ]) do
     artifact([
@@ -326,7 +335,8 @@ defmodule Tightbeam.Artifacts do
       created_at,
       updated_at,
       nil,
-      nil
+      nil,
+      custody
     ])
     |> Map.put(:row_version, row_version)
   end
@@ -345,9 +355,15 @@ defmodule Tightbeam.Artifacts do
   @spec record(DB.server(), map()) :: map()
   def record(db \\ Tightbeam.DB, call) do
     with :ok <- valid_record_shape(call.params) do
-      case captured_input(call.params) do
-        {:ok, digest, bytes} -> record_with_content(db, call, digest, bytes)
-        error -> error
+      case call[:artifact_capture] do
+        %{sha256: digest, custody: status} ->
+          record_with_content(db, call, digest, nil, status)
+
+        nil ->
+          case captured_input(call.params) do
+            {:ok, digest, bytes} -> record_with_content(db, call, digest, bytes, nil)
+            error -> error
+          end
       end
     end
   end
@@ -362,7 +378,7 @@ defmodule Tightbeam.Artifacts do
       message: "artifact-record requires title and originPath"
     }
 
-  defp record_with_content(db, call, digest, captured_bytes) do
+  defp record_with_content(db, call, digest, captured_bytes, custody) do
     case {artifact_creator(call), call[:params][:work_item_id]} do
       {{:ok, session_key, created_by_process}, work_item_id}
       when is_binary(work_item_id) ->
@@ -428,6 +444,8 @@ defmodule Tightbeam.Artifacts do
                        now
                      )
                    end
+
+                   if custody, do: ArtifactCustody.store(txn, artifact_id, custody)
 
                    Publisher.maybe_observed_accepted_in_txn(txn, call)
                    publish_in_txn(txn, "artifact.recorded", artifact_id, call)
@@ -646,14 +664,18 @@ defmodule Tightbeam.Artifacts do
   @doc "Fetch one artifact row, or nil."
   @spec get(DB.server(), String.t()) :: map() | nil
   def get(db \\ Tightbeam.DB, artifact_id) do
-    case DB.query(db, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [artifact_id]) do
+    case DB.query(db, "SELECT #{selected_columns()} FROM artifacts WHERE artifactId = ?1", [
+           artifact_id
+         ]) do
       {:ok, [row]} -> artifact(row)
       {:ok, []} -> nil
     end
   end
 
   defp artifact_in_txn(txn, artifact_id) do
-    case Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId=?1", [artifact_id]) do
+    case Txn.q(txn, "SELECT #{selected_columns()} FROM artifacts WHERE artifactId=?1", [
+           artifact_id
+         ]) do
       [row] -> artifact(row)
     end
   end
@@ -661,7 +683,9 @@ defmodule Tightbeam.Artifacts do
   @doc false
   @spec get_in_txn(Txn.t(), String.t() | nil) :: map() | nil
   def get_in_txn(%Txn{} = txn, artifact_id) do
-    case Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [artifact_id]) do
+    case Txn.q(txn, "SELECT #{selected_columns()} FROM artifacts WHERE artifactId = ?1", [
+           artifact_id
+         ]) do
       [row] -> artifact(row)
       [] -> nil
     end
@@ -705,7 +729,7 @@ defmodule Tightbeam.Artifacts do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT #{columns()} FROM artifacts#{where} ORDER BY createdAt DESC, artifactId DESC",
+        "SELECT #{selected_columns()} FROM artifacts#{where} ORDER BY createdAt DESC, artifactId DESC",
         params
       )
 
@@ -754,7 +778,7 @@ defmodule Tightbeam.Artifacts do
     rows =
       Txn.q(
         txn,
-        "SELECT #{columns()} FROM artifacts WHERE createdBySession=?1 ORDER BY createdAt DESC, artifactId DESC",
+        "SELECT #{selected_columns()} FROM artifacts WHERE createdBySession=?1 ORDER BY createdAt DESC, artifactId DESC",
         [session_key]
       )
       |> Enum.map(&artifact/1)
@@ -869,6 +893,8 @@ defmodule Tightbeam.Artifacts do
   # Declining is safe precisely because custody is keyed on the stored content
   # row and not on `archived`: a row we took no bytes for claims no content and
   # is never refused later. See `Tightbeam.ArtifactContent`.
+  defp custody_bytes(%{custody: _}, _workspace_path, _relative_path), do: nil
+
   defp custody_bytes(row, workspace_path, relative_path) do
     canonical_workspace = canonical_path!(Path.expand(workspace_path))
 
@@ -883,6 +909,28 @@ defmodule Tightbeam.Artifacts do
     else
       _ -> nil
     end
+  end
+
+  def promote_capture(db, id, digest) do
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        case get_in_txn(txn, id) do
+          %{custody: "pinned"} = row ->
+            row
+
+          %{content_sha256: ^digest} ->
+            reserve_version_in_txn(txn, id)
+            :ok = ArtifactCustody.store(txn, id, "pinned")
+            Txn.q(txn, "UPDATE artifacts SET updatedAt=?2 WHERE artifactId=?1", [id, now()])
+            publish_in_txn(txn, "artifact.custody_pinned", id)
+            get_in_txn(txn, id)
+
+          _ ->
+            %{code: "artifact_changed", message: "artifact changed during promotion"}
+        end
+      end)
+
+    result
   end
 
   @doc "Mark an archived artifact as released from Tightbeam custody."
@@ -1093,6 +1141,8 @@ defmodule Tightbeam.Artifacts do
     """
   end
 
+  defp selected_columns, do: columns() <> ", " <> ArtifactCustody.column("artifacts")
+
   defp artifact([
          artifact_id,
          kind,
@@ -1112,9 +1162,10 @@ defmodule Tightbeam.Artifacts do
          created_at,
          updated_at,
          origin_host,
-         origin_workspace
+         origin_workspace,
+         custody
        ]) do
-    %{
+    row = %{
       artifact_id: artifact_id,
       kind: kind,
       title: title,
@@ -1135,6 +1186,8 @@ defmodule Tightbeam.Artifacts do
       created_at: created_at,
       updated_at: updated_at
     }
+
+    if custody, do: Map.put(row, :custody, custody), else: row
   end
 
   if Mix.env() == :test do

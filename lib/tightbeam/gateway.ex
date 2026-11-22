@@ -178,7 +178,16 @@ defmodule Tightbeam.Gateway do
     db = Map.get(config, :db, Tightbeam.DB)
     # The handler and lane closures need the same DB that this composition
     # root admitted. `served_snapshot/4` uses it to read session-scoped state.
-    config = Map.put(config, :db, db)
+    blob_options =
+      Tightbeam.ArtifactBlobStore.options(config.base_dir, config[:artifact_blob_options] || [])
+
+    config =
+      Map.merge(config, %{
+        db: db,
+        artifact_blob_store: Keyword.fetch!(blob_options, :name),
+        artifact_blob_root: Keyword.fetch!(blob_options, :root)
+      })
+
     :ok = DB.assert_base_admitted!(db, config.base_dir)
     Identity.init_after_admission!(config.base_dir, db)
     prod_limit = Map.get(config, :prod_limit, 3)
@@ -288,6 +297,7 @@ defmodule Tightbeam.Gateway do
     router_deps =
       Map.merge(socket_deps, %{
         base_dir: config.base_dir,
+        artifact_blob_store: config.artifact_blob_store,
         cli_token: cli_token,
         diagnostic_scope: config[:diagnostic_scope] || %{},
         session_status: fn session_key -> session_status(session_key, db, config) end,
@@ -335,6 +345,7 @@ defmodule Tightbeam.Gateway do
          {ModelCatalog, base_dir: config.base_dir, db: db},
          {Tightbeam.Retention, db: db},
          {WorkspaceCleanup, config: Map.put(config, :db, db)},
+         {Tightbeam.ArtifactBlobStore, blob_options},
          {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
          {Task, fn -> DB.owed_work(fn -> HarnessHealth.resume_other_routes(db) end) end},
          {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub, db: db},
@@ -1036,10 +1047,20 @@ defmodule Tightbeam.Gateway do
       {"memento-set", []} => fn call -> Tightbeam.Mementos.__handle__(db, "memento-set", call) end,
       {"mementos", []} => fn call -> Tightbeam.Mementos.__handle__(db, "mementos", call) end,
       {"artifact-record", ["artifact.recorded"]} => fn call ->
-        Artifacts.record(db, Map.put(call, :artifact_base_dir, config[:base_dir]))
+        Tightbeam.ArtifactCapture.record(
+          db,
+          Map.put(call, :artifact_base_dir, config[:base_dir]),
+          config
+        )
       end,
       {"artifact-content-fetch", []} => fn call ->
         Tightbeam.ArtifactContent.fetch_call(db, call, config)
+      end,
+      {"artifact-content-capacity", []} => fn _call ->
+        Tightbeam.ArtifactContent.capacity(config)
+      end,
+      {"artifact-content-promote", ["artifact.custody_pinned"]} => fn call ->
+        Tightbeam.ArtifactContent.promote_call(db, call, config)
       end,
       {"workspace-cleanup", []} => fn call ->
         owner = principal_caller(db, call)[:owner_user_id]
@@ -1727,6 +1748,10 @@ defmodule Tightbeam.Gateway do
           "attest",
           call
           |> Map.put(:on_assignment_change, assignment_change)
+          |> Map.put(
+            :artifact_evidence_config,
+            Map.take(config, [:artifact_blob_root, :artifact_archive_inline_limit_bytes])
+          )
           |> Map.put(:wake_scheduler, Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
         )
       end,
