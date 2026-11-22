@@ -234,7 +234,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     turn.seq
   end
 
-  defp fail_assigned_turn!(db, session_key, assignment_id) do
+  defp fail_assigned_turn!(db, session_key, assignment_id, opts \\ []) do
     {:ok, seq} =
       Ledger.enqueue(db, %{
         session_key: session_key,
@@ -247,7 +247,13 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert {:ok, %{seq: ^seq} = turn} = Ledger.claim_next(db, session_key, "assigned-cause")
 
     assert :ok =
-             Ledger.finish(db, seq, "failed", "assigned failure", owner_lease: turn.owner_lease)
+             Ledger.finish(
+               db,
+               seq,
+               "failed",
+               "assigned failure",
+               Keyword.put(opts, :owner_lease, turn.owner_lease)
+             )
 
     seq
   end
@@ -920,6 +926,145 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
     assert Ledger.pending_count(ctx.db, opener.session_key) == 0
     assert Ledger.pending_count(ctx.db, second_opener.session_key) == 0
+  end
+
+  test "a refused multi-assignment carrier wakes each accountable opener once", ctx do
+    busy = hold_recipient!(ctx.db, ctx.holder.session_key)
+    first = session(ctx.db, "first-opener", ctx.main.session_key)
+    second = session(ctx.db, "second-opener", ctx.main.session_key)
+
+    for opener <- [first, second, first] do
+      assignment =
+        Assignments.__handle__(ctx.db, "dispatch", %{
+          verb: "dispatch",
+          origin: "agent:#{opener.session_key}",
+          principal: {:session, opener.session_key},
+          session_key: ctx.holder.session_key,
+          target_role: nil,
+          role_fallback: false,
+          supervision_interval_ms: 1_000,
+          params: %{subject: "carried assignment", brief: "do this work"}
+        })
+
+      assert is_binary(assignment.id)
+    end
+
+    child = session(ctx.db, "decision-child", ctx.holder.session_key)
+
+    {_assignment, blocked} =
+      cannot_proceed_assignment!(
+        ctx,
+        child.session_key,
+        ctx.holder.session_key,
+        "decision carried alongside dispatches"
+      )
+
+    queue_decision_wake!(ctx, blocked.decisionWake)
+    finish_busy_recipient!(ctx.db, busy)
+    [carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "assignment-carrier")
+    assert turn.wake_id == carrier_id
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq])
+
+    assert [%{delivery_wake_id: ^carrier_id}] =
+             NoticeBatcher.source_refs(ctx.db, blocked.decisionWake.wake_id)
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed", "The provider refused the prompt.",
+               owner_lease: turn.owner_lease,
+               work_outcome: :did_not_perform
+             )
+
+    for _ <- 1..2, do: assert(:ok = Bubble.recognize_terminal(ctx.db, turn.seq))
+
+    for opener <- [first, second] do
+      assert [[_seq, cause, _wake, _origin, prompt]] = notice_turn(ctx.db, opener.session_key)
+      assert cause == "bubble:#{turn.seq}"
+      assert prompt =~ "did not perform work"
+      assert undelivered_notices(ctx.db, opener.session_key, turn.seq) == []
+    end
+
+    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+
+    disposer = "session:" <> ctx.holder.session_key
+
+    assert {:ok, [[^disposer]]} =
+             DB.query(ctx.db, "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1", [
+               blocked.cannotProceed.id
+             ])
+  end
+
+  test "exhausting a refusal notice leaves cannot-proceed custody with its disposer", ctx do
+    {assignment, blocked} =
+      cannot_proceed_assignment!(
+        ctx,
+        ctx.holder.session_key,
+        ctx.main.session_key,
+        "refusal leaves disposition with opener"
+      )
+
+    _ = deliver_ready_carriers!(ctx, ctx.main.session_key)
+    assert {:ok, decision} = Ledger.claim_next(ctx.db, ctx.main.session_key, "decision")
+    finish_busy_recipient!(ctx.db, decision)
+
+    cause_seq =
+      fail_assigned_turn!(ctx.db, ctx.holder.session_key, assignment,
+        work_outcome: :did_not_perform
+      )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
+    _ = deliver_ready_carriers!(ctx, ctx.main.session_key)
+    assert {:ok, notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "refusal-notice")
+    cause_ref = "bubble:#{cause_seq}"
+
+    assert [[notice_seq, ^cause_ref, _wake, _origin, _prompt]] =
+             notice_turn(ctx.db, ctx.main.session_key)
+
+    assert notice_seq == notice.seq
+
+    assert :ok =
+             Ledger.finish(ctx.db, notice.seq, "failed", "notice unavailable",
+               owner_lease: notice.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, notice.seq)
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
+
+    disposer = "session:" <> ctx.main.session_key
+
+    assert {:ok, [[^disposer]]} =
+             DB.query(ctx.db, "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1", [
+               blocked.cannotProceed.id
+             ])
+  end
+
+  test "a skipped refusal admission advances the existing Bubble lineage", ctx do
+    assert :appended =
+             Tightbeam.Gateway.deliver_prompt(ctx.holder.session_key, "user:flynn", "do work",
+               db: ctx.db
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "refusal")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed", "The provider refused the prompt.",
+               owner_lease: turn.owner_lease,
+               work_outcome: :did_not_perform
+             )
+
+    supervisor = ctx.supervisor.session_key
+    proxy = start_supervised!({MissingTargetDB, {ctx.db, supervisor, self()}})
+
+    assert :ok = Bubble.recognize_terminal(proxy, turn.seq)
+    assert_receive {:real_missing_target_delivery, ^supervisor}
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+
+    assert notice_turn(ctx.db, supervisor) == []
+    assert [[_seq, cause, _wake, _origin, prompt]] = notice_turn(ctx.db, ctx.main.session_key)
+    assert cause == "bubble:#{turn.seq}"
+    assert prompt =~ "did not perform work"
   end
 
   test "a failed senderless notice to parentless Main surfaces its source once", ctx do

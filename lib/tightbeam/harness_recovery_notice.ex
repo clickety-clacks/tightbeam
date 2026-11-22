@@ -294,8 +294,10 @@ defmodule Tightbeam.HarnessRecoveryNotice do
   end
 
   @doc false
-  def settle_turn_in_txn(%Txn{} = txn, turn_seq, terminal_state, at)
+  def settle_turn_in_txn(%Txn{} = txn, turn_seq, terminal_state, at, opts \\ [])
       when is_integer(turn_seq) and is_binary(terminal_state) and is_integer(at) do
+    prompt_received? = terminal_state == "delivered" or Keyword.get(opts, :prompt_received, false)
+
     attempts =
       Txn.q(
         txn,
@@ -314,7 +316,7 @@ defmodule Tightbeam.HarnessRecoveryNotice do
       )
 
     Enum.each(attempts, fn [hold_id, owner_user_id, attempt, wake_id, _state] ->
-      if terminal_state == "delivered" do
+      if prompt_received? do
         Txn.q(
           txn,
           "UPDATE harness_recovery_notices SET state='delivered',turnSeq=?4,lastOutcome=NULL,canceledBy=NULL,updatedAt=?5 WHERE holdId=?1 AND ownerUserId=?2 AND wakeId=?3 AND state IN ('attempting','awaiting_main')",
@@ -352,7 +354,7 @@ defmodule Tightbeam.HarnessRecoveryNotice do
       end
     end)
 
-    record_late_deliveries_in_txn(txn, turn_seq, terminal_state, at)
+    record_late_deliveries_in_txn(txn, turn_seq, terminal_state, at, prompt_received?)
 
     if terminal_state == "delivered" do
       case Txn.q(
@@ -545,7 +547,7 @@ defmodule Tightbeam.HarnessRecoveryNotice do
     :ok
   end
 
-  defp record_late_deliveries_in_txn(txn, turn_seq, terminal_state, at) do
+  defp record_late_deliveries_in_txn(txn, turn_seq, terminal_state, at, prompt_received?) do
     Txn.q(
       txn,
       """
@@ -585,7 +587,7 @@ defmodule Tightbeam.HarnessRecoveryNotice do
           [hold_id, wake_id, turn_seq]
         ) != []
 
-      if terminal_state == "delivered" and not already_recorded? do
+      if prompt_received? and not already_recorded? do
         record(
           txn,
           "harness_recovery_notice_late_delivery",

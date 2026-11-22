@@ -350,6 +350,7 @@ defmodule Tightbeam.Acp.Adapter do
   @spec prompt(adapter(), String.t(), String.t() | [map()], keyword()) ::
           {:ok,
            %{
+             optional(:work_outcome) => :did_not_perform,
              stop_reason: String.t(),
              text: String.t(),
              messages: [
@@ -1529,6 +1530,7 @@ defmodule Tightbeam.Acp.Adapter do
     state = remember_config_model(state, sid, update)
     state = remember_context_usage(state, sid, update)
     state = record_tool_call(state, sid, update)
+    state = remember_non_refusal_output(state, sid, update)
 
     if update["sessionUpdate"] == "agent_message_chunk" do
       text = get_in(update, ["content", "text"])
@@ -1655,8 +1657,14 @@ defmodule Tightbeam.Acp.Adapter do
     reply =
       case result do
         {:ok, response} ->
-          {:ok,
-           %{stop_reason: response["stopReason"] || "unknown", text: text, messages: messages}}
+          stop_reason = response["stopReason"] || "unknown"
+          reply = %{stop_reason: stop_reason, text: text, messages: messages}
+
+          if stop_reason == "refusal" and is_nil(state.prompts[sid][:non_refusal_output]) do
+            {:ok, Map.put(reply, :work_outcome, :did_not_perform)}
+          else
+            {:ok, reply}
+          end
 
         {:error, reason} ->
           {:error, reason}
@@ -2027,6 +2035,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     case Harness.module!(state.harness).classify_subagent_event(update) do
       {:subagent_start, %{subagent_ref: child_sid}} when is_binary(child_sid) ->
+        state = mark_non_refusal_output(state, root_sid)
         {root_sid, put_in(state.subagent_roots[child_sid], root_sid)}
 
       _other ->
@@ -2133,6 +2142,42 @@ defmodule Tightbeam.Acp.Adapter do
 
       _ ->
         state
+    end
+  end
+
+  defp remember_non_refusal_output(
+         state,
+         sid,
+         %{
+           "sessionUpdate" => "agent_message_chunk",
+           "content" => content
+         } = update
+       )
+       when is_map(content) do
+    if get_in(update, ["_meta", "tightbeam.dev/providerRefusal"]) == true or
+         match?(%{"type" => "text", "text" => ""}, content) do
+      state
+    else
+      mark_non_refusal_output(state, sid)
+    end
+  end
+
+  defp remember_non_refusal_output(state, sid, %{"sessionUpdate" => kind} = update)
+       when kind in ["tool_call", "tool_call_update"] do
+    if Tightbeam.ToolCalls.context_compaction?(update) do
+      state
+    else
+      mark_non_refusal_output(state, Map.get(state.subagent_roots, sid, sid))
+    end
+  end
+
+  defp remember_non_refusal_output(state, _sid, _update), do: state
+
+  defp mark_non_refusal_output(state, sid) do
+    case state.prompts[sid] do
+      nil -> state
+      %{non_refusal_output: true} -> state
+      _prompt -> put_in(state.prompts[sid][:non_refusal_output], true)
     end
   end
 
