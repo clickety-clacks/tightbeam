@@ -8340,7 +8340,10 @@ defmodule Tightbeam.Gateway do
           recurring_wakes:
             db
             |> Tightbeam.CronWake.list_active()
-            |> Enum.filter(&MapSet.member?(keys, &1.session_key)),
+            |> Enum.filter(fn wake ->
+              MapSet.member?(keys, wake.session_key) or Wakes.sent_by?(wake, call[:principal])
+            end)
+            |> Enum.map(&Map.drop(&1, [:origin, :creator_session_key])),
           roles: role_list_result(db).roles,
           archetypes: org_shape.archetypes,
           hosts: org_shape.hosts,

@@ -2169,22 +2169,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     outsider_device(ctx)
     outsider = ensure_main_session(ctx.db, "outsider")
     owner = ctx.admin_session
-    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.opts[:base_dir]})
-    router = Router.init(Keyword.put(ctx.opts, :handlers, handlers))
-
-    dispatch = fn session, request ->
-      response =
-        conn(:post, "/agent/dispatch", JSON.encode!(request))
-        |> put_req_header("authorization", "Bearer #{session.cli_token}")
-        |> put_req_header(
-          "x-tightbeam-cli-version",
-          Tightbeam.CliCompatibility.required_version()
-        )
-        |> Router.call(router)
-
-      assert response.status == 200, response.resp_body
-      JSON.decode!(response.resp_body)["result"]
-    end
+    cli = cli_dispatch(ctx)
+    dispatch = fn session, request -> cli.(session.cli_token, request) end
 
     list = fn session -> dispatch.(session, %{verb: "inspect", params: %{}}) end
 
@@ -2247,6 +2233,44 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     Tightbeam.CronWake.fire_due(ctx.db, next_due)
     assert list.(owner)["wakes"] == after_cancel["wakes"]
     assert list.(owner)["recurringWakes"] == []
+  end
+
+  test "CLI list exposes cross-owner cron roots to the sender and recipient", ctx do
+    outsider_device(ctx)
+    recipient = ensure_main_session(ctx.db, "outsider")
+    cli = cli_dispatch(ctx)
+    inspect_request = %{verb: "inspect", params: %{}}
+    schedule = "*/30 * * * *"
+    recipient_before = cli.(recipient.cli_token, inspect_request)
+
+    for {token, attribution} <- [
+          {ctx.admin_session.cli_token, %{}},
+          {ctx.opts[:cli_token], %{asUser: ctx.admin_session.owner_user_id}}
+        ] do
+      sender = fn request -> cli.(token, Map.merge(request, attribution)) end
+      before = sender.(inspect_request)
+      refute Enum.any?(before["sessions"], &(&1["sessionKey"] == recipient.session_key))
+
+      assert %{"wakeId" => id} =
+               sender.(%{
+                 verb: "wake",
+                 sessionKey: recipient.session_key,
+                 params: %{prompt: "Cross-owner recurring fixture", cron: schedule}
+               })
+
+      sender_list = sender.(inspect_request)
+      recipient_list = cli.(recipient.cli_token, inspect_request)
+      assert [%{"wakeId" => ^id, "schedule" => ^schedule}] = sender_list["recurringWakes"]
+      assert recipient_list["recurringWakes"] == sender_list["recurringWakes"]
+      assert sender_list["wakes"] == before["wakes"]
+      assert recipient_list["wakes"] == recipient_before["wakes"]
+
+      cancel = %{verb: "wake", params: %{cancelWakeId: id}}
+      assert %{"canceled" => false} = cli.(recipient.cli_token, cancel)
+      assert %{"canceled" => true} = sender.(cancel)
+      assert sender.(inspect_request)["recurringWakes"] == []
+      assert cli.(recipient.cli_token, inspect_request)["recurringWakes"] == []
+    end
   end
 
   test "a session whose recorded model left the served catalog reads as recorded", ctx do
@@ -4613,6 +4637,25 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       })
 
     Devices.approve(ctx.db, "outsider-device", "outsider")
+  end
+
+  defp cli_dispatch(ctx) do
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.opts[:base_dir]})
+    router = Router.init(Keyword.put(ctx.opts, :handlers, handlers))
+
+    fn token, request ->
+      response =
+        conn(:post, "/agent/dispatch", JSON.encode!(request))
+        |> put_req_header("authorization", "Bearer #{token}")
+        |> put_req_header(
+          "x-tightbeam-cli-version",
+          Tightbeam.CliCompatibility.required_version()
+        )
+        |> Router.call(router)
+
+      assert response.status == 200, response.resp_body
+      JSON.decode!(response.resp_body)["result"]
+    end
   end
 
   defp decision_kind_rows(ctx) do
