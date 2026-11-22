@@ -106,9 +106,10 @@ defmodule Tightbeam.ConditionFacts do
       kind: kind,
       scope: scope,
       fallback_after: "2h",
-      message: "Wait for this fact with --when-fact #{kind}#{scope_arg} --fallback-after 2h.",
+      message:
+        "Wait for this fact with --when-fact #{kind}#{scope_arg} --fallback-after 2h and a short --wait-reason.",
       example:
-        "tightbeam wake --session <session> --when-fact #{kind}#{scope_arg} --fallback-after 2h --prompt \"re-read the fact\""
+        "tightbeam wake --session <session> --when-fact #{kind}#{scope_arg} --fallback-after 2h --wait-reason \"Waiting for this fact\" --prompt \"re-read the fact\""
     }
   end
 

@@ -635,7 +635,7 @@ defmodule Tightbeam.WakesTest do
     # Count the batcher's own preparation path. Carrier admission keeps its
     # separate, unchanged validation of each included source.
     db_pid = Process.whereis(db)
-    traced = {NoticeBatcher, :prepared_source_in_txn, 2}
+    traced = {NoticeBatcher, :prepared_source_in_txn, 3}
     1 = :erlang.trace_pattern(traced, true, [:local])
     1 = :erlang.trace(db_pid, true, [:call, {:tracer, self()}])
 
@@ -670,7 +670,7 @@ defmodule Tightbeam.WakesTest do
 
   defp collect_prepared_sources(db_pid, acc) do
     receive do
-      {:trace, ^db_pid, :call, {NoticeBatcher, :prepared_source_in_txn, [_txn, wake_id]}} ->
+      {:trace, ^db_pid, :call, {NoticeBatcher, :prepared_source_in_txn, [_txn, wake_id, _at]}} ->
         collect_prepared_sources(db_pid, [wake_id | acc])
     after
       200 -> acc

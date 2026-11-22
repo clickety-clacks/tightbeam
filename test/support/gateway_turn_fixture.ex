@@ -128,6 +128,23 @@ defmodule Tightbeam.GatewayTurnFixture do
       {:reply, :ok, parent}
     end
 
+    def handle_call({:prompt, _sid, "provider refusal fixture", opts}, _from, parent) do
+      :ok = Keyword.fetch!(opts, :trace_dispatch).(4242)
+
+      {:reply,
+       {:ok,
+        %{
+          stop_reason: "refusal",
+          work_outcome: :did_not_perform,
+          text: "The request was declined."
+        }}, parent}
+    end
+
+    def handle_call({:prompt, _sid, "ordinary text fixture", _opts}, _from, parent) do
+      {:reply, {:ok, %{stop_reason: "end_turn", text: "I refuse the premise of the question."}},
+       parent}
+    end
+
     def handle_call({:prompt, _sid, "fail this turn", _opts}, _from, parent),
       do:
         {:reply,

@@ -638,6 +638,7 @@ defmodule Tightbeam.SessionReparentTest do
       prompt: "continue existing assignment",
       assignment_id: "asg_one",
       after_turn: true,
+      wait_reason: "Waiting on the fixture resolver",
       registrant_session_key: "old",
       owner_user_id: "owner"
     }

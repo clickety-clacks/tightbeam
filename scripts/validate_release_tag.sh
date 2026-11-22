@@ -3,11 +3,26 @@ set -eu
 
 tag=${1:-}
 tagged_sha=${2:-}
+mode=${3:-}
 
-[ -n "$tag" ] && [ -n "$tagged_sha" ] || {
-  echo "usage: scripts/validate_release_tag.sh v<major>.<minor>.<patch>+<build> <commit>" >&2
+[ -n "$tag" ] && [ -n "$tagged_sha" ] && [ "$#" -le 3 ] || {
+  echo "usage: scripts/validate_release_tag.sh v<major>.<minor>.<patch>+<build> <commit> [--selected-candidate]" >&2
   exit 2
 }
+
+case "$mode" in
+  "") ;;
+  --selected-candidate)
+    printf '%s\n' "$tagged_sha" | grep -Eq '^[0-9a-f]{40}$' || {
+      echo "release: selected candidate must be an exact lower-case 40-hex SHA" >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo "release: unknown validation mode $mode" >&2
+    exit 2
+    ;;
+esac
 
 printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$' || {
   echo "release: tag must be exactly v<major>.<minor>.<patch>+<build>" >&2
@@ -31,6 +46,17 @@ actual_build=$(git rev-list --count "$tagged_sha")
 }
 
 canonical_ref="refs/heads/main"
+
+if [ "$mode" = --selected-candidate ]; then
+  tracking_ref="refs/remotes/origin/main"
+  git fetch --no-tags origin "+$canonical_ref:$tracking_ref"
+  canonical_sha=$(git rev-parse --verify "$tracking_ref")
+  git merge-base --is-ancestor "$tagged_sha" "$canonical_sha" || {
+    echo "release: selected candidate $tagged_sha is not in canonical $canonical_ref history at $canonical_sha" >&2
+    exit 1
+  }
+  exit 0
+fi
 
 canonical_sha=$(git ls-remote --heads origin "$canonical_ref" | awk 'NR == 1 {print $1}')
 [ -n "$canonical_sha" ] || {

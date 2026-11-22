@@ -84,6 +84,44 @@ defmodule Tightbeam.TurnFailureNoticeTest do
   end
 
   test "health redelivery of a failed batch carrier retains its notice identity", ctx do
+    {first, retried} = claim_health_redelivery!(ctx)
+
+    assert :ok =
+             Ledger.finish(ctx.db, retried.seq, "failed", @limit_429,
+               owner_lease: retried.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, retried.seq)
+    assert [{recipient, prompt}] = notices(ctx.db)
+    assert recipient == ctx.lane.session_key
+    assert prompt =~ "Turn #{first}"
+    assert prompt =~ @limit_429
+  end
+
+  test "a provider refusal after health redelivery has its own opener wake", ctx do
+    {first, retried} = claim_health_redelivery!(ctx)
+
+    assert :ok =
+             Ledger.finish(ctx.db, retried.seq, "failed", "The provider refused the prompt.",
+               owner_lease: retried.owner_lease,
+               work_outcome: :did_not_perform
+             )
+
+    for _ <- 1..2, do: assert(:ok = Bubble.recognize_terminal(ctx.db, retried.seq))
+
+    assert [{recipient, first_prompt}, {recipient, refusal_prompt}] =
+             Enum.sort_by(notices(ctx.db), fn {_recipient, prompt} ->
+               if String.contains?(prompt, "did not perform work"), do: 1, else: 0
+             end)
+
+    assert recipient == ctx.lane.session_key
+    assert first_prompt =~ "Turn #{first}"
+    assert first_prompt =~ @limit_429
+    assert refusal_prompt =~ "Turn #{retried.seq}"
+    assert refusal_prompt =~ "did not perform work"
+  end
+
+  defp claim_health_redelivery!(ctx) do
     wake =
       Wakes.schedule(ctx.db, %{
         session_key: ctx.reviewer.session_key,
@@ -111,15 +149,7 @@ defmodule Tightbeam.TurnFailureNoticeTest do
     assert {:ok, retried} = Ledger.claim_next(ctx.db, ctx.reviewer.session_key, "notice-test")
     assert retried.wake_id == nil
 
-    assert :ok =
-             Ledger.finish(ctx.db, retried.seq, "failed", @limit_429,
-               owner_lease: retried.owner_lease
-             )
-
-    assert :ok = Bubble.recognize_terminal(ctx.db, retried.seq)
-    assert [{recipient, prompt}] = notices(ctx.db)
-    assert recipient == ctx.lane.session_key
-    assert prompt =~ @limit_429
+    {first, retried}
   end
 
   test "a new failed delivery after an earlier one is its own notice", ctx do

@@ -84,6 +84,7 @@ defmodule Tightbeam.Wakes do
           owner_user_id: String.t() | nil,
           obligation_ref: String.t() | nil,
           wait_mode: String.t() | nil,
+          wait_reason: String.t() | nil,
           predicate: map() | nil,
           resolver_kind: String.t() | nil,
           resolver_id: String.t() | nil,
@@ -206,6 +207,10 @@ defmodule Tightbeam.Wakes do
   -- distinction for the deadline's later activity-history lookup.
   CREATE TABLE IF NOT EXISTS wake_activity_exclusions (
     wakeId TEXT PRIMARY KEY
+  );
+  CREATE TABLE IF NOT EXISTS wake_wait_reasons (
+    wakeId TEXT PRIMARY KEY,
+    reason TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS wake_retry_attempts (
     wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
@@ -1104,6 +1109,7 @@ defmodule Tightbeam.Wakes do
   @doc false
   def assignment_closed_in_txn(%Txn{} = txn, assignment_id) do
     Tightbeam.Retirements.blocker_changed_in_txn(txn, "assignment", assignment_id)
+    Tightbeam.HolderProd.cancel_pending_in_txn(txn, assignment_id)
 
     case Txn.q(txn, "SELECT holderKey FROM assignments WHERE id=?1 AND state='closed'", [
            assignment_id
@@ -1615,6 +1621,7 @@ defmodule Tightbeam.Wakes do
       created_at: created_at,
       fired_at: nil,
       delivered_turn_seq: nil,
+      wait_reason: Map.get(input, :wait_reason),
       condition_kind: condition_kind,
       condition_scope: Map.get(input, :condition_scope),
       condition_after_id: condition_after_id,
@@ -1744,6 +1751,13 @@ defmodule Tightbeam.Wakes do
       admit_continuation_in_txn(txn, wake)
     end
 
+    if is_binary(wake.wait_reason) do
+      Txn.q(txn, "INSERT INTO wake_wait_reasons(wakeId,reason) VALUES (?1,?2)", [
+        wake.wake_id,
+        wake.wait_reason
+      ])
+    end
+
     if schedule = Map.get(input, :cron) do
       Txn.q(txn, "INSERT INTO cron_wake_schedules(wakeId,schedule) VALUES(?1,?2)", [
         wake.wake_id,
@@ -1834,6 +1848,7 @@ defmodule Tightbeam.Wakes do
   @spec register_wait_in_txn(Txn.t(), map()) :: wake() | {:error, map()}
   def register_wait_in_txn(%Txn{} = txn, input) do
     with :ok <- validate_wait_input(input),
+         :ok <- Tightbeam.WaitReason.validate(input[:wait_reason], "--wait-reason"),
          {:ok, obligation} <- wait_obligation_in_txn(txn, input),
          :ok <- wait_target_allowed(input, obligation),
          :ok <- recheck_wait_admission_in_txn(txn, input) do
@@ -1900,6 +1915,7 @@ defmodule Tightbeam.Wakes do
             owner_user_id: obligation.owner_user_id,
             obligation_ref: obligation.id,
             wait_mode: "after-turn",
+            wait_reason: input[:wait_reason],
             originating_turn_seq: turn_seq,
             recognition_at: now,
             recognition_path: "after-turn",
@@ -1948,6 +1964,7 @@ defmodule Tightbeam.Wakes do
           owner_user_id: obligation.owner_user_id,
           obligation_ref: obligation.id,
           wait_mode: "dependency",
+          wait_reason: input[:wait_reason],
           predicate: evaluation.canonical,
           resolver_kind: resolver.kind,
           resolver_id: resolver.id,
@@ -2891,6 +2908,13 @@ defmodule Tightbeam.Wakes do
   def row_commit_in_txn(%Txn{} = txn, transitions) do
     transitions = List.wrap(transitions) ++ DB.take_row_commits(txn)
 
+    if Enum.any?(
+         transitions,
+         &(Map.get(&1, :domain) in ["assignment", "turn", "decision_request"])
+       ) do
+      Tightbeam.HolderProd.changed_in_txn(txn)
+    end
+
     if not wait_recognition_ready?(txn) and
          Enum.any?(transitions, &filing_transition?/1) do
       raise RuleEvaluationUnavailable
@@ -3151,7 +3175,7 @@ defmodule Tightbeam.Wakes do
   # never replay the other notices in that batch on the discussion's authority.
   # The existing wake retry lineage supplies persistence and exponential backoff.
   @doc false
-  def preserve_harklight_discussions_in_txn(%Txn{} = txn, turn_seq, terminal) do
+  def preserve_harklight_discussions_in_txn(%Txn{} = txn, turn_seq, terminal, work_outcome) do
     sources =
       Txn.q(
         txn,
@@ -3174,17 +3198,23 @@ defmodule Tightbeam.Wakes do
       )
 
     Enum.each(sources, fn [wake_id, ended_at] ->
-      if terminal == "delivered" do
-        settle_retry_attempt_in_txn(txn, wake_id, turn_seq, "acted", ended_at)
-      else
-        wake = get_in_txn(txn, wake_id)
+      cond do
+        work_outcome == :did_not_perform ->
+          # The provider replied. Close any existing attempt without replaying the prompt.
+          settle_retry_attempt_in_txn(txn, wake_id, turn_seq, "failed", ended_at)
 
-        schedule_retry_in_txn(
-          txn,
-          wake,
-          %{seq: turn_seq, prompt: wake.prompt, ended_at: ended_at},
-          "harklight-discussion-unreceived"
-        )
+        terminal == "delivered" ->
+          settle_retry_attempt_in_txn(txn, wake_id, turn_seq, "acted", ended_at)
+
+        true ->
+          wake = get_in_txn(txn, wake_id)
+
+          schedule_retry_in_txn(
+            txn,
+            wake,
+            %{seq: turn_seq, prompt: wake.prompt, ended_at: ended_at},
+            "harklight-discussion-unreceived"
+          )
       end
     end)
 
@@ -3679,6 +3709,7 @@ defmodule Tightbeam.Wakes do
 
   defp retryable_prompt_wake?(wake, turn) do
     wake.consumer == "prompt" and not wake.digest and
+      not Tightbeam.HolderProd.own_notice?(wake) and
       not String.starts_with?(turn.request_ref || "", "bubble:")
   end
 
@@ -3902,6 +3933,8 @@ defmodule Tightbeam.Wakes do
       wake.wake_id,
       retry_wake_id
     )
+
+    copy_wait_reason_in_txn(txn, wake.wake_id, retry_wake_id)
 
     Tightbeam.QueuedMessageSuppression.copy_prod_request_in_txn(txn, wake.wake_id, retry_wake_id)
 
@@ -4364,6 +4397,7 @@ defmodule Tightbeam.Wakes do
         )
 
         Tightbeam.QueuedMessageSuppression.copy_prod_request_in_txn(txn, wake_id, replacement_id)
+        copy_wait_reason_in_txn(txn, wake_id, replacement_id)
 
         [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
         wake = to_wake(row)
@@ -4533,6 +4567,9 @@ defmodule Tightbeam.Wakes do
       sender_replaced_own_prod?(txn, command, wake) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
+      holder_prod_superseded?(command, wake) ->
+        {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
+
       scheduler_delivery_without_source?(command, wake) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
@@ -4552,6 +4589,19 @@ defmodule Tightbeam.Wakes do
        do: true
 
   defp sender_withdrew_own_notice?(_command), do: false
+
+  defp holder_prod_superseded?(
+         %{
+           requester: %{kind: "process", id: "tightbeam:rail-remedy"},
+           reason_kind: "superseded",
+           causal_source: %{kind: "wake", id: wake_id},
+           outcome: %{kind: "no_replacement"}
+         },
+         %{wake_id: wake_id} = wake
+       ),
+       do: Tightbeam.HolderProd.own_notice?(wake)
+
+  defp holder_prod_superseded?(_command, _wake), do: false
 
   # A sender's prod revision replaces its message, not the assignment or work
   # item mentioned by that message. A closed link must not block withdrawal.
@@ -5517,6 +5567,7 @@ defmodule Tightbeam.Wakes do
       end
 
       publish_change_in_txn(txn, "wake.canceled", wake.wake_id)
+      Tightbeam.HolderProd.changed_in_txn(txn)
       cancellation_result(cancellation)
     else
       false
@@ -5590,6 +5641,7 @@ defmodule Tightbeam.Wakes do
                       w.sessionKey,w.assignmentId
                FROM turns t JOIN wakes w ON w.wakeId=t.wakeId
                WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
+                 AND NOT #{Tightbeam.TurnLifecycle.provider_refusal_sql("t.seq")}
                  AND w.consumer='prompt' AND COALESCE(w.targetGate,1)!=0
                """,
                [seq]
@@ -5686,6 +5738,7 @@ defmodule Tightbeam.Wakes do
            SELECT t.sessionKey,t.assignmentId,t.status,t.error,t.origin,t.prompt FROM turns t
            WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
              AND t.wakeId IS NULL AND t.assignmentId IS NOT NULL
+             AND NOT #{Tightbeam.TurnLifecycle.provider_refusal_sql("t.seq")}
            """,
            [seq]
          ) do
@@ -6769,6 +6822,7 @@ defmodule Tightbeam.Wakes do
       scanned_through: -1,
       batch: Keyword.get(opts, :batch, 100),
       delivery_opts: Keyword.get(opts, :delivery_opts, []),
+      holder_prod: Keyword.get(opts, :holder_prod, false),
       internal_consumers: Keyword.get(opts, :internal_consumers, %{})
     }
 
@@ -6814,6 +6868,11 @@ defmodule Tightbeam.Wakes do
   def handle_cast(:wake_ready, state) do
     {:noreply, queue_due(state)}
   end
+
+  def handle_cast(:holder_prod_changed, %{holder_prod: true} = state),
+    do: {:noreply, arm_due_timer(state)}
+
+  def handle_cast(:holder_prod_changed, state), do: {:noreply, state}
 
   def handle_cast({:schedule_changed, due_at}, state) do
     cond do
@@ -7055,6 +7114,16 @@ defmodule Tightbeam.Wakes do
     Tightbeam.CronWake.fire_due(db, now())
     recognize_due_dependency_waits(db)
     evaluate_conditions(state, :tick)
+
+    if Map.get(state, :holder_prod, false) do
+      case transaction!(db, &Tightbeam.HolderProd.admit_due_in_txn(&1, now(), state.batch)) do
+        {:would_send, count} when count > 0 ->
+          Logger.info("holder_prod_would_send count=#{count}")
+
+        _ ->
+          :ok
+      end
+    end
 
     # E's old generations are historical data, not scheduler input. Retire
     # their pending wake rows without consulting effort_checkin_generations so
@@ -7996,7 +8065,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql(extra_columns \\ "") do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition, deliveredTurnSeq#{extra_columns} FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition, deliveredTurnSeq,(SELECT reason FROM wake_wait_reasons WHERE wakeId=wakes.wakeId)#{extra_columns} FROM wakes"
   end
 
   defp to_wake([
@@ -8050,7 +8119,8 @@ defmodule Tightbeam.Wakes do
          recognition_evidence,
          recognition_disposition,
          recognition_transition,
-         delivered_turn_seq
+         delivered_turn_seq,
+         wait_reason
        ]) do
     %{
       wake_id: wake_id,
@@ -8103,8 +8173,20 @@ defmodule Tightbeam.Wakes do
       recognition_evidence: decode_optional(recognition_evidence),
       recognition_disposition: recognition_disposition,
       recognition_transition: decode_optional(recognition_transition),
-      delivered_turn_seq: delivered_turn_seq
+      delivered_turn_seq: delivered_turn_seq,
+      wait_reason: wait_reason
     }
+  end
+
+  defp copy_wait_reason_in_txn(txn, source, replacement) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO wake_wait_reasons(wakeId,reason)
+      SELECT ?2, reason FROM wake_wait_reasons WHERE wakeId=?1
+      """,
+      [source, replacement]
+    )
   end
 
   defp encode_optional(nil), do: nil
@@ -8188,7 +8270,18 @@ defmodule Tightbeam.Wakes do
       |> Enum.map(&max(&1, pass_at || 0))
       |> Enum.min(fn -> nil end)
 
-    due_at = [next, retry_at] |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
+    holder_prod_at =
+      if Map.get(state, :holder_prod, false) do
+        DB.background_pass(
+          fn -> transaction!(state.db, &Tightbeam.HolderProd.next_deadline_in_txn(&1, now())) end,
+          now() + 1_000
+        )
+      end
+
+    holder_prod_at =
+      if holder_prod_at && pass_at, do: max(holder_prod_at, pass_at), else: holder_prod_at
+
+    due_at = [next, retry_at, holder_prod_at] |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
     set_due_timer(state, due_at)
   end
 
