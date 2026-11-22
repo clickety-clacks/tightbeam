@@ -22,8 +22,10 @@ defmodule Tightbeam.HarnessHealth do
     Gateway,
     Harness,
     HarnessProcess,
+    HarnessHealth.ModelRateLimit,
     Id,
     Ledger,
+    Model,
     Org,
     Wire.Payloads,
     Projection,
@@ -32,6 +34,7 @@ defmodule Tightbeam.HarnessHealth do
   }
 
   alias Tightbeam.DB.Txn
+  alias Tightbeam.HarnessHealth.CompactionObservation
 
   @failure_classes ~w(
     auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
@@ -1126,19 +1129,24 @@ defmodule Tightbeam.HarnessHealth do
             do: "authoritative-provider",
             else: "terminal-failure"
 
+        observation = %{
+          correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
+          harness: to_string(session.harness),
+          host: session.host,
+          failure_class: failure_class,
+          evidence_kind: evidence_kind,
+          session_key: turn.session_key,
+          assignment_id: assignment_id,
+          observed_at: observed_at,
+          cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
+          principal: turn.origin || "process:tightbeam"
+        }
+
         result =
-          observe_in_txn(txn, %{
-            correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
-            harness: to_string(session.harness),
-            host: session.host,
-            failure_class: failure_class,
-            evidence_kind: evidence_kind,
-            session_key: turn.session_key,
-            assignment_id: assignment_id,
-            observed_at: observed_at,
-            cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
-            principal: turn.origin || "process:tightbeam"
-          })
+          case harness_scope_in_txn(txn, session, turn, observation, reason) do
+            :harness -> observe_in_txn(txn, observation)
+            :model -> {:model_scoped, nil}
+          end
 
         unless pre_request_refusal? do
           redelivery_failure_class =
@@ -1157,6 +1165,83 @@ defmodule Tightbeam.HarnessHealth do
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
         after_harness_health_commit(result)
+    end
+  end
+
+  # Model observations never feed harness-wide evidence, even when several
+  # separate models are limited. Account and authoritative signals still do.
+  defp harness_scope_in_txn(_txn, _session, _turn, %{failure_class: class}, _reason)
+       when class != "rate-limit-dead",
+       do: :harness
+
+  defp harness_scope_in_txn(_txn, _session, _turn, %{evidence_kind: "authoritative-provider"}, _),
+    do: :harness
+
+  defp harness_scope_in_txn(txn, session, turn, observation, reason) do
+    model = turn_model_in_txn(txn, turn.seq)
+
+    case ModelRateLimit.scope(evidence_text(reason), rate_limit_message(reason), model) do
+      :account ->
+        :harness
+
+      {:model, model} ->
+        ModelRateLimit.record_in_txn(txn, %{
+          harness: observation.harness,
+          host: session.host,
+          model: model,
+          session_key: turn.session_key,
+          assignment_id: observation.assignment_id,
+          turn_seq: turn.seq,
+          observed_at: observation.observed_at,
+          cause: observation.cause,
+          principal: principal_text(observation.principal)
+        })
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "harness_health_model_rate_limit",
+          turn.session_key,
+          JSON.encode!(%{
+            harness: observation.harness,
+            host: session.host,
+            model: model,
+            turnSeq: turn.seq,
+            correlationId: observation.correlation_id
+          })
+        )
+
+        :model
+    end
+  end
+
+  defp rate_limit_message(reason) when is_binary(reason), do: reason
+
+  defp rate_limit_message(reason) when is_map(reason) do
+    data = reason["data"] || reason[:data]
+
+    [reason["message"] || reason[:message] | rate_limit_details(data)]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join(" ")
+  end
+
+  defp rate_limit_message(_reason), do: ""
+
+  defp rate_limit_details(data) when is_map(data),
+    do: [data["message"] || data[:message], data["details"] || data[:details]]
+
+  defp rate_limit_details(data), do: [data]
+
+  defp turn_model_in_txn(txn, turn_seq) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COALESCE(t.model,s.model) FROM turns t
+           JOIN sessions s ON s.sessionKey=t.sessionKey WHERE t.seq=?1
+           """,
+           [turn_seq]
+         ) do
+      [[model]] -> model
+      [] -> nil
     end
   end
 
@@ -1271,6 +1356,9 @@ defmodule Tightbeam.HarnessHealth do
   def resolve_normal_turn_in_txn(%Txn{} = txn, session, turn) do
     harness = to_string(session.harness)
 
+    # A normal answer on a model releases that model's own rate-limit records.
+    ModelRateLimit.release_in_txn(txn, harness, session.host, turn.seq)
+
     Txn.q(
       txn,
       """
@@ -1354,6 +1442,123 @@ defmodule Tightbeam.HarnessHealth do
       prior -> duplicate_or_refuse!(txn, prior, input, input.evidence_kind)
     end
   end
+
+  @doc "Record a failed temporary compaction on its actual route before trying another."
+  def observe_compactor_failure(db, %{
+        context_id: context_id,
+        harness: harness,
+        host: host,
+        model: model,
+        reason: reason,
+        observed_at: observed_at
+      }) do
+    attempt = JSON.encode!([context_id, harness])
+    reason = reason |> ErrorDiagnostic.classified() |> compactor_failure_reason()
+
+    case compactor_failure_class(reason) do
+      nil ->
+        nil
+
+      failure_class ->
+        if authoritative_compactor_quota?(harness, reason) do
+          {status, record} =
+            observe(db, %{
+              correlation_id: "switch-compaction:" <> attempt,
+              harness: harness,
+              host: host,
+              failure_class: failure_class,
+              evidence_kind: "authoritative-provider",
+              observed_at: observed_at,
+              cause: "compactor #{model}: account quota exhausted",
+              principal: "process:tightbeam"
+            })
+
+          %{
+            status: status,
+            incident_id: Map.get(record, :id),
+            observation_id: Map.fetch!(record, :observationId)
+          }
+        else
+          identity = Model.parse_ref(model)
+
+          model_rate_limit =
+            if failure_class == "rate-limit-dead" and
+                 ModelRateLimit.model_named?(rate_limit_message(reason), identity) do
+              ModelRateLimit.record_compactor_attempt(db, %{
+                harness: harness,
+                host: host,
+                model: identity.family,
+                model_context: identity.context,
+                compaction_attempt_key: attempt,
+                observed_at: observed_at,
+                cause: "compactor: provider limit explicitly named this model",
+                principal: "process:tightbeam"
+              })
+            end
+
+          observation =
+            CompactionObservation.record(
+              db,
+              attempt,
+              harness,
+              host,
+              model,
+              failure_class,
+              observed_at
+            )
+
+          Map.put(observation, :model_rate_limit, model_rate_limit)
+        end
+    end
+  end
+
+  @doc "Recent steering evidence from a temporary compactor, independent of lane admission."
+  def compactor_observation(db, harness, host, observed_at) do
+    CompactionObservation.recent(db, harness, host, observed_at - @evidence_window_ms)
+  end
+
+  defp compactor_failure_reason({stage, reason})
+       when stage in [
+              :session_create_failed,
+              :prompt_failed,
+              :session_close_failed,
+              :mode_apply_failed,
+              :model_apply_failed
+            ],
+       do: compactor_failure_reason(reason)
+
+  defp compactor_failure_reason({:session_prepare_failed, reason, _id, _cleanup}),
+    do: compactor_failure_reason(reason)
+
+  defp compactor_failure_reason({:timeout_cleanup_failed, _}), do: :timeout
+
+  defp compactor_failure_reason(reason), do: reason
+
+  defp compactor_failure_class(:timeout), do: "adapter_unavailable"
+  defp compactor_failure_class({:adapter_unavailable, _}), do: "adapter_unavailable"
+  defp compactor_failure_class(:route_unavailable), do: "adapter_unavailable"
+
+  defp compactor_failure_class(%{"code" => 429}), do: "rate-limit-dead"
+  defp compactor_failure_class(%{code: 429}), do: "rate-limit-dead"
+  defp compactor_failure_class({:http_status, 429}), do: "rate-limit-dead"
+  defp compactor_failure_class(reason), do: classify_turn_failure(reason)
+
+  defp authoritative_compactor_quota?(harness, reason) do
+    authoritative_provider_turn_failure?(%{harness: harness}, reason) or
+      (harness == Tightbeam.Harness.Claude.wire_name() and claude_account_quota?(reason))
+  end
+
+  # Match only the provider's model-free account messages and optional reset
+  # suffix. Extra wording can carry model scope even after an account-like prefix.
+  defp claude_account_quota?(%{"data" => %{"errorKind" => "rate_limit"}, "message" => message})
+       when is_binary(message) do
+    Regex.match?(
+      ~r/\Ayou(?:['’]ve| have) hit your (?:weekly|[0-9]+-hour|usage) limit[.!]?(?: · resets (?:[A-Za-z]{3} [0-9]{1,2}(?:,| at)? )?[0-9]{1,2}(?::[0-9]{2})?(?:am|pm) (?:UTC|\([A-Za-z0-9_+\/-]+\)))?\z/iu,
+      String.trim(message)
+    )
+  end
+
+  defp claude_account_quota?(_), do: false
 
   @doc "Resolve one class-specific open incident on normal-turn success."
   @spec resolve(DB.server(), map()) ::

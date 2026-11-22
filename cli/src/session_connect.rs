@@ -1008,6 +1008,7 @@ fn spawn_send(
             predicate: None,
             assignment_id: None,
             after_turn: false,
+            wait_reason: None,
             replace_queued: false,
             prod_id: None,
             idempotency_key: frame.idempotency_key,

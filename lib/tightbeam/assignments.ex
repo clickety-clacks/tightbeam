@@ -1689,7 +1689,7 @@ defmodule Tightbeam.Assignments do
           "assignmentId=#{assignment_id}. The legacy --when-fact #{kind} path is for a " <>
           "completion attestation only.",
       example:
-        "tightbeam wake --session <session> --when-fact #{kind} --when-scope #{assignment_id} --fallback-after 2h --prompt \"re-read this card\""
+        "tightbeam wake --session <session> --when-fact #{kind} --when-scope #{assignment_id} --fallback-after 2h --wait-reason \"Waiting for assignment completion\" --prompt \"re-read this card\""
     }
   end
 
@@ -2243,6 +2243,12 @@ defmodule Tightbeam.Assignments do
             assignment(row)
             |> then(&Mementos.attach(db, "assignment", &1))
             |> then(&RecordFyis.attach(db, "assignment", &1))
+            |> then(fn assignment ->
+              case Tightbeam.HolderProd.evidence(db, assignment.id, assignment.holderKey) do
+                nil -> assignment
+                evidence -> Map.put(assignment, :holderProd, evidence)
+              end
+            end)
             |> Map.put(:reopenings, list_reopenings(db, assignment_id))
             |> Map.put(
               :commitRefCorrections,
@@ -3145,8 +3151,8 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_kind(call.params[:kind]),
-                 :ok <- valid_note(call.params[:note]),
                  :ok <- valid_cannot_proceed_reason(call.params),
+                 :ok <- valid_note(call.params[:note]),
                  :ok <- absent_verdict_kind(call.params[:verdict_kind]),
                  :ok <- valid_release_tuple_for_kind(call.params),
                  {:ok, call} <- applicable_code_completion_in_txn(txn, assignment, call) do
@@ -3213,6 +3219,18 @@ defmodule Tightbeam.Assignments do
   end
 
   defp insert_and_apply_lifecycle_attest(txn, call, assignment, holder) do
+    case validate_new_wait_attest(call.params) do
+      :ok -> record_lifecycle_attest(txn, call, assignment, holder)
+      {:error, refusal} -> refusal
+    end
+  end
+
+  defp validate_new_wait_attest(%{kind: "cannot-proceed"} = params),
+    do: Tightbeam.WaitReason.validate(params[:note], "--note")
+
+  defp validate_new_wait_attest(_params), do: :ok
+
+  defp record_lifecycle_attest(txn, call, assignment, holder) do
     admitted =
       call
       |> Map.put_new(:verb, "attest")

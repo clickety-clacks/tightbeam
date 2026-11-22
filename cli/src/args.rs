@@ -71,6 +71,7 @@ pub enum Command {
         predicate: Option<serde_json::Value>,
         assignment_id: Option<String>,
         after_turn: bool,
+        wait_reason: Option<String>,
         replace_queued: bool,
         prod_id: Option<String>,
         idempotency_key: Option<String>,
@@ -878,7 +879,7 @@ COMMANDS:
           (--fallback-after 30s|5m|2h | --at <epochMs>) --prompt "<continuation>"
       Ready-now continuation:
         tightbeam wake --session <holderSession> --assignment <assignmentId>
-          --after-turn --prompt "<continuation>"
+          --after-turn --wait-reason "<reason>" --prompt "<continuation>"
       --cron uses five numeric fields in gateway local time, such as "*/30 * * * *".
       It repeats until cancel-wake. Lists, ranges and steps are supported.
       --assignment links a recurring wake to that assignment.
@@ -897,6 +898,9 @@ COMMANDS:
       The accountable agent re-reads durable state and decides the next action.
       The fallback timer detects silence only; it does not select an action.
       A dependency predicate names conditions, optional bindings, and resolverRef.
+      New fact, predicate, after-turn, and holder continuation waits require
+      --wait-reason <reason> (one nonblank line, at most 140 characters).
+      A timed wake to yourself can explicitly record an unlinked wait with --wait-reason.
       No necessity or verifier assignment is required. --after-turn captures the caller's running turn.
       --prompt is the caller's explicit instruction override.
       Tightbeam carries it without rewriting it.
@@ -914,13 +918,13 @@ COMMANDS:
       for other terminal outcomes, use a dependency wait on assignment.state.
       Condition:
         tightbeam wake --session <targetSession> --when-fact assignment-landed \
-          --when-scope <assignmentId> --fallback-after 2h --prompt "read the completed assignment"
+          --when-scope <assignmentId> --fallback-after 2h --wait-reason "Waiting for completion" --prompt "read the completed assignment"
       Dependency predicate example (resolverRef is a nested reference object):
         tightbeam wake --session <holderSession> --assignment <assignmentId> \
           --predicate '{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],
             "bindings":{"assignmentId":"<resolverId>"},
             "resolverRef":{"kind":"assignment","id":"<resolverId>"}}' \
-          --fallback-after 2h --prompt "read the resolver result"
+          --fallback-after 2h --wait-reason "Waiting for the resolver" --prompt "read the resolver result"
 
   condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]
       File an observable fact. Matching condition wakes receive the fact as a new
@@ -1078,11 +1082,15 @@ COMMANDS:
       Removing a retired session's workspace is held while it holds git work no durable
       remote has: commits on no remote ref (a remote whose URL is inside the workdir does not
       count), stashes, uncommitted or untracked changes, in work trees and bare repositories.
-      Other files that are not recorded artifacts are NOT held: they are deleted, so record
-      them first (artifact-record --content-base64, about 100 KB per argument) or copy them to
-      shared storage. Run `retire --session <key>` again on the retired session to list what is
-      held (held_losses); push, capture or copy it, or pass --acknowledge-loss to let the cleanup
-      delete exactly that listed state (new work added later is held again).
+      The Git scan uses locally fetched remote-tracking refs. Run git fetch --prune first: missing
+      refs can cause a hold, and stale refs can hide work after remote deletion or rewriting.
+      Create a branch or tag for any reflog-only commit you want reviewed by the scan.
+      Unrecorded work outside Git is archived within the configured limits and free-space
+      reserve. Regenerable caches and build outputs can be removed. Over-budget work stays
+      in place, with held paths, counts, and sizes. The result gives each session's archive
+      location. Run `retire --session <key>` again to read the held state. Preserve it with
+      artifact-record or a copy to shared storage, or pass --acknowledge-loss to accept
+      removal of the listed contents. Changed work holds again.
 
   tune --session <key> (--harness <harness> [--model <model>] |
        --model <model> | --effort <level> | --fast on|off | --host <host>)
@@ -1238,7 +1246,7 @@ COMMANDS:
           --release-fact-principal-ref <principal>]
       File against an assignment. Verdicts on review cards require the review
       holder; producer-card verdicts may be filed by any session or user.
-      cannot-proceed requires a non-empty --note, keeps the assignment open,
+      cannot-proceed requires a one-line --note of up to 140 characters, keeps the assignment open,
       and accepts the three release-fact flags only as one complete tuple.
   attests <assignmentId>
       List every attest filed against an assignment.
@@ -2358,6 +2366,7 @@ fn parse_with_optional_catalog(
                 predicate,
                 assignment_id,
                 after_turn,
+                wait_reason: flags.get("wait-reason").cloned(),
                 replace_queued,
                 prod_id,
                 idempotency_key,
@@ -7732,6 +7741,7 @@ mod tests {
                 predicate: None,
                 assignment_id: None,
                 after_turn: false,
+                wait_reason: None,
                 replace_queued: false,
                 prod_id: None,
                 idempotency_key: Some("wake-1".to_owned()),
@@ -7764,6 +7774,7 @@ mod tests {
                 predicate: None,
                 assignment_id: None,
                 after_turn: false,
+                wait_reason: None,
                 replace_queued: false,
                 prod_id: None,
                 idempotency_key: None,
@@ -7980,6 +7991,7 @@ mod tests {
                 predicate: Some(serde_json::from_str(predicate).unwrap()),
                 assignment_id: Some("asg_a".to_owned()),
                 after_turn: false,
+                wait_reason: None,
                 replace_queued: false,
                 prod_id: None,
                 idempotency_key: None,
@@ -8012,6 +8024,7 @@ mod tests {
                 predicate: None,
                 assignment_id: Some("asg_a".to_owned()),
                 after_turn: true,
+                wait_reason: None,
                 replace_queued: false,
                 prod_id: None,
                 idempotency_key: None,
@@ -9100,6 +9113,7 @@ mod tests {
                     predicate: None,
                     assignment_id: None,
                     after_turn: false,
+                    wait_reason: None,
                     replace_queued: false,
                     prod_id: None,
                     idempotency_key: None,

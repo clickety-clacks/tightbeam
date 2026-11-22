@@ -811,7 +811,13 @@ defmodule Tightbeam.SessionLane do
         _ -> nil
       end
 
+    refused? = match?({:error, %{work_outcome: :did_not_perform}}, outcome)
     terminal_opts = [owner_lease: state.current_owner_lease]
+
+    terminal_opts =
+      if refused?,
+        do: Keyword.put(terminal_opts, :work_outcome, :did_not_perform),
+        else: terminal_opts
 
     terminal_opts =
       if prewrite_evidence,
@@ -867,6 +873,9 @@ defmodule Tightbeam.SessionLane do
           {"failed", error_text(reason), nil, nil, nil}
       end
 
+    # Alert routing settles on prompt receipt. The turn itself records work failure.
+    receipt_status = if refused?, do: "delivered", else: terminal
+
     transaction =
       DB.transaction_then(
         state.db,
@@ -884,7 +893,7 @@ defmodule Tightbeam.SessionLane do
               HarnessHealth.settle_other_route_in_txn(
                 txn,
                 seq,
-                terminal,
+                receipt_status,
                 System.system_time(:millisecond)
               )
 
@@ -898,6 +907,8 @@ defmodule Tightbeam.SessionLane do
           result
         end
       )
+
+    required_record? = refused? or not is_nil(prewrite_evidence)
 
     case transaction do
       {:ok, {won, recorded}} ->
@@ -920,7 +931,7 @@ defmodule Tightbeam.SessionLane do
                   do: Tightbeam.ReminderDelivery.delivered_in_txn(txn, seq)
 
                 recorded =
-                  if not is_nil(prewrite_evidence) and is_function(in_txn, 1),
+                  if required_record? and is_function(in_txn, 1),
                     do: in_txn.(txn),
                     else: nil
 
@@ -928,7 +939,7 @@ defmodule Tightbeam.SessionLane do
                   HarnessHealth.settle_other_route_in_txn(
                     txn,
                     seq,
-                    terminal,
+                    receipt_status,
                     System.system_time(:millisecond)
                   )
 
@@ -951,7 +962,7 @@ defmodule Tightbeam.SessionLane do
               terminal,
               error,
               publish,
-              if(prewrite_evidence, do: after_commit, else: nil),
+              if(required_record?, do: after_commit, else: nil),
               won,
               recorded
             )
@@ -1166,10 +1177,20 @@ defmodule Tightbeam.SessionLane do
   defp ambiguous,
     do: {:error, %{code: "turn_status_ambiguous", message: "turn liveness is ambiguous"}}
 
-  defp error_text(reason) when is_binary(reason), do: reason
-  defp error_text(%{code: code} = reason) when is_binary(code), do: JSON.encode!(reason)
-  defp error_text(%{"code" => code} = reason) when is_binary(code), do: JSON.encode!(reason)
-  defp error_text(reason), do: inspect(reason)
+  @doc false
+  def error_text(reason) when is_binary(reason), do: reason
+  def error_text(%{code: code} = reason) when is_binary(code), do: JSON.encode!(reason)
+  def error_text(%{"code" => code} = reason) when is_binary(code), do: JSON.encode!(reason)
+
+  # ACP reasons carry structured message and detail fields even when their code
+  # is numeric. Keep those fields readable by the terminal recognizer.
+  def error_text(%{"message" => message} = reason) when is_binary(message) do
+    JSON.encode!(reason)
+  rescue
+    _ -> inspect(reason)
+  end
+
+  def error_text(reason), do: inspect(reason)
 
   defp split_terminal_recorded({:terminal_recorded, recorded, route_publication}),
     do: {recorded, route_publication}

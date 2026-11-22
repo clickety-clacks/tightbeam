@@ -84,6 +84,7 @@ defmodule Tightbeam.Wakes do
           owner_user_id: String.t() | nil,
           obligation_ref: String.t() | nil,
           wait_mode: String.t() | nil,
+          wait_reason: String.t() | nil,
           predicate: map() | nil,
           resolver_kind: String.t() | nil,
           resolver_id: String.t() | nil,
@@ -206,6 +207,10 @@ defmodule Tightbeam.Wakes do
   -- distinction for the deadline's later activity-history lookup.
   CREATE TABLE IF NOT EXISTS wake_activity_exclusions (
     wakeId TEXT PRIMARY KEY
+  );
+  CREATE TABLE IF NOT EXISTS wake_wait_reasons (
+    wakeId TEXT PRIMARY KEY,
+    reason TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS wake_retry_attempts (
     wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
@@ -1104,6 +1109,7 @@ defmodule Tightbeam.Wakes do
   @doc false
   def assignment_closed_in_txn(%Txn{} = txn, assignment_id) do
     Tightbeam.Retirements.blocker_changed_in_txn(txn, "assignment", assignment_id)
+    Tightbeam.HolderProd.cancel_pending_in_txn(txn, assignment_id)
 
     case Txn.q(txn, "SELECT holderKey FROM assignments WHERE id=?1 AND state='closed'", [
            assignment_id
@@ -1615,6 +1621,7 @@ defmodule Tightbeam.Wakes do
       created_at: created_at,
       fired_at: nil,
       delivered_turn_seq: nil,
+      wait_reason: Map.get(input, :wait_reason),
       condition_kind: condition_kind,
       condition_scope: Map.get(input, :condition_scope),
       condition_after_id: condition_after_id,
@@ -1744,6 +1751,13 @@ defmodule Tightbeam.Wakes do
       admit_continuation_in_txn(txn, wake)
     end
 
+    if is_binary(wake.wait_reason) do
+      Txn.q(txn, "INSERT INTO wake_wait_reasons(wakeId,reason) VALUES (?1,?2)", [
+        wake.wake_id,
+        wake.wait_reason
+      ])
+    end
+
     if schedule = Map.get(input, :cron) do
       Txn.q(txn, "INSERT INTO cron_wake_schedules(wakeId,schedule) VALUES(?1,?2)", [
         wake.wake_id,
@@ -1834,6 +1848,7 @@ defmodule Tightbeam.Wakes do
   @spec register_wait_in_txn(Txn.t(), map()) :: wake() | {:error, map()}
   def register_wait_in_txn(%Txn{} = txn, input) do
     with :ok <- validate_wait_input(input),
+         :ok <- Tightbeam.WaitReason.validate(input[:wait_reason], "--wait-reason"),
          {:ok, obligation} <- wait_obligation_in_txn(txn, input),
          :ok <- wait_target_allowed(input, obligation),
          :ok <- recheck_wait_admission_in_txn(txn, input) do
@@ -1900,6 +1915,7 @@ defmodule Tightbeam.Wakes do
             owner_user_id: obligation.owner_user_id,
             obligation_ref: obligation.id,
             wait_mode: "after-turn",
+            wait_reason: input[:wait_reason],
             originating_turn_seq: turn_seq,
             recognition_at: now,
             recognition_path: "after-turn",
@@ -1948,6 +1964,7 @@ defmodule Tightbeam.Wakes do
           owner_user_id: obligation.owner_user_id,
           obligation_ref: obligation.id,
           wait_mode: "dependency",
+          wait_reason: input[:wait_reason],
           predicate: evaluation.canonical,
           resolver_kind: resolver.kind,
           resolver_id: resolver.id,
@@ -2891,6 +2908,13 @@ defmodule Tightbeam.Wakes do
   def row_commit_in_txn(%Txn{} = txn, transitions) do
     transitions = List.wrap(transitions) ++ DB.take_row_commits(txn)
 
+    if Enum.any?(
+         transitions,
+         &(Map.get(&1, :domain) in ["assignment", "turn", "decision_request"])
+       ) do
+      Tightbeam.HolderProd.changed_in_txn(txn)
+    end
+
     if not wait_recognition_ready?(txn) and
          Enum.any?(transitions, &filing_transition?/1) do
       raise RuleEvaluationUnavailable
@@ -3151,7 +3175,7 @@ defmodule Tightbeam.Wakes do
   # never replay the other notices in that batch on the discussion's authority.
   # The existing wake retry lineage supplies persistence and exponential backoff.
   @doc false
-  def preserve_harklight_discussions_in_txn(%Txn{} = txn, turn_seq, terminal) do
+  def preserve_harklight_discussions_in_txn(%Txn{} = txn, turn_seq, terminal, work_outcome) do
     sources =
       Txn.q(
         txn,
@@ -3174,17 +3198,23 @@ defmodule Tightbeam.Wakes do
       )
 
     Enum.each(sources, fn [wake_id, ended_at] ->
-      if terminal == "delivered" do
-        settle_retry_attempt_in_txn(txn, wake_id, turn_seq, "acted", ended_at)
-      else
-        wake = get_in_txn(txn, wake_id)
+      cond do
+        work_outcome == :did_not_perform ->
+          # The provider replied. Close any existing attempt without replaying the prompt.
+          settle_retry_attempt_in_txn(txn, wake_id, turn_seq, "failed", ended_at)
 
-        schedule_retry_in_txn(
-          txn,
-          wake,
-          %{seq: turn_seq, prompt: wake.prompt, ended_at: ended_at},
-          "harklight-discussion-unreceived"
-        )
+        terminal == "delivered" ->
+          settle_retry_attempt_in_txn(txn, wake_id, turn_seq, "acted", ended_at)
+
+        true ->
+          wake = get_in_txn(txn, wake_id)
+
+          schedule_retry_in_txn(
+            txn,
+            wake,
+            %{seq: turn_seq, prompt: wake.prompt, ended_at: ended_at},
+            "harklight-discussion-unreceived"
+          )
       end
     end)
 
@@ -3208,7 +3238,7 @@ defmodule Tightbeam.Wakes do
            txn,
            """
            SELECT t.sessionKey,t.messageId,t.wakeId,t.origin,t.prompt,t.roleRef,t.roleFallback,
-                  t.assignmentId,t.jobRef,t.requestRef,s.harness,s.host
+                  t.assignmentId,t.jobRef,t.requestRef,s.harness,s.host,t.error
            FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
            WHERE t.seq=?1 AND t.messageId IS NOT NULL
              AND (t.status='failed' OR
@@ -3229,7 +3259,8 @@ defmodule Tightbeam.Wakes do
           job_ref,
           request_ref,
           source_harness,
-          source_host
+          source_host,
+          error
         ]
       ]
       when is_binary(source_harness) and is_binary(source_host) ->
@@ -3292,9 +3323,11 @@ defmodule Tightbeam.Wakes do
             parent_session_key,
             session_key,
             source_turn_seq,
+            assignment_id,
             message_id,
             origin,
-            prompt
+            prompt,
+            error
           )
         end
 
@@ -3309,40 +3342,12 @@ defmodule Tightbeam.Wakes do
   end
 
   defp interrupted_redelivery_parent_in_txn(txn, source_session_key, assignment_id) do
-    assignment_parent =
-      if is_binary(assignment_id) do
-        case Txn.q(
-               txn,
-               """
-               SELECT parent.sessionKey
-               FROM assignments assignment
-               JOIN sessions parent ON parent.sessionKey=COALESCE(assignment.currentOpenerSessionKey,assignment.openedBySession)
-               WHERE assignment.id=?1 AND parent.state='active'
-                 AND parent.sessionKey!=?2
-               """,
-               [assignment_id, source_session_key]
-             ) do
-          [[parent_session_key]] -> parent_session_key
-          _ -> nil
-        end
-      end
-
-    assignment_parent ||
-      case Txn.q(
-             txn,
-             """
-             SELECT parent.sessionKey
-             FROM sessions source
-             JOIN sessions parent
-               ON parent.sessionKey=#{Tightbeam.Org.current_parent_sql("source")}
-             WHERE source.sessionKey=?1 AND parent.state='active'
-               AND parent.sessionKey!=source.sessionKey
-             """,
-             [source_session_key]
-           ) do
-        [[parent_session_key]] -> parent_session_key
-        _ -> nil
-      end
+    # Without an opener or ancestor the existing health policy retries on
+    # recovery. The owner's stream can still receive the initial failure notice.
+    case Tightbeam.TurnFailureNotice.recipient(txn, source_session_key, assignment_id, false) do
+      {recipient, _route} -> recipient
+      nil -> nil
+    end
   end
 
   defp ask_interrupted_redelivery_parent_in_txn(
@@ -3350,9 +3355,11 @@ defmodule Tightbeam.Wakes do
          parent_session_key,
          source_session_key,
          source_turn_seq,
+         assignment_id,
          message_id,
          origin,
-         original_prompt
+         original_prompt,
+         error
        ) do
     wake_id = "w_health_redelivery_parent_#{source_turn_seq}"
 
@@ -3361,6 +3368,7 @@ defmodule Tightbeam.Wakes do
         "interrupted-outcome-unknown. No automatic retry was queued. " <>
         "Should the original message be redelivered?\n" <>
         "Source turn: #{source_turn_seq}; message: #{message_id}; sender: #{origin}.\n" <>
+        "Reason: #{Tightbeam.Gateway.recorded_turn_failure_sentence(error)}\n" <>
         "Original message:\n#{original_prompt}\n" <>
         "If you want it retried, use the ordinary dispatch path for that session; " <>
         "otherwise leave the failed turn unchanged."
@@ -3368,6 +3376,7 @@ defmodule Tightbeam.Wakes do
     schedule_in_txn(txn, %{
       wake_id: wake_id,
       session_key: parent_session_key,
+      assignment_id: assignment_id,
       origin: "health-redelivery-parent",
       prompt: prompt,
       due_at: now(),
@@ -3411,6 +3420,15 @@ defmodule Tightbeam.Wakes do
                 'harness-turn:' || a.sourceTurnSeq || ':' || a.failureClass
                 AND observation.evidenceKind IN ('terminal-failure','authoritative-provider')
                 AND incident.state='open'
+            )
+          )
+          -- Another model answering is no evidence for a model-scoped limit;
+          -- only that model's own success (which releases it) or the source
+          -- session itself, for example after a retune, redelivers.
+          AND (
+            a.sessionKey=?3 OR NOT EXISTS (
+              SELECT 1 FROM harness_model_rate_limits held
+              WHERE held.turnSeq=a.sourceTurnSeq AND held.releasedAt IS NULL
             )
           )
           AND NOT EXISTS (
@@ -3691,6 +3709,7 @@ defmodule Tightbeam.Wakes do
 
   defp retryable_prompt_wake?(wake, turn) do
     wake.consumer == "prompt" and not wake.digest and
+      not Tightbeam.HolderProd.own_notice?(wake) and
       not String.starts_with?(turn.request_ref || "", "bubble:")
   end
 
@@ -3914,6 +3933,8 @@ defmodule Tightbeam.Wakes do
       wake.wake_id,
       retry_wake_id
     )
+
+    copy_wait_reason_in_txn(txn, wake.wake_id, retry_wake_id)
 
     Tightbeam.QueuedMessageSuppression.copy_prod_request_in_txn(txn, wake.wake_id, retry_wake_id)
 
@@ -4376,6 +4397,7 @@ defmodule Tightbeam.Wakes do
         )
 
         Tightbeam.QueuedMessageSuppression.copy_prod_request_in_txn(txn, wake_id, replacement_id)
+        copy_wait_reason_in_txn(txn, wake_id, replacement_id)
 
         [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
         wake = to_wake(row)
@@ -4545,6 +4567,9 @@ defmodule Tightbeam.Wakes do
       sender_replaced_own_prod?(txn, command, wake) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
+      holder_prod_superseded?(command, wake) ->
+        {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
+
       scheduler_delivery_without_source?(command, wake) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
@@ -4564,6 +4589,19 @@ defmodule Tightbeam.Wakes do
        do: true
 
   defp sender_withdrew_own_notice?(_command), do: false
+
+  defp holder_prod_superseded?(
+         %{
+           requester: %{kind: "process", id: "tightbeam:rail-remedy"},
+           reason_kind: "superseded",
+           causal_source: %{kind: "wake", id: wake_id},
+           outcome: %{kind: "no_replacement"}
+         },
+         %{wake_id: wake_id} = wake
+       ),
+       do: Tightbeam.HolderProd.own_notice?(wake)
+
+  defp holder_prod_superseded?(_command, _wake), do: false
 
   # A sender's prod revision replaces its message, not the assignment or work
   # item mentioned by that message. A closed link must not block withdrawal.
@@ -5529,6 +5567,7 @@ defmodule Tightbeam.Wakes do
       end
 
       publish_change_in_txn(txn, "wake.canceled", wake.wake_id)
+      Tightbeam.HolderProd.changed_in_txn(txn)
       cancellation_result(cancellation)
     else
       false
@@ -5602,6 +5641,7 @@ defmodule Tightbeam.Wakes do
                       w.sessionKey,w.assignmentId
                FROM turns t JOIN wakes w ON w.wakeId=t.wakeId
                WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
+                 AND NOT #{Tightbeam.TurnLifecycle.provider_refusal_sql("t.seq")}
                  AND w.consumer='prompt' AND COALESCE(w.targetGate,1)!=0
                """,
                [seq]
@@ -5613,12 +5653,17 @@ defmodule Tightbeam.Wakes do
               Txn.q(txn, "SELECT 1 FROM notice_batches WHERE deliveryWakeId=?1", [wake_id]) != []
 
             cond do
-              retry_safe? ->
-                :retry_owned
-
               carrier? ->
                 sources = carrier_failure_sources_in_txn(txn, wake_id)
-                record_sender_failure_in_txn(txn, seq, sources, status)
+
+                if retry_safe? and not mixed_dispatch_sources?(txn, sources) do
+                  :retry_owned
+                else
+                  record_sender_failure_in_txn(txn, seq, sources, status)
+                end
+
+              retry_safe? ->
+                :retry_owned
 
               digest == 0 ->
                 record_sender_failure_in_txn(
@@ -5690,29 +5735,32 @@ defmodule Tightbeam.Wakes do
     case Txn.q(
            txn,
            """
-           SELECT t.sessionKey,t.assignmentId,t.status,t.error FROM turns t
+           SELECT t.sessionKey,t.assignmentId,t.status,t.error,t.origin,t.prompt FROM turns t
            WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
              AND t.wakeId IS NULL AND t.assignmentId IS NOT NULL
+             AND NOT #{Tightbeam.TurnLifecycle.provider_refusal_sql("t.seq")}
            """,
            [seq]
          ) do
-      [[holder, assignment_id, status, error]] ->
-        recipient = interrupted_redelivery_parent_in_txn(txn, holder, assignment_id)
+      [[holder, assignment_id, status, error, origin, prompt]] ->
+        brief = String.replace_prefix(prompt, "[from #{origin}]\n\n", "")
 
-        cond do
-          failed_delivery_retry_owned?(status, error) ->
-            :retry_owned
+        with true <- dispatch_brief?(brief, assignment_id),
+             false <- failed_delivery_retry_owned?(status, error),
+             {recipient, _route} <-
+               Tightbeam.TurnFailureNotice.recipient(txn, holder, assignment_id),
+             {cause, original_error} <-
+               Tightbeam.TurnFailureNotice.original_cause_in_txn(txn, seq),
+             false <- Tightbeam.TurnFailureNotice.initial_admitted?(txn, cause, original_error) do
+          content =
+            "Assignment #{assignment_id} brief to #{holder} undelivered: " <>
+              "delivery turn #{seq} is #{status}." <>
+              failed_delivery_uncertainty(status) <> failed_dispatch_reason(original_error)
 
-          is_binary(recipient) ->
-            content =
-              "Assignment #{assignment_id} brief to #{holder} undelivered: " <>
-                "delivery turn #{seq} is #{status}." <> failed_delivery_uncertainty(status)
-
-            {:notices,
-             List.wrap(append_failed_delivery_notice_in_txn(txn, seq, recipient, content))}
-
-          true ->
-            :not_applicable
+          {:notices,
+           List.wrap(append_failed_delivery_notice_in_txn(txn, cause, recipient, content))}
+        else
+          _ -> :not_applicable
         end
 
       [] ->
@@ -5721,41 +5769,75 @@ defmodule Tightbeam.Wakes do
   end
 
   defp record_sender_failure_in_txn(txn, seq, sources, status) do
+    {cause, original_error} = Tightbeam.TurnFailureNotice.original_cause_in_txn(txn, seq)
+
+    dispatch_recipient =
+      case Txn.q(txn, "SELECT sessionKey,assignmentId FROM turns WHERE seq=?1", [seq]) do
+        [[holder, assignment_id]] ->
+          Tightbeam.TurnFailureNotice.recipient(txn, holder, assignment_id)
+      end
+
+    mixed? = mixed_dispatch_sources?(txn, sources)
+
+    source_order =
+      sources
+      |> Enum.with_index()
+      |> Map.new(fn {[wake_id | _], order} -> {wake_id, order} end)
+
     notices =
       sources
       |> Enum.reduce(%{}, fn [wake_id, creator, origin, target, assignment_id], recipients ->
-        # Stored creator identity is the sender, not the receiver's ancestry.
-        # A substrate marker is readable even if that sender session retired.
-        # A source with no sending session (a system notice) is surfaced once to
-        # its recipient's accountable owner instead; it is never replayed.
+        # Ordinary senders are owed the status of their own messages, separately
+        # from the actionable notice that an assignment turn failed.
         {recipient, told_as} =
-          case failed_source_recipient_in_txn(
-                 txn,
-                 wake_id,
-                 target,
-                 assignment_id,
-                 creator,
-                 origin
-               ) do
-            recipient when is_binary(recipient) ->
+          case failed_source_recipient_in_txn(txn, wake_id, assignment_id, creator, origin) do
+            :dispatch ->
+              case Tightbeam.TurnFailureNotice.recipient(txn, target, assignment_id) do
+                {recipient, _route} -> {recipient, :dispatch}
+                nil -> {nil, nil}
+              end
+
+            {recipient, :sender} when is_binary(recipient) ->
               {recipient, :sender}
 
-            nil ->
-              # A bubble notice's own failure continues its climb instead.
-              if String.starts_with?(wake_id, "bubble:"),
+            _ ->
+              # Mixed dispatch members already own their actionable notices.
+              # A senderless member adds no receipt. A bubble notice's own
+              # failure continues its climb instead.
+              if mixed? or String.starts_with?(wake_id, "bubble:"),
                 do: {nil, nil},
-                else:
-                  {interrupted_redelivery_parent_in_txn(txn, target, assignment_id) ||
-                     failed_source_owner_in_txn(txn, target), {:owner, target}}
+                else: {notice_owner_recipient(dispatch_recipient, txn, target), {:owner, target}}
           end
 
-        if is_binary(recipient) do
-          Map.update(recipients, recipient, [{wake_id, told_as}], &[{wake_id, told_as} | &1])
-        else
-          recipients
+        member_assignment = if mixed? and told_as == :dispatch, do: assignment_id
+
+        cond do
+          not is_binary(recipient) ->
+            recipients
+
+          is_binary(member_assignment) and
+              Tightbeam.TurnFailureNotice.member_admitted?(
+                txn,
+                cause,
+                member_assignment,
+                recipient
+              ) ->
+            recipients
+
+          is_nil(member_assignment) and initial_failure_receipt?(told_as) and
+              Tightbeam.TurnFailureNotice.initial_admitted?(txn, cause, original_error) ->
+            recipients
+
+          true ->
+            key = {recipient, member_assignment}
+            Map.update(recipients, key, [{wake_id, told_as}], &[{wake_id, told_as} | &1])
         end
       end)
-      |> Enum.flat_map(fn {recipient, sources} ->
+      |> Enum.sort_by(fn {_recipient, members} ->
+        {first_wake_id, _route} = List.last(members)
+        Map.fetch!(source_order, first_wake_id)
+      end)
+      |> Enum.flat_map(fn {{recipient, member_assignment}, sources} ->
         sources = Enum.reverse(sources)
         source_names = sources |> Enum.map(&elem(&1, 0)) |> Enum.join(", ")
 
@@ -5769,37 +5851,69 @@ defmodule Tightbeam.Wakes do
               ""
           end
 
+        initial? = Enum.any?(sources, fn {_wake_id, route} -> initial_failure_receipt?(route) end)
+        reason = if initial?, do: failed_dispatch_reason(original_error), else: ""
+
+        receipt_id =
+          cond do
+            member_assignment -> "#{cause}:#{member_assignment}"
+            initial? -> cause
+            true -> seq
+          end
+
         content =
           "Wake #{source_names} undelivered: delivery turn #{seq} is #{status}." <>
-            owner_context <> failed_delivery_uncertainty(status)
+            owner_context <> failed_delivery_uncertainty(status) <> reason
 
-        List.wrap(append_failed_delivery_notice_in_txn(txn, seq, recipient, content))
+        List.wrap(append_failed_delivery_notice_in_txn(txn, receipt_id, recipient, content))
       end)
 
     {:notices, notices}
   end
 
-  defp failed_source_recipient_in_txn(txn, wake_id, target, assignment_id, creator, origin) do
+  defp mixed_dispatch_sources?(txn, [_, _ | _] = sources) do
+    Enum.any?(sources, fn [wake_id, creator, origin, _target, assignment_id] ->
+      failed_source_recipient_in_txn(txn, wake_id, assignment_id, creator, origin) == :dispatch
+    end)
+  end
+
+  defp mixed_dispatch_sources?(_txn, _sources), do: false
+
+  defp failed_source_recipient_in_txn(txn, wake_id, assignment_id, creator, origin) do
     # Dispatch stages this canonical brief when its holder is busy. Assignment
     # attribution alone also occurs on ordinary wakes, whose sender stays owed.
     dispatch? =
       is_binary(assignment_id) and
         case Txn.q(txn, "SELECT prompt FROM wakes WHERE wakeId=?1", [wake_id]) do
-          [[prompt]] -> String.starts_with?(prompt, "[assignment: #{assignment_id}]\n\n")
+          [[prompt]] -> dispatch_brief?(prompt, assignment_id)
           _ -> false
         end
 
     if dispatch?,
-      do: interrupted_redelivery_parent_in_txn(txn, target, assignment_id),
-      else: sender_failure_recipient(creator, origin)
+      do: :dispatch,
+      else: {sender_failure_recipient(creator, origin), :sender}
   end
 
-  defp failed_source_owner_in_txn(txn, target) do
-    # The existing terminal failure route alerts the user's personal stream
-    # when there is no active ancestor. A parentless Main can be that stream.
-    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target]) do
-      [[owner]] when is_binary(owner) -> Tightbeam.Org.personal_session_key(owner)
-      _ -> nil
+  defp dispatch_brief?(prompt, assignment_id),
+    do: String.starts_with?(prompt, "[assignment: #{assignment_id}]\n\n")
+
+  defp failed_dispatch_reason(error),
+    do: "\nReason: " <> Tightbeam.Gateway.recorded_turn_failure_sentence(error)
+
+  defp initial_failure_receipt?(:dispatch), do: true
+  defp initial_failure_receipt?({:owner, _target}), do: true
+  defp initial_failure_receipt?(_route), do: false
+
+  defp notice_owner_recipient({recipient, _route}, _txn, _target), do: recipient
+
+  defp notice_owner_recipient(nil, txn, target) do
+    # A parentless Main still gets its own senderless source receipt as a
+    # transcript entry. Canonical routing never queues another turn to itself.
+    case Txn.q(txn, "SELECT sessionKey FROM sessions WHERE sessionKey=?1 AND kind='main'", [
+           target
+         ]) do
+      [[main]] -> main
+      [] -> nil
     end
   end
 
@@ -5832,13 +5946,21 @@ defmodule Tightbeam.Wakes do
 
         if disposition in [:appended, :duplicate],
           do: {recipient, owner, marker},
-          else: raise("wake undelivered notice conflicts with delivery turn #{seq}")
+          else: historical_failed_delivery_receipt!(seq, content, marker)
 
       _ ->
         # There is no lawful transcript to write. The durable carrier and
         # authorized source projection still expose the incomplete outcome.
         nil
     end
+  end
+
+  # A sweeper replay can encounter the immutable status-only receipt from an
+  # older build. Leave it in place so the terminal route can supply its reason.
+  defp historical_failed_delivery_receipt!(seq, content, %{content: prior}) do
+    if String.starts_with?(content, prior <> "\nReason: "),
+      do: nil,
+      else: raise("wake undelivered notice conflicts with delivery turn #{seq}")
   end
 
   defp sender_failure_recipient(creator, _origin) when is_binary(creator), do: creator
@@ -6700,6 +6822,7 @@ defmodule Tightbeam.Wakes do
       scanned_through: -1,
       batch: Keyword.get(opts, :batch, 100),
       delivery_opts: Keyword.get(opts, :delivery_opts, []),
+      holder_prod: Keyword.get(opts, :holder_prod, false),
       internal_consumers: Keyword.get(opts, :internal_consumers, %{})
     }
 
@@ -6745,6 +6868,11 @@ defmodule Tightbeam.Wakes do
   def handle_cast(:wake_ready, state) do
     {:noreply, queue_due(state)}
   end
+
+  def handle_cast(:holder_prod_changed, %{holder_prod: true} = state),
+    do: {:noreply, arm_due_timer(state)}
+
+  def handle_cast(:holder_prod_changed, state), do: {:noreply, state}
 
   def handle_cast({:schedule_changed, due_at}, state) do
     cond do
@@ -6986,6 +7114,16 @@ defmodule Tightbeam.Wakes do
     Tightbeam.CronWake.fire_due(db, now())
     recognize_due_dependency_waits(db)
     evaluate_conditions(state, :tick)
+
+    if Map.get(state, :holder_prod, false) do
+      case transaction!(db, &Tightbeam.HolderProd.admit_due_in_txn(&1, now(), state.batch)) do
+        {:would_send, count} when count > 0 ->
+          Logger.info("holder_prod_would_send count=#{count}")
+
+        _ ->
+          :ok
+      end
+    end
 
     # E's old generations are historical data, not scheduler input. Retire
     # their pending wake rows without consulting effort_checkin_generations so
@@ -7927,7 +8065,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql(extra_columns \\ "") do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition, deliveredTurnSeq#{extra_columns} FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition, deliveredTurnSeq,(SELECT reason FROM wake_wait_reasons WHERE wakeId=wakes.wakeId)#{extra_columns} FROM wakes"
   end
 
   defp to_wake([
@@ -7981,7 +8119,8 @@ defmodule Tightbeam.Wakes do
          recognition_evidence,
          recognition_disposition,
          recognition_transition,
-         delivered_turn_seq
+         delivered_turn_seq,
+         wait_reason
        ]) do
     %{
       wake_id: wake_id,
@@ -8034,8 +8173,20 @@ defmodule Tightbeam.Wakes do
       recognition_evidence: decode_optional(recognition_evidence),
       recognition_disposition: recognition_disposition,
       recognition_transition: decode_optional(recognition_transition),
-      delivered_turn_seq: delivered_turn_seq
+      delivered_turn_seq: delivered_turn_seq,
+      wait_reason: wait_reason
     }
+  end
+
+  defp copy_wait_reason_in_txn(txn, source, replacement) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO wake_wait_reasons(wakeId,reason)
+      SELECT ?2, reason FROM wake_wait_reasons WHERE wakeId=?1
+      """,
+      [source, replacement]
+    )
   end
 
   defp encode_optional(nil), do: nil
@@ -8119,7 +8270,18 @@ defmodule Tightbeam.Wakes do
       |> Enum.map(&max(&1, pass_at || 0))
       |> Enum.min(fn -> nil end)
 
-    due_at = [next, retry_at] |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
+    holder_prod_at =
+      if Map.get(state, :holder_prod, false) do
+        DB.background_pass(
+          fn -> transaction!(state.db, &Tightbeam.HolderProd.next_deadline_in_txn(&1, now())) end,
+          now() + 1_000
+        )
+      end
+
+    holder_prod_at =
+      if holder_prod_at && pass_at, do: max(holder_prod_at, pass_at), else: holder_prod_at
+
+    due_at = [next, retry_at, holder_prod_at] |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
     set_due_timer(state, due_at)
   end
 

@@ -13,4 +13,4 @@ This register is not an inventory of every existing configuration option.
 
 | Flag / configuration control | Enabled behavior | Default | Owner | Removal condition |
 | --- | --- | --- | --- | --- |
-| `harness_switch_context_enabled` | Captures bounded source context at a harness switch and binds a fitting historical section to the first destination prompt. | `false` | Gateway | Remove after real release-soak acceptance confirms portable context and destination fit across supported harnesses. |
+| `harness_switch_context_enabled` | Captures bounded source context at a harness switch and binds a fitting historical section to the first destination prompt. | `true` | Gateway | Remove after real release-soak acceptance confirms portable context and destination fit across supported harnesses. |

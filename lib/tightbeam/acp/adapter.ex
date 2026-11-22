@@ -127,6 +127,16 @@ defmodule Tightbeam.Acp.Adapter do
   def new_candidate_session(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 30_000)
 
+  @doc "Prepare a temporary summary session with a bounded ACP request budget."
+  def new_compactor_session(adapter, model, cwd, guidance, deadline) do
+    remaining = max(1, deadline - System.monotonic_time(:millisecond))
+
+    case call(adapter, {:new_candidate_session, model, cwd, [], guidance, deadline}, remaining) do
+      {:error, {:adapter_unavailable, "timeout"}} -> {:error, :timeout}
+      reply -> reply
+    end
+  end
+
   # The turn path keeps each failure's diagnostic carrier. The gateway renders
   # `ErrorDiagnostic.classified/1` of it as the text the health and supervision
   # classifiers read, exactly as before diagnostics existed, and records the
@@ -340,6 +350,7 @@ defmodule Tightbeam.Acp.Adapter do
   @spec prompt(adapter(), String.t(), String.t() | [map()], keyword()) ::
           {:ok,
            %{
+             optional(:work_outcome) => :did_not_perform,
              stop_reason: String.t(),
              text: String.t(),
              messages: [
@@ -808,6 +819,20 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp session_call(
+         {:new_candidate_session, model, cwd, mcp_servers, guidance, deadline},
+         _from,
+         state
+       ) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining > 0 do
+      new_session_reply(state, model, cwd, mcp_servers, guidance, deadline, :compactor)
+    else
+      {:reply, {:error, :timeout}, state}
+    end
+  end
+
+  defp session_call(
          {:new_session, model, cwd, mcp_servers, guidance, request_timeout},
          _from,
          state
@@ -1075,18 +1100,35 @@ defmodule Tightbeam.Acp.Adapter do
          request_timeout,
          report_cleanup?
        ) do
+    session = %{cwd: cwd}
+
+    session =
+      if report_cleanup? == :compactor,
+        do: Map.put(session, :compactor_model, model),
+        else: session
+
+    create_timeout =
+      if report_cleanup? == :compactor,
+        do: max(1, request_timeout - System.monotonic_time(:millisecond) - 5_000),
+        else: request_timeout
+
     case Conn.request(
            state.conn,
            "session/new",
            %{
              cwd: cwd,
              mcpServers: mcp_servers,
-             _meta: Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
+             _meta: Harness.module!(state.harness).session_config(session, guidance).meta
            },
-           timeout: request_timeout,
+           timeout: create_timeout,
            diagnostic: true
          ) do
       {:ok, %{"sessionId" => sid} = result} when is_binary(sid) ->
+        request_timeout =
+          if report_cleanup? == :compactor,
+            do: max(1, div(request_timeout - System.monotonic_time(:millisecond), 5)),
+            else: request_timeout
+
         # The apply below resolves wire-by-name candidates from the cached
         # option list, so the session/new options must be remembered first.
         state = %{state | context_usage: Map.delete(state.context_usage, sid)}
@@ -1113,7 +1155,7 @@ defmodule Tightbeam.Acp.Adapter do
             state = %{state | config_options: Map.delete(state.config_options, sid)}
 
             if report_cleanup? do
-              cleanup = close_failed_new_session(state, sid)
+              cleanup = close_failed_new_session(state, sid, request_timeout)
               {:reply, {:error, {:session_prepare_failed, error, sid, cleanup}}, state}
             else
               {:reply, {:error, error}, state}
@@ -1128,8 +1170,11 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp close_failed_new_session(state, sid) do
-    case Conn.request(state.conn, "session/close", %{sessionId: sid}, diagnostic: true) do
+  defp close_failed_new_session(state, sid, timeout) do
+    case Conn.request(state.conn, "session/close", %{sessionId: sid},
+           timeout: timeout,
+           diagnostic: true
+         ) do
       {:ok, _result} -> %{status: "verified", reason: nil}
       {:error, reason} -> %{status: "unverified", reason: reason}
     end
@@ -1485,6 +1530,7 @@ defmodule Tightbeam.Acp.Adapter do
     state = remember_config_model(state, sid, update)
     state = remember_context_usage(state, sid, update)
     state = record_tool_call(state, sid, update)
+    state = remember_non_refusal_output(state, sid, update)
 
     if update["sessionUpdate"] == "agent_message_chunk" do
       text = get_in(update, ["content", "text"])
@@ -1611,8 +1657,14 @@ defmodule Tightbeam.Acp.Adapter do
     reply =
       case result do
         {:ok, response} ->
-          {:ok,
-           %{stop_reason: response["stopReason"] || "unknown", text: text, messages: messages}}
+          stop_reason = response["stopReason"] || "unknown"
+          reply = %{stop_reason: stop_reason, text: text, messages: messages}
+
+          if stop_reason == "refusal" and is_nil(state.prompts[sid][:non_refusal_output]) do
+            {:ok, Map.put(reply, :work_outcome, :did_not_perform)}
+          else
+            {:ok, reply}
+          end
 
         {:error, reason} ->
           {:error, reason}
@@ -1983,6 +2035,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     case Harness.module!(state.harness).classify_subagent_event(update) do
       {:subagent_start, %{subagent_ref: child_sid}} when is_binary(child_sid) ->
+        state = mark_non_refusal_output(state, root_sid)
         {root_sid, put_in(state.subagent_roots[child_sid], root_sid)}
 
       _other ->
@@ -2089,6 +2142,42 @@ defmodule Tightbeam.Acp.Adapter do
 
       _ ->
         state
+    end
+  end
+
+  defp remember_non_refusal_output(
+         state,
+         sid,
+         %{
+           "sessionUpdate" => "agent_message_chunk",
+           "content" => content
+         } = update
+       )
+       when is_map(content) do
+    if get_in(update, ["_meta", "tightbeam.dev/providerRefusal"]) == true or
+         match?(%{"type" => "text", "text" => ""}, content) do
+      state
+    else
+      mark_non_refusal_output(state, sid)
+    end
+  end
+
+  defp remember_non_refusal_output(state, sid, %{"sessionUpdate" => kind} = update)
+       when kind in ["tool_call", "tool_call_update"] do
+    if Tightbeam.ToolCalls.context_compaction?(update) do
+      state
+    else
+      mark_non_refusal_output(state, Map.get(state.subagent_roots, sid, sid))
+    end
+  end
+
+  defp remember_non_refusal_output(state, _sid, _update), do: state
+
+  defp mark_non_refusal_output(state, sid) do
+    case state.prompts[sid] do
+      nil -> state
+      %{non_refusal_output: true} -> state
+      _prompt -> put_in(state.prompts[sid][:non_refusal_output], true)
     end
   end
 

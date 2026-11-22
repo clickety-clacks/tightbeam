@@ -1265,7 +1265,8 @@ defmodule Tightbeam.HarklightLifecycle do
                 true
 
               [seq, status, _] when status in ["failed", "failed_unknown"] ->
-                health_redelivered?(txn, session_key, seq)
+                Tightbeam.TurnLifecycle.provider_refusal_in_txn?(txn, seq) or
+                  health_redelivered?(txn, session_key, seq)
 
               _ ->
                 false

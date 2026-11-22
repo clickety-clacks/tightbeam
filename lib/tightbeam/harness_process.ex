@@ -394,6 +394,8 @@ defmodule Tightbeam.HarnessProcess do
   def complete_park_in_txn(%DB.Txn{} = txn, key) do
     DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
 
+    if DB.Txn.changes(txn) == 1, do: Tightbeam.HolderProd.changed_in_txn(txn)
+
     :ok
   end
 

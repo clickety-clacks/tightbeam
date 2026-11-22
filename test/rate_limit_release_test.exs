@@ -239,7 +239,8 @@ defmodule Tightbeam.RateLimitReleaseTest do
   end
 
   test "a typed error without a reset retains the hold without inventing a deadline", %{db: db} do
-    error = %{@error | "message" => "Rate limit exceeded"}
+    # Plan-limit wording without a reset: account-wide, so it still fences.
+    error = %{@error | "message" => "You've hit your usage limit"}
     fail_turn(db, "k1", error)
     fail_turn(db, "k2", error)
     assert HarnessProcess.parked?(db, @key)
