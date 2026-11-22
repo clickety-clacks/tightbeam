@@ -12842,6 +12842,20 @@ defmodule Tightbeam.GatewayTest do
   @tag :cold_gateway
   @tag :gateway_checkout_refusal
   @tag :tmp_dir
+  test "turns on a disabled route fail and tell the opener without checking out an adapter",
+       ctx do
+    File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "disabled-route")
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-checkout-refusal: ok"
+    )
+  end
+
+  @tag :cold_gateway
+  @tag :gateway_checkout_refusal
+  @tag :tmp_dir
   test "a Pi turn uses its persisted local-openai provider in the onboarding remedy", ctx do
     File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "pi-local")
 

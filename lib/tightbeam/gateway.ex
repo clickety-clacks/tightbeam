@@ -4672,7 +4672,8 @@ defmodule Tightbeam.Gateway do
       end
 
       outcome =
-        with {:ok, adapter, generation} <-
+        with :ok <- stage(:checkout, admit_turn_route(db, session)),
+             {:ok, adapter, generation} <-
                stage(:checkout, checkout_adapter(session, config)),
              {:ok,
               %{
@@ -4866,11 +4867,7 @@ defmodule Tightbeam.Gateway do
             prewrite_evidence =
               Tightbeam.NoticeSubmission.prewrite_evidence(failed_stage, raw_reason)
 
-            reason =
-              case turn_credential_refusal(active_session) do
-                {:refused, message} -> message
-                :not_applicable -> selection_refusal_text(reason) || classified_reason
-              end
+            reason = turn_failure_reason(reason, classified_reason, active_session)
 
             role_model_choices =
               role_model_choices_for_failure(
@@ -5504,6 +5501,41 @@ defmodule Tightbeam.Gateway do
     do: "after #{failures} consecutive failures (last failure unknown)"
 
   defp degraded_detail(_node), do: "(host unreachable or adapter failing; cause unknown)"
+
+  # Check when the lane claims the turn. An accepted or already queued turn
+  # can outlive the credentials that made its placement usable.
+  defp admit_turn_route(db, session) do
+    %{harness: harness, host: host} = session
+
+    case TerminalCredentialFailure.get_open(db, host, harness) do
+      %{id: id} ->
+        disabled_turn_route(session, "Credential failure #{id} is still open.")
+
+      nil ->
+        case turn_credential_refusal(session) do
+          {:refused, reason} -> disabled_turn_route(session, reason)
+          :not_applicable -> :ok
+        end
+    end
+  end
+
+  defp disabled_turn_route(%{harness: harness, host: host}, reason) do
+    {:error,
+     %{
+       code: "harness_route_disabled",
+       message: "Tightbeam cannot run #{harness} on host #{host}. #{reason}"
+     }}
+  end
+
+  defp turn_failure_reason(%{code: "harness_route_disabled", message: message}, _, _),
+    do: message
+
+  defp turn_failure_reason(reason, classified, session) do
+    case turn_credential_refusal(session) do
+      {:refused, message} -> message
+      :not_applicable -> selection_refusal_text(reason) || classified
+    end
+  end
 
   defp checkout_adapter(session, config) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
