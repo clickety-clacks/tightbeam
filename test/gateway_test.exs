@@ -4485,6 +4485,15 @@ defmodule Tightbeam.GatewayTest do
       assert behind.release =~ "harness-health-retry #{held.incident.id}"
     end
 
+    :ok = HarnessProcess.complete_park(ctx.db, held.adapter_key)
+    assert HarnessHealth.get(ctx.db, incident_id).state == "open"
+
+    for id <- ["asg_held_linked", "asg_held_after"] do
+      refute Map.has_key?(read.(id), :heldBehind)
+    end
+
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, held.adapter_key)
+
     assert {:resolved, %{id: ^incident_id}} =
              HarnessHealth.resolve(ctx.db, %{
                correlation_id: "held-fence-resolved",
