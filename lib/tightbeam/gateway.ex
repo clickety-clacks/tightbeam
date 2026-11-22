@@ -375,6 +375,14 @@ defmodule Tightbeam.Gateway do
           db: db,
           runner: Map.get(config, :harklight_send_runner),
           child_opts: [base_dir: config.base_dir, cli_path: Path.join(cli_bin, "tightbeam")]},
+         if(
+           Map.get(
+             config,
+             :coordinator_hold_alerts_enabled,
+             Application.get_env(:tightbeam, :coordinator_hold_alerts_enabled, true)
+           ),
+           do: {Tightbeam.CoordinatorHoldAlerts, db: db, runner: config[:harklight_send_runner]}
+         ),
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,

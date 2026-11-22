@@ -2153,6 +2153,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.Projection.ensure_submitter_column(db)
     :ok = Tightbeam.RecordEvents.ensure_schema(db)
     :ok = Tightbeam.HolderProd.ensure_schema(db)
+    :ok = Tightbeam.CoordinatorHoldAlerts.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
