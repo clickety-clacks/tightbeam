@@ -60,7 +60,7 @@ defmodule Tightbeam.GatewayTest do
 
     expected =
       expected ++
-        ~w(harklight-send harklight-revise harklight-progress harklight-retract harklight-settle harklight-listener-restore harklight-retry harklight-follow harklight-briefings-catchup)
+        ~w(harklight-send harklight-revise harklight-progress harklight-retract harklight-settle harklight-read harklight-ack harklight-reply harklight-result harklight-listener-restore harklight-retry harklight-follow harklight-briefings-catchup)
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 

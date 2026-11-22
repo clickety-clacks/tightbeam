@@ -729,7 +729,7 @@ defmodule Tightbeam.HarklightWakes do
       """
       SELECT s.opId,s.sessionKey,s.payload FROM harklight_send_operations s
       WHERE s.state='pending' AND s.attemptedAt IS NOT NULL
-        AND COALESCE(json_extract(s.payload,'$.operation_kind'),'send')<>'change'
+        AND COALESCE(json_extract(s.payload,'$.operation_kind'),'send') NOT IN ('change','action')
         AND NOT EXISTS (SELECT 1 FROM harklight_command_results r WHERE r.opId=s.opId)
         AND NOT EXISTS (SELECT 1 FROM harklight_operation_pauses p WHERE p.opId=s.opId)
         AND NOT EXISTS (SELECT 1 FROM harklight_operation_guards g WHERE g.opId=s.opId)
@@ -1124,7 +1124,7 @@ defmodule Tightbeam.HarklightWakes do
            retry_message_rows(
              "pending sends",
              db,
-             "SELECT payload FROM harklight_send_operations WHERE sessionKey=?1 AND state='pending' AND COALESCE(json_extract(payload,'$.operation_kind'),'send')<>'change' ORDER BY opId",
+             "SELECT payload FROM harklight_send_operations WHERE sessionKey=?1 AND state='pending' AND COALESCE(json_extract(payload,'$.operation_kind'),'send') NOT IN ('change','action') ORDER BY opId",
              [origin_session]
            ),
          {:ok, terminals} <-
@@ -4382,8 +4382,8 @@ defmodule Tightbeam.HarklightWakes do
     |> Base.encode16(case: :lower)
   end
 
-  defp entry_prompt(txn, origin, line, handle, _event, sender, message, _kind, _author) do
-    instruction = handling_instruction(JSON.decode!(line))
+  defp entry_prompt(txn, origin, line, handle, event, sender, message, _kind, _author) do
+    instruction = handling_instruction(JSON.decode!(line), handle, event, message)
 
     instruction =
       case Org.get_in_txn(txn, origin) do
@@ -4405,29 +4405,36 @@ defmodule Tightbeam.HarklightWakes do
       Tightbeam.HarklightBriefings.chat_prompt_context_in_txn(txn, handle, sender, message)
   end
 
-  defp handling_instruction(%{
-         "kind" => "entry",
-         "item_id" => item,
-         "data" => %{"entry_id" => entry}
-       }) do
-    "Handle this Harklight entry from your originating session. " <>
-      "For a chat reply, run harklight-agent reply --item-id #{item} --in-reply-to #{entry} --body <reply>. " <>
+  defp handling_instruction(
+         %{"kind" => "entry", "item_id" => item, "data" => %{"entry_id" => entry}},
+         handle,
+         event,
+         message
+       ) do
+    action_instruction(handle, event) <>
+      "Reply with `tightbeam harklight-reply --handle #{handle} --request #{message} --in-reply-to #{event} --body <reply> [--op-id <uuid>]`. If the outcome is uncertain, retry the same command with unchanged inputs and the operation ID returned in the response. " <>
       "Report actual attachment transfer or use with harklight-agent file-use --item-id #{item} --entry-id #{entry} --file-id <file> and the applicable outcome."
   end
 
-  defp handling_instruction(%{
-         "kind" => "message",
-         "item_id" => item,
-         "data" => %{"terminal" => %{"state" => "answered"}}
-       }) do
-    "Handle this Harklight entry from your originating session. " <>
+  defp handling_instruction(
+         %{"kind" => "message", "data" => %{"terminal" => %{"state" => "answered"}}},
+         handle,
+         event,
+         message
+       ) do
+    action_instruction(handle, event) <>
       "Reconcile any earlier effect before applying the answer once. " <>
-      "Report its disposition with harklight-agent result --item-id #{item} --status applied|refused|received."
+      "Report its disposition with `tightbeam harklight-result --handle #{handle} --request #{message} --in-reply-to #{event} --status applied|refused|received [--op-id <uuid>]`. If the outcome is uncertain, retry the same command with unchanged inputs and the operation ID returned in the response."
   end
 
-  defp handling_instruction(_) do
+  defp handling_instruction(_, _handle, _event, _message) do
     "Handle this Harklight entry from your originating session. " <>
       "Cleared, expired or superseded requests are closed. Check the recorded outcome before acting."
+  end
+
+  defp action_instruction(handle, event) do
+    "Handle this Harklight entry from your originating session. " <>
+      "Read it with `tightbeam harklight-read --handle #{handle}`. For this delivered chat or answer, confirm handoff with `tightbeam harklight-ack --handle #{handle} --event #{event}` before acting. "
   end
 
   defp pending_supersede_targets(payload) do

@@ -256,6 +256,31 @@ pub enum Command {
         identity: Identity,
         handle: String,
     },
+    HarklightRead {
+        identity: Identity,
+        handle: String,
+    },
+    HarklightAck {
+        identity: Identity,
+        handle: String,
+        event: String,
+    },
+    HarklightReply {
+        identity: Identity,
+        handle: String,
+        request: String,
+        in_reply_to: String,
+        body: String,
+        op_id: Option<String>,
+    },
+    HarklightResult {
+        identity: Identity,
+        handle: String,
+        request: String,
+        in_reply_to: String,
+        status: String,
+        op_id: Option<String>,
+    },
     HarklightFollow {
         identity: Identity,
         message: Option<String>,
@@ -1000,7 +1025,8 @@ COMMANDS:
       For an unresolved send without a server item ID, use its returned opId.
       Use --op-id for a paused handoff receipt from your own dispatched turn.
       For a message Tightbeam has no record for, --op-id <key> names the Harklight
-      operation to retry; the retry has no wake or subscription effect.
+      send or change to retry; the retry has no wake or subscription effect.
+      For a native reply or result, retry the original native command with its returned opId.
   harklight-listener-restore --handle <handle>
       Restore this session's Gateway-managed listener on its existing delivery route.
   harklight-follow (--message <id> | --handle <handle>)
@@ -1008,6 +1034,19 @@ COMMANDS:
   harklight-retry (--all | --message <id> | --session <handle>)
       Retry the bounded listener start for unavailable unanswered conversations.
       Use --session to resume a paused feed from its last saved checkpoint.
+  harklight-read --handle <handle>
+      Read Harklight entries delivered to this session.
+  harklight-ack --handle <handle> --event <id>
+      With Agent 0.2, confirm handoff of a person chat or answer delivered to this session.
+      Closed lifecycle notices can be read without acknowledgment.
+  harklight-reply --handle <handle> --request <id> --in-reply-to <event>
+      --body <text> [--op-id <uuid>]
+      Reply to a delivered Harklight person chat. If uncertain, retry with unchanged inputs
+      and the operation ID returned in the response.
+  harklight-result --handle <handle> --request <id> --in-reply-to <event>
+      --status received|applied|refused [--op-id <uuid>]
+      Report what happened to a delivered Harklight answer. If uncertain, retry with
+      unchanged inputs and the operation ID returned in the response.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
       --type fyi|request [--kind blocker|success]
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]
@@ -3067,6 +3106,99 @@ fn parse_with_optional_catalog(
                 handle: nonempty(flags, "handle").ok_or("--handle is required")?,
             })
         }
+        "harklight-read" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(flag.as_str(), "as" | "as-user" | "as-process" | "handle")
+                })
+            {
+                return Err("usage: tightbeam harklight-read --handle <handle>".to_owned());
+            }
+
+            Ok(Command::HarklightRead {
+                identity: identity(flags)?,
+                handle: nonempty(flags, "handle").ok_or("--handle is required")?,
+            })
+        }
+        "harklight-ack" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "as" | "as-user" | "as-process" | "handle" | "event"
+                    )
+                })
+            {
+                return Err(
+                    "usage: tightbeam harklight-ack --handle <handle> --event <id>".to_owned(),
+                );
+            }
+
+            Ok(Command::HarklightAck {
+                identity: identity(flags)?,
+                handle: nonempty(flags, "handle").ok_or("--handle is required")?,
+                event: nonempty(flags, "event").ok_or("--event is required")?,
+            })
+        }
+        "harklight-reply" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "as" | "as-user"
+                            | "as-process"
+                            | "handle"
+                            | "request"
+                            | "in-reply-to"
+                            | "body"
+                            | "op-id"
+                    )
+                })
+            {
+                return Err("invalid Harklight reply flags".to_owned());
+            }
+
+            Ok(Command::HarklightReply {
+                identity: identity(flags)?,
+                handle: nonempty(flags, "handle").ok_or("--handle is required")?,
+                request: nonempty(flags, "request").ok_or("--request is required")?,
+                in_reply_to: nonempty(flags, "in-reply-to").ok_or("--in-reply-to is required")?,
+                body: flags.get("body").cloned().ok_or("--body is required")?,
+                op_id: nonempty(flags, "op-id"),
+            })
+        }
+        "harklight-result" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "as" | "as-user"
+                            | "as-process"
+                            | "handle"
+                            | "request"
+                            | "in-reply-to"
+                            | "status"
+                            | "op-id"
+                    )
+                })
+            {
+                return Err("invalid Harklight result flags".to_owned());
+            }
+
+            let status = nonempty(flags, "status").ok_or("--status is required")?;
+            if !matches!(status.as_str(), "received" | "applied" | "refused") {
+                return Err("--status must be received, applied, or refused".to_owned());
+            }
+
+            Ok(Command::HarklightResult {
+                identity: identity(flags)?,
+                handle: nonempty(flags, "handle").ok_or("--handle is required")?,
+                request: nonempty(flags, "request").ok_or("--request is required")?,
+                in_reply_to: nonempty(flags, "in-reply-to").ok_or("--in-reply-to is required")?,
+                status,
+                op_id: nonempty(flags, "op-id"),
+            })
+        }
         "harklight-follow" => {
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| {
@@ -4451,7 +4583,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -5593,6 +5725,91 @@ mod tests {
     }
 
     #[test]
+    fn harklight_agent_actions_require_their_scoped_inputs() {
+        assert_eq!(
+            parse(strings(&["harklight-read", "--handle", "handle-example"])),
+            Ok(Command::HarklightRead {
+                identity: Identity::Session,
+                handle: "handle-example".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "harklight-ack",
+                "--handle",
+                "handle-example",
+                "--event",
+                "event-1",
+            ])),
+            Ok(Command::HarklightAck {
+                identity: Identity::Session,
+                handle: "handle-example".to_owned(),
+                event: "event-1".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "harklight-reply",
+                "--handle",
+                "handle-example",
+                "--request",
+                "request-1",
+                "--in-reply-to",
+                "event-1",
+                "--body",
+                "Details",
+                "--op-id",
+                "op-1",
+            ])),
+            Ok(Command::HarklightReply {
+                identity: Identity::Session,
+                handle: "handle-example".to_owned(),
+                request: "request-1".to_owned(),
+                in_reply_to: "event-1".to_owned(),
+                body: "Details".to_owned(),
+                op_id: Some("op-1".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "harklight-result",
+                "--handle",
+                "handle-example",
+                "--request",
+                "request-1",
+                "--in-reply-to",
+                "event-1",
+                "--status",
+                "received",
+            ])),
+            Ok(Command::HarklightResult {
+                identity: Identity::Session,
+                handle: "handle-example".to_owned(),
+                request: "request-1".to_owned(),
+                in_reply_to: "event-1".to_owned(),
+                status: "received".to_owned(),
+                op_id: None,
+            })
+        );
+
+        assert!(parse(strings(&["harklight-ack", "--handle", "handle-example"])).is_err());
+        assert!(
+            parse(strings(&[
+                "harklight-result",
+                "--handle",
+                "handle-example",
+                "--request",
+                "request-1",
+                "--in-reply-to",
+                "event-1",
+                "--status",
+                "unknown",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn harklight_change_commands_accept_session_and_op_id_only_where_they_apply() {
         assert!(matches!(
             parse(strings(&["harklight-retract", "--message", "m", "--session", "h"])),
@@ -5731,6 +5948,36 @@ mod tests {
     #[test]
     fn harklight_change_commands_send_user_and_process_identity_to_gateway() {
         let calls: &[&[&str]] = &[
+            &["harklight-read", "--handle", "handle-example"],
+            &[
+                "harklight-ack",
+                "--handle",
+                "handle-example",
+                "--event",
+                "event-example",
+            ],
+            &[
+                "harklight-reply",
+                "--handle",
+                "handle-example",
+                "--request",
+                "request-example",
+                "--in-reply-to",
+                "event-example",
+                "--body",
+                "reply",
+            ],
+            &[
+                "harklight-result",
+                "--handle",
+                "handle-example",
+                "--request",
+                "request-example",
+                "--in-reply-to",
+                "event-example",
+                "--status",
+                "received",
+            ],
             &[
                 "harklight-revise",
                 "--message",
@@ -5763,6 +6010,10 @@ mod tests {
                     | Command::HarklightRetract { identity, .. }
                     | Command::HarklightSettle { identity, .. }
                     | Command::HarklightListenerRestore { identity, .. }
+                    | Command::HarklightRead { identity, .. }
+                    | Command::HarklightAck { identity, .. }
+                    | Command::HarklightReply { identity, .. }
+                    | Command::HarklightResult { identity, .. }
                     | Command::HarklightFollow { identity, .. } => identity,
                     other => panic!("unexpected command: {other:?}"),
                 };
@@ -7355,6 +7606,10 @@ mod tests {
                 "harklight-follow",
                 "harklight-listener-restore",
                 "harklight-retry",
+                "harklight-read",
+                "harklight-ack",
+                "harklight-reply",
+                "harklight-result",
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",
@@ -8621,7 +8876,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "sample-user"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 

@@ -152,7 +152,7 @@ defmodule GuardReceiptTurn do
         # GuardRuntimeFixture runs this scenario in a short-lived isolated VM.
         # Keep the stand-in first on PATH until that process exits.
         System.put_env("PATH", bin <> ":" <> System.fetch_env!("PATH"))
-        {:ok, _receipt_worker} = Tightbeam.HarklightReceipts.start_link(db: db)
+        {:ok, receipt_worker} = Tightbeam.HarklightReceipts.start_link(db: db)
 
         {Tightbeam.LaneManager, lane_opts} =
           Gateway.children(config)
@@ -200,6 +200,15 @@ defmodule GuardReceiptTurn do
                  DB.query(db, "SELECT status FROM turns WHERE seq=?1", [turn.seq])
 
         refute File.exists?(finished)
+
+        File.write!(release, "")
+        op_id = await_receipt!(db, receipt_worker, wake_id, turn_seq)
+
+        assert String.split(File.read!(calls), "\n", trim: true) == [
+                 "receipt --item-id request --entry-id #{@event_id} --agent #{session.display_name} --op-id #{op_id}"
+               ]
+
+        :ok = GenServer.stop(receipt_worker)
       after
         File.write!(release, "")
 
@@ -221,6 +230,32 @@ defmodule GuardReceiptTurn do
         if Process.alive?(lane), do: GenServer.stop(lane)
       end
     end)
+  end
+
+  # The executable's finished marker precedes the worker's durable result.
+  # Keep the fixture database up until the exact receipt is saved and the drain ends.
+  defp await_receipt!(db, worker, wake_id, turn_seq, attempts \\ 500)
+
+  defp await_receipt!(_db, _worker, _wake_id, _turn_seq, 0),
+    do: flunk("timed out waiting for the Harklight handoff receipt to persist")
+
+  defp await_receipt!(db, worker, wake_id, turn_seq, attempts) do
+    rows =
+      DB.query(
+        db,
+        "SELECT opId,journalId,completedAt FROM harklight_handoff_receipts WHERE wakeId=?1 AND turnSeq=?2",
+        [wake_id, turn_seq]
+      )
+
+    case {rows, :sys.get_state(worker)} do
+      {{:ok, [[op_id, "receipt-journal", completed_at]]}, %{task: nil}}
+      when is_binary(op_id) and is_integer(completed_at) ->
+        op_id
+
+      _ ->
+        Process.sleep(10)
+        await_receipt!(db, worker, wake_id, turn_seq, attempts - 1)
+    end
   end
 
   defp await_file!(path, attempts \\ 500)

@@ -176,7 +176,8 @@ defmodule Tightbeam.HarklightReceipts do
     end
   end
 
-  defp receipt_target(line) do
+  @doc false
+  def receipt_target(line) do
     case JSON.decode(line) do
       {:ok, %{"kind" => "entry", "item_id" => item, "data" => %{"entry_id" => entry}}}
       when is_binary(item) and is_binary(entry) ->
@@ -254,15 +255,65 @@ defmodule Tightbeam.HarklightReceipts do
     end)
   end
 
-  defp process_receipt(db, opts, argv, op, journal) do
+  @doc false
+  def acknowledge(db, wake, turn, opts) do
+    case receipt_for_ack(db, wake) do
+      {:ok, []} ->
+        # The prompt is already dispatched. The receipt worker may not have
+        # discovered this turn yet. Discover its rows before settling this wake.
+        with :ok <- discover_turns(db, "=?1", [turn]) do
+          acknowledge_receipt(db, opts, receipt_for_ack(db, wake))
+        else
+          _ -> acknowledge_receipt(db, opts, :unavailable)
+        end
+
+      row ->
+        acknowledge_receipt(db, opts, row)
+    end
+  end
+
+  defp receipt_for_ack(db, wake) do
+    DB.query(
+      db,
+      "SELECT argv,opId,journalId,completedAt FROM harklight_handoff_receipts WHERE wakeId=?1",
+      [wake]
+    )
+  end
+
+  defp acknowledge_receipt(_db, _opts, {:ok, [[_argv, _op, _journal, completed]]})
+       when is_integer(completed),
+       do: :ok
+
+  defp acknowledge_receipt(db, opts, {:ok, [[argv, op, journal, nil]]}) do
+    case process_receipt(db, opts, JSON.decode!(argv), op, journal, :explicit) do
+      :ok ->
+        :ok
+
+      {pause, reason} when pause in [:paused, :pause_unrecorded] ->
+        {:error, reason}
+
+      _ ->
+        {:error,
+         "Harklight has not confirmed this handoff. Retry acknowledgment for the same event."}
+    end
+  end
+
+  defp acknowledge_receipt(_db, _opts, _row),
+    do:
+      {:error,
+       "The dispatch receipt is not available yet. Retry acknowledgment for the same event."}
+
+  defp process_receipt(db, opts, argv, op, journal, mode \\ :automatic) do
     :global.trans({{__MODULE__, db, op}, self()}, fn ->
       with {:ok, runner} <- runner(opts),
            {:ok, journal} <- bind_journal(db, runner, op, journal),
            {:ok, result} <-
-             HarklightFailures.guarded_attempt(db, op, :automatic, fn ->
+             HarklightFailures.guarded_attempt(db, op, mode, fn ->
                recover_receipt(runner, argv, op, journal)
              end) do
-        settle_result(db, op, result)
+        if mode == :explicit,
+          do: settle_exact_receipt(db, op, result),
+          else: settle_result(db, op, result)
       else
         {:error, "harklight_recovery_held"} -> :guarded
         error -> error

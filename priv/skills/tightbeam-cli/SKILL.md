@@ -29,7 +29,22 @@ harklight-follow --message <id>` or `tightbeam harklight-follow --handle <handle
 receive wakes about another session's Tightbeam-sent message or conversation. Only
 messages and conversations sent through `tightbeam harklight-send` can be followed.
 A follow ends when the conversation is finished, or when its message is retracted or
-superseded. Replies stay on raw `harklight-agent` commands.
+superseded. Use the native commands below to act on entries delivered to this session.
+
+## Harklight entries
+
+Use the native Tightbeam commands for entries delivered to this session. The handle in the delivered entry belongs to its originating session:
+
+```sh
+tightbeam harklight-read --handle <handle>
+tightbeam harklight-ack --handle <handle> --event <event-id>
+tightbeam harklight-reply --handle <handle> --request <request-id> \
+  --in-reply-to <event-id> --body "Here is the requested detail." [--op-id <uuid>]
+tightbeam harklight-result --handle <handle> --request <request-id> \
+  --in-reply-to <event-id> --status received|applied|refused [--op-id <uuid>]
+```
+
+Reading an entry does not acknowledge it. With Harklight Agent 0.2, use `harklight-ack` to confirm handoff of a delivered person chat or answer. Read closed lifecycle notices without acknowledging them. Reply to the request and event from a delivered person chat, or report a result for a delivered answer. Use received when the answer arrived but its effect is not confirmed, applied after applying the authorized outcome, and refused when it cannot be applied. For reply and result, an operation ID is optional. If the outcome is uncertain, retry the same native command with unchanged inputs and the operation ID returned in the response. Do not repeat an effect under a different ID while the first operation is unresolved.
 
 ## Start from the assignment
 

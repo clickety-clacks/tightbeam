@@ -4,6 +4,7 @@ defmodule Tightbeam.HarklightWakesTest do
   alias Tightbeam.{
     DB,
     Ephemeral,
+    HarklightAgentActions,
     HarklightFollows,
     HarklightLifecycle,
     HarklightReceipts,
@@ -1374,7 +1375,10 @@ defmodule Tightbeam.HarklightWakesTest do
     assert prompt =~ "Origin"
     assert prompt =~ "has retired"
     refute prompt =~ "from your originating session"
-    assert prompt =~ "harklight-agent reply --item-id request --in-reply-to entry-1"
+
+    assert prompt =~
+             "tightbeam harklight-reply --handle #{@handle} --request request --in-reply-to v2_"
+
     turn = deliver_discussion_turn!(db, wake_id, main.session_key)
     assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
 
@@ -2502,10 +2506,20 @@ defmodule Tightbeam.HarklightWakesTest do
              )
 
     assert first_prompt =~ "First words"
-    assert first_prompt =~ "reply --item-id request --in-reply-to chat-1"
+
+    assert first_prompt =~
+             "harklight-reply --handle #{@handle} --request request --in-reply-to v2_"
+
+    assert first_prompt =~ "file-use --item-id request --entry-id chat-1"
+    assert first_prompt =~ "the operation ID returned in the response"
     assert second_prompt =~ "Second words"
     assert answer_prompt =~ "Seen"
-    assert answer_prompt =~ "result --item-id request --status applied|refused|received"
+
+    assert answer_prompt =~
+             "harklight-result --handle #{@handle} --request request --in-reply-to v2_"
+
+    assert answer_prompt =~ "--status applied|refused|received"
+    assert answer_prompt =~ "the operation ID returned in the response"
   end
 
   test "other requests on the same handle reach the same origin in feed order", %{
@@ -8552,7 +8566,11 @@ defmodule Tightbeam.HarklightWakesTest do
              HarklightWakes.capture_feed(db, @handle, 1, [feed_chat(1, "request", "1")], :live)
 
     assert {:ok, [[prompt]]} = DB.query(db, "SELECT prompt FROM wakes")
-    assert prompt =~ "harklight-agent reply --item-id request --in-reply-to 1"
+
+    assert prompt =~
+             "tightbeam harklight-reply --handle #{@handle} --request request --in-reply-to v2_"
+
+    assert prompt =~ "tightbeam harklight-ack --handle #{@handle} --event v2_"
     refute prompt =~ "harklight-agent receipt"
   end
 
@@ -9010,6 +9028,409 @@ defmodule Tightbeam.HarklightWakesTest do
       frame(%{kind: "refused", operation: "message-get", status: 404, error: "not_found"})
 
     {reply <> ~s|server returned HTTP 404: Some("not_found") (request ID None)\n|, 2}
+  end
+
+  test "native read, ack, reply and result use only prompts dispatched to the owner or follower",
+       %{db: db, call: owner, main: main} do
+    follower = follower_session(db, main, "agent:native-follower")
+    foreign = follower_session(db, main, "agent:native-unrelated")
+    follower_call = follow_call(owner, follower, %{message_id: "request"})
+
+    assert %{outcome: "committed", wake_effect: "subscribed"} =
+             follow_for_test(db, follower_call, [])
+
+    bind_extra(db, owner, "other")
+    bind_extra(db, owner, "closed")
+
+    assert :ok =
+             HarklightWakes.capture_feed(db, @handle, 1, [feed_chat(1, "request", "chat")], :live)
+
+    assert {:ok, [[chat]]} = DB.query(db, "SELECT eventId FROM harklight_wake_entries")
+
+    assert {:ok, [[prompt], [prompt]]} =
+             DB.query(
+               db,
+               """
+               SELECT w.prompt FROM harklight_wake_deliveries d JOIN wakes w ON w.wakeId=d.wakeId
+               WHERE d.eventId=?1
+               """,
+               [chat]
+             )
+
+    deny_runner = fn args -> flunk("unexpected Agent command: #{inspect(args)}") end
+    ack = %{handle: @handle, event_id: chat}
+    reply = native_write_params(chat, %{body: "Details"})
+
+    assert %{outcome: "refused", code: "harklight_event_unknown"} =
+             HarklightAgentActions.acknowledge(db, %{owner | params: ack}, runner: deny_runner)
+
+    native_dispatch(db, owner.session_key, chat, false)
+    assert %{output: ""} = HarklightAgentActions.read(db, %{owner | params: %{handle: @handle}})
+
+    native_dispatch(db, follower.session_key, chat)
+
+    [private, answer, closed] =
+      for frame <- [
+            feed_chat(2, "other", "private"),
+            native_answer(3),
+            feed_superseded(4, "closed")
+          ] do
+        assert :ok = HarklightWakes.capture_feed(db, @handle, frame["rev"], [frame], :live)
+
+        assert {:ok, [[event]]} =
+                 DB.query(
+                   db,
+                   "SELECT eventId FROM harklight_wake_entries ORDER BY feedCursor DESC LIMIT 1"
+                 )
+
+        native_dispatch(db, owner.session_key, event)
+        if frame["rev"] == 3, do: native_dispatch(db, follower.session_key, event)
+        event
+      end
+
+    result = native_write_params(answer, %{status: "received"})
+
+    for {action, params} <- [
+          {:read, %{handle: @handle}},
+          {:acknowledge, ack},
+          {:reply, reply},
+          {:result, result}
+        ] do
+      args = [db, follow_call(owner, foreign, params)]
+      args = if action == :read, do: args, else: args ++ [[runner: deny_runner]]
+      assert %{code: "harklight_origin_mismatch"} = apply(HarklightAgentActions, action, args)
+    end
+
+    assert %{code: "harklight_event_unknown"} =
+             HarklightAgentActions.acknowledge(
+               db,
+               %{follower_call | params: %{ack | event_id: private}},
+               runner: deny_runner
+             )
+
+    assert %{code: "harklight_action_unsupported"} =
+             HarklightAgentActions.acknowledge(
+               db,
+               %{owner | params: %{ack | event_id: closed}},
+               runner: deny_runner
+             )
+
+    for {session_call, expected} <- [
+          {owner, [private, answer, closed]},
+          {follower_call, [chat, answer]}
+        ] do
+      assert %{outcome: "received", output: output} =
+               HarklightAgentActions.read(db, %{session_call | params: %{handle: @handle}})
+
+      assert Enum.map(String.split(output, "\n"), &JSON.decode!(&1)["event_id"]) == expected
+
+      caller_chat = if session_call == owner, do: private, else: chat
+      item = if session_call == owner, do: "other", else: "request"
+      entry = if session_call == owner, do: "private", else: "chat"
+      params = %{reply | request_id: item, in_reply_to: caller_chat}
+      status = if session_call == owner, do: "received", else: "applied"
+      result = %{result | status: status}
+
+      assert %{code: "harklight_event_mismatch"} =
+               HarklightAgentActions.reply(
+                 db,
+                 %{session_call | params: %{params | request_id: "wrong"}},
+                 runner: deny_runner
+               )
+
+      assert %{code: "harklight_event_mismatch"} =
+               HarklightAgentActions.result(
+                 db,
+                 %{session_call | params: %{result | request_id: "wrong"}},
+                 runner: deny_runner
+               )
+
+      for event <- [caller_chat, answer] do
+        assert %{outcome: "acknowledged", event_id: ^event} =
+                 HarklightAgentActions.acknowledge(
+                   db,
+                   %{session_call | params: %{ack | event_id: event}},
+                   runner: deny_runner
+                 )
+      end
+
+      assert %{outcome: "committed"} =
+               HarklightAgentActions.reply(db, %{session_call | params: params},
+                 runner:
+                   native_runner(fn
+                     [
+                       "reply",
+                       "--item-id",
+                       ^item,
+                       "--in-reply-to",
+                       ^entry,
+                       "--body",
+                       "Details",
+                       "--op-id",
+                       op
+                     ] ->
+                       native_commit("reply", op, item, entry, "Details")
+                   end)
+               )
+
+      assert %{outcome: "committed"} =
+               HarklightAgentActions.result(db, %{session_call | params: result},
+                 runner:
+                   native_runner(fn
+                     ["result", "--item-id", "request", "--status", ^status, "--op-id", op] ->
+                       native_commit("result", op, "request", 100, status)
+                   end)
+               )
+    end
+  end
+
+  test "native ack settles the saved dispatch receipt with the original attribution", %{
+    db: db,
+    call: call
+  } do
+    assert :ok =
+             HarklightWakes.capture_feed(db, @handle, 1, [feed_chat(1, "request", "chat")], :live)
+
+    assert {:ok, [[event]]} = DB.query(db, "SELECT eventId FROM harklight_wake_entries")
+    native_dispatch(db, call.session_key, event, true, false)
+    caller = self()
+
+    runner =
+      native_runner(fn
+        [
+          "receipt",
+          "--item-id",
+          "request",
+          "--entry-id",
+          "chat",
+          "--agent",
+          "Origin",
+          "--op-id",
+          op
+        ] ->
+          send(caller, {:write_receipt, op})
+          frame(%{kind: "outcome_unknown", operation: "receipt", op_id: op}, 7)
+      end)
+
+    assert %{outcome: "outcome_unknown"} =
+             HarklightAgentActions.acknowledge(
+               db,
+               %{call | params: %{handle: @handle, event_id: event}},
+               runner: runner
+             )
+
+    assert_receive {:write_receipt, op}
+
+    assert %{outcome: "acknowledged"} =
+             HarklightAgentActions.acknowledge(
+               db,
+               %{call | params: %{handle: @handle, event_id: event}},
+               runner: fn ["retry", "--op-id", ^op, "--journal-id", "native-journal"] ->
+                 receipt_result(op)
+               end
+             )
+
+    assert {:ok, [[^op, completed]]} =
+             DB.query(db, "SELECT opId,completedAt FROM harklight_handoff_receipts")
+
+    assert is_integer(completed)
+  end
+
+  for {action, command, argument, changed} <-
+        [
+          {:reply, "reply", %{body: "Details"}, %{body: "Other details"}},
+          {:result, "result", %{status: "received"}, %{status: "applied"}}
+        ] do
+    test "native #{command} recovers an acted write only through its saved Agent journal",
+         %{db: db, call: call} do
+      action = unquote(action)
+      command = unquote(command)
+      input = if action == :reply, do: feed_chat(1, "request", "chat"), else: native_answer(1)
+      assert :ok = HarklightWakes.capture_feed(db, @handle, 1, [input], :live)
+      assert {:ok, [[event]]} = DB.query(db, "SELECT eventId FROM harklight_wake_entries")
+      native_dispatch(db, call.session_key, event)
+      params = native_write_params(event, unquote(Macro.escape(argument)))
+      test_pid = self()
+      committed = start_supervised!({Agent, fn -> nil end})
+
+      runner =
+        native_runner(fn args ->
+          assert hd(args) == command
+          op = List.last(args)
+          send(test_pid, {:native_write, op})
+          Agent.update(committed, fn _ -> op end)
+          raise "response lost after Agent committed"
+        end)
+
+      assert %{outcome: "outcome_unknown", op_id: op} =
+               apply(HarklightAgentActions, action, [
+                 db,
+                 %{call | params: params},
+                 [runner: runner]
+               ])
+
+      assert_receive {:native_write, ^op}
+
+      for settlement <- [
+            %{op_id: op},
+            %{message_id: "unrecorded-item", op_id: op},
+            %{message_id: "unrecorded-item", op_id: String.upcase(op)}
+          ] do
+        assert %{outcome: "refused", code: "harklight_native_action"} =
+                 HarklightSend.settle(db, %{call | params: settlement},
+                   runner: fn args -> send(test_pid, {:generic_agent_call, args}) end
+                 )
+
+        refute_received {:generic_agent_call, _}
+      end
+
+      retry = %{call | params: Map.put(params, :op_id, op)}
+      changed = %{call | params: Map.merge(retry.params, unquote(Macro.escape(changed)))}
+
+      deny_runner = fn args ->
+        flunk("changed or cached action reached Agent: #{inspect(args)}")
+      end
+
+      assert %{outcome: "refused", code: "harklight_send_mismatch"} =
+               apply(HarklightAgentActions, action, [db, changed, [runner: deny_runner]])
+
+      assert {:ok, []} = HarklightWakes.pending_send_attempts(db)
+
+      wrong_journal = fn ["retry", "--op-id", ^op, "--journal-id", "native-journal"] ->
+        frame(%{kind: "operation_unresolved", op_id: op, journal_id: "different-journal"}, 7)
+      end
+
+      assert %{outcome: "outcome_unknown", op_id: ^op} =
+               apply(HarklightAgentActions, action, [db, retry, [runner: wrong_journal]])
+
+      wrong_absence = fn ["retry", "--op-id", ^op, "--journal-id", "native-journal"] ->
+        frame(%{kind: "operation_absent", op_id: op, journal_id: "different-journal"}, 1)
+      end
+
+      assert %{outcome: "outcome_unknown", op_id: ^op} =
+               apply(HarklightAgentActions, action, [db, retry, [runner: wrong_absence]])
+
+      mismatched = fn ["retry", "--op-id", ^op, "--journal-id", "native-journal"] ->
+        {data, 0} =
+          if action == :reply,
+            do: native_commit(command, op, "request", "wrong-entry", "Details"),
+            else: native_commit(command, op, "request", 101, "received")
+
+        {data, 0}
+      end
+
+      assert %{outcome: "outcome_unknown", code: "harklight_result_mismatch", op_id: ^op} =
+               apply(HarklightAgentActions, action, [db, retry, [runner: mismatched]])
+
+      recover = fn ["retry", "--op-id", ^op, "--journal-id", "native-journal"] ->
+        assert Agent.get(committed, & &1) == op
+
+        if action == :reply,
+          do: native_commit(command, op, "request", "chat", "Details"),
+          else: native_commit(command, op, "request", 100, "received")
+      end
+
+      assert %{outcome: "committed", op_id: ^op} =
+               saved =
+               apply(HarklightAgentActions, action, [db, retry, [runner: recover]])
+
+      assert ^saved = apply(HarklightAgentActions, action, [db, retry, [runner: deny_runner]])
+
+      refused =
+        native_runner(fn [^command | _] = args ->
+          frame(
+            %{
+              kind: "refused",
+              operation: command,
+              op_id: List.last(args),
+              error: "already_closed"
+            },
+            2
+          )
+        end)
+
+      assert %{outcome: "refused", code: "already_closed", op_id: new_op} =
+               apply(HarklightAgentActions, action, [
+                 db,
+                 %{call | params: params},
+                 [runner: refused]
+               ])
+
+      refute new_op == op
+    end
+  end
+
+  defp native_answer(rev) do
+    feed_superseded(rev, "request")
+    |> put_in(["data", "terminal"], %{"state" => "answered", "at_ms" => 100, "answer" => "Yes"})
+  end
+
+  defp native_write_params(event, fields),
+    do: Map.merge(%{handle: @handle, request_id: "request", in_reply_to: event}, fields)
+
+  defp native_dispatch(db, session, event, dispatched \\ true, complete_receipt \\ true) do
+    assert {:ok, [[wake]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM harklight_wake_deliveries WHERE eventId=?1 AND sessionKey=?2",
+               [event, session]
+             )
+
+    turn = deliver_discussion_turn!(db, wake, session)
+    assert :ok = Ledger.stamp_adapter(db, turn.seq, 1)
+    if dispatched, do: record_prompt_dispatched!(db, turn)
+
+    if dispatched and complete_receipt do
+      assert {:ok, false} =
+               HarklightReceipts.drain(db, MapSet.new([turn.seq]),
+                 runner:
+                   native_runner(fn ["receipt" | _] = args -> receipt_result(List.last(args)) end)
+               )
+    end
+
+    assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    turn
+  end
+
+  defp native_runner(write) do
+    fn
+      ["journal-id"] ->
+        frame(%{kind: "journal", journal_id: "native-journal"})
+
+      ["retry", "--op-id", op, "--journal-id", "native-journal"] ->
+        frame(%{kind: "operation_absent", op_id: op, journal_id: "native-journal"}, 1)
+
+      args ->
+        write.(args)
+    end
+  end
+
+  defp native_commit("reply", op, item, entry, body) do
+    frame(%{
+      kind: "committed",
+      operation: "reply",
+      op_id: op,
+      response: %{
+        entry: %{kind: "reply", author: "origin", item_id: item, in_reply_to: entry, text: body}
+      }
+    })
+  end
+
+  defp native_commit("result", op, item, at, status) do
+    frame(%{
+      kind: "committed",
+      operation: "result",
+      op_id: op,
+      response: %{
+        message: %{item_id: item, terminal: %{state: "answered", at_ms: at}},
+        entry: %{
+          kind: "result",
+          author: "origin",
+          item_id: item,
+          result: %{status: status, result_ref: op}
+        }
+      }
+    })
   end
 
   defp bind_extra(db, call, message) do

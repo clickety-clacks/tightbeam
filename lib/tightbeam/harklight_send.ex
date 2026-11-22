@@ -344,7 +344,8 @@ defmodule Tightbeam.HarklightSend do
     op_id = call.params[:op_id]
     message = call.params[:message_id] || op_id
 
-    with :ok <- origin!(db, call) do
+    with :ok <- origin!(db, call),
+         :ok <- generic_settlement_allowed(db, op_id) do
       send_record = HarklightLifecycle.lookup(db, message)
       change_record = HarklightLifecycle.lookup_change(db, message)
 
@@ -369,9 +370,38 @@ defmodule Tightbeam.HarklightSend do
           recover_one(db, message, opts, :explicit)
       end
     else
-      {:error, code} -> failure("settle", code, early_reason(code), "failed")
+      {:error, "harklight_native_action"} ->
+        failure(
+          "settle",
+          "harklight_native_action",
+          "Retry the original native harklight-reply or harklight-result command with unchanged inputs and the same operation ID.",
+          "refused",
+          %{op_id: op_id}
+        )
+
+      {:error, code} ->
+        failure("settle", code, early_reason(code), "failed")
     end
   end
+
+  defp generic_settlement_allowed(_db, nil), do: :ok
+
+  defp generic_settlement_allowed(db, op_id) when is_binary(op_id) do
+    case DB.query(
+           db,
+           """
+           SELECT 1 FROM harklight_send_operations
+           WHERE opId=?1 AND json_extract(payload,'$.operation_kind')='action'
+           """,
+           [String.downcase(op_id)]
+         ) do
+      {:ok, []} -> :ok
+      {:ok, [[1]]} -> {:error, "harklight_native_action"}
+      {:error, _} -> {:error, "harklight_operation_lookup_unavailable"}
+    end
+  end
+
+  defp generic_settlement_allowed(_db, _op_id), do: {:error, "harklight_op_id_invalid"}
 
   defp settle_receipt(db, session_key, op_id, opts) do
     case HarklightReceipts.settle_paused(db, session_key, op_id, opts) do
@@ -974,7 +1004,8 @@ defmodule Tightbeam.HarklightSend do
     _ -> {:error, "harklight_message_lookup_failed"}
   end
 
-  defp journal_id(runner) do
+  @doc false
+  def journal_id(runner) do
     with {output, 0} <- runner.(["journal-id"]),
          {:ok, %{"kind" => "journal", "journal_id" => id}} <- JSON.decode(output),
          true <- is_binary(id) and id != "" do
@@ -1135,6 +1166,9 @@ defmodule Tightbeam.HarklightSend do
   defp early_reason("harklight_op_id_required"),
     do:
       "Tightbeam has no record of this message, so it does not know which Harklight operation to retry. Run the command again with --op-id <key>, the operation key of the unresolved Harklight operation."
+
+  defp early_reason("harklight_operation_lookup_unavailable"),
+    do: "Tightbeam could not check the saved operation ID. No operation was run."
 
   defp early_reason("harklight_op_id_invalid"),
     do: "--op-id must be a Harklight operation key (a UUID)."
@@ -1518,7 +1552,8 @@ defmodule Tightbeam.HarklightSend do
     )
   end
 
-  defp runner(opts) do
+  @doc false
+  def runner(opts) do
     case Keyword.get(opts, :runner) do
       fun when is_function(fun, 1) ->
         {:ok, fun}
@@ -1531,6 +1566,72 @@ defmodule Tightbeam.HarklightSend do
     end
   end
 
+  @doc false
+  def recover_action(runner, [command | _] = args, op_id, journal, target) do
+    opts = [operations: [command], journal_id: journal, change: true, exact_refusal: true]
+    retry = ["retry", "--op-id", op_id, "--journal-id", journal]
+
+    response =
+      case invoke(runner, retry, "committed", op_id, opts) do
+        {:error, "harklight_operation_absent", _, _} ->
+          invoke(runner, args, "committed", op_id, opts)
+
+        result ->
+          result
+      end
+
+    case response do
+      {:ok, %{"response" => response} = frame} ->
+        if action_matches?(response, target, op_id),
+          do: {:ok, frame},
+          else:
+            {:error, "harklight_result_mismatch", "Agent returned a different Harklight action.",
+             "outcome_unknown"}
+
+      {:ok, _frame} ->
+        {:error, "harklight_result_mismatch", "Agent returned no confirmed Harklight action.",
+         "outcome_unknown"}
+
+      error ->
+        error
+    end
+  end
+
+  defp action_matches?(
+         %{
+           "entry" => %{
+             "item_id" => item,
+             "kind" => "reply",
+             "author" => "origin",
+             "in_reply_to" => entry,
+             "text" => body
+           }
+         },
+         {:reply, item, entry, body},
+         _op_id
+       ),
+       do: true
+
+  defp action_matches?(
+         %{
+           "message" => %{
+             "item_id" => item,
+             "terminal" => %{"state" => "answered", "at_ms" => at}
+           },
+           "entry" => %{
+             "item_id" => item,
+             "kind" => "result",
+             "author" => "origin",
+             "result" => %{"status" => status, "result_ref" => op_id}
+           }
+         },
+         {:result, item, at, status},
+         op_id
+       ),
+       do: true
+
+  defp action_matches?(_response, _target, _op_id), do: false
+
   defp invoke(runner, args, expected, op_id, opts \\ []) do
     {output, status} = runner.(args)
 
@@ -1540,7 +1641,8 @@ defmodule Tightbeam.HarklightSend do
       expected,
       op_id,
       Keyword.get(opts, :operations, operation_names(args)),
-      opts[:journal_id]
+      opts[:journal_id],
+      opts[:exact_refusal]
     )
   rescue
     error ->
@@ -1575,18 +1677,45 @@ defmodule Tightbeam.HarklightSend do
     end)
   end
 
-  defp invoke_response(output, status, expected, op_id, operations, journal_id) do
+  defp invoke_response(output, status, expected, op_id, operations, journal_id, exact_refusal) do
     frames = result_frames(output)
 
     if expected == "committed" do
       HarklightFailures.write_error(frames, status, op_id, operations) ||
-        interpret_response(frames, output, status, expected, op_id, operations, journal_id)
+        interpret_response(
+          frames,
+          output,
+          status,
+          expected,
+          op_id,
+          operations,
+          journal_id,
+          exact_refusal
+        )
     else
-      interpret_response(frames, output, status, expected, op_id, operations, journal_id)
+      interpret_response(
+        frames,
+        output,
+        status,
+        expected,
+        op_id,
+        operations,
+        journal_id,
+        exact_refusal
+      )
     end
   end
 
-  defp interpret_response(frames, output, status, expected, op_id, operations, journal_id) do
+  defp interpret_response(
+         frames,
+         output,
+         status,
+         expected,
+         op_id,
+         operations,
+         journal_id,
+         exact_refusal
+       ) do
     case frames do
       [%{"kind" => "committed", "operation" => operation, "op_id" => ^op_id} = frame]
       when expected == "committed" and status == 0 ->
@@ -1611,7 +1740,9 @@ defmodule Tightbeam.HarklightSend do
 
       [%{"kind" => "refused"} = frame] when status in [2, 5] ->
         operation_matches = frame["operation"] in operations
-        key_matches = is_nil(frame["op_id"]) or frame["op_id"] == op_id
+
+        key_matches =
+          frame["op_id"] == op_id or (exact_refusal != true and is_nil(frame["op_id"]))
 
         if operation_matches and key_matches,
           do:
@@ -1621,7 +1752,7 @@ defmodule Tightbeam.HarklightSend do
             {:error, "harklight_result_unconfirmed", "The returned operation did not match.",
              "outcome_unknown"}
 
-      [] when status in [2, 5] ->
+      [] when status in [2, 5] and exact_refusal != true ->
         {:error, "harklight_refused", String.trim(output), "refused"}
 
       _ ->
