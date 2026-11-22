@@ -1228,6 +1228,7 @@ defmodule Tightbeam.IdentityTest do
   end
 
   test "missing product history reports provenance and abort preserves all published refs", ctx do
+    ctx = %{ctx | base: Path.join(ctx.root, "org's runtime")}
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
     edit!(ctx.base, "agentic-engineering.coder", :guidance, "org-customized", "operator")
@@ -1299,7 +1300,18 @@ defmodule Tightbeam.IdentityTest do
 
     assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
     assert File.read!(Path.join(dir, "guidance/coder.md")) == "org-customized"
-    assert {_, 0} = System.shell(keep_absent, cd: dir)
+
+    other_repo = Path.join(ctx.root, "other-repo")
+    other_file = Path.join(other_repo, new_product_path)
+    File.mkdir_p!(Path.dirname(other_file))
+    git!(other_repo, ["init", "-b", "main"])
+    File.write!(other_file, "unrelated bytes")
+    git!(other_repo, ["add", "--", new_product_path])
+
+    assert {_, 0} = System.shell(keep_absent, cd: other_repo)
+    assert File.read!(other_file) == "unrelated bytes"
+    assert git!(other_repo, ["ls-files", "--", new_product_path]) == new_product_path
+    assert git!(dir, ["ls-files", "--unmerged", "--", new_product_path]) == ""
     refute File.exists?(Path.join(dir, new_product_path))
     assert :ok = Identity.abort_relearn!(ctx.base)
     assert Identity.live_revision!(ctx.base) == live_before

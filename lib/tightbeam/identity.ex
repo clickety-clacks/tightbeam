@@ -1431,7 +1431,7 @@ defmodule Tightbeam.Identity do
           path_dispositions: product_dispositions(dir, incoming, metadata, nil),
           resolution: %{
             instructions:
-              "The published identity is unchanged. Run the chosen Git commands in the gateway's identity repository, then publish after resolving every conflicted file.",
+              "The published identity is unchanged. Run the chosen Git commands on the gateway host, then publish after resolving every conflicted file.",
             publish: "tightbeam identity relearn --resolve",
             abort: "tightbeam identity relearn --abort"
           }
@@ -2317,11 +2317,13 @@ defmodule Tightbeam.Identity do
       }
 
       if stages do
+        git = "git -C #{Support.shell_quote(Path.expand(dir))} --literal-pathspecs"
+
         Map.put(result, :resolution, %{
           reason:
             if(disposition == "base-unavailable", do: "unknown base", else: "merge conflict"),
-          accept_product: conflict_choice(path, "theirs", "3" in stages),
-          keep_organization: conflict_choice(path, "ours", "2" in stages)
+          accept_product: conflict_choice(git, path, "theirs", "3" in stages),
+          keep_organization: conflict_choice(git, path, "ours", "2" in stages)
         })
       else
         result
@@ -2329,14 +2331,14 @@ defmodule Tightbeam.Identity do
     end
   end
 
-  defp conflict_choice(path, side, true) do
+  defp conflict_choice(git, path, side, true) do
     quoted = Support.shell_quote(path)
 
-    "git --literal-pathspecs checkout --#{side} -- #{quoted} && git --literal-pathspecs add -- #{quoted}"
+    "#{git} checkout --#{side} -- #{quoted} && #{git} add -- #{quoted}"
   end
 
-  defp conflict_choice(path, _side, false),
-    do: "git --literal-pathspecs rm -f -- #{Support.shell_quote(path)}"
+  defp conflict_choice(git, path, _side, false),
+    do: "#{git} rm -f -- #{Support.shell_quote(path)}"
 
   defp product_tree_entries(_dir, nil), do: %{}
 

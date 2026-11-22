@@ -242,8 +242,8 @@ case phase do
     guidance_choice = Map.fetch!(choices, "guidance/coder.md")
     assert manifest_choice["reason"] == "unknown base"
     assert guidance_choice["reason"] == "unknown base"
-    assert {_, 0} = System.shell(manifest_choice["keepOrganization"], cd: dir)
-    assert {_, 0} = System.shell(guidance_choice["acceptProduct"], cd: dir)
+    assert {_, 0} = System.shell(manifest_choice["keepOrganization"], cd: root)
+    assert {_, 0} = System.shell(guidance_choice["acceptProduct"], cd: root)
     assert Identity.live_revision!(base) == live
     assert call.(["identity", "status"])["resolution"] == result["resolution"]
 
