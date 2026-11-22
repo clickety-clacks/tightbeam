@@ -2153,11 +2153,100 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.Projection.ensure_submitter_column(db)
     :ok = Tightbeam.RecordEvents.ensure_schema(db)
     :ok = Tightbeam.HolderProd.ensure_schema(db)
+    # This table rebuild follows all predecessor migrations so a refusal above
+    # leaves the older database and its indexes untouched.
+    :ok = upgrade_compactor_model_rate_limit_source(db)
     :ok = Tightbeam.CoordinatorHoldAlerts.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
       {:error, error} -> raise error
+    end
+  end
+
+  defp upgrade_compactor_model_rate_limit_source(db) do
+    case DB.transaction(db, fn txn ->
+           columns =
+             Txn.q(txn, "PRAGMA table_info(harness_model_rate_limits)")
+             |> Enum.map(&Enum.at(&1, 1))
+
+           if "compactionAttemptKey" in columns do
+             :ok
+           else
+             :ok =
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE harness_model_rate_limits RENAME TO harness_model_rate_limits_legacy"
+               )
+
+             :ok = Txn.exec(txn, "DROP INDEX IF EXISTS harness_model_rate_limits_held")
+
+             :ok =
+               Txn.exec(txn, """
+               CREATE TABLE harness_model_rate_limits (
+                 id TEXT PRIMARY KEY,
+                 harness TEXT NOT NULL CHECK(length(trim(harness)) > 0),
+                 host TEXT NOT NULL CHECK(length(trim(host)) > 0),
+                 model TEXT NOT NULL CHECK(length(trim(model)) > 0),
+                 modelContext TEXT,
+                 sessionKey TEXT,
+                 assignmentId TEXT,
+                 turnSeq INTEGER,
+                 compactionAttemptKey TEXT,
+                 observedAt INTEGER NOT NULL,
+                 cause TEXT NOT NULL,
+                 principal TEXT NOT NULL,
+                 releasedAt INTEGER,
+                 releaseCause TEXT CHECK(releaseCause IN ('normal-turn','escalated')),
+                 releaseTurnSeq INTEGER,
+                 CHECK((compactionAttemptKey IS NULL AND sessionKey IS NOT NULL AND turnSeq IS NOT NULL) OR
+                       (compactionAttemptKey IS NOT NULL AND sessionKey IS NULL AND turnSeq IS NULL
+                        AND assignmentId IS NULL)),
+                 CHECK((releasedAt IS NULL AND releaseCause IS NULL) OR
+                       (releasedAt IS NOT NULL AND releaseCause IS NOT NULL))
+               )
+               """)
+
+             :ok =
+               Txn.exec(txn, """
+               INSERT INTO harness_model_rate_limits
+                 (id,harness,host,model,sessionKey,assignmentId,turnSeq,compactionAttemptKey,
+                  observedAt,cause,principal,releasedAt,releaseCause,releaseTurnSeq)
+               SELECT id,harness,host,model,sessionKey,assignmentId,turnSeq,NULL,
+                      observedAt,cause,principal,releasedAt,releaseCause,releaseTurnSeq
+               FROM harness_model_rate_limits_legacy
+               """)
+
+             :ok = Txn.exec(txn, "DROP TABLE harness_model_rate_limits_legacy")
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "CREATE UNIQUE INDEX harness_model_rate_limits_turn ON harness_model_rate_limits(turnSeq) WHERE turnSeq IS NOT NULL"
+               )
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "CREATE UNIQUE INDEX harness_model_rate_limits_attempt ON harness_model_rate_limits(compactionAttemptKey) WHERE compactionAttemptKey IS NOT NULL"
+               )
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "CREATE INDEX harness_model_rate_limits_held ON harness_model_rate_limits(harness,host,model,releasedAt)"
+               )
+
+             :ok
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "compactor_model_rate_limit_source_migration_failed: #{Exception.message(error)}"
     end
   end
 

@@ -96,7 +96,8 @@ if config_env() != :test do
         {"TIGHTBEAM_WORKSPACE_ARCHIVE_MAX_ENTRIES", :workspace_archive_max_entries},
         {"TIGHTBEAM_WORKSPACE_ARCHIVE_MAX_BYTES", :workspace_archive_max_bytes},
         {"TIGHTBEAM_WORKSPACE_ARCHIVE_RESERVE_BYTES", :workspace_archive_reserve_bytes},
-        {"TIGHTBEAM_WORKSPACE_ARCHIVE_RESERVE_PERCENT", :workspace_archive_reserve_percent}
+        {"TIGHTBEAM_WORKSPACE_ARCHIVE_RESERVE_PERCENT", :workspace_archive_reserve_percent},
+        {"TIGHTBEAM_WORKSPACE_CLEANUP_STUCK_ATTEMPTS", :workspace_cleanup_stuck_attempts}
       ],
       value = System.get_env(variable) do
     config :tightbeam, key, String.to_integer(value)

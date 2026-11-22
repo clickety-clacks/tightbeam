@@ -49,7 +49,8 @@ defmodule Tightbeam.GatewayTest do
     expected = expected ++ ~w(breathing)
 
     expected =
-      expected ++ ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch)
+      expected ++
+        ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch workspace-cleanup)
 
     expected =
       expected ++
@@ -75,6 +76,7 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.all?(Map.values(handlers), &is_function(&1, 1))
     assert effects["reopen-assignment"] == ["assignment.reopened"]
     assert effects["artifact-content-fetch"] == []
+    assert effects["workspace-cleanup"] == []
 
     assert effects["tune"] == [
              "transition.recorded",
@@ -12396,6 +12398,17 @@ defmodule Tightbeam.GatewayTest do
       tmp,
       "live_base_gateway_split_messages.exs",
       "guarded-gateway-split-messages: ok"
+    )
+  end
+
+  @tag timeout: 180_000, cold_gateway: true, tmp_dir: true
+  test "a refusal-only turn commits the provider response and one accountable owner notice", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_provider_refusal.exs",
+      "guarded-gateway-provider-refusal: ok"
     )
   end
 
