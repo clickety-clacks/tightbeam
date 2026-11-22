@@ -920,7 +920,19 @@ defmodule Tightbeam.IdentityTest do
     manual_v2 = "alpha\nbeta\nproduct-gamma\n"
     File.write!(Path.join(ctx.product_guidance, "operating-manual.md"), manual_v2)
 
-    assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
+    prior_baseline = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
+    assert {:ok, candidate} = Identity.relearn!(ctx.base, "relearn operator")
+
+    assert [
+             %{
+               path: ^manual_path,
+               disposition: "combined",
+               base_source: "product-baseline-ref",
+               base_revision: ^prior_baseline
+             }
+           ] = Identity.relearn_dispositions(ctx.base, candidate.candidate_revision)
+
+    assert {:ok, _revision} = Identity.publish_live!(ctx.base, candidate)
     assert File.read!(manual) == "organization-alpha\nbeta\nproduct-gamma\n"
 
     baseline = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
@@ -1244,6 +1256,10 @@ defmodule Tightbeam.IdentityTest do
              state: "relearn-conflicted",
              conflicting_paths: ["guidance/coder.md", ^new_product_path],
              provenance_conflicts: [content_conflict, addition_conflict],
+             path_dispositions: [
+               %{path: "guidance/coder.md", disposition: "base-unavailable", base_revision: nil},
+               %{path: ^new_product_path, disposition: "base-unavailable", base_revision: nil}
+             ],
              live_revision: ^live_before
            } =
              relearn.(%{

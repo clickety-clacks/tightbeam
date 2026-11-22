@@ -973,10 +973,25 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     assert File.read!(override) == bytes
 
     assert {:ok, candidate} = Identity.relearn!(base, "fixture")
+
+    assert Enum.any?(Identity.relearn_dispositions(base, candidate.candidate_revision), fn path ->
+             path.path == "rules/row-reaction-handoff.toml" and
+               path.disposition == "kept-organization-default"
+           end)
+
     assert {:ok, _} = Identity.publish_live!(base, candidate)
     assert_single_rail_definition!(base, "reaction", "assignment-terminal-handoff")
     refute File.exists?(stock)
     assert File.read!(override) == bytes
+
+    assert Identity.revision_file_bytes!(
+             base,
+             "tightbeam/product-baseline",
+             "rules/row-reaction-handoff.toml"
+           ) ==
+             File.read!(
+               Application.app_dir(:tightbeam, "priv/seed/rules/row-reaction-handoff.toml")
+             )
   end
 
   test "an edited legacy row reaction stops without changing fixture identity", ctx do

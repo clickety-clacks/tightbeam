@@ -1416,6 +1416,24 @@ defmodule Tightbeam.Identity do
   @spec provenance_conflicts(String.t()) :: [map()]
   def provenance_conflicts(base_dir), do: provenance_conflicts_at_merge(identity_dir(base_dir))
 
+  @doc false
+  def relearn_dispositions(base_dir, candidate_revision \\ nil) do
+    dir = identity_dir(base_dir)
+
+    if candidate_revision do
+      case product_snapshot_for_candidate(dir, candidate_revision) do
+        {incoming, metadata} ->
+          product_dispositions(dir, incoming, metadata, candidate_revision)
+
+        nil ->
+          []
+      end
+    else
+      incoming = git_output!(dir, ["rev-parse", "MERGE_HEAD"])
+      product_dispositions(dir, incoming, product_snapshot_metadata!(dir, incoming), nil)
+    end
+  end
+
   defp identity_dir(base_dir), do: Path.join(base_dir, "identity")
 
   defp seed_dir do
@@ -1555,6 +1573,9 @@ defmodule Tightbeam.Identity do
 
           {revision, "product-baseline-ref", unknown_product_paths}
 
+        {:published_snapshot, revision} ->
+          {revision, "published-product-snapshot", []}
+
         {:legacy, revision, unknown_seed_paths} ->
           {revision, "legacy-upstream-history",
            Enum.uniq(unknown_seed_paths ++ @product_path_overrides)}
@@ -1587,31 +1608,21 @@ defmodule Tightbeam.Identity do
         nil
 
       revision ->
-        roots =
-          dir
-          |> git_output!(["rev-list", "--max-parents=0", "--reverse", revision])
-          |> String.split("\n", trim: true)
+        if product_snapshot_metadata_if_present(dir, revision) do
+          {:published_snapshot, revision}
+        else
+          seed_root = neutral_seed_root(dir, revision)
+          seed_paths = Enum.map(seed_entries(), &elem(&1, 0))
 
-        seed_root =
-          case roots do
-            [root] ->
-              if git_output!(dir, ["show", "-s", "--format=%s", root]) == "seed: neutral-identity",
-                do: root
-
-            _ ->
-              nil
-          end
-
-        unknown_seed_paths =
-          if seed_root do
-            Enum.reject(@seed_owned_paths, fn path ->
-              tree_entry(dir, revision, path) == tree_entry(dir, seed_root, path)
+          # Older imports copied these paths from org main. Only unchanged
+          # entries from the neutral seed commit have attributable product bytes.
+          unknown_seed_paths =
+            Enum.reject(seed_paths, fn path ->
+              seed_root && tree_entry(dir, revision, path) == tree_entry(dir, seed_root, path)
             end)
-          else
-            @seed_owned_paths
-          end
 
-        {:legacy, revision, unknown_seed_paths}
+          {:legacy, revision, unknown_seed_paths}
+        end
     end
   end
 
@@ -1675,7 +1686,7 @@ defmodule Tightbeam.Identity do
         case String.split(output, <<0>>, trim: true) do
           [entry | _] ->
             case String.split(entry, "\t", parts: 2) do
-              [header, _path] ->
+              [header, ^path] ->
                 case String.split(header, " ", trim: true) do
                   [mode, "blob", oid] -> {mode, oid}
                   [mode, "commit", oid] -> {mode, oid}
@@ -1754,7 +1765,10 @@ defmodule Tightbeam.Identity do
          upstream_prior
        ) do
     {shipped, retained} = Enum.split_with(bundle_names, &(&1 in available_bundle_names()))
-    retained_files = Enum.flat_map(retained, &retained_bundle_files(dir, &1))
+    retained_files = Enum.flat_map(retained, &retained_bundle_files(dir, &1, product_base.oid))
+
+    override_handoff =
+      not path_exists_at?(dir, "main", @handoff_seed_path) and alternate_handoff_default?(dir)
 
     # Retained files come first, so a shipped bundle's bytes win on a shared path.
     entries =
@@ -1810,6 +1824,9 @@ defmodule Tightbeam.Identity do
       "previous_upstream" => upstream_prior,
       "previous_baseline" => product_base.previous_baseline,
       "expected_live" => expected_live,
+      "org_revision" => git_output!(dir, ["rev-parse", "main"]),
+      "override_handoff" => override_handoff,
+      "unknown_paths" => unknown_paths,
       "product_paths" => product_paths,
       "provenance_conflicts" => []
     }
@@ -1832,7 +1849,7 @@ defmodule Tightbeam.Identity do
           "provenance_conflicts",
           provenance_conflict_details(
             dir,
-            unknown_paths,
+            if(override_handoff, do: unknown_paths -- [@handoff_seed_path], else: unknown_paths),
             "main",
             incoming_tree,
             product_base
@@ -1868,17 +1885,19 @@ defmodule Tightbeam.Identity do
   # imported with: its receipt paths as they stand on the upstream branch. The
   # organization keeps the bundle until it unlearns it, and local edits on main
   # stay local edits.
-  defp retained_bundle_files(dir, name) do
+  defp retained_bundle_files(_dir, _name, nil), do: []
+
+  defp retained_bundle_files(dir, name, prior_product) do
     paths = read_receipt!(dir, "main", name).paths
-    retained_upstream_files(dir, paths)
+    retained_upstream_files(dir, prior_product, paths)
   end
 
-  defp retained_upstream_files(_dir, []), do: []
+  defp retained_upstream_files(_dir, _prior_product, []), do: []
 
-  defp retained_upstream_files(dir, paths) do
+  defp retained_upstream_files(dir, prior_product, paths) do
     modes =
       dir
-      |> git_output!(["ls-tree", "-r", @upstream, "--" | paths])
+      |> git_output!(["ls-tree", "-r", prior_product, "--" | paths])
       |> String.split("\n", trim: true)
       |> Map.new(fn line ->
         [meta, path] = String.split(line, "\t", parts: 2)
@@ -1889,7 +1908,7 @@ defmodule Tightbeam.Identity do
     paths
     |> Enum.filter(&Map.has_key?(modes, &1))
     |> Enum.map(fn path ->
-      {path, git_show_bytes!(dir, @upstream, path), Map.fetch!(modes, path) == "100755"}
+      {path, git_show_bytes!(dir, prior_product, path), Map.fetch!(modes, path) == "100755"}
     end)
   end
 
@@ -1949,11 +1968,11 @@ defmodule Tightbeam.Identity do
     # A missing current entry alone can be a committed org deletion. Accept it as
     # fresh only when the identity has its neutral seed root and no path history.
     path in @product_path_overrides and
-      neutral_seed_root?(dir, org_revision) and
+      neutral_seed_root(dir, org_revision) != nil and
       not path_in_history?(dir, org_revision, path)
   end
 
-  defp neutral_seed_root?(dir, revision) do
+  defp neutral_seed_root(dir, revision) do
     roots =
       dir
       |> git_output!(["rev-list", "--max-parents=0", revision])
@@ -1961,10 +1980,11 @@ defmodule Tightbeam.Identity do
 
     case roots do
       [root] ->
-        git_output!(dir, ["show", "-s", "--format=%s", root]) == "seed: neutral-identity"
+        if git_output!(dir, ["show", "-s", "--format=%s", root]) == "seed: neutral-identity",
+          do: root
 
       _ ->
-        false
+        nil
     end
   end
 
@@ -1997,7 +2017,7 @@ defmodule Tightbeam.Identity do
 
       merge_args = merge_args ++ [@product_incoming, "-m", message]
 
-      case System.cmd("git", merge_args,
+      case System.cmd("git", without_auto_maintenance(merge_args),
              cd: dir,
              stderr_to_stdout: true,
              env: git_env(author)
@@ -2008,6 +2028,12 @@ defmodule Tightbeam.Identity do
             {:error, String.trim(output)}
           else
             force_provenance_conflicts!(dir, metadata)
+
+            # Keep the exact shipped seed in the product snapshot. An existing
+            # org-wide equivalent suppresses only its installation on org main.
+            if metadata["override_handoff"] do
+              git!(dir, ["rm", "-f", "--ignore-unmatch", "--", @handoff_seed_path])
+            end
 
             case conflict_paths(dir) do
               paths when paths != [] ->
@@ -2185,6 +2211,90 @@ defmodule Tightbeam.Identity do
       []
     end
   end
+
+  defp product_dispositions(dir, incoming, metadata, candidate) do
+    base = product_tree_entries(dir, metadata["base_oid"])
+    org = product_tree_entries(dir, metadata["org_revision"])
+    product = product_tree_entries(dir, incoming)
+    {merged, conflicts} = product_merge_result(dir, candidate)
+    unknown = MapSet.new(metadata["unknown_paths"])
+    provenance_conflicts = MapSet.new(metadata["provenance_conflicts"], &Map.fetch!(&1, "path"))
+
+    for path <- metadata["product_paths"],
+        prior = base[path],
+        local = org[path],
+        next = product[path],
+        outcome = merged[path],
+        known_base = not MapSet.member?(unknown, path),
+        (known_base and prior != next) or local != next or MapSet.member?(conflicts, path) do
+      disposition =
+        cond do
+          MapSet.member?(conflicts, path) and MapSet.member?(provenance_conflicts, path) ->
+            "base-unavailable"
+
+          MapSet.member?(conflicts, path) ->
+            "conflict"
+
+          path == @handoff_seed_path and metadata["override_handoff"] ->
+            "kept-organization-default"
+
+          outcome == local and outcome != next ->
+            "kept-organization"
+
+          outcome == next and outcome == local ->
+            "matched-product"
+
+          outcome == next and is_nil(next) ->
+            "removed-product"
+
+          outcome == next and is_nil(local) ->
+            "added-product"
+
+          outcome == next ->
+            "updated-product"
+
+          true ->
+            "combined"
+        end
+
+      %{
+        path: path,
+        disposition: disposition,
+        base_source: if(known_base, do: metadata["base_source"], else: "unavailable"),
+        base_revision: if(known_base, do: metadata["base_oid"])
+      }
+    end
+  end
+
+  defp product_tree_entries(_dir, nil), do: %{}
+
+  defp product_tree_entries(dir, revision) do
+    dir
+    |> git_output_bytes!(["ls-tree", "-r", "-z", revision])
+    |> String.split(<<0>>, trim: true)
+    |> Map.new(fn entry ->
+      [header, path] = String.split(entry, "\t", parts: 2)
+      [mode, _type, oid] = String.split(header, " ")
+      {path, {mode, oid}}
+    end)
+  end
+
+  defp product_merge_result(dir, nil) do
+    dir
+    |> git_output_bytes!(["ls-files", "--stage", "-z"])
+    |> String.split(<<0>>, trim: true)
+    |> Enum.reduce({%{}, MapSet.new()}, fn entry, {entries, conflicts} ->
+      [header, path] = String.split(entry, "\t", parts: 2)
+
+      case String.split(header, " ") do
+        [mode, oid, "0"] -> {Map.put(entries, path, {mode, oid}), conflicts}
+        [_mode, _oid, _stage] -> {entries, MapSet.put(conflicts, path)}
+      end
+    end)
+  end
+
+  defp product_merge_result(dir, candidate),
+    do: {product_tree_entries(dir, candidate), MapSet.new()}
 
   defp run_pre_merge_hook(dir, author) do
     hook = Path.join([dir, ".git", "hooks", "pre-merge-commit"])
