@@ -44,7 +44,7 @@ tightbeam harklight-result --handle <handle> --request <request-id> \
   --in-reply-to <event-id> --status received|applied|refused [--op-id <uuid>]
 ```
 
-Reading an entry does not acknowledge it. Acknowledge the exact delivered event before acting. Reply or report a result only for the request and event shown in that entry. Use received when the answer arrived but its effect is not confirmed, applied after applying the authorized outcome, and refused when it cannot be applied. For reply and result, an operation ID is optional; if you provide one and the outcome is uncertain, retry with the same ID and unchanged inputs. Do not repeat an effect under a different ID while the first operation is unresolved.
+Reading an entry does not acknowledge it. With Harklight Agent 0.2, use `harklight-ack` to confirm handoff of a delivered person chat or answer. Read closed lifecycle notices without acknowledging them. Reply to the request and event from a delivered person chat, or report a result for a delivered answer. Use received when the answer arrived but its effect is not confirmed, applied after applying the authorized outcome, and refused when it cannot be applied. For reply and result, an operation ID is optional. If the outcome is uncertain, retry the same native command with unchanged inputs and the operation ID returned in the response. Do not repeat an effect under a different ID while the first operation is unresolved.
 
 ## Start from the assignment
 
