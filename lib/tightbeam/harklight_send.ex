@@ -6,6 +6,50 @@ defmodule Tightbeam.HarklightSend do
   @uuid4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
   @decision_request_id ~r/\Adr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
 
+  # Gateway-only FYI. The episode owns the operation, so no agent session or
+  # reply subscription is involved. The configured transport routes new FYIs
+  # to the operator.
+  def send_coordinator_hold(phase, op_id, body, opts) when phase in [:outage, :recovery] do
+    title =
+      case phase do
+        :outage -> "Tightbeam coordinators are held"
+        :recovery -> "A Tightbeam coordinator is available"
+      end
+
+    with {:ok, runner} <- runner(opts),
+         {:ok, input} <-
+           inputs(%{
+             harklight_session: "new",
+             sender_id: "tightbeam",
+             title: title,
+             body: body,
+             message_type: "fyi"
+           }),
+         {:ok, prepared} <- invoke(runner, prepare_args(input, op_id), "prepared", op_id),
+         {:ok, request, _files} <- prepared_request(prepared, input, op_id) do
+      execute_coordinator_hold(runner, op_id, request)
+    else
+      {:error, code} -> {"failed", code}
+      {:error, code, _reason, _outcome} -> {"failed", code}
+    end
+  end
+
+  defp execute_coordinator_hold(runner, op_id, request) do
+    case invoke(runner, ["send", "--execute", "--op-id", op_id], "committed", op_id) do
+      {:ok, result} ->
+        case confirmed_result(result, request, op_id) do
+          {:ok, _} -> {"committed", nil}
+          {:error, code} -> {"outcome_unknown", code}
+        end
+
+      {:error, code, _reason, "refused"} ->
+        {"failed", code}
+
+      {:error, code, _reason, _outcome} ->
+        {"outcome_unknown", code}
+    end
+  end
+
   def send_request(db, call, opts \\ []) do
     result =
       with :ok <- origin!(db, call),
