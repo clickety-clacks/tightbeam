@@ -871,12 +871,12 @@ the same package bytes, candidate manifest, candidate provenance and
 planned release tag in that provenance is metadata only. Neither a Git tag nor
 a GitHub Release is created before the soak.
 
-Keep `main` at that candidate SHA through the install, soak, and publication.
+Staging and publication verify that the exact candidate is still in the
+fetched canonical `main` history.
 The release tag must be exactly `v<major>.<minor>.<patch>+<build>`: the version
 must match `cli/Cargo.toml`, and the build number is `git rev-list --count`
-for the candidate commit. If `main` advances before publication, or a
-candidate check or soak fails, prepare a new candidate from the resulting
-current `main` tip.
+for the candidate commit. If a candidate check or soak fails, prepare a new
+candidate from the current `main` tip.
 
 After the user separately approves installing that exact candidate SHA, install
 those bytes and complete the soak on the maintainers' production deployment.

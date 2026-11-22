@@ -41,6 +41,7 @@ defmodule Tightbeam.Productions.Bubble do
     NoticeBatcher,
     Org,
     Projection,
+    TurnLifecycle,
     TurnFailureNotice,
     Wakes
   }
@@ -79,6 +80,9 @@ defmodule Tightbeam.Productions.Bubble do
     Enum.each(contexts, fn
       %{status: "delivered"} = turn when not restored? ->
         recognize(db, seq, turn.status, turn)
+
+      %{refused?: true, notice?: false} = turn when not restored? ->
+        climb_refusal(db, turn)
 
       %{notice?: false, status: status} = turn when status in @bubbling_terminals ->
         unless ConditionFacts.standing?(db, "user-alerted", turn.owner) do
@@ -185,6 +189,97 @@ defmodule Tightbeam.Productions.Bubble do
     end
   end
 
+  defp climb_refusal(db, turn) do
+    {:ok, cause} = cause_row(db, turn.cause_seq)
+    ancestor = next_active_ancestor(db, turn.session_key)
+
+    {:ok, deliveries} =
+      DB.transaction(db, fn txn ->
+        prefix = "bubble:#{turn.cause_seq}:"
+
+        prior =
+          DB.Txn.q(
+            txn,
+            """
+            SELECT 1 FROM wakes WHERE wakeId>=?1 AND wakeId<?2
+            UNION ALL
+            SELECT 1 FROM turns WHERE wakeId>=?1 AND wakeId<?2 LIMIT 1
+            """,
+            [prefix, "bubble:#{turn.cause_seq};"]
+          )
+
+        if prior != [] do
+          []
+        else
+          case {refusal_openers_in_txn(txn, turn), ancestor} do
+            {[], {:ok, recipient}} ->
+              [{recipient, turn, deliver_bubble_notice_in_txn(txn, recipient, turn, cause)}]
+
+            {[], :exhausted} ->
+              :exhausted
+
+            {openers, _} ->
+              Enum.map(openers, fn [recipient, assignment_id] ->
+                refusal_turn = Map.merge(turn, %{accountable_fallback?: true})
+
+                member_cause = %{cause | assignment_id: assignment_id}
+                result = deliver_bubble_notice_in_txn(txn, recipient, refusal_turn, member_cause)
+                {recipient, refusal_turn, result}
+              end)
+          end
+        end
+      end)
+
+    case deliveries do
+      :exhausted ->
+        terminal_alerts(db, [turn])
+
+      deliveries ->
+        finish_refusal_admissions(db, deliveries)
+    end
+  end
+
+  defp finish_refusal_admissions(db, results) do
+    results
+    |> Enum.group_by(&elem(&1, 0))
+    |> Enum.each(fn {recipient, admissions} ->
+      skipped =
+        for {^recipient, turn, :skipped} <- admissions,
+            do:
+              turn
+              |> Map.merge(%{session_key: recipient, notice?: true})
+              |> Map.drop([:initial?, :accountable_fallback?])
+
+      if skipped != [], do: climb(db, skipped)
+    end)
+
+    Enum.each(results, fn
+      {_recipient, _turn, result} when result in [:skipped, :duplicate] -> :ok
+      {_recipient, _turn, delivery} -> Gateway.complete_delivery(db, delivery)
+    end)
+  end
+
+  defp refusal_openers_in_txn(txn, turn) do
+    DB.Txn.q(
+      txn,
+      """
+      WITH carried(assignmentId) AS (
+        SELECT assignmentId FROM turns WHERE seq=?1 AND assignmentId IS NOT NULL
+        UNION
+        SELECT assignmentId FROM wakes
+        WHERE deliveredTurnSeq=?1 AND digest=0 AND assignmentId IS NOT NULL
+          AND wakeId NOT GLOB 'bubble:*'
+      )
+      SELECT parent.sessionKey, CASE WHEN COUNT(*)=1 THEN MIN(a.id) END
+      FROM carried JOIN assignments a ON a.id=carried.assignmentId
+      JOIN sessions parent ON parent.sessionKey=COALESCE(a.currentOpenerSessionKey,a.openedBySession)
+      WHERE parent.state='active' AND parent.sessionKey!=?2
+      GROUP BY parent.sessionKey ORDER BY parent.sessionKey
+      """,
+      [turn.cause_seq, turn.session_key]
+    )
+  end
+
   defp enqueue_notices(db, turns, recipient) do
     causes =
       Enum.flat_map(turns, fn turn ->
@@ -259,8 +354,13 @@ defmodule Tightbeam.Productions.Bubble do
     reason = Gateway.recorded_turn_failure_sentence(cause.error)
 
     prompt =
-      "Turn #{turn.cause_seq}#{carried_wake(cause)} in #{cause.session_key} could not run: " <>
-        "#{reason}. You are #{role}. What to do about it is your judgment."
+      if cause.refused? do
+        "Turn #{turn.cause_seq}#{carried_wake(cause)} in #{cause.session_key} received the prompt. " <>
+          "The provider refused it: #{reason}. The turn did not perform work."
+      else
+        "Turn #{turn.cause_seq}#{carried_wake(cause)} in #{cause.session_key} could not run: " <>
+          "#{reason}. You are #{role}. What to do about it is your judgment."
+      end
 
     # Retain the existing per-cause UNIQUE replay handling. A duplicate must
     # not roll back or mislabel another member's admission as a duplicate.
@@ -287,7 +387,7 @@ defmodule Tightbeam.Productions.Bubble do
       # admission so restart or publication failure cannot strand it. Replaying
       # an earlier rung must not reclaim authority from a later recipient.
       # A notice routed directly to the accountable opener is informational.
-      if not fallback? and
+      if not fallback? and not cause.refused? and
            (match?({:staged, _}, delivery) or match?({:appended, _, _, _}, delivery)) do
         transfer_cannot_proceed_disposers_for_cause_in_txn(txn, turn.cause_seq, recipient)
       end
@@ -533,11 +633,13 @@ defmodule Tightbeam.Productions.Bubble do
                   "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
                 )
 
-                transfer_cannot_proceed_disposers_to_user_for_cause_in_txn(
-                  txn,
-                  turn.cause_seq,
-                  turn.owner
-                )
+                unless cause.refused? do
+                  transfer_cannot_proceed_disposers_to_user_for_cause_in_txn(
+                    txn,
+                    turn.cause_seq,
+                    turn.owner
+                  )
+                end
 
                 main_key = Org.personal_session_key(turn.owner)
 
@@ -640,7 +742,8 @@ defmodule Tightbeam.Productions.Bubble do
         db,
         """
         SELECT t.sessionKey, t.requestRef, s.ownerUserId, t.status, s.harness, s.host,
-               t.wakeId, t.messageId
+               t.wakeId, t.messageId,
+               (t.status='failed' AND #{TurnLifecycle.provider_refusal_sql("t.seq")})
         FROM turns AS t JOIN sessions AS s ON s.sessionKey = t.sessionKey
         WHERE t.seq = ?1
         """,
@@ -657,7 +760,8 @@ defmodule Tightbeam.Productions.Bubble do
           current_harness,
           current_host,
           wake_id,
-          message_id
+          message_id,
+          refused
         ]
       ] ->
         request_refs =
@@ -673,7 +777,17 @@ defmodule Tightbeam.Productions.Bubble do
             [request_ref]
           end
 
-        request_refs = if request_refs == [], do: [nil], else: request_refs
+        request_refs =
+          cond do
+            request_refs == [] ->
+              [nil]
+
+            refused == 1 and is_nil(request_ref) and carries_assignment_source?(db, seq) ->
+              [nil | request_refs]
+
+            true ->
+              request_refs
+          end
 
         Enum.flat_map(request_refs, fn request_ref ->
           case parse_cause_seq(request_ref, seq) do
@@ -688,8 +802,10 @@ defmodule Tightbeam.Productions.Bubble do
               nil
 
             {kind, cause_seq} ->
+              # A refusal completes this delivery attempt. An earlier transport
+              # failure must not consume this turn's refusal notice.
               cause_seq =
-                if kind == :cause and status in @bubbling_terminals,
+                if kind == :cause and status in @bubbling_terminals and refused != 1,
                   do: TurnFailureNotice.cause_seq(db, seq, session_key, message_id, wake_id),
                   else: cause_seq
 
@@ -709,6 +825,7 @@ defmodule Tightbeam.Productions.Bubble do
                 status: status,
                 cause_seq: cause_seq,
                 notice?: kind == :notice,
+                refused?: refused == 1,
                 harness: harness,
                 host: host
               }
@@ -719,6 +836,19 @@ defmodule Tightbeam.Productions.Bubble do
       [] ->
         []
     end
+  end
+
+  defp carries_assignment_source?(db, seq) do
+    DB.query(
+      db,
+      """
+      SELECT 1 FROM wakes
+      WHERE deliveredTurnSeq=?1 AND digest=0 AND assignmentId IS NOT NULL
+        AND wakeId NOT GLOB 'bubble:*'
+      LIMIT 1
+      """,
+      [seq]
+    ) == {:ok, [[1]]}
   end
 
   defp parse_cause_seq("bubble:" <> cause, _seq) do
@@ -742,7 +872,8 @@ defmodule Tightbeam.Productions.Bubble do
       DB.query(
         db,
         """
-        SELECT t.sessionKey,t.error,s.harness,s.host,t.assignmentId,t.wakeId
+        SELECT t.sessionKey,t.error,s.harness,s.host,t.assignmentId,t.wakeId,
+               (t.status='failed' AND #{TurnLifecycle.provider_refusal_sql("t.seq")})
         FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
         WHERE t.seq=?1
         """,
@@ -750,7 +881,7 @@ defmodule Tightbeam.Productions.Bubble do
       )
 
     case rows do
-      [[session_key, error, harness, host, assignment_id, wake_id]] ->
+      [[session_key, error, harness, host, assignment_id, wake_id, refused]] ->
         {:ok,
          %{
            session_key: session_key,
@@ -759,6 +890,7 @@ defmodule Tightbeam.Productions.Bubble do
            host: host,
            assignment_id: assignment_id,
            wake_id: wake_id,
+           refused?: refused == 1,
            source_wake_ids: carrier_source_wake_ids(db, wake_id)
          }}
 

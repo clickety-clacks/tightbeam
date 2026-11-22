@@ -25,6 +25,7 @@ defmodule Tightbeam.HarnessHealth do
     HarnessHealth.ModelRateLimit,
     Id,
     Ledger,
+    Model,
     Org,
     Wire.Payloads,
     Projection,
@@ -1478,15 +1479,35 @@ defmodule Tightbeam.HarnessHealth do
             observation_id: Map.fetch!(record, :observationId)
           }
         else
-          CompactionObservation.record(
-            db,
-            attempt,
-            harness,
-            host,
-            model,
-            failure_class,
-            observed_at
-          )
+          identity = Model.parse_ref(model)
+
+          model_rate_limit =
+            if failure_class == "rate-limit-dead" and
+                 ModelRateLimit.model_named?(rate_limit_message(reason), identity) do
+              ModelRateLimit.record_compactor_attempt(db, %{
+                harness: harness,
+                host: host,
+                model: identity.family,
+                model_context: identity.context,
+                compaction_attempt_key: attempt,
+                observed_at: observed_at,
+                cause: "compactor: provider limit explicitly named this model",
+                principal: "process:tightbeam"
+              })
+            end
+
+          observation =
+            CompactionObservation.record(
+              db,
+              attempt,
+              harness,
+              host,
+              model,
+              failure_class,
+              observed_at
+            )
+
+          Map.put(observation, :model_rate_limit, model_rate_limit)
         end
     end
   end

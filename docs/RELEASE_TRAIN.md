@@ -58,9 +58,10 @@ Do not build a release candidate until all three gates hold.
    or GitHub Release.
 
 The publisher accepts only a successful manual candidate run from `main`.
-Legacy candidate-branch runs are not eligible for publication. Keep `main` at
-the candidate SHA until publication. If `main` advances first, build and prove a
-new candidate from the new tip.
+Legacy candidate-branch runs are not eligible for publication. Staging and
+publication check that the exact selected candidate is still in the fetched
+canonical `main` history. New commits on `main` can land while it is tested and
+soaked.
 
 A failed check does not produce an eligible candidate. Fix the source through
 a reviewed change to `main`, then dispatch a new candidate for the new exact
@@ -115,7 +116,7 @@ same native package bytes, candidate manifest, checksums, and provenance.
 Use an unused tag exactly in the form
 `v<major>.<minor>.<patch>+<build>`. Its version must match
 `cli/Cargo.toml`; <build> is `git rev-list --count <candidate-sha>`. The tag
-must point to the exact current `main` tip. The publisher validates these
+must point to the exact selected candidate in `main` history. The publisher validates these
 conditions and creates the release tag and GitHub Release together. Do not
 create the tag separately. Never update, delete, or reuse a release tag.
 

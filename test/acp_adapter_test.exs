@@ -66,6 +66,9 @@ defmodule Tightbeam.Acp.AdapterTest do
       send(owner, {:matching_fired, fact_id, resident?})
       {:reply, :ok, state}
     end
+
+    @impl true
+    def handle_cast(:holder_prod_changed, state), do: {:noreply, state}
   end
 
   # The defect this refactor exists to fix, in one assertion. A vendor
@@ -575,6 +578,20 @@ defmodule Tightbeam.Acp.AdapterTest do
           conversationHistory[sid] ||= [];
           conversationHistory[sid].push(text);
         }
+        if (text?.startsWith("refusal fixture: ")) {
+          const mode = text.slice("refusal fixture: ".length);
+          const update = (body) => send({ method: "session/update", params: { sessionId: sid, update: body } });
+          const message = (text, extra = {}) => update({
+            sessionUpdate: "agent_message_chunk", content: { type: "text", text }, ...extra
+          });
+          if (mode === "other output") message("Completed the report.", { messageId: "report" });
+          if (mode === "tool") update({ sessionUpdate: "tool_call", toolCallId: "tool-1", status: "completed" });
+          if (mode === "untyped") message("I refuse this request.");
+          if (mode !== "untyped" && mode !== "empty") {
+            message("The request was declined.", { _meta: { "tightbeam.dev/providerRefusal": true } });
+          }
+          return send({ id: m.id, result: { stopReason: mode === "untyped" ? "end_turn" : "refusal" } });
+        }
         if (text === "fail after dispatch") {
           return send({ id: m.id, error: { code: -32000, message: "post-dispatch failure" } });
         }
@@ -930,6 +947,41 @@ defmodule Tightbeam.Acp.AdapterTest do
               text: "pong[allow-once]",
               messages: [%{message_id: nil, text: "pong[allow-once]"}]
             }} = Adapter.prompt(a, "sess-1", "say pong")
+  end
+
+  test "Claude classifies only a refusal stop without other turn output" do
+    {adapter, _capture_path} = start_adapter(harness: :claude)
+
+    assert {:ok,
+            %{
+              stop_reason: "refusal",
+              work_outcome: :did_not_perform,
+              text: "The request was declined."
+            }} = Adapter.prompt(adapter, "sess-1", "refusal fixture: only")
+
+    for mode <- ["tool", "other output"] do
+      assert {:ok, %{stop_reason: "refusal"} = result} =
+               Adapter.prompt(adapter, "sess-1", "refusal fixture: " <> mode)
+
+      refute Map.has_key?(result, :work_outcome)
+    end
+
+    # A prior prompt's tool or text must not bleed into the next prompt.
+    assert {:ok, %{work_outcome: :did_not_perform, text: ""}} =
+             Adapter.prompt(adapter, "sess-1", "refusal fixture: empty")
+
+    assert {:error, _reason} = Adapter.prompt(adapter, "sess-1", "fail after dispatch")
+  end
+
+  for harness <- [:claude, :codex, :pi] do
+    test "#{harness} ordinary text mentioning refusal stays an ordinary reply" do
+      {adapter, _capture_path} = start_adapter(harness: unquote(harness))
+
+      assert {:ok, %{stop_reason: "end_turn", text: "I refuse this request."} = result} =
+               Adapter.prompt(adapter, "sess-1", "refusal fixture: untyped")
+
+      refute Map.has_key?(result, :work_outcome)
+    end
   end
 
   test "prompt preserves the text-only frame and forwards ordered inline image blocks" do
