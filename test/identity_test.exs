@@ -1084,7 +1084,16 @@ defmodule Tightbeam.IdentityTest do
     assert git!(dir, ["rev-parse", "#{relearn_revision}^2"]) == incoming
 
     organization_v2 = "organization-alpha\nbeta\nproduct-gamma\n"
-    edit_candidate = Identity.edit!(ctx.base, "coder", :guidance, organization_v2, "operator")
+
+    edit_candidate =
+      Identity.edit!(
+        ctx.base,
+        "agentic-engineering.coder",
+        :guidance,
+        organization_v2,
+        "operator"
+      )
+
     edit_revision = edit_candidate.candidate_revision
 
     assert git!(dir, ["rev-parse", "#{edit_revision}^1"]) == relearn_revision
@@ -1105,7 +1114,7 @@ defmodule Tightbeam.IdentityTest do
   test "relearn preserves an org edit when product bytes are unchanged", ctx do
     learn_test_bundle!(ctx)
     path = "guidance/coder.md"
-    edit!(ctx.base, "coder", :guidance, "organization-owned", "operator")
+    edit!(ctx.base, "agentic-engineering.coder", :guidance, "organization-owned", "operator")
 
     assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
     assert File.read!(Path.join(ctx.base, "identity/#{path}")) == "organization-owned"
@@ -1117,7 +1126,7 @@ defmodule Tightbeam.IdentityTest do
 
     edit!(
       ctx.base,
-      "coder",
+      "agentic-engineering.coder",
       :guidance,
       "organization-alpha\nbeta\ngamma\n",
       "operator"
@@ -1135,7 +1144,7 @@ defmodule Tightbeam.IdentityTest do
     File.write!(Path.join(ctx.source, "guidance/coder.md"), "alpha\nbeta\ngamma\n")
     learn_test_bundle!(ctx)
     shared = "shared-alpha\nbeta\ngamma\n"
-    edit!(ctx.base, "coder", :guidance, shared, "operator")
+    edit!(ctx.base, "agentic-engineering.coder", :guidance, shared, "operator")
     File.write!(Path.join(ctx.source, "guidance/coder.md"), shared)
 
     assert {:ok, _revision} = relearn!(ctx.base, "relearn operator")
@@ -1221,7 +1230,7 @@ defmodule Tightbeam.IdentityTest do
   test "missing product history reports provenance and abort preserves all published refs", ctx do
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
-    edit!(ctx.base, "coder", :guidance, "org-customized", "operator")
+    edit!(ctx.base, "agentic-engineering.coder", :guidance, "org-customized", "operator")
     live_before = Identity.live_revision!(ctx.base)
     baseline_before = git!(dir, ["rev-parse", "tightbeam/product-baseline"])
     prior_upstream = git!(dir, ["rev-parse", "tightbeam/upstream"])
@@ -2030,8 +2039,13 @@ defmodule Tightbeam.IdentityTest do
     conflicts = [
       "archetypes/default.toml",
       "guidance/operating-manual.md",
+      "rails/github-auth.toml",
+      "rails/tightbeam-probe.toml",
+      "rules/harklight-decision-request-briefing.toml",
       "rules/harness-health-recovery.toml",
-      "rules/harness-recovery-main-wake.toml"
+      "rules/harness-recovery-main-wake.toml",
+      "rules/row-reaction-handoff.toml",
+      "rules/row-reaction-work-items.toml"
     ]
 
     assert {:conflict, ^conflicts} = relearn!(ctx.base, "operator")
@@ -2040,22 +2054,17 @@ defmodule Tightbeam.IdentityTest do
     provenance_conflicts = Identity.status(ctx.base).provenance_conflicts
     assert Enum.sort(Enum.map(provenance_conflicts, & &1["path"])) == Enum.sort(conflicts)
 
-    expected_base_sources = %{
-      "archetypes/default.toml" => "legacy-upstream-history",
-      "guidance/operating-manual.md" => "historical-base-unavailable",
-      "rules/harness-health-recovery.toml" => "historical-base-unavailable",
-      "rules/harness-recovery-main-wake.toml" => "historical-base-unavailable"
-    }
+    expected_base_sources =
+      Map.new(tl(conflicts), &{&1, "historical-base-unavailable"})
+      |> Map.put("archetypes/default.toml", "legacy-upstream-history")
 
     assert Map.new(provenance_conflicts, &{&1["path"], &1["base_source"]}) ==
              expected_base_sources
 
-    assert Map.new(provenance_conflicts, &{&1["path"], &1["base"]["present"]}) == %{
-             "archetypes/default.toml" => true,
-             "guidance/operating-manual.md" => false,
-             "rules/harness-health-recovery.toml" => false,
-             "rules/harness-recovery-main-wake.toml" => false
-           }
+    expected_base_presence = Map.new(conflicts, &{&1, &1 == "archetypes/default.toml"})
+
+    assert Map.new(provenance_conflicts, &{&1["path"], &1["base"]["present"]}) ==
+             expected_base_presence
 
     Enum.each(tl(conflicts), fn path ->
       refute File.exists?(Path.join(dir, path))

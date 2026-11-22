@@ -1561,9 +1561,18 @@ defmodule Tightbeam.Identity do
         do: previous_baseline
 
     recovered =
-      if baseline,
-        do: {:baseline, baseline},
-        else: recover_legacy_product_base(dir, upstream_prior, expected_live)
+      if baseline == upstream_prior do
+        {:baseline, baseline}
+      else
+        legacy = recover_legacy_product_base(dir, upstream_prior, expected_live)
+        legacy_oid = if legacy, do: elem(legacy, 1)
+
+        cond do
+          is_nil(baseline) -> legacy
+          legacy_oid && legacy_oid != baseline && ancestor?(dir, baseline, legacy_oid) -> legacy
+          true -> {:baseline, baseline}
+        end
+      end
 
     {oid, source, unknown_paths} =
       case recovered do
@@ -1627,29 +1636,32 @@ defmodule Tightbeam.Identity do
   end
 
   defp latest_upstream_ancestor(dir, upstream, live) do
-    latest_upstream_ancestor(dir, upstream, live, MapSet.new())
-  end
+    # Prior imports reached live as merge parents. A repair that simply pointed
+    # the upstream ref at org main did not establish a product baseline.
+    product_parents =
+      dir
+      |> git_output!(["rev-list", "--first-parent", "--merges", "--parents", live])
+      |> String.split("\n", trim: true)
+      |> Enum.flat_map(fn merge -> String.split(merge, " ") |> Enum.drop(2) end)
+      |> MapSet.new()
 
-  defp latest_upstream_ancestor(dir, revision, live, seen) do
-    cond do
-      MapSet.member?(seen, revision) ->
-        nil
+    roots =
+      dir
+      |> git_output!(["rev-list", "--max-parents=0", live])
+      |> String.split("\n", trim: true)
+      |> Enum.filter(fn root ->
+        git_output!(dir, ["show", "-s", "--format=%s", root]) in [
+          "seed: neutral-identity",
+          "learn: agentic-engineering"
+        ]
+      end)
 
-      ancestor?(dir, revision, live) ->
-        revision
+    published = Enum.into(roots, product_parents)
 
-      true ->
-        case System.cmd("git", ["rev-parse", "--verify", "#{revision}^1"],
-               cd: dir,
-               stderr_to_stdout: true
-             ) do
-          {parent, 0} ->
-            latest_upstream_ancestor(dir, String.trim(parent), live, MapSet.put(seen, revision))
-
-          {_output, _status} ->
-            nil
-        end
-    end
+    dir
+    |> git_output!(["rev-list", "--first-parent", upstream])
+    |> String.split("\n", trim: true)
+    |> Enum.find(&MapSet.member?(published, &1))
   end
 
   defp ancestor?(dir, possible_ancestor, revision) do
@@ -1767,8 +1779,8 @@ defmodule Tightbeam.Identity do
     {shipped, retained} = Enum.split_with(bundle_names, &(&1 in available_bundle_names()))
     retained_files = Enum.flat_map(retained, &retained_bundle_files(dir, &1, product_base.oid))
 
-    override_handoff =
-      not path_exists_at?(dir, "main", @handoff_seed_path) and alternate_handoff_default?(dir)
+    handoff_policy =
+      unless path_exists_at?(dir, "main", @handoff_seed_path), do: missing_handoff_policy(dir)
 
     # Retained files come first, so a shipped bundle's bytes win on a shared path.
     entries =
@@ -1825,7 +1837,7 @@ defmodule Tightbeam.Identity do
       "previous_baseline" => product_base.previous_baseline,
       "expected_live" => expected_live,
       "org_revision" => git_output!(dir, ["rev-parse", "main"]),
-      "override_handoff" => override_handoff,
+      "handoff_policy" => handoff_policy,
       "unknown_paths" => unknown_paths,
       "product_paths" => product_paths,
       "provenance_conflicts" => []
@@ -1849,7 +1861,7 @@ defmodule Tightbeam.Identity do
           "provenance_conflicts",
           provenance_conflict_details(
             dir,
-            if(override_handoff, do: unknown_paths -- [@handoff_seed_path], else: unknown_paths),
+            if(handoff_policy, do: unknown_paths -- [@handoff_seed_path], else: unknown_paths),
             "main",
             incoming_tree,
             product_base
@@ -1939,21 +1951,22 @@ defmodule Tightbeam.Identity do
     end)
   end
 
-  defp alternate_handoff_default?(dir) do
+  defp missing_handoff_policy(dir) do
     paths =
       Path.wildcard(Path.join(dir, "rules/*.toml")) ++
         Path.wildcard(Path.join(dir, "kungfu/*/rules/*.toml"))
 
-    Enum.any?(paths, fn path ->
-      relative = Path.relative_to(path, dir)
-
-      with {:ok, %{"reaction" => reactions}} <- Toml.decode(File.read!(path)),
-           true <- Provenance.owner_for_path(dir, relative) == :substrate do
-        Enum.any?(List.wrap(reactions), &organization_handoff?/1)
-      else
-        _ -> false
+    policies =
+      for path <- paths,
+          {:ok, %{"reaction" => reactions}} <- [Toml.decode(File.read!(path))],
+          %{"name" => "assignment-terminal-handoff"} = reaction <- List.wrap(reactions) do
+        case Provenance.owner_for_path(dir, Path.relative_to(path, dir)) do
+          {:kungfu, _} -> "restore-scoped-default"
+          :substrate -> if organization_handoff?(reaction), do: "keep-organization-default"
+        end
       end
-    end)
+
+    Enum.find(["keep-organization-default", "restore-scoped-default"], &(&1 in policies))
   end
 
   defp organization_handoff?(%{"name" => "assignment-terminal-handoff"} = declaration) do
@@ -2031,9 +2044,7 @@ defmodule Tightbeam.Identity do
 
             # Keep the exact shipped seed in the product snapshot. An existing
             # org-wide equivalent suppresses only its installation on org main.
-            if metadata["override_handoff"] do
-              git!(dir, ["rm", "-f", "--ignore-unmatch", "--", @handoff_seed_path])
-            end
+            apply_handoff_policy!(dir, metadata["handoff_policy"])
 
             case conflict_paths(dir) do
               paths when paths != [] ->
@@ -2071,6 +2082,16 @@ defmodule Tightbeam.Identity do
         reraise error, __STACKTRACE__
     end
   end
+
+  defp apply_handoff_policy!(dir, "keep-organization-default"),
+    do: git!(dir, ["rm", "-f", "--ignore-unmatch", "--", @handoff_seed_path])
+
+  defp apply_handoff_policy!(dir, "restore-scoped-default") do
+    if path_exists_at?(dir, "MERGE_HEAD", @handoff_seed_path),
+      do: git!(dir, ["checkout", "MERGE_HEAD", "--", @handoff_seed_path])
+  end
+
+  defp apply_handoff_policy!(_dir, nil), do: :ok
 
   defp run_before_commit(callback, dir, incoming, expected_prior) do
     case callback.() do
@@ -2221,11 +2242,8 @@ defmodule Tightbeam.Identity do
     provenance_conflicts = MapSet.new(metadata["provenance_conflicts"], &Map.fetch!(&1, "path"))
 
     for path <- metadata["product_paths"],
-        prior = base[path],
-        local = org[path],
-        next = product[path],
-        outcome = merged[path],
-        known_base = not MapSet.member?(unknown, path),
+        {prior, local, next, outcome, known_base} =
+          {base[path], org[path], product[path], merged[path], not MapSet.member?(unknown, path)},
         (known_base and prior != next) or local != next or MapSet.member?(conflicts, path) do
       disposition =
         cond do
@@ -2235,7 +2253,7 @@ defmodule Tightbeam.Identity do
           MapSet.member?(conflicts, path) ->
             "conflict"
 
-          path == @handoff_seed_path and metadata["override_handoff"] ->
+          path == @handoff_seed_path and metadata["handoff_policy"] == "keep-organization-default" ->
             "kept-organization-default"
 
           outcome == local and outcome != next ->
