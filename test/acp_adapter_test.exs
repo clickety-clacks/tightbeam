@@ -66,6 +66,9 @@ defmodule Tightbeam.Acp.AdapterTest do
       send(owner, {:matching_fired, fact_id, resident?})
       {:reply, :ok, state}
     end
+
+    @impl true
+    def handle_cast(:holder_prod_changed, state), do: {:noreply, state}
   end
 
   # The defect this refactor exists to fix, in one assertion. A vendor
