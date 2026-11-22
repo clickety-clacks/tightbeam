@@ -71,6 +71,8 @@ defmodule Tightbeam.TerminalDecisionA27aCaptureTest do
 
     Roles.create!(db, "capture-raiser", "capture-owner", raiser.session_key)
     Roles.create!(db, "capture-foreign-raiser", "capture-foreign", foreign.session_key)
+    Tightbeam.TestSupport.OperatorAskFixture.ensure_work_item!(db, "capture-owner")
+    Tightbeam.TestSupport.OperatorAskFixture.ensure_work_item!(db, "capture-foreign")
 
     gateway_config = %{
       db: db,
@@ -248,7 +250,9 @@ defmodule Tightbeam.TerminalDecisionA27aCaptureTest do
       wire!(ctx, ctx.raiser.cli_token, "operator-ask", %{
         question: "capture replacement?",
         options: [%{label: "accept"}, %{label: "decline"}],
-        supersedes: superseded
+        supersedes: superseded,
+        project: Tightbeam.TestSupport.OperatorAskFixture.project(),
+        work_item_id: Tightbeam.TestSupport.OperatorAskFixture.work_item("capture-owner")
       })
 
     hidden = ask(ctx, ctx.foreign.cli_token, "capture hidden?")
@@ -282,9 +286,13 @@ defmodule Tightbeam.TerminalDecisionA27aCaptureTest do
   end
 
   defp ask(ctx, token, question) do
+    owner = if token == ctx.raiser.cli_token, do: "capture-owner", else: "capture-foreign"
+
     wire!(ctx, token, "operator-ask", %{
       question: question,
-      options: [%{label: "accept"}, %{label: "decline"}]
+      options: [%{label: "accept"}, %{label: "decline"}],
+      project: Tightbeam.TestSupport.OperatorAskFixture.project(),
+      work_item_id: Tightbeam.TestSupport.OperatorAskFixture.work_item(owner)
     })["id"]
   end
 

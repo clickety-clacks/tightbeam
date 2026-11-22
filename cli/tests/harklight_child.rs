@@ -104,7 +104,7 @@ fn input_eof_terminates_and_reaps_the_cli() {
 
 #[test]
 fn stop_barrier_waits_for_the_live_cli() {
-    let mut running = start("echo $$; exec sleep 60");
+    let mut running = start("printf 'final diagnostic' >&2; echo $$; exec sleep 60");
     let pid = child_pid(&mut running);
     let mut waiting = barrier(&running.lock);
     std::thread::sleep(Duration::from_millis(100));
@@ -116,7 +116,16 @@ fn stop_barrier_waits_for_the_live_cli() {
         .unwrap()
         .write_all(b"stop\n")
         .unwrap();
-    running.child.wait().unwrap();
+    assert!(running.child.wait().unwrap().success());
+    let mut errors = String::new();
+    running
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut errors)
+        .unwrap();
+    assert_eq!(errors, "final diagnostic");
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     assert!(waiting.wait().unwrap().success());
 }
@@ -125,8 +134,12 @@ fn stop_barrier_waits_for_the_live_cli() {
 fn wrapper_death_cannot_masquerade_as_child_exit() {
     let mut running = start("echo $$; exec sleep 60");
     let pid = child_pid(&mut running);
+    // Child::wait closes its stdin. Keep it open until the wrapper is dead:
+    // otherwise its EOF handler can kill the child while SIGKILL is pending.
+    let input = running.child.stdin.take().unwrap();
     running.child.kill().unwrap();
     running.child.wait().unwrap();
+    drop(input);
     let mut waiting = barrier(&running.lock);
     std::thread::sleep(Duration::from_millis(100));
     assert!(waiting.try_wait().unwrap().is_none());

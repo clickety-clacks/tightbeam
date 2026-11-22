@@ -67,6 +67,7 @@ defmodule Tightbeam.Rules do
 
   @persist_key __MODULE__
   @policy_key {__MODULE__, :policies}
+  @diagnostics_key {__MODULE__, :diagnostics}
   @snapshot_key {__MODULE__, :effective_snapshot}
   @call_snapshot_key {__MODULE__, :call_snapshot}
   @rule_keys MapSet.new([
@@ -119,6 +120,7 @@ defmodule Tightbeam.Rules do
                  "archetype",
                  "host",
                  "on_rule_denied",
+                 "accountable_notice",
                  "params"
                ])
   @binding_tokens ~w(
@@ -370,6 +372,7 @@ defmodule Tightbeam.Rules do
     declarations = Tightbeam.Mementos.read_declarations!(law_base, identity_manifest_sha)
 
     :persistent_term.put({__MODULE__, :unavailable_verbs}, %{})
+    :persistent_term.put(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
 
     entries =
       law_base
@@ -413,16 +416,29 @@ defmodule Tightbeam.Rules do
                   MapSet.to_list(verbs)
               end
 
-            unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
-
-            :persistent_term.put(
-              {__MODULE__, :unavailable_verbs},
-              Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
+            mark_unavailable(
+              affected,
+              path,
+              unavailable_scope_for_path(law_base, path)
             )
+
+            Enum.each(affected, fn verb ->
+              record_unavailable_verb(%{
+                verb: verb,
+                file: diagnostic_file(path, law_base),
+                name: "<file>",
+                reason: Exception.message(error)
+              })
+            end)
 
             []
         end
       end)
+      |> add_builtin_defaults(
+        Keyword.get(opts, :builtin_defaults, false),
+        law_base,
+        identity_manifest_sha
+      )
       |> Enum.map(fn
         {:rule, rule} ->
           # Keep runtime effects in the real base. A recovery snapshot is removed
@@ -464,12 +480,15 @@ defmodule Tightbeam.Rules do
         if duplicates[rule.name] > 1 do
           require Logger
           Logger.warning("rule #{rule.name} unavailable: duplicate name in #{rule.source}")
-          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
 
-          :persistent_term.put(
-            {__MODULE__, :unavailable_verbs},
-            Map.put(unavailable, rule.verb, rule.source)
-          )
+          record_unavailable_verb(%{
+            verb: rule.verb,
+            file: diagnostic_file(rule.source, law_base),
+            name: rule.name,
+            reason: "duplicate name"
+          })
+
+          mark_unavailable([rule.verb], rule.source, unavailable_scope(law_base, rule.owner))
 
           true
         else
@@ -480,12 +499,16 @@ defmodule Tightbeam.Rules do
     policies =
       Enum.reject(policies, fn policy ->
         if duplicates[policy.name] > 1 do
-          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+          mark_unavailable(verbs, policy.source, unavailable_scope(law_base, policy.owner))
 
-          :persistent_term.put(
-            {__MODULE__, :unavailable_verbs},
-            Enum.reduce(verbs, unavailable, &Map.put(&2, &1, policy.source))
-          )
+          Enum.each(verbs, fn verb ->
+            record_unavailable_verb(%{
+              verb: verb,
+              file: diagnostic_file(policy.source, law_base),
+              name: policy.name,
+              reason: "duplicate policy name"
+            })
+          end)
 
           true
         else
@@ -507,12 +530,15 @@ defmodule Tightbeam.Rules do
           error ->
             require Logger
             Logger.warning("rule #{rule.name} unavailable: #{Exception.message(error)}")
-            unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
 
-            :persistent_term.put(
-              {__MODULE__, :unavailable_verbs},
-              Map.put(unavailable, rule.verb, rule.source)
-            )
+            record_unavailable_verb(%{
+              verb: rule.verb,
+              file: diagnostic_file(rule.source, law_base),
+              name: rule.name,
+              reason: Exception.message(error)
+            })
+
+            mark_unavailable([rule.verb], rule.source, unavailable_scope(law_base, rule.owner))
 
             false
         end
@@ -544,12 +570,40 @@ defmodule Tightbeam.Rules do
     rules
   end
 
+  @doc "Return the rule availability diagnostics from the most recent load."
+  def status do
+    diagnostics =
+      :persistent_term.get(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
+
+    unavailable =
+      diagnostics.unavailable_verbs
+      |> Enum.sort_by(&{&1.verb, &1.file, &1.name || ""})
+
+    skipped =
+      diagnostics.skipped_policies
+      |> Enum.sort_by(&{&1.file, &1.name})
+
+    %{
+      recording_available: unavailable == [],
+      unavailable_verbs: unavailable,
+      skipped_policies: skipped
+    }
+  end
+
   @doc false
   def reaction_plans(event, facts) do
     Tightbeam.RowReactions.Plan.evaluate(
       Map.get(effective_snapshot(), :reactions, []),
       event,
       facts
+    )
+  end
+
+  @doc false
+  def reaction_family_loaded?(family) when is_binary(family) do
+    Enum.any?(
+      Map.get(effective_snapshot(), :reactions, []),
+      &(&1.mode == :event and &1.family == family)
     )
   end
 
@@ -704,7 +758,7 @@ defmodule Tightbeam.Rules do
     verb = Map.fetch!(call, :verb)
     edge = edge(call)
 
-    case Map.get(:persistent_term.get({__MODULE__, :unavailable_verbs}, %{}), verb) do
+    case unavailable_source(db, call, verb) do
       nil ->
         candidate_rules = Enum.filter(rules, &(&1.verb == verb and edge in &1.edges))
 
@@ -753,9 +807,9 @@ defmodule Tightbeam.Rules do
       fail = fn message -> raise ArgumentError, message end
       validate_predicate_conditions!(conditions, fail)
       conditions = validate_conditions!(conditions, fail)
-      bindings = validate_bindings_in_txn!(txn, conditions, raw_bindings, owner_user_id)
+      bindings = validate_bindings_in_txn!(txn, conditions, raw_bindings)
 
-      candidates = artifact_candidates_in_txn(txn, conditions, bindings, owner_user_id)
+      candidates = artifact_candidates_in_txn(txn, conditions, bindings)
 
       result =
         Enum.reduce_while(candidates, nil, fn candidate, _acc ->
@@ -838,7 +892,8 @@ defmodule Tightbeam.Rules do
     String.downcase(String.first(value)) <> String.slice(value, 1..-1//1)
   end
 
-  defp validate_bindings_in_txn!(txn, conditions, raw_bindings, owner_user_id)
+  # Bindings must name existing rows; whose rows they are does not matter.
+  defp validate_bindings_in_txn!(txn, conditions, raw_bindings)
        when is_map(raw_bindings) do
     bindings = normalize_bindings(raw_bindings)
     unknown = Map.keys(bindings) -- @predicate_binding_keys
@@ -851,28 +906,20 @@ defmodule Tightbeam.Rules do
 
     if MapSet.member?(facts, "work_item.state") do
       id = required_binding!(bindings, "workItemId")
-      ensure_owned_row!(txn, "work item", id, owner_user_id, "work_items", "id", "ownerUserId")
+      ensure_row!(txn, "work item", id, "work_items", "id")
     end
 
     if Enum.any?(facts, &(&1 in ~w(assignment.state assignment.outcome))) do
       id = required_binding!(bindings, "assignmentId")
 
-      unless owned_assignment?(txn, id, owner_user_id),
-        do: raise(ArgumentError, "unknown or inaccessible assignment binding")
+      unless assignment_exists?(txn, id),
+        do: raise(ArgumentError, "unknown assignment binding")
     end
 
     if MapSet.member?(facts, "decision_request.status") do
       id = required_binding!(bindings, "decisionRequestId")
 
-      ensure_owned_row!(
-        txn,
-        "decision request",
-        id,
-        owner_user_id,
-        "decision_requests",
-        "id",
-        "ownerUserId"
-      )
+      ensure_row!(txn, "decision request", id, "decision_requests", "id")
     end
 
     bindings =
@@ -880,7 +927,7 @@ defmodule Tightbeam.Rules do
         Map.put(
           bindings,
           "artifact",
-          validate_artifact_binding_in_txn!(txn, Map.get(bindings, "artifact"), owner_user_id)
+          validate_artifact_binding_in_txn!(txn, Map.get(bindings, "artifact"))
         )
       else
         bindings
@@ -905,7 +952,7 @@ defmodule Tightbeam.Rules do
     bindings
   end
 
-  defp validate_bindings_in_txn!(_txn, _conditions, _raw_bindings, _owner_user_id),
+  defp validate_bindings_in_txn!(_txn, _conditions, _raw_bindings),
     do: raise(ArgumentError, "predicate bindings must be an object")
 
   defp predicate_binding_key(key) when is_atom(key) do
@@ -934,29 +981,15 @@ defmodule Tightbeam.Rules do
     end
   end
 
-  defp ensure_owned_row!(txn, label, id, owner, table, id_column, owner_column) do
-    sql = "SELECT 1 FROM #{table} WHERE #{id_column}=?1 AND #{owner_column}=?2"
-
-    if DB.Txn.q(txn, sql, [id, owner]) != [[1]],
-      do: raise(ArgumentError, "unknown or inaccessible #{label} binding")
+  defp ensure_row!(txn, label, id, table, id_column) do
+    if DB.Txn.q(txn, "SELECT 1 FROM #{table} WHERE #{id_column}=?1", [id]) != [[1]],
+      do: raise(ArgumentError, "unknown #{label} binding")
   end
 
-  defp owned_assignment?(txn, id, owner) do
-    DB.Txn.q(
-      txn,
-      """
-      SELECT 1
-      FROM assignments a
-      JOIN sessions s ON s.sessionKey=a.holderKey
-      LEFT JOIN work_items wi ON wi.id=a.workItemId
-      WHERE a.id=?1 AND s.ownerUserId=?2
-        AND (a.workItemId IS NULL OR wi.ownerUserId=?2)
-      """,
-      [id, owner]
-    ) == [[1]]
-  end
+  defp assignment_exists?(txn, id),
+    do: DB.Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1", [id]) == [[1]]
 
-  defp validate_artifact_binding_in_txn!(txn, binding, owner) when is_map(binding) do
+  defp validate_artifact_binding_in_txn!(txn, binding) when is_map(binding) do
     binding = Map.new(binding, fn {key, value} -> {predicate_binding_key(key), value} end)
     keys = Map.keys(binding) |> Enum.sort()
 
@@ -972,7 +1005,7 @@ defmodule Tightbeam.Rules do
               "artifact identity binding requires nonblank artifactId and contentSha256"
             )
 
-        ensure_owned_artifact!(txn, artifact_id, owner)
+        ensure_artifact!(txn, artifact_id)
 
       keys in [["producedByAssignmentId"], ["contentSha256", "producedByAssignmentId"]] ->
         producer = Map.get(binding, "producedByAssignmentId")
@@ -982,8 +1015,8 @@ defmodule Tightbeam.Rules do
                  (is_nil(hash) or (is_binary(hash) and hash != "")),
                do: raise(ArgumentError, "artifact producer binding is malformed")
 
-        unless owned_assignment?(txn, producer, owner),
-          do: raise(ArgumentError, "unknown or inaccessible artifact producer binding")
+        unless assignment_exists?(txn, producer),
+          do: raise(ArgumentError, "unknown artifact producer binding")
 
       true ->
         raise ArgumentError,
@@ -993,25 +1026,21 @@ defmodule Tightbeam.Rules do
     binding
   end
 
-  defp validate_artifact_binding_in_txn!(_txn, _binding, _owner),
+  defp validate_artifact_binding_in_txn!(_txn, _binding),
     do: raise(ArgumentError, "bindings are missing artifact")
 
-  defp ensure_owned_artifact!(txn, artifact_id, owner) do
+  defp ensure_artifact!(txn, artifact_id) do
     rows =
       DB.Txn.q(
         txn,
-        """
-        SELECT 1 FROM artifacts art
-        JOIN work_items wi ON wi.id=art.workItemId
-        WHERE art.artifactId=?1 AND wi.ownerUserId=?2
-        """,
-        [artifact_id, owner]
+        "SELECT 1 FROM artifacts art JOIN work_items wi ON wi.id=art.workItemId WHERE art.artifactId=?1",
+        [artifact_id]
       )
 
-    if rows != [[1]], do: raise(ArgumentError, "unknown or inaccessible artifact binding")
+    if rows != [[1]], do: raise(ArgumentError, "unknown artifact binding")
   end
 
-  defp artifact_candidates_in_txn(txn, conditions, bindings, owner) do
+  defp artifact_candidates_in_txn(txn, conditions, bindings) do
     if Enum.any?(conditions, &(&1.fact in @artifact_facts)) do
       binding = Map.get(bindings, "artifact")
 
@@ -1023,26 +1052,26 @@ defmodule Tightbeam.Rules do
               """
               SELECT art.artifactId, art.contentSha256, art.producedByAssignmentId
               FROM artifacts art JOIN work_items wi ON wi.id=art.workItemId
-              WHERE art.artifactId=?1 AND wi.ownerUserId=?2
+              WHERE art.artifactId=?1
               """,
-              [artifact_id, owner]
+              [artifact_id]
             )
 
           %{"producedByAssignmentId" => producer} = artifact_binding ->
             expected_hash = Map.get(artifact_binding, "contentSha256")
-            hash_clause = if is_binary(expected_hash), do: " AND art.contentSha256=?3", else: ""
+            hash_clause = if is_binary(expected_hash), do: " AND art.contentSha256=?2", else: ""
 
             params =
               if is_binary(expected_hash),
-                do: [producer, owner, expected_hash],
-                else: [producer, owner]
+                do: [producer, expected_hash],
+                else: [producer]
 
             DB.Txn.q(
               txn,
               """
               SELECT art.artifactId, art.contentSha256, art.producedByAssignmentId
               FROM artifacts art JOIN work_items wi ON wi.id=art.workItemId
-              WHERE art.producedByAssignmentId=?1 AND wi.ownerUserId=?2#{hash_clause}
+              WHERE art.producedByAssignmentId=?1#{hash_clause}
               ORDER BY art.createdAt, art.artifactId
               """,
               params
@@ -1109,12 +1138,7 @@ defmodule Tightbeam.Rules do
         row_commit_candidate_calls_in_txn(txn, rule, call)
         |> Enum.flat_map(fn candidate_call ->
           candidates =
-            artifact_candidates_in_txn(
-              txn,
-              rule.conditions,
-              candidate_call.predicate_bindings,
-              owner
-            )
+            artifact_candidates_in_txn(txn, rule.conditions, candidate_call.predicate_bindings)
 
           Enum.reduce_while(candidates, [], fn candidate, [] ->
             candidate_call = Map.put(candidate_call, :artifact_candidate, candidate)
@@ -1444,13 +1468,100 @@ defmodule Tightbeam.Rules do
 
   defp field(map, key), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
 
+  # Rules every install gets whether or not its identity defines them. Each is
+  # read from the release (`priv/seed`), never from the identity repository, and is
+  # used only when the loaded law defines no entry with that compiled name. A
+  # receipt-owned reaction has a qualified name and keeps its own scope.
+  # Add a default here by naming the reaction and its seed file.
+  @builtin_default_reactions [
+    {"assignment-terminal-handoff", "rules/row-reaction-handoff.toml"}
+  ]
+
+  defp add_builtin_defaults(entries, false, _law_base, _sha), do: entries
+
+  defp add_builtin_defaults(entries, true, law_base, sha) do
+    Enum.reduce(@builtin_default_reactions, entries, fn {name, relative}, acc ->
+      # Names are unique across rules, policies and reactions: a second entry of
+      # any kind with the same name would make the loader drop both, including a
+      # valid live one. Existing law is never disturbed for the default.
+      cond do
+        Enum.any?(acc, &match?({:reaction, %{name: ^name}}, &1)) ->
+          acc
+
+        Enum.any?(acc, &match?({kind, %{name: ^name}} when kind in [:rule, :policy], &1)) ->
+          require Logger
+
+          Logger.warning(
+            "built-in default rule #{name} is not used: the live identity already has a " <>
+              "rule or policy with that name, which is not a reaction"
+          )
+
+          acc
+
+        true ->
+          acc ++ builtin_default(name, relative, law_base, sha)
+      end
+    end)
+  end
+
+  defp builtin_default(name, relative, law_base, sha) do
+    require Logger
+    shipped = Application.app_dir(:tightbeam, Path.join("priv/seed", relative))
+    # Use the canonical identity-relative location for reporting. The bytes
+    # come from the release, so an identity receipt cannot own this copy.
+    virtual = Path.join([law_base, "identity", relative])
+    bytes = File.read!(shipped)
+
+    [{:reaction, %{name: ^name}}] =
+      loaded =
+      Tightbeam.RowReactions.Loader.compile!(
+        Toml.decode!(bytes),
+        virtual,
+        law_base,
+        sha,
+        bytes,
+        :substrate
+      )
+
+    Logger.info(
+      "built-in default rule #{name} is in use: the live identity does not define it; " <>
+        "`tightbeam identity relearn` installs an editable copy"
+    )
+
+    loaded
+  rescue
+    error ->
+      Logger.warning("built-in default rule #{name} unavailable: #{Exception.message(error)}")
+      []
+  end
+
   defp rule_paths(base_dir) do
     root = Path.join(base_dir, "identity")
 
     (Path.wildcard(Path.join([root, "rules", "*.toml"])) ++
        Path.wildcard(Path.join([root, "kungfu", "*", "rules", "*.toml"])))
+    |> Enum.filter(&rule_file_path?(Path.relative_to(&1, root)))
     |> Enum.uniq()
     |> Enum.sort()
+  end
+
+  @doc """
+  Whether an identity-relative path is a rule file the loader reads.
+
+  The one definition, so a caller that lists a Git revision agrees with the
+  loader: `rules/*.toml` and `kungfu/<name>/rules/*.toml`, never a dot-prefixed
+  segment (as `Path.wildcard/1` never matches one).
+  """
+  @spec rule_file_path?(String.t()) :: boolean()
+  def rule_file_path?(relative) do
+    visible = &(not String.starts_with?(&1, "."))
+
+    String.ends_with?(relative, ".toml") and
+      case Path.split(relative) do
+        ["rules", file] -> visible.(file)
+        ["kungfu", name, "rules", file] -> visible.(name) and visible.(file)
+        _ -> false
+      end
   end
 
   defp owned_archetypes(_base_dir, :substrate), do: MapSet.new()
@@ -1494,6 +1605,24 @@ defmodule Tightbeam.Rules do
         names
     end
   end
+
+  # An org-written entry without `archetypes` names no agent, so it can only
+  # apply to records that involve no agent at all. Say so at load rather than
+  # leaving it to be discovered when the entry never fires.
+  defp warn_omitted_archetypes(entry, :substrate, path, label) do
+    unless Map.has_key?(entry, "archetypes") do
+      require Logger
+
+      Logger.warning(
+        "#{path}: #{label} omits archetypes and applies to no agent; " <>
+          ~s(add archetypes = ["*"] to apply it to every agent)
+      )
+    end
+
+    :ok
+  end
+
+  defp warn_omitted_archetypes(_entry, _owner, _path, _label), do: :ok
 
   defp validate_kungfu_condition_names!(_conditions, :substrate, _owned_archetypes, _fail),
     do: :ok
@@ -1786,6 +1915,70 @@ defmodule Tightbeam.Rules do
     end
   end
 
+  # A refused rule makes its verb unavailable only where the rule would have
+  # applied. A kungfu's refused rule is confined to that kungfu's own archetypes
+  # (the way a refused tool-call rail is); substrate and org-written rules stay
+  # unavailable for everyone.
+  defp unavailable_scope(base_dir, {:kungfu, _name} = owner) do
+    %{
+      owner: owner,
+      base_dir: base_dir,
+      archetypes: base_dir |> owned_archetypes(owner) |> MapSet.to_list() |> Enum.sort()
+    }
+  rescue
+    _ -> :all
+  end
+
+  defp unavailable_scope(_base_dir, _owner), do: :all
+
+  # The owner of a broken file may itself be unreadable (an unreadable or
+  # conflicting receipt); that leaves the verb unavailable for everyone.
+  defp unavailable_scope_for_path(base_dir, path) do
+    owner =
+      Tightbeam.Identity.Provenance.owner_for_path(
+        base_dir,
+        Path.relative_to(path, Path.join(base_dir, "identity"))
+      )
+
+    unavailable_scope(base_dir, owner)
+  rescue
+    _ -> :all
+  end
+
+  defp mark_unavailable(verbs, source, scope) do
+    unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+    :persistent_term.put(
+      {__MODULE__, :unavailable_verbs},
+      Enum.reduce(verbs, unavailable, fn verb, acc ->
+        Map.update(acc, verb, [{source, scope}], &[{source, scope} | &1])
+      end)
+    )
+  end
+
+  defp unavailable_source(db, call, verb) do
+    entries = Map.get(:persistent_term.get({__MODULE__, :unavailable_verbs}, %{}), verb, [])
+
+    Enum.find_value(entries, fn {source, scope} ->
+      if unavailable_scope_applies?(scope, db, call), do: source
+    end)
+  end
+
+  defp unavailable_scope_applies?(:all, _db, _call), do: true
+
+  defp unavailable_scope_applies?(scope, db, call) do
+    case participant_archetypes(db, call) do
+      [_ | _] = participants ->
+        Tightbeam.RailScope.matches_agents?(scope.archetypes, participants)
+
+      [] ->
+        zero_agent_belongs?(scope, db, call)
+    end
+  rescue
+    # A scope that cannot be resolved keeps the verb closed.
+    _ -> true
+  end
+
   defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
     contents = File.read!(path)
     relative = Path.relative_to(path, Path.join(base_dir, "identity"))
@@ -1835,12 +2028,16 @@ defmodule Tightbeam.Rules do
 
                 verb = if is_map(rule), do: Map.get(rule, "verb"), else: nil
                 affected = if MapSet.member?(valid_verbs, verb), do: [verb], else: valid_verbs
-                unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+                mark_unavailable(affected, path, unavailable_scope(base_dir, owner))
 
-                :persistent_term.put(
-                  {__MODULE__, :unavailable_verbs},
-                  Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
-                )
+                Enum.each(affected, fn affected_verb ->
+                  record_unavailable_verb(%{
+                    verb: affected_verb,
+                    file: diagnostic_file(path, base_dir),
+                    name: if(is_map(rule), do: Map.get(rule, "name"), else: "##{ordinal}"),
+                    reason: Exception.message(error)
+                  })
+                end)
 
                 {:unavailable, path}
             end
@@ -1864,8 +2061,11 @@ defmodule Tightbeam.Rules do
             if retired_policy?(policy) do
               require Logger
 
-              Logger.warning(
-                "#{path}: policy #{inspect(Map.get(policy, "name"))} skipped: purpose #{Map.get(policy, "purpose")} is retired"
+              record_skipped_policy(
+                path,
+                base_dir,
+                Map.get(policy, "name"),
+                "skipped: purpose #{Map.get(policy, "purpose")} is retired"
               )
 
               []
@@ -1873,8 +2073,11 @@ defmodule Tightbeam.Rules do
               if unsupported_policy_purpose?(policy) do
                 require Logger
 
-                Logger.warning(
-                  "#{path}: policy #{inspect(Map.get(policy, "name"))}: unsupported purpose: #{inspect(Map.get(policy, "purpose"))}"
+                record_skipped_policy(
+                  path,
+                  base_dir,
+                  Map.get(policy, "name"),
+                  "unsupported purpose: #{inspect(Map.get(policy, "purpose"))}"
                 )
 
                 []
@@ -1933,6 +2136,39 @@ defmodule Tightbeam.Rules do
 
   defp unsupported_policy_purpose?(_policy), do: false
 
+  defp record_skipped_policy(path, base_dir, name, reason) do
+    file = diagnostic_file(path, base_dir)
+    separator = if String.starts_with?(reason, "skipped:"), do: " ", else: ": "
+    warning = "#{file}: policy #{inspect(name)}#{separator}#{reason}"
+    require Logger
+    Logger.warning("#{path}: policy #{inspect(name)}#{separator}#{reason}")
+    item = %{file: file, name: name, reason: reason, message: warning}
+
+    update_diagnostics(fn diagnostics ->
+      %{diagnostics | skipped_policies: [item | diagnostics.skipped_policies]}
+    end)
+  end
+
+  defp record_unavailable_verb(diagnostic) do
+    update_diagnostics(fn diagnostics ->
+      update_in(diagnostics.unavailable_verbs, &[diagnostic | &1])
+    end)
+  end
+
+  defp update_diagnostics(fun) do
+    current =
+      :persistent_term.get(@diagnostics_key, %{unavailable_verbs: [], skipped_policies: []})
+
+    :persistent_term.put(@diagnostics_key, fun.(current))
+  end
+
+  defp diagnostic_file(path, law_base) do
+    identity_root = Path.expand(Path.join(law_base, "identity"))
+    relative = Path.relative_to(Path.expand(path), identity_root)
+
+    if String.starts_with?(relative, "../"), do: Path.basename(path), else: relative
+  end
+
   defp validate_policy!(
          path,
          ordinal,
@@ -1959,6 +2195,7 @@ defmodule Tightbeam.Rules do
 
     conditions = validate_policy_conditions!(Map.get(policy, "when"), fail)
     archetypes = validate_archetypes!(policy, owner, owned_archetypes, fail)
+    warn_omitted_archetypes(policy, owner, path, label)
     validate_kungfu_condition_names!(conditions, owner, owned_archetypes, fail)
     verification = validate_policy_verification!(purpose, Map.get(policy, "verification"), fail)
     evidence_memento = Map.get(policy, "evidence_memento")
@@ -2079,6 +2316,7 @@ defmodule Tightbeam.Rules do
 
     conditions = validate_conditions!(Map.get(rule, "deny_when"), fail)
     archetypes = validate_archetypes!(rule, owner, owned_archetypes, fail)
+    warn_omitted_archetypes(rule, owner, path, label)
     validate_kungfu_condition_names!(conditions, owner, owned_archetypes, fail)
     check = validate_check!(Map.get(rule, "check"), base_dir, owner, fail)
 
@@ -2111,7 +2349,6 @@ defmodule Tightbeam.Rules do
         check,
         effects,
         fail,
-        raw_name,
         filing_remedy?
       )
 
@@ -2417,9 +2654,9 @@ defmodule Tightbeam.Rules do
 
   defp validate_check!(_check, _base_dir, _owner, fail), do: fail.("check must be a table")
 
-  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _name, _filing?), do: nil
+  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _filing?), do: nil
 
-  defp validate_remedy!(remedy, conditions, check, effects, fail, name, filing?)
+  defp validate_remedy!(remedy, conditions, check, effects, fail, filing?)
        when is_map(remedy) do
     unknown = unknown_keys(remedy, @remedy_keys)
     if unknown != [], do: fail.("remedy has unknown keys: #{Enum.join(unknown, ", ")}")
@@ -2437,6 +2674,14 @@ defmodule Tightbeam.Rules do
     unless on_rule_denied in ~w(block surface),
       do: fail.("remedy on_rule_denied must be block or surface")
 
+    accountable_notice = Map.get(remedy, "accountable_notice", false)
+
+    unless is_boolean(accountable_notice),
+      do: fail.("remedy accountable_notice must be a boolean")
+
+    if accountable_notice and action != "wake",
+      do: fail.("remedy accountable_notice is valid only on a wake remedy")
+
     {required_top, allowed_top, required_params, allowed_params} =
       case action do
         "assign" ->
@@ -2453,7 +2698,7 @@ defmodule Tightbeam.Rules do
     present_top =
       remedy
       |> Map.keys()
-      |> Enum.filter(&(&1 not in ~w(action produces on_rule_denied params)))
+      |> Enum.filter(&(&1 not in ~w(action produces on_rule_denied accountable_notice params)))
 
     missing_top = required_top -- present_top
     if missing_top != [], do: fail.("remedy #{action} is missing #{Enum.join(missing_top, ", ")}")
@@ -2516,9 +2761,9 @@ defmodule Tightbeam.Rules do
         :ok
     end
 
-    # This gate records one ordinary holder notice; it does not create a linked
-    # review assignment or require the linked-review remedy binding.
-    if not (name == "completion-requires-review" and action == "wake") and
+    # An accountable-notice remedy records one ordinary notice; it does not create a
+    # linked review assignment or require the linked-review remedy binding.
+    if not accountable_notice and
          is_nil(check) and
          Enum.any?(requirements, fn {fact, kinds} ->
            fact in @linked_review_facts and produces in kinds
@@ -2532,6 +2777,7 @@ defmodule Tightbeam.Rules do
       action: action,
       produces: produces,
       on_rule_denied: on_rule_denied,
+      accountable_notice: accountable_notice,
       target:
         remedy
         |> Map.take(allowed_top)
@@ -2540,7 +2786,7 @@ defmodule Tightbeam.Rules do
     }
   end
 
-  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _name, _filing?),
+  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _filing?),
     do: fail.("remedy must be a table")
 
   defp validate_interpolation!(field, value, fail) when field in @embedded_fields do
@@ -3392,25 +3638,8 @@ defmodule Tightbeam.Rules do
         {nil, cache}
 
       assignment, cache ->
-        kinds =
-          if assignment.effect_kind == "code" and get_in(call, [:params, :kind]) == "completion" do
-            # Let the transaction report uncovered producer commits by hash;
-            # this rule only distinguishes a clean independent review from no
-            # such review or a blocking review verdict.
-            Assignments.qualifying_review_verdict_kinds(
-              db,
-              assignment.id,
-              assignment.holder_key
-            )
-          else
-            Assignments.qualifying_review_verdict_kinds(
-              db,
-              assignment.id,
-              assignment.holder_key
-            )
-          end
-
-        {kinds, cache}
+        {Assignments.qualifying_review_verdict_kinds(db, assignment.id, assignment.holder_key),
+         cache}
     end)
   end
 
@@ -3477,17 +3706,8 @@ defmodule Tightbeam.Rules do
         {nil, cache}
 
       work_item_id, cache ->
-        owner = Map.get(call, :predicate_owner_user_id)
-
-        {sql, params} =
-          if is_binary(owner) do
-            {"SELECT state FROM work_items WHERE id=?1 AND ownerUserId=?2", [work_item_id, owner]}
-          else
-            {"SELECT state FROM work_items WHERE id=?1", [work_item_id]}
-          end
-
         value =
-          case DB.query(db, sql, params) do
+          case DB.query(db, "SELECT state FROM work_items WHERE id=?1", [work_item_id]) do
             {:ok, [[state]]} -> state
             {:ok, []} -> nil
           end
@@ -3556,13 +3776,12 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("decision_request.status", db, call, cache) do
     decision_id = Map.get(call.params, :decision_request_id)
-    owner = Map.get(call, :predicate_owner_user_id)
 
     value =
       case DB.query(
              db,
-             "SELECT status FROM decision_requests WHERE id=?1 AND ownerUserId=?2",
-             [decision_id, owner]
+             "SELECT status FROM decision_requests WHERE id=?1 AND ?2 IS NOT NULL",
+             [decision_id, Map.get(call, :predicate_owner_user_id)]
            ) do
         {:ok, [[status]]} -> status
         {:ok, []} -> nil
@@ -3573,13 +3792,12 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("decision_request.addressed_principal", db, call, cache) do
     decision_id = Map.get(call.params, :decision_request_id)
-    owner = Map.get(call, :predicate_owner_user_id)
 
     value =
       case DB.query(
              db,
-             "SELECT expecterSessionKey,expecterUserId,ownerUserId FROM decision_requests WHERE id=?1 AND ownerUserId=?2",
-             [decision_id, owner]
+             "SELECT expecterSessionKey,expecterUserId,ownerUserId FROM decision_requests WHERE id=?1 AND ?2 IS NOT NULL",
+             [decision_id, Map.get(call, :predicate_owner_user_id)]
            ) do
         {:ok, [[session, _user, _owner]]} when is_binary(session) -> "session:" <> session
         {:ok, [[_session, user, _owner]]} when is_binary(user) -> "user:" <> user
@@ -4358,17 +4576,7 @@ defmodule Tightbeam.Rules do
     assignment =
       case Map.get(call.params, :assignment_id) || Map.get(call.params, "assignment_id") do
         id when is_binary(id) ->
-          case Map.get(call, :predicate_owner_user_id) do
-            owner when is_binary(owner) ->
-              assignment_context(
-                db,
-                "WHERE a.id = ?1 AND s.ownerUserId = ?2 AND (a.workItemId IS NULL OR wi.ownerUserId = ?2)",
-                [id, owner]
-              )
-
-            _ ->
-              assignment_context(db, "WHERE a.id = ?1", [id])
-          end
+          assignment_context(db, "WHERE a.id = ?1", [id])
 
         _ ->
           case Map.get(call.params, :reviews_assignment_id) ||

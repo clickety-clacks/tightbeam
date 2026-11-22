@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use serde_json::Value;
 
 use crate::attempt_diagnostic::command_context::CommandContext;
@@ -199,6 +200,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             predicate,
             assignment_id,
             after_turn,
+            wait_reason,
             replace_queued,
             prod_id,
             idempotency_key,
@@ -238,6 +240,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 ("cron", cron),
                 ("conditionKind", condition_kind),
                 ("conditionScope", condition_scope),
+                ("waitReason", wait_reason),
                 ("idempotencyKey", idempotency_key),
                 ("class", class),
             ] {
@@ -490,6 +493,17 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("artifactId", artifact_id)],
         )),
+        Command::WorkspaceCleanup {
+            identity,
+            action,
+            session_key,
+        } => {
+            let mut params = vec![string_field("action", action)];
+            if let Some(session_key) = session_key {
+                params.push(string_field("sessionKey", session_key));
+            }
+            Ok(request(identity, "workspace-cleanup", vec![], params))
+        }
         Command::ArtifactRecord {
             identity,
             kind,
@@ -500,6 +514,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             content_sha256,
             content_base64,
             produced_by_assignment_id,
+            allow_unpinned,
         } => {
             let mut params = vec![
                 string_field("kind", kind),
@@ -517,16 +532,25 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     params.push(string_field(name, value));
                 }
             }
+            if *allow_unpinned {
+                params.push("\"allowUnpinned\":true".to_owned());
+            }
             Ok(request(identity, "artifact-record", vec![], params))
         }
-        Command::ArtifactContentFetch {
+        Command::ArtifactContentPromote {
             identity,
             artifact_id,
         } => Ok(request(
             identity,
-            "artifact-content-fetch",
+            "artifact-content-promote",
             vec![],
             vec![string_field("artifactId", artifact_id)],
+        )),
+        Command::ArtifactContentCapacity { identity } => Ok(request(
+            identity,
+            "artifact-content-capacity",
+            vec![],
+            vec![],
         )),
         Command::Artifacts {
             identity,
@@ -555,9 +579,13 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             body,
             choices,
             files,
+            answer_ui,
             vendor_session_id,
             supersedes,
             decision_request_id,
+            progress,
+            progress_stage,
+            progress_note,
         } => {
             let mut params = vec![
                 format!(
@@ -581,6 +609,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = body {
                 params.push(string_field("body", value));
             }
+            if let Some(value) = answer_ui {
+                params.push(string_field("answerUi", value));
+            }
             if let Some(value) = vendor_session_id {
                 params.push(string_field("vendorSessionId", value));
             }
@@ -599,7 +630,33 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = decision_request_id {
                 params.push(string_field("decisionRequestId", value));
             }
+            if let Some(value) = progress {
+                params.push(format!("\"progress\":{value}"));
+            }
+            if let Some(value) = progress_stage {
+                params.push(string_field("progressStage", value));
+            }
+            if let Some(value) = progress_note {
+                params.push(string_field("progressNote", value));
+            }
             Ok(request(identity, "harklight-send", vec![], params))
+        }
+        Command::HarklightProgress {
+            identity,
+            message,
+            percent,
+            stage,
+            note,
+        } => {
+            let mut params = vec![
+                string_field("messageId", message),
+                format!("\"percent\":{percent}"),
+                string_field("stage", stage),
+            ];
+            if let Some(value) = note {
+                params.push(string_field("note", value));
+            }
+            Ok(request(identity, "harklight-progress", vec![], params))
         }
         Command::HarklightRevise {
             identity,
@@ -609,6 +666,8 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             body,
             choices,
             clear_choices,
+            session,
+            in_reply_to,
         } => {
             let mut params = vec![
                 string_field("messageId", message),
@@ -623,26 +682,43 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(body) = body {
                 params.push(string_field("body", body));
             }
+            if let Some(session) = session {
+                params.push(string_field("handle", session));
+            }
+            if let Some(entry) = in_reply_to {
+                params.push(string_field("inReplyTo", entry));
+            }
             Ok(request(identity, "harklight-revise", vec![], params))
         }
-        Command::HarklightRetract { identity, message } => Ok(request(
+        Command::HarklightRetract {
             identity,
-            "harklight-retract",
-            vec![],
-            vec![string_field("messageId", message)],
-        )),
-        Command::HarklightSettle { identity, message } => Ok(request(
+            message,
+            session,
+            in_reply_to,
+        } => {
+            let mut params = vec![string_field("messageId", message)];
+            if let Some(session) = session {
+                params.push(string_field("handle", session));
+            }
+            if let Some(entry) = in_reply_to {
+                params.push(string_field("inReplyTo", entry));
+            }
+            Ok(request(identity, "harklight-retract", vec![], params))
+        }
+        Command::HarklightSettle {
             identity,
-            "harklight-settle",
-            vec![],
-            vec![string_field("messageId", message)],
-        )),
-        Command::HarklightCover { identity, session } => Ok(request(
-            identity,
-            "harklight-cover",
-            vec![],
-            vec![string_field("handle", session)],
-        )),
+            message,
+            op_id,
+        } => {
+            let mut params = Vec::new();
+            if let Some(message) = message {
+                params.push(string_field("messageId", message));
+            }
+            if let Some(op_id) = op_id {
+                params.push(string_field("opId", op_id));
+            }
+            Ok(request(identity, "harklight-settle", vec![], params))
+        }
         Command::HarklightListenerRestore { identity, handle } => Ok(request(
             identity,
             "harklight-listener-restore",
@@ -822,6 +898,8 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             session_key,
             idempotency_key,
             keep_open_descendants,
+            acknowledge_loss,
+            dry_run,
         } => {
             let mut params = Vec::new();
             if let Some(value) = idempotency_key.as_ref() {
@@ -829,6 +907,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if *keep_open_descendants {
                 params.push("\"keepOpenDescendants\":true".to_owned());
+            }
+            if *acknowledge_loss {
+                params.push("\"acknowledgeLoss\":true".to_owned());
+            }
+            if *dry_run {
+                params.push("\"dryRun\":true".to_owned());
             }
             Ok(request(
                 identity,
@@ -1102,7 +1186,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             question,
             note,
             options,
+            project,
             assignment_id,
+            work_item_id,
             deadline_ms,
             supersedes,
         } => {
@@ -1120,8 +1206,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     serde_json::to_string(&options).expect("operator option labels serialize")
                 ));
             }
+            if let Some(value) = project {
+                params.push(string_field("project", value));
+            }
+            // assignment_id and work_item_id are the names rule facts read.
             if let Some(value) = assignment_id {
-                params.push(string_field("assignment", value));
+                params.push(string_field("assignment_id", value));
+            }
+            if let Some(value) = work_item_id {
+                params.push(string_field("work_item_id", value));
             }
             if let Some(value) = deadline_ms {
                 params.push(format!("\"deadline\":{value}"));
@@ -1226,6 +1319,22 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("reason", reason),
             ],
         )),
+        Command::AssignmentOpenerAccept {
+            identity,
+            assignment_id,
+            to_session_key,
+        } => {
+            let mut params = vec![string_field("assignmentId", assignment_id)];
+            if let Some(to_session_key) = to_session_key {
+                params.push(string_field("toSessionKey", to_session_key));
+            }
+            Ok(request(
+                identity,
+                "assignment-opener-accept",
+                vec![],
+                params,
+            ))
+        }
         Command::ReopenAssignment {
             identity,
             assignment_id,
@@ -2555,11 +2664,46 @@ fn send_diagnostic_with_timeout(
         .ok_or_else(|| "diagnostic_response_invalid".to_owned())
 }
 
+fn artifact_upload_file(request: &RequestSpec) -> Result<Option<fs::File>, String> {
+    if request.path != "/agent/dispatch" {
+        return Ok(None);
+    }
+    let Ok(body) = serde_json::from_str::<Value>(&request.body_json) else {
+        return Ok(None);
+    };
+    let params = &body["params"];
+    if body["verb"] != "artifact-record" || params.get("contentBase64").is_some() {
+        return Ok(None);
+    }
+    let Some(path) = params["originPath"].as_str() else {
+        return Ok(None);
+    };
+    let path = Path::new(path);
+    if !path.is_absolute() && path.to_string_lossy().contains(':') {
+        return Ok(None);
+    }
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect artifact file: {error}")),
+    };
+    if metadata.is_dir() {
+        return Err("artifact origin is a directory; record a file or package the directory into an archive file".to_owned());
+    }
+    if !metadata.is_file() {
+        return Err("artifact origin must be a regular file".to_owned());
+    }
+    fs::File::open(path)
+        .map(Some)
+        .map_err(|error| format!("could not open artifact file: {error}"))
+}
+
 fn send_to_with_timeout(
     endpoint: &Endpoint,
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, String> {
+    let artifact_upload = artifact_upload_file(request)?;
     let tune = is_tune(request);
     let presentation = if tune {
         FailurePresentation::Tune
@@ -2589,6 +2733,12 @@ fn send_to_with_timeout(
         crate::attempt_diagnostic::observation::attach_request_id(gateway, attempt.as_ref());
     let call = if method == "GET" {
         gateway.call()
+    } else if let Some(file) = artifact_upload {
+        let metadata = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&request.body_json);
+        gateway
+            .set("content-type", "application/octet-stream")
+            .set("x-tightbeam-artifact-record", &metadata)
+            .send(file)
     } else {
         gateway
             .set("content-type", "application/json")
@@ -4160,7 +4310,8 @@ fn local_harklight_identity_refusal(
         {
             Some("harklight-briefings-catchup requires an active admin-owned session")
         }
-        Command::HarklightRevise { identity, .. }
+        Command::HarklightProgress { identity, .. }
+        | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightListenerRestore { identity, .. }
@@ -4169,7 +4320,6 @@ fn local_harklight_identity_refusal(
         | Command::HarklightReply { identity, .. }
         | Command::HarklightResult { identity, .. }
         | Command::HarklightFollow { identity, .. }
-        | Command::HarklightCover { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
         {
             Some("invalid Harklight command flags")
@@ -4193,9 +4343,13 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessHealthRetry { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::ArtifactContentFetch { identity, .. }
+        | Command::ArtifactContentPromote { identity, .. }
+        | Command::ArtifactContentCapacity { identity, .. }
+        | Command::WorkspaceCleanup { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
         | Command::HarklightBriefingsCatchup { identity, .. }
+        | Command::HarklightProgress { identity, .. }
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
@@ -4205,7 +4359,6 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarklightReply { identity, .. }
         | Command::HarklightResult { identity, .. }
         | Command::HarklightFollow { identity, .. }
-        | Command::HarklightCover { identity, .. }
         | Command::HarklightRetry { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
@@ -4231,6 +4384,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::AssignmentStopTurn { identity, .. }
         | Command::CancelTurn { identity, .. }
         | Command::RevokeAssignment { identity, .. }
+        | Command::AssignmentOpenerAccept { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
         | Command::AssignmentCommitRefCorrect { identity, .. }
@@ -4474,7 +4628,6 @@ mod tests {
                 vec!["harklight-follow", "--handle", "h"],
                 "harklight-follow",
             ),
-            (vec!["harklight-cover", "--session", "h"], "harklight-cover"),
             (vec!["harklight-retry", "--all"], "harklight-retry"),
             (vec!["harklight-retry", "--message", "m"], "harklight-retry"),
             (vec!["harklight-retry", "--session", "h"], "harklight-retry"),
@@ -4496,9 +4649,7 @@ mod tests {
                 assert_eq!(body["params"]["stake"], "the demo slips");
                 assert_eq!(body["params"]["byWhen"], "2026-11-01T17:00:00Z");
                 assert_eq!(body["params"]["reply"], true);
-            } else if (verb == "harklight-follow" || verb == "harklight-cover")
-                && body["params"].get("handle").is_some()
-            {
+            } else if verb == "harklight-follow" && body["params"].get("handle").is_some() {
                 assert_eq!(body["params"]["handle"], "h");
             } else if verb == "harklight-listener-restore" {
                 assert_eq!(body["params"]["handle"], "h");
@@ -4581,6 +4732,48 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+        }
+    }
+
+    #[test]
+    fn harklight_change_commands_send_session_and_op_id_when_given() {
+        for (args, verb, key, value) in [
+            (
+                vec!["harklight-retract", "--message", "m", "--session", "h"],
+                "harklight-retract",
+                "handle",
+                "h",
+            ),
+            (
+                vec![
+                    "harklight-revise",
+                    "--message",
+                    "m",
+                    "--base-revision",
+                    "2",
+                    "--title",
+                    "new",
+                    "--session",
+                    "h",
+                ],
+                "harklight-revise",
+                "handle",
+                "h",
+            ),
+            (
+                vec!["harklight-settle", "--message", "m", "--op-id", "k"],
+                "harklight-settle",
+                "opId",
+                "k",
+            ),
+        ] {
+            let command =
+                crate::args::parse(args.into_iter().map(str::to_owned).collect()).unwrap();
+            let request = build_request(&command).unwrap();
+            let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+            assert_eq!(body["verb"], verb);
+            assert_eq!(body["params"]["messageId"], "m");
+            assert_eq!(body["params"][key], value);
         }
     }
 
@@ -4780,6 +4973,36 @@ mod tests {
     }
 
     #[test]
+    fn harklight_send_keeps_answer_ui_path_as_an_unchanged_scalar() {
+        let request: Value = serde_json::from_str(&body(&[
+            "harklight-send",
+            "--session",
+            "new",
+            "--sender-id",
+            "sender",
+            "--title",
+            "Choose a cover",
+            "--type",
+            "request",
+            "--answer-ui",
+            "/tmp/cover assets/answer-ui.json",
+            "--files-json",
+            r#"["/tmp/cover-a.jpg","/tmp/cover-b.jpg"]"#,
+        ]))
+        .unwrap();
+
+        assert_eq!(request["verb"], "harklight-send");
+        assert_eq!(
+            request["params"]["answerUi"],
+            "/tmp/cover assets/answer-ui.json"
+        );
+        assert_eq!(
+            request["params"]["files"],
+            serde_json::json!(["/tmp/cover-a.jpg", "/tmp/cover-b.jpg"])
+        );
+    }
+
+    #[test]
     fn documented_work_item_body_invocation_keeps_a_prefixed_identity() {
         let request: serde_json::Value = serde_json::from_str(&body(&[
             "--as",
@@ -4859,6 +5082,40 @@ mod tests {
                 "verb": "artifact-content-fetch",
                 "asUser": "flynn",
                 "params": {"artifactId": "art_fixture"}
+            })
+        );
+    }
+
+    #[test]
+    fn workspace_cleanup_commands_send_action_and_optional_session_scope() {
+        let status = build_request(&parse(&[
+            "workspace-cleanup",
+            "status",
+            "--as-user",
+            "owner",
+        ]))
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status.body_json).unwrap(),
+            serde_json::json!({
+                "verb": "workspace-cleanup",
+                "asUser": "owner",
+                "params": {"action": "status"}
+            })
+        );
+
+        let retry = build_request(&parse(&[
+            "workspace-cleanup",
+            "retry",
+            "--session",
+            "retired-key",
+        ]))
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&retry.body_json).unwrap(),
+            serde_json::json!({
+                "verb": "workspace-cleanup",
+                "params": {"action": "retry", "sessionKey": "retired-key"}
             })
         );
     }
@@ -4953,6 +5210,39 @@ mod tests {
                     args.extend([flag, value]);
                 }
             }
+            assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn assignment_opener_accept_names_one_assignment_and_optional_successor() {
+        assert_eq!(
+            body(&["assignment-opener-accept", "asg_one", "--as-user", "owner"]),
+            r#"{"asUser":"owner","verb":"assignment-opener-accept","params":{"assignmentId":"asg_one"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "assignment-opener-accept",
+                "asg_one",
+                "--to",
+                "new seat",
+                "--as-user",
+                "owner",
+            ]),
+            r#"{"asUser":"owner","verb":"assignment-opener-accept","params":{"assignmentId":"asg_one","toSessionKey":"new seat"}}"#
+        );
+        for args in [
+            vec!["assignment-opener-accept"],
+            vec!["assignment-opener-accept", "asg_one", "asg_two"],
+            vec![
+                "assignment-opener-accept",
+                "asg_one",
+                "--to",
+                "a",
+                "--to",
+                "b",
+            ],
+        ] {
             assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
         }
     }
@@ -5838,6 +6128,8 @@ mod tests {
                 "release train",
                 "--options",
                 "accept,wait",
+                "--project",
+                "Tightbeam",
                 "--assignment",
                 "asg_1",
                 "--deadline",
@@ -5847,7 +6139,33 @@ mod tests {
                 "--as",
                 "parent",
             ]),
-            r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","note":"release train","options":[{"label":"accept"},{"label":"wait"}],"assignment":"asg_1","deadline":7200000,"supersedes":"dr_old"}}"#
+            r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","note":"release train","options":[{"label":"accept"},{"label":"wait"}],"project":"Tightbeam","assignment_id":"asg_1","deadline":7200000,"supersedes":"dr_old"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "operator-ask",
+                "--question",
+                "ship window?",
+                "--project",
+                "Tightbeam",
+                "--work-item",
+                "wi_1",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","project":"Tightbeam","work_item_id":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "operator-ask",
+                "--question",
+                "continue?",
+                "--note",
+                "context",
+                "--assignment",
+                "asg_1"
+            ]),
+            r#"{"verb":"operator-ask","params":{"question":"continue?","note":"context","assignment_id":"asg_1"}}"#
         );
         assert_eq!(
             body(&[
@@ -6734,6 +7052,28 @@ mod tests {
                     "flynn",
                 ][..],
                 r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"keepOpenDescendants":true}}"#,
+            ),
+            (
+                &[
+                    "retire",
+                    "--session",
+                    "agent:r",
+                    "--acknowledge-loss",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"acknowledgeLoss":true}}"#,
+            ),
+            (
+                &[
+                    "retire",
+                    "--session",
+                    "agent:r",
+                    "--dry-run",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"dryRun":true}}"#,
             ),
             (
                 &[

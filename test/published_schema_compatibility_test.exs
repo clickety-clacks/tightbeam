@@ -26,10 +26,15 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
     assert {:ok, [["standalone-toplines-v7"]]} =
              DB.query(db, "SELECT shape FROM topline_schema_stamp")
 
-    before = actor_schema(db)
+    before =
+      Enum.map(actor_schema(db), fn
+        ["attests", sql] -> ["attests", Schema.attest_lifecycle_actor_sql(sql)]
+        row -> row
+      end)
+
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["session-custody-artifact-process-attribution-v1-0117"]]} =
+    assert {:ok, [["holder-role-provenance-v1-0118"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert actor_schema(db) == before
@@ -90,7 +95,7 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["session-custody-artifact-process-attribution-v1-0117"]]} =
+    assert {:ok, [["holder-role-provenance-v1-0118"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert release_rows(db) == rows_before
@@ -146,6 +151,26 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
              DB.query(db, sql, ["both-verdict", session.session_key, "fixture-owner"])
 
     assert Exception.message(error) =~ "CHECK constraint failed"
+
+    for kind <- ["progress", "completion", "cannot-proceed"],
+        {actor, by_session, by_user} <- [
+          {"session", session.session_key, nil},
+          {"user", nil, "fixture-owner"},
+          {"process", nil, nil}
+        ] do
+      lifecycle_sql =
+        "INSERT INTO attests(id,assignmentId,kind,bySession,byUser,ts) VALUES (?1,'actor-fixture',?2,?3,?4,1)"
+
+      assert {:ok, _} = DB.query(db, lifecycle_sql, [kind <> actor, kind, by_session, by_user])
+
+      assert {:error, _} =
+               DB.query(db, lifecycle_sql, [
+                 kind <> actor <> "both",
+                 kind,
+                 session.session_key,
+                 "fixture-owner"
+               ])
+    end
 
     assert {:ok, [[0]]} =
              DB.query(

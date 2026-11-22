@@ -871,8 +871,8 @@ defmodule Tightbeam.NoticeBatcher do
     |> then(&Tightbeam.HarklightLifecycle.ready_sources_in_txn(txn, &1))
   end
 
-  defp prepared_source_in_txn(txn, wake_id) do
-    if prepare_due_source_in_txn(txn, wake_id) do
+  defp prepared_source_in_txn(txn, wake_id, at) do
+    if prepare_due_source_in_txn(txn, wake_id, at) do
       case Wakes.get_in_txn(txn, wake_id) do
         %{state: "pending"} = source -> source
         _ -> nil
@@ -928,7 +928,7 @@ defmodule Tightbeam.NoticeBatcher do
         |> Enum.filter(&MapSet.member?(own_ids, &1))
         |> Enum.reject(&MapSet.member?(deferred_ids, &1))
         |> Enum.flat_map(fn wake_id ->
-          case prepared_own_source_in_txn(txn, wake_id) do
+          case prepared_own_source_in_txn(txn, wake_id, at) do
             nil ->
               []
 
@@ -948,11 +948,11 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  defp prepared_own_source_in_txn(txn, wake_id) do
+  defp prepared_own_source_in_txn(txn, wake_id, at) do
     :ok = Txn.exec(txn, "SAVEPOINT notice_source_prepare")
 
     try do
-      source = prepared_source_in_txn(txn, wake_id)
+      source = prepared_source_in_txn(txn, wake_id, at)
 
       source =
         if source,
@@ -1246,13 +1246,13 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  defp prepare_due_source_in_txn(txn, wake_id) do
+  defp prepare_due_source_in_txn(txn, wake_id, at) do
     if Tightbeam.RowReactions.prepare_in_txn(txn, wake_id) == :ready,
-      do: prepare_elected_source_in_txn(txn, wake_id),
+      do: prepare_elected_source_in_txn(txn, wake_id, at),
       else: false
   end
 
-  defp prepare_elected_source_in_txn(txn, wake_id) do
+  defp prepare_elected_source_in_txn(txn, wake_id, at) do
     case Txn.q(
            txn,
            "SELECT t.sessionKey FROM wakes w JOIN turns t ON t.seq=w.deliveredTurnSeq WHERE w.wakeId=?1",
@@ -1274,8 +1274,12 @@ defmodule Tightbeam.NoticeBatcher do
       [] ->
         case Wakes.get_in_txn(txn, wake_id) do
           %{state: "pending"} = wake ->
-            update_source_lane_in_txn(txn, wake)
-            true
+            if Tightbeam.HolderProd.prepare_in_txn(txn, wake, at) do
+              update_source_lane_in_txn(txn, wake)
+              true
+            else
+              false
+            end
 
           _ ->
             false

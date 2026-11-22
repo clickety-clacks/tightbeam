@@ -29,7 +29,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert Archetypes.init_identity!(ctx.base_dir) == :initialized
     identity_dir = Path.join(ctx.base_dir, "identity")
 
-    for ref <- ["tightbeam/upstream", "main", "tightbeam/live"] do
+    for ref <- ["tightbeam/upstream", "main", "tightbeam/live", "tightbeam/product-baseline"] do
       assert {oid, 0} = System.cmd("git", ["rev-parse", ref], cd: identity_dir)
       assert String.trim(oid) != ""
     end
@@ -103,7 +103,7 @@ defmodule Tightbeam.ArchetypesTest do
                Path.join(identity_dir, "rules/harness-health-recovery.toml"),
                Path.join(identity_dir, "rules/harness-recovery-main-wake.toml"),
                Path.join(identity_dir, "rules/row-reaction-handoff.toml"),
-               Path.join(identity_dir, "rules/row-reaction-terminal-action.toml")
+               Path.join(identity_dir, "rules/row-reaction-work-items.toml")
              ]
 
     assert File.read!(Path.join(identity_dir, "rules/harness-health-recovery.toml")) ==
@@ -210,14 +210,24 @@ defmodule Tightbeam.ArchetypesTest do
       end)
 
     facts =
-      Application.app_dir(:tightbeam, "priv/kungfu/*/manifest.toml")
+      :tightbeam
+      |> Application.fetch_env!(:kungfu_bundle_root_dir)
+      |> Path.join("*/manifest.toml")
       |> Path.wildcard()
-      |> Enum.sort()
-      |> Enum.map_join("\n\n", fn path ->
-        manifest = path |> File.read!() |> Toml.decode!()
-        name = path |> Path.dirname() |> Path.basename()
+      |> Enum.map(fn path ->
+        {path |> Path.dirname() |> Path.basename(), path |> File.read!() |> Toml.decode!()}
+      end)
+      |> Enum.sort_by(fn {name, manifest} -> {not Map.get(manifest, "primary", false), name} end)
+      |> Enum.map_join("\n\n", fn {name, manifest} ->
         phrases = Enum.map_join(Map.get(manifest, "phrases", []), "\n", &"- #{&1}")
-        "### `#{name}`\nPurpose: #{Map.fetch!(manifest, "purpose")}\nPhrases:\n#{phrases}"
+
+        primary =
+          if Map.get(manifest, "primary", false),
+            do:
+              "Primary: when more than one bundle fits the user's goal, offer this one first.\n",
+            else: ""
+
+        "### `#{name}`\n#{primary}Purpose: #{Map.fetch!(manifest, "purpose")}\nPhrases:\n#{phrases}"
       end)
 
     assert facts != ""
@@ -289,6 +299,16 @@ defmodule Tightbeam.ArchetypesTest do
     refute manual =~ "worktree-session"
   end
 
+  test "the operating manual says a filed decision request is a complete ask with an attachable hook" do
+    manual = Archetypes.builtin_fragments()["operating-manual.md"]
+
+    assert manual =~ "Filing a decision request is a complete, proper ask to the user."
+    assert manual =~ "never makes it a failure or blocks it"
+    assert manual =~ "Tightbeam does not convert a filed request into a Harklight message."
+    assert manual =~ "`decision-request-filed` condition fact (edge `row-commit`)"
+    assert manual =~ "an organization can attach its own rule"
+  end
+
   @tag timeout: 180_000
   test "assignment custody is single-homed and landing remains with delivery owners", ctx do
     heading = "## 3. Obligations have one holder, and a holder keeps them until they are disposed"
@@ -299,7 +319,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert manual =~ "Nothing else transfers it"
 
     role_guidance = fn role ->
-      Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/guidance/#{role}.md")
+      Path.expand("test/support/fixtures/kungfu/agentic-engineering/guidance/#{role}.md")
       |> File.read!()
     end
 
@@ -408,18 +428,14 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     refute File.exists?(
-             Application.app_dir(
-               :tightbeam,
-               "priv/kungfu/agentic-engineering/archetypes/reviewer.toml"
+             Path.expand(
+               "test/support/fixtures/kungfu/agentic-engineering/archetypes/reviewer.toml"
              )
            )
 
     for skill <- ~w(reviewing-code reviewing-specs) do
       refute File.dir?(
-               Application.app_dir(
-                 :tightbeam,
-                 "priv/kungfu/agentic-engineering/skills/#{skill}"
-               )
+               Path.expand("test/support/fixtures/kungfu/agentic-engineering/skills/#{skill}")
              )
     end
 
@@ -552,7 +568,7 @@ defmodule Tightbeam.ArchetypesTest do
     revision = Identity.live_revision!(ctx.base_dir)
 
     archetype_paths =
-      Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/archetypes/*.toml")
+      Path.expand("test/support/fixtures/kungfu/agentic-engineering/archetypes/*.toml")
       |> Path.wildcard()
       |> Enum.sort()
 

@@ -1,26 +1,30 @@
 defmodule Tightbeam.HarklightWakes do
   @moduledoc """
-  Durable, origin-bound handoff from a Harklight controller stream to ordinary
-  prompt wakes. The external CLI owns the feed journal and cursor; this table
-  owns each handle's sender and follower subscriptions and remembers every line
-  captured for one or more sessions.
+  Routes filtered Harklight changes to durable Tightbeam wakes. Tightbeam
+  checkpoints its own capture independently of the Agent CLI's journal.
   """
 
   use GenServer
   require Logger
-  alias Tightbeam.{DB, ErrorDiagnostic, HarklightLifecycle, Org, Placement, Supervision, Wakes}
-  alias Tightbeam.DB.Txn
 
-  @attach_retry_delays [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
-  @attach_retry_window_ms 180_000
-  # Harklight has already accepted the attachment when the gateway records it
-  # as active. A failed record (an overloaded database) is retried with capped
-  # backoff; the last delay repeats until the record is written.
-  @attachment_state_retry_delays [250, 500, 1_000, 2_000, 5_000, 10_000, 30_000]
-  # Released Server serializes every origin attach through one Relay process.
-  # Restore starts all listeners at once, so cap concurrent attach attempts to
-  # keep that queue inside the Relay call timeout (WI2979 fifth fleet run).
-  @attach_concurrency 4
+  alias Tightbeam.{
+    DB,
+    ErrorDiagnostic,
+    HarklightFailures,
+    HarklightLifecycle,
+    Org,
+    Placement,
+    Supervision,
+    Wakes
+  }
+
+  alias Tightbeam.DB.Txn
+  alias Tightbeam.HarklightFeedCustody, as: FeedCustody
+  alias Tightbeam.HarklightListenerOutage, as: Outage
+
+  @feed_state_retry_delays [250, 500, 1_000, 2_000, 5_000, 10_000, 30_000]
+  @feed_read_retry_delay 250
+  @retry_delays [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 300_000]
 
   @max_diagnostic_lines 3
   @max_diagnostic_line_chars 240
@@ -63,6 +67,21 @@ defmodule Tightbeam.HarklightWakes do
     lastError TEXT,
     createdAt INTEGER NOT NULL,
     updatedAt INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS harklight_feed_checkpoints (
+    handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
+    rev INTEGER NOT NULL CHECK(rev >= 0)
+  );
+  CREATE TABLE IF NOT EXISTS harklight_feed_launches (
+    handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
+    owner TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS harklight_feed_stops (
+    handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle)
+  );
+  CREATE TABLE IF NOT EXISTS harklight_feed_pauses (
+    handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
+    diagnostic TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS harklight_wake_requests (
     senderId TEXT NOT NULL,
@@ -134,107 +153,19 @@ defmodule Tightbeam.HarklightWakes do
 
   def ensure_schema(db \\ DB) do
     with :ok <- DB.execute(db, @ddl),
+         :ok <- Outage.ensure_schema(db),
+         :ok <- HarklightFailures.ensure_schema(db),
          :ok <- HarklightLifecycle.ensure_schema(db),
-         :ok <- Tightbeam.HarklightOrigin.ensure_schema(db),
+         :ok <- Tightbeam.HarklightReceipts.ensure_schema(db),
          :ok <- Tightbeam.HarklightBriefings.ensure_schema(db) do
       backfill_pending_supersedes(db)
     end
   end
 
-  @doc false
-  def ack2_for_dispatched_turn(db, turn_seq, session_key, agent_name, opts \\ []) do
-    query = """
-    SELECT DISTINCT e.handle,e.eventId,h.sessionKey
-    FROM wakes w
-    LEFT JOIN wake_retry_attempts retry ON retry.wakeId=w.wakeId
-    JOIN harklight_wake_deliveries d
-      ON d.wakeId=COALESCE(retry.rootWakeId,w.wakeId)
-        AND COALESCE(d.currentRecipientSessionKey,d.sessionKey)=w.sessionKey
-    JOIN harklight_wake_entries e ON e.handle=d.handle AND e.eventId=d.eventId
-    JOIN harklight_wake_handles h ON h.handle=e.handle
-    WHERE w.deliveredTurnSeq=?1 AND COALESCE(d.currentRecipientSessionKey,d.sessionKey)=?2
-      AND e.entryKind IN ('discussion','terminal') AND e.entryAuthor='person'
-      AND EXISTS (
-        SELECT 1 FROM turn_lifecycle_events event
-        WHERE event.turnSeq=w.deliveredTurnSeq AND event.kind='prompt_dispatched'
-      )
-    ORDER BY e.feedCursor,e.handle,e.eventId
-    """
-
-    case DB.query(db, query, [turn_seq, session_key]) do
-      {:ok, []} ->
-        :ok
-
-      {:ok, entries} ->
-        case ack2_runner(opts) do
-          {:ok, runner} ->
-            Enum.each(entries, fn [handle, event_id, owner_session_key] ->
-              args =
-                ["ack2", "--session", handle, "--event", event_id, "--agent", agent_name]
-
-              args = if owner_session_key == session_key, do: args, else: args ++ ["--rerouted"]
-
-              case safe_ack2_call(runner, args) do
-                {:ok, {_output, 0}} ->
-                  :ok
-
-                {:ok, {_output, status}} ->
-                  Logger.error(
-                    "Harklight ACK2 failed for dispatched turn #{turn_seq} (exit status #{inspect(status)})"
-                  )
-
-                :error ->
-                  Logger.error("Harklight ACK2 could not run for dispatched turn #{turn_seq}")
-              end
-            end)
-
-            :ok
-
-          {:error, reason} ->
-            Logger.error(
-              "Harklight ACK2 could not run for dispatched turn #{turn_seq}: #{reason}"
-            )
-
-            :ok
-        end
-
-      {:error, reason} ->
-        Logger.error(
-          "Harklight ACK2 lookup failed for dispatched turn #{turn_seq}: #{inspect(reason)}"
-        )
-
-        :ok
-    end
+  def start_link(opts) do
+    opts = Keyword.merge(Application.get_env(:tightbeam, :harklight_recovery_options, []), opts)
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
-
-  defp ack2_runner(opts) do
-    case Keyword.get(opts, :runner) do
-      runner when is_function(runner, 1) ->
-        {:ok, runner}
-
-      nil ->
-        case System.find_executable("harklight-agent") do
-          nil ->
-            {:error, "harklight_cli_missing"}
-
-          executable ->
-            {:ok, fn args -> System.cmd(executable, args, stderr_to_stdout: true) end}
-        end
-    end
-  end
-
-  defp safe_ack2_call(runner, args) do
-    case runner.(args) do
-      result when is_tuple(result) and tuple_size(result) == 2 -> {:ok, result}
-      _other -> :error
-    end
-  rescue
-    _ -> :error
-  catch
-    _, _ -> :error
-  end
-
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
   @doc false
   def retirement_handoff_in_txn(%Txn{} = txn, session_key) do
@@ -403,19 +334,7 @@ defmodule Tightbeam.HarklightWakes do
         Wakes.schedule_in_txn(txn, %{
           session_key: successor,
           origin: "process:tightbeam",
-          prompt:
-            entry_prompt(
-              txn,
-              origin,
-              line,
-              handle,
-              event,
-              sender,
-              message,
-              kind,
-              author,
-              successor
-            ),
+          prompt: entry_prompt(txn, origin, line, handle, event, sender, message, kind, author),
           due_at: System.system_time(:millisecond),
           creator_session_key: origin,
           class: "blocker"
@@ -535,7 +454,7 @@ defmodule Tightbeam.HarklightWakes do
   # Revise/retract operations use the existing operation journal. Their tagged
   # payload keeps the exact argv (including the original operation ID) apart
   # from the send payload shape consumed by send recovery and registration.
-  def prepare_change(db, call, op_id, message_id, command, request) do
+  def prepare_change(db, call, op_id, message_id, command, request, context \\ %{}) do
     session_key = call.session_key
 
     with true <- authenticated_origin?(call),
@@ -552,7 +471,11 @@ defmodule Tightbeam.HarklightWakes do
           "operation_kind" => "change",
           "command" => command,
           "message_id" => message_id,
-          "request" => request
+          "request" => request,
+          "journal_id" => context[:journal_id],
+          "item_id" => context[:item_id],
+          "in_reply_to" => context[:in_reply_to],
+          "handle" => context[:handle]
         })
 
       case DB.transaction(db, fn txn ->
@@ -803,7 +726,15 @@ defmodule Tightbeam.HarklightWakes do
   def pending_send_attempts(db) do
     DB.query(
       db,
-      "SELECT opId,sessionKey,payload FROM harklight_send_operations WHERE state='pending' AND attemptedAt IS NOT NULL AND COALESCE(json_extract(payload,'$.operation_kind'),'send') NOT IN ('change','action') AND opId NOT IN (SELECT opId FROM harklight_command_results) ORDER BY attemptedAt,opId"
+      """
+      SELECT s.opId,s.sessionKey,s.payload FROM harklight_send_operations s
+      WHERE s.state='pending' AND s.attemptedAt IS NOT NULL
+        AND COALESCE(json_extract(s.payload,'$.operation_kind'),'send') NOT IN ('change','action')
+        AND NOT EXISTS (SELECT 1 FROM harklight_command_results r WHERE r.opId=s.opId)
+        AND NOT EXISTS (SELECT 1 FROM harklight_operation_pauses p WHERE p.opId=s.opId)
+        AND NOT EXISTS (SELECT 1 FROM harklight_operation_guards g WHERE g.opId=s.opId)
+      ORDER BY s.attemptedAt,s.opId
+      """
     )
   end
 
@@ -961,6 +892,15 @@ defmodule Tightbeam.HarklightWakes do
             session_key: call.session_key
           }
 
+        {:error, {"harklight_feed_paused", diagnostic}} ->
+          %{
+            command: "listener-restore",
+            code: "harklight_feed_paused",
+            outcome: "refused",
+            handle: handle,
+            reason: "#{diagnostic}. Run tightbeam harklight-retry --session #{handle} to resume."
+          }
+
         {:error, reason} ->
           %{command: "listener-restore", code: reason, outcome: "refused", handle: handle}
       end
@@ -1030,7 +970,11 @@ defmodule Tightbeam.HarklightWakes do
   defp retry_targets(db, :all) do
     case DB.query(
            db,
-           "SELECT handle,sessionKey,state,lastError FROM harklight_wake_handles h WHERE state='unavailable' OR (state='active' AND NOT EXISTS (SELECT 1 FROM harklight_origin_moves m WHERE m.handle=h.handle)) ORDER BY createdAt,handle"
+           """
+           SELECT h.handle,h.sessionKey,h.state,COALESCE(p.diagnostic,h.lastError)
+           FROM harklight_wake_handles h LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
+           WHERE h.state IN ('active','unavailable') ORDER BY h.createdAt,h.handle
+           """
          ) do
       {:ok, rows} ->
         active = for [handle, _, "active", _] <- rows, do: handle
@@ -1098,7 +1042,11 @@ defmodule Tightbeam.HarklightWakes do
   defp retry_target_by_handle(db, handle) do
     case DB.query(
            db,
-           "SELECT handle,sessionKey,state,lastError FROM harklight_wake_handles WHERE handle=?1",
+           """
+           SELECT h.handle,h.sessionKey,h.state,COALESCE(p.diagnostic,h.lastError)
+           FROM harklight_wake_handles h LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
+           WHERE h.handle=?1
+           """,
            [handle]
          ) do
       {:ok, [[handle, session_key, state, last_error]]} ->
@@ -1342,15 +1290,7 @@ defmodule Tightbeam.HarklightWakes do
       |> Enum.filter(&(&1.state == "waiting"))
       |> Enum.map(& &1.message_id)
 
-    reasons = Map.put(reasons, :waiting_messages, waiting)
-
-    case Map.get(reasons, :open_requests) do
-      count when is_integer(count) and count > length(waiting) ->
-        Map.put(reasons, :unmatched_harklight_open_requests, count - length(waiting))
-
-      _ ->
-        reasons
-    end
+    Map.put(reasons, :waiting_messages, waiting)
   end
 
   defp selector_name(:all), do: "all"
@@ -1386,85 +1326,137 @@ defmodule Tightbeam.HarklightWakes do
     :ok
   end
 
-  def origin_turn_ended(session_key) do
-    if pid = Process.whereis(__MODULE__),
-      do: GenServer.cast(pid, {:origin_turn_ended, session_key})
-
-    :ok
-  end
-
-  def h8a_acknowledged(handle) do
-    if pid = Process.whereis(__MODULE__), do: GenServer.cast(pid, {:h8a_acknowledged, handle})
-    :ok
-  end
-
   @impl true
   def init(opts) do
     DB.owed_work()
 
     Process.flag(:trap_exit, true)
     send(self(), :restore)
-    delays = Keyword.get(opts, :attach_retry_delays, @attach_retry_delays)
-    window = Keyword.get(opts, :attach_retry_window_ms, @attach_retry_window_ms)
 
     state_delays =
-      Keyword.get(opts, :attachment_state_retry_delays, @attachment_state_retry_delays)
+      Keyword.get(opts, :feed_state_retry_delays, @feed_state_retry_delays)
+
+    child_opts =
+      Keyword.get(opts, :child_opts, Application.get_env(:tightbeam, :harklight_child_opts, []))
+
+    custody_dir =
+      Keyword.get_lazy(opts, :feed_custody_dir, fn ->
+        child_opts
+        |> Keyword.get_lazy(:base_dir, &Tightbeam.BaseDir.resolve/0)
+        |> Path.join("harklight-feed-custody")
+      end)
 
     {:ok,
      %{
        db: Keyword.get(opts, :db, DB),
-       child_opts:
-         Keyword.get(
-           opts,
-           :child_opts,
-           Application.get_env(:tightbeam, :harklight_child_opts, [])
-         ),
+       child_opts: child_opts,
+       custody_dir: custody_dir,
+       launch_owners: %{},
        listener:
-         Keyword.get(opts, :listener, fn manager, handle, vendor_id ->
-           run_listener(manager, handle, vendor_id, delays, window, state_delays)
+         Keyword.get(opts, :listener, fn manager, handle, _vendor_id ->
+           run_listener(manager, handle, state_delays)
          end),
        send_runner: Keyword.get(opts, :send_runner),
        workers: %{},
        ports: %{},
        refs: %{},
        failures: %{},
+       pending_failures: %{},
        attempts: %{},
        retry_waiters: %{},
        starts_in_flight: MapSet.new(),
        manual_starts: MapSet.new(),
        retry_timers: %{},
+       outage_timers: %{},
+       outage_notice_delay: Keyword.get(opts, :outage_notice_delay_ms, 600_000),
+       wall_now: Keyword.get(opts, :wall_now, fn -> System.system_time(:millisecond) end),
        gone_tasks: %{},
        deferred: MapSet.new(),
-       retry_delays: Keyword.get(opts, :retry_delays, [1_000, 2_000, 4_000, 8_000, 16_000]),
+       retry_delays: Keyword.get(opts, :retry_delays, @retry_delays),
+       sustain_retries: Keyword.get(opts, :sustain_retries, true),
+       retry_jitter: Keyword.get(opts, :retry_jitter, true),
+       admission_queue: [],
+       admission_timer: nil,
+       admission_next: nil,
+       admission_spacing: Keyword.get(opts, :feed_start_spacing_ms, 250),
+       launching: MapSet.new(),
+       transport_failures: %{},
+       cooldown_until: nil,
+       cooldown_level: 0,
+       cooldown_threshold: Keyword.get(opts, :feed_cooldown_threshold, 4),
+       cooldown_window: Keyword.get(opts, :feed_cooldown_window_ms, 600_000),
+       cooldown_base: Keyword.get(opts, :feed_cooldown_base_ms, 30_000),
+       cooldown_max: Keyword.get(opts, :feed_cooldown_max_ms, 300_000),
        restart: MapSet.new(),
-       stopping: MapSet.new(),
-       attach_limit: Keyword.get(opts, :attach_concurrency, @attach_concurrency),
-       attach_slots: MapSet.new(),
-       attach_waiting: :queue.new()
+       stopping: MapSet.new()
      }}
   end
 
   @impl true
   def handle_info(:restore, state) do
-    {:ok, rows} =
-      DB.query(
-        state.db,
-        "SELECT handle FROM harklight_wake_handles WHERE state IN ('active','unavailable') AND NOT EXISTS (SELECT 1 FROM harklight_origin_moves m WHERE m.handle=harklight_wake_handles.handle) ORDER BY createdAt,handle"
-      )
+    with {:ok, rows} <-
+           DB.query(
+             state.db,
+             """
+             SELECT h.handle, (s.handle IS NOT NULL OR p.handle IS NOT NULL)
+             FROM harklight_wake_handles h
+             LEFT JOIN harklight_feed_stops s ON s.handle=h.handle
+             LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
+             WHERE h.state IN ('active','unavailable')
+             ORDER BY h.createdAt,h.handle
+             """
+           ),
+         {:ok, outages} <- Outage.pending(state.db) do
+      state = Enum.reduce(outages, state, &arm_outage(&2, &1))
 
-    state = Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle, :startup) end)
+      state =
+        Enum.reduce(rows, state, fn [handle, stopped], acc ->
+          mode = if stopped == 1, do: :fenced, else: :startup
+          start_worker(acc, handle, mode)
+        end)
 
-    Task.start(fn ->
-      Tightbeam.HarklightSend.recover_pending(state.db, runner: state.send_runner)
-      HarklightLifecycle.process_terminals(state.db, runner: state.send_runner)
-    end)
+      Task.start(fn ->
+        Tightbeam.HarklightSend.recover_pending(state.db, runner: state.send_runner)
+        HarklightLifecycle.process_terminals(state.db, runner: state.send_runner)
+      end)
 
-    {:noreply, state}
+      {:noreply, state}
+    else
+      {:error, _} ->
+        Process.send_after(self(), :restore, @feed_read_retry_delay)
+        {:noreply, state}
+    end
   end
 
-  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
-    state = release_attach_slot(state, pid)
+  def handle_info({:outage_notice, handle, episode, token}, state) do
+    case Map.get(state.outage_timers, handle) do
+      {_, ^token} ->
+        state = cancel_outage_timer(state, handle)
+        now = state.wall_now.()
+        delay = state.outage_notice_delay
 
+        case Outage.notify(state.db, handle, episode, now, delay) do
+          {:ok, {:early, row}} ->
+            {:noreply, arm_outage(state, row)}
+
+          {:ok, _} ->
+            {:noreply, state}
+
+          {:error, _} ->
+            {:noreply, arm_outage(state, [handle, episode, now - delay + 1_000, nil])}
+        end
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:admit_feed, token}, %{admission_timer: {_, token}} = state),
+    do: {:noreply, admit_feed(%{state | admission_timer: nil})}
+
+  def handle_info({:admit_feed, _stale}, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
     case Map.pop(state.gone_tasks, ref) do
       {handle, tasks} when is_binary(handle) ->
         state = %{state | gone_tasks: tasks}
@@ -1491,23 +1483,63 @@ defmodule Tightbeam.HarklightWakes do
         end
 
       {nil, _} ->
-        worker_down(state, ref)
+        {:noreply, state} = worker_down(state, ref)
+        {:noreply, admit_feed(state)}
     end
   end
 
-  def handle_info({:retry_listener, handle, token}, state) do
+  def handle_info({:retry_listener, handle, token, action}, state) do
     case Map.get(state.retry_timers, handle) do
       {_, ^token} ->
-        {:noreply,
-         start_worker(%{state | retry_timers: Map.delete(state.retry_timers, handle)}, handle)}
+        state = %{state | retry_timers: Map.delete(state.retry_timers, handle)}
+
+        case action do
+          :recover ->
+            {:noreply, recover_worker(state, handle)}
+
+          mode ->
+            state = persist_feed_failure(state, handle)
+
+            if Map.has_key?(state.pending_failures, handle),
+              do:
+                {:noreply, schedule_listener_retry(state, handle, @feed_read_retry_delay, mode)},
+              else: {:noreply, start_worker(state, handle, mode)}
+        end
 
       _ ->
         {:noreply, state}
     end
   end
 
-  # DOWN owns worker bookkeeping. Linked exits ensure a controller crash cannot
-  # leave a worker holding the original handle's listener lock.
+  def handle_info({:reconcile_origin, session_key}, state),
+    do: {:noreply, reconcile_origin(state, session_key)}
+
+  def handle_info({:reconcile_retirement, handles, gone_handles}, state),
+    do: {:noreply, reconcile_retirement(state, handles, MapSet.new(gone_handles))}
+
+  def handle_info({:feed_drain_timeout, handle, token}, state) do
+    if state.launch_owners[handle] == token do
+      if port = state.ports[handle], do: close_listener_port(port)
+      Process.exit(state.workers[handle], :kill)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:feed_result, pid, token, result}, state) do
+    case Enum.find(state.workers, fn {_handle, worker} -> worker == pid end) do
+      {handle, ^pid} when is_map_key(state.launch_owners, handle) ->
+        if state.launch_owners[handle] == token,
+          do: {:noreply, apply_feed_result(state, handle, token, result)},
+          else: {:noreply, state}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  # DOWN owns worker bookkeeping. Linked exits also shut down the worker
+  # when its manager crashes.
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   defp worker_down(state, ref) do
@@ -1516,25 +1548,24 @@ defmodule Tightbeam.HarklightWakes do
         {:noreply, state}
 
       {handle, refs} ->
+        deferred_read = MapSet.member?(state.restart, {handle, :deferred_read})
+        launched? = Map.has_key?(state.launch_owners, handle)
+
         state = %{
           state
           | refs: refs,
             workers: Map.delete(state.workers, handle),
+            launching: MapSet.delete(state.launching, handle),
             starts_in_flight: MapSet.delete(state.starts_in_flight, handle),
             ports: Map.delete(state.ports, handle),
-            restart: MapSet.delete(state.restart, {handle, :deciding})
+            launch_owners: Map.delete(state.launch_owners, handle),
+            restart:
+              state.restart
+              |> MapSet.delete({handle, :deciding})
+              |> MapSet.delete({handle, :deferred_read})
         }
 
         cond do
-          Tightbeam.HarklightOrigin.managed?(state.db, handle) ->
-            {:noreply,
-             %{
-               state
-               | stopping: MapSet.delete(state.stopping, handle),
-                 restart:
-                   state.restart |> MapSet.delete(handle) |> MapSet.delete({handle, :new_request})
-             }}
-
           MapSet.member?(state.stopping, handle) ->
             state = %{
               state
@@ -1546,11 +1577,15 @@ defmodule Tightbeam.HarklightWakes do
               complete_retry_waiter(
                 state,
                 handle,
-                {:failed, "listener start stopped before attachment completed",
+                {:failed, "listener start stopped before feed catch-up completed",
                  retry_waiter_started_for(state, handle)}
               )
 
-            {:noreply, state}
+            if Map.has_key?(state.pending_failures, handle),
+              do:
+                {:noreply,
+                 schedule_listener_retry(state, handle, @feed_read_retry_delay, :recover)},
+              else: {:noreply, state}
 
           MapSet.member?(state.restart, handle) ->
             mode =
@@ -1566,12 +1601,17 @@ defmodule Tightbeam.HarklightWakes do
 
             {:noreply, start_worker(state, handle, mode)}
 
-          true ->
-            if MapSet.member?(state.manual_starts, handle) do
-              if Map.has_key?(state.failures, handle),
-                do: mark_terminated(state.db, handle),
-                else: mark_finished(state.db, handle, "listener_terminated")
+          deferred_read ->
+            mode = if MapSet.member?(state.manual_starts, handle), do: :retry, else: :existing
+            {:noreply, schedule_listener_retry(state, handle, @feed_read_retry_delay, mode)}
 
+          true ->
+            state =
+              if Map.has_key?(state.failures, handle),
+                do: state,
+                else: observe_feed_failure(state, handle, "listener_terminated", not launched?)
+
+            if MapSet.member?(state.manual_starts, handle) do
               state =
                 complete_retry_waiter(
                   state,
@@ -1580,48 +1620,201 @@ defmodule Tightbeam.HarklightWakes do
                    retry_waiter_started_for(state, handle)}
                 )
 
-              {:noreply, %{state | manual_starts: MapSet.delete(state.manual_starts, handle)}}
+              state = %{state | manual_starts: MapSet.delete(state.manual_starts, handle)}
+              {:noreply, recover_worker(state, handle)}
             else
-              mark_terminated(state.db, handle)
               {:noreply, recover_worker(state, handle)}
             end
         end
     end
   end
 
-  # A retry starts only after the old worker has terminated. A gone request is
-  # also serialized with later attachment so a late response cannot mark a
-  # newly attached conversation gone.
+  # Restart only after the preceding worker has exited.
   defp recover_worker(state, handle) do
     status = Map.get(state.failures, handle, "listener_terminated")
 
+    state = persist_feed_failure(state, handle)
+
+    cond do
+      Map.has_key?(state.pending_failures, handle) ->
+        schedule_listener_retry(state, handle, @feed_read_retry_delay, :recover)
+
+      retryable_failure?(status) ->
+        recover_worker(state, handle, status)
+
+      true ->
+        state
+    end
+  end
+
+  defp recover_worker(state, handle, status) do
     case DB.query(
            state.db,
            "SELECT sessionKey,host,state FROM harklight_wake_handles WHERE handle=?1",
            [handle]
          ) do
-      {:ok, [[session_key, host, handle_state]]} when handle_state != "complete" ->
+      {:ok, [[_session_key, host, handle_state]]} when handle_state != "complete" ->
         attempt = Map.get(state.attempts, handle, 0)
-        delay = Enum.at(state.retry_delays, attempt)
+        fallback = if state.sustain_retries, do: List.last(state.retry_delays)
+        delay = Enum.at(state.retry_delays, attempt, fallback)
 
-        if listener_eligible?(state.db, handle, session_key, host) and
-             retryable_failure?(status) and is_integer(delay) do
-          token = make_ref()
-          timer = Process.send_after(self(), {:retry_listener, handle, token}, delay)
+        case listener_eligibility(state.db, handle, host) do
+          {:ok, eligible} ->
+            if eligible and is_integer(delay) and retryable_failure?(status) do
+              next_attempt = min(attempt + 1, length(state.retry_delays))
+              state = %{state | attempts: Map.put(state.attempts, handle, next_attempt)}
+              schedule_listener_retry(state, handle, jitter(delay, state.retry_jitter), :existing)
+            else
+              case finish_recovery(state.db, handle, status) do
+                {:ok, _} ->
+                  cancel_outage_timer(state, handle)
 
-          %{
-            state
-            | attempts: Map.put(state.attempts, handle, attempt + 1),
-              retry_timers: Map.put(state.retry_timers, handle, {timer, token})
-          }
-        else
-          notify_owner_after_recovery_exhaustion(state.db, handle, status)
-          start_gone(state, handle)
+                {:error, _} ->
+                  schedule_listener_retry(state, handle, @feed_read_retry_delay, :recover)
+              end
+            end
+
+          {:error, _reason} ->
+            schedule_listener_retry(state, handle, @feed_read_retry_delay, :recover)
         end
+
+      {:error, _reason} ->
+        schedule_listener_retry(state, handle, @feed_read_retry_delay, :recover)
 
       _ ->
         state
     end
+  end
+
+  defp observe_feed_failure(state, handle, status, ended? \\ false) do
+    state = observe_transport_failure(state, handle, status)
+    previous = Map.get(state.pending_failures, handle)
+
+    evidence =
+      case previous do
+        {^status, at, ended_before?} ->
+          {status, at, ended_before? or ended?}
+
+        {earlier, at, ended_before?} ->
+          if retryable_failure?(status),
+            do: {earlier, at, ended_before? or ended?},
+            else: {status, state.wall_now.(), ended?}
+
+        nil ->
+          {status, state.wall_now.(), ended?}
+      end
+
+    if evidence != previous, do: FeedCustody.remember(state.custody_dir, handle, evidence)
+
+    state = %{
+      state
+      | failures: Map.put(state.failures, handle, status),
+        pending_failures: Map.put(state.pending_failures, handle, evidence)
+    }
+
+    persist_feed_failure(state, handle)
+  end
+
+  defp observe_transport_failure(state, handle, {:harklight_failure, {_error, code}, "listen", _})
+       when code in ["transport_error", "timeout"] do
+    now = System.monotonic_time(:millisecond)
+
+    failures =
+      state.transport_failures
+      |> Map.filter(fn {_handle, at} -> now - at < state.cooldown_window end)
+      |> Map.put(handle, now)
+
+    state = %{state | transport_failures: failures}
+
+    if state.cooldown_level > 0 or map_size(failures) >= state.cooldown_threshold do
+      level = min(state.cooldown_level + 1, 10)
+      ceiling = min(state.cooldown_base * Integer.pow(2, level - 1), state.cooldown_max)
+      delay = jitter(ceiling, state.retry_jitter)
+
+      %{
+        state
+        | cooldown_until: max(state.cooldown_until || now, now + delay),
+          cooldown_level: level
+      }
+    else
+      state
+    end
+  end
+
+  defp observe_transport_failure(state, _handle, _status), do: state
+
+  defp persist_feed_failure(state, handle) do
+    case Map.fetch(state.pending_failures, handle) do
+      {:ok, {status, at, ended?}} ->
+        FeedCustody.retry_write(state.custody_dir, handle)
+
+        # Keep the journal and pending evidence when SQLite refuses admission.
+        # Waiting here would block the worker and manager retry paths.
+        result =
+          DB.refusable(fn ->
+            DB.transaction(state.db, fn txn ->
+              projected =
+                if retryable_failure?(status),
+                  do: Outage.start_in_txn(txn, handle, failure_details(status), at),
+                  else: mark_finished_in_txn(txn, handle, status, at)
+
+              if ended?, do: FeedCustody.release_launch_in_txn(txn, handle)
+              projected
+            end)
+          end)
+
+        case result do
+          {:ok, [_, _, _, _] = row} -> state |> clear_pending_failure(handle) |> arm_outage(row)
+          {:ok, nil} -> clear_pending_failure(state, handle)
+          {:ok, :ok} -> state |> clear_pending_failure(handle) |> cancel_outage_timer(handle)
+          {:error, _} -> state
+        end
+
+      :error ->
+        state
+    end
+  end
+
+  defp clear_pending_failure(state, handle) do
+    case FeedCustody.forget(state.custody_dir, handle) do
+      :ok -> %{state | pending_failures: Map.delete(state.pending_failures, handle)}
+      {:error, _} -> state
+    end
+  end
+
+  defp arm_outage(state, [_handle, _episode, _started, notice]) when is_binary(notice), do: state
+
+  defp arm_outage(state, [handle, episode, started, nil]) do
+    if Map.has_key?(state.outage_timers, handle) do
+      state
+    else
+      delay = max(0, started + state.outage_notice_delay - state.wall_now.())
+      token = make_ref()
+      timer = Process.send_after(self(), {:outage_notice, handle, episode, token}, delay)
+      %{state | outage_timers: Map.put(state.outage_timers, handle, {timer, token})}
+    end
+  end
+
+  defp cancel_outage_timer(state, handle) do
+    case Map.pop(state.outage_timers, handle) do
+      {nil, _} ->
+        state
+
+      {{timer, _}, timers} ->
+        Process.cancel_timer(timer)
+        %{state | outage_timers: timers}
+    end
+  end
+
+  defp jitter(delay, _) when delay <= 1, do: delay
+  defp jitter(delay, false), do: delay
+  defp jitter(delay, true), do: div(delay, 2) + :rand.uniform(delay - div(delay, 2))
+
+  defp schedule_listener_retry(state, handle, delay, action) do
+    state = cancel_retry(state, handle)
+    token = make_ref()
+    timer = Process.send_after(self(), {:retry_listener, handle, token, action}, delay)
+    %{state | retry_timers: Map.put(state.retry_timers, handle, {timer, token})}
   end
 
   defp start_gone(state, handle) do
@@ -1633,50 +1826,87 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  # A lock refusal does not identify its owner. It can be our previous child
-  # still releasing the lock; bounded attempts let that clear. The Agent takes
-  # the exclusive lock before attaching, so a held lock never starts a second
-  # stream. Persistent contention ends in gone with its observed reason intact.
+  defp retryable_failure?(:complete), do: false
+
   defp retryable_failure?({:harklight_failure, {_error, code}, _, _}) do
-    code not in ~w(missing_journal unproven_handle invalid_handle invalid_attachment
-      invalid_attachment_receipt support_mismatch configuration_error
+    code not in ~w(missing_journal configuration_error
       not_found forbidden operation_conflict invalid_field unsupported_version
-      feed_gap feed_conflict invalid_notice invalid_response)
+      feed_gap feed_conflict invalid_notice invalid_response feed_refused internal_error
+      feed_custody_uncertain)
   end
 
   defp retryable_failure?({:harklight_failure, error, _, _}), do: retryable_failure?(error)
 
   defp retryable_failure?(error),
-    do: error not in ~w(origin_unavailable origin_host_mismatch listener_unsupported
+    do: error not in ~w(cli_missing origin_unavailable origin_host_mismatch
       event_identity_invalid event_identity_mismatch event_order_invalid invalid_listener_line
-      unexpected_listener_line)
+      unexpected_feed_record)
 
-  defp transient_origin_failure?({:harklight_failure, {_error, code}, operation, _diagnostic})
-       when operation in ["attach", "listen"] and code in ["transport_error", "timeout"],
+  defp paused_feed_failure?({:harklight_failure, {"live_updates_paused", reason}, _, _})
+       when reason in ["internal_error", "feed_custody_uncertain"],
        do: true
 
-  defp transient_origin_failure?({:harklight_failure, error, operation, diagnostic})
-       when operation in ["attach", "listen"] do
-    retryable_failure?({:harklight_failure, error, operation, diagnostic}) and
-      origin_transport_failure?(diagnostic)
-  end
+  defp paused_feed_failure?(_), do: false
 
-  defp transient_origin_failure?(_status), do: false
+  defp durable_feed_stop?(status),
+    do:
+      status not in [:complete, "origin_unavailable", "origin_host_mismatch"] and
+        not paused_feed_failure?(status) and not retryable_failure?(status)
 
   @impl true
-  def terminate(_reason, state) do
+  def terminate(reason, state) do
+    if state.admission_timer, do: Process.cancel_timer(elem(state.admission_timer, 0))
     Enum.each(state.retry_timers, fn {_, {timer, _}} -> Process.cancel_timer(timer) end)
+    Enum.each(state.outage_timers, fn {_, {timer, _}} -> Process.cancel_timer(timer) end)
+
+    Enum.each(state.pending_failures, fn {handle, _} ->
+      FeedCustody.retry_write(state.custody_dir, handle)
+    end)
+
+    if reason in [:normal, :shutdown] or match?({:shutdown, _}, reason) do
+      deadline = Tightbeam.Application.shutdown_deadline(drain_deadline())
+
+      workers =
+        for {handle, _port} <- state.ports,
+            pid = state.workers[handle],
+            token = state.launch_owners[handle],
+            into: %{} do
+          send(pid, {:close_feed, self(), token, deadline})
+          {pid, {handle, token}}
+        end
+
+      settle_draining_feeds(state, workers, deadline)
+    end
+
     Enum.each(state.ports, fn {_handle, port} -> close_listener_port(port) end)
     Enum.each(state.workers, fn {_handle, worker} -> Process.exit(worker, :shutdown) end)
   end
 
-  def handle_cast({:pointer_changed, session_key}, state) do
-    Tightbeam.HarklightOriginListener.resume_session(session_key)
+  defp settle_draining_feeds(_state, workers, _deadline) when map_size(workers) == 0, do: :ok
 
+  defp settle_draining_feeds(state, workers, deadline) do
+    receive do
+      {:feed_result, pid, token, result} when is_map_key(workers, pid) ->
+        case workers[pid] do
+          {handle, ^token} ->
+            state = apply_feed_result(state, handle, token, result)
+            settle_draining_feeds(state, Map.delete(workers, pid), deadline)
+
+          _ ->
+            settle_draining_feeds(state, workers, deadline)
+        end
+    after
+      max(0, deadline - System.monotonic_time(:millisecond)) -> :ok
+    end
+  end
+
+  defp drain_deadline, do: System.monotonic_time(:millisecond) + 1_000
+
+  def handle_cast({:pointer_changed, session_key}, state) do
     {:ok, rows} =
       DB.query(
         state.db,
-        "SELECT handle FROM harklight_wake_handles WHERE sessionKey=?1 AND state IN ('active','unavailable') AND NOT EXISTS (SELECT 1 FROM harklight_origin_moves m WHERE m.handle=harklight_wake_handles.handle)",
+        "SELECT handle FROM harklight_wake_handles WHERE sessionKey=?1 AND state IN ('active','unavailable')",
         [session_key]
       )
 
@@ -1691,53 +1921,16 @@ defmodule Tightbeam.HarklightWakes do
     {:noreply, reconcile_retirement(state, handles, MapSet.new(gone_handles))}
   end
 
-  def handle_cast({:decision_slot, pid, ref}, state),
-    do: handle_cast({:attach_slot, pid, {:decision, ref}}, state)
-
-  def handle_cast({:attach_slot, pid, ref}, state) do
-    if MapSet.size(state.attach_slots) < state.attach_limit do
-      send(pid, {:attach_slot, ref})
-      {:noreply, %{state | attach_slots: MapSet.put(state.attach_slots, pid)}}
-    else
-      # Share the existing bounded slot pool. Actual attachments retain FIFO
-      # order ahead of queued decisions, so startup reads cannot monopolize it.
-      waiting =
-        if is_tuple(ref) do
-          :queue.in({pid, ref}, state.attach_waiting)
-        else
-          {attaches, decisions} =
-            state.attach_waiting
-            |> :queue.to_list()
-            |> Enum.split_while(fn {_, queued_ref} -> not is_tuple(queued_ref) end)
-
-          :queue.from_list(attaches ++ [{pid, ref}] ++ decisions)
-        end
-
-      {:noreply, %{state | attach_waiting: waiting}}
-    end
-  end
-
-  def handle_cast({:attach_slot_released, pid}, state),
-    do: {:noreply, release_attach_slot(state, pid)}
-
   @impl true
   def handle_cast({:activate, handle, true}, state) do
-    Tightbeam.HarklightOriginListener.resume_handle(handle)
-
-    if Tightbeam.HarklightOrigin.managed?(state.db, handle),
-      do: {:noreply, state},
-      else: {:noreply, force_worker(state, handle, :new_request)}
+    {:noreply, force_worker(state, handle, :new_request)}
   end
 
   def handle_cast({:activate, handle, false}, state) do
-    Tightbeam.HarklightOriginListener.resume_handle(handle)
     # Registration must interrupt an outstanding closure read, while an already
     # running listener continues normally.
     state =
       cond do
-        Tightbeam.HarklightOrigin.managed?(state.db, handle) ->
-          state
-
         MapSet.member?(state.restart, {handle, :deciding}) ->
           force_worker(state, handle, :new_request)
 
@@ -1749,149 +1942,117 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   def handle_cast({:origin_ready, session_key}, state) do
-    Tightbeam.HarklightOriginListener.resume_session(session_key)
-
     {:ok, rows} =
       DB.query(
         state.db,
-        "SELECT handle FROM harklight_wake_handles WHERE (sessionKey=?1 OR currentReceiverSessionKey=?1) AND state IN ('active','unavailable') AND NOT EXISTS (SELECT 1 FROM harklight_origin_moves m WHERE m.handle=harklight_wake_handles.handle) ORDER BY createdAt,handle",
+        "SELECT handle FROM harklight_wake_handles WHERE (sessionKey=?1 OR currentReceiverSessionKey=?1) AND state IN ('active','unavailable') ORDER BY createdAt,handle",
         [session_key]
       )
 
     {:noreply, Enum.reduce(rows, state, fn [handle], acc -> start_worker(acc, handle) end)}
   end
 
-  def handle_cast({:origin_turn_ended, session_key}, state) do
-    case answer_completion_candidates(state.db, session_key) do
-      {:ok, candidates} ->
-        schedule_answered_checks(self(), state.db, state.send_runner, candidates)
-
-      _ ->
-        :ok
-    end
-
-    {:noreply, state}
-  end
-
-  def handle_cast({:h8a_acknowledged, handle}, state) do
-    schedule_answered_checks(self(), state.db, state.send_runner, [[handle]])
-    {:noreply, state}
-  end
-
-  def handle_cast({:answer_completion_evidence, handle, evidence}, state) do
-    result =
-      DB.transaction(state.db, fn txn ->
-        HarklightLifecycle.complete_answered_in_txn(txn, handle, evidence)
-      end)
-
-    state = if result == {:ok, true}, do: stop_worker(state, handle), else: state
-    {:noreply, state}
-  end
-
-  defp answer_completion_candidates(db, session_key) do
-    DB.query(
-      db,
-      """
-      SELECT DISTINCT h.handle
-      FROM harklight_wake_handles h
-      JOIN harklight_wake_entries e ON e.handle=h.handle
-      WHERE h.state IN ('active','unavailable') AND e.entryKind='terminal'
-        AND (?1 IS NULL OR COALESCE(h.currentReceiverSessionKey,h.sessionKey)=?1)
-      ORDER BY h.handle
-      """,
-      [session_key]
-    )
-  end
-
-  defp schedule_answered_checks(manager, db, runner, candidates) do
-    Task.start(fn -> schedule_answered_checks_now(manager, db, runner, candidates) end)
-  end
-
-  defp schedule_answered_checks_now(manager, db, runner, candidates) do
-    Enum.each(candidates, fn [handle] ->
-      case HarklightLifecycle.completion_evidence(db, handle, runner: runner) do
-        {:ok, evidence} ->
-          GenServer.cast(manager, {:answer_completion_evidence, handle, evidence})
-
-        _ ->
-          :ok
-      end
-    end)
-  end
-
   defp reconcile_origin(state, session_key) do
-    {:ok, rows} =
-      DB.query(
-        state.db,
-        "SELECT handle,sessionKey,host,state FROM harklight_wake_handles WHERE sessionKey=?1 OR currentReceiverSessionKey=?1",
-        [session_key]
-      )
+    case DB.query(
+           state.db,
+           "SELECT handle,sessionKey,host,state FROM harklight_wake_handles WHERE sessionKey=?1 OR currentReceiverSessionKey=?1",
+           [session_key]
+         ) do
+      {:ok, rows} ->
+        reconcile_rows(state, rows, MapSet.new())
 
-    reconcile_rows(state, rows, MapSet.new())
+      {:error, _reason} ->
+        Process.send_after(self(), {:reconcile_origin, session_key}, @feed_read_retry_delay)
+        state
+    end
   end
 
   defp reconcile_retirement(state, handles, gone_handles) do
     Enum.reduce(handles, state, fn handle, acc ->
-      {:ok, rows} =
-        DB.query(
-          acc.db,
-          "SELECT handle,sessionKey,host,state FROM harklight_wake_handles WHERE handle=?1",
-          [handle]
-        )
-
-      reconcile_rows(acc, rows, gone_handles)
+      case DB.query(
+             acc.db,
+             "SELECT handle,sessionKey,host,state FROM harklight_wake_handles WHERE handle=?1",
+             [handle]
+           ) do
+        {:ok, rows} -> reconcile_rows(acc, rows, gone_handles)
+        {:error, _reason} -> defer_reconciliation(acc, handle, gone_handles)
+      end
     end)
   end
 
   defp reconcile_rows(state, rows, gone_handles) do
     Enum.reduce(rows, state, fn [handle, origin_session_key, host, handle_state], acc ->
-      if listener_eligible?(acc.db, handle, origin_session_key, host) do
-        if handle_state == "complete", do: acc, else: start_worker(acc, handle)
-      else
-        # Persist invalidation before the worker's DOWN can reach observers.
-        mark_finished(acc.db, handle, "origin_unavailable")
-        acc = stop_worker(acc, handle)
-        notify_pending_origin_unavailable(acc.db, handle)
+      case listener_eligibility(acc.db, handle, host) do
+        {:ok, true} ->
+          if handle_state == "complete", do: acc, else: start_worker(acc, handle)
 
-        cond do
-          MapSet.member?(gone_handles, handle) ->
-            mark_origin_gone_async(handle)
-            acc
+        {:ok, false} ->
+          # Persist invalidation before the worker's DOWN can reach observers.
+          with {:ok, origin_active} <- session_active(acc.db, origin_session_key),
+               :ok <- mark_finished(acc.db, handle, "origin_unavailable") do
+            acc = stop_worker(acc, handle)
+            notify_pending_origin_unavailable(acc.db, handle)
 
-          host == Placement.local_host_name() and
-              match?(%{state: "active"}, Org.get(acc.db, origin_session_key)) ->
-            start_gone(acc, handle)
+            cond do
+              MapSet.member?(gone_handles, handle) ->
+                mark_origin_gone_async(handle)
+                acc
 
-          true ->
-            acc
-        end
+              host == Placement.local_host_name() and origin_active ->
+                start_gone(acc, handle)
+
+              true ->
+                acc
+            end
+          else
+            {:error, _reason} -> defer_reconciliation(acc, handle, gone_handles)
+          end
+
+        {:error, _reason} ->
+          defer_reconciliation(acc, handle, gone_handles)
       end
     end)
   end
 
-  defp actual_receiver_eligible?(db, handle, _session_key, host) do
-    {:ok, [[receiver]]} =
-      DB.query(
-        db,
-        "SELECT COALESCE(currentReceiverSessionKey,sessionKey) FROM harklight_wake_handles WHERE handle=?1",
-        [handle]
-      )
+  defp defer_reconciliation(state, handle, gone_handles) do
+    gone = if MapSet.member?(gone_handles, handle), do: [handle], else: []
+    Process.send_after(self(), {:reconcile_retirement, [handle], gone}, @feed_read_retry_delay)
+    state
+  end
 
-    match?(%{state: "active", host: ^host}, Org.get(db, receiver)) or
-      match?(
-        {:ok, [[1]]},
-        DB.query(
-          db,
-          """
-          SELECT 1
-          FROM harklight_wake_follows f
-          JOIN sessions s ON s.sessionKey=f.sessionKey
-          WHERE f.handle=?1 AND f.state='open' AND s.state='active' AND s.host=?2
-          LIMIT 1
-          """,
-          [handle, host]
-        )
-      )
+  defp session_active(db, session_key) do
+    with {:ok, rows} <-
+           DB.query(db, "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'", [
+             session_key
+           ]) do
+      {:ok, rows != []}
+    end
+  end
+
+  defp listener_eligibility(db, handle, host) do
+    if host == Placement.local_host_name() do
+      with {:ok, rows} <-
+             DB.query(
+               db,
+               """
+               SELECT 1
+               FROM harklight_wake_handles h
+               JOIN sessions s ON s.state='active' AND s.host=?2
+               WHERE h.handle=?1 AND (
+                 s.sessionKey=COALESCE(h.currentReceiverSessionKey,h.sessionKey) OR EXISTS (
+                   SELECT 1 FROM harklight_wake_follows f
+                   WHERE f.handle=h.handle AND f.sessionKey=s.sessionKey AND f.state='open'
+                 )
+               )
+               LIMIT 1
+               """,
+               [handle, host]
+             ) do
+        {:ok, rows != []}
+      end
+    else
+      {:ok, false}
+    end
   end
 
   defp actual_receiver_eligible_in_txn?(txn, handle, _session_key, host) do
@@ -1939,7 +2100,7 @@ defmodule Tightbeam.HarklightWakes do
         try do
           case System.cmd(
                  executable,
-                 ["session", "end", "--session", handle, "--gone"],
+                 ["session", "end", "--session", handle],
                  stderr_to_stdout: true
                ) do
             {_output, 0} ->
@@ -1962,8 +2123,7 @@ defmodule Tightbeam.HarklightWakes do
   defp force_worker(state, handle, mode \\ :existing) do
     case Map.fetch(state.workers, handle) do
       {:ok, worker} ->
-        if port = Map.get(state.ports, handle), do: close_listener_port(port)
-        Process.exit(worker, :shutdown)
+        request_worker_close(state, handle, worker)
         restart = MapSet.put(state.restart, handle)
 
         restart =
@@ -1979,10 +2139,36 @@ defmodule Tightbeam.HarklightWakes do
   defp stop_worker(state, handle) do
     state = cancel_retry(state, handle)
 
+    state =
+      complete_retry_waiter(
+        state,
+        handle,
+        {:failed, "listener receiver is no longer eligible",
+         retry_waiter_started_for(state, handle)}
+      )
+
+    deferred =
+      Enum.reduce(
+        [handle, {handle, :retry}, {handle, :startup}, {handle, :new_request}],
+        state.deferred,
+        &MapSet.delete(&2, &1)
+      )
+
+    state = %{
+      state
+      | admission_queue: List.keydelete(state.admission_queue, handle, 0),
+        manual_starts: MapSet.delete(state.manual_starts, handle),
+        deferred: deferred
+    }
+
+    state =
+      if Map.has_key?(state.pending_failures, handle),
+        do: schedule_listener_retry(state, handle, @feed_read_retry_delay, :recover),
+        else: state
+
     case Map.fetch(state.workers, handle) do
       {:ok, worker} ->
-        if port = Map.get(state.ports, handle), do: close_listener_port(port)
-        Process.exit(worker, :shutdown)
+        request_worker_close(state, handle, worker)
 
         %{
           state
@@ -1996,29 +2182,14 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  # A worker that exits while holding or awaiting a slot is released by DOWN.
-  defp release_attach_slot(state, pid) do
-    waiting = :queue.filter(fn {waiter, _ref} -> waiter != pid end, state.attach_waiting)
+  defp request_worker_close(state, handle, worker) do
+    case Map.fetch(state.launch_owners, handle) do
+      {:ok, token} ->
+        send(worker, {:close_feed, self(), token, drain_deadline()})
+        Process.send_after(self(), {:feed_drain_timeout, handle, token}, 1_000)
 
-    if MapSet.member?(state.attach_slots, pid) do
-      grant_attach_slot(%{
-        state
-        | attach_slots: MapSet.delete(state.attach_slots, pid),
-          attach_waiting: waiting
-      })
-    else
-      %{state | attach_waiting: waiting}
-    end
-  end
-
-  defp grant_attach_slot(state) do
-    case :queue.out(state.attach_waiting) do
-      {{:value, {pid, ref}}, waiting} ->
-        send(pid, {:attach_slot, ref})
-        %{state | attach_slots: MapSet.put(state.attach_slots, pid), attach_waiting: waiting}
-
-      {:empty, _} ->
-        state
+      :error ->
+        Process.exit(worker, :shutdown)
     end
   end
 
@@ -2026,20 +2197,6 @@ defmodule Tightbeam.HarklightWakes do
     Map.get(state.workers, handle) == pid and
       not MapSet.member?(state.stopping, handle) and
       not MapSet.member?(state.restart, handle)
-  end
-
-  defp update_retry_started_for(state, handle, started_for) do
-    case Map.get(state.retry_waiters, handle) do
-      nil ->
-        state
-
-      waiter ->
-        %{
-          state
-          | retry_waiters:
-              Map.put(state.retry_waiters, handle, %{waiter | started_for: started_for})
-        }
-    end
   end
 
   defp retry_waiter_started_for(state, handle) do
@@ -2063,7 +2220,11 @@ defmodule Tightbeam.HarklightWakes do
   defp retry_failure_reason(db, handle) do
     case DB.query(
            db,
-           "SELECT lastError FROM harklight_wake_handles WHERE handle=?1",
+           """
+           SELECT COALESCE(p.diagnostic,h.lastError)
+           FROM harklight_wake_handles h LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
+           WHERE h.handle=?1
+           """,
            [handle]
          ) do
       {:ok, [[reason]]} when is_binary(reason) and reason != "" -> reason
@@ -2072,7 +2233,8 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp listener_start_in_flight?(state, handle) do
-    MapSet.member?(state.starts_in_flight, handle) or
+    List.keymember?(state.admission_queue, handle, 0) or
+      MapSet.member?(state.starts_in_flight, handle) or
       Map.has_key?(state.retry_timers, handle) or
       Map.has_key?(state.retry_waiters, handle) or
       MapSet.member?(state.restart, handle)
@@ -2085,61 +2247,59 @@ defmodule Tightbeam.HarklightWakes do
       MapSet.member?(state.deferred, handle)
   end
 
-  defp listener_eligible?(db, handle, session_key, host) do
-    host == Placement.local_host_name() and
-      actual_receiver_eligible?(db, handle, session_key, host)
-  end
-
   defp listener_eligible_in_txn?(txn, handle, session_key, host) do
     host == Placement.local_host_name() and
       actual_receiver_eligible_in_txn?(txn, handle, session_key, host)
   end
 
-  @doc false
-  def stop_for_origin(handle, server \\ __MODULE__) do
-    with {:ok, opts} <- GenServer.call(server, {:stop_origin_reader, handle}, :infinity),
-         do: Tightbeam.HarklightChild.await_stopped({:handle, handle}, opts)
-  end
-
-  @doc false
-  def begin_origin_move(handle, session_key, server \\ __MODULE__),
-    do: GenServer.call(server, {:begin_origin_move, handle, session_key}, :infinity)
-
   @impl true
-  def handle_call({:begin_origin_move, handle, session_key}, _from, state) do
-    result = Tightbeam.HarklightOrigin.begin_move(state.db, handle, session_key)
-    # Preserve the current reader until the first settling cover. Only future
-    # starts and restart requests are suppressed by this durable marker.
-    state =
-      case result do
-        {:ok, result} when result in [:started, :moving, :covered] -> cancel_retry(state, handle)
-        _ -> state
-      end
-
-    {:reply, result, state}
-  end
-
   def handle_call({:launch_child, handle, executable, args}, {pid, _} = from, state) do
-    if valid_worker?(state, handle, from) and
-         not Tightbeam.HarklightOrigin.managed?(state.db, handle) do
-      case Tightbeam.HarklightChild.open({:handle, handle}, executable, args, state.child_opts) do
-        {:ok, port, initial} ->
-          true = Port.connect(port, pid)
-          {:reply, {:ok, port, initial}, %{state | ports: Map.put(state.ports, handle, port)}}
+    if valid_worker?(state, handle, from) do
+      explicit? = MapSet.member?(state.manual_starts, handle)
+      token = Tightbeam.Id.uuid4()
 
-        error ->
-          {:reply, error, state}
+      case FeedCustody.arm_launch(state.db, handle, token, explicit?) do
+        :ok ->
+          state = %{state | launch_owners: Map.put(state.launch_owners, handle, token)}
+          open_feed_child(state, handle, pid, token, executable, args)
+
+        {:error, :feed_launch_unavailable} = error ->
+          {:reply, error, %{state | restart: MapSet.put(state.restart, {handle, :deferred_read})}}
       end
     else
       {:reply, {:error, :listener_fenced}, state}
     end
   end
 
-  def handle_call({:stop_origin_reader, handle}, _from, state) do
-    if Tightbeam.HarklightOrigin.managed?(state.db, handle) do
-      {:reply, {:ok, state.child_opts}, stop_worker(state, handle)}
-    else
-      {:reply, {:error, :handle_not_moving}, state}
+  defp open_feed_child(state, handle, pid, token, executable, args) do
+    case Tightbeam.HarklightChild.open({:handle, handle}, executable, args, state.child_opts) do
+      {:ok, port, initial} ->
+        true = Port.connect(port, pid)
+        next = System.monotonic_time(:millisecond) + state.admission_spacing
+
+        state = %{
+          state
+          | launching: MapSet.delete(state.launching, handle),
+            admission_next: next,
+            ports: Map.put(state.ports, handle, port)
+        }
+
+        {:reply, {:ok, port, initial, token}, admit_feed(state)}
+
+      {:error, reason} ->
+        status = failure_status("listener_failed", "listen", inspect(reason))
+
+        ended? =
+          case reason do
+            {:child_start_failed, exit_status} ->
+              Tightbeam.HarklightChild.verified_exit?(exit_status)
+
+            other ->
+              other not in [:child_readiness_unknown, :child_readiness_invalid]
+          end
+
+        state = apply_feed_result(state, handle, token, {:failed, status, ended?})
+        {:reply, {:error, :feed_open_accounted}, state}
     end
   end
 
@@ -2152,19 +2312,22 @@ defmodule Tightbeam.HarklightWakes do
 
   def handle_call({:retry_handle, handle}, from, state) do
     cond do
-      listener_start_in_flight?(state, handle) ->
+      Map.has_key?(state.retry_waiters, handle) or
+          (listener_start_in_flight?(state, handle) and
+             not Map.has_key?(state.retry_timers, handle) and
+             not List.keymember?(state.admission_queue, handle, 0)) ->
         {:reply, :in_progress, state}
 
       true ->
         case DB.query(
                state.db,
-               "SELECT state,EXISTS(SELECT 1 FROM harklight_origin_moves m WHERE m.handle=h.handle) FROM harklight_wake_handles h WHERE h.handle=?1",
+               "SELECT state FROM harklight_wake_handles WHERE handle=?1",
                [handle]
              ) do
-          {:ok, [[state_value, moved]]} when state_value in ["active", "complete"] ->
+          {:ok, [[state_value]]} when state_value in ["active", "complete"] ->
             # A listener that ended before its state was recorded leaves an
             # active row with nothing listening; start it like a failed one.
-            if state_value == "active" and moved == 0 and not listener_present?(state, handle) do
+            if state_value == "active" and not listener_present?(state, handle) do
               state = %{
                 state
                 | retry_waiters:
@@ -2176,7 +2339,7 @@ defmodule Tightbeam.HarklightWakes do
               {:reply, {:not_failed, state_value}, state}
             end
 
-          {:ok, [["unavailable", _moved]]} ->
+          {:ok, [["unavailable"]]} ->
             state = %{
               state
               | retry_waiters:
@@ -2202,28 +2365,46 @@ defmodule Tightbeam.HarklightWakes do
     # retirement handoff moves it off the session that first opened it.
     case DB.query(
            state.db,
-           "SELECT COALESCE(currentReceiverSessionKey,sessionKey),host,state FROM harklight_wake_handles WHERE handle=?1",
+           """
+           SELECT COALESCE(h.currentReceiverSessionKey,h.sessionKey),h.host,h.state,p.diagnostic,s.handle
+           FROM harklight_wake_handles h
+           LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
+           LEFT JOIN harklight_feed_stops s ON s.handle=h.handle
+           WHERE h.handle=?1
+           """,
            [handle]
          ) do
-      {:ok, [[^session_key, host, handle_state]]}
+      {:ok, [[^session_key, _host, handle_state, diagnostic, _stop]]}
+      when is_binary(diagnostic) and handle_state in ["active", "unavailable"] ->
+        {:reply, {:error, {"harklight_feed_paused", diagnostic}}, state}
+
+      {:ok, [[^session_key, _host, "unavailable", nil, ^handle]]} ->
+        {:reply, {:error, "harklight_feed_stopped"}, state}
+
+      {:ok, [[^session_key, host, handle_state, nil, nil]]}
       when handle_state in ["active", "unavailable"] ->
-        if listener_eligible?(state.db, handle, session_key, host) do
-          already_running? =
-            Map.has_key?(state.workers, handle) and not Map.has_key?(state.failures, handle)
+        case listener_eligibility(state.db, handle, host) do
+          {:ok, true} ->
+            already_running? =
+              Map.has_key?(state.workers, handle) and not Map.has_key?(state.failures, handle)
 
-          state =
-            cond do
-              already_running? -> state
-              Map.has_key?(state.workers, handle) -> force_worker(state, handle, :existing)
-              true -> start_worker(state, handle, :existing)
-            end
+            state =
+              cond do
+                already_running? -> state
+                Map.has_key?(state.workers, handle) -> force_worker(state, handle, :existing)
+                true -> start_worker(state, handle, :existing)
+              end
 
-          {:reply, {:ok, if(already_running?, do: "active", else: "restoring")}, state}
-        else
-          {:reply, {:error, "harklight_origin_unavailable"}, state}
+            {:reply, {:ok, if(already_running?, do: "active", else: "restoring")}, state}
+
+          {:ok, false} ->
+            {:reply, {:error, "harklight_origin_unavailable"}, state}
+
+          {:error, _reason} ->
+            {:reply, {:error, "harklight_listener_unavailable"}, state}
         end
 
-      {:ok, [[_other_session, _host, _state]]} ->
+      {:ok, [[_other_session, _host, _state, _diagnostic, _stop]]} ->
         {:reply, {:error, "harklight_origin_mismatch"}, state}
 
       {:ok, []} ->
@@ -2235,54 +2416,63 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   @impl true
-  def handle_call({:capture, handle, line}, from, state) do
+  def handle_call({:feed_start, handle}, from, state) do
     result =
-      if valid_worker?(state, handle, from),
-        do: capture_line(state.db, handle, line),
-        else: {:error, "listener_fenced"}
-
-    if result == :ok,
-      do: HarklightLifecycle.acknowledge_pending(state.db, runner: state.send_runner)
-
-    state =
-      if result == :ok, do: %{state | attempts: Map.delete(state.attempts, handle)}, else: state
+      if valid_worker?(state, handle, from) do
+        case DB.query(state.db, "SELECT rev FROM harklight_feed_checkpoints WHERE handle=?1", [
+               handle
+             ]) do
+          {:ok, [[rev]]} -> {:ok, state.db, rev}
+          {:ok, []} -> {:ok, state.db, nil}
+          _ -> {:error, "capture_unavailable"}
+        end
+      else
+        {:error, "listener_fenced"}
+      end
 
     {:reply, result, state}
   end
 
-  def handle_call({:start_decided, handle, decision, mode}, from, state) do
+  def handle_call({:feed_capture, handle, rev, frames, mode}, from, state) do
     if valid_worker?(state, handle, from) do
-      closed? =
-        if mode == :retry,
-          do: match?({:closed, _}, decision),
-          else: decision
+      case capture_feed_result(state.db, handle, rev, frames, mode) do
+        {:ok, true} -> {:reply, :ok, confirm_feed_recovery(state, handle)}
+        {:ok, false} -> {:reply, :ok, state}
+        error -> {:reply, error, state}
+      end
+    else
+      {:reply, {:error, "listener_fenced"}, state}
+    end
+  end
 
-      {reply, state} = if closed?, do: {:skip, state}, else: prepare_listener(state, handle)
+  def handle_call({:feed_live, handle}, from, state) do
+    if valid_worker?(state, handle, from) do
+      case Outage.finish(state.db, handle, true, state.wall_now.()) do
+        {:ok, :ok} -> {:reply, :ok, confirm_feed_recovery(state, handle)}
+        {:error, _} -> {:reply, {:error, "capture_unavailable"}, state}
+      end
+    else
+      {:reply, {:error, "listener_fenced"}, state}
+    end
+  end
+
+  def handle_call({:start_feed, handle}, from, state) do
+    if valid_worker?(state, handle, from) do
+      {reply, state} = prepare_listener(state, handle)
+
+      state = %{state | restart: MapSet.delete(state.restart, {handle, :deciding})}
 
       state =
-        if reply == :skip,
-          do: %{state | stopping: MapSet.put(state.stopping, handle)},
-          else: %{state | restart: MapSet.delete(state.restart, {handle, :deciding})}
+        case reply do
+          :skip ->
+            %{state | stopping: MapSet.put(state.stopping, handle)}
 
-      state =
-        if mode == :retry do
-          case {closed?, reply, decision} do
-            {true, :skip, {:closed, _}} ->
-              complete_retry_waiter(state, handle, :skipped_closed)
+          :defer ->
+            state = observe_feed_failure(state, handle, "feed_preparation_unavailable")
+            %{state | restart: MapSet.put(state.restart, {handle, :deferred_read})}
 
-            {false, {:listen, _}, {:start, started_for}} ->
-              update_retry_started_for(state, handle, started_for)
-
-            {false, :skip, {:start, _}} ->
-              complete_retry_waiter(
-                state,
-                handle,
-                {:failed, retry_failure_reason(state.db, handle),
-                 retry_waiter_started_for(state, handle)}
-              )
-          end
-        else
-          state
+          {:listen, _} ->
+            state
         end
 
       {:reply, reply, state}
@@ -2299,33 +2489,51 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  def handle_call({:attached, handle}, from, state) do
+  def handle_call({:feed_ready, handle}, from, state) do
+    valid? = valid_worker?(state, handle, from)
+    state = if valid?, do: persist_feed_failure(state, handle), else: state
+
     result =
-      if valid_worker?(state, handle, from) do
-        # The listener worker already owns the attachment-state retry (#804).
-        # Preserve its refusal/backoff path instead of blocking the manager here.
+      if valid? and not Map.has_key?(state.pending_failures, handle) do
+        # The worker retries this local write without blocking the manager.
         case DB.refusable(fn ->
-               DB.query(
-                 state.db,
-                 "UPDATE harklight_wake_handles SET state='active',lastError=NULL,updatedAt=?2 WHERE handle=?1",
-                 [handle, System.system_time(:millisecond)]
-               )
+               with {:ok, _} <-
+                      DB.query(
+                        state.db,
+                        "UPDATE harklight_wake_handles SET state='active',lastError=NULL,updatedAt=?2 WHERE handle=?1",
+                        [handle, System.system_time(:millisecond)]
+                      ) do
+                 if MapSet.member?(state.manual_starts, handle) do
+                   with {:ok, _} <-
+                          DB.query(
+                            state.db,
+                            "DELETE FROM harklight_feed_pauses WHERE handle=?1",
+                            [handle]
+                          ) do
+                     DB.query(state.db, "DELETE FROM harklight_feed_stops WHERE handle=?1", [
+                       handle
+                     ])
+                   end
+                 else
+                   {:ok, []}
+                 end
+               end
              end) do
           {:ok, _} -> :ok
-          {:error, _} -> {:error, "attachment_state_unavailable"}
+          {:error, _} -> {:error, "feed_state_unavailable"}
         end
       else
-        {:error, "listener_fenced"}
+        if valid?, do: {:error, "feed_state_unavailable"}, else: {:error, "listener_fenced"}
       end
 
-    # Quiet conversations may reconnect without capturing another event. Only
-    # consecutive failed attachments consume the recovery budget.
+    # Catch-up releases the manual wait but does not prove live recovery.
     state =
       if result == :ok do
         state = %{
           state
-          | attempts: Map.delete(state.attempts, handle),
-            manual_starts: MapSet.delete(state.manual_starts, handle),
+          | manual_starts: MapSet.delete(state.manual_starts, handle),
+            failures: Map.delete(state.failures, handle),
+            launching: MapSet.delete(state.launching, handle),
             starts_in_flight: MapSet.delete(state.starts_in_flight, handle)
         }
 
@@ -2337,93 +2545,117 @@ defmodule Tightbeam.HarklightWakes do
             complete_retry_waiter(state, handle, {:listening, started_for})
         end
       else
-        state
+        if result == {:error, "feed_state_unavailable"},
+          do: observe_feed_failure(state, handle, "feed_state_unavailable"),
+          else: state
       end
 
-    {:reply, result, state}
+    {:reply, result, admit_feed(state)}
   end
 
   def handle_call({:finished, handle, status}, from, state) do
-    valid? =
-      valid_worker?(state, handle, from) and
-        not Tightbeam.HarklightOrigin.managed?(state.db, handle)
+    if valid_worker?(state, handle, from) do
+      state = observe_feed_failure(state, handle, status, true)
 
-    result =
-      if valid? do
-        # Later restoration failures still matter when the durable handle is
-        # already unavailable; owner wake/state gating remains in the writer.
-        if status != :complete, do: log_listener_failure(handle, status)
-        mark_finished(state.db, handle, status)
+      if Map.has_key?(state.pending_failures, handle) and paused_feed_failure?(status) do
+        {:reply, {:error, "listener_state_unavailable"}, state}
       else
-        :ok
-      end
+        if status != :complete, do: log_listener_failure(handle, status)
 
-    state =
-      if valid? do
-        state = %{state | failures: Map.put(state.failures, handle, status)}
-
-        if status == :complete do
-          complete_retry_waiter(
-            state,
-            handle,
-            {:failed, "listener completed before attachment was observed",
-             retry_waiter_started_for(state, handle)}
-          )
-        else
+        state =
           complete_retry_waiter(
             state,
             handle,
             {:failed, retry_failure_reason(state.db, handle),
              retry_waiter_started_for(state, handle)}
           )
-        end
-      else
-        state
-      end
 
-    {:reply, result, state}
+        {:reply, :ok, state}
+      end
+    else
+      {:reply, :ok, state}
+    end
   end
 
-  defp mark_terminated(db, handle) do
-    DB.transaction(db, fn txn ->
-      case Txn.q(txn, "SELECT state FROM harklight_wake_handles WHERE handle=?1", [handle]) do
-        [["active"]] -> mark_finished_in_txn(txn, handle, "listener_terminated")
-        _ -> :ok
-      end
-    end)
+  defp apply_feed_result(state, handle, token, :clean) do
+    unless Map.has_key?(state.pending_failures, handle) do
+      FeedCustody.release_launch(state.db, handle, token)
+    end
+
+    state
   end
 
-  defp mark_finished(db, handle, status) do
-    case DB.transaction(db, fn txn -> mark_finished_in_txn(txn, handle, status) end) do
+  defp apply_feed_result(state, handle, _token, :uncertain) do
+    # The next admission discovers the still-owned fence.
+    %{state | failures: Map.put(state.failures, handle, "listener_terminated")}
+  end
+
+  defp apply_feed_result(state, handle, _token, {:failed, status, ended?}) do
+    log_listener_failure(handle, status)
+    observe_feed_failure(state, handle, status, ended?)
+  end
+
+  defp confirm_feed_recovery(state, handle) do
+    state = cancel_outage_timer(state, handle)
+    if state.admission_timer, do: Process.cancel_timer(elem(state.admission_timer, 0))
+
+    admit_feed(%{
+      state
+      | attempts: Map.delete(state.attempts, handle),
+        transport_failures: Map.delete(state.transport_failures, handle),
+        admission_timer: nil,
+        cooldown_until: nil,
+        cooldown_level: 0
+    })
+  end
+
+  defp mark_finished(db, handle, status, now \\ System.system_time(:millisecond)) do
+    case DB.transaction(db, fn txn -> mark_finished_in_txn(txn, handle, status, now) end) do
       {:ok, result} -> result
       {:error, _} -> {:error, "listener_state_unavailable"}
     end
   end
 
-  defp mark_finished_in_txn(txn, handle, status) do
+  defp mark_finished_in_txn(txn, handle, status, now) do
     case Txn.q(txn, "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1", [
            handle
          ]) do
       [[session_key, current_state]] when current_state in ["active", "unavailable"] ->
-        now = System.system_time(:millisecond)
         completed = status == :complete
         next_state = if completed, do: "complete", else: "unavailable"
 
         {error, operation, diagnostic} =
           if completed, do: {nil, nil, nil}, else: failure_details(status)
 
+        summary = if paused_feed_failure?(status), do: "Live updates paused", else: error
+        last_error = if diagnostic, do: summary <> ": " <> diagnostic, else: summary
+
+        if paused_feed_failure?(status) do
+          Txn.q(
+            txn,
+            """
+            INSERT INTO harklight_feed_pauses(handle,diagnostic) VALUES(?1,?2)
+            ON CONFLICT(handle) DO UPDATE SET diagnostic=excluded.diagnostic
+            """,
+            [handle, last_error]
+          )
+        end
+
         Txn.q(
           txn,
           "UPDATE harklight_wake_handles SET state=?2,lastError=?3,updatedAt=?4 WHERE handle=?1",
-          [handle, next_state, if(diagnostic, do: error <> ": " <> diagnostic, else: error), now]
+          [handle, next_state, last_error, now]
         )
 
         if completed, do: HarklightLifecycle.complete_in_txn(txn, handle)
 
-        # Suppress only an explicitly identified origin transport failure
-        # while its existing finite recovery budget runs. Other failures keep
-        # their immediate owner notice.
-        if not completed and not transient_origin_failure?(status),
+        Outage.finish_in_txn(txn, handle, false, now)
+
+        if durable_feed_stop?(status) do
+          Txn.q(txn, "INSERT OR IGNORE INTO harklight_feed_stops(handle) VALUES(?1)", [handle])
+        end
+
+        if not completed,
           do:
             notify_owner_in_txn(
               txn,
@@ -2446,43 +2678,39 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp notify_owner_after_recovery_exhaustion(db, handle, status) do
+  defp finish_recovery(db, handle, status) do
     {error, operation, diagnostic} = failure_details(status)
     now = System.system_time(:millisecond)
 
-    case DB.transaction(db, fn txn ->
-           case Txn.q(
-                  txn,
-                  "SELECT sessionKey,state FROM harklight_wake_handles WHERE handle=?1",
-                  [
-                    handle
-                  ]
-                ) do
-             [[session_key, state]] when state in ["active", "unavailable"] ->
-               notify_owner_in_txn(
-                 txn,
-                 session_key,
-                 handle,
-                 if(error == "origin_unavailable",
-                   do: "origin_unavailable",
-                   else: "listener_failure"
-                 ),
-                 error,
-                 operation,
-                 diagnostic,
-                 now
-               )
+    DB.transaction(db, fn txn ->
+      case Txn.q(
+             txn,
+             """
+             SELECT h.sessionKey,h.state,o.noticeWakeId
+             FROM harklight_wake_handles h
+             LEFT JOIN harklight_listener_outages o ON o.handle=h.handle
+             WHERE h.handle=?1
+             """,
+             [handle]
+           ) do
+        [[session_key, state, nil]] when state in ["active", "unavailable"] ->
+          notify_owner_in_txn(
+            txn,
+            session_key,
+            handle,
+            "listener_failure",
+            error,
+            operation,
+            diagnostic,
+            now
+          )
 
-             _ ->
-               :ok
-           end
-         end) do
-      {:ok, _} ->
-        :ok
+        _ ->
+          :ok
+      end
 
-      {:error, _} ->
-        Logger.error("Harklight recovery notice could not be recorded for handle=#{handle}")
-    end
+      Outage.finish_in_txn(txn, handle, false, now)
+    end)
   end
 
   defp notify_pending_origin_unavailable(db, handle) do
@@ -2520,7 +2748,13 @@ defmodule Tightbeam.HarklightWakes do
          diagnostic,
          now
        ) do
-    wake_id = "w_harklight_notice_recovery_" <> handle
+    wake_id =
+      if error == "live_updates_paused" do
+        digest = :crypto.hash(:sha256, diagnostic) |> Base.url_encode64(padding: false)
+        "w_harklight_notice_paused_" <> handle <> "_" <> digest
+      else
+        "w_harklight_notice_recovery_" <> handle
+      end
 
     if Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) == [] do
       [[current_receiver]] =
@@ -2539,15 +2773,18 @@ defmodule Tightbeam.HarklightWakes do
       if recipient do
         cli_output =
           case {error, operation, diagnostic} do
+            {"live_updates_paused", _operation, diagnostic} ->
+              " Live updates paused. #{diagnostic}. To resume from the last saved checkpoint, run tightbeam harklight-retry --session #{handle}."
+
             {_, operation, diagnostic}
-            when operation in ["attach", "listen"] and is_binary(diagnostic) ->
+            when operation == "listen" and is_binary(diagnostic) ->
               " #{String.upcase(operation)} failure: #{diagnostic}."
 
             {"origin_unavailable", _, _} ->
               " The original session is inactive or no longer belongs to the recorded host."
 
             {"origin_host_mismatch", _, _} ->
-              " The original session belongs to another host; this controller cannot attach it."
+              " The original session belongs to another host; this host cannot resume it."
 
             _ ->
               " Failure cause is unknown. No safe Agent CLI diagnostic was captured."
@@ -2578,74 +2815,139 @@ defmodule Tightbeam.HarklightWakes do
         do: %{state | manual_starts: MapSet.put(state.manual_starts, handle)},
         else: state
 
-    if handle in Map.values(state.gone_tasks) do
-      deferred = MapSet.put(state.deferred, handle)
-      deferred = if mode != :existing, do: MapSet.put(deferred, {handle, mode}), else: deferred
-      %{state | deferred: deferred}
-    else
-      if Map.has_key?(state.workers, handle) do
+    cond do
+      Map.has_key?(state.pending_failures, handle) ->
+        schedule_listener_retry(state, handle, @feed_read_retry_delay, mode)
+
+      handle in Map.values(state.gone_tasks) ->
+        deferred = MapSet.put(state.deferred, handle)
+        deferred = if mode != :existing, do: MapSet.put(deferred, {handle, mode}), else: deferred
+        %{state | deferred: deferred}
+
+      Map.has_key?(state.workers, handle) ->
         state
-      else
-        manager = self()
 
-        {:ok, pid} =
-          Task.start_link(fn ->
-            decision = decide_start(state, manager, handle, mode)
+      mode != :retry and List.keymember?(state.admission_queue, handle, 0) ->
+        state
 
-            case GenServer.call(manager, {:start_decided, handle, decision, mode}, :infinity) do
-              {:listen, vendor_id} -> state.listener.(manager, handle, vendor_id)
-              :skip -> :ok
-            end
-          end)
+      true ->
+        restore_feed_custody(state, handle, mode)
+    end
+  end
 
-        ref = Process.monitor(pid)
+  defp restore_feed_custody(state, handle, mode) do
+    case FeedCustody.pending(state.custody_dir, handle) do
+      :clear when mode == :fenced ->
+        state
 
-        %{
+      :clear ->
+        check_launch_custody(state, handle, mode)
+
+      {:ok, {status, _at, _ended?} = evidence} ->
+        state = %{
           state
-          | workers: Map.put(state.workers, handle, pid),
-            starts_in_flight: MapSet.put(state.starts_in_flight, handle),
-            refs: Map.put(state.refs, ref, handle),
-            restart: MapSet.put(state.restart, {handle, :deciding})
+          | failures: Map.put(state.failures, handle, status),
+            pending_failures: Map.put(state.pending_failures, handle, evidence)
         }
+
+        if mode in [:retry, :fenced],
+          do: schedule_listener_retry(state, handle, 0, mode),
+          else: recover_worker(state, handle)
+
+      {:error, _} ->
+        schedule_listener_retry(state, handle, @feed_read_retry_delay, mode)
+    end
+  end
+
+  defp check_launch_custody(state, handle, mode) do
+    case FeedCustody.launch_owner(state.db, handle) do
+      {:ok, nil} ->
+        enqueue_feed(state, handle, mode)
+
+      {:ok, _previous_owner} ->
+        case report_uncertain_launch(state.db, handle) do
+          {:ok, :ok} when mode == :retry -> enqueue_feed(state, handle, mode)
+          {:ok, :ok} -> state
+          {:error, _} -> schedule_listener_retry(state, handle, @feed_read_retry_delay, mode)
+        end
+
+      {:error, _} ->
+        schedule_listener_retry(state, handle, @feed_read_retry_delay, mode)
+    end
+  end
+
+  defp enqueue_feed(state, handle, mode) do
+    queue = List.keydelete(state.admission_queue, handle, 0)
+    request = {handle, mode}
+    queue = if mode == :retry, do: [request | queue], else: queue ++ [request]
+    admit_feed(%{state | admission_queue: queue})
+  end
+
+  defp report_uncertain_launch(db, handle) do
+    status =
+      failure_status(
+        {"live_updates_paused", "feed_custody_uncertain"},
+        "listen",
+        "The listener stopped before the feed outcome was recorded. Use explicit Harklight retry to resume."
+      )
+
+    DB.transaction(db, fn txn ->
+      case Txn.q(
+             txn,
+             """
+             SELECT 1 FROM harklight_feed_pauses WHERE handle=?1
+             UNION ALL SELECT 1 FROM harklight_feed_stops WHERE handle=?1
+             """,
+             [handle]
+           ) do
+        [] -> mark_finished_in_txn(txn, handle, status, System.system_time(:millisecond))
+        _ -> :ok
       end
+    end)
+  end
+
+  defp admit_feed(%{admission_queue: []} = state), do: state
+  defp admit_feed(%{admission_timer: {_, _}} = state), do: state
+
+  defp admit_feed(state) do
+    now = System.monotonic_time(:millisecond)
+    due = max(state.admission_next || now, state.cooldown_until || now)
+
+    cond do
+      MapSet.size(state.launching) > 0 ->
+        state
+
+      due > now ->
+        token = make_ref()
+        timer = Process.send_after(self(), {:admit_feed, token}, due - now)
+        %{state | admission_timer: {timer, token}}
+
+      true ->
+        [{handle, _mode} | queue] = state.admission_queue
+        state = %{state | admission_queue: queue, admission_next: now + state.admission_spacing}
+        state |> spawn_feed_worker(handle) |> admit_feed()
     end
   end
 
-  defp decide_start(_state, _manager, _handle, :new_request), do: false
+  defp spawn_feed_worker(state, handle) do
+    manager = self()
 
-  defp decide_start(state, manager, handle, :retry) do
-    ref = make_ref()
-    GenServer.cast(manager, {:decision_slot, self(), ref})
+    {:ok, pid} =
+      Task.start_link(fn ->
+        case GenServer.call(manager, {:start_feed, handle}, :infinity) do
+          {:listen, vendor_id} -> state.listener.(manager, handle, vendor_id)
+          stop when stop in [:skip, :defer] -> :ok
+        end
+      end)
 
-    receive do
-      {:attach_slot, {:decision, ^ref}} -> :ok
-    end
-
-    try do
-      HarklightLifecycle.listener_start_decision(state.db, handle, runner: state.send_runner)
-    after
-      GenServer.cast(manager, {:attach_slot_released, self()})
-    end
-  end
-
-  defp decide_start(state, manager, handle, mode) do
-    ref = make_ref()
-    GenServer.cast(manager, {:decision_slot, self(), ref})
-
-    receive do
-      {:attach_slot, {:decision, ^ref}} -> :ok
-    end
-
-    try do
-      skip? = HarklightLifecycle.closed_for_start?(state.db, handle, runner: state.send_runner)
-
-      if skip? and mode == :startup,
-        do: HarklightLifecycle.complete_answered(state.db, handle, runner: state.send_runner)
-
-      skip?
-    after
-      GenServer.cast(manager, {:attach_slot_released, self()})
-    end
+    %{
+      state
+      | workers: Map.put(state.workers, handle, pid),
+        launching: MapSet.put(state.launching, handle),
+        starts_in_flight: MapSet.put(state.starts_in_flight, handle),
+        refs: Map.put(state.refs, Process.monitor(pid), handle),
+        restart: MapSet.put(state.restart, {handle, :deciding})
+    }
   end
 
   defp cancel_retry(state, handle) do
@@ -2660,135 +2962,114 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp prepare_listener(state, handle) do
+    manual? = MapSet.member?(state.manual_starts, handle)
+
     case DB.query(
            state.db,
-           "SELECT sessionKey,host,vendorSessionId,state FROM harklight_wake_handles WHERE handle=?1 AND NOT EXISTS (SELECT 1 FROM harklight_origin_moves m WHERE m.handle=harklight_wake_handles.handle)",
+           """
+           SELECT sessionKey,host,vendorSessionId,state,p.diagnostic,s.handle
+           FROM harklight_wake_handles h LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
+           LEFT JOIN harklight_feed_stops s ON s.handle=h.handle
+           WHERE h.handle=?1
+           """,
            [handle]
          ) do
-      {:ok, [[session_key, host, saved_vendor_id, state_value]]}
-      when state_value in ["active", "unavailable"] ->
-        if listener_eligible?(state.db, handle, session_key, host) do
-          vendor_id =
-            case Org.get(state.db, session_key) do
-              %{state: "active", host: ^host} ->
-                case Org.current_pointer(state.db, session_key) do
-                  nil -> saved_vendor_id
-                  pointer -> pointer.harness_session_id
-                end
+      {:ok, [[session_key, host, saved_vendor_id, state_value, pause, stop]]}
+      when state_value in ["active", "unavailable"] and
+             (manual? or (is_nil(pause) and is_nil(stop))) ->
+        case listener_eligibility(state.db, handle, host) do
+          {:ok, true} ->
+            prepare_eligible_listener(state, handle, session_key, host, saved_vendor_id)
 
-              _ ->
-                saved_vendor_id
-            end
+          {:ok, false} ->
+            prepare_ineligible_listener(state, handle, host)
 
-          if vendor_id != saved_vendor_id do
-            DB.query(
-              state.db,
-              "UPDATE harklight_wake_handles SET vendorSessionId=?2,updatedAt=?3 WHERE handle=?1",
-              [handle, vendor_id, System.system_time(:millisecond)]
-            )
-          end
-
-          {{:listen, vendor_id}, %{state | failures: Map.delete(state.failures, handle)}}
-        else
-          reason =
-            if host == Placement.local_host_name(),
-              do: "origin_unavailable",
-              else: "origin_host_mismatch"
-
-          mark_finished(state.db, handle, reason)
-
-          state =
-            if host == Placement.local_host_name(), do: start_gone(state, handle), else: state
-
-          {:skip, state}
+          {:error, _reason} ->
+            {:defer, state}
         end
+
+      {:error, _reason} ->
+        {:defer, state}
 
       _ ->
         {:skip, state}
     end
   end
 
-  defp run_listener(manager, handle, vendor_id, delays, window, state_delays) do
-    Process.flag(:trap_exit, true)
-
-    case System.find_executable("harklight-agent") do
-      nil ->
-        finish(
-          manager,
-          handle,
-          failure_status(
-            "cli_missing",
-            "attach",
-            attempt_diagnostic(
-              "ATTACH startup (CLI unavailable; subprocess not launched)",
-              nil,
-              nil
-            )
-          )
-        )
-
-      executable ->
-        executable = {manager, handle, executable}
-
-        args = [
-          "attach",
-          "--session",
-          handle,
-          "--vendor-session-id",
-          vendor_id || "none",
-          "--route",
-          "other",
-          "--controller",
-          "--ack2"
-        ]
-
-        deadline = System.monotonic_time(:millisecond) + window
-
-        case attach_with_transport_recovery(
-               executable,
-               args,
-               delays,
-               deadline,
-               manager,
-               handle,
-               nil
-             ) do
-          :ok ->
-            case record_attachment(manager, handle, state_delays) do
-              :ok -> follow(manager, executable, handle)
-              {:error, reason} -> finish(manager, handle, reason)
+  defp prepare_eligible_listener(state, handle, session_key, host, saved_vendor_id) do
+    vendor_identity =
+      DB.read_transaction(state.db, fn txn ->
+        case Org.get_in_txn(txn, session_key) do
+          %{state: "active", host: ^host} ->
+            case Org.current_pointer_snapshot_in_txn(txn, session_key) do
+              %{harness_session_id: id} -> id
+              nil -> saved_vendor_id
             end
 
-          {:error, reason, diagnostic} ->
-            finish(manager, handle, failure_status(reason, "attach", diagnostic))
-
-          {:error, reason} ->
-            finish(manager, handle, reason)
+          _ ->
+            saved_vendor_id
         end
+      end)
+
+    with {:ok, vendor_id} <- vendor_identity,
+         :ok <- store_vendor_identity(state.db, handle, vendor_id, saved_vendor_id) do
+      {{:listen, vendor_id}, %{state | failures: Map.delete(state.failures, handle)}}
+    else
+      {:error, _reason} -> {:defer, state}
+    end
+  end
+
+  defp store_vendor_identity(_db, _handle, id, id), do: :ok
+
+  defp store_vendor_identity(db, handle, vendor_id, _saved_vendor_id) do
+    with {:ok, _} <-
+           DB.query(
+             db,
+             "UPDATE harklight_wake_handles SET vendorSessionId=?2,updatedAt=?3 WHERE handle=?1",
+             [handle, vendor_id, System.system_time(:millisecond)]
+           ) do
+      :ok
+    end
+  end
+
+  defp prepare_ineligible_listener(state, handle, host) do
+    local = host == Placement.local_host_name()
+    reason = if local, do: "origin_unavailable", else: "origin_host_mismatch"
+
+    case mark_finished(state.db, handle, reason) do
+      :ok -> {:skip, if(local, do: start_gone(state, handle), else: state)}
+      {:error, _reason} -> {:defer, state}
+    end
+  end
+
+  defp run_listener(manager, handle, state_delays) do
+    Process.flag(:trap_exit, true)
+
+    with executable when is_binary(executable) <- System.find_executable("harklight-agent"),
+         {:ok, db, cursor} <- GenServer.call(manager, {:feed_start, handle}, :infinity) do
+      follow(manager, db, executable, handle, cursor, state_delays)
+    else
+      nil -> finish(manager, handle, "cli_missing")
+      {:error, reason} -> finish(manager, handle, reason)
     end
   rescue
     _ -> finish(manager, handle, "listener_failed")
   end
 
-  # Harklight has accepted the attachment; only the gateway's own record of it
-  # failed. Ending the worker here would leave the conversation without a
-  # listener, and recovery cannot be relied on while the same database refuses
-  # its writes and reads. Keep the attachment and retry the record with capped
-  # backoff until it is written, the worker is fenced, or it is stopped.
-  defp record_attachment(manager, handle, delays) do
-    case GenServer.call(manager, {:attached, handle}, :infinity) do
-      {:error, "attachment_state_unavailable"} ->
+  defp record_feed_ready(manager, handle, delays) do
+    case GenServer.call(manager, {:feed_ready, handle}, :infinity) do
+      {:error, "feed_state_unavailable"} ->
         [delay | rest] = delays
 
         Logger.warning(
-          "Harklight listener state write failed handle=#{handle}; attachment kept, retrying in #{delay}ms"
+          "Harklight listener state write failed handle=#{handle}; feed kept, retrying in #{delay}ms"
         )
 
         receive do
           {:EXIT, ^manager, exit_reason} -> exit(exit_reason)
           {:EXIT, _sender, :shutdown} -> exit(:shutdown)
         after
-          delay -> record_attachment(manager, handle, if(rest == [], do: delays, else: rest))
+          delay -> record_feed_ready(manager, handle, if(rest == [], do: delays, else: rest))
         end
 
       result ->
@@ -2796,199 +3077,8 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  # Keep the original same-operation recovery inside each attempt. Only an
-  # observed transport failure can schedule another attempt; a handle refusal
-  # or an unclassified unknown result retains the existing disposition.
-  defp attach_with_transport_recovery(executable, args, delays, deadline, manager, handle, last) do
-    case paced_attach(executable, args, deadline, manager, last) do
-      {:transport, reason, diagnostic} = failure ->
-        case delays do
-          [delay | rest] ->
-            if System.monotonic_time(:millisecond) + delay <= deadline do
-              log_listener_failure(handle, failure_status(reason, "attach", diagnostic))
-
-              receive do
-                {:EXIT, ^manager, exit_reason} -> exit(exit_reason)
-              after
-                delay ->
-                  if System.monotonic_time(:millisecond) <= deadline do
-                    attach_with_transport_recovery(
-                      executable,
-                      args,
-                      rest,
-                      deadline,
-                      manager,
-                      handle,
-                      failure
-                    )
-                  else
-                    {:error, tag_transport_failure(reason), diagnostic}
-                  end
-              end
-            else
-              {:error, tag_transport_failure(reason), diagnostic}
-            end
-
-          [] ->
-            {:error, tag_transport_failure(reason), diagnostic}
-        end
-
-      result ->
-        result
-    end
-  end
-
-  # Waiting for a slot spends the same retry window; a retry granted after the
-  # deadline reports the previous transport failure instead of attaching.
-  defp paced_attach(executable, args, deadline, manager, last) do
-    ref = make_ref()
-    GenServer.cast(manager, {:attach_slot, self(), ref})
-
-    receive do
-      {:attach_slot, ^ref} -> :ok
-      {:EXIT, ^manager, exit_reason} -> exit(exit_reason)
-    end
-
-    try do
-      if last && System.monotonic_time(:millisecond) > deadline,
-        do: last,
-        else: attach(executable, args)
-    after
-      GenServer.cast(manager, {:attach_slot_released, self()})
-    end
-  end
-
-  defp attach(executable, args) do
-    case attach_once(executable, args, "ATTACH initial attempt") do
-      {:unknown, op_id, initial_diagnostic, _transport} ->
-        case retry_existing_operation(executable, op_id) do
-          {:ok, retry_diagnostic} ->
-            case attach_once(executable, args, "ATTACH after same-operation retry") do
-              :ok ->
-                :ok
-
-              {:unknown, _op_id, diagnostic, transport} ->
-                {if(transport, do: :transport, else: :error), "attachment_outcome_unknown",
-                 [initial_diagnostic, retry_diagnostic, diagnostic]}
-
-              {kind, reason, diagnostic} when kind in [:error, :transport] ->
-                {kind, reason, [initial_diagnostic, retry_diagnostic, diagnostic]}
-            end
-
-          {:transport, retry_diagnostic} ->
-            {:transport, "attachment_outcome_unknown", [initial_diagnostic, retry_diagnostic]}
-
-          {:error, retry_diagnostic} ->
-            {:error, "attachment_outcome_unknown", [initial_diagnostic, retry_diagnostic]}
-
-          {:error, reason, retry_diagnostic} ->
-            {:error, reason, [initial_diagnostic, retry_diagnostic]}
-        end
-
-      result ->
-        attach_result(result)
-    end
-  rescue
-    _ ->
-      {:error, "attachment_cli_failed", attempt_diagnostic("ATTACH initial attempt", nil, nil)}
-  end
-
-  defp retry_existing_operation(executable, op_id) do
-    case Tightbeam.HarklightChild.command(executable, ["retry", "--op-id", op_id]) do
-      {output, 0} ->
-        {:ok, attempt_diagnostic("ATTACH existing same-operation retry", 0, output)}
-
-      {output, exit_status} ->
-        diagnostic =
-          attempt_diagnostic("ATTACH existing same-operation retry", exit_status, output)
-
-        kind = if retry_transport_failure?(output, op_id), do: :transport, else: :error
-        {kind, diagnostic}
-    end
-  rescue
-    _ ->
-      {:error, "attachment_cli_failed",
-       attempt_diagnostic("ATTACH existing same-operation retry", nil, nil)}
-  end
-
-  defp attach_once(executable, args, attempt) do
-    case Tightbeam.HarklightChild.command(executable, args) do
-      {output, 0} ->
-        if Enum.any?(String.split(output, "\n", trim: true), fn line ->
-             match?({:ok, %{"kind" => "attached", "ready_for_listen" => true}}, JSON.decode(line))
-           end),
-           do: :ok,
-           else: {:error, "attachment_unconfirmed", attempt_diagnostic(attempt, 0, output)}
-
-      {output, exit_status} ->
-        unknown =
-          output
-          |> String.split("\n", trim: true)
-          |> Enum.find_value(fn line ->
-            case JSON.decode(line) do
-              {:ok, %{"kind" => "outcome_unknown", "op_id" => id}} when is_binary(id) -> id
-              _ -> nil
-            end
-          end)
-
-        diagnostic = attempt_diagnostic(attempt, exit_status, output)
-
-        if unknown,
-          do: {:unknown, unknown, diagnostic, attach_transport_failure?(output)},
-          else:
-            {if(attach_transport_failure?(output), do: :transport, else: :error),
-             classified_reason("attachment_refused", output), diagnostic}
-    end
-  rescue
-    _ -> {:error, "attachment_cli_failed", attempt_diagnostic(attempt, nil, nil)}
-  end
-
-  defp attach_transport_failure?(output) do
-    Enum.any?(String.split(output, "\n", trim: true), fn line ->
-      case JSON.decode(line) do
-        {:ok, %{"kind" => kind, "reason_source" => "agent", "reason_code" => code}}
-        when kind in ["refused", "connection_error", "outcome_unknown"] and
-               code in ["transport_error", "timeout"] ->
-          true
-
-        _ ->
-          false
-      end
-    end)
-  end
-
-  # Agent 0.1.6's generic retry omits reason_code. Its ApiError::Transport
-  # Display prefix is emitted on stderr beside the same operation's unknown
-  # record. Inspect that source-defined prefix, but never retain the raw URL.
-  defp retry_transport_failure?(output, op_id) do
-    lines = String.split(output, "\n", trim: true)
-
-    Enum.any?(lines, &String.starts_with?(&1, "origin request failed: ")) and
-      Enum.any?(lines, fn line ->
-        case JSON.decode(line) do
-          {:ok, %{"kind" => "outcome_unknown", "op_id" => ^op_id}} -> true
-          _ -> false
-        end
-      end)
-  end
-
-  defp attach_result({:unknown, _op_id, diagnostic}),
-    do: {:error, "attachment_outcome_unknown", diagnostic}
-
-  defp attach_result({:unknown, _}), do: {:error, "attachment_outcome_unknown", nil}
-  defp attach_result({:error, reason}), do: {:error, reason, nil}
-  defp attach_result(result), do: result
-
-  defp attempt_diagnostic(attempt, exit_status, output) do
-    status = exit_status_detail(exit_status)
-
-    output = sanitize_refusal_output(output)
-    output_detail = if output, do: "sanitized output: #{output}", else: "no safe output captured"
-
-    "#{attempt}; #{status}; #{output_detail}"
-    |> String.slice(0, @max_diagnostic_line_chars)
-  end
-
+  # Keep feed diagnostics separate from captured content and include the observed
+  # exit status whenever the wrapper reports one.
   defp listen_attempt_diagnostics(attempt, exit_status, diagnostics) do
     status = exit_status_detail(exit_status)
 
@@ -3009,42 +3099,48 @@ defmodule Tightbeam.HarklightWakes do
   defp exit_status_detail(status) when is_integer(status), do: "exit status: #{status}"
   defp exit_status_detail(_), do: "exit status: unknown (not observed)"
 
-  defp follow(manager, {_manager, _handle, executable}, handle) do
-    {:ok, port, initial} =
-      GenServer.call(
-        manager,
-        {:launch_child, handle, executable,
-         ["listen", "--follow", "--controller", "--session", handle, "--ack2"]},
-        :infinity
-      )
+  defp follow(manager, db, executable, handle, cursor, state_delays) do
+    resume = if is_nil(cursor), do: ["--snapshot"], else: ["--after", to_string(cursor)]
+    args = ["listen", "--follow", "--session", handle | resume]
 
-    try do
-      case GenServer.call(manager, {:listener_port, handle, port}, :infinity) do
-        :ok ->
-          true = Port.command(port, "continue\n")
-          receive_lines(manager, port, handle, initial, [])
+    case GenServer.call(manager, {:launch_child, handle, executable, args}, :infinity) do
+      {:ok, port, initial, token} ->
+        try do
+          feed = %{
+            db: db,
+            executable: executable,
+            token: token,
+            baseline: nil,
+            diagnostic_evidence: :quiet,
+            ready: false,
+            state_delays: state_delays
+          }
 
-        {:error, reason} ->
-          finish(manager, handle, reason)
-      end
-    after
-      close_listener_port(port)
+          # The wrapper buffers forwarding until we say continue. If this
+          # worker has already been fenced, forward only to the drain.
+          case GenServer.call(manager, {:listener_port, handle, port}, :infinity) do
+            :ok ->
+              true = Port.command(port, "continue\n")
+              receive_lines(manager, port, handle, initial, [], feed)
+
+            {:error, "listener_fenced"} ->
+              true = Port.command(port, "continue\n")
+              stop_and_drain(manager, port, feed, initial, [], :closing, drain_deadline())
+          end
+        after
+          close_listener_port(port)
+        end
+
+      {:error, reason} when reason in [:feed_launch_unavailable, :feed_open_accounted] ->
+        :ok
+
+      {:error, reason} ->
+        finish(manager, handle, failure_status("listener_failed", "listen", inspect(reason)))
     end
-  rescue
-    _ ->
-      finish(
-        manager,
-        handle,
-        failure_status(
-          "listener_failed",
-          "listen",
-          attempt_diagnostic("LISTEN attempt (Port unavailable or receive failed)", nil, nil)
-        )
-      )
   end
 
   # The wrapper observes input EOF, terminates and reaps its CLI child. Closing
-  # this port requests cleanup; M2 separately waits on its lifetime-lock barrier.
+  # this port requests cleanup.
   defp close_listener_port(port) do
     Tightbeam.HarklightChild.request_stop(port)
     if Port.info(port), do: Port.close(port)
@@ -3052,8 +3148,11 @@ defmodule Tightbeam.HarklightWakes do
     ArgumentError -> :ok
   end
 
-  defp receive_lines(manager, port, handle, pending, diagnostics) do
+  defp receive_lines(manager, port, handle, pending, diagnostics, feed) do
     receive do
+      {:close_feed, ^manager, token, deadline} when token == feed.token ->
+        stop_and_drain(manager, port, feed, pending, diagnostics, :closing, deadline)
+
       {:EXIT, ^manager, reason} ->
         exit(reason)
 
@@ -3061,77 +3160,187 @@ defmodule Tightbeam.HarklightWakes do
         exit(:shutdown)
 
       {^port, {:data, bytes}} ->
-        data = pending <> bytes
-        lines = :binary.split(data, "\n", [:global])
-        remainder = List.last(lines)
+        case consume_feed_lines(manager, handle, pending <> bytes, diagnostics, feed) do
+          {:ok, remainder, diagnostics, feed} ->
+            receive_lines(manager, port, handle, remainder, diagnostics, feed)
 
-        result =
-          lines
-          |> Enum.drop(-1)
-          |> Enum.reduce_while({:ok, diagnostics}, fn line, {:ok, current_diagnostics} ->
-            case receive_listener_line(manager, handle, line, current_diagnostics) do
-              {:ok, next_diagnostics} ->
-                {:cont, {:ok, next_diagnostics}}
+          {:error, reason, unread, diagnostics, feed} ->
+            mode =
+              if reason == "listener_fenced",
+                do: :closing,
+                else: {:failed, listener_failure(reason, nil, diagnostics)}
 
-              {:error, reason, next_diagnostics} ->
-                {:halt, {:error, reason, next_diagnostics}}
-            end
-          end)
-
-        case result do
-          {:ok, next_diagnostics} ->
-            receive_lines(manager, port, handle, remainder, next_diagnostics)
-
-          {:error, reason, next_diagnostics} ->
-            close_listener_port(port)
-
-            finish(
-              manager,
-              handle,
-              failure_status(
-                reason,
-                "listen",
-                listen_attempt_diagnostics("LISTEN attempt", nil, next_diagnostics)
-              )
-            )
+            stop_and_drain(manager, port, feed, unread, diagnostics, mode, drain_deadline())
         end
 
-      {^port, {:exit_status, 0}} ->
-        status =
-          if pending == "",
-            do: :complete,
-            else:
-              failure_status(
-                "incomplete_line",
-                "listen",
-                listen_attempt_diagnostics(
-                  "LISTEN attempt",
-                  0,
-                  append_diagnostic(diagnostics, pending)
-                )
-              )
-
-        finish(manager, handle, status)
-
-      {^port, {:exit_status, exit_status}} ->
-        diagnostics = append_diagnostic(diagnostics, pending)
-
-        finish(
-          manager,
-          handle,
-          failure_status(
-            "listener_stopped",
-            "listen",
-            listen_attempt_diagnostics("LISTEN attempt", exit_status, diagnostics)
-          )
-        )
+      {^port, {:exit_status, status}} ->
+        drain = %{drain_state(feed, diagnostics, :running) | pending: pending}
+        send_feed_result(manager, feed.token, drained_result(status, drain))
     end
+  end
+
+  defp consume_feed_lines(manager, handle, data, diagnostics, feed) do
+    case :binary.split(data, "\n") do
+      [line, rest] ->
+        case receive_listener_line(manager, handle, line, diagnostics, feed) do
+          {:ok, diagnostics, feed} ->
+            consume_feed_lines(manager, handle, rest, diagnostics, feed)
+
+          {:error, reason, diagnostics} ->
+            {:error, reason, data, diagnostics, feed}
+        end
+
+      [remainder] ->
+        {:ok, remainder, diagnostics, feed}
+    end
+  end
+
+  defp stop_and_drain(manager, port, feed, pending, diagnostics, mode, deadline) do
+    Tightbeam.HarklightChild.request_stop(port)
+    drain = drain_output(drain_state(feed, diagnostics, mode), pending)
+    drain_port(manager, port, feed.token, drain, deadline)
+  end
+
+  defp drain_state(feed, diagnostics, mode) do
+    %{
+      pending: "",
+      diagnostics: diagnostics,
+      evidence: feed.diagnostic_evidence,
+      baseline: if(feed.baseline, do: elem(feed.baseline, 0)),
+      discarded: false,
+      fallback: if(match?({:failed, _}, mode), do: elem(mode, 1)),
+      mode: mode
+    }
+  end
+
+  defp drain_port(manager, port, token, drain, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0,
+      do: send_feed_result(manager, token, drained_result(nil, drain)),
+      else: receive_drain(manager, port, token, drain, deadline, remaining)
+  end
+
+  defp receive_drain(manager, port, token, drain, deadline, remaining) do
+    receive do
+      {^port, {:data, bytes}} ->
+        drain_port(manager, port, token, drain_output(drain, bytes), deadline)
+
+      {^port, {:exit_status, status}} ->
+        send_feed_result(manager, token, drained_result(status, drain))
+
+      {:close_feed, ^manager, ^token, final_deadline} ->
+        drain = %{drain | mode: :closing}
+        drain_port(manager, port, token, drain, min(deadline, final_deadline))
+
+      {:EXIT, ^manager, reason} ->
+        exit(reason)
+    after
+      remaining -> send_feed_result(manager, token, drained_result(nil, drain))
+    end
+  end
+
+  defp drain_output(drain, bytes) do
+    parts = :binary.split(drain.pending <> bytes, "\n", [:global])
+    {pending, lines} = List.pop_at(parts, -1)
+    Enum.reduce(lines, %{drain | pending: pending}, &drain_line/2)
+  end
+
+  defp drain_line(line, drain) do
+    if structured_output_line?(line) do
+      %{drain | discarded: true, baseline: drained_baseline(JSON.decode(line), drain.baseline)}
+    else
+      line = String.replace_invalid(line)
+
+      %{
+        drain
+        | evidence: observe_feed_diagnostic(drain.evidence, line),
+          diagnostics: append_diagnostic(drain.diagnostics, line)
+      }
+    end
+  end
+
+  defp drained_baseline({:ok, %{"kind" => "baseline", "rev" => rev}}, nil)
+       when is_integer(rev) and rev >= 0,
+       do: rev
+
+  defp drained_baseline({:ok, %{"kind" => "baseline_complete", "rev" => rev}}, rev)
+       when is_integer(rev),
+       do: nil
+
+  defp drained_baseline({:ok, %{"kind" => kind}}, baseline)
+       when kind in ["caught_up", "focus", "message", "entry", "advisory"],
+       do: baseline
+
+  defp drained_baseline(_, _), do: :unverified
+
+  # Keep outcome evidence independently of the bounded, redacted log buffer.
+  # The wrapper can mask a natural exit, but cannot turn stderr into silence.
+  defp observe_feed_diagnostic({:terminal, _} = evidence, _line), do: evidence
+
+  defp observe_feed_diagnostic(evidence, line) do
+    case HarklightFailures.listen_pause(line) || HarklightFailures.listen_refusal(line) do
+      nil -> if String.trim(line) == "", do: evidence, else: :ambiguous
+      terminal -> {:terminal, terminal}
+    end
+  end
+
+  defp drained_result(status, drain) do
+    evidence = observe_feed_diagnostic(drain.evidence, String.replace_invalid(drain.pending))
+    diagnostics = append_diagnostic(drain.diagnostics, drain.pending)
+    ended? = Tightbeam.HarklightChild.verified_exit?(status)
+    reason = listener_exit_reason(status, diagnostics)
+    failure = listener_failure(reason, status, diagnostics)
+
+    cond do
+      match?({:terminal, _}, evidence) ->
+        {:failed, terminal_feed_failure(elem(evidence, 1), status, diagnostics), ended?}
+
+      not retryable_failure?(failure) ->
+        {:failed, failure, ended?}
+
+      drain.fallback && not retryable_failure?(drain.fallback) ->
+        {:failed, drain.fallback, ended?}
+
+      drain.mode == :closing ->
+        if status == 0 and quiet_drain?(drain, evidence), do: :clean, else: :uncertain
+
+      drain.fallback ->
+        complete? = is_nil(drain.baseline) and drain.pending == ""
+        known_exit? = status != 0 or evidence == :quiet
+        {:failed, drain.fallback, ended? and complete? and known_exit?}
+
+      not ended? ->
+        :uncertain
+
+      not is_nil(drain.baseline) or structured_output_line?(drain.pending) ->
+        {:failed, listener_failure("incomplete_line", status, diagnostics), false}
+
+      true ->
+        {:failed, failure, true}
+    end
+  end
+
+  defp quiet_drain?(drain, evidence),
+    do:
+      evidence == :quiet and not drain.discarded and is_nil(drain.baseline) and
+        drain.pending == ""
+
+  defp terminal_feed_failure({:internal_error, _, _} = pause, _status, _diagnostics),
+    do: paused_feed_status(pause)
+
+  defp terminal_feed_failure(code, status, diagnostics),
+    do: listener_failure({"listener_stopped", Atom.to_string(code)}, status, diagnostics)
+
+  defp send_feed_result(manager, token, result) do
+    send(manager, {:feed_result, self(), token, result})
+    :ok
   end
 
   # The Agent emits JSON events on stdout and reconnect/refusal messages on
   # stderr. The port merges them; keep plain-text diagnostics without treating
   # them as events, and leave every JSON line on the existing capture path.
-  defp receive_listener_line(manager, handle, line, diagnostics) do
+  defp receive_listener_line(manager, handle, line, diagnostics, feed) do
     decoded =
       try do
         JSON.decode(line)
@@ -3140,15 +3349,10 @@ defmodule Tightbeam.HarklightWakes do
       end
 
     case decoded do
-      {:ok, %{"kind" => kind}}
-      when kind in ["refused", "connection_error", "outcome_unknown", "error"] ->
-        {:error, classified_reason("listener_stopped", line),
-         append_diagnostic(diagnostics, line)}
-
-      {:ok, _event} ->
-        case GenServer.call(manager, {:capture, handle, line}, :infinity) do
-          :ok -> {:ok, diagnostics}
-          {:error, reason} -> {:error, reason, append_diagnostic(diagnostics, line)}
+      {:ok, event} ->
+        case apply_listener_frame(manager, handle, event, feed) do
+          {:ok, next_feed} -> {:ok, diagnostics, next_feed}
+          {:error, reason} -> {:error, reason, diagnostics}
         end
 
       {:error, _} ->
@@ -3157,34 +3361,215 @@ defmodule Tightbeam.HarklightWakes do
         if structured_output_line?(diagnostic_line) do
           {:error, "invalid_listener_line", diagnostics}
         else
-          {:ok, append_diagnostic(diagnostics, diagnostic_line)}
+          evidence = observe_feed_diagnostic(feed.diagnostic_evidence, diagnostic_line)
+
+          {:ok, append_diagnostic(diagnostics, diagnostic_line),
+           %{feed | diagnostic_evidence: evidence}}
         end
     end
   end
 
-  defp failure_status("listener_stopped" = error, "listen" = operation, diagnostic) do
-    error = if origin_transport_failure?(diagnostic), do: {error, "transport_error"}, else: error
-    {:harklight_failure, error, operation, diagnostic}
+  defp apply_listener_frame(
+         manager,
+         handle,
+         %{"kind" => "focus", "data" => %{"focus" => focus}},
+         %{baseline: nil} = feed
+       )
+       when is_map(focus) do
+    with :ok <- GenServer.call(manager, {:feed_live, handle}, :infinity), do: {:ok, feed}
+  end
+
+  defp apply_listener_frame(_manager, _handle, %{"kind" => "focus"}, feed), do: {:ok, feed}
+
+  defp apply_listener_frame(
+         _manager,
+         _handle,
+         %{"kind" => "baseline", "rev" => rev},
+         %{baseline: nil} = feed
+       )
+       when is_integer(rev) and rev >= 0,
+       do: {:ok, %{feed | baseline: {rev, []}}}
+
+  defp apply_listener_frame(
+         manager,
+         handle,
+         %{"kind" => "baseline_complete", "rev" => rev},
+         %{baseline: {rev, frames}} = feed
+       ) do
+    with :ok <- submit_feed(manager, handle, rev, Enum.reverse(frames), :baseline, feed) do
+      {:ok, %{feed | baseline: nil}}
+    end
+  end
+
+  defp apply_listener_frame(
+         manager,
+         handle,
+         %{"kind" => "caught_up", "rev" => rev},
+         %{baseline: nil} = feed
+       )
+       when is_integer(rev) and rev >= 0 do
+    with :ok <- submit_feed(manager, handle, rev, [], :live, feed) do
+      mark_feed_ready(manager, handle, feed)
+    end
+  end
+
+  defp apply_listener_frame(
+         manager,
+         handle,
+         %{"kind" => kind, "rev" => rev, "data" => data} = frame,
+         feed
+       )
+       when kind in ["message", "entry", "advisory"] and is_integer(rev) and rev > 0 and
+              is_map(data) do
+    case feed.baseline do
+      {position, frames} ->
+        {:ok, %{feed | baseline: {position, [frame | frames]}}}
+
+      nil ->
+        with :ok <- submit_feed(manager, handle, rev, [frame], :live, feed) do
+          {:ok, feed}
+        end
+    end
+  end
+
+  defp apply_listener_frame(_manager, _handle, _frame, _feed),
+    do: {:error, "unexpected_feed_record"}
+
+  defp mark_feed_ready(_manager, _handle, %{ready: true} = feed), do: {:ok, feed}
+
+  defp mark_feed_ready(manager, handle, feed) do
+    with :ok <- record_feed_ready(manager, handle, feed.state_delays),
+         do: {:ok, %{feed | ready: true}}
+  end
+
+  defp submit_feed(manager, handle, rev, frames, mode, feed) do
+    with {:ok, frames} <- feed_entry_items(feed, handle, frames) do
+      GenServer.call(manager, {:feed_capture, handle, rev, frames, mode}, :infinity)
+    end
+  end
+
+  defp feed_entry_items(feed, handle, frames) do
+    messages =
+      Map.new(
+        for %{"kind" => "message", "data" => %{"item_id" => id} = data} <- frames, do: {id, data}
+      )
+
+    Enum.reduce_while(frames, {:ok, []}, fn frame, {:ok, acc} ->
+      case feed_entry_item(feed, handle, frame, messages) do
+        {:ok, enriched} -> {:cont, {:ok, [enriched | acc]}}
+        error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, frames} -> {:ok, Enum.reverse(frames)}
+      error -> error
+    end
+  end
+
+  defp feed_entry_item(
+         feed,
+         handle,
+         %{
+           "kind" => "entry",
+           "data" => %{"kind" => "reply", "author" => "person", "item_id" => id}
+         } = frame,
+         messages
+       )
+       when is_binary(id) do
+    case DB.query(
+           feed.db,
+           "SELECT 1 FROM harklight_wake_requests WHERE handle=?1 AND messageId=?2",
+           [handle, id]
+         ) do
+      {:ok, [[1]]} ->
+        {:ok, frame}
+
+      {:ok, []} ->
+        with {:ok, item} <- feed_message(feed.executable, messages, id) do
+          {:ok, Map.put(frame, "item", item)}
+        end
+
+      _ ->
+        {:error, "capture_unavailable"}
+    end
+  end
+
+  defp feed_entry_item(_feed, _handle, frame, _messages), do: {:ok, frame}
+
+  defp feed_message(executable, messages, id) do
+    case Map.fetch(messages, id) do
+      {:ok, item} ->
+        {:ok, item}
+
+      :error ->
+        with {output, 0} <-
+               System.cmd(executable, ["message-get", "--item-id", id], stderr_to_stdout: true),
+             {:ok, %{"message" => %{"item_id" => ^id} = item}} <- JSON.decode(output) do
+          {:ok, item}
+        else
+          {output, status} when is_integer(status) ->
+            {:error,
+             HarklightFailures.read_error(output, status, "message-get") ||
+               "harklight_message_lookup_failed"}
+
+          _ ->
+            {:error, "harklight_message_lookup_failed"}
+        end
+    end
+  rescue
+    _ -> {:error, "harklight_message_lookup_failed"}
+  end
+
+  # The feed writes only stream records to stdout. The Agent's refusals are
+  # reported via exit status and stderr, without a write-operation JSON frame.
+  defp listener_exit_reason(2, _diagnostics), do: {"listener_stopped", "feed_refused"}
+  defp listener_exit_reason(5, _diagnostics), do: {"listener_stopped", "unsupported_version"}
+
+  defp listener_exit_reason(1, diagnostics) do
+    diagnostic = Enum.join(diagnostics, "\n")
+
+    cond do
+      String.contains?(diagnostic, [
+        "invalid agent change or cursor",
+        "invalid agent snapshot",
+        "server sent an unexpected response"
+      ]) ->
+        {"listener_stopped", "invalid_response"}
+
+      Regex.match?(
+        ~r/server request via configured address .* failed:|could not read HTTP [0-9]+ response/,
+        diagnostic
+      ) ->
+        {"listener_stopped", "transport_error"}
+
+      true ->
+        "listener_stopped"
+    end
+  end
+
+  defp listener_exit_reason(_status, _diagnostics), do: "listener_stopped"
+
+  defp listener_failure({:internal_error, _, _} = error, _exit_status, _diagnostics),
+    do: paused_feed_status(error)
+
+  defp listener_failure(reason, exit_status, diagnostics) do
+    failure_status(
+      reason,
+      "listen",
+      listen_attempt_diagnostics("LISTEN attempt", exit_status, diagnostics)
+    )
+  end
+
+  defp paused_feed_status({:internal_error, operation, request_id}) do
+    failure_status(
+      {"live_updates_paused", "internal_error"},
+      operation,
+      HarklightFailures.details(operation, request_id)
+    )
   end
 
   defp failure_status(error, operation, diagnostic),
     do: {:harklight_failure, error, operation, diagnostic}
-
-  defp tag_transport_failure({_error, _code} = reason), do: reason
-  defp tag_transport_failure(reason), do: {reason, "transport_error"}
-
-  defp origin_transport_failure?(diagnostic) do
-    diagnostic_contains?(diagnostic, "origin request failed:") or
-      diagnostic_contains?(diagnostic, "reason_code=transport_error") or
-      diagnostic_contains?(diagnostic, "reason_code=timeout")
-  end
-
-  defp diagnostic_contains?(diagnostic, text) do
-    diagnostic
-    |> List.wrap()
-    |> Enum.join(" ")
-    |> String.contains?(text)
-  end
 
   defp failure_details({:harklight_failure, {error, code}, operation, diagnostics}),
     do:
@@ -3195,29 +3580,6 @@ defmodule Tightbeam.HarklightWakes do
     do: {to_string(error), operation, format_failure_diagnostics(diagnostics)}
 
   defp failure_details(error), do: {to_string(error), nil, nil}
-
-  # Agent v0.1.6 controller_attach uses this closed vocabulary. Unknown output
-  # retains bounded retry and the existing sanitized diagnostics, never an
-  # inference from arbitrary stderr text.
-  defp classified_reason(error, output) do
-    codes = ~w(missing_journal unproven_handle invalid_handle invalid_attachment
-      invalid_attachment_receipt support_mismatch configuration_error listener_active
-      already_listening not_found forbidden operation_conflict invalid_field unsupported_version
-      feed_gap feed_conflict invalid_notice invalid_response journal_error local_io timeout
-      transport_error stream_ended stream_io storage_unavailable unknown)
-
-    code =
-      output
-      |> String.split("\n", trim: true)
-      |> Enum.find_value(fn line ->
-        case JSON.decode(line) do
-          {:ok, %{"reason_code" => code}} -> if code in codes, do: code
-          _ -> nil
-        end
-      end)
-
-    if code, do: {error, code}, else: error
-  end
 
   defp log_listener_failure(handle, status) do
     {error, operation, diagnostic} = failure_details(status)
@@ -3233,7 +3595,10 @@ defmodule Tightbeam.HarklightWakes do
       diagnostic ||
         "stage/attempt: unknown; exit status: unknown (not observed); no safe output captured"
 
-    Logger.warning(
+    level = if paused_feed_failure?(status), do: :error, else: :warning
+
+    Logger.log(
+      level,
       "Harklight listener failure handle=#{handle} error=#{error} operation=#{operation}; #{diagnostic}"
     )
   end
@@ -3282,15 +3647,6 @@ defmodule Tightbeam.HarklightWakes do
       {:ok, %{"type" => "error", "reason" => reason}} when is_binary(reason) ->
         [reason]
 
-      {:ok,
-       %{
-         "kind" => "attached",
-         "ready_for_listen" => false,
-         "listening_support" => %{"unsupported_reason" => reason}
-       }}
-      when is_binary(reason) ->
-        [reason]
-
       {:ok, _structured_output} ->
         []
 
@@ -3333,52 +3689,303 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp combine_diagnostics(left, right) do
-    [left, right]
-    |> Enum.reject(&(not is_binary(&1) or &1 == ""))
-    |> Enum.uniq()
-    |> Enum.join(" | ")
-    |> String.slice(0, @max_diagnostic_chars)
-    |> blank_to_nil()
-  end
-
   defp blank_to_nil(""), do: nil
   defp blank_to_nil(value), do: value
 
-  defp finish(manager, handle, status),
-    do: GenServer.call(manager, {:finished, handle, status}, :infinity)
+  defp finish(manager, handle, status) do
+    result = GenServer.call(manager, {:finished, handle, status}, :infinity)
+
+    if result == {:error, "listener_state_unavailable"} and paused_feed_failure?(status) do
+      receive do
+        {:EXIT, ^manager, reason} -> exit(reason)
+        {:EXIT, _sender, :shutdown} -> exit(:shutdown)
+      after
+        @feed_read_retry_delay -> finish(manager, handle, status)
+      end
+    else
+      result
+    end
+  end
 
   @doc false
+  def capture_feed(db, handle, rev, frames, mode) do
+    case capture_feed_result(db, handle, rev, frames, mode) do
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
+
+  defp capture_feed_result(db, handle, rev, frames, mode)
+       when is_integer(rev) and rev >= 0 and mode in [:baseline, :live] do
+    case DB.transaction(db, fn txn ->
+           [[session, host, handle_state, event_position]] =
+             Txn.q(
+               txn,
+               "SELECT sessionKey,host,state,lastCursor FROM harklight_wake_handles WHERE handle=?1",
+               [handle]
+             )
+
+           unless handle_state in ["active", "unavailable"] and
+                    listener_eligible_in_txn?(txn, handle, session, host) do
+             raise "harklight_origin_unavailable"
+           end
+
+           if handle_state == "unavailable" do
+             Txn.q(
+               txn,
+               "UPDATE harklight_wake_handles SET state='active',lastError=NULL WHERE handle=?1",
+               [handle]
+             )
+           end
+
+           previous =
+             case Txn.q(txn, "SELECT rev FROM harklight_feed_checkpoints WHERE handle=?1", [
+                    handle
+                  ]) do
+               [[position]] -> position
+               [] -> -1
+             end
+
+           if mode == :baseline or rev > previous do
+             ordered = if mode == :baseline, do: Enum.sort_by(frames, & &1["rev"]), else: frames
+
+             Enum.each(ordered, fn frame ->
+               case capture_change_in_txn(txn, handle, frame) do
+                 :ok -> :ok
+                 {:error, reason} -> raise reason
+               end
+             end)
+
+             Txn.q(
+               txn,
+               """
+               INSERT INTO harklight_feed_checkpoints(handle,rev) VALUES(?1,?2)
+               ON CONFLICT(handle) DO UPDATE SET rev=excluded.rev
+               """,
+               [handle, rev]
+             )
+
+             if mode == :live and frames != [] do
+               case Txn.q(txn, "SELECT lastCursor FROM harklight_wake_handles WHERE handle=?1", [
+                      handle
+                    ]) do
+                 [[position]] when position > event_position ->
+                   Outage.captured_in_txn(txn, handle, rev, System.system_time(:millisecond))
+
+                 _ ->
+                   false
+               end
+             else
+               false
+             end
+           else
+             false
+           end
+         end) do
+      {:ok, recovered} -> {:ok, recovered}
+      {:error, %RuntimeError{message: reason}} -> {:error, reason}
+      {:error, _} -> {:error, "capture_unavailable"}
+    end
+  end
+
+  defp capture_change_in_txn(
+         txn,
+         handle,
+         %{
+           "kind" => "entry",
+           "data" =>
+             %{
+               "author" => "person",
+               "kind" => "reply",
+               "entry_id" => entry_id,
+               "item_id" => item_id,
+               "request_revision" => request_revision
+             } = entry
+         } = frame
+       )
+       when is_binary(item_id) and is_binary(entry_id) and is_integer(request_revision) and
+              request_revision > 0 do
+    capture_consumer_event(
+      txn,
+      handle,
+      item_id,
+      frame["item"],
+      frame,
+      ["entry", entry_id],
+      request_revision,
+      Map.put(entry, "kind", "discussion")
+    )
+  end
+
+  defp capture_change_in_txn(
+         txn,
+         handle,
+         %{
+           "kind" => "message",
+           "data" =>
+             %{
+               "session" => handle,
+               "item_id" => item_id,
+               "revision" => revision,
+               "terminal" => %{"state" => state, "at_ms" => timestamp} = terminal
+             } = item
+         } = frame
+       )
+       when is_binary(item_id) and is_integer(revision) and revision > 0 and is_integer(timestamp) and
+              state in ["answered", "cleared", "expired", "superseded"] do
+    author = if state == "answered", do: "person", else: "server"
+
+    entry =
+      Map.merge(terminal, %{
+        "kind" => "terminal",
+        "terminal_state" => state,
+        "author" => author
+      })
+
+    capture_consumer_event(
+      txn,
+      handle,
+      item_id,
+      item,
+      frame,
+      ["terminal", item_id, state, timestamp],
+      revision,
+      entry
+    )
+  end
+
+  defp capture_change_in_txn(_txn, _handle, %{
+         "kind" => "entry",
+         "data" => %{"kind" => "reply", "author" => "person"}
+       }),
+       do: {:error, "event_identity_invalid"}
+
+  defp capture_change_in_txn(_txn, _handle, %{"kind" => kind, "data" => data})
+       when kind in ["entry", "message", "advisory"] and is_map(data), do: :ok
+
+  defp capture_change_in_txn(_txn, _handle, _frame), do: {:error, "unexpected_feed_record"}
+
+  defp capture_consumer_event(txn, handle, item_id, item, frame, identity, revision, entry) do
+    case registered_item(txn, handle, item_id, item) do
+      {:ok, sender, local_id} ->
+        event_id =
+          "v2_" <> (:crypto.hash(:sha256, JSON.encode!(identity)) |> Base.encode16(case: :lower))
+
+        case Txn.q(
+               txn,
+               """
+               SELECT 1 FROM harklight_wake_entries WHERE handle=?1 AND eventId=?2
+               UNION ALL SELECT 1 FROM harklight_wake_suppressed_entries WHERE handle=?1 AND eventId=?2
+               UNION ALL SELECT 1 FROM harklight_held_terminals WHERE handle=?1 AND eventId=?2
+               """,
+               [handle, event_id]
+             ) do
+          [] ->
+            [[previous]] =
+              Txn.q(txn, "SELECT lastCursor FROM harklight_wake_handles WHERE handle=?1", [handle])
+
+            cursor = previous + 1
+
+            line =
+              JSON.encode!(%{
+                "kind" => frame["kind"],
+                "rev" => frame["rev"],
+                "data" => frame["data"],
+                "item_id" => item_id,
+                "session_handle" => handle,
+                "event_id" => event_id,
+                "feed_cursor" => cursor,
+                "request_revision" => revision,
+                "request" => %{"sender_id" => sender, "message_id" => local_id},
+                "entry" => entry
+              })
+
+            capture_event_in_txn(
+              txn,
+              handle,
+              line,
+              event_id,
+              cursor,
+              sender,
+              local_id,
+              revision,
+              entry["kind"],
+              entry["author"]
+            )
+
+          _ ->
+            :ok
+        end
+
+      :unregistered ->
+        case Txn.q(
+               txn,
+               """
+               SELECT 1 FROM harklight_send_operations s
+               LEFT JOIN harklight_command_results r ON r.opId=s.opId
+               WHERE s.state='pending' AND s.attemptedAt IS NOT NULL AND r.opId IS NULL
+                 AND json_extract(s.payload,'$.request.session_handle')=?1
+                 AND json_extract(s.payload,'$.request.protocol')=2 LIMIT 1
+               """,
+               [handle]
+             ) do
+          [] -> :ok
+          _ -> {:error, "harklight_send_pending"}
+        end
+    end
+  end
+
+  defp registered_item(txn, handle, item_id, item) do
+    case Txn.q(
+           txn,
+           "SELECT senderId FROM harklight_wake_requests WHERE handle=?1 AND messageId=?2",
+           [handle, item_id]
+         ) do
+      [[sender]] -> {:ok, sender, item_id}
+      [] -> registered_migrated_item(txn, handle, item_id, item)
+    end
+  end
+
+  defp registered_migrated_item(txn, handle, item_id, %{
+         "item_id" => item_id,
+         "legacy_message_id" => legacy,
+         "sender" => sender,
+         "session" => handle
+       })
+       when is_binary(legacy) and is_binary(sender) do
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM harklight_wake_requests WHERE handle=?1 AND senderId=?2 AND messageId=?3",
+           [handle, sender, legacy]
+         ) do
+      [[1]] -> {:ok, sender, legacy}
+      [] -> :unregistered
+    end
+  end
+
+  defp registered_migrated_item(_txn, _handle, _item_id, _item), do: :unregistered
+
+  # Replays a previously stored event without translating its durable identity.
+  # Only capture_feed/5 accepts records from a running Agent.
   def capture_line(db, handle, line) do
     with {:ok, event} <- JSON.decode(line),
          true <- is_map(event) do
       case event do
-        %{"kind" => "event"} -> capture_event(db, handle, line, event)
-        %{"kind" => "idle", "open_requests" => 0} -> :ok
-        %{"kind" => "unsupported"} -> {:error, "listener_unsupported"}
-        _ -> {:error, "unexpected_listener_line"}
+        %{"kind" => "event"} ->
+          capture_event(db, handle, line, event)
+
+        %{"kind" => "message", "item_id" => item_id} when is_binary(item_id) ->
+          capture_event(db, handle, line, event)
+
+        _ ->
+          {:error, "unexpected_feed_record"}
       end
     else
       _ -> {:error, "invalid_listener_line"}
     end
   end
 
-  @doc false
-  def capture_origin_line(db, line) do
-    with {:ok, %{"kind" => "event", "session_handle" => handle} = event} <- JSON.decode(line),
-         true <- is_binary(handle) do
-      # Ignore foreign and non-opted-in handles before interpreting their payload.
-      # Admission is checked again inside the write transaction.
-      if Tightbeam.HarklightOrigin.managed?(db, handle),
-        do: capture_event(db, handle, line, event, :origin),
-        else: :ignored
-    else
-      {:ok, %{"kind" => "event"}} -> :ignored
-      _ -> {:error, "unexpected_origin_line"}
-    end
-  end
-
-  defp capture_event(db, handle, line, event, source \\ :legacy) do
+  defp capture_event(db, handle, line, event) do
     request = event["request"] || %{}
     entry = event["entry"] || %{}
     event_id = event["event_id"]
@@ -3390,7 +3997,8 @@ defmodule Tightbeam.HarklightWakes do
     author = entry["author"]
 
     if event["session_handle"] != handle or not is_binary(event_id) or
-         not is_integer(cursor) or cursor < 1 or event_id != Integer.to_string(cursor) or
+         not is_integer(cursor) or cursor < 1 or
+         (event["kind"] == "event" and event_id != Integer.to_string(cursor)) or
          not is_binary(sender_id) or not is_binary(message_id) or
          not (is_nil(revision) or is_integer(revision)) or
          kind not in ["discussion", "terminal"] or
@@ -3398,54 +4006,18 @@ defmodule Tightbeam.HarklightWakes do
       {:error, "event_identity_invalid"}
     else
       case DB.transaction(db, fn txn ->
-             admission =
-               if source == :origin,
-                 do: Tightbeam.HarklightOrigin.admission(txn, handle),
-                 else: :legacy
-
-             case admission do
-               :ignored ->
-                 :ignored
-
-               :moving ->
-                 Tightbeam.HarklightOrigin.stage(txn, handle, event_id, cursor, line)
-
-               mode ->
-                 if mode == :confirmed,
-                   do: Tightbeam.HarklightOrigin.stage(txn, handle, event_id, cursor, line)
-
-                 result =
-                   capture_event_in_txn(
-                     txn,
-                     handle,
-                     line,
-                     event_id,
-                     cursor,
-                     sender_id,
-                     message_id,
-                     revision,
-                     kind,
-                     author,
-                     mode == :confirmed
-                   )
-
-                 cond do
-                   result == :ok and mode == :confirmed ->
-                     Tightbeam.HarklightOrigin.captured(txn, handle, event_id)
-
-                   mode == :confirmed and
-                       result in [
-                         {:error, "harklight_origin_unavailable"},
-                         {:error, "harklight_send_pending"}
-                       ] ->
-                     # One temporarily unavailable recipient must not stop the
-                     # enrollment's stream or lose an already-offered entry.
-                     :captured
-
-                   true ->
-                     result
-                 end
-             end
+             capture_event_in_txn(
+               txn,
+               handle,
+               line,
+               event_id,
+               cursor,
+               sender_id,
+               message_id,
+               revision,
+               kind,
+               author
+             )
            end) do
         {:ok, result} -> result
         {:error, _} -> {:error, "capture_unavailable"}
@@ -3456,7 +4028,7 @@ defmodule Tightbeam.HarklightWakes do
   defp valid_entry_author?("discussion", author, _entry), do: author in ["person", "agent"]
 
   defp valid_entry_author?("terminal", "server", entry),
-    do: entry["terminal_state"] in ["expired", "superseded"]
+    do: entry["terminal_state"] in ["cleared", "expired", "superseded"]
 
   defp valid_entry_author?("terminal", author, _entry), do: author in ["person", "agent"]
 
@@ -3470,8 +4042,7 @@ defmodule Tightbeam.HarklightWakes do
          message_id,
          revision,
          kind,
-         author,
-         replay?
+         author
        ) do
     handle_state =
       Txn.q(
@@ -3481,22 +4052,13 @@ defmodule Tightbeam.HarklightWakes do
       )
 
     case handle_state do
-      [[session_key, host, prior_cursor, state]]
-      when state == "active" or (replay? and state == "unavailable") ->
+      [[session_key, host, prior_cursor, "active"]] ->
         if listener_eligible_in_txn?(txn, handle, session_key, host) do
-          if state == "unavailable",
-            do:
-              Txn.q(
-                txn,
-                "UPDATE harklight_wake_handles SET state='active',lastError=NULL WHERE handle=?1",
-                [handle]
-              )
-
           capture_for_active_origin(
             txn,
             handle,
             session_key,
-            if(replay?, do: min(prior_cursor, cursor - 1), else: prior_cursor),
+            prior_cursor,
             line,
             event_id,
             cursor,
@@ -3617,6 +4179,19 @@ defmodule Tightbeam.HarklightWakes do
     else
       wake_id = "w_harklight_" <> handle <> "_" <> String.pad_leading(event_id, 20, "0")
 
+      prompt =
+        entry_prompt(
+          txn,
+          session_key,
+          line,
+          handle,
+          event_id,
+          sender_id,
+          message_id,
+          kind,
+          author
+        )
+
       now = System.system_time(:millisecond)
 
       recipients =
@@ -3670,19 +4245,7 @@ defmodule Tightbeam.HarklightWakes do
                 wake_id: recipient_wake_id,
                 session_key: recipient,
                 origin: "process:tightbeam",
-                prompt:
-                  entry_prompt(
-                    txn,
-                    session_key,
-                    line,
-                    handle,
-                    event_id,
-                    sender_id,
-                    message_id,
-                    kind,
-                    author,
-                    recipient
-                  ),
+                prompt: prompt,
                 due_at: now,
                 creator_session_key: session_key,
                 class: "blocker"
@@ -3819,8 +4382,8 @@ defmodule Tightbeam.HarklightWakes do
     |> Base.encode16(case: :lower)
   end
 
-  defp entry_prompt(txn, origin, line, handle, event, sender, message, kind, author, _recipient) do
-    instruction = handling_instruction(handle, event, message, kind, author)
+  defp entry_prompt(txn, origin, line, handle, event, sender, message, _kind, _author) do
+    instruction = handling_instruction(JSON.decode!(line), handle, event, message)
 
     instruction =
       case Org.get_in_txn(txn, origin) do
@@ -3842,12 +4405,36 @@ defmodule Tightbeam.HarklightWakes do
       Tightbeam.HarklightBriefings.chat_prompt_context_in_txn(txn, handle, sender, message)
   end
 
-  defp handling_instruction(handle, event_id, message_id, _kind, _author) do
-    "Handle this Harklight entry from your originating session. Read it with `tightbeam harklight-read --handle #{handle}` and acknowledge it with `tightbeam harklight-ack --handle #{handle} --event #{event_id}` before acting. Reading does not acknowledge the entry. " <>
-      "For a person discussion, reply with `tightbeam harklight-reply --handle #{handle} --request #{message_id} --in-reply-to #{event_id} --body <reply> [--op-id <uuid>]`. Reuse the same operation ID if the result is uncertain. " <>
-      "For an answered terminal by a person, reconcile any earlier effect before applying once, then report with `tightbeam harklight-result --handle #{handle} --request #{message_id} --in-reply-to #{event_id} --status applied|refused|received [--op-id <uuid>]`. An agent-authored terminal is not the person's choice. " <>
-      "For cleared, expired or superseded, stop work on that request; do not treat it as approval. " <>
-      "If delivered is true, check prior effects before acting again. Do not run listen; the controller listens."
+  defp handling_instruction(
+         %{"kind" => "entry", "item_id" => item, "data" => %{"entry_id" => entry}},
+         handle,
+         event,
+         message
+       ) do
+    action_instruction(handle, event) <>
+      "Reply with `tightbeam harklight-reply --handle #{handle} --request #{message} --in-reply-to #{event} --body <reply> [--op-id <uuid>]`. Reuse the same operation ID and inputs if the result is uncertain. " <>
+      "Report actual attachment transfer or use with harklight-agent file-use --item-id #{item} --entry-id #{entry} --file-id <file> and the applicable outcome."
+  end
+
+  defp handling_instruction(
+         %{"kind" => "message", "data" => %{"terminal" => %{"state" => "answered"}}},
+         handle,
+         event,
+         message
+       ) do
+    action_instruction(handle, event) <>
+      "Reconcile any earlier effect before applying the answer once. " <>
+      "Report its disposition with `tightbeam harklight-result --handle #{handle} --request #{message} --in-reply-to #{event} --status applied|refused|received [--op-id <uuid>]`. Reuse the same operation ID and inputs if the result is uncertain."
+  end
+
+  defp handling_instruction(_, _handle, _event, _message) do
+    "Handle this Harklight entry from your originating session. " <>
+      "Cleared, expired or superseded requests are closed. Check the recorded outcome before acting."
+  end
+
+  defp action_instruction(handle, event) do
+    "Handle this Harklight entry from your originating session. " <>
+      "Read it with `tightbeam harklight-read --handle #{handle}` and confirm its handoff with `tightbeam harklight-ack --handle #{handle} --event #{event}` before acting. "
   end
 
   defp pending_supersede_targets(payload) do

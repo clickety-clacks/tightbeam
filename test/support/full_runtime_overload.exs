@@ -13,6 +13,7 @@ Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
+Application.put_env(:tightbeam, :kungfu_bundle_root_dir, Path.expand("fixtures/kungfu", __DIR__))
 
 false = File.exists?(base)
 {:ok, db} = DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])
@@ -122,12 +123,11 @@ Org.create(DB, %{
   model: Model.new("fixture-model")
 })
 
-# Settle startup recovery, including both listener managers, before measuring.
+# Settle startup recovery, including the Harklight listener manager, before measuring.
 for name <- [
       Tightbeam.WakeScheduler,
       Tightbeam.LaneManager,
-      Tightbeam.HarklightWakes,
-      Tightbeam.HarklightOriginListener
+      Tightbeam.HarklightWakes
     ],
     do: :sys.get_state(name)
 
@@ -190,7 +190,6 @@ assert DB.overloaded?(DB)
 nudge = Task.async(fn -> Wakes.nudge_matching(Tightbeam.WakeScheduler, 1) end)
 :ok = :sys.resume(Tightbeam.WakeScheduler)
 send(Tightbeam.HarnessHealth.RecoveryScheduler, :resume_due)
-GenServer.cast(Tightbeam.HarklightOriginListener, {:resume_session, key})
 GenServer.cast(Tightbeam.HarklightWakes, {:origin_ready, key})
 send(Tightbeam.WorkspaceCleanup, :drain)
 GenServer.cast(Tightbeam.Productions.BubbleSweeper, {:recognize, 0})

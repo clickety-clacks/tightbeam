@@ -1,6 +1,7 @@
 defmodule Tightbeam.RowReactions.Snapshot do
   @moduledoc false
   alias Tightbeam.{
+    Assignments,
     DeliveryResponsibilities,
     Harness,
     HarnessProcess,
@@ -11,8 +12,21 @@ defmodule Tightbeam.RowReactions.Snapshot do
 
   alias Tightbeam.DB.Txn
 
-  @assignment ~w(id holderKey workItemId openedBySession currentOpenerSessionKey openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
+  @assignment ~w(id holderKey workItemId reviewsAssignmentId openedBySession currentOpenerSessionKey openedByUser openedAt state outcome closedAt closingAttestId closedBySession closedByUser closedByProcess)
   def assignment(txn, id), do: one(txn, "assignments", @assignment, "id=?1", [id])
+
+  def attest(txn, id) do
+    one(
+      txn,
+      "attests",
+      ~w(id assignmentId kind verdictKind note bySession byUser ts waitId),
+      "id=?1",
+      [id]
+    )
+  end
+
+  def work_item(txn, id),
+    do: one(txn, "work_items", ~w(id ownerUserId state), "id=?1", [id])
 
   def harness_health_hold(txn, incident_id) do
     case Txn.q(
@@ -116,6 +130,36 @@ defmodule Tightbeam.RowReactions.Snapshot do
     end
   end
 
+  def current(txn, %{"kind" => "work_item_observation", "workItemId" => id} = event, _recorded) do
+    item =
+      one(
+        txn,
+        "work_items",
+        ~w(id title ownerUserId state deliveryOwnerSessionKey routingWakeId slateWakeId createdAt createdByUser createdBySession createdContextKnown),
+        "id=?1",
+        [id]
+      )
+
+    [[count]] =
+      Txn.q(txn, "SELECT COUNT(*) FROM assignments WHERE workItemId=?1 AND state='open'", [id])
+
+    personal = if item, do: Org.personal_session_key(item["ownerUserId"])
+
+    %{
+      "work_item" => item,
+      "open_assignment_count" => count,
+      "personal_session_key" => personal,
+      "sessions" =>
+        sessions(txn, [
+          personal,
+          item && item["deliveryOwnerSessionKey"],
+          get_in(event, ["principal", "id"])
+        ]),
+      "configured_triage_deadline_ms" =>
+        Application.get_env(:tightbeam, :work_item_triage_deadline_ms)
+    }
+  end
+
   def current(txn, %{"kind" => "assignment"} = event, _recorded) do
     terminal = event["terminal"]
 
@@ -184,6 +228,36 @@ defmodule Tightbeam.RowReactions.Snapshot do
       "hold" => harness_health_hold(txn, event["holdId"]),
       "recovery_check" =>
         Map.take(event, ~w(holdId cycleId route startedAt finishedAt outcome errorExcerpt))
+    }
+  end
+
+  def current(txn, %{"kind" => "assignment_attest", "after" => after_event}, _recorded) do
+    assignment_id = after_event["assignment"]["id"]
+    context = assignment_context(txn, assignment_id)
+    request_id = after_event["lateRequestId"]
+
+    %{
+      "assignment" => context.assignment,
+      "work_item" => context.work_item,
+      "assignment_owner_user_id" => context.owner_user_id,
+      "personal_session_key" => context.personal_session_key,
+      "process_notification_recipient" => context.process_notification_recipient,
+      "sessions" => context.sessions,
+      "request" => request(txn, request_id),
+      "ruling_result_recipients" => ruling_result_recipients(txn, request_id)
+    }
+  end
+
+  def current(txn, %{"kind" => "assignment_start", "after" => after_event}, _recorded) do
+    context = assignment_context(txn, after_event["assignment"]["id"])
+
+    %{
+      "assignment" => context.assignment,
+      "work_item" => context.work_item,
+      "assignment_owner_user_id" => context.owner_user_id,
+      "personal_session_key" => context.personal_session_key,
+      "process_notification_recipient" => context.process_notification_recipient,
+      "sessions" => context.sessions
     }
   end
 
@@ -288,6 +362,96 @@ defmodule Tightbeam.RowReactions.Snapshot do
 
       row |> Map.put("obligationNamespace", namespace) |> Map.put("obligationTarget", target)
     end
+  end
+
+  def assignment_context(txn, id) do
+    assignment = assignment(txn, id)
+    work_item = assignment && work_item(txn, assignment["workItemId"])
+
+    {notification_session, notification_owner} =
+      if assignment,
+        do: Assignments.process_notification_recipient_in_txn(txn, id),
+        else: {nil, nil}
+
+    owner_user_id =
+      (work_item && work_item["ownerUserId"]) || notification_owner ||
+        assignment_owner_from_sessions(txn, assignment)
+
+    process_recipient =
+      if assignment && is_nil(assignment["openedBySession"]) &&
+           is_nil(assignment["openedByUser"]) do
+        %{
+          "sessionKey" => notification_session || Org.personal_session_key(owner_user_id),
+          "ownerUserId" => owner_user_id
+        }
+      end
+
+    personal = if is_binary(owner_user_id), do: Org.personal_session_key(owner_user_id)
+
+    keys =
+      [
+        assignment && assignment["holderKey"],
+        assignment && assignment["currentOpenerSessionKey"],
+        assignment && assignment["openedBySession"],
+        personal,
+        process_recipient && process_recipient["sessionKey"]
+      ]
+      |> Enum.filter(&is_binary/1)
+
+    %{
+      assignment: assignment,
+      work_item: work_item,
+      owner_user_id: owner_user_id,
+      personal_session_key: personal,
+      process_notification_recipient: process_recipient,
+      sessions: sessions(txn, keys)
+    }
+  end
+
+  defp assignment_owner_from_sessions(_txn, nil), do: nil
+
+  defp assignment_owner_from_sessions(txn, assignment) do
+    session_owner(txn, assignment["holderKey"]) || assignment["openedByUser"] ||
+      session_owner(txn, assignment["openedBySession"])
+  end
+
+  defp session_owner(_txn, nil), do: nil
+
+  defp session_owner(txn, key) do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [key]) do
+      [[owner]] -> owner
+      [] -> nil
+    end
+  end
+
+  defp request(_txn, nil), do: nil
+
+  defp request(txn, id) do
+    one(
+      txn,
+      "decision_requests",
+      ~w(id kind assignmentId raiserId raiserSessionKey ownerUserId status),
+      "id=?1",
+      [id]
+    )
+  end
+
+  defp ruling_result_recipients(_txn, nil), do: []
+
+  defp ruling_result_recipients(txn, id) do
+    Txn.q(
+      txn,
+      """
+      SELECT sessionKey,ownerUserId FROM wakes
+      WHERE conditionKind='escalation-ruled' AND conditionScope=?1
+        AND origin='process:tightbeam' AND sessionKey IS NOT NULL
+      ORDER BY rowid
+      """,
+      [id]
+    )
+    |> Enum.map(fn [session_key, owner] ->
+      %{"sessionKey" => session_key, "ownerUserId" => owner}
+    end)
   end
 
   # A receipt records the accountable actor's statement. Parsing does not

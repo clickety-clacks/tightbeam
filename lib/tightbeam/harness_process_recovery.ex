@@ -225,6 +225,7 @@ defmodule Tightbeam.HarnessProcess.Recovery do
       [adapter_key, generation]
     )
 
+    if DB.Txn.changes(txn) == 1, do: Tightbeam.CoordinatorHoldAlerts.changed_in_txn(txn)
     :ok
   end
 

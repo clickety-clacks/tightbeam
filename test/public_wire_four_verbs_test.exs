@@ -199,7 +199,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert correction_count(ctx.db) == before + 1
   end
 
-  test "observe and resolve other cross the real wire with target and idempotency boundaries",
+  test "observe and resolve other cross the real wire, across owners, with idempotency boundaries",
        ctx do
     owner = "wire-source-owner"
     assert %{user_id: ^owner, is_admin: false} = Devices.add_user(ctx.db, owner, false)
@@ -259,7 +259,8 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(repeated.resp_body)["result"]["status"] == "duplicate"
     assert other_incident_count(ctx.db) == 1
 
-    unauthorized =
+    # A session of another user may report the same failure; it joins the open incident.
+    cross_owner_observer =
       dispatch_cli(ctx, stranger.cli_token, %{
         observe_body
         | as: stranger_role,
@@ -270,11 +271,12 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
           }
       })
 
-    assert unauthorized.status == 403
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "not_authorized"
+    assert cross_owner_observer.status == 200, cross_owner_observer.resp_body
     assert other_incident_count(ctx.db) == 1
 
-    wrong_target =
+    # A session may report the same failure seen on another user's session; it
+    # attaches to the open incident.
+    cross_owner_target =
       dispatch_cli(ctx, source.cli_token, %{
         observe_body
         | params: %{
@@ -284,8 +286,8 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
           }
       })
 
-    assert wrong_target.status == 403
-    assert JSON.decode!(wrong_target.resp_body)["error"]["code"] == "not_authorized"
+    assert cross_owner_target.status == 200, cross_owner_target.resp_body
+    assert JSON.decode!(cross_owner_target.resp_body)["result"]["status"] == "attached"
     assert other_incident_count(ctx.db) == 1
 
     recovery_condition = "a normal provider turn completes"
@@ -324,30 +326,22 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert missing.status == 403
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_authorized"
 
-    refused =
-      dispatch_cli(ctx, stranger.cli_token, %{
-        resolve_body
-        | as: stranger_role,
-          params: %{resolve_params | idempotencyKey: "wire-health-refused"}
-      })
-
-    assert refused.status == 403
-    assert JSON.decode!(refused.resp_body)["error"]["code"] == "not_authorized"
     assert incident_state(ctx.db, incident_id) == "open"
 
-    peer_resolve_body = %{resolve_body | as: peer_role}
-    resolved = dispatch_cli(ctx, peer.cli_token, peer_resolve_body)
+    # A session of another user may resolve the incident.
+    stranger_resolve_body = %{resolve_body | as: stranger_role}
+    resolved = dispatch_cli(ctx, stranger.cli_token, stranger_resolve_body)
     assert resolved.status == 200, resolved.resp_body
     assert JSON.decode!(resolved.resp_body)["result"]["status"] == "resolved"
     assert incident_state(ctx.db, incident_id) == "resolved"
 
-    resolve_replay = dispatch_cli(ctx, peer.cli_token, peer_resolve_body)
+    resolve_replay = dispatch_cli(ctx, peer.cli_token, %{resolve_body | as: peer_role})
     assert resolve_replay.status == 403
     assert JSON.decode!(resolve_replay.resp_body)["error"]["code"] == "not_authorized"
     assert incident_state(ctx.db, incident_id) == "resolved"
   end
 
-  test "promotion close crosses the real wire with provenance, auth, and replay protection",
+  test "promotion close crosses the real wire, across owners, with provenance and replay",
        ctx do
     owner = ctx.device.user_id
     source = wire_session(ctx.db, "wire-promotion-source", owner, "coder")
@@ -500,17 +494,6 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
 
     body = %{verb: "harness-health-close-promotion", as: source_role, params: params}
 
-    unauthorized =
-      dispatch_cli(ctx, stranger.cli_token, %{
-        body
-        | as: stranger_role,
-          params: %{params | idempotencyKey: "wire-promotion-stranger"}
-      })
-
-    assert unauthorized.status == 403
-    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "not_authorized"
-    assert promotion_state(ctx.db, promotion_id) == "open"
-
     missing =
       dispatch_cli(ctx, source.cli_token, %{
         body
@@ -525,12 +508,13 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "promotion_not_found"
     assert promotion_state(ctx.db, promotion_id) == "open"
 
-    peer_body = %{body | as: peer_role}
-    closed = dispatch_cli(ctx, peer.cli_token, peer_body)
+    # A session of another user may close the promotion.
+    stranger_body = %{body | as: stranger_role}
+    closed = dispatch_cli(ctx, stranger.cli_token, stranger_body)
     assert closed.status == 200, closed.resp_body
     assert JSON.decode!(closed.resp_body)["result"]["promotion"]["state"] == "closed"
 
-    replay = dispatch_cli(ctx, peer.cli_token, peer_body)
+    replay = dispatch_cli(ctx, stranger.cli_token, stranger_body)
     assert replay.status == 200, replay.resp_body
     assert JSON.decode!(replay.resp_body)["result"]["promotion"]["state"] == "closed"
     assert promotion_state(ctx.db, promotion_id) == "closed"

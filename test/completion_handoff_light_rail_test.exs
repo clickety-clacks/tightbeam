@@ -1006,6 +1006,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
   end
 
+  # 0.1.17 stops shipping the 2-hour reminder, so the shipped manual no longer
+  # tells agents to expect it or to file its note.
   test "the shipped parent directive appears in composed guidance for both harnesses", _ctx do
     base =
       Path.join(
@@ -1020,44 +1022,23 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       |> File.read!()
       |> String.replace(~r/\s+/, " ")
 
-    assert packaged_manual =~ "copy `assignment_id`, `source_kind`, and `source_token`"
-
-    assert packaged_manual =~
-             "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired>: <what you did>"
-
-    assert packaged_manual =~ "use the plain ASCII colon after the outcome"
-    refute packaged_manual =~ "preserve the literal em dash"
-    assert packaged_manual =~ "No reminder is scheduled"
-
-    assert Regex.match?(
-             ~r/No reminder is scheduled without a lawful\s+progress-attest destination/,
-             packaged_manual
-           )
-
-    assert packaged_manual =~ "Do not self-assign or fabricate an acknowledgment"
-
     :initialized = Tightbeam.Identity.init!(base)
     revision = Tightbeam.Identity.live_revision!(base)
 
-    for harness <- [:codex, :claude] do
-      snapshot = Tightbeam.Identity.snapshot_at!(base, revision, "default", harness)
-      guidance = String.replace(snapshot.guidance, ~r/\s+/, " ")
-      assert guidance =~ "copy `assignment_id`, `source_kind`, and `source_token`"
+    views =
+      for harness <- [:codex, :claude] do
+        snapshot = Tightbeam.Identity.snapshot_at!(base, revision, "default", harness)
+        refute Regex.match?(~r/^#include/m, snapshot.guidance)
+        String.replace(snapshot.guidance, ~r/\s+/, " ")
+      end
 
-      assert guidance =~
-               "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired>: <what you did>"
-
-      assert guidance =~ "use the plain ASCII colon after the outcome"
-      refute guidance =~ "preserve the literal em dash"
-      assert guidance =~ "No reminder is scheduled"
-
-      assert Regex.match?(
-               ~r/No reminder is scheduled without a lawful\s+progress-attest destination/,
-               guidance
-             )
-
-      assert guidance =~ "Do not self-assign or fabricate an acknowledgment"
-      refute Regex.match?(~r/^#include/m, snapshot.guidance)
+    for text <- [packaged_manual | views] do
+      assert text =~ "choose whether to keep, park, or retire it"
+      assert text =~ "record what you did in a `progress` attest naming the child"
+      assert text =~ "Do not self-assign or fabricate an acknowledgment"
+      refute text =~ "completion-handoff-action"
+      refute text =~ "terminal-action reminder"
+      refute text =~ "No reminder is scheduled"
     end
   end
 
@@ -1568,38 +1549,230 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert terminal_notices(ctx.db) == []
   end
 
-  test "cutover records its watermark once and adopts no earlier notice", ctx do
+  test "cutover adopts pending output once and keeps its terminal occurrence identity", ctx do
+    stop_supervised!(ctx.scheduler)
+    {_parent, child, root} = completed_child(ctx)
+    forget_reaction_ledger!(ctx.db)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert adopted = Enum.find(terminal_notices(ctx.db), &(&1.wake_id == root.wake_id))
+    assert adopted.wake_id == root.wake_id
+    assert adopted.due_at == root.due_at
+
+    assert {:ok, {:ok, replay}} =
+             DB.transaction(
+               ctx.db,
+               &Wakes.admit_terminal_notification_in_txn(&1, child.id)
+             )
+
+    assert replay.wake_id == root.wake_id
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert Enum.count(terminal_notices(ctx.db), &(&1.wake_id == root.wake_id)) == 1
+    start_scheduler(ctx.db)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert_delivered_carrier(ctx.db, root.wake_id)
+    assert [_] = pending_reminders(ctx.db, root.wake_id)
+  end
+
+  test "cutover preserves a delivered root through bubble resweep and adopts its pending reminder",
+       ctx do
+    {_parent, _child, root} = completed_child(ctx)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    carrier = assert_delivered_carrier(ctx.db, root.wake_id)
+    [reminder] = pending_reminders(ctx.db, root.wake_id)
+
+    assert {:ok, [[delivery_seq]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [root.wake_id])
+
+    assert is_integer(delivery_seq)
+
+    assert {:ok, [[^delivery_seq]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [carrier])
+
+    finish_carrier_turn!(ctx.db, carrier)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO production_cursors(name,seq) VALUES('bubble',?1) ON CONFLICT(name) DO UPDATE SET seq=excluded.seq",
+               [delivery_seq - 1]
+             )
+
+    stop_supervised!(ctx.scheduler)
+    forget_reaction_ledger!(ctx.db)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert assert_delivered_carrier(ctx.db, root.wake_id) == carrier
+    assert [adopted] = pending_reminders(ctx.db, root.wake_id)
+    assert adopted.wake_id == reminder.wake_id
+    assert adopted.due_at == reminder.due_at
+
+    delivery_event_id = "wake-delivery:#{root.wake_id}:#{delivery_seq}"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE eventId=?1",
+               [delivery_event_id]
+             )
+
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper,
+         db: ctx.db, interval: 3_600_000, name: :completion_handoff_cutover_sweeper}
+      )
+
+    Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+
+    assert {:ok, [[cursor]]} =
+             DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+
+    assert cursor >= delivery_seq
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [root.wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [adopted.wake_id]
+             )
+
+    start_scheduler(ctx.db)
+    set_due_now(ctx.db, adopted.wake_id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, adopted.wake_id).state == "fired"
+    assert_delivered_carrier(ctx.db, adopted.wake_id)
+
+    assert length(terminal_notices(ctx.db)) == 1
+  end
+
+  test "unproven historical output is held with a reason while other pending output proceeds",
+       ctx do
+    stop_supervised!(ctx.scheduler)
+    {_parent, _child, root} = completed_child(ctx)
+
+    unknown =
+      Wakes.schedule(ctx.db, %{
+        wake_id: "unknown-historical-output",
+        session_key: "other-parent",
+        owner_user_id: "flynn",
+        origin: "process:tightbeam",
+        prompt: "Historical output with no provable source",
+        due_at: System.system_time(:millisecond),
+        obligation_ref: "terminal-child-owner-notification:unknown-assignment"
+      })
+
+    forget_reaction_ledger!(ctx.db)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+    assert {:ok, [["held", reason]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,lastError FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [unknown.wake_id]
+             )
+
+    assert reason =~ "unproven"
+    start_scheduler(ctx.db)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert_delivered_carrier(ctx.db, root.wake_id)
+    assert Wakes.get(ctx.db, unknown.wake_id).state == "pending"
+    assert turn_count(ctx.db, unknown.wake_id) == 0
+  end
+
+  test "cutover adopts only eligible pending notices at the recorded watermark and reports them once",
+       ctx do
     stop_supervised!(ctx.scheduler)
     {_parent, _child, root} = completed_child(ctx)
     forget_reaction_ledger!(ctx.db)
 
-    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert {:ok, [[watermark]]} =
+             DB.query(ctx.db, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO row_reaction_cutovers(source,watermark,adoptedAt,heldCount) VALUES(?1,?2,?3,0)",
+               [
+                 "terminal-notices/v1",
+                 JSON.encode!(%{"wakeRowid" => watermark}),
+                 System.system_time(:millisecond)
+               ]
+             )
+
+    later =
+      Wakes.schedule(ctx.db, %{
+        wake_id: "post-watermark-legacy-notice",
+        session_key: "other-parent",
+        owner_user_id: "flynn",
+        origin: "process:tightbeam",
+        prompt: "Legacy output written after the cutover watermark",
+        due_at: System.system_time(:millisecond) + 3_600_000,
+        obligation_ref: "terminal-child-owner-notification:unknown-assignment"
+      })
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+      end)
+
+    assert log =~ "OPERATOR NOTICE: terminal-notice cutover recorded"
+    assert log =~ "1 notice wake(s) were pending at that watermark; 1 were linked"
+
+    assert adopted = Enum.find(terminal_notices(ctx.db), &(&1.wake_id == root.wake_id))
+    assert adopted.wake_id == root.wake_id
+    assert adopted.due_at == root.due_at
+
+    assert {:ok, [[encoded_watermark]]} =
+             DB.query(
+               ctx.db,
+               "SELECT watermark FROM row_reaction_cutovers WHERE source='terminal-notices/v1'"
+             )
+
+    assert JSON.decode!(encoded_watermark) == %{"wakeRowid" => watermark}
+
+    assert {:ok, [[same_watermark]]} =
+             DB.query(
+               ctx.db,
+               "SELECT watermark FROM row_reaction_cutovers WHERE source='terminal-notices/pending-adoption/v1'"
+             )
+
+    assert JSON.decode!(same_watermark) == %{"wakeRowid" => watermark}
 
     assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT heldCount FROM row_reaction_cutovers")
+             DB.query(
+               ctx.db,
+               "SELECT heldCount FROM row_reaction_cutovers WHERE source='terminal-notices/v1'"
+             )
 
     assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT 1 FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
-               [root.wake_id]
+               [later.wake_id]
              )
 
-    # The earlier notice is still an ordinary pending wake and still delivers.
-    assert Wakes.get(ctx.db, root.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, later.wake_id).state == "pending"
 
-    log =
+    repeated_log =
       ExUnit.CaptureLog.capture_log(fn ->
-        forget_reaction_ledger!(ctx.db)
         assert :ok = Tightbeam.RowReactions.recover(ctx.db)
       end)
 
-    assert log =~ "OPERATOR NOTICE: terminal-notice cutover recorded"
-    assert log =~ "1 notice wake(s) created before this upgrade are still pending"
-    start_scheduler(ctx.db)
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert_delivered_carrier(ctx.db, root.wake_id)
+    refute repeated_log =~ "OPERATOR NOTICE: terminal-notice cutover recorded"
+    assert Enum.count(terminal_notices(ctx.db), &(&1.wake_id == root.wake_id)) == 1
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [root.wake_id]
+             )
   end
 
   test "an undelivered intent resumes once through transport lineage when its recipient becomes eligible",
@@ -1623,7 +1796,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert {:ok, [[action_id, "pending", "undelivered"]]} =
              DB.query(
                ctx.db,
-               "SELECT id,status,json_extract(result,'$.delivery') FROM row_reaction_actions"
+               "SELECT id,status,json_extract(result,'$.delivery') FROM row_reaction_actions WHERE family='terminal-handoff'"
              )
 
     for _ <- 1..2, do: assert(:ok == Tightbeam.RowReactions.recover(ctx.db))
@@ -1652,7 +1825,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert {:ok, [[^action_id, "pending", retry_id, intent_id]]} =
              DB.query(
                ctx.db,
-               "SELECT id,status,json_extract(result,'$.wake_id'),json_extract(result,'$.intent_wake_id') FROM row_reaction_actions"
+               "SELECT id,status,json_extract(result,'$.wake_id'),json_extract(result,'$.intent_wake_id') FROM row_reaction_actions WHERE family='terminal-handoff'"
              )
 
     assert intent_id == failed.wake_id
@@ -1745,7 +1918,13 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
              handle(ctx, "attest", attest_call({:session, "holder"}, child.id, "completion"))
 
     [failed] = terminal_notices(ctx.db)
-    assert {:ok, [["pending"]]} = DB.query(ctx.db, "SELECT status FROM row_reaction_actions")
+
+    assert {:ok, [["pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM row_reaction_actions WHERE family='terminal-handoff'"
+             )
+
     path = Path.join(ctx.law, "identity/rules/row-reaction-handoff.toml")
 
     File.write!(
@@ -1759,7 +1938,13 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     Rules.load!(ctx.law, Map.keys(ctx.handlers))
     assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-    assert {:ok, [["canceled"]]} = DB.query(ctx.db, "SELECT status FROM row_reaction_actions")
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM row_reaction_actions WHERE family='terminal-handoff'"
+             )
+
     assert [^failed] = terminal_notices(ctx.db)
     assert turn_count(ctx.db, failed.wake_id) == 0
   end
@@ -1871,6 +2056,188 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     assert length(facts["attests"]) == 2
     assert Enum.count(facts["attests"], &is_map(&1["disposition"])) == 1
+  end
+
+  @identity_shapes Path.expand("fixtures/identity-seed-shapes", __DIR__)
+
+  # The path an install takes from its identity as an earlier release (or a
+  # fresh install) left it to a delivered notice, with no relearn and no other
+  # step. `:migration` is the normal boot (the rail-scope migration, then the law
+  # load); `:built_in_only` skips the migration so the live identity lacks the
+  # rule and the loader's built-in default supplies it.
+  for shape <- ["fresh", "0.1.15", "0.1.16"],
+      outcome <- ["completed", "revoked"],
+      startup <- [:migration, :built_in_only] do
+    test "a #{shape} install notifies the parent when a child assignment is #{outcome} (#{startup})",
+         ctx do
+      base = Path.join(System.tmp_dir!(), "boot-notice-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf!(base) end)
+      File.mkdir_p!(base)
+      init_identity_shape!(base, unquote(shape))
+
+      if unquote(startup) == :migration,
+        do: Tightbeam.Identity.RailScopeMigration.run!(base, ctx.db)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+        end)
+
+      if unquote(startup) == :built_in_only and unquote(shape) != "fresh",
+        do: assert(log =~ "built-in default rule assignment-terminal-handoff is in use")
+
+      if unquote(outcome) == "completed" do
+        {_parent, _child, root} = completed_child(ctx)
+        assert root.prompt =~ ~s(outcome="completed")
+      else
+        item = create_work_item(ctx, "withdrawn child")
+
+        child =
+          handle(
+            ctx,
+            "assign",
+            assign_call({:session, "notice-parent"}, "holder", "child task", item.id,
+              effect_kind: "coordination"
+            )
+          )
+
+        assert %{outcome: "revoked"} =
+                 Assignments.__handle__(
+                   ctx.db,
+                   "revoke-assignment",
+                   call("revoke-assignment", {:session, "notice-parent"}, nil, %{
+                     assignment_id: child.id,
+                     reason: "withdrawn"
+                   })
+                 )
+
+        assert [notice] = terminal_notices(ctx.db)
+        assert notice.prompt =~ ~s(outcome="revoked")
+        assert notice.session_key == "notice-parent"
+      end
+    end
+  end
+
+  @handoff "assignment-terminal-handoff"
+  @handoff_seed "rules/row-reaction-handoff.toml"
+  @bundle "scoped-notices"
+  @bundle_rule "kungfu/#{@bundle}/rules/child-notice.toml"
+  @bundle_archetype "kungfu/#{@bundle}/archetypes/worker.toml"
+  @qualified_archetype "#{@bundle}.worker"
+
+  for global <- [:builtin, :seed, :custom],
+      {scope, scoped_sessions} <- [
+        {:inside, ["notice-parent", "holder"]},
+        {:cross_scope, ["notice-parent"]},
+        {:outside, []}
+      ] do
+    test "a #{scope} completion delivers one handoff with the #{global} global rule", ctx do
+      base = scoped_handoff_identity!(unquote(global))
+
+      for key <- unquote(scoped_sessions) do
+        assert {:ok, _} =
+                 DB.query(ctx.db, "UPDATE sessions SET archetype=?1 WHERE sessionKey=?2", [
+                   @qualified_archetype,
+                   key
+                 ])
+      end
+
+      Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+
+      assert %{name: scoped_rule, owner: {:kungfu, @bundle}, archetypes: [@qualified_archetype]} =
+               Enum.find(
+                 Rules.effective_snapshot().reactions,
+                 &(&1.short_name == @handoff and
+                     &1.owner == {:kungfu, @bundle})
+               )
+
+      assert scoped_rule == "#{@bundle}.#{@handoff}"
+      {_parent, _child, notice} = completed_child(ctx)
+      assert notice.session_key == "notice-parent"
+      expected_rule = if unquote(scope) == :inside, do: scoped_rule, else: @handoff
+
+      expected_source =
+        case {unquote(scope), unquote(global)} do
+          {:inside, _} -> @bundle_rule
+          {_, :custom} -> "rules/custom-handoff.toml"
+          _ -> @handoff_seed
+        end
+
+      assert {:ok, [[^expected_rule, ^expected_source]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT json_extract(plan,'$.rule'), json_extract(plan,'$.provenance.source')
+                 FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1
+                 """,
+                 [notice.wake_id]
+               )
+
+      assert :ok = Wakes.fire_due(ctx.scheduler)
+      assert_delivered_carrier(ctx.db, notice.wake_id)
+    end
+  end
+
+  test "unrelated authored reactions still fail duplicate handoff identity validation", ctx do
+    base = scoped_handoff_identity!(:builtin)
+    path = Path.join([base, "identity", "rules", "other-reaction.toml"])
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, String.replace(handoff_seed_bytes(), @handoff, "other-reaction"))
+    Gateway.load_law!(%{base_dir: base, db: ctx.db}, Map.keys(ctx.handlers))
+
+    assert_raise ArgumentError, "duplicate reaction identity or name", fn ->
+      event = %{"kind" => "assignment", "org" => "test", "id" => "test"}
+      Rules.reaction_plans(event, %{"sessions" => []})
+    end
+  end
+
+  defp scoped_handoff_identity!(global) do
+    base = Path.join(System.tmp_dir!(), "scoped-handoff-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(base) end)
+    init_identity_shape!(base, if(global == :seed, do: "fresh", else: "0.1.15"))
+    root = Path.join(base, "identity")
+    seed = handoff_seed_bytes()
+
+    for {path, bytes} <- [
+          {@bundle_rule, String.replace(seed, ~s(["*"]), ~s(["#{@qualified_archetype}"]))},
+          {@bundle_archetype, ~s(name = "worker"\nskills = []\nwhere = ["*"]\n)},
+          {"kungfu/#{@bundle}/installed.toml",
+           ~s(name = "#{@bundle}"\npaths = ["#{@bundle_rule}", "#{@bundle_archetype}"]\n)}
+        ] do
+      destination = Path.join(root, path)
+      File.mkdir_p!(Path.dirname(destination))
+      File.write!(destination, bytes)
+    end
+
+    if global == :custom do
+      path = Path.join(root, "rules/custom-handoff.toml")
+      File.mkdir_p!(Path.dirname(path))
+
+      File.write!(
+        path,
+        String.replace(seed, "[[reaction]]", ~s([[reaction]]\nenglish = "Custom handoff"))
+      )
+    end
+
+    base
+  end
+
+  defp handoff_seed_bytes,
+    do: File.read!(Application.app_dir(:tightbeam, Path.join("priv/seed", @handoff_seed)))
+
+  defp init_identity_shape!(base, "fresh"), do: :initialized = Tightbeam.Identity.init!(base)
+
+  defp init_identity_shape!(base, shape) do
+    previous = Application.get_env(:tightbeam, :identity_seed_dir)
+    Application.put_env(:tightbeam, :identity_seed_dir, Path.join(@identity_shapes, shape))
+
+    try do
+      :initialized = Tightbeam.Identity.init!(base)
+    after
+      if previous,
+        do: Application.put_env(:tightbeam, :identity_seed_dir, previous),
+        else: Application.delete_env(:tightbeam, :identity_seed_dir)
+    end
   end
 
   defp forget_reaction_ledger!(db) do

@@ -425,7 +425,7 @@ defmodule Tightbeam.SentinelsTest do
     end
 
     test "shipped landing watcher can be configured and enabled from setup.md", ctx do
-      bundle_root = Path.expand("../priv/kungfu", __DIR__)
+      bundle_root = Path.expand("support/fixtures/kungfu", __DIR__)
       shipped_bundle = Path.join(bundle_root, "agentic-engineering")
       previous_bundle_root = Application.get_env(:tightbeam, :kungfu_bundle_root_dir)
       previous_identity_source = Application.get_env(:tightbeam, :identity_source_dir)

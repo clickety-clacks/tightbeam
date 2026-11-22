@@ -145,7 +145,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     delivery_rule = "kungfu/#{kungfu}/rules/delivery.toml"
 
     File.cp!(
-      "priv/kungfu/agentic-engineering/rules/delivery.toml",
+      "test/support/fixtures/kungfu/agentic-engineering/rules/delivery.toml",
       Path.join(kungfu_rules_dir, "delivery.toml")
     )
 
@@ -197,14 +197,17 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
       File.write!(Path.join(base, "identity/rules/#{name}.toml"), source)
     end
 
-    for name <- ~w(row-reaction-handoff.toml row-reaction-terminal-action.toml) do
+    for path <- [
+          "priv/seed/rules/row-reaction-handoff.toml",
+          "test/support/fixtures/rules/row-reaction-terminal-action.toml"
+        ] do
       File.write!(
-        Path.join([base, "identity/rules", name]),
-        substrate_wildcard_rules(File.read!(Path.join("priv/seed/rules", name)))
+        Path.join([base, "identity/rules", Path.basename(path)]),
+        substrate_wildcard_rules(File.read!(path))
       )
     end
 
-    Rules.load!(base, Map.keys(handlers))
+    Tightbeam.TerminalReactionFixture.load_work_items!(base, Map.keys(handlers), false)
     # Real wake scheduling and atomic carrier admission; the local doorbell
     # does not execute a provider or synthesize an assistant turn.
     # Nothing calls an adapter or manufactures an inference/tool-call result.
@@ -505,7 +508,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
         # The fixture's rest already carries the posture gate the shipped file
         # ends with; take only the shipped completion rule.
         shipped_completion =
-          File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+          File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml")
           |> String.split("\n# Posture gate", parts: 2)
           |> hd()
           |> substrate_wildcard_rules()

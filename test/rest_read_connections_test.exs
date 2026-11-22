@@ -103,6 +103,8 @@ defmodule Tightbeam.RestReadConnectionsTest do
     reads =
       Task.async(fn ->
         %{
+          observer_sequences: get(ctx, "/api/session-message-sequences", "tbc_test"),
+          user_sequences: get(ctx, "/api/session-message-sequences", ctx.device.token),
           observer_history: get(ctx, "/api/sessions/#{key}/messages", "tbc_test"),
           user_history: get(ctx, "/api/sessions/#{key}/messages", ctx.device.token),
           detail: get(ctx, "/api/sessions/#{key}", ctx.device.token),
@@ -121,6 +123,17 @@ defmodule Tightbeam.RestReadConnectionsTest do
 
       assert Enum.map(JSON.decode!(response.resp_body)["items"], & &1["content"]) ==
                ["message 1", "message 2", "message 3"]
+    end
+
+    [_, _, latest] = StateResources.query_messages_for_session(ctx.db, key)
+
+    for name <- [:observer_sequences, :user_sequences] do
+      response = responses[name]
+      assert response.status == 200, response.resp_body
+
+      assert %{"sessionKey" => key, "latestMessageSeq" => latest.seq} in JSON.decode!(
+               response.resp_body
+             )["items"]
     end
 
     assert responses.detail.status == 200, responses.detail.resp_body
@@ -189,6 +202,21 @@ defmodule Tightbeam.RestReadConnectionsTest do
 
     assert responses["/api/sessions/#{key}/messages/#{message_id}"].status == 200
     assert responses["/api/sessions"].status == 200
+  end
+
+  test "bulk sequence query uses one indexed seek per session without scanning history", ctx do
+    principal = %{kind: "observer", id: "observer", is_admin: false, core_detail_trace: self()}
+    StateResources.query_session_message_sequences(ctx.db, principal)
+    assert [{sql, params}] = traced_queries([])
+    {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, params)
+    details = Enum.map(plan, &List.last/1)
+
+    assert Enum.any?(
+             details,
+             &String.contains?(&1, "SEARCH m USING COVERING INDEX messages_session")
+           )
+
+    refute Enum.any?(details, &Regex.match?(~r/SCAN (m|messages)\b/, &1))
   end
 
   test "a read right after a committed write sees the write", ctx do

@@ -41,7 +41,11 @@ defmodule Tightbeam.SessionLane do
     reservation_owner_ref: nil,
     settlement_waiters: [],
     settlement_rechecking: false,
-    deferred_drain: false
+    deferred_drain: false,
+    # Set when the last start attempt found a standing park fence, so a
+    # diagnostic read can say why a queued turn is not starting. Cleared on a
+    # start attempt that finds none.
+    held: nil
   ]
 
   @doc """
@@ -195,10 +199,22 @@ defmodule Tightbeam.SessionLane do
   end
 
   # Both acceptance and execution share the lane mailbox with terminal handling.
+  # A failure inside either callback belongs to the caller that supplied it:
+  # it is raised again here, in the caller, while the lane and its running
+  # turn carry on.
   def change_at_boundary(session_key, apply, defer) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{pid, _}] -> GenServer.call(pid, {:change_at_boundary, apply, defer}, :infinity)
-      [] -> :no_lane
+      [{pid, _}] ->
+        case GenServer.call(pid, {:change_at_boundary, apply, defer}, :infinity) do
+          {:change_callback_failed, kind, reason, stacktrace} ->
+            :erlang.raise(kind, reason, stacktrace)
+
+          result ->
+            result
+        end
+
+      [] ->
+        :no_lane
     end
   end
 
@@ -255,6 +271,7 @@ defmodule Tightbeam.SessionLane do
        reservationPresent: not is_nil(state.reservation_token),
        settlementRechecking: state.settlement_rechecking,
        deferredDrain: state.deferred_drain,
+       held: state.held,
        taskPresent: not is_nil(state.task_ref),
        taskAlive: is_pid(state.task_pid) and Process.alive?(state.task_pid)
      }, state}
@@ -500,9 +517,21 @@ defmodule Tightbeam.SessionLane do
 
   def handle_call({:change_at_boundary, apply, defer}, _from, state) do
     result =
-      if not is_nil(state.task_ref) or Ledger.running?(state.db, state.session_key),
-        do: defer.(),
-        else: apply.()
+      try do
+        if not is_nil(state.task_ref) or Ledger.running?(state.db, state.session_key),
+          do: defer.(),
+          else: apply.()
+      catch
+        # The callbacks are the caller's code. Letting their exit stop the
+        # lane would kill the turn it is running and lose the caller's reply.
+        kind, reason ->
+          Logger.error(
+            "session configuration change failed inside lane #{state.session_key}: " <>
+              Exception.format_banner(kind, reason, __STACKTRACE__)
+          )
+
+          {:change_callback_failed, kind, reason, __STACKTRACE__}
+      end
 
     {:reply, result, state}
   end
@@ -697,9 +726,21 @@ defmodule Tightbeam.SessionLane do
 
   defp claim_and_start(state) do
     if harness_parked?(state) do
-      state
+      %{state | held: held_by_fence(state)}
     else
-      claim_next(state)
+      claim_next(%{state | held: nil})
+    end
+  end
+
+  defp held_by_fence(state) do
+    with {:ok, [[harness, host]]} <-
+           DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [
+             state.session_key
+           ]),
+         %{} = hold <- Tightbeam.HarnessHealth.Hold.for_host(state.db, harness, host) do
+      Map.take(hold, [:incident_id, :failure_class, :since, :release])
+    else
+      _ -> %{incident_id: nil, failure_class: nil, since: nil, release: nil}
     end
   end
 
@@ -770,7 +811,13 @@ defmodule Tightbeam.SessionLane do
         _ -> nil
       end
 
+    refused? = match?({:error, %{work_outcome: :did_not_perform}}, outcome)
     terminal_opts = [owner_lease: state.current_owner_lease]
+
+    terminal_opts =
+      if refused?,
+        do: Keyword.put(terminal_opts, :work_outcome, :did_not_perform),
+        else: terminal_opts
 
     terminal_opts =
       if prewrite_evidence,
@@ -826,6 +873,9 @@ defmodule Tightbeam.SessionLane do
           {"failed", error_text(reason), nil, nil, nil}
       end
 
+    # Alert routing settles on prompt receipt. The turn itself records work failure.
+    receipt_status = if refused?, do: "delivered", else: terminal
+
     transaction =
       DB.transaction_then(
         state.db,
@@ -843,7 +893,7 @@ defmodule Tightbeam.SessionLane do
               HarnessHealth.settle_other_route_in_txn(
                 txn,
                 seq,
-                terminal,
+                receipt_status,
                 System.system_time(:millisecond)
               )
 
@@ -857,6 +907,8 @@ defmodule Tightbeam.SessionLane do
           result
         end
       )
+
+    required_record? = refused? or not is_nil(prewrite_evidence)
 
     case transaction do
       {:ok, {won, recorded}} ->
@@ -879,7 +931,7 @@ defmodule Tightbeam.SessionLane do
                   do: Tightbeam.ReminderDelivery.delivered_in_txn(txn, seq)
 
                 recorded =
-                  if not is_nil(prewrite_evidence) and is_function(in_txn, 1),
+                  if required_record? and is_function(in_txn, 1),
                     do: in_txn.(txn),
                     else: nil
 
@@ -887,7 +939,7 @@ defmodule Tightbeam.SessionLane do
                   HarnessHealth.settle_other_route_in_txn(
                     txn,
                     seq,
-                    terminal,
+                    receipt_status,
                     System.system_time(:millisecond)
                   )
 
@@ -910,7 +962,7 @@ defmodule Tightbeam.SessionLane do
               terminal,
               error,
               publish,
-              if(prewrite_evidence, do: after_commit, else: nil),
+              if(required_record?, do: after_commit, else: nil),
               won,
               recorded
             )
@@ -1125,10 +1177,20 @@ defmodule Tightbeam.SessionLane do
   defp ambiguous,
     do: {:error, %{code: "turn_status_ambiguous", message: "turn liveness is ambiguous"}}
 
-  defp error_text(reason) when is_binary(reason), do: reason
-  defp error_text(%{code: code} = reason) when is_binary(code), do: JSON.encode!(reason)
-  defp error_text(%{"code" => code} = reason) when is_binary(code), do: JSON.encode!(reason)
-  defp error_text(reason), do: inspect(reason)
+  @doc false
+  def error_text(reason) when is_binary(reason), do: reason
+  def error_text(%{code: code} = reason) when is_binary(code), do: JSON.encode!(reason)
+  def error_text(%{"code" => code} = reason) when is_binary(code), do: JSON.encode!(reason)
+
+  # ACP reasons carry structured message and detail fields even when their code
+  # is numeric. Keep those fields readable by the terminal recognizer.
+  def error_text(%{"message" => message} = reason) when is_binary(message) do
+    JSON.encode!(reason)
+  rescue
+    _ -> inspect(reason)
+  end
+
+  def error_text(reason), do: inspect(reason)
 
   defp split_terminal_recorded({:terminal_recorded, recorded, route_publication}),
     do: {recorded, route_publication}

@@ -126,6 +126,51 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     lane
   end
 
+  test "the shared adapter persists an assistant segment after overload without raising", %{
+    db: db
+  } do
+    seq = enqueue!(db, "k1", "hello")
+
+    state = %Tightbeam.Acp.Adapter{
+      db: db,
+      harness: :claude,
+      chunks: %{"sid" => []},
+      tool_turns: %{"sid" => %{session_key: "k1", turn_seq: seq}}
+    }
+
+    notification =
+      {:acp_notification, "session/update",
+       %{
+         "sessionId" => "sid",
+         "update" => %{
+           "sessionUpdate" => "agent_message_chunk",
+           "messageId" => "message-1",
+           "content" => %{"type" => "text", "text" => "kept"}
+         }
+       }}
+
+    overload!(db)
+    parent = self()
+
+    waiter =
+      Task.async(fn ->
+        send(parent, :receiving_segment)
+        result = Tightbeam.Acp.Adapter.handle_info(notification, state)
+        # The scope must not mark the adapter's unrelated calls as owed work.
+        send(parent, {:scope_restored, DB.owed_work?()})
+        result
+      end)
+
+    assert_receive :receiving_segment
+    assert Task.yield(waiter, 300) == nil
+    assert {:message_queue_len, 128} = Process.info(Process.whereis(db), :message_queue_len)
+    relieve!(db)
+    assert {:noreply, updated} = Task.await(waiter, 5_000)
+    assert updated.chunks["sid"] != []
+    assert_receive {:scope_restored, false}
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turn_events WHERE turnSeq=?1", [seq])
+  end
+
   describe "the owed-work scope" do
     test "waits out a refused call and sends it once the queue has room", %{db: db} do
       overload!(db)
@@ -353,7 +398,7 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     end
   end
 
-  test "Harklight attachment keeps its existing worker-owned refusal retry", %{db: db} do
+  test "Harklight feed keeps its worker-owned readiness retry", %{db: db} do
     manager = start_supervised!({Tightbeam.HarklightWakes, db: db})
     worker = self()
     :sys.get_state(manager)
@@ -361,8 +406,8 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     overload!(db)
 
     try do
-      assert {:error, "attachment_state_unavailable"} =
-               GenServer.call(manager, {:attached, "attachment"}, 500)
+      assert {:error, "feed_state_unavailable"} =
+               GenServer.call(manager, {:feed_ready, "attachment"}, 500)
 
       assert MapSet.new() == GenServer.call(manager, {:unlistened_handles, []}, 500)
     after

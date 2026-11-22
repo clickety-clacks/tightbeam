@@ -47,6 +47,9 @@ defmodule Tightbeam.HarnessHealthTest do
     end
   end
 
+  @judgment_words ~w(must required requires should please invalid error forbidden refus denied violat cannot) ++
+                    ["not allowed", "blocked by"]
+
   setup do
     db = :"harness_health_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -1387,13 +1390,25 @@ defmodule Tightbeam.HarnessHealthTest do
                  })
              })
 
+    # The cited attest must carry the cited review artifact (H1); citing the
+    # unrelated spec as the review artifact still refuses.
     assert %{code: "invalid_promotion_close", message: "invalid_promotion_close"} =
              handlers["harness-health-close-promotion"].(%{
                principal: {:user, "flynn"},
                params:
                  Map.merge(close_params, %{
-                   spec_artifact_id: unrelated_spec_id,
-                   idempotency_key: "public-promotion-unrelated-spec"
+                   review_artifact_id: unrelated_spec_id,
+                   idempotency_key: "public-promotion-unrelated-review-artifact"
+                 })
+             })
+
+    assert %{code: "invalid_promotion_close", message: "invalid_promotion_close"} =
+             handlers["harness-health-close-promotion"].(%{
+               principal: {:user, "flynn"},
+               params:
+                 Map.merge(close_params, %{
+                   spec_artifact_id: "art_public_promotion_missing_spec",
+                   idempotency_key: "public-promotion-missing-spec"
                  })
              })
 
@@ -1403,48 +1418,21 @@ defmodule Tightbeam.HarnessHealthTest do
                params: close_params
              })
 
-    assert {:ok, []} =
-             DB.query(ctx.db, "UPDATE assignments SET holderKey=?1 WHERE id=?2", [
-               member.session,
-               review_id
-             ])
-
-    assert {:ok, []} =
-             DB.query(ctx.db, "UPDATE attests SET bySession=?1 WHERE id=?2", [
-               member.session,
-               attest_id
-             ])
-
-    assert %{code: "invalid_promotion_close", message: "invalid_promotion_close"} =
-             handlers["harness-health-close-promotion"].(%{
-               principal: {:user, "flynn"},
-               params: %{close_params | idempotency_key: "public-promotion-same-holder"}
-             })
-
-    assert {:ok, []} =
-             DB.query(ctx.db, "UPDATE assignments SET holderKey=?1 WHERE id=?2", [
-               ctx.outside_session,
-               review_id
-             ])
-
-    assert {:ok, []} =
-             DB.query(ctx.db, "UPDATE attests SET bySession=?1 WHERE id=?2", [
-               ctx.outside_session,
-               attest_id
-             ])
-
     assert %{
              ok: true,
-             promotion: %{
-               state: "closed",
-               namedClass: "provider-network-drift",
-               reviewAttestId: ^attest_id
-             }
+             promotion:
+               %{
+                 state: "closed",
+                 namedClass: "provider-network-drift",
+                 reviewAttestId: ^attest_id
+               } = closed
            } =
              handlers["harness-health-close-promotion"].(%{
                principal: {:user, "flynn"},
                params: close_params
              })
+
+    refute Map.has_key?(closed, :fyi)
 
     assert %{ok: true, promotion: duplicate} =
              handlers["harness-health-close-promotion"].(%{
@@ -1470,11 +1458,257 @@ defmodule Tightbeam.HarnessHealthTest do
                [String.duplicate("e", 64), report_id]
              )
 
-    assert %{code: "invalid_promotion_close", message: "invalid_promotion_close"} =
+    # The close is already recorded. Repeating it after the report's recorded
+    # hash changed returns the closed promotion and states the new mismatch.
+    assert %{ok: true, promotion: %{state: "closed", fyi: [line]}} =
              handlers["harness-health-close-promotion"].(%{
                principal: {:user, "flynn"},
                params: %{close_params | idempotency_key: "public-promotion-mutated-report"}
              })
+
+    assert line ==
+             "FYI: review attest #{attest_id} cites sha256 #{report_sha}; review artifact " <>
+               "#{report_id} is sha256 #{String.duplicate("e", 64)}; decide for yourself whether that is acceptable"
+
+    assert {:ok, [["closed", "tightbeam-specs/public-promotion.md", ^spec_sha]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,specRef,specSha256 FROM harness_health_class_promotions WHERE id=?1",
+               [promotion_id]
+             )
+  end
+
+  test "recurring review outcomes and promotion-close mismatches are recorded with FYIs", ctx do
+    [member | _] = ctx.sessions
+    handlers = Gateway.handlers(%{db: ctx.db})
+    {first, second, promotion_id} = recurring_other_incidents(ctx, "recurring FYI evidence")
+
+    # HH6: a recurring description with an open case may close its review with
+    # another outcome. The case stays linked and open for its own close.
+    line =
+      "FYI: incidents with this description have recurred 2 times and promotion case " <>
+        "#{promotion_id} is open; this review records confirmed_other; " <>
+        "decide for yourself whether that is acceptable"
+
+    review = %{
+      principal: {:session, member.session},
+      params: %{
+        incident_id: second.id,
+        outcome: "confirmed_other",
+        cause: "the recurrence is a known operating condition",
+        idempotency_key: "recurring-fyi-review"
+      }
+    }
+
+    assert %{ok: true, review: %{state: "closed", outcome: "confirmed_other", fyi: [^line]}} =
+             handlers["harness-health-review-other"].(review)
+
+    assert {:ok, [["closed", "confirmed_other", ^promotion_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,outcome,promotionCaseId FROM harness_health_other_reviews WHERE incidentId=?1",
+               [second.id]
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM harness_health_class_promotions WHERE id=?1", [
+               promotion_id
+             ])
+
+    assert %{ok: true, review: %{"fyi" => [^line]}} =
+             handlers["harness-health-review-other"].(review)
+
+    # An unknown review outcome still refuses (HH8).
+    assert {:error, %{code: "invalid_review_outcome"}} =
+             HarnessHealth.review_other(ctx.db, %{
+               incident_id: first.id,
+               outcome: "no-such-outcome",
+               cause: "unknown outcome",
+               principal: {:session, member.session},
+               idempotency_key: "recurring-fyi-unknown-outcome"
+             })
+
+    # H2 and H3: the close stores the spec artifact's own path and hash, and
+    # states each difference from the cited records.
+    at = System.system_time(:millisecond)
+    work_item_id = "wi_recurring_fyi"
+    candidate_id = "asg_recurring_fyi_candidate"
+    review_id = "asg_recurring_fyi_review"
+    spec_id = "art_recurring_fyi_spec"
+    report_id = "art_recurring_fyi_report"
+    attest_id = "att_recurring_fyi_clean"
+    bound_sha = String.duplicate("a", 64)
+    spec_sha = String.duplicate("f", 64)
+    report_sha = String.duplicate("b", 64)
+    candidate_commit = String.duplicate("c", 40)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO work_items(id,title,specRefName,specRefSha256,ownerUserId,createdByUser,createdAt) VALUES(?1,'recurring fyi','specs/x.md',?2,'flynn','flynn',?3)",
+               [work_item_id, bound_sha, at]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES(?1,'candidate',?2,'flynn',?3,'open',?4)",
+               [candidate_id, member.session, at, work_item_id]
+             )
+
+    # The reviewer holds the review card and is also the candidate holder and
+    # the source session of both incidents.
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,workItemId,reviewsAssignmentId) VALUES(?1,'self review',?2,'flynn',?3,'open',?4,?5)",
+               [review_id, member.session, at, work_item_id, candidate_id]
+             )
+
+    for {id, kind, path, sha} <- [
+          {spec_id, "spec", "specs/x.md", spec_sha},
+          {report_id, "report", "reports/x.md", report_sha}
+        ] do
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO artifacts(artifactId,kind,title,createdBySession,workItemId,originPath,contentSha256,state,createdAt,updatedAt) VALUES(?1,?2,?1,?3,?4,?5,?6,'in-workspace',?7,?7)",
+                 [id, kind, member.session, work_item_id, path, sha, at]
+               )
+    end
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests(id,assignmentId,kind,verdictKind,bySession,commitRefs,artifactId,contentSha256,ts) VALUES(?1,?2,'verdict','reviewed-clean',?3,?4,?5,?6,?7)",
+               [
+                 attest_id,
+                 review_id,
+                 member.session,
+                 JSON.encode!([%{"repo" => "node-b", "commit" => candidate_commit}]),
+                 report_id,
+                 report_sha,
+                 at
+               ]
+             )
+
+    close = %{
+      principal: {:session, member.session},
+      params: %{
+        promotion_id: promotion_id,
+        named_class: "provider-network-drift",
+        spec_artifact_id: spec_id,
+        review_artifact_id: report_id,
+        review_attest_id: attest_id,
+        review_assignment_id: review_id,
+        candidate_commit: candidate_commit,
+        idempotency_key: "recurring-fyi-close"
+      }
+    }
+
+    # H1 still refuses: a cited attest that is not a reviewed-clean verdict.
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE attests SET verdictKind='changes-requested' WHERE id=?1", [
+               attest_id
+             ])
+
+    assert %{code: "invalid_promotion_close"} =
+             handlers["harness-health-close-promotion"].(
+               put_in(close, [:params, :idempotency_key], "recurring-fyi-not-clean")
+             )
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE attests SET verdictKind='reviewed-clean' WHERE id=?1", [
+               attest_id
+             ])
+
+    suffix = "; decide for yourself whether that is acceptable"
+
+    expected = [
+      "FYI: work item #{work_item_id} binds spec specs/x.md sha256 #{bound_sha}; " <>
+        "spec artifact #{spec_id} is specs/x.md sha256 #{spec_sha}" <> suffix,
+      "FYI: reviewer session #{member.session} is also the candidate holder" <> suffix,
+      "FYI: reviewer session #{member.session} is also the source session of incident #{first.id}" <>
+        suffix,
+      "FYI: reviewer session #{member.session} is also the source session of incident #{second.id}" <>
+        suffix,
+      "FYI: reviewer session #{member.session} is also the caller" <> suffix
+    ]
+
+    assert %{ok: true, promotion: %{state: "closed", fyi: ^expected}} =
+             handlers["harness-health-close-promotion"].(close)
+
+    assert {:ok, [["closed", "specs/x.md", ^spec_sha, ^report_id, ^attest_id, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,specRef,specSha256,reviewArtifactId,reviewAttestId,reviewedClean FROM harness_health_class_promotions WHERE id=?1",
+               [promotion_id]
+             )
+
+    assert %{ok: true, promotion: %{"fyi" => ^expected}} =
+             handlers["harness-health-close-promotion"].(close)
+
+    assert %{ok: true, promotion: %{fyi: ^expected}} =
+             handlers["harness-health-close-promotion"].(
+               put_in(close, [:params, :idempotency_key], "recurring-fyi-close-again")
+             )
+
+    for line <- expected, word <- @judgment_words do
+      refute String.contains?(String.downcase(line), word)
+    end
+  end
+
+  defp recurring_other_incidents(ctx, description) do
+    [member | _] = ctx.sessions
+    at = System.system_time(:millisecond)
+
+    common = %{
+      harness: "claude",
+      host: "testhost",
+      source_session_key: member.session,
+      principal: {:session, member.session},
+      description: description,
+      evidence_mode: "exact_error",
+      observed_state: "provider route failed",
+      exact_observed_error: "recurring reset",
+      exact_probe: "provider health probe",
+      recovery_condition: "a normal provider turn completes",
+      not_known_class_reason: "not one of the named classes",
+      world_status: "UNKNOWN",
+      redaction_confirmed: true
+    }
+
+    assert {:opened, first} =
+             HarnessHealth.observe_other(
+               ctx.db,
+               Map.merge(common, %{
+                 observed_at: at - 100,
+                 accepted_at: at - 100,
+                 valid_until: at - 1,
+                 idempotency_key: description <> " first"
+               })
+             )
+
+    assert {:opened, second} =
+             HarnessHealth.observe_other(
+               ctx.db,
+               Map.merge(common, %{
+                 observed_at: at,
+                 accepted_at: at,
+                 valid_until: at + 500,
+                 idempotency_key: description <> " second"
+               })
+             )
+
+    assert {:ok, [[promotion_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT promotionCaseId FROM harness_health_other_reviews WHERE incidentId=?1",
+               [second.id]
+             )
+
+    assert is_binary(promotion_id)
+    {first, second, promotion_id}
   end
 
   test "captured terminal errors preserve auth, rate-limit, and unrelated classes" do
@@ -2268,6 +2502,324 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  # These response shapes are exercised by the adapter's model-invalid-params
+  # and model-refusal fixtures in acp_adapter_test.exs.
+  for {name, reason, diagnostic} <- [
+        {"fresh invalid params", %{"code" => -32_602, "message" => "Invalid params"},
+         %{"phase" => "model", "kind" => "jsonrpc_error"}},
+        {"fresh invalid model option",
+         %{"code" => -32_000, "message" => "Invalid value for config option model"},
+         %{"phase" => "model", "kind" => "jsonrpc_error"}},
+        {"wrapped invalid params",
+         {:model_apply_failed, %{"code" => -32_602, "message" => "Invalid params"}}, nil},
+        {"wrapped invalid model option",
+         {:model_apply_failed,
+          %{"code" => -32_000, "message" => "Invalid value for config option model"}}, nil},
+        {"double quoted model name",
+         %{"code" => -32_603, "message" => ~s(Model "future-model" not found)}, nil},
+        {"typed atom-key model unavailable",
+         %{code: "model_unavailable", message: "Selected configuration rejected"}, nil},
+        {"typed string-key model unavailable",
+         %{"code" => "model_unavailable", "message" => "Selected configuration rejected"}, nil},
+        {"wrapped typed atom-key model unavailable",
+         {:model_apply_failed,
+          %{code: "model_unavailable", message: "Selected configuration rejected"}}, nil},
+        {"wrapped typed string-key model unavailable",
+         {:model_apply_failed,
+          %{"code" => "model_unavailable", "message" => "Selected configuration rejected"}}, nil}
+      ] do
+    test "model selection refusal is not replayed: #{name}", ctx do
+      [failed, _second, healthy] = ctx.sessions
+
+      source =
+        fail_health_turn!(
+          ctx.db,
+          failed.session,
+          "selection-refusal",
+          "original prompt",
+          Tightbeam.ErrorDiagnostic.diagnosed(
+            unquote(Macro.escape(reason)),
+            unquote(Macro.escape(diagnostic))
+          ),
+          stage: :session
+        )
+
+      restore_health_turn!(ctx.db, healthy.session, "selection-restoration")
+
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [
+                 source.message_id
+               ])
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+                 [source.seq]
+               )
+    end
+  end
+
+  for {name, reason} <- [
+        {"model phase", %{code: -32_000, message: "Sign in to continue"}},
+        {"model wrapper",
+         {:model_apply_failed, %{"code" => -32_000, "message" => "Sign in to continue"}}}
+      ] do
+    test "authentication-required response remains recoverable: #{name}", ctx do
+      [failed, _second, healthy] = ctx.sessions
+
+      source =
+        fail_health_turn!(
+          ctx.db,
+          failed.session,
+          "authentication-required",
+          "recover this prompt",
+          Tightbeam.ErrorDiagnostic.diagnosed(
+            unquote(Macro.escape(reason)),
+            %{"phase" => "model", "kind" => "jsonrpc_error"}
+          ),
+          stage: :session
+        )
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+                 [source.seq]
+               )
+
+      restore_health_turn!(ctx.db, healthy.session, "authentication-restoration")
+      restore_health_turn!(ctx.db, healthy.session, "second-authentication-restoration")
+
+      assert {:ok, [[2]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [
+                 source.message_id
+               ])
+    end
+  end
+
+  test "transport and rate limits during model application still recover once", ctx do
+    [failed, _second, healthy] = ctx.sessions
+
+    for {reason, kind} <- [
+          {{:adapter_unavailable, :noproc}, "exit"},
+          {:timeout, "timeout"},
+          {@captured_claude_rate_limit, "jsonrpc_error"},
+          {%{"status" => 429, "message" => "Too many requests"}, "http_response"}
+        ] do
+      message_id = "model-application-outage-#{kind}-#{System.unique_integer([:positive])}"
+
+      source =
+        fail_health_turn!(
+          ctx.db,
+          failed.session,
+          message_id,
+          "recover this prompt",
+          Tightbeam.ErrorDiagnostic.diagnosed(
+            {:model_apply_failed, reason},
+            %{"phase" => "model", "kind" => kind}
+          ),
+          stage: :session
+        )
+
+      restore_health_turn!(ctx.db, healthy.session, "outage-restoration-#{message_id}")
+      restore_health_turn!(ctx.db, healthy.session, "second-restoration-#{message_id}")
+
+      assert {:ok, [[2]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [message_id])
+
+      {:ok, redelivery} = Ledger.claim_next(ctx.db, failed.session, "recovery-test")
+      assert redelivery.message_id == source.message_id
+
+      assert :ok =
+               Ledger.finish(ctx.db, redelivery.seq, "delivered", nil,
+                 owner_lease: redelivery.owner_lease
+               )
+    end
+  end
+
+  test "quoted model-not-found refusal is attempted once after route recovery", ctx do
+    [failed, _second, healthy] = ctx.sessions
+
+    source =
+      fail_health_turn!(
+        ctx.db,
+        failed.session,
+        "quoted-model-refusal",
+        "do not replay this prompt",
+        %{"code" => -32_603, "message" => "Model 'claude-haiku-55' not found"},
+        stage: :session,
+        assignment_id: failed.assignment
+      )
+
+    restore_health_turn!(ctx.db, healthy.session, "quoted-model-restoration")
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE messageId=?1", [source.message_id])
+  end
+
+  test "pre-request model refusal is not recorded or redelivered after route recovery", ctx do
+    [failed, second, healthy] = ctx.sessions
+
+    sources =
+      for {ref, message_id, reason} <- [
+            {failed, "pi-model-refusal",
+             %{"code" => -32_603, "message" => "pi set_model failed: Model not found"}},
+            {failed, "mapped-model-refusal", {:model_apply_failed, :model_unavailable}},
+            {second, "second-mapped-model-refusal", {:model_apply_failed, :model_unavailable}}
+          ] do
+        fail_health_turn!(
+          ctx.db,
+          ref.session,
+          message_id,
+          "do not replay this prompt",
+          reason,
+          stage: :session,
+          assignment_id: ref.assignment
+        )
+      end
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq IN (?1,?2,?3)",
+               Enum.map(sources, & &1.seq)
+             )
+
+    assert [incident] = HarnessHealth.active(ctx.db)
+    assert incident.failureClass == "model_unavailable"
+    assert incident.repair.action == "tune"
+
+    assert ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "testhost",
+             "model_unavailable"
+           )
+
+    assert HarnessHealth.get(ctx.db, incident.id).observations
+           |> Enum.map(& &1.correlation_id)
+           |> MapSet.new() ==
+             sources
+             |> Enum.drop(1)
+             |> Enum.map(&"harness-turn:#{&1.seq}:model_unavailable")
+             |> MapSet.new()
+
+    _restoration = restore_health_turn!(ctx.db, healthy.session, "pi-route-restoration")
+
+    refute ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "testhost",
+             "model_unavailable"
+           )
+
+    assert {:ok, [[3]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
+                 "('pi-model-refusal','mapped-model-refusal','second-mapped-model-refusal') " <>
+                 "AND status='failed'"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
+                 "('pi-model-refusal','mapped-model-refusal','second-mapped-model-refusal') " <>
+                 "AND status='queued'"
+             )
+  end
+
+  test "closed assignment source is skipped while open assignment recovery proceeds", ctx do
+    [closed, open, healthy] = ctx.sessions
+    auth_refusal = %{"status" => 401, "error" => "unauthorized"}
+
+    closed_source =
+      fail_health_turn!(
+        ctx.db,
+        closed.session,
+        "closed-assignment-source",
+        "closed assignment prompt",
+        auth_refusal,
+        assignment_id: closed.assignment
+      )
+
+    open_source =
+      fail_health_turn!(
+        ctx.db,
+        open.session,
+        "open-assignment-source",
+        "open assignment prompt",
+        auth_refusal,
+        assignment_id: open.assignment
+      )
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 "INSERT INTO assignment_revocations " <>
+                   "(id,assignmentId,revokedAt,revokedBySession,reason) " <>
+                   "VALUES ('rev_health_closed',?1,100,?2,'closed source fixture')",
+                 [closed.assignment, closed.session]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 "INSERT INTO assignment_revocation_generations " <>
+                   "(revocationId,assignmentId,reopeningId) " <>
+                   "VALUES ('rev_health_closed',?1,NULL)",
+                 [closed.assignment]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 "UPDATE assignments SET state='closed',outcome='revoked',closedAt=100," <>
+                   "closedBySession=?2 WHERE id=?1",
+                 [closed.assignment, closed.session]
+               )
+
+               :ok
+             end)
+
+    restoration = restore_health_turn!(ctx.db, healthy.session, "closed-source-restoration")
+
+    assert {:ok, [[nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT restorationTurnSeq,redeliveryTurnSeq FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq=?1",
+               [closed_source.seq]
+             )
+
+    assert {:ok, [[restoration_seq, redelivery_seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT restorationTurnSeq,redeliveryTurnSeq FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq=?1",
+               [open_source.seq]
+             )
+
+    assert restoration_seq == restoration.seq
+    assert is_integer(redelivery_seq)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns " <>
+                 "WHERE messageId='closed-assignment-source' AND status='queued'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns " <>
+                 "WHERE messageId='open-assignment-source' AND status='queued'"
+             )
+  end
+
   test "unclassified and compaction failures redeliver once on same-harness success", ctx do
     [first, second, healthy | _] = ctx.sessions
 
@@ -2429,7 +2981,8 @@ defmodule Tightbeam.HarnessHealthTest do
         "interrupted-dispatched-source",
         "original dispatched prompt",
         :interrupted_outcome_unknown,
-        assignment_id: dispatched.assignment
+        assignment_id: dispatched.assignment,
+        stored_error: "interrupted: adapter exited before reporting its result"
       )
 
     parented_source =
@@ -2439,7 +2992,8 @@ defmodule Tightbeam.HarnessHealthTest do
         "interrupted-parented-source",
         "original parented prompt",
         :interrupted_outcome_unknown,
-        assignment_id: parented.assignment
+        assignment_id: parented.assignment,
+        stored_error: "interrupted: adapter exited before reporting its result"
       )
 
     main_session = ctx.main_session
@@ -2463,7 +3017,11 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert Enum.all?(wake_rows, fn [session_key, prompt] ->
              session_key == ctx.main_session and
-               String.contains?(prompt, "Should the original message be redelivered?")
+               String.contains?(prompt, "Should the original message be redelivered?") and
+               String.contains?(
+                 prompt,
+                 "Reason: interrupted: adapter exited before reporting its result"
+               )
            end)
 
     assert Enum.any?(wake_rows, fn [_session_key, prompt] ->
@@ -4395,6 +4953,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
   defp fail_health_turn!(db, session_key, message_id, prompt, reason, opts \\ []) do
     terminal = Keyword.get(opts, :terminal, "failed")
+    failed_stage = Keyword.get(opts, :stage, :prompt)
 
     {:ok, source_seq} =
       Ledger.enqueue(db, %{
@@ -4416,10 +4975,11 @@ defmodule Tightbeam.HarnessHealthTest do
                         txn,
                         source_seq,
                         terminal,
-                        if(terminal == "failed_unknown",
-                          do: "interrupted: outcome unknown",
-                          else: "HTTP 401"
-                        ),
+                        Keyword.get_lazy(opts, :stored_error, fn ->
+                          if terminal == "failed_unknown",
+                            do: "interrupted: outcome unknown",
+                            else: "HTTP 401"
+                        end),
                         owner_lease: turn.owner_lease
                       )
 
@@ -4436,7 +4996,7 @@ defmodule Tightbeam.HarnessHealthTest do
                    txn,
                    session,
                    turn,
-                   :prompt,
+                   failed_stage,
                    reason
                  )
                end

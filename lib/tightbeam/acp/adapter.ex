@@ -62,6 +62,7 @@ defmodule Tightbeam.Acp.Adapter do
     :on_guidance,
     :on_guidance_verified,
     :on_subagent_event,
+    :launch_identity_status,
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
@@ -126,6 +127,16 @@ defmodule Tightbeam.Acp.Adapter do
           | {:error, term()}
   def new_candidate_session(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 30_000)
+
+  @doc "Prepare a temporary summary session with a bounded ACP request budget."
+  def new_compactor_session(adapter, model, cwd, guidance, deadline) do
+    remaining = max(1, deadline - System.monotonic_time(:millisecond))
+
+    case call(adapter, {:new_candidate_session, model, cwd, [], guidance, deadline}, remaining) do
+      {:error, {:adapter_unavailable, "timeout"}} -> {:error, :timeout}
+      reply -> reply
+    end
+  end
 
   # The turn path keeps each failure's diagnostic carrier. The gateway renders
   # `ErrorDiagnostic.classified/1` of it as the text the health and supervision
@@ -340,6 +351,7 @@ defmodule Tightbeam.Acp.Adapter do
   @spec prompt(adapter(), String.t(), String.t() | [map()], keyword()) ::
           {:ok,
            %{
+             optional(:work_outcome) => :did_not_perform,
              stop_reason: String.t(),
              text: String.t(),
              messages: [
@@ -431,6 +443,9 @@ defmodule Tightbeam.Acp.Adapter do
   @spec conn(adapter()) :: pid()
   def conn(adapter), do: GenServer.call(adapter, :conn)
 
+  @doc "The latest process identity check for this adapter launch."
+  def launch_identity_status(adapter), do: GenServer.call(adapter, :launch_identity_status)
+
   ## Server
 
   @impl true
@@ -490,33 +505,46 @@ defmodule Tightbeam.Acp.Adapter do
           Keyword.get(opts, :harness_process_direct_launcher, false)
       )
 
-    case Keyword.fetch(opts, :harness_process_launch_id) do
-      {:ok, launch_id} ->
-        db = Keyword.get(opts, :db, Tightbeam.DB)
+    launch_identity_status =
+      case Keyword.fetch(opts, :harness_process_launch_id) do
+        {:ok, launch_id} ->
+          db = Keyword.get(opts, :db, Tightbeam.DB)
 
-        case capture_launch_identity(db, launch_id, conn, 250) do
-          :ok ->
-            :ok
+          case Tightbeam.HarnessProcess.capture_identity(db, launch_id, 5_000, conn) do
+            :ok ->
+              :ok
 
-          {:error, reason} ->
-            row = Enum.find(Tightbeam.HarnessProcess.list(db), &(&1.launch_id == launch_id))
-            receipt = Conn.launch_exit(conn, 100)
+            {:pending, _reason} = pending ->
+              parent = self()
 
-            _ =
-              Tightbeam.HarnessProcess.settle(
-                db,
-                launch_id,
-                row.adapter_key,
-                "adapter-boot",
-                receipt
-              )
+              {:ok, _task} =
+                Task.start_link(fn ->
+                  Process.sleep(250)
+                  result = capture_launch_identity(db, launch_id, conn, 500)
+                  send(parent, {:launch_identity_result, launch_id, result})
+                end)
 
-            raise "harness process identity unavailable: #{inspect(reason)}"
-        end
+              pending
 
-      :error ->
-        :ok
-    end
+            {:error, reason} ->
+              row = Enum.find(Tightbeam.HarnessProcess.list(db), &(&1.launch_id == launch_id))
+              receipt = Conn.launch_exit(conn, 100)
+
+              _ =
+                Tightbeam.HarnessProcess.settle(
+                  db,
+                  launch_id,
+                  row.adapter_key,
+                  "adapter-boot",
+                  receipt
+                )
+
+              raise "harness process identity unavailable: #{inspect(reason)}"
+          end
+
+        :error ->
+          nil
+      end
 
     state = %__MODULE__{
       db: Keyword.get(opts, :db, Tightbeam.DB),
@@ -529,7 +557,8 @@ defmodule Tightbeam.Acp.Adapter do
       on_auth_event: Keyword.get(opts, :on_auth_event),
       on_guidance: Keyword.get(opts, :on_guidance),
       on_guidance_verified: Keyword.get(opts, :on_guidance_verified),
-      on_subagent_event: Keyword.get(opts, :on_subagent_event)
+      on_subagent_event: Keyword.get(opts, :on_subagent_event),
+      launch_identity_status: launch_identity_status
     }
 
     # A binary that cannot execute still opens the port (the spawn is `sh -c`),
@@ -808,6 +837,20 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp session_call(
+         {:new_candidate_session, model, cwd, mcp_servers, guidance, deadline},
+         _from,
+         state
+       ) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining > 0 do
+      new_session_reply(state, model, cwd, mcp_servers, guidance, deadline, :compactor)
+    else
+      {:reply, {:error, :timeout}, state}
+    end
+  end
+
+  defp session_call(
          {:new_session, model, cwd, mcp_servers, guidance, request_timeout},
          _from,
          state
@@ -1037,6 +1080,9 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp session_call(:conn, _from, state), do: {:reply, state.conn, state}
 
+  defp session_call(:launch_identity_status, _from, state),
+    do: {:reply, state.launch_identity_status, state}
+
   defp switch_model_in_place_reply(state, sid, model, request_timeout) do
     case apply_model_to_session(state, sid, model, request_timeout) do
       {:ok, applied_model, reported} ->
@@ -1075,18 +1121,35 @@ defmodule Tightbeam.Acp.Adapter do
          request_timeout,
          report_cleanup?
        ) do
+    session = %{cwd: cwd}
+
+    session =
+      if report_cleanup? == :compactor,
+        do: Map.put(session, :compactor_model, model),
+        else: session
+
+    create_timeout =
+      if report_cleanup? == :compactor,
+        do: max(1, request_timeout - System.monotonic_time(:millisecond) - 5_000),
+        else: request_timeout
+
     case Conn.request(
            state.conn,
            "session/new",
            %{
              cwd: cwd,
              mcpServers: mcp_servers,
-             _meta: Harness.module!(state.harness).session_config(%{cwd: cwd}, guidance).meta
+             _meta: Harness.module!(state.harness).session_config(session, guidance).meta
            },
-           timeout: request_timeout,
+           timeout: create_timeout,
            diagnostic: true
          ) do
       {:ok, %{"sessionId" => sid} = result} when is_binary(sid) ->
+        request_timeout =
+          if report_cleanup? == :compactor,
+            do: max(1, div(request_timeout - System.monotonic_time(:millisecond), 5)),
+            else: request_timeout
+
         # The apply below resolves wire-by-name candidates from the cached
         # option list, so the session/new options must be remembered first.
         state = %{state | context_usage: Map.delete(state.context_usage, sid)}
@@ -1113,7 +1176,7 @@ defmodule Tightbeam.Acp.Adapter do
             state = %{state | config_options: Map.delete(state.config_options, sid)}
 
             if report_cleanup? do
-              cleanup = close_failed_new_session(state, sid)
+              cleanup = close_failed_new_session(state, sid, request_timeout)
               {:reply, {:error, {:session_prepare_failed, error, sid, cleanup}}, state}
             else
               {:reply, {:error, error}, state}
@@ -1128,8 +1191,11 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp close_failed_new_session(state, sid) do
-    case Conn.request(state.conn, "session/close", %{sessionId: sid}, diagnostic: true) do
+  defp close_failed_new_session(state, sid, timeout) do
+    case Conn.request(state.conn, "session/close", %{sessionId: sid},
+           timeout: timeout,
+           diagnostic: true
+         ) do
       {:ok, _result} -> %{status: "verified", reason: nil}
       {:error, reason} -> %{status: "unverified", reason: reason}
     end
@@ -1459,6 +1525,26 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @impl true
+  def handle_info({:launch_identity_result, _launch_id, :ok}, state),
+    do: {:noreply, %{state | launch_identity_status: :ok}}
+
+  def handle_info({:launch_identity_result, launch_id, {:error, reason}}, state) do
+    row = Enum.find(Tightbeam.HarnessProcess.list(state.db), &(&1.launch_id == launch_id))
+    receipt = Conn.launch_exit(state.conn, 100)
+
+    _ =
+      Tightbeam.HarnessProcess.settle(
+        state.db,
+        launch_id,
+        row.adapter_key,
+        "adapter-boot",
+        receipt
+      )
+
+    {:stop, {:launch_identity_failed, reason},
+     %{state | launch_identity_status: {:error, reason}}}
+  end
+
   def handle_info({:session_operation_done, key, pid, reply, updates}, state) do
     case state.operations[key] do
       %{pid: ^pid} = operation -> finish_operation(state, key, operation, reply, updates)
@@ -1485,6 +1571,7 @@ defmodule Tightbeam.Acp.Adapter do
     state = remember_config_model(state, sid, update)
     state = remember_context_usage(state, sid, update)
     state = record_tool_call(state, sid, update)
+    state = remember_non_refusal_output(state, sid, update)
 
     if update["sessionUpdate"] == "agent_message_chunk" do
       text = get_in(update, ["content", "text"])
@@ -1500,13 +1587,15 @@ defmodule Tightbeam.Acp.Adapter do
           case {logical_message_id, state.tool_turns[sid], update["content"]} do
             {logical_id, %{session_key: session_key, turn_seq: turn_seq}, content}
             when is_binary(logical_id) and is_map(content) ->
-              case Tightbeam.TurnEvents.append_assistant_segment(
-                     state.db,
-                     session_key,
-                     turn_seq,
-                     logical_id,
-                     content
-                   ) do
+              case Tightbeam.DB.owed_work(fn ->
+                     Tightbeam.TurnEvents.append_assistant_segment(
+                       state.db,
+                       session_key,
+                       turn_seq,
+                       logical_id,
+                       content
+                     )
+                   end) do
                 {:ok, _event} ->
                   state
 
@@ -1609,8 +1698,14 @@ defmodule Tightbeam.Acp.Adapter do
     reply =
       case result do
         {:ok, response} ->
-          {:ok,
-           %{stop_reason: response["stopReason"] || "unknown", text: text, messages: messages}}
+          stop_reason = response["stopReason"] || "unknown"
+          reply = %{stop_reason: stop_reason, text: text, messages: messages}
+
+          if stop_reason == "refusal" and is_nil(state.prompts[sid][:non_refusal_output]) do
+            {:ok, Map.put(reply, :work_outcome, :did_not_perform)}
+          else
+            {:ok, reply}
+          end
 
         {:error, reason} ->
           {:error, reason}
@@ -1981,6 +2076,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     case Harness.module!(state.harness).classify_subagent_event(update) do
       {:subagent_start, %{subagent_ref: child_sid}} when is_binary(child_sid) ->
+        state = mark_non_refusal_output(state, root_sid)
         {root_sid, put_in(state.subagent_roots[child_sid], root_sid)}
 
       _other ->
@@ -2087,6 +2183,42 @@ defmodule Tightbeam.Acp.Adapter do
 
       _ ->
         state
+    end
+  end
+
+  defp remember_non_refusal_output(
+         state,
+         sid,
+         %{
+           "sessionUpdate" => "agent_message_chunk",
+           "content" => content
+         } = update
+       )
+       when is_map(content) do
+    if get_in(update, ["_meta", "tightbeam.dev/providerRefusal"]) == true or
+         match?(%{"type" => "text", "text" => ""}, content) do
+      state
+    else
+      mark_non_refusal_output(state, sid)
+    end
+  end
+
+  defp remember_non_refusal_output(state, sid, %{"sessionUpdate" => kind} = update)
+       when kind in ["tool_call", "tool_call_update"] do
+    if Tightbeam.ToolCalls.context_compaction?(update) do
+      state
+    else
+      mark_non_refusal_output(state, Map.get(state.subagent_roots, sid, sid))
+    end
+  end
+
+  defp remember_non_refusal_output(state, _sid, _update), do: state
+
+  defp mark_non_refusal_output(state, sid) do
+    case state.prompts[sid] do
+      nil -> state
+      %{non_refusal_output: true} -> state
+      _prompt -> put_in(state.prompts[sid][:non_refusal_output], true)
     end
   end
 

@@ -10,6 +10,8 @@ dir = Path.join(base, "identity")
 
 # Synthetic local/upstream divergence only; no copied organization or provider.
 Application.put_env(:tightbeam, :identity_source_dir, source)
+# The engineering bundle is no longer shipped; offer it from the test fixture root.
+Application.put_env(:tightbeam, :kungfu_bundle_root_dir, Path.expand("fixtures/kungfu", __DIR__))
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
 Application.put_env(:tightbeam, :autostart, false)
@@ -46,7 +48,7 @@ if phase == "conflict" do
         ~w(manifest.toml capabilities.md intake.md preferred-models.md setup.md sentinels/landing-watch) do
     dest = Path.join(source, file)
     File.mkdir_p!(Path.dirname(dest))
-    File.cp!(Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/#{file}"), dest)
+    File.cp!(Path.expand("fixtures/kungfu/agentic-engineering/#{file}", __DIR__), dest)
   end
 
   {:ok, db} = DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])
@@ -139,7 +141,7 @@ end
 
 case phase do
   "conflict" ->
-    call.(["learn", "agentic-engineering"])
+    assert %{"state" => "published"} = call.(["learn", "agentic-engineering"])
     edit.(["--manifest"], manifest.("local"))
     edit.([], "local customization\n")
     File.write!(Path.join(root, "stable"), Identity.live_revision!(base))
@@ -150,6 +152,11 @@ case phase do
 
     assert Enum.sort(result["conflictingPaths"]) ==
              Enum.sort([bundle_coder_path, "guidance/coder.md"])
+
+    reported_conflicts =
+      for %{"path" => path, "disposition" => "conflict"} <- result["pathDispositions"], do: path
+
+    assert Enum.sort(reported_conflicts) == Enum.sort([bundle_coder_path, "guidance/coder.md"])
 
     assert Identity.live_revision!(base) == File.read!(Path.join(root, "stable"))
     File.write!(Path.join(root, "pending.json"), JSON.encode!(snapshot.()))
@@ -200,6 +207,51 @@ case phase do
     assert call.(["identity", "relearn"])["state"] == "published"
     assert Archetypes.get(qualified_coder).where == ["resolved"]
     assert File.read!(Path.join(dir, "guidance/coder.md")) == "resolved customization\n"
+
+    old_tree = git.(["rev-parse", "tightbeam/upstream^{tree}"])
+
+    unrelated =
+      git.([
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@tightbeam.invalid",
+        "commit-tree",
+        old_tree,
+        "-m",
+        "Fixture with no attributable product history"
+      ])
+
+    git.(["update-ref", "refs/heads/tightbeam/upstream", unrelated])
+    git.(["update-ref", "-d", "refs/heads/tightbeam/product-baseline"])
+    live = Identity.live_revision!(base)
+
+    result = call.(["identity", "relearn"])
+    assert result["state"] == "relearn-conflicted"
+    assert Identity.live_revision!(base) == live
+    status = call.(["identity", "status"])
+    assert status["pathDispositions"] == result["pathDispositions"]
+    assert status["resolution"] == result["resolution"]
+
+    assert Identity.revision_file_bytes!(base, live, "guidance/coder.md") ==
+             "resolved customization\n"
+
+    choices = Map.new(result["pathDispositions"], &{&1["path"], &1["resolution"]})
+    assert Map.keys(choices) |> Enum.sort() == Enum.sort([bundle_coder_path, "guidance/coder.md"])
+    manifest_choice = Map.fetch!(choices, bundle_coder_path)
+    guidance_choice = Map.fetch!(choices, "guidance/coder.md")
+    assert manifest_choice["reason"] == "unknown base"
+    assert guidance_choice["reason"] == "unknown base"
+    assert {_, 0} = System.shell(manifest_choice["keepOrganization"], cd: root)
+    assert {_, 0} = System.shell(guidance_choice["acceptProduct"], cd: root)
+    assert Identity.live_revision!(base) == live
+    assert call.(["identity", "status"])["resolution"] == result["resolution"]
+
+    assert ["tightbeam" | publish] = String.split(result["resolution"]["publish"])
+    assert publish == ["identity", "relearn", "--resolve"]
+    assert call.(publish)["state"] == "published"
+    assert Archetypes.get(qualified_coder).where == ["resolved"]
+    assert File.read!(Path.join(dir, "guidance/coder.md")) == "incoming guidance\n"
 end
 
 assert Path.wildcard(Path.join(base, ".identity-law-*")) == []

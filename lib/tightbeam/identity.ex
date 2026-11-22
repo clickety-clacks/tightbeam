@@ -2,9 +2,10 @@ defmodule Tightbeam.Identity do
   @moduledoc """
   The served-identity seam.
 
-  `identity/` is a three-ref git repository: `tightbeam/upstream` records
-  successive shipped kungfu snapshots, `main` carries local customization,
-  and `tightbeam/live` is the only publication sessions read. Provisioning
+  `identity/` is a git repository: `tightbeam/upstream` records the last
+  published product snapshot, `tightbeam/product-baseline` records its
+  attributable base, `main` carries local customization, and `tightbeam/live`
+  is the only publication sessions read. Provisioning
   resolves `tightbeam/live` once, reads guidance and skills through that OID,
   materializes only the reserved `tightbeam__*` skill namespace at the
   session cwd, and returns the OID to stamp on the session row.
@@ -14,16 +15,22 @@ defmodule Tightbeam.Identity do
 
   alias Tightbeam.{Archetypes, Credentials, Harness}
   alias Tightbeam.Harness.Support
-  alias Tightbeam.Identity.Renderer
+  alias Tightbeam.Identity.{Provenance, Renderer}
+  alias Tightbeam.RowReactions.Plan
 
   @upstream "tightbeam/upstream"
   @live "tightbeam/live"
+  @product_baseline "tightbeam/product-baseline"
+  @product_incoming "tightbeam/product-incoming"
+  @product_metadata_trailer "Tightbeam-Identity-Product-Metadata"
   @required_refs ["main", @upstream, @live]
   @reserved_prefix "tightbeam__"
   @not_live "nothing changed live, and sessions keep being served the live revision."
   @publish_step "A successful `tightbeam identity edit` publishes everything on main."
   @publish_step_later "Once it does, a successful `tightbeam identity edit` publishes everything on main."
   @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
+  @handoff_seed_path "rules/row-reaction-handoff.toml"
+  @product_path_overrides ["guidance/operating-manual.md"]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
   @bundle_setup_path "setup.md"
   @sentinel_keys ~w(name command requires events)
@@ -241,6 +248,7 @@ defmodule Tightbeam.Identity do
         validate_revision_dir!(candidate, revision)
         git!(candidate, ["branch", @upstream])
         git!(candidate, ["branch", @live])
+        git!(candidate, ["branch", @product_baseline])
         File.rm_rf!(identity_dir)
         File.rename!(candidate, identity_dir)
         :initialized
@@ -469,7 +477,14 @@ defmodule Tightbeam.Identity do
       available_bundles()
       |> Enum.map_join("\n\n", fn bundle ->
         phrases = Enum.map_join(bundle.phrases, "\n", &"- #{&1}")
-        "### `#{bundle.name}`\nPurpose: #{bundle.purpose}\nPhrases:\n#{phrases}"
+
+        primary =
+          if bundle.primary,
+            do:
+              "Primary: when more than one bundle fits the user's goal, offer this one first.\n",
+            else: ""
+
+        "### `#{bundle.name}`\n#{primary}Purpose: #{bundle.purpose}\nPhrases:\n#{phrases}"
       end)
 
     """
@@ -718,12 +733,32 @@ defmodule Tightbeam.Identity do
         require_clean_main!(dir)
         expected_prior = git_output!(dir, ["rev-parse", @live])
         upstream_prior = git_output!(dir, ["rev-parse", @upstream])
+        product_base = product_base_info(dir, upstream_prior, expected_prior)
         learned = learned_bundle_names(dir)
         receipt = bundle_receipt(name, bundle)
-        import_upstream!(dir, learned ++ [name], "learn: #{name}")
 
-        case merge_upstream(dir, "learn: #{name}", author, expected_prior, upstream_prior, fn ->
-               write_receipt!(dir, receipt)
+        import_product_snapshot!(
+          dir,
+          learned ++ [name],
+          "learn: #{name}",
+          product_base,
+          expected_prior,
+          upstream_prior
+        )
+
+        case merge_upstream(dir, "learn: #{name}", author, expected_prior, fn ->
+               missing =
+                 Enum.reject(receipt.paths, &File.regular?(Path.join(dir, &1)))
+
+               case missing do
+                 [] ->
+                   write_receipt!(dir, receipt)
+
+                 paths ->
+                   {:error,
+                    "cannot learn #{name}: merged identity is missing shipped bundle paths: " <>
+                      Enum.join(paths, ", ")}
+               end
              end) do
           {:ok, revision} -> {:ok, revision}
           other -> other
@@ -740,22 +775,32 @@ defmodule Tightbeam.Identity do
     require_clean_main!(dir)
     expected_prior = git_output!(dir, ["rev-parse", @live])
 
+    # A path another learned bundle also claims stays; that bundle still owns it.
+    claimed_elsewhere =
+      dir
+      |> learned_bundle_names()
+      |> List.delete(name)
+      |> Enum.flat_map(&read_receipt!(dir, "main", &1).paths)
+      |> MapSet.new()
+
+    removable = Enum.reject(receipt.paths, &MapSet.member?(claimed_elsewhere, &1))
+
     originals =
-      receipt.paths
+      removable
       |> Enum.filter(&File.regular?(Path.join(dir, &1)))
       |> Map.new(fn relative ->
         path = Path.join(dir, relative)
         {relative, File.read!(path)}
       end)
 
-    Enum.each(receipt.paths, &File.rm(Path.join(dir, &1)))
+    Enum.each(removable, &File.rm(Path.join(dir, &1)))
     receipt_path = receipt_path(name)
     receipt_bytes = File.read!(Path.join(dir, receipt_path))
     File.rm!(Path.join(dir, receipt_path))
 
     fingerprint =
       try do
-        remove_empty_parent_dirs!(dir, [receipt_path | receipt.paths])
+        remove_empty_parent_dirs!(dir, [receipt_path | removable])
         validate_candidate_tree!(dir, expected_prior)
       rescue
         error ->
@@ -808,13 +853,17 @@ defmodule Tightbeam.Identity do
     |> Enum.sort()
   end
 
-  @doc "Kungfu bundles shipped with this Tightbeam build and their offer metadata."
+  @doc """
+  Kungfu bundles shipped with this Tightbeam build and their offer metadata, in
+  offer order: a bundle whose manifest sets `primary = true` first, then by name.
+  """
   @spec available_bundles() :: [
           %{
             name: String.t(),
             purpose: String.t(),
             phrases: [String.t()],
-            root_archetype: String.t()
+            root_archetype: String.t(),
+            primary: boolean()
           }
         ]
   def available_bundles do
@@ -830,9 +879,11 @@ defmodule Tightbeam.Identity do
         name: name,
         purpose: manifest.purpose,
         phrases: manifest.phrases,
-        root_archetype: manifest.root_archetype
+        root_archetype: manifest.root_archetype,
+        primary: manifest.primary
       }
     end)
+    |> Enum.sort_by(&{not &1.primary, &1.name})
   end
 
   defp bundle_manifest!(content, path) do
@@ -858,9 +909,16 @@ defmodule Tightbeam.Identity do
           phrases
       end
 
+    primary = Map.get(manifest, "primary", false)
+
+    unless is_boolean(primary) do
+      raise ArgumentError, "kungfu manifest primary must be true or false: #{path}"
+    end
+
     %{
       purpose: purpose,
       phrases: phrases,
+      primary: primary,
       root_archetype: Map.fetch!(manifest, "root_archetype"),
       sentinels: sentinel_declarations!(Map.get(manifest, "sentinels", []), path),
       events: outside_events!(Map.get(manifest, "events", []), path)
@@ -1203,12 +1261,13 @@ defmodule Tightbeam.Identity do
     require_clean_main!(dir)
     expected_prior = git_output!(dir, ["rev-parse", @live])
     upstream_prior = git_output!(dir, ["rev-parse", @upstream])
+    product_base = product_base_info(dir, upstream_prior, expected_prior)
     learned = learned_bundle_names(dir)
     names = ["neutral-identity" | learned]
     message = "relearn: #{Enum.join(names, ", ")}"
-    import_upstream!(dir, learned, message)
+    import_product_snapshot!(dir, learned, message, product_base, expected_prior, upstream_prior)
 
-    merge_upstream(dir, message, author, expected_prior, upstream_prior, fn ->
+    merge_upstream(dir, message, author, expected_prior, fn ->
       refresh_receipts!(dir, learned)
     end)
   end
@@ -1218,7 +1277,9 @@ defmodule Tightbeam.Identity do
   def abort_relearn!(base_dir) do
     dir = identity_dir(base_dir)
     require_conflict!(dir)
+    incoming = git_output!(dir, ["rev-parse", "MERGE_HEAD"])
     git!(dir, ["merge", "--abort"])
+    delete_product_incoming!(dir, incoming)
     :ok
   end
 
@@ -1251,7 +1312,7 @@ defmodule Tightbeam.Identity do
     conflicts = conflict_paths(dir)
     missing = missing_installed_kungfu(base_dir, live)
 
-    %{
+    result = %{
       live_revision: live,
       source_revision: source,
       source_notice: source_notice(dir, source, live),
@@ -1260,6 +1321,8 @@ defmodule Tightbeam.Identity do
       state: if(conflicts == [], do: :ready, else: :relearn_conflicted),
       conflicting_paths: conflicts
     }
+
+    Map.merge(result, relearn_conflict_details(base_dir))
   end
 
   @doc "Missing shipped paths and named rules for bundles learned into the live identity."
@@ -1350,6 +1413,42 @@ defmodule Tightbeam.Identity do
       "to descend from live; `tightbeam identity status` compares them. " <> @publish_step_later
   end
 
+  @doc "Explain relearn conflicts whose prior product base could not be proven."
+  @spec provenance_conflicts(String.t()) :: [map()]
+  def provenance_conflicts(base_dir), do: provenance_conflicts_at_merge(identity_dir(base_dir))
+
+  @doc false
+  def relearn_conflict_details(base_dir) do
+    dir = identity_dir(base_dir)
+
+    case pending_product_snapshot(dir) do
+      nil ->
+        %{provenance_conflicts: []}
+
+      {incoming, metadata} ->
+        %{
+          provenance_conflicts: Map.get(metadata, "provenance_conflicts", []),
+          path_dispositions: product_dispositions(dir, incoming, metadata, nil),
+          resolution: %{
+            instructions:
+              "The published identity is unchanged. Run the chosen Git commands on the gateway host, then publish after resolving every conflicted file.",
+            publish: "tightbeam identity relearn --resolve",
+            abort: "tightbeam identity relearn --abort"
+          }
+        }
+    end
+  end
+
+  @doc false
+  def relearn_dispositions(base_dir, candidate_revision) do
+    dir = identity_dir(base_dir)
+
+    case product_snapshot_for_candidate(dir, candidate_revision) do
+      {incoming, metadata} -> product_dispositions(dir, incoming, metadata, candidate_revision)
+      nil -> []
+    end
+  end
+
   defp identity_dir(base_dir), do: Path.join(base_dir, "identity")
 
   defp seed_dir do
@@ -1392,6 +1491,16 @@ defmodule Tightbeam.Identity do
   end
 
   defp seed_entries, do: source_entries(seed_dir())
+
+  defp product_guidance_entries do
+    manual =
+      case Application.get_env(:tightbeam, :identity_product_guidance_dir) do
+        nil -> Map.fetch!(Archetypes.builtin_fragments(), "operating-manual.md")
+        guidance_dir -> File.read!(Path.join(guidance_dir, "operating-manual.md"))
+      end
+
+    [{"guidance/operating-manual.md", manual}]
+  end
 
   defp source_entries(root), do: source_entries(root, "")
 
@@ -1458,80 +1567,808 @@ defmodule Tightbeam.Identity do
     }
   end
 
-  defp import_upstream!(dir, bundle_names, message) do
-    entries =
-      seed_entries_for_import(dir) ++
-        Enum.flat_map(bundle_names, fn name ->
-          bundle = bundle_dir(name)
-          refuse_seed_owned_bundle_paths!(name, bundle)
-          bundle_entries(name, bundle)
-        end)
+  defp product_base_info(dir, upstream_prior, expected_live) do
+    previous_baseline = optional_ref_oid(dir, @product_baseline)
+    upstream_paths = tree_paths(dir, upstream_prior)
 
-    executables =
-      Enum.flat_map(bundle_names, fn name ->
-        name
-        |> bundle_sentinel_commands!(bundle_dir(name))
-        |> Enum.map(&Path.join(["kungfu", name, &1]))
-      end)
+    baseline =
+      if previous_baseline && ancestor?(dir, previous_baseline, expected_live),
+        do: previous_baseline
 
-    git!(dir, ["switch", @upstream])
-    replace_with_entries!(dir, entries)
-    Enum.each(executables, &File.chmod!(Path.join(dir, &1), 0o755))
-    git!(dir, ["add", "-A"])
-    git!(dir, ["commit", "--allow-empty", "-m", message], "tightbeam")
-    git!(dir, ["switch", "main"])
-  end
+    recovered =
+      if baseline == upstream_prior do
+        {:baseline, baseline}
+      else
+        legacy = recover_legacy_product_base(dir, upstream_prior, expected_live)
+        legacy_oid = if legacy, do: elem(legacy, 1)
 
-  defp seed_entries_for_import(dir) do
-    Enum.map(seed_entries(), fn {relative, shipped_bytes} ->
-      bytes =
-        if path_exists_at?(dir, "main", relative),
-          do: git_show_bytes!(dir, "main", relative),
-          else: shipped_bytes
-
-      {relative, bytes}
-    end)
-  end
-
-  defp merge_upstream(dir, message, author, expected_prior, upstream_prior, before_commit) do
-    case System.cmd(
-           "git",
-           ["merge", "--no-ff", "--no-commit", @upstream, "-m", message],
-           cd: dir,
-           stderr_to_stdout: true,
-           env: git_env(author)
-         ) do
-      {_output, 0} ->
-        case run_pre_merge_hook(dir, author) do
-          {_output, 0} ->
-            fingerprint =
-              try do
-                before_commit.()
-                validate_candidate_tree!(dir, expected_prior)
-              rescue
-                error ->
-                  git!(dir, ["merge", "--abort"])
-                  git!(dir, ["update-ref", "refs/heads/#{@upstream}", upstream_prior])
-                  reraise error, __STACKTRACE__
-              end
-
-            git!(dir, ["add", "-A"])
-            git!(dir, ["commit", "-m", message], author)
-            {:ok, candidate_result(dir, expected_prior, fingerprint)}
-
-          {output, _status} ->
-            git!(dir, ["merge", "--abort"])
-            git!(dir, ["update-ref", "refs/heads/#{@upstream}", upstream_prior])
-            {:error, String.trim(output)}
+        cond do
+          is_nil(baseline) -> legacy
+          legacy_oid && legacy_oid != baseline && ancestor?(dir, baseline, legacy_oid) -> legacy
+          true -> {:baseline, baseline}
         end
+      end
 
-      {output, _status} ->
-        case conflict_paths(dir) do
-          [] -> {:error, String.trim(output)}
-          paths -> {:conflict, paths}
+    {oid, source, unknown_paths} =
+      case recovered do
+        {:baseline, revision} ->
+          unknown_product_paths =
+            Enum.filter(@product_path_overrides, &is_nil(tree_entry(dir, revision, &1)))
+
+          {revision, "product-baseline-ref", unknown_product_paths}
+
+        {:published_snapshot, revision} ->
+          {revision, "published-product-snapshot", []}
+
+        {:legacy, revision, unknown_seed_paths} ->
+          {revision, "legacy-upstream-history",
+           Enum.uniq(unknown_seed_paths ++ @product_path_overrides)}
+
+        nil ->
+          {nil, "historical-base-unavailable",
+           upstream_paths ++ @seed_owned_paths ++ @product_path_overrides}
+      end
+
+    product_paths =
+      (if(oid, do: tree_paths(dir, oid), else: []) ++
+         upstream_paths ++
+         @seed_owned_paths ++
+         @product_path_overrides)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    %{
+      oid: oid,
+      source: source,
+      unknown_paths: Enum.uniq(unknown_paths),
+      product_paths: product_paths,
+      previous_baseline: previous_baseline
+    }
+  end
+
+  defp recover_legacy_product_base(dir, upstream, live) do
+    case latest_upstream_ancestor(dir, upstream, live) do
+      nil ->
+        nil
+
+      revision ->
+        if product_snapshot_metadata_if_present(dir, revision) do
+          {:published_snapshot, revision}
+        else
+          seed_source = legacy_seed_source(dir, revision)
+          seed_root = neutral_seed_root(dir, seed_source)
+          seed_paths = Enum.map(seed_entries(), &elem(&1, 0))
+
+          # Older imports copied these paths from org main. A namespacing
+          # migration transforms the upstream tree, so prove its seed entries
+          # against the input tree before using the migrated bytes as the base.
+          unknown_seed_paths =
+            Enum.reject(seed_paths, fn path ->
+              seed_root && tree_entry(dir, seed_source, path) == tree_entry(dir, seed_root, path)
+            end)
+
+          {:legacy, revision, unknown_seed_paths}
         end
     end
   end
+
+  defp legacy_seed_source(dir, upstream) do
+    case git_output!(dir, ["show", "-s", "--format=%s", upstream]) do
+      "identity: namespace upstream rail baseline" ->
+        git_output!(dir, ["rev-parse", "#{upstream}^1"])
+
+      _ ->
+        upstream
+    end
+  end
+
+  defp latest_upstream_ancestor(dir, upstream, live) do
+    # Prior imports reached live as merge parents. A repair that simply pointed
+    # the upstream ref at org main did not establish a product baseline.
+    product_parents =
+      dir
+      |> git_output!(["rev-list", "--first-parent", "--merges", "--parents", live])
+      |> String.split("\n", trim: true)
+      |> Enum.flat_map(fn merge -> String.split(merge, " ") |> Enum.drop(2) end)
+      |> MapSet.new()
+
+    roots =
+      dir
+      |> git_output!(["rev-list", "--max-parents=0", live])
+      |> String.split("\n", trim: true)
+      |> Enum.filter(fn root ->
+        git_output!(dir, ["show", "-s", "--format=%s", root]) in [
+          "seed: neutral-identity",
+          "learn: agentic-engineering"
+        ]
+      end)
+
+    published = Enum.into(roots, product_parents)
+
+    dir
+    |> git_output!(["rev-list", "--first-parent", upstream])
+    |> String.split("\n", trim: true)
+    |> Enum.find(&MapSet.member?(published, &1))
+  end
+
+  defp ancestor?(dir, possible_ancestor, revision) do
+    case System.cmd("git", ["merge-base", "--is-ancestor", possible_ancestor, revision], cd: dir) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
+  end
+
+  defp optional_ref_oid(dir, ref) do
+    full_ref = "refs/heads/#{ref}"
+
+    case System.cmd("git", ["rev-parse", "--verify", "--quiet", full_ref],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
+      {oid, 0} -> String.trim(oid)
+      {_output, 1} -> nil
+      {output, status} -> raise "git rev-parse #{full_ref} failed (#{status}): #{output}"
+    end
+  end
+
+  defp tree_paths(dir, revision) do
+    git_output!(dir, ["ls-tree", "-r", "--name-only", revision])
+    |> String.split("\n", trim: true)
+  end
+
+  defp tree_entry(dir, revision, path) do
+    case System.cmd("git", ["ls-tree", "-r", "-z", revision, "--", ":(literal)#{path}"],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        case String.split(output, <<0>>, trim: true) do
+          [entry | _] ->
+            case String.split(entry, "\t", parts: 2) do
+              [header, ^path] ->
+                case String.split(header, " ", trim: true) do
+                  [mode, "blob", oid] -> {mode, oid}
+                  [mode, "commit", oid] -> {mode, oid}
+                  _ -> nil
+                end
+
+              _ ->
+                nil
+            end
+
+          [] ->
+            nil
+        end
+
+      {output, status} ->
+        raise "git ls-tree failed (#{status}): #{output}"
+    end
+  end
+
+  defp describe_tree_entry(nil), do: %{"present" => false}
+
+  defp describe_tree_entry({mode, oid}),
+    do: %{"present" => true, "mode" => mode, "oid" => oid}
+
+  defp delete_product_incoming!(dir, expected) do
+    case optional_ref_oid(dir, @product_incoming) do
+      ^expected -> git!(dir, ["update-ref", "-d", "refs/heads/#{@product_incoming}", expected])
+      _ -> :ok
+    end
+  end
+
+  defp git_output_bytes!(dir, args) do
+    case System.cmd("git", args, cd: dir, stderr_to_stdout: true) do
+      {output, 0} -> output
+      {output, status} -> raise "git #{Enum.join(args, " ")} failed (#{status}): #{output}"
+    end
+  end
+
+  defp git_input!(dir, args, input) do
+    # Port.command/2 only sends iodata; it cannot signal EOF to Git. Keep the
+    # supported commands fixed and redirect a private file so Git reads the
+    # complete transaction, observes EOF, and returns its real exit status.
+    command =
+      case args do
+        ["update-index", "-z", "--index-info"] -> "git update-index -z --index-info"
+        ["update-ref", "--stdin"] -> "git update-ref --stdin"
+        _ -> raise ArgumentError, "unsupported git stdin command: #{inspect(args)}"
+      end
+
+    input_name = ".tightbeam-git-input-#{System.unique_integer([:positive, :monotonic])}"
+    input_path = Path.join(dir, input_name)
+    File.write!(input_path, input, [:binary, :exclusive])
+
+    try do
+      case System.shell("#{command} < #{input_name}",
+             cd: dir,
+             stderr_to_stdout: true
+           ) do
+        {_output, 0} ->
+          :ok
+
+        {output, status} ->
+          raise "git #{Enum.join(args, " ")} failed (#{status}): #{output}"
+      end
+    after
+      File.rm(input_path)
+    end
+  end
+
+  defp import_product_snapshot!(
+         dir,
+         bundle_names,
+         message,
+         product_base,
+         expected_live,
+         upstream_prior
+       ) do
+    {shipped, retained} = Enum.split_with(bundle_names, &(&1 in available_bundle_names()))
+    retained_files = Enum.flat_map(retained, &retained_bundle_files(dir, &1, product_base.oid))
+
+    handoff_policy =
+      unless path_exists_at?(dir, "main", @handoff_seed_path), do: missing_handoff_policy(dir)
+
+    # Retained files come first, so a shipped bundle's bytes win on a shared path.
+    entries =
+      seed_entries() ++
+        Enum.map(retained_files, fn {relative, bytes, _executable?} -> {relative, bytes} end) ++
+        Enum.flat_map(shipped, fn name ->
+          bundle = bundle_dir(name)
+          refuse_seed_owned_bundle_paths!(name, bundle)
+          bundle_entries(name, bundle)
+        end) ++ product_guidance_entries()
+
+    executables =
+      Enum.flat_map(retained_files, fn
+        {relative, _bytes, true} -> [relative]
+        {_relative, _bytes, false} -> []
+      end) ++
+        Enum.flat_map(shipped, fn name ->
+          name
+          |> bundle_sentinel_commands!(bundle_dir(name))
+          |> Enum.map(&Path.join(["kungfu", name, &1]))
+        end)
+
+    case optional_ref_oid(dir, @product_incoming) do
+      nil ->
+        :ok
+
+      pending ->
+        if product_snapshot_metadata_if_present(dir, pending) && ancestor?(dir, pending, "main") do
+          raise ArgumentError, "identity has an unpublished product relearn candidate"
+        else
+          git!(dir, ["update-ref", "-d", "refs/heads/#{@product_incoming}", pending])
+        end
+    end
+
+    incoming_paths = Enum.map(entries, &elem(&1, 0))
+
+    unknown_paths =
+      if(is_nil(product_base.oid),
+        do: product_base.unknown_paths ++ incoming_paths,
+        else: product_base.unknown_paths
+      )
+      |> Enum.uniq()
+
+    product_paths =
+      (product_base.product_paths ++ incoming_paths ++ @seed_owned_paths)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    metadata = %{
+      "version" => 1,
+      "base_oid" => product_base.oid,
+      "base_source" => product_base.source,
+      "previous_upstream" => upstream_prior,
+      "previous_baseline" => product_base.previous_baseline,
+      "expected_live" => expected_live,
+      "org_revision" => git_output!(dir, ["rev-parse", "main"]),
+      "handoff_policy" => handoff_policy,
+      "unknown_paths" => unknown_paths,
+      "product_paths" => product_paths,
+      "provenance_conflicts" => []
+    }
+
+    try do
+      if product_base.oid do
+        git!(dir, ["switch", "-C", @product_incoming, product_base.oid])
+      else
+        git!(dir, ["switch", "--orphan", @product_incoming])
+      end
+
+      replace_with_entries!(dir, entries)
+      Enum.each(executables, &File.chmod!(Path.join(dir, &1), 0o755))
+      git!(dir, ["add", "-A"])
+      incoming_tree = git_output!(dir, ["write-tree"])
+
+      metadata =
+        Map.put(
+          metadata,
+          "provenance_conflicts",
+          provenance_conflict_details(
+            dir,
+            if(handoff_policy, do: unknown_paths -- [@handoff_seed_path], else: unknown_paths),
+            "main",
+            incoming_tree,
+            product_base
+          )
+        )
+
+      encoded_metadata =
+        metadata
+        |> :erlang.term_to_binary([:deterministic])
+        |> Base.url_encode64(padding: false)
+
+      product_commit_message =
+        message <> "\n\n" <> @product_metadata_trailer <> ": " <> encoded_metadata
+
+      git!(dir, ["commit", "--allow-empty", "-m", product_commit_message], "tightbeam")
+      incoming = git_output!(dir, ["rev-parse", @product_incoming])
+      git!(dir, ["switch", "main"])
+      incoming
+    rescue
+      error ->
+        if git_output!(dir, ["branch", "--show-current"]) == @product_incoming do
+          git!(dir, ["switch", "main"])
+        end
+
+        if optional_ref_oid(dir, @product_incoming),
+          do: git!(dir, ["update-ref", "-d", "refs/heads/#{@product_incoming}"])
+
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  # A learned bundle that this build no longer ships keeps the bytes it was last
+  # imported with: its receipt paths as they stand on the upstream branch. The
+  # organization keeps the bundle until it unlearns it, and local edits on main
+  # stay local edits.
+  defp retained_bundle_files(_dir, _name, nil), do: []
+
+  defp retained_bundle_files(dir, name, prior_product) do
+    paths = read_receipt!(dir, "main", name).paths
+    retained_upstream_files(dir, prior_product, paths)
+  end
+
+  defp retained_upstream_files(_dir, _prior_product, []), do: []
+
+  defp retained_upstream_files(dir, prior_product, paths) do
+    modes =
+      dir
+      |> git_output!(["ls-tree", "-r", prior_product, "--" | paths])
+      |> String.split("\n", trim: true)
+      |> Map.new(fn line ->
+        [meta, path] = String.split(line, "\t", parts: 2)
+        [mode | _] = String.split(meta, " ")
+        {path, mode}
+      end)
+
+    paths
+    |> Enum.filter(&Map.has_key?(modes, &1))
+    |> Enum.map(fn path ->
+      {path, git_show_bytes!(dir, prior_product, path), Map.fetch!(modes, path) == "100755"}
+    end)
+  end
+
+  defp provenance_conflict_details(dir, unknown_paths, org_revision, incoming_tree, product_base) do
+    Enum.flat_map(unknown_paths, fn path ->
+      org_entry = tree_entry(dir, org_revision, path)
+      incoming_entry = tree_entry(dir, incoming_tree, path)
+      base_entry = if product_base.oid, do: tree_entry(dir, product_base.oid, path)
+
+      if org_entry == incoming_entry or
+           (is_nil(org_entry) and proven_new_product_path_absence?(dir, org_revision, path)) do
+        []
+      else
+        [
+          %{
+            "path" => path,
+            "base_source" =>
+              if(is_nil(base_entry),
+                do: "historical-base-unavailable",
+                else: product_base.source
+              ),
+            "base" => describe_tree_entry(base_entry),
+            "org" => describe_tree_entry(org_entry),
+            "incoming" => describe_tree_entry(incoming_entry)
+          }
+        ]
+      end
+    end)
+  end
+
+  defp missing_handoff_policy(dir) do
+    paths =
+      Path.wildcard(Path.join(dir, "rules/*.toml")) ++
+        Path.wildcard(Path.join(dir, "kungfu/*/rules/*.toml"))
+
+    policies =
+      for path <- paths,
+          {:ok, %{"reaction" => reactions}} <- [Toml.decode(File.read!(path))],
+          %{"name" => "assignment-terminal-handoff"} = reaction <- List.wrap(reactions) do
+        case Provenance.owner_for_path(dir, Path.relative_to(path, dir)) do
+          {:kungfu, _} -> "restore-scoped-default"
+          :substrate -> if organization_handoff?(reaction), do: "keep-organization-default"
+        end
+      end
+
+    Enum.find(["keep-organization-default", "restore-scoped-default"], &(&1 in policies))
+  end
+
+  defp organization_handoff?(%{"name" => "assignment-terminal-handoff"} = declaration) do
+    declaration |> Plan.compile!(nil) |> Plan.handoff_default?()
+  rescue
+    ArgumentError -> false
+  end
+
+  defp organization_handoff?(_declaration), do: false
+
+  defp proven_new_product_path_absence?(dir, org_revision, path) do
+    # A missing current entry alone can be a committed org deletion. Accept it as
+    # fresh only when the identity has its neutral seed root and no path history.
+    path in @product_path_overrides and
+      neutral_seed_root(dir, org_revision) != nil and
+      not path_in_history?(dir, org_revision, path)
+  end
+
+  defp neutral_seed_root(dir, revision) do
+    roots =
+      dir
+      |> git_output!(["rev-list", "--max-parents=0", revision])
+      |> String.split("\n", trim: true)
+
+    case roots do
+      [root] ->
+        if git_output!(dir, ["show", "-s", "--format=%s", root]) == "seed: neutral-identity",
+          do: root
+
+      _ ->
+        nil
+    end
+  end
+
+  defp path_in_history?(dir, revision, path) do
+    case System.cmd(
+           "git",
+           ["log", "--full-history", "--format=%H", revision, "--", ":(literal)#{path}"],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
+      {commits, 0} ->
+        String.trim(commits) != ""
+
+      {output, status} ->
+        raise "git log for #{path} failed (#{status}): #{output}"
+    end
+  end
+
+  defp merge_upstream(dir, message, author, expected_prior, before_commit) do
+    incoming = git_output!(dir, ["rev-parse", @product_incoming])
+    metadata = product_snapshot_metadata!(dir, incoming)
+
+    try do
+      merge_args = ["merge", "--no-ff", "--no-commit"]
+
+      merge_args =
+        if is_nil(metadata["base_oid"]),
+          do: merge_args ++ ["--allow-unrelated-histories"],
+          else: merge_args
+
+      merge_args = merge_args ++ [@product_incoming, "-m", message]
+
+      case System.cmd("git", without_auto_maintenance(merge_args),
+             cd: dir,
+             stderr_to_stdout: true,
+             env: git_env(author)
+           ) do
+        {output, status} ->
+          if status != 0 and conflict_paths(dir) == [] do
+            cleanup_product_merge!(dir, incoming)
+            {:error, String.trim(output)}
+          else
+            force_provenance_conflicts!(dir, metadata)
+
+            # Keep the exact shipped seed in the product snapshot. An existing
+            # org-wide equivalent suppresses only its installation on org main.
+            apply_handoff_policy!(dir, metadata["handoff_policy"])
+
+            case conflict_paths(dir) do
+              paths when paths != [] ->
+                {:conflict, paths}
+
+              [] ->
+                case run_pre_merge_hook(dir, author) do
+                  {_hook_output, 0} ->
+                    case run_before_commit(before_commit, dir, incoming, expected_prior) do
+                      {:ok, fingerprint} ->
+                        git!(dir, ["add", "-A"])
+                        git!(dir, ["commit", "-m", message], author)
+                        {:ok, candidate_result(dir, expected_prior, fingerprint)}
+
+                      {:error, reason} ->
+                        cleanup_product_merge!(dir, incoming)
+                        {:error, reason}
+                    end
+
+                  {hook_output, _hook_status} ->
+                    cleanup_product_merge!(dir, incoming)
+                    {:error, String.trim(hook_output)}
+                end
+            end
+          end
+      end
+    rescue
+      error ->
+        if merge_pending?(dir) do
+          cleanup_product_merge!(dir, incoming)
+        else
+          delete_product_incoming!(dir, incoming)
+        end
+
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  defp apply_handoff_policy!(dir, "keep-organization-default"),
+    do: git!(dir, ["rm", "-f", "--ignore-unmatch", "--", @handoff_seed_path])
+
+  defp apply_handoff_policy!(dir, "restore-scoped-default") do
+    if path_exists_at?(dir, "MERGE_HEAD", @handoff_seed_path),
+      do: git!(dir, ["checkout", "MERGE_HEAD", "--", @handoff_seed_path])
+  end
+
+  defp apply_handoff_policy!(_dir, nil), do: :ok
+
+  defp run_before_commit(callback, dir, incoming, expected_prior) do
+    case callback.() do
+      :ok ->
+        try do
+          {:ok, validate_candidate_tree!(dir, expected_prior)}
+        rescue
+          error ->
+            cleanup_product_merge!(dir, incoming)
+            reraise error, __STACKTRACE__
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+
+      other ->
+        {:error, "pre-commit identity callback returned #{inspect(other)}"}
+    end
+  rescue
+    error ->
+      cleanup_product_merge!(dir, incoming)
+      reraise error, __STACKTRACE__
+  end
+
+  defp force_provenance_conflicts!(dir, metadata) do
+    metadata
+    |> Map.get("provenance_conflicts", [])
+    |> Enum.each(fn conflict ->
+      path = Map.fetch!(conflict, "path")
+      org_entry = tree_entry(dir, "main", path)
+      incoming_entry = tree_entry(dir, "MERGE_HEAD", path)
+
+      git!(dir, ["update-index", "--force-remove", "--", path])
+
+      stages =
+        [{2, org_entry}, {3, incoming_entry}]
+        |> Enum.flat_map(fn
+          {_stage, nil} -> []
+          {stage, entry} -> [index_info_line(entry, stage, path)]
+        end)
+
+      if stages != [],
+        do: git_input!(dir, ["update-index", "-z", "--index-info"], IO.iodata_to_binary(stages))
+
+      # Keep the conflicted worktree at the organization's side. In
+      # particular, an absent organization path stays absent when the
+      # incoming side adds it, so an unresolved legacy deletion is not
+      # silently replaced before the conflict is settled.
+      restore_tree_path!(dir, path, org_entry)
+    end)
+  end
+
+  defp index_info_line({mode, oid}, stage, path),
+    do: [mode, " ", oid, " ", Integer.to_string(stage), "\t", path, <<0>>]
+
+  defp restore_tree_path!(dir, path, nil), do: File.rm_rf!(Path.join(dir, path))
+
+  defp restore_tree_path!(dir, path, {mode, oid}) do
+    destination = Path.join(dir, path)
+    File.rm_rf!(destination)
+    File.mkdir_p!(Path.dirname(destination))
+    bytes = git_output_bytes!(dir, ["cat-file", "blob", oid])
+
+    case mode do
+      "120000" ->
+        File.ln_s!(bytes, destination)
+
+      "160000" ->
+        :ok
+
+      _ ->
+        File.write!(destination, bytes)
+        if mode == "100755", do: File.chmod!(destination, 0o755)
+    end
+  end
+
+  defp cleanup_product_merge!(dir, incoming) do
+    if merge_pending?(dir), do: git!(dir, ["merge", "--abort"])
+    delete_product_incoming!(dir, incoming)
+  end
+
+  defp product_snapshot_metadata_if_present(dir, revision) do
+    message = git_output!(dir, ["show", "-s", "--format=%B", revision])
+
+    encoded =
+      message
+      |> String.split("\n")
+      |> Enum.find_value(fn line ->
+        case String.split(line, ": ", parts: 2) do
+          [@product_metadata_trailer, value] -> value
+          _ -> nil
+        end
+      end)
+
+    case encoded do
+      nil ->
+        nil
+
+      value ->
+        metadata =
+          case Base.url_decode64(value, padding: false) do
+            {:ok, payload} ->
+              try do
+                :erlang.binary_to_term(payload, [:safe])
+              rescue
+                _ -> :invalid
+              end
+
+            _ ->
+              :invalid
+          end
+
+        case metadata do
+          %{"version" => 1} = metadata ->
+            metadata
+
+          _ ->
+            raise ArgumentError,
+                  "identity product snapshot #{revision} has invalid provenance metadata"
+        end
+    end
+  end
+
+  defp product_snapshot_metadata!(dir, revision) do
+    product_snapshot_metadata_if_present(dir, revision) ||
+      raise ArgumentError, "identity product snapshot #{revision} has no provenance metadata"
+  end
+
+  defp provenance_conflicts_at_merge(dir) do
+    case pending_product_snapshot(dir) do
+      nil -> []
+      {_incoming, metadata} -> Map.get(metadata, "provenance_conflicts", [])
+    end
+  end
+
+  defp pending_product_snapshot(dir) do
+    if merge_pending?(dir) do
+      incoming = git_output!(dir, ["rev-parse", "MERGE_HEAD"])
+
+      if metadata = product_snapshot_metadata_if_present(dir, incoming),
+        do: {incoming, metadata}
+    end
+  end
+
+  defp product_dispositions(dir, incoming, metadata, candidate) do
+    base = product_tree_entries(dir, metadata["base_oid"])
+    org = product_tree_entries(dir, metadata["org_revision"])
+    product = product_tree_entries(dir, incoming)
+    {merged, conflicts} = product_merge_result(dir, candidate)
+    unknown = MapSet.new(metadata["unknown_paths"])
+    provenance_conflicts = MapSet.new(metadata["provenance_conflicts"], &Map.fetch!(&1, "path"))
+
+    paths = Enum.sort(Enum.uniq(metadata["product_paths"] ++ Map.keys(conflicts)))
+
+    for path <- paths,
+        {prior, local, next, outcome, known_base} =
+          {base[path], org[path], product[path], merged[path], not MapSet.member?(unknown, path)},
+        (known_base and prior != next) or local != next or Map.has_key?(conflicts, path) do
+      stages = conflicts[path]
+
+      disposition =
+        cond do
+          stages && MapSet.member?(provenance_conflicts, path) ->
+            "base-unavailable"
+
+          stages ->
+            "conflict"
+
+          path == @handoff_seed_path and metadata["handoff_policy"] == "keep-organization-default" ->
+            "kept-organization-default"
+
+          outcome == local and outcome != next ->
+            "kept-organization"
+
+          outcome == next and outcome == local ->
+            "matched-product"
+
+          outcome == next and is_nil(next) ->
+            "removed-product"
+
+          outcome == next and is_nil(local) ->
+            "added-product"
+
+          outcome == next ->
+            "updated-product"
+
+          true ->
+            "combined"
+        end
+
+      result = %{
+        path: path,
+        disposition: disposition,
+        base_source: if(known_base, do: metadata["base_source"], else: "unavailable"),
+        base_revision: if(known_base, do: metadata["base_oid"])
+      }
+
+      if stages do
+        git = "git -C #{Support.shell_quote(Path.expand(dir))} --literal-pathspecs"
+
+        Map.put(result, :resolution, %{
+          reason:
+            if(disposition == "base-unavailable", do: "unknown base", else: "merge conflict"),
+          accept_product: conflict_choice(git, path, "theirs", "3" in stages),
+          keep_organization: conflict_choice(git, path, "ours", "2" in stages)
+        })
+      else
+        result
+      end
+    end
+  end
+
+  defp conflict_choice(git, path, side, true) do
+    quoted = Support.shell_quote(path)
+
+    "#{git} checkout --#{side} -- #{quoted} && #{git} add -- #{quoted}"
+  end
+
+  defp conflict_choice(git, path, _side, false),
+    do: "#{git} rm -f -- #{Support.shell_quote(path)}"
+
+  defp product_tree_entries(_dir, nil), do: %{}
+
+  defp product_tree_entries(dir, revision) do
+    dir
+    |> git_output_bytes!(["ls-tree", "-r", "-z", revision])
+    |> String.split(<<0>>, trim: true)
+    |> Map.new(fn entry ->
+      [header, path] = String.split(entry, "\t", parts: 2)
+      [mode, _type, oid] = String.split(header, " ")
+      {path, {mode, oid}}
+    end)
+  end
+
+  defp product_merge_result(dir, nil) do
+    dir
+    |> git_output_bytes!(["ls-files", "--stage", "-z"])
+    |> String.split(<<0>>, trim: true)
+    |> Enum.reduce({%{}, %{}}, fn entry, {entries, conflicts} ->
+      [header, path] = String.split(entry, "\t", parts: 2)
+
+      case String.split(header, " ") do
+        [mode, oid, "0"] -> {Map.put(entries, path, {mode, oid}), conflicts}
+        [_mode, _oid, stage] -> {entries, Map.update(conflicts, path, [stage], &[stage | &1])}
+      end
+    end)
+  end
+
+  defp product_merge_result(dir, candidate),
+    do: {product_tree_entries(dir, candidate), %{}}
 
   defp run_pre_merge_hook(dir, author) do
     hook = Path.join([dir, ".git", "hooks", "pre-merge-commit"])
@@ -1641,7 +2478,10 @@ defmodule Tightbeam.Identity do
   defp refresh_receipts_for_merge!(_dir, _subject), do: :ok
 
   defp refresh_receipts!(dir, names) do
-    Enum.each(names, fn name ->
+    # A retained bundle's receipt stays as it is; there is no shipped source to compare.
+    names
+    |> Enum.filter(&(&1 in available_bundle_names()))
+    |> Enum.each(fn name ->
       write_receipt!(dir, current_bundle_receipt(dir, name))
     end)
   end
@@ -1658,7 +2498,7 @@ defmodule Tightbeam.Identity do
     newly_installed =
       shipped.paths
       |> Enum.reject(&(&1 in previously_owned))
-      |> Enum.filter(&index_matches_revision?(dir, @upstream, &1))
+      |> Enum.filter(&index_matches_revision?(dir, "MERGE_HEAD", &1))
 
     paths =
       (previously_owned ++ newly_installed)
@@ -1714,7 +2554,9 @@ defmodule Tightbeam.Identity do
       |> String.split("\n", trim: true)
       |> List.first()
 
-    root != nil and
+    # The mint lists the shipped bundle's files. A build that no longer ships it
+    # leaves those files in place as organization files instead.
+    "agentic-engineering" in available_bundle_names() and root != nil and
       git_output!(dir, ["show", "-s", "--format=%s", root]) ==
         "learn: agentic-engineering" and
       receipt_at(dir, "main", "agentic-engineering") == :error and
@@ -2160,8 +3002,23 @@ defmodule Tightbeam.Identity do
         true ->
           case System.cmd("git", ["merge-base", "--is-ancestor", expected, revision], cd: dir) do
             {_output, 0} ->
-              git!(dir, ["update-ref", "refs/heads/#{@live}", revision, expected])
-              {:ok, revision}
+              case product_snapshot_for_candidate(dir, revision) do
+                nil ->
+                  git!(dir, ["update-ref", "refs/heads/#{@live}", revision, expected])
+                  {:ok, revision}
+
+                {incoming, metadata} ->
+                  if metadata["expected_live"] != expected do
+                    {:error,
+                     %{
+                       code: "identity_publication_conflict",
+                       expected: metadata["expected_live"],
+                       actual: expected
+                     }}
+                  else
+                    publish_product_snapshot!(dir, revision, expected, incoming, metadata)
+                  end
+              end
 
             _ ->
               {:error,
@@ -2181,12 +3038,97 @@ defmodule Tightbeam.Identity do
       validate_revision_dir!(dir, main)
 
       case System.cmd("git", ["merge-base", "--is-ancestor", live, main], cd: dir) do
-        {_output, 0} -> git!(dir, ["update-ref", "refs/heads/#{@live}", main, live])
-        _ -> raise ArgumentError, "tightbeam/live cannot fast-forward to main"
+        {_output, 0} ->
+          case product_snapshot_for_candidate(dir, main) do
+            nil ->
+              git!(dir, ["update-ref", "refs/heads/#{@live}", main, live])
+
+            {incoming, metadata} ->
+              case publish_product_snapshot!(dir, main, live, incoming, metadata) do
+                {:ok, _revision} ->
+                  :ok
+
+                {:error, result} ->
+                  raise "cannot publish pending identity product snapshot: #{inspect(result)}"
+              end
+          end
+
+        _ ->
+          raise ArgumentError, "tightbeam/live cannot fast-forward to main"
       end
 
       main
     end)
+  end
+
+  defp product_snapshot_for_candidate(dir, revision) do
+    case optional_ref_oid(dir, @product_incoming) do
+      nil ->
+        nil
+
+      incoming ->
+        case product_snapshot_metadata_if_present(dir, incoming) do
+          nil ->
+            nil
+
+          metadata ->
+            if first_parent_contains_product_merge?(dir, revision, incoming),
+              do: {incoming, metadata},
+              else: nil
+        end
+    end
+  end
+
+  defp first_parent_contains_product_merge?(dir, revision, incoming) do
+    dir
+    |> git_output!(["rev-list", "--first-parent", "--merges", revision])
+    |> String.split("\n", trim: true)
+    |> Enum.any?(fn merge ->
+      case String.split(git_output!(dir, ["rev-list", "--parents", "-n", "1", merge]), " ",
+             trim: true
+           ) do
+        [_commit, _first_parent, ^incoming] -> true
+        _ -> false
+      end
+    end)
+  end
+
+  defp publish_product_snapshot!(dir, revision, expected_live, incoming, metadata) do
+    expected_upstream = metadata["previous_upstream"]
+    expected_baseline = metadata["previous_baseline"]
+
+    if metadata["expected_live"] != expected_live do
+      raise ArgumentError,
+            "identity product snapshot was prepared against a different live revision"
+    end
+
+    commands = [
+      "start",
+      "update refs/heads/#{@live} #{revision} #{expected_live}",
+      "update refs/heads/#{@upstream} #{incoming} #{expected_upstream}",
+      if(expected_baseline,
+        do: "update refs/heads/#{@product_baseline} #{incoming} #{expected_baseline}",
+        else: "create refs/heads/#{@product_baseline} #{incoming}"
+      ),
+      "delete refs/heads/#{@product_incoming} #{incoming}",
+      "prepare",
+      "commit",
+      ""
+    ]
+
+    try do
+      git_input!(dir, ["update-ref", "--stdin"], Enum.join(commands, "\n"))
+      {:ok, revision}
+    rescue
+      error ->
+        {:error,
+         %{
+           code: "identity_publication_conflict",
+           expected: expected_live,
+           actual: git_output!(dir, ["rev-parse", @live]),
+           detail: Exception.message(error)
+         }}
+    end
   end
 
   defp candidate_result(dir, expected_prior, fingerprint) do
@@ -2255,10 +3197,27 @@ defmodule Tightbeam.Identity do
   end
 
   defp git!(dir, args, author \\ nil) do
-    case System.cmd("git", args, cd: dir, stderr_to_stdout: true, env: git_env(author)) do
+    case System.cmd("git", without_auto_maintenance(args),
+           cd: dir,
+           stderr_to_stdout: true,
+           env: git_env(author)
+         ) do
       {_output, 0} -> :ok
       {output, status} -> raise "git #{Enum.join(args, " ")} failed (#{status}): #{output}"
     end
+  end
+
+  # Git launches automatic maintenance after commits and merges. By default it
+  # detaches, so a worker can keep writing into an initialization candidate
+  # after we rename it, or into a temporary identity after its owner starts
+  # removing it. Waiting for it instead would put an unbounded child on the
+  # identity write path (and, for initialization, under its lock) after Git has
+  # already committed. So identity writes start no maintenance at all; the
+  # identity repository stays small and is not part of any caller's own Git
+  # maintenance policy.
+  @doc false
+  def without_auto_maintenance(args) do
+    ["-c", "maintenance.auto=false", "-c", "gc.auto=0" | args]
   end
 
   defp git_env(nil), do: []

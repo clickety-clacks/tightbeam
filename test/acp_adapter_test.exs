@@ -66,6 +66,9 @@ defmodule Tightbeam.Acp.AdapterTest do
       send(owner, {:matching_fired, fact_id, resident?})
       {:reply, :ok, state}
     end
+
+    @impl true
+    def handle_cast(:holder_prod_changed, state), do: {:noreply, state}
   end
 
   # The defect this refactor exists to fix, in one assertion. A vendor
@@ -232,8 +235,19 @@ defmodule Tightbeam.Acp.AdapterTest do
   const efforts = {};
   const fastValues = {};
   const offeredModels = {};
+  // Sessions the adapter holds in memory. Recorded from the pinned
+  // claude-agent-acp 0.81.0 (dist/fork-session.js, dist/acp-agent.js): session/fork
+  // writes a forked transcript through the Claude Agent SDK and returns ONLY
+  // { sessionId }; it never registers that id. Until session/load (or resume)
+  // registers it, set_config_option, set_mode, prompt and close on the fork id
+  // throw "Session not found", which the ACP SDK 1.5.0 (errorToResult) sends as
+  // -32603 "Internal error" with data.details.
   const liveSessions = new Set();
   const conversationHistory = {};
+  const unloadedFork = (sid) =>
+    typeof sid === "string" && sid.startsWith("sess-fork-") && !liveSessions.has(sid);
+  const sessionNotFound = (id) =>
+    send({ id, error: { code: -32603, message: "Internal error", data: { details: "Session not found" } } });
   const defaultOfferedModels = [
     "default", "opus[1m]", "claude-fable-5[1m]", "nova[1m]", "sonnet", "haiku",
     "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol", "orbit-9"
@@ -362,26 +376,19 @@ defmodule Tightbeam.Acp.AdapterTest do
         models[sid] = models[m.params.sessionId] || "haiku";
         offeredModels[sid] = [...offeredModelMenu];
         conversationHistory[sid] = [...(conversationHistory[m.params.sessionId] || [])];
-        if (failMode === "resident-two-claude-models") {
-          return send({ id: m.id, result: { sessionId: sid } });
-        }
-        return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
+        // The real fork answers with the new id alone: no configOptions, not live.
+        return send({ id: m.id, result: { sessionId: sid } });
       }
       case "session/close": {
         capture(m);
         const sid = m.params.sessionId;
-        if (failMode === "resident-two-claude-models" && sid.startsWith("sess-fork-") && !liveSessions.has(sid)) {
-          return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
-        }
+        if (unloadedFork(sid)) return sessionNotFound(m.id);
         liveSessions.delete(sid);
         return send({ id: m.id, result: {} });
       }
       case "session/set_config_option": {
         capture(m);
-        if (failMode === "resident-two-claude-models" &&
-            m.params.sessionId.startsWith("sess-fork-") && !liveSessions.has(m.params.sessionId)) {
-          return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
-        }
+        if (unloadedFork(m.params.sessionId)) return sessionNotFound(m.id);
         if (failMode === "resident-two-claude-models" &&
             m.params.configId === "model" && m.params.value === "claude-sonnet-5") {
           models[m.params.sessionId] = "sonnet";
@@ -547,6 +554,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       }
       case "session/set_mode": {
         capture(m);
+        if (unloadedFork(m.params.sessionId)) return sessionNotFound(m.id);
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: {} }), 75);
         if (gateMode === "mode-refused-data" && m.params.sessionId === "probe-sess") {
           return send({ id: m.id, error: { code: -32000, message: "mode refused", data: { modeId: m.params.modeId, policy: "probe mode denied" } } });
@@ -561,16 +569,28 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = m.params.sessionId;
         capture(m);
         const text = m.params.prompt?.[0]?.text;
+        if (unloadedFork(sid)) return sessionNotFound(m.id);
         if (failMode === "resident-two-claude-models") {
-          if (sid.startsWith("sess-fork-") && !liveSessions.has(sid)) {
-            return send({ id: m.id, error: { code: -32603, message: "Session not found" } });
-          }
           if (sid.startsWith("sess-fork-") &&
               !conversationHistory[sid]?.includes("persist the resident Claude conversation")) {
             return send({ id: m.id, error: { code: -32000, message: "Forked conversation history missing" } });
           }
           conversationHistory[sid] ||= [];
           conversationHistory[sid].push(text);
+        }
+        if (text?.startsWith("refusal fixture: ")) {
+          const mode = text.slice("refusal fixture: ".length);
+          const update = (body) => send({ method: "session/update", params: { sessionId: sid, update: body } });
+          const message = (text, extra = {}) => update({
+            sessionUpdate: "agent_message_chunk", content: { type: "text", text }, ...extra
+          });
+          if (mode === "other output") message("Completed the report.", { messageId: "report" });
+          if (mode === "tool") update({ sessionUpdate: "tool_call", toolCallId: "tool-1", status: "completed" });
+          if (mode === "untyped") message("I refuse this request.");
+          if (mode !== "untyped" && mode !== "empty") {
+            message("The request was declined.", { _meta: { "tightbeam.dev/providerRefusal": true } });
+          }
+          return send({ id: m.id, result: { stopReason: mode === "untyped" ? "end_turn" : "refusal" } });
         }
         if (text === "fail after dispatch") {
           return send({ id: m.id, error: { code: -32000, message: "post-dispatch failure" } });
@@ -927,6 +947,41 @@ defmodule Tightbeam.Acp.AdapterTest do
               text: "pong[allow-once]",
               messages: [%{message_id: nil, text: "pong[allow-once]"}]
             }} = Adapter.prompt(a, "sess-1", "say pong")
+  end
+
+  test "Claude classifies only a refusal stop without other turn output" do
+    {adapter, _capture_path} = start_adapter(harness: :claude)
+
+    assert {:ok,
+            %{
+              stop_reason: "refusal",
+              work_outcome: :did_not_perform,
+              text: "The request was declined."
+            }} = Adapter.prompt(adapter, "sess-1", "refusal fixture: only")
+
+    for mode <- ["tool", "other output"] do
+      assert {:ok, %{stop_reason: "refusal"} = result} =
+               Adapter.prompt(adapter, "sess-1", "refusal fixture: " <> mode)
+
+      refute Map.has_key?(result, :work_outcome)
+    end
+
+    # A prior prompt's tool or text must not bleed into the next prompt.
+    assert {:ok, %{work_outcome: :did_not_perform, text: ""}} =
+             Adapter.prompt(adapter, "sess-1", "refusal fixture: empty")
+
+    assert {:error, _reason} = Adapter.prompt(adapter, "sess-1", "fail after dispatch")
+  end
+
+  for harness <- [:claude, :codex, :pi] do
+    test "#{harness} ordinary text mentioning refusal stays an ordinary reply" do
+      {adapter, _capture_path} = start_adapter(harness: unquote(harness))
+
+      assert {:ok, %{stop_reason: "end_turn", text: "I refuse this request."} = result} =
+               Adapter.prompt(adapter, "sess-1", "refusal fixture: untyped")
+
+      refute Map.has_key?(result, :work_outcome)
+    end
   end
 
   test "prompt preserves the text-only frame and forwards ordered inline image blocks" do
@@ -1691,8 +1746,24 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
   end
 
+  # The deadline tests below opt in to a budget. A default prompt has none.
+  @explicit_prompt_timeout 30 * 60_000
+
+  # A mailbox barrier. Everything this process sent to `pid` earlier, and every
+  # message `pid` emitted to a process this test has already passed through
+  # `barrier/1`, has been handled once it returns. It observes the absence of an
+  # effect without sleeping for it.
+  defp barrier(pid) do
+    _ = :sys.get_state(pid)
+    :ok
+  end
+
   for death <- [:caller, :worker] do
     @death death
+    # No real timer can fire in this test: the deadline is far away and the
+    # grace is its five second maximum. The original deadline and its grace
+    # expiry are delivered here, in the order and at the time the test chooses,
+    # so a slow or stalled machine cannot reorder them against a wait budget.
     test "#{death} death with ignored cancellation cannot tear down before the original deadline" do
       {adapter, capture} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
       conn = Adapter.conn(adapter)
@@ -1701,12 +1772,16 @@ defmodule Tightbeam.Acp.AdapterTest do
 
       caller =
         Task.async(fn ->
-          Adapter.prompt(adapter, "canceled", "stall", timeout: 1_500, cancel_grace: 50)
+          Adapter.prompt(adapter, "canceled", "stall",
+            timeout: @explicit_prompt_timeout,
+            cancel_grace: 5_000
+          )
         end)
 
       peer = Task.async(fn -> Adapter.prompt(adapter, "healthy", "peer") end)
       assert pending_count?(conn, 2)
       {id, entry} = prompt_entry(conn, "canceled")
+      assert entry.deadline > System.monotonic_time(:millisecond)
       worker = elem(entry.from, 0)
       worker_monitor = Process.monitor(worker)
 
@@ -1716,23 +1791,76 @@ defmodule Tightbeam.Acp.AdapterTest do
 
       assert eventually(fn -> not is_nil(:sys.get_state(conn).pending[id].cancel_reason) end)
       assert :sys.get_state(conn).pending[id].cancel_timer == nil
-      # An ignored cancel outlives the injected grace without affecting the
-      # shared connection. Even an early stale grace signal has no authority.
+
+      # The death only cancels its own session. A grace signal that arrives
+      # before the original deadline has no authority, however early or stale.
       send(conn, {:prompt_cancel_expired, id, entry.token})
-      refute_receive {:DOWN, ^adapter_monitor, :process, ^adapter, _}, 200
+      barrier(conn)
+      barrier(adapter)
+      refute_received {:DOWN, ^adapter_monitor, :process, ^adapter, _}
+      assert Process.alive?(adapter)
       assert Process.alive?(conn)
+      assert Map.has_key?(:sys.get_state(adapter).prompts, "canceled")
+      assert :sys.get_state(conn).pending[id].cancel_timer == nil
+
+      # The ignored cancel does not affect the shared connection.
       Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "healthy"})
       assert {:ok, _} = Task.await(peer)
       assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
 
+      # The original deadline arrives. It starts the grace but is not itself
+      # a teardown.
+      send(conn, {:prompt_deadline, id, entry.token})
+      barrier(conn)
+      barrier(adapter)
+
+      assert %{cancel_reason: :prompt_timeout, cancel_timer: grace} =
+               :sys.get_state(conn).pending[id]
+
+      assert is_reference(grace)
+      refute_received {:DOWN, ^adapter_monitor, :process, ^adapter, _}
+      assert Process.alive?(adapter)
+
+      # Only the grace expiry that follows the deadline tears the connection down.
+      send(conn, {:prompt_cancel_expired, id, entry.token})
+
       assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter,
                       {:prompt_cancel_unacknowledged, "canceled"}},
-                     3_000
+                     10_000
 
-      assert System.monotonic_time(:millisecond) >= entry.deadline
-      assert_receive {:DOWN, ^conn_monitor, :process, ^conn, _}, 2_000
-      assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _}, 2_000
+      assert_receive {:DOWN, ^conn_monitor, :process, ^conn, _}, 10_000
+      assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _}, 10_000
       if @death == :worker, do: assert({:error, :prompt_timeout} = Task.await(caller))
+    end
+
+    # The same property against the real clock. Nothing here depends on how
+    # early a step runs: the only time assertion is that teardown is observed no
+    # earlier than the deadline, which a slow machine can only make truer.
+    test "#{death} death with ignored cancellation tears down only at the real deadline" do
+      {adapter, _capture} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+      conn = Adapter.conn(adapter)
+      adapter_monitor = Process.monitor(adapter)
+      started = System.monotonic_time(:millisecond)
+
+      caller =
+        Task.async(fn ->
+          Adapter.prompt(adapter, "canceled", "stall", timeout: 1_500, cancel_grace: 50)
+        end)
+
+      assert pending_count?(conn, 1)
+      worker = prompt_requester(conn)
+      worker_monitor = Process.monitor(worker)
+
+      if @death == :caller,
+        do: Task.shutdown(caller, :brutal_kill),
+        else: Process.exit(worker, :kill)
+
+      assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter,
+                      {:prompt_cancel_unacknowledged, "canceled"}},
+                     10_000
+
+      assert System.monotonic_time(:millisecond) >= started + 1_500
+      assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _}, 10_000
     end
   end
 
@@ -1750,9 +1878,6 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Process.alive?(adapter)
     assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
   end
-
-  # The deadline tests below opt in to a budget. A default prompt has none.
-  @explicit_prompt_timeout 30 * 60_000
 
   test "a default prompt arms no deadline and no request timer" do
     {adapter, _capture} = start_adapter(gate_mode: "late-success-turn", probe: false)

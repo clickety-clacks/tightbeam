@@ -596,6 +596,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: System.system_time(:millisecond),
                  assignment_id: "A",
                  after_turn: true,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -613,6 +614,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: System.system_time(:millisecond),
                  assignment_id: "A",
                  after_turn: true,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -767,6 +769,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       session_key: "holder",
       params: %{
         prompt: "Continue only if still useful.",
+        wait_reason: "Waiting for the resolver",
         after_ms: 60_000,
         assignment_id: "A",
         predicate: predicate("R"),
@@ -774,7 +777,11 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       }
     }
 
+    assert %{code: "missing_reason"} =
+             handler.(update_in(call.params, &Map.delete(&1, :wait_reason)))
+
     response = handler.(call)
+    assert response.wait_reason == "Waiting for the resolver"
     assert response.recognition_path == nil
     refute response.eligible
     assert Wakes.get(ctx.db, response.wake_id).owner_user_id == "owner-a"
@@ -936,6 +943,47 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert attest_count(ctx.db, "V") == 2
   end
 
+  test "fired wait owner can record a verdict after its verifier closes", ctx do
+    verified_wait =
+      register_legacy_wait(
+        ctx.db,
+        System.system_time(:millisecond) - 1,
+        predicate("R")
+      )
+
+    challenged_wait =
+      register_legacy_wait(
+        ctx.db,
+        System.system_time(:millisecond) - 1,
+        predicate("R")
+      )
+
+    assert %{outcome: "revoked"} = revoke(ctx.db, "V")
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, verified_wait.wake_id).fired_at
+    assert Wakes.get(ctx.db, challenged_wait.wake_id).fired_at
+
+    closed_verifier =
+      attest(ctx.db, "V", "verifier", "verdict", "wait-verified", verified_wait.wake_id)
+
+    assert closed_verifier.code == "assignment_closed"
+    assert attest_count(ctx.db, "V") == 0
+
+    non_owner = attest(ctx.db, "A", "intruder", "verdict", "wait-verified", verified_wait.wake_id)
+    assert non_owner.code == "invalid_wait_verdict"
+    assert attest_count(ctx.db, "A") == 0
+
+    verified = attest(ctx.db, "A", "holder", "verdict", "wait-verified", verified_wait.wake_id)
+    assert verified.attest.waitId == verified_wait.wake_id
+    assert Wakes.get(ctx.db, verified_wait.wake_id).verification_state == "confirmed"
+
+    challenged =
+      attest(ctx.db, "A", "holder", "verdict", "wait-challenged", challenged_wait.wake_id)
+
+    assert challenged.attest.waitId == challenged_wait.wake_id
+    assert Wakes.get(ctx.db, challenged_wait.wake_id).verification_state == "challenged"
+  end
+
   test "terminal verifier and fallback end provisional waiting without inventing confirmation",
        ctx do
     verifier_terminal = register_legacy_wait(ctx.db, due_after(), predicate("R"))
@@ -1005,6 +1053,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_after(),
                  assignment_id: "A",
                  predicate: declaration,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1029,6 +1078,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  prompt: "do not persist",
                  assignment_id: "A",
                  predicate: predicate("R"),
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1045,6 +1095,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_after(),
                  assignment_id: "B",
                  predicate: predicate("R"),
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1064,6 +1115,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_after(),
                  assignment_id: "A",
                  predicate: invalid_resolver,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1102,7 +1154,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       handler = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})["wake"]
 
       shipped =
-        File.read!("priv/kungfu/agentic-engineering/rules/verification.toml")
+        File.read!("test/support/fixtures/kungfu/agentic-engineering/rules/verification.toml")
         |> Tightbeam.TestRailScopeFixtures.wildcard_substrate(["rule", "policy"])
 
       File.write!(Path.join(ctx.base, "identity/rules/verification.toml"), shipped)
@@ -1110,6 +1162,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
       params = %{
         prompt: "Continue the holder's work.",
+        wait_reason: "Waiting on fixture follow-through",
         after_ms: 60_000,
         assignment_id: "A",
         nudge: false
@@ -1156,7 +1209,10 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     shipped =
       File.read!(
-        Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__)
+        Path.expand(
+          "support/fixtures/kungfu/agentic-engineering/rules/verification.toml",
+          __DIR__
+        )
       )
       |> Tightbeam.TestRailScopeFixtures.wildcard_substrate(["rule", "policy"])
 
@@ -1177,6 +1233,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       due_at: due_after(),
       assignment_id: "A",
       predicate: predicate("R"),
+      wait_reason: "Waiting on the fixture resolver",
       registrant_session_key: "supervisor",
       owner_user_id: "owner-a"
     }
@@ -1390,6 +1447,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  prompt: "Resume #{assignment_id} exactly.",
                  assignment_id: assignment_id,
                  after_turn: true,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1460,6 +1518,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  due_at: due_at,
                  assignment_id: "A",
                  predicate: predicate,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "holder",
                  owner_user_id: "owner-a"
                })
@@ -1870,11 +1929,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       principal: {:session, "holder"},
       session_key: "holder",
       origin: "agent:holder-role",
-      params: %{
-        question: question,
-        options: [%{label: "continue"}, %{label: "stop"}],
-        supersedes: supersedes
-      }
+      params:
+        Tightbeam.TestSupport.OperatorAskFixture.link(db, "holder", %{
+          question: question,
+          options: [%{label: "continue"}, %{label: "stop"}],
+          supersedes: supersedes
+        })
     })
   end
 

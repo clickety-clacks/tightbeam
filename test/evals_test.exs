@@ -7,8 +7,8 @@ defmodule Tightbeam.EvalsTest do
     [_, scenario] = String.split(evals, "5. **matching-goal kungfu offer**", parts: 2)
     scenario = scenario |> String.split("\n\nRunner:", parts: 2) |> hd()
 
-    assert scenario =~ ~s("I want to write software.")
-    assert scenario =~ "first sentence names `agentic-engineering`"
+    assert scenario =~ ~s("I want one agent to talk to.")
+    assert scenario =~ "first sentence names `uncle-enzo`"
     assert scenario =~ "offers to learn it before"
     assert scenario =~ "any other plan"
     assert scenario =~ "runs a tool before making the offer"

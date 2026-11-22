@@ -35,9 +35,14 @@ defmodule Tightbeam.RowReactions.Plan do
   end
 
   def compile!(rail, provenance, owner, owned_archetypes) do
-    fields!(rail, ~w(name family events when effects), ~w(bind english archetypes))
+    fields!(rail, ~w(name family events when effects), ~w(bind english archetypes policy_context))
     Enum.each(~w(name family), &text!(rail[&1]))
     archetypes = validate_archetypes!(rail, owner, owned_archetypes)
+
+    policy_context = Map.get(rail, "policy_context", "participants")
+
+    unless policy_context in ["participants", "organization"],
+      do: raise(ArgumentError, "unsupported reaction policy context")
 
     english = Map.get(rail, "english")
     if english, do: text!(english)
@@ -71,7 +76,9 @@ defmodule Tightbeam.RowReactions.Plan do
     Enum.each(effects, fn effect ->
       fields!(effect, ~w(slot kind when value), ~w(withdraw))
       text!(effect["slot"])
-      unless effect["kind"] == "notice", do: raise(ArgumentError, "unsupported reaction effect")
+
+      unless effect["kind"] in ["notice", "cancel_notice"],
+        do: raise(ArgumentError, "unsupported reaction effect")
 
       Enum.each(~w(when value withdraw), fn key ->
         Expression.validate!(effect[key])
@@ -83,6 +90,7 @@ defmodule Tightbeam.RowReactions.Plan do
 
     %{
       mode: :event,
+      policy_context: policy_context,
       name: Tightbeam.Identity.Provenance.qualify(owner, rail["name"]),
       short_name: rail["name"],
       owner: owner,
@@ -98,6 +106,27 @@ defmodule Tightbeam.RowReactions.Plan do
       provenance: provenance
     }
   end
+
+  @doc false
+  def handoff_default?(%{owner: :substrate, archetypes: archetypes} = rail) do
+    (archetypes == ["*"] or Map.get(rail, :policy_context) == "organization") and
+      terminal_handoff?(rail)
+  end
+
+  def handoff_default?(_rail), do: false
+
+  defp terminal_handoff?(%{
+         mode: :event,
+         short_name: "assignment-terminal-handoff",
+         family: "terminal-handoff",
+         events: events,
+         effects: effects
+       }) do
+    "assignment" in events and
+      Enum.any?(effects, &match?(%{"slot" => "handoff", "kind" => "notice"}, &1))
+  end
+
+  defp terminal_handoff?(_rail), do: false
 
   # A nonmatching rail still supplies its typed withdrawal parameters. They
   # cannot admit work; they describe how an already pending output is canceled.
@@ -145,12 +174,45 @@ defmodule Tightbeam.RowReactions.Plan do
         end
       end)
 
+    plans = select_terminal_handoff(plans, event)
     unique!(Enum.map(plans, & &1.identity))
 
     Enum.map(plans, fn plan ->
       plan |> Map.delete(:context) |> Map.delete(:rail)
     end)
   end
+
+  # The canonical organization-wide handoff may be the built-in, the stock
+  # seed, or an operator edit. A matching bundle uses the same action identity,
+  # so the election must happen after scope matching and before admission.
+  defp select_terminal_handoff(plans, %{"kind" => "assignment", "org" => org, "id" => id}) do
+    identity = [org, "terminal-handoff", id, "handoff"]
+    handoffs = Enum.filter(plans, &(&1.identity == identity))
+
+    with {[_global], [_ | _] = candidates} <- Enum.split_with(handoffs, &global_handoff?/1),
+         true <- Enum.all?(candidates, &bundle_handoff?/1) do
+      case Enum.filter(candidates, & &1.selected) do
+        [] -> plans -- candidates
+        [winner] -> plans -- (handoffs -- [winner])
+        _ -> plans
+      end
+    else
+      _ -> plans
+    end
+  end
+
+  defp select_terminal_handoff(plans, _event), do: plans
+
+  defp global_handoff?(%{kind: "notice", rail: rail}), do: handoff_default?(rail)
+  defp global_handoff?(_plan), do: false
+
+  defp bundle_handoff?(%{
+         kind: "notice",
+         rail: %{owner: {:kungfu, _}, short_name: "assignment-terminal-handoff"}
+       }),
+       do: true
+
+  defp bundle_handoff?(_plan), do: false
 
   defp validate_archetypes!(rail, owner, owned_archetypes) do
     names = Map.get(rail, "archetypes", [])
@@ -235,6 +297,10 @@ defmodule Tightbeam.RowReactions.Plan do
   defp expression_reference(_), do: nil
 
   defp archetype_reference?(name), do: String.ends_with?(name, ".archetype")
+
+  # Organization-level declarations elect policy independently of their audience.
+  # Session-scoped declarations retain the existing participant restrictions.
+  defp scope_matches?(%{policy_context: "organization"}, _event, _facts, _value), do: true
 
   defp scope_matches?(rail, _event, facts, value) do
     base = Map.get(facts, "scope_participant_archetypes", [])

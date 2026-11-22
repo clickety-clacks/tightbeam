@@ -135,7 +135,9 @@ defmodule Tightbeam.Harness.Claude do
       |> Map.put_new(:patch_adapter, &Tightbeam.Harness.ClaudeFoldedPrompt.local/1)
       |> Map.put_new(:remote_patch, &Tightbeam.Harness.ClaudeFoldedPrompt.remote(target, &1, &2))
 
-    Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
+    Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target),
+      verify_version: @adapter_version
+    )
   end
 
   @impl true
@@ -169,9 +171,19 @@ defmodule Tightbeam.Harness.Claude do
 
     case Map.fetch(session, :cwd) do
       {:ok, cwd} ->
-        Map.put(meta, :claudeCode, %{
-          options: %{settings: %{claudeMdExcludes: ancestor_instruction_paths(cwd)}}
-        })
+        options = %{settings: %{claudeMdExcludes: ancestor_instruction_paths(cwd)}}
+
+        options =
+          case Map.get(session, :compactor_model) do
+            %Model{} = model ->
+              # The pinned ACP forwards these SDK options to this session only.
+              Map.merge(options, %{model: Model.to_ref(model), tools: []})
+
+            nil ->
+              options
+          end
+
+        Map.put(meta, :claudeCode, %{options: options})
 
       :error ->
         meta

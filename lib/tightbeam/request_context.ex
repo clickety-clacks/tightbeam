@@ -99,6 +99,12 @@ defmodule Tightbeam.RequestContext do
     :ok
   end
 
+  @doc false
+  def caller(caller) do
+    if context = Process.get(@key), do: Process.put(@key, Map.put(context, :caller, caller))
+    :ok
+  end
+
   def idempotent? do
     case Process.get(@key) do
       %{idempotent: true} -> true

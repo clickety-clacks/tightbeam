@@ -23,7 +23,9 @@ defmodule Tightbeam.StateResources do
          sessions.provider, sessions.model, sessions.thinkingLevel, sessions.modelContext,
          sessions.host, sessions.clearedThroughSeq, sessions.state, sessions.createdAt,
          sessions.updatedAt, sessions.mechanicalStatus, sessions.updatedAt,
-         #{Tightbeam.Org.topology_parent_sql("sessions")}
+         #{Tightbeam.Org.topology_parent_sql("sessions")},
+         (SELECT fyi FROM record_fyis
+          WHERE recordKind = 'session' AND recordId = sessions.sessionKey)
   FROM sessions
   """
 
@@ -47,8 +49,10 @@ defmodule Tightbeam.StateResources do
            WHEN t.origin IS NULL THEN NULL
            ELSE 'other'
          END,
-         t.batchMemberCount
+         t.batchMemberCount,
+         #{Tightbeam.HarnessHealth.Hold.turn_columns_sql()}
   FROM turns AS t
+  #{Tightbeam.HarnessHealth.Hold.turn_join_sql()}
   """
 
   @assignment_select """
@@ -87,7 +91,8 @@ defmodule Tightbeam.StateResources do
              SELECT 1 FROM attests AS filed WHERE filed.assignmentId = a.id
            ) THEN 'open'
            ELSE 'active'
-         END
+         END,
+         (SELECT fyi FROM record_fyis WHERE recordKind = 'assignment' AND recordId = a.id)
   FROM assignments AS a
   LEFT JOIN work_items AS wi ON wi.id = a.workItemId
   """
@@ -258,17 +263,17 @@ defmodule Tightbeam.StateResources do
     "work items" =>
       ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
     "assignments" =>
-      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
+      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus fyi rowVersion),
     "attests" =>
-      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs ts rowVersion),
+      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs fyi ts rowVersion),
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
-      ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt triggerSource batchMemberCount rowVersion),
+      ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt triggerSource batchMemberCount holdSince holdIncidentId holdFailureClass holdRelease rowVersion),
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
-      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities rowVersion),
+      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities fyi rowVersion),
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "users" => ~w(userId isAdmin createdAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
@@ -332,7 +337,7 @@ defmodule Tightbeam.StateResources do
     },
     "wakes" => %{
       strings:
-        ~w(wakeId sessionKey targetRole origin prompt consumer state reresolve reresolveSeed conditionKind conditionScope firedBy creatorSessionKey workItemId assignmentId class classElection deliveryRule deliveryStatus),
+        ~w(wakeId sessionKey targetRole origin prompt consumer state reresolve reresolveSeed conditionKind conditionScope firedBy creatorSessionKey workItemId assignmentId class classElection deliveryRule deliveryStatus waitReason),
       integers:
         ~w(dueAt createdAt firedAt reresolveRung conditionAfterId canceledAt targetGate rowVersion),
       booleans: ~w(rumination digest summon),
@@ -341,12 +346,12 @@ defmodule Tightbeam.StateResources do
     },
     "turns" => %{
       strings:
-        ~w(sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness status owner requestRef error triggerSource),
+        ~w(sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness status owner requestRef error triggerSource holdIncidentId holdFailureClass holdRelease),
       integers:
-        ~w(seq replyAttention adapterGen createdAt startedAt endedAt publishedAt batchMemberCount rowVersion),
+        ~w(seq replyAttention adapterGen createdAt startedAt endedAt publishedAt batchMemberCount holdSince rowVersion),
       booleans: [],
       nullable:
-        ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt triggerSource batchMemberCount)
+        ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt triggerSource batchMemberCount holdIncidentId holdFailureClass)
     },
     "decision requests" => %{
       strings:
@@ -475,6 +480,9 @@ defmodule Tightbeam.StateResources do
     {"work items", "landings"} => {:array, :landing, :preserve},
     {"assignments", "files"} => {:array, :string, :preserve},
     {"attests", "commitRefs"} => {:array, :commit_ref, :preserve},
+    {"attests", "fyi"} => {:array, :string, :preserve},
+    {"assignments", "fyi"} => {:array, :string, :preserve},
+    {"sessions", "fyi"} => {:array, :string, :preserve},
     {"decision requests", "options"} => {:array, :decision_option, :preserve},
     {"decision requests", "context"} => :json,
     {"sessions", "overrides"} => :session_overrides,
@@ -849,6 +857,33 @@ defmodule Tightbeam.StateResources do
     |> Enum.map(&session_query_row/1)
   end
 
+  @doc "Return all visible session message high-water marks using indexed latest-row seeks."
+  def query_session_message_sequences(db, principal) do
+    {where, params} =
+      cond do
+        principal.kind == "observer" -> {"1", []}
+        principal.is_admin -> {"1", []}
+        principal.kind == "session" -> {"1", []}
+        true -> {"sessions.ownerUserId = ?", [principal.id]}
+      end
+
+    observed_query(
+      db,
+      principal,
+      """
+      SELECT sessions.sessionKey,
+             COALESCE((SELECT m.seq FROM messages AS m
+                       WHERE m.sessionKey = sessions.sessionKey
+                       ORDER BY m.seq DESC LIMIT 1), 0)
+      FROM sessions
+      WHERE #{where}
+      ORDER BY sessions.sessionKey ASC
+      """,
+      params
+    )
+    |> Enum.map(fn [key, seq] -> %{"sessionKey" => key, "latestMessageSeq" => seq} end)
+  end
+
   @doc "Return a bounded page of sessions visible to one REST principal."
   def query_sessions_page(db, principal, boundary, limit, archetypes \\ nil) do
     trace_core_detail(principal, {:au4_visibility, "sessions"})
@@ -1183,7 +1218,8 @@ defmodule Tightbeam.StateResources do
          updated_at,
          mechanical_status,
          row_version,
-         topology_parent
+         topology_parent,
+         fyi
        ]) do
     %{
       session_key: session_key,
@@ -1212,7 +1248,8 @@ defmodule Tightbeam.StateResources do
       created_at: created_at,
       updated_at: updated_at,
       mechanical_status: mechanical_status,
-      row_version: row_version
+      row_version: row_version,
+      fyi: record_fyi(fyi)
     }
   end
 
@@ -1391,6 +1428,7 @@ defmodule Tightbeam.StateResources do
           by_harness: by_harness,
           by_provider: by_provider,
           commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
+          fyi: Map.get(Tightbeam.RecordFyis.list_many(db, "attest", [id]), id, []),
           ts: ts
         }
 
@@ -1990,7 +2028,8 @@ defmodule Tightbeam.StateResources do
          holder_provider,
          files,
          effect_kind,
-         derived_status
+         derived_status,
+         fyi
        ]) do
     %{
       id: id,
@@ -2016,9 +2055,14 @@ defmodule Tightbeam.StateResources do
       holder_provider: holder_provider,
       files: JSON.decode!(files),
       effect_kind: effect_kind,
-      derived_status: derived_status
+      derived_status: derived_status,
+      fyi: record_fyi(fyi)
     }
   end
+
+  # FYI lines recorded with the write that created a record, or [].
+  defp record_fyi(nil), do: []
+  defp record_fyi(fyi) when is_binary(fyi), do: JSON.decode!(fyi)
 
   defp bool_int(true), do: 1
   defp bool_int(false), do: 0
@@ -2072,11 +2116,12 @@ defmodule Tightbeam.StateResources do
   end
 
   def work_item(row), do: public(row)
-  def assignment(row), do: public(row)
+  def assignment(nil), do: nil
+  def assignment(row), do: row |> public() |> Map.put_new("fyi", [])
 
   def attest(row) do
     reject_public_shape_drift!(row, "attests")
-    row |> public() |> closed_projection("attests")
+    row |> public() |> Map.put_new("fyi", []) |> closed_projection("attests")
   end
 
   def wake(nil), do: nil
@@ -2168,6 +2213,8 @@ defmodule Tightbeam.StateResources do
         "updatedAt" => session_wire_value!(row, :updated_at, "updatedAt"),
         "mechanicalStatus" => session_wire_value!(row, :mechanical_status, "mechanicalStatus"),
         "capabilities" => %{"setHarness" => set_harness},
+        # Rows read from the sessions table carry their stored FYI lines.
+        "fyi" => value(row, :fyi) || [],
         "rowVersion" => session_wire_value!(row, :row_version, "rowVersion")
       }
     )
@@ -2227,13 +2274,15 @@ defmodule Tightbeam.StateResources do
   def role(row), do: row |> public() |> closed_projection("roles")
 
   def artifact(row) do
+    {custody, row} = Map.pop(row, :custody)
     reject_public_shape_drift!(row, "artifacts")
     version = value(row, :row_version)
 
     unless is_integer(version) and version > 0,
       do: raise(ArgumentError, "artifact rowVersion is projection_invalid")
 
-    row |> public() |> closed_projection("artifacts")
+    projection = row |> public() |> closed_projection("artifacts")
+    if custody, do: Map.put(projection, "custody", custody), else: projection
   end
 
   def message(row) do
@@ -2608,9 +2657,15 @@ defmodule Tightbeam.StateResources do
         do: fields,
         else: List.delete(fields, "triggerSource")
 
-    if Map.has_key?(item, "batchMemberCount"),
+    fields =
+      if Map.has_key?(item, "batchMemberCount"),
+        do: fields,
+        else: List.delete(fields, "batchMemberCount")
+
+    # Present only on a queued turn read behind a standing park fence.
+    if Map.has_key?(item, "holdSince"),
       do: fields,
-      else: List.delete(fields, "batchMemberCount")
+      else: fields -- ~w(holdSince holdIncidentId holdFailureClass holdRelease)
   end
 
   defp conditional_fields!("transcript messages", fields, item) do
@@ -2640,6 +2695,9 @@ defmodule Tightbeam.StateResources do
         List.delete(fields, "messageType")
     end
   end
+
+  defp conditional_fields!("wakes", fields, %{"waitReason" => reason}) when is_binary(reason),
+    do: fields ++ ["waitReason"]
 
   defp conditional_fields!(_resource, fields, _item), do: fields
 
@@ -3299,7 +3357,10 @@ defmodule Tightbeam.StateResources do
          ended_at,
          published_at,
          trigger_source,
-         batch_member_count
+         batch_member_count,
+         hold_since,
+         hold_incident_id,
+         hold_failure_class
        ]) do
     %{
       seq: seq,
@@ -3329,6 +3390,20 @@ defmodule Tightbeam.StateResources do
       trigger_source: trigger_source,
       batch_member_count: batch_member_count
     }
+    |> put_turn_hold(hold_since, hold_incident_id, hold_failure_class)
+  end
+
+  # A queued turn behind a standing park fence says so. The fields exist only
+  # while held; the release wording is shared with the repair refusal.
+  defp put_turn_hold(row, nil, _incident_id, _failure_class), do: row
+
+  defp put_turn_hold(row, since, incident_id, failure_class) do
+    Map.merge(row, %{
+      hold_since: since,
+      hold_incident_id: incident_id,
+      hold_failure_class: failure_class,
+      hold_release: Tightbeam.HarnessHealth.Hold.release_text(incident_id, failure_class)
+    })
   end
 
   defp message_row([
@@ -3676,6 +3751,9 @@ defmodule Tightbeam.StateResources do
 
     if keys != [] and Enum.all?(keys, &is_binary/1) do
       expected = Map.fetch!(@item_field_order, resource)
+
+      expected =
+        if resource == "wakes", do: conditional_fields!(resource, expected, row), else: expected
 
       unless Enum.sort(keys) == Enum.sort(expected) do
         raise ArgumentError, "#{resource} public item has an extra or missing field"

@@ -1,6 +1,13 @@
 import Config
 
 if config_env() != :test do
+  case System.get_env("TIGHTBEAM_COORDINATOR_HOLD_ALERTS") do
+    nil -> :ok
+    "true" -> config :tightbeam, :coordinator_hold_alerts_enabled, true
+    "false" -> config :tightbeam, :coordinator_hold_alerts_enabled, false
+    _ -> raise ArgumentError, "TIGHTBEAM_COORDINATOR_HOLD_ALERTS must be true or false"
+  end
+
   if value = System.get_env("TIGHTBEAM_BASE_DIR") do
     config :tightbeam, :base_dir, value
   end
@@ -45,6 +52,20 @@ if config_env() != :test do
     config :tightbeam, :wake_tick_ms, String.to_integer(value)
   end
 
+  if value = System.get_env("TIGHTBEAM_HOLDER_PROD_HOURLY_CAP") do
+    case Integer.parse(value) do
+      {cap, ""} when cap > 0 -> config :tightbeam, :holder_prod_hourly_cap, cap
+      _ -> raise ArgumentError, "TIGHTBEAM_HOLDER_PROD_HOURLY_CAP must be a positive integer"
+    end
+  end
+
+  case System.get_env("TIGHTBEAM_HOLDER_PROD_REPORT_ONLY") do
+    nil -> :ok
+    "false" -> :ok
+    "true" -> config :tightbeam, :holder_prod_report_only, true
+    _ -> raise ArgumentError, "TIGHTBEAM_HOLDER_PROD_REPORT_ONLY must be true or false"
+  end
+
   if value = System.get_env("TIGHTBEAM_PROD_LIMIT") do
     config :tightbeam, :prod_limit, String.to_integer(value)
   end
@@ -69,6 +90,34 @@ if config_env() != :test do
 
   if value = System.get_env("TIGHTBEAM_ARCHIVE_DIR") do
     config :tightbeam, :archive_dir, value
+  end
+
+  for {variable, key} <- [
+        {"TIGHTBEAM_WORKSPACE_ARCHIVE_MAX_ENTRIES", :workspace_archive_max_entries},
+        {"TIGHTBEAM_WORKSPACE_ARCHIVE_MAX_BYTES", :workspace_archive_max_bytes},
+        {"TIGHTBEAM_WORKSPACE_ARCHIVE_RESERVE_BYTES", :workspace_archive_reserve_bytes},
+        {"TIGHTBEAM_WORKSPACE_ARCHIVE_RESERVE_PERCENT", :workspace_archive_reserve_percent},
+        {"TIGHTBEAM_WORKSPACE_CLEANUP_STUCK_ATTEMPTS", :workspace_cleanup_stuck_attempts}
+      ],
+      value = System.get_env(variable) do
+    config :tightbeam, key, String.to_integer(value)
+  end
+
+  if value = System.get_env("TIGHTBEAM_ARTIFACT_ARCHIVE_INLINE_LIMIT_BYTES") do
+    config :tightbeam, :artifact_archive_inline_limit_bytes, String.to_integer(value)
+  end
+
+  if root = System.get_env("TIGHTBEAM_ARTIFACT_BLOB_ROOT") do
+    config :tightbeam, :artifact_blob_root, root
+  end
+
+  for {var, key} <- [
+        {"TIGHTBEAM_ARTIFACT_BLOB_BUDGET_BYTES", :artifact_blob_budget_bytes},
+        {"TIGHTBEAM_ARTIFACT_BLOB_FREE_FLOOR_BYTES", :artifact_blob_free_floor_bytes},
+        {"TIGHTBEAM_ARTIFACT_BLOB_FREE_FLOOR_PERCENT", :artifact_blob_free_floor_percent}
+      ],
+      value = System.get_env(var) do
+    config :tightbeam, key, String.to_integer(value)
   end
 
   if value = System.get_env("TIGHTBEAM_DB_CALL_TIMEOUT_MS") do

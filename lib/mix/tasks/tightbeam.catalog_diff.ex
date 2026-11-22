@@ -206,8 +206,9 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
 
       {:error, :enoent} ->
         Mix.raise(
-          "working_set_not_installed: the agentic-engineering kungfu bundle and its " <>
-            "preferred-model working set are not installed; run: tightbeam learn agentic-engineering"
+          "working_set_not_installed: the identity has no guidance/preferred-models.md " <>
+            "working set; it is installed by the agentic-engineering kungfu, which this " <>
+            "build no longer ships"
         )
 
       {:error, reason} ->

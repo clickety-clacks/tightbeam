@@ -15,6 +15,9 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     WorkItems
   }
 
+  @judgment_words ~w(must required requires should please invalid error forbidden refus denied violat cannot) ++
+                    ["not allowed", "blocked by"]
+
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = Schema.ensure_all(db)
@@ -108,40 +111,58 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert DeliveryResponsibilities.current_owner(db, "wi_a1")["accountableSessionKey"] == "pdo-a"
   end
 
-  test "owner remedy text describes explicit update without an owner-admin permission claim", %{
-    db: db
-  } do
-    assert %{code: "delivery_owner_missing", message: missing} =
+  test "staffing-owner facts are stated as neutral FYIs on the opened assignment", %{db: db} do
+    assert %{id: missing_id, workItemId: "wi_a1", fyi: [missing]} =
              assign(db, {:session, "peer"}, "worker-a", "wi_a1")
 
-    assert missing =~ "set the intended owner explicitly with work-item-update --delivery-owner"
-    refute missing =~ "human owner/admin"
+    assert missing == fyi("work item wi_a1 has no recorded delivery owner")
 
     set_owner(db, {:session, "peer"}, "wi_a1", "pdo-a")
 
-    assert %{code: "delivery_owner_mismatch", message: mismatch} =
+    assert %{fyi: [mismatch]} =
              assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1",
                delivery_owner_ref: "session:pdo-b"
              )
 
-    assert mismatch =~ "explicitly update the link with work-item-update --delivery-owner"
-    refute mismatch =~ "owner/admin"
+    assert mismatch ==
+             fyi(
+               "work item wi_a1 records delivery owner session:pdo-a; this call names session:pdo-b"
+             )
 
     {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='pdo-a'")
 
-    assert %{code: "delivery_owner_unavailable", message: unavailable} =
-             assign(db, {:session, "peer"}, "worker-a", "wi_a1")
+    assert %{fyi: [unavailable]} = assign(db, {:session, "peer"}, "worker-a", "wi_a1")
 
-    assert unavailable =~ "explicitly replace the link with work-item-update --delivery-owner"
-    refute unavailable =~ "human owner/admin"
+    assert unavailable ==
+             fyi("work item wi_a1 records delivery owner session:pdo-a, whose session is retired")
+
+    for line <- [missing, mismatch, unavailable], word <- @judgment_words do
+      refute String.contains?(String.downcase(line), word)
+    end
+
+    assert %{fyi: [^missing]} =
+             Assignments.__handle__(db, "assignment-get", %{
+               verb: "assignment-get",
+               origin: "user:owner",
+               principal: {:user, "owner"},
+               session_key: nil,
+               params: %{assignment_id: missing_id}
+             })
+
+    assert {:ok, [[stored]]} =
+             DB.query(
+               db,
+               "SELECT fyi FROM record_fyis WHERE recordKind='assignment' AND recordId=?1",
+               [missing_id]
+             )
+
+    assert JSON.decode!(stored) == [missing]
   end
 
   test "role names, shared human ownership, and ancestry do not elect an owner", %{db: db} do
-    assert %{code: "delivery_owner_missing", message: missing} =
-             assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1")
-
-    assert missing =~ "no recorded delivery owner"
-    assert missing =~ "work-item-update --delivery-owner"
+    assert %{fyi: [missing]} = assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1")
+    assert missing == fyi("work item wi_a1 has no recorded delivery owner")
+    assert is_nil(DeliveryResponsibilities.current_owner(db, "wi_a1"))
 
     set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
     {:ok, _} = DB.query(db, "UPDATE sessions SET spawnedBy='pdo-a' WHERE sessionKey='peer'")
@@ -220,10 +241,141 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     after_success = count(db, "assignments")
 
-    assert %{code: "delivery_owner_missing"} =
+    assert %{holderKey: "worker-a", workItemId: "wi_a2", fyi: [missing]} =
              assign(db, {:user, "owner"}, "worker-a", "wi_a2")
 
-    assert count(db, "assignments") == after_success
+    assert missing == fyi("work item wi_a2 has no recorded delivery owner")
+    assert count(db, "assignments") == after_success + 1
+  end
+
+  test "API intake admits first assign and dispatch without a reminder rail", %{db: db} do
+    for verb <- ["assign", "dispatch"], principal <- [{:user, "owner"}, {:session, "peer"}] do
+      item = api_item(db)
+
+      assert {:ok, [[nil]]} =
+               DB.query(db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+      assert %{holderKey: "worker-a"} = assign(db, principal, "worker-a", item.id, verb: verb)
+      assert is_nil(DeliveryResponsibilities.current_owner(db, item.id))
+    end
+  end
+
+  test "nil reminder provenance does not admit raw, unattributed, foreign or owner-ref intake", %{
+    db: db
+  } do
+    # An ownerless item is stated as an FYI on the opened assignment; none of
+    # these intakes records an owner.
+    assert %{fyi: [missing]} = assign(db, {:user, "owner"}, "worker-a", "wi_a1")
+    assert missing == fyi("work item wi_a1 has no recorded delivery owner")
+    assert is_nil(DeliveryResponsibilities.current_owner(db, "wi_a1"))
+
+    unattributed = api_item(db)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE work_items SET createdByUser=NULL,createdBySession=NULL WHERE id=?1",
+               [unattributed.id]
+             )
+
+    assert %{fyi: [missing]} = assign(db, {:user, "owner"}, "worker-a", unattributed.id)
+    assert missing == fyi("work item #{unattributed.id} has no recorded delivery owner")
+    assert is_nil(DeliveryResponsibilities.current_owner(db, unattributed.id))
+
+    item = api_item(db)
+
+    assert %{fyi: [missing]} = assign(db, {:session, "foreign-worker"}, "foreign-worker", item.id)
+    assert missing == fyi("work item #{item.id} has no recorded delivery owner")
+    assert is_nil(DeliveryResponsibilities.current_owner(db, item.id))
+
+    assert %{fyi: [_ | _]} =
+             assign(db, {:user, "owner"}, "worker-a", item.id, delivery_owner_ref: "pdo-a")
+
+    assert is_nil(DeliveryResponsibilities.current_owner(db, item.id))
+  end
+
+  test "API provenance never overrides canceled, mismatched or missing reminder references", %{
+    db: db
+  } do
+    for status <- ["canceled", "mismatched", "missing"] do
+      item = api_item(db)
+
+      assert {:ok, wake} =
+               DB.transaction(db, fn txn ->
+                 Tightbeam.Wakes.schedule_in_txn(txn, %{
+                   session_key: Org.personal_session_key("owner"),
+                   origin: "process:tightbeam",
+                   prompt: "Legacy reminder",
+                   due_at: System.system_time(:millisecond) + 60_000,
+                   work_item_id: if(status == "mismatched", do: "wi_a1", else: item.id)
+                 })
+               end)
+
+      assert {:ok, _} =
+               DB.query(db, "UPDATE work_items SET routingWakeId=?2 WHERE id=?1", [
+                 item.id,
+                 wake.wake_id
+               ])
+
+      if status == "missing" do
+        assert {:ok, _} = DB.query(db, "DELETE FROM wakes WHERE wakeId=?1", [wake.wake_id])
+      end
+
+      if status == "canceled" do
+        assert {:ok, true} =
+                 DB.transaction(db, fn txn ->
+                   command = %{
+                     wake_id: wake.wake_id,
+                     requester: %{kind: "process", id: "tightbeam:row-reactions"},
+                     reason_kind: "superseded",
+                     causal_source: %{kind: "wake", id: wake.wake_id}
+                   }
+
+                   {:ok, outcome} =
+                     Tightbeam.Wakes.public_cancellation_outcome_in_txn(txn, command)
+
+                   Tightbeam.Wakes.cancel_in_txn(txn, Map.put(command, :outcome, outcome))
+                 end)
+      end
+
+      assert %{fyi: [missing]} = assign(db, {:user, "owner"}, "worker-a", item.id)
+      assert missing == fyi("work item #{item.id} has no recorded delivery owner")
+    end
+  end
+
+  test "nil-pointer API intake still obeys elected engineering delivery and topology rules", %{
+    db: db
+  } do
+    item = api_item(db)
+
+    tmp =
+      Path.join(
+        System.tmp_dir!(),
+        "no-reminder-owner-rules-#{System.unique_integer([:positive])}"
+      )
+
+    load_delivery_rules!(tmp)
+    File.rm!(Path.join(tmp, "identity/rules/row-reaction-work-items.toml"))
+    Rules.load!(tmp, ["spawn", "assign", "dispatch"])
+    on_exit(fn -> File.rm_rf!(tmp) end)
+
+    for verb <- ["assign", "dispatch"] do
+      assert {:error, %{code: "rule_denied"}} =
+               Dispatch.dispatch(
+                 db,
+                 assignment_handlers(db),
+                 production_call(verb, {:user, "owner"}, "worker-a", item.id)
+               )
+    end
+  end
+
+  defp api_item(db) do
+    WorkItems.__handle__(db, "work-item-create", %{
+      verb: "work-item-create",
+      principal: {:user, "owner"},
+      origin: "user:owner",
+      params: %{title: "API intake"}
+    })
   end
 
   test "authenticated unlinked control survives intake and is not creator-only", %{db: db} do
@@ -235,20 +387,26 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
         params: %{title: "Existing unlinked control"}
       })
 
-    assert %{holderKey: "worker-a"} = assign(db, {:user, "owner"}, "worker-a", item.id)
+    assert %{holderKey: "worker-a"} =
+             intake = assign(db, {:user, "owner"}, "worker-a", item.id)
+
+    refute Map.has_key?(intake, :fyi)
 
     assert {:ok, [[nil]]} =
              DB.query(db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
 
-    assert %{holderKey: "lane-a"} = assign(db, {:session, "peer"}, "lane-a", item.id)
+    assert %{holderKey: "lane-a"} = control = assign(db, {:session, "peer"}, "lane-a", item.id)
+    refute Map.has_key?(control, :fyi)
     assert is_nil(DeliveryResponsibilities.current_owner(db, item.id))
 
     before = count(db, "assignments")
 
-    assert %{code: "delivery_owner_missing"} =
+    # Outside authenticated intake, the ownerless item is stated as an FYI.
+    assert %{holderKey: "foreign-worker", fyi: [missing]} =
              assign(db, {:session, "foreign-worker"}, "foreign-worker", item.id)
 
-    assert count(db, "assignments") == before
+    assert missing == fyi("work item #{item.id} has no recorded delivery owner")
+    assert count(db, "assignments") == before + 1
   end
 
   test "missing references, unavailable owners, and mismatched owner refs are named", %{db: db} do
@@ -266,21 +424,22 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
 
-    assert %{code: "delivery_owner_mismatch", message: mismatch} =
+    assert %{fyi: [mismatch]} =
              assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1",
                delivery_owner_ref: "session:successor-a"
              )
 
-    assert mismatch =~ "records delivery owner session:pdo-a"
-    assert mismatch =~ "session:successor-a"
+    assert mismatch ==
+             fyi(
+               "work item wi_a1 records delivery owner session:pdo-a; this call names session:successor-a"
+             )
 
     {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='pdo-a'")
 
-    assert %{code: "delivery_owner_unavailable", message: unavailable} =
-             assign(db, {:session, "peer"}, "worker-a", "wi_a1")
+    assert %{fyi: [unavailable]} = assign(db, {:session, "peer"}, "worker-a", "wi_a1")
 
-    assert unavailable =~ "session:pdo-a"
-    assert unavailable =~ "replace the link with work-item-update --delivery-owner"
+    assert unavailable ==
+             fyi("work item wi_a1 records delivery owner session:pdo-a, whose session is retired")
   end
 
   test "sessions can staff without becoming the delivery owner", %{db: db} do
@@ -786,27 +945,42 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     set_owner(db, {:user, "owner"}, "wi_a2", "pdo-b")
     {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='pdo-b'")
 
-    for {verb, work_item_id, owner_ref, expected_code, expected_message} <- [
-          {"assign", "wi_b1", nil, "delivery_owner_missing", "work-item-update --delivery-owner"},
-          {"dispatch", "wi_b1", nil, "delivery_owner_missing",
-           "work-item-handoff --work-item wi_b1"},
-          {"assign", "wi_a1", "session:successor-a", "delivery_owner_mismatch", "session:pdo-a"},
-          {"dispatch", "wi_a1", "session:successor-a", "delivery_owner_mismatch",
-           "session:pdo-a"},
-          {"assign", "wi_a2", nil, "delivery_owner_unavailable", "session:pdo-b"},
-          {"dispatch", "wi_a2", nil, "delivery_owner_unavailable", "session:pdo-b"}
+    # The substrate states an ownerless item as an FYI; the loaded engineering
+    # rules still refuse production staffing on it.
+    for {verb, rule} <- [
+          {"assign", "engineering-assign-production-needs-delivery-owner"},
+          {"dispatch", "engineering-dispatch-production-needs-delivery-owner"}
         ] do
-      call = production_call(verb, {:session, "peer"}, "worker-a", work_item_id)
-      call = if owner_ref, do: put_in(call, [:params, :delivery_owner_ref], owner_ref), else: call
+      call = production_call(verb, {:session, "peer"}, "worker-a", "wi_b1")
 
-      assert {:error, %{code: ^expected_code, message: message}} =
+      assert {:error, %{code: "rule_denied", rule: ^rule}} =
                Dispatch.dispatch(db, handlers, call)
 
-      assert message =~ expected_message
-      assert message =~ work_item_id
       assert count(db, "assignments") == before
       assert count(db, "wakes") == wakes_before
     end
+
+    # No loaded rule covers a named owner that differs from the recorded one,
+    # or a recorded owner whose session is retired: those are admitted with FYIs.
+    for {verb, work_item_id, owner_ref, fact} <- [
+          {"assign", "wi_a1", "session:successor-a",
+           "work item wi_a1 records delivery owner session:pdo-a; this call names session:successor-a"},
+          {"dispatch", "wi_a1", "session:successor-a",
+           "work item wi_a1 records delivery owner session:pdo-a; this call names session:successor-a"},
+          {"assign", "wi_a2", nil,
+           "work item wi_a2 records delivery owner session:pdo-b, whose session is retired"},
+          {"dispatch", "wi_a2", nil,
+           "work item wi_a2 records delivery owner session:pdo-b, whose session is retired"}
+        ] do
+      call = production_call(verb, {:session, "peer"}, "worker-a", work_item_id)
+      call = if owner_ref, do: put_in(call, [:params, :delivery_owner_ref], owner_ref), else: call
+      line = fyi(fact)
+
+      assert {:ok, %{holderKey: "worker-a", workItemId: ^work_item_id, fyi: [^line]}} =
+               Dispatch.dispatch(db, handlers, call)
+    end
+
+    assert count(db, "assignments") == before + 4
 
     assert {:ok, %{holderKey: "worker-a"}} =
              Dispatch.dispatch(
@@ -952,9 +1126,14 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                }
              end)
 
-    assert %{code: "delivery_owner_mismatch"} = mismatch
+    assert {:ok,
+            [
+              "work item wi_a1 records delivery owner session:pdo-a; this call names session:lane-a"
+            ]} = mismatch
+
     assert %{code: "delivery_owner_reference_requires_work_item"} = itemless_ref
-    assert %{code: "work_item_required"} = spoofed
+    # Outside the exact internal remedy, itemless spawn is stated as an FYI fact.
+    assert {:ok, ["this production staffing names no work item"]} = spoofed
   end
 
   test "unlinked stores have no recipient or second delivery ledger", %{db: db} do
@@ -1072,16 +1251,18 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     })
   end
 
+  defp fyi(fact), do: "FYI: " <> fact <> "; decide for yourself whether that is acceptable"
+
   defp load_delivery_rules!(tmp) do
     rules_dir = Path.join([tmp, "identity", "rules"])
     File.mkdir_p!(rules_dir)
 
     File.cp!(
-      Path.expand("../priv/kungfu/agentic-engineering/rules/delivery.toml", __DIR__),
+      Path.expand("support/fixtures/kungfu/agentic-engineering/rules/delivery.toml", __DIR__),
       Path.join(rules_dir, "delivery.toml")
     )
 
-    Rules.load!(tmp, ["spawn", "assign", "dispatch"])
+    Tightbeam.TerminalReactionFixture.load_work_items!(tmp, ["spawn", "assign", "dispatch"])
   end
 
   defp work_item_call(principal, work_item_id) do

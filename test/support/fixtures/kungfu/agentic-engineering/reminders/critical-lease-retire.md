@@ -1,0 +1,1 @@
+A retirement including this session was deferred because it holds critical section '{reason}', with hard deadline {hard_deadline}. After {retry_deadline}, {retry_owner} will be woken to retry retirement against the current state. This does not schedule automatic retirement.

@@ -129,6 +129,9 @@ defmodule Tightbeam.Gateway do
   @harness_handoff_content_limit 1_200
   @harness_handoff_attachment_limit 4
   @harness_handoff_metadata_limit 120
+  @harness_switch_compactor_attempt_ms 45_000
+  @harness_switch_compactor_open_ms 15_000
+  @harness_switch_compactor_checkout_ms 10_000
   @harness_switch_compactor_timeout_ms 30_000
   @harness_switch_compactor_close_timeout_ms 5_000
 
@@ -175,7 +178,16 @@ defmodule Tightbeam.Gateway do
     db = Map.get(config, :db, Tightbeam.DB)
     # The handler and lane closures need the same DB that this composition
     # root admitted. `served_snapshot/4` uses it to read session-scoped state.
-    config = Map.put(config, :db, db)
+    blob_options =
+      Tightbeam.ArtifactBlobStore.options(config.base_dir, config[:artifact_blob_options] || [])
+
+    config =
+      Map.merge(config, %{
+        db: db,
+        artifact_blob_store: Keyword.fetch!(blob_options, :name),
+        artifact_blob_root: Keyword.fetch!(blob_options, :root)
+      })
+
     :ok = DB.assert_base_admitted!(db, config.base_dir)
     Identity.init_after_admission!(config.base_dir, db)
     prod_limit = Map.get(config, :prod_limit, 3)
@@ -239,10 +251,9 @@ defmodule Tightbeam.Gateway do
     defaults = defaults(config, db)
     # Bubble recognition stays outside the lane transaction; it can enqueue
     # turns and therefore must not run synchronously inside LaneManager.
-    on_terminal = fn session_key, seq ->
+    on_terminal = fn _session_key, seq ->
       Tightbeam.HarnessHealth.reconcile_delivered_turn(db, seq)
       Tightbeam.Productions.BubbleSweeper.recognize(seq)
-      Tightbeam.HarklightWakes.origin_turn_ended(session_key)
     end
 
     handler_table =
@@ -286,6 +297,7 @@ defmodule Tightbeam.Gateway do
     router_deps =
       Map.merge(socket_deps, %{
         base_dir: config.base_dir,
+        artifact_blob_store: config.artifact_blob_store,
         cli_token: cli_token,
         diagnostic_scope: config[:diagnostic_scope] || %{},
         session_status: fn session_key -> session_status(session_key, db, config) end,
@@ -333,9 +345,10 @@ defmodule Tightbeam.Gateway do
          {ModelCatalog, base_dir: config.base_dir, db: db},
          {Tightbeam.Retention, db: db},
          {WorkspaceCleanup, config: Map.put(config, :db, db)},
+         {Tightbeam.ArtifactBlobStore, blob_options},
          {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
          {Task, fn -> DB.owed_work(fn -> HarnessHealth.resume_other_routes(db) end) end},
-         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
+         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub, db: db},
          # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
          # statute, and the episode writer must already own the ordering before the first
          # evaluation runs. Explicitly a child rather than lazily started — a lazy start
@@ -349,6 +362,7 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.ListenerLifecycle, []},
          {Tightbeam.Wakes,
           db: db,
+          holder_prod: true,
           deliver: deliver,
           delivery_opts: delivery_config,
           internal_consumers: %{
@@ -363,14 +377,19 @@ defmodule Tightbeam.Gateway do
           identity_staleness_check: fn -> emit_identity_staleness_alarm(db) end,
           identity_staleness_interval_ms: @identity_staleness_interval_ms,
           name: Tightbeam.WakeScheduler},
+         {Tightbeam.HarklightReceipts, db: db},
          {Tightbeam.HarklightWakes,
           db: db,
           send_runner: Map.get(config, :harklight_send_runner),
           child_opts: [base_dir: config.base_dir, cli_path: Path.join(cli_bin, "tightbeam")]},
-         {Tightbeam.HarklightOriginListener,
-          db: db,
-          runner: Map.get(config, :harklight_send_runner),
-          child_opts: [base_dir: config.base_dir, cli_path: Path.join(cli_bin, "tightbeam")]},
+         if(
+           Map.get(
+             config,
+             :coordinator_hold_alerts_enabled,
+             Application.get_env(:tightbeam, :coordinator_hold_alerts_enabled, true)
+           ),
+           do: {Tightbeam.CoordinatorHoldAlerts, db: db, runner: config[:harklight_send_runner]}
+         ),
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
@@ -380,6 +399,8 @@ defmodule Tightbeam.Gateway do
           db: db,
           name: Tightbeam.AdapterCoordinator},
          {Tightbeam.Productions.BubbleSweeper, db: db},
+         {Tightbeam.PathNotes,
+          db: db, stat_config: Map.take(config, [:file_stat, :ssh_executable])},
          {Tightbeam.LaneManager,
           db: db,
           lane_sup: Tightbeam.LaneSupervisor,
@@ -1026,16 +1047,71 @@ defmodule Tightbeam.Gateway do
       {"memento-set", []} => fn call -> Tightbeam.Mementos.__handle__(db, "memento-set", call) end,
       {"mementos", []} => fn call -> Tightbeam.Mementos.__handle__(db, "mementos", call) end,
       {"artifact-record", ["artifact.recorded"]} => fn call ->
-        Artifacts.record(db, Map.put(call, :artifact_base_dir, config[:base_dir]))
+        Tightbeam.ArtifactCapture.record(
+          db,
+          Map.put(call, :artifact_base_dir, config[:base_dir]),
+          config
+        )
       end,
       {"artifact-content-fetch", []} => fn call ->
-        Tightbeam.ArtifactContent.fetch_call(db, call)
+        Tightbeam.ArtifactContent.fetch_call(db, call, config)
+      end,
+      {"artifact-content-capacity", []} => fn _call ->
+        Tightbeam.ArtifactContent.capacity(config)
+      end,
+      {"artifact-content-promote", ["artifact.custody_pinned"]} => fn call ->
+        Tightbeam.ArtifactContent.promote_call(db, call, config)
+      end,
+      {"workspace-cleanup", []} => fn call ->
+        owner = principal_caller(db, call)[:owner_user_id]
+        admin? = admin_caller?(db, call)
+        p = call.params
+
+        case p[:action] do
+          "status" ->
+            rows = WorkspaceCleanup.statuses(db, if(admin?, do: nil, else: owner || ""), config)
+
+            rows =
+              if is_binary(p[:session_key]),
+                do: Enum.filter(rows, &(&1.session_key == p.session_key)),
+                else: rows
+
+            %{cleanups: rows}
+
+          "retry" ->
+            session = Org.get(db, p[:session_key])
+
+            cond do
+              not is_binary(p[:session_key]) or p[:session_key] == "" ->
+                %{code: "invalid", message: "retry requires a retired session key"}
+
+              is_nil(session) or session.state != "retired" ->
+                %{code: "cleanup_not_found", message: "no retired session cleanup for that key"}
+
+              not admin? and (is_nil(owner) or owner != session.owner_user_id) ->
+                %{
+                  code: "forbidden",
+                  message: "only the session owner or an admin may retry cleanup"
+                }
+
+              true ->
+                WorkspaceCleanup.retry(db, p[:session_key], call.origin)
+            end
+
+          _ ->
+            %{code: "invalid", message: "workspace-cleanup action must be status or retry"}
+        end
       end,
       {"artifact-get", []} => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
       end,
       {"harklight-send", []} => fn call ->
         HarklightSend.send_request(db, call, runner: Map.get(config, :harklight_send_runner))
+      end,
+      {"harklight-progress", []} => fn call ->
+        HarklightSend.change_request(db, call, "progress",
+          runner: Map.get(config, :harklight_send_runner)
+        )
       end,
       {"harklight-revise", []} => fn call ->
         HarklightSend.change_request(db, call, "revise",
@@ -1049,9 +1125,6 @@ defmodule Tightbeam.Gateway do
       end,
       {"harklight-settle", []} => fn call ->
         HarklightSend.settle(db, call, runner: Map.get(config, :harklight_send_runner))
-      end,
-      {"harklight-cover", []} => fn call ->
-        Tightbeam.HarklightOriginListener.cover(call)
       end,
       {"harklight-listener-restore", []} => fn call ->
         HarklightWakes.restore_listener(db, call, call.params[:handle])
@@ -1068,9 +1141,7 @@ defmodule Tightbeam.Gateway do
         Tightbeam.HarklightWakes.retry_command(db, call)
       end,
       {"harklight-read", []} => fn call ->
-        Tightbeam.HarklightAgentActions.read(db, call,
-          runner: Map.get(config, :harklight_send_runner)
-        )
+        Tightbeam.HarklightAgentActions.read(db, call)
       end,
       {"harklight-ack", []} => fn call ->
         Tightbeam.HarklightAgentActions.acknowledge(db, call,
@@ -1268,7 +1339,8 @@ defmodule Tightbeam.Gateway do
               if(admin_caller?(db, call),
                 do: nil,
                 else: principal_caller(db, call)[:owner_user_id] || ""
-              )
+              ),
+              config
             ),
           setup: Sentinels.setup_all(config.base_dir, db, host)
         }
@@ -1694,6 +1766,10 @@ defmodule Tightbeam.Gateway do
           "attest",
           call
           |> Map.put(:on_assignment_change, assignment_change)
+          |> Map.put(
+            :artifact_evidence_config,
+            Map.take(config, [:artifact_blob_root, :artifact_archive_inline_limit_bytes])
+          )
           |> Map.put(:wake_scheduler, Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
         )
       end,
@@ -1799,6 +1875,9 @@ defmodule Tightbeam.Gateway do
       {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
       {"session-custody-transfer", ["wake.scheduled"]} => fn call ->
         Tightbeam.SessionCustodyTransfer.handle(db, call)
+      end,
+      {"assignment-opener-accept", ["wake.scheduled"]} => fn call ->
+        Tightbeam.AssignmentOpenerAcceptance.handle(db, call)
       end,
       {"session-po-set", ["wake.scheduled"]} => fn call ->
         SessionPoAssociations.handle(db, call)
@@ -2032,8 +2111,10 @@ defmodule Tightbeam.Gateway do
   defp execute_claimed_assignment_repair(config, db, call, assignment, attempt_id) do
     {result, incident} =
       with {:ok, session} <- repair_holder(db, assignment),
+           :ok <- refuse_held(db, assignment),
            {:ok, incident} <- repair_incident(db, assignment, session, call.params[:action]) do
-        {execute_assignment_repair(config, db, call, assignment, session, incident), incident}
+        {execute_assignment_repair(config, db, call, assignment, session, incident)
+         |> with_repair_fyi(incident), incident}
       else
         {:error, code, message} -> {%{ok: false, code: code, message: message}, nil}
       end
@@ -2098,33 +2179,39 @@ defmodule Tightbeam.Gateway do
   defp repair_assignment(_db, _assignment_id),
     do: {:error, "invalid_request", "repair-assignment requires assignmentId"}
 
-  defp repair_authorized(db, call, assignment) do
-    allowed =
-      case call.principal do
-        {:user, user} ->
-          assignment.opened_by_user == user or admin_caller?(db, call)
+  # Any user, session or automation may repair; the attempt records who asked.
+  defp repair_authorized(_db, %{principal: {kind, _}}, _assignment)
+       when kind in [:user, :session, :process],
+       do: :ok
 
-        {:session, session} ->
-          assignment.opened_by_session == session or
-            assignment.opened_by_user == principal_caller(db, call).owner_user_id or
-            admin_caller?(db, call)
-
-        {:process, _} ->
-          true
-
-        _ ->
-          false
-      end
-
-    if allowed,
-      do: :ok,
-      else: {:error, "not_authorized", "assignment repair requires its opener or an admin"}
-  end
+  defp repair_authorized(_db, _call, _assignment),
+    do: {:error, "principal_required", "assignment repair requires a user, session or process"}
 
   defp repair_holder(db, assignment) do
     case Org.get(db, assignment.holder) do
       %{state: "active"} = session -> {:ok, session}
       _ -> {:error, "holder_unavailable", "assignment holder is not an active session"}
+    end
+  end
+
+  # An assignment whose only turn is queued behind a standing park fence has
+  # nothing to repair: the turn starts when the fence lifts. Every action gets
+  # the same answer, whether or not the incident links the assignment.
+  defp refuse_held(db, assignment) do
+    case HarnessHealth.Hold.for_assignment(db, assignment.id) do
+      nil ->
+        :ok
+
+      hold ->
+        opener =
+          if hold.opened_by_assignment_id,
+            do:
+              " The assignment whose failure opened the incident is #{hold.opened_by_assignment_id}.",
+            else: ""
+
+        {:error, "held_behind_incident",
+         "this assignment's turn is held, not stuck; nothing here to repair. " <>
+           hold.release <> opener}
     end
   end
 
@@ -2146,11 +2233,22 @@ defmodule Tightbeam.Gateway do
       [[id, failure_class] | _] ->
         guidance = HarnessHealth.get(db, id).repair
 
+        # A repair other than the incident's recommended one runs as
+        # requested; the difference is stated as an FYI with its result.
         if action == guidance.action do
           {:ok, %{id: id, failure_class: failure_class, action: action}}
         else
-          {:error, "wrong_repair",
-           "#{failure_class} requires repair action #{guidance.action}, not #{inspect(action)}"}
+          {:ok,
+           %{
+             id: id,
+             failure_class: failure_class,
+             action: action,
+             fyi: [
+               Tightbeam.RecordFyis.line(
+                 "incident #{id} recommends #{guidance.action}; this repair requests #{action}"
+               )
+             ]
+           }}
         end
 
       [] when action == "relaunch" ->
@@ -2172,25 +2270,32 @@ defmodule Tightbeam.Gateway do
        ) do
     model = call.params[:model]
 
-    if is_binary(model) and model != "" do
-      tuned =
-        tune_result(
-          config,
-          db,
-          call
-          |> Map.put(:session_key, session.session_key)
-          |> Map.put(
-            :params,
-            %{setting: "set_model", model: model}
-            |> maybe_put(:effort, call.params[:effort])
-            |> maybe_put(:context, call.params[:context])
-          )
-          |> Map.put(:repair_assignment_id, assignment.id)
-        )
+    cond do
+      not (is_binary(model) and model != "") ->
+        %{ok: false, code: "model_required", message: "model_unavailable repair requires --model"}
 
-      if Map.has_key?(tuned, :code), do: tuned, else: rerun_latest(db, call, assignment, incident)
-    else
-      %{ok: false, code: "model_required", message: "model_unavailable repair requires --model"}
+      not failed_turn_available?(db, call, assignment) ->
+        no_failed_turn()
+
+      true ->
+        tuned =
+          tune_result(
+            config,
+            db,
+            call
+            |> Map.put(:session_key, session.session_key)
+            |> Map.put(
+              :params,
+              %{setting: "set_model", model: model}
+              |> maybe_put(:effort, call.params[:effort])
+              |> maybe_put(:context, call.params[:context])
+            )
+            |> Map.put(:repair_assignment_id, assignment.id)
+          )
+
+        if Map.has_key?(tuned, :code),
+          do: tuned,
+          else: rerun_latest(db, call, assignment, incident)
     end
   end
 
@@ -2206,16 +2311,22 @@ defmodule Tightbeam.Gateway do
     coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
     key = adapter_key(session)
 
-    case AdapterCoordinator.close_adapter(coordinator, key) do
-      :ok ->
-        if incident.failure_class == "rate-limit-dead" do
-          :ok = HarnessProcess.complete_park(db, key)
-        end
+    # Refuse before closing the adapter or lifting the fence: both reach every
+    # session on this harness and host, not only this assignment.
+    if failed_turn_available?(db, call, assignment) do
+      case AdapterCoordinator.close_adapter(coordinator, key) do
+        :ok ->
+          if incident.failure_class == "rate-limit-dead" do
+            :ok = HarnessProcess.complete_park(db, key)
+          end
 
-        rerun_latest(db, call, assignment, incident)
+          rerun_latest(db, call, assignment, incident)
 
-      {:error, reason} ->
-        repair_failed(reason, operation: "close_adapter", phase: "repair_#{action}")
+        {:error, reason} ->
+          repair_failed(reason, operation: "close_adapter", phase: "repair_#{action}")
+      end
+    else
+      no_failed_turn()
     end
   end
 
@@ -2267,6 +2378,26 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # The terminal turn a repair would rerun: the explicit one, or the latest.
+  # Read before any repair effect so a refusal changes nothing.
+  defp failed_turn_available?(db, call, assignment) do
+    seq = call.params[:turn_seq]
+
+    {sql, args} =
+      if is_integer(seq) do
+        {"SELECT 1 FROM turns WHERE seq=?2 AND assignmentId=?1 AND status IN ('failed','failed_unknown')",
+         [assignment.id, seq]}
+      else
+        {"SELECT 1 FROM turns WHERE assignmentId=?1 AND status IN ('failed','failed_unknown') LIMIT 1",
+         [assignment.id]}
+      end
+
+    match?({:ok, [[1]]}, DB.query(db, sql, args))
+  end
+
+  defp no_failed_turn,
+    do: %{ok: false, code: "no_failed_turn", message: "assignment has no terminal failed turn"}
+
   defp rerun_latest(db, call, assignment, incident) do
     source_seq = call.params[:turn_seq]
 
@@ -2292,7 +2423,7 @@ defmodule Tightbeam.Gateway do
 
     cond do
       not is_integer(source_seq) ->
-        %{ok: false, code: "no_failed_turn", message: "assignment has no terminal failed turn"}
+        no_failed_turn()
 
       not is_binary(repair_key) or repair_key == "" ->
         %{ok: false, code: "idempotency_key_required", message: "repair requires --key"}
@@ -2323,6 +2454,10 @@ defmodule Tightbeam.Gateway do
         end
     end
   end
+
+  defp with_repair_fyi(%{code: _} = result, _incident), do: result
+  defp with_repair_fyi(result, %{fyi: fyi}), do: Map.put(result, :fyi, fyi)
+  defp with_repair_fyi(result, _incident), do: result
 
   # The public message stays the inspected classification; the reason's own
   # structure and any carried node ride in the diagnostic.
@@ -3725,7 +3860,15 @@ defmodule Tightbeam.Gateway do
       |> Map.merge(published_identity(session.model))
       |> Map.put(:capabilities, StateResources.session(session)["capabilities"])
 
-    Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
+    item = Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
+
+    case Map.get(
+           Tightbeam.RecordFyis.list_many(db, "session", [session.session_key]),
+           session.session_key
+         ) do
+      nil -> item
+      fyi -> Map.put(item, :fyi, fyi)
+    end
   end
 
   # A catalog entry for a reader who has to pick one — an operator reading a
@@ -3998,102 +4141,141 @@ defmodule Tightbeam.Gateway do
 
   @doc false
   def harness_switch_compactor_call(coordinator, host, cwd, compactor, input, instructions) do
-    with :codex_acp <- Map.get(compactor, :route),
-         harness_module when is_atom(harness_module) <- Map.get(compactor, :harness),
-         harness <- Harness.module!(harness_module),
-         model when is_binary(model) <- Map.get(compactor, :model),
-         {:ok, adapter, _generation} <-
-           AdapterCoordinator.adapter_for_turn(coordinator, {harness.id(), "shared", host}) do
+    harness_switch_compactor_call(
+      coordinator,
+      host,
+      cwd,
+      compactor,
+      input,
+      instructions,
+      @harness_switch_compactor_attempt_ms
+    )
+  end
+
+  @doc false
+  def harness_switch_compactor_call(
+        coordinator,
+        host,
+        cwd,
+        compactor,
+        input,
+        instructions,
+        timeout
+      )
+      when is_integer(timeout) and timeout in 1..@harness_switch_compactor_attempt_ms do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    with true <- HarnessSwitchContext.supported_compactor_route?(compactor),
+         harness <- compactor.harness,
+         model when is_binary(model) <- compactor.model,
+         key <- {harness.id(), "shared", host},
+         {:ok, adapter, _generation} <- compactor_checkout(coordinator, key, deadline) do
       selected_model =
         Model.new(model,
           effort: Map.get(compactor, :effort),
           context: Map.get(compactor, :context)
         )
 
-      case Adapter.new_session(adapter, selected_model, cwd, [], instructions) do
+      open_deadline =
+        min(System.monotonic_time(:millisecond) + @harness_switch_compactor_open_ms, deadline)
+
+      case Adapter.new_compactor_session(
+             adapter,
+             selected_model,
+             cwd,
+             instructions,
+             open_deadline
+           ) do
         {:ok, acp_session_id} ->
+          prompt_timeout =
+            min(@harness_switch_compactor_timeout_ms, compactor_remaining(deadline) - 17_000)
+
           prompt_result =
-            compactor_adapter_call(fn ->
-              Adapter.prompt(adapter, acp_session_id, input,
-                timeout: @harness_switch_compactor_timeout_ms
-              )
-            end)
+            if prompt_timeout > 0 do
+              Adapter.prompt(adapter, acp_session_id, input, timeout: prompt_timeout)
+            else
+              {:error, :timeout}
+            end
+
+          close_timeout =
+            min(
+              @harness_switch_compactor_close_timeout_ms,
+              max(1, compactor_remaining(deadline) - 5_000)
+            )
 
           close_result =
-            compactor_adapter_call(fn ->
-              Adapter.close_session(adapter, acp_session_id,
-                request_timeout: @harness_switch_compactor_close_timeout_ms
-              )
-            end)
+            Adapter.close_session(adapter, acp_session_id, request_timeout: close_timeout)
 
-          compactor_result(prompt_result, close_result, selected_model, input)
+          compactor_result(prompt_result, close_result, compactor, selected_model, input)
 
         {:error, reason} ->
           {:error, {:session_create_failed, reason}}
       end
     else
+      {:error, _} = error -> error
       _ -> {:error, :route_unavailable}
     end
-  rescue
-    _error -> {:error, :route_unavailable}
-  catch
-    :exit, _reason -> {:error, :route_unavailable}
   end
 
-  defp compactor_adapter_call(fun) do
-    fun.()
-  rescue
-    _error -> {:error, :route_unavailable}
-  catch
-    :exit, _reason -> {:error, :route_unavailable}
+  defp compactor_checkout(coordinator, key, deadline) do
+    timeout = min(@harness_switch_compactor_checkout_ms, compactor_remaining(deadline))
+    AdapterCoordinator.adapter_for_compaction(coordinator, key, timeout)
   end
+
+  defp compactor_remaining(deadline), do: max(0, deadline - System.monotonic_time(:millisecond))
 
   defp compactor_result(
          {:ok, %{stop_reason: "end_turn", text: text}},
          :ok,
+         compactor,
          selected_model,
          input
        )
        when is_binary(text) and byte_size(text) > 0 do
     {:ok, text,
      %{
-       route: "codex_acp",
+       route: Atom.to_string(compactor.route),
        model: Model.to_ref(selected_model),
        input_bytes: byte_size(input),
        output_bytes: byte_size(text)
      }}
   end
 
-  defp compactor_result(prompt_result, _close_result, _model, _input)
+  defp compactor_result(prompt_result, close_result, _compactor, _model, _input)
        when prompt_result in [
               {:error, :timeout},
               {:error, :prompt_timeout},
               {:error, {:acp_request_not_dispatched, :prompt_timeout}}
             ],
-       do: {:error, :timeout}
+       do: compactor_timeout(close_result)
 
   defp compactor_result(
          {:error, {:prompt_interrupted, {:cancel_unacknowledged, _session_id}}},
-         _close_result,
+         close_result,
+         _compactor,
          _model,
          _input
        ),
-       do: {:error, :timeout}
+       do: compactor_timeout(close_result)
 
-  defp compactor_result({:error, reason}, _close_result, _model, _input),
+  defp compactor_result({:error, reason}, _close_result, _compactor, _model, _input),
     do: {:error, {:prompt_failed, reason}}
 
   defp compactor_result(
          {:ok, %{stop_reason: "end_turn", text: text}},
          {:error, reason},
+         _compactor,
          _model,
          _input
        )
        when is_binary(text) and byte_size(text) > 0,
        do: {:error, {:session_close_failed, reason}}
 
-  defp compactor_result(_prompt_result, _close_result, _model, _input),
+  defp compactor_result(_prompt_result, _close_result, _compactor, _model, _input),
     do: {:error, :incomplete_or_unusable_response}
+
+  defp compactor_timeout(:ok), do: {:error, :timeout}
+  defp compactor_timeout({:error, reason}), do: {:error, {:timeout_cleanup_failed, reason}}
 
   defp turn_human_messages(db, turn, session_key) do
     rows =
@@ -4497,6 +4679,9 @@ defmodule Tightbeam.Gateway do
 
     runner = fn turn ->
       session = Org.get(db, turn.session_key)
+      # Path checks start before anything else so they have the most time to
+      # return; the prompt below never waits for them.
+      path_plan = Tightbeam.PathNotes.claimed(db, turn)
       echo = Projection.get(db, turn.message_id)
       correlation = (echo && echo.client_message_id) || turn.message_id
       publish_turn_state(db, turn.session_key, correlation, "running", nil)
@@ -4512,9 +4697,8 @@ defmodule Tightbeam.Gateway do
         })
       )
 
-      terminal_publish = fn terminal ->
-        state = if terminal == "delivered", do: "delivered", else: "failed"
-        publish_turn_state(db, turn.session_key, correlation, state, nil)
+      terminal_publish = fn terminal, error ->
+        publish_turn_state(db, turn.session_key, correlation, terminal, error)
         publish_session_indicator(db, turn.session_key, session.owner_user_id)
 
         broadcast(
@@ -4529,7 +4713,8 @@ defmodule Tightbeam.Gateway do
       end
 
       outcome =
-        with {:ok, adapter, generation} <-
+        with :ok <- stage(:checkout, admit_turn_route(db, session)),
+             {:ok, adapter, generation} <-
                stage(:checkout, checkout_adapter(session, config)),
              {:ok,
               %{
@@ -4593,45 +4778,30 @@ defmodule Tightbeam.Gateway do
                    db,
                    prompt_adapter,
                    harness_session_id,
-                   prepared_prompt,
+                   Tightbeam.PathNotes.annotate(prepared_prompt, path_plan),
                    trace_dispatch: fn request_id ->
-                     case Tightbeam.TurnLifecycle.append(db, turn.seq, %{
-                            event_key: "prompt:dispatched",
-                            producer_event_id:
-                              "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
-                            kind: "prompt_dispatched",
-                            stage: "prompt",
-                            outcome: "dispatched",
-                            cause: "acp:port-write",
-                            principal: "process:tightbeam",
-                            owner_lease: turn.owner_lease,
-                            adapter_gen: prompt_generation,
-                            acp_request_id: request_id,
-                            detail: %{v: 1}
-                          }) do
-                       result when result in [:ok, :duplicate] ->
-                         case Task.start(fn ->
-                                Tightbeam.HarklightWakes.ack2_for_dispatched_turn(
-                                  db,
-                                  turn.seq,
-                                  turn.session_key,
-                                  active_session.display_name
-                                )
-                              end) do
-                           {:ok, _pid} ->
-                             :ok
+                     result =
+                       DB.owed_work(fn ->
+                         Tightbeam.TurnLifecycle.append(db, turn.seq, %{
+                           event_key: "prompt:dispatched",
+                           producer_event_id:
+                             "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
+                           kind: "prompt_dispatched",
+                           stage: "prompt",
+                           outcome: "dispatched",
+                           cause: "acp:port-write",
+                           principal: "process:tightbeam",
+                           owner_lease: turn.owner_lease,
+                           adapter_gen: prompt_generation,
+                           acp_request_id: request_id,
+                           detail: %{v: 1, harklight_receipt_agent: active_session.display_name}
+                         })
+                       end)
 
-                           {:error, reason} ->
-                             Logger.error(
-                               "Harklight ACK2 task could not start for dispatched turn #{turn.seq}: #{inspect(reason)}"
-                             )
-                         end
+                     if result in [:ok, :duplicate],
+                       do: Tightbeam.HarklightReceipts.dispatched(turn.seq)
 
-                         result
-
-                       result ->
-                         result
-                     end
+                     result
                    end,
                    progress:
                      progress_fun(db, turn.session_key, session.owner_user_id, correlation),
@@ -4641,6 +4811,7 @@ defmodule Tightbeam.Gateway do
                  active_session
                ) do
           attention_tier = elected_attention(db, turn.seq)
+          refused? = match?(%{work_outcome: :did_not_perform}, result)
 
           # The lane's terminal CAS owns success publication. Recovery can
           # terminalize this turn while its adapter result is in flight; a
@@ -4655,7 +4826,8 @@ defmodule Tightbeam.Gateway do
             )
 
             health_publication =
-              HarnessHealth.resolve_normal_turn_in_txn(txn, active_session, turn)
+              unless refused?,
+                do: HarnessHealth.resolve_normal_turn_in_txn(txn, active_session, turn)
 
             fn ->
               Enum.each(replies, &publish_message(db, turn.session_key, &1))
@@ -4663,7 +4835,28 @@ defmodule Tightbeam.Gateway do
             end
           end
 
-          {:ok, %{terminal_publish: terminal_publish, record_in_txn: record_in_txn}}
+          if refused? do
+            reason = "The provider refused the prompt."
+
+            failure_publish = fn terminal ->
+              append_turn_failed_marker(db, turn.session_key, reason)
+              terminal_publish.(terminal, reason)
+            end
+
+            {:error,
+             %{
+               work_outcome: :did_not_perform,
+               reason: reason,
+               terminal_publish: failure_publish,
+               record_in_txn: record_in_txn
+             }}
+          else
+            {:ok,
+             %{
+               terminal_publish: fn terminal -> terminal_publish.(terminal, nil) end,
+               record_in_txn: record_in_txn
+             }}
+          end
         else
           {:error, failure} ->
             {failed_stage, reason, active_session} = turn_failure_context(failure, session)
@@ -4700,11 +4893,7 @@ defmodule Tightbeam.Gateway do
             prewrite_evidence =
               Tightbeam.NoticeSubmission.prewrite_evidence(failed_stage, raw_reason)
 
-            reason =
-              case turn_credential_refusal(active_session) do
-                {:refused, message} -> message
-                :not_applicable -> selection_refusal_text(reason) || classified_reason
-              end
+            reason = turn_failure_reason(reason, classified_reason, active_session)
 
             role_model_choices =
               role_model_choices_for_failure(
@@ -4797,7 +4986,7 @@ defmodule Tightbeam.Gateway do
                 active_session,
                 turn,
                 failed_stage,
-                raw_reason
+                ErrorDiagnostic.diagnosed(raw_reason, diagnostic)
               )
             end
 
@@ -5339,6 +5528,41 @@ defmodule Tightbeam.Gateway do
 
   defp degraded_detail(_node), do: "(host unreachable or adapter failing; cause unknown)"
 
+  # Check when the lane claims the turn. An accepted or already queued turn
+  # can outlive the credentials that made its placement usable.
+  defp admit_turn_route(db, session) do
+    %{harness: harness, host: host} = session
+
+    case TerminalCredentialFailure.get_open(db, host, harness) do
+      %{id: id} ->
+        disabled_turn_route(session, "Credential failure #{id} is still open.")
+
+      nil ->
+        case turn_credential_refusal(session) do
+          {:refused, reason} -> disabled_turn_route(session, reason)
+          :not_applicable -> :ok
+        end
+    end
+  end
+
+  defp disabled_turn_route(%{harness: harness, host: host}, reason) do
+    {:error,
+     %{
+       code: "harness_route_disabled",
+       message: "Tightbeam cannot run #{harness} on host #{host}. #{reason}"
+     }}
+  end
+
+  defp turn_failure_reason(%{code: "harness_route_disabled", message: message}, _, _),
+    do: message
+
+  defp turn_failure_reason(reason, classified, session) do
+    case turn_credential_refusal(session) do
+      {:refused, message} -> message
+      :not_applicable -> selection_refusal_text(reason) || classified
+    end
+  end
+
   defp checkout_adapter(session, config) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
@@ -5815,15 +6039,13 @@ defmodule Tightbeam.Gateway do
   defp identity_relearn_result(config, db, %{params: %{action: "resolve"}} = call) do
     candidate = Identity.resolve_relearn!(config.base_dir, call.origin)
 
-    publish_identity_candidate(config, db, call, candidate, %{state: "published"})
-    |> with_relearn_setup(config, db)
+    publish_relearn(config, db, call, candidate)
   end
 
   defp identity_relearn_result(config, db, call) do
     case Identity.relearn!(config.base_dir, call.origin) do
       {:ok, candidate} ->
-        publish_identity_candidate(config, db, call, candidate, %{state: "published"})
-        |> with_relearn_setup(config, db)
+        publish_relearn(config, db, call, candidate)
 
       {:conflict, paths} ->
         %{
@@ -5831,6 +6053,7 @@ defmodule Tightbeam.Gateway do
           conflicting_paths: paths,
           live_revision: Identity.live_revision!(config.base_dir)
         }
+        |> Map.merge(Identity.relearn_conflict_details(config.base_dir))
 
       {:error, message} ->
         %{
@@ -5840,6 +6063,16 @@ defmodule Tightbeam.Gateway do
           live_revision: Identity.live_revision!(config.base_dir)
         }
     end
+  end
+
+  defp publish_relearn(config, db, call, candidate) do
+    dispositions = Identity.relearn_dispositions(config.base_dir, candidate.candidate_revision)
+
+    publish_identity_candidate(config, db, call, candidate, %{
+      state: "published",
+      path_dispositions: dispositions
+    })
+    |> with_relearn_setup(config, db)
   end
 
   defp with_relearn_setup(%{state: "published"} = result, config, db) do
@@ -6029,6 +6262,7 @@ defmodule Tightbeam.Gateway do
           state: "relearn-conflicted",
           kungfu: call.params.name,
           conflicting_paths: paths,
+          provenance_conflicts: Identity.provenance_conflicts(config.base_dir),
           live_revision: Identity.live_revision!(config.base_dir)
         }
 
@@ -6381,10 +6615,16 @@ defmodule Tightbeam.Gateway do
       Identity.with_recovery_law!(config.base_dir, fn law_base, revision ->
         Archetypes.load!(law_base)
         Rails.load!(law_base)
-        Rules.load!(config.base_dir, verbs, law_base: law_base, revision: revision)
+
+        Rules.load!(config.base_dir, verbs,
+          law_base: law_base,
+          revision: revision,
+          builtin_defaults: true
+        )
       end)
 
     Tightbeam.RowReactions.recover(Map.get(config, :db, Tightbeam.DB))
+    Tightbeam.CoordinatorHoldAlerts.changed()
     rules
   end
 
@@ -6448,6 +6688,7 @@ defmodule Tightbeam.Gateway do
       end
 
     identity
+    |> Map.merge(Rules.status())
     |> Map.put(:sessions, sessions)
     |> maybe_put_guidance(guidance)
   end
@@ -7047,6 +7288,25 @@ defmodule Tightbeam.Gateway do
           stamp: "committed",
           enqueue: "already_pending",
           delivery: "pending",
+          reread: "unconfirmed",
+          wake_id: wake_id
+        }
+
+      existing_wakes != [] ->
+        # Delivery failure does not erase the notice. Recovery owns retries;
+        # another apply pass must not create a second source for this revision.
+        [[wake_id, _state] | _] = existing_wakes
+
+        delivery =
+          case NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id) do
+            [[_seq, status, _assignment_id] | _] -> status
+            [] -> "pending"
+          end
+
+        %{
+          stamp: "committed",
+          enqueue: "already_recorded",
+          delivery: delivery,
           reread: "unconfirmed",
           wake_id: wake_id
         }
@@ -8344,6 +8604,8 @@ defmodule Tightbeam.Gateway do
 
         if is_map(wake) and is_binary(wake[:wake_id]) do
           wake_response(wake)
+          |> maybe_add_wait_reason(wake)
+          |> maybe_add_replaced_wake_ids(wake)
           |> maybe_add_producer_warning(wake)
           |> maybe_add_after_fact_hint(db, p)
         else
@@ -8369,7 +8631,9 @@ defmodule Tightbeam.Gateway do
         do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
 
     if prior do
-      wake = Wakes.get_in_txn(txn, prior.session_key)
+      wake =
+        Wakes.get_in_txn(txn, prior.session_key)
+        |> replay_wake_replacement_in_txn(txn, call.origin, p.idempotency_key)
 
       if is_map(wake),
         do: Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
@@ -8385,6 +8649,18 @@ defmodule Tightbeam.Gateway do
           idempotency_key: p.idempotency_key,
           session_key: wake.wake_id
         })
+
+        if Map.has_key?(wake, :replaced_wake_ids) do
+          DB.Txn.q(
+            txn,
+            "UPDATE wire_idempotency SET responseJson=?3 WHERE ownerUserId=?1 AND operation='wake' AND idempotencyKey=?2",
+            [
+              call.origin,
+              p.idempotency_key,
+              JSON.encode!(%{replacedWakeIds: wake.replaced_wake_ids})
+            ]
+          )
+        end
       end
 
       if is_map(wake) and is_binary(wake[:wake_id]),
@@ -8393,6 +8669,28 @@ defmodule Tightbeam.Gateway do
       maybe_warn_unserved_in_txn(txn, wake, p[:condition_kind])
     end
   end
+
+  defp replay_wake_replacement_in_txn(wake, txn, owner, key) when is_map(wake) do
+    case DB.Txn.q(
+           txn,
+           "SELECT responseJson FROM wire_idempotency WHERE ownerUserId=?1 AND operation='wake' AND idempotencyKey=?2",
+           [owner, key]
+         ) do
+      [[response]] when is_binary(response) ->
+        %{"replacedWakeIds" => ids} = JSON.decode!(response)
+        Map.put(wake, :replaced_wake_ids, ids)
+
+      [[nil]] ->
+        wake
+    end
+  end
+
+  defp replay_wake_replacement_in_txn(wake, _txn, _owner, _key), do: wake
+
+  defp maybe_add_replaced_wake_ids(response, %{replaced_wake_ids: ids}),
+    do: Map.put(response, :replaced_wake_ids, ids)
+
+  defp maybe_add_replaced_wake_ids(response, _wake), do: response
 
   defp maybe_warn_unserved_in_txn(txn, %{wake_id: _} = wake, kind) when is_binary(kind) do
     if ConditionFacts.substrate_defined_kind?(kind) or FactProducers.served_in_txn?(txn, kind) do
@@ -8488,6 +8786,7 @@ defmodule Tightbeam.Gateway do
           replacement_assignment_id: replacement_assignment_id,
           predicate: p[:predicate],
           after_turn: p[:after_turn] == true,
+          wait_reason: p[:wait_reason],
           registrant_session_key: creator_session_key(call[:principal]),
           owner_user_id: wait_owner_user_id_in_txn(txn, call[:principal])
         })
@@ -8680,15 +8979,28 @@ defmodule Tightbeam.Gateway do
        ) do
     p = call.params
     assignment_id = wake_assignment_id_in_txn(txn, call)
+    continuation = dated_continuation_assignment_id_in_txn(txn, call, session_key)
+    future? = due_at > System.system_time(:millisecond)
 
-    # Immediate assignment pointers and recurring crons are references, not holder work.
-    # Keep the assignment on each wake without counting its creation as activity.
-    activity_assignment_id =
-      if immediate_assignment_pointer_request?(p) or is_binary(p[:cron]),
-        do: nil,
-        else: assignment_id
+    explicit_timed_wait? =
+      Map.has_key?(p, :wait_reason) and future? and call.principal == {:session, session_key} and
+        is_nil(p[:cron]) and p[:replace_queued] != true
 
-    wake =
+    wait? =
+      is_binary(condition_kind) or (future? and is_binary(continuation)) or explicit_timed_wait?
+
+    with :ok <-
+           if(wait?,
+             do: Tightbeam.WaitReason.validate(p[:wait_reason], "--wait-reason"),
+             else: :ok
+           ) do
+      # Immediate assignment pointers and recurring crons are references, not holder work.
+      # Keep the assignment on each wake without counting its creation as activity.
+      activity_assignment_id =
+        if immediate_assignment_pointer_request?(p) or is_binary(p[:cron]),
+          do: nil,
+          else: assignment_id
+
       Wakes.schedule_in_txn(txn, %{
         session_key: session_key,
         target_role: Map.get(call, :target_role),
@@ -8699,6 +9011,7 @@ defmodule Tightbeam.Gateway do
         due_at: due_at,
         condition_kind: condition_kind,
         condition_scope: condition_scope,
+        wait_reason: if(wait?, do: p[:wait_reason]),
         creator_session_key: creator_session_key(call[:principal]),
         # A class is the sender's election. An explicit time is also the
         # sender's election and inhibits batching without discarding the class.
@@ -8710,8 +9023,7 @@ defmodule Tightbeam.Gateway do
         reresolve: p[:reresolve],
         reresolve_seed: p[:reresolve_seed],
         reresolve_rung: p[:reresolve_rung],
-        dated_continuation_assignment_id:
-          dated_continuation_assignment_id_in_txn(txn, call, session_key),
+        dated_continuation_assignment_id: continuation,
         # Typed waits validate the assignment through register_wait_in_txn/2.
         # Internal process and bound remedy wakes continue to use their carriers.
         assignment_id: assignment_id,
@@ -8719,8 +9031,7 @@ defmodule Tightbeam.Gateway do
         prod_sender: prod_sender(call[:principal]),
         activity_assignment_id: activity_assignment_id
       })
-
-    wake
+    end
   end
 
   defp replacement_assignment_id_in_txn(txn, call, session_key) do
@@ -8848,6 +9159,11 @@ defmodule Tightbeam.Gateway do
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
   end
+
+  defp maybe_add_wait_reason(response, %{wait_reason: reason}) when is_binary(reason),
+    do: Map.put(response, :wait_reason, reason)
+
+  defp maybe_add_wait_reason(response, _wake), do: response
 
   defp maybe_add_after_fact_hint(response, db, params) do
     if is_integer(params[:after_ms]) and params.after_ms > 0 and is_nil(params[:at]) and
@@ -9312,7 +9628,8 @@ defmodule Tightbeam.Gateway do
                  p.idempotency_key
                ) do
             nil ->
-              with nil <- held_spawn_name_refusal(txn, p[:handle]),
+              with :ok <- spawn_fence_check_in_txn(txn, routed.harness, host),
+                   nil <- held_spawn_name_refusal(txn, p[:handle]),
                    true <- not is_nil(Archetypes.get(archetype.name)) do
                 if spawn_cap_reached_in_txn?(
                      txn,
@@ -9330,8 +9647,20 @@ defmodule Tightbeam.Gateway do
                     )
 
                   case staffing do
-                    :ok ->
+                    %{code: _} = denial ->
+                      {:delivery_owner_denied, denial}
+
+                    staffing ->
                       session = Org.create_in_txn(txn, input)
+
+                      # Staffing-owner facts are stated as FYIs on the spawned session.
+                      :ok =
+                        Tightbeam.RecordFyis.put_in_txn(
+                          txn,
+                          "session",
+                          session.session_key,
+                          staffing_fyi(staffing)
+                        )
 
                       if is_nil(caller.caller_session) and
                            String.starts_with?(call.origin, "user:") and
@@ -9388,12 +9717,12 @@ defmodule Tightbeam.Gateway do
                       )
 
                       {:created, session}
-
-                    %{code: _} = denial ->
-                      {:delivery_owner_denied, denial}
                   end
                 end
               else
+                {:error, denial} ->
+                  {:spawn_denied, denial}
+
                 false ->
                   {:error, :unknown_archetype}
 
@@ -9412,6 +9741,9 @@ defmodule Tightbeam.Gateway do
 
         {:ok, {:cap_exceeded, cap}} ->
           spawn_cap_exceeded(cap, caller.owner_user_id)
+
+        {:ok, {:spawn_denied, denial}} ->
+          denial
 
         {:ok, {:name_taken, refusal}} ->
           refusal
@@ -9444,6 +9776,18 @@ defmodule Tightbeam.Gateway do
     else
       {:error, denial} ->
         classified_denial("placement_denied", denial)
+    end
+  end
+
+  defp spawn_fence_check_in_txn(txn, harness, host) do
+    if HarnessProcess.parked_in_txn?(txn, {Harness.parse!(harness).id(), "shared", host}) do
+      {:error,
+       %{
+         code: "harness_fenced",
+         message: "cannot spawn: selected harness #{harness} on host #{host} is fenced"
+       }}
+    else
+      :ok
     end
   end
 
@@ -9500,23 +9844,33 @@ defmodule Tightbeam.Gateway do
   defp finish_spawn(db, _call, caller, session) do
     stream = Payloads.stream_session(session)
     broadcast(db, caller.owner_user_id, Payloads.stream_created(stream))
-    spawn_result(session, stream)
+    spawned_session_result(db, session, stream)
   end
 
   defp spawn_replay(db, session_key) do
     session = Org.get(db, session_key)
-    spawn_result(session, Payloads.stream_session(session))
+    spawned_session_result(db, session, Payloads.stream_session(session))
   end
 
-  defp spawn_result(session, stream) do
-    %{
+  defp spawned_session_result(db, session, stream) do
+    result = %{
       stream: stream,
       session_key: session.session_key,
       handle: session.handle,
       requested: published_identity(session.model),
       running_status: "not reported by #{session.harness}"
     }
+
+    fyis = Tightbeam.RecordFyis.list_many(db, "session", [session.session_key])
+
+    case Map.get(fyis, session.session_key) do
+      nil -> result
+      fyi -> Map.put(result, :fyi, fyi)
+    end
   end
+
+  defp staffing_fyi({:ok, facts}), do: Enum.map(facts, &Tightbeam.RecordFyis.line/1)
+  defp staffing_fyi(:ok), do: []
 
   defp held_spawn_name_refusal(_db, nil), do: nil
 
@@ -10768,26 +11122,28 @@ defmodule Tightbeam.Gateway do
       allow_queued = repair_tune_authorized?(db, call, session)
 
       {boundary, applies} =
-        model_change_boundary(config, db, session, allow_queued, fn running? ->
-          run_session_mutation(session.session_key, fn ->
-            if running? do
-              apply_running_model(
-                config,
-                db,
-                Org.get(db, session.session_key),
-                new_ref,
-                routed.provider
-              )
-            else
-              apply_tuned_model(
-                config,
-                db,
-                session,
-                new_ref,
-                routed.provider,
-                call[:principal] || call.origin
-              )
-            end
+        contain_model_change_exit(fn ->
+          model_change_boundary(config, db, session, allow_queued, fn running? ->
+            run_session_mutation(session.session_key, fn ->
+              if running? do
+                apply_running_model(
+                  config,
+                  db,
+                  Org.get(db, session.session_key),
+                  new_ref,
+                  routed.provider
+                )
+              else
+                apply_tuned_model(
+                  config,
+                  db,
+                  session,
+                  new_ref,
+                  routed.provider,
+                  call[:principal] || call.origin
+                )
+              end
+            end)
           end)
         end)
 
@@ -10853,6 +11209,13 @@ defmodule Tightbeam.Gateway do
           |> Map.merge(runtime_actual(actual))
           |> Map.put(:projection_committed, false)
 
+        {:ok, {:error, {:runtime_config_not_sent, _reason}}} ->
+          tune_error(
+            "runtime_config_not_sent",
+            "the configuration request was not sent; nothing changed; retry the change",
+            diagnostic
+          )
+
         {:ok, {:error, {:runtime_config_unknown, _reason}}} ->
           tune_error(
             "runtime_config_unknown",
@@ -10892,6 +11255,36 @@ defmodule Tightbeam.Gateway do
     else
       {:error, denial} -> normalize_tune_denial(denial)
     end
+  end
+
+  # Exceptions retain their original stack and DB classification through the
+  # lane's caller-side re-raise and Dispatch.invoke. Only transport exits need
+  # conversion here; after entering the boundary their effect can be unknown.
+  defp contain_model_change_exit(fun) do
+    fun.()
+  catch
+    :exit, reason ->
+      model_change_exit(reason, __STACKTRACE__, :runtime_config_unknown, nil)
+  end
+
+  defp model_change_exit(reason, stacktrace, code, sent) do
+    diagnostic =
+      ErrorDiagnostic.caught(:exit, reason, stacktrace,
+        operation: "tune",
+        phase: "model_boundary",
+        sent: sent
+      )
+
+    {{:ok, {:error, ErrorDiagnostic.diagnosed({code, reason}, diagnostic)}}, "now"}
+  end
+
+  # Admission cannot send a configuration request: a timeout here can only
+  # create a quiet lane later, never apply the requested model.
+  defp ensure_model_change_lane(config, session_key) do
+    LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session_key)
+  catch
+    :exit, reason ->
+      model_change_exit(reason, __STACKTRACE__, :runtime_config_not_sent, false)
   end
 
   defp runtime_actual(%Model{} = model) do
@@ -10938,30 +11331,30 @@ defmodule Tightbeam.Gateway do
   # a claim that tokens already being generated use the requested configuration.
   defp model_change_boundary(config, db, session, allow_queued, apply) do
     if Harness.running_model_tuning_supported?(session.harness) do
-      LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session.session_key)
+      with :ok <- ensure_model_change_lane(config, session.session_key) do
+        Tightbeam.SessionLane.change_at_boundary(
+          session.session_key,
+          fn ->
+            case config[:on_tune_fence] do
+              callback when is_function(callback, 0) -> callback.()
+              _ -> :ok
+            end
 
-      Tightbeam.SessionLane.change_at_boundary(
-        session.session_key,
-        fn ->
-          case config[:on_tune_fence] do
-            callback when is_function(callback, 0) -> callback.()
-            _ -> :ok
-          end
+            refused? =
+              if allow_queued,
+                do: Ledger.running?(db, session.session_key),
+                else: Ledger.pending_count(db, session.session_key) > 0
 
-          refused? =
-            if allow_queued,
-              do: Ledger.running?(db, session.session_key),
-              else: Ledger.pending_count(db, session.session_key) > 0
-
-          if refused?,
-            do: {{:error, :turn_in_progress}, "now"},
-            else: {{:ok, apply.(false)}, "now"}
-        end,
-        fn -> {{:ok, apply.(true)}, "after_turn"} end
-      )
-      |> case do
-        :no_lane -> {{:error, :no_lane}, "now"}
-        result -> result
+            if refused?,
+              do: {{:error, :turn_in_progress}, "now"},
+              else: {{:ok, apply.(false)}, "now"}
+          end,
+          fn -> {{:ok, apply.(true)}, "after_turn"} end
+        )
+        |> case do
+          :no_lane -> {{:error, :no_lane}, "now"}
+          result -> result
+        end
       end
     else
       {at_tune_boundary(config, db, session.session_key, fn -> apply.(false) end,
@@ -11978,13 +12371,21 @@ defmodule Tightbeam.Gateway do
     prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
 
     cond do
-      prior && prior.session_key == call.session_key ->
+      p[:dry_run] == true ->
+        retire_preview(config, db, owner, call)
+
+      prior && prior.session_key == call.session_key && p[:acknowledge_loss] != true ->
         retired_keys = retired_subtree_keys(db, call.session_key)
 
         kept_descendants =
           retirement_move_replay(db, call.session_key, owner, p[:idempotency_key])
 
-        %{deleted_session_key: call.session_key, retired_session_keys: retired_keys, deferred: []}
+        %{
+          deleted_session_key: call.session_key,
+          retired_session_keys: retired_keys,
+          retired_sessions: Enum.map(retired_keys, &retired_workspace_entry(config, db, &1)),
+          deferred: []
+        }
         |> maybe_put_kept_descendants(kept_descendants)
         |> then(&retire_replay_observation(db, call, &1))
 
@@ -12001,7 +12402,7 @@ defmodule Tightbeam.Gateway do
             }
 
           %{owner_user_id: ^owner} = session ->
-            if session.state == "active" do
+            if session.state == "active" and p[:acknowledge_loss] != true do
               principal = retirement_principal_ref(call.principal)
               retirement_request_id = "rtr_" <> Tightbeam.Id.uuid4()
 
@@ -12092,6 +12493,8 @@ defmodule Tightbeam.Gateway do
                 %{
                   deleted_session_key: session.session_key,
                   retired_session_keys: Enum.map(result.retired, & &1.session_key),
+                  retired_sessions:
+                    Enum.map(result.retired, &retired_workspace_entry(config, db, &1.session_key)),
                   deferred: result.deferred
                 }
                 |> maybe_put_kept_descendants(result.kept_descendants)
@@ -12102,21 +12505,137 @@ defmodule Tightbeam.Gateway do
                 end)
               end
             else
-              retire_replay_observation(
-                db,
-                call,
-                %{
-                  deleted_session_key: session.session_key,
-                  retired_session_keys: [],
-                  deferred: []
-                }
-              )
+              retired_workspace_response(config, db, call, session, p[:acknowledge_loss] == true)
             end
 
           _ ->
             %{code: "not_found"}
         end
     end
+  end
+
+  # Retiring an already-retired session reports the work its workspace
+  # cleanup is holding back, and `acknowledge_loss` lets that cleanup delete it.
+  defp retired_workspace_response(config, db, call, session, acknowledge?) do
+    keys = [session.session_key | retired_subtree_keys(db, session.session_key)] |> Enum.uniq()
+
+    held =
+      Enum.flat_map(keys, fn key ->
+        db
+        |> WorkspaceCleanup.held_losses(key)
+        |> Enum.map(
+          &Map.merge(&1, %{"session_key" => key, "display_name" => retired_display_name(db, key)})
+        )
+      end)
+
+    cond do
+      acknowledge? and held == [] ->
+        %{code: "invalid", message: "no held workspace losses to acknowledge"}
+
+      acknowledge? ->
+        by = retirement_principal_ref(call.principal)
+        Enum.each(keys, &WorkspaceCleanup.acknowledge(db, &1, by))
+        workspace_response(config, db, call, session, keys, %{acknowledged_losses: held})
+
+      held != [] ->
+        workspace_response(config, db, call, session, keys, %{held_losses: held})
+
+      true ->
+        workspace_response(config, db, call, session, keys, %{})
+    end
+  end
+
+  # Retire returns before any workspace is touched: cleanup is queued and runs
+  # one session at a time. Each entry says where the workdir is and how its
+  # cleanup stands (queued, held, blocked, completed).
+  defp retired_workspace_entry(config, db, key) do
+    session = Org.get(db, key)
+
+    workdir =
+      try do
+        Tightbeam.Placement.workdir_path(config, session)
+      rescue
+        _ -> nil
+      end
+
+    status = WorkspaceCleanup.status(db, key) || %{cleanup: "queued", reasons: []}
+
+    archive_path =
+      if status.cleanup == "completed",
+        do: status[:archive_path],
+        else: status[:archive_path] || WorkspaceCleanup.projected_archive(config, db, session)
+
+    Map.merge(status, %{
+      session_key: key,
+      display_name: session && session.display_name,
+      host: session && session.host,
+      workdir: workdir,
+      archive_host: session && session.host,
+      archive_path: archive_path
+    })
+  end
+
+  defp retired_display_name(db, key) do
+    case Org.get(db, key) do
+      %{display_name: name} -> name
+      _ -> nil
+    end
+  end
+
+  # Read-only. Shows the blast radius of a retire: every session it would
+  # remove (with what its workspace scan finds on its own host), every
+  # session it would keep, and whether it would refuse without
+  # --keep-open-descendants. Nothing is written.
+  defp retire_preview(config, db, owner, call) do
+    case Org.get(db, call.session_key) do
+      %{owner_user_id: ^owner, is_built_in: true} ->
+        %{
+          code: "denied",
+          message:
+            "main sessions are permanent — they are the fallback for roles and user references"
+        }
+
+      %{owner_user_id: ^owner, state: "active"} ->
+        {:ok, plan} =
+          DB.transaction(db, fn txn ->
+            retirement_plan_in_txn(txn, call.session_key, owner, true)
+          end)
+
+        scans =
+          WorkspaceCleanup.preview(config, db, Enum.map(plan.retired, & &1.session_key))
+
+        %{
+          dry_run: true,
+          session_key: call.session_key,
+          would_retire: scans,
+          would_keep: Enum.map(plan.kept, &session_details/1),
+          would_keep_protected_roots: Enum.map(plan.frontiers, &protected_descendant_details/1),
+          requires_keep_open_descendants: plan.frontiers != [],
+          sessions_with_held_work: Enum.count(scans, &(&1.losses != []))
+        }
+
+      %{owner_user_id: ^owner} = session ->
+        retired_workspace_response(config, db, call, session, false)
+
+      _ ->
+        %{code: "not_found"}
+    end
+  end
+
+  defp workspace_response(config, db, call, session, keys, extra) do
+    retire_replay_observation(
+      db,
+      call,
+      Map.merge(
+        %{
+          deleted_session_key: session.session_key,
+          retired_session_keys: [],
+          retired_sessions: Enum.map(keys, &retired_workspace_entry(config, db, &1)),
+          deferred: []
+        },
+        extra
+      )
+    )
   end
 
   defp retire_withdraw_result(db, call) do
@@ -12237,6 +12756,7 @@ defmodule Tightbeam.Gateway do
           end)
 
         retired = Enum.reject(active_subtree, &MapSet.member?(kept_keys, &1.session_key))
+        kept = Enum.filter(active_subtree, &MapSet.member?(kept_keys, &1.session_key))
 
         if protected != [] and not keep_open_descendants? do
           %{
@@ -12254,6 +12774,7 @@ defmodule Tightbeam.Gateway do
             owner: owner,
             keep_open_descendants: keep_open_descendants?,
             retired: retired,
+            kept: kept,
             frontiers: frontiers,
             accountable_parent: accountable_parent
           }
@@ -12827,6 +13348,18 @@ defmodule Tightbeam.Gateway do
   end
 
   defp error_sentence(reason), do: inspect(reason)
+
+  @doc false
+  def recorded_turn_failure_sentence(error) when is_binary(error) do
+    case JSON.decode(error) do
+      {:ok, reason} when is_map(reason) -> error_sentence(reason)
+      _ -> error
+    end
+  rescue
+    _ -> error
+  end
+
+  def recorded_turn_failure_sentence(nil), do: "reason unrecorded"
 
   defp append_turn_failed_marker(db, session_key, reason),
     do: append_turn_failed_marker(db, session_key, reason, false)

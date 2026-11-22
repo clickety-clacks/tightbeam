@@ -64,7 +64,7 @@ defmodule Tightbeam.Dispatch do
 
   @type handlers :: %{optional(String.t()) => handler()}
 
-  @read_verbs ~w(facts-read fact-demand fact-producers artifact-content-fetch artifact-get artifacts mementos decision-requests
+  @read_verbs ~w(facts-read fact-demand fact-producers artifact-content-fetch artifact-content-capacity artifact-get artifacts mementos decision-requests
     decision-request host-env-list sentinel-list sentinel-events sentinel-subscriptions identity-status kungfu-list harness-processes
     role-list breathing work-item-get work-item-trace transcript execution-map execution-map-select
     toplines topline topline-placement-list work-item-list attests check-attest assignment-get assignments inspect
@@ -245,14 +245,11 @@ defmodule Tightbeam.Dispatch do
       {:remedy, statute, ref, error} ->
         outcome = RailRemedy.fire(db, handlers, statute, ref, call)
 
-        if statute.name in [
-             "completion-requires-review",
-             "agentic-engineering.completion-requires-review"
-           ] and verb == "attest" and
-             call.params[:kind] == "completion" and review_notice_routed?(outcome) do
-          # A missing review keeps the assignment open, but it does not erase
-          # the holder's completion report. The remedy's notice is stored
-          # before the handler records it.
+        if Map.get(statute.remedy, :accountable_notice, false) and verb == "attest" and
+             call.params[:kind] == "completion" and notice_routed?(outcome) do
+          # An accountable-notice remedy keeps the assignment open, but it does
+          # not erase the holder's completion report. The remedy's notice is
+          # stored before the handler records it.
           dispatch_to_handler(
             db,
             handlers,
@@ -862,7 +859,7 @@ defmodule Tightbeam.Dispatch do
       params["reviews_assignment_id"] || params[:work_item_id] || params["work_item_id"]
   end
 
-  defp review_notice_routed?(%{outcome: outcome, producer_id: producer_id})
+  defp notice_routed?(%{outcome: outcome, producer_id: producer_id})
        when outcome in [
               "notice-stored",
               "claimed-dispatched",
@@ -871,7 +868,7 @@ defmodule Tightbeam.Dispatch do
             ] and is_binary(producer_id),
        do: true
 
-  defp review_notice_routed?(_outcome), do: false
+  defp notice_routed?(_outcome), do: false
 
   defp remedy_error(error, %{denial: denial}) do
     error

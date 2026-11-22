@@ -32,6 +32,8 @@ defmodule Tightbeam.Wire.Router do
     the in-memory observation window Artifacts reads for its evidence class.
   - GET  /api/streams          — device auth; owner-only catalog (even admins).
   - POST /api/streams          — spawn verb (displayName + idempotencyKey).
+  - GET  /api/session-message-sequences — roster visibility; all session keys and
+    latest global transcript sequences (0 when empty), sorted by key, unpaged.
   - GET  /api/trackable-sessions — static {sessions: []} (client probe).
   - PATCH  /api/streams/:key   — tune(rename). DELETE /api/streams/:key —
     retire (absent session + idempotencyKey still dispatches; else 404).
@@ -77,16 +79,20 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle harklight-read harklight-ack harklight-reply harklight-result harklight-listener-restore harklight-cover harklight-retry harklight-briefings-catchup harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests check-attest revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-read harklight-ack harklight-reply harklight-result harklight-progress harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-retry harklight-briefings-catchup harklight-follow spawn session-reparent session-po-set retire retire-withdraw critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests check-attest revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
                    "assess_attachments",
                    "session-custody-transfer",
+                   "assignment-opener-accept",
                    "fact-demand",
                    "sentinel-demand",
                    "fact-producer-claim",
                    "fact-producers",
                    "artifact-content-fetch",
+                   "artifact-content-capacity",
+                   "artifact-content-promote",
+                   "workspace-cleanup",
                    "assignment-commitref-correct",
                    "harness-health-observe-other",
                    "harness-health-resolve-other",
@@ -338,7 +344,7 @@ defmodule Tightbeam.Wire.Router do
 
   post "/agent/dispatch" do
     with {:ok, auth} <- agent_dispatch_auth(conn) do
-      with_json(conn, fn body, conn ->
+      with_agent_body(conn, fn body, conn ->
         cond do
           body["verb"] == "post" and auth == :org ->
             dispatch_rest_post(conn, auth, body)
@@ -379,24 +385,27 @@ defmodule Tightbeam.Wire.Router do
 
               call =
                 case {verb, principal} do
-                  {"artifact-content-fetch", {:session, session_key}} ->
+                  {verb, {:session, session_key}}
+                  when verb in ["artifact-content-fetch", "artifact-content-promote"] ->
                     Map.put(call, :rest_principal, %{
                       kind: "session",
                       id: session_key,
                       is_admin: false
                     })
 
-                  {"artifact-content-fetch", {:process, name}} ->
+                  {verb, {:process, name}}
+                  when verb in ["artifact-content-fetch", "artifact-content-promote"] ->
                     Map.put(call, :rest_principal, %{kind: "process", id: name, is_admin: true})
 
-                  {"artifact-content-fetch", {:user, user_id}} ->
+                  {verb, {:user, user_id}}
+                  when verb in ["artifact-content-fetch", "artifact-content-promote"] ->
                     Map.put(call, :rest_principal, state_principal_view({:user, user_id}, conn))
 
                   _ ->
                     call
                 end
 
-              dispatch_response(conn, call, 200, &%{"result" => &1})
+              dispatch_with_artifact_upload(conn, call)
             else
               {:error, status, code, message} ->
                 error(conn, status, code, message)
@@ -412,6 +421,52 @@ defmodule Tightbeam.Wire.Router do
 
       {:error, status, code, message, diagnostic} ->
         error(conn, status, code, message, diagnostic)
+    end
+  end
+
+  defp with_agent_body(conn, fun) do
+    case Plug.Conn.get_req_header(conn, "x-tightbeam-artifact-record") do
+      [] ->
+        with_json(conn, fun)
+
+      [metadata] ->
+        with {:ok, json} <- Base.url_decode64(metadata, padding: false),
+             {:ok, %{"verb" => "artifact-record", "params" => params} = body}
+             when is_map(params) <- JSON.decode(json),
+             false <- Map.has_key?(params, "contentBase64"),
+             origin when is_binary(origin) and origin != "" <- params["originPath"] do
+          fun.(body, Plug.Conn.put_private(conn, :artifact_body_upload, true))
+        else
+          _ -> error(conn, 400, "invalid_artifact_upload", "expected artifact record metadata")
+        end
+
+      _ ->
+        error(conn, 400, "invalid_artifact_upload", "expected one artifact metadata header")
+    end
+  end
+
+  defp dispatch_with_artifact_upload(conn, call) do
+    if conn.private[:artifact_body_upload] do
+      case deps(conn)[:artifact_blob_store] do
+        nil ->
+          error(conn, 503, "artifact_store_unavailable")
+
+        store ->
+          case Tightbeam.ArtifactCapture.upload(conn, store, call.params) do
+            {%{custody: _} = capture, conn} ->
+              dispatch_response(
+                conn,
+                Map.put(call, :artifact_capture, capture),
+                200,
+                &%{"result" => &1}
+              )
+
+            {%{code: _} = result, conn} ->
+              dispatch_error(conn, call, 400, result)
+          end
+      end
+    else
+      dispatch_response(conn, call, 200, &%{"result" => &1})
     end
   end
 
@@ -602,6 +657,10 @@ defmodule Tightbeam.Wire.Router do
       Map.fetch!(@core_detail_specs, :decision_requests),
       decision_request_id
     )
+  end
+
+  get "/api/session-message-sequences" do
+    session_message_sequences(conn)
   end
 
   get "/api/sessions" do
@@ -1282,6 +1341,20 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp observer_principal, do: %{kind: "observer", id: "observer", is_admin: false}
+
+  defp session_message_sequences(conn) do
+    with {:ok, auth} <- core_detail_auth(conn, "sessions"),
+         {:ok, query} <- observer_read_query(conn, "sessions"),
+         {:ok, principal} <- observer_read_route_principal(auth, query, conn),
+         true <- Enum.all?(Map.keys(query), &(&1 == "asUser")) do
+      json(conn, 200, %{
+        "items" => StateResources.query_session_message_sequences(db(conn), principal)
+      })
+    else
+      false -> error(conn, 400, "invalid_filter")
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
 
   defp session_index(conn) do
     with {:ok, auth} <-
@@ -3797,6 +3870,10 @@ defmodule Tightbeam.Wire.Router do
 
   defp allowed_agent_verb(verb, {:device, _device}) when verb in @read_marker_verbs, do: :ok
 
+  # The Chat server signs in with the org CLI token plus `asUser` for both human
+  # send and read markers; the handler still requires that `asUser` names a user.
+  defp allowed_agent_verb(verb, :org) when verb in @read_marker_verbs, do: :ok
+
   defp allowed_agent_verb(_verb, {:device, _device}),
     do: {:error, 401, "auth_failed", nil}
 
@@ -4136,11 +4213,14 @@ defmodule Tightbeam.Wire.Router do
   # `--session <key>` is a COHORT FILTER over creator identity, not a target, so
   # resolving it as one would turn a roster filter into a session-existence
   # oracle. Both verbs' selectors travel as ordinary body params.
-  @non_target_verbs ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-read harklight-ack harklight-reply harklight-result harklight-listener-restore harklight-cover harklight-retry harklight-briefings-catchup harklight-follow settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
+  @non_target_verbs ~w(harklight-send harklight-read harklight-ack harklight-reply harklight-result harklight-progress harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-retry harklight-briefings-catchup harklight-follow settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
 
   @non_target_verbs @non_target_verbs ++
                       [
                         "artifact-content-fetch",
+                        "artifact-content-promote",
+                        "artifact-content-capacity",
+                        "workspace-cleanup",
                         "assignment-commitref-correct",
                         "harness-health-observe-other",
                         "harness-health-resolve-other",
@@ -4241,7 +4321,7 @@ defmodule Tightbeam.Wire.Router do
     do: session_key
 
   defp artifact_caller_session(verb, nil, {:session, session_key})
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-read harklight-ack harklight-reply harklight-result harklight-listener-restore harklight-cover harklight-retry harklight-follow),
+       when verb in ~w(harklight-send harklight-read harklight-ack harklight-reply harklight-result harklight-progress harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-retry harklight-follow harklight-briefings-catchup),
        do: session_key
 
   defp artifact_caller_session(_verb, session_key, _principal), do: session_key
@@ -4697,6 +4777,9 @@ defmodule Tightbeam.Wire.Router do
   # handler reads, so the link silently never landed.
   @param_aliases %{
     "assign" => %{reviews: :reviews_assignment_id},
+    # Rules and obligation facts read assignment_id and work_item_id; the CLI
+    # has always sent operator-ask's link as "assignment".
+    "operator-ask" => %{assignment: :assignment_id, work_item: :work_item_id},
     "tune" => %{
       reasoning_level: :reasoningLevel,
       fast_mode: :fastMode
@@ -4706,18 +4789,19 @@ defmodule Tightbeam.Wire.Router do
   @param_keys %{
     "harklight-send" => ~w(
         harklight_session sender_id title message_type message_kind importance stake by_when reply
-        body choices files vendor_session_id supersedes decision_request_id
+        body choices files answer_ui vendor_session_id supersedes decision_request_id progress progress_stage progress_note
       )a,
-    "harklight-revise" => ~w(message_id base_revision title body choices clear_choices)a,
-    "harklight-retract" => ~w(message_id)a,
-    "harklight-settle" => ~w(message_id)a,
+    "harklight-progress" => ~w(message_id percent stage note)a,
+    "harklight-revise" =>
+      ~w(message_id base_revision title body choices clear_choices handle in_reply_to)a,
+    "harklight-retract" => ~w(message_id handle in_reply_to)a,
+    "harklight-settle" => ~w(message_id op_id)a,
     "harklight-listener-restore" => ~w(handle)a,
     "harklight-read" => ~w(handle)a,
     "harklight-ack" => ~w(handle event_id)a,
     "harklight-reply" => ~w(handle request_id in_reply_to body op_id)a,
     "harklight-result" => ~w(handle request_id in_reply_to status op_id)a,
     "harklight-follow" => ~w(message_id handle)a,
-    "harklight-cover" => ~w(handle)a,
     "harklight-briefings-catchup" => ~w(limit)a,
     "harklight-retry" => ~w(all message_id handle)a,
     "work-item-list" =>
@@ -4746,9 +4830,12 @@ defmodule Tightbeam.Wire.Router do
     "add-user" => ~w(is_admin user_id)a,
     "answer" => ~w(answer idempotency_key reason request request_id)a,
     "artifact-content-fetch" => ~w(artifact_id)a,
+    "artifact-content-promote" => ~w(artifact_id)a,
+    "artifact-content-capacity" => [],
+    "workspace-cleanup" => ~w(action session_key)a,
     "artifact-get" => ~w(artifact_id)a,
     "artifact-record" =>
-      ~w(content_base64 content_sha256 description kind origin_path produced_by_assignment_id title work_item_id)a,
+      ~w(allow_unpinned content_base64 content_sha256 description kind origin_path produced_by_assignment_id title work_item_id)a,
     "artifacts" => ~w(session_key work_item_id kind)a,
     "memento-set" => ~w(record name values clear)a,
     "mementos" => ~w(record history name limit cursor)a,
@@ -4808,14 +4895,14 @@ defmodule Tightbeam.Wire.Router do
     "onboard" =>
       ~w(provider phase kind machine lease_id reason source code callback_url owner_user_id)a,
     "operator-ask" =>
-      ~w(assignment assignment_id choices context deadline idempotency_key note options owner_user_id question supersedes work_item_id)a,
+      ~w(assignment assignment_id choices context deadline idempotency_key note options owner_user_id project question supersedes work_item work_item_id)a,
     "operator-rule" => ~w(decision idempotency_key rationale reason request request_id response)a,
     "operator-withdraw" => ~w(idempotency_key reason request request_id)a,
     "register-host" => ~w(adapter_bin_dir base_dir cli_bin name ssh)a,
     "reopen-assignment" => ~w(assignment_id reason)a,
     "repair-assignment" =>
       ~w(action assignment_id context effort idempotency_key model outcome turn_seq)a,
-    "retire" => ~w(idempotency_key keep_open_descendants session_key)a,
+    "retire" => ~w(acknowledge_loss dry_run idempotency_key keep_open_descendants session_key)a,
     "retire-withdraw" => ~w(reason session_key)a,
     "return" => ~w(idempotency_key reason request request_id)a,
     "revoke-assignment" => ~w(assignment_id reason)a,
@@ -4839,6 +4926,7 @@ defmodule Tightbeam.Wire.Router do
     "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
     "session-custody-transfer" =>
       ~w(from_session_key idempotency_key parent_session_key to_session_key)a,
+    "assignment-opener-accept" => ~w(assignment_id to_session_key)a,
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
     "spawn" =>
       ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id owner_user_id)a,
@@ -4852,7 +4940,7 @@ defmodule Tightbeam.Wire.Router do
       ~w(adopted context display_name effort fast_mode harness host idempotency_key mode model reasoning_level session_key setting skill guidance thinking_level verbosity)a,
     "unlearn" => ~w(idempotency_key name)a,
     "wake" =>
-      ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class cron condition_kind condition_scope idempotency_key predicate prod_id replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
+      ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class cron condition_kind condition_scope idempotency_key predicate prod_id replace_queued reresolve reresolve_rung reresolve_seed nudge wait_reason)a,
     "work-item-close" => ~w(work_item_id)a,
     "work-item-create" =>
       ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body mementos owner_user_id)a,
@@ -4949,11 +5037,21 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp dispatch_error(conn, %{verb: verb}, status, result)
-       when verb in ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-read harklight-ack harklight-reply harklight-result harklight-listener-restore harklight-cover harklight-retry harklight-follow) do
+       when verb in ~w(harklight-send harklight-read harklight-ack harklight-reply harklight-result harklight-progress harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-retry harklight-follow) do
     json(conn, status, %{"error" => wire_value(result)})
   end
 
   defp dispatch_error(conn, %{verb: "tune"}, status, result) do
+    json(conn, status, %{"error" => Map.delete(result, :ok)})
+  end
+
+  defp dispatch_error(
+         conn,
+         %{verb: verb},
+         status,
+         result
+       )
+       when verb in ["artifact-record", "artifact-content-fetch", "artifact-content-promote"] do
     json(conn, status, %{"error" => Map.delete(result, :ok)})
   end
 

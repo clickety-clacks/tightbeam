@@ -35,8 +35,12 @@ defmodule ItemlessSpawnDispatchRuntime do
   @staffing_rule "agentic-engineering.engineering-spawn-staffing-needs-work-item"
   @staffing_message "#{@staffing_rule}: Worker staffing requires a known work item. Create or link the work item before retrying."
 
+  # The engineering bundle is no longer shipped; learn it from the test fixture root.
+  @fixture_kungfu Path.expand("fixtures/kungfu", __DIR__)
+
   def run do
     Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: initial_config, base: base} ->
+      Application.put_env(:tightbeam, :kungfu_bundle_root_dir, @fixture_kungfu)
       {:ok, candidate} = Identity.learn!(base, "agentic-engineering", "test")
       {:ok, _revision} = Identity.publish_live!(base, candidate)
 
@@ -45,7 +49,7 @@ defmodule ItemlessSpawnDispatchRuntime do
 
       {:ok, _revision} = Identity.publish_live!(base, helper_candidate)
       install_fixture_adapter!(base)
-      _archetypes = Archetypes.load!(base)
+      archetypes = Archetypes.load!(base)
 
       config =
         initial_config
@@ -64,9 +68,12 @@ defmodule ItemlessSpawnDispatchRuntime do
         )
 
       for {key, archetype} <- [
-            {"caller", "agentic-engineering.coder"},
-            {"unqualified", "agentic-engineering.coder"},
-            {"coordinator", "agentic-engineering.pdo"}
+            {"caller", "pdo"},
+            {"default-caller", "default"},
+            {"unqualified", "default"},
+            {"coordinator", "pdo"},
+            {"engineering-caller", "agentic-engineering.orchestrator"},
+            {"engineering-unqualified", "agentic-engineering.orchestrator"}
           ] do
         Org.create(db, %{
           session_key: key,
@@ -90,77 +97,117 @@ defmodule ItemlessSpawnDispatchRuntime do
       assert {:ok, [["open"]]} =
                DB.query(db, "SELECT state FROM assignments WHERE id='caller-open'")
 
-      helper_call = spawn_call("caller", "session:caller", "helper")
-      session_count_before = count_sessions(db)
+      :ok =
+        DB.execute(
+          db,
+          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt) VALUES ('engineering-open','Helper scope','engineering-caller','owner',1)"
+        )
 
-      assert {:ok, helper} = Dispatch.dispatch(db, handlers, helper_call)
-      helper_key = helper.session_key
-      assert is_binary(helper_key)
-      assert Org.get(db, helper_key).state == "active"
-      assert Ephemeral.caller(db, helper_key) == "caller"
-      assert count_sessions(db) == session_count_before + 1
+      :ok =
+        DB.execute(
+          db,
+          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt) VALUES ('default-open','Helper scope','default-caller','owner',1)"
+        )
 
-      assert {:ok, [["verb"]]} =
-               DB.query(
-                 db,
-                 "SELECT kind FROM events WHERE verb='spawn' AND origin='session:caller' ORDER BY id LIMIT 1"
-               )
+      # R4 is unreachable with shipped archetypes. Inspect the loaded rule and
+      # its real archetypes; do not invent an engineering helper to exercise it.
+      staffing = Enum.find(rules, &(&1.name == @staffing_rule))
+      for name <- staffing.archetypes, do: refute(archetypes[name].ephemeral)
 
-      assert {:ok, [[0]]} =
-               DB.query(
-                 db,
-                 "SELECT COUNT(*) FROM events WHERE kind='denied' AND verb='spawn' AND origin='session:caller'"
-               )
+      assert Enum.any?(staffing.conditions, fn condition ->
+               condition.fact == "spawn.itemless_ephemeral_caller_qualified" and
+                 condition.op == "eq" and condition.value == false
+             end)
 
-      assert_exact_staffing_refusal!(
-        db,
-        handlers,
-        spawn_call("caller", "session:caller", "agentic-engineering.coder")
-      )
+      IO.puts("R4: unreachable with shipped archetypes; no staffing participant is ephemeral")
+      IO.puts("adapter: synthetic; real model turn unproven")
+
+      # R1/R2: both engineering and substrate callers use the actual session route.
+      for caller <- ["caller", "engineering-caller"] do
+        helper_call = spawn_call(caller, "session:#{caller}", "helper")
+        session_count_before = count_sessions(db)
+        assert {:ok, helper} = Dispatch.dispatch(db, handlers, helper_call)
+        helper_key = helper.session_key
+        assert Org.get(db, helper_key).state == "active"
+        assert Ephemeral.caller(db, helper_key) == caller
+        assert count_sessions(db) == session_count_before + 1
+
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   db,
+                   "SELECT COUNT(*) FROM events WHERE kind='denied' AND verb='spawn' AND origin=?1",
+                   ["session:#{caller}"]
+                 )
+
+        assert {:ok, [[0]]} =
+                 DB.query(db, "SELECT COUNT(*) FROM assignments WHERE holderKey=?1", [helper_key])
+
+        deliver_helper_result!(config, db, helper_key, caller)
+      end
+
+      # R3 holds whether or not the engineering caller has an open assignment.
+      for caller <- ["engineering-caller", "engineering-unqualified"] do
+        assert_exact_staffing_refusal!(
+          db,
+          handlers,
+          spawn_call(caller, "session:#{caller}", "agentic-engineering.coder")
+        )
+      end
 
       count_before = count_sessions(db)
 
-      assert {:error,
-              %{
-                code: "work_item_required",
-                message:
-                  "production staffing requires an exact work item; create or link the item before staffing"
-              }} =
+      assert {:error, %{code: "qualified_archetype_required", message: message}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 spawn_call("unqualified", "session:unqualified", "coder")
+               )
+
+      assert message =~ "agentic-engineering.coder"
+      assert count_sessions(db) == count_before
+
+      # This bare helper archetype has no configured staffing rule. The W9
+      # substrate check now accepts its missing item and records the fact.
+      line =
+        "FYI: this production staffing names no work item; decide for yourself whether that is acceptable"
+
+      assert {:ok, %{session_key: unqualified_helper, fyi: [^line]}} =
                Dispatch.dispatch(
                  db,
                  handlers,
                  spawn_call("unqualified", "session:unqualified", "helper")
+                 |> put_in([:params, :display_name], "WI3FE unqualified helper")
                )
 
-      assert count_sessions(db) == count_before
+      assert count_sessions(db) == count_before + 1
+      assert Tightbeam.StateResources.query_session(db, unqualified_helper).fyi == [line]
 
-      assert_ephemeral_obligation_refusal!(db, handlers, "caller")
-
-      deliver_helper_result!(config, db, helper_key)
+      # R5 is independent of the caller's archetype.
+      for caller <- ["caller", "engineering-caller"] do
+        assert_ephemeral_obligation_refusal!(db, handlers, caller)
+      end
     end)
   end
 
   defp report_loaded_rule_set!(base) do
-    expected =
-      ~w(
-        ac6a.toml
-        delivery.toml
-        engineering.toml
-        row-reaction-handoff.toml
-        row-reaction-terminal-action.toml
-        verification.toml
-        harklight-decision-request-briefing.toml
-        harness-health-recovery.toml
-        harness-recovery-main-wake.toml
-      )
-      |> Enum.sort()
+    shipped = Application.app_dir(:tightbeam, "priv")
+
+    seed =
+      Path.wildcard(Path.join([shipped, "seed", "rules", "*.toml"]))
+      |> Enum.map(&("identity/" <> Path.relative_to(&1, Path.join(shipped, "seed"))))
+
+    engineering =
+      Path.wildcard(Path.join([@fixture_kungfu, "agentic-engineering", "rules", "*.toml"]))
+      |> Enum.map(&("identity/kungfu/" <> Path.relative_to(&1, @fixture_kungfu)))
+
+    expected = Enum.sort(seed ++ engineering)
 
     files =
       (Path.wildcard(Path.join([base, "identity", "rules", "*.toml"])) ++
          Path.wildcard(Path.join([base, "identity", "kungfu", "*", "rules", "*.toml"])))
       |> Enum.sort()
 
-    assert Enum.sort(Enum.map(files, &Path.basename/1)) == expected
+    assert Enum.map(files, &Path.relative_to(&1, base)) == expected
 
     hashes =
       Enum.map(files, fn path ->
@@ -183,7 +230,7 @@ defmodule ItemlessSpawnDispatchRuntime do
       principal: {:session, caller},
       session_key: nil,
       params: %{
-        display_name: "WI3FE #{archetype}",
+        display_name: "WI3FE #{caller} #{archetype}",
         archetype: archetype,
         idempotency_key: "wi3fe-#{caller}-#{archetype}"
       }
@@ -277,7 +324,11 @@ defmodule ItemlessSpawnDispatchRuntime do
     count_before = count_sessions(db)
     call = spawn_call(caller, "session:#{caller}", "helper")
     call = %{call | params: Map.put(call.params, :work_item_id, item.id)}
-    call = %{call | params: Map.put(call.params, :idempotency_key, "wi3fe-linked-helper")}
+
+    call = %{
+      call
+      | params: Map.put(call.params, :idempotency_key, "wi3fe-linked-helper-#{caller}")
+    }
 
     assert {:error,
             %{code: "ephemeral_obligation", message: "ephemeral spawns cannot bind work items"}} =
@@ -286,9 +337,9 @@ defmodule ItemlessSpawnDispatchRuntime do
     assert count_sessions(db) == count_before
   end
 
-  defp deliver_helper_result!(config, db, helper_key) do
+  defp deliver_helper_result!(config, db, helper_key, caller) do
     {:ok, lane} = GenServer.start_link(ItemlessSpawnDoorbell, self())
-    {:ok, adapter} = AdapterStub.start_link(self())
+    {:ok, adapter} = AdapterStub.start_link({:unique_sessions, self()})
     {:ok, coordinator} = CoordinatorStub.start_link({adapter, self()})
 
     try do
@@ -308,7 +359,7 @@ defmodule ItemlessSpawnDispatchRuntime do
         Ledger.enqueue(db, %{
           session_key: helper_key,
           message_id: message.id,
-          origin: "session:caller",
+          origin: "session:#{caller}",
           prompt: "inspection: 3 files"
         })
 
@@ -320,7 +371,7 @@ defmodule ItemlessSpawnDispatchRuntime do
       assert :ok = Tightbeam.GatewayTurnFixture.commit_success!(db, turn, record)
 
       assert Org.get(db, helper_key).state == "retired"
-      assert Wakes.get(db, "ephemeral-result:" <> helper_key).session_key == "caller"
+      assert Wakes.get(db, "ephemeral-result:" <> helper_key).session_key == caller
 
       assert Wakes.get(db, "ephemeral-result:" <> helper_key).prompt ==
                "Ephemeral spawn result from #{helper_key}:\n\nINSPECTION: 3 FILES"
@@ -334,7 +385,7 @@ defmodule ItemlessSpawnDispatchRuntime do
 
       result_wake_id = "ephemeral-result:" <> helper_key
 
-      assert {:ok, [["caller", delivered_content]]} =
+      assert {:ok, [[^caller, delivered_content]]} =
                DB.query(
                  db,
                  """
@@ -355,7 +406,7 @@ defmodule ItemlessSpawnDispatchRuntime do
                  [result_wake_id]
                )
 
-      assert {:ok, returned} = Ledger.claim_next(db, "caller", "test")
+      assert {:ok, returned} = Ledger.claim_next(db, caller, "test")
       assert returned.prompt =~ "INSPECTION: 3 FILES"
 
       assert {:ok, [[1]]} =

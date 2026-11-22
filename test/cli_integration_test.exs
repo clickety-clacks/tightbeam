@@ -54,7 +54,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, binary: binary}
   end
 
-  setup %{binary: binary} do
+  setup %{binary: binary} = test do
     db = :"cli_integration_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -122,6 +122,32 @@ defmodule Tightbeam.CliIntegrationTest do
       wake_tick_ms: 1_000
     }
 
+    gateway_config =
+      if test[:artifact_pin_store] do
+        root = Path.join(base_dir, "artifact-blobs")
+
+        store =
+          start_supervised!(
+            {Tightbeam.ArtifactBlobStore,
+             root: root, budget_bytes: 140_006, floor_bytes: 0, floor_percent: 0}
+          )
+
+        receiver = self()
+
+        capture_runner = fn argv, collector ->
+          send(receiver, {:remote_artifact_capture, argv})
+          {Enum.into([:binary.copy(<<0, 255>>, 70_000)], collector), 0}
+        end
+
+        Map.merge(gateway_config, %{
+          artifact_blob_root: root,
+          artifact_blob_store: store,
+          artifact_capture_runner: capture_runner
+        })
+      else
+        gateway_config
+      end
+
     Archetypes.load!(base_dir)
     real_handlers = Gateway.handlers(gateway_config)
     Rules.load!(base_dir, Map.keys(real_handlers))
@@ -154,6 +180,7 @@ defmodule Tightbeam.CliIntegrationTest do
         db: db,
         base_dir: base_dir,
         handlers: handlers,
+        artifact_blob_store: gateway_config[:artifact_blob_store],
         cli_token: "tbc_cli_integration",
         session_status: fn _ -> nil end
       )
@@ -684,7 +711,8 @@ defmodule Tightbeam.CliIntegrationTest do
         System.cmd(
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
-            timing_args ++ ["--prompt", prompt],
+            timing_args ++
+            ["--prompt", prompt, "--wait-reason", "Waiting on the fixture checkpoint"],
           cd: ctx.workdir
         )
 
@@ -755,13 +783,34 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assignment = JSON.decode!(assignment_output)["id"]
     future = Integer.to_string(System.system_time(:millisecond) + 3_600_000)
+    reason = "Waiting for the external deadline"
+
+    {refusal, 1} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-holder",
+          "--assignment",
+          assignment,
+          "--after",
+          "1h",
+          "--prompt",
+          "continue the same assignment"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert refusal =~ "Recording a wait requires a nonblank --wait-reason"
 
     for timing <- [["--after", "1h"], ["--at", future]] do
       {output, 0} =
         System.cmd(
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
-            timing ++ ["--prompt", "continue the same assignment"],
+            timing ++ ["--prompt", "continue the same assignment", "--wait-reason", reason],
           cd: ctx.workdir,
           stderr_to_stdout: true
         )
@@ -770,6 +819,7 @@ defmodule Tightbeam.CliIntegrationTest do
       assert wake.assignment_id == assignment
       assert wake.obligation_ref == assignment
       assert wake.creator_session_key == "cli-holder"
+      assert wake.wait_reason == reason
       assert wake.wait_mode == nil
       assert wake.due_at > wake.created_at
 
@@ -985,6 +1035,8 @@ defmodule Tightbeam.CliIntegrationTest do
     fact_wake =
       schedule_assignment_wake.(
         [
+          "--wait-reason",
+          "Waiting for the build",
           "--when-fact",
           "build-finished",
           "--when-scope",
@@ -997,6 +1049,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert fact_wake.condition_kind == "build-finished"
     assert fact_wake.condition_scope == "build-1"
+    assert fact_wake.wait_reason == "Waiting for the build"
 
     {:ok, _} =
       Ledger.enqueue(ctx.db, %{
@@ -1010,13 +1063,19 @@ defmodule Tightbeam.CliIntegrationTest do
 
     after_prompt = "D3 manual: continue the named assignment"
 
-    after_wake = schedule_assignment_wake.(["--after-turn"], after_prompt)
+    after_wake =
+      schedule_assignment_wake.(
+        ["--after-turn", "--wait-reason", "Waiting for this turn to end"],
+        after_prompt
+      )
+
     after_id = after_wake.wake_id
     assert after_wake.assignment_id == assignment
     assert after_wake.obligation_ref == assignment
     assert after_wake.creator_session_key == "cli-holder"
     assert after_wake.originating_turn_seq == turn.seq
     assert after_wake.wait_mode == "after-turn"
+    assert after_wake.wait_reason == "Waiting for this turn to end"
     assert after_wake.prompt == after_prompt
 
     assert {:ok, [[0]]} =
@@ -1034,7 +1093,14 @@ defmodule Tightbeam.CliIntegrationTest do
 
     dependency =
       schedule_assignment_wake.(
-        ["--predicate", JSON.encode!(predicate), "--fallback-after", "1h"],
+        [
+          "--predicate",
+          JSON.encode!(predicate),
+          "--fallback-after",
+          "1h",
+          "--wait-reason",
+          "Waiting for the resolver disposition"
+        ],
         dependency_prompt
       )
 
@@ -1042,6 +1108,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert dependency.assignment_id == assignment
     assert dependency.obligation_ref == assignment
     assert dependency.creator_session_key == "cli-holder"
+    assert dependency.wait_reason == "Waiting for the resolver disposition"
     assert dependency.originating_turn_seq == turn.seq
     assert dependency.verification_assignment_id == nil
     assert dependency.verification_state == nil
@@ -1209,6 +1276,194 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert JSON.decode!(payload) == nil
     refute payload =~ Base.encode64(bytes)
+  end
+
+  @tag artifact_pin_store: true
+  test "real CLI streams large pins, deduplicates, and makes the capacity fallback explicit",
+       ctx do
+    bytes = :binary.copy(<<0, 255>>, 70_000)
+    path = Path.join(ctx.workdir, "artifact.bin")
+    File.write!(path, bytes)
+
+    item =
+      ctx.handlers["work-item-create"].(%{
+        principal: {:user, "flynn"},
+        params: %{title: "Pinned capture"}
+      })
+
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+
+    record = [
+      "artifact-record",
+      "--kind",
+      "data",
+      "--title",
+      "Pinned",
+      "--path",
+      path,
+      "--work-item",
+      item.id
+    ]
+
+    {pinned, 0} = run.(record)
+    pinned = JSON.decode!(pinned)
+    assert pinned["custody"] == "pinned"
+    assert pinned["contentSha256"] == Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    {duplicate, 0} = run.(record)
+    assert JSON.decode!(duplicate)["contentSha256"] == pinned["contentSha256"]
+
+    assert {:ok, _} =
+             Tightbeam.Placement.register_host(ctx.db, "capture-fixture", %{
+               base_dir: "/remote/base",
+               ssh: "fixture@capture-fixture"
+             })
+
+    remote_path = "capture-fixture:/remote/base/file with spaces"
+    {remote, 0} = run.(List.replace_at(record, 6, remote_path))
+    assert %{"custody" => "pinned", "contentSha256" => digest} = JSON.decode!(remote)
+    assert digest == pinned["contentSha256"]
+    assert_receive {:remote_artifact_capture, ["ssh" | args]}
+    assert "fixture@capture-fixture" in args
+    assert List.last(args) =~ "/remote/base/file with spaces"
+
+    File.write!(path, "new version")
+    {fetched, 0} = run.(["artifact-content-fetch", pinned["artifactId"]])
+
+    assert %{"custody" => "pinned", "source" => "pinned_copy", "contentBase64" => encoded} =
+             JSON.decode!(fetched)
+
+    assert Base.decode64!(encoded) == bytes
+
+    config = %{
+      db: ctx.db,
+      artifact_blob_root: Path.join(ctx.base_dir, "artifact-blobs"),
+      artifact_archive_inline_limit_bytes: byte_size(bytes) - 1
+    }
+
+    limited =
+      Gateway.handlers(config)["artifact-content-fetch"].(%{
+        principal: {:session, ctx.session.session_key},
+        rest_principal: %{kind: "session", id: ctx.session.session_key, is_admin: false},
+        params: %{artifact_id: pinned["artifactId"]}
+      })
+
+    assert limited.verification_status == "match"
+    assert limited.content_size == byte_size(bytes)
+    assert limited.content_sha256 == pinned["contentSha256"]
+    assert limited.content_unavailable_reason =~ "too large to return inline"
+    refute Map.has_key?(limited, :content_base64)
+
+    {mismatch, 1} = run.(record ++ ["--sha256", pinned["contentSha256"], "--allow-unpinned"])
+    assert mismatch =~ "content_sha256_mismatch"
+    {full, 1} = run.(record)
+    assert full =~ "artifact_store_full"
+    assert full =~ "--allow-unpinned"
+    {unpinned, 0} = run.(record ++ ["--allow-unpinned"])
+    assert %{"custody" => "unpinned", "warning" => _, "artifactId" => id} = JSON.decode!(unpinned)
+    {unavailable, 1} = run.(["artifact-content-fetch", id])
+    assert unavailable =~ "unpinned"
+
+    {list, 0} = run.(["artifacts", "--work-item", item.id])
+
+    assert Enum.any?(
+             JSON.decode!(list)["artifacts"],
+             &(&1["artifactId"] == id and &1["custody"] == "unpinned")
+           )
+
+    {capacity, 0} = run.(["artifact-content-capacity"])
+
+    assert %{"usedBytes" => 140_000, "stagedBytes" => 0, "effectiveLimitBytes" => 140_006} =
+             JSON.decode!(capacity)
+
+    legacy =
+      Tightbeam.Artifacts.record(ctx.db, %{
+        principal: {:session, ctx.session.session_key},
+        session_key: ctx.session.session_key,
+        params: %{
+          kind: "data",
+          title: "Legacy capture",
+          origin_path: "legacy.bin",
+          content_base64: Base.encode64(bytes),
+          work_item_id: item.id
+        }
+      })
+
+    {promoted, 0} = run.(["artifact-content-promote", legacy.artifact_id])
+    assert JSON.decode!(promoted)["custody"] == "pinned"
+
+    {directory, 1} = run.(List.replace_at(record, 6, ctx.workdir))
+    assert directory =~ "artifact origin is a directory"
+
+    encoded_inline = Base.encode64("inline")
+    inline_sha = Base.encode16(:crypto.hash(:sha256, "inline"), case: :lower)
+
+    for origin <- ["https://example.test/report", "tightbeam-transcript:example-session"] do
+      {pointer, 0} = run.(List.replace_at(record, 6, origin))
+
+      assert %{"custody" => "external_pointer", "originPath" => ^origin, "artifactId" => id} =
+               JSON.decode!(pointer)
+
+      {unavailable, 1} = run.(["artifact-content-fetch", id])
+      assert unavailable =~ "external pointer"
+      assert unavailable =~ "external_pointer"
+
+      inline =
+        List.replace_at(record, 6, origin) ++
+          ["--content-base64", encoded_inline, "--sha256", inline_sha]
+
+      {pinned_reference, 0} = run.(inline)
+
+      assert %{"custody" => "pinned", "originPath" => ^origin, "artifactId" => pinned_id} =
+               JSON.decode!(pinned_reference)
+
+      {reference_bytes, 0} = run.(["artifact-content-fetch", pinned_id])
+      assert %{"contentBase64" => ^encoded_inline} = JSON.decode!(reference_bytes)
+
+      {bad_sha, 1} = run.(List.replace_at(inline, -1, String.duplicate("0", 64)))
+      assert bad_sha =~ "content_sha256_mismatch"
+    end
+
+    origin = "https://example.test/streamed"
+    {version, 0} = run.(["version"])
+
+    metadata =
+      %{
+        verb: "artifact-record",
+        params: %{
+          kind: "data",
+          title: "Streamed reference",
+          originPath: origin,
+          contentSha256: inline_sha,
+          workItemId: item.id
+        }
+      }
+      |> JSON.encode!()
+      |> Base.url_encode64(padding: false)
+
+    assert {:ok, {{_, 200, _}, _, response}} =
+             :httpc.request(
+               :post,
+               {~c"http://127.0.0.1:#{ctx.port}/agent/dispatch",
+                [
+                  {~c"authorization", ~c"Bearer #{ctx.session.cli_token}"},
+                  {~c"x-tightbeam-cli-version", version |> String.trim() |> String.to_charlist()},
+                  {~c"x-tightbeam-artifact-record", String.to_charlist(metadata)}
+                ], ~c"application/octet-stream", "inline"},
+               [],
+               body_format: :binary
+             )
+
+    assert %{"result" => %{"custody" => "pinned", "originPath" => ^origin}} =
+             JSON.decode!(response)
+
+    {empty, 0} = run.(List.replace_at(record, 6, origin) ++ ["--content-base64", ""])
+    assert %{"custody" => "pinned", "artifactId" => empty_id} = JSON.decode!(empty)
+    {empty_content, 0} = run.(["artifact-content-fetch", empty_id])
+    assert %{"contentBase64" => "", "contentSize" => 0} = JSON.decode!(empty_content)
+
+    unreadable = List.replace_at(record, 6, "unknown-fixture:/remote/file")
+    {failure, 1} = run.(unreadable ++ ["--allow-unpinned"])
+    assert failure =~ "unknown_artifact_host"
   end
 
   test "real CLI writes and reads declared record metadata", ctx do
@@ -2407,20 +2662,20 @@ defmodule Tightbeam.CliIntegrationTest do
                stderr_to_stdout: true
              )
 
-    # Consume this exact notice turn before the next card's notice is eligible;
-    # filing an attest does not finish a recipient turn.
-    assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
+    # The verdict remains durable, but R01 keeps unlinked ordinary verdicts quiet.
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='topology-decided'",
+               [topology_id]
+             )
 
-    assert {:ok, [[topology_notice_id]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
                [topology_id]
              )
-
-    topology_delivery = assert_cli_source_delivery!(ctx.db, topology_notice_id, "cli-holder")
-    assert topology_delivery.source.prompt =~ topology_id
-    finish_cli_delivery!(ctx.db, "cli-holder", topology_delivery.seq)
 
     # The posture gate refuses a coder card on an unpostured work item, so the
     # slice is ruled first, through the same real CLI.
@@ -2447,17 +2702,21 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    # The posture verdict can now deliver before later CLI calls. Consume its
-    # carrier so the holder is ready for the implementation receipt notice.
-    assert {:ok, [[posture_notice_id]]} =
+    # The posture verdict is durable and satisfies the gate, but remains quiet
+    # because it is an unlinked ordinary verdict under R01.
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [topology_id, topology_notice_id]
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='posture-light'",
+               [topology_id]
              )
 
-    posture_delivery = assert_cli_source_delivery!(ctx.db, posture_notice_id, "cli-holder")
-    finish_cli_delivery!(ctx.db, "cli-holder", posture_delivery.seq)
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
+               [topology_id]
+             )
 
     {assigned, 0} =
       System.cmd(
@@ -2575,7 +2834,8 @@ defmodule Tightbeam.CliIntegrationTest do
     ]
 
     # A1 first denial: the completion is refused and the wake names the
-    # missing verification verdict.
+    # missing verification verdict. The ordinary tests-passed receipt is
+    # durable but does not create an R01 opener notice.
     {denied, denied_status} =
       System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
@@ -2599,16 +2859,19 @@ defmodule Tightbeam.CliIntegrationTest do
     assert verification_wake.prompt =~ "no verification verdict is filed"
     assert verification_wake.prompt =~ work_id
 
-    assert {:ok, [[receipt_notice_id]]} =
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='tests-passed'",
+               [work_id]
+             )
+
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
                [work_id]
              )
-
-    receipt_delivery = assert_cli_source_delivery!(ctx.db, receipt_notice_id, "cli-holder")
-    assert receipt_delivery.source.prompt =~ "Attest "
-    finish_cli_delivery!(ctx.db, "cli-holder", receipt_delivery.seq)
 
     {_verified, 0} =
       System.cmd(
@@ -2629,6 +2892,13 @@ defmodule Tightbeam.CliIntegrationTest do
 
     finish_cli_delivery!(ctx.db, "cli-coder", verification_delivery.seq)
 
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND verdictKind='verified'",
+               [work_id]
+             )
+
     # A1 second denial: the artifact statute prods next, naming its own record.
     {denied_again, denied_again_status} =
       System.cmd(ctx.binary, completion_args,
@@ -2639,16 +2909,12 @@ defmodule Tightbeam.CliIntegrationTest do
     assert denied_again_status != 0
     assert denied_again =~ "completion-requires-results-artifact"
 
-    assert {:ok, [[verified_notice_id]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [work_id, receipt_notice_id]
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
+               [work_id]
              )
-
-    attest_delivery = assert_cli_source_delivery!(ctx.db, verified_notice_id, "cli-holder")
-    attest_batch = Wakes.get(ctx.db, attest_delivery.carrier_id)
-    assert attest_batch.prompt =~ "Attest "
 
     assert %{status: "live", producer_key: artifact_source_id} =
              RailRemedy.episode(
@@ -2781,9 +3047,9 @@ defmodule Tightbeam.CliIntegrationTest do
            } = machine_line!(refused)
   end
 
-  # Code-completion evidence remains required even when the org has no learned
-  # statutes; the refusal creates no remedy episode or wake.
-  test "real CLI requires code completion evidence on a rule-free org", ctx do
+  # Substrate evidence checks report missing facts without refusing completion;
+  # accepting the write creates no remedy episode or wake.
+  test "real CLI records missing code completion evidence as FYIs on a rule-free org", ctx do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     coder =
@@ -2832,21 +3098,31 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
-    {denied, denied_status} =
+    {accepted, accepted_status} =
       System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
         cd: coder_dir,
         stderr_to_stdout: true
       )
 
-    assert denied_status != 0
-    assert denied =~ "inapplicable_code_evidence"
+    assert accepted_status == 0
+    result = JSON.decode!(accepted)
 
-    assert {:ok, [["open", nil]]} =
+    expected = [
+      "FYI: this code assignment has no verified verdict from its holder; decide for yourself whether that is acceptable",
+      "FYI: this code assignment has no review conclusion; decide for yourself whether that is acceptable"
+    ]
+
+    assert result["fyi"] == expected
+    assert result["attest"]["fyi"] == expected
+
+    assert {:ok, [["closed", closing_attest_id]]} =
              DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
                work_id
              ])
 
-    assert {:ok, [[0]]} =
+    assert closing_attest_id == result["attest"]["id"]
+
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
@@ -3138,10 +3414,11 @@ defmodule Tightbeam.CliIntegrationTest do
       Escalation.operator_ask(ctx.db, %{
         origin: "agent:cli-holder",
         principal: {:session, ctx.session.session_key},
-        params: %{
-          question: "ship terminal parity?",
-          options: [%{label: "ship"}, %{label: "hold"}]
-        }
+        params:
+          Tightbeam.TestSupport.OperatorAskFixture.link(ctx.db, ctx.session.session_key, %{
+            question: "ship terminal parity?",
+            options: [%{label: "ship"}, %{label: "hold"}]
+          })
       })
 
     ruled =
@@ -3481,6 +3758,27 @@ defmodule Tightbeam.CliIntegrationTest do
                         params: %{all: true}
                       }}
     end
+  end
+
+  test "real CLI harklight-briefings-catchup retains the authenticated caller through the router",
+       ctx do
+    Org.set_host(ctx.db, ctx.session.session_key, Tightbeam.Placement.local_host_name())
+
+    {catchup_output, 0} =
+      System.cmd(ctx.binary, ["harklight-briefings-catchup"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"ok" => true, "listed" => 0} = JSON.decode!(catchup_output)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "harklight-briefings-catchup",
+                      session_key: "cli-holder",
+                      principal: {:session, "cli-holder"},
+                      transport_session_key: "cli-holder"
+                    }}
   end
 
   test "real CLI keeps explicit Harklight identities local with session credentials",

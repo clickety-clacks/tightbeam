@@ -61,7 +61,13 @@ defmodule Tightbeam.Harness.ClaudeFoldedPrompt do
   }
   """
 
+  # The pinned adapter emits the classifier's explanation as a plain text
+  # chunk. Preserve that text and mark its origin before it crosses ACP.
+  @refusal_anchor ~S'content: { type: "text", text: lastRefusalExplanation },'
+  @refusal_chunk @refusal_anchor <> ~S' _meta: { "tightbeam.dev/providerRefusal": true },'
+
   @replacements [
+    {@refusal_anchor, @refusal_chunk},
     {@helper_anchor, @helper_anchor <> "\n" <> @helper},
     {@result_anchor, @result_anchor <> "\n" <> @result},
     {@idle_anchor,

@@ -169,25 +169,24 @@ defmodule Tightbeam.ConditionFactsTest do
     assert {:ok, fact} = Dispatch.dispatch(ctx.db, handlers, call)
     assert fact.kind == "fixture-ready"
     assert fact.scope == "synthetic"
-    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
-    Hub.delivered(hub, self())
+    sync_firehose(ctx, hub)
+    assert_received {:firehose_notice, %{"class" => "verb.accepted"}}
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "condition_fact.filed",
-                      "refs" => %{"factId" => fact_id},
-                      "payload" => payload
-                    }}
+    assert_received {:firehose_notice,
+                     %{
+                       "class" => "condition_fact.filed",
+                       "refs" => %{"factId" => fact_id},
+                       "payload" => payload
+                     }}
 
     assert fact_id == fact.fact_id
     assert payload["id"] == fact.fact_id
     refute Map.has_key?(payload, "factId")
     assert payload["rowVersion"] == fact.fact_id
-    Hub.delivered(hub, self())
     assert {:ok, ^fact} = Dispatch.dispatch(ctx.db, handlers, call)
-    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
-    Hub.delivered(hub, self())
-    refute_receive {:firehose_notice, _}
+    sync_firehose(ctx, hub)
+    assert_received {:firehose_notice, %{"class" => "verb.accepted"}}
+    refute_received {:firehose_notice, _}
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE kind='fixture-ready'")
@@ -230,7 +229,8 @@ defmodule Tightbeam.ConditionFactsTest do
                Wakes.cancel_in_txn(txn, %{command | expected_origin: "user:other"})
              end)
 
-    refute_receive {:firehose_notice, _}
+    sync_firehose(ctx, hub)
+    refute_received {:firehose_notice, _}
 
     assert {:error, %RuntimeError{message: "rollback cancel"}} =
              DB.transaction(ctx.db, fn txn ->
@@ -245,18 +245,20 @@ defmodule Tightbeam.ConditionFactsTest do
                wake.wake_id
              ])
 
-    refute_receive {:firehose_notice, _}
+    sync_firehose(ctx, hub)
+    refute_received {:firehose_notice, _}
 
     assert {:ok, {:accepted_in_txn, event_id, %{canceled: true}}} =
              DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
 
     assert event_id > 0
-    assert_receive {:firehose_notice, %{"class" => "wake.canceled", "payload" => payload}}
+    sync_firehose(ctx, hub)
+    assert_received {:firehose_notice, %{"class" => "wake.canceled", "payload" => payload}}
     assert payload["wakeId"] == wake.wake_id
     assert payload["state"] == "canceled"
-    Hub.delivered(hub, self())
     assert {:ok, false} = DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
-    refute_receive {:firehose_notice, _}
+    sync_firehose(ctx, hub)
+    refute_received {:firehose_notice, _}
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
@@ -288,7 +290,8 @@ defmodule Tightbeam.ConditionFactsTest do
     assert is_integer(wrong.fact_id)
     assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
     assert turn_count(ctx.db, wake.wake_id) == 0
-    refute_receive {:firehose_notice, _}
+    sync_firehose(ctx, hub)
+    refute_received {:firehose_notice, _}
 
     matched =
       ConditionFacts.file(ctx.db, ctx.scheduler, %{
@@ -299,41 +302,37 @@ defmodule Tightbeam.ConditionFactsTest do
       })
 
     assert is_integer(matched.fact_id)
+    sync_firehose(ctx, hub)
 
-    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => fired_payload}}
+    assert_received {:firehose_notice, %{"class" => "wake.fired", "payload" => fired_payload}}
     assert fired_payload["wakeId"] == wake.wake_id
     assert fired_payload["state"] == "pending"
     assert fired_payload["firedBy"] == "condition"
-    Hub.delivered(hub, self())
 
-    assert_receive {:firehose_notice,
-                    %{"class" => "session.updated", "payload" => session_payload}}
+    assert_received {:firehose_notice,
+                     %{"class" => "session.updated", "payload" => session_payload}}
 
     assert session_payload["sessionKey"] == ctx.session.session_key
     assert session_payload["mechanicalStatus"] == "running"
-    Hub.delivered(hub, self())
 
-    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => carrier_payload}}
+    assert_received {:firehose_notice, %{"class" => "wake.fired", "payload" => carrier_payload}}
     assert carrier_payload["digest"] == true
     assert carrier_payload["deliveryStatus"] == "queued"
-    Hub.delivered(hub, self())
 
-    assert_receive {:firehose_notice,
-                    %{"class" => "message.created", "payload" => message_payload}}
+    assert_received {:firehose_notice,
+                     %{"class" => "message.created", "payload" => message_payload}}
 
     assert message_payload["sessionKey"] == ctx.session.session_key
     assert message_payload["sender"] == "process:tightbeam"
     assert message_payload["content"] =~ "re-adjudicate"
     assert message_payload["content"] =~ "sender=agent:owner"
-    Hub.delivered(hub, self())
 
     # Carrier admission publishes its turn and message before completing the source.
-    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
+    assert_received {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
     assert payload["wakeId"] == wake.wake_id
     assert payload["state"] == "fired"
     assert payload["firedBy"] == "condition"
-    Hub.delivered(hub, self())
-    assert_receive {:lane_nudged, key}
+    assert_received {:lane_nudged, key}
     assert key == ctx.session.session_key
 
     assert [
@@ -352,8 +351,9 @@ defmodule Tightbeam.ConditionFactsTest do
              ])
 
     assert :ok = Wakes.fire_matching(ctx.scheduler, matched.fact_id)
-    refute_receive {:firehose_notice, _}
-    refute_receive {:lane_nudged, _}
+    sync_firehose(ctx, hub)
+    refute_received {:firehose_notice, _}
+    refute_received {:lane_nudged, _}
 
     assert [
              %{
@@ -910,6 +910,7 @@ defmodule Tightbeam.ConditionFactsTest do
       session_key: ctx.session.session_key,
       params: %{
         prompt: "re-adjudicate",
+        wait_reason: "Waiting for deployment confirmation",
         after_ms: 60_000,
         condition_kind: "deploy-succeeded",
         condition_scope: "prod",
@@ -1146,6 +1147,7 @@ defmodule Tightbeam.ConditionFactsTest do
                          prompt: "Continue from the synthetic condition.",
                          due_at: System.system_time(:millisecond) + 60_000,
                          assignment_id: target.session_key,
+                         wait_reason: "Waiting on the fixture resolver",
                          registrant_session_key: target.session_key,
                          owner_user_id: target.owner_user_id,
                          predicate: %{
@@ -1339,6 +1341,25 @@ defmodule Tightbeam.ConditionFactsTest do
                scope: ConditionFacts.harness_scope("claude", "node-a"),
                origin: "agent:observer"
              })
+  end
+
+  defp sync_firehose(ctx, hub) do
+    # Filing queues a scheduler delivery pass after eager recognition. Drain
+    # that pass before marking the database's committed publications. A call from this
+    # test directly to the Hub would have a different sender and could overtake
+    # those publications; delivered/2 is a no-op, not a barrier.
+    :sys.get_state(ctx.scheduler, 30_000)
+    token = make_ref()
+    marker = %{"class" => "verb.accepted", "refs" => %{"testBarrier" => token}}
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.handoff(txn, hub, {:publish, marker})
+             end)
+
+    # The Hub sends this after all earlier DB publications. The timeout is a
+    # deadlock guard; every behavior assertion below checks the completed batch.
+    assert_receive {:firehose_notice, ^marker}, 30_000
   end
 
   defp condition_wake(ctx, kind, scope, due_at \\ nil) do

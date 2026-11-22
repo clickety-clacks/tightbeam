@@ -14,7 +14,7 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
   }
   @seed_reactions %{
     "assignment-terminal-handoff" => "rules/row-reaction-handoff.toml",
-    "terminal-child-action-reminder" => "rules/row-reaction-terminal-action.toml"
+    "r04-work-item-notice" => "rules/row-reaction-work-items.toml"
   }
   @legacy_reaction_fixture_dir Path.expand(
                                  "fixtures/rail-scope-migration/legacy-reactions",
@@ -29,6 +29,52 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     %{base_dir: base_dir}
+  end
+
+  test "migration publication produces a staleness notice for a session on the prior revision",
+       ctx do
+    init_fixture!(ctx.base_dir)
+    db = start_db!()
+    seed_migration_rows!(db)
+    Tightbeam.Devices.add_user(db, "sample-owner", true)
+    ensure_main_session(db, "sample-owner")
+    prior = Identity.live_revision!(ctx.base_dir)
+    Tightbeam.Org.set_identity_revision(db, "session-fixture", prior)
+    :ok = Tightbeam.AdminProjection.bootstrap_served(db, ctx.base_dir)
+
+    report = RailScopeMigration.run!(ctx.base_dir, db)
+    revision = report["result_revision"]
+    refute revision == prior
+    # Boot's later bootstrap must not hide the migration's publication.
+    :ok = Tightbeam.AdminProjection.bootstrap_served(db, ctx.base_dir)
+
+    {:ok, seq} =
+      Tightbeam.Ledger.enqueue(db, %{
+        session_key: "session-fixture",
+        message_id: "migration-staleness-turn",
+        origin: "user:sample-owner",
+        prompt: "fixture"
+      })
+
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE turns SET status='delivered', startedAt=?2, endedAt=?2 WHERE seq=?1",
+               [seq, now]
+             )
+
+    assert {:scheduled, 1, ^revision} =
+             Tightbeam.Gateway.identity_staleness_alarm_for_test(db, now)
+
+    target = Tightbeam.Org.personal_session_key("sample-owner")
+
+    assert {:ok, [[^target, prompt]]} =
+             DB.query(db, "SELECT sessionKey,prompt FROM wakes WHERE origin='process:tightbeam'")
+
+    assert prompt =~ revision
+    assert :already_notified = Tightbeam.Gateway.identity_staleness_alarm_for_test(db, now)
   end
 
   @briefing_source "rules/briefings.toml"
@@ -84,7 +130,10 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
         principal: {:session, "briefing-compiler"},
         session_key: "briefing-compiler",
         transport_session_key: "briefing-compiler",
-        params: %{question: "Which option?"}
+        params:
+          Tightbeam.TestSupport.OperatorAskFixture.link(db, "briefing-compiler", %{
+            question: "Which option?"
+          })
       })
 
     assert is_binary(request.id)
@@ -230,6 +279,14 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     for name <- Map.keys(@seed_reactions) do
       assert_single_rail_definition!(ctx.base_dir, "reaction", name)
     end
+
+    # The 2-hour reminder no longer ships: its legacy copy goes and is not replanted.
+    refute File.exists?(Path.join(identity_dir, "rules/row-reaction-terminal-action.toml"))
+
+    refute identity_dir
+           |> Path.join("**/*.toml")
+           |> Path.wildcard()
+           |> Enum.any?(&(File.read!(&1) =~ ~s(name = "terminal-child-action-reminder")))
 
     assert Path.join(identity_dir, "kungfu/#{@kungfu}/archetypes/#{@archetype}.toml")
            |> File.exists?()
@@ -390,6 +447,36 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     assert File.read!(Path.join(dir, "rules/topology.toml")) == expected
   end
 
+  test "a learned completion review rail gains its accountable-notice declaration", ctx do
+    init_fixture!(ctx.base_dir)
+    db = start_db!()
+    dir = Path.join(ctx.base_dir, "identity")
+
+    legacy =
+      "test/support/fixtures/kungfu/agentic-engineering/rules/engineering.toml"
+      |> File.read!()
+      |> String.split("\n# Posture gate")
+      |> hd()
+      |> String.replace(~r/^archetypes = .*\n/m, "")
+      |> String.replace("accountable_notice = true\n", "")
+
+    refute legacy =~ "accountable_notice"
+    File.write!(Path.join(dir, "rules/engineering.toml"), legacy)
+    commit_fixture!(dir, "fixture: learned 0.1.16 completion review rail")
+    assert %{"status" => "complete"} = RailScopeMigration.run!(ctx.base_dir, db)
+
+    migrated = File.read!(Path.join(dir, "rules/engineering.toml"))
+    assert migrated =~ "accountable_notice = true"
+
+    # The migrated copy loads and keeps the rail's behaviour.
+    handlers = Tightbeam.Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+    on_exit(fn -> Tightbeam.Rules.load!("/missing-accountable-notice-reset", []) end)
+
+    assert rules = Tightbeam.Rules.load!(ctx.base_dir, Map.keys(handlers))
+    assert [rule] = Enum.filter(rules, &(&1.short_name == "completion-requires-review"))
+    assert rule.remedy.accountable_notice
+  end
+
   test "migrated relearn preserves substrate namesakes and merges org kungfu edits", ctx do
     init_fixture!(ctx.base_dir, verb: "post")
     db = start_db!()
@@ -443,7 +530,52 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     File.write!(rule_path, String.replace(rule_bytes, "sample rule", "organization rule text"))
     commit_fixture!(dir, "fixture: org edits after learn")
 
-    RailScopeMigration.run!(ctx.base_dir, db)
+    # Make an unguarded commit repack in the foreground so even a failing
+    # regression test can clean up without racing the writer.
+    git!(dir, ["config", "--local", "maintenance.auto", "true"])
+    git!(dir, ["config", "--local", "maintenance.gc.enabled", "true"])
+    git!(dir, ["config", "--local", "maintenance.autoDetach", "false"])
+    git!(dir, ["config", "--local", "gc.autoDetach", "false"])
+    git!(dir, ["config", "--local", "gc.auto", "1"])
+
+    object_source = Path.join(ctx.base_dir, "loose-object")
+
+    for contents <- ~w(32 119 334) do
+      File.write!(object_source, contents)
+      git!(dir, ["hash-object", "-w", object_source])
+    end
+
+    local_config = git!(dir, ["config", "--local", "--list"])
+    trace_path = Path.join(ctx.base_dir, "upstream-migration-trace.jsonl")
+    previous_trace = System.get_env("GIT_TRACE2_EVENT")
+    System.put_env("GIT_TRACE2_EVENT", trace_path)
+
+    try do
+      RailScopeMigration.run!(ctx.base_dir, db)
+    after
+      if previous_trace,
+        do: System.put_env("GIT_TRACE2_EVENT", previous_trace),
+        else: System.delete_env("GIT_TRACE2_EVENT")
+    end
+
+    events =
+      trace_path
+      |> File.stream!()
+      |> Enum.map(&JSON.decode!/1)
+
+    assert Enum.any?(events, fn event ->
+             event["event"] == "start" and
+               "identity: namespace upstream rail baseline" in event["argv"]
+           end)
+
+    maintenance =
+      for %{"event" => "cmd_name", "name" => name} <- events,
+          name in ~w(maintenance gc repack),
+          do: name
+
+    assert maintenance == []
+    assert git!(dir, ["config", "--local", "--list"]) == local_config
+
     upstream = git!(dir, ["rev-parse", "tightbeam/upstream"])
     assert git!(dir, ["merge-base", "main", upstream]) == upstream
     assert git!(dir, ["ls-tree", "--name-only", upstream, "--", "archetypes/pdo.toml"]) == ""
@@ -784,6 +916,84 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
     assert report =~ "other-kungfu and sample-kungfu"
   end
 
+  test "identity import restores the stock default alongside a scoped handoff and unlearn keeps it",
+       ctx do
+    base = ctx.base_dir
+    init_fixture!(base, bundle_handoff: "rules/child-notice.toml")
+    db = start_db!()
+    seed_migration_rows!(db)
+
+    identity_dir = Path.join(base, "identity")
+    git!(identity_dir, ["switch", "--detach", "main"])
+    git!(identity_dir, ["rm", "kungfu/#{@kungfu}/installed.toml"])
+    git!(identity_dir, ["commit", "-m", "fixture: shipped snapshot without receipt"])
+    git!(identity_dir, ["update-ref", "refs/heads/tightbeam/upstream", "HEAD"])
+    git!(identity_dir, ["switch", "main"])
+    stock = Path.join(identity_dir, "rules/row-reaction-handoff.toml")
+    alternate = "kungfu/#{@kungfu}/rules/child-notice.toml"
+
+    assert RailScopeMigration.run!(base, db)["status"] == "complete"
+    assert Provenance.owner_for_path(base, alternate) == {:kungfu, @kungfu}
+    scoped_bytes = File.read!(Path.join(identity_dir, alternate))
+    refute File.exists?(stock)
+    assert_single_rail_definition!(base, "reaction", "r04-work-item-notice")
+
+    assert {:ok, candidate} = Identity.learn!(base, "uncle-enzo", "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    stock_bytes = File.read!(stock)
+    assert File.read!(Path.join(identity_dir, alternate)) == scoped_bytes
+
+    assert {:ok, candidate} = Identity.relearn!(base, "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    assert File.read!(stock) == stock_bytes
+    assert File.read!(Path.join(identity_dir, alternate)) == scoped_bytes
+    assert Provenance.owner_for_path(base, alternate) == {:kungfu, @kungfu}
+
+    assert {:ok, _} = Identity.publish_live!(base, Identity.unlearn!(base, @kungfu, "fixture"))
+    refute File.exists?(Path.join(identity_dir, alternate))
+    assert File.read!(stock) == stock_bytes
+  end
+
+  test "learn and relearn keep an alternate organization handoff as the sole default", ctx do
+    base = ctx.base_dir
+    init_seed_upgrade_fixture!(base)
+    identity_dir = Path.join(base, "identity")
+    override = Path.join(identity_dir, "rules/org-child-notice.toml")
+    stock = Path.join(identity_dir, "rules/row-reaction-handoff.toml")
+    File.cp!(Path.join(@legacy_reaction_fixture_dir, "row-reaction-handoff.toml"), override)
+    commit_fixture!(identity_dir, "fixture: alternate organization handoff")
+
+    assert RailScopeMigration.run!(base, start_db!())["status"] == "complete"
+    assert_single_rail_definition!(base, "reaction", "assignment-terminal-handoff")
+    bytes = File.read!(override)
+
+    assert {:ok, candidate} = Identity.learn!(base, "uncle-enzo", "fixture")
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    refute File.exists?(stock)
+    assert File.read!(override) == bytes
+
+    assert {:ok, candidate} = Identity.relearn!(base, "fixture")
+
+    assert Enum.any?(Identity.relearn_dispositions(base, candidate.candidate_revision), fn path ->
+             path.path == "rules/row-reaction-handoff.toml" and
+               path.disposition == "kept-organization-default"
+           end)
+
+    assert {:ok, _} = Identity.publish_live!(base, candidate)
+    assert_single_rail_definition!(base, "reaction", "assignment-terminal-handoff")
+    refute File.exists?(stock)
+    assert File.read!(override) == bytes
+
+    assert Identity.revision_file_bytes!(
+             base,
+             "tightbeam/product-baseline",
+             "rules/row-reaction-handoff.toml"
+           ) ==
+             File.read!(
+               Application.app_dir(:tightbeam, "priv/seed/rules/row-reaction-handoff.toml")
+             )
+  end
+
   test "an edited legacy row reaction stops without changing fixture identity", ctx do
     init_fixture!(ctx.base_dir, edit_reaction: true)
     db = start_db!()
@@ -842,6 +1052,15 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
 
     write_legacy_reaction_copies!(identity_dir)
 
+    bundle_handoff = Keyword.get(opts, :bundle_handoff)
+
+    if bundle_handoff do
+      File.cp!(
+        Path.join(@legacy_reaction_fixture_dir, "row-reaction-handoff.toml"),
+        Path.join(identity_dir, bundle_handoff)
+      )
+    end
+
     if Keyword.get(opts, :edit_reaction, false) do
       File.write!(
         Path.join(identity_dir, "rules/row-reaction-handoff.toml"),
@@ -855,6 +1074,14 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
       "name = \"#{@kungfu}\"\nroot_archetype = \"#{@archetype}\"\n"
     )
 
+    if bundle_handoff do
+      File.write!(
+        Path.join(identity_dir, "kungfu/#{@kungfu}/manifest.toml"),
+        "purpose = \"Exercise identity migration with a learned kungfu.\"\n",
+        [:append]
+      )
+    end
+
     paths = [
       "archetypes/#{@archetype}.toml",
       "rules/sample.toml",
@@ -863,6 +1090,8 @@ defmodule Tightbeam.Identity.RailScopeMigrationTest do
       "rules/row-reaction-terminal-action.toml",
       "kungfu/#{@kungfu}/manifest.toml"
     ]
+
+    paths = if bundle_handoff, do: paths ++ [bundle_handoff], else: paths
 
     File.write!(
       Path.join(identity_dir, "kungfu/#{@kungfu}/installed.toml"),

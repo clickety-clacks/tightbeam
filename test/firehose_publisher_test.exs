@@ -171,6 +171,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert observed_state_classes() == ["session.spawned"]
 
     handlers = Gateway.handlers(%{db: db})
+    elect_work_item_reminders!(handlers)
 
     call = %{
       verb: "work-item-create",
@@ -330,6 +331,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     handlers = Gateway.handlers(config)
+    elect_work_item_reminders!(handlers)
 
     immediate_wake = %{
       verb: "wake",
@@ -598,6 +600,22 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
              Dispatch.dispatch(db, handlers, clean)
 
+    blocked =
+      tests_passed
+      |> put_in([:params, :verdict_kind], "blocked")
+      |> put_in([:params, :note], "effect matrix blocker")
+
+    assert {:ok, %{attest: %{verdictKind: "blocked"}}} =
+             Dispatch.dispatch(db, handlers, blocked)
+
+    cleared =
+      tests_passed
+      |> put_in([:params, :verdict_kind], "cleared")
+      |> put_in([:params, :note], "effect matrix blocker cleared")
+
+    assert {:ok, %{attest: %{verdictKind: "cleared"}}} =
+             Dispatch.dispatch(db, handlers, cleared)
+
     verified =
       tests_passed
       |> put_in([:params, :verdict_kind], "verified")
@@ -618,6 +636,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
           {"effect-dispatcher",
            "[verdict filed: reviewed-clean on #{review.id}: Synthetic review fixture]"},
           {"effect-target",
+           "[verdict filed: blocked on #{assignment.id}: effect matrix blocker]"},
+          {"effect-target",
+           "[verdict filed: cleared on #{assignment.id}: effect matrix blocker cleared]"},
+          {"effect-target",
            "[verdict filed: verified on #{assignment.id}: effect matrix tests passed]"},
           {"effect-target", "[completion filed on #{assignment.id}: effect matrix complete]"},
           {"effect-target", "[assignment closed: #{assignment.id} — completed]"}
@@ -628,7 +650,9 @@ defmodule Tightbeam.Firehose.PublisherTest do
     completion_effects = notice_state_classes(completion_publications)
     asynchronous_delivery = ~w(session.updated wake.fired)
 
-    assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
+    # R01 keeps an unlinked verified verdict quiet, so no opener-turn delivery
+    # effects accompany the durable attest and completion events.
+    refute Enum.any?(asynchronous_delivery, &(&1 in completion_effects))
 
     completion_attest_effects =
       completion_effects
@@ -1107,6 +1131,119 @@ defmodule Tightbeam.Firehose.PublisherTest do
     end
   end
 
+  test "completion and operator-request publications preserve recorded FYIs" do
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneStub, name: Tightbeam.LaneManager})
+    db = :firehose_record_fyis_db
+    scheduler = :firehose_record_fyis_scheduler
+    start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!(Supervisor.child_spec({LaneStub, name: scheduler}, id: scheduler))
+    :ok = Tightbeam.Schema.ensure_all(db)
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+    {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',1,1)")
+    register_testhost(db)
+    holder = Org.personal_session_key("flynn")
+    handlers = Gateway.handlers(%{db: db, wake_scheduler: scheduler})
+
+    assert {:ok, item} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "work-item-create",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{title: "Preserve recorded FYIs"}
+             })
+
+    call = %{
+      verb: "assign",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: holder,
+      target_role: nil,
+      role_fallback: false,
+      params: %{subject: "plain evidence", effect_kind: "evidence", work_item_id: item.id}
+    }
+
+    assert {:ok, plain} = Dispatch.dispatch(db, handlers, call)
+
+    assert {:ok, inner} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               put_in(call.params, %{
+                 subject: "inner review",
+                 reviews_assignment_id: plain.id,
+                 work_item_id: item.id
+               })
+             )
+
+    assert {:ok, outer} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               put_in(call.params, %{
+                 subject: "outer review",
+                 reviews_assignment_id: inner.id,
+                 work_item_id: item.id
+               })
+             )
+
+    line =
+      "FYI: assignment #{inner.id} that this card reviews is itself a review card; " <>
+        "decide for yourself whether that is acceptable"
+
+    assert outer.fyi == [line]
+
+    for {assignment, expected} <- [{plain, []}, {outer, [line]}] do
+      _ = drain_notices()
+
+      complete = %{
+        verb: "attest",
+        origin: "agent:" <> holder,
+        principal: {:session, holder},
+        session_key: nil,
+        params: %{assignment_id: assignment.id, kind: "completion", note: "finished evidence"}
+      }
+
+      assert {:ok, %{assignment: %{state: "closed"}}} =
+               Dispatch.dispatch(db, handlers, complete)
+
+      assert %{"assignment.closed" => [notice]} = observed_state_notices()
+      assert notice["payload"]["id"] == assignment.id
+      assert notice["payload"]["fyi"] == expected
+      assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"]["fyi"] == expected
+
+      assert StateResources.query_assignment(db, assignment.id, %{principal: {:user, "flynn"}}).fyi ==
+               expected
+    end
+
+    _ = drain_notices()
+
+    ask = %{
+      verb: "operator-ask",
+      origin: "agent:" <> holder,
+      principal: {:session, holder},
+      session_key: nil,
+      params: %{question: "Keep this completed evidence?", assignment: outer.id}
+    }
+
+    expected = [
+      "FYI: linked assignment #{outer.id} is closed; decide for yourself whether that is acceptable"
+    ]
+
+    assert {:ok, %{fyi: ^expected} = request} = Dispatch.dispatch(db, handlers, ask)
+    assert %{"decision_request.opened" => [notice]} = observed_state_notices()
+    assert notice["payload"]["id"] == request.id
+    assert notice["payload"]["fyi"] == expected
+    assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"]["fyi"] == expected
+
+    # The nontransactional publisher uses the corresponding raw read path.
+    assert :ok = Publisher.accepted(db, ask, request)
+    assert %{"decision_request.opened" => [notice]} = observed_state_notices()
+    assert notice["payload"]["fyi"] == expected
+    assert Escalation.raw_by_id(db, request.id).fyi == expected
+  end
+
   test "0.1.9 operator decisions emit opened, ruled, and withdrawn classes" do
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
 
@@ -1175,7 +1312,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
       principal: {:session, "operator-raiser"},
       transport_session_key: "operator-raiser",
       session_key: nil,
-      params: %{question: "Ship the candidate?", options: [%{label: "ship"}, %{label: "hold"}]}
+      params:
+        Tightbeam.TestSupport.OperatorAskFixture.link(db, "operator-raiser", %{
+          question: "Ship the candidate?",
+          options: [%{label: "ship"}, %{label: "hold"}]
+        })
     }
 
     assert {:ok, %{status: "open"} = request} = Dispatch.dispatch(db, handlers, ask)
@@ -1552,6 +1693,65 @@ defmodule Tightbeam.Firehose.PublisherTest do
     refute Map.has_key?(notice["payload"], "role")
   end
 
+  test "an accepted notice's database read cannot hold up the hub" do
+    db = :firehose_stalled_read_db
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      Tightbeam.DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
+
+    role = Tightbeam.Roles.create!(db, "worker", "flynn", nil)
+    _earlier = drain_notices()
+
+    call = %{
+      verb: "role-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{name: "worker"}
+    }
+
+    owner = GenServer.whereis(db)
+    :ok = :sys.suspend(owner)
+    publisher = Task.async(fn -> Publisher.accepted(db, call, role) end)
+
+    try do
+      # Wait until the canonical read is queued at the stalled database.
+      assert wait_until(fn ->
+               match?({:message_queue_len, n} when n > 0, Process.info(owner, :message_queue_len))
+             end)
+
+      # A socket heartbeat makes this call; it must answer while the read waits.
+      assert is_integer(GenServer.call(Hub, {:sequence, self()}, 1_000))
+      refute_receive {:firehose_notice, _notice}
+    after
+      :ok = :sys.resume(owner)
+    end
+
+    assert :ok = Task.await(publisher)
+    assert %{"class" => "verb.accepted"} = receive_notice()
+    assert %{"class" => "role.created", "payload" => payload} = receive_notice()
+
+    assert payload ==
+             Tightbeam.StateResources.role(Tightbeam.StateResources.query_role(db, "worker"))
+
+    refute_receive {:firehose_notice, _notice}
+  end
+
+  test "a failed canonical read still publishes the verb observation" do
+    call = %{
+      verb: "role-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{name: "worker"}
+    }
+
+    assert :ok = Publisher.accepted(:firehose_absent_db, call, %{name: "worker"})
+    assert %{"class" => "verb.accepted", "refs" => %{"origin" => "user:flynn"}} = receive_notice()
+    refute_receive {:firehose_notice, _notice}
+    assert Process.alive?(GenServer.whereis(Hub))
+  end
+
   test "a rail denial emits both observational classes" do
     call = %{
       verb: "attest",
@@ -1655,6 +1855,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     register_testhost(db)
     assert observed_state_classes() == ["session.spawned"]
     handlers = Gateway.handlers(%{db: db})
+    elect_work_item_reminders!(handlers)
 
     call = %{
       verb: "work-item-create",
@@ -1691,6 +1892,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, _} = Dispatch.dispatch(db, handlers, update)
     assert observed_classes() == ["verb.accepted"]
     assert canonical.() == before
+  end
+
+  defp elect_work_item_reminders!(handlers) do
+    law =
+      Path.join(System.tmp_dir!(), "firehose-reminder-law-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(law) end)
+    Tightbeam.TerminalReactionFixture.load_work_items!(law, Map.keys(handlers), false)
   end
 
   defp message_fixture(id, seq, session_key, content) do
@@ -1747,6 +1956,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
   defp observed_classes do
     drain_notices()
     |> Enum.map(& &1["class"])
+  end
+
+  defp wait_until(check, attempts \\ 200) do
+    cond do
+      check.() ->
+        true
+
+      attempts == 0 ->
+        false
+
+      true ->
+        Process.sleep(5)
+        wait_until(check, attempts - 1)
+    end
   end
 
   defp drain_notices(acc \\ []) do

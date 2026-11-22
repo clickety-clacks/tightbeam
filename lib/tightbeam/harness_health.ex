@@ -18,18 +18,23 @@ defmodule Tightbeam.HarnessHealth do
     ConditionFacts,
     DB,
     EventLog,
+    ErrorDiagnostic,
     Gateway,
     Harness,
     HarnessProcess,
+    HarnessHealth.ModelRateLimit,
     Id,
     Ledger,
+    Model,
     Org,
     Wire.Payloads,
     Projection,
+    RecordFyis,
     Wakes
   }
 
   alias Tightbeam.DB.Txn
+  alias Tightbeam.HarnessHealth.CompactionObservation
 
   @failure_classes ~w(
     auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
@@ -1085,12 +1090,19 @@ defmodule Tightbeam.HarnessHealth do
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
+    diagnostic = ErrorDiagnostic.of(reason)
+    reason = ErrorDiagnostic.classified(reason)
+    pre_request_refusal? = pre_request_model_selection_refusal?(failed_stage, reason, diagnostic)
+
     case classify_turn_failure(reason) do
       nil ->
         # The terminal failure path has no assistant output. Preserve a
         # message-bearing unclassified failure so the next successful turn on
         # this harness and host can act as the bounded recovery signal.
-        Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        unless pre_request_refusal? do
+          Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
+        end
+
         nil
 
       failure_class ->
@@ -1117,36 +1129,176 @@ defmodule Tightbeam.HarnessHealth do
             do: "authoritative-provider",
             else: "terminal-failure"
 
-        result =
-          observe_in_txn(txn, %{
-            correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
-            harness: to_string(session.harness),
-            host: session.host,
-            failure_class: failure_class,
-            evidence_kind: evidence_kind,
-            session_key: turn.session_key,
-            assignment_id: assignment_id,
-            observed_at: observed_at,
-            cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
-            principal: turn.origin || "process:tightbeam"
-          })
+        observation = %{
+          correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
+          harness: to_string(session.harness),
+          host: session.host,
+          failure_class: failure_class,
+          evidence_kind: evidence_kind,
+          session_key: turn.session_key,
+          assignment_id: assignment_id,
+          observed_at: observed_at,
+          cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
+          principal: turn.origin || "process:tightbeam"
+        }
 
-        redelivery_failure_class =
-          case typed_redelivery_failure_class(reason) do
-            ^failure_class -> failure_class
-            _ -> "unclassified"
+        result =
+          case harness_scope_in_txn(txn, session, turn, observation, reason) do
+            :harness -> observe_in_txn(txn, observation)
+            :model -> {:model_scoped, nil}
           end
 
-        Wakes.record_health_redelivery_source_in_txn(
-          txn,
-          turn.seq,
-          redelivery_failure_class
-        )
+        unless pre_request_refusal? do
+          redelivery_failure_class =
+            case typed_redelivery_failure_class(reason) do
+              ^failure_class -> failure_class
+              _ -> "unclassified"
+            end
+
+          Wakes.record_health_redelivery_source_in_txn(
+            txn,
+            turn.seq,
+            redelivery_failure_class
+          )
+        end
 
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
         after_harness_health_commit(result)
     end
+  end
+
+  # Model observations never feed harness-wide evidence, even when several
+  # separate models are limited. Account and authoritative signals still do.
+  defp harness_scope_in_txn(_txn, _session, _turn, %{failure_class: class}, _reason)
+       when class != "rate-limit-dead",
+       do: :harness
+
+  defp harness_scope_in_txn(_txn, _session, _turn, %{evidence_kind: "authoritative-provider"}, _),
+    do: :harness
+
+  defp harness_scope_in_txn(txn, session, turn, observation, reason) do
+    model = turn_model_in_txn(txn, turn.seq)
+
+    case ModelRateLimit.scope(evidence_text(reason), rate_limit_message(reason), model) do
+      :account ->
+        :harness
+
+      {:model, model} ->
+        ModelRateLimit.record_in_txn(txn, %{
+          harness: observation.harness,
+          host: session.host,
+          model: model,
+          session_key: turn.session_key,
+          assignment_id: observation.assignment_id,
+          turn_seq: turn.seq,
+          observed_at: observation.observed_at,
+          cause: observation.cause,
+          principal: principal_text(observation.principal)
+        })
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "harness_health_model_rate_limit",
+          turn.session_key,
+          JSON.encode!(%{
+            harness: observation.harness,
+            host: session.host,
+            model: model,
+            turnSeq: turn.seq,
+            correlationId: observation.correlation_id
+          })
+        )
+
+        :model
+    end
+  end
+
+  defp rate_limit_message(reason) when is_binary(reason), do: reason
+
+  defp rate_limit_message(reason) when is_map(reason) do
+    data = reason["data"] || reason[:data]
+
+    [reason["message"] || reason[:message] | rate_limit_details(data)]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join(" ")
+  end
+
+  defp rate_limit_message(_reason), do: ""
+
+  defp rate_limit_details(data) when is_map(data),
+    do: [data["message"] || data[:message], data["details"] || data[:details]]
+
+  defp rate_limit_details(data), do: [data]
+
+  defp turn_model_in_txn(txn, turn_seq) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COALESCE(t.model,s.model) FROM turns t
+           JOIN sessions s ON s.sessionKey=t.sessionKey WHERE t.seq=?1
+           """,
+           [turn_seq]
+         ) do
+      [[model]] -> model
+      [] -> nil
+    end
+  end
+
+  defp pre_request_model_selection_refusal?(:session, reason, diagnostic) do
+    selection_reason = model_application_reason(reason)
+    failure_class = classify_turn_failure(selection_reason)
+
+    model_phase? =
+      match?({:model_apply_failed, _}, reason) or match?(%{"phase" => "model"}, diagnostic)
+
+    # Model application can fail because the adapter or provider is down.
+    # Those failures still need recovery, even when the phase is model selection.
+    if failure_class in [
+         "auth-dead",
+         "rate-limit-dead",
+         "adapter_unavailable",
+         "task_crash",
+         "interrupted-outcome-unknown"
+       ] do
+      false
+    else
+      failure_class == "model_unavailable" or
+        (model_phase? and model_selection_response?(selection_reason)) or
+        model_refusal_text?(selection_reason)
+    end
+  end
+
+  defp pre_request_model_selection_refusal?(_failed_stage, _reason, _diagnostic), do: false
+
+  defp model_application_reason({:model_apply_failed, reason}),
+    do: model_application_reason(reason)
+
+  defp model_application_reason(reason), do: reason
+
+  # Invalid params identifies a rejected model-selection request. Other codes,
+  # including authentication-required (-32000), need model-specific evidence.
+  defp model_selection_response?(%{"code" => -32_602}), do: true
+  defp model_selection_response?(%{code: -32_602}), do: true
+  defp model_selection_response?(_reason), do: false
+
+  defp model_refusal_text?(%{"message" => message}) when is_binary(message),
+    do: model_refusal_text?(message)
+
+  defp model_refusal_text?(%{message: message}) when is_binary(message),
+    do: model_refusal_text?(message)
+
+  defp model_refusal_text?(reason) do
+    evidence = reason |> evidence_text() |> String.downcase()
+
+    contains_any?(evidence, [
+      "model_unavailable",
+      "model unavailable",
+      "model is not available",
+      "unknown model",
+      "unsupported model",
+      "invalid value for config option model"
+    ]) or Regex.match?(~r/\bmodel(?:\s+['"][^'"]+['"])?\s+not found\b/, evidence)
   end
 
   @doc "Record a terminal class whose owner is the lane or boot reconciler."
@@ -1203,6 +1355,9 @@ defmodule Tightbeam.HarnessHealth do
   @spec resolve_normal_turn_in_txn(Txn.t(), map(), map()) :: :ok
   def resolve_normal_turn_in_txn(%Txn{} = txn, session, turn) do
     harness = to_string(session.harness)
+
+    # A normal answer on a model releases that model's own rate-limit records.
+    ModelRateLimit.release_in_txn(txn, harness, session.host, turn.seq)
 
     Txn.q(
       txn,
@@ -1287,6 +1442,123 @@ defmodule Tightbeam.HarnessHealth do
       prior -> duplicate_or_refuse!(txn, prior, input, input.evidence_kind)
     end
   end
+
+  @doc "Record a failed temporary compaction on its actual route before trying another."
+  def observe_compactor_failure(db, %{
+        context_id: context_id,
+        harness: harness,
+        host: host,
+        model: model,
+        reason: reason,
+        observed_at: observed_at
+      }) do
+    attempt = JSON.encode!([context_id, harness])
+    reason = reason |> ErrorDiagnostic.classified() |> compactor_failure_reason()
+
+    case compactor_failure_class(reason) do
+      nil ->
+        nil
+
+      failure_class ->
+        if authoritative_compactor_quota?(harness, reason) do
+          {status, record} =
+            observe(db, %{
+              correlation_id: "switch-compaction:" <> attempt,
+              harness: harness,
+              host: host,
+              failure_class: failure_class,
+              evidence_kind: "authoritative-provider",
+              observed_at: observed_at,
+              cause: "compactor #{model}: account quota exhausted",
+              principal: "process:tightbeam"
+            })
+
+          %{
+            status: status,
+            incident_id: Map.get(record, :id),
+            observation_id: Map.fetch!(record, :observationId)
+          }
+        else
+          identity = Model.parse_ref(model)
+
+          model_rate_limit =
+            if failure_class == "rate-limit-dead" and
+                 ModelRateLimit.model_named?(rate_limit_message(reason), identity) do
+              ModelRateLimit.record_compactor_attempt(db, %{
+                harness: harness,
+                host: host,
+                model: identity.family,
+                model_context: identity.context,
+                compaction_attempt_key: attempt,
+                observed_at: observed_at,
+                cause: "compactor: provider limit explicitly named this model",
+                principal: "process:tightbeam"
+              })
+            end
+
+          observation =
+            CompactionObservation.record(
+              db,
+              attempt,
+              harness,
+              host,
+              model,
+              failure_class,
+              observed_at
+            )
+
+          Map.put(observation, :model_rate_limit, model_rate_limit)
+        end
+    end
+  end
+
+  @doc "Recent steering evidence from a temporary compactor, independent of lane admission."
+  def compactor_observation(db, harness, host, observed_at) do
+    CompactionObservation.recent(db, harness, host, observed_at - @evidence_window_ms)
+  end
+
+  defp compactor_failure_reason({stage, reason})
+       when stage in [
+              :session_create_failed,
+              :prompt_failed,
+              :session_close_failed,
+              :mode_apply_failed,
+              :model_apply_failed
+            ],
+       do: compactor_failure_reason(reason)
+
+  defp compactor_failure_reason({:session_prepare_failed, reason, _id, _cleanup}),
+    do: compactor_failure_reason(reason)
+
+  defp compactor_failure_reason({:timeout_cleanup_failed, _}), do: :timeout
+
+  defp compactor_failure_reason(reason), do: reason
+
+  defp compactor_failure_class(:timeout), do: "adapter_unavailable"
+  defp compactor_failure_class({:adapter_unavailable, _}), do: "adapter_unavailable"
+  defp compactor_failure_class(:route_unavailable), do: "adapter_unavailable"
+
+  defp compactor_failure_class(%{"code" => 429}), do: "rate-limit-dead"
+  defp compactor_failure_class(%{code: 429}), do: "rate-limit-dead"
+  defp compactor_failure_class({:http_status, 429}), do: "rate-limit-dead"
+  defp compactor_failure_class(reason), do: classify_turn_failure(reason)
+
+  defp authoritative_compactor_quota?(harness, reason) do
+    authoritative_provider_turn_failure?(%{harness: harness}, reason) or
+      (harness == Tightbeam.Harness.Claude.wire_name() and claude_account_quota?(reason))
+  end
+
+  # Match only the provider's model-free account messages and optional reset
+  # suffix. Extra wording can carry model scope even after an account-like prefix.
+  defp claude_account_quota?(%{"data" => %{"errorKind" => "rate_limit"}, "message" => message})
+       when is_binary(message) do
+    Regex.match?(
+      ~r/\Ayou(?:['’]ve| have) hit your (?:weekly|[0-9]+-hour|usage) limit[.!]?(?: · resets (?:[A-Za-z]{3} [0-9]{1,2}(?:,| at)? )?[0-9]{1,2}(?::[0-9]{2})?(?:am|pm) (?:UTC|\([A-Za-z0-9_+\/-]+\)))?\z/iu,
+      String.trim(message)
+    )
+  end
+
+  defp claude_account_quota?(_), do: false
 
   @doc "Resolve one class-specific open incident on normal-turn success."
   @spec resolve(DB.server(), map()) ::
@@ -1591,8 +1863,27 @@ defmodule Tightbeam.HarnessHealth do
         [description_digest]
       )
 
-    if recurrence > 1 and outcome != "promotion_required",
-      do: raise(ArgumentError, "invalid_review_outcome")
+    promotion_case_id = promotion_case_id(txn, description_digest, recurrence)
+
+    # A recurring description with an open promotion case may still be
+    # reviewed with another outcome; the case stays linked and open, and the
+    # recurrence is stated as an FYI. With no open case this stays a refusal.
+    fyi =
+      cond do
+        recurrence > 1 and outcome != "promotion_required" and is_nil(promotion_case_id) ->
+          raise ArgumentError, "invalid_review_outcome"
+
+        recurrence > 1 and outcome != "promotion_required" ->
+          [
+            RecordFyis.line(
+              "incidents with this description have recurred #{recurrence} times and " <>
+                "promotion case #{promotion_case_id} is open; this review records #{outcome}"
+            )
+          ]
+
+        true ->
+          []
+      end
 
     if recurrence <= 1 and outcome == "promotion_required",
       do: raise(ArgumentError, "promotion_required")
@@ -1601,8 +1892,6 @@ defmodule Tightbeam.HarnessHealth do
       do: raise(ArgumentError, "invalid_review_outcome")
 
     cause = required_review_cause!(input)
-
-    promotion_case_id = promotion_case_id(txn, description_digest, recurrence)
 
     if recurrence > 1 and is_nil(promotion_case_id),
       do: raise(ArgumentError, "promotion_required")
@@ -1649,7 +1938,9 @@ defmodule Tightbeam.HarnessHealth do
       ["hhore_" <> Id.uuid4(), incident_id, reviewer, JSON.encode!(event), now(input)]
     )
 
+    :ok = RecordFyis.put_in_txn(txn, "harness_health_review", incident_id, fyi)
     result = %{incidentId: incident_id, state: "closed", outcome: outcome}
+    result = if fyi == [], do: result, else: Map.put(result, :fyi, fyi)
 
     store_other_idempotency(
       txn,
@@ -1768,6 +2059,7 @@ defmodule Tightbeam.HarnessHealth do
                 namedClass: named_class,
                 reviewAttestId: provenance.existing_review_attest_id || review_attest_id
               }
+              |> then(&promotion_fyi(txn, promotion_id, &1, provenance.fyi))
 
             [["closed", _named, _ref, _sha, _artifact, _attest, _first]] ->
               raise ArgumentError, "promotion_closed"
@@ -1817,12 +2109,21 @@ defmodule Tightbeam.HarnessHealth do
                 ]
               )
 
+              :ok =
+                RecordFyis.put_in_txn(
+                  txn,
+                  "harness_health_promotion",
+                  promotion_id,
+                  provenance.fyi
+                )
+
               %{
                 promotionId: promotion_id,
                 state: "closed",
                 namedClass: named_class,
                 reviewAttestId: review_attest_id
               }
+              |> then(&promotion_fyi(txn, promotion_id, &1, provenance.fyi))
 
             [] ->
               raise ArgumentError, "promotion_not_found"
@@ -1873,26 +2174,23 @@ defmodule Tightbeam.HarnessHealth do
       stored_review_attest_id
     ] = promotion
 
+    # H1: the closed row stores the spec artifact's path and hash and the
+    # cited reviewed-clean verdict, so those must exist and be well formed.
     spec =
       case Txn.q(
              txn,
              "SELECT kind,originPath,contentSha256,workItemId FROM artifacts WHERE artifactId=?1",
              [spec_artifact_id]
            ) do
-        [["spec", ref, sha, work_item_id]]
+        [[kind, ref, sha, work_item_id]]
         when is_binary(ref) and is_binary(sha) and is_binary(work_item_id) ->
           if sha256_digest?(sha),
-            do: %{spec_ref: ref, spec_sha256: sha, work_item_id: work_item_id},
+            do: %{kind: kind, spec_ref: ref, spec_sha256: sha, work_item_id: work_item_id},
             else: raise(ArgumentError, "invalid_promotion_close")
 
         _ ->
           raise ArgumentError, "invalid_promotion_close"
       end
-
-    unless Txn.q(txn, "SELECT specRefName,specRefSha256 FROM work_items WHERE id=?1", [
-             spec.work_item_id
-           ]) == [[spec.spec_ref, spec.spec_sha256]],
-           do: raise(ArgumentError, "invalid_promotion_close")
 
     review =
       case Txn.q(
@@ -1900,9 +2198,9 @@ defmodule Tightbeam.HarnessHealth do
              "SELECT kind,contentSha256,workItemId FROM artifacts WHERE artifactId=?1",
              [review_artifact_id]
            ) do
-        [["report", sha, work_item_id]] when is_binary(sha) and is_binary(work_item_id) ->
+        [[kind, sha, work_item_id]] when is_binary(sha) and is_binary(work_item_id) ->
           if sha256_digest?(sha),
-            do: %{content_sha256: sha, work_item_id: work_item_id},
+            do: %{kind: kind, content_sha256: sha, work_item_id: work_item_id},
             else: raise(ArgumentError, "invalid_promotion_close")
 
         _ ->
@@ -1939,19 +2237,11 @@ defmodule Tightbeam.HarnessHealth do
           raise ArgumentError, "invalid_promotion_close"
       end
 
-    unless attest.content_sha256 == review.content_sha256 and
-             commit_ref_matches?(attest.commit_refs, candidate_commit),
+    unless Regex.match?(~r/\A[0-9a-f]{40}\z/, candidate_commit) and
+             review_assignment_id != promotion_id,
            do: raise(ArgumentError, "invalid_promotion_close")
 
-    candidate_work_item_id = review_work_item_id(txn, review_assignment_id)
-
-    unless review_assignment_id != promotion_id and
-             is_binary(candidate_work_item_id) and
-             review.work_item_id == candidate_work_item_id and
-             spec.work_item_id == candidate_work_item_id and
-             review_bound_to_candidate?(txn, review_assignment_id, attest.reviewer_session),
-           do: raise(ArgumentError, "invalid_promotion_close")
-
+    # H4: the promotion's own two incidents must agree with its stored digest.
     unless is_binary(first_incident) and is_binary(second_incident) and
              first_incident != second_incident and
              Txn.q(
@@ -1961,23 +2251,27 @@ defmodule Tightbeam.HarnessHealth do
              ) == [[2]],
            do: raise(ArgumentError, "invalid_promotion_close")
 
-    source_sessions =
-      Txn.q(
-        txn,
-        "SELECT DISTINCT sessionKey FROM harness_health_observations WHERE id IN ((SELECT openObservationId FROM harness_health_incidents WHERE id=?1),(SELECT openObservationId FROM harness_health_incidents WHERE id=?2)) AND sessionKey IS NOT NULL",
-        [first_incident, second_incident]
-      )
-      |> List.flatten()
-
-    unless attest.reviewer_session not in source_sessions and
-             attest.reviewer_session != principal_session(input),
-           do: raise(ArgumentError, "invalid_promotion_close")
-
-    if input[:spec_ref] && input.spec_ref != spec.spec_ref,
-      do: raise(ArgumentError, "invalid_promotion_close")
-
-    if input[:spec_sha256] && input.spec_sha256 != spec.spec_sha256,
-      do: raise(ArgumentError, "invalid_promotion_close")
+    # H2 and H3: comparisons between the cited records are stated as FYIs.
+    facts =
+      promotion_record_facts(spec, spec_artifact_id, review, review_artifact_id, input) ++
+        promotion_review_facts(
+          txn,
+          attest,
+          review,
+          review_attest_id,
+          review_artifact_id,
+          review_assignment_id,
+          candidate_commit,
+          spec,
+          spec_artifact_id
+        ) ++
+        promotion_reviewer_facts(
+          txn,
+          attest.reviewer_session,
+          first_incident,
+          second_incident,
+          input
+        )
 
     existing_review_attest_id =
       if promotion_state == "closed" do
@@ -1993,43 +2287,191 @@ defmodule Tightbeam.HarnessHealth do
       end
 
     spec
+    |> Map.take([:spec_ref, :spec_sha256, :work_item_id])
     |> Map.put(:reviewer_session, attest.reviewer_session)
     |> Map.put(:reviewer_user, attest.reviewer_user)
     |> Map.put(:review_artifact_sha256, review.content_sha256)
     |> Map.put(:existing_review_attest_id, existing_review_attest_id)
+    |> Map.put(:fyi, facts |> Enum.uniq() |> Enum.map(&RecordFyis.line/1))
   end
 
-  defp review_bound_to_candidate?(txn, assignment_id, reviewer_session) do
+  # A close returns the FYIs recorded with the promotion's close, followed by
+  # any this request's own comparisons found that are not already among them.
+  defp promotion_fyi(txn, promotion_id, result, current) do
+    recorded =
+      txn
+      |> RecordFyis.list_many("harness_health_promotion", [promotion_id])
+      |> Map.get(promotion_id, [])
+
+    case Enum.uniq(recorded ++ current) do
+      [] -> result
+      fyi -> Map.put(result, :fyi, fyi)
+    end
+  end
+
+  defp promotion_record_facts(spec, spec_artifact_id, review, review_artifact_id, input) do
+    [
+      if(spec.kind != "spec",
+        do: "spec artifact #{spec_artifact_id} is recorded with kind #{spec.kind}, not spec"
+      ),
+      if(review.kind != "report",
+        do:
+          "review artifact #{review_artifact_id} is recorded with kind #{review.kind}, not report"
+      ),
+      if(input[:spec_ref] && input.spec_ref != spec.spec_ref,
+        do:
+          "this close names spec #{input.spec_ref}; spec artifact #{spec_artifact_id} is #{spec.spec_ref}"
+      ),
+      if(input[:spec_sha256] && input.spec_sha256 != spec.spec_sha256,
+        do:
+          "this close names spec sha256 #{input.spec_sha256}; " <>
+            "spec artifact #{spec_artifact_id} is sha256 #{spec.spec_sha256}"
+      )
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp promotion_review_facts(
+         txn,
+         attest,
+         review,
+         review_attest_id,
+         review_artifact_id,
+         review_assignment_id,
+         candidate_commit,
+         spec,
+         spec_artifact_id
+       ) do
+    binding =
+      case Txn.q(txn, "SELECT specRefName,specRefSha256 FROM work_items WHERE id=?1", [
+             spec.work_item_id
+           ]) do
+        [[ref, sha]] when ref == spec.spec_ref and sha == spec.spec_sha256 ->
+          nil
+
+        [[nil, nil]] ->
+          "work item #{spec.work_item_id} binds no spec; " <>
+            "spec artifact #{spec_artifact_id} is #{spec.spec_ref} sha256 #{spec.spec_sha256}"
+
+        [[ref, sha]] ->
+          "work item #{spec.work_item_id} binds spec #{ref} sha256 #{sha}; " <>
+            "spec artifact #{spec_artifact_id} is #{spec.spec_ref} sha256 #{spec.spec_sha256}"
+      end
+
+    review_work_item_id = review_work_item_id(txn, review_assignment_id)
+
+    [
+      binding,
+      if(attest.content_sha256 != review.content_sha256,
+        do:
+          "review attest #{review_attest_id} cites sha256 #{attest.content_sha256}; " <>
+            "review artifact #{review_artifact_id} is sha256 #{review.content_sha256}"
+      ),
+      if(not commit_ref_matches?(attest.commit_refs, candidate_commit),
+        do:
+          "review attest #{review_attest_id} lists commits #{listed_commits(attest.commit_refs)}; " <>
+            "the candidate commit is #{candidate_commit}"
+      ),
+      cond do
+        is_nil(review_work_item_id) ->
+          "review assignment #{review_assignment_id} records no work item"
+
+        review.work_item_id != review_work_item_id ->
+          "review artifact #{review_artifact_id} is on work item #{review.work_item_id}; " <>
+            "review assignment #{review_assignment_id} is on work item #{review_work_item_id}"
+
+        true ->
+          nil
+      end,
+      if(is_binary(review_work_item_id) and spec.work_item_id != review_work_item_id,
+        do:
+          "spec artifact #{spec_artifact_id} is on work item #{spec.work_item_id}; " <>
+            "review assignment #{review_assignment_id} is on work item #{review_work_item_id}"
+      )
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Kernel.++(review_binding_facts(txn, review_assignment_id, attest, review_attest_id))
+  end
+
+  defp listed_commits(encoded) do
+    case is_binary(encoded) && JSON.decode(encoded) do
+      {:ok, [_ | _] = refs} ->
+        refs
+        |> Enum.map(fn ref -> if is_map(ref), do: ref["commit"], else: nil end)
+        |> Enum.reject(&is_nil/1)
+        |> case do
+          [] -> "none"
+          commits -> Enum.join(commits, ", ")
+        end
+
+      _ ->
+        "none"
+    end
+  end
+
+  # The review card is bound to the candidate when the verdict's author holds
+  # it, it reviews an assignment on its own work item, and that assignment is
+  # not itself a review card held by the reviewer.
+  defp review_binding_facts(txn, review_assignment_id, attest, review_attest_id) do
+    reviewer = attest.reviewer_session
+
     case Txn.q(
            txn,
            """
-           SELECT review.holderKey,review.state,review.workItemId,review.reviewsAssignmentId,
+           SELECT review.holderKey,review.workItemId,
                   candidate.id,candidate.holderKey,candidate.workItemId,candidate.reviewsAssignmentId
            FROM assignments review
-           JOIN assignments candidate ON candidate.id=review.reviewsAssignmentId
+           LEFT JOIN assignments candidate ON candidate.id=review.reviewsAssignmentId
            WHERE review.id=?1
            """,
-           [assignment_id]
+           [review_assignment_id]
          ) do
-      [
-        [
-          ^reviewer_session,
-          state,
-          review_work_item_id,
-          _parent,
-          _candidate_id,
-          candidate_holder,
-          candidate_work_item_id,
-          nil
-        ]
-      ]
-      when state in ["open", "closed"] and review_work_item_id == candidate_work_item_id and
-             candidate_holder != reviewer_session ->
-        true
+      [[_holder, _work_item, nil, _candidate_holder, _candidate_item, _candidate_reviews]] ->
+        ["review assignment #{review_assignment_id} does not review another assignment"]
 
-      _ ->
-        false
+      [[holder, work_item, candidate, candidate_holder, candidate_item, candidate_reviews]] ->
+        [
+          if(holder != reviewer,
+            do:
+              "review attest #{review_attest_id} was filed by session #{reviewer}; " <>
+                "review assignment #{review_assignment_id} is held by session #{holder}"
+          ),
+          if(work_item != candidate_item,
+            do:
+              "review assignment #{review_assignment_id} is on work item #{inspect_item(work_item)}; " <>
+                "assignment #{candidate} it reviews is on work item #{inspect_item(candidate_item)}"
+          ),
+          if(is_binary(candidate_reviews),
+            do:
+              "assignment #{candidate} that review assignment #{review_assignment_id} reviews is itself a review card"
+          ),
+          if(candidate_holder == reviewer,
+            do: "reviewer session #{reviewer} is also the candidate holder"
+          )
+        ]
+        |> Enum.reject(&is_nil/1)
     end
+  end
+
+  defp inspect_item(nil), do: "none"
+  defp inspect_item(work_item_id), do: work_item_id
+
+  defp promotion_reviewer_facts(txn, reviewer, first_incident, second_incident, input) do
+    source_facts =
+      for incident_id <- Enum.uniq([first_incident, second_incident]),
+          Txn.q(
+            txn,
+            "SELECT 1 FROM harness_health_observations WHERE id=(SELECT openObservationId FROM harness_health_incidents WHERE id=?1) AND sessionKey=?2",
+            [incident_id, reviewer]
+          ) == [[1]],
+          do: "reviewer session #{reviewer} is also the source session of incident #{incident_id}"
+
+    caller_facts =
+      if reviewer == principal_session(Map.get(input, :principal)),
+        do: ["reviewer session #{reviewer} is also the caller"],
+        else: []
+
+    source_facts ++ caller_facts
   end
 
   defp review_work_item_id(txn, assignment_id) do
@@ -2045,44 +2487,24 @@ defmodule Tightbeam.HarnessHealth do
   defp promotion_close_authorized?(txn, {kind, value}, promotion_id)
        when kind in [:user, :session] do
     case kind do
+      # Any user, or any active session, may close an existing promotion.
       :user ->
-        admin_user?(txn, value) or
-          Txn.q(
-            txn,
-            "SELECT 1 FROM harness_health_class_promotions p JOIN harness_health_incidents i ON i.id IN (p.firstIncidentId,p.secondIncidentId) JOIN harness_health_observations o ON o.id=i.openObservationId JOIN sessions s ON s.sessionKey=o.sessionKey WHERE p.id=?1 AND s.ownerUserId=?2",
-            [promotion_id, value]
-          ) != []
+        promotion_exists?(txn, promotion_id)
 
       :session ->
-        case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [value]) do
-          [["active"]] ->
-            Txn.q(
-              txn,
-              """
-              SELECT o.sessionKey,s.ownerUserId,r.custodian
-              FROM harness_health_class_promotions p
-              JOIN harness_health_incidents i ON i.id IN (p.firstIncidentId,p.secondIncidentId)
-              JOIN harness_health_observations o ON o.id=i.openObservationId
-              JOIN sessions s ON s.sessionKey=o.sessionKey
-              LEFT JOIN harness_health_other_reviews r ON r.incidentId=i.id
-              WHERE p.id=?1
-              """,
-              [promotion_id]
-            )
-            |> Enum.any?(fn [source, owner, custodian] ->
-              value == source or value == custodian or
-                session_owner_authorized?(txn, value, owner)
-            end)
-
-          _ ->
-            false
-        end
+        Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [value]) == [["active"]] and
+          promotion_exists?(txn, promotion_id)
     end
   end
 
   defp promotion_close_authorized?(_txn, {:process, _name}, _id), do: true
 
   defp promotion_close_authorized?(_txn, _principal, _promotion_id), do: false
+
+  defp promotion_exists?(txn, promotion_id),
+    do:
+      Txn.q(txn, "SELECT 1 FROM harness_health_class_promotions WHERE id=?1", [promotion_id]) !=
+        []
 
   defp review_authorized?(_txn, _id, {:process, _name}), do: true
 
@@ -2101,19 +2523,11 @@ defmodule Tightbeam.HarnessHealth do
         [incident_id]
       )
 
+    # Any user or session may act on an existing incident, whoever owns it.
     case {rows, principal} do
-      {[[source, custodian, owner]], {:session, session}} ->
-        session == custodian or session == source or
-          session_owner_authorized?(txn, session, owner)
-
-      {[[_, _, owner]], {:user, user}} ->
-        user == owner or admin_user?(txn, user)
-
-      {[[_, _, owner]], "user:" <> user} ->
-        user == owner or admin_user?(txn, user)
-
-      _ ->
-        false
+      {[_row], {kind, _}} when kind in [:session, :user] -> true
+      {[_row], "user:" <> _user} -> true
+      _ -> false
     end
   end
 
@@ -2134,19 +2548,11 @@ defmodule Tightbeam.HarnessHealth do
         [incident_id]
       )
 
+    # Any user or session may act on an existing incident, whoever owns it.
     case {rows, principal} do
-      {[[source, owner, custodian]], {:session, session}} ->
-        session == source or session == custodian or
-          session_owner_authorized?(txn, session, owner)
-
-      {[[_, owner, _]], {:user, user}} ->
-        user == owner or admin_user?(txn, user)
-
-      {[[_, owner, _]], "user:" <> user} ->
-        user == owner or admin_user?(txn, user)
-
-      _ ->
-        false
+      {[_row], {kind, _}} when kind in [:session, :user] -> true
+      {[_row], "user:" <> _user} -> true
+      _ -> false
     end
   end
 
@@ -3059,14 +3465,9 @@ defmodule Tightbeam.HarnessHealth do
            "SELECT ownerUserId,state FROM sessions WHERE sessionKey=?1 AND harness=?2 AND host=?3",
            [input.source_session_key, input.harness, input.host]
          ) do
-      [[owner_user_id, "active"]] ->
-        unless other_source_authorized?(
-                 txn,
-                 input.principal_identity,
-                 input.source_session_key,
-                 owner_user_id
-               ),
-               do: raise(ArgumentError, "not_authorized")
+      [[_owner_user_id, "active"]] ->
+        unless other_source_authorized?(input.principal_identity),
+          do: raise(ArgumentError, "not_authorized")
 
       [[_, _]] ->
         raise(ArgumentError, "source_not_active")
@@ -3076,23 +3477,13 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
-  defp other_source_authorized?(txn, {:session, session_key}, source, owner),
-    do: session_key == source or session_owner_authorized?(txn, session_key, owner)
+  # Any user, session or automation may report a failure seen on any session.
+  defp other_source_authorized?({kind, _value}) when kind in [:session, :user, :process],
+    do: true
 
-  defp other_source_authorized?(txn, {:user, user}, _source, owner),
-    do: user == owner or admin_user?(txn, user)
-
-  defp other_source_authorized?(txn, user, source, owner) when is_binary(user) do
-    case user do
-      "session:" <> session -> other_source_authorized?(txn, {:session, session}, source, owner)
-      "user:" <> user_id -> other_source_authorized?(txn, {:user, user_id}, source, owner)
-      _ -> false
-    end
-  end
-
-  defp other_source_authorized?(_txn, {:process, _name}, _source, _owner), do: true
-
-  defp other_source_authorized?(_txn, _principal, _source, _owner), do: false
+  defp other_source_authorized?("session:" <> _session), do: true
+  defp other_source_authorized?("user:" <> _user), do: true
+  defp other_source_authorized?(_principal), do: false
 
   defp admin_user?(txn, user),
     do: Txn.q(txn, "SELECT 1 FROM users WHERE userId=?1 AND isAdmin=1", [user]) == [[1]]

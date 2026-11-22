@@ -670,6 +670,7 @@ class Watcher:
                 "--when-fact", BRANCH_ATTENTION,
                 "--when-scope", self.branch.scope,
                 "--fallback-after", WAKE_FALLBACK,
+                "--wait-reason", "Waiting for a branch attention event",
                 "--key", key,
                 "--prompt", prompt,
             ]

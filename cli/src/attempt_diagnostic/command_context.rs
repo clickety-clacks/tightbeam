@@ -74,6 +74,7 @@ impl CommandContext {
             HarnessHealthRetry { .. } => ("cli.harness_health_retry", DispatchPath),
             ArtifactRecord { .. } => ("cli.artifact_record", DispatchPath),
             HarklightSend { .. } => ("cli.harklight_send", DispatchPath),
+            HarklightProgress { .. } => ("cli.harklight_progress", DispatchPath),
             HarklightRevise { .. } => ("cli.harklight_revise", DispatchPath),
             HarklightRetract { .. } => ("cli.harklight_retract", DispatchPath),
             HarklightSettle { .. } => ("cli.harklight_settle", DispatchPath),
@@ -83,10 +84,12 @@ impl CommandContext {
             HarklightReply { .. } => ("cli.harklight_reply", DispatchPath),
             HarklightResult { .. } => ("cli.harklight_result", DispatchPath),
             HarklightFollow { .. } => ("cli.harklight_follow", DispatchPath),
-            HarklightCover { .. } => ("cli.harklight_cover", DispatchPath),
             HarklightBriefingsCatchup { .. } => ("cli.harklight_briefings_catchup", DispatchPath),
             HarklightRetry { .. } => ("cli.harklight_retry", DispatchPath),
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
+            ArtifactContentPromote { .. } => ("cli.artifact_content_promote", DispatchPath),
+            ArtifactContentCapacity { .. } => ("cli.artifact_content_capacity", DispatchPath),
+            WorkspaceCleanup { .. } => ("cli.workspace_cleanup", DispatchPath),
             Artifacts { .. } => ("cli.artifacts", DispatchPath),
             ToolCallObserved => ("cli.tool_call_observed", Requests::ToolCallObserved),
             Spawn { .. } => ("cli.spawn", CatalogAndDispatch),
@@ -113,6 +116,7 @@ impl CommandContext {
             AssignmentStopTurn { .. } => ("cli.assignment_stop_turn", DispatchPath),
             CancelTurn { .. } => ("cli.cancel_turn", DispatchPath),
             RevokeAssignment { .. } => ("cli.revoke_assignment", DispatchPath),
+            AssignmentOpenerAccept { .. } => ("cli.assignment_opener_accept", DispatchPath),
             ReopenAssignment { .. } => ("cli.reopen_assignment", DispatchPath),
             RepairAssignment { .. } => ("cli.repair_assignment", DispatchPath),
             AssignmentCommitRefCorrect { .. } => {
@@ -328,6 +332,13 @@ impl Eq for CommandContext {}
 fn dispatch_effect(command: &Command) -> EffectContract {
     use Command::*;
     use EffectContract::*;
+    if let WorkspaceCleanup { action, .. } = command {
+        return if action == "status" {
+            Read
+        } else {
+            WriteWithoutIdempotency
+        };
+    }
     match command {
         IdentityCurrent | GithubAuthCheck { .. } | SessionConnect { .. } => Unknown,
         Help
@@ -336,6 +347,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | SessionDiagnose { .. }
         | HarnessHealthEvidenceOther { .. }
         | ArtifactContentFetch { .. }
+        | ArtifactContentCapacity { .. }
         | Artifacts { .. }
         | FactDemand { .. }
         | FactProducers { .. }
@@ -474,15 +486,16 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         },
 
         ArtifactRecord { .. }
+        | ArtifactContentPromote { .. }
         | HarnessHealthRetry { .. }
         | FactProducerClaim { .. }
         | HarklightSend { .. }
+        | HarklightProgress { .. }
         | HarklightRevise { .. }
         | HarklightRetract { .. }
         | HarklightSettle { .. }
         | HarklightListenerRestore { .. }
         | HarklightFollow { .. }
-        | HarklightCover { .. }
         | HarklightBriefingsCatchup { .. }
         | HarklightRetry { .. }
         | ToolCallObserved
@@ -497,6 +510,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | AssignmentStopTurn { .. }
         | CancelTurn { .. }
         | RevokeAssignment { .. }
+        | AssignmentOpenerAccept { .. }
         | ReopenAssignment { .. }
         | WorkItemUpdate { .. }
         | Attend { .. }
@@ -523,6 +537,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | SentinelEnvSet { .. }
         | SentinelEnvUnset { .. }
         | HostToolchainSet { .. }
+        | WorkspaceCleanup { .. }
         | Assimilate(_) => WriteWithoutIdempotency,
     }
 }
@@ -793,6 +808,8 @@ mod tests {
                 session_key: "PRIVATE_TARGET".into(),
                 idempotency_key: key.map(str::to_owned),
                 keep_open_descendants: false,
+                acknowledge_loss: false,
+                dry_run: false,
             };
             let context = CommandContext::for_command(&command).unwrap();
             assert_eq!(effect(context, "POST", "/agent/dispatch"), expected);

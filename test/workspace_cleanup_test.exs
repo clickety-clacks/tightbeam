@@ -39,6 +39,8 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       db: db,
       base_dir: base,
       wake_tick_ms: 1_000,
+      workspace_archive_reserve_bytes: 0,
+      workspace_archive_reserve_percent: 0,
       workspace_cleanup_runner: &WorkspaceCleanup.system_runner/3
     }
 
@@ -83,7 +85,8 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     :sys.get_state(worker)
   end
 
-  test "a workspace with no artifacts disappears and completed work is not queued again", ctx do
+  test "a workspace with unrecorded work is archived and completed work is not queued again",
+       ctx do
     File.write!(Path.join(ctx.workspace, "scratch"), "discard")
     retire(ctx)
 
@@ -91,12 +94,17 @@ defmodule Tightbeam.WorkspaceCleanupTest do
              WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
 
     refute File.exists?(ctx.workspace)
+
+    assert %{cleanup: "completed", archive_path: archive} =
+             WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    assert File.read!(Path.join(archive, "scratch")) == "discard"
     assert WorkspaceCleanup.health(ctx.db).count == 0
     assert :ok = Schema.ensure_all(ctx.db)
     assert WorkspaceCleanup.health(ctx.db).count == 0
   end
 
-  test "cleanup ignores unrelated and unplaceable references and archives only declared files",
+  test "cleanup archives unrecorded and declared files without following unrelated references",
        ctx do
     kept = Path.join(ctx.workspace, "reports/kept.md")
     File.mkdir_p!(Path.dirname(kept))
@@ -125,7 +133,9 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert archived.state == "archived"
     assert File.read!(archived.home) == "preserve"
     assert File.ls!(Path.dirname(archived.home)) == ["kept.md"]
-    refute File.exists?(Path.join(Path.dirname(Path.dirname(archived.home)), "scratch"))
+
+    assert File.read!(Path.join(Path.dirname(Path.dirname(archived.home)), "scratch")) ==
+             "discard"
   end
 
   test "configured archive crosses filesystems and resumes after the move before repointing",
@@ -137,6 +147,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
     kept = Path.join(ctx.workspace, "kept")
     File.write!(kept, "preserve across devices")
+    File.write!(Path.join(ctx.workspace, "scratch"), "unrecorded across devices")
     artifact = artifact(ctx, kept)
     retire(ctx)
     # A failed database update must leave the move recoverable on the next attempt.
@@ -159,10 +170,204 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     home = Artifacts.get(ctx.db, artifact.artifact_id).home
     assert String.starts_with?(home, archive <> "/")
     assert File.read!(home) == "preserve across devices"
+    assert File.read!(Path.join(Path.dirname(home), "scratch")) == "unrecorded across devices"
+    assert %{archive_path: location} = WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+    assert location == Path.dirname(home)
 
     if archive_parent == "/dev/shm" do
       assert File.stat!(ctx.base).major_device != File.stat!(archive).major_device
     end
+  end
+
+  test "owner retry reruns holds without deleting over-budget unrecorded files", ctx do
+    File.write!(Path.join(ctx.workspace, "scratch"), "keep me")
+    retire(ctx)
+
+    config =
+      ctx.config
+      |> Map.put(:workspace_archive_max_entries, 0)
+      |> Map.put(:workspace_cleanup_stuck_attempts, 2)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{cleanup: "held"} = WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    assert %{ok: true, cleanup: "queued"} =
+             WorkspaceCleanup.retry(ctx.db, ctx.session.session_key)
+
+    assert %{cleanup: "queued"} = WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert File.read!(Path.join(ctx.workspace, "scratch")) == "keep me"
+
+    assert %{cleanup: "held", blocker_state: "stuck"} =
+             WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    {:ok, [[stored]]} =
+      DB.query(ctx.db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [
+        ctx.session.session_key
+      ])
+
+    report = JSON.decode!(stored)
+    assert report["retry_requested"]["by"] == "unknown"
+    assert report["retry_outcome"]["status"] == "incomplete"
+
+    {:ok, [[event]]} =
+      DB.query(
+        ctx.db,
+        "SELECT detail FROM lifecycle_events WHERE kind='retired_workspace_cleanup_retry_outcome' AND subject=?1",
+        [ctx.session.session_key]
+      )
+
+    assert JSON.decode!(event)["status"] == "incomplete"
+  end
+
+  test "cleanup status is owner scoped and retry rejects a different owner", ctx do
+    retire(ctx)
+    handler = Gateway.handlers(ctx.config)["workspace-cleanup"]
+    owner_call = %{origin: "user:owner", principal: {:user, "owner"}, params: %{action: "status"}}
+
+    assert %{
+             cleanups: [
+               %{
+                 session_key: "cleanup-example",
+                 cleanup: "queued",
+                 workdir_host: host,
+                 archive_path: archive
+               }
+             ]
+           } =
+             handler.(owner_call)
+
+    assert is_binary(host)
+    assert is_binary(archive)
+
+    foreign_retry = %{
+      origin: "user:another-owner",
+      principal: {:user, "another-owner"},
+      params: %{action: "retry", session_key: ctx.session.session_key}
+    }
+
+    assert %{code: "forbidden"} = handler.(foreign_retry)
+
+    owner_retry = %{owner_call | params: %{action: "retry", session_key: ctx.session.session_key}}
+    assert %{ok: true, cleanup: "queued"} = handler.(owner_retry)
+
+    assert {:ok, [[stored]]} =
+             DB.query(
+               ctx.db,
+               "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [ctx.session.session_key]
+             )
+
+    assert JSON.decode!(stored)["retry_requested"]["by"] == "user:owner"
+  end
+
+  test "unchanged operational blockers become stuck after the configured attempts", ctx do
+    retire(ctx)
+
+    runner = fn _argv, _script, _input ->
+      {"E\tentry_remove_failed\t" <> Base.encode16("nested", case: :lower) <> "\nDONE\t1\n", 0}
+    end
+
+    config =
+      ctx.config
+      |> Map.put(:workspace_cleanup_runner, runner)
+      |> Map.put(:workspace_cleanup_stuck_attempts, 2)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{cleanup: "blocked", blocker_state: nil} =
+             WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{
+             cleanup: "blocked",
+             blocker_state: "stuck",
+             operator_action: action,
+             blockers: [%{"reason" => "entry_remove_failed", "path" => "nested"}]
+           } =
+             WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+
+    assert action =~ "reported paths"
+    assert WorkspaceCleanup.health(ctx.db).by_state["blocked"] == 1
+  end
+
+  test "mount boundary is marked stuck on its first failed attempt", ctx do
+    retire(ctx)
+
+    config =
+      Map.put(ctx.config, :workspace_cleanup_runner, fn _argv, _script, _input ->
+        {"E\tmount_boundary\t" <> Base.encode16("nested", case: :lower) <> "\nDONE\t1\n", 0}
+      end)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{cleanup: "blocked", blocker_state: "stuck", reasons: ["mount_boundary"]} =
+             WorkspaceCleanup.status(ctx.db, ctx.session.session_key)
+  end
+
+  test "stuck cleanup rows do not block the next queued session", ctx do
+    retire(ctx)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE retired_workspace_cleanup SET reason='stuck: mount_boundary',nextAt=0 WHERE sessionKey=?1",
+        [ctx.session.session_key]
+      )
+
+    next =
+      Org.create(ctx.db, %{
+        session_key: "cleanup-next",
+        display_name: "Next cleanup",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        host: Placement.local_host_name(),
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("example")
+      })
+
+    next_workspace = Placement.workdir_path(ctx.config, next)
+    File.mkdir_p!(next_workspace)
+    File.write!(Path.join(next_workspace, "scratch"), "archive this")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        next.session_key
+      ])
+
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+    send(worker, :drain)
+    :sys.get_state(worker)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT completed FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [
+                 next.session_key
+               ]
+             )
+
+    assert {:ok, [[0, "stuck: mount_boundary"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT completed,reason FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [ctx.session.session_key]
+             )
   end
 
   test "the recorded backlog migration runs once and includes retirements with no attempt", ctx do
@@ -228,12 +433,14 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     kept = Path.join(ctx.workspace, "kept")
     File.write!(kept, "older archive")
     artifact = artifact(ctx, kept)
+    duplicate = artifact(ctx, kept)
     retire(ctx)
 
     assert %{status: "completed"} =
              WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
 
     old_home = Artifacts.get(ctx.db, artifact.artifact_id).home
+    assert Artifacts.get(ctx.db, duplicate.artifact_id).home == old_home
     archive = Path.join(ctx.base, "configured-archive")
     Application.put_env(:tightbeam, :archive_dir, archive)
     on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
@@ -266,11 +473,50 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     :sys.get_state(worker)
     moved = Artifacts.get(ctx.db, artifact.artifact_id)
     assert String.starts_with?(moved.home, archive <> "/")
+    assert Artifacts.get(ctx.db, duplicate.artifact_id).home == moved.home
     assert File.read!(moved.home) == "older archive"
     refute File.exists?(old_home)
     send(worker, :drain)
     :sys.get_state(worker)
     assert Artifacts.get(ctx.db, artifact.artifact_id).home == moved.home
+  end
+
+  test "relocation recovery repoints present files and keeps a missing descendant's old home",
+       ctx do
+    present = Path.join(ctx.workspace, "present")
+    missing = Path.join(ctx.workspace, "missing")
+    File.write!(present, "present bytes")
+    File.write!(missing, "missing bytes")
+    present_id = artifact(ctx, present).artifact_id
+    missing_id = artifact(ctx, missing).artifact_id
+    retire(ctx)
+
+    assert %{status: "completed"} =
+             WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+    present_home = Artifacts.get(ctx.db, present_id).home
+    missing_home = Artifacts.get(ctx.db, missing_id).home
+    old_entry = Path.dirname(present_home)
+    destination = Path.join(ctx.base, "relocated")
+    target_entry = Path.join(destination, Path.basename(old_entry))
+    File.mkdir_p!(destination)
+    File.rename!(old_entry, target_entry)
+    File.rm!(Path.join(target_entry, "missing"))
+    Application.put_env(:tightbeam, :archive_dir, destination)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(worker, :drain)
+        :sys.get_state(worker)
+      end)
+
+    assert Artifacts.get(ctx.db, present_id).home == Path.join(target_entry, "present")
+    assert Artifacts.get(ctx.db, missing_id).home == missing_home
+    assert log =~ "archive relocation kept the old home for #{missing_id}"
+    assert log =~ Path.join(target_entry, "missing")
   end
 
   test "one failed workspace does not prevent the next cleanup and retries when due", ctx do
@@ -323,7 +569,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert WorkspaceCleanup.health(ctx.db).count == 0
   end
 
-  test "a missing artifact does not stop deletion of unrelated files", ctx do
+  test "a missing artifact does not stop archiving other files", ctx do
     missing = Path.join(ctx.workspace, "missing")
     artifact(ctx, missing)
     present = Path.join(ctx.workspace, "present")
@@ -339,7 +585,9 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert Enum.any?(blockers, &(&1.reason == "artifact_missing"))
     refute File.exists?(scratch)
     refute File.exists?(ctx.workspace)
-    assert File.read!(Artifacts.get(ctx.db, kept.artifact_id).home) == "keep"
+    archived = Artifacts.get(ctx.db, kept.artifact_id)
+    assert File.read!(archived.home) == "keep"
+    assert File.read!(Path.join(Path.dirname(archived.home), "scratch")) == "discard"
 
     assert %{count: 0, reasons: [%{completed: true, reason: "artifact_missing", count: 1}]} =
              WorkspaceCleanup.health(ctx.db)
@@ -726,8 +974,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
 
   test "all missing artifacts leave no workspace or empty archive", ctx do
     artifact = artifact(ctx, Path.join(ctx.workspace, "nested/lost"))
-    File.mkdir_p!(Path.join(ctx.workspace, "nested"))
-    File.write!(Path.join(ctx.workspace, "scratch"), "discard")
+    File.write!(Path.join(ctx.workspace, ".DS_Store"), "regenerable")
     retire(ctx)
 
     assert %{status: "completed", blockers: [%{reason: "artifact_missing"}]} =
@@ -750,19 +997,33 @@ defmodule Tightbeam.WorkspaceCleanupTest do
              WorkspaceCleanup.health(ctx.db)
   end
 
-  test "removal reports store counts without paths", ctx do
-    for n <- 1..1000, do: File.write!(Path.join(ctx.workspace, "scratch-#{n}"), "discard")
+  test "archive reports store grouped scope totals for unrecorded files", ctx do
+    reports = Path.join(ctx.workspace, "reports")
+    File.mkdir_p!(reports)
+    for n <- 1..1000, do: File.write!(Path.join(reports, "scratch-#{n}"), "keep")
     retire(ctx)
     report = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
     assert report.status == "completed"
-    assert report.removed_count == 1001
+    assert report.removed_count == 0
 
     {:ok, [[stored]]} =
       DB.query(ctx.db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [
         ctx.session.session_key
       ])
 
-    assert JSON.decode!(stored) == %{"removed_count" => 1001, "blockers" => []}
+    assert JSON.decode!(stored) == %{
+             "removed_count" => 0,
+             "blockers" => [],
+             "archive_created" => true,
+             "unrecorded" => [
+               %{
+                 "path" => "reports",
+                 "entries" => 1001,
+                 "bytes" => 4000,
+                 "disposition" => "archive"
+               }
+             ]
+           }
 
     {:ok, [[event]]} =
       DB.query(
@@ -772,6 +1033,94 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       )
 
     assert JSON.decode!(event) == JSON.decode!(stored)
+  end
+
+  test "archives unrecorded files and symlinks but leaves generated data out", ctx do
+    project = Path.join(ctx.workspace, "project")
+    File.mkdir_p!(Path.join(project, "target"))
+    File.mkdir_p!(Path.join(project, "empty"))
+    File.write!(Path.join(project, "Cargo.toml"), "[package]")
+    File.write!(Path.join(project, "target/generated"), "cache")
+    File.write!(Path.join(project, "notes.txt"), "notes")
+    File.ln_s!("missing-target", Path.join(project, "link"))
+    File.write!(Path.join(ctx.workspace, ".tightbeam-session"), "synthetic metadata")
+    retire(ctx)
+    key = ctx.session.session_key
+
+    assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+    assert %{archive_path: archive} = WorkspaceCleanup.status(ctx.db, key)
+    assert File.read!(Path.join(archive, "project/notes.txt")) == "notes"
+    assert File.read_link!(Path.join(archive, "project/link")) == "missing-target"
+    assert File.dir?(Path.join(archive, "project/empty"))
+    refute File.dir?(Path.join(archive, "project/target"))
+    refute File.exists?(Path.join(archive, ".tightbeam-session"))
+  end
+
+  for {name, key, value, reason} <- [
+        {"entry limit", :workspace_archive_max_entries, 1, "archive_budget_exceeded"},
+        {"byte limit", :workspace_archive_max_bytes, 3, "archive_budget_exceeded"},
+        {"destination reserve", :workspace_archive_reserve_bytes, 10_000_000_000_000_000,
+         "archive_reserve"}
+      ] do
+    test "#{name} holds each scope and binds acknowledgement to its contents", ctx do
+      dir = Path.join(ctx.workspace, "notes")
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "a")
+      File.write!(path, "work")
+      File.write!(Path.join(ctx.workspace, ".DS_Store"), "cache")
+      config = Map.put(ctx.config, unquote(key), unquote(value))
+      key = ctx.session.session_key
+
+      call = fn params ->
+        Gateway.handlers(config)["retire"].(%{
+          origin: "user:owner",
+          principal: {:user, "owner"},
+          session_key: key,
+          params: params
+        })
+      end
+
+      assert %{
+               would_retire: [
+                 %{
+                   archive_path: expected,
+                   unrecorded: [
+                     %{path: "notes", entries: 2, bytes: 4, disposition: "held"}
+                   ]
+                 }
+               ]
+             } = call.(%{dry_run: true})
+
+      assert Org.get(ctx.db, key).state == "active"
+      assert File.read!(path) == "work"
+      assert %{retired_sessions: [%{archive_path: ^expected}]} = call.(%{})
+
+      assert %{status: "incomplete", removed_count: 0} =
+               WorkspaceCleanup.process_session(config, ctx.db, key)
+
+      assert %{
+               held_losses: [%{"detail" => detail}],
+               retired_sessions: [
+                 %{archive_path: ^expected, unrecorded: [%{"entries" => 2, "bytes" => 4}]}
+               ]
+             } = call.(%{})
+
+      assert detail =~ unquote(reason)
+      assert File.exists?(Path.join(ctx.workspace, ".DS_Store"))
+
+      assert %{acknowledged_losses: [_]} = call.(%{acknowledge_loss: true})
+      File.write!(path, "more")
+
+      assert %{status: "incomplete", removed_count: 0} =
+               WorkspaceCleanup.process_session(config, ctx.db, key)
+
+      assert File.read!(path) == "more"
+
+      assert %{acknowledged_losses: [_]} = call.(%{acknowledge_loss: true})
+      assert %{status: "completed"} = WorkspaceCleanup.process_session(config, ctx.db, key)
+      assert %{retired_sessions: [%{archive_path: nil, cleanup: "completed"}]} = call.(%{})
+      refute File.exists?(ctx.workspace)
+    end
   end
 
   test "repeated failures grow the retry interval and doctor groups reasons", ctx do
@@ -806,6 +1155,613 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert %{count: 2, reasons: [%{count: 2, reason: reason}]} = WorkspaceCleanup.health(ctx.db)
     assert reason =~ "cleanup_command_failed"
   end
+
+  describe "uncaptured work is held, never silently removed" do
+    test "a commit on no remote ref holds removal and is named with its remedy path", ctx do
+      repo = init_repo(ctx.workspace, "tb/repo")
+      commit(repo, "work.txt", "unpushed")
+      File.write!(Path.join(ctx.workspace, "scratch"), "discard")
+      retire(ctx)
+
+      report = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert report.status == "incomplete"
+      assert Enum.any?(report.blockers, &(&1.reason == "uncaptured_work"))
+      assert report.removed_count == 0
+      assert File.read!(Path.join(repo, "work.txt")) == "unpushed"
+      assert File.exists?(Path.join(ctx.workspace, "scratch"))
+
+      assert [%{"kind" => "git", "path" => "tb/repo", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+
+      assert detail =~ "unpushed_commits=1"
+      assert WorkspaceCleanup.health(ctx.db).count == 1
+    end
+
+    test "stashes, uncommitted changes and untracked files each hold removal", ctx do
+      for {name, prepare} <- [
+            {"stash", &stash_change/1},
+            {"dirty", &dirty_change/1},
+            {"untracked", &untracked_file/1}
+          ] do
+        repo = init_pushed_repo(ctx, name)
+        prepare.(repo)
+      end
+
+      retire(ctx)
+      report = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+      assert report.status == "incomplete"
+
+      held = WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+      assert Enum.map(held, & &1["path"]) == ["dirty", "stash", "untracked"]
+      assert Enum.at(held, 0)["detail"] =~ "modified=1"
+      assert Enum.at(held, 1)["detail"] =~ "stashes=1"
+      assert Enum.at(held, 2)["detail"] =~ "untracked=1"
+      assert File.dir?(ctx.workspace)
+    end
+
+    test "a local branch with no upstream carrying an unpushed commit holds removal and is named",
+         ctx do
+      repo = init_pushed_repo(ctx, "branches")
+      git!(repo, ["checkout", "-q", "-b", "feature-no-upstream"])
+      commit(repo, "feature.txt", "only on this branch")
+      git!(repo, ["checkout", "-q", "-"])
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert [%{"path" => "branches", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+
+      assert detail =~ "unpushed_commits=1"
+      assert detail =~ "unpushed_refs=heads/feature-no-upstream"
+    end
+
+    test "branches whose commits are all reachable from a remote ref do not hold removal", ctx do
+      repo = init_pushed_repo(ctx, "reachable")
+      git!(repo, ["branch", "no-upstream-but-pushed"])
+      git!(repo, ["tag", "pushed-tag"])
+      retire(ctx)
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      refute File.exists?(ctx.workspace)
+    end
+
+    test "a detached HEAD in a linked worktree outside the workdir holds removal", ctx do
+      repo = init_pushed_repo(ctx, "main-repo")
+      outside = Path.join(ctx.base, "linked-worktree")
+      git!(repo, ["worktree", "add", "-q", "--detach", outside])
+      commit(outside, "detached.txt", "only on a detached HEAD")
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert [%{"path" => "main-repo", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key)
+
+      assert detail =~ "unpushed_refs=detached:"
+    end
+
+    test "a clean checkout with every commit on a remote ref is removed without ceremony", ctx do
+      init_pushed_repo(ctx, "clean")
+      File.write!(Path.join(ctx.workspace, "clean/ignored.log"), "ignored")
+      File.write!(Path.join(ctx.workspace, "clean/.gitignore"), "ignored.log\n")
+      {_, 0} = System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "add", ".gitignore"])
+
+      {_, 0} =
+        System.cmd("git", ["-C", Path.join(ctx.workspace, "clean"), "commit", "-qm", "ignore"])
+
+      {_, 0} =
+        System.cmd("git", [
+          "-C",
+          Path.join(ctx.workspace, "clean"),
+          "push",
+          "-q",
+          "origin",
+          "HEAD"
+        ])
+
+      retire(ctx)
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      refute File.exists?(ctx.workspace)
+      assert WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key) == []
+    end
+
+    test "an in-workspace artifact with no stored content is archived, not lost", ctx do
+      kept = Path.join(ctx.workspace, "reports/evidence.md")
+      File.mkdir_p!(Path.dirname(kept))
+      File.write!(kept, "evidence")
+      artifact = artifact(ctx, kept)
+      retire(ctx)
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      archived = Artifacts.get(ctx.db, artifact.artifact_id)
+      assert archived.state == "archived"
+      assert File.read!(archived.home) == "evidence"
+    end
+
+    test "held work leaves recorded artifacts in place until the loss is acknowledged", ctx do
+      kept = Path.join(ctx.workspace, "reports/evidence.md")
+      File.mkdir_p!(Path.dirname(kept))
+      File.write!(kept, "evidence")
+      artifact = artifact(ctx, kept)
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "unpushed")
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+      assert File.read!(kept) == "evidence"
+    end
+
+    test "acknowledgement records what was accepted and permits only that removal", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "unpushed")
+      retire(ctx)
+      key = ctx.session.session_key
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      assert {:ok, [%{"path" => "repo"}]} =
+               WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+
+      assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      refute File.exists?(ctx.workspace)
+
+      {:ok, [[stored]]} =
+        DB.query(ctx.db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [key])
+
+      assert %{"acknowledged" => [%{"key" => "git:repo@" <> _, "by" => "user:owner", "at" => at}]} =
+               JSON.decode!(stored)
+
+      assert is_integer(at)
+      assert {:error, :nothing_held} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+    end
+
+    test "work that appears after an acknowledgement is held again", ctx do
+      first = init_repo(ctx.workspace, "first")
+      commit(first, "a.txt", "a")
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert {:ok, _} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+      second = init_repo(ctx.workspace, "second")
+      commit(second, "b.txt", "b")
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert File.exists?(Path.join(second, "b.txt"))
+      assert [%{"path" => "second"}] = WorkspaceCleanup.held_losses(ctx.db, key)
+    end
+
+    test "new work in an acknowledged repository is held again", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "a.txt", "a")
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert {:ok, _} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+      commit(repo, "b.txt", "b")
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert File.read!(Path.join(repo, "b.txt")) == "b"
+      assert [%{"path" => "repo", "detail" => detail}] = WorkspaceCleanup.held_losses(ctx.db, key)
+      assert detail =~ "unpushed_commits=2"
+    end
+
+    for {change, filename, detail_field} <- [
+          {:staged, "tracked.txt", "modified"},
+          {:unstaged, "tracked.txt", "modified"},
+          {:untracked, "-new file.txt", "untracked"}
+        ] do
+      test "#{change} file edited after acknowledgement is held again", ctx do
+        repo = init_pushed_repo(ctx, "repo")
+        filename = unquote(filename)
+        path = Path.join(repo, filename)
+        field = unquote(detail_field)
+        File.write!(path, <<0, "original edit">>)
+        if unquote(change) == :staged, do: git!(repo, ["add", "--", filename])
+        retire(ctx)
+        key = ctx.session.session_key
+
+        assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+        assert {:ok, [%{"detail" => original}]} =
+                 WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+
+        File.write!(path, <<0, "a changed edit">>)
+        if unquote(change) == :staged, do: git!(repo, ["add", "--", filename])
+
+        assert %{ok: true, cleanup: "queued"} = WorkspaceCleanup.retry(ctx.db, key)
+
+        assert %{status: "incomplete", removed_count: 0} =
+                 WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+        assert File.read!(path) == <<0, "a changed edit">>
+        assert [%{"detail" => changed}] = WorkspaceCleanup.held_losses(ctx.db, key)
+        assert original =~ "#{field}=1"
+        assert changed =~ "#{field}=1"
+        assert original != changed
+
+        assert {:ok, [_]} = WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+        assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      end
+    end
+
+    test "a bare repository and a clone that pushes to it inside the workdir are both held",
+         ctx do
+      origin = Path.join(ctx.workspace, "origin.git")
+      {_, 0} = System.cmd("git", ["init", "-q", "--bare", origin])
+      app = init_repo(ctx.workspace, "app")
+      git!(app, ["remote", "add", "origin", origin])
+      commit(app, "work.txt", "pushed only to a local bare remote")
+      git!(app, ["push", "-q", "origin", "HEAD"])
+      retire(ctx)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+      held =
+        Map.new(WorkspaceCleanup.held_losses(ctx.db, ctx.session.session_key), &{&1["path"], &1})
+
+      assert Map.keys(held) |> Enum.sort() == ["app", "origin.git"]
+      assert held["app"]["detail"] =~ "workdir_remotes=origin"
+      assert held["origin.git"]["detail"] =~ "bare=1"
+      assert File.dir?(origin)
+    end
+
+    test "a bare clone reports detached commits and stashes made in an external linked worktree",
+         ctx do
+      source = init_pushed_repo(ctx, "source")
+      bare = Path.join(ctx.workspace, "bare.git")
+      remote = Path.join(ctx.base, "remote-source.git")
+      git!(source, ["clone", "-q", "--bare", remote, bare])
+      git!(bare, ["fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*"])
+
+      outside = Path.join(ctx.base, "bare-linked-worktree")
+      git!(bare, ["worktree", "add", "-q", "--detach", outside])
+      commit(outside, "detached.txt", "only on a detached HEAD")
+      stash_change(outside)
+      retire(ctx)
+      key = ctx.session.session_key
+
+      assert %{status: "incomplete", removed_count: 0} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      assert [%{"path" => "bare.git", "detail" => detail}] =
+               WorkspaceCleanup.held_losses(ctx.db, key)
+
+      assert detail =~ "unpushed_refs=detached:"
+      assert detail =~ "stash_entries=stash@{0}"
+      assert File.dir?(bare)
+    end
+
+    test "an absolute local remote resolves symlinks and dot segments before reachability", ctx do
+      origin = Path.join(ctx.workspace, "origin.git")
+      {_, 0} = System.cmd("git", ["init", "-q", "--bare", origin])
+      symlink = Path.join(ctx.base, "origin-link")
+      File.ln_s!(origin, symlink)
+
+      dot_segments =
+        ctx.base <>
+          "/../" <>
+          Path.basename(ctx.base) <>
+          "/" <>
+          Path.relative_to(origin, ctx.base)
+
+      for {name, alias_path} <- [{"dot-segments", dot_segments}, {"symlink", symlink}] do
+        repo = init_repo(ctx.workspace, name)
+        git!(repo, ["remote", "add", "origin", alias_path])
+        commit(repo, "work.txt", "pushed to #{name}")
+        git!(repo, ["push", "-q", "origin", "HEAD:refs/heads/#{name}"])
+      end
+
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      held = Map.new(WorkspaceCleanup.held_losses(ctx.db, key), &{&1["path"], &1["detail"]})
+      assert held["dot-segments"] =~ "workdir_remotes=origin"
+      assert held["dot-segments"] =~ "unpushed_commits=1"
+      assert held["symlink"] =~ "workdir_remotes=origin"
+      assert held["symlink"] =~ "unpushed_commits=1"
+    end
+
+    test "structured loss details include every unpushed ref and stash entry", ctx do
+      repo = init_pushed_repo(ctx, "repo")
+      commit(repo, "feature.txt", "unpushed")
+
+      for n <- 0..11 do
+        git!(repo, ["branch", "feature-#{n}"])
+        File.write!(Path.join(repo, "tracked.txt"), "stashed change #{n}")
+        git!(repo, ["stash"])
+      end
+
+      retire(ctx)
+      key = ctx.session.session_key
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert [%{"detail" => detail}] = WorkspaceCleanup.held_losses(ctx.db, key)
+      assert [_, refs] = Regex.run(~r/unpushed_refs=(\S+)/, detail)
+      assert [_, stashes] = Regex.run(~r/stash_entries=(\S+)/, detail)
+      assert Enum.count(String.split(refs, ",")) == 13
+
+      assert Enum.sort(String.split(stashes, ",")) ==
+               Enum.sort(for n <- 0..11, do: "stash@{#{n}}")
+
+      for n <- 0..11 do
+        assert "heads/feature-#{n}" in String.split(refs, ",")
+      end
+    end
+
+    test "retire --acknowledge-loss releases a stuck hold through the real worker", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "unpushed")
+      key = ctx.session.session_key
+
+      retire_call = fn params ->
+        Gateway.handlers(ctx.config)["retire"].(%{
+          origin: "user:owner",
+          principal: {:user, "owner"},
+          session_key: key,
+          params: params
+        })
+      end
+
+      assert %{code: "invalid"} = retire_call.(%{acknowledge_loss: true})
+      retire(ctx)
+
+      for _ <- 1..3 do
+        assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      end
+
+      assert %{cleanup: "held", blocker_state: "stuck", next_attempt_at: nil} =
+               WorkspaceCleanup.status(ctx.db, key)
+
+      assert %{held_losses: [%{"path" => "repo", "session_key" => ^key}]} = retire_call.(%{})
+      assert File.exists?(Path.join(repo, "work.txt"))
+
+      worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+
+      assert %{acknowledged_losses: [%{"path" => "repo"}]} =
+               retire_call.(%{acknowledge_loss: true})
+
+      :sys.get_state(worker)
+
+      assert [%{cleanup: "completed", archive_path: nil, attempts: 4}] =
+               WorkspaceCleanup.statuses(ctx.db, "owner", ctx.config)
+
+      refute File.exists?(ctx.workspace)
+    end
+
+    test "cleanup write-back preserves consent and retry recorded during a scan", ctx do
+      repo = init_repo(ctx.workspace, "repo")
+      commit(repo, "work.txt", "original")
+      key = ctx.session.session_key
+      retire(ctx)
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+
+      parent = self()
+
+      config =
+        Map.put(ctx.config, :workspace_cleanup_runner, fn invocation, script, manifest ->
+          send(parent, {:scanning, self()})
+
+          receive do
+            :continue -> WorkspaceCleanup.system_runner(invocation, script, manifest)
+          end
+        end)
+
+      scan = Task.async(fn -> WorkspaceCleanup.process_session(config, ctx.db, key) end)
+      assert_receive {:scanning, runner}, 5_000
+
+      assert {:ok, [%{"path" => "repo"}]} =
+               WorkspaceCleanup.acknowledge(ctx.db, key, "user:owner")
+
+      assert %{ok: true} = WorkspaceCleanup.retry(ctx.db, key, "user:owner")
+      File.write!(Path.join(repo, "work.txt"), "changed during scan")
+      send(runner, :continue)
+      assert %{status: "incomplete"} = Task.await(scan, 10_000)
+
+      assert %{cleanup: "queued", next_attempt_at: 0} = WorkspaceCleanup.status(ctx.db, key)
+
+      assert {:ok, [[stored]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1",
+                 [
+                   key
+                 ]
+               )
+
+      assert %{
+               "acknowledged" => [%{"key" => "git:repo@" <> _, "by" => "user:owner"}],
+               "retry_requested" => %{"by" => "user:owner"}
+             } = saved = JSON.decode!(stored)
+
+      refute Map.has_key?(saved, "retry_outcome")
+
+      assert %{status: "incomplete"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, key)
+      assert %{cleanup: "held"} = WorkspaceCleanup.status(ctx.db, key)
+      assert File.read!(Path.join(repo, "work.txt")) == "changed during scan"
+    end
+  end
+
+  describe "a retire removes the whole subtree, so each session is checked" do
+    test "a closed child's unpushed commit is held and the result lists the child", ctx do
+      {child, child_workspace} = child_session(ctx, "closed-child", ctx.session.session_key)
+      child_repo = init_repo(child_workspace, "repo")
+      commit(child_repo, "work.txt", "child work")
+      root_key = ctx.session.session_key
+
+      result = retire_call(ctx, root_key, %{keep_open_descendants: true})
+
+      assert result.retired_session_keys |> Enum.sort() ==
+               Enum.sort([root_key, child.session_key])
+
+      names = Map.new(result.retired_sessions, &{&1.session_key, &1.display_name})
+      assert names == %{root_key => "Example", child.session_key => "Closed child"}
+
+      assert %{status: "completed"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, root_key)
+
+      assert %{status: "incomplete"} =
+               WorkspaceCleanup.process_session(ctx.config, ctx.db, child.session_key)
+
+      assert File.read!(Path.join(child_repo, "work.txt")) == "child work"
+
+      assert %{held_losses: [held]} = retire_call(ctx, root_key, %{})
+      assert %{"session_key" => key, "display_name" => "Closed child", "path" => "repo"} = held
+      assert key == child.session_key
+    end
+
+    test "a protected descendant is kept with its subtree and its workspace is untouched", ctx do
+      ensure_main_session(ctx.db, "owner")
+      {holder, holder_workspace} = child_session(ctx, "holder", ctx.session.session_key)
+      {grandchild, _} = child_session(ctx, "grandchild", holder.session_key)
+      repo = init_repo(holder_workspace, "repo")
+      commit(repo, "work.txt", "holder work")
+
+      {:ok, []} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt) VALUES ('open-one','Ship',?1,?2,1)",
+          [holder.session_key, ctx.session.session_key]
+        )
+
+      assert %{code: "open_descendants"} = retire_call(ctx, ctx.session.session_key, %{})
+      result = retire_call(ctx, ctx.session.session_key, %{keep_open_descendants: true})
+
+      assert result.retired_session_keys == [ctx.session.session_key]
+      assert Org.get(ctx.db, holder.session_key).state == "active"
+      assert Org.get(ctx.db, grandchild.session_key).state == "active"
+      assert File.read!(Path.join(repo, "work.txt")) == "holder work"
+    end
+
+    test "the preview lists every session and its scan and changes nothing", ctx do
+      ensure_main_session(ctx.db, "owner")
+      {child, child_workspace} = child_session(ctx, "closed-child", ctx.session.session_key)
+      {holder, _} = child_session(ctx, "holder", ctx.session.session_key)
+      repo = init_repo(child_workspace, "repo")
+      commit(repo, "work.txt", "child work")
+
+      {:ok, []} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt) VALUES ('open-one','Ship',?1,?2,1)",
+          [holder.session_key, ctx.session.session_key]
+        )
+
+      before = DB.query(ctx.db, "SELECT sessionKey,state FROM sessions ORDER BY sessionKey")
+      cleanup_rows = "SELECT COUNT(*) FROM retired_workspace_cleanup"
+      {:ok, [[0]]} = DB.query(ctx.db, cleanup_rows)
+
+      preview = retire_call(ctx, ctx.session.session_key, %{dry_run: true})
+
+      assert %{dry_run: true, requires_keep_open_descendants: true, sessions_with_held_work: 1} =
+               preview
+
+      by_key = Map.new(preview.would_retire, &{&1.session_key, &1})
+
+      assert Map.keys(by_key) |> Enum.sort() ==
+               Enum.sort([ctx.session.session_key, child.session_key])
+
+      assert %{scan: "ok", losses: []} = by_key[ctx.session.session_key]
+
+      assert %{scan: "ok", display_name: "Closed child", losses: [%{kind: "git", path: "repo"}]} =
+               by_key[child.session_key]
+
+      assert [%{session_key: kept}] = preview.would_keep
+      assert kept == holder.session_key
+
+      assert before ==
+               DB.query(ctx.db, "SELECT sessionKey,state FROM sessions ORDER BY sessionKey")
+
+      assert {:ok, [[0]]} = DB.query(ctx.db, cleanup_rows)
+      assert File.read!(Path.join(repo, "work.txt")) == "child work"
+      assert Org.get(ctx.db, ctx.session.session_key).state == "active"
+    end
+  end
+
+  defp child_session(ctx, slug, parent_key) do
+    child =
+      Org.create(ctx.db, %{
+        session_key: slug,
+        display_name: slug |> String.replace("-", " ") |> String.capitalize(),
+        kind: "custom",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        spawned_by: parent_key,
+        archetype: "default",
+        host: Placement.local_host_name(),
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("example")
+      })
+
+    workspace = Placement.workdir_path(ctx.config, child)
+    File.mkdir_p!(workspace)
+    {child, workspace}
+  end
+
+  defp retire_call(ctx, key, params) do
+    Gateway.handlers(ctx.config)["retire"].(%{
+      origin: "user:owner",
+      principal: {:user, "owner"},
+      session_key: key,
+      params: params
+    })
+  end
+
+  defp git!(repo, args) do
+    {_, 0} =
+      System.cmd(
+        "git",
+        ["-c", "user.name=t", "-c", "user.email=t@example.com", "-C", repo | args],
+        stderr_to_stdout: true
+      )
+  end
+
+  defp init_repo(workspace, name) do
+    repo = Path.join(workspace, name)
+    File.mkdir_p!(repo)
+    git!(repo, ["init", "-q"])
+    repo
+  end
+
+  defp commit(repo, file, content) do
+    File.write!(Path.join(repo, file), content)
+    git!(repo, ["add", file])
+    git!(repo, ["commit", "-qm", "add " <> file])
+  end
+
+  # A checkout whose only commit is on a remote ref, like a clean clone.
+  defp init_pushed_repo(ctx, name) do
+    remote = Path.join(ctx.base, "remote-#{name}.git")
+    {_, 0} = System.cmd("git", ["init", "-q", "--bare", remote])
+    repo = init_repo(ctx.workspace, name)
+    commit(repo, "tracked.txt", "tracked")
+    git!(repo, ["remote", "add", "origin", remote])
+    git!(repo, ["push", "-q", "origin", "HEAD"])
+    repo
+  end
+
+  defp stash_change(repo) do
+    File.write!(Path.join(repo, "tracked.txt"), "changed")
+    git!(repo, ["stash"])
+  end
+
+  defp dirty_change(repo), do: File.write!(Path.join(repo, "tracked.txt"), "changed")
+  defp untracked_file(repo), do: File.write!(Path.join(repo, "new.txt"), "new")
 
   defp retire(ctx) do
     {:ok, _} =

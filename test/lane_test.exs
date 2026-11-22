@@ -100,6 +100,47 @@ defmodule Tightbeam.LaneTest do
     send(next_worker, :finish)
   end
 
+  test "a change that fails inside the lane leaves the lane and its running turn alive", ctx do
+    parent = self()
+    seq = enqueue!(ctx.db, "k1", "first")
+
+    runner = fn turn ->
+      send(parent, {:failing_change_turn, turn.prompt, self()})
+
+      receive do
+        :finish -> {:ok, %{text: turn.prompt}}
+      end
+    end
+
+    lane =
+      start_supervised!(
+        {SessionLane, session_key: "k1", db: ctx.db, task_sup: ctx.task_sup, runner: runner}
+      )
+
+    assert_receive {:failing_change_turn, "first", worker}, 1_000
+
+    # A configuration callback whose own call exits, as an adapter call that
+    # times out does, reaches the caller that supplied it.
+    assert {:deliberate_change_exit, _} =
+             catch_exit(
+               SessionLane.change_at_boundary(
+                 "k1",
+                 fn -> flunk("must not apply while the turn is running") end,
+                 fn -> exit({:deliberate_change_exit, :timeout}) end
+               )
+             )
+
+    assert Process.alive?(lane)
+    assert [{^lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k1")
+
+    send(worker, :finish)
+
+    assert eventually(fn ->
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]) ==
+               {:ok, [["delivered"]]}
+           end)
+  end
+
   test "a rolled-back runtime swap leaves its accepted change pending", %{db: db} do
     %{change_id: id} = Tightbeam.RuntimeChanges.enqueue(db, "k1", %{harness: "codex"})
 
@@ -1045,7 +1086,24 @@ defmodule Tightbeam.LaneTest do
 
   test "a placement refusal reaches the turn publisher by name, not as task_crash", ctx do
     parent = self()
-    seq = enqueue!(ctx.db, "k1", "vanished host")
+    seq = enqueue!(ctx.db, "k2", "[assignment: asg_placement]\n\nvanished host")
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=NULL WHERE sessionKey='k2'")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments (id,subject,holderKey,openedBySession,openedAt,state)
+               VALUES ('asg_placement','review','k2','k1',1,'open')
+               """
+             )
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE turns SET assignmentId='asg_placement' WHERE seq=?1", [seq])
+
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
 
     expected =
       "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> " <>
@@ -1065,16 +1123,22 @@ defmodule Tightbeam.LaneTest do
         end,
         interval: 60_000,
         terminal_publisher: fn payload -> send(parent, {:turn_payload, payload}) end,
+        on_terminal: fn _session, terminal_seq ->
+          send(
+            parent,
+            {:recognized, Tightbeam.Productions.Bubble.recognize_terminal(ctx.db, terminal_seq)}
+          )
+        end,
         name: :placement_refusal_lane_manager
       )
 
-    :ok = LaneManager.ensure_lane(:placement_refusal_lane_manager, "k1")
+    :ok = LaneManager.ensure_lane(:placement_refusal_lane_manager, "k2")
 
     assert_receive {:turn_payload,
                     %{
                       status: "failed",
                       error: error,
-                      session_key: "k1"
+                      session_key: "k2"
                     }}
 
     assert error == expected
@@ -1084,6 +1148,19 @@ defmodule Tightbeam.LaneTest do
 
     assert status == "failed"
     assert stored_error == expected
+    assert_receive {:recognized, :ok}
+
+    assert {:ok, [["k1", content]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,content FROM messages WHERE clientMessageId=?1",
+               [
+                 "wake-undelivered:#{seq}"
+               ]
+             )
+
+    assert content =~ "Reason: " <> expected
+    assert Ledger.pending_count(ctx.db, "k1") == 0
   end
 
   defp eventually(fun, tries \\ 60) do

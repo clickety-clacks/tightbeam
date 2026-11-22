@@ -7,16 +7,21 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   identity repository so it survives a refused boot without becoming served law.
   """
 
-  alias Tightbeam.{DB, Identity}
+  alias Tightbeam.{AdminProjection, DB, Identity}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Identity.{Provenance, TomlEdit}
 
   @report_name "rail-scope-migration-report.json"
   @migration_id "rail-scope-v1"
+  # One reaction name per seed file: the file is planted once and carries all
+  # of its reactions.
   @seed_reactions %{
     "assignment-terminal-handoff" => "rules/row-reaction-handoff.toml",
-    "terminal-child-action-reminder" => "rules/row-reaction-terminal-action.toml"
+    "r04-work-item-notice" => "rules/row-reaction-work-items.toml"
   }
+  # Shipped in 0.1.16 and no longer shipped: an unedited legacy copy is removed
+  # and not replanted, while pending rows keep their substrate rule name.
+  @retired_seed_reactions ["terminal-child-action-reminder"]
   @seed_rails %{
     "github-auth" => "rails/github-auth.toml",
     "tightbeam-probe" => "rails/tightbeam-probe.toml"
@@ -183,6 +188,21 @@ defmodule Tightbeam.Identity.RailScopeMigration do
                  if plan.identity_changed? do
                    candidate_revision = apply_identity_plan!(dir, plan, revision)
                    :ok = publish_identity!(base_dir, revision, candidate_revision)
+
+                   # Bootstrap only seeds absent rows. Advance the existing served
+                   # stamp with the same snapshot and allocator as publication, in
+                   # this transaction so a failed migration rolls both back.
+                   identity = AdminProjection.served_identity_entry(txn, base_dir)
+
+                   AdminProjection.allocate_in_txn(
+                     txn,
+                     "identity",
+                     "served",
+                     System.system_time(:millisecond),
+                     fingerprint: AdminProjection.fingerprint(identity.item),
+                     item: JSON.encode!(identity.item)
+                   )
+
                    candidate_revision
                  else
                    revision
@@ -255,7 +275,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
       archetypes: archetypes,
       name_map: name_map,
       rail_map: %{},
-      reaction_names: Map.keys(@seed_reactions),
+      reaction_names: Map.keys(@seed_reactions) ++ @retired_seed_reactions,
       writes: %{},
       removals: reaction_scan.removed_paths,
       skip_paths: reaction_scan.candidate_paths,
@@ -604,6 +624,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
            ), changes}
       end
 
+    rail = declare_legacy_accountable_notice(key, rail)
     context = migration_context(key, rail)
 
     {rail, condition_changes} =
@@ -614,6 +635,19 @@ defmodule Tightbeam.Identity.RailScopeMigration do
   end
 
   defp migrate_rail(other, _key, _path, _owner, _owned, _name_map, changes), do: {other, changes}
+
+  # Earlier releases gave the substrate a built-in exemption for the completion
+  # review rail, found by its name. The exemption is now data the rail declares,
+  # so a rail learned before the change gets the declaration here; without it the
+  # rail would no longer load. Only this migration knows the legacy name.
+  defp declare_legacy_accountable_notice(
+         "rule",
+         %{"name" => "completion-requires-review", "remedy" => %{"action" => "wake"} = remedy} =
+           rail
+       ),
+       do: %{rail | "remedy" => Map.put_new(remedy, "accountable_notice", true)}
+
+  defp declare_legacy_accountable_notice(_key, rail), do: rail
 
   defp migration_context("rule", rail) do
     verbs = List.wrap(Map.get(rail, "verb")) ++ List.wrap(Map.get(rail, "verbs"))
@@ -935,6 +969,7 @@ defmodule Tightbeam.Identity.RailScopeMigration do
 
   defp plan_seed_reactions(plan, seed_reactions, reaction_scan) do
     substrate_reactions = substrate_reaction_index(plan)
+    bundle_reactions = reaction_index(plan, &match?({:kungfu, _}, &1))
 
     Enum.reduce(@seed_reactions, plan, fn {name, relative}, acc ->
       existing = Map.get(substrate_reactions, name, [])
@@ -950,6 +985,12 @@ defmodule Tightbeam.Identity.RailScopeMigration do
             )
 
           %{acc | stops: [stop | acc.stops]}
+
+        # Keep a scoped handoff already owned by a receipt. Startup supplies
+        # the default for other participants, and import restores the stock seed.
+        name == "assignment-terminal-handoff" and existing == [] and
+            Map.has_key?(bundle_reactions, name) ->
+          acc
 
         existing == [] ->
           case Map.fetch(seed_reactions, relative) do
@@ -1210,7 +1251,15 @@ defmodule Tightbeam.Identity.RailScopeMigration do
     try do
       write_identity_plan!(scratch, plan)
       git!(scratch, ["add", "-A"])
-      git!(scratch, ["commit", "-m", "identity: namespace upstream rail baseline"], "tightbeam")
+
+      args =
+        Identity.without_auto_maintenance([
+          "commit",
+          "-m",
+          "identity: namespace upstream rail baseline"
+        ])
+
+      git!(scratch, args, "tightbeam")
       git_output!(scratch, ["rev-parse", "HEAD"])
     after
       git!(dir, ["worktree", "remove", "--force", scratch])
@@ -1840,10 +1889,12 @@ defmodule Tightbeam.Identity.RailScopeMigration do
     end)
   end
 
-  defp substrate_reaction_index(plan) do
+  defp substrate_reaction_index(plan), do: reaction_index(plan, &(&1 == :substrate))
+
+  defp reaction_index(plan, owner?) do
     merged_entries(plan)
     |> Enum.filter(fn {path, _} ->
-      scoped_rail_path?(path) and owner_for_destination(plan, path) == :substrate
+      scoped_rail_path?(path) and owner?.(owner_for_destination(plan, path))
     end)
     |> Enum.reduce(%{}, fn {path, bytes}, index ->
       case Toml.decode(bytes) do

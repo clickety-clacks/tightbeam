@@ -60,6 +60,7 @@ defmodule Tightbeam.Firehose.Registry do
     {"artifact.recorded", "artifacts", "upsert", "artifactId"},
     {"artifact.archived", "artifacts", "upsert", "artifactId"},
     {"artifact.released", "artifacts", "upsert", "artifactId"},
+    {"artifact.custody_pinned", "artifacts", "upsert", "artifactId"},
     {"read_marker.updated", "read-markers", "upsert", "scopeKey"},
     {"message.created", "messages", "upsert", "messageId"},
     {"transition.recorded", "messages", "upsert", "messageId"},

@@ -200,7 +200,7 @@ defmodule Tightbeam.SessionDiagnoseTest do
 
     assert data["applicationDraining"]
     assert data["reservationGate"] == false
-    assert data["parkGate"] == "unavailable_without_db_query"
+    assert data["parkGate"] == %{"status" => "not_fenced_at_last_start_attempt"}
     assert :sys.get_state(pid) == state
   end
 
@@ -222,7 +222,7 @@ defmodule Tightbeam.SessionDiagnoseTest do
     assert data["reservationGate"] == true
     assert data["lane"]["recorded"]["settlementRechecking"] == true
     assert data["lane"]["recorded"]["deferredDrain"] == true
-    assert data["parkGate"] == "unavailable_without_db_query"
+    assert data["parkGate"] == %{"status" => "not_fenced_at_last_start_attempt"}
     assert :sys.get_state(pid) == state
   end
 

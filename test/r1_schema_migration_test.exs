@@ -12,7 +12,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     db: db
   } do
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["session-custody-artifact-process-attribution-v1-0117"]]
+    assert shape(db) == [["holder-role-provenance-v1-0118"]]
     assert_columns(db)
     seed(db)
     assert rows(db, "SELECT reminderState FROM assignments") == [[nil]]
@@ -32,7 +32,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     facts = rows(db, "SELECT * FROM condition_facts")
     objects = guards(db)
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["session-custody-artifact-process-attribution-v1-0117"]]
+    assert shape(db) == [["holder-role-provenance-v1-0118"]]
     # Preserve every historical value despite Firehose's explicit table rebuild.
     assert rows(db, "SELECT #{Enum.join(assignment_columns, ",")} FROM assignments") ==
              assignments
@@ -79,6 +79,11 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     before = snapshot(db)
     assert_raise DB.Error, fn -> Schema.ensure_all(db) end
     assert snapshot(db) == before
+
+    assert rows(
+             db,
+             "SELECT name FROM sqlite_master WHERE name LIKE 'harness_compaction_observations%'"
+           ) == []
 
     assert rows(
              db,

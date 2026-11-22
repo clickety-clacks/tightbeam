@@ -17,6 +17,20 @@ defmodule Tightbeam.WorkspaceCleanup do
     "ServerAliveCountMax=2"
   ]
   @default_runner_timeout_ms 900_000
+  @default_stuck_attempts 3
+  @external_resource Path.join(__DIR__, "workspace_inventory.py")
+  @inventory_script File.read!(@external_resource)
+  @archive_limits %{
+    workspace_archive_max_entries: 5_000,
+    workspace_archive_max_bytes: 200 * 1024 * 1024,
+    workspace_archive_reserve_bytes: 50 * 1024 * 1024 * 1024,
+    workspace_archive_reserve_percent: 5
+  }
+
+  @local_archived_home """
+  state='archived' AND (originHost=?2 OR originHost IS NULL)
+    AND (home=?1 OR substr(home,1,length(?1)+1)=?1 || '/')
+  """
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -50,7 +64,7 @@ defmodule Tightbeam.WorkspaceCleanup do
         {:ok, rows} =
           DB.query(
             state.db,
-            "SELECT sessionKey,nextAt FROM retired_workspace_cleanup WHERE completed=0 ORDER BY nextAt,sessionKey LIMIT 1"
+            "SELECT sessionKey,nextAt FROM retired_workspace_cleanup WHERE completed=0 AND COALESCE(reason,'') NOT LIKE 'stuck:%' ORDER BY nextAt,sessionKey LIMIT 1"
           )
 
         case rows do
@@ -119,10 +133,10 @@ defmodule Tightbeam.WorkspaceCleanup do
   def archive_root(host), do: Path.join(host.base_dir, "archive")
 
   defp relocate_archive(config, db, failures, backoff) do
-    source = Path.join(config.base_dir, "archive")
-    destination = archive_root(%{ssh: nil, base_dir: config.base_dir})
+    source = Path.expand(Path.join(config.base_dir, "archive"))
+    destination = Path.expand(archive_root(%{ssh: nil, base_dir: config.base_dir}))
 
-    if Path.expand(source) != Path.expand(destination) do
+    if source != destination do
       if relative_inside(destination, source) != nil or
            relative_inside(source, destination) != nil,
          do: raise(ArgumentError, "archive relocation directories overlap")
@@ -131,7 +145,13 @@ defmodule Tightbeam.WorkspaceCleanup do
       {:ok, rows} =
         DB.query(
           db,
-          "SELECT home FROM artifacts WHERE state='archived' AND (originHost=?2 OR originHost IS NULL) AND substr(home,1,length(?1)+1)=?1 || '/' UNION SELECT archivePath FROM retired_workspace_cleanup WHERE substr(archivePath,1,length(?1)+1)=?1 || '/' AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?2)",
+          """
+          SELECT home FROM artifacts WHERE #{@local_archived_home} AND home<>?1
+          UNION
+          SELECT archivePath FROM retired_workspace_cleanup
+          WHERE substr(archivePath,1,length(?1)+1)=?1 || '/'
+            AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?2)
+          """,
           [source, Tightbeam.Placement.local_host_name()]
         )
 
@@ -224,20 +244,26 @@ defmodule Tightbeam.WorkspaceCleanup do
         raise "archive move exited with status #{status}: #{String.trim(output)}"
     end
 
-    {:ok, :ok} =
+    {:ok, missing} =
       DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          "SELECT artifactId,home FROM artifacts WHERE state='archived' AND (originHost=?2 OR originHost IS NULL) AND (home=?1 OR substr(home,1,length(?1)+1)=?1 || '/')",
-          [old, Tightbeam.Placement.local_host_name()]
-        )
-        |> Enum.each(fn [id, home] ->
-          Tightbeam.Artifacts.repoint_archive_in_txn(
+        missing =
+          Txn.q(
             txn,
-            id,
-            target <> String.replace_prefix(home, old, "")
+            "SELECT artifactId,home FROM artifacts WHERE #{@local_archived_home}",
+            [old, Tightbeam.Placement.local_host_name()]
           )
-        end)
+          |> Enum.reduce([], fn [id, home], missing ->
+            mapped = target <> String.replace_prefix(home, old, "")
+
+            case File.stat(mapped) do
+              {:ok, _} ->
+                Tightbeam.Artifacts.repoint_archive_in_txn(txn, id, mapped)
+                missing
+
+              {:error, reason} ->
+                [{id, mapped, reason} | missing]
+            end
+          end)
 
         Txn.q(
           txn,
@@ -245,10 +271,24 @@ defmodule Tightbeam.WorkspaceCleanup do
           [old, target, Tightbeam.Placement.local_host_name()]
         )
 
-        :ok
+        missing
       end)
 
-    :ok
+    Enum.each(missing, fn {id, mapped, reason} ->
+      Logger.warning(
+        "archive relocation kept the old home for #{id}: #{mapped} unavailable (#{reason})"
+      )
+    end)
+
+    case missing do
+      [] ->
+        :ok
+
+      missing ->
+        if Enum.all?(missing, fn {_, _, reason} -> reason in [:enoent, :enotdir] end),
+          do: :missing,
+          else: :retry
+    end
   rescue
     error ->
       Logger.warning("archive relocation deferred for #{entry}: #{Exception.message(error)}")
@@ -264,6 +304,32 @@ defmodule Tightbeam.WorkspaceCleanup do
   end
 
   defp archive_name(key), do: Base.url_encode64(key, padding: false)
+
+  def archive_destination(host, key),
+    do: Path.join(Path.expand(archive_root(host)), archive_name(key))
+
+  def projected_archive(config, db, session) do
+    hosts = Tightbeam.Placement.hosts(config.base_dir, db)
+    archive_destination(Map.fetch!(hosts, session.host), session.session_key)
+  rescue
+    _ -> nil
+  end
+
+  defp archive_limits(config) do
+    Enum.map(
+      [
+        :workspace_archive_max_entries,
+        :workspace_archive_max_bytes,
+        :workspace_archive_reserve_bytes,
+        :workspace_archive_reserve_percent
+      ],
+      fn key ->
+        limit = Map.get(config, key, Application.get_env(:tightbeam, key, @archive_limits[key]))
+        if not (is_integer(limit) and limit >= 0), do: raise(ArgumentError, "invalid #{key}")
+        limit
+      end
+    )
+  end
 
   defp move_script(timeout_ms \\ @default_runner_timeout_ms) do
     """
@@ -310,6 +376,8 @@ defmodule Tightbeam.WorkspaceCleanup do
   end
 
   def process_session(config, db, key) do
+    previous = stored_report(db, key)
+
     report =
       try do
         session = Tightbeam.Org.get(db, key)
@@ -321,7 +389,9 @@ defmodule Tightbeam.WorkspaceCleanup do
         if relative_inside(root, workspace) != nil or relative_inside(workspace, root) != nil,
           do: raise(ArgumentError, "archive directory overlaps workspace")
 
-        destination = Path.join(root, archive_name(key))
+        destination = archive_destination(host, key)
+
+        acknowledged = previous |> Map.get("acknowledged", []) |> Enum.map(& &1["key"])
 
         {:ok, [[destination]]} =
           DB.query(
@@ -337,6 +407,8 @@ defmodule Tightbeam.WorkspaceCleanup do
           hosts: hosts,
           workspace: workspace,
           archive_path: destination,
+          acknowledged_losses: acknowledged,
+          archive_limits: archive_limits(config),
           runner: Map.get(config, :workspace_cleanup_runner),
           runner_timeout_ms:
             Map.get(config, :workspace_cleanup_timeout_ms, @default_runner_timeout_ms)
@@ -348,27 +420,17 @@ defmodule Tightbeam.WorkspaceCleanup do
           failed_report([session_key: key], "cleanup_failed", "#{kind}: #{inspect(error)}")
       end
 
-    {:ok, [[attempts]]} =
-      DB.query(db, "SELECT attempts FROM retired_workspace_cleanup WHERE sessionKey=?1", [key])
+    {:ok, retry_outcome} =
+      DB.transaction(db, fn txn -> record_pass_in_txn(txn, key, report, previous, config) end)
 
-    summary = report_summary(report)
-
-    reason =
-      report.blockers |> Enum.map(& &1.reason) |> Enum.uniq() |> Enum.sort() |> Enum.join(", ")
-
-    {:ok, _} =
-      DB.query(
+    if retry_outcome do
+      EventLog.lifecycle(
         db,
-        "UPDATE retired_workspace_cleanup SET completed=?2, nextAt=?3, report=?4, reason=?5, attempts=attempts+1 WHERE sessionKey=?1",
-        [
-          key,
-          if(report.status == "completed", do: 1, else: 0),
-          System.system_time(:millisecond) +
-            min(300_000 * Integer.pow(2, min(attempts, 8)), 86_400_000),
-          JSON.encode!(summary),
-          if(reason == "", do: nil, else: reason)
-        ]
+        "retired_workspace_cleanup_retry_outcome",
+        key,
+        JSON.encode!(Map.put(retry_outcome, "session_key", key))
       )
+    end
 
     if report.status != "completed",
       do: Logger.warning("workspace cleanup incomplete #{key}: #{inspect(report.blockers)}")
@@ -376,8 +438,75 @@ defmodule Tightbeam.WorkspaceCleanup do
     report
   end
 
-  def health(db \\ DB, owner \\ nil) do
-    {:ok, rows} =
+  defp record_pass_in_txn(txn, key, report, previous, config) do
+    [[attempts, raw_report]] =
+      Txn.q(txn, "SELECT attempts,report FROM retired_workspace_cleanup WHERE sessionKey=?1", [
+        key
+      ])
+
+    current = decoded_report(raw_report)
+    completed? = report.status == "completed"
+
+    # The scan only used the requests it saw at startup. Leave any newer request
+    # queued so the next pass can apply it to a fresh inventory.
+    requeued? =
+      not completed? and
+        (current["acknowledged"] != previous["acknowledged"] or
+           current["retry_requested"] != previous["retry_requested"])
+
+    summary = report_summary(report, current)
+
+    {summary, stuck?} =
+      if completed? or requeued?,
+        do: {summary, false},
+        else: track_blocker_streak(summary, current, config)
+
+    requested_retry = current["retry_requested"]
+
+    retry_outcome =
+      if requested_retry && requested_retry == previous["retry_requested"] &&
+           get_in(current, ["retry_outcome", "requested_at"]) != requested_retry["at"] do
+        %{
+          "requested_at" => requested_retry["at"],
+          "completed" => completed?,
+          "status" => if(stuck?, do: "stuck", else: report.status),
+          "blockers" => Map.get(summary, :blocker_details, [])
+        }
+      end
+
+    summary = if retry_outcome, do: Map.put(summary, :retry_outcome, retry_outcome), else: summary
+
+    reason =
+      report.blockers |> Enum.map(& &1.reason) |> Enum.uniq() |> Enum.sort() |> Enum.join(", ")
+
+    reason = if stuck? and reason != "", do: "stuck: " <> reason, else: reason
+
+    next_at =
+      if requeued?,
+        do: 0,
+        else:
+          System.system_time(:millisecond) +
+            min(300_000 * Integer.pow(2, min(attempts, 8)), 86_400_000)
+
+    Txn.q(
+      txn,
+      "UPDATE retired_workspace_cleanup SET completed=?2, nextAt=?3, report=?4, reason=?5, attempts=attempts+1 WHERE sessionKey=?1",
+      [
+        key,
+        if(completed?, do: 1, else: 0),
+        next_at,
+        JSON.encode!(summary),
+        if(requeued? or reason == "", do: nil, else: reason)
+      ]
+    )
+
+    retry_outcome
+  end
+
+  def health(db \\ DB, owner \\ nil, config \\ nil) do
+    rows = statuses(db, owner, config)
+
+    {:ok, grouped} =
       DB.query(
         db,
         "SELECT completed,COALESCE(reason,'cleanup pending'),COUNT(*) FROM retired_workspace_cleanup c LEFT JOIN sessions s ON s.sessionKey=c.sessionKey WHERE (completed=0 OR reason IS NOT NULL) AND (?1 IS NULL OR s.ownerUserId=?1) GROUP BY completed,reason ORDER BY completed,reason",
@@ -386,11 +515,16 @@ defmodule Tightbeam.WorkspaceCleanup do
 
     %{
       count:
-        Enum.reduce(rows, 0, fn [done, _, n], count ->
-          if done == 0, do: count + n, else: count
+        Enum.reduce(grouped, 0, fn [done, _, count], total ->
+          if done == 0, do: total + count, else: total
         end),
+      by_state:
+        rows
+        |> Enum.reject(&(&1.cleanup == "completed"))
+        |> Enum.frequencies_by(& &1.cleanup),
+      sessions: Enum.map(rows, &Map.drop(&1, [:unrecorded, :losses])),
       reasons:
-        Enum.map(rows, fn [done, reason, count] ->
+        Enum.map(grouped, fn [done, reason, count] ->
           %{completed: done == 1, reason: reason, count: count}
         end)
     }
@@ -481,7 +615,10 @@ defmodule Tightbeam.WorkspaceCleanup do
            plan.keep,
            Keyword.get(opts, :archive_path),
            Keyword.get(opts, :runner),
-           Keyword.get(opts, :runner_timeout_ms, @default_runner_timeout_ms)
+           Keyword.get(opts, :runner_timeout_ms, @default_runner_timeout_ms),
+           Keyword.get(opts, :acknowledged_losses, []),
+           Keyword.get(opts, :archive_limits, archive_limits(%{})),
+           false
          ) do
       {:ok, execution} ->
         if execution.status == "completed" and Keyword.get(opts, :archive_path) do
@@ -538,11 +675,476 @@ defmodule Tightbeam.WorkspaceCleanup do
     |> Map.merge(%{removed_count_complete: false, result_confirmed: false})
   end
 
-  defp report_summary(report),
-    do: %{
+  # The stored report carries the operator's loss acknowledgements across
+  # cleanup runs; a run never drops them.
+  defp report_summary(report, stored \\ %{}) do
+    losses = report |> Map.get(:losses, []) |> Enum.map(&Map.take(&1, [:kind, :path, :detail]))
+
+    summary = %{
       removed_count: report.removed_count,
       blockers: report.blockers |> Enum.map(& &1.reason) |> Enum.uniq()
     }
+
+    summary =
+      if report.status == "completed" or report.blockers == [],
+        do: summary,
+        else:
+          Map.put(
+            summary,
+            :blocker_details,
+            Enum.map(report.blockers, &Map.take(&1, [:reason, :path, :detail, :exit]))
+          )
+
+    summary = if losses == [], do: summary, else: Map.put(summary, :losses, losses)
+
+    summary =
+      summary
+      |> Map.put(:archive_created, Map.get(report, :archive_created, false))
+      |> Map.put(:unrecorded, Map.get(report, :unrecorded, []))
+
+    summary =
+      case Map.get(stored, "acknowledged", []) do
+        [] -> summary
+        acknowledged -> Map.put(summary, :acknowledged, acknowledged)
+      end
+
+    case Map.get(stored, "retry_requested") do
+      nil ->
+        summary
+
+      retry_requested ->
+        summary = Map.put(summary, :retry_requested, retry_requested)
+
+        case Map.get(stored, "retry_outcome") do
+          nil -> summary
+          retry_outcome -> Map.put(summary, :retry_outcome, retry_outcome)
+        end
+    end
+  end
+
+  defp stored_report(db, key) do
+    with {:ok, [[json]]} when is_binary(json) <-
+           DB.query(db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [key]),
+         {:ok, %{} = report} <- JSON.decode(json) do
+      report
+    else
+      _ -> %{}
+    end
+  end
+
+  @doc """
+  Read-only preview for sessions that are still active: scans each session's
+  workspace on its own host for work a retirement would hold back, without
+  changing anything. Returns one entry per key with `scan: "ok"` and the
+  losses, or `scan: "unavailable"` and a reason when the host cannot be read.
+  """
+  def preview(config, db, session_keys) do
+    timeout = Map.get(config, :workspace_cleanup_scan_timeout_ms, 60_000)
+
+    session_keys
+    |> Task.async_stream(&preview_one(config, db, &1, timeout),
+      max_concurrency: 4,
+      timeout: timeout + 10_000,
+      on_timeout: :kill_task,
+      ordered: true
+    )
+    |> Enum.zip(session_keys)
+    |> Enum.map(fn
+      {{:ok, entry}, _key} -> entry
+      {{:exit, reason}, key} -> preview_entry(db, key, {:unavailable, inspect(reason)})
+    end)
+  end
+
+  defp preview_one(config, db, key, timeout) do
+    result =
+      try do
+        session = Tightbeam.Org.get(db, key)
+        hosts = Tightbeam.Placement.hosts(config.base_dir, db)
+        host = Map.fetch!(hosts, session.host)
+        workspace = Tightbeam.Placement.workdir_path(config, session)
+
+        with {:ok, {:ok, keep}} <-
+               DB.transaction(db, fn txn ->
+                 protection_plan(txn, session.host, host, hosts, workspace)
+               end),
+             {:ok, execution} <-
+               execute(
+                 host,
+                 workspace,
+                 keep,
+                 archive_destination(host, key),
+                 Map.get(config, :workspace_cleanup_runner),
+                 timeout,
+                 [],
+                 archive_limits(config),
+                 true
+               ) do
+          if execution.result_confirmed and
+               Enum.all?(execution.blockers, &(&1.reason == "artifact_missing")),
+             do:
+               {:ok, execution.losses, execution.unrecorded, session.host,
+                archive_destination(host, key)},
+             else: {:unavailable, inspect(Enum.map(execution.blockers, & &1.reason))}
+        else
+          {:ok, {:error, blocker}} -> {:unavailable, inspect(blocker)}
+          {:error, blocker} -> {:unavailable, inspect(blocker)}
+          other -> {:unavailable, inspect(other)}
+        end
+      rescue
+        error -> {:unavailable, Exception.message(error)}
+      catch
+        kind, reason -> {:unavailable, "#{kind}: #{inspect(reason)}"}
+      end
+
+    preview_entry(db, key, result)
+  end
+
+  defp preview_entry(db, key, {:ok, losses, unrecorded, host, destination}) do
+    %{
+      session_key: key,
+      display_name: display_name(db, key),
+      scan: "ok",
+      archive_host: host,
+      archive_path: destination,
+      unrecorded: unrecorded,
+      losses: Enum.map(losses, &Map.take(&1, [:kind, :path, :detail]))
+    }
+  end
+
+  defp preview_entry(db, key, {:unavailable, reason}) do
+    %{
+      session_key: key,
+      display_name: display_name(db, key),
+      scan: "unavailable",
+      detail: reason,
+      losses: []
+    }
+  end
+
+  defp display_name(db, key) do
+    case Tightbeam.Org.get(db, key) do
+      %{display_name: name} -> name
+      _ -> nil
+    end
+  end
+
+  @doc """
+  Where a retired session's workspace cleanup stands, from its queue row and
+  stored report: `queued` (not yet attempted), `completed`, `held` (work is
+  waiting for acknowledgement), or `blocked` (attempts fail; `reasons` names
+  why). Returns `nil` when the session has no cleanup row.
+  """
+  def status(db, key) do
+    case DB.query(
+           db,
+           "SELECT completed, attempts, nextAt, reason, archivePath, report FROM retired_workspace_cleanup WHERE sessionKey=?1",
+           [key]
+         ) do
+      {:ok, [[1, attempts, _next, _reason, path, report]]} ->
+        report = decoded_report(report)
+        archived = Map.get_lazy(report, "archive_created", fn -> recorded_archive?(db, path) end)
+
+        %{
+          cleanup: "completed",
+          reasons: Map.get(report, "blockers", []),
+          blockers: Map.get(report, "blocker_details", []),
+          operator_action: nil,
+          archive_path: if(archived, do: path),
+          unrecorded: Map.get(report, "unrecorded", []),
+          losses: Map.get(report, "losses", []),
+          attempts: attempts,
+          next_attempt_at: nil
+        }
+
+      {:ok, [[0, attempts, next_at, nil, path, raw_report]]} ->
+        report = decoded_report(raw_report)
+
+        %{
+          cleanup: "queued",
+          reasons: [],
+          blockers: [],
+          archive_path: path,
+          unrecorded: Map.get(report, "unrecorded", []),
+          losses: Map.get(report, "losses", []),
+          attempts: attempts,
+          next_attempt_at: next_at
+        }
+
+      {:ok, [[0, attempts, next_at, reason, path, report]]} ->
+        report = decoded_report(report)
+
+        reasons =
+          Map.get(
+            report,
+            "blockers",
+            if(is_binary(reason), do: String.split(reason, ", "), else: [])
+          )
+
+        held? = "uncaptured_work" in reasons
+        stuck? = Map.get(report, "stuck", false) or String.starts_with?(reason || "", "stuck:")
+
+        %{
+          cleanup: if(held?, do: "held", else: "blocked"),
+          blocker_state: if(stuck?, do: "stuck"),
+          reasons: reasons,
+          blockers: Map.get(report, "blocker_details", []),
+          operator_action: Map.get(report, "operator_action"),
+          operator_actions: Map.get(report, "operator_actions", []),
+          archive_path: path,
+          unrecorded: Map.get(report, "unrecorded", []),
+          losses: Map.get(report, "losses", []),
+          attempts: attempts,
+          next_attempt_at: if(stuck?, do: nil, else: next_at)
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc "Lists cleanup status rows visible to an owner, or all rows for an admin."
+  def statuses(db, owner \\ nil, config \\ nil) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT c.sessionKey,s.displayName,s.host FROM retired_workspace_cleanup c JOIN sessions s ON s.sessionKey=c.sessionKey WHERE (?1 IS NULL OR s.ownerUserId=?1) ORDER BY c.nextAt,c.sessionKey",
+        [owner]
+      )
+
+    Enum.map(rows, fn [key, name, host] ->
+      row = status(db, key) || %{}
+
+      archive_path =
+        if row[:cleanup] == "completed" do
+          row[:archive_path]
+        else
+          row[:archive_path] ||
+            if config, do: projected_archive(config, db, %{host: host, session_key: key})
+        end
+
+      row
+      |> Map.put(:archive_path, archive_path)
+      |> Map.merge(%{session_key: key, display_name: name, workdir_host: host})
+    end)
+  rescue
+    error -> {:error, Exception.message(error)}
+  end
+
+  @doc "Requeues an unfinished cleanup. All cleanup safeguards run again."
+  def retry(db, key, by \\ "unknown") do
+    result =
+      DB.transaction(db, fn txn ->
+        case Txn.q(
+               txn,
+               "SELECT completed,report FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [key]
+             ) do
+          [[0, raw_report]] ->
+            requested_at = System.system_time(:millisecond)
+
+            report =
+              raw_report
+              |> decoded_report()
+              |> Map.put("retry_requested", %{"by" => by, "at" => requested_at})
+
+            requeue_in_txn(txn, key, report)
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "retired_workspace_cleanup_retry_requested",
+              key,
+              JSON.encode!(%{by: by, requested_at: requested_at})
+            )
+
+            :queued
+
+          [[1, _]] ->
+            :completed
+
+          [] ->
+            :missing
+        end
+      end)
+
+    case result do
+      {:ok, :queued} ->
+        kick()
+        %{ok: true, session_key: key, cleanup: "queued"}
+
+      {:ok, :completed} ->
+        %{code: "cleanup_already_completed", message: "workspace cleanup is already completed"}
+
+      {:ok, :missing} ->
+        %{code: "cleanup_not_found", message: "no retired workspace cleanup row for session"}
+
+      {:error, error} ->
+        %{code: "cleanup_retry_failed", message: Exception.message(error)}
+    end
+  end
+
+  defp track_blocker_streak(summary, previous, config) do
+    blockers = Map.get(summary, :blocker_details, [])
+    reasons = Enum.map(blockers, & &1.reason) |> Enum.uniq() |> Enum.sort()
+
+    signature =
+      blockers
+      |> Enum.map(&[&1.reason, Map.get(&1, :path)])
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    old_signature = Map.get(previous, "blocker_signature")
+    old_streak = Map.get(previous, "blocker_streak", 0)
+
+    streak =
+      if signature != [] and signature == old_signature,
+        do: old_streak + 1,
+        else: if(signature == [], do: 0, else: 1)
+
+    threshold = stuck_attempt_limit(config)
+
+    stuck? = "mount_boundary" in reasons or (signature != [] and streak >= threshold)
+    actions = blocker_operator_actions(reasons)
+
+    {summary
+     |> Map.put(:blocker_signature, signature)
+     |> Map.put(:blocker_streak, streak)
+     |> Map.put(:stuck, stuck?)
+     |> Map.put(:operator_actions, actions)
+     |> Map.put(:operator_action, Enum.join(actions, " ")), stuck?}
+  end
+
+  defp blocker_operator_actions(reasons) do
+    Enum.map(reasons, fn
+      "uncaptured_work" ->
+        "Capture or copy the listed work, or acknowledge the exact inventory, then retry."
+
+      "mount_boundary" ->
+        "Move or remove the nested mount, then retry the cleanup."
+
+      reason when reason in ["entry_remove_failed", "directory_remove_failed"] ->
+        "Resolve filesystem permissions or open-file errors at the reported paths, then retry."
+
+      _reason ->
+        "Resolve the reported filesystem or cleanup error, then retry."
+    end)
+    |> Enum.uniq()
+  end
+
+  defp stuck_attempt_limit(config) do
+    limit =
+      Map.get(
+        config || %{},
+        :workspace_cleanup_stuck_attempts,
+        Application.get_env(
+          :tightbeam,
+          :workspace_cleanup_stuck_attempts,
+          @default_stuck_attempts
+        )
+      )
+
+    if is_integer(limit) and limit > 0,
+      do: limit,
+      else: raise(ArgumentError, "workspace_cleanup_stuck_attempts must be a positive integer")
+  end
+
+  defp decoded_report(raw) when is_binary(raw) do
+    case JSON.decode(raw) do
+      {:ok, %{} = report} -> report
+      _ -> %{}
+    end
+  end
+
+  defp decoded_report(_raw), do: %{}
+
+  defp recorded_archive?(_db, nil), do: false
+
+  defp recorded_archive?(db, path) do
+    match?(
+      {:ok, [[1]]},
+      DB.query(
+        db,
+        "SELECT 1 FROM artifacts WHERE state='archived' AND substr(home,1,length(?1)+1)=?1||'/' LIMIT 1",
+        [path]
+      )
+    )
+  end
+
+  @doc """
+  The losses a retired session's last cleanup run held back, as
+  `%{kind, path, detail}` maps; `[]` when nothing is held.
+  """
+  def held_losses(db, key) do
+    db |> stored_report(key) |> losses_on_hold()
+  end
+
+  defp losses_on_hold(%{"losses" => losses, "blockers" => blockers}) when is_list(losses),
+    do: if("uncaptured_work" in blockers, do: losses, else: [])
+
+  defp losses_on_hold(_report), do: []
+
+  @doc """
+  Acknowledges the losses currently held for a retired session so the next
+  cleanup run may delete them. Returns `{:ok, acknowledged_losses}` or
+  `{:error, :nothing_held}`. Acknowledgements are stored by loss key
+  (`kind:path`) with who and when, in the cleanup report.
+  """
+  def acknowledge(db, key, by) do
+    result =
+      DB.transaction(db, fn txn ->
+        with [[raw_report]] <-
+               Txn.q(
+                 txn,
+                 "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1 AND completed=0",
+                 [key]
+               ),
+             stored = decoded_report(raw_report),
+             [_ | _] = losses <- losses_on_hold(stored) do
+          now = System.system_time(:millisecond)
+
+          entries =
+            Enum.map(losses, fn loss ->
+              %{"key" => loss_key(loss), "by" => by, "at" => now, "detail" => loss["detail"]}
+            end)
+
+          keys = Enum.map(entries, & &1["key"])
+          previous = stored |> Map.get("acknowledged", []) |> Enum.reject(&(&1["key"] in keys))
+          requeue_in_txn(txn, key, Map.put(stored, "acknowledged", previous ++ entries))
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "retired_workspace_loss_acknowledged",
+            key,
+            JSON.encode!(%{by: by, acknowledged: keys})
+          )
+
+          losses
+        else
+          [] -> []
+        end
+      end)
+
+    case result do
+      {:ok, []} ->
+        {:error, :nothing_held}
+
+      {:ok, losses} ->
+        kick()
+        {:ok, losses}
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
+  defp requeue_in_txn(txn, key, report) do
+    report = Map.drop(report, ["stuck", "blocker_streak", "blocker_signature"])
+
+    Txn.q(
+      txn,
+      "UPDATE retired_workspace_cleanup SET nextAt=0,reason=NULL,report=?2 WHERE sessionKey=?1",
+      [key, JSON.encode!(report)]
+    )
+  end
 
   defp record_report(db, report) do
     kind =
@@ -729,7 +1331,17 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
-  defp execute(host, workspace, keep, archive_path, runner, timeout_ms) do
+  defp execute(
+         host,
+         workspace,
+         keep,
+         archive_path,
+         runner,
+         timeout_ms,
+         acknowledged,
+         limits,
+         scan_only
+       ) do
     cond do
       contains_line_break?(workspace) ->
         {:error, %{reason: "workspace_path_unrepresentable"}}
@@ -738,7 +1350,16 @@ defmodule Tightbeam.WorkspaceCleanup do
         {:error, %{reason: "cleanup_runner_timeout_invalid"}}
 
       true ->
-        script = cleanup_script(Path.expand(workspace), archive_path, timeout_ms)
+        script =
+          cleanup_script(
+            Path.expand(workspace),
+            archive_path,
+            timeout_ms,
+            acknowledged,
+            limits,
+            scan_only
+          )
+
         manifest = if keep.paths == [], do: "", else: Enum.join(keep.paths, "\n") <> "\n"
 
         invocation =
@@ -796,7 +1417,7 @@ defmodule Tightbeam.WorkspaceCleanup do
   end
 
   defp execution_report({output, status}) when is_binary(output) and is_integer(status) do
-    {removed, errors, done, diagnostics} = parse_output(output)
+    {removed, errors, done, diagnostics, losses} = parse_output(output)
 
     command_errors =
       if status == 0, do: [], else: [%{reason: "cleanup_command_failed", exit: status}]
@@ -817,6 +1438,9 @@ defmodule Tightbeam.WorkspaceCleanup do
       removed_count: removed,
       removed_count_complete: done in [0, 1],
       blockers: blockers,
+      losses: losses,
+      unrecorded: inventory_report(output),
+      archive_created: "A" in String.split(output, "\n"),
       diagnostics: diagnostics,
       command_exit: status,
       result_confirmed: done in [0, 1]
@@ -833,33 +1457,80 @@ defmodule Tightbeam.WorkspaceCleanup do
     do: failed_report([], "cleanup_runner_result_invalid", inspect(other))
 
   defp parse_output(output) do
-    Enum.reduce(String.split(output, "\n", trim: true), {0, [], nil, []}, fn line,
-                                                                             {removed, errors,
-                                                                              done, diagnostics} ->
-      case String.split(line, "\t") do
-        ["R"] ->
-          {removed + 1, errors, done, diagnostics}
+    {removed, errors, done, diagnostics, losses} =
+      Enum.reduce(String.split(output, "\n", trim: true), {0, [], nil, [], []}, fn line, acc ->
+        {removed, errors, done, diagnostics, losses} = acc
 
-        ["E", reason, hex] ->
-          path =
+        case String.split(line, "\t") do
+          ["R"] ->
+            {removed + 1, errors, done, diagnostics, losses}
+
+          ["E", reason, hex] ->
+            path =
+              case decode_path(hex) do
+                {:ok, decoded} -> decoded
+                :error -> nil
+              end
+
+            {removed, [%{reason: reason, path: path} | errors], done, diagnostics, losses}
+
+          ["L", kind, hex, detail] ->
             case decode_path(hex) do
-              {:ok, decoded} -> decoded
-              :error -> nil
+              {:ok, path} ->
+                loss = %{kind: kind, path: path, detail: detail}
+                {removed, errors, done, diagnostics, [loss | losses]}
+
+              :error ->
+                {removed, errors, done, [line | diagnostics], losses}
             end
 
-          {removed, [%{reason: reason, path: path} | errors], done, diagnostics}
+          ["A"] ->
+            acc
 
-        ["DONE", "0"] ->
-          {removed, errors, 0, diagnostics}
+          ["U", _, _, _, _] ->
+            acc
 
-        ["DONE", "1"] ->
-          {removed, errors, 1, diagnostics}
+          ["DONE", "0"] ->
+            {removed, errors, 0, diagnostics, losses}
 
-        _ ->
-          {removed, errors, done, [line | diagnostics]}
-      end
-    end)
+          ["DONE", "1"] ->
+            {removed, errors, 1, diagnostics, losses}
+
+          _ ->
+            {removed, errors, done, [line | diagnostics], losses}
+        end
+      end)
+
+    {removed, errors, done, diagnostics, Enum.sort_by(losses, &loss_key/1)}
   end
+
+  defp inventory_report(output) do
+    for line <- String.split(output, "\n"),
+        ["U", hex, entries, bytes, disposition] <- [String.split(line, "\t")],
+        {:ok, path} <- [decode_path(hex)],
+        {entries, ""} <- [Integer.parse(entries)],
+        {bytes, ""} <- [Integer.parse(bytes)] do
+      %{path: path, entries: entries, bytes: bytes, disposition: disposition}
+    end
+  end
+
+  # The acknowledgement key binds the loss to the scanned state, so work that
+  # changes after it was acknowledged is held again.
+  @doc false
+  def loss_key(%{kind: kind, path: path} = loss),
+    do: kind <> ":" <> path <> "@" <> loss_state(Map.get(loss, :detail))
+
+  def loss_key(%{"kind" => kind, "path" => path} = loss),
+    do: kind <> ":" <> path <> "@" <> loss_state(Map.get(loss, "detail"))
+
+  defp loss_state(detail) when is_binary(detail) do
+    case Regex.run(~r/ state=(\S+)$/, detail) do
+      [_, state] -> state
+      _ -> ""
+    end
+  end
+
+  defp loss_state(_), do: ""
 
   defp decode_path(hex) do
     case Base.decode16(hex, case: :mixed) do
@@ -873,17 +1544,22 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
-  defp cleanup_script(root, archive_path, timeout_ms) do
+  defp cleanup_script(root, archive_path, timeout_ms, acknowledged, limits, scan_only) do
     """
     #{move_script(timeout_ms)}
     umask 077
     root=#{shell_quote(root)}
     workspace_root=$root
     archive=#{shell_quote(archive_path || "")}
+    ack_list=#{shell_quote(Enum.join(acknowledged, "\n"))}
     keep_list=$(cat)
+    loss_hold=0
+    archive_recovery=0
+    scan_only=#{if scan_only, do: 1, else: 0}
     had_error=0
     unsafe_route=0
     present_keep_list=
+    retained_dirs=
 
     emit_path() {
       printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n'
@@ -909,11 +1585,238 @@ defmodule Tightbeam.WorkspaceCleanup do
       esac
     }
 
+    is_retained_directory() {
+      case "\n$retained_dirs\n" in
+        *"\n$1\n"*) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+
     has_protected_descendant() {
       case "\n$keep_list\n" in
         *"\n$1"/*) return 0 ;;
         *) return 1 ;;
       esac
+    }
+
+    emit_loss() {
+      encoded=$(emit_path "$2")
+      printf 'L\\t%s\\t%s\\t%s\\n' "$1" "$encoded" "$3"
+    }
+
+    is_acknowledged() {
+      case "\n$ack_list\n" in
+        *"\n$1:$2\n"*) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+
+    under_protected() (
+      saved_ifs=$IFS
+      IFS='
+    '
+      set -f
+      for keep in $keep_list; do
+        [ "$keep" = . ] && return 0
+        case "$1" in
+          "$keep"|"$keep"/*) return 0 ;;
+        esac
+      done
+      return 1
+    )
+
+    git_in_repo() {
+      git -c safe.directory='*' -C "$repo" "$@"
+    }
+
+    git_count() {
+      out=$(git_in_repo "$@" 2>/dev/null) || { echo unknown; return; }
+      if [ -z "$out" ]; then echo 0; else printf '%s\n' "$out" | awk 'END { print NR }'; fi
+    }
+
+    hash_untracked() (
+      cd "$repo" || return 1
+      # The producer reports a listing failure even when xargs exits successfully.
+      { git -c safe.directory='*' ls-files -z --others --exclude-standard || printf 'unknown\\n' >&3; } |
+        xargs -0 sh -c '
+          for path do
+            printf "%s\\000" "$path"
+            if [ -L "$path" ]; then
+              printf "symlink\\000"
+              readlink "./$path" || exit 1
+            elif [ -f "$path" ]; then
+              printf "file\\000"
+              git hash-object --no-filters -- "$path" || exit 1
+            elif [ -d "$path" ]; then
+              # Git can list an embedded repository as one directory entry.
+              # The repository scan checks that directory separately.
+              printf "directory"
+            else
+              exit 1
+            fi
+            printf "\\000"
+          done
+        ' sh
+    )
+
+    repo_state_bytes() {
+      printf '%s\\000' "$head_oid" "$detached"
+      git_in_repo for-each-ref || return 1
+      printf '%s\\000' "$stash_entries"
+      if [ "$bare" -eq 0 ]; then
+        git_in_repo status --porcelain -z --untracked-files=no || return 1
+        # Hash HEAD-to-index and index-to-worktree separately, including when one
+        # change would cancel the other in a single HEAD-to-worktree diff.
+        git_in_repo diff --cached --binary --no-ext-diff --no-textconv -- || return 1
+        git_in_repo diff --binary --no-ext-diff --no-textconv -- || return 1
+        hash_untracked || return 1
+      fi
+    }
+
+    hash_repo_state() {
+      # Keep the byte stream out of shell variables. Send failures around the
+      # pipeline on fd 3 so a hash of partial input can never authorize removal.
+      { { repo_state_bytes || printf 'unknown\\n' >&3; } | git hash-object --stdin; } 3>&1
+    }
+
+    # A remote counts as durable unless its URL is a local path inside the
+    # workdir being removed (or a local path that cannot be resolved).
+    remote_is_inside() {
+      url=$1
+      case "$url" in
+        file://*) url=${url#file://} ;;
+        /*) ;;
+        *://*) return 1 ;;
+        *:*) return 1 ;;
+      esac
+      case "$url" in
+        /*) abs=$url ;;
+        *) abs=$repo/$url ;;
+      esac
+      [ -e "$abs" ] || return 0
+      abs=$(realpath "$abs" 2>/dev/null) || return 0
+      case "$abs" in
+        "$scan_root_real"|"$scan_root_real"/*) return 0 ;;
+      esac
+      return 1
+    }
+
+    # Prints one L line when the repository holds work that no durable remote has.
+    # The line carries a digest of the repository state; an acknowledgement is
+    # bound to that digest, so changed work needs a fresh acknowledgement.
+    scan_one_repo() {
+      repo=$1
+      rel=$2
+      bare=$3
+      under_protected "$rel" && return 0
+      export GIT_CEILING_DIRECTORIES=${repo%/*}
+      if ! command -v git >/dev/null 2>&1; then
+        is_acknowledged git "$rel@" || emit_loss git "$rel" "git unavailable; repository state unknown"
+        return 0
+      fi
+      durable=
+      local_remotes=
+      for remote in $(git -c safe.directory='*' -C "$repo" remote 2>/dev/null); do
+        url=$(git -c safe.directory='*' -C "$repo" remote get-url "$remote" 2>/dev/null) || url=
+        if remote_is_inside "$url"; then
+          local_remotes="${local_remotes:+$local_remotes,}$remote"
+        else
+          durable="$durable --remotes=$remote"
+        fi
+      done
+      head_oid=$(git_in_repo rev-parse -q --verify HEAD 2>/dev/null) || head_oid=
+      worktrees=$(git_in_repo worktree list --porcelain 2>/dev/null) || {
+        emit_loss git "$rel" "Git worktree list unavailable; repository state unknown"
+        return 0
+      }
+      # Include detached HEADs of all linked worktrees, including those outside
+      # the workdir. Git's bare worktree record omits HEAD itself.
+      detached=$(printf '%s\\n' "$worktrees" | awk '/^HEAD / { head = $2 } /^detached/ { print head }')
+      if [ "$bare" -eq 1 ] && [ -n "$head_oid" ] && ! git_in_repo symbolic-ref -q HEAD >/dev/null 2>&1; then
+        detached="$head_oid $detached"
+      fi
+      detached=$(printf '%s\\n' $detached | sort -u)
+      not_args=
+      [ -z "$durable" ] || not_args="--not $durable"
+      # Every local branch tip (with or without an upstream), every tag and every
+      # detached HEAD is tested for reachability from the durable remote refs.
+      unpushed=$(git_in_repo rev-list --count --branches --tags $head_oid $detached $not_args 2>/dev/null) || unpushed=unknown
+      unpushed_refs=
+      if [ "$unpushed" != 0 ]; then
+        for ref in $(git_in_repo for-each-ref --format='%(refname)' refs/heads refs/tags 2>/dev/null) $detached; do
+          if [ -n "$(git_in_repo rev-list -n 1 "$ref" $not_args 2>/dev/null)" ]; then
+            case "$ref" in
+              refs/*) label=${ref#refs/} ;;
+              *) label=detached:$ref ;;
+            esac
+            unpushed_refs="${unpushed_refs:+$unpushed_refs,}$label"
+          fi
+        done
+      fi
+      # Git requires a worktree argument for stash list even though the list
+      # only reads the shared stash reflog, which a bare repo can also have.
+      if stash_entries=$(git_in_repo --work-tree="$repo" stash list --format='%H %gd' 2>/dev/null); then
+        stashes=$(printf '%s\\n' "$stash_entries" | awk 'NF { count++ } END { print count + 0 }')
+      else
+        stashes=unknown
+      fi
+      modified=0
+      untracked=0
+      if [ "$bare" -eq 0 ]; then
+        modified=$(git_count status --porcelain --untracked-files=no)
+        untracked=$(git_count ls-files --others --exclude-standard)
+      fi
+      if [ "$unpushed" = 0 ] && [ "$stashes" = 0 ] && [ "$modified" = 0 ] && [ "$untracked" = 0 ]; then
+        return 0
+      fi
+      repo_state=unknown
+      if [ "$stashes" != unknown ]; then
+        repo_state=$(hash_repo_state 2>/dev/null) || repo_state=unknown
+      fi
+      case "$repo_state" in
+        ""|*unknown*) repo_state=unknown ;;
+        *) is_acknowledged git "$rel@$repo_state" && return 0 ;;
+      esac
+      detail="unpushed_commits=$unpushed stashes=$stashes modified=$modified untracked=$untracked"
+      [ -z "$unpushed_refs" ] || detail="$detail unpushed_refs=$unpushed_refs"
+      if [ "$stashes" != 0 ] && [ "$stashes" != unknown ]; then
+        stash_names=$(printf '%s\\n' "$stash_entries" | awk '{print $2}' | paste -sd, -)
+        [ -z "$stash_names" ] || detail="$detail stash_entries=$stash_names"
+      fi
+      [ "$bare" -eq 0 ] || detail="$detail bare=1"
+      [ -z "$local_remotes" ] || detail="$detail workdir_remotes=$local_remotes"
+      emit_loss git "$rel" "$detail state=$repo_state"
+    }
+
+    # Read-only. Prints one L line per unacknowledged loss: git work trees and
+    # bare repositories carrying commits on no durable remote ref, stashes,
+    # uncommitted changes or untracked files.
+    scan_losses() {
+      export GIT_OPTIONAL_LOCKS=0
+      scan_root_real=$(CDPATH= cd -P "$root" 2>/dev/null && pwd -P) || scan_root_real=$root
+      while IFS= read -r gitpath; do
+        [ -n "$gitpath" ] || continue
+        repo=${gitpath%/.git}
+        if [ "$repo" = "$root" ]; then rel=.; else rel=${repo#"$root"/}; fi
+        scan_one_repo "$repo" "$rel" 0
+      done <<GITPATHS
+    $(find "$root" -name .git \\( -type d -o -type f \\) -prune -print 2>/dev/null)
+    GITPATHS
+      while IFS= read -r headpath; do
+        [ -n "$headpath" ] || continue
+        dir=${headpath%/HEAD}
+        [ -d "$dir/objects" ] && [ -d "$dir/refs" ] || continue
+        [ "$(git -c safe.directory='*' -C "$dir" rev-parse --is-bare-repository 2>/dev/null)" = true ] || continue
+        if [ "$dir" = "$root" ]; then rel=.; else rel=${dir#"$root"/}; fi
+        scan_one_repo "$dir" "$rel" 1
+      done <<BAREPATHS
+    $(find "$root" -name .git -prune -o -type f -name HEAD -print 2>/dev/null)
+    BAREPATHS
+    }
+
+    scan_unrecorded() {
+      printf '%s\\000%s' "$keep_list" "$ack_list" |
+        python3 -c #{shell_quote(@inventory_script)} "$root" "$archive" #{Enum.join(limits, " ")}
     }
 
     exact_keep_path() (
@@ -986,7 +1889,7 @@ defmodule Tightbeam.WorkspaceCleanup do
 
         if is_protected "$child_rel"; then
           continue
-        elif has_protected_descendant "$child_rel"; then
+        elif has_protected_descendant "$child_rel" || is_retained_directory "$child_rel"; then
           if [ -L "$name" ]; then
             emit_error symlink_route "$child_rel"
             local_failed=1
@@ -1037,6 +1940,7 @@ defmodule Tightbeam.WorkspaceCleanup do
 
     if [ ! -e "$root" ] && [ ! -L "$root" ] && [ -n "$archive" ] && [ -d "$archive" ]; then
       root=$archive
+      archive_recovery=1
     fi
 
     if [ ! -e "$root" ] && [ ! -L "$root" ]; then
@@ -1085,11 +1989,55 @@ defmodule Tightbeam.WorkspaceCleanup do
         IFS=$saved_ifs
         keep_list=$present_keep_list
 
-        if [ "$unsafe_route" -eq 0 ] && ! is_protected .; then
+        if [ "$unsafe_route" -eq 0 ] && [ "$archive_recovery" -eq 0 ]; then
+          scan_output=$(scan_losses)
+          if inventory_output=$(scan_unrecorded); then
+            inventory_keep=$(printf '%s\\n' "$inventory_output" | sed -n 's/^K[[:space:]]//p')
+            retained_dirs=$(printf '%s\\n' "$inventory_output" | sed -n 's/^D[[:space:]]//p')
+          else
+            emit_error unrecorded_inventory_unavailable .
+            had_error=1
+            loss_hold=1
+          fi
+          inventory_report=$(printf '%s\\n' "$inventory_output" | grep -v '^[KD]' || :)
+          if [ -n "$inventory_report" ]; then
+            scan_output=$(printf '%s\\n%s' "$scan_output" "$inventory_report")
+          fi
+          if [ -n "$inventory_keep" ] && [ "$loss_hold" -eq 0 ]; then
+            keep_list=$(printf '%s\\n%s' "$keep_list" "$inventory_keep")
+          fi
+          [ -z "$scan_output" ] || printf '%s\n' "$scan_output"
+          if [ "$scan_only" -eq 1 ]; then
+            if [ "$had_error" -eq 0 ]; then
+              printf 'DONE\t0\n'
+              exit 0
+            fi
+            printf 'DONE\t1\n'
+            exit 2
+          fi
+          loss_output=$(printf '%s\n' "$scan_output" | grep '^L' || :)
+          if [ -n "$loss_output" ]; then
+            saved_ifs=$IFS
+            IFS='
+    '
+            set -f
+            for loss_line in $loss_output; do
+              loss_kind=$(printf '%s' "$loss_line" | cut -f2)
+              loss_hex=$(printf '%s' "$loss_line" | cut -f3)
+              printf 'E\tuncaptured_work\t%s\n' "$(emit_path "$loss_kind:")$loss_hex"
+            done
+            set +f
+            IFS=$saved_ifs
+            loss_hold=1
+            had_error=1
+          fi
+        fi
+
+        if [ "$archive_recovery" -eq 0 ] && [ "$unsafe_route" -eq 0 ] && [ "$loss_hold" -eq 0 ] && ! is_protected .; then
           if cleanup_dir ""; then :; else had_error=1; fi
         fi
 
-        if [ -z "$keep_list" ] && [ "$had_error" -eq 0 ]; then
+        if [ "$archive_recovery" -eq 0 ] && [ -z "$keep_list" ] && [ -z "$retained_dirs" ] && [ "$had_error" -eq 0 ]; then
           if [ ! -L "$root" ] && [ "$(stat_identity "$root")" = "$root_id" ] &&
              rmdir "$root" 2>/dev/null; then
             emit_removed .
@@ -1101,9 +2049,10 @@ defmodule Tightbeam.WorkspaceCleanup do
       fi
     fi
 
-    if [ "$had_error" -eq 0 ] && [ -n "$keep_list" ] && [ -n "$archive" ]; then
+    if [ "$had_error" -eq 0 ] && [ -n "$archive" ] &&
+       { [ -n "$keep_list" ] || [ -n "$retained_dirs" ] || [ "$archive_recovery" -eq 1 ]; }; then
       if move_workspace "$workspace_root" "$archive"; then
-        :
+        printf 'A\\n'
       else
         emit_error archive_move_failed "$archive"
         had_error=1

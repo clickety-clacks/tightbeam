@@ -1,4 +1,5 @@
 root_archetype = "uncle-enzo.exec"
+primary = true
 purpose = "Run your organization with executives who hold your intent and talk to you, and deliverators who own getting each feature or concern delivered."
 phrases = [
   "I want one agent to talk to, and I don't want it buried in status traffic.",

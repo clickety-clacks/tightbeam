@@ -33,7 +33,12 @@ defmodule Tightbeam.WorkItemsTest do
     holder = session(db, "holder", "flynn")
     other = session(db, "other-holder", "other")
     handlers = Gateway.handlers(%{db: db})
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+
+    Tightbeam.TerminalReactionFixture.load_work_items!(
+      Path.join(System.tmp_dir!(), "work-items-law-#{System.unique_integer([:positive])}"),
+      Map.keys(handlers)
+    )
+
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
@@ -608,6 +613,15 @@ defmodule Tightbeam.WorkItemsTest do
     assert new_item.deliveryOwnerSessionKey == owner
     assert new_item.title == "New handoff"
 
+    assert {:ok, [[new_routing, "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wi.routingWakeId,w.state FROM work_items wi JOIN wakes w ON w.wakeId=wi.routingWakeId WHERE wi.id=?1",
+               [new_item.id]
+             )
+
+    assert is_binary(new_routing)
+
     created_notice =
       drain_firehose_notices(hub)
       |> Enum.find(&(&1["class"] == "work_item.created"))
@@ -635,6 +649,10 @@ defmodule Tightbeam.WorkItemsTest do
     assert new_prompt =~ new_brief
 
     existing = create(ctx, {:user, "flynn"}, %{title: "Existing handoff"})
+
+    assert {:ok, [[existing_routing]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [existing.id])
+
     existing_brief = "Take ownership of the existing item."
 
     assert {:ok, %{created: false, wakeScheduled: true, workItem: existing_item}} =
@@ -652,6 +670,13 @@ defmodule Tightbeam.WorkItemsTest do
     assert existing_item.id == existing.id
     assert existing_item.title == existing.title
     assert existing_item.deliveryOwnerSessionKey == owner
+
+    assert {:ok, [[^existing_routing, "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wi.routingWakeId,w.state FROM work_items wi JOIN wakes w ON w.wakeId=wi.routingWakeId WHERE wi.id=?1",
+               [existing.id]
+             )
 
     updated_notice =
       drain_firehose_notices(hub)

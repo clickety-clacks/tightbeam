@@ -24,7 +24,7 @@ defmodule Tightbeam.Diagnostics do
   @ingress_records 8_192
   @max_record_bytes 4_096
   @max_text_bytes 256
-  @text_fields [:operation, :cause, :principal_ref]
+  @text_fields [:operation, :cause, :principal_ref, :caller]
 
   @health_key {__MODULE__, :health}
   @health_slots 5
@@ -35,7 +35,7 @@ defmodule Tightbeam.Diagnostics do
   @ingress_depth 5
 
   @allowed_fields ~w(schema_version observed_at_ms event actor request_id db_call_id
-    operation effect_kind principal_kind principal_ref queue_ms execute_ms callback_ms
+    operation caller effect_kind principal_kind principal_ref queue_ms execute_ms callback_ms
     callback_sql_ms callback_outside_sql_ms total_ms elapsed_ms timeout_source budget_ms
     sqlite_timeout_source sqlite_busy_budget_ms result_class cause response_state http_status
     gateway_accepted effect_state action listener_generation prior_listener_generation)a
@@ -117,6 +117,11 @@ defmodule Tightbeam.Diagnostics do
     {:ok,
      %{
        path: Keyword.get(opts, :path),
+       archives:
+         Map.new([:slow, :pressure], fn kind ->
+           path = Keyword.get(opts, :path)
+           {kind, archive_state(if(path, do: path <> ".#{kind}"))}
+         end),
        health: publish_health(),
        notify: Keyword.get(opts, :notify),
        records: :queue.new(),
@@ -150,11 +155,75 @@ defmodule Tightbeam.Diagnostics do
         state
       end
 
-    {:noreply, bounded_enqueue(state, record)}
+    state = bounded_enqueue(state, record)
+
+    archives =
+      Enum.reduce(state.archives, state.archives, fn {kind, archive}, acc ->
+        if retain?(kind, record) do
+          Map.put(
+            acc,
+            kind,
+            %{archive | health: state.health} |> store(line, bytes) |> bounded_enqueue(record)
+          )
+        else
+          acc
+        end
+      end)
+
+    {:noreply, %{state | archives: archives}}
   end
 
   @impl true
-  def handle_call(:records, _from, state), do: {:reply, :queue.to_list(state.records), state}
+  def handle_call(:records, _from, state) do
+    records =
+      [
+        :queue.to_list(state.records)
+        | Enum.map(state.archives, fn {_, a} -> :queue.to_list(a.records) end)
+      ]
+      |> List.flatten()
+      |> Enum.uniq()
+      |> Enum.sort_by(& &1.observed_at_ms)
+
+    {:reply, records, state}
+  end
+
+  # Independent bounds: a flood of refusals or queued reads cannot erase the
+  # transactions that occupied the owner. All extra storage runs in this sink.
+  defp retain?(:slow, %{event: "db_server_completed", operation: "db.transaction"} = record) do
+    is_integer(record[:total_ms]) and is_integer(record[:queue_ms]) and
+      record.total_ms - record.queue_ms >= 1_000
+  end
+
+  defp retain?(:pressure, %{event: "db_caller_completed"} = record) do
+    record[:result_class] == "db_overloaded" or
+      (is_integer(record[:queue_ms]) and record.queue_ms >= 1_000)
+  end
+
+  defp retain?(_, _), do: false
+
+  defp archive_state(path) do
+    %{
+      path: path,
+      health: :persistent_term.get(@health_key, nil),
+      records: :queue.new(),
+      record_count: 0,
+      prepared: false,
+      complete_tail: true,
+      bytes: 0,
+      count: 0
+    }
+  end
+
+  defp store(%{path: nil} = state, _line, _bytes), do: state
+
+  defp store(state, line, bytes) do
+    with {:ok, prepared} <- prepare(state),
+         {:ok, rotated} <- rotate_if_needed(prepared, bytes) do
+      append(rotated, line, bytes)
+    else
+      {:error, unwritten} -> unwritten
+    end
+  end
 
   defp submit(record, server) do
     json = JSON.encode!(record)

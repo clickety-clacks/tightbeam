@@ -21,7 +21,9 @@ defmodule GuardCheckoutRefusal do
     Model,
     ModelCatalog,
     Org,
-    Projection
+    Projection,
+    SessionLane,
+    StateResources
   }
 
   alias Tightbeam.GatewayTurnFixture.CoordinatorStub
@@ -29,7 +31,16 @@ defmodule GuardCheckoutRefusal do
   def run do
     Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
       mode = Path.join(Path.dirname(base), "checkout-case.txt") |> File.read!()
-      assert mode in ["missing", "fresh", "transient", "cursor", "pi-local", "degraded-cause"]
+
+      assert mode in [
+               "missing",
+               "fresh",
+               "transient",
+               "cursor",
+               "pi-local",
+               "degraded-cause",
+               "disabled-route"
+             ]
 
       {harness, provider, model} =
         if mode == "pi-local" do
@@ -149,7 +160,8 @@ defmodule GuardCheckoutRefusal do
                   "transient" => "o6-transient",
                   "cursor" => "cursor-refusal-wire",
                   "pi-local" => "o6-pi-local",
-                  "degraded-cause" => "degraded-cause"
+                  "degraded-cause" => "degraded-cause",
+                  "disabled-route" => "disabled-route"
                 },
                 mode
               )
@@ -184,6 +196,132 @@ defmodule GuardCheckoutRefusal do
         GenServer.stop(lane)
       end
     end)
+  end
+
+  defp prove("disabled-route", db, doorbell, _registry, runner) do
+    opener = "agent:fixture:opener"
+
+    Org.create(db, %{
+      session_key: opener,
+      display_name: "Opener",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("gpt-6-luna")
+    })
+
+    assert %{"options" => options} = StateResources.set_harness_capability(Org.get(db, "k1"))
+    assert %{"enabled" => false} = Enum.find(options, &(&1["value"] == "claude"))
+
+    parent = self()
+    {:ok, task_sup} = Task.Supervisor.start_link()
+
+    for timing <- ["before-enqueue", "after-enqueue"] do
+      assignment = "asg_route_#{timing}"
+
+      {:ok, []} =
+        DB.query(
+          db,
+          """
+          INSERT INTO assignments
+            (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+          VALUES (?1,'check route','k1',?2,1,'open','claude','anthropic')
+          """,
+          [assignment, opener]
+        )
+
+      if timing == "before-enqueue" do
+        degrade_host_catalog("testhost", "claude", {:needs_onboarding, :missing})
+      end
+
+      assert :appended =
+               Gateway.deliver_prompt("k1", "user:flynn", "test #{timing}",
+                 db: db,
+                 lane_manager: doorbell,
+                 assignment_id: assignment
+               )
+
+      assert {:ok, [[seq]]} =
+               DB.query(db, "SELECT seq FROM turns WHERE assignmentId=?1 AND status='queued'", [
+                 assignment
+               ])
+
+      if timing == "after-enqueue" do
+        assert {_, :fresh} = ModelCatalog.get("testhost", "claude", ModelCatalog)
+        degrade_host_catalog("testhost", "claude", {:needs_onboarding, :revoked})
+      end
+
+      {:ok, registry} = Registry.start_link(keys: :unique, name: Tightbeam.LaneRegistry)
+
+      {:ok, lane} =
+        SessionLane.start_link(
+          db: db,
+          session_key: "k1",
+          task_sup: task_sup,
+          runner: runner,
+          on_terminal: fn "k1", terminal_seq ->
+            assert :ok = Tightbeam.Productions.Bubble.recognize_terminal(db, terminal_seq)
+            send(parent, {:admission_failed, terminal_seq})
+          end
+        )
+
+      assert_receive {:admission_failed, ^seq}, 2_000
+
+      assert {:ok, [["failed", reason]]} =
+               DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [seq])
+
+      assert reason =~ "cannot run claude on host testhost"
+      assert reason =~ "tightbeam onboard anthropic"
+      refute_received {:adapter_key, _}
+
+      assert {:ok, [[^opener, notice]]} =
+               DB.query(
+                 db,
+                 """
+                 SELECT sessionKey,prompt FROM turns WHERE wakeId LIKE ?1
+                 UNION ALL
+                 SELECT sessionKey,prompt FROM wakes WHERE wakeId LIKE ?1 AND state='pending'
+                 """,
+                 ["bubble:#{seq}:%"]
+               )
+
+      assert notice =~ reason
+
+      assert {:ok, [[marker]]} =
+               DB.query(
+                 db,
+                 "SELECT content FROM messages WHERE sessionKey='k1' AND content LIKE '[turn failed]%' AND instr(content,?1)>0",
+                 [reason]
+               )
+
+      assert marker =~ reason
+      GenServer.stop(lane)
+      Supervisor.stop(registry)
+
+      Tightbeam.GuardGatewayFixture.seed_catalog!(ModelCatalog, fn state ->
+        put_in(state.entries[{"testhost", "claude"}], %{
+          entries: [%{family: "fable", provider: :anthropic}],
+          derived_at: state.now.(),
+          attempted_at: state.now.(),
+          reason: nil,
+          refreshing: true
+        })
+      end)
+    end
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "check available route",
+               db: db,
+               lane_manager: doorbell
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "test")
+    assert {:error, %{reason: reason}} = runner.(Map.put(turn, :session_key, "k1"))
+    assert_receive {:adapter_key, {:claude, "shared", "testhost"}}, 2_000
+    assert reason =~ "degraded"
   end
 
   defp prove("cursor", db, lane, exact_registry, runner) do

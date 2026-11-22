@@ -175,7 +175,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
 
     for name <- Identity.public_kungfu_names(base) do
       raw = Identity.public_kungfu(base, name)
-      root = Application.app_dir(:tightbeam, "priv/kungfu/" <> name)
+      root = Path.join(Application.fetch_env!(:tightbeam, :kungfu_bundle_root_dir), name)
 
       expected =
         for path <- ~w(README.md capabilities.md preferred-models.md),
