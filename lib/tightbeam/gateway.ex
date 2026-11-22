@@ -5989,15 +5989,13 @@ defmodule Tightbeam.Gateway do
   defp identity_relearn_result(config, db, %{params: %{action: "resolve"}} = call) do
     candidate = Identity.resolve_relearn!(config.base_dir, call.origin)
 
-    publish_identity_candidate(config, db, call, candidate, %{state: "published"})
-    |> with_relearn_setup(config, db)
+    publish_relearn(config, db, call, candidate)
   end
 
   defp identity_relearn_result(config, db, call) do
     case Identity.relearn!(config.base_dir, call.origin) do
       {:ok, candidate} ->
-        publish_identity_candidate(config, db, call, candidate, %{state: "published"})
-        |> with_relearn_setup(config, db)
+        publish_relearn(config, db, call, candidate)
 
       {:conflict, paths} ->
         %{
@@ -6005,6 +6003,7 @@ defmodule Tightbeam.Gateway do
           conflicting_paths: paths,
           live_revision: Identity.live_revision!(config.base_dir)
         }
+        |> Map.merge(Identity.relearn_conflict_details(config.base_dir))
 
       {:error, message} ->
         %{
@@ -6014,6 +6013,16 @@ defmodule Tightbeam.Gateway do
           live_revision: Identity.live_revision!(config.base_dir)
         }
     end
+  end
+
+  defp publish_relearn(config, db, call, candidate) do
+    dispositions = Identity.relearn_dispositions(config.base_dir, candidate.candidate_revision)
+
+    publish_identity_candidate(config, db, call, candidate, %{
+      state: "published",
+      path_dispositions: dispositions
+    })
+    |> with_relearn_setup(config, db)
   end
 
   defp with_relearn_setup(%{state: "published"} = result, config, db) do
@@ -6203,6 +6212,7 @@ defmodule Tightbeam.Gateway do
           state: "relearn-conflicted",
           kungfu: call.params.name,
           conflicting_paths: paths,
+          provenance_conflicts: Identity.provenance_conflicts(config.base_dir),
           live_revision: Identity.live_revision!(config.base_dir)
         }
 
