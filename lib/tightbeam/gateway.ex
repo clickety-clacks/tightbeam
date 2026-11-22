@@ -8337,6 +8337,10 @@ defmodule Tightbeam.Gateway do
         result = %{
           sessions: Enum.map(sessions, &inspect_session(db, &1)),
           wakes: wakes,
+          recurring_wakes:
+            db
+            |> Tightbeam.CronWake.list_active()
+            |> Enum.filter(&MapSet.member?(keys, &1.session_key)),
           roles: role_list_result(db).roles,
           archetypes: org_shape.archetypes,
           hosts: org_shape.hosts,

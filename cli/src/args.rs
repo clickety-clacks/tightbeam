@@ -1067,6 +1067,8 @@ COMMANDS:
       Show the sessions you can address (with handles + provenance), the
       org's shape — archetypes (with allowed hosts), known hosts, and the
       valid model catalog per harness — and, for admins, pending devices.
+      Active cron schedules appear in recurringWakes with their schedule and
+      root wakeId for cancel-wake. Ordinary pending prompts appear in wakes.
         tightbeam list --as orchestrator:news
 
   session-reparent --session <key> --parent <key> [--assignment <id>] --key <key>

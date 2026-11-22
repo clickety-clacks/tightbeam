@@ -122,6 +122,38 @@ defmodule Tightbeam.CronWake do
     end
   end
 
+  @doc "List pending cron roots with their stored schedules, next due first."
+  def list_active(db) do
+    rows =
+      DB.read_transaction!(db, fn txn ->
+        # Boot can continue without the cron schema when its migration fails.
+        # Ordinary listing needs no schedule lookup when there are no roots.
+        case Txn.q(txn, "SELECT 1 FROM wakes WHERE state='pending' AND consumer='cron' LIMIT 1") do
+          [] ->
+            []
+
+          [[1]] ->
+            Txn.q(txn, """
+            SELECT w.wakeId, w.sessionKey, w.targetRole, w.prompt, w.dueAt, s.schedule
+            FROM wakes w JOIN cron_wake_schedules s ON s.wakeId=w.wakeId
+            WHERE w.state='pending' AND w.consumer='cron'
+            ORDER BY w.dueAt, w.wakeId
+            """)
+        end
+      end)
+
+    Enum.map(rows, fn [id, session, role, prompt, due_at, schedule] ->
+      %{
+        wake_id: id,
+        session_key: session,
+        target_role: role,
+        prompt: prompt,
+        due_at: due_at,
+        schedule: schedule
+      }
+    end)
+  end
+
   def fire_due(db, at) do
     {:ok, rows} =
       DB.query(
