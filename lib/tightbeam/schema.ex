@@ -2059,6 +2059,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.SubtreeGuidance.ensure_schema(db)
     :ok = upgrade_agent_reparent(db)
     :ok = upgrade_artifact_origins(db)
+    :ok = Tightbeam.ArtifactCustody.ensure_schema(db)
     :ok = Tightbeam.Ledger.ensure_schema(db)
     :ok = upgrade_identity_publication_denial_diagnostic(db)
     :ok = upgrade_work_item_delivery_owner_link(db)

@@ -2274,13 +2274,15 @@ defmodule Tightbeam.StateResources do
   def role(row), do: row |> public() |> closed_projection("roles")
 
   def artifact(row) do
+    {custody, row} = Map.pop(row, :custody)
     reject_public_shape_drift!(row, "artifacts")
     version = value(row, :row_version)
 
     unless is_integer(version) and version > 0,
       do: raise(ArgumentError, "artifact rowVersion is projection_invalid")
 
-    row |> public() |> closed_projection("artifacts")
+    projection = row |> public() |> closed_projection("artifacts")
+    if custody, do: Map.put(projection, "custody", custody), else: projection
   end
 
   def message(row) do

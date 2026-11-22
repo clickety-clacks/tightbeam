@@ -54,7 +54,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, binary: binary}
   end
 
-  setup %{binary: binary} do
+  setup %{binary: binary} = test do
     db = :"cli_integration_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -122,6 +122,32 @@ defmodule Tightbeam.CliIntegrationTest do
       wake_tick_ms: 1_000
     }
 
+    gateway_config =
+      if test[:artifact_pin_store] do
+        root = Path.join(base_dir, "artifact-blobs")
+
+        store =
+          start_supervised!(
+            {Tightbeam.ArtifactBlobStore,
+             root: root, budget_bytes: 140_006, floor_bytes: 0, floor_percent: 0}
+          )
+
+        receiver = self()
+
+        capture_runner = fn argv, collector ->
+          send(receiver, {:remote_artifact_capture, argv})
+          {Enum.into([:binary.copy(<<0, 255>>, 70_000)], collector), 0}
+        end
+
+        Map.merge(gateway_config, %{
+          artifact_blob_root: root,
+          artifact_blob_store: store,
+          artifact_capture_runner: capture_runner
+        })
+      else
+        gateway_config
+      end
+
     Archetypes.load!(base_dir)
     real_handlers = Gateway.handlers(gateway_config)
     Rules.load!(base_dir, Map.keys(real_handlers))
@@ -154,6 +180,7 @@ defmodule Tightbeam.CliIntegrationTest do
         db: db,
         base_dir: base_dir,
         handlers: handlers,
+        artifact_blob_store: gateway_config[:artifact_blob_store],
         cli_token: "tbc_cli_integration",
         session_status: fn _ -> nil end
       )
@@ -1249,6 +1276,194 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert JSON.decode!(payload) == nil
     refute payload =~ Base.encode64(bytes)
+  end
+
+  @tag artifact_pin_store: true
+  test "real CLI streams large pins, deduplicates, and makes the capacity fallback explicit",
+       ctx do
+    bytes = :binary.copy(<<0, 255>>, 70_000)
+    path = Path.join(ctx.workdir, "artifact.bin")
+    File.write!(path, bytes)
+
+    item =
+      ctx.handlers["work-item-create"].(%{
+        principal: {:user, "flynn"},
+        params: %{title: "Pinned capture"}
+      })
+
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+
+    record = [
+      "artifact-record",
+      "--kind",
+      "data",
+      "--title",
+      "Pinned",
+      "--path",
+      path,
+      "--work-item",
+      item.id
+    ]
+
+    {pinned, 0} = run.(record)
+    pinned = JSON.decode!(pinned)
+    assert pinned["custody"] == "pinned"
+    assert pinned["contentSha256"] == Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    {duplicate, 0} = run.(record)
+    assert JSON.decode!(duplicate)["contentSha256"] == pinned["contentSha256"]
+
+    assert {:ok, _} =
+             Tightbeam.Placement.register_host(ctx.db, "capture-fixture", %{
+               base_dir: "/remote/base",
+               ssh: "fixture@capture-fixture"
+             })
+
+    remote_path = "capture-fixture:/remote/base/file with spaces"
+    {remote, 0} = run.(List.replace_at(record, 6, remote_path))
+    assert %{"custody" => "pinned", "contentSha256" => digest} = JSON.decode!(remote)
+    assert digest == pinned["contentSha256"]
+    assert_receive {:remote_artifact_capture, ["ssh" | args]}
+    assert "fixture@capture-fixture" in args
+    assert List.last(args) =~ "/remote/base/file with spaces"
+
+    File.write!(path, "new version")
+    {fetched, 0} = run.(["artifact-content-fetch", pinned["artifactId"]])
+
+    assert %{"custody" => "pinned", "source" => "pinned_copy", "contentBase64" => encoded} =
+             JSON.decode!(fetched)
+
+    assert Base.decode64!(encoded) == bytes
+
+    config = %{
+      db: ctx.db,
+      artifact_blob_root: Path.join(ctx.base_dir, "artifact-blobs"),
+      artifact_archive_inline_limit_bytes: byte_size(bytes) - 1
+    }
+
+    limited =
+      Gateway.handlers(config)["artifact-content-fetch"].(%{
+        principal: {:session, ctx.session.session_key},
+        rest_principal: %{kind: "session", id: ctx.session.session_key, is_admin: false},
+        params: %{artifact_id: pinned["artifactId"]}
+      })
+
+    assert limited.verification_status == "match"
+    assert limited.content_size == byte_size(bytes)
+    assert limited.content_sha256 == pinned["contentSha256"]
+    assert limited.content_unavailable_reason =~ "too large to return inline"
+    refute Map.has_key?(limited, :content_base64)
+
+    {mismatch, 1} = run.(record ++ ["--sha256", pinned["contentSha256"], "--allow-unpinned"])
+    assert mismatch =~ "content_sha256_mismatch"
+    {full, 1} = run.(record)
+    assert full =~ "artifact_store_full"
+    assert full =~ "--allow-unpinned"
+    {unpinned, 0} = run.(record ++ ["--allow-unpinned"])
+    assert %{"custody" => "unpinned", "warning" => _, "artifactId" => id} = JSON.decode!(unpinned)
+    {unavailable, 1} = run.(["artifact-content-fetch", id])
+    assert unavailable =~ "unpinned"
+
+    {list, 0} = run.(["artifacts", "--work-item", item.id])
+
+    assert Enum.any?(
+             JSON.decode!(list)["artifacts"],
+             &(&1["artifactId"] == id and &1["custody"] == "unpinned")
+           )
+
+    {capacity, 0} = run.(["artifact-content-capacity"])
+
+    assert %{"usedBytes" => 140_000, "stagedBytes" => 0, "effectiveLimitBytes" => 140_006} =
+             JSON.decode!(capacity)
+
+    legacy =
+      Tightbeam.Artifacts.record(ctx.db, %{
+        principal: {:session, ctx.session.session_key},
+        session_key: ctx.session.session_key,
+        params: %{
+          kind: "data",
+          title: "Legacy capture",
+          origin_path: "legacy.bin",
+          content_base64: Base.encode64(bytes),
+          work_item_id: item.id
+        }
+      })
+
+    {promoted, 0} = run.(["artifact-content-promote", legacy.artifact_id])
+    assert JSON.decode!(promoted)["custody"] == "pinned"
+
+    {directory, 1} = run.(List.replace_at(record, 6, ctx.workdir))
+    assert directory =~ "artifact origin is a directory"
+
+    encoded_inline = Base.encode64("inline")
+    inline_sha = Base.encode16(:crypto.hash(:sha256, "inline"), case: :lower)
+
+    for origin <- ["https://example.test/report", "tightbeam-transcript:example-session"] do
+      {pointer, 0} = run.(List.replace_at(record, 6, origin))
+
+      assert %{"custody" => "external_pointer", "originPath" => ^origin, "artifactId" => id} =
+               JSON.decode!(pointer)
+
+      {unavailable, 1} = run.(["artifact-content-fetch", id])
+      assert unavailable =~ "external pointer"
+      assert unavailable =~ "external_pointer"
+
+      inline =
+        List.replace_at(record, 6, origin) ++
+          ["--content-base64", encoded_inline, "--sha256", inline_sha]
+
+      {pinned_reference, 0} = run.(inline)
+
+      assert %{"custody" => "pinned", "originPath" => ^origin, "artifactId" => pinned_id} =
+               JSON.decode!(pinned_reference)
+
+      {reference_bytes, 0} = run.(["artifact-content-fetch", pinned_id])
+      assert %{"contentBase64" => ^encoded_inline} = JSON.decode!(reference_bytes)
+
+      {bad_sha, 1} = run.(List.replace_at(inline, -1, String.duplicate("0", 64)))
+      assert bad_sha =~ "content_sha256_mismatch"
+    end
+
+    origin = "https://example.test/streamed"
+    {version, 0} = run.(["version"])
+
+    metadata =
+      %{
+        verb: "artifact-record",
+        params: %{
+          kind: "data",
+          title: "Streamed reference",
+          originPath: origin,
+          contentSha256: inline_sha,
+          workItemId: item.id
+        }
+      }
+      |> JSON.encode!()
+      |> Base.url_encode64(padding: false)
+
+    assert {:ok, {{_, 200, _}, _, response}} =
+             :httpc.request(
+               :post,
+               {~c"http://127.0.0.1:#{ctx.port}/agent/dispatch",
+                [
+                  {~c"authorization", ~c"Bearer #{ctx.session.cli_token}"},
+                  {~c"x-tightbeam-cli-version", version |> String.trim() |> String.to_charlist()},
+                  {~c"x-tightbeam-artifact-record", String.to_charlist(metadata)}
+                ], ~c"application/octet-stream", "inline"},
+               [],
+               body_format: :binary
+             )
+
+    assert %{"result" => %{"custody" => "pinned", "originPath" => ^origin}} =
+             JSON.decode!(response)
+
+    {empty, 0} = run.(List.replace_at(record, 6, origin) ++ ["--content-base64", ""])
+    assert %{"custody" => "pinned", "artifactId" => empty_id} = JSON.decode!(empty)
+    {empty_content, 0} = run.(["artifact-content-fetch", empty_id])
+    assert %{"contentBase64" => "", "contentSize" => 0} = JSON.decode!(empty_content)
+
+    unreadable = List.replace_at(record, 6, "unknown-fixture:/remote/file")
+    {failure, 1} = run.(unreadable ++ ["--allow-unpinned"])
+    assert failure =~ "unknown_artifact_host"
   end
 
   test "real CLI writes and reads declared record metadata", ctx do

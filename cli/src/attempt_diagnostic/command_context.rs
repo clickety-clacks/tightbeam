@@ -83,6 +83,8 @@ impl CommandContext {
             HarklightBriefingsCatchup { .. } => ("cli.harklight_briefings_catchup", DispatchPath),
             HarklightRetry { .. } => ("cli.harklight_retry", DispatchPath),
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
+            ArtifactContentPromote { .. } => ("cli.artifact_content_promote", DispatchPath),
+            ArtifactContentCapacity { .. } => ("cli.artifact_content_capacity", DispatchPath),
             WorkspaceCleanup { .. } => ("cli.workspace_cleanup", DispatchPath),
             Artifacts { .. } => ("cli.artifacts", DispatchPath),
             ToolCallObserved => ("cli.tool_call_observed", Requests::ToolCallObserved),
@@ -341,6 +343,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | SessionDiagnose { .. }
         | HarnessHealthEvidenceOther { .. }
         | ArtifactContentFetch { .. }
+        | ArtifactContentCapacity { .. }
         | Artifacts { .. }
         | FactDemand { .. }
         | FactProducers { .. }
@@ -471,6 +474,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         },
 
         ArtifactRecord { .. }
+        | ArtifactContentPromote { .. }
         | HarnessHealthRetry { .. }
         | FactProducerClaim { .. }
         | HarklightSend { .. }

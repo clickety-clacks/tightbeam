@@ -52,6 +52,8 @@ defmodule Tightbeam.GatewayTest do
       expected ++
         ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch workspace-cleanup)
 
+    expected = expected ++ ~w(artifact-content-capacity artifact-content-promote)
+
     expected =
       expected ++
         ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other harness-health-close-promotion harness-health-evidence-other harness-health-retry)
