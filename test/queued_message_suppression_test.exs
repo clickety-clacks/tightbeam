@@ -1093,6 +1093,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
                  due_at: System.system_time(:millisecond),
                  assignment_id: "asg_continuation",
                  after_turn: true,
+                 wait_reason: "Waiting on the fixture resolver",
                  registrant_session_key: "k1",
                  owner_user_id: "flynn"
                })

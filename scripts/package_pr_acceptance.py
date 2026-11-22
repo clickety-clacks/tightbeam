@@ -234,6 +234,7 @@ def run_acceptance(args, cli, gateway, watcher, source, gh_env, scratch):
         wait_until("live watcher claim", claim_until, 60)
         wake = scratch_cli("wake", "--user", "acceptance", "--when-fact",
                            "pr.checks-completed", "--when-scope", scope, "--fallback-after", "2h",
+                           "--wait-reason", "Waiting for the required checks to finish",
                            "--prompt", "Read the completed required checks", "--as-user", "acceptance")
         wake_result = json.loads(wake.stdout)
         require(not wake_result.get("warnings"),

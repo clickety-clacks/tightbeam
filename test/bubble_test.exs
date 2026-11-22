@@ -1132,6 +1132,74 @@ defmodule Tightbeam.Productions.BubbleTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
   end
 
+  test "failed assigned work alerts the accountable parent once and suppresses holder nudges",
+       ctx do
+    id = "asg_failed_nudge_fixture"
+    holder = ctx.holder.session_key
+    parent = ctx.supervisor.session_key
+    quiet = :timer.minutes(30)
+    opened = System.system_time(:millisecond) - quiet
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt,state)
+               VALUES (?1,'Fixture assignment',?2,?3,?4,'open')
+               """,
+               [id, holder, parent, opened]
+             )
+
+    busy = hold_recipient!(ctx.db, parent)
+    seq = fail_assigned_turn!(ctx.db, holder, id)
+    assert :ok = Bubble.recognize_terminal(ctx.db, seq)
+    assert :ok = Bubble.recognize_terminal(ctx.db, seq)
+
+    source_id = "bubble:#{seq}:#{parent}"
+    assert %{session_key: ^parent, assignment_id: ^id} = Tightbeam.Wakes.get(ctx.db, source_id)
+    finish_busy_recipient!(ctx.db, busy)
+    assert [_carrier] = deliver_ready_carriers!(ctx, parent)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE wakeId=?1 AND deliveredTurnSeq IS NOT NULL",
+               [source_id]
+             )
+
+    for interval <- 1..4 do
+      at = System.system_time(:millisecond) + interval * quiet
+      assert {:ok, :ok} = DB.transaction(ctx.db, &Tightbeam.HolderProd.admit_due_in_txn(&1, at))
+    end
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_holder_prod_attempts WHERE assignmentId=?1",
+               [id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1", [id])
+
+    assert {:ok, resumed_seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder,
+               message_id: "resumed-after-failure",
+               origin: "session:#{parent}",
+               prompt: "Continue the fixture assignment",
+               assignment_id: id
+             })
+
+    assert {:ok, %{seq: ^resumed_seq} = turn} = Ledger.claim_next(ctx.db, holder, "nudge-test")
+
+    assert :ok =
+             Ledger.finish(ctx.db, resumed_seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    assert %{state: "scheduled"} = Tightbeam.HolderProd.evidence(ctx.db, id, holder)
+    IO.puts("Holder nudge failure proof parent_deliveries=1 follow_up_nudges=0 holder_attests=0")
+  end
+
   test "an open incident uses the failure fallback only for its affected harness", ctx do
     assert {:opened, _incident} =
              HarnessHealth.observe(ctx.db, %{

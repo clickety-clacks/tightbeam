@@ -39,6 +39,50 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
     assert status != 0
   end
 
+  test "canonical staging and publication accept the selected SHA only while it is on main" do
+    fixture = git_fixture!("0.1.17", "main")
+    tag = "v0.1.17+#{fixture.build}"
+    args = [@script, tag, fixture.head, "--selected-candidate"]
+
+    assert {_, 0} = command("sh", args, cd: fixture.repo)
+    advance_canonical!(fixture)
+    git!(fixture.repo, ["checkout", "--detach", fixture.head])
+
+    assert {_, 0} = command("sh", args, cd: fixture.repo)
+    {output, status} = command("sh", Enum.drop(args, -1), cd: fixture.repo)
+    assert status != 0
+    assert output =~ "is not the canonical refs/heads/main tip"
+
+    for invalid <- ["v0.1.17+#{fixture.build + 1}", "v0.1.18+#{fixture.build}"] do
+      {_, status} =
+        command("sh", [@script, invalid, fixture.head, "--selected-candidate"], cd: fixture.repo)
+
+      assert status != 0
+    end
+
+    git!(fixture.repo, ["checkout", "--detach", fixture.parent])
+    git!(fixture.repo, ["commit", "--allow-empty", "-m", "divergent canonical tip"])
+    divergent = git!(fixture.repo, ["rev-parse", "HEAD"])
+    git!(fixture.repo, ["push", "--force", "origin", "HEAD:refs/heads/main"])
+    git!(fixture.repo, ["update-ref", "refs/remotes/origin/main", fixture.head])
+    git!(fixture.repo, ["checkout", "--detach", fixture.head])
+
+    {output, status} = command("sh", args, cd: fixture.repo)
+    assert status != 0
+    assert output =~ "is not in canonical refs/heads/main history at #{divergent}"
+  end
+
+  test "only canonical staging and publication opt into selected candidate validation" do
+    candidate = File.read!(Path.join(@root, ".github/workflows/release-candidate.yml"))
+    legacy = File.read!(Path.join(@root, ".github/workflows/ci.yml"))
+
+    assert candidate =~
+             ~s(sh scripts/validate_release_tag.sh "$release_tag" "$CANDIDATE_SHA" --selected-candidate)
+
+    assert legacy =~ ~s(sh scripts/validate_release_tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA")
+    refute legacy =~ "--selected-candidate"
+  end
+
   test "the publish workflow validates and publishes the selected candidate" do
     workflow = File.read!(Path.join(@root, ".github/workflows/publish-release.yml"))
 
@@ -48,7 +92,10 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
     assert workflow =~ "install_approved_sha:"
     assert workflow =~ "soak_outcome:"
     assert workflow =~ "soaked_sha:"
-    assert workflow =~ ~s(sh scripts/validate_release_tag.sh "$RELEASE_TAG" "$CANDIDATE_SHA")
+
+    assert workflow =~
+             ~s(sh scripts/validate_release_tag.sh "$RELEASE_TAG" "$CANDIDATE_SHA" --selected-candidate)
+
     assert workflow =~ "release-candidate-proof-" <> <<36>> <> "{{ inputs.candidate_sha }}"
     assert workflow =~ "release-candidate-stage-" <> <<36>> <> "{{ inputs.candidate_sha }}"
     assert workflow =~ "verify_release_candidate_stage.py verify"

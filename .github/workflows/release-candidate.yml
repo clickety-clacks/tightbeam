@@ -406,7 +406,7 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cli/Cargo.toml)
           build=$(git rev-list --count "$CANDIDATE_SHA")
           release_tag="v$version+$build"
-          sh scripts/validate_release_tag.sh "$release_tag" "$CANDIDATE_SHA"
+          sh scripts/validate_release_tag.sh "$release_tag" "$CANDIDATE_SHA" --selected-candidate
           python3 scripts/verify_release_candidate_stage.py create \
             --proof-manifest evidence/release-candidate-manifest.json \
             --evidence-root evidence \

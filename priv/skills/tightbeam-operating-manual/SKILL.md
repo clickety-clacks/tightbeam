@@ -22,19 +22,20 @@ its own classified mechanism, outside this record's authority.
 
 For a row dependency, link the resolving assignment or decision and use
 `wake --session <key> --assignment <id> --predicate '<JSON>' --fallback-after
-<duration> --prompt "<dependent action>"`. The predicate names conditions,
+<duration> --wait-reason "<why you are waiting>" --prompt "<dependent action>"`.
+The predicate names conditions,
 bindings and resolverRef; no necessity or verifier assignment is required. The
 wait fires when its conditions hold, when its resolver ends, or at the fallback.
 Read the current disposition before acting.
 
 Only this predicate form declares a dependency. The other assignment waits are
 distinct. A dated holder continuation is your own `--assignment <id>` wake to
-yourself with `--after` or `--at`, on an open assignment you hold: it records
-your next step at a time and names no resolver. An `--after-turn` continuation
-fires once your current turn ends and covers only its named obligation, not
-unrelated work. A fact wake without `--assignment` is not bound to any waiting
-card; its `--when-scope` names what fires it, not who waits. Read a wait's own
-record before relying on it as a card's dependency or next step.
+yourself with `--after` or `--at` and `--wait-reason "<reason>"`, on an open
+assignment you hold. It records your next step at a time and names no resolver.
+An `--after-turn --wait-reason "<reason>"` continuation fires once your current
+turn ends and covers only its named obligation. A fact wake uses `--assignment`
+to name the waiting card and `--when-scope` to name what fires it. Read a wait's
+own record before relying on it as a card's dependency or next step.
 
 ## Ending a cannot-proceed block
 

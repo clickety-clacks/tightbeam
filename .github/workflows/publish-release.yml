@@ -84,7 +84,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          sh scripts/validate_release_tag.sh "$RELEASE_TAG" "$CANDIDATE_SHA"
+          sh scripts/validate_release_tag.sh "$RELEASE_TAG" "$CANDIDATE_SHA" --selected-candidate
           existing_tag=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")
           [ -z "$existing_tag" ] || {
             echo "release: tag already exists; refusing to replace a release" >&2
