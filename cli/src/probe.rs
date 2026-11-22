@@ -1682,7 +1682,7 @@ fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
 }
 
 fn workspace_cleanup_lines(health: &Value) -> Vec<String> {
-    match health["count"].as_u64() {
+    let mut lines = match health["count"].as_u64() {
         Some(0)
             if health["reasons"]
                 .as_array()
@@ -1703,7 +1703,7 @@ fn workspace_cleanup_lines(health: &Value) -> Vec<String> {
                         if row["completed"].as_bool().unwrap_or(false) {
                             "finished"
                         } else {
-                            "pending"
+                            row["state"].as_str().unwrap_or("pending")
                         }
                     ));
                 }
@@ -1716,7 +1716,42 @@ fn workspace_cleanup_lines(health: &Value) -> Vec<String> {
                 .as_str()
                 .unwrap_or("gateway did not report cleanup status")
         )],
+    };
+
+    if let Some(sessions) = health["sessions"].as_array() {
+        for session in sessions {
+            let key = session["session_key"].as_str().unwrap_or("unknown session");
+            let state = session["cleanup"].as_str().unwrap_or("unknown");
+            let blocker_state = session["blocker_state"]
+                .as_str()
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default();
+            let archive = session["archive_path"]
+                .as_str()
+                .unwrap_or("archive location unavailable");
+            lines.push(format!(
+                "  {state}{blocker_state} session={key} archive={archive}"
+            ));
+            if let Some(blockers) = session["blockers"].as_array() {
+                for blocker in blockers {
+                    lines.push(format!(
+                        "    {} path={}",
+                        blocker["reason"].as_str().unwrap_or("blocked"),
+                        blocker["path"].as_str().unwrap_or("unknown")
+                    ));
+                }
+            }
+            if let Some(actions) = session["operator_actions"].as_array() {
+                for action in actions.iter().filter_map(Value::as_str) {
+                    lines.push(format!("    action: {action}"));
+                }
+            } else if let Some(action) = session["operator_action"].as_str() {
+                lines.push(format!("    action: {action}"));
+            }
+        }
     }
+
+    lines
 }
 
 /// What the gateway reports about this host's sentinels, or why it could not.
@@ -1959,6 +1994,57 @@ mod tests {
         assert!(
             workspace_cleanup_lines(&serde_json::json!({"unavailable": "offline"}))[0]
                 .contains("offline")
+        );
+    }
+
+    #[test]
+    fn doctor_surfaces_stuck_cleanup_paths_and_recovery_action() {
+        let lines = workspace_cleanup_lines(&serde_json::json!({
+            "count": 1,
+            "reasons": [{"count": 1, "reason": "entry_remove_failed", "state": "blocked", "completed": false}],
+            "sessions": [{
+                "session_key": "retired-session",
+                "cleanup": "blocked",
+                "blocker_state": "stuck",
+                "archive_path": "/archive/retired-session",
+                "blockers": [{"reason": "entry_remove_failed", "path": "cache/file"}],
+                "operator_action": "Resolve the filesystem error, then retry."
+            }]
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("blocked (stuck) session=retired-session"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("entry_remove_failed path=cache/file"))
+        );
+        assert!(lines.iter().any(|line| line.contains("then retry")));
+    }
+
+    #[test]
+    fn doctor_includes_completed_cleanup_and_archive_location() {
+        let lines = workspace_cleanup_lines(&serde_json::json!({
+            "count": 0,
+            "reasons": [],
+            "sessions": [{
+                "session_key": "retired-session",
+                "cleanup": "completed",
+                "archive_path": "/archive/retired-session",
+                "blockers": []
+            }]
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("completed session=retired-session"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("archive=/archive/retired-session"))
         );
     }
 
