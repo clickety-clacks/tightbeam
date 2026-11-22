@@ -1748,15 +1748,19 @@ defmodule Tightbeam.HarklightWakes do
       {:ok, {status, at, ended?}} ->
         FeedCustody.retry_write(state.custody_dir, handle)
 
+        # Keep the journal and pending evidence when SQLite refuses admission.
+        # Waiting here would block the worker and manager retry paths.
         result =
-          DB.transaction(state.db, fn txn ->
-            projected =
-              if retryable_failure?(status),
-                do: Outage.start_in_txn(txn, handle, failure_details(status), at),
-                else: mark_finished_in_txn(txn, handle, status, at)
+          DB.refusable(fn ->
+            DB.transaction(state.db, fn txn ->
+              projected =
+                if retryable_failure?(status),
+                  do: Outage.start_in_txn(txn, handle, failure_details(status), at),
+                  else: mark_finished_in_txn(txn, handle, status, at)
 
-            if ended?, do: FeedCustody.release_launch_in_txn(txn, handle)
-            projected
+              if ended?, do: FeedCustody.release_launch_in_txn(txn, handle)
+              projected
+            end)
           end)
 
         case result do
