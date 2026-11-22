@@ -4412,7 +4412,7 @@ defmodule Tightbeam.HarklightWakes do
          message
        ) do
     action_instruction(handle, event) <>
-      "Reply with `tightbeam harklight-reply --handle #{handle} --request #{message} --in-reply-to #{event} --body <reply> [--op-id <uuid>]`. Reuse the same operation ID and inputs if the result is uncertain. " <>
+      "Reply with `tightbeam harklight-reply --handle #{handle} --request #{message} --in-reply-to #{event} --body <reply> [--op-id <uuid>]`. If the outcome is uncertain, retry the same command with unchanged inputs and the operation ID returned in the response. " <>
       "Report actual attachment transfer or use with harklight-agent file-use --item-id #{item} --entry-id #{entry} --file-id <file> and the applicable outcome."
   end
 
@@ -4424,7 +4424,7 @@ defmodule Tightbeam.HarklightWakes do
        ) do
     action_instruction(handle, event) <>
       "Reconcile any earlier effect before applying the answer once. " <>
-      "Report its disposition with `tightbeam harklight-result --handle #{handle} --request #{message} --in-reply-to #{event} --status applied|refused|received [--op-id <uuid>]`. Reuse the same operation ID and inputs if the result is uncertain."
+      "Report its disposition with `tightbeam harklight-result --handle #{handle} --request #{message} --in-reply-to #{event} --status applied|refused|received [--op-id <uuid>]`. If the outcome is uncertain, retry the same command with unchanged inputs and the operation ID returned in the response."
   end
 
   defp handling_instruction(_, _handle, _event, _message) do
@@ -4434,7 +4434,7 @@ defmodule Tightbeam.HarklightWakes do
 
   defp action_instruction(handle, event) do
     "Handle this Harklight entry from your originating session. " <>
-      "Read it with `tightbeam harklight-read --handle #{handle}` and confirm its handoff with `tightbeam harklight-ack --handle #{handle} --event #{event}` before acting. "
+      "Read it with `tightbeam harklight-read --handle #{handle}`. For this delivered chat or answer, confirm handoff with `tightbeam harklight-ack --handle #{handle} --event #{event}` before acting. "
   end
 
   defp pending_supersede_targets(payload) do

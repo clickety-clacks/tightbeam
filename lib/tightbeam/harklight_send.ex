@@ -344,7 +344,8 @@ defmodule Tightbeam.HarklightSend do
     op_id = call.params[:op_id]
     message = call.params[:message_id] || op_id
 
-    with :ok <- origin!(db, call) do
+    with :ok <- origin!(db, call),
+         :ok <- generic_settlement_allowed(db, op_id) do
       send_record = HarklightLifecycle.lookup(db, message)
       change_record = HarklightLifecycle.lookup_change(db, message)
 
@@ -369,9 +370,38 @@ defmodule Tightbeam.HarklightSend do
           recover_one(db, message, opts, :explicit)
       end
     else
-      {:error, code} -> failure("settle", code, early_reason(code), "failed")
+      {:error, "harklight_native_action"} ->
+        failure(
+          "settle",
+          "harklight_native_action",
+          "Retry the original native harklight-reply or harklight-result command with unchanged inputs and the same operation ID.",
+          "refused",
+          %{op_id: op_id}
+        )
+
+      {:error, code} ->
+        failure("settle", code, early_reason(code), "failed")
     end
   end
+
+  defp generic_settlement_allowed(_db, nil), do: :ok
+
+  defp generic_settlement_allowed(db, op_id) when is_binary(op_id) do
+    case DB.query(
+           db,
+           """
+           SELECT 1 FROM harklight_send_operations
+           WHERE opId=?1 AND json_extract(payload,'$.operation_kind')='action'
+           """,
+           [String.downcase(op_id)]
+         ) do
+      {:ok, []} -> :ok
+      {:ok, [[1]]} -> {:error, "harklight_native_action"}
+      {:error, _} -> {:error, "harklight_operation_lookup_unavailable"}
+    end
+  end
+
+  defp generic_settlement_allowed(_db, _op_id), do: {:error, "harklight_op_id_invalid"}
 
   defp settle_receipt(db, session_key, op_id, opts) do
     case HarklightReceipts.settle_paused(db, session_key, op_id, opts) do
@@ -1136,6 +1166,9 @@ defmodule Tightbeam.HarklightSend do
   defp early_reason("harklight_op_id_required"),
     do:
       "Tightbeam has no record of this message, so it does not know which Harklight operation to retry. Run the command again with --op-id <key>, the operation key of the unresolved Harklight operation."
+
+  defp early_reason("harklight_operation_lookup_unavailable"),
+    do: "Tightbeam could not check the saved operation ID. No operation was run."
 
   defp early_reason("harklight_op_id_invalid"),
     do: "--op-id must be a Harklight operation key (a UUID)."

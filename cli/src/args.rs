@@ -1025,7 +1025,8 @@ COMMANDS:
       For an unresolved send without a server item ID, use its returned opId.
       Use --op-id for a paused handoff receipt from your own dispatched turn.
       For a message Tightbeam has no record for, --op-id <key> names the Harklight
-      operation to retry; the retry has no wake or subscription effect.
+      send or change to retry; the retry has no wake or subscription effect.
+      For a native reply or result, retry the original native command with its returned opId.
   harklight-listener-restore --handle <handle>
       Restore this session's Gateway-managed listener on its existing delivery route.
   harklight-follow (--message <id> | --handle <handle>)
@@ -1036,13 +1037,16 @@ COMMANDS:
   harklight-read --handle <handle>
       Read Harklight entries delivered to this session.
   harklight-ack --handle <handle> --event <id>
-      Acknowledge an entry delivered to this session.
+      With Agent 0.2, confirm handoff of a person chat or answer delivered to this session.
+      Closed lifecycle notices can be read without acknowledgment.
   harklight-reply --handle <handle> --request <id> --in-reply-to <event>
       --body <text> [--op-id <uuid>]
-      Reply to a delivered Harklight discussion.
+      Reply to a delivered Harklight person chat. If uncertain, retry with unchanged inputs
+      and the operation ID returned in the response.
   harklight-result --handle <handle> --request <id> --in-reply-to <event>
       --status received|applied|refused [--op-id <uuid>]
-      Report what happened to a delivered Harklight answer.
+      Report what happened to a delivered Harklight answer. If uncertain, retry with
+      unchanged inputs and the operation ID returned in the response.
   harklight-send --session new|<handle> --sender-id <id> --title <text>
       --type fyi|request [--kind blocker|success]
       [--importance low|normal|high|now] [--stake <text>] [--by-when <RFC3339>]

@@ -2511,6 +2511,7 @@ defmodule Tightbeam.HarklightWakesTest do
              "harklight-reply --handle #{@handle} --request request --in-reply-to v2_"
 
     assert first_prompt =~ "file-use --item-id request --entry-id chat-1"
+    assert first_prompt =~ "the operation ID returned in the response"
     assert second_prompt =~ "Second words"
     assert answer_prompt =~ "Seen"
 
@@ -2518,6 +2519,7 @@ defmodule Tightbeam.HarklightWakesTest do
              "harklight-result --handle #{@handle} --request request --in-reply-to v2_"
 
     assert answer_prompt =~ "--status applied|refused|received"
+    assert answer_prompt =~ "the operation ID returned in the response"
   end
 
   test "other requests on the same handle reach the same origin in feed order", %{
@@ -9268,6 +9270,19 @@ defmodule Tightbeam.HarklightWakesTest do
                ])
 
       assert_receive {:native_write, ^op}
+
+      for settlement <- [
+            %{op_id: op},
+            %{message_id: "unrecorded-item", op_id: op},
+            %{message_id: "unrecorded-item", op_id: String.upcase(op)}
+          ] do
+        assert %{outcome: "refused", code: "harklight_native_action"} =
+                 HarklightSend.settle(db, %{call | params: settlement},
+                   runner: fn args -> send(test_pid, {:generic_agent_call, args}) end
+                 )
+
+        refute_received {:generic_agent_call, _}
+      end
 
       retry = %{call | params: Map.put(params, :op_id, op)}
       changed = %{call | params: Map.merge(retry.params, unquote(Macro.escape(changed)))}
