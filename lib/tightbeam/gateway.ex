@@ -5985,10 +5985,9 @@ defmodule Tightbeam.Gateway do
         %{
           state: "relearn-conflicted",
           conflicting_paths: paths,
-          provenance_conflicts: Identity.provenance_conflicts(config.base_dir),
-          path_dispositions: Identity.relearn_dispositions(config.base_dir),
           live_revision: Identity.live_revision!(config.base_dir)
         }
+        |> Map.merge(Identity.relearn_conflict_details(config.base_dir))
 
       {:error, message} ->
         %{

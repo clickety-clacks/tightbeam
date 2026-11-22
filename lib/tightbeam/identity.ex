@@ -1312,16 +1312,17 @@ defmodule Tightbeam.Identity do
     conflicts = conflict_paths(dir)
     missing = missing_installed_kungfu(base_dir, live)
 
-    %{
+    result = %{
       live_revision: live,
       source_revision: source,
       source_notice: source_notice(dir, source, live),
       missing_installed_kungfu: missing,
       missing_installed_kungfu_notice: format_missing_installed_kungfu_notice(missing),
       state: if(conflicts == [], do: :ready, else: :relearn_conflicted),
-      conflicting_paths: conflicts,
-      provenance_conflicts: provenance_conflicts_at_merge(dir)
+      conflicting_paths: conflicts
     }
+
+    Map.merge(result, relearn_conflict_details(base_dir))
   end
 
   @doc "Missing shipped paths and named rules for bundles learned into the live identity."
@@ -1417,20 +1418,34 @@ defmodule Tightbeam.Identity do
   def provenance_conflicts(base_dir), do: provenance_conflicts_at_merge(identity_dir(base_dir))
 
   @doc false
-  def relearn_dispositions(base_dir, candidate_revision \\ nil) do
+  def relearn_conflict_details(base_dir) do
     dir = identity_dir(base_dir)
 
-    if candidate_revision do
-      case product_snapshot_for_candidate(dir, candidate_revision) do
-        {incoming, metadata} ->
-          product_dispositions(dir, incoming, metadata, candidate_revision)
+    case pending_product_snapshot(dir) do
+      nil ->
+        %{provenance_conflicts: []}
 
-        nil ->
-          []
-      end
-    else
-      incoming = git_output!(dir, ["rev-parse", "MERGE_HEAD"])
-      product_dispositions(dir, incoming, product_snapshot_metadata!(dir, incoming), nil)
+      {incoming, metadata} ->
+        %{
+          provenance_conflicts: Map.get(metadata, "provenance_conflicts", []),
+          path_dispositions: product_dispositions(dir, incoming, metadata, nil),
+          resolution: %{
+            instructions:
+              "The published identity is unchanged. Run the chosen Git commands in the gateway's identity repository, then publish after resolving every conflicted file.",
+            publish: "tightbeam identity relearn --resolve",
+            abort: "tightbeam identity relearn --abort"
+          }
+        }
+    end
+  end
+
+  @doc false
+  def relearn_dispositions(base_dir, candidate_revision) do
+    dir = identity_dir(base_dir)
+
+    case product_snapshot_for_candidate(dir, candidate_revision) do
+      {incoming, metadata} -> product_dispositions(dir, incoming, metadata, candidate_revision)
+      nil -> []
     end
   end
 
@@ -2233,15 +2248,18 @@ defmodule Tightbeam.Identity do
   end
 
   defp provenance_conflicts_at_merge(dir) do
+    case pending_product_snapshot(dir) do
+      nil -> []
+      {_incoming, metadata} -> Map.get(metadata, "provenance_conflicts", [])
+    end
+  end
+
+  defp pending_product_snapshot(dir) do
     if merge_pending?(dir) do
       incoming = git_output!(dir, ["rev-parse", "MERGE_HEAD"])
 
-      case product_snapshot_metadata_if_present(dir, incoming) do
-        nil -> []
-        metadata -> Map.get(metadata, "provenance_conflicts", [])
-      end
-    else
-      []
+      if metadata = product_snapshot_metadata_if_present(dir, incoming),
+        do: {incoming, metadata}
     end
   end
 
@@ -2253,16 +2271,20 @@ defmodule Tightbeam.Identity do
     unknown = MapSet.new(metadata["unknown_paths"])
     provenance_conflicts = MapSet.new(metadata["provenance_conflicts"], &Map.fetch!(&1, "path"))
 
-    for path <- metadata["product_paths"],
+    paths = Enum.sort(Enum.uniq(metadata["product_paths"] ++ Map.keys(conflicts)))
+
+    for path <- paths,
         {prior, local, next, outcome, known_base} =
           {base[path], org[path], product[path], merged[path], not MapSet.member?(unknown, path)},
-        (known_base and prior != next) or local != next or MapSet.member?(conflicts, path) do
+        (known_base and prior != next) or local != next or Map.has_key?(conflicts, path) do
+      stages = conflicts[path]
+
       disposition =
         cond do
-          MapSet.member?(conflicts, path) and MapSet.member?(provenance_conflicts, path) ->
+          stages && MapSet.member?(provenance_conflicts, path) ->
             "base-unavailable"
 
-          MapSet.member?(conflicts, path) ->
+          stages ->
             "conflict"
 
           path == @handoff_seed_path and metadata["handoff_policy"] == "keep-organization-default" ->
@@ -2287,14 +2309,34 @@ defmodule Tightbeam.Identity do
             "combined"
         end
 
-      %{
+      result = %{
         path: path,
         disposition: disposition,
         base_source: if(known_base, do: metadata["base_source"], else: "unavailable"),
         base_revision: if(known_base, do: metadata["base_oid"])
       }
+
+      if stages do
+        Map.put(result, :resolution, %{
+          reason:
+            if(disposition == "base-unavailable", do: "unknown base", else: "merge conflict"),
+          accept_product: conflict_choice(path, "theirs", "3" in stages),
+          keep_organization: conflict_choice(path, "ours", "2" in stages)
+        })
+      else
+        result
+      end
     end
   end
+
+  defp conflict_choice(path, side, true) do
+    quoted = Support.shell_quote(path)
+
+    "git --literal-pathspecs checkout --#{side} -- #{quoted} && git --literal-pathspecs add -- #{quoted}"
+  end
+
+  defp conflict_choice(path, _side, false),
+    do: "git --literal-pathspecs rm -f -- #{Support.shell_quote(path)}"
 
   defp product_tree_entries(_dir, nil), do: %{}
 
@@ -2313,18 +2355,18 @@ defmodule Tightbeam.Identity do
     dir
     |> git_output_bytes!(["ls-files", "--stage", "-z"])
     |> String.split(<<0>>, trim: true)
-    |> Enum.reduce({%{}, MapSet.new()}, fn entry, {entries, conflicts} ->
+    |> Enum.reduce({%{}, %{}}, fn entry, {entries, conflicts} ->
       [header, path] = String.split(entry, "\t", parts: 2)
 
       case String.split(header, " ") do
         [mode, oid, "0"] -> {Map.put(entries, path, {mode, oid}), conflicts}
-        [_mode, _oid, _stage] -> {entries, MapSet.put(conflicts, path)}
+        [_mode, _oid, stage] -> {entries, Map.update(conflicts, path, [stage], &[stage | &1])}
       end
     end)
   end
 
   defp product_merge_result(dir, candidate),
-    do: {product_tree_entries(dir, candidate), MapSet.new()}
+    do: {product_tree_entries(dir, candidate), %{}}
 
   defp run_pre_merge_hook(dir, author) do
     hook = Path.join([dir, ".git", "hooks", "pre-merge-commit"])

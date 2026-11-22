@@ -1267,7 +1267,12 @@ defmodule Tightbeam.IdentityTest do
              provenance_conflicts: [content_conflict, addition_conflict],
              path_dispositions: [
                %{path: "guidance/coder.md", disposition: "base-unavailable", base_revision: nil},
-               %{path: ^new_product_path, disposition: "base-unavailable", base_revision: nil}
+               %{
+                 path: ^new_product_path,
+                 disposition: "base-unavailable",
+                 base_revision: nil,
+                 resolution: %{reason: "unknown base", keep_organization: keep_absent}
+               }
              ],
              live_revision: ^live_before
            } =
@@ -1294,6 +1299,8 @@ defmodule Tightbeam.IdentityTest do
 
     assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
     assert File.read!(Path.join(dir, "guidance/coder.md")) == "org-customized"
+    assert {_, 0} = System.shell(keep_absent, cd: dir)
+    refute File.exists?(Path.join(dir, new_product_path))
     assert :ok = Identity.abort_relearn!(ctx.base)
     assert Identity.live_revision!(ctx.base) == live_before
     assert git!(dir, ["rev-parse", "tightbeam/upstream"]) == upstream_before
