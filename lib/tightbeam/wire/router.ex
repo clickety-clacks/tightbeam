@@ -90,6 +90,7 @@ defmodule Tightbeam.Wire.Router do
                    "fact-producer-claim",
                    "fact-producers",
                    "artifact-content-fetch",
+                   "workspace-cleanup",
                    "assignment-commitref-correct",
                    "harness-health-observe-other",
                    "harness-health-resolve-other",
@@ -4166,6 +4167,7 @@ defmodule Tightbeam.Wire.Router do
   @non_target_verbs @non_target_verbs ++
                       [
                         "artifact-content-fetch",
+                        "workspace-cleanup",
                         "assignment-commitref-correct",
                         "harness-health-observe-other",
                         "harness-health-resolve-other",
@@ -4770,6 +4772,7 @@ defmodule Tightbeam.Wire.Router do
     "add-user" => ~w(is_admin user_id)a,
     "answer" => ~w(answer idempotency_key reason request request_id)a,
     "artifact-content-fetch" => ~w(artifact_id)a,
+    "workspace-cleanup" => ~w(action session_key)a,
     "artifact-get" => ~w(artifact_id)a,
     "artifact-record" =>
       ~w(content_base64 content_sha256 description kind origin_path produced_by_assignment_id title work_item_id)a,

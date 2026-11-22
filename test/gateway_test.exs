@@ -49,7 +49,8 @@ defmodule Tightbeam.GatewayTest do
     expected = expected ++ ~w(breathing)
 
     expected =
-      expected ++ ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch)
+      expected ++
+        ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch workspace-cleanup)
 
     expected =
       expected ++
@@ -75,6 +76,7 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.all?(Map.values(handlers), &is_function(&1, 1))
     assert effects["reopen-assignment"] == ["assignment.reopened"]
     assert effects["artifact-content-fetch"] == []
+    assert effects["workspace-cleanup"] == []
 
     assert effects["tune"] == [
              "transition.recorded",

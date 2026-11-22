@@ -17,6 +17,7 @@ defmodule Tightbeam.WorkspaceCleanup do
     "ServerAliveCountMax=2"
   ]
   @default_runner_timeout_ms 900_000
+  @default_stuck_attempts 3
   @external_resource Path.join(__DIR__, "workspace_inventory.py")
   @inventory_script File.read!(@external_resource)
   @archive_limits %{
@@ -63,7 +64,7 @@ defmodule Tightbeam.WorkspaceCleanup do
         {:ok, rows} =
           DB.query(
             state.db,
-            "SELECT sessionKey,nextAt FROM retired_workspace_cleanup WHERE completed=0 ORDER BY nextAt,sessionKey LIMIT 1"
+            "SELECT sessionKey,nextAt FROM retired_workspace_cleanup WHERE completed=0 AND COALESCE(reason,'') NOT LIKE 'stuck:%' ORDER BY nextAt,sessionKey LIMIT 1"
           )
 
         case rows do
@@ -375,6 +376,8 @@ defmodule Tightbeam.WorkspaceCleanup do
   end
 
   def process_session(config, db, key) do
+    previous = stored_report(db, key)
+
     report =
       try do
         session = Tightbeam.Org.get(db, key)
@@ -388,8 +391,7 @@ defmodule Tightbeam.WorkspaceCleanup do
 
         destination = archive_destination(host, key)
 
-        acknowledged =
-          stored_report(db, key) |> Map.get("acknowledged", []) |> Enum.map(& &1["key"])
+        acknowledged = previous |> Map.get("acknowledged", []) |> Enum.map(& &1["key"])
 
         {:ok, [[destination]]} =
           DB.query(
@@ -418,27 +420,17 @@ defmodule Tightbeam.WorkspaceCleanup do
           failed_report([session_key: key], "cleanup_failed", "#{kind}: #{inspect(error)}")
       end
 
-    {:ok, [[attempts]]} =
-      DB.query(db, "SELECT attempts FROM retired_workspace_cleanup WHERE sessionKey=?1", [key])
+    {:ok, retry_outcome} =
+      DB.transaction(db, fn txn -> record_pass_in_txn(txn, key, report, previous, config) end)
 
-    summary = report_summary(report, stored_report(db, key))
-
-    reason =
-      report.blockers |> Enum.map(& &1.reason) |> Enum.uniq() |> Enum.sort() |> Enum.join(", ")
-
-    {:ok, _} =
-      DB.query(
+    if retry_outcome do
+      EventLog.lifecycle(
         db,
-        "UPDATE retired_workspace_cleanup SET completed=?2, nextAt=?3, report=?4, reason=?5, attempts=attempts+1 WHERE sessionKey=?1",
-        [
-          key,
-          if(report.status == "completed", do: 1, else: 0),
-          System.system_time(:millisecond) +
-            min(300_000 * Integer.pow(2, min(attempts, 8)), 86_400_000),
-          JSON.encode!(summary),
-          if(reason == "", do: nil, else: reason)
-        ]
+        "retired_workspace_cleanup_retry_outcome",
+        key,
+        JSON.encode!(Map.put(retry_outcome, "session_key", key))
       )
+    end
 
     if report.status != "completed",
       do: Logger.warning("workspace cleanup incomplete #{key}: #{inspect(report.blockers)}")
@@ -446,8 +438,75 @@ defmodule Tightbeam.WorkspaceCleanup do
     report
   end
 
-  def health(db \\ DB, owner \\ nil) do
-    {:ok, rows} =
+  defp record_pass_in_txn(txn, key, report, previous, config) do
+    [[attempts, raw_report]] =
+      Txn.q(txn, "SELECT attempts,report FROM retired_workspace_cleanup WHERE sessionKey=?1", [
+        key
+      ])
+
+    current = decoded_report(raw_report)
+    completed? = report.status == "completed"
+
+    # The scan only used the requests it saw at startup. Leave any newer request
+    # queued so the next pass can apply it to a fresh inventory.
+    requeued? =
+      not completed? and
+        (current["acknowledged"] != previous["acknowledged"] or
+           current["retry_requested"] != previous["retry_requested"])
+
+    summary = report_summary(report, current)
+
+    {summary, stuck?} =
+      if completed? or requeued?,
+        do: {summary, false},
+        else: track_blocker_streak(summary, current, config)
+
+    requested_retry = current["retry_requested"]
+
+    retry_outcome =
+      if requested_retry && requested_retry == previous["retry_requested"] &&
+           get_in(current, ["retry_outcome", "requested_at"]) != requested_retry["at"] do
+        %{
+          "requested_at" => requested_retry["at"],
+          "completed" => completed?,
+          "status" => if(stuck?, do: "stuck", else: report.status),
+          "blockers" => Map.get(summary, :blocker_details, [])
+        }
+      end
+
+    summary = if retry_outcome, do: Map.put(summary, :retry_outcome, retry_outcome), else: summary
+
+    reason =
+      report.blockers |> Enum.map(& &1.reason) |> Enum.uniq() |> Enum.sort() |> Enum.join(", ")
+
+    reason = if stuck? and reason != "", do: "stuck: " <> reason, else: reason
+
+    next_at =
+      if requeued?,
+        do: 0,
+        else:
+          System.system_time(:millisecond) +
+            min(300_000 * Integer.pow(2, min(attempts, 8)), 86_400_000)
+
+    Txn.q(
+      txn,
+      "UPDATE retired_workspace_cleanup SET completed=?2, nextAt=?3, report=?4, reason=?5, attempts=attempts+1 WHERE sessionKey=?1",
+      [
+        key,
+        if(completed?, do: 1, else: 0),
+        next_at,
+        JSON.encode!(summary),
+        if(requeued? or reason == "", do: nil, else: reason)
+      ]
+    )
+
+    retry_outcome
+  end
+
+  def health(db \\ DB, owner \\ nil, config \\ nil) do
+    rows = statuses(db, owner, config)
+
+    {:ok, grouped} =
       DB.query(
         db,
         "SELECT completed,COALESCE(reason,'cleanup pending'),COUNT(*) FROM retired_workspace_cleanup c LEFT JOIN sessions s ON s.sessionKey=c.sessionKey WHERE (completed=0 OR reason IS NOT NULL) AND (?1 IS NULL OR s.ownerUserId=?1) GROUP BY completed,reason ORDER BY completed,reason",
@@ -456,11 +515,16 @@ defmodule Tightbeam.WorkspaceCleanup do
 
     %{
       count:
-        Enum.reduce(rows, 0, fn [done, _, n], count ->
-          if done == 0, do: count + n, else: count
+        Enum.reduce(grouped, 0, fn [done, _, count], total ->
+          if done == 0, do: total + count, else: total
         end),
+      by_state:
+        rows
+        |> Enum.reject(&(&1.cleanup == "completed"))
+        |> Enum.frequencies_by(& &1.cleanup),
+      sessions: Enum.map(rows, &Map.drop(&1, [:unrecorded, :losses])),
       reasons:
-        Enum.map(rows, fn [done, reason, count] ->
+        Enum.map(grouped, fn [done, reason, count] ->
           %{completed: done == 1, reason: reason, count: count}
         end)
     }
@@ -621,6 +685,16 @@ defmodule Tightbeam.WorkspaceCleanup do
       blockers: report.blockers |> Enum.map(& &1.reason) |> Enum.uniq()
     }
 
+    summary =
+      if report.status == "completed" or report.blockers == [],
+        do: summary,
+        else:
+          Map.put(
+            summary,
+            :blocker_details,
+            Enum.map(report.blockers, &Map.take(&1, [:reason, :path, :detail, :exit]))
+          )
+
     summary = if losses == [], do: summary, else: Map.put(summary, :losses, losses)
 
     summary =
@@ -628,9 +702,23 @@ defmodule Tightbeam.WorkspaceCleanup do
       |> Map.put(:archive_created, Map.get(report, :archive_created, false))
       |> Map.put(:unrecorded, Map.get(report, :unrecorded, []))
 
-    case Map.get(stored, "acknowledged", []) do
-      [] -> summary
-      acknowledged -> Map.put(summary, :acknowledged, acknowledged)
+    summary =
+      case Map.get(stored, "acknowledged", []) do
+        [] -> summary
+        acknowledged -> Map.put(summary, :acknowledged, acknowledged)
+      end
+
+    case Map.get(stored, "retry_requested") do
+      nil ->
+        summary
+
+      retry_requested ->
+        summary = Map.put(summary, :retry_requested, retry_requested)
+
+        case Map.get(stored, "retry_outcome") do
+          nil -> summary
+          retry_outcome -> Map.put(summary, :retry_outcome, retry_outcome)
+        end
     end
   end
 
@@ -752,39 +840,211 @@ defmodule Tightbeam.WorkspaceCleanup do
            "SELECT completed, attempts, nextAt, reason, archivePath, report FROM retired_workspace_cleanup WHERE sessionKey=?1",
            [key]
          ) do
-      {:ok, [[1, _attempts, _next, _reason, path, report]]} ->
+      {:ok, [[1, attempts, _next, _reason, path, report]]} ->
         report = decoded_report(report)
         archived = Map.get_lazy(report, "archive_created", fn -> recorded_archive?(db, path) end)
 
         %{
           cleanup: "completed",
-          reasons: [],
+          reasons: Map.get(report, "blockers", []),
+          blockers: Map.get(report, "blocker_details", []),
+          operator_action: nil,
           archive_path: if(archived, do: path),
-          unrecorded: Map.get(report, "unrecorded", [])
+          unrecorded: Map.get(report, "unrecorded", []),
+          losses: Map.get(report, "losses", []),
+          attempts: attempts,
+          next_attempt_at: nil
         }
 
-      {:ok, [[0, 0, _next, _reason, path, _report]]} ->
-        %{cleanup: "queued", reasons: [], archive_path: path}
+      {:ok, [[0, attempts, next_at, nil, path, raw_report]]} ->
+        report = decoded_report(raw_report)
+
+        %{
+          cleanup: "queued",
+          reasons: [],
+          blockers: [],
+          archive_path: path,
+          unrecorded: Map.get(report, "unrecorded", []),
+          losses: Map.get(report, "losses", []),
+          attempts: attempts,
+          next_attempt_at: next_at
+        }
 
       {:ok, [[0, attempts, next_at, reason, path, report]]} ->
-        reasons = if is_binary(reason), do: String.split(reason, ", "), else: []
-        held? = "uncaptured_work" in reasons
+        report = decoded_report(report)
 
         reasons =
-          if held?, do: reasons -- ["cleanup_command_failed", "cleanup_incomplete"], else: reasons
+          Map.get(
+            report,
+            "blockers",
+            if(is_binary(reason), do: String.split(reason, ", "), else: [])
+          )
+
+        held? = "uncaptured_work" in reasons
+        stuck? = Map.get(report, "stuck", false) or String.starts_with?(reason || "", "stuck:")
 
         %{
           cleanup: if(held?, do: "held", else: "blocked"),
+          blocker_state: if(stuck?, do: "stuck"),
           reasons: reasons,
+          blockers: Map.get(report, "blocker_details", []),
+          operator_action: Map.get(report, "operator_action"),
+          operator_actions: Map.get(report, "operator_actions", []),
           archive_path: path,
-          unrecorded: Map.get(decoded_report(report), "unrecorded", []),
+          unrecorded: Map.get(report, "unrecorded", []),
+          losses: Map.get(report, "losses", []),
           attempts: attempts,
-          next_attempt_at: next_at
+          next_attempt_at: if(stuck?, do: nil, else: next_at)
         }
 
       _ ->
         nil
     end
+  end
+
+  @doc "Lists cleanup status rows visible to an owner, or all rows for an admin."
+  def statuses(db, owner \\ nil, config \\ nil) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT c.sessionKey,s.displayName,s.host FROM retired_workspace_cleanup c JOIN sessions s ON s.sessionKey=c.sessionKey WHERE (?1 IS NULL OR s.ownerUserId=?1) ORDER BY c.nextAt,c.sessionKey",
+        [owner]
+      )
+
+    Enum.map(rows, fn [key, name, host] ->
+      row = status(db, key) || %{}
+
+      archive_path =
+        if row[:cleanup] == "completed" do
+          row[:archive_path]
+        else
+          row[:archive_path] ||
+            if config, do: projected_archive(config, db, %{host: host, session_key: key})
+        end
+
+      row
+      |> Map.put(:archive_path, archive_path)
+      |> Map.merge(%{session_key: key, display_name: name, workdir_host: host})
+    end)
+  rescue
+    error -> {:error, Exception.message(error)}
+  end
+
+  @doc "Requeues an unfinished cleanup. All cleanup safeguards run again."
+  def retry(db, key, by \\ "unknown") do
+    result =
+      DB.transaction(db, fn txn ->
+        case Txn.q(
+               txn,
+               "SELECT completed,report FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [key]
+             ) do
+          [[0, raw_report]] ->
+            requested_at = System.system_time(:millisecond)
+
+            report =
+              raw_report
+              |> decoded_report()
+              |> Map.put("retry_requested", %{"by" => by, "at" => requested_at})
+
+            requeue_in_txn(txn, key, report)
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "retired_workspace_cleanup_retry_requested",
+              key,
+              JSON.encode!(%{by: by, requested_at: requested_at})
+            )
+
+            :queued
+
+          [[1, _]] ->
+            :completed
+
+          [] ->
+            :missing
+        end
+      end)
+
+    case result do
+      {:ok, :queued} ->
+        kick()
+        %{ok: true, session_key: key, cleanup: "queued"}
+
+      {:ok, :completed} ->
+        %{code: "cleanup_already_completed", message: "workspace cleanup is already completed"}
+
+      {:ok, :missing} ->
+        %{code: "cleanup_not_found", message: "no retired workspace cleanup row for session"}
+
+      {:error, error} ->
+        %{code: "cleanup_retry_failed", message: Exception.message(error)}
+    end
+  end
+
+  defp track_blocker_streak(summary, previous, config) do
+    blockers = Map.get(summary, :blocker_details, [])
+    reasons = Enum.map(blockers, & &1.reason) |> Enum.uniq() |> Enum.sort()
+
+    signature =
+      blockers
+      |> Enum.map(&[&1.reason, Map.get(&1, :path)])
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    old_signature = Map.get(previous, "blocker_signature")
+    old_streak = Map.get(previous, "blocker_streak", 0)
+
+    streak =
+      if signature != [] and signature == old_signature,
+        do: old_streak + 1,
+        else: if(signature == [], do: 0, else: 1)
+
+    threshold = stuck_attempt_limit(config)
+
+    stuck? = "mount_boundary" in reasons or (signature != [] and streak >= threshold)
+    actions = blocker_operator_actions(reasons)
+
+    {summary
+     |> Map.put(:blocker_signature, signature)
+     |> Map.put(:blocker_streak, streak)
+     |> Map.put(:stuck, stuck?)
+     |> Map.put(:operator_actions, actions)
+     |> Map.put(:operator_action, Enum.join(actions, " ")), stuck?}
+  end
+
+  defp blocker_operator_actions(reasons) do
+    Enum.map(reasons, fn
+      "uncaptured_work" ->
+        "Capture or copy the listed work, or acknowledge the exact inventory, then retry."
+
+      "mount_boundary" ->
+        "Move or remove the nested mount, then retry the cleanup."
+
+      reason when reason in ["entry_remove_failed", "directory_remove_failed"] ->
+        "Resolve filesystem permissions or open-file errors at the reported paths, then retry."
+
+      _reason ->
+        "Resolve the reported filesystem or cleanup error, then retry."
+    end)
+    |> Enum.uniq()
+  end
+
+  defp stuck_attempt_limit(config) do
+    limit =
+      Map.get(
+        config || %{},
+        :workspace_cleanup_stuck_attempts,
+        Application.get_env(
+          :tightbeam,
+          :workspace_cleanup_stuck_attempts,
+          @default_stuck_attempts
+        )
+      )
+
+    if is_integer(limit) and limit > 0,
+      do: limit,
+      else: raise(ArgumentError, "workspace_cleanup_stuck_attempts must be a positive integer")
   end
 
   defp decoded_report(raw) when is_binary(raw) do
@@ -814,14 +1074,13 @@ defmodule Tightbeam.WorkspaceCleanup do
   `%{kind, path, detail}` maps; `[]` when nothing is held.
   """
   def held_losses(db, key) do
-    case stored_report(db, key) do
-      %{"losses" => losses, "blockers" => blockers} when is_list(losses) ->
-        if "uncaptured_work" in blockers, do: losses, else: []
-
-      _ ->
-        []
-    end
+    db |> stored_report(key) |> losses_on_hold()
   end
+
+  defp losses_on_hold(%{"losses" => losses, "blockers" => blockers}) when is_list(losses),
+    do: if("uncaptured_work" in blockers, do: losses, else: [])
+
+  defp losses_on_hold(_report), do: []
 
   @doc """
   Acknowledges the losses currently held for a retired session so the next
@@ -830,39 +1089,61 @@ defmodule Tightbeam.WorkspaceCleanup do
   (`kind:path`) with who and when, in the cleanup report.
   """
   def acknowledge(db, key, by) do
-    case held_losses(db, key) do
-      [] ->
-        {:error, :nothing_held}
+    result =
+      DB.transaction(db, fn txn ->
+        with [[raw_report]] <-
+               Txn.q(
+                 txn,
+                 "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1 AND completed=0",
+                 [key]
+               ),
+             stored = decoded_report(raw_report),
+             [_ | _] = losses <- losses_on_hold(stored) do
+          now = System.system_time(:millisecond)
 
-      losses ->
-        now = System.system_time(:millisecond)
-        stored = stored_report(db, key)
+          entries =
+            Enum.map(losses, fn loss ->
+              %{"key" => loss_key(loss), "by" => by, "at" => now, "detail" => loss["detail"]}
+            end)
 
-        entries =
-          Enum.map(losses, fn loss ->
-            %{"key" => loss_key(loss), "by" => by, "at" => now, "detail" => loss["detail"]}
-          end)
+          keys = Enum.map(entries, & &1["key"])
+          previous = stored |> Map.get("acknowledged", []) |> Enum.reject(&(&1["key"] in keys))
+          requeue_in_txn(txn, key, Map.put(stored, "acknowledged", previous ++ entries))
 
-        keys = Enum.map(entries, & &1["key"])
-        previous = stored |> Map.get("acknowledged", []) |> Enum.reject(&(&1["key"] in keys))
-
-        {:ok, _} =
-          DB.query(
-            db,
-            "UPDATE retired_workspace_cleanup SET report=?2, nextAt=0 WHERE sessionKey=?1 AND completed=0",
-            [key, JSON.encode!(Map.put(stored, "acknowledged", previous ++ entries))]
+          EventLog.lifecycle_in_txn(
+            txn,
+            "retired_workspace_loss_acknowledged",
+            key,
+            JSON.encode!(%{by: by, acknowledged: keys})
           )
 
-        EventLog.lifecycle(
-          db,
-          "retired_workspace_loss_acknowledged",
-          key,
-          JSON.encode!(%{by: by, acknowledged: Enum.map(entries, & &1["key"])})
-        )
+          losses
+        else
+          [] -> []
+        end
+      end)
 
+    case result do
+      {:ok, []} ->
+        {:error, :nothing_held}
+
+      {:ok, losses} ->
         kick()
         {:ok, losses}
+
+      {:error, error} ->
+        raise error
     end
+  end
+
+  defp requeue_in_txn(txn, key, report) do
+    report = Map.drop(report, ["stuck", "blocker_streak", "blocker_signature"])
+
+    Txn.q(
+      txn,
+      "UPDATE retired_workspace_cleanup SET nextAt=0,reason=NULL,report=?2 WHERE sessionKey=?1",
+      [key, JSON.encode!(report)]
+    )
   end
 
   defp record_report(db, report) do
