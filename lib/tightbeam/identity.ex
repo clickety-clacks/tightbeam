@@ -1620,18 +1620,30 @@ defmodule Tightbeam.Identity do
         if product_snapshot_metadata_if_present(dir, revision) do
           {:published_snapshot, revision}
         else
-          seed_root = neutral_seed_root(dir, revision)
+          seed_source = legacy_seed_source(dir, revision)
+          seed_root = neutral_seed_root(dir, seed_source)
           seed_paths = Enum.map(seed_entries(), &elem(&1, 0))
 
-          # Older imports copied these paths from org main. Only unchanged
-          # entries from the neutral seed commit have attributable product bytes.
+          # Older imports copied these paths from org main. A namespacing
+          # migration transforms the upstream tree, so prove its seed entries
+          # against the input tree before using the migrated bytes as the base.
           unknown_seed_paths =
             Enum.reject(seed_paths, fn path ->
-              seed_root && tree_entry(dir, revision, path) == tree_entry(dir, seed_root, path)
+              seed_root && tree_entry(dir, seed_source, path) == tree_entry(dir, seed_root, path)
             end)
 
           {:legacy, revision, unknown_seed_paths}
         end
+    end
+  end
+
+  defp legacy_seed_source(dir, upstream) do
+    case git_output!(dir, ["show", "-s", "--format=%s", upstream]) do
+      "identity: namespace upstream rail baseline" ->
+        git_output!(dir, ["rev-parse", "#{upstream}^1"])
+
+      _ ->
+        upstream
     end
   end
 

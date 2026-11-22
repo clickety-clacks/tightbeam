@@ -141,7 +141,7 @@ end
 
 case phase do
   "conflict" ->
-    call.(["learn", "agentic-engineering"])
+    assert %{"state" => "published"} = call.(["learn", "agentic-engineering"])
     edit.(["--manifest"], manifest.("local"))
     edit.([], "local customization\n")
     File.write!(Path.join(root, "stable"), Identity.live_revision!(base))
