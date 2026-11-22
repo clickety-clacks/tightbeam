@@ -20,6 +20,7 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Model
 
   @ddl """
   CREATE TABLE IF NOT EXISTS harness_model_rate_limits (
@@ -98,51 +99,111 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
   defp names_model?(text, model) do
     model = String.downcase(model)
 
-    # The family is a word inside the model id after its leading vendor word,
-    # for example "opus" in an "<vendor>-opus-5-5" id.
-    family =
-      case String.split(model, ["-", "_", "."], trim: true) do
-        [_vendor | rest] -> Enum.find(rest, &Regex.match?(~r/\A[a-z]+\z/, &1))
-        _ -> nil
-      end
-
-    [model, family]
+    [model, family_token(model)]
     |> Enum.filter(&(is_binary(&1) and String.length(&1) >= 4))
-    |> Enum.any?(fn name ->
-      qualifier = Regex.escape(name)
-
-      Regex.match?(
-        ~r/\b#{qualifier}(?:['’]s)?\s+(?:(?:model|session|hourly|daily|weekly|monthly|usage|rate|request)\s+)*(?:limit|quota)\b|\b(?:limit|quota)(?:\s+(?:reached|exceeded))?\s+(?:for|on)\s+(?:the\s+)?#{qualifier}\b/u,
-        text
-      )
-    end)
+    |> Enum.any?(&limit_names?(text, &1, "\\b", "\\b"))
   end
 
-  @doc "Record one model-scoped limit."
-  @spec record_in_txn(Txn.t(), map()) :: :ok
-  def record_in_txn(%Txn{} = txn, input) do
-    Txn.q(
-      txn,
-      """
-      INSERT OR IGNORE INTO harness_model_rate_limits
-        (id,harness,host,model,sessionKey,assignmentId,turnSeq,observedAt,cause,principal)
-      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-      """,
-      [
-        "hmrl_" <> Tightbeam.Id.uuid4(),
-        input.harness,
-        input.host,
-        input.model,
-        input.session_key,
-        input.assignment_id,
-        input.turn_seq,
-        input.observed_at,
-        input.cause,
-        input.principal
-      ]
-    )
+  defp family_token(model) do
+    # The family is a word inside the model id after its leading vendor word,
+    # for example "opus" in an "<vendor>-opus-5-5" id.
+    case String.split(model, ["-", "_", "."], trim: true) do
+      [_vendor | rest] -> Enum.find(rest, &Regex.match?(~r/\A[a-z]+\z/, &1))
+      _ -> nil
+    end
+  end
 
-    :ok
+  defp limit_names?(text, name, left, right) do
+    qualifier = left <> Regex.escape(name) <> right
+
+    Regex.match?(
+      ~r/#{qualifier}(?:['’]s)?\s+(?:(?:model|session|hourly|daily|weekly|monthly|usage|rate|request)\s+)*(?:limit|quota)\b|\b(?:limit|quota)(?:\s+(?:reached|exceeded))?\s+(?:for|on)\s+(?:the\s+)?#{qualifier}/u,
+      text
+    )
+  end
+
+  @doc "True only when provider wording explicitly names the attempted model or its family."
+  @spec model_named?(String.t(), Model.t()) :: boolean()
+  def model_named?(message, %Model{} = model) when is_binary(message) do
+    text = String.downcase(message)
+    family = String.downcase(model.family)
+    ref = model |> Model.to_ref() |> String.downcase()
+
+    # A word boundary alone would also accept the prefix of a longer model ID.
+    # A final period is punctuation unless another identifier segment follows.
+    [ref, family, family_token(family)]
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.uniq()
+    |> Enum.any?(&limit_names?(text, &1, "(?<![\\w./-])", "(?![\\w/\\[-]|\\.\\w)"))
+  end
+
+  def model_named?(_message, _model), do: false
+
+  @doc "Record one model-scoped limit."
+  @spec record_in_txn(Txn.t(), map()) :: :ok | :recorded | :duplicate
+  def record_in_txn(%Txn{} = txn, input) do
+    case Map.fetch(input, :compaction_attempt_key) do
+      {:ok, attempt_key} ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO harness_model_rate_limits
+            (id,harness,host,model,modelContext,sessionKey,assignmentId,turnSeq,
+             compactionAttemptKey,observedAt,cause,principal)
+          VALUES (?1,?2,?3,?4,?5,NULL,NULL,NULL,?6,?7,?8,?9)
+          ON CONFLICT(compactionAttemptKey) WHERE compactionAttemptKey IS NOT NULL DO NOTHING
+          """,
+          [
+            "hmrl_" <> Tightbeam.Id.uuid4(),
+            input.harness,
+            input.host,
+            input.model,
+            Map.get(input, :model_context),
+            attempt_key,
+            input.observed_at,
+            input.cause,
+            input.principal
+          ]
+        )
+
+        if Txn.changes(txn) == 1, do: :recorded, else: :duplicate
+
+      :error ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO harness_model_rate_limits
+            (id,harness,host,model,sessionKey,assignmentId,turnSeq,compactionAttemptKey,
+             observedAt,cause,principal)
+          VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?9,?10)
+          ON CONFLICT(turnSeq) WHERE turnSeq IS NOT NULL DO NOTHING
+          """,
+          [
+            "hmrl_" <> Tightbeam.Id.uuid4(),
+            input.harness,
+            input.host,
+            input.model,
+            input.session_key,
+            input.assignment_id,
+            input.turn_seq,
+            input.observed_at,
+            input.cause,
+            input.principal
+          ]
+        )
+
+        :ok
+    end
+  end
+
+  @doc "Record a positively model-named compactor limit with its attempt identity."
+  def record_compactor_attempt(db \\ DB, input) do
+    {:ok, status} =
+      DB.transaction(db, fn txn ->
+        record_in_txn(txn, input)
+      end)
+
+    %{status: Atom.to_string(status), attempt_key: input.compaction_attempt_key}
   end
 
   @doc "Release every held record for the model a normal turn just answered on."
