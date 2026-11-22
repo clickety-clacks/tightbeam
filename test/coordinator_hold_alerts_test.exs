@@ -1,7 +1,9 @@
 defmodule Tightbeam.CoordinatorHoldAlertsTest do
   use Tightbeam.TestCase, async: false
+  @moduletag :tmp_dir
 
   alias Tightbeam.{
+    Archetypes,
     CoordinatorHoldAlerts,
     DB,
     Devices,
@@ -27,7 +29,32 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
   @model "claude-opus-5-5"
   @other_model "claude-sonnet-5-5"
 
-  setup do
+  setup %{tmp_dir: base_dir} do
+    previous = :persistent_term.get(Archetypes, :missing)
+
+    on_exit(fn ->
+      case previous do
+        :missing -> :persistent_term.erase(Archetypes)
+        value -> :persistent_term.put(Archetypes, value)
+      end
+    end)
+
+    bundle = Path.join(base_dir, "identity/kungfu/uncle-enzo")
+    File.mkdir_p!(Path.join(bundle, "archetypes"))
+
+    manifests =
+      for role <- ~w(exec deliverator exec-assistant) do
+        File.write!(Path.join(bundle, "archetypes/#{role}.toml"), "name = \"#{role}\"\n")
+        "kungfu/uncle-enzo/archetypes/#{role}.toml"
+      end
+
+    File.write!(Path.join(bundle, "installed.toml"), """
+    name = "uncle-enzo"
+    paths = #{JSON.encode!(manifests)}
+    """)
+
+    assert %{"uncle-enzo.exec" => %{manifest_name: "exec"}} = Archetypes.load!(base_dir)
+
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = Tightbeam.Schema.ensure_all(db)
     Devices.add_user(db, "fixture-owner", true)
@@ -38,7 +65,8 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
     session(ctx.db, @main, "generic", "claude", "build-host", @model)
     session(ctx.db, @exec, "uncle-enzo.exec", "claude", "second-host", @model)
     session(ctx.db, @deliverator, "uncle-enzo.deliverator", "claude", "build-host", @other_model)
-    session(ctx.db, @worker, "worker", "claude", "third-host", @model)
+    session(ctx.db, @worker, "uncle-enzo.exec-assistant", "claude", "third-host", @model)
+    session(ctx.db, @remote_worker, "missing.exec", "claude", "third-host", @model)
     assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, @park)
     assert reconcile(ctx) == nil
     refute_received {:sent, _, _, _}
@@ -49,7 +77,8 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
     assert_received {:sent, first, "Tightbeam coordinators are held", body}
     assert body =~ "All 3 coordinators are held."
     assert body =~ "claude at build-host has 2 held sessions."
-    assert body =~ "claude (#{@model}) at second-host has 1 held session"
+    assert body =~ "claude at second-host has 1 held session"
+    refute body =~ @model
     assert body =~ "Tightbeam will resume work"
     refute body =~ @exec
     refute body =~ "third-host"
@@ -77,8 +106,13 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
     session(ctx.db, @main, "generic", "claude", "build-host", @model)
     session(ctx.db, @worker, "worker", "claude", "build-host", @other_model)
     session(ctx.db, @remote_worker, "worker", "claude", "second-host", @model)
-    session(ctx.db, @exec, "exec", "claude", "second-host", @model)
-    assert :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE archetype='exec'")
+    session(ctx.db, @exec, "uncle-enzo.exec", "claude", "second-host", @model)
+
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               "UPDATE sessions SET state='retired' WHERE archetype='uncle-enzo.exec'"
+             )
 
     model_hold(ctx.db, @main, "build-host", @model)
     refute HarnessProcess.parked?(ctx.db, @park)
@@ -147,7 +181,7 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
     refute_received {:sent, _, _, _}
     assert %{host: "second-host"} = Org.set_host(ctx.db, @exec, "second-host")
     assert_receive {:sent, _, "A Tightbeam coordinator is available", recovery}, 1_000
-    assert recovery =~ "An exec can take turns again on claude at second-host."
+    assert recovery =~ "Exec can take turns again on claude at second-host."
     refute recovery =~ "sample-secret"
     refute recovery =~ "s_private"
     assert HarnessProcess.parked?(ctx.db, @park)
@@ -290,7 +324,13 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
                  txn,
                  """
                  INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt)
-                 VALUES ('window','Approved install window token=sample-secret asg_private','fixture-owner','fixture-owner',?1),
+                 VALUES ('window','Approved install window','fixture-owner','fixture-owner',?1),
+                        ('private-window','Private token=sample-secret asg_private','fixture-owner','fixture-owner',?1),
+                        ('private-id','Review wi_private','fixture-owner','fixture-owner',?1),
+                        ('private-key','Do not share key=example-value','fixture-owner','fixture-owner',?1),
+                        ('private-uuid','Review 317c35c2-76f1-4ff0-b659-3c616e20e210','fixture-owner','fixture-owner',?1),
+                        ('private-hex','Review 0123456789abcdef','fixture-owner','fixture-owner',?1),
+                        ('private-token','Review abcdefgXYZ12_token123456789','fixture-owner','fixture-owner',?1),
                         ('foreign-window','Serve window','another-owner','another-owner',?1)
                  """,
                  [@at]
@@ -299,12 +339,36 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
                Txn.q(
                  txn,
                  """
+                 INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
+                 VALUES ('fixture-assignment','Assignment subject stays private',?1,'fixture-owner',?2)
+                 """,
+                 [@main, @at]
+               )
+
+               Txn.q(
+                 txn,
+                 """
                  INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,state,work_item_id,deliveredTurnSeq)
                  VALUES ('member',?1,'process:tightbeam','install',?2,?3,'fired','window',?4),
+                        ('private-member',?1,'process:tightbeam','install',?2,?3,'fired','private-window',?4),
+                        ('id-member',?1,'process:tightbeam','install',?2,?3,'fired','private-id',?4),
+                        ('key-member',?1,'process:tightbeam','install',?2,?3,'fired','private-key',?4),
+                        ('uuid-member',?1,'process:tightbeam','install',?2,?3,'fired','private-uuid',?4),
+                        ('hex-member',?1,'process:tightbeam','install',?2,?3,'fired','private-hex',?4),
+                        ('token-member',?1,'process:tightbeam','install',?2,?3,'fired','private-token',?4),
                         ('foreign-member',?1,'process:tightbeam','serve',?2-1,?3,'fired','foreign-window',?4),
                         ('ordinary',?1,'process:tightbeam','ordinary work',?3,?3,'fired',NULL,?4)
                  """,
                  [@main, deadline, @at, seq]
+               )
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,assignmentId)
+                 VALUES ('assignment-source',?1,'process:tightbeam','timed work',?2,?3,'fixture-assignment')
+                 """,
+                 [@main, deadline - 2, @at]
                )
 
                :ok
@@ -344,10 +408,17 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
 
     assert reconcile(ctx) == nil
     assert_received {:sent, _, "Tightbeam coordinators are held", body}
-    assert body =~ "Install window due"
+    assert body =~ "Approved install window due"
+    assert body =~ "7 held items with deadlines. Earliest due"
     assert body =~ "Provider reset Nov 22 11:00 UTC."
     refute body =~ "sample-secret"
     refute body =~ "asg_private"
+    refute body =~ "wi_private"
+    refute body =~ "example-value"
+    refute body =~ @handle
+    refute body =~ "0123456789abcdef"
+    refute body =~ "abcdefgXYZ12_token123456789"
+    refute body =~ "Assignment subject stays private"
     refute body =~ "Serve window"
     refute body =~ "Scheduled work"
 

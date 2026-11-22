@@ -6493,6 +6493,7 @@ defmodule Tightbeam.Gateway do
       end)
 
     Tightbeam.RowReactions.recover(Map.get(config, :db, Tightbeam.DB))
+    Tightbeam.CoordinatorHoldAlerts.changed()
     rules
   end
 

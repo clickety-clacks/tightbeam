@@ -3,10 +3,12 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
   use GenServer
   require Logger
 
-  alias Tightbeam.{DB, HarklightSend, Id, Org, RateLimitReset}
+  alias Tightbeam.{Archetypes, DB, ErrorDiagnostic, HarklightSend, Id, Org, RateLimitReset}
   alias Tightbeam.DB.Txn
 
   @alert_interval_ms :timer.minutes(5)
+  @title_id ~r/\b(?:(?:wi|asg|s|att|art|dr)_[a-z0-9_-]+|[a-f0-9]{16,}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\b/i
+  @title_secret ~r/\b(?:[\w-]*(?:key|token|secret|password)["']?\s*[:=]\s*\S+|[a-z0-9_+\/-]{32,}|(?=[a-z0-9_+\/-]*\d)[a-z0-9_+\/-]{24,})/i
 
   @ddl """
   CREATE TABLE IF NOT EXISTS coordinator_hold_episodes (
@@ -110,10 +112,12 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
   end
 
   defp active_sessions(txn, owner) do
+    catalog = Archetypes.all()
+
     Txn.q(
       txn,
       """
-      SELECT s.sessionKey,s.archetype,s.harness,s.host,s.model,
+      SELECT s.sessionKey,s.archetype,s.harness,s.host,
              p.requestedAt,p.generation,
              (SELECT i.id FROM harness_health_incidents i
                WHERE p.adapterKey IS NOT NULL AND i.harness=s.harness AND i.host=s.host
@@ -138,7 +142,6 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
                      archetype,
                      harness,
                      host,
-                     model,
                      parked_at,
                      park_generation,
                      incident_id,
@@ -160,12 +163,10 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
         key: key,
         harness: harness,
         host: host,
-        model: model,
-        parked: not is_nil(parked_at),
         sources: sources,
         incident_id: incident_id,
         model_reset: model_reset(cause, observed_at),
-        coordinator: coordinator_label(owner, key, archetype)
+        coordinator: coordinator_label(owner, key, Map.get(catalog, archetype))
       }
     end)
   end
@@ -174,9 +175,9 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
     if key == Org.personal_session_key(owner) do
       "Main"
     else
-      case List.last(String.split(archetype, ".")) do
-        "exec" -> "An exec"
-        "deliverator" -> "A deliverator"
+      case archetype do
+        %{manifest_name: "exec"} -> "Exec"
+        %{manifest_name: "deliverator"} -> "Deliverator"
         _ -> nil
       end
     end
@@ -437,11 +438,9 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
 
     routes =
       held
-      |> Enum.group_by(&{&1.harness, &1.host, if(&1.parked, do: nil, else: &1.model)})
+      |> Enum.group_by(&{&1.harness, &1.host})
       |> Enum.sort()
-      |> Enum.map(fn {{harness, host, model}, group} ->
-        route = if model, do: "#{harness} (#{model})", else: harness
-
+      |> Enum.map(fn {{harness, host}, group} ->
         resets =
           group
           |> Enum.flat_map(&[park_reset(txn, &1.incident_id), &1.model_reset])
@@ -455,7 +454,7 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
 
         count = length(group)
         unit = if count == 1, do: "session", else: "sessions"
-        "#{route} at #{host} has #{count} held #{unit}. #{reset}"
+        "#{harness} at #{host} has #{count} held #{unit}. #{reset}"
       end)
 
     urgent = urgent_work(txn, owner, held)
@@ -492,46 +491,69 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
   defp urgent_work(txn, owner, held) do
     keys = JSON.encode!(Enum.map(held, & &1.key))
 
-    Txn.q(
-      txn,
-      """
-      WITH held_sessions AS (SELECT value AS sessionKey FROM json_each(?1)),
-      sources AS (
-        SELECT w.wakeId,w.assignmentId,w.work_item_id,w.dueAt,w.createdAt,w.ownerUserId,NULL AS requestRef
-        FROM wakes w JOIN held_sessions h ON h.sessionKey=w.sessionKey
-        WHERE w.state='pending' AND w.consumer='prompt'
-        UNION
-        SELECT w.wakeId,COALESCE(w.assignmentId,t.assignmentId),w.work_item_id,w.dueAt,w.createdAt,w.ownerUserId,t.requestRef
-        FROM held_sessions h JOIN turns t ON t.sessionKey=h.sessionKey AND t.status='queued'
-        JOIN wakes w ON w.deliveredTurnSeq=t.seq OR w.wakeId=t.wakeId
+    work =
+      Txn.q(
+        txn,
+        """
+        WITH held_sessions AS (SELECT value AS sessionKey FROM json_each(?1)),
+        sources AS (
+          SELECT w.wakeId,w.assignmentId,w.work_item_id,w.dueAt,w.createdAt,w.ownerUserId,NULL AS requestRef
+          FROM wakes w JOIN held_sessions h ON h.sessionKey=w.sessionKey
+          WHERE w.state='pending' AND w.consumer='prompt'
+          UNION
+          SELECT w.wakeId,COALESCE(w.assignmentId,t.assignmentId),w.work_item_id,w.dueAt,w.createdAt,w.ownerUserId,t.requestRef
+          FROM held_sessions h JOIN turns t ON t.sessionKey=h.sessionKey AND t.status='queued'
+          JOIN wakes w ON w.deliveredTurnSeq=t.seq OR w.wakeId=t.wakeId
+        )
+        SELECT item.title, MIN(COALESCE(d.deadlineAt,CASE WHEN s.dueAt>s.createdAt THEN s.dueAt END))
+        FROM sources s
+        LEFT JOIN assignments a ON a.id=s.assignmentId AND EXISTS (
+          SELECT 1 FROM sessions holder WHERE holder.sessionKey=a.holderKey AND holder.ownerUserId=?2
+        )
+        LEFT JOIN work_items item ON item.id=COALESCE(s.work_item_id,a.workItemId)
+          AND item.ownerUserId=?2
+        LEFT JOIN decision_requests d ON d.status='open' AND d.ownerUserId=?2
+          AND (d.id=s.requestRef OR d.deadlineWakeId=s.wakeId)
+        WHERE (s.ownerUserId IS NULL OR s.ownerUserId=?2)
+          AND (s.assignmentId IS NULL OR a.id IS NOT NULL)
+          AND (COALESCE(s.work_item_id,a.workItemId) IS NULL OR item.id IS NOT NULL)
+          AND (s.requestRef IS NULL OR d.id IS NOT NULL)
+          AND (d.deadlineAt IS NOT NULL OR s.dueAt>s.createdAt)
+        GROUP BY item.id IS NULL,COALESCE(item.id,s.wakeId),item.title
+        ORDER BY 2,1
+        """,
+        [keys, owner]
       )
-      SELECT DISTINCT
-        CASE
-          WHEN lower(COALESCE(item.title,a.subject,'')) LIKE '%install window%' THEN 'Install window'
-          WHEN lower(COALESCE(item.title,a.subject,'')) LIKE '%serve window%' THEN 'Serve window'
-          WHEN d.deadlineAt IS NOT NULL THEN 'Decision'
-          ELSE 'Scheduled work'
-        END,
-        COALESCE(d.deadlineAt,CASE WHEN s.dueAt>s.createdAt THEN s.dueAt END)
-      FROM sources s
-      LEFT JOIN assignments a ON a.id=s.assignmentId AND EXISTS (
-        SELECT 1 FROM sessions holder WHERE holder.sessionKey=a.holderKey AND holder.ownerUserId=?2
-      )
-      LEFT JOIN work_items item ON item.id=COALESCE(s.work_item_id,a.workItemId)
-        AND item.ownerUserId=?2
-      LEFT JOIN decision_requests d ON d.status='open' AND d.ownerUserId=?2
-        AND (d.id=s.requestRef OR d.deadlineWakeId=s.wakeId)
-      WHERE (s.ownerUserId IS NULL OR s.ownerUserId=?2)
-        AND (s.assignmentId IS NULL OR a.id IS NOT NULL)
-        AND (COALESCE(s.work_item_id,a.workItemId) IS NULL OR item.id IS NOT NULL)
-        AND (s.requestRef IS NULL OR d.id IS NOT NULL)
-        AND (d.deadlineAt IS NOT NULL OR s.dueAt>s.createdAt)
-      ORDER BY 2,1 LIMIT 3
-      """,
-      [keys, owner]
-    )
-    |> Enum.map(fn [label, at] -> "#{label} due #{time(at)}." end)
+
+    {labelled, hidden} =
+      work
+      |> Enum.map(fn [title, at] -> {safe_title(title), at} end)
+      |> Enum.split_with(fn {title, _at} -> is_binary(title) end)
+
+    {shown, remaining} = Enum.split(labelled, 3)
+    lines = Enum.map(shown, fn {title, at} -> "#{title} due #{time(at)}." end)
+
+    case hidden ++ remaining do
+      [] ->
+        lines
+
+      work ->
+        earliest = work |> Enum.map(&elem(&1, 1)) |> Enum.min()
+        lines ++ ["#{length(work)} held items with deadlines. Earliest due #{time(earliest)}."]
+    end
   end
+
+  defp safe_title(title) when is_binary(title) do
+    if ErrorDiagnostic.redact_text(title) == title and not Regex.match?(@title_id, title) and
+         not Regex.match?(@title_secret, title) do
+      case String.split(title) do
+        [] -> nil
+        words -> words |> Enum.join(" ") |> String.slice(0, 120)
+      end
+    end
+  end
+
+  defp safe_title(_title), do: nil
 
   defp time(at) do
     case DateTime.from_unix(at, :millisecond) do
