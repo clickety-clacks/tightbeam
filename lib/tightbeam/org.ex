@@ -1957,6 +1957,11 @@ defmodule Tightbeam.Org do
       if before.host != session.host or before.state != session.state,
         do: Txn.handoff(txn, Tightbeam.HarklightWakes, {:origin_changed, session_key})
 
+      placement_fields = [:harness, :host, :model, :archetype, :state]
+
+      if Map.take(before, placement_fields) != Map.take(session, placement_fields),
+        do: Tightbeam.CoordinatorHoldAlerts.changed_in_txn(txn)
+
       {:changed, session, result}
     end
   end
@@ -1976,6 +1981,9 @@ defmodule Tightbeam.Org do
   end
 
   defp publish_session_in_txn(txn, class, session) do
+    if class in ["session.spawned", "session.retired"],
+      do: Tightbeam.CoordinatorHoldAlerts.changed_in_txn(txn)
+
     Publisher.committed_in_txn(txn, class, session, %{
       "sessionKey" => session.session_key
     })
