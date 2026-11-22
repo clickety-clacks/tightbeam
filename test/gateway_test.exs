@@ -4445,8 +4445,28 @@ defmodule Tightbeam.GatewayTest do
               turn["holdRelease"]}
   end
 
-  test "assignment-get names the hold on a held assignment only", ctx do
+  test "the opener can read a rate-limit hold and queued turns run after it clears", ctx do
     held = held_behind_fence!(ctx)
+    parent = self()
+
+    lane =
+      start_supervised!(
+        {SessionLane,
+         session_key: "k1",
+         db: ctx.db,
+         task_sup: Tightbeam.TurnTaskSupervisor,
+         runner: fn turn ->
+           send(parent, {:ran_held_turn, turn.seq})
+           {:ok, %{text: "recovered"}}
+         end}
+      )
+
+    incident_id = held.incident.id
+
+    assert %{held: %{incident_id: ^incident_id}, taskPresent: false} =
+             GenServer.call(lane, :diagnostic_snapshot)
+
+    refute_received {:ran_held_turn, _}
 
     handler =
       ctx.catalog_base
@@ -4465,8 +4485,33 @@ defmodule Tightbeam.GatewayTest do
       assert behind.release =~ "harness-health-retry #{held.incident.id}"
     end
 
-    :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, held.adapter_key)
+    assert {:resolved, %{id: ^incident_id}} =
+             HarnessHealth.resolve(ctx.db, %{
+               correlation_id: "held-fence-resolved",
+               harness: "claude",
+               host: "testhost",
+               failure_class: "rate-limit-dead",
+               session_key: "k1",
+               observed_at: 130,
+               cause: "synthetic recovery",
+               principal: "process:tightbeam"
+             })
+
+    refute HarnessProcess.parked?(ctx.db, held.adapter_key)
     refute Map.has_key?(read.("asg_held_linked"), :heldBehind)
+
+    assert :ok = SessionLane.nudge("k1")
+
+    for seq <- [held.linked_seq, held.after_seq] do
+      assert_receive {:ran_held_turn, ^seq}, 1_000
+
+      assert eventually(fn ->
+               match?(
+                 {:ok, [["delivered"]]},
+                 DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+               )
+             end)
+    end
   end
 
   test "an assignment with a running turn is not held, though its queued follow-up is", ctx do
