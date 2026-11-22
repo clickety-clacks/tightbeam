@@ -3692,10 +3692,12 @@ defmodule Tightbeam.HarklightWakesTest do
       )
 
       if @retry_recovered do
-        await_listener_port()
-
-        assert {:ok, [["active", nil]]} =
-                 DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+        # Attach and same-operation retry also register ports for this handle.
+        assert eventually(fn ->
+                 File.exists?(calls <> ".listening") and
+                   DB.query(db, "SELECT state,lastError FROM harklight_wake_handles") ==
+                     {:ok, [["active", nil]]}
+               end)
       else
         await_handle_error(db, "attachment_")
         origin = session.session_key
