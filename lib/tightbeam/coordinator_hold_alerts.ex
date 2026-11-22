@@ -7,7 +7,7 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
   alias Tightbeam.DB.Txn
 
   @alert_interval_ms :timer.minutes(5)
-  @title_id ~r/\b(?:(?:wi|asg|s|att|art|dr)_[a-z0-9_-]+|[a-f0-9]{16,}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})\b/i
+  @title_id ~r/\b(?:(?:wi|asg|s|att|art|dr)_[a-z0-9_-]+|[a-f0-9]{16,}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}|agent:main:clawline:\S+:main)\b/i
   @title_secret ~r/\b(?:[\w-]*(?:key|token|secret|password)["']?\s*[:=]\s*\S+|[a-z0-9_+\/-]{32,}|(?=[a-z0-9_+\/-]*\d)[a-z0-9_+\/-]{24,})/i
 
   @ddl """

@@ -331,9 +331,10 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
                         ('private-uuid','Review 317c35c2-76f1-4ff0-b659-3c616e20e210','fixture-owner','fixture-owner',?1),
                         ('private-hex','Review 0123456789abcdef','fixture-owner','fixture-owner',?1),
                         ('private-token','Review abcdefgXYZ12_token123456789','fixture-owner','fixture-owner',?1),
+                        ('private-session',?2,'fixture-owner','fixture-owner',?1),
                         ('foreign-window','Serve window','another-owner','another-owner',?1)
                  """,
-                 [@at]
+                 [@at, "Move #{@main} to Codex"]
                )
 
                Txn.q(
@@ -356,6 +357,7 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
                         ('uuid-member',?1,'process:tightbeam','install',?2,?3,'fired','private-uuid',?4),
                         ('hex-member',?1,'process:tightbeam','install',?2,?3,'fired','private-hex',?4),
                         ('token-member',?1,'process:tightbeam','install',?2,?3,'fired','private-token',?4),
+                        ('session-member',?1,'process:tightbeam','install',?2,?3,'fired','private-session',?4),
                         ('foreign-member',?1,'process:tightbeam','serve',?2-1,?3,'fired','foreign-window',?4),
                         ('ordinary',?1,'process:tightbeam','ordinary work',?3,?3,'fired',NULL,?4)
                  """,
@@ -409,7 +411,7 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
     assert reconcile(ctx) == nil
     assert_received {:sent, _, "Tightbeam coordinators are held", body}
     assert body =~ "Approved install window due"
-    assert body =~ "7 held items with deadlines. Earliest due"
+    assert body =~ "8 held items with deadlines. Earliest due"
     assert body =~ "Provider reset Nov 22 11:00 UTC."
     refute body =~ "sample-secret"
     refute body =~ "asg_private"
@@ -418,6 +420,7 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
     refute body =~ @handle
     refute body =~ "0123456789abcdef"
     refute body =~ "abcdefgXYZ12_token123456789"
+    refute body =~ @main
     refute body =~ "Assignment subject stays private"
     refute body =~ "Serve window"
     refute body =~ "Scheduled work"
