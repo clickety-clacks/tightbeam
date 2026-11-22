@@ -583,6 +583,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vendor_session_id,
             supersedes,
             decision_request_id,
+            progress,
+            progress_stage,
+            progress_note,
         } => {
             let mut params = vec![
                 format!(
@@ -627,7 +630,33 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = decision_request_id {
                 params.push(string_field("decisionRequestId", value));
             }
+            if let Some(value) = progress {
+                params.push(format!("\"progress\":{value}"));
+            }
+            if let Some(value) = progress_stage {
+                params.push(string_field("progressStage", value));
+            }
+            if let Some(value) = progress_note {
+                params.push(string_field("progressNote", value));
+            }
             Ok(request(identity, "harklight-send", vec![], params))
+        }
+        Command::HarklightProgress {
+            identity,
+            message,
+            percent,
+            stage,
+            note,
+        } => {
+            let mut params = vec![
+                string_field("messageId", message),
+                format!("\"percent\":{percent}"),
+                string_field("stage", stage),
+            ];
+            if let Some(value) = note {
+                params.push(string_field("note", value));
+            }
+            Ok(request(identity, "harklight-progress", vec![], params))
         }
         Command::HarklightRevise {
             identity,
@@ -638,6 +667,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             choices,
             clear_choices,
             session,
+            in_reply_to,
         } => {
             let mut params = vec![
                 string_field("messageId", message),
@@ -655,16 +685,23 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(session) = session {
                 params.push(string_field("handle", session));
             }
+            if let Some(entry) = in_reply_to {
+                params.push(string_field("inReplyTo", entry));
+            }
             Ok(request(identity, "harklight-revise", vec![], params))
         }
         Command::HarklightRetract {
             identity,
             message,
             session,
+            in_reply_to,
         } => {
             let mut params = vec![string_field("messageId", message)];
             if let Some(session) = session {
                 params.push(string_field("handle", session));
+            }
+            if let Some(entry) = in_reply_to {
+                params.push(string_field("inReplyTo", entry));
             }
             Ok(request(identity, "harklight-retract", vec![], params))
         }
@@ -673,18 +710,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             message,
             op_id,
         } => {
-            let mut params = vec![string_field("messageId", message)];
+            let mut params = Vec::new();
+            if let Some(message) = message {
+                params.push(string_field("messageId", message));
+            }
             if let Some(op_id) = op_id {
                 params.push(string_field("opId", op_id));
             }
             Ok(request(identity, "harklight-settle", vec![], params))
         }
-        Command::HarklightCover { identity, session } => Ok(request(
-            identity,
-            "harklight-cover",
-            vec![],
-            vec![string_field("handle", session)],
-        )),
         Command::HarklightListenerRestore { identity, handle } => Ok(request(
             identity,
             "harklight-listener-restore",
@@ -4219,12 +4253,12 @@ fn local_harklight_identity_refusal(
         {
             Some("harklight-briefings-catchup requires an active admin-owned session")
         }
-        Command::HarklightRevise { identity, .. }
+        Command::HarklightProgress { identity, .. }
+        | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
-        | Command::HarklightCover { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
         {
             Some("invalid Harklight command flags")
@@ -4254,12 +4288,12 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
         | Command::HarklightBriefingsCatchup { identity, .. }
+        | Command::HarklightProgress { identity, .. }
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
-        | Command::HarklightCover { identity, .. }
         | Command::HarklightRetry { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
@@ -4529,7 +4563,6 @@ mod tests {
                 vec!["harklight-follow", "--handle", "h"],
                 "harklight-follow",
             ),
-            (vec!["harklight-cover", "--session", "h"], "harklight-cover"),
             (vec!["harklight-retry", "--all"], "harklight-retry"),
             (vec!["harklight-retry", "--message", "m"], "harklight-retry"),
             (vec!["harklight-retry", "--session", "h"], "harklight-retry"),
@@ -4551,9 +4584,7 @@ mod tests {
                 assert_eq!(body["params"]["stake"], "the demo slips");
                 assert_eq!(body["params"]["byWhen"], "2026-11-01T17:00:00Z");
                 assert_eq!(body["params"]["reply"], true);
-            } else if (verb == "harklight-follow" || verb == "harklight-cover")
-                && body["params"].get("handle").is_some()
-            {
+            } else if verb == "harklight-follow" && body["params"].get("handle").is_some() {
                 assert_eq!(body["params"]["handle"], "h");
             } else if verb == "harklight-listener-restore" {
                 assert_eq!(body["params"]["handle"], "h");

@@ -1,6 +1,11 @@
 defmodule Tightbeam.HarklightChild do
   @moduledoc false
 
+  # The wrapper reserves this status for an unsuccessful output drain.
+  @unverified_exit 125
+
+  def verified_exit?(status), do: status in 0..(@unverified_exit - 1) and status != 101
+
   # open runs inside the manager's admission callback. Readiness means the
   # wrapper already owns its lifetime lock; no unregistered launch can pass a
   # moving marker or a subsequent restart barrier.
@@ -35,7 +40,7 @@ defmodule Tightbeam.HarklightChild do
 
   def command({manager, handle, executable}, args) do
     case GenServer.call(manager, {:launch_child, handle, executable, args}, :infinity) do
-      {:ok, port, initial} -> collect(port, initial)
+      {:ok, port, initial, _token} -> collect(port, initial)
       {:error, reason} -> raise "Harklight child launch refused: #{inspect(reason)}"
     end
   end

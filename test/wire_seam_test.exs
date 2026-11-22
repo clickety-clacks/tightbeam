@@ -417,13 +417,28 @@ defmodule Tightbeam.Wire.SeamTest do
     assert JSON.decode!(local.resp_body)["error"]["code"] == "invalid_harklight_send"
   end
 
-  test "Harklight wire keys reach prepare and uncertain results retain the message ID", ctx do
-    runner = fn args ->
-      if Enum.take(args, 2) == ["send", "--prepare"] do
-        assert Enum.take(args, 2) == ["send", "--prepare"]
+  test "Harklight wire keys reach prepare and uncertain sends settle by operation ID", ctx do
+    handle = "069c53c7-765f-48d1-bda7-98b58ad94194"
+
+    prepared = %{
+      sender: "sender",
+      session: handle,
+      message: %{title: "Question", body: "Body", message_type: "request"},
+      files: [%{name: "file", size: 4, sha256: String.duplicate("a", 64)}],
+      supersedes: ["old"],
+      supersedes_local: []
+    }
+
+    runner = fn
+      ["journal-id"] ->
+        harklight_frame(%{kind: "journal", journal_id: "wire-fixture-journal"})
+
+      ["send", "--prepare", "--op-id", op | _] = args ->
         assert "--reply" in args
+        refute "--vendor-session-id" in args
 
         for pair <- [
+              ["--session", "new"],
               ["--sender-id", "sender"],
               ["--title", "Question"],
               ["--type", "request"],
@@ -432,7 +447,6 @@ defmodule Tightbeam.Wire.SeamTest do
               ["--stake", "the demo slips"],
               ["--by-when", "2026-11-01T17:00:00Z"],
               ["--body", "Body"],
-              ["--vendor-session-id", "vendor"],
               ["--choice", "Yes"],
               ["--file", "/tmp/file"],
               ["--supersedes", "old"]
@@ -440,30 +454,16 @@ defmodule Tightbeam.Wire.SeamTest do
           assert pair in Enum.chunk_every(args, 2, 1, :discard)
         end
 
-        op = Enum.at(args, 3)
+        send(self(), {:wire_prepared, op})
+        harklight_frame(harklight_prepared(op, handle, prepared))
 
-        {JSON.encode!(%{
-           kind: "prepared",
-           op_id: op,
-           files: [],
-           request: %{
-             type: "send",
-             op_id: op,
-             session_handle: "069c53c7-765f-48d1-bda7-98b58ad94194",
-             route: "other",
-             vendor_session_id: "vendor",
-             message: %{
-               sender_id: "sender",
-               message_id: "minted-id",
-               title: "Question",
-               body: "Body",
-               supersedes: ["old"]
-             }
-           }
-         }), 0}
-      else
-        {JSON.encode!(%{kind: "outcome_unknown", op_id: List.last(args)}), 7}
-      end
+      ["send", "--execute", "--op-id", op] ->
+        send(self(), {:wire_executed, op})
+        harklight_frame(%{kind: "outcome_unknown", operation: "send", op_id: op}, 7)
+
+      ["retry", "--op-id", op, "--journal-id", "wire-fixture-journal"] ->
+        send(self(), {:wire_retried, op})
+        harklight_frame(harklight_committed(op, handle, prepared, []))
     end
 
     handlers =
@@ -499,12 +499,43 @@ defmodule Tightbeam.Wire.SeamTest do
       })
 
     error = JSON.decode!(response.resp_body)["error"]
-    assert error["messageId"] == "minted-id"
+    assert_received {:wire_prepared, op}
+    assert_received {:wire_executed, ^op}
+    assert error["opId"] == op
+    refute Map.has_key?(error, "messageId")
+    assert error["handle"] == handle
     assert error["messageType"] == "request"
     assert error["messageTypeLabel"] == "Request"
     assert error["outcome"] == "outcome_unknown"
     assert error["wakeEffect"] == "none"
-    assert error["reason"] =~ "harklight-settle --message minted-id"
+    assert error["reason"] =~ "harklight-settle --op-id #{op}"
+
+    assert {:ok, [["vendor", "pending"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT json_extract(payload,'$.request.vendor_session_id'),state
+               FROM harklight_send_operations WHERE opId=?1
+               """,
+               [op]
+             )
+
+    result =
+      ok!(
+        dispatch_cli(%{ctx | opts: opts}, session.cli_token, %{
+          verb: "harklight-settle",
+          params: %{opId: op}
+        })
+      )
+
+    assert_received {:wire_retried, ^op}
+
+    assert %{
+             "opId" => ^op,
+             "messageId" => "server-item",
+             "outcome" => "committed",
+             "wakeEffect" => "subscribed"
+           } = result
   end
 
   test "committed Harklight sends expose mapped contradiction matches in the result", ctx do
@@ -527,42 +558,26 @@ defmodule Tightbeam.Wire.SeamTest do
       ]
     }
 
-    runner = fn args ->
-      if Enum.take(args, 2) == ["send", "--prepare"] do
-        op_id = Enum.at(args, 3)
+    prepared = %{
+      sender: "sender",
+      session: handle,
+      message: %{title: "Question", message_type: "request"},
+      files: [],
+      supersedes: [],
+      supersedes_local: []
+    }
 
-        {JSON.encode!(%{
-           kind: "prepared",
-           op_id: op_id,
-           files: [],
-           request: %{
-             type: "send",
-             op_id: op_id,
-             session_handle: handle,
-             route: "other",
-             message: %{
-               sender_id: "sender",
-               message_id: "minted-id",
-               title: "Question",
-               message_type: "request",
-               reply: true,
-               supersedes: []
-             }
-           }
-         }) <> "\n", 0}
-      else
-        op_id = List.last(args)
+    advisory = Map.put(contradictions, "advisory_type", "possible_contradictions")
 
-        {JSON.encode!(%{
-           kind: "committed",
-           operation: "send",
-           op_id: op_id,
-           response: %{
-             session_handle: handle,
-             possible_contradictions: contradictions
-           }
-         }) <> "\n", 0}
-      end
+    runner = fn
+      ["journal-id"] ->
+        harklight_frame(%{kind: "journal", journal_id: "wire-fixture-journal"})
+
+      ["send", "--prepare", "--op-id", op | _] ->
+        harklight_frame(harklight_prepared(op, handle, prepared))
+
+      ["send", "--execute", "--op-id", op] ->
+        harklight_frame(harklight_committed(op, handle, prepared, [advisory]))
     end
 
     handlers =
@@ -583,21 +598,22 @@ defmodule Tightbeam.Wire.SeamTest do
     session = create_session(ctx.db, "wire-harklight-contradictions", "wire-test-owner")
     Org.set_host(ctx.db, session.session_key, Tightbeam.Placement.local_host_name())
 
-    response =
-      dispatch_cli(%{ctx | opts: opts}, session.cli_token, %{
-        verb: "harklight-send",
-        params: %{
-          harklightSession: "new",
-          senderId: "sender",
-          title: "Question",
-          messageType: "request",
-          reply: true
-        }
-      })
-
-    result = JSON.decode!(response.resp_body)["result"]
+    result =
+      ok!(
+        dispatch_cli(%{ctx | opts: opts}, session.cli_token, %{
+          verb: "harklight-send",
+          params: %{
+            harklightSession: "new",
+            senderId: "sender",
+            title: "Question",
+            messageType: "request",
+            reply: true
+          }
+        })
+      )
 
     assert result["outcome"] == "committed"
+    assert result["messageId"] == "server-item"
 
     assert result["possibleContradictions"] == %{
              "status" => "complete",
@@ -725,6 +741,42 @@ defmodule Tightbeam.Wire.SeamTest do
 
     assert JSON.decode!(response.resp_body)["error"]["code"] == "unknown_review_target"
     assert assignment_id(ctx.db, "review a ghost") == nil
+  end
+
+  defp harklight_frame(frame, status \\ 0), do: {JSON.encode!(frame) <> "\n", status}
+
+  defp harklight_prepared(op, handle, metadata) do
+    %{
+      kind: "prepared",
+      operation: "send",
+      op_id: op,
+      request_id: op,
+      session_handle: handle,
+      prepared: metadata
+    }
+  end
+
+  defp harklight_committed(op, handle, metadata, advisories) do
+    %{
+      kind: "committed",
+      operation: "send",
+      op_id: op,
+      request_id: op,
+      session_handle: handle,
+      item_id: "server-item",
+      prepared: metadata,
+      response: %{
+        rev: 12,
+        message: %{
+          item_id: "server-item",
+          session: handle,
+          sender: metadata.sender,
+          revision: 1,
+          message: metadata.message,
+          advisories: advisories
+        }
+      }
+    }
   end
 
   # A refusal here is the interesting failure, and the raw Plug.Conn dump buries

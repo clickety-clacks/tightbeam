@@ -99,7 +99,7 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
     assert recovery_body =~ "One other session"
     assert reconcile(ctx, @at + 3) == nil
     refute_received {:sent, _, _, _}
-    assert_no_agent_side_effects(ctx.db)
+    assert_no_agent_side_effects(ctx.db, 1)
   end
 
   test "a model-only outage releases on a normal answer on the same route", ctx do
@@ -311,6 +311,47 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
     assert body =~ "The only active coordinator is held."
     assert reconcile(ctx, @at + 1) == nil
     refute_received {:sent, _, _, _}
+  end
+
+  test "a committed prepare response completes the episode without executing again", ctx do
+    session(ctx.db, @main, "generic", "claude", "build-host", @model)
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, @park)
+
+    assert reconcile(%{ctx | runner: runner(self(), :already_committed)}) == nil
+    assert_received {:already_committed, operation}
+    refute_received {:sent, _, _, _}
+
+    assert {:ok, [["committed"]]} =
+             DB.query(ctx.db, "SELECT outcome FROM coordinator_hold_sends WHERE operationId=?1", [
+               operation
+             ])
+
+    assert_no_agent_side_effects(ctx.db, 0)
+  end
+
+  test "an internal error logs the original operation and stays uncertain across restart", ctx do
+    session(ctx.db, @main, "generic", "claude", "build-host", @model)
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, @park)
+    runner = runner(self(), :internal_error)
+
+    diagnostic =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert reconcile(%{ctx | runner: runner}) == nil
+      end)
+
+    assert_received {:sent, operation, "Tightbeam coordinators are held", _}
+    assert diagnostic =~ "Harklight internal_error. Operation send. Request-Id req-hold-500."
+    assert diagnostic =~ "Operation ID #{operation}"
+
+    opts = [db: ctx.db, runner: runner, clock: fn -> @at + 1 end]
+    server = start_supervised!({CoordinatorHoldAlerts, opts})
+    :sys.get_state(server)
+    refute_received {:sent, _, _, _}
+
+    assert {:ok, [[^operation, "outcome_unknown"]]} =
+             DB.query(ctx.db, "SELECT operationId,outcome FROM coordinator_hold_sends")
+
+    assert_no_agent_side_effects(ctx.db, 0)
   end
 
   test "a held carrier includes owned window timing without copying private titles", ctx do
@@ -543,61 +584,111 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
              end)
   end
 
-  defp assert_no_agent_side_effects(db) do
-    for table <- ~w(harklight_wake_handles wakes) do
+  defp assert_no_agent_side_effects(db, turns) do
+    for table <- ~w(harklight_wake_handles harklight_send_operations wakes) do
       assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM #{table}")
     end
 
-    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM turns")
+    assert {:ok, [[^turns]]} = DB.query(db, "SELECT count(*) FROM turns")
   end
 
   defp runner(test, mode \\ :committed) do
     fn
+      ["journal-id"] ->
+        frame(%{kind: "journal", journal_id: "fixture-journal"})
+
       ["send", "--prepare" | args] ->
         op = arg(args, "--op-id")
         assert arg(args, "--type") == "fyi"
         assert arg(args, "--session") == "new"
-        assert arg(args, "--route") == "other"
-        refute "--reply" in args
+        assert arg(args, "--sender-id") == "tightbeam"
+        refute Enum.any?(~w(--route --reply --file --supersedes), &(&1 in args))
         title = arg(args, "--title")
         body = arg(args, "--body")
-        Process.put({__MODULE__, op}, {title, body})
 
-        frame(%{
-          kind: "prepared",
-          op_id: op,
+        prepared = %{
+          sender: "tightbeam",
+          session: @handle,
           files: [],
-          request: %{
-            type: "send",
+          supersedes: [],
+          supersedes_local: [],
+          message: %{title: title, body: body, message_type: "fyi"}
+        }
+
+        if mode == :already_committed do
+          send(test, {:already_committed, op})
+          committed(op, prepared)
+        else
+          Process.put({__MODULE__, op}, prepared)
+
+          frame(%{
+            kind: "prepared",
+            operation: "send",
             op_id: op,
-            route: "other",
+            request_id: op,
             session_handle: @handle,
-            message: %{sender_id: "tightbeam", title: title, body: body, message_id: op}
-          }
-        })
+            prepared: prepared
+          })
+        end
 
       ["send", "--execute", "--op-id", op] ->
-        {title, body} = Process.delete({__MODULE__, op})
+        %{message: %{title: title, body: body}} = prepared = Process.delete({__MODULE__, op})
         send(test, {:sent, op, title, body})
 
         case mode do
           :committed ->
-            frame(%{
-              kind: "committed",
-              operation: "send",
-              op_id: op,
-              response: %{session_handle: @handle, sender_id: "tightbeam", message_id: op}
-            })
+            committed(op, prepared)
 
           :refused ->
-            {"refused", 2}
+            frame(
+              %{kind: "refused", operation: "send", op_id: op, status: 403, error: "forbidden"},
+              2
+            )
 
           :unknown ->
-            {"transport closed", 1}
+            frame(
+              %{
+                kind: "outcome_unknown",
+                operation: "send",
+                op_id: op,
+                status: 503,
+                error: "storage_unavailable"
+              },
+              7
+            )
+
+          :internal_error ->
+            frame(
+              %{
+                kind: "outcome_unknown",
+                operation: "send",
+                op_id: op,
+                status: 500,
+                error: "internal_error",
+                retryable: false,
+                request_id: "req-hold-500"
+              },
+              7
+            )
         end
     end
   end
 
+  defp committed(op, prepared) do
+    item = "fixture-item-#{op}"
+
+    frame(%{
+      kind: "committed",
+      operation: "send",
+      op_id: op,
+      request_id: op,
+      session_handle: @handle,
+      item_id: item,
+      prepared: prepared,
+      response: %{message: %{item_id: item, session: @handle, sender: "tightbeam"}}
+    })
+  end
+
   defp arg(args, flag), do: Enum.at(args, Enum.find_index(args, &(&1 == flag)) + 1)
-  defp frame(map), do: {JSON.encode!(map), 0}
+  defp frame(map, status \\ 0), do: {JSON.encode!(map), status}
 end

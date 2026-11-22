@@ -158,7 +158,7 @@ defmodule Tightbeam.GatewayTurnFixture do
       do: {:reply, {:error, JSON.decode!(json)}, parent}
 
     def handle_call({:prompt, _sid, prompt, opts}, from, parent) do
-      if is_binary(prompt) and String.contains?(prompt, "HARKLIGHT_ACK2_GATEWAY_FIXTURE") do
+      if is_binary(prompt) and String.contains?(prompt, "HARKLIGHT_RECEIPT_GATEWAY_FIXTURE") do
         :ok = Keyword.fetch!(opts, :trace_dispatch).(4242)
       end
 
