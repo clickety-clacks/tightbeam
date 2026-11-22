@@ -85,6 +85,7 @@ impl CommandContext {
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
             ArtifactContentPromote { .. } => ("cli.artifact_content_promote", DispatchPath),
             ArtifactContentCapacity { .. } => ("cli.artifact_content_capacity", DispatchPath),
+            WorkspaceCleanup { .. } => ("cli.workspace_cleanup", DispatchPath),
             Artifacts { .. } => ("cli.artifacts", DispatchPath),
             ToolCallObserved => ("cli.tool_call_observed", Requests::ToolCallObserved),
             Spawn { .. } => ("cli.spawn", CatalogAndDispatch),
@@ -327,6 +328,13 @@ impl Eq for CommandContext {}
 fn dispatch_effect(command: &Command) -> EffectContract {
     use Command::*;
     use EffectContract::*;
+    if let WorkspaceCleanup { action, .. } = command {
+        return if action == "status" {
+            Read
+        } else {
+            WriteWithoutIdempotency
+        };
+    }
     match command {
         IdentityCurrent | GithubAuthCheck { .. } | SessionConnect { .. } => Unknown,
         Help
@@ -517,6 +525,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | SentinelEnvSet { .. }
         | SentinelEnvUnset { .. }
         | HostToolchainSet { .. }
+        | WorkspaceCleanup { .. }
         | Assimilate(_) => WriteWithoutIdempotency,
     }
 }

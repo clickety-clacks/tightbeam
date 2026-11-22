@@ -187,6 +187,11 @@ pub enum Command {
     ArtifactContentCapacity {
         identity: Identity,
     },
+    WorkspaceCleanup {
+        identity: Identity,
+        action: String,
+        session_key: Option<String>,
+    },
     Artifacts {
         identity: Identity,
         work_item_id: Option<String>,
@@ -1016,6 +1021,10 @@ COMMANDS:
       Copy a verified legacy capture into the pinned store.
   artifact-content-capacity
       Read the store's used, staged, free, and effective limit bytes.
+  workspace-cleanup status [--session <key>]
+      Show owner-scoped retired workspace cleanup state, blockers and archive location.
+  workspace-cleanup retry --session <key>
+      Requeue cleanup as the session owner or an admin. All hold and acknowledgement checks run again.
   memento-set --record <kind>:<id> --name <name> (--value <value>... | --clear)
       Set a declared record value and retain its history.
   mementos --record <kind>:<id> [--history] [--name <name>]
@@ -2690,6 +2699,25 @@ fn parse_with_optional_catalog(
                 artifact_id: parsed.positional[1].clone(),
             })
         }
+        "workspace-cleanup" => {
+            let action = parsed.positional.get(1).map(String::as_str).unwrap_or("");
+            let session_key = nonempty(flags, "session");
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| {
+                    !matches!(flag.as_str(), "session" | "as" | "as-user" | "as-process")
+                })
+                || !matches!(action, "status" | "retry")
+                || (action == "retry" && session_key.is_none())
+                || (flags.contains_key("session") && session_key.is_none())
+            {
+                return Err("usage: tightbeam workspace-cleanup status [--session <key>] | retry --session <key>".to_owned());
+            }
+            Ok(Command::WorkspaceCleanup {
+                identity: identity(flags)?,
+                action: action.to_owned(),
+                session_key,
+            })
+        }
         "artifact-record" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--content-base64 <bytes>] [--produced-by-assignment <assignmentId>] [--allow-unpinned]".to_owned());
@@ -4340,7 +4368,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -7244,6 +7272,7 @@ mod tests {
                 "work-item-trace",
                 "work-item-icebox",
                 "work-item-reopen",
+                "workspace-cleanup",
             ]
             .into_iter()
             .collect()
@@ -8441,7 +8470,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "sample-user"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -8737,6 +8766,46 @@ mod tests {
             assert_eq!(
                 parse(values),
                 Err("usage: tightbeam artifact-content-fetch <artifactId>".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_cleanup_status_and_retry_parse_with_owner_identity() {
+        assert_eq!(
+            parse(strings(&[
+                "workspace-cleanup",
+                "status",
+                "--as-user",
+                "owner"
+            ])),
+            Ok(Command::WorkspaceCleanup {
+                identity: Identity::User("owner".to_owned()),
+                action: "status".to_owned(),
+                session_key: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "workspace-cleanup",
+                "retry",
+                "--session",
+                "retired-key"
+            ])),
+            Ok(Command::WorkspaceCleanup {
+                identity: Identity::Session,
+                action: "retry".to_owned(),
+                session_key: Some("retired-key".to_owned()),
+            })
+        );
+        for values in [
+            strings(&["workspace-cleanup", "retry"]),
+            strings(&["workspace-cleanup", "retry", "--session"]),
+            strings(&["workspace-cleanup", "unknown"]),
+        ] {
+            assert_eq!(
+                parse(values),
+                Err("usage: tightbeam workspace-cleanup status [--session <key>] | retry --session <key>".to_owned())
             );
         }
     }

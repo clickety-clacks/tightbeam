@@ -92,6 +92,7 @@ defmodule Tightbeam.Wire.Router do
                    "artifact-content-fetch",
                    "artifact-content-capacity",
                    "artifact-content-promote",
+                   "workspace-cleanup",
                    "assignment-commitref-correct",
                    "harness-health-observe-other",
                    "harness-health-resolve-other",
@@ -4219,6 +4220,7 @@ defmodule Tightbeam.Wire.Router do
                         "artifact-content-fetch",
                         "artifact-content-promote",
                         "artifact-content-capacity",
+                        "workspace-cleanup",
                         "assignment-commitref-correct",
                         "harness-health-observe-other",
                         "harness-health-resolve-other",
@@ -4825,6 +4827,7 @@ defmodule Tightbeam.Wire.Router do
     "artifact-content-fetch" => ~w(artifact_id)a,
     "artifact-content-promote" => ~w(artifact_id)a,
     "artifact-content-capacity" => [],
+    "workspace-cleanup" => ~w(action session_key)a,
     "artifact-get" => ~w(artifact_id)a,
     "artifact-record" =>
       ~w(allow_unpinned content_base64 content_sha256 description kind origin_path produced_by_assignment_id title work_item_id)a,
