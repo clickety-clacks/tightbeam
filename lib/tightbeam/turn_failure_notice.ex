@@ -153,11 +153,12 @@ defmodule Tightbeam.TurnFailureNotice do
     ) != []
   end
 
-  def member_admitted?(txn, seq, assignment_id, recipient) do
+  # Custody can change after delivery. Read prior notices by failure and assignment.
+  def member_admitted?(txn, seq, assignment_id) do
     Txn.q(
       txn,
       """
-      SELECT 1 FROM wakes WHERE wakeId=?1 AND sessionKey=?2 AND assignmentId=?4
+      SELECT 1 FROM wakes WHERE wakeId=?1 AND assignmentId=?2
       UNION ALL
       SELECT 1 FROM sessions recipient
       WHERE EXISTS (
@@ -168,9 +169,8 @@ defmodule Tightbeam.TurnFailureNotice do
       """,
       [
         "w_health_redelivery_parent_#{seq}",
-        recipient,
-        "wake-undelivered:#{seq}:#{assignment_id}",
-        assignment_id
+        assignment_id,
+        "wake-undelivered:#{seq}:#{assignment_id}"
       ]
     ) != []
   end

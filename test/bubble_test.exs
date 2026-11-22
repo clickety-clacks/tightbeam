@@ -734,6 +734,101 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert Ledger.pending_count(ctx.db, ctx.holder.session_key) == 0
   end
 
+  test "a failed mixed carrier with a retry question reports an assignment once across reparenting",
+       ctx do
+    assert %{id: work_item} =
+             Tightbeam.WorkItems.__handle__(ctx.db, "work-item-create", %{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{title: "Reparent after a failed dispatch"}
+             })
+
+    holder = ctx.holder.session_key
+    old_parent = ctx.supervisor.session_key
+    new_parent = ctx.main.session_key
+    busy = hold_recipient!(ctx.db, holder)
+
+    assert %{id: assignment} =
+             Assignments.__handle__(ctx.db, "dispatch", %{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: holder,
+               target_role: nil,
+               role_fallback: false,
+               supervision_interval_ms: 1_000,
+               params: %{
+                 subject: "dispatch subject",
+                 brief: "do this work",
+                 work_item_id: work_item
+               }
+             })
+
+    other =
+      Tightbeam.Wakes.schedule(ctx.db, %{
+        session_key: holder,
+        origin: "process:tightbeam",
+        prompt: "another message in the carrier",
+        due_at: 0
+      })
+
+    assert :queued =
+             Tightbeam.Gateway.deliver_prompt(holder, other.origin, other.prompt,
+               db: ctx.db,
+               wake_id: other.wake_id,
+               fire_wake_in_txn: true
+             )
+
+    finish_busy_recipient!(ctx.db, busy)
+    [carrier_id] = deliver_ready_carriers!(ctx, holder)
+    assert {:ok, %{wake_id: ^carrier_id} = turn} = Ledger.claim_next(ctx.db, holder, "dispatch")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed_unknown", "adapter unavailable",
+               owner_lease: turn.owner_lease
+             )
+
+    question_id = "w_health_redelivery_parent_#{turn.seq}"
+
+    Tightbeam.Wakes.schedule(ctx.db, %{
+      wake_id: question_id,
+      session_key: old_parent,
+      assignment_id: assignment,
+      origin: "health-redelivery-parent",
+      prompt: "Existing retry question",
+      due_at: 0
+    })
+
+    notice_recipients = fn ->
+      DB.query(
+        ctx.db,
+        """
+        SELECT sessionKey FROM wakes WHERE wakeId=?1
+        UNION ALL
+        SELECT sessionKey FROM messages WHERE deviceId='process:tightbeam' AND clientMessageId=?2
+        """,
+        [question_id, "wake-undelivered:#{turn.seq}:#{assignment}"]
+      )
+    end
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+    assert {:ok, [[^old_parent]]} = notice_recipients.()
+
+    assert %{"session" => %{"currentParent" => ^new_parent}} =
+             Tightbeam.SessionReparent.handle(ctx.db, %{
+               principal: {:user, "flynn"},
+               params: %{
+                 session_key: holder,
+                 parent_session_key: new_parent,
+                 assignment_id: assignment,
+                 idempotency_key: "reparent-after-failure-notice"
+               }
+             })
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+    assert {:ok, [[^old_parent]]} = notice_recipients.()
+    assert notice_turn(ctx.db, new_parent) == []
+  end
+
   for scenario <- [
         :distinct_openers,
         :shared_opener_scoped_question,

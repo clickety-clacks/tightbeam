@@ -5816,12 +5816,7 @@ defmodule Tightbeam.Wakes do
             recipients
 
           is_binary(member_assignment) and
-              Tightbeam.TurnFailureNotice.member_admitted?(
-                txn,
-                cause,
-                member_assignment,
-                recipient
-              ) ->
+              Tightbeam.TurnFailureNotice.member_admitted?(txn, cause, member_assignment) ->
             recipients
 
           is_nil(member_assignment) and initial_failure_receipt?(told_as) and
