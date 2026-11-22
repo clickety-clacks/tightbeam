@@ -42,7 +42,13 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
 
   @impl true
   def init(opts) do
-    state = %{db: Keyword.fetch!(opts, :db), runner: opts[:runner], timer: nil}
+    state = %{
+      db: Keyword.fetch!(opts, :db),
+      runner: opts[:runner],
+      clock: Keyword.get(opts, :clock, &now/0),
+      timer: nil
+    }
+
     {:ok, state, {:continue, :reconcile}}
   end
 
@@ -62,42 +68,52 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
     if state.timer, do: Process.cancel_timer(state.timer)
 
     timer =
-      case DB.owed_work(fn -> reconcile(state.db, now(), state.runner) end) do
+      case DB.owed_work(fn -> reconcile(state.db, state.clock, state.runner) end) do
         nil -> nil
-        due_at -> :erlang.start_timer(max(0, due_at - now()), self(), :reconcile)
+        due_at -> :erlang.start_timer(max(0, due_at - state.clock.()), self(), :reconcile)
       end
 
     %{state | timer: timer}
   end
 
   @doc false
-  def reconcile(db, at, runner) do
+  def reconcile(db, clock, runner) do
     {:ok, {due_at, pending}} =
       DB.transaction(db, fn txn ->
-        # Harklight's configured destination belongs to the gateway operator.
-        # Match the gateway's first-admin convention for owner notices.
-        case Txn.q(
-               txn,
-               "SELECT userId FROM users WHERE isAdmin=1 ORDER BY createdAt,userId LIMIT 1"
-             ) do
-          [[owner]] ->
-            {due_at, allow_outage} = reconcile_owner(txn, owner, active_sessions(txn, owner), at)
+        case operator_owner(txn) do
+          owner when is_binary(owner) ->
+            {due_at, allow_outage} =
+              reconcile_owner(txn, owner, active_sessions(txn, owner), clock.())
+
             {due_at, pending_sends(txn, owner, allow_outage)}
 
-          [] ->
+          nil ->
             {nil, []}
         end
       end)
 
-    Enum.each(pending, &claim_and_deliver(db, &1, at, runner))
-    due_at
+    Enum.reduce(pending, due_at, fn [operation], next_due ->
+      case claim_and_deliver(db, operation, clock, runner) do
+        {:defer, at} -> if next_due, do: min(next_due, at), else: at
+        :ok -> next_due
+      end
+    end)
+  end
+
+  # Harklight's configured destination belongs to the gateway operator.
+  # Match the gateway's first-admin convention for owner notices.
+  defp operator_owner(txn) do
+    case Txn.q(txn, "SELECT userId FROM users WHERE isAdmin=1 ORDER BY createdAt,userId LIMIT 1") do
+      [[owner]] -> owner
+      [] -> nil
+    end
   end
 
   defp active_sessions(txn, owner) do
     Txn.q(
       txn,
       """
-      SELECT s.ownerUserId,s.sessionKey,s.archetype,s.displayName,s.harness,s.host,s.model,
+      SELECT s.sessionKey,s.archetype,s.harness,s.host,s.model,
              p.requestedAt,p.generation,
              (SELECT i.id FROM harness_health_incidents i
                WHERE p.adapterKey IS NOT NULL AND i.harness=s.harness AND i.host=s.host
@@ -118,10 +134,8 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
       [owner]
     )
     |> Enum.map(fn [
-                     owner,
                      key,
                      archetype,
-                     name,
                      harness,
                      host,
                      model,
@@ -143,9 +157,7 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
         )
 
       %{
-        owner: owner,
         key: key,
-        name: name,
         harness: harness,
         host: host,
         model: model,
@@ -153,13 +165,21 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
         sources: sources,
         incident_id: incident_id,
         model_reset: model_reset(cause, observed_at),
-        coordinator: key == Org.personal_session_key(owner) or coordinator_archetype?(archetype)
+        coordinator: coordinator_label(owner, key, archetype)
       }
     end)
   end
 
-  defp coordinator_archetype?(archetype) do
-    List.last(String.split(archetype, ".")) in ["exec", "deliverator"]
+  defp coordinator_label(owner, key, archetype) do
+    if key == Org.personal_session_key(owner) do
+      "Main"
+    else
+      case List.last(String.split(archetype, ".")) do
+        "exec" -> "An exec"
+        "deliverator" -> "A deliverator"
+        _ -> nil
+      end
+    end
   end
 
   defp model_reset(cause, observed_at) when is_binary(cause) do
@@ -174,19 +194,29 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
   defp model_reset(_cause, _at), do: nil
 
   defp reconcile_owner(txn, owner, sessions, at) do
-    coordinators = Enum.filter(sessions, & &1.coordinator)
-    available = Enum.find(coordinators, &(&1.sources == []))
-
-    case {coordinators, available, open_episode(txn, owner)} do
-      {[], _, _} ->
+    case coordinator_state(sessions) do
+      :empty ->
         {nil, false}
 
-      {_, nil, episode} ->
-        {outage(txn, owner, episode, coordinators, sessions, at), true}
+      {:held, coordinators} ->
+        {outage(txn, owner, open_episode(txn, owner), coordinators, at), true}
 
-      {_, ready, episode} ->
-        if episode, do: recover(txn, episode, ready, sessions, at)
+      {:ready, ready} ->
+        if episode = open_episode(txn, owner), do: recover(txn, episode, ready, sessions, at)
         {nil, false}
+    end
+  end
+
+  defp coordinator_state(sessions) do
+    case Enum.filter(sessions, & &1.coordinator) do
+      [] ->
+        :empty
+
+      coordinators ->
+        case Enum.find(coordinators, &(&1.sources == [])) do
+          nil -> {:held, coordinators}
+          ready -> {:ready, ready}
+        end
     end
   end
 
@@ -203,34 +233,43 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
     end
   end
 
-  defp outage(txn, owner, episode, coordinators, sessions, at) do
+  defp outage(txn, owner, episode, coordinators, at) do
     episode =
       episode ||
         open_episode_in_txn(txn, owner, Enum.flat_map(coordinators, & &1.sources), at)
 
-    [[already_reserved, last_attempt]] =
+    [[already_reserved]] =
+      Txn.q(
+        txn,
+        "SELECT EXISTS(SELECT 1 FROM coordinator_hold_sends WHERE episodeId=?1 AND phase='outage')",
+        [episode]
+      )
+
+    if already_reserved == 0 do
+      case outage_due(txn, owner, at) do
+        nil ->
+          reserve(txn, episode, "outage", "")
+          nil
+
+        due_at ->
+          due_at
+      end
+    end
+  end
+
+  defp outage_due(txn, owner, at) do
+    [[due_at]] =
       Txn.q(
         txn,
         """
-        SELECT EXISTS(SELECT 1 FROM coordinator_hold_sends WHERE episodeId=?1 AND phase='outage'),
-               MAX(s.attemptedAt)
+        SELECT MAX(s.attemptedAt)+?2
         FROM coordinator_hold_sends s JOIN coordinator_hold_episodes e ON e.id=s.episodeId
-        WHERE e.ownerUserId=?2 AND s.phase='outage'
+        WHERE e.ownerUserId=?1 AND s.phase='outage'
         """,
-        [episode, owner]
+        [owner, @alert_interval_ms]
       )
 
-    cond do
-      already_reserved == 1 ->
-        nil
-
-      last_attempt && at < last_attempt + @alert_interval_ms ->
-        last_attempt + @alert_interval_ms
-
-      true ->
-        reserve(txn, episode, "outage", outage_body(txn, coordinators, sessions))
-        nil
-    end
+    if is_integer(due_at) and at < due_at, do: due_at
   end
 
   defp open_episode_in_txn(txn, owner, sources, at) do
@@ -261,12 +300,7 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
       [[outcome]] when outcome in ["committed", "outcome_unknown"] ->
         count = Enum.count(sessions, &(&1.sources != []))
 
-        name =
-          if ready.key == Org.personal_session_key(ready.owner),
-            do: "Main",
-            else: short(ready.name)
-
-        line = "#{name} can take turns again on #{ready.harness} at #{ready.host}."
+        line = "#{ready.coordinator} can take turns again on #{ready.harness} at #{ready.host}."
 
         remaining =
           case count do
@@ -308,25 +342,75 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
     )
   end
 
-  defp claim_and_deliver(db, [operation], at, runner) do
-    case DB.query(
-           db,
-           """
-           UPDATE coordinator_hold_sends SET attemptedAt=?2,outcome='outcome_unknown'
-           WHERE operationId=?1 AND attemptedAt IS NULL
-           AND (phase='recovery' OR EXISTS(
-             SELECT 1 FROM coordinator_hold_episodes e WHERE e.id=episodeId AND e.closedAt IS NULL
-           ))
-           RETURNING episodeId,phase,body
-           """,
-           [operation, at]
-         ) do
-      {:ok, [[episode, phase, body]]} ->
-        deliver(db, episode, phase, operation, body, runner)
+  defp claim_and_deliver(db, operation, clock, runner) do
+    {:ok, claim} = DB.transaction(db, &claim_in_txn(&1, operation, clock))
 
-      {:ok, []} ->
+    case claim do
+      {:send, episode, phase, body} ->
+        deliver(db, episode, phase, operation, body, runner)
+        :ok
+
+      result ->
+        result
+    end
+  end
+
+  defp claim_in_txn(txn, operation, clock) do
+    owner = operator_owner(txn)
+
+    case Txn.q(
+           txn,
+           """
+           SELECT e.id,e.closedAt,s.phase,s.body FROM coordinator_hold_sends s
+           JOIN coordinator_hold_episodes e ON e.id=s.episodeId
+           WHERE s.operationId=?1 AND s.attemptedAt IS NULL AND e.ownerUserId=?2
+           """,
+           [operation, owner]
+         ) do
+      [[episode, nil, "outage", _body]] ->
+        claim_outage(txn, owner, episode, operation, clock)
+
+      [[episode, _closed_at, "recovery", body]] ->
+        mark_attempt(txn, operation, episode, "recovery", body, clock.())
+
+      _ ->
         :ok
     end
+  end
+
+  defp claim_outage(txn, owner, episode, operation, clock) do
+    sessions = active_sessions(txn, owner)
+
+    case coordinator_state(sessions) do
+      {:held, coordinators} ->
+        body = outage_body(txn, owner, coordinators, sessions)
+        at = clock.()
+
+        case outage_due(txn, owner, at) do
+          nil -> mark_attempt(txn, operation, episode, "outage", body, at)
+          due_at -> {:defer, due_at}
+        end
+
+      {:ready, ready} ->
+        recover(txn, episode, ready, sessions, clock.())
+        :ok
+
+      :empty ->
+        :ok
+    end
+  end
+
+  defp mark_attempt(txn, operation, episode, phase, body, at) do
+    Txn.q(
+      txn,
+      """
+      UPDATE coordinator_hold_sends SET attemptedAt=?2,outcome='outcome_unknown',body=?3
+      WHERE operationId=?1
+      """,
+      [operation, at, body]
+    )
+
+    {:send, episode, phase, body}
   end
 
   defp deliver(db, episode, phase, operation, body, runner) do
@@ -348,7 +432,7 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
     end
   end
 
-  defp outage_body(txn, coordinators, sessions) do
+  defp outage_body(txn, owner, coordinators, sessions) do
     held = Enum.reject(sessions, &(&1.sources == []))
 
     routes =
@@ -374,7 +458,7 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
         "#{route} at #{host} has #{count} held #{unit}. #{reset}"
       end)
 
-    urgent = urgent_work(txn, held)
+    urgent = urgent_work(txn, owner, held)
     next = "Tightbeam will resume work as routes recover and tell you when a coordinator can act."
     next = if urgent == [], do: next, else: next <> " Check any deadline above that is at risk."
 
@@ -405,7 +489,7 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
     reset
   end
 
-  defp urgent_work(txn, held) do
+  defp urgent_work(txn, owner, held) do
     keys = JSON.encode!(Enum.map(held, & &1.key))
 
     Txn.q(
@@ -413,31 +497,41 @@ defmodule Tightbeam.CoordinatorHoldAlerts do
       """
       WITH held_sessions AS (SELECT value AS sessionKey FROM json_each(?1)),
       sources AS (
-        SELECT w.wakeId,w.assignmentId,w.work_item_id,w.dueAt,w.createdAt,NULL AS requestRef
+        SELECT w.wakeId,w.assignmentId,w.work_item_id,w.dueAt,w.createdAt,w.ownerUserId,NULL AS requestRef
         FROM wakes w JOIN held_sessions h ON h.sessionKey=w.sessionKey
         WHERE w.state='pending' AND w.consumer='prompt'
         UNION
-        SELECT w.wakeId,COALESCE(w.assignmentId,t.assignmentId),w.work_item_id,w.dueAt,w.createdAt,t.requestRef
+        SELECT w.wakeId,COALESCE(w.assignmentId,t.assignmentId),w.work_item_id,w.dueAt,w.createdAt,w.ownerUserId,t.requestRef
         FROM held_sessions h JOIN turns t ON t.sessionKey=h.sessionKey AND t.status='queued'
         JOIN wakes w ON w.deliveredTurnSeq=t.seq OR w.wakeId=t.wakeId
       )
       SELECT DISTINCT
-        COALESCE(item.title,a.subject,'Scheduled work'),
+        CASE
+          WHEN lower(COALESCE(item.title,a.subject,'')) LIKE '%install window%' THEN 'Install window'
+          WHEN lower(COALESCE(item.title,a.subject,'')) LIKE '%serve window%' THEN 'Serve window'
+          WHEN d.deadlineAt IS NOT NULL THEN 'Decision'
+          ELSE 'Scheduled work'
+        END,
         COALESCE(d.deadlineAt,CASE WHEN s.dueAt>s.createdAt THEN s.dueAt END)
       FROM sources s
-      LEFT JOIN assignments a ON a.id=s.assignmentId
+      LEFT JOIN assignments a ON a.id=s.assignmentId AND EXISTS (
+        SELECT 1 FROM sessions holder WHERE holder.sessionKey=a.holderKey AND holder.ownerUserId=?2
+      )
       LEFT JOIN work_items item ON item.id=COALESCE(s.work_item_id,a.workItemId)
-      LEFT JOIN decision_requests d ON d.status='open'
+        AND item.ownerUserId=?2
+      LEFT JOIN decision_requests d ON d.status='open' AND d.ownerUserId=?2
         AND (d.id=s.requestRef OR d.deadlineWakeId=s.wakeId)
-      WHERE d.deadlineAt IS NOT NULL OR s.dueAt>s.createdAt
+      WHERE (s.ownerUserId IS NULL OR s.ownerUserId=?2)
+        AND (s.assignmentId IS NULL OR a.id IS NOT NULL)
+        AND (COALESCE(s.work_item_id,a.workItemId) IS NULL OR item.id IS NOT NULL)
+        AND (s.requestRef IS NULL OR d.id IS NOT NULL)
+        AND (d.deadlineAt IS NOT NULL OR s.dueAt>s.createdAt)
       ORDER BY 2,1 LIMIT 3
       """,
-      [keys]
+      [keys, owner]
     )
-    |> Enum.map(fn [title, at] -> "#{short(title)} due #{time(at)}." end)
+    |> Enum.map(fn [label, at] -> "#{label} due #{time(at)}." end)
   end
-
-  defp short(text), do: text |> String.replace(~r/\s+/, " ") |> String.slice(0, 120)
 
   defp time(at) do
     case DateTime.from_unix(at, :millisecond) do

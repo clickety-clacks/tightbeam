@@ -132,6 +132,8 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
 
   test "boot and a coordinator move drive outage and recovery across a worker restart", ctx do
     session(ctx.db, @main, "generic", "claude", "build-host", @model)
+    session(ctx.db, @exec, "uncle-enzo.exec", "claude", "build-host", @model)
+    Org.rename(ctx.db, @exec, "Private fixture token=sample-secret s_private")
     assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, @park)
 
     opts = [db: ctx.db, runner: ctx.runner]
@@ -143,12 +145,90 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
     server = start_supervised!({CoordinatorHoldAlerts, opts})
     :sys.get_state(server)
     refute_received {:sent, _, _, _}
-    assert %{host: "second-host"} = Org.set_host(ctx.db, @main, "second-host")
+    assert %{host: "second-host"} = Org.set_host(ctx.db, @exec, "second-host")
     assert_receive {:sent, _, "A Tightbeam coordinator is available", recovery}, 1_000
-    assert recovery =~ "Main can take turns again on claude at second-host."
+    assert recovery =~ "An exec can take turns again on claude at second-host."
+    refute recovery =~ "sample-secret"
+    refute recovery =~ "s_private"
     assert HarnessProcess.parked?(ctx.db, @park)
     :sys.get_state(server)
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM coordinator_hold_sends")
+  end
+
+  test "a committed route recovery after reservation prevents the new outage send", ctx do
+    session(ctx.db, @main, "generic", "claude", "build-host", @model)
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, @park)
+
+    {previous, runner} =
+      pending_recovery(ctx, fn ->
+        # The earlier send runs after the new outage was reserved and before it is claimed.
+        assert {:ok, [[nil]]} =
+                 DB.query(ctx.db, """
+                 SELECT s.attemptedAt FROM coordinator_hold_sends s
+                 JOIN coordinator_hold_episodes e ON e.id=s.episodeId
+                 WHERE e.closedAt IS NULL AND s.phase='outage'
+                 """)
+
+        assert :ok = HarnessProcess.complete_park(ctx.db, @park)
+      end)
+
+    assert reconcile(%{ctx | runner: runner}) == nil
+    assert_received {:sent, ^previous, "A Tightbeam coordinator is available", _}
+    refute_received {:sent, _, _, _}
+
+    assert {:ok, [[@at, nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT e.closedAt,s.attemptedAt FROM coordinator_hold_sends s
+               JOIN coordinator_hold_episodes e ON e.id=s.episodeId
+               WHERE e.openedAt=?1 AND s.phase='outage'
+               """,
+               [@at]
+             )
+  end
+
+  test "a delayed recovery cannot backdate the next outage or shorten the floor after restart",
+       ctx do
+    session(ctx.db, @main, "generic", "claude", "build-host", @model)
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, @park)
+    clock_cell = :atomics.new(1, [])
+    :atomics.put(clock_cell, 1, @at)
+    clock = fn -> :atomics.get(clock_cell, 1) end
+    delay = :timer.minutes(1)
+
+    {previous, runner} =
+      pending_recovery(ctx, fn -> :atomics.add(clock_cell, 1, delay) end)
+
+    opts = [db: ctx.db, runner: runner, clock: clock]
+    server = start_supervised!({CoordinatorHoldAlerts, opts})
+    assert_receive {:sent, ^previous, "A Tightbeam coordinator is available", _}, 1_000
+    assert_receive {:sent, first, "Tightbeam coordinators are held", _}, 1_000
+    :sys.get_state(server)
+    attempted_at = @at + delay
+
+    assert {:ok, [[^attempted_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT attemptedAt FROM coordinator_hold_sends WHERE operationId=?1",
+               [first]
+             )
+
+    assert :ok = HarnessProcess.complete_park(ctx.db, @park)
+    assert_receive {:sent, _, "A Tightbeam coordinator is available", _}, 1_000
+    :sys.get_state(server)
+    stop_supervised!(CoordinatorHoldAlerts)
+
+    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, @park)
+    :atomics.put(clock_cell, 1, @at + @interval)
+    server = start_supervised!({CoordinatorHoldAlerts, opts})
+    :sys.get_state(server)
+    refute_received {:sent, _, _, _}
+
+    :atomics.put(clock_cell, 1, attempted_at + @interval)
+    CoordinatorHoldAlerts.changed()
+    assert_receive {:sent, next, "Tightbeam coordinators are held", _}, 1_000
+    assert next != first
   end
 
   test "a refused send is terminal and an uncertain send is never attempted again", ctx do
@@ -193,12 +273,13 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
              """)
 
     assert reconcile(ctx) == nil
-    assert_received {:sent, ^operation, "Tightbeam coordinators are held", "Reserved alert"}
+    assert_received {:sent, ^operation, "Tightbeam coordinators are held", body}
+    assert body =~ "The only active coordinator is held."
     assert reconcile(ctx, @at + 1) == nil
     refute_received {:sent, _, _, _}
   end
 
-  test "a source wake in a held carrier supplies a named install window and reset timing", ctx do
+  test "a held carrier includes owned window timing without copying private titles", ctx do
     session(ctx.db, @main, "generic", "claude", "build-host", @model)
     seq = enqueue(ctx.db, @main)
     deadline = @at + :timer.hours(1)
@@ -209,7 +290,8 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
                  txn,
                  """
                  INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt)
-                 VALUES ('window','Approved install window','fixture-owner','fixture-owner',?1)
+                 VALUES ('window','Approved install window token=sample-secret asg_private','fixture-owner','fixture-owner',?1),
+                        ('foreign-window','Serve window','another-owner','another-owner',?1)
                  """,
                  [@at]
                )
@@ -219,6 +301,7 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
                  """
                  INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,state,work_item_id,deliveredTurnSeq)
                  VALUES ('member',?1,'process:tightbeam','install',?2,?3,'fired','window',?4),
+                        ('foreign-member',?1,'process:tightbeam','serve',?2-1,?3,'fired','foreign-window',?4),
                         ('ordinary',?1,'process:tightbeam','ordinary work',?3,?3,'fired',NULL,?4)
                  """,
                  [@main, deadline, @at, seq]
@@ -261,8 +344,11 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
 
     assert reconcile(ctx) == nil
     assert_received {:sent, _, "Tightbeam coordinators are held", body}
-    assert body =~ "Approved install window due"
+    assert body =~ "Install window due"
     assert body =~ "Provider reset Nov 22 11:00 UTC."
+    refute body =~ "sample-secret"
+    refute body =~ "asg_private"
+    refute body =~ "Serve window"
     refute body =~ "Scheduled work"
 
     # Admission can reopen while the health incident still awaits a success.
@@ -272,7 +358,51 @@ defmodule Tightbeam.CoordinatorHoldAlertsTest do
     assert_received {:sent, _, "A Tightbeam coordinator is available", _}
   end
 
-  defp reconcile(ctx, at \\ @at), do: CoordinatorHoldAlerts.reconcile(ctx.db, at, ctx.runner)
+  defp reconcile(ctx, at \\ @at),
+    do: CoordinatorHoldAlerts.reconcile(ctx.db, fn -> at end, ctx.runner)
+
+  defp pending_recovery(ctx, before_execute) do
+    operation = Tightbeam.Id.uuid4()
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO coordinator_hold_episodes(id,ownerUserId,openedAt,closedAt,holdSources)
+                 VALUES ('previous','fixture-owner',?1,?2,'[]')
+                 """,
+                 [@at - @interval, @at - 1]
+               )
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO coordinator_hold_sends(episodeId,phase,operationId,body,attemptedAt,outcome)
+                 VALUES ('previous','outage',?1,'Previous outage',?2,'committed')
+                 """,
+                 [Tightbeam.Id.uuid4(), @at - @interval]
+               )
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO coordinator_hold_sends(episodeId,phase,operationId,body)
+                 VALUES ('previous','recovery',?1,'Previous recovery')
+                 """,
+                 [operation]
+               )
+
+               :ok
+             end)
+
+    runner = fn args ->
+      if args == ["send", "--execute", "--op-id", operation], do: before_execute.()
+      ctx.runner.(args)
+    end
+
+    {operation, runner}
+  end
 
   defp session(db, key, archetype, harness, host, model) do
     Org.create(db, %{
