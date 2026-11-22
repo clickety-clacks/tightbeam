@@ -4774,22 +4774,11 @@ defmodule Tightbeam.Wakes do
 
   defp authorize_cancel(
          %{requester: %{kind: kind, id: id}, reason_kind: "requester_withdrew"},
-         %{origin: origin, creator_session_key: creator_session_key}
+         %{origin: _, creator_session_key: _} = wake
        )
        when kind in ["user", "session"] and is_binary(id) and id != "" do
-    case {kind, origin, creator_session_key} do
-      {"session", _origin, sender} when is_binary(sender) ->
-        if id == sender, do: :ok, else: :error
-
-      {"session", "session:" <> sender, nil} ->
-        if id == sender, do: :ok, else: :error
-
-      {"user", "user:" <> sender, _creator} ->
-        if id == sender, do: :ok, else: :error
-
-      _ ->
-        :error
-    end
+    principal = if kind == "session", do: {:session, id}, else: {:user, id}
+    if sent_by?(wake, principal), do: :ok, else: :error
   end
 
   defp authorize_cancel(
@@ -4804,6 +4793,18 @@ defmodule Tightbeam.Wakes do
   end
 
   defp authorize_cancel(_command, _wake), do: :error
+
+  @doc false
+  def sent_by?(%{creator_session_key: id}, {:session, id}) when is_binary(id) and id != "",
+    do: true
+
+  def sent_by?(%{creator_session_key: nil, origin: "session:" <> id}, {:session, id})
+      when id != "",
+      do: true
+
+  def sent_by?(%{origin: "user:" <> id}, {:user, id}) when id != "", do: true
+
+  def sent_by?(_wake, _principal), do: false
 
   defp primary_work(_txn, %{assignment_id: nil, work_item_id: nil}),
     do: {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}

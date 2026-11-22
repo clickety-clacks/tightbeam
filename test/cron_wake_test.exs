@@ -292,6 +292,7 @@ defmodule Tightbeam.CronWakeTest do
 
     assert log =~ "cron unavailable: schema migration failed:"
     assert log =~ "cron migration rejected"
+    assert CronWake.list_active(db) == []
     assert {:ok, []} = DB.query(db, "SELECT * FROM cron_wake_migration")
 
     assert {:ok, []} =

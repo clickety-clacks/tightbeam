@@ -2165,6 +2165,114 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              rest_session["capabilities"]["setHarness"]
   end
 
+  test "CLI list exposes the active cron root through firing and cancellation", ctx do
+    outsider_device(ctx)
+    outsider = ensure_main_session(ctx.db, "outsider")
+    owner = ctx.admin_session
+    cli = cli_dispatch(ctx)
+    dispatch = fn session, request -> cli.(session.cli_token, request) end
+
+    list = fn session -> dispatch.(session, %{verb: "inspect", params: %{}}) end
+
+    cancel = fn session, id ->
+      dispatch.(session, %{verb: "wake", params: %{cancelWakeId: id}})
+    end
+
+    before = list.(owner)
+    assert before["recurringWakes"] == []
+    assert Enum.any?(before["wakes"], &(&1["wakeId"] == ctx.wake.wake_id))
+
+    schedule = "*/30 * * * *"
+    prompt = "Recurring list fixture"
+
+    assert %{"wakeId" => id, "dueAt" => first_due} =
+             dispatch.(owner, %{
+               verb: "wake",
+               sessionKey: owner.session_key,
+               params: %{prompt: prompt, cron: schedule}
+             })
+
+    recipient = owner.session_key
+    listed = list.(owner)
+
+    assert [
+             %{
+               "wakeId" => ^id,
+               "sessionKey" => ^recipient,
+               "prompt" => ^prompt,
+               "schedule" => ^schedule,
+               "dueAt" => ^first_due
+             }
+           ] = listed["recurringWakes"]
+
+    assert listed["wakes"] == before["wakes"]
+    hidden = list.(outsider)
+    assert hidden["recurringWakes"] == []
+    refute Enum.any?(hidden["wakes"], &(&1["wakeId"] == ctx.wake.wake_id))
+    assert %{"canceled" => false} = cancel.(outsider, id)
+
+    Tightbeam.CronWake.fire_due(ctx.db, first_due)
+    after_tick = list.(owner)
+
+    assert [%{"wakeId" => listed_id, "dueAt" => next_due, "schedule" => ^schedule}] =
+             after_tick["recurringWakes"]
+
+    assert listed_id == id
+    assert next_due > first_due
+    assert [emitted] = Enum.filter(after_tick["wakes"], &(&1["prompt"] == prompt))
+    assert emitted["consumer"] == "prompt"
+    refute emitted["wakeId"] == listed_id
+    refute Map.has_key?(emitted, "schedule")
+    assert List.delete(after_tick["wakes"], emitted) == before["wakes"]
+
+    assert %{"canceled" => true} = cancel.(owner, listed_id)
+    after_cancel = list.(owner)
+    assert after_cancel["recurringWakes"] == []
+    assert after_cancel["wakes"] == after_tick["wakes"]
+
+    Tightbeam.CronWake.fire_due(ctx.db, next_due)
+    assert list.(owner)["wakes"] == after_cancel["wakes"]
+    assert list.(owner)["recurringWakes"] == []
+  end
+
+  test "CLI list exposes cross-owner cron roots to the sender and recipient", ctx do
+    outsider_device(ctx)
+    recipient = ensure_main_session(ctx.db, "outsider")
+    cli = cli_dispatch(ctx)
+    inspect_request = %{verb: "inspect", params: %{}}
+    schedule = "*/30 * * * *"
+    recipient_before = cli.(recipient.cli_token, inspect_request)
+
+    for {token, attribution} <- [
+          {ctx.admin_session.cli_token, %{}},
+          {ctx.opts[:cli_token], %{asUser: ctx.admin_session.owner_user_id}}
+        ] do
+      sender = fn request -> cli.(token, Map.merge(request, attribution)) end
+      before = sender.(inspect_request)
+      refute Enum.any?(before["sessions"], &(&1["sessionKey"] == recipient.session_key))
+
+      assert %{"wakeId" => id} =
+               sender.(%{
+                 verb: "wake",
+                 sessionKey: recipient.session_key,
+                 params: %{prompt: "Cross-owner recurring fixture", cron: schedule}
+               })
+
+      sender_list = sender.(inspect_request)
+      recipient_list = cli.(recipient.cli_token, inspect_request)
+      assert [%{"wakeId" => ^id, "schedule" => ^schedule}] = sender_list["recurringWakes"]
+      assert recipient_list["recurringWakes"] == sender_list["recurringWakes"]
+      assert sender_list["wakes"] == before["wakes"]
+      assert recipient_list["wakes"] == recipient_before["wakes"]
+
+      cancel = %{verb: "wake", params: %{cancelWakeId: id}}
+      assert %{"canceled" => false} = cli.(recipient.cli_token, cancel)
+      assert %{"canceled" => true} = sender.(cancel)
+      assert sender.(inspect_request)["recurringWakes"] == []
+      assert cli.(recipient.cli_token, inspect_request)["recurringWakes"] == []
+    end
+  end
+
   test "a session whose recorded model left the served catalog reads as recorded", ctx do
     # The served catalog is not empty: it lists fable on testhost/claude. The
     # session's stored selection is history and is reported as recorded.
@@ -4529,6 +4637,25 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       })
 
     Devices.approve(ctx.db, "outsider-device", "outsider")
+  end
+
+  defp cli_dispatch(ctx) do
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.opts[:base_dir]})
+    router = Router.init(Keyword.put(ctx.opts, :handlers, handlers))
+
+    fn token, request ->
+      response =
+        conn(:post, "/agent/dispatch", JSON.encode!(request))
+        |> put_req_header("authorization", "Bearer #{token}")
+        |> put_req_header(
+          "x-tightbeam-cli-version",
+          Tightbeam.CliCompatibility.required_version()
+        )
+        |> Router.call(router)
+
+      assert response.status == 200, response.resp_body
+      JSON.decode!(response.resp_body)["result"]
+    end
   end
 
   defp decision_kind_rows(ctx) do
