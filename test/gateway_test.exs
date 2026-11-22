@@ -52,13 +52,15 @@ defmodule Tightbeam.GatewayTest do
       expected ++
         ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch workspace-cleanup)
 
+    expected = expected ++ ~w(artifact-content-capacity artifact-content-promote)
+
     expected =
       expected ++
         ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other harness-health-close-promotion harness-health-evidence-other harness-health-retry)
 
     expected =
       expected ++
-        ~w(harklight-send harklight-revise harklight-retract harklight-settle harklight-listener-restore harklight-cover harklight-retry harklight-follow harklight-briefings-catchup)
+        ~w(harklight-send harklight-revise harklight-progress harklight-retract harklight-settle harklight-listener-restore harklight-retry harklight-follow harklight-briefings-catchup)
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle retire-withdraw)
 
@@ -12478,13 +12480,13 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag timeout: 180_000, cold_gateway: true, tmp_dir: true
-  test "a dispatched Harklight wake records ACK2 without blocking the adapter turn", %{
+  test "a dispatched Harklight wake records its receipt without blocking the adapter turn", %{
     tmp_dir: tmp
   } do
     Tightbeam.GuardRuntimeFixture.run!(
       tmp,
-      "gateway_ack2_turn.exs",
-      "guarded-gateway-ack2-turn: ok"
+      "gateway_receipt_turn.exs",
+      "guarded-gateway-receipt-turn: ok"
     )
   end
 

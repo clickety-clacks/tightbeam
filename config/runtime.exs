@@ -107,6 +107,19 @@ if config_env() != :test do
     config :tightbeam, :artifact_archive_inline_limit_bytes, String.to_integer(value)
   end
 
+  if root = System.get_env("TIGHTBEAM_ARTIFACT_BLOB_ROOT") do
+    config :tightbeam, :artifact_blob_root, root
+  end
+
+  for {var, key} <- [
+        {"TIGHTBEAM_ARTIFACT_BLOB_BUDGET_BYTES", :artifact_blob_budget_bytes},
+        {"TIGHTBEAM_ARTIFACT_BLOB_FREE_FLOOR_BYTES", :artifact_blob_free_floor_bytes},
+        {"TIGHTBEAM_ARTIFACT_BLOB_FREE_FLOOR_PERCENT", :artifact_blob_free_floor_percent}
+      ],
+      value = System.get_env(var) do
+    config :tightbeam, key, String.to_integer(value)
+  end
+
   if value = System.get_env("TIGHTBEAM_DB_CALL_TIMEOUT_MS") do
     config :tightbeam, :db_call_timeout_ms, String.to_integer(value)
   end

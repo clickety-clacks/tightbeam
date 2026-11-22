@@ -5,6 +5,8 @@ defmodule Tightbeam.NoticeBatcherFixture.LaneStub do
   def init(:ok), do: {:ok, :ok}
   @impl true
   def handle_call({:ensure_lane, _session}, _from, state), do: {:reply, :ok, state}
+  @impl true
+  def handle_cast({:ensure_lane, _session}, state), do: {:noreply, state}
 end
 
 defmodule Tightbeam.NoticeBatcherFixture do

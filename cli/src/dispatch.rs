@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use serde_json::Value;
 
 use crate::attempt_diagnostic::command_context::CommandContext;
@@ -513,6 +514,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             content_sha256,
             content_base64,
             produced_by_assignment_id,
+            allow_unpinned,
         } => {
             let mut params = vec![
                 string_field("kind", kind),
@@ -530,8 +532,26 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     params.push(string_field(name, value));
                 }
             }
+            if *allow_unpinned {
+                params.push("\"allowUnpinned\":true".to_owned());
+            }
             Ok(request(identity, "artifact-record", vec![], params))
         }
+        Command::ArtifactContentPromote {
+            identity,
+            artifact_id,
+        } => Ok(request(
+            identity,
+            "artifact-content-promote",
+            vec![],
+            vec![string_field("artifactId", artifact_id)],
+        )),
+        Command::ArtifactContentCapacity { identity } => Ok(request(
+            identity,
+            "artifact-content-capacity",
+            vec![],
+            vec![],
+        )),
         Command::Artifacts {
             identity,
             work_item_id,
@@ -563,6 +583,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vendor_session_id,
             supersedes,
             decision_request_id,
+            progress,
+            progress_stage,
+            progress_note,
         } => {
             let mut params = vec![
                 format!(
@@ -607,7 +630,33 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = decision_request_id {
                 params.push(string_field("decisionRequestId", value));
             }
+            if let Some(value) = progress {
+                params.push(format!("\"progress\":{value}"));
+            }
+            if let Some(value) = progress_stage {
+                params.push(string_field("progressStage", value));
+            }
+            if let Some(value) = progress_note {
+                params.push(string_field("progressNote", value));
+            }
             Ok(request(identity, "harklight-send", vec![], params))
+        }
+        Command::HarklightProgress {
+            identity,
+            message,
+            percent,
+            stage,
+            note,
+        } => {
+            let mut params = vec![
+                string_field("messageId", message),
+                format!("\"percent\":{percent}"),
+                string_field("stage", stage),
+            ];
+            if let Some(value) = note {
+                params.push(string_field("note", value));
+            }
+            Ok(request(identity, "harklight-progress", vec![], params))
         }
         Command::HarklightRevise {
             identity,
@@ -618,6 +667,7 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             choices,
             clear_choices,
             session,
+            in_reply_to,
         } => {
             let mut params = vec![
                 string_field("messageId", message),
@@ -635,16 +685,23 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(session) = session {
                 params.push(string_field("handle", session));
             }
+            if let Some(entry) = in_reply_to {
+                params.push(string_field("inReplyTo", entry));
+            }
             Ok(request(identity, "harklight-revise", vec![], params))
         }
         Command::HarklightRetract {
             identity,
             message,
             session,
+            in_reply_to,
         } => {
             let mut params = vec![string_field("messageId", message)];
             if let Some(session) = session {
                 params.push(string_field("handle", session));
+            }
+            if let Some(entry) = in_reply_to {
+                params.push(string_field("inReplyTo", entry));
             }
             Ok(request(identity, "harklight-retract", vec![], params))
         }
@@ -653,18 +710,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             message,
             op_id,
         } => {
-            let mut params = vec![string_field("messageId", message)];
+            let mut params = Vec::new();
+            if let Some(message) = message {
+                params.push(string_field("messageId", message));
+            }
             if let Some(op_id) = op_id {
                 params.push(string_field("opId", op_id));
             }
             Ok(request(identity, "harklight-settle", vec![], params))
         }
-        Command::HarklightCover { identity, session } => Ok(request(
-            identity,
-            "harklight-cover",
-            vec![],
-            vec![string_field("handle", session)],
-        )),
         Command::HarklightListenerRestore { identity, handle } => Ok(request(
             identity,
             "harklight-listener-restore",
@@ -2553,11 +2607,46 @@ fn send_diagnostic_with_timeout(
         .ok_or_else(|| "diagnostic_response_invalid".to_owned())
 }
 
+fn artifact_upload_file(request: &RequestSpec) -> Result<Option<fs::File>, String> {
+    if request.path != "/agent/dispatch" {
+        return Ok(None);
+    }
+    let Ok(body) = serde_json::from_str::<Value>(&request.body_json) else {
+        return Ok(None);
+    };
+    let params = &body["params"];
+    if body["verb"] != "artifact-record" || params.get("contentBase64").is_some() {
+        return Ok(None);
+    }
+    let Some(path) = params["originPath"].as_str() else {
+        return Ok(None);
+    };
+    let path = Path::new(path);
+    if !path.is_absolute() && path.to_string_lossy().contains(':') {
+        return Ok(None);
+    }
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect artifact file: {error}")),
+    };
+    if metadata.is_dir() {
+        return Err("artifact origin is a directory; record a file or package the directory into an archive file".to_owned());
+    }
+    if !metadata.is_file() {
+        return Err("artifact origin must be a regular file".to_owned());
+    }
+    fs::File::open(path)
+        .map(Some)
+        .map_err(|error| format!("could not open artifact file: {error}"))
+}
+
 fn send_to_with_timeout(
     endpoint: &Endpoint,
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, String> {
+    let artifact_upload = artifact_upload_file(request)?;
     let tune = is_tune(request);
     let presentation = if tune {
         FailurePresentation::Tune
@@ -2587,6 +2676,12 @@ fn send_to_with_timeout(
         crate::attempt_diagnostic::observation::attach_request_id(gateway, attempt.as_ref());
     let call = if method == "GET" {
         gateway.call()
+    } else if let Some(file) = artifact_upload {
+        let metadata = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&request.body_json);
+        gateway
+            .set("content-type", "application/octet-stream")
+            .set("x-tightbeam-artifact-record", &metadata)
+            .send(file)
     } else {
         gateway
             .set("content-type", "application/json")
@@ -4158,12 +4253,12 @@ fn local_harklight_identity_refusal(
         {
             Some("harklight-briefings-catchup requires an active admin-owned session")
         }
-        Command::HarklightRevise { identity, .. }
+        Command::HarklightProgress { identity, .. }
+        | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
-        | Command::HarklightCover { identity, .. }
             if matches!(identity, Identity::User(_) | Identity::Process(_)) =>
         {
             Some("invalid Harklight command flags")
@@ -4187,16 +4282,18 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessHealthRetry { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::ArtifactContentFetch { identity, .. }
+        | Command::ArtifactContentPromote { identity, .. }
+        | Command::ArtifactContentCapacity { identity, .. }
         | Command::WorkspaceCleanup { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::HarklightSend { identity, .. }
         | Command::HarklightBriefingsCatchup { identity, .. }
+        | Command::HarklightProgress { identity, .. }
         | Command::HarklightRevise { identity, .. }
         | Command::HarklightRetract { identity, .. }
         | Command::HarklightSettle { identity, .. }
         | Command::HarklightListenerRestore { identity, .. }
         | Command::HarklightFollow { identity, .. }
-        | Command::HarklightCover { identity, .. }
         | Command::HarklightRetry { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
@@ -4466,7 +4563,6 @@ mod tests {
                 vec!["harklight-follow", "--handle", "h"],
                 "harklight-follow",
             ),
-            (vec!["harklight-cover", "--session", "h"], "harklight-cover"),
             (vec!["harklight-retry", "--all"], "harklight-retry"),
             (vec!["harklight-retry", "--message", "m"], "harklight-retry"),
             (vec!["harklight-retry", "--session", "h"], "harklight-retry"),
@@ -4488,9 +4584,7 @@ mod tests {
                 assert_eq!(body["params"]["stake"], "the demo slips");
                 assert_eq!(body["params"]["byWhen"], "2026-11-01T17:00:00Z");
                 assert_eq!(body["params"]["reply"], true);
-            } else if (verb == "harklight-follow" || verb == "harklight-cover")
-                && body["params"].get("handle").is_some()
-            {
+            } else if verb == "harklight-follow" && body["params"].get("handle").is_some() {
                 assert_eq!(body["params"]["handle"], "h");
             } else if verb == "harklight-listener-restore" {
                 assert_eq!(body["params"]["handle"], "h");

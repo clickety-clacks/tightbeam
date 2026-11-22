@@ -74,15 +74,17 @@ impl CommandContext {
             HarnessHealthRetry { .. } => ("cli.harness_health_retry", DispatchPath),
             ArtifactRecord { .. } => ("cli.artifact_record", DispatchPath),
             HarklightSend { .. } => ("cli.harklight_send", DispatchPath),
+            HarklightProgress { .. } => ("cli.harklight_progress", DispatchPath),
             HarklightRevise { .. } => ("cli.harklight_revise", DispatchPath),
             HarklightRetract { .. } => ("cli.harklight_retract", DispatchPath),
             HarklightSettle { .. } => ("cli.harklight_settle", DispatchPath),
             HarklightListenerRestore { .. } => ("cli.harklight_listener_restore", DispatchPath),
             HarklightFollow { .. } => ("cli.harklight_follow", DispatchPath),
-            HarklightCover { .. } => ("cli.harklight_cover", DispatchPath),
             HarklightBriefingsCatchup { .. } => ("cli.harklight_briefings_catchup", DispatchPath),
             HarklightRetry { .. } => ("cli.harklight_retry", DispatchPath),
             ArtifactContentFetch { .. } => ("cli.artifact_content_fetch", DispatchPath),
+            ArtifactContentPromote { .. } => ("cli.artifact_content_promote", DispatchPath),
+            ArtifactContentCapacity { .. } => ("cli.artifact_content_capacity", DispatchPath),
             WorkspaceCleanup { .. } => ("cli.workspace_cleanup", DispatchPath),
             Artifacts { .. } => ("cli.artifacts", DispatchPath),
             ToolCallObserved => ("cli.tool_call_observed", Requests::ToolCallObserved),
@@ -341,6 +343,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | SessionDiagnose { .. }
         | HarnessHealthEvidenceOther { .. }
         | ArtifactContentFetch { .. }
+        | ArtifactContentCapacity { .. }
         | Artifacts { .. }
         | FactDemand { .. }
         | FactProducers { .. }
@@ -471,15 +474,16 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         },
 
         ArtifactRecord { .. }
+        | ArtifactContentPromote { .. }
         | HarnessHealthRetry { .. }
         | FactProducerClaim { .. }
         | HarklightSend { .. }
+        | HarklightProgress { .. }
         | HarklightRevise { .. }
         | HarklightRetract { .. }
         | HarklightSettle { .. }
         | HarklightListenerRestore { .. }
         | HarklightFollow { .. }
-        | HarklightCover { .. }
         | HarklightBriefingsCatchup { .. }
         | HarklightRetry { .. }
         | ToolCallObserved

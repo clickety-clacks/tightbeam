@@ -1,4 +1,4 @@
-defmodule GuardAck2TurnDoorbell do
+defmodule GuardReceiptTurnDoorbell do
   use GenServer
 
   def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
@@ -10,7 +10,7 @@ defmodule GuardAck2TurnDoorbell do
   end
 end
 
-defmodule GuardAck2Turn do
+defmodule GuardReceiptTurn do
   import ExUnit.Assertions
 
   alias Tightbeam.{ConnRegistry, DB, Gateway, HarklightWakes, Ledger, Model, Org, Placement}
@@ -37,7 +37,7 @@ defmodule GuardAck2Turn do
       session =
         Org.create(db, %{
           session_key: @session_key,
-          display_name: "ACK2 fixture agent",
+          display_name: "handoff receipt fixture agent",
           kind: "main",
           owner_user_id: "fixture-owner",
           origin: "user:fixture-owner",
@@ -75,24 +75,25 @@ defmodule GuardAck2Turn do
                )
 
       assert :ok =
-               HarklightWakes.capture_line(
+               HarklightWakes.capture_feed(
                  db,
                  @handle,
-                 JSON.encode!(%{
-                   "kind" => "event",
-                   "session_handle" => @handle,
-                   "event_id" => @event_id,
-                   "feed_cursor" => String.to_integer(@event_id),
-                   "request" => %{"sender_id" => "sender", "message_id" => "request"},
-                   "request_revision" => 1,
-                   "delivered" => false,
-                   "acted" => false,
-                   "entry" => %{
-                     "kind" => "discussion",
-                     "author" => "person",
-                     "content" => "HARKLIGHT_ACK2_GATEWAY_FIXTURE"
+                 707,
+                 [
+                   %{
+                     "kind" => "entry",
+                     "rev" => 707,
+                     "data" => %{
+                       "item_id" => "request",
+                       "entry_id" => @event_id,
+                       "request_revision" => 1,
+                       "kind" => "reply",
+                       "author" => "person",
+                       "text" => "HARKLIGHT_RECEIPT_GATEWAY_FIXTURE"
+                     }
                    }
-                 })
+                 ],
+                 :live
                )
 
       assert {:ok, [[wake_id, prompt]]} =
@@ -102,7 +103,7 @@ defmodule GuardAck2Turn do
                  [@session_key]
                )
 
-      bin = Path.join(base, "ack2-test-bin")
+      bin = Path.join(base, "receipt-test-bin")
       File.mkdir_p!(bin)
       executable = Path.join(bin, "harklight-agent")
       calls = executable <> ".calls"
@@ -114,16 +115,25 @@ defmodule GuardAck2Turn do
         executable,
         """
         #!/bin/sh
-        printf '%s\\n' "$*" >> "$0.calls"
+        case "$1" in
+          journal-id) printf '%s\n' '{"kind":"journal","journal_id":"receipt-journal"}'; exit 0 ;;
+          retry)
+            printf '{"kind":"operation_absent","op_id":"%s","journal_id":"receipt-journal"}\n' "$3"
+            exit 1
+            ;;
+        esac
+        printf '%s\n' "$*" >> "$0.calls"
+        for arg in "$@"; do operation="$arg"; done
         : > "$0.started"
         while [ ! -f "$0.release" ]; do sleep 0.01; done
+        printf '{"kind":"committed","operation":"receipt","op_id":"%s","response":{"status":"recorded"}}\n' "$operation"
         : > "$0.finished"
         exit 0
         """
       )
 
       File.chmod!(executable, 0o755)
-      {:ok, lane} = GenServer.start_link(GuardAck2TurnDoorbell, self())
+      {:ok, lane} = GenServer.start_link(GuardReceiptTurnDoorbell, self())
       {:ok, adapter} = AdapterStub.start_link(self())
       {:ok, coordinator} = CoordinatorStub.start_link({adapter, self()})
 
@@ -131,17 +141,18 @@ defmodule GuardAck2Turn do
         ConnRegistry.register(ConnRegistry, %{
           pid: self(),
           user_id: session.owner_user_id,
-          device_id: "ack2-gateway",
+          device_id: "receipt-gateway",
           is_admin: false,
           subscriptions: MapSet.new(["chat"])
         })
 
-      Process.put(:ack2_gateway_runner_task, nil)
+      Process.put(:receipt_gateway_runner_task, nil)
 
       try do
         # GuardRuntimeFixture runs this scenario in a short-lived isolated VM.
         # Keep the stand-in first on PATH until that process exits.
         System.put_env("PATH", bin <> ":" <> System.fetch_env!("PATH"))
+        {:ok, _receipt_worker} = Tightbeam.HarklightReceipts.start_link(db: db)
 
         {Tightbeam.LaneManager, lane_opts} =
           Gateway.children(config)
@@ -156,10 +167,10 @@ defmodule GuardAck2Turn do
                    lane_manager: lane,
                    wake_id: wake_id,
                    fire_wake_in_txn: true,
-                   client_message_id: "ack2-gateway-turn"
+                   client_message_id: "receipt-gateway-turn"
                  )
 
-        assert {:ok, turn} = Ledger.claim_next(db, @session_key, "ack2-gateway-turn")
+        assert {:ok, turn} = Ledger.claim_next(db, @session_key, "receipt-gateway-turn")
         turn = Map.put(turn, :session_key, session.session_key)
         turn_seq = turn.seq
 
@@ -167,13 +178,13 @@ defmodule GuardAck2Turn do
                  DB.query(db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id])
 
         task = Task.async(fn -> runner.(turn) end)
-        Process.put(:ack2_gateway_runner_task, task)
+        Process.put(:receipt_gateway_runner_task, task)
 
         assert_receive {:prompt_started, ^adapter}, 60_000
         await_file!(started)
 
-        assert File.read!(calls) ==
-                 "ack2 --session #{@handle} --event #{@event_id} --agent #{session.display_name}\n"
+        assert File.read!(calls) =~
+                 "receipt --item-id request --entry-id #{@event_id} --agent #{session.display_name} --op-id "
 
         refute File.exists?(release)
 
@@ -195,7 +206,7 @@ defmodule GuardAck2Turn do
         if Process.alive?(adapter), do: send(adapter, :continue_prompt)
         if File.exists?(started), do: await_file!(finished)
 
-        case Process.get(:ack2_gateway_runner_task) do
+        case Process.get(:receipt_gateway_runner_task) do
           %Task{pid: pid} = task when is_pid(pid) ->
             if Process.alive?(pid), do: Task.shutdown(task, :brutal_kill)
 
@@ -203,7 +214,7 @@ defmodule GuardAck2Turn do
             :ok
         end
 
-        Process.delete(:ack2_gateway_runner_task)
+        Process.delete(:receipt_gateway_runner_task)
 
         if Process.alive?(coordinator), do: GenServer.stop(coordinator)
         if Process.alive?(adapter), do: GenServer.stop(adapter)
@@ -213,7 +224,7 @@ defmodule GuardAck2Turn do
   end
 
   defp await_file!(path, attempts \\ 500)
-  defp await_file!(_path, 0), do: raise("timed out waiting for ACK2 command fixture")
+  defp await_file!(_path, 0), do: raise("timed out waiting for handoff receipt command fixture")
 
   defp await_file!(path, attempts) do
     if File.exists?(path) do
@@ -225,5 +236,5 @@ defmodule GuardAck2Turn do
   end
 end
 
-GuardAck2Turn.run()
-IO.puts("guarded-gateway-ack2-turn: ok")
+GuardReceiptTurn.run()
+IO.puts("guarded-gateway-receipt-turn: ok")

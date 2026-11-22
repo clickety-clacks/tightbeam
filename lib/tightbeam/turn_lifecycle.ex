@@ -33,7 +33,7 @@ defmodule Tightbeam.TurnLifecycle do
 
   @detail_keys %{
     "claimed" => ~w(v owner),
-    "prompt_dispatched" => ~w(v),
+    "prompt_dispatched" => ~w(v harklight_receipt_agent),
     "terminal_committed" => ~w(v status prewrite workOutcome reason promptDelivery)
   }
 

@@ -3,10 +3,12 @@
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+const UNVERIFIED_EXIT: i32 = 125;
 
 pub fn run(args: &[String]) -> Result<i32, String> {
     if args.len() < 3 || args[0] != "--lock" {
@@ -33,8 +35,10 @@ pub fn run(args: &[String]) -> Result<i32, String> {
 
     let stopped = Arc::new(AtomicBool::new(false));
     let child_pid = Arc::new(Mutex::new(None::<u32>));
+    let requested_stop = Arc::new(AtomicBool::new(false));
     let input_stopped = stopped.clone();
     let input_pid = child_pid.clone();
+    let input_stop = requested_stop.clone();
     let (release, released) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -42,15 +46,12 @@ pub fn run(args: &[String]) -> Result<i32, String> {
         let mut line = String::new();
         let continuing = input.read_line(&mut line).is_ok() && line == "continue\n";
         let _ = release.send(continuing);
-        if continuing {
-            line.clear();
-            let _ = input.read_line(&mut line);
-        }
+        line.clear();
+        let stop = continuing && input.read_line(&mut line).is_ok() && line == "stop\n";
         input_stopped.store(true, Ordering::SeqCst);
         if let Some(pid) = *input_pid.lock().unwrap() {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
+            let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } == 0;
+            input_stop.store(stop && killed, Ordering::SeqCst);
         }
     });
 
@@ -96,19 +97,35 @@ pub fn run(args: &[String]) -> Result<i32, String> {
     }
     let mut errors = child.stderr.take().unwrap();
     let copy_errors = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut errors, &mut std::io::stderr());
+        let mut target = std::io::stderr();
+        std::io::copy(&mut errors, &mut target)?;
+        target.flush()
     });
     let mut output = child.stdout.take().unwrap();
     let copy = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut output, &mut std::io::stdout());
+        let mut target = std::io::stdout();
+        std::io::copy(&mut output, &mut target)?;
+        target.flush()
     });
-    let status = child.wait().map_err(|e| e.to_string())?;
+    let Ok(status) = child.wait() else {
+        eprintln!("child exit could not be verified");
+        return Ok(UNVERIFIED_EXIT);
+    };
     *child_pid.lock().unwrap() = None;
-    let _ = copy.join();
-    let _ = copy_errors.join();
-    // Keep the lock until both child exit and output drain have been observed.
+    let output = copy.join();
+    let errors = copy_errors.join();
+    if !matches!(output, Ok(Ok(()))) || !matches!(errors, Ok(Ok(()))) {
+        eprintln!("child output forwarding could not be verified");
+        return Ok(UNVERIFIED_EXIT);
+    }
+    // A successful explicit stop includes the reaped child and both drained
+    // streams. Keep a natural exit status even when a stop raced that exit.
     drop(lock);
-    Ok(status.code().unwrap_or(1))
+    if status.signal() == Some(libc::SIGKILL) && requested_stop.load(Ordering::SeqCst) {
+        Ok(0)
+    } else {
+        Ok(status.code().unwrap_or(1))
+    }
 }
 
 fn lock_exclusive(fd: i32) -> Result<(), String> {
