@@ -75,13 +75,24 @@ Use the gateway's bearer authentication and normal resource visibility rules.
 
 Usage routes accept `refresh=wait` for a bounded wait and
 `refresh=background` for a read that can return a retained sample. Requests
-respect provider rate-limit holds.
+respect provider rate-limit holds. Use `refresh=cache` to read the stored
+projection without starting or waiting for a provider read. Cache-only reads
+return an empty results list when no accounts are visible and a result with
+`sample: null` when a visible account has no reading. A missing or invisible
+account returns HTTP 404.
 
 For live capacity, authenticate to [Firehose](firehose.md), subscribe, and
-wait for `subscription_ready` before reading the REST snapshot. Treat change
-events as invalidations and fetch current REST data. After a disconnect or
-`reload_required`, establish a new subscription and rebuild the snapshot.
-Firehose delivers live events for the current subscription.
+wait for `subscription_ready` before reading a `refresh=cache` REST snapshot.
+Queue invalidations received during the snapshot and reconcile them with more
+cache-only reads. The relevant Firehose classes are `capacity.changed`,
+`provider_account.changed`, `provider_account.removed`,
+`account_serving.changed`, and `account_limit.changed`. A successful capacity
+read can advance the observation timestamp while usage percentages stay the
+same.
+
+After a disconnect or `reload_required`, establish a new subscription and
+rebuild the snapshot. Firehose delivers live events for the current
+subscription.
 
 ## Using Lachesis alongside Tightbeam
 

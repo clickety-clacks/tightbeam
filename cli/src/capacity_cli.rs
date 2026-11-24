@@ -283,6 +283,37 @@ mod tests {
     }
 
     #[test]
+    fn watch_distinguishes_empty_snapshot_from_an_account_without_usage() {
+        let action = CapacityAction::Watch { account: None };
+        let empty = serde_json::json!({
+            "generatedAt": 1795530000000_i64,
+            "results": [],
+            "counts": {"live": 0, "cache": 0, "stale": 0, "error": 0},
+        });
+        assert_eq!(
+            format_capacity(&action, &empty, false),
+            "No provider accounts.\n"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&format_capacity(&action, &empty, true)).unwrap(),
+            empty,
+        );
+
+        let sample: Value = serde_json::from_str(CAPACITY).unwrap();
+        let account = &sample["results"][1];
+        let action = CapacityAction::Watch {
+            account: Some("acct_secondary".into()),
+        };
+        let text = format_capacity(&action, account, false);
+        assert!(text.contains("Unknown period login (acct_secondary)"));
+        assert!(text.contains("none (never_observed)"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&format_capacity(&action, account, true)).unwrap()["sample"],
+            Value::Null,
+        );
+    }
+
+    #[test]
     fn account_summary_keeps_login_status_and_serving_separate() {
         let account = serde_json::json!({
             "id": "acct_backup",
