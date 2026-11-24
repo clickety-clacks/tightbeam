@@ -525,6 +525,20 @@ pub enum Command {
         body: Option<String>,
         clear_body: bool,
     },
+    WorkItemWait {
+        identity: Identity,
+        work_item_id: String,
+        assignment: Option<String>,
+        decision: Option<String>,
+        condition_kind: Option<String>,
+        condition_scope: Option<String>,
+        after_ms: String,
+        wait_reason: String,
+    },
+    WorkItemWaitWithdraw {
+        identity: Identity,
+        work_item_id: String,
+    },
     WorkItemGet {
         identity: Identity,
         work_item_id: String,
@@ -1183,6 +1197,11 @@ COMMANDS:
       inherit priority changes.
       Body-only forms: --body <text>, --body=<text>, or --clear-body. A body
       update replaces the whole text; --clear-body removes it.
+  work-item-wait <workItemId> (--assignment <id>|--decision <id>|--when-fact <kind> --when-scope <scope>)
+      --fallback-after <duration> --wait-reason "<short reason>"
+      Quiet only bare-item reminders until this recorded dependency ends.
+      Inspect the wait with work-item-get; recording another target replaces it.
+  work-item-wait-withdraw <workItemId>
   work-item-get <workItemId>
   work-item-trace <workItemId>
   attend [--high]
@@ -4012,6 +4031,56 @@ fn parse_with_optional_catalog(
                 priority: priority_flag(flags)?,
                 body: None,
                 clear_body: false,
+            })
+        }
+        "work-item-wait" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam work-item-wait <workItemId> (--assignment <id>|--decision <id>|--when-fact <kind> --when-scope <scope>) --fallback-after <duration> --wait-reason <reason>".to_owned());
+            }
+            let assignment = nonempty(flags, "assignment");
+            let decision = nonempty(flags, "decision");
+            let condition_kind = nonempty(flags, "when-fact");
+            let condition_scope = nonempty(flags, "when-scope");
+            if [
+                assignment.is_some(),
+                decision.is_some(),
+                condition_kind.is_some(),
+            ]
+            .into_iter()
+            .filter(|v| *v)
+            .count()
+                != 1
+                || condition_kind.is_some() != condition_scope.is_some()
+            {
+                return Err(
+                    "name exactly one --assignment, --decision, or --when-fact with --when-scope"
+                        .to_owned(),
+                );
+            }
+            let wait_reason = nonempty(flags, "wait-reason").ok_or("--wait-reason is required")?;
+            if wait_reason.chars().count() > 140 || wait_reason.contains(['\n', '\r']) {
+                return Err("--wait-reason must be one line, at most 140 characters".to_owned());
+            }
+            let fallback =
+                nonempty(flags, "fallback-after").ok_or("--fallback-after is required")?;
+            Ok(Command::WorkItemWait {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+                assignment,
+                decision,
+                condition_kind,
+                condition_scope,
+                after_ms: parse_duration("fallback-after", &fallback)?,
+                wait_reason,
+            })
+        }
+        "work-item-wait-withdraw" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam work-item-wait-withdraw <workItemId>".to_owned());
+            }
+            Ok(Command::WorkItemWaitWithdraw {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
             })
         }
         "work-item-get" => {
@@ -7654,6 +7723,8 @@ mod tests {
                 "work-item-create",
                 "work-item-fail",
                 "work-item-get",
+                "work-item-wait",
+                "work-item-wait-withdraw",
                 "work-item-handoff",
                 "work-item-update",
                 "attend",

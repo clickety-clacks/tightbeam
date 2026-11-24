@@ -1809,6 +1809,29 @@ defmodule Tightbeam.Schema do
                                        object
                                    end)
 
+  @item_wait_cancellation_migration "work-item-wait-cancellation/v1"
+  @item_wait_cancellation_objects Enum.map(@retirement_cancellation_objects, fn
+                                    %{name: "wake_cancellations", sql: sql} = object ->
+                                      anchor = "(requesterId = 'tightbeam:row-reactions' AND"
+
+                                      route =
+                                        "(requesterId = 'tightbeam:work-item-waits' AND reasonKind = 'superseded' AND " <>
+                                          "causalSourceKind = 'wake' AND outcomeKind = 'no_replacement') OR "
+
+                                      [_, _] = String.split(sql, anchor)
+
+                                      %{
+                                        object
+                                        | sql:
+                                            String.replace(sql, anchor, route <> anchor,
+                                              global: false
+                                            )
+                                      }
+
+                                    object ->
+                                      object
+                                  end)
+
   @doc false
   def live_base_upgrade_predecessor, do: @operator_decision_shape
 
@@ -2148,6 +2171,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_retirement_parent_moves(db)
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
+    :ok = upgrade_item_wait_cancellation(db)
     :ok = upgrade_session_custody_v1(db)
     :ok = upgrade_attest_lifecycle_actor(db)
     :ok = upgrade_holder_role_v1(db)
@@ -4342,6 +4366,7 @@ defmodule Tightbeam.Schema do
     # successor can be elected only after the stamped prerequisite is active.
     if effort_holder_activity_cancellation_active?(txn) do
       cond do
+        item_wait_cancellation_active?(txn) -> @item_wait_cancellation_objects
         retirement_cancellation_active?(txn) -> @retirement_cancellation_objects
         row_reaction_cancellation_active?(txn) -> @row_reaction_cancellation_objects
         true -> @effort_holder_activity_cancellation_objects
@@ -6102,6 +6127,75 @@ defmodule Tightbeam.Schema do
     ]) == [[1]]
   end
 
+  defp item_wait_cancellation_active?(txn) do
+    Txn.q(txn, "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1", [
+      @item_wait_cancellation_migration
+    ]) == [[1]]
+  end
+
+  defp upgrade_item_wait_cancellation(db) do
+    case DB.migration_transaction(
+           db,
+           :item_wait_cancellation,
+           [],
+           ["PRAGMA writable_schema = OFF"],
+           fn txn ->
+             current =
+               Enum.find(@item_wait_cancellation_objects, &(&1.name == "wake_cancellations"))
+
+             if item_wait_cancellation_active?(txn) do
+               validate_owned_object!(txn, current)
+             else
+               unless retirement_cancellation_active?(txn),
+                 do:
+                   raise(ShapeError,
+                     message: "item wait cancellation requires its stamped predecessor"
+                   )
+
+               previous =
+                 Enum.find(@retirement_cancellation_objects, &(&1.name == "wake_cancellations"))
+
+               validate_owned_object!(txn, previous)
+
+               sql =
+                 current.sql
+                 |> String.replace(~r/\bIF\s+NOT\s+EXISTS\s+/u, "", global: false)
+                 |> String.trim()
+                 |> String.trim_trailing(";")
+
+               [[version]] = Txn.q(txn, "PRAGMA schema_version")
+               :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
+
+               Txn.q(
+                 txn,
+                 "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='wake_cancellations'",
+                 [sql]
+               )
+
+               1 = Txn.changes(txn)
+               :ok = Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+               :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO supervision_liveness_migrations(migrationId,appliedAt,affectedRows,cause,principal)
+                 VALUES(?1,?2,0,'release_upgrade','process:tightbeam')
+                 """,
+                 [@item_wait_cancellation_migration, System.system_time(:millisecond)]
+               )
+
+               validate_owned_object!(txn, current)
+             end
+
+             :ok
+           end
+         ) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
   defp retirement_cancellation_active?(txn) do
     Txn.q(txn, "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1", [
       @retirement_cancellation_migration
@@ -6119,7 +6213,16 @@ defmodule Tightbeam.Schema do
                Enum.find(@retirement_cancellation_objects, &(&1.name == "wake_cancellations"))
 
              if retirement_cancellation_active?(txn) do
-               validate_owned_object!(txn, current)
+               expected =
+                 if item_wait_cancellation_active?(txn),
+                   do:
+                     Enum.find(
+                       @item_wait_cancellation_objects,
+                       &(&1.name == "wake_cancellations")
+                     ),
+                   else: current
+
+               validate_owned_object!(txn, expected)
              else
                unless row_reaction_cancellation_active?(txn),
                  do:
@@ -6184,13 +6287,22 @@ defmodule Tightbeam.Schema do
 
              if row_reaction_cancellation_active?(txn) do
                expected =
-                 if retirement_cancellation_active?(txn),
-                   do:
+                 cond do
+                   item_wait_cancellation_active?(txn) ->
+                     Enum.find(
+                       @item_wait_cancellation_objects,
+                       &(&1.name == "wake_cancellations")
+                     )
+
+                   retirement_cancellation_active?(txn) ->
                      Enum.find(
                        @retirement_cancellation_objects,
                        &(&1.name == "wake_cancellations")
-                     ),
-                   else: current
+                     )
+
+                   true ->
+                     current
+                 end
 
                validate_owned_object!(txn, expected)
              else

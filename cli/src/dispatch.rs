@@ -1497,6 +1497,42 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "work-item-update", vec![], params))
         }
+        Command::WorkItemWait {
+            identity,
+            work_item_id,
+            assignment,
+            decision,
+            condition_kind,
+            condition_scope,
+            after_ms,
+            wait_reason,
+        } => {
+            let mut params = vec![
+                string_field("workItemId", work_item_id),
+                string_field("waitReason", wait_reason),
+                format!("\"afterMs\":{after_ms}"),
+            ];
+            for (key, value) in [
+                ("assignmentId", assignment),
+                ("decisionRequestId", decision),
+                ("conditionKind", condition_kind),
+                ("conditionScope", condition_scope),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(key, value));
+                }
+            }
+            Ok(request(identity, "work-item-wait", vec![], params))
+        }
+        Command::WorkItemWaitWithdraw {
+            identity,
+            work_item_id,
+        } => Ok(request(
+            identity,
+            "work-item-wait-withdraw",
+            vec![],
+            vec![string_field("workItemId", work_item_id)],
+        )),
         Command::WorkItemGet {
             identity,
             work_item_id,
@@ -4392,6 +4428,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemHandoff { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
+        | Command::WorkItemWait { identity, .. }
+        | Command::WorkItemWaitWithdraw { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Breathing { identity, .. }
@@ -4534,6 +4572,29 @@ fn current_session_key_from(cwd: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn item_wait_commands_preserve_target_reason_and_fallback() {
+        assert_eq!(
+            body(&[
+                "work-item-wait",
+                "wi_1",
+                "--assignment",
+                "asg_2",
+                "--fallback-after",
+                "3h",
+                "--wait-reason",
+                "Waiting for review",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-wait","params":{"workItemId":"wi_1","waitReason":"Waiting for review","afterMs":10800000,"assignmentId":"asg_2"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-wait-withdraw", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-wait-withdraw","params":{"workItemId":"wi_1"}}"#
+        );
+    }
+
     #[test]
     fn parent_assignment_is_forwarded_for_both_opening_routes() {
         for args in [

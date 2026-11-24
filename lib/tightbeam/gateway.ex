@@ -1716,6 +1716,12 @@ defmodule Tightbeam.Gateway do
       {"topline-placement-list", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-placement-list", call)
       end,
+      {"work-item-wait", ["work_item.updated", "wake.scheduled"]} => fn call ->
+        WorkItems.__handle__(db, "work-item-wait", call)
+      end,
+      {"work-item-wait-withdraw", ["work_item.updated"]} => fn call ->
+        WorkItems.__handle__(db, "work-item-wait-withdraw", call)
+      end,
       {"work-item-list", []} => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       {"work-item-update", ["work_item.updated"]} => fn call ->
         WorkItems.__handle__(

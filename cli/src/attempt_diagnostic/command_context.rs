@@ -125,6 +125,8 @@ impl CommandContext {
             WorkItemCreate { .. } => ("cli.work_item_create", DispatchPath),
             WorkItemHandoff { .. } => ("cli.work_item_handoff", DispatchPath),
             WorkItemUpdate { .. } => ("cli.work_item_update", DispatchPath),
+            WorkItemWait { .. } => ("cli.work_item_wait", DispatchPath),
+            WorkItemWaitWithdraw { .. } => ("cli.work_item_wait_withdraw", DispatchPath),
             WorkItemGet { .. } => ("cli.work_item_get", DispatchPath),
             WorkItemTrace { .. } => ("cli.work_item_trace", DispatchPath),
             Attend { .. } => ("cli.attend", DispatchPath),
@@ -512,6 +514,8 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | RevokeAssignment { .. }
         | AssignmentOpenerAccept { .. }
         | ReopenAssignment { .. }
+        | WorkItemWait { .. }
+        | WorkItemWaitWithdraw { .. }
         | WorkItemUpdate { .. }
         | Attend { .. }
         | WorkItemIcebox { .. }
