@@ -4419,6 +4419,124 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  for scenario <- [:active, :retired, :closed_work_item, :missing_recipient] do
+    @late_review_scenario scenario
+    test "late changes request respects reopening eligibility: #{scenario}", ctx do
+      scenario = @late_review_scenario
+      session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+      session(ctx.db, "current-owner", "flynn")
+      item = create_work_item(ctx, "late review")
+
+      producer =
+        assign_call({:user, "flynn"}, "completed evidence", nil, item.id)
+        |> put_in([:params, :effect_kind], "coordination")
+        |> then(&handle(ctx, "assign", &1))
+
+      review =
+        assign_call({:user, "flynn"}, "late review", nil, item.id)
+        |> put_in([:params, :reviews_assignment_id], producer.id)
+        |> Map.put(:session_key, "other-session")
+        |> then(&handle(ctx, "assign", &1))
+
+      first = handle(ctx, "attest", attest_call({:session, "holder"}, producer.id, "completion"))
+      assert first.assignment.state == "closed"
+      set_delivery_owner(ctx, item.id, "current-owner")
+
+      case scenario do
+        :active ->
+          :ok
+
+        :retired ->
+          assert %{state: "retired"} = Org.retire(ctx.db, "holder", "user:flynn")
+
+        :missing_recipient ->
+          assert %{state: "retired"} = Org.retire(ctx.db, "holder", "user:flynn")
+          assert %{state: "retired"} = Org.retire(ctx.db, "current-owner", "user:flynn")
+
+          assert %{state: "retired"} =
+                   Org.retire(ctx.db, Org.personal_session_key("flynn"), "user:flynn")
+
+        :closed_work_item ->
+          assert {:ok, []} =
+                   DB.query(ctx.db, "UPDATE work_items SET state='closed' WHERE id=?1", [item.id])
+      end
+
+      verdict_call =
+        attest_call({:session, "other-session"}, review.id, "verdict")
+        |> put_in([:params, :verdict_kind], "changes-requested")
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %{attest: %{verdictKind: "changes-requested"}} =
+                   handle(ctx, "attest", verdict_call)
+        end)
+
+      if scenario == :missing_recipient do
+        assert log =~ "undelivered"
+        assert log =~ "missing_accountable_owner"
+      end
+
+      assert {:ok, [[verdict_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT id FROM attests WHERE assignmentId=?1 AND verdictKind='changes-requested'",
+                 [review.id]
+               )
+
+      assert {:ok, [["changes-requested"]]} =
+               DB.query(ctx.db, "SELECT verdictKind FROM attests WHERE id=?1", [verdict_id])
+
+      if scenario == :active do
+        assert {:ok, [["open", nil, nil]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
+                   [producer.id]
+                 )
+
+        assert {:ok, [[1]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM assignment_reopenings WHERE assignmentId=?1",
+                   [producer.id]
+                 )
+      else
+        assert {:ok, [["closed", "completed", closing_id]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
+                   [producer.id]
+                 )
+
+        assert closing_id == first.attest.id
+
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM assignment_reopenings WHERE assignmentId=?1",
+                   [producer.id]
+                 )
+      end
+
+      assert {:ok, notices} =
+               DB.query(
+                 ctx.db,
+                 "SELECT sessionKey,prompt FROM wakes WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'",
+                 [producer.id]
+               )
+
+      if scenario == :missing_recipient do
+        assert notices == []
+      else
+        expected_recipient = if scenario == :active, do: "holder", else: "current-owner"
+        assert [[^expected_recipient, prompt]] = notices
+        assert prompt =~ verdict_id
+        assert prompt =~ producer.id
+        if scenario != :active, do: assert(prompt =~ "reassign")
+      end
+    end
+  end
+
   test "a clean review does not reclose a reopened assignment with its earlier completion",
        ctx do
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
