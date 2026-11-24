@@ -108,8 +108,18 @@ defmodule Tightbeam.HarnessProcessTest do
   test "remote adapter launch carries its owning-host writer lock", %{tmp_dir: tmp} do
     db = start_supervised!({DB, path: ":memory:", name: :writer_launch_fixture})
     :ok = HarnessProcess.ensure_schema(db)
+    :ok = Tightbeam.AccountWriter.ensure_schema(db)
+    key = {:claude, "acct_fixture", "testhost"}
+    key_name = "claude:acct_fixture@testhost"
 
-    opts =
+    assert {:ok, {:ok, lease}} = Tightbeam.AccountWriter.reserve(db, key_name)
+
+    assert {:ok, {:error, :credential_writer_active}} =
+             Tightbeam.AccountWriter.reserve(db, key_name)
+
+    assert {:ok, false} = Tightbeam.AccountWriter.settle(db, key_name, "stale-lease")
+
+    prepare = fn ->
       HarnessProcess.prepare_launch(
         [
           cmd: ["ssh", "fixture-host", "exec", "/bin/true"],
@@ -119,8 +129,14 @@ defmodule Tightbeam.HarnessProcessTest do
           account_writer_lock: "/fixture/account home/.tightbeam/account-writer.lock"
         ],
         db,
-        {:claude, "acct_fixture", "testhost"}
+        key
       )
+    end
+
+    assert_raise RuntimeError, ~r/credential writer active/, prepare
+    assert {:ok, true} = Tightbeam.AccountWriter.settle(db, key_name, lease)
+    opts = prepare.()
+    assert {:ok, {:error, :adapter_unresolved}} = Tightbeam.AccountWriter.reserve(db, key_name)
 
     assert [
              "ssh",

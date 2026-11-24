@@ -142,6 +142,7 @@ defmodule Tightbeam.HarnessProcess do
 
     identity_path = Path.join([root, "harness-processes", launch_id <> ".identity"])
     dedicated_cursor? = Keyword.get(opts, :cursor_execution_identity, false)
+    writer_lock = Keyword.get(opts, :account_writer_lock)
 
     preparation_boot =
       if is_nil(ssh) do
@@ -160,57 +161,62 @@ defmodule Tightbeam.HarnessProcess do
     end
 
     case DB.transaction(db, fn txn ->
-           case DB.Txn.q(
-                  txn,
-                  """
-                  SELECT 1 FROM harness_processes
-                   WHERE adapterKey = ?1
-                     AND state IN ('launching','running','park_requested','kill_failed')
-                     AND resolvedAt IS NULL
-                  UNION ALL
-                  SELECT 1 FROM harness_park_fences WHERE adapterKey = ?1
-                  LIMIT 1
-                  """,
-                  [key_name(key)]
-                ) do
-             [] ->
-               [[launch_sequence]] =
+           if writer_lock && Tightbeam.AccountWriter.reserved?(txn, key_name(key)) do
+             :writer_active
+           else
+             case DB.Txn.q(
+                    txn,
+                    """
+                    SELECT 1 FROM harness_processes
+                     WHERE adapterKey = ?1
+                       AND state IN ('launching','running','park_requested','kill_failed')
+                       AND resolvedAt IS NULL
+                    UNION ALL
+                    SELECT 1 FROM harness_park_fences WHERE adapterKey = ?1
+                    LIMIT 1
+                    """,
+                    [key_name(key)]
+                  ) do
+               [] ->
+                 [[launch_sequence]] =
+                   DB.Txn.q(
+                     txn,
+                     "SELECT COALESCE(MAX(launchSequence), 0) + 1 FROM harness_processes"
+                   )
+
                  DB.Txn.q(
                    txn,
-                   "SELECT COALESCE(MAX(launchSequence), 0) + 1 FROM harness_processes"
+                   """
+                   INSERT INTO harness_processes
+                     (launchId, adapterKey, harness, preset, host, ssh, helperPath,
+                      identityPath, launchSequence, state, createdAt, preparationBootIdentity)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'launching', ?10, ?11)
+                   """,
+                   [
+                     launch_id,
+                     key_name(key),
+                     to_string(harness),
+                     preset,
+                     host,
+                     ssh,
+                     helper_path,
+                     identity_path,
+                     launch_sequence,
+                     now(),
+                     preparation_boot
+                   ]
                  )
 
-               DB.Txn.q(
-                 txn,
-                 """
-                 INSERT INTO harness_processes
-                   (launchId, adapterKey, harness, preset, host, ssh, helperPath,
-                    identityPath, launchSequence, state, createdAt, preparationBootIdentity)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'launching', ?10, ?11)
-                 """,
-                 [
-                   launch_id,
-                   key_name(key),
-                   to_string(harness),
-                   preset,
-                   host,
-                   ssh,
-                   helper_path,
-                   identity_path,
-                   launch_sequence,
-                   now(),
-                   preparation_boot
-                 ]
-               )
+                 :ok
 
-               :ok
-
-             [[1]] ->
-               :fenced
+               [[1]] ->
+                 :fenced
+             end
            end
          end) do
       {:ok, :ok} -> :ok
       {:ok, :fenced} -> raise "adapter park in progress for #{key_name(key)}"
+      {:ok, :writer_active} -> raise "credential writer active for #{key_name(key)}"
     end
 
     opts
@@ -225,7 +231,7 @@ defmodule Tightbeam.HarnessProcess do
         launch_id,
         root,
         Keyword.get(opts, :cursor_rails_sha256),
-        Keyword.get(opts, :account_writer_lock)
+        writer_lock
       )
     )
     |> Keyword.put(:harness_process_launch_id, launch_id)
