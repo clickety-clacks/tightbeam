@@ -89,7 +89,16 @@ defmodule Tightbeam.HarklightListenerOutage do
 
         [[session, state, error, operation, diagnostic, nil, _started]]
         when state != "complete" ->
-          if recipient = recipient(txn, handle) do
+          recipient = recipient(txn, handle)
+
+          if shared = recipient && open_notice(txn, handle, recipient) do
+            Txn.q(txn, "UPDATE harklight_listener_outages SET noticeWakeId=?2 WHERE handle=?1", [
+              handle,
+              shared
+            ])
+          end
+
+          if recipient && is_nil(shared) do
             base = "w_harklight_notice_recovery_" <> handle
 
             id =
@@ -111,7 +120,7 @@ defmodule Tightbeam.HarklightListenerOutage do
                 class: "blocker",
                 due_at: now,
                 prompt:
-                  "Harklight listening for session #{session} and handle #{handle} stopped (#{error}).#{detail} Replies on this thread will not reach the current receiver while it is unavailable. Automatic recovery continues."
+                  "Harklight listening for session #{session} and handle #{handle} stopped (#{error}).#{detail} Replies on this thread will not reach the current receiver while it is unavailable. Automatic recovery continues. Your other Harklight conversations that stop before this one recovers are not reported separately."
               })
 
             Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
@@ -155,7 +164,9 @@ defmodule Tightbeam.HarklightListenerOutage do
            [handle]
          ) do
       [[episode, notice]] when resumed? and is_binary(notice) ->
-        if recipient = recipient(txn, handle) do
+        recipient = recipient(txn, handle)
+
+        if recipient && not notice_shared?(txn, handle, notice) do
           wake =
             Wakes.schedule_in_txn(txn, %{
               wake_id: "w_harklight_listening_" <> episode,
@@ -163,7 +174,8 @@ defmodule Tightbeam.HarklightListenerOutage do
               origin: "process:tightbeam",
               class: "fyi",
               due_at: now,
-              prompt: "Tightbeam is receiving Harklight updates again for conversation #{handle}."
+              prompt:
+                "Tightbeam is receiving Harklight updates again for conversation #{handle}. Every conversation in the earlier outage notice has recovered or ended."
             })
 
           Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
@@ -175,6 +187,31 @@ defmodule Tightbeam.HarklightListenerOutage do
 
     Txn.q(txn, "DELETE FROM harklight_listener_outages WHERE handle=?1", [handle])
     :ok
+  end
+
+  # One outage usually stops many conversations. Each receiver hears once when
+  # the first is overdue and once when the last one recovers.
+  defp open_notice(txn, handle, recipient) do
+    case Txn.q(
+           txn,
+           """
+           SELECT o.noticeWakeId FROM harklight_listener_outages o
+           JOIN wakes w ON w.wakeId=o.noticeWakeId
+           WHERE o.handle<>?1 AND w.sessionKey=?2 LIMIT 1
+           """,
+           [handle, recipient]
+         ) do
+      [[notice]] -> notice
+      [] -> nil
+    end
+  end
+
+  defp notice_shared?(txn, handle, notice) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM harklight_listener_outages WHERE handle<>?1 AND noticeWakeId=?2 LIMIT 1",
+      [handle, notice]
+    ) != []
   end
 
   defp recipient(txn, handle) do

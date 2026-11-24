@@ -159,6 +159,10 @@ defmodule Tightbeam.HarklightFailures do
     end
   end
 
+  # The Server sends this reason only when the enrolled device itself is
+  # removed. Other closings, and any refused request, can pass.
+  defp non_http_listen_refusal("agent feed closed: revoked"), do: :identity_revoked
+
   defp non_http_listen_refusal("agent feed closed: " <> reason) when reason != "",
     do: :feed_refused
 
