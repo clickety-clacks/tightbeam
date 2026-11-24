@@ -5756,13 +5756,7 @@ defmodule Tightbeam.Assignments do
   defp assignment_owner_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
-           """
-           SELECT COALESCE(s.ownerUserId,w.ownerUserId)
-           FROM assignments a
-           LEFT JOIN sessions s ON s.sessionKey=a.holderKey
-           LEFT JOIN work_items w ON w.id=a.workItemId
-           WHERE a.id=?1
-           """,
+           "SELECT s.ownerUserId FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey WHERE a.id=?1",
            [assignment_id]
          ) do
       [[owner]] -> owner

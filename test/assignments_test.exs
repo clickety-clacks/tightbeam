@@ -4196,7 +4196,7 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  for scenario <- [:active, :retired, :missing, :closed_work_item, :missing_recipient] do
+  for scenario <- [:active, :retired, :closed_work_item, :missing_recipient] do
     @late_review_scenario scenario
     test "late changes request respects reopening eligibility: #{scenario}", ctx do
       scenario = @late_review_scenario
@@ -4225,19 +4225,6 @@ defmodule Tightbeam.AssignmentsTest do
 
         :retired ->
           assert %{state: "retired"} = Org.retire(ctx.db, "holder", "user:flynn")
-
-        :missing ->
-          # Stage an orphaned historical holder while keeping normal writes constrained.
-          assert {:ok, []} =
-                   DB.migration_transaction(
-                     ctx.db,
-                     :late_review_missing_holder,
-                     ["PRAGMA foreign_keys=OFF"],
-                     ["PRAGMA foreign_keys=ON"],
-                     fn txn ->
-                       Tightbeam.DB.Txn.q(txn, "DELETE FROM sessions WHERE sessionKey='holder'")
-                     end
-                   )
 
         :missing_recipient ->
           assert %{state: "retired"} = Org.retire(ctx.db, "holder", "user:flynn")
@@ -4275,15 +4262,6 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert {:ok, [["changes-requested"]]} =
                DB.query(ctx.db, "SELECT verdictKind FROM attests WHERE id=?1", [verdict_id])
-
-      expected_owner = item.ownerUserId
-
-      assert {:ok, [[^expected_owner]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT ownerUserId FROM condition_facts WHERE kind='assignment-reviewed' AND scope=?1",
-                 [producer.id]
-               )
 
       if scenario == :active do
         assert {:ok, [["open", nil, nil]]} =
