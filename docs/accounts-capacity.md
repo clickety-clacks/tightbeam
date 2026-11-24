@@ -4,6 +4,12 @@ Tightbeam can keep several Claude or Codex subscription accounts signed in on
 each host. An account ID identifies one login on one host. The **serving**
 account is the login Tightbeam uses for new turns on that host and harness.
 
+The gateway's `provider_accounts_enabled` feature flag defaults to off.
+Automatic switching is a separate setting and also defaults to off.
+`tightbeam config get account-switching` shows the current setting.
+An operator can use `tightbeam config set account-switching on --harness claude`
+to enable it for Claude, or use `off` to disable it.
+
 ```sh
 tightbeam accounts list
 tightbeam accounts show acct_example

@@ -64,6 +64,26 @@ fn reset_time(value: &Value) -> String {
     )
 }
 
+fn account_summary(account: &Value) -> String {
+    let mut output = format!(
+        "{} ({}) · {} on {}",
+        scalar(&account["label"]),
+        scalar(&account["id"]),
+        scalar(&account["harness"]),
+        scalar(&account["host"]),
+    );
+    if account["serving"] == true {
+        output.push_str(" [serving]");
+    }
+    let _ = writeln!(
+        output,
+        "\n  Login: {}  Enabled: {}",
+        with_reason(&account["loginState"], &account["loginReason"]),
+        scalar(&account["enabled"]),
+    );
+    output
+}
+
 fn capacity_usage(value: &Value) -> String {
     match value["results"].as_array() {
         Some(results) if results.is_empty() => "No provider accounts.\n".into(),
@@ -260,6 +280,29 @@ mod tests {
             assert!(text.contains(expected), "missing {expected}:\n{text}");
         }
         assert!(!text.contains("0.0% used"));
+    }
+
+    #[test]
+    fn account_summary_keeps_login_status_and_serving_separate() {
+        let account = serde_json::json!({
+            "id": "acct_backup",
+            "host": "worker.example",
+            "provider": "anthropic",
+            "harness": "claude",
+            "label": "Backup login",
+            "loginState": "needs_sign_in",
+            "loginReason": "file_missing",
+            "enabled": true,
+            "serving": false,
+        });
+        let text = account_summary(&account);
+        assert_eq!(
+            text,
+            "Backup login (acct_backup) · claude on worker.example\n  Login: needs_sign_in (file_missing)  Enabled: true\n",
+        );
+        let mut serving = account;
+        serving["serving"] = Value::Bool(true);
+        assert!(account_summary(&serving).contains("[serving]"));
     }
 
     #[test]
