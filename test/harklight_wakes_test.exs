@@ -4007,6 +4007,19 @@ defmodule Tightbeam.HarklightWakesTest do
       assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
       assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes")
 
+      # A finished one refuses the send too, without offering a retry.
+      assert reason =~ "harklight-retry"
+      :ok = DB.execute(db, "UPDATE harklight_wake_handles SET state='complete'")
+
+      assert %{code: "harklight_first_open_pending", reason: finished} =
+               HarklightSend.send_request(db, %{call | params: params},
+                 runner: fn args -> flunk("Agent called: #{inspect(args)}") end
+               )
+
+      refute finished =~ "harklight-retry"
+      assert finished =~ "start a new conversation"
+      :ok = DB.execute(db, "UPDATE harklight_wake_handles SET state='active'")
+
       # Retrying everything is not a choice to open this one.
       assert %{results: []} = HarklightWakes.retry_command(db, %{params: %{all: true}})
       refute File.exists?(agent <> ".calls")
@@ -4059,6 +4072,39 @@ defmodule Tightbeam.HarklightWakesTest do
       assert eventually(fn ->
                DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[3]]}
              end)
+    end
+  end
+
+  test "a held conversation's old outage is not announced as recovering", %{db: db} do
+    for held? <- [false, true] do
+      if held?, do: migrated_from_01!(db)
+
+      {:ok, _} =
+        DB.transaction(
+          db,
+          &Tightbeam.HarklightListenerOutage.start_in_txn(
+            &1,
+            @handle,
+            {"listener_stopped", nil, nil},
+            1
+          )
+        )
+
+      listener = fn _, _, _ -> receive(do: (:hold -> :ok)) end
+      opts = [db: db, listener: listener, outage_notice_delay_ms: 0, feed_start_spacing_ms: 1]
+      start_supervised!({HarklightWakes, opts})
+
+      if held? do
+        refute eventually(
+                 fn -> DB.query(db, "SELECT count(*) FROM wakes") != {:ok, [[0]]} end,
+                 35
+               )
+      else
+        await_notice!(db)
+        :ok = stop_supervised(HarklightWakes)
+        :ok = DB.execute(db, "DELETE FROM harklight_listener_outages")
+        :ok = DB.execute(db, "DELETE FROM wakes")
+      end
     end
   end
 
@@ -6752,8 +6798,6 @@ defmodule Tightbeam.HarklightWakesTest do
     refute_receive :attempt, 30
     refute File.exists?(calls)
 
-    # An activation while the last worker is winding down is not a later one.
-    assert eventually(fn -> :sys.get_state(HarklightWakes).workers == %{} end)
     # An activation while the last worker is winding down is not a later one.
     assert eventually(fn -> :sys.get_state(HarklightWakes).workers == %{} end)
     HarklightWakes.activate(@handle)

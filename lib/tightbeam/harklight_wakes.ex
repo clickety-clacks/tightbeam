@@ -930,7 +930,7 @@ defmodule Tightbeam.HarklightWakes do
             code: code,
             outcome: "refused",
             handle: handle,
-            reason: first_open_reason()
+            reason: first_open_reason("active")
           }
 
         {:error, reason} ->
@@ -1443,7 +1443,13 @@ defmodule Tightbeam.HarklightWakes do
              """
            ),
          {:ok, outages} <- Outage.pending(state.db) do
-      state = Enum.reduce(outages, state, &arm_outage(&2, &1))
+      # Nothing recovers a held conversation, so its outage is not announced.
+      held = for [handle, hold, _] when is_binary(hold) <- rows, into: MapSet.new(), do: handle
+
+      state =
+        outages
+        |> Enum.reject(&MapSet.member?(held, hd(&1)))
+        |> Enum.reduce(state, &arm_outage(&2, &1))
 
       state =
         Enum.reduce(rows, state, fn [handle, hold, recorded], acc ->
@@ -1929,21 +1935,26 @@ defmodule Tightbeam.HarklightWakes do
   defp identity_revoked?({:harklight_failure, {_, "identity_revoked"}, _, _}), do: true
   defp identity_revoked?(_), do: false
 
-  def first_open_reason do
+  # A finished conversation cannot be opened, so retry is not offered for it.
+  defp first_open_reason(state) do
+    open =
+      if state == "complete",
+        do: "",
+        else: "It opens only with harklight-retry --session. "
+
     "This conversation has messages from before Harklight 0.2 and has not been opened since. " <>
-      "Its first read can deliver earlier replies again, so it opens only with harklight-retry --session. " <>
-      "To send, start a new conversation."
+      "Its first read can deliver earlier replies again. " <>
+      open <> "To send, start a new conversation."
   end
 
-  @doc false
   def first_open_pending(db, handle) do
     case DB.query(
            db,
-           "SELECT 1 FROM harklight_wake_handles h WHERE h.handle=?1 AND #{@earlier_unopened_sql}",
+           "SELECT h.state FROM harklight_wake_handles h WHERE h.handle=?1 AND #{@earlier_unopened_sql}",
            [handle]
          ) do
       {:ok, []} -> :ok
-      {:ok, _} -> {:error, @first_open_pending}
+      {:ok, [[state]]} -> {:error, @first_open_pending, first_open_reason(state)}
       {:error, _} -> {:error, "harklight_send_unavailable"}
     end
   end

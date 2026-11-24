@@ -29,11 +29,11 @@ defmodule Tightbeam.HarklightSend do
         {:unresolved, id} ->
           unresolved_result("send", id)
 
+        {:error, "harklight_first_open_pending" = code, reason} ->
+          failure("send", code, reason, "refused")
+
         {:error, code, reason} ->
           failure("send", code, reason, "failed")
-
-        {:error, "harklight_first_open_pending" = code} ->
-          failure("send", code, HarklightWakes.first_open_reason(), "refused")
 
         {:error, reason} ->
           failure("send", reason, early_reason(reason), "failed")
