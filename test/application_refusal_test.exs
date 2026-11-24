@@ -82,6 +82,10 @@ defmodule Tightbeam.ApplicationRefusalTest do
   end
 
   defp boot_with(env, path, tmp) do
+    executable_overrides =
+      Tightbeam.Harness.executable_path_env_vars()
+      |> Enum.map(&{&1, nil})
+
     {output, status} =
       System.cmd(System.find_executable("elixir"), ["-S", "mix", "run", "--no-halt"],
         cd: File.cwd!(),
@@ -93,7 +97,7 @@ defmodule Tightbeam.ApplicationRefusalTest do
             {"TIGHTBEAM_BASE_DIR", tmp},
             {"TIGHTBEAM_CWD", tmp},
             {"TIGHTBEAM_PORT", "0"}
-          ] ++ env
+          ] ++ executable_overrides ++ env
       )
 
     {output, status}

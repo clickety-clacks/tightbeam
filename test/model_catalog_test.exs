@@ -2170,7 +2170,7 @@ defmodule Tightbeam.ModelCatalogTest do
       assert ModelCatalog.get("satellite", "claude", catalog) == expected
     end
 
-    test "without CODEX_PATH the codex client_version comes from bare PATH on the owning host",
+    test "without CODEX_PATH the codex client_version follows launch PATH or the managed bundle",
          ctx do
       parent = self()
 
@@ -2186,10 +2186,11 @@ defmodule Tightbeam.ModelCatalogTest do
       line = Enum.join(command, " ")
 
       # `client_version` silently filters the catalog, so it must be the version
-      # the codex binary ON THAT HOST reports. A constant in our source would
-      # return 200 with an empty list and blame the account.
-      assert line =~ "raw=$(codex --version)"
-      refute line =~ "codex_path="
+      # the selected launch-PATH or managed executable ON THAT HOST reports. A
+      # constant in our source would return 200 with an empty list and blame the account.
+      assert line =~ "command -v codex"
+      assert line =~ Path.join([ctx.satellite_base, "adapters", "node_modules", ".bin", "codex"])
+      assert line =~ ~s|raw=$("$codex_path" --version)|
       assert line =~ "client_version=${raw##* }"
       refute line =~ ~r/client_version=\d/
 
@@ -2207,7 +2208,7 @@ defmodule Tightbeam.ModelCatalogTest do
       File.write!(codex_path, "#!/bin/sh\nprintf 'codex-cli 0.155.1\\n'\n")
       File.chmod!(codex_path, 0o755)
 
-      fake_bin = Path.join(ctx.base_dir, "catalog-bin")
+      fake_bin = Path.join(ctx.base_dir, "bin")
       body_path = Path.join(ctx.base_dir, "codex-catalog.json")
       curl_path = Path.join(fake_bin, "curl")
       File.mkdir_p!(fake_bin)

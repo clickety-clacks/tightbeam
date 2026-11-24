@@ -66,7 +66,11 @@ defmodule Tightbeam.GuardRuntimeFixture do
       )
       |> Enum.map(&{&1, nil})
 
-    env = env ++ [{"TMPDIR", tmp}, {"TIGHTBEAM_BASE_DIR", base}]
+    executable_overrides =
+      Tightbeam.Harness.executable_path_env_vars()
+      |> Enum.map(&{&1, nil})
+
+    env = env ++ executable_overrides ++ [{"TMPDIR", tmp}, {"TIGHTBEAM_BASE_DIR", base}]
 
     %{
       executable: System.find_executable("elixir"),
