@@ -1242,7 +1242,17 @@ defmodule Tightbeam.Acp.Adapter do
                 end
 
               _unknown ->
-                {:reply, {:ok, :unknown}, state}
+                # No selection to apply, so the harness keeps what it resumed with.
+                # Only its answer says what that is: remember a readable one for
+                # the readback (the stored selection and what is applied stay as
+                # they were), and nothing when the answer names no model.
+                case model_ref_from_config(result, state.preset.effort_config) do
+                  {:ok, reported} ->
+                    {:reply, {:ok, :unknown}, remember_model(state, sid, reported)}
+
+                  :error ->
+                    {:reply, {:ok, :unknown}, state}
+                end
             end
           else
             {:error, reason} ->

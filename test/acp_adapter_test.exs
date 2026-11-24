@@ -315,7 +315,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     },
     { id: "effort", currentValue: efforts[sid] || "default" },
     { id: "reasoning_effort", currentValue: efforts[sid] || "medium" }
-  ] });
+  ].filter((option) => !(failMode === "no-model-option" && option.id === "model")) });
   const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, clientCapabilities: m.params.clientCapabilities, mcpServers: m.params.mcpServers, modeId: m.params.modeId, configId: m.params.configId, value: m.params.value, cwd: m.params.cwd, sessionId: m.params.sessionId, prompt: m.params.prompt, meta: m.params._meta }) + "\n");
   let pendingPrompt = null;
   const stalledPrompts = new Map();
@@ -1060,7 +1060,8 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.load_session(a, "sess-1", nil, "/tmp", [], "guidance")
 
     assert Adapter.knows_session?(a, "sess-1")
-    assert {:error, :model_readback_unavailable} = Adapter.current_model(a, "sess-1")
+    # The harness answered with the model it resumed; that is the readback.
+    assert {:ok, %Model{family: "owner-model"}} = Adapter.current_model(a, "sess-1")
 
     refute Enum.any?(
              captured_requests(capture_path),
@@ -5203,16 +5204,42 @@ defmodule Tightbeam.Acp.AdapterTest do
       refute_receive {:running_model, _sid, _report}, 50
     end
 
-    test "a loaded session reports the model it was loaded with, and an unreadable one nothing" do
+    test "a loaded session reports the model it was loaded with" do
       {adapter, _capture} = start_reporting_adapter(fail_mode: "load-owner")
-
-      assert {:ok, :unknown} = Adapter.load_session(adapter, "sess-1", nil, "/tmp", [], "g")
-      refute_receive {:running_model, _sid, _report}, 100
 
       assert {:ok, _model} =
                Adapter.load_session(adapter, "sess-2", Model.new("stale-record"), "/tmp", [], "g")
 
       assert_receive {:running_model, "sess-2", %{id: "stale-record"}}
+    end
+
+    test "a load with no selection reports what the harness answered, and nothing when it names none" do
+      {adapter, capture_path} = start_reporting_adapter(fail_mode: "load-owner")
+
+      assert {:ok, :unknown} = Adapter.load_session(adapter, "sess-1", nil, "/tmp", [], "g")
+      assert_receive {:running_model, "sess-1", %{id: "owner-model"}}
+
+      # Nothing was applied: reporting reads the harness's answer, never the
+      # configured selection.
+      refute Enum.any?(
+               captured_requests(capture_path),
+               &(&1["method"] == "session/set_config_option")
+             )
+
+      {unreadable, _capture} = start_reporting_adapter(fail_mode: "no-model-option")
+      assert {:ok, :unknown} = Adapter.load_session(unreadable, "sess-1", nil, "/tmp", [], "g")
+      assert {:error, :model_readback_unavailable} = Adapter.current_model(unreadable, "sess-1")
+      refute_receive {:running_model, _sid, _report}, 100
+    end
+
+    test "a create with no selection reports what the harness answered, and nothing when it names none" do
+      {adapter, _capture} = start_reporting_adapter()
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "g")
+      assert_receive {:running_model, "sess-1", %{id: "haiku"}}
+
+      {unreadable, _capture} = start_reporting_adapter(fail_mode: "no-model-option")
+      assert {:ok, "sess-1"} = Adapter.new_session(unreadable, nil, "/tmp", [], "g")
+      refute_receive {:running_model, _sid, _report}, 100
     end
 
     test "a tuned model reports once, and applying the same model reports nothing" do

@@ -274,6 +274,101 @@ defmodule Tightbeam.RunningModelTest do
     assert Org.get(ctx.db, "s1").running_model == nil
   end
 
+  describe "failed writes" do
+    # A writer whose database writes fail on demand, to prove a failure never
+    # leaves a value standing.
+    setup ctx do
+      {:ok, fail} = Agent.start_link(fn -> %{clears: false, reports: false} end)
+      stop_supervised!(RunningModel)
+
+      set = fn db, session_key, report, current? ->
+        kind = if report, do: :reports, else: :clears
+        if Agent.get(fail, &Map.fetch!(&1, kind)), do: raise("synthetic #{kind} failure")
+        Org.set_running_model(db, session_key, report, current?)
+      end
+
+      writer =
+        start_supervised!(
+          {RunningModel, db: ctx.db, name: RunningModel, set_running_model: set, retry_ms: 10}
+        )
+
+      %{writer: writer, fail: fail}
+    end
+
+    test "a boot clear that fails stops startup; the next start clears and waits out overload",
+         ctx do
+      report(ctx, "sid-1", %{id: "sonnet", label: nil})
+      stop_supervised!(RunningModel)
+
+      boom = fn _db, _session_key, _report, _current? -> raise "synthetic boot failure" end
+
+      assert {:error, _} =
+               start_supervised(
+                 {RunningModel, db: ctx.db, name: RunningModel, set_running_model: boom}
+               )
+
+      assert %{id: "sonnet"} = Org.get(ctx.db, "s1").running_model
+
+      writer = start_supervised!({RunningModel, db: ctx.db, name: RunningModel})
+      assert Org.get(ctx.db, "s1").running_model == nil
+
+      # Owed work: the writer's database calls wait out an overloaded owner.
+      {:dictionary, dictionary} = Process.info(writer, :dictionary)
+      assert List.keyfind(dictionary, {DB, :owed_work}, 0) == {{DB, :owed_work}, true}
+    end
+
+    test "a failed clear on adapter loss is retried until the value is gone", ctx do
+      report(ctx, "sid-1", %{id: "sonnet", label: nil})
+      Agent.update(ctx.fail, &%{&1 | clears: true})
+
+      RunningModel.adapter_gone(ctx.writer, ctx.key)
+      _ = :sys.get_state(ctx.writer)
+      assert %{id: "sonnet"} = Org.get(ctx.db, "s1").running_model
+
+      Agent.update(ctx.fail, &%{&1 | clears: false})
+      assert eventually(fn -> Org.get(ctx.db, "s1").running_model == nil end)
+    end
+
+    test "a retried clear never erases a report that arrived after the loss", ctx do
+      report(ctx, "sid-1", %{id: "sonnet", label: nil})
+      Agent.update(ctx.fail, &%{&1 | clears: true})
+
+      RunningModel.adapter_gone(ctx.writer, ctx.key)
+      _ = :sys.get_state(ctx.writer)
+      assert %{id: "sonnet"} = Org.get(ctx.db, "s1").running_model
+
+      # The replacement adapter reports while the clear is still failing.
+      RunningModel.report(ctx.writer, ctx.key, 2, "sid-1", %{id: "opus", label: nil})
+      _ = :sys.get_state(ctx.writer)
+      assert %{id: "opus"} = Org.get(ctx.db, "s1").running_model
+
+      Agent.update(ctx.fail, &%{&1 | clears: false})
+      # Let the retry run, and prove it did by waiting for it to settle.
+      :timer.sleep(100)
+      _ = :sys.get_state(ctx.writer)
+      assert %{id: "opus"} = Org.get(ctx.db, "s1").running_model
+      assert :sys.get_state(ctx.writer).lost == %{}
+    end
+
+    test "a report whose write fails is kept and retried", ctx do
+      Agent.update(ctx.fail, &%{&1 | reports: true})
+      report(ctx, "sid-1", %{id: "sonnet", label: nil})
+      assert Org.get(ctx.db, "s1").running_model == nil
+
+      Agent.update(ctx.fail, &%{&1 | reports: false})
+      assert eventually(fn -> match?(%{id: "sonnet"}, Org.get(ctx.db, "s1").running_model) end)
+    end
+
+    test "a newer report replaces a failed one before its retry", ctx do
+      Agent.update(ctx.fail, &%{&1 | reports: true})
+      report(ctx, "sid-1", %{id: "sonnet", label: nil})
+      report(ctx, "sid-1", %{id: "opus", label: nil})
+
+      Agent.update(ctx.fail, &%{&1 | reports: false})
+      assert eventually(fn -> match?(%{id: "opus"}, Org.get(ctx.db, "s1").running_model) end)
+    end
+  end
+
   describe "adapter coordinator" do
     setup do
       dir = Path.join(System.tmp_dir!(), "running-model-#{System.unique_integer([:positive])}")

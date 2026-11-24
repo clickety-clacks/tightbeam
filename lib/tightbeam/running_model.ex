@@ -10,6 +10,9 @@ defmodule Tightbeam.RunningModel do
   unchanged report publishes nothing and a changed one bumps the session's row
   version and publishes the ordinary `session.updated` after commit.
 
+  A write or clear that fails is kept and retried on a short, bounded backoff
+  until it lands, so a value is never left standing because one attempt failed.
+
   The value is stored, never probed: reading a session never loads an agent.
   Doubt resolves to null. Starting clears every stored value before any adapter
   can start (nothing is loaded yet), then asks live adapters, if this is a
@@ -21,6 +24,8 @@ defmodule Tightbeam.RunningModel do
   require Logger
 
   alias Tightbeam.{AdapterCoordinator, DB, Org}
+
+  @retry_cap_ms 5_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
@@ -37,19 +42,33 @@ defmodule Tightbeam.RunningModel do
   end
 
   # The boot clear finishes inside init, so the supervisor starts the adapter
-  # coordinator only after it: a clear can never erase a fresh report.
+  # coordinator only after it: a clear can never erase a fresh report. The writer
+  # is owed work, so database overload is waited out; a real failure raises here,
+  # because startup cannot go on with a value that may be stale.
   @impl true
   def init(opts) do
+    DB.owed_work()
+
     state = %{
       db: Keyword.get(opts, :db, DB),
       coordinator: Keyword.get(opts, :coordinator, AdapterCoordinator),
-      pending: %{}
+      set: Keyword.get(opts, :set_running_model, &Org.set_running_model/4),
+      retry_ms: Keyword.get(opts, :retry_ms, 100),
+      # The latest report per adapter and harness session id.
+      pending: %{},
+      # Work that failed and will be tried again: `{key, sid} => report` for
+      # reports, `key => loss sequence` for adapter losses.
+      retry_reports: %{},
+      lost: %{},
+      attempts: %{},
+      # The writer's own order of events. `written` is the sequence at which a
+      # session last had a report stored, so a retried clear never erases a value
+      # that arrived after the loss it is clearing.
+      seq: 0,
+      written: %{}
     }
 
-    guarded(fn ->
-      state.db |> running_sessions() |> Enum.each(&clear(state.db, &1.session_key))
-    end)
-
+    state.db |> running_sessions() |> Enum.each(&clear(state, &1.session_key))
     {:ok, state, {:continue, :resync}}
   end
 
@@ -59,11 +78,10 @@ defmodule Tightbeam.RunningModel do
     {:noreply, state}
   end
 
-  # `pending` is the latest report per adapter and harness session id. It lets a
-  # report that arrives before the gateway records its pointer (a harness reports
-  # a new session's model first) apply when the pointer lands, and lets a new
-  # pointer pick up a report already held. It is replaced by the next report,
-  # dropped on unload (a nil report) and with its adapter.
+  # `pending` lets a report that arrives before the gateway records its pointer
+  # (a harness reports a new session's model first) apply when the pointer lands,
+  # and lets a new pointer pick up a report already held. It is replaced by the
+  # next report, dropped on unload (a nil report) and with its adapter.
   @impl true
   def handle_cast({:report, key, generation, sid, report}, state) do
     case state.pending[{key, sid}] do
@@ -76,44 +94,133 @@ defmodule Tightbeam.RunningModel do
             do: Map.put(state.pending, {key, sid}, {generation, report}),
             else: Map.delete(state.pending, {key, sid})
 
-        guarded(fn -> apply_report(state.db, key, sid, report, nil) end)
-        {:noreply, %{state | pending: pending}}
+        state = %{state | pending: pending, seq: state.seq + 1}
+        {:noreply, deliver(state, key, sid, report, nil)}
     end
   end
 
   def handle_cast({:pointer_recorded, session_key, sid}, state) do
-    for {{key, ^sid}, {_generation, report}} <- state.pending do
-      guarded(fn -> apply_report(state.db, key, sid, report, session_key) end)
-    end
+    state =
+      Enum.reduce(state.pending, state, fn
+        {{key, ^sid}, {_generation, report}}, state ->
+          deliver(%{state | seq: state.seq + 1}, key, sid, report, session_key)
+
+        _other, state ->
+          state
+      end)
 
     {:noreply, state}
   end
 
   def handle_cast({:adapter_gone, key}, state) do
-    guarded(fn ->
-      state.db
-      |> running_sessions()
-      |> Enum.filter(&(Tightbeam.Gateway.adapter_key(&1) == key))
-      |> Enum.each(&clear(state.db, &1.session_key))
-    end)
+    state = %{state | seq: state.seq + 1}
 
-    {:noreply, %{state | pending: Map.reject(state.pending, fn {{k, _sid}, _} -> k == key end)}}
+    state = %{
+      state
+      | pending: Map.reject(state.pending, fn {{k, _sid}, _} -> k == key end),
+        retry_reports: Map.reject(state.retry_reports, fn {{k, _sid}, _} -> k == key end)
+    }
+
+    {:noreply, clear_lost(state, key, state.seq)}
   end
 
-  defp apply_report(db, key, sid, report, only_session_key) do
+  @impl true
+  def handle_info({:retry_report, key, sid}, state) do
+    case state.retry_reports[{key, sid}] do
+      nil -> {:noreply, state}
+      report -> {:noreply, deliver(state, key, sid, report, nil)}
+    end
+  end
+
+  def handle_info({:retry_loss, key}, state) do
+    case state.lost[key] do
+      nil -> {:noreply, state}
+      loss_seq -> {:noreply, clear_lost(state, key, loss_seq)}
+    end
+  end
+
+  def handle_info(_other, state), do: {:noreply, state}
+
+  # Store a report. Success settles it; a failure keeps the latest report for this
+  # session id and tries again, since an idle session may never report again.
+  defp deliver(state, key, sid, report, only_session_key) do
+    case apply_report(state, key, sid, report, only_session_key) do
+      {:ok, session_keys} ->
+        written =
+          if report,
+            do: Enum.reduce(session_keys, state.written, &Map.put(&2, &1, state.seq)),
+            else: state.written
+
+        %{
+          state
+          | written: written,
+            retry_reports: Map.delete(state.retry_reports, {key, sid}),
+            attempts: Map.delete(state.attempts, {:report, key, sid})
+        }
+
+      :error ->
+        state = %{state | retry_reports: Map.put(state.retry_reports, {key, sid}, report)}
+        schedule(state, {:report, key, sid}, {:retry_report, key, sid})
+    end
+  end
+
+  # Clear what an adapter's loss left behind, but only values older than the loss:
+  # one stored since by a newer adapter is a valid report and stays.
+  defp clear_lost(state, key, loss_seq) do
+    result =
+      try do
+        state.db
+        |> running_sessions()
+        |> Enum.filter(&(Tightbeam.Gateway.adapter_key(&1) == key))
+        |> Enum.filter(&(Map.get(state.written, &1.session_key, 0) <= loss_seq))
+        |> Enum.map(&clear_ok?(state, &1.session_key))
+        |> Enum.all?()
+      rescue
+        error -> log_failure(error) && false
+      catch
+        kind, reason -> log_failure({kind, reason}) && false
+      end
+
+    if result do
+      %{
+        state
+        | lost: Map.delete(state.lost, key),
+          attempts: Map.delete(state.attempts, {:loss, key})
+      }
+    else
+      state = %{state | lost: Map.put(state.lost, key, loss_seq)}
+      schedule(state, {:loss, key}, {:retry_loss, key})
+    end
+  end
+
+  # Retries back off from `retry_ms` up to a few seconds and continue until the
+  # work lands: the value is cleared or stored, never left stale.
+  defp schedule(state, attempt_key, message) do
+    attempt = Map.get(state.attempts, attempt_key, 0)
+
+    Process.send_after(
+      self(),
+      message,
+      min(state.retry_ms * Integer.pow(2, attempt), @retry_cap_ms)
+    )
+
+    %{state | attempts: Map.put(state.attempts, attempt_key, attempt + 1)}
+  end
+
+  defp apply_report(state, key, sid, report, only_session_key) do
     {:ok, rows} =
       DB.query(
-        db,
+        state.db,
         "SELECT DISTINCT sessionKey FROM harness_pointers WHERE harnessSessionId = ?1",
-        [
-          sid
-        ]
+        [sid]
       )
 
-    rows
-    |> Enum.map(fn [session_key] -> session_key end)
-    |> Enum.filter(&(is_nil(only_session_key) or &1 == only_session_key))
-    |> Enum.each(fn session_key ->
+    session_keys =
+      rows
+      |> Enum.map(fn [session_key] -> session_key end)
+      |> Enum.filter(&(is_nil(only_session_key) or &1 == only_session_key))
+
+    Enum.each(session_keys, fn session_key ->
       current? = fn txn, session ->
         Tightbeam.Gateway.adapter_key(session) == key and
           match?(
@@ -122,11 +229,24 @@ defmodule Tightbeam.RunningModel do
           )
       end
 
-      Org.set_running_model(db, session_key, report, current?)
+      state.set.(state.db, session_key, report, current?)
     end)
+
+    {:ok, session_keys}
+  rescue
+    error -> log_failure(error) && :error
+  catch
+    kind, reason -> log_failure({kind, reason}) && :error
   end
 
-  defp clear(db, session_key), do: Org.set_running_model(db, session_key, nil)
+  defp clear(state, session_key), do: state.set.(state.db, session_key, nil, fn _, _ -> true end)
+
+  defp clear_ok?(state, session_key) do
+    clear(state, session_key)
+    true
+  rescue
+    error -> log_failure(error) && false
+  end
 
   defp running_sessions(db) do
     {:ok, rows} =
@@ -140,13 +260,8 @@ defmodule Tightbeam.RunningModel do
     end)
   end
 
-  # A failed write must not take the writer down with it: the next report or
-  # clear for that session corrects it.
-  defp guarded(fun) do
-    fun.()
-  rescue
-    error -> Logger.warning("running-model write failed: #{Exception.message(error)}")
-  catch
-    kind, reason -> Logger.warning("running-model write failed: #{inspect({kind, reason})}")
+  defp log_failure(error) do
+    Logger.warning("running-model write failed, will retry: #{inspect(error)}")
+    true
   end
 end
