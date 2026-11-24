@@ -35,10 +35,15 @@ defmodule Tightbeam.HarklightBounces do
   @read_interval 900_000
   @max_title 120
 
+  # The title comes from Tightbeam's own saved send, never from a lookup.
   @registration_sql """
-  SELECT r.handle,r.senderId,r.messageId,h.sessionKey,h.host,h.state,
+  SELECT r.handle,r.senderId,r.messageId,h.sessionKey,h.host,
+         CASE WHEN json_valid(o.payload) THEN json_extract(o.payload,'$.request.message.title') END,
          COALESCE(h.currentReceiverSessionKey,h.sessionKey)
-  FROM harklight_wake_requests r JOIN harklight_wake_handles h ON h.handle=r.handle
+  FROM harklight_wake_requests r
+  JOIN harklight_wake_handles h ON h.handle=r.handle
+  LEFT JOIN harklight_send_operations o
+    ON o.senderId=r.senderId AND o.messageId=r.messageId AND o.state='bound'
   """
 
   def ensure_schema(db) do
@@ -258,7 +263,7 @@ defmodule Tightbeam.HarklightBounces do
       end
 
     case rows do
-      [[handle, _sender, message_id, origin, host, state, receiver]] ->
+      [[handle, _sender, message_id, origin, host, title, receiver]] ->
         cond do
           candidate.handle not in [nil, handle] or item["session"] not in [nil, handle] ->
             :foreign
@@ -272,7 +277,7 @@ defmodule Tightbeam.HarklightBounces do
                handle: handle,
                message_id: message_id,
                origin: origin,
-               handle_state: state,
+               title: title,
                receiver: receiver
              }}
         end
@@ -402,7 +407,7 @@ defmodule Tightbeam.HarklightBounces do
     ids = "message #{reg.message_id}, conversation #{reg.handle}, started by #{reg.origin}"
 
     head =
-      case title(item) do
+      case title(item) || title(reg.title) do
         nil ->
           "- Message #{reg.message_id} (conversation #{reg.handle}, started by #{reg.origin})"
 
@@ -444,6 +449,7 @@ defmodule Tightbeam.HarklightBounces do
   defp title(%{"message" => %{"title" => title}}) when is_binary(title) and title != "",
     do: clean(title, @max_title)
 
+  defp title(text) when is_binary(text) and text != "", do: clean(text, @max_title)
   defp title(_), do: nil
 
   defp quoted(text), do: "\"" <> String.replace(text, "\"", "'") <> "\""

@@ -672,7 +672,7 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert [["soft_bounce"]] = wake_rows(db, "SELECT advisoryType FROM harklight_bounces")
   end
 
-  test "a live advisory has no message to name: the wake gives its ID", ctx do
+  test "a live advisory names the message by the title of Tightbeam's own saved send", ctx do
     %{db: db, main: main} = ctx
     worker = agent(db, "worker", main)
     conversation(db, @handle, worker)
@@ -684,9 +684,31 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert [[prompt]] = wake_rows(db, "SELECT prompt FROM wakes")
 
     assert prompt =~
+             "- \"Saved item-1\" (message item-1, conversation #{@handle}, started by #{worker}): revision 1, bounced at "
+  end
+
+  test "a live advisory with no saved title falls back to the message ID", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+    {:ok, _} = DB.query(db, "UPDATE harklight_send_operations SET payload='{}'")
+
+    assert :ok =
+             HarklightWakes.capture_feed(
+               db,
+               @handle,
+               5,
+               [advisory_frame(5, "item-1", "adv-1")],
+               :live
+             )
+
+    assert [[prompt]] = wake_rows(db, "SELECT prompt FROM wakes")
+
+    assert prompt =~
              "- Message item-1 (conversation #{@handle}, started by #{worker}): revision 1, bounced at "
 
-    refute prompt =~ ~s(- ")
+    refute prompt =~ "- \""
   end
 
   test "a live advisory marked moot closes without a wake", ctx do
@@ -1323,7 +1345,14 @@ defmodule Tightbeam.HarklightBouncesTest do
         [id, handle]
       )
 
-    payload = JSON.encode!(%{"request" => %{"protocol" => 2, "session_handle" => handle}})
+    payload =
+      JSON.encode!(%{
+        "request" => %{
+          "protocol" => 2,
+          "session_handle" => handle,
+          "message" => %{"sender_id" => "sender", "message_id" => id, "title" => "Saved #{id}"}
+        }
+      })
 
     {:ok, _} =
       DB.query(
