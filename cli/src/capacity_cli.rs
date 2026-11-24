@@ -1,3 +1,4 @@
+use crate::args::CapacityAction;
 use crate::dispatch::{self, Endpoint};
 use crate::session_connect::ReadSelection;
 use serde_json::Value;
@@ -112,32 +113,120 @@ fn usage_result(result: &Value) -> String {
         with_reason(&summary["usageFreshness"], &summary["usageFreshnessReason"]),
         scalar(&summary["usageAgeSeconds"]),
     );
-    if let Some(windows) = sample["windows"].as_array() {
-        for window in windows {
-            let remaining = window["usedPercent"].as_f64().map_or(Value::Null, |used| {
-                Value::from((100.0 - used).clamp(0.0, 100.0))
-            });
-            let _ = writeln!(
-                output,
-                "  {}: {} used, {} remaining, reset {}",
-                scalar(&window["name"]),
-                percent(&window["usedPercent"]),
-                percent(&remaining),
-                reset_time(&window["resetsAt"]),
-            );
-        }
-    }
+    write_usage_windows(&mut output, &sample["windows"]);
     if let Some(code) = result.pointer("/error/code").and_then(Value::as_str) {
         let _ = writeln!(output, "  Reading error: {code}");
     }
     output
 }
 
-fn format_snapshot(value: &Value, json: bool) -> String {
+fn write_usage_windows(output: &mut String, windows: &Value) {
+    for window in windows.as_array().into_iter().flatten() {
+        let remaining = window["usedPercent"].as_f64().map_or(Value::Null, |used| {
+            Value::from((100.0 - used).clamp(0.0, 100.0))
+        });
+        let _ = write!(
+            output,
+            "  {}: {} used, {} remaining, reset {}",
+            scalar(&window["name"]),
+            percent(&window["usedPercent"]),
+            percent(&remaining),
+            reset_time(&window["resetsAt"]),
+        );
+        if let Some(model) = window["model"].as_str() {
+            let _ = write!(output, " (model: {model})");
+        }
+        output.push('\n');
+    }
+}
+
+fn capacity_history(value: &Value) -> String {
+    let mut output = format!("History for {}\n", scalar(&value["accountId"]));
+    match value["samples"].as_array() {
+        Some(samples) if !samples.is_empty() => {
+            for sample in samples {
+                let _ = writeln!(output, "{}", reset_time(&sample["observedAt"]));
+                write_usage_windows(&mut output, &sample["windows"]);
+            }
+        }
+        _ => output.push_str("No usage history.\n"),
+    }
+    output
+}
+
+fn capacity_forecast(value: &Value) -> String {
+    let Some(accounts) = value["accounts"].as_array() else {
+        return forecast_account(value);
+    };
+    let mut output = format!("Forecast: {}\n", scalar(&value["status"]));
+    for account in accounts {
+        output.push_str(&forecast_account(account));
+    }
+    for pool in value["pools"].as_array().into_iter().flatten() {
+        let _ = writeln!(
+            output,
+            "{} {} {} pool: {}, {} effective percent points remaining, exhaustion {}",
+            scalar(&pool["provider"]),
+            scalar(&pool["plan"]),
+            scalar(&pool["windowName"]),
+            scalar(&pool["status"]),
+            scalar(&pool["effectiveRemainingPercentPoints"]),
+            reset_time(&pool["exhaustionAt"]),
+        );
+    }
+    output
+}
+
+fn forecast_account(value: &Value) -> String {
+    let mut output = format!(
+        "{}: {} ({} samples), exhaustion {}\n",
+        scalar(&value["accountId"]),
+        with_reason(&value["status"], &value["qualification"]),
+        scalar(&value["historySampleCount"]),
+        reset_time(&value["exhaustionAt"]),
+    );
+    for window in value["windows"].as_array().into_iter().flatten() {
+        let _ = writeln!(
+            output,
+            "  {}: {}, {} remaining, exhaustion {}",
+            scalar(&window["name"]),
+            scalar(&window["status"]),
+            percent(&window["remainingPercent"]),
+            reset_time(&window["exhaustionAt"]),
+        );
+    }
+    output
+}
+
+fn capacity_health(value: &Value) -> String {
+    let mut output = format!("Capacity health: {}\n", scalar(&value["status"]));
+    if let Some(providers) = value["providers"].as_object() {
+        for (provider, health) in providers {
+            let accounts = &health["accounts"];
+            let _ = writeln!(
+                output,
+                "{provider}: CLI available {}, {} accounts ({} ready, {} degraded, {} need sign-in, {} unknown)",
+                scalar(&health["cliAvailable"]),
+                scalar(&accounts["total"]),
+                scalar(&accounts["ready"]),
+                scalar(&accounts["degraded"]),
+                scalar(&accounts["reauthRequired"]),
+                scalar(&accounts["unknown"]),
+            );
+        }
+    }
+    output
+}
+
+fn format_capacity(action: &CapacityAction, value: &Value, json: bool) -> String {
     if json {
-        format!("{value}\n")
-    } else {
-        capacity_usage(value)
+        return format!("{value}\n");
+    }
+    match action {
+        CapacityAction::Show { .. } | CapacityAction::Watch { .. } => capacity_usage(value),
+        CapacityAction::History { .. } => capacity_history(value),
+        CapacityAction::Forecast { .. } => capacity_forecast(value),
+        CapacityAction::Health => capacity_health(value),
     }
 }
 
@@ -154,11 +243,12 @@ mod tests {
     #[test]
     fn capacity_fixture_preserves_rest_body_and_exposes_unknowns() {
         let response: Value = serde_json::from_str(CAPACITY).unwrap();
-        let json = format_snapshot(&response, true);
+        let action = CapacityAction::Watch { account: None };
+        let json = format_capacity(&action, &response, true);
         assert_eq!(json.lines().count(), 1);
         assert_eq!(serde_json::from_str::<Value>(&json).unwrap(), response);
 
-        let text = format_snapshot(&response, false);
+        let text = format_capacity(&action, &response, false);
         for expected in [
             "Primary login (acct_primary) [serving]",
             "32.5% used, 67.5% remaining, reset 1795540000000 ms since Unix epoch",
@@ -170,6 +260,51 @@ mod tests {
             assert!(text.contains(expected), "missing {expected}:\n{text}");
         }
         assert!(!text.contains("0.0% used"));
+    }
+
+    #[test]
+    fn nullable_forecast_and_health_are_visible_without_synthesizing_values() {
+        let forecast = serde_json::json!({
+            "status": "insufficient_history",
+            "accounts": [{
+                "accountId": "acct_example",
+                "status": "insufficient_history",
+                "qualification": "needs_more_samples",
+                "historySampleCount": 1,
+                "exhaustionAt": null,
+                "windows": []
+            }],
+            "pools": []
+        });
+        let output = format_capacity(
+            &CapacityAction::Forecast { account: None },
+            &forecast,
+            false,
+        );
+        assert!(output.contains("acct_example: insufficient_history (needs_more_samples) (1 samples), exhaustion unknown"));
+        let health = serde_json::json!({
+            "status": "degraded",
+            "providers": {
+                "anthropic": {
+                    "cliAvailable": false,
+                    "accounts": {
+                        "total": 2, "ready": 0, "degraded": 0, "reauthRequired": 1, "unknown": 1
+                    }
+                }
+            }
+        });
+        let output = format_capacity(&CapacityAction::Health, &health, false);
+        assert!(output.contains(
+            "CLI available false, 2 accounts (0 ready, 0 degraded, 1 need sign-in, 1 unknown)"
+        ));
+        let history = serde_json::json!({"accountId":"acct_example","samples":[]});
+        let action = CapacityAction::History {
+            account: "acct_example".into(),
+        };
+        assert_eq!(
+            format_capacity(&action, &history, false),
+            "History for acct_example\nNo usage history.\n"
+        );
     }
 
     #[test]
