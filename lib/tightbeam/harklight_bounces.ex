@@ -59,7 +59,7 @@ defmodule Tightbeam.HarklightBounces do
       ackOpId TEXT NOT NULL UNIQUE,
       ackJournalId TEXT,
       ackCompletedAt INTEGER,
-      ackOutcome TEXT CHECK(ackOutcome IN ('acknowledged','gone')),
+      ackOutcome TEXT CHECK(ackOutcome IN ('acknowledged','gone','moot','delivered')),
       CHECK ((outcome='woken' AND recipient IS NOT NULL AND wakeId IS NOT NULL)
           OR (outcome='closed' AND recipient IS NULL AND wakeId IS NULL)),
       CHECK ((ackCompletedAt IS NULL AND ackOutcome IS NULL)
@@ -209,7 +209,20 @@ defmodule Tightbeam.HarklightBounces do
       )
     end)
 
-    Enum.each(closed, &record(txn, &1, source, "closed", nil, nil, now))
+    # A notice already seen as moot is never acknowledged: Harklight answers
+    # such an acknowledgment with moot and not delivered, which the Agent
+    # reports as an error.
+    Enum.each(closed, fn candidate ->
+      record(txn, candidate, source, "closed", nil, nil, now)
+
+      if candidate.advisory["moot"] == true do
+        Txn.q(
+          txn,
+          "UPDATE harklight_bounces SET ackCompletedAt=?2,ackOutcome='moot' WHERE advisoryId=?1",
+          [candidate.advisory["advisory_id"], now]
+        )
+      end
+    end)
 
     woken =
       open
@@ -625,20 +638,63 @@ defmodule Tightbeam.HarklightBounces do
 
         :refused ->
           # A definite refusal recorded nothing; only then may a new key be used.
-          DB.query(
-            db,
-            "UPDATE harklight_bounces SET ackOpId=?2,ackJournalId=NULL WHERE advisoryId=?1 AND ackCompletedAt IS NULL",
-            [advisory, Id.uuid4()]
-          )
+          with :pending <- already_settled(db, runner, advisory, item) do
+            DB.query(
+              db,
+              "UPDATE harklight_bounces SET ackOpId=?2,ackJournalId=NULL WHERE advisoryId=?1 AND ackCompletedAt IS NULL",
+              [advisory, Id.uuid4()]
+            )
 
-          :pending
+            :pending
+          end
 
         :pending ->
+          already_settled(db, runner, advisory, item)
+      end
+    else
+      _ -> :pending
+    end
+  end
+
+  # An acknowledgment that did not confirm: read the message's current
+  # advisory. If it has become moot (Harklight answers an acknowledgment of a
+  # moot notice with moot and not delivered, which the Agent reports as an
+  # error) or is delivered, there is nothing left to acknowledge and the
+  # retries stop. Otherwise, or if it cannot be read, keep retrying.
+  defp already_settled(db, runner, advisory, item) do
+    with {[%{"message" => %{"advisories" => advisories}}], 0} when is_list(advisories) <-
+           run_message(runner, ["message-get", "--item-id", item]),
+         %{} = current <- Enum.find(advisories, &(&1["advisory_id"] == advisory)) do
+      cond do
+        current["moot"] == true ->
+          Logger.info("Harklight bounce #{advisory} became moot; acknowledgment dropped")
+          complete(db, advisory, "moot")
+
+        current["delivered"] == true ->
+          complete(db, advisory, "delivered")
+
+        true ->
           :pending
       end
     else
       _ -> :pending
     end
+  end
+
+  # `message-get` prints the plain response, not a `kind` frame.
+  defp run_message(runner, argv) do
+    {output, status} = runner.(argv)
+
+    frames =
+      for line <- String.split(output, "\n", trim: true),
+          {:ok, %{} = frame} <- [JSON.decode(line)],
+          do: frame
+
+    {frames, status}
+  rescue
+    _ -> {[], :error}
+  catch
+    _, _ -> {[], :error}
   end
 
   defp journal(_db, _runner, _op, journal) when is_binary(journal), do: {:ok, journal}

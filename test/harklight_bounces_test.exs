@@ -774,7 +774,7 @@ defmodule Tightbeam.HarklightBouncesTest do
     refute soft =~ "had not been opened"
   end
 
-  test "a moot advisory closes without a wake and is acknowledged, whatever the item says", ctx do
+  test "a moot advisory closes without a wake and is never acknowledged", ctx do
     %{db: db, main: main} = ctx
     worker = agent(db, "worker", main)
     conversation(db, @handle, worker)
@@ -785,10 +785,73 @@ defmodule Tightbeam.HarklightBouncesTest do
              read(db, [item("item-1", @handle, advisories: [moot])])
 
     assert [[0]] = wake_rows(db, "SELECT count(*) FROM wakes")
-    assert [["closed"]] = wake_rows(db, "SELECT outcome FROM harklight_bounces")
+
+    assert [["closed", "moot"]] =
+             wake_rows(db, "SELECT outcome,ackOutcome FROM harklight_bounces")
+
     %{calls: calls, runner: runner} = ack_runner()
     assert {:ok, false} = HarklightBounces.ack_owed(db, runner: runner)
-    assert [_] = for(["advisory-ack" | _] = call <- Agent.get(calls, & &1), do: call)
+    assert [] = Agent.get(calls, & &1)
+  end
+
+  test "an acknowledgment that fails because the notice became moot stops retrying", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+    assert {:ok, _} = read(db, [item("item-1", @handle, advisories: [advisory("adv-1")])])
+    assert [[1]] = wake_rows(db, "SELECT count(*) FROM wakes")
+
+    # Moot after the wake: Harklight answers moot and not delivered, which the
+    # Agent reports as an error.
+    %{calls: calls, runner: runner} =
+      ack_runner(
+        ack: :moot_reply,
+        lookup: %{"adv-1" => %{"moot" => true, "delivered" => false}}
+      )
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, false} = HarklightBounces.ack_owed(db, runner: runner)
+      end)
+
+    assert log =~ "became moot"
+    assert [["moot"]] = wake_rows(db, "SELECT ackOutcome FROM harklight_bounces")
+
+    # Done for good: no further acknowledgment, no further wake.
+    attempts = fn -> Enum.count(Agent.get(calls, & &1), &match?(["advisory-ack" | _], &1)) end
+    assert attempts.() == 1
+    assert {:ok, false} = HarklightBounces.ack_owed(db, runner: runner)
+    assert attempts.() == 1
+    assert [[1]] = wake_rows(db, "SELECT count(*) FROM wakes")
+  end
+
+  test "an acknowledgment that fails is retried while the notice is still live", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+    assert {:ok, _} = read(db, [item("item-1", @handle, advisories: [advisory("adv-1")])])
+
+    for lookup <- [%{"adv-1" => %{"moot" => false, "delivered" => false}}, :fail] do
+      %{runner: runner} = ack_runner(ack: :moot_reply, lookup: lookup)
+      assert {:ok, true} = HarklightBounces.ack_owed(db, runner: runner)
+      assert [[nil]] = wake_rows(db, "SELECT ackCompletedAt FROM harklight_bounces")
+    end
+  end
+
+  test "an acknowledgment that fails because someone else delivered it is let go", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+    assert {:ok, _} = read(db, [item("item-1", @handle, advisories: [advisory("adv-1")])])
+
+    %{runner: runner} =
+      ack_runner(ack: :moot_reply, lookup: %{"adv-1" => %{"moot" => false, "delivered" => true}})
+
+    assert {:ok, false} = HarklightBounces.ack_owed(db, runner: runner)
+    assert [["delivered"]] = wake_rows(db, "SELECT ackOutcome FROM harklight_bounces")
   end
 
   test "a bounced item with no terminal is woken even if Harklight closed it in the inbox", ctx do
@@ -1257,10 +1320,22 @@ defmodule Tightbeam.HarklightBouncesTest do
 
         ["advisory-ack", "--item-id", item, "--advisory-id", id, "--op-id", op] ->
           acknowledge(state, ack, item, id, op)
+
+        ["message-get", "--item-id", item] ->
+          lookup(Keyword.get(opts, :lookup, %{}), item)
       end
     end
 
     %{calls: calls, runner: runner}
+  end
+
+  defp lookup(:fail, _item), do: {"message-get: server returned HTTP 503\n", 1}
+
+  defp lookup(current, item) do
+    advisories = for {id, fields} <- current, do: Map.put(fields, "advisory_id", id)
+
+    {JSON.encode!(%{"rev" => 9, "message" => %{"item_id" => item, "advisories" => advisories}}) <>
+       "\n", 0}
   end
 
   defp page(pages, token) do
@@ -1290,6 +1365,13 @@ defmodule Tightbeam.HarklightBouncesTest do
       :lose ->
         frame(%{kind: "outcome_unknown", operation: "advisory-ack", op_id: op, status: 503}, 7)
 
+      # The Agent rejects a reply that is not delivered=true.
+      :moot_reply ->
+        frame(
+          %{kind: "outcome_unknown", operation: "advisory-ack", op_id: op, request_id: "r1"},
+          7
+        )
+
       :refused ->
         frame(
           %{
@@ -1317,6 +1399,7 @@ defmodule Tightbeam.HarklightBouncesTest do
   end
 
   defp behavior(_state, :ok, _id), do: :ok
+  defp behavior(_state, :moot_reply, _id), do: :moot_reply
   defp behavior(_state, %{} = per_advisory, id), do: Map.get(per_advisory, id, :ok)
 
   defp behavior(state, :lose_first_reply, _id) do
