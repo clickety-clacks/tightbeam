@@ -12,8 +12,80 @@ use serde_json::{Value, json};
 
 use crate::child_process::{RunError, Supervised, nonblocking, supervise};
 
+use super::{
+    ProbeResult, claude_usage_at, codex_expiry, codex_subscription, codex_usage, credential, error,
+    normalize_codex_app_server, now_ms, required_string, usage_agent,
+};
+
 const DEADLINE: Duration = Duration::from_secs(15);
 const MAX_LINE: usize = 512 * 1024;
+
+// The eventual caller is the single owning-host command built by the idle
+// writer lease. There is no runtime entrypoint until that lease is verified.
+pub(super) fn collect(provider: &str, binary: &Path, home: &Path) -> ProbeResult {
+    match provider {
+        "openai" => collect_codex(binary, home),
+        "anthropic" => collect_claude(binary, home, super::CLAUDE_USAGE, super::CLAUDE_PROFILE),
+        _ => Err(error("UPSTREAM_CONTRACT_CHANGED")),
+    }
+}
+
+fn collect_codex(binary: &Path, home: &Path) -> ProbeResult {
+    let path = home.join("auth.json");
+    let original = credential(&path)?;
+    let expiry = codex_expiry(&original["tokens"]["access_token"]);
+    let refresh = expiry.is_none_or(|expiry| expiry <= now_ms());
+    let (account, limits) = codex(binary, home, refresh).map_err(native_failure)?;
+    let updated = credential(&path)?;
+    let observed = now_ms();
+
+    // A successful but unrepresentable response can use the HTTP mapping.
+    // Do not immediately repeat a failed native quota request against the
+    // provider, since it may have rejected or throttled the request.
+    match normalize_codex_app_server(&limits, &account, observed) {
+        Ok(mut sample) => {
+            let identity = updated["tokens"]["id_token"].as_str();
+            sample["subscription"] = codex_subscription(identity, observed);
+            Ok(sample)
+        }
+        Err(_) => codex_usage(&updated, &usage_agent()),
+    }
+}
+
+fn collect_claude(binary: &Path, home: &Path, usage_url: &str, profile_url: &str) -> ProbeResult {
+    let path = home.join(".credentials.json");
+    let original = credential(&path)?;
+    let oauth = &original["claudeAiOauth"];
+    required_string(&oauth["accessToken"])?;
+    let needs_refresh = oauth["expiresAt"]
+        .as_i64()
+        .is_none_or(|expiry| expiry <= now_ms());
+    let updated = if needs_refresh {
+        claude(binary, home).map_err(native_failure)?;
+        let updated = credential(&path)?;
+        if updated["claudeAiOauth"]["expiresAt"]
+            .as_i64()
+            .is_none_or(|expiry| expiry <= now_ms())
+        {
+            return Err(error("REFRESH_REJECTED"));
+        }
+        updated
+    } else {
+        original
+    };
+
+    claude_usage_at(&updated, &usage_agent(), usage_url, profile_url)
+}
+
+fn native_failure(reason: RunError) -> Value {
+    // Upstream protocol errors and child output never leave this process.
+    match reason {
+        RunError::Failed(message) if message.contains("onboarding lease expired") => {
+            error("UPSTREAM_TIMEOUT")
+        }
+        _ => error("UPSTREAM_UNAVAILABLE"),
+    }
+}
 
 pub(super) fn codex(binary: &Path, home: &Path, refresh: bool) -> Result<(Value, Value), RunError> {
     let mut command = native_command(binary, home);
@@ -228,8 +300,25 @@ touch finished-codex
         assert!(dir.join("finished-codex").exists());
         let normalized = super::super::normalize_codex_app_server(&limits, &account, 1000).unwrap();
         assert_eq!(normalized["windows"][0]["windowSeconds"], 18_000);
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"tokens":{"access_token":"synthetic-invalid-jwt","id_token":"not-a-token"}}"#,
+        )
+        .unwrap();
+        let sample = collect("openai", &binary, &dir).unwrap();
+        assert_eq!(sample["windows"][0]["usedPercent"], 42.0);
+        assert_eq!(sample["subscription"]["statusReason"], "unrecognized_value");
         claude(&binary, &dir).unwrap();
         assert!(dir.join("finished-claude").exists());
+        std::fs::write(
+            dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"synthetic","expiresAt":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            collect("anthropic", &binary, &dir),
+            Err(error("REFRESH_REJECTED"))
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

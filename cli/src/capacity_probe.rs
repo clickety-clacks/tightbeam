@@ -36,6 +36,10 @@ pub(crate) fn probe(args: &[String]) -> Result<i32, String> {
 }
 
 fn read(path: &str, usage: fn(&Value, &ureq::Agent) -> ProbeResult) -> ProbeResult {
+    usage(&credential(path.as_ref())?, &usage_agent())
+}
+
+fn credential(path: &std::path::Path) -> ProbeResult {
     let raw = std::fs::read(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             error("CREDENTIAL_MISSING")
@@ -43,22 +47,21 @@ fn read(path: &str, usage: fn(&Value, &ureq::Agent) -> ProbeResult) -> ProbeResu
             error("CREDENTIAL_UNREADABLE")
         }
     })?;
-    let credential = serde_json::from_slice(&raw).map_err(|_| error("CREDENTIAL_REJECTED"))?;
-    let agent = ureq::AgentBuilder::new()
+    serde_json::from_slice(&raw).map_err(|_| error("CREDENTIAL_REJECTED"))
+}
+
+fn usage_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
         .redirects(0)
         .timeout(TIMEOUT)
-        .build();
-    usage(&credential, &agent)
+        .build()
 }
 
 fn codex_usage(credential: &Value, agent: &ureq::Agent) -> ProbeResult {
     let tokens = &credential["tokens"];
     let access = required_string(&tokens["access_token"])?;
     let account = required_string(&tokens["account_id"])?;
-    let expires = jwt_claims(access)
-        .and_then(|claims| claims["exp"].as_i64())
-        .and_then(|expiry| expiry.checked_mul(1000));
-    require_unexpired(expires)?;
+    require_unexpired(codex_expiry(&tokens["access_token"]))?;
 
     let payload = request(
         agent
@@ -70,6 +73,12 @@ fn codex_usage(credential: &Value, agent: &ureq::Agent) -> ProbeResult {
     let mut sample = normalize_codex(&payload, observed)?;
     sample["subscription"] = codex_subscription(tokens["id_token"].as_str(), observed);
     Ok(sample)
+}
+
+fn codex_expiry(access: &Value) -> Option<i64> {
+    jwt_claims(access.as_str()?)
+        .and_then(|claims| claims["exp"].as_i64())
+        .and_then(|expiry| expiry.checked_mul(1000))
 }
 
 fn claude_usage(credential: &Value, agent: &ureq::Agent) -> ProbeResult {
