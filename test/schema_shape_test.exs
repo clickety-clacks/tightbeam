@@ -2329,7 +2329,7 @@ defmodule Tightbeam.SchemaShapeTest do
              )
   end
 
-  # Restore the declared attribution clauses before labeling this fixture as
+  # Restore the declared decision-request and attribution clauses before labeling this fixture as
   # the earlier reparent predecessor. No row values change.
   defp restore_predecessor_attribution!(db) do
     :ok = DB.execute(db, "DROP INDEX IF EXISTS events_process_assignment")
@@ -2395,6 +2395,24 @@ defmodule Tightbeam.SchemaShapeTest do
                    Tightbeam.DB.Txn.q(
                      txn,
                      "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'"
+                   )
+
+                 # A current bootstrap also allows the gateway's sessionless operator request.
+                 # The predecessor accepts only operator requests with a raiser session.
+                 coordinator_raiser_check =
+                   ~r"""
+                   \(\(raiserId\s+<>\s+'process:tightbeam/coordinator-hold'\s+
+                   AND\s+raiserSessionKey\s+IS\s+NOT\s+NULL\)\s+
+                   OR\s+\(raiserId\s+=\s+'process:tightbeam/coordinator-hold'\s+
+                   AND\s+raiserSessionKey\s+IS\s+NULL\s+
+                   AND\s+assignmentId\s+IS\s+NULL\s+AND\s+deadlineAt\s+IS\s+NULL\)\)
+                   """x
+
+                 decision_sql =
+                   Regex.replace(
+                     coordinator_raiser_check,
+                     decision_sql,
+                     "raiserSessionKey IS NOT NULL"
                    )
 
                  decision_sql =

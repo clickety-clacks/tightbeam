@@ -2157,6 +2157,8 @@ defmodule Tightbeam.Schema do
     # This table rebuild follows all predecessor migrations so a refusal above
     # leaves the older database and its indexes untouched.
     :ok = upgrade_compactor_model_rate_limit_source(db)
+    :ok = Tightbeam.Escalation.ensure_coordinator_operator_schema(db)
+    :ok = Tightbeam.CoordinatorHoldDecisions.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok

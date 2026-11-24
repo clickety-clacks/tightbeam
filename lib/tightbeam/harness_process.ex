@@ -386,7 +386,10 @@ defmodule Tightbeam.HarnessProcess do
   def complete_park_in_txn(%DB.Txn{} = txn, key) do
     DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
 
-    if DB.Txn.changes(txn) == 1, do: Tightbeam.HolderProd.changed_in_txn(txn)
+    if DB.Txn.changes(txn) == 1 do
+      Tightbeam.HolderProd.changed_in_txn(txn)
+      Tightbeam.CoordinatorHoldDecisions.changed_in_txn(txn)
+    end
 
     :ok
   end
@@ -1696,23 +1699,26 @@ defmodule Tightbeam.HarnessProcess do
       [adapter_key, at, Id.ulid()]
     )
 
+    if DB.Txn.changes(txn) == 1, do: Tightbeam.CoordinatorHoldDecisions.changed_in_txn(txn)
     :ok
   end
 
   defp complete_reconciled_park_name(db, adapter_key) do
     incident_guard = rate_limit_incident_guard(db)
 
-    {:ok, _} =
+    {:ok, deleted} =
       DB.query(
         db,
         """
         DELETE FROM harness_park_fences
          WHERE adapterKey = ?1
          #{incident_guard}
+         RETURNING adapterKey
         """,
         [adapter_key]
       )
 
+    if deleted != [], do: Tightbeam.CoordinatorHoldDecisions.changed()
     :ok
   end
 
@@ -1750,6 +1756,7 @@ defmodule Tightbeam.HarnessProcess do
         """
       )
 
+    if released != [], do: Tightbeam.CoordinatorHoldDecisions.changed()
     Enum.map(released, fn [adapter_key] -> adapter_key end)
   end
 

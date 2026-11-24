@@ -4,6 +4,7 @@ defmodule Tightbeam.Harness.RecoveryProbe do
   alias Tightbeam.{DB, ErrorDiagnostic, Homes, Placement}
   alias Tightbeam.Harness.Support
 
+  @supported_harnesses ~w(claude codex)
   @error_limit 512
   @help_output_limit 65_536
   @selection_output_limit 4_096
@@ -99,11 +100,22 @@ defmodule Tightbeam.Harness.RecoveryProbe do
     kind, reason -> {:inconclusive, diagnostic({kind, reason})}
   end
 
+  @doc false
+  def supported_route?(%{
+        "harness" => harness,
+        "host" => host,
+        "model" => model,
+        "sharedAccount" => "shared"
+      }),
+      do:
+        harness in @supported_harnesses and is_binary(host) and host != "" and is_binary(model) and
+          model != ""
+
+  def supported_route?(_route), do: false
+
   defp route_context(base_dir, db, route) do
-    with harness when harness in ["claude", "codex"] <- route["harness"],
-         host when is_binary(host) and host != "" <- route["host"],
-         model when is_binary(model) and model != "" <- route["model"],
-         "shared" <- route["sharedAccount"],
+    with true <- supported_route?(route),
+         %{"harness" => harness, "host" => host} <- route,
          {:ok, host_config} <- Map.fetch(Placement.hosts(base_dir, db), host),
          path when is_binary(path) and path != "" <-
            Placement.toolchain_path_preview(%{base_dir: base_dir, db: db}, host),
