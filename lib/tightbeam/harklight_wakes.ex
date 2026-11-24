@@ -26,9 +26,9 @@ defmodule Tightbeam.HarklightWakes do
   @feed_read_retry_delay 250
   @retry_delays [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 300_000]
 
-  # The Agent waits for a lost Server inside its own process. After this long a
-  # start that has not caught up gives up its admission slot and keeps running.
-  @feed_start_limit 60_000
+  # A feed that stays up this long after catching up has recovered. Focus
+  # records need a separate grant, so a quiet feed may never confirm itself.
+  @feed_steady_delay 60_000
 
   @max_diagnostic_lines 3
   @max_diagnostic_line_chars 240
@@ -997,7 +997,8 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  # Besides failed handles, select active ones that have no listener: a listener
+  # Opening a conversation held for its first opening is a separate choice, made
+  # with a handle or message. Besides failed handles, select active ones that have no listener: a listener
   # that ended before its state was recorded leaves its row looking healthy.
   defp retry_targets(db, :all) do
     case DB.query(
@@ -1005,7 +1006,8 @@ defmodule Tightbeam.HarklightWakes do
            """
            SELECT h.handle,h.sessionKey,h.state,COALESCE(p.diagnostic,h.lastError)
            FROM harklight_wake_handles h LEFT JOIN harklight_feed_pauses p ON p.handle=h.handle
-           WHERE h.state IN ('active','unavailable') ORDER BY h.createdAt,h.handle
+           WHERE h.state IN ('active','unavailable') AND NOT #{@earlier_unopened_sql}
+           ORDER BY h.createdAt,h.handle
            """
          ) do
       {:ok, rows} ->
@@ -1412,7 +1414,7 @@ defmodule Tightbeam.HarklightWakes do
        admission_next: nil,
        admission_spacing: Keyword.get(opts, :feed_start_spacing_ms, 250),
        launching: MapSet.new(),
-       feed_start_limit: Keyword.get(opts, :feed_start_limit_ms, @feed_start_limit),
+       feed_steady_delay: Keyword.get(opts, :feed_steady_delay_ms, @feed_steady_delay),
        transport_failures: %{},
        cooldown_until: nil,
        cooldown_level: 0,
@@ -1469,14 +1471,7 @@ defmodule Tightbeam.HarklightWakes do
         now = state.wall_now.()
         delay = state.outage_notice_delay
 
-        # Focus records need a separate grant, so a quiet recovered feed may
-        # never have confirmed itself.
-        result =
-          if caught_up?(state, handle),
-            do: Outage.finish(state.db, handle, false, now),
-            else: Outage.notify(state.db, handle, episode, now, delay)
-
-        case result do
+        case Outage.notify(state.db, handle, episode, now, delay) do
           {:ok, {:early, row}} ->
             {:noreply, arm_outage(state, row)}
 
@@ -1497,10 +1492,20 @@ defmodule Tightbeam.HarklightWakes do
 
   def handle_info({:admit_feed, _stale}, state), do: {:noreply, state}
 
-  def handle_info({:feed_start_limit, handle, pid}, state) do
-    if state.workers[handle] == pid and MapSet.member?(state.launching, handle),
-      do: {:noreply, admit_feed(%{state | launching: MapSet.delete(state.launching, handle)})},
-      else: {:noreply, state}
+  def handle_info({:feed_steady, handle, pid}, state) do
+    if state.workers[handle] == pid and not Map.has_key?(state.failures, handle) and
+         not MapSet.member?(state.stopping, handle) and not MapSet.member?(state.restart, handle) do
+      case DB.refusable(fn -> Outage.finish(state.db, handle, true, state.wall_now.()) end) do
+        {:ok, _} ->
+          {:noreply, confirm_feed_recovery(state, handle)}
+
+        {:error, _} ->
+          arm_feed_steady(state, handle, pid)
+          {:noreply, state}
+      end
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
@@ -1840,10 +1845,8 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp caught_up?(state, handle) do
-    Map.has_key?(state.ports, handle) and not MapSet.member?(state.starts_in_flight, handle) and
-      not Map.has_key?(state.failures, handle)
-  end
+  defp arm_feed_steady(state, handle, pid),
+    do: Process.send_after(self(), {:feed_steady, handle, pid}, state.feed_steady_delay)
 
   defp arm_outage(state, [_handle, _episode, _started, notice]) when is_binary(notice), do: state
 
@@ -2634,6 +2637,8 @@ defmodule Tightbeam.HarklightWakes do
             starts_in_flight: MapSet.delete(state.starts_in_flight, handle)
         }
 
+        arm_feed_steady(state, handle, elem(from, 0))
+
         case Map.get(state.retry_waiters, handle) do
           nil ->
             state
@@ -3001,8 +3006,6 @@ defmodule Tightbeam.HarklightWakes do
           stop when stop in [:skip, :defer] -> :ok
         end
       end)
-
-    Process.send_after(self(), {:feed_start_limit, handle, pid}, state.feed_start_limit)
 
     %{
       state
@@ -3397,7 +3400,7 @@ defmodule Tightbeam.HarklightWakes do
         {:failed, drain.fallback, ended? and complete? and known_exit?}
 
       not ended? ->
-        :uncertain
+        {:failed, failure, false}
 
       not is_nil(drain.baseline) or structured_output_line?(drain.pending) ->
         {:failed, listener_failure("incomplete_line", status, diagnostics), false}

@@ -4007,6 +4007,10 @@ defmodule Tightbeam.HarklightWakesTest do
       assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
       assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes")
 
+      # Retrying everything is not a choice to open this one.
+      assert %{results: []} = HarklightWakes.retry_command(db, %{params: %{all: true}})
+      refute File.exists?(agent <> ".calls")
+
       assert %{counts: %{listening: 1}} =
                HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
 
@@ -4154,44 +4158,6 @@ defmodule Tightbeam.HarklightWakesTest do
     end
   end
 
-  test "a start that never catches up does not hold back the others", %{db: db, session: session} do
-    second = "7d737f62-bbd7-4c51-978d-f6ff5b4d8147"
-    third = "7d737f62-bbd7-4c51-978d-f6ff5b4d8148"
-
-    for {h, m} <- [{second, "other"}, {third, "third"}],
-        do: seed_completion_handle(db, session.session_key, h, m)
-
-    parent = self()
-
-    listener = fn manager, handle, _ ->
-      send(parent, {:started, handle, System.monotonic_time(:millisecond)})
-      if handle == @handle, do: receive(do: (:server_back -> :ok))
-      :ok = GenServer.call(manager, {:feed_ready, handle})
-      send(parent, {:ready, handle})
-      receive do: (:hold -> :ok)
-    end
-
-    manager =
-      start_supervised!(
-        {HarklightWakes,
-         db: db, listener: listener, feed_start_spacing_ms: 40, feed_start_limit_ms: 120}
-      )
-
-    assert_receive {:started, @handle, _}, 1_000
-    refute_receive {:started, _, _}, 60
-    assert_receive {:started, ^second, at_second}, 1_000
-    assert_receive {:started, ^third, at_third}, 1_000
-    assert at_third - at_second >= 35
-    assert_receive {:ready, ^third}, 1_000
-
-    # The waiting start is left running, unreported, and finishes normally.
-    assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
-    state = :sys.get_state(manager)
-    assert MapSet.to_list(state.starts_in_flight) == [@handle]
-    send(state.workers[@handle], :server_back)
-    assert_receive {:ready, @handle}, 1_000
-  end
-
   # Agent 0.2.3 keeps running while it is cut off, and prints these.
   @agent_023_lines [
     "listen: feed connection ended; reconnecting",
@@ -4256,31 +4222,110 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:ok, []} = DB.query(db, "SELECT owner FROM harklight_feed_launches")
   end
 
-  test "a quiet recovered feed is not reported as out", %{db: db} do
+  test "a quiet feed's outages are each reported once and each end without a focus record", %{
+    db: db
+  } do
     :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
 
     fake_harklight_agent!("""
-    if [ ! -e "$0.failed" ]; then touch "$0.failed"; exit 1; fi
+    if [ -e "$0.down" ]; then exit 1; fi
     printf '%s\n' '{"kind":"caught_up","rev":8}'
-    exec sleep 30
+    while [ ! -e "$0.down" ]; do sleep 0.02; done
+    exit 1
+    """)
+
+    agent = System.find_executable("harklight-agent")
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db,
+         retry_delays: [40],
+         feed_start_spacing_ms: 1,
+         outage_notice_delay_ms: 400,
+         feed_steady_delay_ms: 150}
+      )
+
+    count = fn pattern ->
+      {:ok, [[count]]} =
+        DB.query(db, "SELECT count(*) FROM wakes WHERE wakeId LIKE ?1", [pattern])
+
+      count
+    end
+
+    for round <- 1..2 do
+      assert eventually(fn -> :sys.get_state(manager).starts_in_flight == MapSet.new() end)
+      File.touch!(agent <> ".down")
+      assert eventually(fn -> count.("w_harklight_notice_recovery_%") == round end)
+      assert {:ok, [_]} = Tightbeam.HarklightListenerOutage.pending(db)
+      File.rm!(agent <> ".down")
+
+      assert eventually(fn -> count.("w_harklight_listening_%") == round end)
+      assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
+      refute Map.has_key?(:sys.get_state(manager).attempts, @handle)
+    end
+
+    # A short outage that ends by itself is not reported.
+    File.touch!(agent <> ".down")
+    assert eventually(fn -> match?({:ok, [_]}, Tightbeam.HarklightListenerOutage.pending(db)) end)
+    File.rm!(agent <> ".down")
+    assert eventually(fn -> Tightbeam.HarklightListenerOutage.pending(db) == {:ok, []} end)
+    assert count.("w_harklight_notice_recovery_%") == 2
+  end
+
+  test "a feed that keeps catching up and ending is still reported", %{db: db} do
+    :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
+
+    fake_harklight_agent!("""
+    printf '%s\n' '{"kind":"caught_up","rev":8}'
+    sleep 0.05
+    exit 1
     """)
 
     start_supervised!(
       {HarklightWakes,
-       db: db, retry_delays: [5], feed_start_spacing_ms: 1, outage_notice_delay_ms: 600}
+       db: db,
+       retry_delays: [10],
+       feed_start_spacing_ms: 1,
+       outage_notice_delay_ms: 400,
+       feed_steady_delay_ms: 300}
     )
 
-    assert eventually(fn ->
-             match?({:ok, [_]}, Tightbeam.HarklightListenerOutage.pending(db))
-           end)
+    await_notice!(db)
+  end
 
-    # No focus record and no reply ever confirms the feed.
-    assert eventually(fn ->
-             Tightbeam.HarklightListenerOutage.pending(db) == {:ok, []}
-           end)
+  for status <- [101, 125, 126, 127, 137] do
+    test "a feed that ends unverified with #{status} is an outage, logged and retried", %{db: db} do
+      :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
 
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes")
-    assert {:ok, [["active"]]} = DB.query(db, "SELECT state FROM harklight_wake_handles")
+      fake_harklight_agent!("""
+      printf '%s\n' "$*" >> "$0.calls"
+      exit #{unquote(status)}
+      """)
+
+      agent = System.find_executable("harklight-agent")
+      calls = fn -> String.split(File.read!(agent <> ".calls"), "\n", trim: true) end
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          start_supervised!(
+            {HarklightWakes,
+             db: db, retry_delays: [20], feed_start_spacing_ms: 1, outage_notice_delay_ms: 0}
+          )
+
+          assert eventually(fn -> File.exists?(agent <> ".calls") and length(calls.()) > 1 end)
+        end)
+
+      assert log =~ "Harklight listener failure handle=#{@handle}"
+      assert log =~ "exit status: #{unquote(status)}"
+      assert {:ok, [[@handle, _, _, _]]} = Tightbeam.HarklightListenerOutage.pending(db)
+      await_notice!(db)
+
+      assert {:ok, [["unavailable", error]]} =
+               DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+
+      assert error =~ "exit status: #{unquote(status)}"
+    end
   end
 
   test "a large forward jump, then a lower expired-cursor baseline, loses and repeats nothing", %{
