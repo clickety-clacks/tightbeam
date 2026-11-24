@@ -1168,7 +1168,8 @@ COMMANDS:
 
   accounts list | show <accountId>
       List provider accounts and see their login and serving status.
-      Pass --json for the API response.
+      Pass --json for the API response. With an organization credential,
+      select read visibility with --as-user or --as-process.
       accounts use <accountId>
       accounts rename <accountId> <label>
       accounts enable|disable|remove|verify <accountId>
@@ -4679,25 +4680,23 @@ fn parse_accounts(parsed: &Flags) -> Result<Command, String> {
     let args: Vec<_> = parsed.positional[1..].iter().map(String::as_str).collect();
     let action = match args.as_slice() {
         ["list"] => AccountAction::List,
-        ["show", account] if !account.trim().is_empty() => AccountAction::Show((*account).into()),
-        ["use", account] if !account.trim().is_empty() => AccountAction::Use((*account).into()),
+        [verb, account] if !account.trim().is_empty() => {
+            let account = (*account).to_owned();
+            match *verb {
+                "show" => AccountAction::Show(account),
+                "use" => AccountAction::Use(account),
+                "enable" => AccountAction::Enable(account),
+                "disable" => AccountAction::Disable(account),
+                "remove" => AccountAction::Remove(account),
+                "verify" => AccountAction::Verify(account),
+                _ => return Err("usage: tightbeam help accounts".into()),
+            }
+        }
         ["rename", account, label] if !account.trim().is_empty() && !label.trim().is_empty() => {
             AccountAction::Rename {
                 account: (*account).into(),
                 label: (*label).into(),
             }
-        }
-        ["enable", account] if !account.trim().is_empty() => {
-            AccountAction::Enable((*account).into())
-        }
-        ["disable", account] if !account.trim().is_empty() => {
-            AccountAction::Disable((*account).into())
-        }
-        ["remove", account] if !account.trim().is_empty() => {
-            AccountAction::Remove((*account).into())
-        }
-        ["verify", account] if !account.trim().is_empty() => {
-            AccountAction::Verify((*account).into())
         }
         _ => return Err("usage: tightbeam help accounts".into()),
     };

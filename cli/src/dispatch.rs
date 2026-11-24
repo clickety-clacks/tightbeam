@@ -4335,7 +4335,9 @@ fn local_harklight_identity_refusal(
 
 fn command_identity(command: &Command) -> Option<&Identity> {
     match command {
-        Command::Wake { identity, .. }
+        Command::Accounts { identity, .. }
+        | Command::Capacity { identity, .. }
+        | Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
         | Command::FactDemand { identity, .. }
         | Command::FactProducerClaim { identity, .. }
