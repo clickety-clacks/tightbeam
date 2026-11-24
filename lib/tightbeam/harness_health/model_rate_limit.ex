@@ -166,12 +166,7 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
           ]
         )
 
-        if Txn.changes(txn) == 1 do
-          Tightbeam.CoordinatorHoldAlerts.changed_in_txn(txn)
-          :recorded
-        else
-          :duplicate
-        end
+        if Txn.changes(txn) == 1, do: :recorded, else: :duplicate
 
       :error ->
         Txn.q(
@@ -196,8 +191,6 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
             input.principal
           ]
         )
-
-        if Txn.changes(txn) == 1, do: Tightbeam.CoordinatorHoldAlerts.changed_in_txn(txn)
 
         :ok
     end
@@ -235,9 +228,7 @@ defmodule Tightbeam.HarnessHealth.ModelRateLimit do
           [harness, host, model, System.system_time(:millisecond), turn_seq]
         )
 
-        released = Txn.changes(txn)
-        if released > 0, do: Tightbeam.CoordinatorHoldAlerts.changed_in_txn(txn)
-        released
+        Txn.changes(txn)
 
       _ ->
         0
