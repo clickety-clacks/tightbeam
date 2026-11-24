@@ -2370,7 +2370,7 @@ defmodule Tightbeam.Wakes do
            id: id,
            holder: "user:" <> request_owner,
            addressee: addressee,
-           terminal: status in ~w(ruled consumed withdrawn superseded),
+           terminal: status in ~w(answered returned ruled consumed withdrawn superseded),
            disposition: status
          }}
 
@@ -2689,15 +2689,7 @@ defmodule Tightbeam.Wakes do
     {:ok, %{kind: nil, id: nil, holder: nil, addressee: nil, terminal: false, disposition: nil}}
   end
 
-  defp item_resolver_in_txn(txn, ref, owner) do
-    case resolver_in_txn(txn, ref, owner) do
-      {:ok, %{kind: "decision_request", disposition: "returned"} = resolver} ->
-        {:ok, %{resolver | terminal: true}}
-
-      result ->
-        result
-    end
-  end
+  defp item_resolver_in_txn(txn, ref, owner), do: resolver_in_txn(txn, ref, owner)
 
   defp resolver_for_wake_in_txn(txn, %{resolver_kind: kind, resolver_id: id} = wake) do
     result =
@@ -2793,7 +2785,7 @@ defmodule Tightbeam.Wakes do
         value
 
       {"decision_request.status", value}
-      when value in ~w(ruled consumed withdrawn superseded) ->
+      when value in ~w(answered returned ruled consumed withdrawn superseded) ->
         value
 
       _ ->

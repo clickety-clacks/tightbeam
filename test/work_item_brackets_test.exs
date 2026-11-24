@@ -1849,6 +1849,255 @@ defmodule Tightbeam.WorkItemBracketsTest do
     end
   end
 
+  for terminal <- [:answer, :return] do
+    @terminal terminal
+    test "agent decision #{@terminal} releases one item continuation and restores reminders",
+         ctx do
+      item = create(ctx, {:user, "flynn"}, %{title: "Decision wait"})
+
+      request =
+        Tightbeam.Escalation.ask(ctx.db, %{
+          verb: "ask",
+          principal: {:session, "holder"},
+          origin: "agent:holder",
+          session_key: Org.personal_session_key("flynn"),
+          params: %{question: "Which result?"}
+        })
+
+      %{wait: wait} = record_item_wait(ctx, item.id, %{decision_request_id: request.id})
+
+      call = %{
+        verb: to_string(@terminal),
+        principal: {:session, "holder"},
+        origin: "agent:holder",
+        params: %{request: request.id, reason: "Needs context", answer: "Proceed"}
+      }
+
+      result = ctx.handlers[to_string(@terminal)].(call)
+      expected = if @terminal == :answer, do: "success", else: "reconsideration"
+      assert result.status == if(@terminal == :answer, do: "answered", else: "returned")
+      # Recognition is caused by the write, before any scheduler/deadline pass.
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_path == expected
+      assert get(ctx, item.id).wait.recognitionDisposition == result.status
+      refute get(ctx, item.id).wait.active
+      reminder = routing_wake_id(ctx.db, item.id)
+      assert is_binary(reminder)
+      recognized_at = Wakes.get(ctx.db, wait.wakeId).recognition_at
+      assert ctx.handlers[to_string(@terminal)].(call).status == result.status
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_at == recognized_at
+      scheduler = item_wait_scheduler(ctx)
+      assert :ok = Wakes.fire_due(scheduler)
+      stop_supervised!(scheduler)
+      scheduler = item_wait_scheduler(ctx)
+      assert :ok = Wakes.fire_due(scheduler)
+      assert routing_wake_id(ctx.db, item.id) == reminder
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT COUNT(*) FROM turns t WHERE t.wakeId=?1 OR t.wakeId IN (
+                   SELECT b.deliveryWakeId FROM notice_batch_members m JOIN notice_batches b ON b.batchId=m.batchId
+                   WHERE m.sourceWakeId=?1 AND b.state='delivered')
+                 """,
+                 [wait.wakeId]
+               )
+
+      deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, reminder))
+      next_reminder = routing_wake_id(ctx.db, item.id)
+      assert next_reminder != reminder
+      assert Wakes.get(ctx.db, next_reminder).state == "pending"
+    end
+  end
+
+  test "agent withdrawal and retirement withdrawal both recognize item waits", ctx do
+    for terminal <- [:withdraw, :retirement] do
+      item = create(ctx, {:user, "flynn"}, %{title: "Decision withdrawal"})
+
+      request =
+        Tightbeam.Escalation.ask(ctx.db, %{
+          verb: "ask",
+          principal: {:session, "holder"},
+          origin: "agent:holder",
+          session_key: Org.personal_session_key("flynn"),
+          params: %{question: "Which result?"}
+        })
+
+      %{wait: wait} = record_item_wait(ctx, item.id, %{decision_request_id: request.id})
+
+      if terminal == :withdraw do
+        assert %{status: "withdrawn"} =
+                 Tightbeam.Escalation.withdraw(ctx.db, %{
+                   principal: {:session, "holder"},
+                   origin: "agent:holder",
+                   params: %{request: request.id, reason: "No longer needed"}
+                 })
+      else
+        assert :ok = Tightbeam.Escalation.withdraw_for_retired(ctx.db, "holder")
+      end
+
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "reconsideration"
+      assert get(ctx, item.id).wait.recognitionDisposition == "withdrawn"
+      refute get(ctx, item.id).wait.active
+      assert is_binary(routing_wake_id(ctx.db, item.id))
+    end
+  end
+
+  test "retirement and boot recovery recognize revoked assignment item waits", ctx do
+    for recovery? <- [false, true] do
+      holder = "retiring-resolver-#{recovery?}"
+      session(ctx.db, holder, "flynn")
+      item = create(ctx, {:user, "flynn"}, %{title: "Wait for retiring resolver"})
+      upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+      {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, holder, "Dependency", upstream.id)
+      %{wait: wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id})
+
+      if recovery? do
+        Org.retire(ctx.db, holder, "user:flynn")
+        assert :ok = Tightbeam.Supervision.close_retired_holder_assignments(ctx.db)
+      else
+        result =
+          ctx.handlers["retire"].(%{
+            origin: "user:flynn",
+            principal: {:user, "flynn"},
+            session_key: holder,
+            params: %{}
+          })
+
+        assert holder in result.retired_session_keys
+      end
+
+      assert get(ctx, item.id).wait.recognitionDisposition == "revoked"
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "reconsideration"
+      refute get(ctx, item.id).wait.active
+      assert is_binary(routing_wake_id(ctx.db, item.id))
+    end
+  end
+
+  test "statute ruling waiver consumption and withdrawal paths recognize item waits", ctx do
+    for terminal <- [:rule, :consume_inline, :waive, :withdraw, :recovery] do
+      item = create(ctx, {:user, "flynn"}, %{title: "Statute dependency"})
+
+      call = %{
+        verb: "attest",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: nil,
+        params: %{assignment_id: "dependency-#{terminal}", kind: "completion"}
+      }
+
+      statute = %{name: "wait-review-#{terminal}", text: "Owner review"}
+
+      assert {:decision_pending, id} =
+               Tightbeam.Escalation.escalate(ctx.db, call, statute, %{
+                 question: "Allow the action?",
+                 options: nil
+               })
+
+      %{wait: wait} = record_item_wait(ctx, item.id, %{decision_request_id: id})
+
+      case terminal do
+        kind when kind in [:rule, :consume_inline] ->
+          Tightbeam.Escalation.rule(
+            ctx.db,
+            %{
+              origin: "user:flynn",
+              principal: {:user, "flynn"},
+              params: %{request_id: id, decision: "allow"}
+            },
+            authorized: true
+          )
+
+        :waive ->
+          Tightbeam.Escalation.waive(
+            ctx.db,
+            %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{request_id: id}},
+            authorized: true
+          )
+
+        :withdraw ->
+          Tightbeam.Escalation.withdraw(ctx.db, %{
+            origin: "user:flynn",
+            principal: {:user, "flynn"},
+            params: %{request_id: id, reason: "No longer needed"}
+          })
+
+        :recovery ->
+          Tightbeam.Escalation.withdraw_episodes(ctx.db, [id], statute.name)
+      end
+
+      expected =
+        if terminal in [:rule, :consume_inline, :waive], do: "success", else: "reconsideration"
+
+      assert Wakes.get(ctx.db, wait.wakeId).recognition_path == expected,
+             "terminal path #{terminal}"
+
+      refute get(ctx, item.id).wait.active
+      assert is_binary(routing_wake_id(ctx.db, item.id))
+
+      if terminal in [:rule, :consume_inline] do
+        if terminal == :consume_inline do
+          assert {:ok, true} =
+                   DB.transaction(ctx.db, fn txn ->
+                     Tightbeam.Escalation.consume_in_txn(txn, id, "memento-set", "user:flynn")
+                   end)
+        else
+          assert Tightbeam.Escalation.consume(ctx.db, id)
+        end
+
+        # Consumption follows ruling: suppression has already ended before either path.
+        refute get(ctx, item.id).wait.active
+        %{wait: consumed} = record_item_wait(ctx, item.id, %{decision_request_id: id})
+        assert consumed.recognitionPath == "success"
+        assert consumed.recognitionDisposition == "consumed"
+        refute consumed.active
+      end
+    end
+  end
+
+  test "operator ruling and historical surrendered assignment are recognized", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Operator dependency"})
+
+    request =
+      Tightbeam.Escalation.operator_ask(ctx.db, %{
+        principal: {:session, "holder"},
+        session_key: "holder",
+        origin: "agent:holder",
+        params:
+          Tightbeam.TestSupport.OperatorAskFixture.link(ctx.db, "holder", %{
+            question: "Choose",
+            options: [%{label: "proceed"}, %{label: "stop"}]
+          })
+      })
+
+    %{wait: wait} = record_item_wait(ctx, item.id, %{decision_request_id: request.id})
+
+    assert %{status: "ruled"} =
+             Tightbeam.Escalation.operator_rule(ctx.db, %{
+               principal: {:user, "flynn"},
+               origin: "user:flynn",
+               params: %{request: request.id, decision: "proceed"}
+             })
+
+    assert get(ctx, item.id).wait.recognitionDisposition == "ruled"
+    assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "success"
+    refute get(ctx, item.id).wait.active
+
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Legacy dependency"})
+    {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Legacy", upstream.id)
+    complete(ctx, "holder", resolver.id)
+    # Current writers never create surrendered; retain admission for stored history.
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET outcome='surrendered' WHERE id=?1", [
+               resolver.id
+             ])
+
+    %{wait: historical} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id})
+    assert historical.recognitionPath == "reconsideration"
+    assert historical.recognitionDisposition == "surrendered"
+    refute historical.active
+  end
+
   defp item_wait_scheduler(ctx) do
     name = :"item_wait_scheduler_#{System.unique_integer([:positive])}"
 
