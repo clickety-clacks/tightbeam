@@ -527,7 +527,6 @@ defmodule Tightbeam.Credentials do
     Tightbeam.DB.owed_work()
 
     machine = Keyword.fetch!(opts, :machine)
-    backfill = {:continue, {:backfill_shared_accounts, Keyword.get(opts, :provider_accounts_db)}}
 
     {:ok,
      %{
@@ -568,20 +567,21 @@ defmodule Tightbeam.Credentials do
        present_but_unverified: %{},
        pending: %{},
        status_reads: %{},
-       last_status: %{}
-     }, backfill}
+       last_status: %{},
+       provider_accounts_db: Keyword.get(opts, :provider_accounts_db),
+       shared_backfills: %{}
+     }, {:continue, :backfill_shared_accounts}}
   end
 
   @impl true
-  def handle_continue({:backfill_shared_accounts, nil}, state), do: {:noreply, state}
-
-  def handle_continue({:backfill_shared_accounts, db}, state) do
-    Enum.each([:openai, :anthropic], &backfill_shared_account(db, state, &1))
-    {:noreply, state}
+  def handle_continue(:backfill_shared_accounts, state) do
+    {:noreply, Enum.reduce([:openai, :anthropic], state, &start_shared_backfill(&2, &1))}
   end
 
   @impl true
   def handle_call({:status, provider, deadline}, from, state) do
+    state = start_shared_backfill(state, provider)
+
     if System.monotonic_time(:millisecond) >= deadline - @status_cleanup_ms do
       {:reply, unanswered(state, provider), state}
     else
@@ -858,6 +858,12 @@ defmodule Tightbeam.Credentials do
   end
 
   @impl true
+  def handle_info({:backfill_shared_account, provider}, state),
+    do: {:noreply, start_shared_backfill(state, provider)}
+
+  def handle_info({:shared_backfill_finished, provider}, state),
+    do: {:noreply, update_in(state.shared_backfills, &Map.delete(&1, provider))}
+
   def handle_info({:status_result, ref, result}, state) do
     case Map.pop(state.status_reads, ref) do
       {nil, _reads} ->
@@ -1052,7 +1058,7 @@ defmodule Tightbeam.Credentials do
           :ok ->
             result =
               with :ok <- mark_onboarded!(state, provider, :subscription, credential),
-                   :ok <- state.on_credential_present.(provider),
+                   :ok <- notify_credential_present(state, provider),
                    captured <- capture_sessions(state, provider),
                    :ok <- state.resume.(provider) do
                 publish_sessions(state, captured, :onboarded)
@@ -1305,43 +1311,80 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  defp notify_credential_present(state, provider) do
+    with :ok <- state.on_credential_present.(provider) do
+      send(self(), {:backfill_shared_account, provider})
+      :ok
+    end
+  end
+
+  defp start_shared_backfill(%{provider_accounts_db: nil} = state, _provider), do: state
+
+  defp start_shared_backfill(state, provider) when provider in [:openai, :anthropic] do
+    if Map.has_key?(state.shared_backfills, provider) do
+      state
+    else
+      owner = self()
+
+      {:ok, pid} =
+        Task.start(fn ->
+          try do
+            backfill_shared_account(state.provider_accounts_db, state, provider)
+          rescue
+            error -> log_shared_backfill_error(state, provider, Exception.message(error))
+          catch
+            :exit, reason -> log_shared_backfill_error(state, provider, inspect(reason))
+          after
+            send(owner, {:shared_backfill_finished, provider})
+          end
+        end)
+
+      put_in(state.shared_backfills[provider], pid)
+    end
+  end
+
+  defp start_shared_backfill(state, _provider), do: state
+
   defp backfill_shared_account(db, state, provider) do
     harness = harness_id(provider)
+    home = Homes.home_path(state.base_dir, state.machine, harness)
+    module = Harness.parse!(Atom.to_string(harness))
 
     if is_nil(Tightbeam.ProviderAccounts.shared_id(db, harness, state.machine)) and
-         credential_present?(state, provider) do
-      case read_metadata(state, provider) do
-        {:ok, metadata} ->
-          {login_state, reason} = backfill_login_state(metadata)
+         module.credential_ready?(credential_target(state), home) do
+      with {:ok, metadata} <- read_metadata(state, provider) do
+        {login_state, reason} = backfill_login_state(metadata)
 
-          {:ok, :ok} =
-            Tightbeam.ProviderAccounts.record_existing_shared(
-              db,
-              state.machine,
-              provider,
-              harness,
-              decode_kind(metadata["kind"]),
-              login_state,
-              reason,
-              metadata["onboarded_at_ms"]
-            )
-
-        {:error, reason} ->
-          state.log_event.(
-            "provider_account_backfill_refused",
-            "#{provider}@#{state.machine}",
-            inspect(reason)
-          )
+        Tightbeam.ProviderAccounts.record_existing_shared(
+          db,
+          state.machine,
+          provider,
+          harness,
+          decode_kind(metadata["kind"]),
+          login_state,
+          reason,
+          metadata["onboarded_at_ms"]
+        )
+      end
+      |> case do
+        {:ok, :ok} -> :ok
+        {:error, reason} -> log_shared_backfill_error(state, provider, inspect(reason))
       end
     end
   end
 
+  defp log_shared_backfill_error(state, provider, reason) do
+    Logger.warning(
+      "provider account backfill refused for #{provider}@#{state.machine}: #{reason}"
+    )
+  end
+
   defp backfill_login_state(metadata) do
     cond do
-      metadata["present_but_unverified"] -> {"needs_sign_in", "present_but_unverified"}
-      metadata["subscription_status"] == "unsupported" -> {"needs_sign_in", "unsupported"}
-      metadata["terminal"] == true -> {"needs_sign_in", "revoked"}
-      true -> {"signed_in", nil}
+      metadata["present_but_unverified"] -> {"needs_sign_in", "never_verified"}
+      metadata["subscription_status"] == "unsupported" -> {"needs_sign_in", "unreadable"}
+      metadata["terminal"] == true -> {"needs_sign_in", "rejected_by_provider"}
+      true -> {"signed_in", "ok"}
     end
   end
 
@@ -1620,7 +1663,7 @@ defmodule Tightbeam.Credentials do
       case activate_staged_credential(state, provider, kind, credential) do
         :ok ->
           result =
-            with :ok <- state.on_credential_present.(provider),
+            with :ok <- notify_credential_present(state, provider),
                  captured <- capture_sessions(state, provider),
                  :ok <- state.resume.(provider) do
               publish_sessions(state, captured, :onboarded)

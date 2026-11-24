@@ -264,7 +264,7 @@ defmodule Tightbeam.StateResources do
       ~w(id host provider harness label kind slot loginState loginReason identityKey identityReason enabled signedInAt updatedAt rowVersion),
     "account serving" => ~w(harness host accountId revision reason sinceAt previousAccountId),
     "account limits" =>
-      ~w(id accountId identityKey scope observedAt resetAt evidenceKind evidenceTurnSeq clearedAt clearCause),
+      ~w(id accountId identityKey scope observedAt lastObservedAt resetAt resetSource standingId evidenceKind evidenceTurnSeq clearedAt clearCause),
     "work items" =>
       ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
     "assignments" =>
@@ -321,17 +321,17 @@ defmodule Tightbeam.StateResources do
         ~w(id host provider harness label kind slot loginState loginReason identityKey identityReason),
       integers: ~w(signedInAt updatedAt rowVersion),
       booleans: ~w(enabled),
-      nullable: ~w(loginReason identityKey identityReason signedInAt)
+      nullable: ~w(identityKey identityReason signedInAt)
     },
     "account serving" => %{
       strings: ~w(harness host accountId reason previousAccountId),
       integers: ~w(revision sinceAt),
       booleans: [],
-      nullable: ~w(previousAccountId)
+      nullable: ~w(accountId previousAccountId)
     },
     "account limits" => %{
-      strings: ~w(id accountId identityKey scope evidenceKind clearCause),
-      integers: ~w(observedAt resetAt evidenceTurnSeq clearedAt),
+      strings: ~w(id accountId identityKey scope resetSource standingId evidenceKind clearCause),
+      integers: ~w(observedAt lastObservedAt resetAt evidenceTurnSeq clearedAt),
       booleans: [],
       nullable: ~w(identityKey resetAt evidenceTurnSeq clearedAt clearCause)
     },

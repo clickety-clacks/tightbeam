@@ -51,9 +51,9 @@ defmodule Tightbeam.ProviderAccountsUpgradeTest do
                  "slot" => "shared",
                  "label" => "default",
                  "loginState" => "signed_in",
-                 "loginReason" => nil,
+                 "loginReason" => "ok",
                  "identityKey" => nil,
-                 "identityReason" => "legacy_identity_unread",
+                 "identityReason" => "not_checked",
                  "enabled" => true
                } = account
 
@@ -80,6 +80,78 @@ defmodule Tightbeam.ProviderAccountsUpgradeTest do
       assert credential_files([codex, claude]) == snapshot
       assert DB.query(db, "PRAGMA foreign_key_check") == {:ok, []}
     end
+  end
+
+  test "an unreachable remote backfill does not block credential-owner calls" do
+    db = start_supervised!({DB, path: ":memory:", name: :remote_provider_accounts_upgrade})
+    assert :ok = Schema.ensure_all(db)
+    test = self()
+
+    worker =
+      start_supervised!(
+        {Credentials,
+         name: :remote_provider_account_fixture,
+         machine: @host,
+         base_dir: "/fixture",
+         ssh: "unreachable.example.invalid",
+         provider_accounts_db: db,
+         sh: fn args ->
+           if "sh" in args do
+             send(test, {:backfill_probing, self()})
+
+             receive do
+               :offline -> {"fixture host unreachable", 255}
+             end
+           else
+             {"fixture host unreachable", 255}
+           end
+         end,
+         sh_out: fn _args -> {"fixture host unreachable", 255} end}
+      )
+
+    assert_receive {:backfill_probing, first}, 5_000
+    assert_receive {:backfill_probing, second}, 5_000
+
+    try do
+      assert {:error, _} = GenServer.call(worker, {:kind, :openai}, 1_000)
+      assert ProviderAccounts.list(db) == []
+    after
+      send(first, :offline)
+      send(second, :offline)
+    end
+  end
+
+  test "a failed account insert is logged without stopping the credential owner" do
+    db = start_supervised!({DB, path: ":memory:", name: :failed_provider_accounts_upgrade})
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(db, """
+             CREATE TRIGGER reject_backfill BEFORE INSERT ON provider_accounts
+             BEGIN SELECT RAISE(ABORT, 'fixture account insert refused'); END;
+             """)
+
+    base_dir = Path.join(System.tmp_dir!(), "account-upgrade-#{Tightbeam.Id.uuid4()}")
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+    store_fixture(base_dir, :openai, %{"kind" => "api_key"})
+
+    log = ExUnit.CaptureLog.capture_log(fn -> start_owner(db, base_dir) end)
+    assert log =~ "fixture account insert refused"
+    assert ProviderAccounts.list(db) == []
+    assert Credentials.kind(:openai, :provider_account_fixture) == :api_key
+  end
+
+  test "a Claude-only credential store creates no Codex account" do
+    db = start_supervised!({DB, path: ":memory:", name: :claude_only_provider_accounts_upgrade})
+    assert :ok = Schema.ensure_all(db)
+    base_dir = Path.join(System.tmp_dir!(), "account-upgrade-#{Tightbeam.Id.uuid4()}")
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+    store_fixture(base_dir, :anthropic, %{"terminal" => true})
+
+    start_owner(db, base_dir, :none)
+
+    assert [%{"harness" => "claude", "loginReason" => "rejected_by_provider"}] =
+             ProviderAccounts.list(db)
   end
 
   defp load_predecessor(db, filename) do
@@ -118,7 +190,7 @@ defmodule Tightbeam.ProviderAccountsUpgradeTest do
     end
   end
 
-  defp start_owner(db, base_dir) do
+  defp start_owner(db, base_dir, codex_kind \\ :api_key) do
     worker =
       start_supervised!(
         {Credentials,
@@ -132,7 +204,12 @@ defmodule Tightbeam.ProviderAccountsUpgradeTest do
          sh: fn _ -> flunk("upgrade must not open a subprocess to inspect local credentials") end}
       )
 
-    # The credential owner serializes the backfill before serving calls.
-    assert Credentials.kind(:openai, worker) == :api_key
+    # Monitoring the off-owner tasks keeps the test independent of scheduler timing.
+    for {_provider, pid} <- :sys.get_state(worker).shared_backfills do
+      ref = Process.monitor(pid)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+    end
+
+    assert Credentials.kind(:openai, worker) == codex_kind
   end
 end

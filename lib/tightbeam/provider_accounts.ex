@@ -10,7 +10,7 @@ defmodule Tightbeam.ProviderAccounts do
   @shape "provider-accounts-v1"
   @account_fields ~w(id host provider harness label kind slot loginState loginReason identityKey identityReason enabled signedInAt updatedAt rowVersion)
   @serving_fields ~w(harness host accountId revision reason sinceAt previousAccountId)
-  @limit_fields ~w(id accountId identityKey scope observedAt resetAt evidenceKind evidenceTurnSeq clearedAt clearCause)
+  @limit_fields ~w(id accountId identityKey scope observedAt lastObservedAt resetAt resetSource standingId evidenceKind evidenceTurnSeq clearedAt clearCause)
 
   @account_select Enum.join(@account_fields, ",")
   @serving_select Enum.join(@serving_fields, ",")
@@ -26,25 +26,28 @@ defmodule Tightbeam.ProviderAccounts do
     kind TEXT NOT NULL CHECK (kind IN ('subscription', 'api_key')),
     slot TEXT NOT NULL CHECK (slot = 'shared' OR slot = id),
     loginState TEXT NOT NULL CHECK (loginState IN ('signed_in', 'needs_sign_in', 'unknown', 'removed')),
-    loginReason TEXT,
+    loginReason TEXT NOT NULL CHECK (loginReason IN ('ok', 'never_verified', 'rejected_by_provider', 'expired_not_refreshed', 'scope_insufficient', 'file_missing', 'unreadable', 'host_unreachable', 'duplicate_account', 'removed_by_operator')),
     identityKey TEXT,
-    identityReason TEXT,
+    identityReason TEXT CHECK (identityReason IN ('not_checked', 'file_missing', 'unreadable', 'not_exposed_by_provider', 'host_unreachable')),
     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
     signedInAt INTEGER,
     updatedAt INTEGER NOT NULL,
     rowVersion INTEGER NOT NULL,
-    UNIQUE (host, harness, label),
     UNIQUE (host, harness, slot),
     UNIQUE (harness, host, id),
-    CHECK (kind != 'api_key' OR slot = 'shared')
+    CHECK (kind != 'api_key' OR slot = 'shared'),
+    CHECK ((identityKey IS NULL) = (identityReason IS NOT NULL))
   );
+
+  CREATE UNIQUE INDEX provider_accounts_active_label
+  ON provider_accounts (host, harness, label) WHERE loginState != 'removed';
 
   CREATE TABLE account_serving (
     harness TEXT NOT NULL,
     host TEXT NOT NULL,
-    accountId TEXT NOT NULL,
+    accountId TEXT,
     revision INTEGER NOT NULL CHECK (revision > 0),
-    reason TEXT NOT NULL CHECK (reason IN ('initial', 'operator', 'exhausted', 'login_unusable', 'removed')),
+    reason TEXT NOT NULL CHECK (reason IN ('initial', 'operator', 'exhausted', 'login_unusable', 'removed', 'recovered_from_none', 'none_signed_in', 'all_removed')),
     sinceAt INTEGER NOT NULL,
     previousAccountId TEXT,
     PRIMARY KEY (harness, host),
@@ -56,18 +59,44 @@ defmodule Tightbeam.ProviderAccounts do
     id TEXT PRIMARY KEY NOT NULL,
     accountId TEXT NOT NULL REFERENCES provider_accounts (id),
     identityKey TEXT,
-    scope TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK (
+      scope IN ('account', 'primary', 'secondary', 'five_hour', 'seven_day')
+      OR scope GLOB 'additional:?*' OR scope GLOB 'limit:?*'
+    ),
     observedAt INTEGER NOT NULL,
+    lastObservedAt INTEGER NOT NULL CHECK (lastObservedAt >= observedAt),
     resetAt INTEGER,
+    resetSource TEXT NOT NULL CHECK (resetSource IN ('provider_stated', 'reading', 'assumed', 'none')),
+    standingId TEXT NOT NULL,
     evidenceKind TEXT NOT NULL,
     evidenceTurnSeq INTEGER,
     clearedAt INTEGER,
-    clearCause TEXT
+    clearCause TEXT CHECK (clearCause IN ('reset_passed', 'probe_succeeded', 'reading_below_limit', 'turn_succeeded', 'signed_in_again', 'operator', 'assumed_expiry', 'account_removed')),
+    CHECK ((resetAt IS NULL) = (resetSource = 'none')),
+    CHECK ((clearedAt IS NULL) = (clearCause IS NULL))
   );
 
   CREATE INDEX account_limits_account ON account_limits (accountId, observedAt, id);
   CREATE INDEX account_limits_active_identity ON account_limits (identityKey, scope)
   WHERE clearedAt IS NULL AND identityKey IS NOT NULL;
+
+  CREATE UNIQUE INDEX account_limits_one_standing
+  ON account_limits (accountId, scope) WHERE clearedAt IS NULL;
+
+  CREATE TABLE capacity_windows (
+    accountId TEXT NOT NULL REFERENCES provider_accounts (id),
+    windowId TEXT NOT NULL,
+    windowScope TEXT NOT NULL CHECK (windowScope IN ('account', 'model')),
+    model TEXT,
+    usedPercent REAL NOT NULL CHECK (usedPercent BETWEEN 0 AND 100),
+    resetAt INTEGER,
+    windowSeconds INTEGER,
+    observedAt INTEGER NOT NULL,
+    readAttemptAt INTEGER NOT NULL CHECK (readAttemptAt <= observedAt),
+    freshness TEXT NOT NULL,
+    PRIMARY KEY (accountId, windowId),
+    CHECK ((model IS NULL) = (windowScope = 'account'))
+  );
 
   ALTER TABLE turns ADD COLUMN accountId TEXT REFERENCES provider_accounts (id);
   """
@@ -177,7 +206,7 @@ defmodule Tightbeam.ProviderAccounts do
           (id, host, provider, harness, label, kind, slot, loginState, loginReason,
            identityReason, enabled, signedInAt, updatedAt, rowVersion)
         VALUES (?1, ?2, ?3, ?4, 'default', ?5, 'shared', ?6, ?7,
-                'legacy_identity_unread', 1, ?8, ?9, ?9)
+                'not_checked', 1, ?8, ?9, ?9)
         ON CONFLICT (host, harness, slot) DO NOTHING
         """,
         [
