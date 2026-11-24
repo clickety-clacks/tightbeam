@@ -8674,8 +8674,31 @@ defmodule Tightbeam.Gateway do
         do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, wake)
 
       warn_unserved_condition_in_txn(txn, wake, p[:condition_kind])
+      |> warn_missing_wait_reason(call, due_at)
     end
   end
+
+  defp warn_missing_wait_reason(%{wake_id: _} = wake, %{principal: {:session, _}} = call, due_at) do
+    p = call.params
+
+    waiting? =
+      is_binary(p[:cron]) or is_binary(p[:condition_kind]) or is_map(p[:predicate]) or
+        p[:after_turn] == true or due_at > System.system_time(:millisecond)
+
+    if waiting? and is_nil(wake[:wait_reason]) do
+      warning = %{
+        code: "missing_wait_reason",
+        message:
+          "Wait scheduled without a reason. Add --wait-reason with a short explanation (at most 140 characters)."
+      }
+
+      Map.update(wake, :warnings, [warning], &(&1 ++ [warning]))
+    else
+      wake
+    end
+  end
+
+  defp warn_missing_wait_reason(wake, _call, _due_at), do: wake
 
   defp replay_wake_replacement_in_txn(wake, txn, owner, key) when is_map(wake) do
     case DB.Txn.q(
@@ -8998,7 +9021,7 @@ defmodule Tightbeam.Gateway do
       is_binary(condition_kind) or (future? and is_binary(continuation)) or explicit_timed_wait?
 
     with :ok <-
-           if(wait?,
+           if(wait? or Map.has_key?(p, :wait_reason),
              do: Tightbeam.WaitReason.validate(p[:wait_reason], "--wait-reason"),
              else: :ok
            ) do
@@ -9019,7 +9042,7 @@ defmodule Tightbeam.Gateway do
         due_at: due_at,
         condition_kind: condition_kind,
         condition_scope: condition_scope,
-        wait_reason: if(wait?, do: p[:wait_reason]),
+        wait_reason: p[:wait_reason],
         creator_session_key: creator_session_key(call[:principal]),
         # A class is the sender's election. An explicit time is also the
         # sender's election and inhibits batching without discarding the class.

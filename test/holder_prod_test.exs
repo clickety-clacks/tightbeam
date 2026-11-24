@@ -340,6 +340,70 @@ defmodule Tightbeam.HolderProdTest do
     end
   end
 
+  test "supplied reasons survive timed other-agent and cron wakes without new absence refusals",
+       ctx do
+    for trigger <- [%{after_ms: @quiet}, %{cron: "0 * * * *"}, %{}] do
+      assert %{wake_id: legacy} = gateway_wake(ctx.db, "other", trigger)
+      assert Wakes.get(ctx.db, legacy).wait_reason == nil
+      reason = "Waiting for the next scheduled check"
+
+      assert %{wake_id: id, wait_reason: ^reason} =
+               gateway_wake(ctx.db, "other", Map.put(trigger, :wait_reason, reason))
+
+      assert Wakes.get(ctx.db, id).wait_reason == reason
+      assert StateResources.wake(StateResources.query_wake(ctx.db, id))["waitReason"] == reason
+
+      assert %{code: "invalid_wait_reason"} =
+               gateway_wake(ctx.db, "other", Map.put(trigger, :wait_reason, "two\nlines"))
+
+      assert %{code: "wait_reason_too_long"} =
+               gateway_wake(
+                 ctx.db,
+                 "other",
+                 Map.put(trigger, :wait_reason, String.duplicate("a", 141))
+               )
+    end
+  end
+
+  test "missing reason notices apply only to new agent waits", ctx do
+    for trigger <- [%{after_ms: @quiet}, %{cron: "0 * * * *"}] do
+      assert %{warnings: [%{code: "missing_wait_reason", message: message}]} =
+               gateway_wake(ctx.db, "other", trigger)
+
+      assert message =~ "140 characters"
+      assert message =~ "--wait-reason"
+    end
+
+    refute Map.has_key?(gateway_wake(ctx.db, "other", %{}), :warnings)
+
+    refute Map.has_key?(
+             gateway_wake(ctx.db, "other", %{
+               after_ms: @quiet,
+               wait_reason: "Follow up after processing"
+             }),
+             :warnings
+           )
+
+    params = %{after_ms: @quiet, idempotency_key: "legacy-timed-wake"}
+    assert %{wake_id: wake_id, warnings: [_]} = gateway_wake(ctx.db, "other", params)
+    assert %{wake_id: ^wake_id} = replay = gateway_wake(ctx.db, "other", params)
+    refute Map.has_key?(replay, :warnings)
+
+    for principal <- [{:process, "tightbeam"}, {:user, "owner"}] do
+      result =
+        Gateway.handlers(%{db: ctx.db})["wake"].(%{
+          verb: "wake",
+          origin: "process:tightbeam",
+          principal: principal,
+          session_key: "other",
+          params: %{prompt: "Follow through", after_ms: @quiet}
+        })
+
+      assert %{wake_id: _} = result
+      refute Map.has_key?(result, :warnings)
+    end
+  end
+
   test "ordinary notices need no reason and a historical reasonless wait still suppresses", ctx do
     assert %{wake_id: notice_id} = gateway_wake(ctx.db, "other", %{after_ms: @quiet})
 

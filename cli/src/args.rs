@@ -932,6 +932,8 @@ COMMANDS:
       Ready-now continuation:
         tightbeam wake --session <holderSession> --assignment <assignmentId>
           --after-turn --wait-reason "<reason>" --prompt "<continuation>"
+      --wait-reason explains why the wake was scheduled; --prompt says what to do.
+      Other wake forms may also supply the same short, single-line reason.
       --cron uses five numeric fields in gateway local time, such as "*/30 * * * *".
       It repeats until cancel-wake. Lists, ranges and steps are supported.
       --assignment links a recurring wake to that assignment.

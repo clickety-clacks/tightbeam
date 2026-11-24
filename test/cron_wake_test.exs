@@ -63,6 +63,25 @@ defmodule Tightbeam.CronWakeTest do
     (:calendar.datetime_to_gregorian_seconds(utc) - 62_167_219_200) * 1000
   end
 
+  test "cron roots and each occurrence retain the supplied why", %{db: db} do
+    reason = "Waiting for the scheduled check"
+    wake = schedule(db, %{wait_reason: reason})
+
+    assert Enum.find(CronWake.list_active(db), &(&1.wake_id == wake.wake_id)).wait_reason ==
+             reason
+
+    CronWake.fire_due(db, wake.due_at)
+
+    assert {:ok, [[id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE consumer='prompt' AND prompt='check progress'"
+             )
+
+    assert Wakes.get(db, id).wait_reason == reason
+    assert Wakes.get(db, wake.wake_id).wait_reason == reason
+  end
+
   test "R1.1 five-field cron supports half-hour, hourly, lists, ranges and steps" do
     at = local_ms({2026, 10, 16}, {10, 0, 0})
     assert CronWake.next_at("*/30 * * * *", at) == at + 30 * 60_000

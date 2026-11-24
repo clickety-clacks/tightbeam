@@ -135,7 +135,8 @@ defmodule Tightbeam.CronWake do
           [[1]] ->
             Txn.q(txn, """
             SELECT w.wakeId, w.sessionKey, w.targetRole, w.prompt, w.dueAt, s.schedule,
-                   w.origin, w.creatorSessionKey
+                   w.origin, w.creatorSessionKey,
+                   (SELECT reason FROM wake_wait_reasons WHERE wakeId=w.wakeId)
             FROM wakes w JOIN cron_wake_schedules s ON s.wakeId=w.wakeId
             WHERE w.state='pending' AND w.consumer='cron'
             ORDER BY w.dueAt, w.wakeId
@@ -143,7 +144,7 @@ defmodule Tightbeam.CronWake do
         end
       end)
 
-    Enum.map(rows, fn [id, session, role, prompt, due_at, schedule, origin, creator] ->
+    Enum.map(rows, fn [id, session, role, prompt, due_at, schedule, origin, creator, reason] ->
       %{
         wake_id: id,
         session_key: session,
@@ -152,7 +153,8 @@ defmodule Tightbeam.CronWake do
         due_at: due_at,
         schedule: schedule,
         origin: origin,
-        creator_session_key: creator
+        creator_session_key: creator,
+        wait_reason: reason
       }
     end)
   end
