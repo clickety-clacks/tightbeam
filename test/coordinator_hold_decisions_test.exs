@@ -3,6 +3,7 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
   @moduletag :tmp_dir
 
   alias Tightbeam.{
+    AdapterCoordinator,
     Archetypes,
     CoordinatorHoldDecisions,
     DB,
@@ -14,12 +15,20 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
     Ledger,
     Model,
     Org,
+    RateLimitReset,
     Rules,
     Wakes
   }
 
   alias Tightbeam.DB.Txn
-  alias Tightbeam.HarnessHealth.{ModelRateLimit, RecoveryCheck, RecoverySchedule}
+
+  alias Tightbeam.HarnessHealth.{
+    ModelRateLimit,
+    RecoveryCheck,
+    RecoverySchedule,
+    RecoveryScheduler
+  }
+
   alias Tightbeam.RowReactions.Snapshot
 
   @owner "fixture-owner"
@@ -252,6 +261,93 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
     assert_no_notifications(ctx)
   end
 
+  test "a scheduled retry survives scheduler restart and clears the hold after a successful probe",
+       ctx do
+    load_recovery_policy(ctx)
+    probe_log = install_successful_probe(ctx.base_dir)
+    adapters = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+
+    start_supervised!(
+      {AdapterCoordinator,
+       adapter_sup: adapters,
+       adapter_context: fn _key -> flunk("retry must not start an adapter") end,
+       adapter_opts: fn _key, _context -> flunk("retry must not start an adapter") end,
+       db: ctx.db}
+    )
+
+    task_sup = start_supervised!(Task.Supervisor)
+    opts = [db: ctx.db, base_dir: ctx.base_dir, task_sup: task_sup]
+    now = System.system_time(:millisecond)
+    session(ctx.db, @main, "generic", "build-host")
+    incident = account_hold(ctx, @main, "build-host", observed_at: now)
+    first_scheduler = start_supervised!({RecoveryScheduler, opts})
+    :sys.get_state(first_scheduler)
+    :ok = :sys.suspend(first_scheduler)
+
+    assert reconcile(ctx, now) == nil
+    assert [%{id: id, options: [@wait, @retry]}] = requests(ctx)
+    assert %{status: "ruled"} = rule(ctx, id, @retry["label"])
+    assert HarnessProcess.parked?(ctx.db, @park)
+    refute File.exists?(probe_log)
+
+    assert {:ok, [[cycle]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cycleId FROM harness_health_recovery_schedules WHERE holdId=?1 AND status='pending'",
+               [incident]
+             )
+
+    stop_supervised!(RecoveryScheduler)
+    restarted_scheduler = start_supervised!({RecoveryScheduler, opts})
+    refute first_scheduler == restarted_scheduler
+
+    assert eventually(fn -> HarnessHealth.get(ctx.db, incident).state == "resolved" end)
+    refute HarnessProcess.parked?(ctx.db, @park)
+    assert File.read!(probe_log) == @model <> "\n"
+    assert reconcile(ctx, now + 1) == nil
+
+    assert [%{id: ^id, status: "ruled", context: %{"retryResults" => [result]}}] =
+             requests(ctx, "all")
+
+    assert result == %{
+             "harness" => "claude",
+             "host" => "build-host",
+             "outcome" => "succeeded",
+             "providerResponse" => nil
+           }
+
+    assert {:ok, [[^cycle, "succeeded"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cycleId,outcome FROM harness_health_recovery_checks WHERE holdId=?1",
+               [incident]
+             )
+
+    assert_no_notifications(ctx)
+  end
+
+  for {scenario, harness, host} <- [
+        {"a harness without a recovery probe", "fixture", "build-host"},
+        {"a supported harness on an unregistered host", "claude", "unregistered-host"}
+      ] do
+    test "#{scenario} offers only Wait", ctx do
+      load_recovery_policy(ctx)
+      harness = unquote(harness)
+      host = unquote(host)
+      session(ctx.db, @main, "generic", host, harness)
+      incident = account_hold(ctx, @main, host, harness: harness)
+
+      assert {:ok, %{"routesComplete" => true, "fencePresent" => true}} =
+               DB.transaction(ctx.db, &Snapshot.harness_health_hold(&1, incident))
+
+      assert reconcile(ctx) == nil
+      assert [%{question: question, options: [@wait]}] = requests(ctx)
+      assert question =~ "These holds cannot be retried here."
+      refute question =~ "unregistered-host"
+      assert_no_notifications(ctx)
+    end
+  end
+
   test "one ruling covers each held incident and joins a check already running", ctx do
     load_recovery_policy(ctx)
     session(ctx.db, @main, "generic", "build-host")
@@ -347,13 +443,16 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
     session(ctx.db, @main, "generic", "build-host")
     Org.rename(ctx.db, @main, "Display secret=private-display")
     deadline = @at + 60_000
+    foreign_owner = "different-fixture-owner"
+    Devices.add_user(ctx.db, foreign_owner, false)
 
-    for {suffix, title} <- [
-          {"safe", "Approved install window"},
-          {"secret", "Check token=private-token"},
-          {"record", "Investigate asg_private"},
-          {"session", "Move #{@main} to a different model"},
-          {"uuid", "Investigate 317c35c2-76f1-4ff0-b659-3c616e20e210"}
+    for {suffix, title, owner} <- [
+          {"safe", "Approved install window", @owner},
+          {"secret", "Check token=private-token", @owner},
+          {"record", "Investigate asg_private", @owner},
+          {"session", "Move #{@main} to a different model", @owner},
+          {"uuid", "Investigate 317c35c2-76f1-4ff0-b659-3c616e20e210", @owner},
+          {"foreign", "Vendor delivery window", foreign_owner}
         ] do
       {:ok, []} =
         DB.query(
@@ -362,7 +461,7 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
           INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt)
           VALUES (?1,?2,?3,?3,?4)
           """,
-          [suffix, title, @owner, @at]
+          [suffix, title, owner, @at]
         )
 
       {:ok, []} =
@@ -376,10 +475,36 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
         )
     end
 
-    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, @park)
+    observed = DateTime.to_unix(~U[2026-11-22 09:00:00Z], :millisecond)
+    incident = account_hold(ctx, @main, "build-host", observed_at: observed)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               [[observation]] =
+                 Txn.q(
+                   txn,
+                   "SELECT openObservationId FROM harness_health_incidents WHERE id=?1",
+                   [
+                     incident
+                   ]
+                 )
+
+               RateLimitReset.schedule_in_txn(
+                 txn,
+                 %{session_key: @main, harness: "claude", host: "build-host"},
+                 {:opened, %{observationId: observation}},
+                 %{
+                   "data" => %{"errorKind" => "rate_limit"},
+                   "message" => "You've hit your weekly limit · resets 11:00am UTC"
+                 },
+                 observed
+               )
+             end)
+
     assert reconcile(ctx) == nil
     assert [%{question: question}] = requests(ctx)
     assert question =~ "Approved install window due"
+    assert question =~ "Known provider resets: Nov 22 11:00 UTC."
     assert question =~ "4 held items with deadlines. Earliest due"
 
     for private <- [
@@ -388,7 +513,8 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
           "private-token",
           "asg_private",
           "317c35c2",
-          "Private wake body"
+          "Private wake body",
+          "Vendor delivery window"
         ] do
       refute question =~ private
     end
@@ -411,7 +537,7 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
   defp user_call(params),
     do: %{origin: "user:" <> @owner, principal: {:user, @owner}, params: params}
 
-  defp session(db, key, archetype, host) do
+  defp session(db, key, archetype, host, harness \\ "claude") do
     Org.create(db, %{
       session_key: key,
       display_name: key,
@@ -419,8 +545,8 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
       kind: if(key == @main, do: "main", else: "custom"),
       origin: "test",
       archetype: archetype,
-      harness: "claude",
-      provider: "anthropic",
+      harness: harness,
+      provider: if(harness == "claude", do: "anthropic", else: "fixture_provider"),
       host: host,
       model: Model.new(@model)
     })
@@ -447,7 +573,7 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
     Rules.load!(ctx.base_dir, [])
   end
 
-  defp account_hold(ctx, session_key \\ @main, host \\ "build-host") do
+  defp account_hold(ctx, session_key \\ @main, host \\ "build-host", opts \\ []) do
     {:ok, {:ok, seq}} =
       DB.transaction(ctx.db, fn txn ->
         {:ok, seq} =
@@ -466,11 +592,11 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
              HarnessHealth.observe(ctx.db, %{
                correlation_id: "harness-turn:#{seq}:rate-limit-dead",
                session_key: session_key,
-               harness: "claude",
+               harness: Keyword.get(opts, :harness, "claude"),
                host: host,
                failure_class: "rate-limit-dead",
                evidence_kind: "authoritative-provider",
-               observed_at: @at,
+               observed_at: Keyword.get(opts, :observed_at, @at),
                cause: "Fixture account limit",
                principal: "process:tightbeam"
              })
@@ -504,6 +630,40 @@ defmodule Tightbeam.CoordinatorHoldDecisionsTest do
                  at + 1
                )
              end)
+  end
+
+  defp install_successful_probe(base_dir) do
+    bin = Path.join(base_dir, "bin")
+    path = Path.join(bin, "claude")
+    File.mkdir_p!(bin)
+
+    File.write!(path, """
+    #!/bin/sh
+    case "$1" in
+      --version) printf 'fixture claude version\\n' ;;
+      --help) printf '%s\\n' '-p --tools --model --safe-mode --strict-mcp-config --no-session-persistence --output-format' ;;
+      -p)
+        test "$4" = "--model" || exit 2
+        printf '%s\\n' "$5" >> "${0%/*}/fixture-probe.log"
+        ;;
+      *) exit 2 ;;
+    esac
+    """)
+
+    File.chmod!(path, 0o700)
+    Path.join(bin, "fixture-probe.log")
+  end
+
+  defp eventually(fun, attempts \\ 500)
+  defp eventually(fun, 0), do: fun.()
+
+  defp eventually(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(10)
+      eventually(fun, attempts - 1)
+    end
   end
 
   defp assert_filing_fact(ctx, id) do
