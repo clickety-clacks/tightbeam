@@ -799,6 +799,12 @@ defmodule Tightbeam.Acp.AdapterTest do
           handler -> Keyword.put(adapter_opts, :on_subagent_event, handler)
         end
       end)
+      |> then(fn adapter_opts ->
+        case Keyword.get(opts, :on_running_model) do
+          nil -> adapter_opts
+          hook -> Keyword.put(adapter_opts, :on_running_model, hook)
+        end
+      end)
 
     adapter =
       start_supervised!(%{
@@ -5172,5 +5178,154 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert ["initialize"] =
              captured_requests(capture_path)
              |> Enum.map(& &1["method"])
+  end
+
+  # The adapter reports each change to the model a session runs through one hook,
+  # from whichever path changed it, and reports nothing when nothing changed.
+  describe "running model reports" do
+    defp start_reporting_adapter(opts \\ []) do
+      owner = self()
+
+      start_adapter(
+        Keyword.put(opts, :on_running_model, fn sid, report ->
+          send(owner, {:running_model, sid, report})
+        end)
+      )
+    end
+
+    test "a created session reports the model the harness selected" do
+      {adapter, _capture} = start_reporting_adapter()
+
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+
+      assert_receive {:running_model, "sess-1", %{id: "haiku", label: label}}
+      assert label == Adapter.current_model_label(adapter, "sess-1")
+      refute_receive {:running_model, _sid, _report}, 50
+    end
+
+    test "a loaded session reports the model it was loaded with, and an unreadable one nothing" do
+      {adapter, _capture} = start_reporting_adapter(fail_mode: "load-owner")
+
+      assert {:ok, :unknown} = Adapter.load_session(adapter, "sess-1", nil, "/tmp", [], "g")
+      refute_receive {:running_model, _sid, _report}, 100
+
+      assert {:ok, _model} =
+               Adapter.load_session(adapter, "sess-2", Model.new("stale-record"), "/tmp", [], "g")
+
+      assert_receive {:running_model, "sess-2", %{id: "stale-record"}}
+    end
+
+    test "a tuned model reports once, and applying the same model reports nothing" do
+      {adapter, _capture} = start_reporting_adapter()
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+      assert_receive {:running_model, "sess-1", %{id: "haiku"}}
+
+      assert :ok = Adapter.apply_model(adapter, "sess-1", Model.new("sonnet"))
+      assert_receive {:running_model, "sess-1", %{id: "sonnet"}}
+
+      assert :ok = Adapter.apply_model(adapter, "sess-1", Model.new("sonnet"))
+      assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "a turn changes no model")
+      refute_receive {:running_model, _sid, _report}, 100
+    end
+
+    test "a switch the harness makes by itself reports, and an unreadable one reports unknown" do
+      {adapter, _capture} = start_reporting_adapter()
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+      assert_receive {:running_model, "sess-1", %{id: "haiku"}}
+
+      update = fn options ->
+        send(
+          adapter,
+          {:acp_notification, "session/update",
+           %{
+             "sessionId" => "sess-1",
+             "update" => %{"sessionUpdate" => "config_option_update", "configOptions" => options}
+           }}
+        )
+      end
+
+      update.([%{"id" => "model", "currentValue" => "opus"}])
+      assert_receive {:running_model, "sess-1", %{id: "opus"}}
+
+      update.([%{"id" => "model", "currentValue" => 7}])
+      assert_receive {:running_model, "sess-1", nil}
+    end
+
+    test "a refused model reports unknown" do
+      {adapter, _capture} = start_reporting_adapter(fail_mode: "model-refusal")
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+      assert_receive {:running_model, "sess-1", %{id: "haiku"}}
+
+      assert {:error, _refusal} = Adapter.apply_model(adapter, "sess-1", Model.new("sonnet"))
+      assert_receive {:running_model, "sess-1", nil}
+    end
+
+    test "a session the adapter lets go of reports unknown" do
+      {adapter, _capture} = start_reporting_adapter()
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+      assert_receive {:running_model, "sess-1", %{id: "haiku"}}
+
+      assert :ok = Adapter.close_session(adapter, "sess-1")
+      assert_receive {:running_model, "sess-1", nil}
+    end
+
+    test "a label that only repeats the model id is reported as null" do
+      {adapter, _capture} = start_reporting_adapter()
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+      assert_receive {:running_model, "sess-1", %{id: "haiku", label: "Haiku"}}
+
+      # An option the harness names by its raw id has no readable name.
+      :sys.replace_state(adapter, fn state ->
+        options =
+          for option <- state.config_options["sess-1"] do
+            if option["id"] == "model",
+              do: Map.put(option, "options", [%{"value" => "haiku", "name" => "haiku"}]),
+              else: option
+          end
+
+        %{state | config_options: Map.put(state.config_options, "sess-1", options)}
+      end)
+
+      Adapter.resend_running_models(adapter)
+      assert_receive {:running_model, "sess-1", %{id: "haiku", label: nil}}
+    end
+
+    test "a stream of usage updates costs no report, and stop paths still work" do
+      {adapter, _capture} = start_reporting_adapter()
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+      assert_receive {:running_model, "sess-1", %{id: "haiku"}}
+
+      for used <- 1..20 do
+        send(
+          adapter,
+          {:acp_notification, "session/update",
+           %{
+             "sessionId" => "sess-1",
+             "update" => %{"sessionUpdate" => "usage_update", "used" => used, "size" => 100}
+           }}
+        )
+      end
+
+      _ = :sys.get_state(adapter)
+      refute_received {:running_model, _sid, _report}
+
+      monitor = Process.monitor(adapter)
+      Adapter.request_close(adapter)
+      assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
+    end
+
+    test "a hook that raises does not stop the adapter" do
+      {adapter, _capture} = start_adapter(on_running_model: fn _sid, _report -> raise "boom" end)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+          # The report runs as the callback returns; wait for that callback.
+          _ = :sys.get_state(adapter)
+        end)
+
+      assert log =~ "running-model report failed"
+      assert Adapter.knows_session?(adapter, "sess-1")
+    end
   end
 end

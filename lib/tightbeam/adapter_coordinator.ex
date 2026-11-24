@@ -247,6 +247,12 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.cast(server, {:close_adapter, key})
   end
 
+  @doc "Have every live adapter report its sessions' models again (casts only)."
+  def request_running_model_reports(server \\ __MODULE__) do
+    if GenServer.whereis(server), do: GenServer.cast(server, :resend_running_models)
+    :ok
+  end
+
   @doc "Clear an open adapter circuit after a real recovery probe succeeds."
   def release_recovered_circuit(server \\ __MODULE__, key) do
     GenServer.call(server, {:release_recovered_circuit, key})
@@ -277,6 +283,7 @@ defmodule Tightbeam.AdapterCoordinator do
       adapter_opts: Keyword.fetch!(opts, :adapter_opts),
       snapshot_name: Keyword.get(opts, :name, __MODULE__),
       snapshot_publication: true,
+      running_model: Keyword.get(opts, :running_model, Tightbeam.RunningModel),
       db: db,
       park_grace_ms: Keyword.get(opts, :park_grace_ms, 10_000),
       backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
@@ -634,6 +641,31 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_cast({:release_load_slot, machine, slot}, state) do
     {:noreply, release_slot(machine, slot, state)}
+  end
+
+  # A restarted writer lost what adapters told it; every live adapter says it again.
+  def handle_cast(:resend_running_models, state) do
+    for {_key, %{pid: pid}} <- state.adapters,
+        is_pid(pid),
+        do: Tightbeam.Acp.Adapter.resend_running_models(pid)
+
+    {:noreply, state}
+  end
+
+  # An adapter reports a change to the model one of its sessions runs. Only the
+  # adapter instance this entry currently holds is believed; a report from a
+  # replaced or dead generation is dropped here, in the same mailbox that
+  # handles its death, so reports and clears reach the writer in order.
+  def handle_cast({:running_model, key, generation, pid, sid, report}, state) do
+    case state.adapters[key] do
+      %{pid: ^pid, generation: ^generation} ->
+        Tightbeam.RunningModel.report(state.running_model, key, generation, sid, report)
+
+      _ ->
+        :ok
+    end
+
+    {:noreply, state}
   end
 
   defp do_close_adapter(key, state), do: do_close_adapter(key, state, :process_tree)
@@ -1605,6 +1637,9 @@ defmodule Tightbeam.AdapterCoordinator do
     opts =
       opts
       |> Keyword.put(:connection_generation, generation)
+      |> Keyword.put(:on_running_model, fn sid, report ->
+        GenServer.cast(coordinator, {:running_model, key, generation, self(), sid, report})
+      end)
       |> Keyword.put(:on_ready, fn ->
         send(coordinator, {:adapter_ready, key, self(), generation, token})
       end)
@@ -1913,6 +1948,11 @@ defmodule Tightbeam.AdapterCoordinator do
   defp put_adapter(state, key, entry) do
     previous = state.adapters[key]
     state = %{state | adapters: Map.put(state.adapters, key, entry)}
+
+    # Whatever the adapter was told about its sessions' models died with it:
+    # death, stop, park, restart and replacement all pass through here.
+    if previous && is_pid(previous.pid) && previous.pid != entry.pid,
+      do: Tightbeam.RunningModel.adapter_gone(state.running_model, key)
 
     if state.snapshot_publication and
          (previous == nil or health_entry(previous) != health_entry(entry)) do
