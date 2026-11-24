@@ -1199,7 +1199,7 @@ COMMANDS:
       update replaces the whole text; --clear-body removes it.
   work-item-wait <workItemId> (--assignment <id>|--decision <id>|--when-fact <kind> --when-scope <scope>)
       [--fallback-after <duration>] --wait-reason "<short reason>"
-      Events require a fallback; assignment and decision waits end with their target.
+      Fallback is required for events and refused for assignment or decision targets.
       Quiet only bare-item reminders until this recorded dependency ends.
       Inspect the wait with work-item-get; recording another target replaces it.
   work-item-wait-withdraw <workItemId>
@@ -4059,6 +4059,9 @@ fn parse_with_optional_catalog(
                 );
             }
             let wait_reason = nonempty(flags, "wait-reason").ok_or("--wait-reason is required")?;
+            if condition_kind.is_none() && flags.contains_key("fallback-after") {
+                return Err("--fallback-after is only supported for event waits".to_owned());
+            }
             let fallback = nonempty(flags, "fallback-after")
                 .map(|value| parse_duration("fallback-after", &value))
                 .transpose()?;
@@ -5288,6 +5291,26 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn item_wait_rejects_record_fallbacks() {
+        for target in ["--assignment", "--decision"] {
+            assert_eq!(
+                parse(strings(&[
+                    "work-item-wait",
+                    "wi_1",
+                    target,
+                    "target_1",
+                    "--fallback-after",
+                    "3h",
+                    "--wait-reason",
+                    "Waiting for target"
+                ]))
+                .unwrap_err(),
+                "--fallback-after is only supported for event waits"
+            );
+        }
+    }
+
     #[test]
     fn progress_inputs_preserve_values_and_refuse_conflicts() {
         for percent in ["0", "100"] {

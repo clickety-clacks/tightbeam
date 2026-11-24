@@ -97,21 +97,9 @@ defmodule Tightbeam.WorkItemWaits do
             warning =
               Gateway.warn_unserved_condition_in_txn(txn, wake, call.params[:condition_kind])
 
-            response =
-              if warning[:warnings],
-                do: Map.put(response, :warnings, warning.warnings),
-                else: response
-
-            if declaration.resolver_ref.kind != "condition_fact" and call.params[:after_ms] do
-              Map.update(
-                response,
-                :warnings,
-                [record_deadline_warning()],
-                &(&1 ++ [record_deadline_warning()])
-              )
-            else
-              response
-            end
+            if warning[:warnings],
+              do: Map.put(response, :warnings, warning.warnings),
+              else: response
         end
       end
     else
@@ -154,18 +142,9 @@ defmodule Tightbeam.WorkItemWaits do
   end
 
   defp deadline(params, _) do
-    case params[:after_ms] do
-      ms when is_nil(ms) or (is_integer(ms) and ms > 0) -> {:ok, Wakes.no_deadline()}
-      _ -> error("invalid_fallback", "--fallback-after must be a positive duration when supplied")
-    end
-  end
-
-  defp record_deadline_warning do
-    %{
-      code: "record-wait-has-no-deadline",
-      message:
-        "Assignment and decision waits remain quiet until the target ends; --fallback-after does not override that lifetime."
-    }
+    if is_nil(params[:after_ms]),
+      do: {:ok, Wakes.no_deadline()},
+      else: error("invalid_fallback", "--fallback-after is only supported for event waits")
   end
 
   defp declaration(_txn, params) do

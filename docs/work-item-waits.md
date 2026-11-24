@@ -35,8 +35,8 @@ wait. A target ending another way wakes for reconsideration. An already resolved
 or terminal target is recognized immediately. Fallback expiry also releases the
 wait and identifies that outcome without claiming the dependency succeeded.
 Assignment and decision waits have no deadline: only the target ending releases
-them. An optional fallback duration does not override their lifetime and returns
-a warning. The continuation goes once to the current active delivery owner, with the
+them. `--fallback-after` is refused for assignment and decision targets; it belongs
+to events only. The continuation goes once to the current active delivery owner, with the
 personal Main fallback for an ownerless item or retired owner.
 
 The item keeps its wait if assignments open or close while it stands. Their

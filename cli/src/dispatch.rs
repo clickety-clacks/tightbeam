@@ -4593,8 +4593,10 @@ mod tests {
             body(&[
                 "work-item-wait",
                 "wi_1",
-                "--assignment",
-                "asg_2",
+                "--when-fact",
+                "dependency-ready",
+                "--when-scope",
+                "release-1",
                 "--fallback-after",
                 "3h",
                 "--wait-reason",
@@ -4602,7 +4604,7 @@ mod tests {
                 "--as-user",
                 "flynn"
             ]),
-            r#"{"asUser":"flynn","verb":"work-item-wait","params":{"workItemId":"wi_1","waitReason":"Waiting for review","afterMs":10800000,"assignmentId":"asg_2"}}"#
+            r#"{"asUser":"flynn","verb":"work-item-wait","params":{"workItemId":"wi_1","waitReason":"Waiting for review","afterMs":10800000,"conditionKind":"dependency-ready","conditionScope":"release-1"}}"#
         );
         assert_eq!(
             body(&["work-item-wait-withdraw", "wi_1", "--as-user", "flynn"]),

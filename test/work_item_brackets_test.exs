@@ -1617,7 +1617,11 @@ defmodule Tightbeam.WorkItemBracketsTest do
         "work-item-wait",
         {:user, "flynn"},
         Map.merge(
-          %{work_item_id: id, after_ms: 10_800_000, wait_reason: "Waiting for upstream work"},
+          %{
+            work_item_id: id,
+            after_ms: if(target[:condition_kind], do: 10_800_000),
+            wait_reason: "Waiting for upstream work"
+          },
           target
         )
       )
@@ -1642,7 +1646,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
              })
   end
 
-  test "record targets need no fallback and an optional duration cannot end them early", ctx do
+  test "record targets have no deadline and refuse fallback durations", ctx do
     item = create(ctx, {:user, "flynn"}, %{title: "Record lifetime"})
     upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
     {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Dependency", upstream.id)
@@ -1650,10 +1654,16 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert wait.dueAt == nil
     assert wait.active
 
-    assert %{wait: %{wakeId: same}} =
-             record_item_wait(ctx, item.id, %{assignment_id: resolver.id, after_ms: 1})
+    for target <- [%{assignment_id: resolver.id}, %{decision_request_id: "dr_unused"}] do
+      assert %{
+               code: "invalid_fallback",
+               message: "--fallback-after is only supported for event waits"
+             } =
+               record_item_wait(ctx, item.id, Map.put(target, :after_ms, 1))
 
-    assert same == wait.wakeId
+      assert get(ctx, item.id).wait.wakeId == wait.wakeId
+    end
+
     scheduler = item_wait_scheduler(ctx)
     assert :ok = Wakes.fire_due(scheduler)
     assert get(ctx, item.id).wait.active
