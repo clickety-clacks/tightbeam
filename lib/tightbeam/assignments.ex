@@ -885,11 +885,73 @@ defmodule Tightbeam.Assignments do
               "[cannot-proceed released: #{assignment_id} by #{fact.kind}/#{fact.scope}]"
             )
 
+            schedule_release_continuation_in_txn(txn, assignment_id, holder, fact)
+
           nil ->
             :ok
         end
       end
     end)
+
+    :ok
+  end
+
+  defp schedule_release_continuation_in_txn(txn, assignment_id, holder, fact) do
+    recipient =
+      case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1 AND state='active'", [
+             holder
+           ]) do
+        [[owner]] ->
+          {:ok,
+           %{
+             session_key: holder,
+             owner_user_id: owner,
+             work_item_id: fetch_assignment(txn, assignment_id).workItemId
+           }}
+
+        _ ->
+          Tightbeam.RailRemedy.review_notice_recipient_in_txn(txn, assignment_id)
+      end
+
+    case recipient do
+      {:ok, recipient} ->
+        # A fact wait already promises this recipient a turn for this occurrence.
+        # Include unscoped waits and role-addressed waits bound to the holder.
+        existing =
+          Txn.q(
+            txn,
+            """
+            SELECT 1 FROM wakes
+            WHERE state='pending' AND consumer='prompt'
+              AND ((targetRole IS NULL AND sessionKey=?1)
+                OR targetRole IN (SELECT name FROM roles WHERE boundSessionKey=?1))
+              AND conditionKind=?2 AND (conditionScope IS NULL OR conditionScope=?3)
+              AND conditionAfterId<?4
+            LIMIT 1
+            """,
+            [recipient.session_key, fact.kind, fact.scope, fact.fact_id]
+          )
+
+        if existing == [] do
+          Wakes.schedule_in_txn(txn, %{
+            session_key: recipient.session_key,
+            owner_user_id: recipient.owner_user_id,
+            work_item_id: recipient.work_item_id,
+            assignment_id: assignment_id,
+            origin: "process:tightbeam",
+            prompt:
+              "Cannot-proceed released for #{assignment_id} by #{fact.kind}/#{fact.scope}. " <>
+                "Re-read the assignment and continue its work or arrange an active holder.",
+            due_at: fact.ts,
+            summon: true
+          })
+        end
+
+      {:error, reason} ->
+        Logger.warning(
+          "cannot-proceed release notice for assignment #{assignment_id} undelivered: #{inspect(reason)}"
+        )
+    end
 
     :ok
   end

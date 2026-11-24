@@ -3362,6 +3362,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert :ok = Wakes.fire_matching(scheduler, fact.fact_id)
     assert :ok = Wakes.fire_due(scheduler)
+
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
   end
@@ -3371,16 +3372,17 @@ defmodule Tightbeam.AssignmentsTest do
     test "release reuses holder's pending #{@release_wait_scope} fact wait", ctx do
       {assignment, _blocked} = release_wake_fixture(ctx)
 
-      wait = Wakes.schedule(ctx.db, %{
-        session_key: "holder",
-        creator_session_key: "holder",
-        origin: "agent:holder",
-        prompt: "continue the blocked assignment",
-        assignment_id: assignment.id,
-        condition_kind: "dependency-ready",
-        condition_scope: if(@release_wait_scope == :exact, do: assignment.id),
-        due_at: System.system_time(:millisecond) + 60_000
-      })
+      wait =
+        Wakes.schedule(ctx.db, %{
+          session_key: "holder",
+          creator_session_key: "holder",
+          origin: "agent:holder",
+          prompt: "continue the blocked assignment",
+          assignment_id: assignment.id,
+          condition_kind: "dependency-ready",
+          condition_scope: if(@release_wait_scope == :exact, do: assignment.id),
+          due_at: System.system_time(:millisecond) + 60_000
+        })
 
       scheduler = terminal_notice_scheduler(ctx.db)
       fact = ConditionFacts.file(ctx.db, scheduler, release_wake_fact(assignment.id))
@@ -3390,14 +3392,18 @@ defmodule Tightbeam.AssignmentsTest do
       assert {:ok, [[1]]} =
                DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
 
-      assert {:ok, [[1]]} =
-               DB.query(ctx.db,
-                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='holder' AND consumer='prompt'",
-                 [assignment.id])
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='holder' AND origin='process:tightbeam' AND prompt LIKE 'Cannot-proceed released for %'",
+                 [assignment.id]
+               )
 
       assert {:ok, :ok} =
                DB.transaction(ctx.db, &Assignments.release_cannot_proceed_in_txn(&1, fact))
+
       assert :ok = Wakes.fire_due(scheduler)
+
       assert {:ok, [[1]]} =
                DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
     end
@@ -3406,32 +3412,71 @@ defmodule Tightbeam.AssignmentsTest do
   test "release of a retired holder's block tells the current accountable owner", ctx do
     owner = session(ctx.db, "delivery-owner", "flynn")
     item = create_work_item(ctx, "released block with retired holder")
-    assert {:ok, _} = DB.query(ctx.db,
-      "UPDATE work_items SET deliveryOwnerSessionKey=?2 WHERE id=?1", [item.id, owner.sessionKey])
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE work_items SET deliveryOwnerSessionKey=?2 WHERE id=?1", [
+               item.id,
+               owner.session_key
+             ])
+
     {assignment, _blocked} = release_wake_fixture(ctx, item.id)
-    assert {:ok, _} = DB.query(ctx.db,
-      "UPDATE sessions SET state='retired' WHERE sessionKey='holder'")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET state='retired' WHERE sessionKey='holder'"
+             )
+
     scheduler = terminal_notice_scheduler(ctx.db)
     ConditionFacts.file(ctx.db, scheduler, release_wake_fact(assignment.id))
     assert :ok = Wakes.fire_due(scheduler)
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='delivery-owner'")
   end
 
+  test "release remains settled when no accountable recipient is active", ctx do
+    {assignment, _blocked} = release_wake_fixture(ctx)
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='retired'")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, _} =
+                 DB.transaction(ctx.db, fn txn ->
+                   ConditionFacts.file_in_txn(txn, release_wake_fact(assignment.id))
+                 end)
+      end)
+
+    assert log =~ "missing_accountable_owner"
+
+    assert {:ok, [["settled", "release-fact"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind FROM assignment_cannot_proceed WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
   defp release_wake_fixture(ctx, work_item_id \\ nil) do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     session(ctx.db, Org.personal_session_key("flynn"), "flynn")
-    assignment = assign_call({:user, "flynn"}, "blocked continuation", nil, work_item_id)
+
+    assignment =
+      assign_call({:user, "flynn"}, "blocked continuation", nil, work_item_id)
       |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
-    blocked = attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
       |> put_in([:params, :note], "waiting for dependency")
       |> put_in([:params, :release_fact_kind], "dependency-ready")
       |> put_in([:params, :release_fact_scope], assignment.id)
       |> put_in([:params, :release_fact_principal_ref], "agent:holder")
       |> then(&handle(ctx, "attest", &1))
+
     {assignment, blocked}
   end
 
@@ -4055,6 +4100,13 @@ defmodule Tightbeam.AssignmentsTest do
                ctx,
                "attest",
                attest_call({:session, "holder"}, assignment.id, "completion")
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Cannot-proceed released for %'",
+               [assignment.id]
              )
   end
 
