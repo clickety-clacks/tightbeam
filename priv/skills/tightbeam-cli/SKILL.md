@@ -83,6 +83,44 @@ Recover the card in this order:
 After context loss, repeat this recovery from rows. Do not reconstruct state from chat
 memory.
 
+### Read conversation history
+
+Use `tightbeam transcript --session '<exact session key>' --limit 20` from the
+assignment worktree. If you only have a display name, use
+`tightbeam transcript --name '<display name>'` to find candidate session keys.
+Page back with `--before <oldestId>` or catch up with `--after <newestId>`, using
+the returned cursor. Never open or query `state.db`. The gateway applies your
+transcript access through the CLI.
+
+### Follow new messages with Firehose
+
+The CLI has no Firehose subscribe command. If you already have an authorized
+Firehose client, connect it to the configured gateway's WebSocket endpoint
+`/ws/changes?protocolVersion=2`. Use `wss://` when the gateway is served over
+HTTPS. Have the client send the auth frame using the credential it was
+provisioned with. Never extract or copy credentials from Tightbeam files.
+Without a provisioned client, ask the gateway operator for access or use
+`tightbeam transcript` for history.
+
+For a 20-second watch, set the client's deadline before connecting. Send these
+JSON text frames in order. The placeholders stand for values supplied in the
+client process. Keep the credential out of command arguments, logs and output.
+
+1. Send `{"type":"auth","token":"<client credential>"}`. Wait for
+   `auth_result` with `success: true` before proceeding. An operator client
+   using an organization credential supplies the authorized user's ID as
+   `asUser`.
+2. Send
+   `{"type":"subscribe","subscriptionId":"messages","filters":{"sessionKey":"<exact session key>","classes":["message.created"]}}`.
+   Wait for `subscription_ready` before consuming notices. Close the socket
+   when the deadline expires, even if nothing arrives.
+
+`classes` matches class prefixes. `sessionKey` narrows the stream to one
+session. The gateway also accepts `workItemId`, `origin`, `principal` and
+`archetype` filters. Filters do not widen your access. Message notices identify
+changes. Read the transcript for the conversation and catch up there after a
+disconnect because Firehose has no replay.
+
 ## Perform only the obligation
 
 Read the assignment subject, its attests, the work item, and the named artifacts before

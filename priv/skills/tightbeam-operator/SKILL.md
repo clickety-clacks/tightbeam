@@ -39,8 +39,8 @@ When they name a machine or organization, use that one. The CLI finds its gatewa
 - `tightbeam doctor --as-user <userId>` reports the local installation's health when a
   command fails to reach the gateway.
 - Do not read `.tightbeam-session`, `gateway.json`, or Tightbeam's credential
-  directories, and do not call the gateway's HTTP interface yourself. The CLI is the
-  interface.
+  directories. Use the CLI for organization operations. Firehose is a separate
+  read-only stream described below.
 - Starting, stopping, or upgrading the gateway changes the whole organization. Report a
   gateway that is down; change its state only when the person asks.
 
@@ -73,16 +73,52 @@ tightbeam assignments --state open --as-user <userId>
 tightbeam assignment-get <assignmentId> --as-user <userId>
 tightbeam attests <assignmentId> --as-user <userId>
 tightbeam artifacts --work-item <workItemId> --as-user <userId>
-tightbeam transcript --session <sessionKey> --as-user <userId>
 ```
 
 `list` shows the sessions you can address, archetypes, hosts, and the model catalog.
 `execution-map` shows every visible work item with who holds it, whether anything is
 running, and how long it has been quiet; add `--tree` for the causal forest.
-`transcript --name <displayName>` returns candidate sessions, never content.
 
 Report at the level the person asked about: what works, what is blocked, and what
 needs their decision. Keep identifiers as supporting detail and say what each one is.
+
+### Read conversation history
+
+Use `tightbeam transcript --session '<exact session key>' --limit 20 --as-user '<user ID>'`.
+If you only have a display name, use
+`tightbeam transcript --name '<display name>' --as-user '<user ID>'` to find
+candidate session keys. Page back with `--before <oldestId>` or catch up with
+`--after <newestId>`, using the returned cursor. Never open or query `state.db`.
+The gateway applies your transcript access through the CLI.
+
+### Follow new messages with Firehose
+
+The CLI has no Firehose subscribe command. If you already have an authorized
+Firehose client, connect it to the configured gateway's WebSocket endpoint
+`/ws/changes?protocolVersion=2`. Use `wss://` when the gateway is served over
+HTTPS. Have the client send the auth frame using the credential it was
+provisioned with. Never extract or copy credentials from Tightbeam files.
+Without a provisioned client, ask the gateway operator for access or use
+`tightbeam transcript` for history.
+
+For a 20-second watch, set the client's deadline before connecting. Send these
+JSON text frames in order. The placeholders stand for values supplied in the
+client process. Keep the credential out of command arguments, logs and output.
+
+1. Send `{"type":"auth","token":"<client credential>"}`. Wait for
+   `auth_result` with `success: true` before proceeding. An operator client
+   using an organization credential supplies the authorized user's ID as
+   `asUser`.
+2. Send
+   `{"type":"subscribe","subscriptionId":"messages","filters":{"sessionKey":"<exact session key>","classes":["message.created"]}}`.
+   Wait for `subscription_ready` before consuming notices. Close the socket
+   when the deadline expires, even if nothing arrives.
+
+`classes` matches class prefixes. `sessionKey` narrows the stream to one
+session. The gateway also accepts `workItemId`, `origin`, `principal` and
+`archetype` filters. Filters do not widen your access. Message notices identify
+changes. Read the transcript for the conversation and catch up there after a
+disconnect because Firehose has no replay.
 
 ## Decision requests
 
