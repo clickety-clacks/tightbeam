@@ -9020,9 +9020,15 @@ defmodule Tightbeam.Gateway do
     wait? =
       is_binary(condition_kind) or (future? and is_binary(continuation)) or explicit_timed_wait?
 
+    # Optional paths historically accept null/blank as omitted. Existing explicit
+    # holder waits still require their reason; malformed nonblank values are refused.
+    reason = p[:wait_reason]
+
+    omitted? = is_nil(reason) or (is_binary(reason) and String.trim(reason) == "")
+
     with :ok <-
-           if(wait? or Map.has_key?(p, :wait_reason),
-             do: Tightbeam.WaitReason.validate(p[:wait_reason], "--wait-reason"),
+           if(wait? or not omitted?,
+             do: Tightbeam.WaitReason.validate(reason, "--wait-reason"),
              else: :ok
            ) do
       # Immediate assignment pointers and recurring crons are references, not holder work.
@@ -9042,7 +9048,7 @@ defmodule Tightbeam.Gateway do
         due_at: due_at,
         condition_kind: condition_kind,
         condition_scope: condition_scope,
-        wait_reason: p[:wait_reason],
+        wait_reason: if(omitted?, do: nil, else: reason),
         creator_session_key: creator_session_key(call[:principal]),
         # A class is the sender's election. An explicit time is also the
         # sender's election and inhibits batching without discarding the class.

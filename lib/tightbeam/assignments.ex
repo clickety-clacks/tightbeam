@@ -956,6 +956,8 @@ defmodule Tightbeam.Assignments do
     )
 
     if Txn.changes(txn) == 1 do
+      Tightbeam.WaitLinks.publish_source_change_in_txn(txn, nil, assignment_id)
+
       EventLog.lifecycle_in_txn(
         txn,
         "cannot_proceed_disposer_transferred",
@@ -996,6 +998,8 @@ defmodule Tightbeam.Assignments do
     )
 
     if Txn.changes(txn) == 1 do
+      Tightbeam.WaitLinks.publish_source_change_in_txn(txn, nil, assignment_id)
+
       EventLog.lifecycle_in_txn(
         txn,
         "cannot_proceed_disposer_transferred",

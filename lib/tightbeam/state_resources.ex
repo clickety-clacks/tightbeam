@@ -765,6 +765,9 @@ defmodule Tightbeam.StateResources do
 
   def query_wake(db, %{key: id, principal: principal}) do
     detail_selection(db, "wakes", principal, &wake_projection_in_txn(&1, id))
+    |> then(fn row ->
+      with_read_transaction(db, &Tightbeam.WaitLinks.project_wake(&1, row, principal))
+    end)
   end
 
   def query_wake(db, id) do
@@ -799,7 +802,11 @@ defmodule Tightbeam.StateResources do
         page
         | rows:
             Enum.map(page.rows, fn [_created_at, wake_id] ->
-              Wakes.delivery_projection_in_txn(txn, wake_id)
+              Tightbeam.WaitLinks.project_wake(
+                txn,
+                Wakes.delivery_projection_in_txn(txn, wake_id),
+                principal
+              )
             end)
       }
     end)

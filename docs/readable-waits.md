@@ -6,7 +6,7 @@ nonblank single line of at most 140 characters. `wake --wait-reason` accepts thi
 field on timed, recurring, conditional, dependency and after-turn declarations.
 Existing item waits use the same field and validator.
 
-Newly covered wake forms accept an omitted reason. New agent waits return a
+Newly covered wake forms accept an omitted, null or blank reason. New agent waits return a
 `missing_wait_reason` warning in the command reply; this does not create a turn
 or refuse the wake. Process and user callers, ordinary immediate messages, and
 idempotent replays do not receive that warning. Previously mandatory dependency
@@ -29,7 +29,7 @@ Each response contains `items`, `source`, `asOf`, `rowVersion`, `nextCursor` and
 `cursor` unchanged for the next page. `nextCursor: null` ends the page sequence.
 Active records are selected by default; `includeEnded=true` includes retained
 ended records. Cursors are scoped to the source and the ended-record selection.
-Pages are ordered by recorded creation time and a stable source identity.
+Pages are ordered by recorded creation time and a stable record ordinal; cursor keys do not expose hidden target IDs. Pending after-turn waits remain active until the originating turn ends. A trigger already released for delivery is no longer a wait; recurring roots remain active for their next occurrence.
 
 An edge has `id`, nullable `wakeId`, `kind`, nullable `waitReason`, `createdAt`,
 `state`, `recognition`, `from`, `to` and `waitOn`. `to` is the primary target;
@@ -38,13 +38,13 @@ has `kind: "time"` and `role: "fallback"`, distinct from a timed wake's
 `role: "due"`. Assignments include their state, holder and work item; decisions
 include their state and addressee; session endpoints include `running` and
 `runningSince`. Unreadable targets remain as `{kind, id: null, visible: false}`.
-A source the caller cannot read returns 404.
+Unreadable wake rows remain as hidden edges with null identifiers and reason. Wake detail and event targets use the same unreadable-target placeholder. A source the caller cannot read returns 404.
 
 Targets come from existing record references, predicates and schedules. A custom
 fact's scope remains an event scope, even when its spelling resembles a record
 ID. Substrate assignment facts can name an assignment. After-turn waits name
 their recorded originating turn. No target is inferred from a prompt. Decision
-and cannot-proceed edges without a wake reason expose null, rather than copying
+addressees and raisers follow current custody. Decision and cannot-proceed edges without a wake reason expose null, rather than copying
 a potentially long question or note into the short reason field.
 
 These are direct links, not a recursively expanded graph. Clients follow exact
@@ -57,9 +57,14 @@ read at different moments.
 ## Changes and compatibility
 
 Wake reads and events add `waitOn` using the same derived references. Work-item
-reads add `waiting: {agent, time, userIds}` and `running`, and linked changes
-publish ordinary work-item updates. Item-wait readback retains `reason` for
+reads add `waiting: {agent, time, event, userIds}` and `running`, and linked changes
+publish ordinary work-item updates, including operator questions and disposer transfers. Item summaries seek linked assignment, wake and decision indexes rather than scanning organization-wide pending work. Item-wait readback retains `reason` for
 compatibility and adds `waitReason` and `waitOn`.
+
+`event` covers pending custom-fact waits; reserved assignment facts count as
+`agent`. A fallback deadline does not set `time`: that flag means the awaited
+time itself. Any true flag or nonempty `userIds` means waiting; all false/empty
+means not waiting.
 
 These are additive response fields. Existing change subscriptions already accept
 one `workItemId` per subscription. Wake and decision notices now carry that

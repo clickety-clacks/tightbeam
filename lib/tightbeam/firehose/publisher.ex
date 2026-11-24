@@ -96,7 +96,8 @@ defmodule Tightbeam.Firehose.Publisher do
     )
   end
 
-  defp with_source_work_item_ref(db, %{verb: "wake"} = call, result) when is_map(result) do
+  defp with_source_work_item_ref(db, %{verb: verb} = call, result)
+       when verb in ~w(wake operator-ask operator-rule operator-withdraw) and is_map(result) do
     case source_work_item_ref(db, result) do
       %{"workItemId" => id} ->
         Map.update(call, :params, %{work_item_id: id}, &Map.put(&1, :work_item_id, id))
@@ -109,7 +110,9 @@ defmodule Tightbeam.Firehose.Publisher do
   defp with_source_work_item_ref(_db, call, _result), do: call
 
   defp source_work_item_ref(db, payload) when is_map(payload) do
-    item = payload[:work_item_id] || payload["workItemId"]
+    payload = payload["item"] || payload
+    context = payload[:context] || payload["context"] || %{}
+    item = payload[:work_item_id] || payload["workItemId"] || context["workItemId"]
     assignment = payload[:assignment_id] || payload["assignmentId"]
 
     item =

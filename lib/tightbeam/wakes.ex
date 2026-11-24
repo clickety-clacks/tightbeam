@@ -5726,7 +5726,7 @@ defmodule Tightbeam.Wakes do
         nil
 
       [row] ->
-        wake_with_delivery_projection(row)
+        wake_with_delivery_projection(row) |> Tightbeam.WaitLinks.with_schedule(txn)
     end
   end
 
@@ -5734,12 +5734,11 @@ defmodule Tightbeam.Wakes do
     ", (SELECT status FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
       ", (SELECT createdAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
       ", (SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-      ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-      ", (SELECT schedule FROM cron_wake_schedules WHERE wakeId=wakes.wakeId)"
+      ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)"
   end
 
   defp wake_with_delivery_projection(row) do
-    {wake_columns, [status, created_at, started_at, ended_at, cron]} = Enum.split(row, -5)
+    {wake_columns, [status, created_at, started_at, ended_at]} = Enum.split(row, -4)
     wake = to_wake(wake_columns)
 
     # Keep the existing maximum-durable-timestamp version convention, now
@@ -5752,7 +5751,6 @@ defmodule Tightbeam.Wakes do
     wake
     |> Map.put(:delivery_status, status)
     |> Map.put(:row_version, version)
-    |> Map.put(:cron, cron)
   end
 
   @doc "Record a failed carrier's outcome in its sender's existing transcript, without a turn."
@@ -6128,20 +6126,30 @@ defmodule Tightbeam.Wakes do
     case DB.transaction(db, fn txn ->
            query = fn sql, params -> Txn.q(txn, sql, params) end
 
-           Keyset.page(
-             query,
-             select_from,
-             "wakes",
-             "sessionKey = ?",
-             [session_key],
-             ["createdAt", "wakeId"],
-             boundary,
-             limit,
-             fn row -> [Enum.at(row, 8), hd(row)] end
-           )
+           page =
+             Keyset.page(
+               query,
+               select_from,
+               "wakes",
+               "sessionKey = ?",
+               [session_key],
+               ["createdAt", "wakeId"],
+               boundary,
+               limit,
+               fn row -> [Enum.at(row, 8), hd(row)] end
+             )
+
+           %{
+             rows:
+               Enum.map(
+                 page.rows,
+                 &(wake_with_delivery_projection(&1) |> Tightbeam.WaitLinks.with_schedule(txn))
+               ),
+             flags: page
+           }
          end) do
       {:ok, page} ->
-        %{rows: Enum.map(page.rows, &wake_with_delivery_projection/1), flags: page}
+        page
 
       {:error, error} ->
         raise error

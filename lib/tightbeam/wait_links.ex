@@ -51,6 +51,36 @@ defmodule Tightbeam.WaitLinks do
     end
   end
 
+  @doc false
+  def project_wake(_txn, nil, _principal), do: nil
+
+  def project_wake(txn, row, principal) do
+    Map.put(row, "waitOn", Enum.map(wake_targets(row), &visible_ref(txn, &1, principal)))
+  end
+
+  @doc false
+  def project_notice(
+        db,
+        %{"class" => "wake." <> _, "payload" => %{"waitOn" => targets} = payload} = notice,
+        principal
+      ) do
+    DB.read_transaction!(db, fn txn ->
+      Map.put(
+        notice,
+        "payload",
+        Map.put(payload, "waitOn", Enum.map(targets, &visible_ref(txn, &1, principal)))
+      )
+    end)
+  end
+
+  def project_notice(_db, notice, _principal), do: notice
+
+  defp visible_ref(_txn, %{"visible" => false} = ref, _principal), do: ref
+
+  defp visible_ref(txn, ref, principal) do
+    if target(txn, ref, principal)["visible"], do: ref, else: hidden(ref)
+  end
+
   defp ref(_kind, nil), do: nil
   defp ref(kind, id), do: %{"kind" => kind, "id" => id}
   defp event(nil, _scope), do: nil
@@ -66,36 +96,62 @@ defmodule Tightbeam.WaitLinks do
   defp time(at, role, cron),
     do: %{"kind" => "time", "id" => nil, "dueAt" => at, "role" => role, "cron" => cron}
 
+  defp active_wake_sql do
+    "w.state='pending' AND (w.recognitionAt IS NULL OR w.waitMode='after-turn') AND (w.firedAt IS NULL OR w.consumer='cron')"
+  end
+
   @doc "Small work-item indicators; reads only records explicitly linked to each item."
   def summaries(db, ids) do
     sql = """
-    SELECT wi.id,
-      EXISTS(SELECT 1 FROM wakes w WHERE
-        (w.work_item_id=wi.id OR w.assignmentId IN (SELECT id FROM assignments WHERE workItemId=wi.id))
-        AND w.state='pending' AND w.recognitionAt IS NULL
-        AND (w.resolverKind='assignment' OR w.waitMode='after-turn')),
-      EXISTS(SELECT 1 FROM wakes w WHERE
-        (w.work_item_id=wi.id OR w.assignmentId IN (SELECT id FROM assignments WHERE workItemId=wi.id))
-        AND w.state='pending' AND w.recognitionAt IS NULL AND w.waitMode IS NULL
-        AND w.conditionKind IS NULL AND (EXISTS(SELECT 1 FROM cron_wake_schedules c WHERE c.wakeId=w.wakeId) OR w.dueAt>w.createdAt)),
+    WITH items AS MATERIALIZED (SELECT value id FROM json_each(?1)),
+    item_assignments AS MATERIALIZED (
+      SELECT a.id,a.workItemId FROM items i JOIN assignments a ON a.workItemId=i.id
+    ),
+    item_wakes AS MATERIALIZED (
+      SELECT i.id itemId,COALESCE(w.conditionKind,json_extract(w.predicate,'$.bindings.conditionKind')) waitFactKind,w.* FROM items i JOIN wakes w INDEXED BY wakes_wait_links_item ON w.work_item_id=i.id
+      WHERE #{active_wake_sql()}
+      UNION ALL
+      SELECT a.workItemId itemId,COALESCE(w.conditionKind,json_extract(w.predicate,'$.bindings.conditionKind')) waitFactKind,w.* FROM item_assignments a JOIN wakes w INDEXED BY wakes_assignment ON w.assignmentId=a.id
+      WHERE w.work_item_id IS NOT a.workItemId AND #{active_wake_sql()}
+    ),
+    item_decisions AS MATERIALIZED (
+      SELECT a.workItemId itemId,d.* FROM item_assignments a
+        JOIN decision_requests d INDEXED BY decision_requests_rest_assignment_order ON d.assignmentId=a.id WHERE d.status='open'
+      UNION
+      SELECT w.itemId,d.* FROM item_wakes w JOIN decision_requests d ON d.id=w.resolverId
+        WHERE w.resolverKind='decision_request' AND d.status='open'
+      UNION
+      SELECT i.id itemId,d.* FROM items i JOIN decision_requests d INDEXED BY decision_requests_wait_item
+        ON json_extract(d.context,'$.workItemId')=i.id WHERE d.status='open'
+    ),
+    item_blocks AS MATERIALIZED (
+      SELECT a.workItemId itemId,cp.* FROM item_assignments a
+        JOIN assignment_cannot_proceed cp INDEXED BY cannot_proceed_wait_assignment ON cp.assignmentId=a.id
+        WHERE cp.state='standing'
+    ),
+    item_running AS MATERIALIZED (
+      SELECT i.id itemId FROM items i JOIN turns t INDEXED BY turns_wait_item ON t.jobRef=i.id WHERE t.status='running'
+      UNION
+      SELECT a.workItemId itemId FROM item_assignments a JOIN turns t INDEXED BY turns_wait_assignment ON t.assignmentId=a.id WHERE t.status='running'
+    )
+    SELECT i.id,
+      EXISTS(SELECT 1 FROM item_wakes w WHERE w.itemId=i.id AND
+        (w.resolverKind='assignment' OR w.waitMode='after-turn' OR w.waitFactKind IN ('assignment-landed','assignment-reviewed','assignment-blocked'))) OR EXISTS(SELECT 1 FROM item_blocks cp WHERE cp.itemId=i.id AND cp.releaseFactKind IN ('assignment-landed','assignment-reviewed','assignment-blocked')),
+      EXISTS(SELECT 1 FROM item_wakes w WHERE w.itemId=i.id AND
+        (w.consumer='cron' OR (w.waitMode IS NULL AND w.conditionKind IS NULL AND w.dueAt>w.createdAt))),
+      EXISTS(SELECT 1 FROM item_wakes w WHERE w.itemId=i.id AND w.waitFactKind IS NOT NULL AND w.waitFactKind NOT IN ('assignment-landed','assignment-reviewed','assignment-blocked')) OR EXISTS(SELECT 1 FROM item_blocks cp WHERE cp.itemId=i.id AND cp.releaseFactKind IS NOT NULL AND cp.releaseFactKind NOT IN ('assignment-landed','assignment-reviewed','assignment-blocked')),
       COALESCE((SELECT json_group_array(json_object('kind',r.kind,'session',r.session,'user',r.user)) FROM (
-        SELECT d.kind,d.expecterSessionKey session,COALESCE(d.expecterUserId,d.ownerUserId) user
-        FROM decision_requests d WHERE d.status='open'
-          AND NOT EXISTS(SELECT 1 FROM assignment_cannot_proceed cp WHERE cp.decisionRequestId=d.id AND cp.state='standing' AND cp.releaseFactKind IS NULL) AND
-          (d.assignmentId IN (SELECT id FROM assignments WHERE workItemId=wi.id)
-          OR d.id IN (SELECT w.resolverId FROM wakes w WHERE
-            (w.work_item_id=wi.id OR w.assignmentId IN (SELECT id FROM assignments WHERE workItemId=wi.id))
-            AND w.resolverKind='decision_request' AND w.state='pending' AND w.recognitionAt IS NULL))
+        SELECT d.kind,COALESCE(d.currentExpecterSessionKey,d.expecterSessionKey) session,COALESCE(d.expecterUserId,d.ownerUserId) user
+        FROM item_decisions d WHERE d.itemId=i.id AND NOT EXISTS(
+          SELECT 1 FROM item_blocks cp WHERE cp.decisionRequestId=d.id)
         UNION ALL
         SELECT 'cannot-proceed',
           CASE WHEN cp.disposerRef LIKE 'session:%' THEN substr(cp.disposerRef,9) END,
           CASE WHEN cp.disposerRef LIKE 'user:%' THEN substr(cp.disposerRef,6) END
-        FROM assignment_cannot_proceed cp WHERE cp.state='standing' AND cp.releaseFactKind IS NULL
-          AND cp.assignmentId IN (SELECT id FROM assignments WHERE workItemId=wi.id)
+        FROM item_blocks cp WHERE cp.itemId=i.id AND cp.releaseFactKind IS NULL
       ) r), '[]'),
-      EXISTS(SELECT 1 FROM turns t WHERE t.status='running' AND
-        (t.jobRef=wi.id OR t.assignmentId IN (SELECT id FROM assignments WHERE workItemId=wi.id)))
-    FROM work_items wi WHERE wi.id IN (SELECT value FROM json_each(?1))
+      EXISTS(SELECT 1 FROM item_running t WHERE t.itemId=i.id)
+    FROM items i
     """
 
     rows =
@@ -108,7 +164,7 @@ defmodule Tightbeam.WaitLinks do
           rows
       end
 
-    Map.new(rows, fn [id, agent, time, decisions, running] ->
+    Map.new(rows, fn [id, agent, time, event, decisions, running] ->
       decisions = JSON.decode!(decisions)
 
       users =
@@ -124,6 +180,7 @@ defmodule Tightbeam.WaitLinks do
          waiting: %{
            agent: agent == 1 or Enum.any?(decisions, &is_binary(&1["session"])),
            time: time == 1,
+           event: event == 1,
            userIds: users
          },
          running: running == 1
@@ -164,15 +221,14 @@ defmodule Tightbeam.WaitLinks do
   end
 
   @doc false
-  def with_schedule(txn, wake) do
-    cron =
-      case Txn.q(txn, "SELECT schedule FROM cron_wake_schedules WHERE wakeId=?1", [wake.wake_id]) do
-        [[schedule]] -> schedule
-        [] -> nil
-      end
-
-    Map.put(wake, :cron, cron)
+  def with_schedule(%{consumer: "cron"} = wake, txn) do
+    case Txn.q(txn, "SELECT schedule FROM cron_wake_schedules WHERE wakeId=?1", [wake.wake_id]) do
+      [[schedule]] -> Map.put(wake, :cron, schedule)
+      [] -> wake
+    end
   end
+
+  def with_schedule(wake, _txn), do: wake
 
   def request(query, kind, id) do
     query =
@@ -197,6 +253,8 @@ defmodule Tightbeam.WaitLinks do
 
   def page(db, kind, id, principal, request) do
     DB.read_transaction!(db, fn txn ->
+      txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
+
       case target(txn, ref(kind, id), principal) do
         %{"visible" => false} -> {:error, :not_found}
         source -> {:ok, page_in_txn(txn, kind, id, source, principal, request)}
@@ -233,51 +291,81 @@ defmodule Tightbeam.WaitLinks do
   end
 
   defp candidates(kind, id, ended) do
-    active_wake = if ended, do: "1=1", else: "w.state='pending' AND w.recognitionAt IS NULL"
+    active_wake = if ended, do: "1=1", else: active_wake_sql()
     active_assignment = if ended, do: "1=1", else: "a.state='open'"
     active_decision = if ended, do: "1=1", else: "d.status='open'"
     active_block = if ended, do: "1=1", else: "cp.state='standing'"
 
     waiting =
-      "(w.waitMode IS NOT NULL OR w.conditionKind IS NOT NULL OR EXISTS(SELECT 1 FROM cron_wake_schedules c WHERE c.wakeId=w.wakeId) OR w.dueAt>w.createdAt)"
+      "(w.waitMode IS NOT NULL OR w.conditionKind IS NOT NULL OR w.consumer='cron' OR w.dueAt>w.createdAt)"
 
-    wake = fn scope ->
-      "SELECT w.createdAt at,'wake:'||w.wakeId key,'wake' type,w.wakeId id FROM wakes w WHERE (#{scope}) AND #{active_wake} AND #{waiting}"
+    wake = fn scope, index ->
+      "SELECT w.createdAt at,'wake:'||printf('%020d',w.rowid) key,'wake' type,w.wakeId id FROM wakes w INDEXED BY #{index} WHERE (#{scope}) AND #{active_wake} AND #{waiting}"
     end
 
     decision = fn scope ->
-      "SELECT d.raisedAt at,'decision:'||d.id key,'decision' type,d.id FROM decision_requests d WHERE (#{scope}) AND #{active_decision}"
+      "SELECT d.raisedAt at,'decision:'||printf('%020d',d.rowid) key,'decision' type,d.id FROM decision_requests d WHERE (#{scope}) AND +#{active_decision}"
     end
 
     case kind do
       "work-item" ->
-        {wake.(
-           "w.work_item_id=? OR w.assignmentId IN (SELECT id FROM assignments WHERE workItemId=?)"
-         ) <>
-           " UNION ALL SELECT a.openedAt,'assignment:'||a.id,'assignment',a.id FROM assignments a WHERE a.workItemId=? AND #{active_assignment}",
-         [id, id, id]}
+        {wake.("w.work_item_id=?", "wakes_wait_links_item") <>
+           " UNION ALL " <>
+           wake.(
+             "w.assignmentId IN (SELECT id FROM assignments WHERE workItemId=?) AND w.work_item_id IS NOT ?",
+             "wakes_assignment"
+           ) <>
+           " UNION ALL SELECT a.openedAt,'assignment:'||printf('%020d',a.rowid),'assignment',a.id FROM assignments a WHERE a.workItemId=? AND #{active_assignment}" <>
+           " UNION ALL " <>
+           decision.("json_extract(d.context,'$.workItemId')=? AND d.assignmentId IS NULL"),
+         [id, id, id, id, id]}
 
       "assignment" ->
-        {wake.("w.assignmentId=?") <>
+        {wake.("w.assignmentId=?", "wakes_assignment") <>
            " UNION ALL " <>
            decision.("d.assignmentId=?") <>
-           " UNION ALL SELECT cp.createdAt,'cannot-proceed:'||cp.id,'cannot-proceed',cp.id FROM assignment_cannot_proceed cp WHERE cp.assignmentId=? AND #{active_block}",
+           " UNION ALL SELECT cp.createdAt,'cannot-proceed:'||printf('%020d',cp.rowid),'cannot-proceed',cp.id FROM assignment_cannot_proceed cp INDEXED BY cannot_proceed_wait_assignment WHERE cp.assignmentId=? AND #{active_block}",
          [id, id, id]}
 
       "session" ->
-        {wake.("w.sessionKey=?") <> " UNION ALL " <> decision.("d.raiserSessionKey=?"), [id, id]}
+        {wake.("w.sessionKey=?", "wakes_rest_session_created_order") <>
+           " UNION ALL " <> decision.("COALESCE(d.currentRaiserSessionKey,d.raiserSessionKey)=?"),
+         [id, id]}
 
       "decision" ->
         {decision.("d.id=?"), [id]}
     end
   end
 
-  defp edge(txn, kind, source_id, [at, key, "wake", id], principal) do
-    wake = with_schedule(txn, Wakes.get_in_txn(txn, id))
+  defp edge(txn, kind, source_id, [at, _key, "wake", id], principal) do
+    wake = with_schedule(Wakes.get_in_txn(txn, id), txn)
+    notice = %{"class" => "wake.scheduled", "payload" => StateResources.wake(wake), "refs" => %{}}
+
+    visible =
+      StateVisibility.core_detail_visible?(txn, "wakes", wake, principal) or
+        StateVisibility.visible?(txn, notice, principal)
+
+    if visible do
+      wake_edge(txn, kind, source_id, at, id, wake, principal)
+    else
+      %{
+        id: nil,
+        wakeId: nil,
+        kind: "wake",
+        visible: false,
+        waitReason: nil,
+        from: ref(kind, source_id),
+        to: hidden(%{"kind" => "wake"}),
+        waitOn: [hidden(%{"kind" => "wake"})]
+      }
+    end
+  end
+
+  defp wake_edge(txn, kind, source_id, at, id, wake, principal) do
     targets = Enum.map(wake_targets(wake), &target(txn, &1, principal))
 
     %{
-      id: key,
+      id: "wake:" <> id,
       wakeId: id,
       kind: wake_kind(wake),
       waitReason: wake.wait_reason,
@@ -295,7 +383,7 @@ defmodule Tightbeam.WaitLinks do
     }
   end
 
-  defp edge(txn, kind, source_id, [at, key, "cannot-proceed", id], principal) do
+  defp edge(txn, kind, source_id, [at, _key, "cannot-proceed", id], principal) do
     [[state, fact_kind, scope, opener, decision_id]] =
       Txn.q(
         txn,
@@ -317,7 +405,7 @@ defmodule Tightbeam.WaitLinks do
       end
 
     %{
-      id: key,
+      id: "cannot-proceed:" <> id,
       wakeId: nil,
       kind: "cannot-proceed",
       waitReason: nil,
@@ -330,7 +418,7 @@ defmodule Tightbeam.WaitLinks do
     }
   end
 
-  defp edge(txn, kind, source_id, [at, key, type, id], principal) do
+  defp edge(txn, kind, source_id, [at, _key, type, id], principal) do
     destination = target(txn, ref(type, id), principal)
 
     {edge_kind, destination} =
@@ -339,17 +427,18 @@ defmodule Tightbeam.WaitLinks do
           {"addressee",
            destination["addressee"] || %{"kind" => "user", "id" => nil, "visible" => false}}
         else
-          {if(destination["decisionKind"] == "agent",
-             do: "agent-question",
-             else: "operator-question"
-           ), destination}
+          {cond do
+             destination["visible"] == false -> "question"
+             destination["addressee"]["kind"] == "session" -> "agent-question"
+             true -> "operator-question"
+           end, destination}
         end
       else
         {"assignment", destination}
       end
 
     %{
-      id: key,
+      id: if(destination["visible"] == false, do: nil, else: type <> ":" <> id),
       wakeId: nil,
       kind: edge_kind,
       waitReason: nil,
@@ -431,10 +520,24 @@ defmodule Tightbeam.WaitLinks do
   defp target(txn, %{"kind" => "decision", "id" => id} = ref, principal) do
     row = Escalation.raw_by_id_in_txn(txn, id)
 
-    if row && StateVisibility.core_detail_visible?(txn, "decision requests", row, principal) do
+    if row &&
+         StateVisibility.visible?(
+           txn,
+           %{
+             "class" => "decision_request.updated",
+             "payload" => StateResources.decision_request(row),
+             "refs" => %{}
+           },
+           principal
+         ) do
       addressee =
-        if row[:expecter_session_key],
-          do: target(txn, ref("session", row.expecter_session_key), principal),
+        if row[:current_expecter_session_key] || row[:expecter_session_key],
+          do:
+            target(
+              txn,
+              ref("session", row[:current_expecter_session_key] || row.expecter_session_key),
+              principal
+            ),
           else: target(txn, ref("user", row[:expecter_user_id] || row.owner_user_id), principal)
 
       Map.merge(ref, %{

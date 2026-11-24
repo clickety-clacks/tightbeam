@@ -2150,6 +2150,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
     :ok = upgrade_session_custody_v1(db)
+    :ok = ensure_wait_links_indexes(db)
     :ok = upgrade_attest_lifecycle_actor(db)
     :ok = upgrade_holder_role_v1(db)
     :ok = Tightbeam.Projection.ensure_submitter_column(db)
@@ -3885,6 +3886,31 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "REST wake collection index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp ensure_wait_links_indexes(db) do
+    indexes = [
+      {"cannot_proceed_wait_assignment",
+       "CREATE INDEX IF NOT EXISTS cannot_proceed_wait_assignment ON assignment_cannot_proceed(assignmentId,createdAt,id)"},
+      {"decision_requests_wait_item",
+       "CREATE INDEX IF NOT EXISTS decision_requests_wait_item ON decision_requests(json_extract(context,'$.workItemId'))"},
+      {"decision_requests_wait_raiser",
+       "CREATE INDEX IF NOT EXISTS decision_requests_wait_raiser ON decision_requests(COALESCE(currentRaiserSessionKey,raiserSessionKey),raisedAt,id)"},
+      {"turns_wait_item", "CREATE INDEX IF NOT EXISTS turns_wait_item ON turns(jobRef,status)"},
+      {"turns_wait_assignment",
+       "CREATE INDEX IF NOT EXISTS turns_wait_assignment ON turns(assignmentId,status)"}
+    ]
+
+    case DB.migration_transaction(db, :wait_links_indexes, [], [], fn txn ->
+           Enum.each(indexes, fn {_name, sql} -> :ok = Txn.exec(txn, sql) end)
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError, message: "Wait link index migration failed: #{Exception.message(error)}"
     end
   end
 

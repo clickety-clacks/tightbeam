@@ -257,6 +257,20 @@ defmodule Tightbeam.SessionCustodyTransfer do
       [target, source, at]
     )
 
+    Enum.each(selected.raisers ++ selected.expecters, fn id ->
+      Tightbeam.Escalation.publish_wait_source_in_txn(
+        txn,
+        Tightbeam.Escalation.raw_by_id_in_txn(txn, id)
+      )
+    end)
+
+    Enum.each(selected.disposers, fn id ->
+      [[assignment_id]] =
+        Txn.q(txn, "SELECT assignmentId FROM assignment_cannot_proceed WHERE id=?1", [id])
+
+      Tightbeam.WaitLinks.publish_source_change_in_txn(txn, nil, assignment_id)
+    end)
+
     Enum.each(selected.work_items, fn item_id ->
       Wakes.readdress_accountability_notices_in_txn(txn, item_id)
       WorkItemSummary.publish_change_in_txn(txn, item_id, call)

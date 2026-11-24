@@ -2317,7 +2317,7 @@ defmodule Tightbeam.Escalation do
           hub
         )
 
-        Tightbeam.WaitLinks.publish_source_change_in_txn(txn, nil, after_row.assignment_id)
+        publish_wait_source_in_txn(txn, after_row)
       else
         if before_item != after_item do
           raise DB.Error, message: "invalid decision request public transition"
@@ -2330,6 +2330,15 @@ defmodule Tightbeam.Escalation do
     else
       after_row
     end
+  end
+
+  @doc false
+  def publish_wait_source_in_txn(txn, request) do
+    Tightbeam.WaitLinks.publish_source_change_in_txn(
+      txn,
+      (request.context || %{})["workItemId"],
+      request.assignment_id
+    )
   end
 
   defp restore_decision_revision_in_txn(_txn, nil, _after_row), do: :ok
@@ -2706,6 +2715,8 @@ defmodule Tightbeam.Escalation do
 
     request = request_in_txn(txn, request_id)
 
+    publish_wait_source_in_txn(txn, request)
+    if ask.supersedes, do: publish_wait_source_in_txn(txn, request_in_txn(txn, ask.supersedes))
     file_filing_fact_in_txn(txn, request, raiser_id, "operator-ask")
 
     EventLog.lifecycle_in_txn(
@@ -2962,6 +2973,7 @@ defmodule Tightbeam.Escalation do
             %{failures: []} ->
               terminal_test_step(opts, :after_validate)
               Wakes.clear_decision_request_notice_in_txn(txn, request.id)
+              publish_wait_source_in_txn(txn, ruled)
               {terminal_projection(ruled), fact_id}
 
             %{failures: failures} ->
@@ -3167,6 +3179,7 @@ defmodule Tightbeam.Escalation do
 
               Wakes.clear_decision_request_notice_in_txn(txn, request.id)
               withdrawn = request_in_txn(txn, request.id)
+              publish_wait_source_in_txn(txn, withdrawn)
               Publisher.maybe_accepted_in_txn(txn, call, withdrawn)
               withdrawn
           end

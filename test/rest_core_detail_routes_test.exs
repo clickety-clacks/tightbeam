@@ -3918,6 +3918,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
         {resource, field} == {"work items", "waiting"} ->
           assert is_boolean(value["agent"]) and is_boolean(value["time"])
+          assert is_boolean(value["event"])
           assert is_list(value["userIds"])
 
         {resource, field} == {"wakes", "waitOn"} ->

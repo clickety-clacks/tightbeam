@@ -125,7 +125,23 @@ defmodule Tightbeam.SessionCustodyTransferTest do
     params = %{from_session_key: "old", to_session_key: "successor", idempotency_key: "move-one"}
     call = %{principal: {:user, "owner"}, params: params}
 
+    before_item =
+      Tightbeam.StateResources.query_work_item(ctx.db, "wi_transfer", %{
+        principal: {:user, "owner"}
+      })
+
     result = Gateway.handlers(%{db: ctx.db})["session-custody-transfer"].(call)
+
+    after_item =
+      Tightbeam.StateResources.query_work_item(ctx.db, "wi_transfer", %{
+        principal: {:user, "owner"}
+      })
+
+    assert after_item.row_version > before_item.row_version
+    principal = %{kind: "user", id: "owner", is_admin: false}
+    {:ok, request} = Tightbeam.WaitLinks.request(%{}, "decision", "dr_asked")
+    {:ok, page} = Tightbeam.WaitLinks.page(ctx.db, "decision", "dr_asked", principal, request)
+    assert hd(page.items).to["id"] == "successor"
     assert is_binary(result["eventId"])
     assert result["before"] != result["after"]
     assert result["principal"] == "user:owner"
@@ -265,7 +281,11 @@ defmodule Tightbeam.SessionCustodyTransferTest do
 
     assert version > 1
     assert rows(ctx.db, "SELECT * FROM work_items WHERE id<>'wi_bare' ORDER BY id") == before
-    assert rows(ctx.db, "SELECT workItemId FROM work_item_versions") == [["wi_bare"]]
+    # The other item keeps its owner; its transferred question still changes the wait summary.
+    assert rows(ctx.db, "SELECT workItemId FROM work_item_versions ORDER BY workItemId") == [
+             ["wi_bare"],
+             ["wi_transfer"]
+           ]
 
     assert rows(ctx.db, "SELECT holderKey FROM assignments WHERE id='asg_held'") == [
              ["successor"]
