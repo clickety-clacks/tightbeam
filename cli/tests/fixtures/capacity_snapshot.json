@@ -1,0 +1,66 @@
+{
+  "generatedAt": 1795530000000,
+  "counts": {"live": 1, "cache": 0, "stale": 0, "error": 1},
+  "results": [
+    {
+      "accountId": "acct_primary",
+      "status": "live",
+      "sample": {
+        "accountId": "acct_primary",
+        "provider": "openai",
+        "label": "Primary login",
+        "plan": "plus",
+        "observedAt": 1795530000000,
+        "ageSeconds": 0,
+        "windows": [
+          {"id": "primary", "name": "Primary", "usedPercent": 32.5, "resetsAt": 1795540000000, "windowSeconds": 18000, "scope": "account", "model": null}
+        ],
+        "diagnostics": [],
+        "serving": true
+      },
+      "error": null,
+      "summary": {
+        "label": "Primary login",
+        "provider": "openai",
+        "accountState": "ready",
+        "accountStateReason": null,
+        "usageFreshness": "current",
+        "usageFreshnessReason": null,
+        "usageObservedAt": 1795530000000,
+        "usageAgeSeconds": 0,
+        "plan": "plus",
+        "planUnknownReason": null,
+        "subscriptionStatus": "active",
+        "subscriptionStatusReason": null,
+        "subscriptionPeriodEndAt": null,
+        "subscriptionPeriodEndKind": null,
+        "subscriptionPeriodEndUnknownReason": "not_reported",
+        "subscriptionObservedAt": 1795530000000
+      }
+    },
+    {
+      "accountId": "acct_secondary",
+      "status": "error",
+      "sample": null,
+      "error": {"code": "CREDENTIAL_MISSING", "message": "Sign in to read provider usage."},
+      "summary": {
+        "label": "Unknown period login",
+        "provider": "anthropic",
+        "accountState": "reauth_required",
+        "accountStateReason": "file_missing",
+        "usageFreshness": "none",
+        "usageFreshnessReason": "never_observed",
+        "usageObservedAt": null,
+        "usageAgeSeconds": null,
+        "plan": null,
+        "planUnknownReason": "not_reported",
+        "subscriptionStatus": "unknown",
+        "subscriptionStatusReason": "not_reported",
+        "subscriptionPeriodEndAt": null,
+        "subscriptionPeriodEndKind": null,
+        "subscriptionPeriodEndUnknownReason": "not_reported",
+        "subscriptionObservedAt": null
+      }
+    }
+  ]
+}

@@ -181,12 +181,12 @@ enum SnapshotEmissionError {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ReadSelection {
+pub(crate) struct ReadSelection {
     as_user: Option<String>,
 }
 
 impl ReadSelection {
-    fn for_invocation(endpoint: &Endpoint, identity: &Identity) -> Self {
+    pub(crate) fn for_invocation(endpoint: &Endpoint, identity: &Identity) -> Self {
         let as_user = match identity {
             Identity::User(user) if is_org_credential(endpoint) => Some(user.clone()),
             _ => None,
@@ -202,7 +202,7 @@ impl ReadSelection {
         frame
     }
 
-    fn request_path(&self, path: &str) -> String {
+    pub(crate) fn request_path(&self, path: &str) -> String {
         match &self.as_user {
             Some(user) => format!(
                 "{path}{}asUser={}",

@@ -185,7 +185,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         | Command::GithubAuthCheck { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_)
-        | Command::SessionConnect { .. } => {
+        | Command::SessionConnect { .. }
+        | Command::Accounts { .. }
+        | Command::Capacity { .. } => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
         }
         Command::Wake {
@@ -4033,6 +4035,9 @@ where
     match command {
         Command::Help | Command::CommandHelp(_) => {
             unreachable!("help is handled before dispatch")
+        }
+        Command::Accounts { .. } | Command::Capacity { .. } => {
+            Err("account and capacity API integration is pending".into())
         }
         Command::IdentityCurrent => print_current_session_identity(),
         Command::Doctor {

@@ -2,6 +2,7 @@ mod anthropic_oauth;
 mod args;
 mod attempt_diagnostic;
 mod base_dir;
+mod capacity_cli;
 mod capacity_probe;
 mod catalog_probe;
 mod ceremonies;

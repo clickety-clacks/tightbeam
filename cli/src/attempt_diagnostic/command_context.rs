@@ -50,6 +50,8 @@ impl CommandContext {
             // dedicated transport callers are explicitly integrated.
             IdentityCurrent
             | GithubAuthCheck { .. }
+            | Accounts { .. }
+            | Capacity { .. }
             | SessionConnect { .. }
             | SessionDiagnose { .. } => {
                 return None;
@@ -340,7 +342,11 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         };
     }
     match command {
-        IdentityCurrent | GithubAuthCheck { .. } | SessionConnect { .. } => Unknown,
+        IdentityCurrent
+        | GithubAuthCheck { .. }
+        | SessionConnect { .. }
+        | Accounts { .. }
+        | Capacity { .. } => Unknown,
         Help
         | CommandHelp(_)
         | Doctor { .. }

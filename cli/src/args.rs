@@ -45,8 +45,48 @@ pub enum TuneControl {
     Host(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountAction {
+    List,
+    Show(String),
+    Use(String),
+    Rename { account: String, label: String },
+    Enable(String),
+    Disable(String),
+    Remove(String),
+    Verify(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapacityAction {
+    Show {
+        account: Option<String>,
+        refresh: bool,
+    },
+    History {
+        account: String,
+    },
+    Forecast {
+        account: Option<String>,
+    },
+    Health,
+    Watch {
+        account: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    Accounts {
+        identity: Identity,
+        action: AccountAction,
+        json: bool,
+    },
+    Capacity {
+        identity: Identity,
+        action: CapacityAction,
+        json: bool,
+    },
     Help,
     /// Help for one named command: `tightbeam assimilate --help`, `tightbeam help
     /// assimilate`. Printing the whole manual in answer to a question about one
@@ -1126,6 +1166,23 @@ COMMANDS:
   session-rename --session <key> --display-name <label>
       Change a session's display name without changing its stable session key.
 
+  accounts list | show <accountId>
+      List provider accounts and see their login and serving status.
+      Pass --json for the API response.
+      accounts use <accountId>
+      accounts rename <accountId> <label>
+      accounts enable|disable|remove|verify <accountId>
+
+  capacity [show] [--account <accountId>] [--refresh] [--json]
+      Show usage, reset times, reading freshness and subscription status.
+      --refresh waits for a fresh reading subject to provider availability.
+      capacity history --account <accountId> [--json]
+      capacity forecast [--account <accountId>] [--json]
+      capacity health [--json]
+      capacity watch [--account <accountId>] [--json]
+      Watch prints an initial snapshot and live updates, then rebuilds after reconnect.
+      With --json, watch prints one JSON value per line.
+
   session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]
       Run the persistent NDJSON stdin/stdout connection for one selected session.
       Its initial snapshot includes existing wake prompts and delivery status.
@@ -1627,7 +1684,12 @@ fn split_args(args: Vec<String>) -> Flags {
     while index < args.len() {
         let arg = &args[index];
         if let Some(name) = arg.strip_prefix("--") {
-            if BOOLEAN_FLAGS.contains(&name) {
+            if BOOLEAN_FLAGS.contains(&name)
+                || (name == "refresh"
+                    && positional
+                        .first()
+                        .is_some_and(|arg: &String| arg == "capacity"))
+            {
                 if flags.insert(name.to_owned(), String::new()).is_some() {
                     duplicates.insert(name.to_owned());
                 }
@@ -3423,6 +3485,8 @@ fn parse_with_optional_catalog(
                     .ok_or("--display-name is required")?,
             })
         }
+        "accounts" => parse_accounts(&parsed),
+        "capacity" => parse_capacity(&parsed),
         "session-connect" => {
             let usage = "usage: tightbeam session-connect --session <sessionKey> [--as-user <userId> | --as-process <name>]";
             if parsed.positional.len() != 1
@@ -4586,6 +4650,94 @@ fn parse_with_optional_catalog(
             "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, check-attest, breathing, assign, assignment-get, assignments, dispatch, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, retire-withdraw, session-rename, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, workspace-cleanup, memento-set, mementos, harklight-send, harklight-read, harklight-ack, harklight-reply, harklight-result, harklight-briefings-catchup, harklight-follow, harklight-listener-restore, harklight-retry, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
+}
+
+fn validate_account_capacity_flags(
+    verb: &str,
+    parsed: &Flags,
+    allowed: &[&str],
+    read: bool,
+) -> Result<Identity, String> {
+    closed_command_flags(verb, &parsed.flags, allowed)?;
+    if read && parsed.flags.contains_key("as") {
+        return Err(format!("{verb} reads accept --as-user or --as-process"));
+    }
+    if !parsed.duplicates.is_empty() {
+        return Err(format!("{verb} does not accept repeated options"));
+    }
+    for flag in ["account", "as", "as-user", "as-process"] {
+        if let Some(value) = parsed.flags.get(flag) {
+            if value.trim().is_empty() || value.starts_with("--") {
+                return Err(format!("--{flag} requires a value"));
+            }
+        }
+    }
+    identity(&parsed.flags)
+}
+
+fn parse_accounts(parsed: &Flags) -> Result<Command, String> {
+    let args: Vec<_> = parsed.positional[1..].iter().map(String::as_str).collect();
+    let action = match args.as_slice() {
+        ["list"] => AccountAction::List,
+        ["show", account] if !account.trim().is_empty() => AccountAction::Show((*account).into()),
+        ["use", account] if !account.trim().is_empty() => AccountAction::Use((*account).into()),
+        ["rename", account, label] if !account.trim().is_empty() && !label.trim().is_empty() => {
+            AccountAction::Rename {
+                account: (*account).into(),
+                label: (*label).into(),
+            }
+        }
+        ["enable", account] if !account.trim().is_empty() => {
+            AccountAction::Enable((*account).into())
+        }
+        ["disable", account] if !account.trim().is_empty() => {
+            AccountAction::Disable((*account).into())
+        }
+        ["remove", account] if !account.trim().is_empty() => {
+            AccountAction::Remove((*account).into())
+        }
+        ["verify", account] if !account.trim().is_empty() => {
+            AccountAction::Verify((*account).into())
+        }
+        _ => return Err("usage: tightbeam help accounts".into()),
+    };
+    let read = matches!(action, AccountAction::List | AccountAction::Show(_));
+    let flags: &[&str] = if read { &["json"] } else { &[] };
+    Ok(Command::Accounts {
+        identity: validate_account_capacity_flags("accounts", parsed, flags, read)?,
+        action,
+        json: parsed.flags.contains_key("json"),
+    })
+}
+
+fn parse_capacity(parsed: &Flags) -> Result<Command, String> {
+    let flags = &parsed.flags;
+    let account = nonempty(flags, "account");
+    let args: Vec<_> = parsed.positional[1..].iter().map(String::as_str).collect();
+    let (action, allowed): (_, &[_]) = match args.as_slice() {
+        [] | ["show"] => (
+            CapacityAction::Show {
+                account,
+                refresh: flags.contains_key("refresh"),
+            },
+            &["account", "refresh", "json"],
+        ),
+        ["history"] => (
+            CapacityAction::History {
+                account: account.ok_or("capacity history requires --account")?,
+            },
+            &["account", "json"],
+        ),
+        ["forecast"] => (CapacityAction::Forecast { account }, &["account", "json"]),
+        ["health"] => (CapacityAction::Health, &["json"]),
+        ["watch"] => (CapacityAction::Watch { account }, &["account", "json"]),
+        _ => return Err("usage: tightbeam help capacity".into()),
+    };
+    Ok(Command::Capacity {
+        identity: validate_account_capacity_flags("capacity", parsed, allowed, true)?,
+        action,
+        json: flags.contains_key("json"),
+    })
 }
 
 fn parse_host_env_set(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
@@ -7535,6 +7687,81 @@ mod tests {
     }
 
     #[test]
+    fn account_and_capacity_grammar_keeps_reads_and_mutations_distinct() {
+        assert_eq!(
+            parse(strings(&[
+                "accounts",
+                "rename",
+                "acct_example",
+                "Second login",
+                "--as",
+                "operator"
+            ])),
+            Ok(Command::Accounts {
+                identity: Identity::Role("operator".into()),
+                action: AccountAction::Rename {
+                    account: "acct_example".into(),
+                    label: "Second login".into(),
+                },
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "capacity",
+                "--refresh",
+                "--account",
+                "acct_example",
+                "--json",
+                "--as-user",
+                "operator"
+            ])),
+            Ok(Command::Capacity {
+                identity: Identity::User("operator".into()),
+                action: CapacityAction::Show {
+                    account: Some("acct_example".into()),
+                    refresh: true
+                },
+                json: true,
+            })
+        );
+        for args in [
+            &["capacity", "history"][..],
+            &["capacity", "watch", "--refresh"],
+            &["capacity", "health", "--account", "acct_example"],
+            &["capacity", "show", "--account", "--json"],
+            &["capacity", "show", "--json", "--json"],
+            &["capacity", "show", "--as", "operator"],
+            &["accounts", "list", "acct_example"],
+            &["accounts", "remove", "acct_example", "--json"],
+        ] {
+            assert!(parse(strings(args)).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn account_and_capacity_help_lists_supported_operations() {
+        let accounts = render_command_help(None, "accounts").unwrap();
+        for action in [
+            "list", "show", "use", "rename", "enable", "disable", "remove", "verify",
+        ] {
+            assert!(accounts.contains(action), "{accounts}");
+        }
+        let capacity = render_command_help(None, "capacity").unwrap();
+        for action in [
+            "show",
+            "history",
+            "forecast",
+            "health",
+            "watch",
+            "--refresh",
+            "--json",
+        ] {
+            assert!(capacity.contains(action), "{capacity}");
+        }
+    }
+
+    #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
         let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
         assert!(
@@ -7567,6 +7794,8 @@ mod tests {
         assert_eq!(
             headings,
             [
+                "accounts",
+                "capacity",
                 "ask",
                 "answer",
                 "return",
