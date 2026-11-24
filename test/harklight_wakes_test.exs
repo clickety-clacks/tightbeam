@@ -4223,12 +4223,12 @@ defmodule Tightbeam.HarklightWakesTest do
       manager =
         start_supervised!(
           {HarklightWakes,
-           db: db, retry_delays: [1, 700], retry_jitter: false, feed_start_spacing_ms: 1}
+           db: db, retry_delays: [1, 5_000], retry_jitter: false, feed_start_spacing_ms: 1}
         )
 
       assert eventually(fn -> Map.has_key?(:sys.get_state(manager).retry_timers, @handle) end)
       refute eventually(fn -> length(calls.()) > 1 end, 30)
-      assert eventually(fn -> length(calls.()) > 1 end)
+      assert eventually(fn -> length(calls.()) > 1 end, 1_000)
       assert {:ok, [[8]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
       assert {:ok, []} = DB.query(db, "SELECT handle FROM harklight_feed_stops")
     end
