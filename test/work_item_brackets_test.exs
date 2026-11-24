@@ -1479,6 +1479,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert get(ctx, item.id).wait.active
     assert %{outcome: "revoked"} = revoke(ctx, resolver.id)
     assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "reconsideration"
+    assert get(ctx, item.id).wait.recognitionDisposition == "revoked"
     assert is_binary(slate_wake_id(ctx.db, item.id))
     assert routing_wake_id(ctx.db, item.id) == nil
   end
@@ -1581,9 +1582,9 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert %{code: "invalid_resolver"} =
              record_item_wait(ctx, item.id, %{assignment_id: "missing"})
 
-    assert %{code: "unknown_event"} =
+    assert %{code: "invalid_wait_target"} =
              record_item_wait(ctx, item.id, %{
-               condition_kind: "unknown-event",
+               condition_kind: " ",
                condition_scope: "scope"
              })
 
@@ -1621,6 +1622,86 @@ defmodule Tightbeam.WorkItemBracketsTest do
         )
       )
     )
+  end
+
+  test "unannounced events are accepted with the ordinary producer warning and require a fallback",
+       ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Agent event"})
+
+    assert %{code: "invalid_fallback"} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: "release-live",
+               condition_scope: "next-release",
+               after_ms: nil
+             })
+
+    assert %{wait: %{active: true}, warnings: [%{code: "no-live-producer", kind: "release-live"}]} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: "release-live",
+               condition_scope: "next-release"
+             })
+  end
+
+  test "record targets need no fallback and an optional duration cannot end them early", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Record lifetime"})
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+    {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Dependency", upstream.id)
+    %{wait: wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id, after_ms: nil})
+    assert wait.dueAt == nil
+    assert wait.active
+
+    assert %{wait: %{wakeId: same}} =
+             record_item_wait(ctx, item.id, %{assignment_id: resolver.id, after_ms: 1})
+
+    assert same == wait.wakeId
+    scheduler = item_wait_scheduler(ctx)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert get(ctx, item.id).wait.active
+    assert Wakes.get(ctx.db, wait.wakeId).recognition_path == nil
+    complete(ctx, "holder", resolver.id)
+    refute get(ctx, item.id).wait.active
+  end
+
+  test "ordinary existing schema gains item waits without rewriting elected rules", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Existing item"})
+    reminder = routing_wake_id(ctx.db, item.id)
+    rule_path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    rules = File.read!(rule_path)
+    # This additive link table is the only new schema object. Preserve existing
+    # work, wake and reaction rows while bootstrapping its predecessor shape.
+    assert {:ok, _} = DB.query(ctx.db, "DROP TABLE work_item_waits")
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert File.read!(rule_path) == rules
+    assert routing_wake_id(ctx.db, item.id) == reminder
+
+    assert %{wait: %{active: true}} =
+             record_item_wait(ctx, item.id, %{
+               condition_kind: "agreed-event",
+               condition_scope: "upstream"
+             })
+
+    assert Wakes.get(ctx.db, reminder).state == "canceled"
+    assert File.read!(rule_path) == rules
+  end
+
+  test "unchanged customized reminder rules respect item waits and resume their interval", ctx do
+    rule_path = Path.join(ctx.law_base, "identity/rules/row-reaction-work-items.toml")
+    File.write!(rule_path, File.read!(rule_path) |> String.replace("86400000", "7000"))
+    Rules.load!(ctx.law_base, Map.keys(ctx.handlers))
+    item = create(ctx, {:user, "flynn"}, %{title: "Custom reminder"})
+    upstream = create(ctx, {:user, "flynn"}, %{title: "Dependency"})
+    {:ok, resolver} = disp_assign(ctx, {:user, "flynn"}, "holder", "Dependency", upstream.id)
+    %{wait: wait} = record_item_wait(ctx, item.id, %{assignment_id: resolver.id, after_ms: nil})
+    {:ok, assignment} = disp_assign(ctx, {:user, "flynn"}, "holder", "Local work", item.id)
+    complete(ctx, "holder", assignment.id)
+    assert slate_wake_id(ctx.db, item.id) == nil
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert slate_wake_id(ctx.db, item.id) == nil
+    complete(ctx, "holder", resolver.id)
+    wake = Wakes.get(ctx.db, wait.wakeId)
+    reminder = Wakes.get(ctx.db, slate_wake_id(ctx.db, item.id))
+    assert reminder.due_at >= wake.recognition_at + 7000
+    assert reminder.due_at < wake.recognition_at + 20_000
   end
 
   test "fact wait recognizes an existing occurrence and a future matching fact", ctx do
@@ -1686,6 +1767,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert :ok = Wakes.fire_due(scheduler)
     assert :ok = Wakes.fire_due(scheduler)
     assert Wakes.get(ctx.db, wait.wakeId).recognition_path == "fallback"
+    assert get(ctx, item.id).wait.recognitionPath == "fallback"
+    assert is_map(get(ctx, item.id).wait.recognitionEvidence)
     refute get(ctx, item.id).wait.active
     reminder = routing_wake_id(ctx.db, item.id)
     assert is_binary(reminder)

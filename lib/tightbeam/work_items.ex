@@ -917,7 +917,7 @@ defmodule Tightbeam.WorkItems do
                 })
               )
             else
-              Tightbeam.WorkItemWaits.dispose_in_txn(txn, id)
+              Tightbeam.WorkItemWaits.dispose_in_txn(txn, id, to_string(transition_id))
 
               cancel_brackets_in_txn(txn, id, %{
                 causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},

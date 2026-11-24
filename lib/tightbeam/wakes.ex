@@ -1861,6 +1861,9 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc false
+  def no_deadline, do: 253_402_300_799_000
+
+  @doc false
   def register_work_item_wait_in_txn(txn, input, declaration) do
     with :ok <- Tightbeam.WaitReason.validate(input[:wait_reason], "--wait-reason"),
          {:ok, _contracts} <- dependency_contracts(declaration.conditions),
@@ -4506,7 +4509,6 @@ defmodule Tightbeam.Wakes do
     "tightbeam:wake-scheduler" =>
       ~w(production_unmatched consumer_unavailable target_unresolvable),
     "tightbeam:work-items" => ~w(routing_bracket_satisfied),
-    "tightbeam:work-item-waits" => ~w(superseded),
     "tightbeam:assignments" => ~w(obligation_disposed cannot_proceed_released superseded),
     "tightbeam:escalation" => ~w(obligation_disposed),
     "tightbeam:sentinel-supervisor" => ~w(condition_cleared),
@@ -4625,9 +4627,6 @@ defmodule Tightbeam.Wakes do
 
   defp cancellation_primary_work(txn, command, wake) do
     cond do
-      item_wait_withdrawal?(txn, command, wake) ->
-        {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
-
       sender_withdrew_own_notice?(command) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
@@ -4647,20 +4646,6 @@ defmodule Tightbeam.Wakes do
         primary_work(txn, wake)
     end
   end
-
-  defp item_wait_withdrawal?(
-         txn,
-         %{
-           requester: %{kind: "process", id: "tightbeam:work-item-waits"},
-           reason_kind: "superseded",
-           causal_source: %{kind: "wake", id: id}
-         },
-         %{wake_id: id}
-       ) do
-    Tightbeam.WorkItemWaits.linked_in_txn?(txn, id)
-  end
-
-  defp item_wait_withdrawal?(_, _, _), do: false
 
   defp sender_withdrew_own_notice?(%{
          requester: %{kind: kind},
@@ -4841,6 +4826,18 @@ defmodule Tightbeam.Wakes do
   end
 
   defp pending_wake(_txn, _command), do: :error
+
+  # The work-item command has checked owner/admin or current delivery custody.
+  # This withdraws that item's wait, not any other sender's notice.
+  defp authorize_cancel(
+         %{
+           requester: %{kind: kind},
+           reason_kind: "requester_withdrew",
+           item_wait_withdrawal: true
+         },
+         %{work_item_id: id, assignment_id: nil}
+       )
+       when kind in ["user", "session"] and is_binary(id), do: :ok
 
   defp authorize_cancel(
          %{

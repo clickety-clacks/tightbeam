@@ -1510,8 +1510,10 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             let mut params = vec![
                 string_field("workItemId", work_item_id),
                 string_field("waitReason", wait_reason),
-                format!("\"afterMs\":{after_ms}"),
             ];
+            if let Some(value) = after_ms {
+                params.push(format!("\"afterMs\":{value}"));
+            }
             for (key, value) in [
                 ("assignmentId", assignment),
                 ("decisionRequestId", decision),
@@ -4574,6 +4576,19 @@ fn current_session_key_from(cwd: &Path) -> Result<String, String> {
 mod tests {
     #[test]
     fn item_wait_commands_preserve_target_reason_and_fallback() {
+        assert_eq!(
+            body(&[
+                "work-item-wait",
+                "wi_1",
+                "--decision",
+                "dr_2",
+                "--wait-reason",
+                "Waiting for decision",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-wait","params":{"workItemId":"wi_1","waitReason":"Waiting for decision","decisionRequestId":"dr_2"}}"#
+        );
         assert_eq!(
             body(&[
                 "work-item-wait",

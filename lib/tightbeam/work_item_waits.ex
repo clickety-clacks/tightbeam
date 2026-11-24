@@ -1,6 +1,6 @@
 defmodule Tightbeam.WorkItemWaits do
   @moduledoc "Work-item ownership of existing dependency wakes; no separate scheduler."
-  alias Tightbeam.{DB, Wakes, RowReactions, Org, ConditionFacts, FactProducers}
+  alias Tightbeam.{DB, Wakes, RowReactions, Org, Gateway}
   alias Tightbeam.DB.Txn
 
   def ensure_schema(db) do
@@ -29,11 +29,13 @@ defmodule Tightbeam.WorkItemWaits do
           wakeId: wake_id,
           reason: wake.wait_reason,
           predicate: wake.predicate,
-          dueAt: wake.due_at,
+          dueAt: if(wake.due_at == Wakes.no_deadline(), do: nil, else: wake.due_at),
           active: is_nil(released_at),
           releasedAt: released_at,
           recognitionPath: wake.recognition_path,
           recognitionReason: wake.recognition_reason,
+          recognitionDisposition: wake.recognition_disposition,
+          recognitionEvidence: wake.recognition_evidence,
           state: wake.state
         }
 
@@ -54,8 +56,8 @@ defmodule Tightbeam.WorkItemWaits do
   def apply_in_txn(txn, item, call, :record) do
     with :ok <- bare_open(txn, item),
          :ok <- Tightbeam.WaitReason.validate(call.params[:wait_reason], "--wait-reason"),
-         :ok <- fallback(call.params[:after_ms]),
-         {:ok, declaration} <- declaration(txn, call.params) do
+         {:ok, declaration} <- declaration(txn, call.params),
+         {:ok, deadline} <- deadline(call.params, declaration) do
       current = get_in_txn(txn, item.id)
       # A retry does not move the safety deadline. A changed reason or target replaces it.
       if current && current.active && current.reason == call.params.wait_reason &&
@@ -80,14 +82,36 @@ defmodule Tightbeam.WorkItemWaits do
               wait_reason: call.params.wait_reason,
               prompt:
                 "The recorded wait for work item #{item.id} ended. Read the wait outcome and decide the next action: tightbeam work-item-get #{item.id}.",
-              due_at: now() + call.params.after_ms
+              due_at: deadline
             },
             declaration
           )
 
         case result do
-          {:error, error} -> error
-          _ -> %{wait: get_in_txn(txn, item.id)}
+          {:error, error} ->
+            error
+
+          wake ->
+            response = %{wait: get_in_txn(txn, item.id)}
+
+            warning =
+              Gateway.warn_unserved_condition_in_txn(txn, wake, call.params[:condition_kind])
+
+            response =
+              if warning[:warnings],
+                do: Map.put(response, :warnings, warning.warnings),
+                else: response
+
+            if declaration.resolver_ref.kind != "condition_fact" and call.params[:after_ms] do
+              Map.update(
+                response,
+                :warnings,
+                [record_deadline_warning()],
+                &(&1 ++ [record_deadline_warning()])
+              )
+            else
+              response
+            end
         end
       end
     else
@@ -95,14 +119,14 @@ defmodule Tightbeam.WorkItemWaits do
     end
   end
 
-  def apply_in_txn(txn, item, _call, :withdraw) do
+  def apply_in_txn(txn, item, call, :withdraw) do
     case get_in_txn(txn, item.id) do
       nil ->
         %{wait: nil}
 
       current ->
         release_in_txn(txn, current.wakeId)
-        cancel_in_txn(txn, current.wakeId)
+        withdraw_in_txn(txn, current.wakeId, call)
         %{wait: get_in_txn(txn, item.id)}
     end
   end
@@ -122,10 +146,29 @@ defmodule Tightbeam.WorkItemWaits do
     end
   end
 
-  defp fallback(ms) when is_integer(ms) and ms > 0, do: :ok
-  defp fallback(_), do: error("invalid_fallback", "--fallback-after must be a positive duration")
+  defp deadline(params, %{resolver_ref: %{kind: "condition_fact"}}) do
+    case params[:after_ms] do
+      ms when is_integer(ms) and ms > 0 -> {:ok, now() + ms}
+      _ -> error("invalid_fallback", "event waits require a positive --fallback-after duration")
+    end
+  end
 
-  defp declaration(txn, params) do
+  defp deadline(params, _) do
+    case params[:after_ms] do
+      ms when is_nil(ms) or (is_integer(ms) and ms > 0) -> {:ok, Wakes.no_deadline()}
+      _ -> error("invalid_fallback", "--fallback-after must be a positive duration when supplied")
+    end
+  end
+
+  defp record_deadline_warning do
+    %{
+      code: "record-wait-has-no-deadline",
+      message:
+        "Assignment and decision waits remain quiet until the target ends; --fallback-after does not override that lifetime."
+    }
+  end
+
+  defp declaration(_txn, params) do
     case {params[:assignment_id], params[:decision_request_id], params[:condition_kind],
           params[:condition_scope]} do
       {id, nil, nil, nil} when is_binary(id) and id != "" ->
@@ -148,18 +191,15 @@ defmodule Tightbeam.WorkItemWaits do
 
       {nil, nil, kind, scope}
       when is_binary(kind) and kind != "" and is_binary(scope) and scope != "" ->
-        if ConditionFacts.substrate_defined_kind?(kind) or FactProducers.served_in_txn?(txn, kind) do
+        if String.trim(kind) == "" or String.trim(scope) == "" do
+          error("invalid_wait_target", "event kind and scope must be nonblank")
+        else
           {:ok,
            %{
              conditions: [%{fact: "condition_fact.matches", op: "eq", value: true}],
              bindings: %{conditionKind: kind, conditionScope: scope, conditionAfterId: 0},
              resolver_ref: %{kind: "condition_fact", id: JSON.encode!([kind, scope])}
            }}
-        else
-          error(
-            "unknown_event",
-            "no known producer for event #{kind}; record a producer before waiting"
-          )
         end
 
       _ ->
@@ -189,7 +229,12 @@ defmodule Tightbeam.WorkItemWaits do
           [id, now()]
         )
 
-        cancel_in_txn(txn, old.wakeId)
+        cancel_in_txn(txn, old.wakeId, %{
+          requester: %{kind: "process", id: "tightbeam:work-items"},
+          reason_kind: "routing_bracket_satisfied",
+          causal_source: %{kind: "routing_bracket", id: id},
+          outcome: %{kind: "replacement", replacement_wake_id: wake.wake_id}
+        })
     end
 
     Txn.q(
@@ -260,7 +305,7 @@ defmodule Tightbeam.WorkItemWaits do
     end
   end
 
-  def dispose_in_txn(txn, id) do
+  def dispose_in_txn(txn, id, transition_id) do
     case get_in_txn(txn, id) do
       nil ->
         :ok
@@ -272,21 +317,44 @@ defmodule Tightbeam.WorkItemWaits do
           [id, now()]
         )
 
-        cancel_in_txn(txn, wait.wakeId)
+        cancel_in_txn(txn, wait.wakeId, %{
+          requester: %{kind: "process", id: "tightbeam:work-items"},
+          reason_kind: "routing_bracket_satisfied",
+          causal_source: %{kind: "work_item_transition", id: transition_id},
+          outcome: %{
+            kind: "disposition",
+            disposition_kind: "work_item_transition",
+            disposition_id: transition_id
+          }
+        })
     end
   end
 
-  defp cancel_in_txn(txn, wake_id) do
+  defp withdraw_in_txn(txn, wake_id, call) do
+    {kind, id} = call.principal
+
+    cancel_in_txn(txn, wake_id, %{
+      requester: %{kind: to_string(kind), id: id},
+      reason_kind: "requester_withdrew",
+      expected_origin: call.origin,
+      item_wait_withdrawal: true,
+      causal_source: %{
+        kind: "verb_call",
+        accepted_event: %{
+          origin: call.origin,
+          session_key: call[:session_key],
+          principal: call.principal
+        }
+      },
+      outcome: %{kind: "no_replacement"}
+    })
+  end
+
+  defp cancel_in_txn(txn, wake_id, command) do
     case Wakes.get_in_txn(txn, wake_id) do
       %{state: "pending", delivered_turn_seq: nil} ->
-        unless Wakes.cancel_in_txn(txn, %{
-                 wake_id: wake_id,
-                 requester: %{kind: "process", id: "tightbeam:work-item-waits"},
-                 reason_kind: "superseded",
-                 causal_source: %{kind: "wake", id: wake_id},
-                 outcome: %{kind: "no_replacement"}
-               }),
-               do: raise(DB.Error, message: "item wait withdrawal refused")
+        unless Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)),
+          do: raise(DB.Error, message: "item wait withdrawal refused")
 
       _ ->
         :ok

@@ -532,7 +532,7 @@ pub enum Command {
         decision: Option<String>,
         condition_kind: Option<String>,
         condition_scope: Option<String>,
-        after_ms: String,
+        after_ms: Option<String>,
         wait_reason: String,
     },
     WorkItemWaitWithdraw {
@@ -1198,7 +1198,8 @@ COMMANDS:
       Body-only forms: --body <text>, --body=<text>, or --clear-body. A body
       update replaces the whole text; --clear-body removes it.
   work-item-wait <workItemId> (--assignment <id>|--decision <id>|--when-fact <kind> --when-scope <scope>)
-      --fallback-after <duration> --wait-reason "<short reason>"
+      [--fallback-after <duration>] --wait-reason "<short reason>"
+      Events require a fallback; assignment and decision waits end with their target.
       Quiet only bare-item reminders until this recorded dependency ends.
       Inspect the wait with work-item-get; recording another target replaces it.
   work-item-wait-withdraw <workItemId>
@@ -4035,7 +4036,7 @@ fn parse_with_optional_catalog(
         }
         "work-item-wait" => {
             if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam work-item-wait <workItemId> (--assignment <id>|--decision <id>|--when-fact <kind> --when-scope <scope>) --fallback-after <duration> --wait-reason <reason>".to_owned());
+                return Err("usage: tightbeam work-item-wait <workItemId> (--assignment <id>|--decision <id>|--when-fact <kind> --when-scope <scope>) [--fallback-after <duration>] --wait-reason <reason>".to_owned());
             }
             let assignment = nonempty(flags, "assignment");
             let decision = nonempty(flags, "decision");
@@ -4058,11 +4059,12 @@ fn parse_with_optional_catalog(
                 );
             }
             let wait_reason = nonempty(flags, "wait-reason").ok_or("--wait-reason is required")?;
-            if wait_reason.chars().count() > 140 || wait_reason.contains(['\n', '\r']) {
-                return Err("--wait-reason must be one line, at most 140 characters".to_owned());
+            let fallback = nonempty(flags, "fallback-after")
+                .map(|value| parse_duration("fallback-after", &value))
+                .transpose()?;
+            if condition_kind.is_some() && fallback.is_none() {
+                return Err("event waits require --fallback-after".to_owned());
             }
-            let fallback =
-                nonempty(flags, "fallback-after").ok_or("--fallback-after is required")?;
             Ok(Command::WorkItemWait {
                 identity: identity(flags)?,
                 work_item_id: parsed.positional[1].clone(),
@@ -4070,7 +4072,7 @@ fn parse_with_optional_catalog(
                 decision,
                 condition_kind,
                 condition_scope,
-                after_ms: parse_duration("fallback-after", &fallback)?,
+                after_ms: fallback,
                 wait_reason,
             })
         }

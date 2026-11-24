@@ -8679,7 +8679,7 @@ defmodule Tightbeam.Gateway do
       if is_map(wake) and is_binary(wake[:wake_id]),
         do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, wake)
 
-      maybe_warn_unserved_in_txn(txn, wake, p[:condition_kind])
+      warn_unserved_condition_in_txn(txn, wake, p[:condition_kind])
     end
   end
 
@@ -8705,7 +8705,8 @@ defmodule Tightbeam.Gateway do
 
   defp maybe_add_replaced_wake_ids(response, _wake), do: response
 
-  defp maybe_warn_unserved_in_txn(txn, %{wake_id: _} = wake, kind) when is_binary(kind) do
+  @doc false
+  def warn_unserved_condition_in_txn(txn, %{wake_id: _} = wake, kind) when is_binary(kind) do
     if ConditionFacts.substrate_defined_kind?(kind) or FactProducers.served_in_txn?(txn, kind) do
       wake
     else
@@ -8717,7 +8718,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp maybe_warn_unserved_in_txn(_txn, wake, _kind), do: wake
+  def warn_unserved_condition_in_txn(_txn, wake, _kind), do: wake
 
   defp maybe_add_producer_warning(response, %{warnings: warnings}),
     do: Map.put(response, :warnings, warnings)
