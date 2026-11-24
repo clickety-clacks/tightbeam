@@ -828,6 +828,38 @@ defmodule Tightbeam.HarklightBouncesTest do
     end
   end
 
+  test "a woken advisory later seen moot or delivered is never acknowledged", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "a")
+    sent(db, @handle, "b")
+
+    assert {:ok, %{woken: ["adv-a", "adv-b"]}} =
+             read(db, [
+               item("a", @handle, advisories: [advisory("adv-a")]),
+               item("b", @handle, advisories: [advisory("adv-b")])
+             ])
+
+    # Next read: one went moot, the other was delivered elsewhere.
+    assert {:ok, %{woken: []}} =
+             read(db, [
+               item("a", @handle, advisories: [advisory("adv-a", extra: %{"moot" => true})]),
+               item("b", @handle, advisories: [advisory("adv-b", delivered: true)])
+             ])
+
+    assert [["adv-a", "moot"], ["adv-b", "delivered"]] =
+             wake_rows(
+               db,
+               "SELECT advisoryId,ackOutcome FROM harklight_bounces ORDER BY advisoryId"
+             )
+
+    %{calls: calls, runner: runner} = ack_runner()
+    assert {:ok, false} = HarklightBounces.ack_owed(db, runner: runner)
+    assert [] = Agent.get(calls, & &1)
+    assert [[1]] = wake_rows(db, "SELECT count(*) FROM wakes")
+  end
+
   test "an acknowledgment for a message that is gone stops retrying", ctx do
     %{db: db, main: main} = ctx
     worker = agent(db, "worker", main)

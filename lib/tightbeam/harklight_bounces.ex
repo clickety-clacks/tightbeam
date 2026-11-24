@@ -134,6 +134,8 @@ defmodule Tightbeam.HarklightBounces do
   def process_in_txn(%Txn{} = txn, candidates, source) when source in [:feed, :read] do
     now = System.system_time(:millisecond)
 
+    settle_owed_in_txn(txn, candidates)
+
     checked =
       for candidate <- candidates,
           bounce?(candidate),
@@ -196,6 +198,29 @@ defmodule Tightbeam.HarklightBounces do
       unroutable: Enum.map(unroutable, & &1.advisory["advisory_id"]),
       left_alone_open: left_alone
     }
+  end
+
+  # A woken advisory seen moot or delivered before its acknowledgment went out
+  # needs none: Harklight settles a moot notice without one.
+  defp settle_owed_in_txn(txn, candidates) do
+    now = System.system_time(:millisecond)
+
+    for %{advisory: %{"advisory_id" => id} = advisory} <- candidates,
+        is_binary(id),
+        kind(advisory) != :ignore,
+        outcome =
+          if(advisory["moot"] == true,
+            do: "moot",
+            else: if(advisory["delivered"] == true, do: "delivered")
+          ),
+        do:
+          Txn.q(
+            txn,
+            "UPDATE harklight_bounces SET ackCompletedAt=?2,ackOutcome=?3 WHERE advisoryId=?1 AND ackCompletedAt IS NULL",
+            [id, now, outcome]
+          )
+
+    :ok
   end
 
   defp ended?(item, advisory),
