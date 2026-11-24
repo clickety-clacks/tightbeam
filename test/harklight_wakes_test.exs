@@ -4154,6 +4154,108 @@ defmodule Tightbeam.HarklightWakesTest do
     end
   end
 
+  test "a start that never catches up does not hold back the others", %{db: db, session: session} do
+    second = "7d737f62-bbd7-4c51-978d-f6ff5b4d8147"
+    third = "7d737f62-bbd7-4c51-978d-f6ff5b4d8148"
+
+    for {h, m} <- [{second, "other"}, {third, "third"}],
+        do: seed_completion_handle(db, session.session_key, h, m)
+
+    parent = self()
+
+    listener = fn manager, handle, _ ->
+      send(parent, {:started, handle, System.monotonic_time(:millisecond)})
+      if handle == @handle, do: receive(do: (:server_back -> :ok))
+      :ok = GenServer.call(manager, {:feed_ready, handle})
+      send(parent, {:ready, handle})
+      receive do: (:hold -> :ok)
+    end
+
+    manager =
+      start_supervised!(
+        {HarklightWakes,
+         db: db, listener: listener, feed_start_spacing_ms: 40, feed_start_limit_ms: 120}
+      )
+
+    assert_receive {:started, @handle, _}, 1_000
+    refute_receive {:started, _, _}, 60
+    assert_receive {:started, ^second, at_second}, 1_000
+    assert_receive {:started, ^third, at_third}, 1_000
+    assert at_third - at_second >= 35
+    assert_receive {:ready, ^third}, 1_000
+
+    # The waiting start is left running, unreported, and finishes normally.
+    assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
+    state = :sys.get_state(manager)
+    assert MapSet.to_list(state.starts_in_flight) == [@handle]
+    send(state.workers[@handle], :server_back)
+    assert_receive {:ready, @handle}, 1_000
+  end
+
+  # Agent 0.2.3 keeps running while it is cut off, and prints these.
+  @agent_023_lines [
+    "listen: feed connection ended; reconnecting",
+    "listen: server request via configured address localhost failed: error sending request: connection refused; reconnecting",
+    ~s|listen: server returned HTTP 500: Some("internal_error") (request ID Some("r1")); reconnecting|,
+    ~s|listen: internal_error (Request-Id Some("r2")); reconnecting|,
+    "listen: HTTP 400 response was outside the Harklight API. Check the configured address or device port.; reconnecting",
+    "listen: server sent an unexpected response (request ID None); reconnecting",
+    "listen: invalid agent change or cursor; reconnecting",
+    "listen: invalid agent snapshot; reconnecting",
+    "listen: agent feed closed: future_reason; reconnecting",
+    "listen: live updates resumed"
+  ]
+
+  test "Agent 0.2.3 reconnect lines leave a running feed and its later exit alone", %{db: db} do
+    :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
+    lines = Enum.map_join(@agent_023_lines, " ", &"'#{&1}'")
+    chat = JSON.encode!(feed_chat(9, "request", "after-reconnect"))
+
+    fake_harklight_agent!("""
+    printf '%s\n' "$*" >> "$0.calls"
+    printf '%s\n' '{"kind":"caught_up","rev":8}'
+    printf '%s\n' #{lines} >&2
+    sleep 0.1
+    printf '%s\n' '#{chat}' '{"kind":"caught_up","rev":9}'
+    while [ ! -e "$0.exit" ]; do sleep 0.02; done
+    exit 1
+    """)
+
+    agent = System.find_executable("harklight-agent")
+    start_supervised!({HarklightWakes, db: db, retry_delays: [5_000], retry_jitter: false})
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[9]]}
+           end)
+
+    assert File.read!(agent <> ".calls") == "listen --follow --session #{@handle} --after 8\n"
+    assert {:ok, []} = Tightbeam.HarklightListenerOutage.pending(db)
+    File.touch!(agent <> ".exit")
+
+    # The later exit is classified by itself, not by the earlier lines.
+    assert eventually(fn -> handle_failed_with?(db, "listener_stopped") end)
+    assert {:ok, [[error]]} = DB.query(db, "SELECT lastError FROM harklight_wake_handles")
+    assert error =~ "no safe output captured"
+    refute error =~ "reason_code"
+  end
+
+  test "Agent 0.2.3 reconnect lines do not make an orderly stop uncertain", %{db: db} do
+    :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
+    lines = Enum.map_join(@agent_023_lines, " ", &"'#{&1}'")
+
+    fake_harklight_agent!("""
+    printf '%s\n' #{lines} >&2
+    printf '%s\n' '{"kind":"caught_up","rev":8}'
+    exec sleep 30
+    """)
+
+    manager = start_supervised!({HarklightWakes, db: db})
+    await_listener_port()
+    assert eventually(fn -> MapSet.size(:sys.get_state(manager).starts_in_flight) == 0 end)
+    :ok = stop_supervised(HarklightWakes)
+    assert {:ok, []} = DB.query(db, "SELECT owner FROM harklight_feed_launches")
+  end
+
   test "a quiet recovered feed is not reported as out", %{db: db} do
     :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
 

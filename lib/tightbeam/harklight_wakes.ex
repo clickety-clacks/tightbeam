@@ -26,6 +26,10 @@ defmodule Tightbeam.HarklightWakes do
   @feed_read_retry_delay 250
   @retry_delays [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 300_000]
 
+  # The Agent waits for a lost Server inside its own process. After this long a
+  # start that has not caught up gives up its admission slot and keeps running.
+  @feed_start_limit 60_000
+
   @max_diagnostic_lines 3
   @max_diagnostic_line_chars 240
   @max_diagnostic_chars 768
@@ -1408,6 +1412,7 @@ defmodule Tightbeam.HarklightWakes do
        admission_next: nil,
        admission_spacing: Keyword.get(opts, :feed_start_spacing_ms, 250),
        launching: MapSet.new(),
+       feed_start_limit: Keyword.get(opts, :feed_start_limit_ms, @feed_start_limit),
        transport_failures: %{},
        cooldown_until: nil,
        cooldown_level: 0,
@@ -1491,6 +1496,12 @@ defmodule Tightbeam.HarklightWakes do
     do: {:noreply, admit_feed(%{state | admission_timer: nil})}
 
   def handle_info({:admit_feed, _stale}, state), do: {:noreply, state}
+
+  def handle_info({:feed_start_limit, handle, pid}, state) do
+    if state.workers[handle] == pid and MapSet.member?(state.launching, handle),
+      do: {:noreply, admit_feed(%{state | launching: MapSet.delete(state.launching, handle)})},
+      else: {:noreply, state}
+  end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
     case Map.pop(state.gone_tasks, ref) do
@@ -2991,6 +3002,8 @@ defmodule Tightbeam.HarklightWakes do
         end
       end)
 
+    Process.send_after(self(), {:feed_start_limit, handle, pid}, state.feed_start_limit)
+
     %{
       state
       | workers: Map.put(state.workers, handle, pid),
@@ -3348,8 +3361,13 @@ defmodule Tightbeam.HarklightWakes do
 
   defp observe_feed_diagnostic(evidence, line) do
     case HarklightFailures.listen_pause(line) || HarklightFailures.listen_refusal(line) do
-      nil -> if String.trim(line) == "", do: evidence, else: :ambiguous
-      terminal -> {:terminal, terminal}
+      nil ->
+        if String.trim(line) == "" or HarklightFailures.listen_progress?(line),
+          do: evidence,
+          else: :ambiguous
+
+      terminal ->
+        {:terminal, terminal}
     end
   end
 
@@ -3754,7 +3772,8 @@ defmodule Tightbeam.HarklightWakes do
   end
 
   defp append_diagnostic(diagnostics, output) do
-    case sanitize_refusal_output(output) do
+    case not HarklightFailures.listen_progress?(output) && sanitize_refusal_output(output) do
+      false -> diagnostics
       nil -> diagnostics
       diagnostic -> Enum.take(diagnostics ++ [diagnostic], -@max_diagnostic_lines)
     end
