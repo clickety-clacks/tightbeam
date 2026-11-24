@@ -1670,6 +1670,93 @@ defmodule Tightbeam.AssignmentsTest do
       end
     end
 
+    for effect_kind <- ["coordination", "code"] do
+      @producer_effect effect_kind
+      test "a clean review preserves an automatically reopened #{@producer_effect} assignment after notice delivery",
+           ctx do
+        session(ctx.db, "notice-parent", "flynn")
+
+        producer =
+          assign_call({:session, "notice-parent"}, "reviewed producer")
+          |> put_in([:params, :effect_kind], @producer_effect)
+          |> then(&handle(ctx, "assign", &1))
+
+        review =
+          assign_call({:session, "notice-parent"}, "producer review")
+          |> put_in([:params, :reviews_assignment_id], producer.id)
+          |> Map.put(:session_key, "other-session")
+          |> then(&handle(ctx, "assign", &1))
+
+        verdict = fn principal, assignment, kind ->
+          attest_call(principal, assignment.id, "verdict")
+          |> put_in([:params, :verdict_kind], kind)
+          |> then(&handle(ctx, "attest", &1))
+        end
+
+        complete = fn ->
+          handle(ctx, "attest", attest_call({:session, "holder"}, producer.id, "completion"))
+        end
+
+        review_verdict = fn kind -> verdict.({:session, "other-session"}, review, kind) end
+
+        if @producer_effect == "code" do
+          assert %{attest: %{verdictKind: "verified"}} =
+                   verdict.({:session, "holder"}, producer, "verified")
+
+          assert %{attest: %{verdictKind: "reviewed-clean"}} = review_verdict.("reviewed-clean")
+        end
+
+        notices = fn ->
+          Enum.filter(
+            terminal_notices(ctx.db),
+            &(&1.obligation_ref == "terminal-child-owner-notification:" <> producer.id)
+          )
+        end
+
+        assert %{assignment: %{state: "closed"}, attest: %{id: first_id}} = complete.()
+        assert [first_notice] = notices.()
+        assert first_notice.prompt =~ ~s(source_token="#{first_id}")
+        force_wake_due(ctx.db, first_notice.wake_id)
+        scheduler = terminal_notice_scheduler(ctx.db)
+        assert :ok = Wakes.fire_due(scheduler)
+        assert %{state: "fired"} = Wakes.get(ctx.db, first_notice.wake_id)
+
+        assert [[_seq, "notice-parent", "queued", _carrier_id]] =
+                 source_delivery_turns(ctx.db, first_notice.wake_id)
+
+        assert %{attest: %{verdictKind: "changes-requested"}} =
+                 review_verdict.("changes-requested")
+
+        readback = fn ->
+          handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, producer.id))
+        end
+
+        assert %{state: "open", reopenings: [%{priorClosingAttestId: ^first_id}]} = readback.()
+
+        assert %{attest: %{id: clean_id, verdictKind: "reviewed-clean"}} =
+                 review_verdict.("reviewed-clean")
+
+        assert %{state: "open", outcome: nil, closingAttestId: nil} = readback.()
+
+        assert {:ok, [["reviewed-clean"]]} =
+                 DB.query(ctx.db, "SELECT verdictKind FROM attests WHERE id=?1", [clean_id])
+
+        first_wake_id = first_notice.wake_id
+        assert [%{wake_id: ^first_wake_id, state: "fired"}] = notices.()
+
+        assert %{assignment: %{state: "closed", outcome: "completed"}, attest: %{id: second_id}} =
+                 complete.()
+
+        assert second_id != first_id
+        assert %{closingAttestId: ^second_id} = readback.()
+
+        assert {[%{state: "fired"}], [second_notice]} =
+                 Enum.split_with(notices.(), &(&1.wake_id == first_wake_id))
+
+        assert second_notice.prompt =~ ~s(source_token="#{second_id}")
+      end
+    end
+
     test "retiring a notice recipient readdresses its pending terminal notice", ctx do
       {_assignment, wake, personal} = terminal_delivery_fixture(ctx, "completion")
 
