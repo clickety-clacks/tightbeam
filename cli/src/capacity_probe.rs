@@ -4,6 +4,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+#[cfg(test)]
+mod native;
+
 use chrono::DateTime;
 use serde_json::{Value, json};
 
