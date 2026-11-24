@@ -1033,8 +1033,7 @@ COMMANDS:
       Follow a message or conversation sent through Tightbeam.
   harklight-retry (--all | --message <id> | --session <handle>)
       Retry the bounded listener start for unavailable unanswered conversations.
-      Listeners recover by themselves. Use --session to resume one after a revoked
-      identity is enrolled again, or to open a conversation held since before 0.2.
+      Use --session to resume a paused feed from its last saved checkpoint.
   harklight-read --handle <handle>
       Read Harklight entries delivered to this session.
   harklight-ack --handle <handle> --event <id>
