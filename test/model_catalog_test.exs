@@ -305,7 +305,7 @@ defmodule Tightbeam.ModelCatalogTest do
     before = :sys.get_state(pid)
 
     log =
-      capture_log(fn ->
+      capture_log([colors: [enabled: false]], fn ->
         send(pid, {:stray, :message})
         assert :sys.get_state(pid) == before
       end)
