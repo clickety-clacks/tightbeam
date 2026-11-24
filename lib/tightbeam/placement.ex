@@ -1553,7 +1553,9 @@ defmodule Tightbeam.Placement do
     base =
       if Map.get(config, :provider_accounts_enabled, false) and
            function_exported?(module, :conversation_directory, 0) do
-        Keyword.put(base, :account_writer_lock, Homes.account_writer_lock(home))
+        base
+        |> Keyword.put(:account_writer_lock, Homes.account_writer_lock(home))
+        |> Keyword.put(:account_writer_target, target)
       else
         base
       end

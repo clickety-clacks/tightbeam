@@ -3,6 +3,7 @@ defmodule Tightbeam.AccountWriter do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Harness.Support
 
   def ensure_schema(db) do
     DB.execute(db, """
@@ -12,6 +13,62 @@ defmodule Tightbeam.AccountWriter do
       acquiredAt INTEGER NOT NULL
     )
     """)
+  end
+
+  def run(db, adapter_key, target, home, argv) when is_list(argv) and argv != [] do
+    reconcile(db, adapter_key, target, home)
+
+    with {:ok, {:ok, lease}} <- reserve(db, adapter_key) do
+      receipt = receipt_path(home, lease)
+      helper = Path.join(target.host_config[:cli_bin] || target.cli_bin, "tightbeam")
+
+      command = [
+        helper,
+        "harness-exec",
+        receipt <> ".identity",
+        lease,
+        "--writer-lock",
+        Tightbeam.Homes.account_writer_lock(home),
+        "--writer-receipt",
+        receipt,
+        "--" | argv
+      ]
+
+      result = target.sh.(on_host(target, command))
+
+      with {bytes, 0} <- target.sh.(on_host(target, ["cat", receipt])),
+           {:ok, _} <- settle_from_receipt(db, adapter_key, lease, bytes) do
+        {:ok, result}
+      else
+        _ -> {:error, :unconfirmed_writer_settlement}
+      end
+    else
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def reconcile(db, adapter_key, target, home) do
+    with {:ok, [[lease]]} <-
+           DB.query(db, "SELECT leaseId FROM account_writer_leases WHERE adapterKey = ?1", [
+             adapter_key
+           ]),
+         {receipt, 0} <- target.sh.(on_host(target, ["cat", receipt_path(home, lease)])),
+         {:ok, true} <- settle_from_receipt(db, adapter_key, lease, receipt) do
+      :settled
+    else
+      _ -> :unconfirmed
+    end
+  end
+
+  defp receipt_path(home, lease),
+    do: Path.join([home, ".tightbeam", "account-writers", lease <> ".done"])
+
+  defp on_host(%{host_config: %{ssh: nil}}, command), do: command
+
+  defp on_host(%{host_config: %{ssh: destination}}, command) do
+    ["ssh" | Support.ssh_opts()] ++
+      [destination, Enum.map_join(command, " ", &Support.shell_quote/1)]
   end
 
   def reserve(db, adapter_key) do

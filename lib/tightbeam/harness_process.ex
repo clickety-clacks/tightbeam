@@ -160,6 +160,10 @@ defmodule Tightbeam.HarnessProcess do
       if dedicated_cursor?, do: File.chmod!(Path.dirname(identity_path), 0o2770)
     end
 
+    if target = Keyword.get(opts, :account_writer_target) do
+      Tightbeam.AccountWriter.reconcile(db, key_name(key), target, Keyword.fetch!(opts, :home))
+    end
+
     case DB.transaction(db, fn txn ->
            if writer_lock && Tightbeam.AccountWriter.reserved?(txn, key_name(key)) do
              :writer_active

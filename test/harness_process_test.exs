@@ -105,6 +105,53 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 7)
   end
 
+  test "writer admission survives transport loss until the owning host returns its receipt", %{
+    tmp_dir: tmp
+  } do
+    db = start_supervised!({DB, path: ":memory:", name: :writer_receipt_fixture})
+    :ok = HarnessProcess.ensure_schema(db)
+    :ok = Tightbeam.AccountWriter.ensure_schema(db)
+    key = "claude:shared@testhost"
+
+    target = %{
+      host_config: %{ssh: nil},
+      cli_bin: tmp,
+      sh: fn
+        [
+          _helper,
+          "harness-exec",
+          _identity,
+          lease,
+          "--writer-lock",
+          _lock,
+          "--writer-receipt",
+          receipt,
+          "--",
+          "/bin/true"
+        ] ->
+          send(self(), {:writer_started, lease, receipt})
+          {"transport lost", 255}
+
+        ["cat", path] ->
+          case File.read(path) do
+            {:ok, bytes} -> {bytes, 0}
+            {:error, :enoent} -> {"absent", 1}
+          end
+      end
+    }
+
+    assert {:error, :unconfirmed_writer_settlement} =
+             Tightbeam.AccountWriter.run(db, key, target, tmp, ["/bin/true"])
+
+    assert_receive {:writer_started, lease, receipt}
+    assert {:ok, {:error, :credential_writer_active}} = Tightbeam.AccountWriter.reserve(db, key)
+    File.mkdir_p!(Path.dirname(receipt))
+    File.write!(receipt, "tightbeam-account-writer-v1\t#{lease}\t0\n")
+    assert :settled = Tightbeam.AccountWriter.reconcile(db, key, target, tmp)
+    assert {:ok, {:ok, new_lease}} = Tightbeam.AccountWriter.reserve(db, key)
+    refute new_lease == lease
+  end
+
   test "remote adapter launch carries its owning-host writer lock", %{tmp_dir: tmp} do
     db = start_supervised!({DB, path: ":memory:", name: :writer_launch_fixture})
     :ok = HarnessProcess.ensure_schema(db)
