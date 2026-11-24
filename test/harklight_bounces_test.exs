@@ -50,11 +50,15 @@ defmodule Tightbeam.HarklightBouncesTest do
 
   ## The kind decision is one function
 
-  test "kind decides full, ignored and unknown notices in one place" do
-    assert HarklightBounces.kind(%{"advisory_type" => "unseen_interval_elapsed"}) == :full
-    assert HarklightBounces.kind(%{"advisory_type" => "possible_contradictions"}) == :ignore
-    assert HarklightBounces.kind(%{"advisory_type" => "opened_interval_elapsed"}) == :unknown
-    assert HarklightBounces.kind(%{"advisory_type" => ""}) == :ignore
+  test "kind decides full, soft and ignored notices in one place" do
+    for type <- ["unseen_interval_elapsed", "full_bounce"],
+        do: assert(HarklightBounces.kind(%{"advisory_type" => type}) == :full)
+
+    assert HarklightBounces.kind(%{"advisory_type" => "soft_bounce"}) == :soft
+
+    for type <- ["possible_contradictions", "opened_interval_elapsed", "mystery", ""],
+        do: assert(HarklightBounces.kind(%{"advisory_type" => type}) == :ignore)
+
     assert HarklightBounces.kind(%{}) == :ignore
   end
 
@@ -71,7 +75,7 @@ defmodule Tightbeam.HarklightBouncesTest do
 
     assert :ok = capture(db, 5, [frame], item)
     assert [[^worker, prompt]] = wake_rows(db, "SELECT sessionKey,prompt FROM wakes")
-    assert prompt =~ "Harklight has no record that the person saw this message"
+    assert prompt =~ "This message had not been opened when it bounced."
 
     # The same advisory heard again: by a replayed feed revision, by a later
     # baseline carrying it, and by the read path. Nobody is woken again.
@@ -82,7 +86,10 @@ defmodule Tightbeam.HarklightBouncesTest do
                db,
                @handle,
                9,
-               [message_frame(8, item), Map.put(advisory_frame(9, "item-1", "adv-1"), "item", item)],
+               [
+                 message_frame(8, item),
+                 Map.put(advisory_frame(9, "item-1", "adv-1"), "item", item)
+               ],
                :baseline
              )
 
@@ -129,7 +136,8 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert [["adv-answered", "closed"], ["adv-open", "woken"]] =
              wake_rows(db, "SELECT advisoryId,outcome FROM harklight_bounces ORDER BY advisoryId")
 
-    assert [[1]] = wake_rows(db, "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_bounce_%'")
+    assert [[1]] =
+             wake_rows(db, "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_bounce_%'")
   end
 
   test "a bounce skipped by a checkpoint or baseline is heard by the read path", ctx do
@@ -223,7 +231,8 @@ defmodule Tightbeam.HarklightBouncesTest do
              DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[3]]}
            end)
 
-    assert [["adv-1", "woken"]] = wake_rows(db, "SELECT advisoryId,outcome FROM harklight_bounces")
+    assert [["adv-1", "woken"]] =
+             wake_rows(db, "SELECT advisoryId,outcome FROM harklight_bounces")
   end
 
   test "a failed message lookup leaves the advisory for the read path", ctx do
@@ -582,7 +591,7 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert length(woken) == 30
     assert [[^worker, prompt]] = wake_rows(db, "SELECT sessionKey,prompt FROM wakes")
     assert length(String.split(prompt, "\n- ")) - 1 == 30
-    assert prompt =~ "each of these 30 messages"
+    assert prompt =~ "Each of these 30 messages had not been opened when it bounced."
   end
 
   test "30 overdue bounces for retired targets arrive at their parent as one wake", ctx do
@@ -648,7 +657,7 @@ defmodule Tightbeam.HarklightBouncesTest do
 
   ## What the wake says
 
-  test "the full bounce wake says only what is true and resends nothing", ctx do
+  test "the full bounce wake says only what was true when it bounced and resends nothing", ctx do
     %{db: db, main: main} = ctx
     worker = agent(db, "worker", main)
     conversation(db, @handle, worker)
@@ -657,7 +666,7 @@ defmodule Tightbeam.HarklightBouncesTest do
     advisory =
       advisory("adv-1",
         extra: %{
-          "due_at_ms" => 1_700_000_000_000,
+          "evaluated_at_ms" => 1_700_000_000_000,
           "bounce_after_days" => 3,
           "level_name" => "Important"
         }
@@ -669,46 +678,82 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert [[prompt]] = wake_rows(db, "SELECT prompt FROM wakes")
 
     assert prompt ==
-             "Harklight bounce. Harklight has no record that the person saw this message, and it is still open.\n" <>
+             "Harklight bounce. This message had not been opened when it bounced.\n" <>
                "- \"Deploy approval\" (message item-1, conversation #{@handle}, started by #{worker}): " <>
-               "it was due to be seen by 2023-11-14T22:13:20.000Z, 3 days after Harklight accepted it (level Important).\n" <>
+               "it bounced at 2023-11-14T22:13:20.000Z (bounce interval 3 days, level Important).\n" <>
                "Decide whether it is still valid and worth resending, and whether its importance warrants a higher priority. " <>
                "To send it again use `tightbeam harklight-send`; to withdraw it use `tightbeam harklight-retract --message <message id>`. " <>
                "Tightbeam has not resent anything and will not."
+
+    refute prompt =~ "never saw"
+    refute prompt =~ "inbox"
 
     assert [["input-needed", "process:tightbeam"]] =
              wake_rows(db, "SELECT class,origin FROM wakes")
   end
 
-  test "an unknown notice type is worded without claiming anything", ctx do
+  test "a soft bounce says it was opened but not acted on, as of when it bounced", ctx do
     %{db: db, main: main} = ctx
     worker = agent(db, "worker", main)
     conversation(db, @handle, worker)
     sent(db, @handle, "item-1")
 
-    unknown =
-      advisory("adv-1",
-        type: "opened_interval_elapsed",
-        extra: %{"text" => "Harklight says: pay attention\nplease"}
-      )
+    soft =
+      advisory("adv-1", type: "soft_bounce", extra: %{"evaluated_at_ms" => 1_700_000_000_000})
 
     assert {:ok, %{woken: ["adv-1"]}} =
-             read(db, [item("item-1", @handle, advisories: [unknown], title: "Plan")])
+             read(db, [item("item-1", @handle, advisories: [soft], title: "Plan")])
 
     assert [[prompt]] = wake_rows(db, "SELECT prompt FROM wakes")
 
     assert prompt ==
-             "Harklight sent a notice of a type Tightbeam does not recognise, so Tightbeam cannot say what it means.\n" <>
+             "Harklight soft bounce. This message had been opened but not acted on when it bounced.\n" <>
                "- \"Plan\" (message item-1, conversation #{@handle}, started by #{worker}): " <>
-               "notice type \"opened_interval_elapsed\". Harklight's text: \"Harklight says: pay attention please\".\n" <>
-               "Look at the message in Harklight and decide whether any action is needed. Tightbeam has not resent anything and will not."
+               "it bounced at 2023-11-14T22:13:20.000Z (bounce interval 2 days, level Normal).\n" <>
+               "Decide whether it is still valid and worth resending, and whether its importance warrants a higher priority. " <>
+               "To send it again use `tightbeam harklight-send`; to withdraw it use `tightbeam harklight-retract --message <message id>`. " <>
+               "Tightbeam has not resent anything and will not."
 
-    refute prompt =~ "no record"
-    refute prompt =~ "saw"
-    assert [["unknown"]] = wake_rows(db, "SELECT kind FROM harklight_bounces")
+    assert [["soft"]] = wake_rows(db, "SELECT kind FROM harklight_bounces")
   end
 
-  test "full and unknown notices for one agent are one wake in two plain sections", ctx do
+  test "the later full_bounce type is handled as a full bounce", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+
+    assert {:ok, %{woken: ["adv-1"]}} =
+             read(db, [
+               item("item-1", @handle, advisories: [advisory("adv-1", type: "full_bounce")])
+             ])
+
+    assert [["full"]] = wake_rows(db, "SELECT kind FROM harklight_bounces")
+  end
+
+  test "any other notice type is ignored: no wake, no record, no acknowledgment", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+
+    other = advisory("adv-1", type: "opened_interval_elapsed")
+    message = item("item-1", @handle, advisories: [other])
+
+    assert {:ok, %{woken: [], closed: []}} = read(db, [message])
+
+    frame = %{
+      "kind" => "advisory",
+      "rev" => 3,
+      "data" => %{"item_id" => "item-1", "advisory" => other}
+    }
+
+    assert :ok = capture(db, 3, [frame], message)
+    assert [[0]] = wake_rows(db, "SELECT count(*) FROM harklight_bounces")
+    assert [[0]] = wake_rows(db, "SELECT count(*) FROM wakes")
+  end
+
+  test "full and soft bounces for one agent are one wake in two sections", ctx do
     %{db: db, main: main} = ctx
     worker = agent(db, "worker", main)
     conversation(db, @handle, worker)
@@ -718,15 +763,102 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert {:ok, _} =
              read(db, [
                item("a", @handle, advisories: [advisory("adv-a")]),
-               item("b", @handle, advisories: [advisory("adv-b", type: "mystery", extra: %{"text" => nil})])
+               item("b", @handle, advisories: [advisory("adv-b", type: "soft_bounce")])
              ])
 
     assert [[prompt]] = wake_rows(db, "SELECT prompt FROM wakes")
-    [full, unknown] = String.split(prompt, "\n\n")
-    assert full =~ "no record that the person saw this message"
-    refute full =~ "mystery"
-    assert unknown =~ "does not recognise"
-    refute unknown =~ "saw"
+    [full, soft] = String.split(prompt, "\n\n")
+    assert full =~ "had not been opened when it bounced"
+    refute full =~ "acted on"
+    assert soft =~ "had been opened but not acted on when it bounced"
+    refute soft =~ "had not been opened"
+  end
+
+  test "a moot advisory closes without a wake and is acknowledged, whatever the item says", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+    moot = advisory("adv-1", extra: %{"moot" => true})
+
+    assert {:ok, %{closed: ["adv-1"], woken: []}} =
+             read(db, [item("item-1", @handle, advisories: [moot])])
+
+    assert [[0]] = wake_rows(db, "SELECT count(*) FROM wakes")
+    assert [["closed"]] = wake_rows(db, "SELECT outcome FROM harklight_bounces")
+    %{calls: calls, runner: runner} = ack_runner()
+    assert {:ok, false} = HarklightBounces.ack_owed(db, runner: runner)
+    assert [_] = for(["advisory-ack" | _] = call <- Agent.get(calls, & &1), do: call)
+  end
+
+  test "a bounced item with no terminal is woken even if Harklight closed it in the inbox", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+    # Inbox closure is not a terminal: the agent row keeps terminal null.
+    message =
+      item("item-1", @handle, advisories: [advisory("adv-1")], extra: %{"inbox" => "closed"})
+
+    assert {:ok, %{woken: ["adv-1"]}} = read(db, [message])
+  end
+
+  test "a bounce neither ends the conversation nor stops later chat", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "request")
+
+    assert :ok = capture(db, 5, [advisory_frame(5, "request", "adv-1")], item("request", @handle))
+    assert [["active"]] = wake_rows(db, "SELECT state FROM harklight_wake_handles")
+
+    chat = %{
+      "kind" => "entry",
+      "rev" => 6,
+      "data" => %{
+        "item_id" => "request",
+        "entry_id" => "chat-1",
+        "request_revision" => 1,
+        "kind" => "reply",
+        "author" => "person",
+        "text" => "Reply"
+      }
+    }
+
+    assert :ok = HarklightWakes.capture_feed(db, @handle, 6, [chat], :live)
+
+    assert [[^worker]] =
+             wake_rows(
+               db,
+               "SELECT sessionKey FROM harklight_wake_deliveries WHERE eventId LIKE 'v2_%'"
+             )
+
+    assert [["active"]] = wake_rows(db, "SELECT state FROM harklight_wake_handles")
+
+    assert [[0]] =
+             wake_rows(db, "SELECT count(*) FROM harklight_wake_follows WHERE state='ended'")
+  end
+
+  test "open bounces on messages Tightbeam did not send are counted and left alone", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "ours")
+
+    messages = [
+      item("ours", @handle, advisories: [advisory("adv-ours")]),
+      item("foreign-1", @handle, advisories: [advisory("adv-f1")]),
+      item("foreign-2", @other_handle, advisories: [advisory("adv-f2", type: "soft_bounce")]),
+      item("foreign-3", @handle,
+        advisories: [advisory("adv-f3")],
+        terminal: %{"state" => "answered", "at_ms" => 1}
+      ),
+      item("foreign-4", @handle, advisories: [advisory("adv-f4", extra: %{"moot" => true})])
+    ]
+
+    assert {:ok, %{woken: ["adv-ours"], left_alone_open: left}} = read(db, messages)
+    assert Enum.sort(left) == ["adv-f1", "adv-f2"]
+    assert [["adv-ours"]] = wake_rows(db, "SELECT advisoryId FROM harklight_bounces")
   end
 
   test "a title cannot break the wake text", ctx do
@@ -995,7 +1127,10 @@ defmodule Tightbeam.HarklightBouncesTest do
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
 
     try do
-      {:ok, _} = DB.transaction(db, fn txn -> Tightbeam.DB.Txn.q(txn, "DELETE FROM sessions WHERE sessionKey=?1", [key]) end)
+      {:ok, _} =
+        DB.transaction(db, fn txn ->
+          Tightbeam.DB.Txn.q(txn, "DELETE FROM sessions WHERE sessionKey=?1", [key])
+        end)
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
     end

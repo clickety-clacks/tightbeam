@@ -34,7 +34,6 @@ defmodule Tightbeam.HarklightBounces do
   @read_interval 900_000
   @read_spacing 60_000
   @max_title 120
-  @max_notice_text 500
 
   @registration_sql """
   SELECT r.handle,r.senderId,r.messageId,h.sessionKey,h.host,h.state,
@@ -51,7 +50,7 @@ defmodule Tightbeam.HarklightBounces do
       senderId TEXT NOT NULL,
       messageId TEXT NOT NULL,
       advisoryType TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK(kind IN ('full','unknown')),
+      kind TEXT NOT NULL CHECK(kind IN ('full','soft')),
       outcome TEXT NOT NULL CHECK(outcome IN ('woken','closed')),
       recipient TEXT REFERENCES sessions(sessionKey),
       wakeId TEXT REFERENCES wakes(wakeId),
@@ -74,18 +73,18 @@ defmodule Tightbeam.HarklightBounces do
   ## The kind decision. This is the only place that says what a bounce means.
 
   @doc """
-  What an advisory is: `:full` (Harklight has no record that the person saw the
-  message), `:ignore` (not a bounce) or `:unknown` (a bounce type this build
-  does not know, worded without claiming anything about it).
+  What an advisory is. The list of types Tightbeam acts on lives here and
+  nowhere else; every other type, `possible_contradictions` included, is
+  `:ignore`: no wake, no record, no acknowledgment.
 
-  Harklight Server 0.2.8 carries one bounce type, `unseen_interval_elapsed`, and
-  it means the person never saw the message. A soft bounce (opened, not acted
-  on) needs its own marker from Harklight; it becomes one more clause here and a
-  sentence in `section/3`, and nothing else changes.
+    * `:full`: the message had not been opened when it bounced
+      (`unseen_interval_elapsed`, current and historical, and `full_bounce`).
+    * `:soft`: it had been opened but not acted on by then (`soft_bounce`).
   """
-  def kind(%{"advisory_type" => "unseen_interval_elapsed"}), do: :full
-  def kind(%{"advisory_type" => "possible_contradictions"}), do: :ignore
-  def kind(%{"advisory_type" => type}) when is_binary(type) and type != "", do: :unknown
+  def kind(%{"advisory_type" => type}) when type in ["unseen_interval_elapsed", "full_bounce"],
+    do: :full
+
+  def kind(%{"advisory_type" => "soft_bounce"}), do: :soft
   def kind(_), do: :ignore
 
   ## Feed path
@@ -171,21 +170,28 @@ defmodule Tightbeam.HarklightBounces do
   def process_in_txn(%Txn{} = txn, candidates, source) when source in [:feed, :read] do
     now = System.system_time(:millisecond)
 
-    decided =
+    fresh =
       candidates
       |> Enum.filter(&bounce?/1)
       |> Enum.uniq_by(& &1.advisory["advisory_id"])
       |> Enum.reject(&recorded?(txn, &1))
-      |> Enum.flat_map(fn candidate ->
-        with item when is_map(item) <- candidate.item,
-             {:ok, reg} <- registration(txn, candidate, item) do
-          [Map.put(candidate, :reg, reg)]
-        else
-          _ -> []
-        end
-      end)
 
-    {closed, open} = Enum.split_with(decided, &(not is_nil(&1.item["terminal"])))
+    checked =
+      for candidate <- fresh, is_map(candidate.item) do
+        {candidate, registration(txn, candidate, candidate.item)}
+      end
+
+    decided = for {candidate, {:ok, reg}} <- checked, do: Map.put(candidate, :reg, reg)
+
+    # Open bounces on messages Tightbeam did not send: counted, never touched.
+    left_alone =
+      for {candidate, :foreign} <- checked, not ended?(candidate.item, candidate.advisory) do
+        candidate.advisory["advisory_id"]
+      end
+
+    # Moot (the person answered, saw, retracted, revised or let it expire) or a
+    # real terminal: nothing to wake. Closing the item in the inbox is not one.
+    {closed, open} = Enum.split_with(decided, &ended?(&1.item, &1.advisory))
 
     routed =
       for candidate <- open do
@@ -220,6 +226,7 @@ defmodule Tightbeam.HarklightBounces do
       woken: woken,
       closed: Enum.map(closed, & &1.advisory["advisory_id"]),
       unroutable: Enum.map(unroutable, & &1.advisory["advisory_id"]),
+      left_alone_open: left_alone,
       repaired:
         for(
           entry <- open,
@@ -229,6 +236,8 @@ defmodule Tightbeam.HarklightBounces do
         )
     }
   end
+
+  defp ended?(item, advisory), do: advisory["moot"] == true or not is_nil(item["terminal"])
 
   defp bounce?(%{advisory: %{"advisory_id" => id} = advisory}) when is_binary(id) and id != "",
     do: kind(advisory) != :ignore and advisory["delivered"] != true
@@ -242,7 +251,7 @@ defmodule Tightbeam.HarklightBounces do
   end
 
   # Only a message Tightbeam sent (its own request record) on a conversation of
-  # this host. A feed capture also requires the conversation to be the feed's.
+  # this host: `:foreign` is not ours, `:elsewhere` is ours but another host's. A feed capture also requires the conversation to be the feed's.
   defp registration(txn, candidate, item) do
     id = candidate.item_id
 
@@ -262,21 +271,29 @@ defmodule Tightbeam.HarklightBounces do
           rows
       end
 
-    with [[handle, sender, message_id, origin, host, state, receiver]] <- rows,
-         true <- host == Placement.local_host_name(),
-         true <- candidate.handle in [nil, handle],
-         true <- item["session"] in [nil, handle] do
-      {:ok,
-       %{
-         handle: handle,
-         sender: sender,
-         message_id: message_id,
-         origin: origin,
-         handle_state: state,
-         receiver: receiver
-       }}
-    else
-      _ -> :unregistered
+    case rows do
+      [[handle, sender, message_id, origin, host, state, receiver]] ->
+        cond do
+          candidate.handle not in [nil, handle] or item["session"] not in [nil, handle] ->
+            :foreign
+
+          host != Placement.local_host_name() ->
+            :elsewhere
+
+          true ->
+            {:ok,
+             %{
+               handle: handle,
+               sender: sender,
+               message_id: message_id,
+               origin: origin,
+               handle_state: state,
+               receiver: receiver
+             }}
+        end
+
+      _ ->
+        :foreign
     end
   end
 
@@ -359,7 +376,7 @@ defmodule Tightbeam.HarklightBounces do
 
   defp prompt(txn, recipient, entries) do
     sections =
-      for kind <- [:full, :unknown],
+      for kind <- [:full, :soft],
           group = Enum.filter(entries, &(kind(&1.advisory) == kind)),
           group != [] do
         section(kind, group, {txn, recipient})
@@ -368,21 +385,27 @@ defmodule Tightbeam.HarklightBounces do
     Enum.join(sections, "\n\n")
   end
 
-  defp section(:full, group, ctx) do
+  # What was true when Harklight bounced it, said as of then. The person may
+  # have opened or acted on the message since; the wake does not say otherwise.
+  defp section(kind, group, ctx) do
     n = length(group)
+    one? = n == 1
 
     subject =
-      if n == 1,
-        do: "Harklight has no record that the person saw this message, and it is still open.",
-        else:
-          "Harklight has no record that the person saw each of these #{n} messages, and each is still open."
+      case kind do
+        :full ->
+          "Harklight bounce. #{if one?, do: "This message had", else: "Each of these #{n} messages had"} not been opened when it bounced."
 
-    lines = Enum.map(group, &full_line(&1, ctx))
+        :soft ->
+          "Harklight soft bounce. #{if one?, do: "This message had", else: "Each of these #{n} messages had"} been opened but not acted on when it bounced."
+      end
+
+    lines = Enum.map(group, &line(kind, &1, ctx))
 
     Enum.join(
-      ["Harklight bounce. " <> subject | lines] ++
+      [subject | lines] ++
         [
-          "Decide whether #{if n == 1, do: "it is", else: "each is"} still valid and worth resending, and whether its importance warrants a higher priority. " <>
+          "Decide whether #{if one?, do: "it is", else: "each is"} still valid and worth resending, and whether its importance warrants a higher priority. " <>
             "To send it again use `tightbeam harklight-send`; to withdraw it use `tightbeam harklight-retract --message <message id>`. " <>
             "Tightbeam has not resent anything and will not."
         ],
@@ -390,59 +413,27 @@ defmodule Tightbeam.HarklightBounces do
     )
   end
 
-  defp section(:unknown, group, ctx) do
-    n = length(group)
-
-    lines = Enum.map(group, &unknown_line(&1, ctx))
-
-    Enum.join(
-      [
-        "Harklight sent #{if n == 1, do: "a notice", else: "#{n} notices"} of a type Tightbeam does not recognise, so Tightbeam cannot say what #{if n == 1, do: "it means", else: "they mean"}."
-        | lines
-      ] ++
-        [
-          "Look at #{if n == 1, do: "the message", else: "the messages"} in Harklight and decide whether any action is needed. Tightbeam has not resent anything and will not."
-        ],
-      "\n"
-    )
-  end
-
-  defp full_line(%{advisory: advisory, item: item, reg: reg} = entry, ctx) do
+  defp line(_kind, %{advisory: advisory, item: item, reg: reg} = entry, ctx) do
     "- #{quoted(title(item))} (message #{reg.message_id}, conversation #{reg.handle}, started by #{reg.origin}): " <>
-      "#{due_clause(advisory)}#{receiver_clause(entry, ctx)}"
+      "#{bounced_clause(advisory)}#{receiver_clause(entry, ctx)}"
   end
 
-  defp unknown_line(%{advisory: advisory, item: item, reg: reg} = entry, ctx) do
-    text =
-      case advisory["text"] do
-        text when is_binary(text) and text != "" ->
-          " Harklight's text: #{quoted(clean(text, @max_notice_text))}."
-
-        _ ->
-          ""
-      end
-
-    "- #{quoted(title(item))} (message #{reg.message_id}, conversation #{reg.handle}, started by #{reg.origin}): " <>
-      "notice type #{quoted(clean(advisory["advisory_type"], 80))}.#{text}#{receiver_clause(entry, ctx)}"
-  end
-
-  defp due_clause(advisory) do
+  defp bounced_clause(advisory) do
     days = days(advisory["bounce_after_days"])
 
-    level =
-      if is_binary(advisory["level_name"]),
-        do: " (level #{clean(advisory["level_name"], 80)})",
-        else: ""
+    detail =
+      [
+        days && "bounce interval #{days}",
+        is_binary(advisory["level_name"]) && "level #{clean(advisory["level_name"], 80)}"
+      ]
+      |> Enum.filter(& &1)
+      |> Enum.join(", ")
 
-    cond do
-      is_integer(advisory["due_at_ms"]) and days ->
-        "it was due to be seen by #{time(advisory["due_at_ms"])}, #{days} after Harklight accepted it#{level}."
+    detail = if detail == "", do: "", else: " (#{detail})"
 
-      is_integer(advisory["due_at_ms"]) ->
-        "it was due to be seen by #{time(advisory["due_at_ms"])}#{level}."
-
-      true ->
-        "its time to be seen has passed#{level}."
+    case advisory["evaluated_at_ms"] do
+      at when is_integer(at) -> "it bounced at #{time(at)}#{detail}."
+      _ -> "it bounced#{detail}."
     end
   end
 
@@ -794,7 +785,10 @@ defmodule Tightbeam.HarklightBounces do
         :ok
 
       {:ok, summary} ->
-        Logger.info("Harklight bounce read: #{inspect(Map.take(summary, [:woken, :closed]))}")
+        Logger.info(
+          "Harklight bounce read: woken=#{length(summary.woken)} closed=#{length(summary.closed)} " <>
+            "left_alone_open=#{length(summary.left_alone_open)}"
+        )
 
       {:error, reason} ->
         Logger.warning("Harklight bounce read failed: #{inspect(reason)}")
