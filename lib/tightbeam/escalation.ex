@@ -54,6 +54,104 @@ defmodule Tightbeam.Escalation do
   # unread — if a closure ever needs to consult it, the closure is in the wrong place.
   @summon_kind "episode_summoned"
 
+  @coordinator_raiser "process:tightbeam/coordinator-hold"
+  @session_operator_check ~r/(\(kind = 'operator'\n[ ]+AND )raiserSessionKey IS NOT NULL(?=\n[ ]+AND statuteName IS NULL)/
+  @process_operator_check """
+  ((raiserId <> '#{@coordinator_raiser}' AND raiserSessionKey IS NOT NULL)
+            OR (raiserId = '#{@coordinator_raiser}' AND raiserSessionKey IS NULL
+                AND assignmentId IS NULL AND deadlineAt IS NULL))
+  """
+
+  def ensure_coordinator_operator_schema(db) do
+    case DB.migration_transaction(
+           db,
+           :coordinator_operator_request,
+           [],
+           ["PRAGMA writable_schema = OFF"],
+           fn txn ->
+             [[ddl]] = Txn.q(txn, "SELECT sql FROM sqlite_master WHERE name='decision_requests'")
+             process_check = String.trim_trailing(@process_operator_check)
+
+             unless String.contains?(ddl, process_check) do
+               # Change only the operator CHECK. Existing rows, indexes, and triggers stay in place.
+               case Regex.scan(@session_operator_check, ddl) do
+                 [[_check, _prefix]] ->
+                   :ok
+
+                 _ ->
+                   raise DB.Error, message: "unexpected coordinator operator schema predecessor"
+               end
+
+               ddl =
+                 Regex.replace(@session_operator_check, ddl, fn _check, prefix ->
+                   prefix <> process_check
+                 end)
+
+               [[version]] = Txn.q(txn, "PRAGMA schema_version")
+               :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
+
+               Txn.q(
+                 txn,
+                 "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='decision_requests'",
+                 [ddl]
+               )
+
+               1 = Txn.changes(txn)
+               :ok = Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+               :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
+             end
+
+             :ok
+           end
+         ) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  def file_coordinator_hold_in_txn(txn, owner, episode, question, choices, at) do
+    ask = %{
+      assignment_id: nil,
+      work_item_id: nil,
+      deadline_ms: nil,
+      question: question,
+      options: Enum.map(choices, &%{"label" => &1}),
+      note: nil,
+      supersedes: nil
+    }
+
+    insert_operator_request_in_txn(
+      txn,
+      nil,
+      owner,
+      @coordinator_raiser,
+      "coordinator-hold:" <> episode,
+      ask,
+      at: at
+    )
+  end
+
+  @doc false
+  def withdraw_coordinator_hold_in_txn(txn, id) do
+    case request_in_txn_optional(txn, id) do
+      %{raiser_id: @coordinator_raiser, kind: "operator", status: "open"} ->
+        operator_withdraw_in_txn(
+          txn,
+          %{principal: {:process, "tightbeam/coordinator-hold"}, origin: @coordinator_raiser},
+          id,
+          "A Tightbeam coordinator can act again.",
+          []
+        )
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp coordinator_request?(request),
+    do: request.kind == "operator" and request.raiser_id == @coordinator_raiser
+
   @ddl """
   CREATE TABLE IF NOT EXISTS decision_requests (
     id                TEXT PRIMARY KEY,
@@ -933,7 +1031,14 @@ defmodule Tightbeam.Escalation do
                after_request = request_in_txn_optional(txn, request_id)
 
                transition =
-                 changed_decision_transition(before, after_request, call.origin, "operator-rule")
+                 unless after_request && coordinator_request?(after_request) do
+                   changed_decision_transition(
+                     before,
+                     after_request,
+                     call.origin,
+                     "operator-rule"
+                   )
+                 end
 
                {result, fact_id, List.wrap(transition)}
              end,
@@ -957,7 +1062,9 @@ defmodule Tightbeam.Escalation do
             deliveries
           )
 
-          nudge(opts, result[:ruling_fact_id] && [result.ruling_fact_id])
+          unless result[:raiser_id] == @coordinator_raiser,
+            do: nudge(opts, result[:ruling_fact_id] && [result.ruling_fact_id])
+
           warn_non_owner_ruling(result, db, call, request_id)
 
         {:error, error} ->
@@ -2637,8 +2744,8 @@ defmodule Tightbeam.Escalation do
          opts
        ) do
     request_id = "dr_" <> Tightbeam.Id.uuid4()
-    raised_at = now()
-    deadline_at = raised_at + ask.deadline_ms
+    raised_at = opts[:at] || now()
+    deadline_at = if ask.deadline_ms, do: raised_at + ask.deadline_ms
 
     if ask.supersedes do
       terminal_test_step(opts, :before_terminal_cas)
@@ -2680,7 +2787,8 @@ defmodule Tightbeam.Escalation do
 
     request = request_in_txn(txn, request_id)
 
-    file_filing_fact_in_txn(txn, request, raiser_id, "operator-ask")
+    cause = if coordinator_request?(request), do: "coordinator-hold", else: "operator-ask"
+    file_filing_fact_in_txn(txn, request, raiser_id, cause)
 
     EventLog.lifecycle_in_txn(
       txn,
@@ -2701,14 +2809,16 @@ defmodule Tightbeam.Escalation do
     # The same request ref lets every terminal transition retract this reminder
     # if the operator answers before the deadline. A delivered wake is already
     # terminal, so the deadline can notify Main only once.
-    Wakes.schedule_in_txn(txn, %{
-      session_key: Org.personal_session_key(owner_user_id),
-      origin: "process:tightbeam",
-      prompt: operator_deadline_notification(request),
-      due_at: deadline_at,
-      target_gate: 0,
-      obligation_ref: Wakes.decision_request_notice_ref(request.id)
-    })
+    if deadline_at do
+      Wakes.schedule_in_txn(txn, %{
+        session_key: Org.personal_session_key(owner_user_id),
+        origin: "process:tightbeam",
+        prompt: operator_deadline_notification(request),
+        due_at: deadline_at,
+        target_gate: 0,
+        obligation_ref: Wakes.decision_request_notice_ref(request.id)
+      })
+    end
 
     request
   end
@@ -2767,6 +2877,10 @@ defmodule Tightbeam.Escalation do
 
         %{kind: "agent"} ->
           {error("invalid", "agent requests use answer or return"), nil}
+
+        %{raiser_id: @coordinator_raiser} = request
+        when call.principal != {:user, request.owner_user_id} ->
+          {error("not_owner", "only the addressed owner can rule this request"), nil}
 
         request ->
           case request.status do
@@ -2868,16 +2982,18 @@ defmodule Tightbeam.Escalation do
           terminal_test_step(opts, :before_terminal_cas)
           ruled_at = now()
 
-          Wakes.schedule_in_txn(txn, %{
-            session_key: notification_session,
-            origin: "process:tightbeam",
-            prompt: terminal_notification(request.id),
-            due_at: ruled_at,
-            target_gate: 0,
-            creator_session_key: via,
-            condition_kind: @terminal_condition_kind,
-            condition_scope: request.id
-          })
+          if notification_session do
+            Wakes.schedule_in_txn(txn, %{
+              session_key: notification_session,
+              origin: "process:tightbeam",
+              prompt: terminal_notification(request.id),
+              due_at: ruled_at,
+              target_gate: 0,
+              creator_session_key: via,
+              condition_kind: @terminal_condition_kind,
+              condition_scope: request.id
+            })
+          end
 
           terminal_test_step(opts, :after_schedule)
 
@@ -2930,13 +3046,19 @@ defmodule Tightbeam.Escalation do
 
           terminal_test_step(opts, :after_event)
 
+          if coordinator_request?(request) do
+            Tightbeam.CoordinatorHoldDecisions.ruling_in_txn(txn, request, decision, ruled_at)
+          end
+
           ruled = request_in_txn(txn, request.id)
 
           case validate_terminal_request_in_txn(txn, ruled) do
             %{failures: []} ->
               terminal_test_step(opts, :after_validate)
               Wakes.clear_decision_request_notice_in_txn(txn, request.id)
-              {terminal_projection(ruled), fact_id}
+
+              {terminal_projection(ruled),
+               if(coordinator_request?(ruled), do: nil, else: fact_id)}
 
             %{failures: failures} ->
               raise DB.Error, message: Enum.join(failures, ",")
@@ -2946,6 +3068,8 @@ defmodule Tightbeam.Escalation do
         end
     end
   end
+
+  defp ruling_recipient_in_txn(_txn, %{raiser_id: @coordinator_raiser}), do: {:ok, nil, false}
 
   defp ruling_recipient_in_txn(txn, request) do
     case late_ruling_route_in_txn(txn, request) do
@@ -3406,6 +3530,9 @@ defmodule Tightbeam.Escalation do
       else:
         {:error, error("invalid_decision", "decision must be one of: #{Enum.join(labels, ", ")}")}
   end
+
+  defp operator_decision(%{raiser_id: @coordinator_raiser} = request, %{mode: "text"} = answer),
+    do: operator_decision(request, %{answer | mode: "label"})
 
   defp operator_decision(_request, %{mode: "text", value: value}), do: {:ok, value}
 
@@ -3889,6 +4016,7 @@ defmodule Tightbeam.Escalation do
               request
               |> operator_projection(surface)
               |> with_project_attribution(request, assignment_work_items)
+              |> with_coordinator_details(txn, request)
 
             case Map.get(fyis, request.id) do
               nil -> projection
@@ -3919,6 +4047,30 @@ defmodule Tightbeam.Escalation do
 
         {request, _failures} = Enum.min_by(invalid, fn {request, _} -> request.id end)
         integrity_error(request.id)
+    end
+  end
+
+  defp with_coordinator_details(projection, txn, request) do
+    if coordinator_request?(request) do
+      cond do
+        request.status == "withdrawn" ->
+          Map.put(projection, :withdrawn_reason, request.withdrawn_reason)
+
+        request.context["retryStatus"] ->
+          context =
+            Map.put(
+              request.context,
+              "retryResults",
+              Tightbeam.CoordinatorHoldDecisions.retry_results_in_txn(txn, request.id)
+            )
+
+          Map.put(projection, :context, context)
+
+        true ->
+          projection
+      end
+    else
+      projection
     end
   end
 
@@ -4149,17 +4301,29 @@ defmodule Tightbeam.Escalation do
         do: terminal_notification_count_in_txn(txn, request),
         else: 0
 
+    process_request? = coordinator_request?(request)
+
+    raiser_valid =
+      if process_request?,
+        do: is_nil(request.raiser_session_key),
+        else: non_blank?(request.raiser_session_key)
+
+    deadline_valid =
+      if process_request? do
+        is_nil(request.deadline_at) and is_nil(request.assignment_id)
+      else
+        is_integer(request.deadline_at) and request.deadline_at > request.raised_at
+      end
+
     request_identity_valid =
       canonical_request_id?(request.id) and request.kind == "operator" and
         non_blank?(request.raiser_id) and non_blank?(request.owner_user_id) and
-        non_blank?(request.raiser_session_key) and non_blank?(request.action_key) and
-        non_blank?(request.question) and is_integer(request.raised_at) and
-        is_integer(request.deadline_at) and request.deadline_at > request.raised_at and
+        raiser_valid and non_blank?(request.action_key) and
+        non_blank?(request.question) and is_integer(request.raised_at) and deadline_valid and
         (is_nil(request.assignment_id) or non_blank?(request.assignment_id)) and
         is_map(request.context)
 
-    owner_valid =
-      non_blank?(request.owner_user_id) and non_blank?(request.raiser_session_key)
+    owner_valid = non_blank?(request.owner_user_id) and raiser_valid
 
     options_valid = valid_operator_options?(request.options)
     decision_valid = normalized_text?(request.decision)
@@ -4173,7 +4337,9 @@ defmodule Tightbeam.Escalation do
     session_valid = terminal_performer_session_valid?(request, epoch)
     lifecycle_valid = request.status == "ruled" and is_nil(request.consumed_at)
     event_valid = event_count == 1
-    notification_valid = epoch != :post_activation or notification_count == 1
+
+    notification_valid =
+      epoch != :post_activation or notification_count == if(process_request?, do: 0, else: 1)
 
     checks = %{
       "requestIdentity" =>
@@ -4393,6 +4559,21 @@ defmodule Tightbeam.Escalation do
   defp terminal_cardinality(1), do: "one"
   defp terminal_cardinality(count) when is_integer(count) and count > 1, do: "many"
   defp terminal_cardinality(_count), do: "unknown"
+
+  defp terminal_notification_count_in_txn(txn, %{raiser_id: @coordinator_raiser} = request) do
+    [[count]] =
+      Txn.q(
+        txn,
+        """
+        SELECT COUNT(*) FROM wakes
+        WHERE origin='process:tightbeam' AND conditionKind=?1 AND conditionScope=?2
+          AND prompt IN (?3, '[woke: fact ' || ?1 || '/' || ?2 || ']' || char(10) || char(10) || ?3)
+        """,
+        [@terminal_condition_kind, request.id, terminal_notification(request.id)]
+      )
+
+    count
+  end
 
   defp terminal_notification_count_in_txn(txn, request) do
     {settlement_due_at, deadline_relative_due_at} = terminal_notification_due_at_contract(request)
