@@ -915,24 +915,7 @@ defmodule Tightbeam.Assignments do
 
     case recipient do
       {:ok, recipient} ->
-        # A fact wait already promises this recipient a turn for this occurrence.
-        # Include unscoped waits and role-addressed waits bound to the holder.
-        existing =
-          Txn.q(
-            txn,
-            """
-            SELECT 1 FROM wakes
-            WHERE state='pending' AND consumer='prompt'
-              AND ((targetRole IS NULL AND sessionKey=?1)
-                OR targetRole IN (SELECT name FROM roles WHERE boundSessionKey=?1))
-              AND conditionKind=?2 AND (conditionScope IS NULL OR conditionScope=?3)
-              AND conditionAfterId<?4
-            LIMIT 1
-            """,
-            [recipient.session_key, fact.kind, fact.scope, fact.fact_id]
-          )
-
-        if existing == [] do
+        if not Wakes.pending_fact_wait_in_txn?(txn, recipient.session_key, fact) do
           Wakes.schedule_in_txn(txn, %{
             session_key: recipient.session_key,
             owner_user_id: recipient.owner_user_id,

@@ -3348,6 +3348,73 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  for scope <- [:exact, :any, :nonmatching] do
+    @dependency_scope scope
+    test "release deduplicates only a satisfied #{@dependency_scope} dependency wait", ctx do
+      {assignment, _blocked} = release_wake_fixture(ctx)
+
+      resolver =
+        assign_call({:user, "flynn"}, "dependency resolver", nil, nil)
+        |> put_in([:params, :effect_kind], "coordination")
+        |> then(&handle(ctx, "assign", &1))
+
+      assert {:ok, wait} =
+               DB.transaction(ctx.db, fn txn ->
+                 Wakes.register_wait_in_txn(txn, %{
+                   session_key: "holder",
+                   origin: "agent:holder",
+                   prompt: "continue after dependency",
+                   due_at: System.system_time(:millisecond) + 60_000,
+                   assignment_id: assignment.id,
+                   registrant_session_key: "holder",
+                   owner_user_id: "flynn",
+                   wait_reason: "Waiting for the exact release fact",
+                   predicate: %{
+                     "conditions" =>
+                       [%{"fact" => "condition_fact.matches", "op" => "eq", "value" => true}] ++
+                         if(@dependency_scope == :nonmatching,
+                           do: [
+                             %{"fact" => "assignment.state", "op" => "eq", "value" => "closed"}
+                           ],
+                           else: []
+                         ),
+                     "bindings" => %{
+                       "conditionKind" => "dependency-ready",
+                       "conditionScope" =>
+                         if(@dependency_scope == :any, do: nil, else: assignment.id),
+                       "assignmentId" => resolver.id
+                     },
+                     "resolverRef" => %{"kind" => "assignment", "id" => resolver.id},
+                     "necessity" => "The release fact permits continuation."
+                   }
+                 })
+               end)
+
+      assert wait.wait_mode == "dependency"
+      scheduler = terminal_notice_scheduler(ctx.db)
+      ConditionFacts.file(ctx.db, scheduler, release_wake_fact(assignment.id))
+      assert :ok = Wakes.fire_due(scheduler)
+
+      if @dependency_scope == :nonmatching do
+        assert Wakes.get(ctx.db, wait.wake_id).recognition_path == nil
+      else
+        assert Wakes.get(ctx.db, wait.wake_id).recognition_path == "success"
+      end
+
+      expected = if @dependency_scope == :nonmatching, do: 1, else: 0
+
+      assert {:ok, [[^expected]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND origin='process:tightbeam' AND prompt LIKE 'Cannot-proceed released for %'",
+                 [assignment.id]
+               )
+
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+    end
+  end
+
   test "release delivers one continuation and replay adds none", ctx do
     {assignment, _blocked} = release_wake_fixture(ctx)
     scheduler = terminal_notice_scheduler(ctx.db)
