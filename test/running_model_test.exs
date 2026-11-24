@@ -359,6 +359,35 @@ defmodule Tightbeam.RunningModelTest do
       assert eventually(fn -> match?(%{id: "sonnet"}, Org.get(ctx.db, "s1").running_model) end)
     end
 
+    test "a failed unload (nil report) is retried and clears the value", ctx do
+      report(ctx, "sid-1", %{id: "sonnet", label: nil})
+      Agent.update(ctx.fail, &%{&1 | clears: true})
+
+      report(ctx, "sid-1", nil)
+      assert %{id: "sonnet"} = Org.get(ctx.db, "s1").running_model
+
+      Agent.update(ctx.fail, &%{&1 | clears: false})
+      assert eventually(fn -> Org.get(ctx.db, "s1").running_model == nil end)
+    end
+
+    test "a report dropped as stale does not shield a value from the retried loss clear", ctx do
+      report(ctx, "sid-1", %{id: "sonnet", label: nil})
+      Agent.update(ctx.fail, &%{&1 | clears: true})
+
+      RunningModel.adapter_gone(ctx.writer, ctx.key)
+      _ = :sys.get_state(ctx.writer)
+
+      # A later report that names this session's id but not its adapter is stale
+      # and changes nothing; the old value is still standing.
+      wrong_host = {elem(ctx.key, 0), "shared", "elsewhere"}
+      RunningModel.report(ctx.writer, wrong_host, 2, "sid-1", %{id: "opus", label: nil})
+      _ = :sys.get_state(ctx.writer)
+      assert %{id: "sonnet"} = Org.get(ctx.db, "s1").running_model
+
+      Agent.update(ctx.fail, &%{&1 | clears: false})
+      assert eventually(fn -> Org.get(ctx.db, "s1").running_model == nil end)
+    end
+
     test "a newer report replaces a failed one before its retry", ctx do
       Agent.update(ctx.fail, &%{&1 | reports: true})
       report(ctx, "sid-1", %{id: "sonnet", label: nil})

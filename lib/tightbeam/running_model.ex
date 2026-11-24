@@ -126,9 +126,10 @@ defmodule Tightbeam.RunningModel do
 
   @impl true
   def handle_info({:retry_report, key, sid}, state) do
-    case state.retry_reports[{key, sid}] do
-      nil -> {:noreply, state}
-      report -> {:noreply, deliver(state, key, sid, report, nil)}
+    # A nil report (an unload or refusal) is real work to retry, so ask for the key.
+    case Map.fetch(state.retry_reports, {key, sid}) do
+      :error -> {:noreply, state}
+      {:ok, report} -> {:noreply, deliver(state, key, sid, report, nil)}
     end
   end
 
@@ -145,10 +146,17 @@ defmodule Tightbeam.RunningModel do
   # session id and tries again, since an idle session may never report again.
   defp deliver(state, key, sid, report, only_session_key) do
     case apply_report(state, key, sid, report, only_session_key) do
-      {:ok, session_keys} ->
+      {:ok, outcomes} ->
+        # Only a report that was stored or confirmed counts as newer than a loss;
+        # one dropped as stale left the old value standing.
+        stored =
+          for {session_key, outcome} <- outcomes,
+              outcome in [:changed, :unchanged],
+              do: session_key
+
         written =
           if report,
-            do: Enum.reduce(session_keys, state.written, &Map.put(&2, &1, state.seq)),
+            do: Enum.reduce(stored, state.written, &Map.put(&2, &1, state.seq)),
             else: state.written
 
         %{
@@ -201,7 +209,7 @@ defmodule Tightbeam.RunningModel do
     Process.send_after(
       self(),
       message,
-      min(state.retry_ms * Integer.pow(2, attempt), @retry_cap_ms)
+      min(state.retry_ms * Integer.pow(2, min(attempt, 10)), @retry_cap_ms)
     )
 
     %{state | attempts: Map.put(state.attempts, attempt_key, attempt + 1)}
@@ -220,19 +228,20 @@ defmodule Tightbeam.RunningModel do
       |> Enum.map(fn [session_key] -> session_key end)
       |> Enum.filter(&(is_nil(only_session_key) or &1 == only_session_key))
 
-    Enum.each(session_keys, fn session_key ->
-      current? = fn txn, session ->
-        Tightbeam.Gateway.adapter_key(session) == key and
-          match?(
-            %{harness_session_id: ^sid},
-            Org.current_pointer_snapshot_in_txn(txn, session.session_key)
-          )
-      end
+    outcomes =
+      Enum.map(session_keys, fn session_key ->
+        current? = fn txn, session ->
+          Tightbeam.Gateway.adapter_key(session) == key and
+            match?(
+              %{harness_session_id: ^sid},
+              Org.current_pointer_snapshot_in_txn(txn, session.session_key)
+            )
+        end
 
-      state.set.(state.db, session_key, report, current?)
-    end)
+        {session_key, state.set.(state.db, session_key, report, current?)}
+      end)
 
-    {:ok, session_keys}
+    {:ok, outcomes}
   rescue
     error -> log_failure(error) && :error
   catch
