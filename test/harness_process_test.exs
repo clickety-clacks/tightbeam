@@ -150,6 +150,10 @@ defmodule Tightbeam.HarnessProcessTest do
     assert :settled = Tightbeam.AccountWriter.reconcile(db, key, target, tmp)
     assert {:ok, {:ok, new_lease}} = Tightbeam.AccountWriter.reserve(db, key)
     refute new_lease == lease
+
+    failure_receipt = Path.join(Path.dirname(receipt), new_lease <> ".done.identity.failed")
+    File.write!(failure_receipt, "tightbeam-launch-failed-v1\t#{new_lease}\twriter_lock\t1\n")
+    assert :settled = Tightbeam.AccountWriter.reconcile(db, key, target, tmp)
   end
 
   test "remote adapter launch carries its owning-host writer lock", %{tmp_dir: tmp} do

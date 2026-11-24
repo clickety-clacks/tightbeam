@@ -36,11 +36,9 @@ defmodule Tightbeam.AccountWriter do
 
       result = target.sh.(on_host(target, command))
 
-      with {bytes, 0} <- target.sh.(on_host(target, ["cat", receipt])),
-           {:ok, _} <- settle_from_receipt(db, adapter_key, lease, bytes) do
-        {:ok, result}
-      else
-        _ -> {:error, :unconfirmed_writer_settlement}
+      case reconcile_lease(db, adapter_key, target, receipt, lease) do
+        :settled -> {:ok, result}
+        :unconfirmed -> {:error, :unconfirmed_writer_settlement}
       end
     else
       {:ok, {:error, reason}} -> {:error, reason}
@@ -52,12 +50,28 @@ defmodule Tightbeam.AccountWriter do
     with {:ok, [[lease]]} <-
            DB.query(db, "SELECT leaseId FROM account_writer_leases WHERE adapterKey = ?1", [
              adapter_key
-           ]),
-         {receipt, 0} <- target.sh.(on_host(target, ["cat", receipt_path(home, lease)])),
-         {:ok, true} <- settle_from_receipt(db, adapter_key, lease, receipt) do
-      :settled
+           ]) do
+      reconcile_lease(db, adapter_key, target, receipt_path(home, lease), lease)
     else
       _ -> :unconfirmed
+    end
+  end
+
+  defp reconcile_lease(db, key, target, receipt, lease) do
+    with {bytes, 0} <- target.sh.(on_host(target, ["cat", receipt])),
+         {:ok, _} <- settle_from_receipt(db, key, lease, bytes) do
+      :settled
+    else
+      _ ->
+        with {bytes, 0} <- target.sh.(on_host(target, ["cat", receipt <> ".identity.failed"])),
+             ["tightbeam-launch-failed-v1", ^lease, step, status] <- String.split(bytes, "\t"),
+             true <- step in ~w(fork session leader boot start_time write writer_lock),
+             {code, "\n"} when code > 0 and code <= 255 <- Integer.parse(status),
+             {:ok, _} <- settle(db, key, lease) do
+          :settled
+        else
+          _ -> :unconfirmed
+        end
     end
   end
 

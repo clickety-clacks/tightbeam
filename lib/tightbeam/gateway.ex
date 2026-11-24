@@ -347,7 +347,10 @@ defmodule Tightbeam.Gateway do
 
     (credential_children(config, db) ++
        [
-         {ModelCatalog, base_dir: config.base_dir, db: db},
+         {ModelCatalog,
+          base_dir: config.base_dir,
+          db: db,
+          account_writer_config: if(Map.get(config, :provider_accounts_enabled), do: config)},
          {Tightbeam.Retention, db: db},
          {WorkspaceCleanup, config: Map.put(config, :db, db)},
          {Tightbeam.ArtifactBlobStore, blob_options},

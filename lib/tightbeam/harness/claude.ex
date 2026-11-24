@@ -570,25 +570,56 @@ defmodule Tightbeam.Harness.Claude do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
 
     fn path ->
-      # The script's own stderr is folded into its stdout so a failure carries a
-      # reason; ssh's is NOT, because an ssh warning on a SUCCESSFUL connection
-      # would land in the middle of the JSON body.
-      # The CLI reads the credential, not this shell. It is installed in the local base
-      # dir and on every assimilated host, and the gateway already execs it there for
-      # `harness-group`. Only remote calls carry this script over ssh.
-      script = """
-      exec 2>&1
-      set -eu
-      exec #{Support.shell_quote(cli_path(state))} catalog-probe anthropic #{kind} \
-        #{Support.shell_quote(credential_path)} #{Support.shell_quote("#{@api_base}#{path}")}
-      """
+      host = Map.get(state, :host_name) || dest || Tightbeam.Placement.local_host_name()
+      probe_args = ["anthropic", to_string(kind), credential_path, "#{@api_base}#{path}"]
 
-      host = if dest, do: Map.get(state, :host_name) || dest
+      case {kind, Map.get(state.options, :account_writer_config)} do
+        {:subscription, config} when is_map(config) ->
+          account = %{"host" => host, "harness" => wire_name(), "slot" => "shared"}
 
-      case Support.catalog_probe(sh, Support.catalog_probe_argv(dest, script), host) do
-        {:ok, body, _trailer} -> {:ok, body}
-        {:error, reason} -> {:error, reason}
+          case Tightbeam.Credentials.with_idle_account_writer(config, account, fn _context ->
+                 [cli_path(state), "catalog-probe" | probe_args]
+               end) do
+            {:ok, result} ->
+              parse_catalog_probe(fn _argv -> result end, [], host)
+
+            {:error, reason} when reason in [:adapter_unresolved, :credential_writer_active] ->
+              case run_catalog_probe(sh, dest, state, ["--read-only" | probe_args], host) do
+                {:error, {:http_status, 401, _}} -> {:error, :credential_writer_busy}
+                result -> result
+              end
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+
+        _ ->
+          run_catalog_probe(sh, dest, state, probe_args, host)
       end
+    end
+  end
+
+  defp run_catalog_probe(sh, dest, state, args, host) do
+    {mode, ["anthropic", kind, credential_path, url]} =
+      case args do
+        ["--read-only" | rest] -> {"--read-only ", rest}
+        _ -> {"", args}
+      end
+
+    script = """
+    exec 2>&1
+    set -eu
+    exec #{Support.shell_quote(cli_path(state))} catalog-probe #{mode}anthropic #{kind} \
+      #{Support.shell_quote(credential_path)} #{Support.shell_quote(url)}
+    """
+
+    parse_catalog_probe(sh, Support.catalog_probe_argv(dest, script), if(dest, do: host))
+  end
+
+  defp parse_catalog_probe(sh, argv, host) do
+    case Support.catalog_probe(sh, argv, host) do
+      {:ok, body, _trailer} -> {:ok, body}
+      {:error, reason} -> {:error, reason}
     end
   end
 
