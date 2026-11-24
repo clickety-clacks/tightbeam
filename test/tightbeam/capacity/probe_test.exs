@@ -40,6 +40,25 @@ defmodule Tightbeam.Harness.CapacityProbeTest do
     refute inspect(sample) =~ "sensitive-fixture"
   end
 
+  test "profile hold survives the closed projection and blocks all provider reads" do
+    alias Tightbeam.Capacity.ReadPolicy
+
+    observed_at = 1_800_000_000_000
+
+    assert {:ok, %{profile_hold: profile_hold, windows: [%{used_percent: 42}]}} =
+             CapacityProbe.decode("""
+             {"sample":{"observedAt":1800000000000,"windows":[{"id":"five_hour","name":"Five hour","scope":"account","usedPercent":42}],"diagnostics":[],"profileHold":{"code":"UPSTREAM_RATE_LIMITED","retryAfterSeconds":3600,"discarded":"private"}}}
+             """)
+
+    assert profile_hold == %{code: "UPSTREAM_RATE_LIMITED", retry_after_seconds: 3600}
+    retry_at = ReadPolicy.retry_at(profile_hold, observed_at)
+    entry = %{attempted_at: observed_at, retry_at: retry_at}
+    assert ReadPolicy.action(entry, :background, observed_at + :timer.minutes(15)) == :held
+    assert ReadPolicy.action(entry, :wait, observed_at + :timer.minutes(15)) == :held
+    assert ReadPolicy.due_at(entry, observed_at) == observed_at + :timer.hours(1)
+    assert ReadPolicy.action(entry, :wait, retry_at) == :wait
+  end
+
   test "known rate limits preserve the delay and unknown output gets a fixed error" do
     assert {:error, %{code: "UPSTREAM_RATE_LIMITED", retry_after_seconds: 89}} =
              CapacityProbe.decode(

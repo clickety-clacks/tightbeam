@@ -3,6 +3,12 @@ defmodule Tightbeam.Capacity.ReadPolicy do
 
   @cache_ms :timer.seconds(30)
   @cadence_ms :timer.minutes(15)
+  @max_timestamp 9_223_372_036_854_775_807
+
+  def retry_at(%{code: "UPSTREAM_RATE_LIMITED", retry_after_seconds: delay}, received_at),
+    do: min(received_at + delay * 1000, @max_timestamp)
+
+  def retry_at(_, _), do: nil
 
   def due_at(%{attempted_at: nil, retry_at: nil}, now), do: now
   def due_at(%{attempted_at: nil, retry_at: hold}, _now), do: hold

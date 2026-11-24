@@ -70,6 +70,15 @@ fn codex_usage(credential: &Value, agent: &ureq::Agent) -> ProbeResult {
 }
 
 fn claude_usage(credential: &Value, agent: &ureq::Agent) -> ProbeResult {
+    claude_usage_at(credential, agent, CLAUDE_USAGE, CLAUDE_PROFILE)
+}
+
+fn claude_usage_at(
+    credential: &Value,
+    agent: &ureq::Agent,
+    usage_url: &str,
+    profile_url: &str,
+) -> ProbeResult {
     let oauth = &credential["claudeAiOauth"];
     let access = required_string(&oauth["accessToken"])?;
     require_unexpired(oauth["expiresAt"].as_i64())?;
@@ -83,12 +92,17 @@ fn claude_usage(credential: &Value, agent: &ureq::Agent) -> ProbeResult {
     let auth = format!("Bearer {access}");
     let payload = request(
         agent
-            .get(CLAUDE_USAGE)
+            .get(usage_url)
             .set("Authorization", &auth)
             .set("anthropic-beta", CLAUDE_BETA),
     )?;
     let mut sample = normalize_claude(&payload, now_ms())?;
-    let profile = request(agent.get(CLAUDE_PROFILE).set("Authorization", &auth));
+    let profile = request(agent.get(profile_url).set("Authorization", &auth));
+    if let Err(error) = &profile {
+        if error["code"] == "UPSTREAM_RATE_LIMITED" {
+            sample["profileHold"] = error.clone();
+        }
+    }
     let (status, status_reason) = match profile {
         Ok(profile) => match field(&profile, "subscription_status") {
             Ok(Some(Value::String(status)))
@@ -614,6 +628,59 @@ mod tests {
             Err(error("UPSTREAM_CONTRACT_CHANGED"))
         );
         check_pinned_lachesis_usage_fixtures();
+    }
+
+    #[test]
+    fn claude_profile_rate_limit_keeps_usage_and_retry_after() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (path, response) in [
+                (
+                    "/usage",
+                    "200 OK\r\nConnection: close\r\nContent-Length: 32\r\n\r\n{\"five_hour\":{\"utilization\":42}}",
+                ),
+                (
+                    "/profile",
+                    "429 Too Many Requests\r\nRetry-After: 3600\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, format!("GET {path} HTTP/1.1\r\n"));
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                write!(stream, "HTTP/1.1 {response}").unwrap();
+            }
+        });
+        let credentials = json!({"claudeAiOauth":{
+            "accessToken":"synthetic-access", "expiresAt":now_ms() + 60_000, "scopes":["user:profile"]
+        }});
+        let agent = ureq::AgentBuilder::new().timeout(TIMEOUT).build();
+        let sample = claude_usage_at(
+            &credentials,
+            &agent,
+            &format!("{base}/usage"),
+            &format!("{base}/profile"),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(sample["windows"][0]["usedPercent"], 42.0);
+        assert_eq!(sample["subscription"]["statusReason"], "read_failed");
+        assert_eq!(
+            sample["profileHold"],
+            json!({"code":"UPSTREAM_RATE_LIMITED","retryAfterSeconds":3600})
+        );
     }
 
     #[test]

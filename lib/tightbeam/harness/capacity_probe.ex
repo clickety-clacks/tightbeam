@@ -51,6 +51,8 @@ defmodule Tightbeam.Harness.CapacityProbe do
          {:ok, diagnostics} <- diagnostics(sample["diagnostics"]) do
       plan = string(sample["plan"])
 
+      hold = profile_hold(sample["profileHold"])
+
       {:ok,
        %{
          observed_at: observed,
@@ -58,13 +60,22 @@ defmodule Tightbeam.Harness.CapacityProbe do
          windows: windows,
          diagnostics: diagnostics,
          subscription: subscription(sample["subscription"])
-       }}
+       }
+       |> then(fn decoded ->
+         if hold, do: Map.put(decoded, :profile_hold, hold), else: decoded
+       end)}
     else
       :error -> invalid_contract()
     end
   end
 
   defp sample(_), do: invalid_contract()
+
+  defp profile_hold(%{"code" => "UPSTREAM_RATE_LIMITED", "retryAfterSeconds" => delay})
+       when is_integer(delay) and delay > 0,
+       do: %{code: "UPSTREAM_RATE_LIMITED", retry_after_seconds: delay}
+
+  defp profile_hold(_), do: nil
 
   defp decode_windows(windows) do
     if Enum.all?(windows, &valid_window?/1) do
