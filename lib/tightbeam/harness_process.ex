@@ -386,10 +386,7 @@ defmodule Tightbeam.HarnessProcess do
   def complete_park_in_txn(%DB.Txn{} = txn, key) do
     DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
 
-    if DB.Txn.changes(txn) == 1 do
-      Tightbeam.HolderProd.changed_in_txn(txn)
-      Tightbeam.CoordinatorHoldAlerts.changed_in_txn(txn)
-    end
+    if DB.Txn.changes(txn) == 1, do: Tightbeam.HolderProd.changed_in_txn(txn)
 
     :ok
   end
@@ -1698,27 +1695,23 @@ defmodule Tightbeam.HarnessProcess do
       "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt, generation) VALUES (?1, ?2, ?3)",
       [adapter_key, at, Id.ulid()]
     )
-
-    if DB.Txn.changes(txn) == 1, do: Tightbeam.CoordinatorHoldAlerts.changed_in_txn(txn)
     :ok
   end
 
   defp complete_reconciled_park_name(db, adapter_key) do
     incident_guard = rate_limit_incident_guard(db)
 
-    {:ok, released} =
+    {:ok, _} =
       DB.query(
         db,
         """
         DELETE FROM harness_park_fences
          WHERE adapterKey = ?1
          #{incident_guard}
-         RETURNING adapterKey
         """,
         [adapter_key]
       )
 
-    if released != [], do: Tightbeam.CoordinatorHoldAlerts.changed()
     :ok
   end
 
@@ -1756,7 +1749,6 @@ defmodule Tightbeam.HarnessProcess do
         """
       )
 
-    if released != [], do: Tightbeam.CoordinatorHoldAlerts.changed()
     Enum.map(released, fn [adapter_key] -> adapter_key end)
   end
 

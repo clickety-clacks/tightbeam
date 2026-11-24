@@ -15,64 +15,6 @@ defmodule Tightbeam.HarklightSend do
   @uuid4 ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
   @decision_request_id ~r/\Adr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i
 
-  # Gateway-only FYI. The episode owns the operation, so no agent session or
-  # reply subscription is involved. The configured transport routes new FYIs
-  # to the operator.
-  def send_coordinator_hold(phase, op_id, body, opts) when phase in [:outage, :recovery] do
-    title =
-      case phase do
-        :outage -> "Tightbeam coordinators are held"
-        :recovery -> "A Tightbeam coordinator is available"
-      end
-
-    with {:ok, runner} <- runner(opts),
-         {:ok, input} <-
-           inputs(%{
-             harklight_session: "new",
-             sender_id: "tightbeam",
-             title: title,
-             body: body,
-             message_type: "fyi"
-           }),
-         {:ok, journal_id} <- journal_id(runner),
-         {:ok, prepared} <- invoke(runner, prepare_args(input, [], op_id), "prepared", op_id) do
-      case prepared_request(prepared, input, [], op_id, journal_id) do
-        {:ok, request, []} ->
-          execute_coordinator_hold(runner, op_id, prepared, request)
-
-        {:error, code} ->
-          outcome = if prepared["kind"] == "committed", do: "outcome_unknown", else: "failed"
-          {outcome, code}
-      end
-    else
-      {:error, code} -> {"failed", code}
-      {:error, code, _reason, "outcome_unknown"} -> {"outcome_unknown", code}
-      {:error, code, _reason, _outcome} -> {"failed", code}
-    end
-  end
-
-  defp execute_coordinator_hold(runner, op_id, prepared, request) do
-    # The episode commits attemptedAt before calling this path. That row keeps
-    # uncertain writes out of automatic recovery across worker restarts.
-    case send_prepared(runner, op_id, prepared) do
-      {:ok, result} ->
-        case confirmed_result(result, request, op_id) do
-          {:ok, _item_id, _response} -> {"committed", nil}
-          {:error, code} -> {"outcome_unknown", code}
-        end
-
-      {:internal_error, operation, request_id} ->
-        HarklightFailures.log_error(operation, request_id, op_id)
-        {"outcome_unknown", "internal_error"}
-
-      {:error, code, _reason, "refused"} ->
-        {"failed", code}
-
-      {:error, code, _reason, _outcome} ->
-        {"outcome_unknown", code}
-    end
-  end
-
   def send_request(db, call, opts \\ []) do
     result =
       with :ok <- origin!(db, call),
