@@ -2089,6 +2089,7 @@ defmodule Tightbeam.Schema do
     # Build these additive access paths only after the existing migrations and
     # qualifications succeed, but before publishing a successful boot marker.
     :ok = Tightbeam.ConditionFacts.ensure_filing_index(db)
+    :ok = Tightbeam.ConditionFacts.ensure_landing_indexes(db)
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
     :ok = ensure_rest_collection_indexes(db)

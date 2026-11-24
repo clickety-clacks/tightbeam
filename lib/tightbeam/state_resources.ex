@@ -563,6 +563,7 @@ defmodule Tightbeam.StateResources do
 
   def query_work_item(db, selection, call) do
     {id, filters} = if is_map(selection), do: {nil, selection}, else: {selection, %{}}
+    id_filter = if is_binary(id), do: "wi.id = ?1", else: "(?1 IS NULL OR wi.id = ?1)"
     {principal_kind, principal_id, is_admin} = detail_principal(call)
     principal = Map.get(call, :rest_principal)
     trace_core_detail(principal, {:au4_visibility, "work items"})
@@ -584,7 +585,7 @@ defmodule Tightbeam.StateResources do
           FROM work_items AS wi
           LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
           LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
-          WHERE (?1 IS NULL OR wi.id = ?1) AND (
+          WHERE #{id_filter} AND (
             ?2 = 1 OR
             (?3 = 'user' AND wi.ownerUserId = ?4) OR
             ?3 = 'session'

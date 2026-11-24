@@ -61,9 +61,17 @@ reads add `waiting: {agent, time, userIds}` and `running`, and linked changes
 publish ordinary work-item updates. Item-wait readback retains `reason` for
 compatibility and adds `waitReason` and `waitOn`.
 
-These are additive response fields. The work-item-ID list filter on change
-subscriptions is a later change; clients can keep their existing scoped
-subscription and re-read only visible records.
+These are additive response fields. Existing change subscriptions already accept
+one `workItemId` per subscription. Wake and decision notices now carry that
+reference when the source item is known directly or through an assignment;
+unlinked records do not invent an item. No new list-filter syntax is needed.
+
+Work-item notices retain the invalidation contract in `docs/firehose.md`: clients
+re-read their exact detail route. A complete summary snapshot in one producer
+is not a new direct-application contract for every producer. Exact item detail
+uses a primary-key seek; its associated landing lookup seeks the recorded merge
+and head-commit indexes. The dispatch detail verbs are also reachable under the
+organization credential; REST is the consuming client's preferred interface.
 
 A later release may require reasons on newly declared agent waits, after an
 inventory of omitted reasons and affected callers. This change does not enable

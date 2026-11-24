@@ -490,6 +490,86 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert "flynn" in item["waiting"]["userIds"]
   end
 
+  @tag :wait_links
+  test "exact work item reads seek the primary key and scoped notices carry its id", ctx do
+    {response, trace} =
+      traced_get(ctx, "/api/work-items/#{ctx.work_item.id}?asUser=flynn", "tbc_core_detail")
+
+    assert response.status == 200
+
+    sql =
+      Enum.find_value(trace, fn
+        {:sql_query, sql, _} -> if String.contains?(sql, "FROM work_items AS wi"), do: sql
+        _ -> nil
+      end)
+
+    assert sql =~ "WHERE wi.id = ?1"
+    refute sql =~ "?1 IS NULL OR"
+
+    assert {:ok, plan} =
+             DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, [
+               ctx.work_item.id,
+               1,
+               "user",
+               "flynn",
+               nil,
+               nil,
+               nil,
+               nil,
+               nil,
+               nil,
+               nil
+             ])
+
+    assert Enum.any?(plan, fn row -> String.contains?(List.last(row), "SEARCH wi") end)
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.admin_session.session_key,
+        origin: "user:flynn",
+        prompt: "Resume",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: ctx.assignment.id,
+        wait_reason: "Waiting for processing"
+      })
+
+    notice = Publisher.state_notice(ctx.db, %{verb: "wake", params: %{}}, wake)
+    assert notice["refs"]["workItemId"] == ctx.work_item.id
+    assert Hub.matches?(notice, %{"workItemId" => ctx.work_item.id})
+
+    assert :ok =
+             Hub.register(Hub, self(), %{
+               mode: :subscribed,
+               db: ctx.db,
+               user_id: "flynn",
+               is_admin: true
+             })
+
+    assert :ok =
+             Hub.subscribe(Hub, self(), "wait-records", %{
+               "workItemId" => ctx.work_item.id,
+               "classes" => ["wake.", "decision_request."]
+             })
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+               decision = Escalation.raw_by_id_in_txn(txn, ctx.decision_request_ids.effort)
+
+               Publisher.committed_in_txn(txn, "decision_request.opened", decision, %{
+                 "decisionRequestId" => decision.id
+               })
+             end)
+
+    item_id = ctx.work_item.id
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "wake.scheduled", "refs" => %{"workItemId" => ^item_id}}}
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "decision_request.opened", "refs" => %{"workItemId" => ^item_id}}}
+  end
+
   test "real reopen returns the canonical REST assignment and summary notice", ctx do
     law =
       Path.join(

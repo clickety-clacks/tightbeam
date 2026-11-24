@@ -2,6 +2,7 @@ defmodule Tightbeam.Firehose.Publisher do
   @moduledoc "Post-commit translation from accepted dispatch verbs to live notices."
 
   require Logger
+  alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.StateResources
@@ -86,12 +87,60 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
+    call = with_source_work_item_ref(txn, call, result)
+
     Txn.handoff(
       txn,
       Hub.destination(hub(call)),
       {:accepted, call, canonical_in_txn(txn, call, result)}
     )
   end
+
+  defp with_source_work_item_ref(db, %{verb: "wake"} = call, result) when is_map(result) do
+    case source_work_item_ref(db, result) do
+      %{"workItemId" => id} ->
+        Map.update(call, :params, %{work_item_id: id}, &Map.put(&1, :work_item_id, id))
+
+      _ ->
+        call
+    end
+  end
+
+  defp with_source_work_item_ref(_db, call, _result), do: call
+
+  defp source_work_item_ref(db, payload) when is_map(payload) do
+    item = payload[:work_item_id] || payload["workItemId"]
+    assignment = payload[:assignment_id] || payload["assignmentId"]
+
+    item =
+      if is_nil(item) and is_binary(assignment) do
+        sql = "SELECT workItemId FROM assignments WHERE id=?1"
+
+        rows =
+          case db do
+            %Txn{} ->
+              Txn.q(db, sql, [assignment])
+
+            nil ->
+              []
+
+            _ ->
+              {:ok, rows} = DB.query(db, sql, [assignment])
+              rows
+          end
+
+        case rows do
+          [[id]] -> id
+          [] -> nil
+        end
+      else
+        item
+      end
+
+    if is_binary(item), do: %{"workItemId" => item}, else: %{}
+  end
+
+  defp source_work_item_ref(_db, _payload), do: %{}
 
   defp canonical_in_txn(txn, %{verb: verb} = call, result)
        when verb in ~w(work-item-create work-item-handoff work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail) do
@@ -204,6 +253,11 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @doc false
   def committed_in_txn(%Txn{} = txn, class, payload, refs, hub) do
+    refs =
+      if String.starts_with?(class, ["wake.", "decision_request."]),
+        do: Map.merge(refs, source_work_item_ref(txn, payload)),
+        else: refs
+
     if class == "kungfu.updated" do
       Txn.handoff(txn, Hub.destination(hub), {:publish, committed_notice(class, payload, refs)})
     else
@@ -529,8 +583,12 @@ defmodule Tightbeam.Firehose.Publisher do
 
   def state_notice(db, %{verb: verb} = call, result) do
     case @state_verbs[verb] do
-      {class, serializer} -> build(class, call, canonical_result(db, call, result), serializer)
-      nil -> nil
+      {class, serializer} ->
+        result = canonical_result(db, call, result)
+        build(class, with_source_work_item_ref(db, call, result), result, serializer)
+
+      nil ->
+        nil
     end
   end
 

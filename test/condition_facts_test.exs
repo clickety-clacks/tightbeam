@@ -705,6 +705,7 @@ defmodule Tightbeam.ConditionFactsTest do
     end
   end
 
+  @tag :landing_seek
   test "observed merge payloads persist once and associate by exact merge or head commit", ctx do
     merge_commit = String.duplicate("a", 40)
     head_commit = String.duplicate("b", 40)
@@ -760,6 +761,44 @@ defmodule Tightbeam.ConditionFactsTest do
                "observedAt" => first.ts
              }
            ]
+
+    observer = self()
+
+    assert {:ok, [_landing]} =
+             DB.read_transaction(ctx.db, fn txn ->
+               trace = fn {:sql_query, sql, _count} ->
+                 send(observer, {:landing_lookup_sql, sql})
+               end
+
+               ConditionFacts.landings_for_commits(Tightbeam.DB.Txn.observe_queries(txn, trace), [
+                 merge_commit
+               ])
+             end)
+
+    assert_receive {:landing_lookup_sql, sql}
+
+    assert {:ok, plan} =
+             DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, [JSON.encode!([merge_commit])])
+
+    details = Enum.map(plan, &List.last/1)
+
+    assert Enum.any?(
+             details,
+             &String.contains?(
+               &1,
+               "SEARCH condition_facts USING INDEX condition_facts_landing_commit"
+             )
+           )
+
+    assert Enum.any?(
+             details,
+             &String.contains?(
+               &1,
+               "SEARCH condition_facts USING INDEX condition_facts_landing_head"
+             )
+           )
+
+    refute Enum.any?(details, &String.contains?(&1, "SCAN condition_facts"))
 
     assert ConditionFacts.landings_for_commits(ctx.db, [head_commit]) ==
              ConditionFacts.landings_for_commits(ctx.db, [merge_commit])
