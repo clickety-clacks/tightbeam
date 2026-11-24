@@ -224,6 +224,67 @@ defmodule Tightbeam.SessionCustodyTransferTest do
     assert rows(ctx.db, "SELECT COUNT(*) FROM session_reparent_events") == [[1]]
   end
 
+  test "item ownership follows explicit open links, not transferred assignment membership", ctx do
+    {:ok, _} =
+      DB.query(ctx.db, """
+      INSERT INTO work_items
+        (id,title,ownerUserId,state,deliveryOwnerSessionKey,createdBySession,createdAt)
+      VALUES ('wi_bare','bare','owner','open','old','old',1),
+             ('wi_closed','closed','owner','closed','old','old',1),
+             ('wi_iceboxed','iceboxed','owner','iceboxed','old','old',1),
+             ('wi_failed','failed','owner','failed','old','old',1),
+             ('wi_other','other','owner','open','holder','holder',1)
+      """)
+
+    {:ok, _} =
+      DB.query(ctx.db, """
+      INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt,state,workItemId)
+      VALUES ('asg_other_item','another owner','old','holder',3,'open','wi_other')
+      """)
+
+    before = rows(ctx.db, "SELECT * FROM work_items WHERE id<>'wi_bare' ORDER BY id")
+
+    call = %{
+      principal: {:user, "owner"},
+      params: %{from_session_key: "old", to_session_key: "successor", idempotency_key: "items"}
+    }
+
+    result = SessionCustodyTransfer.handle(ctx.db, call)
+
+    assert [%{"id" => "wi_bare", "deliveryOwnerSessionKey" => "old", "rowVersion" => 1}] =
+             result["before"]["workItems"]
+
+    assert [
+             %{
+               "id" => "wi_bare",
+               "deliveryOwnerSessionKey" => "successor",
+               "rowVersion" => version,
+               "createdBySession" => "old"
+             }
+           ] = result["after"]["workItems"]
+
+    assert version > 1
+    assert rows(ctx.db, "SELECT * FROM work_items WHERE id<>'wi_bare' ORDER BY id") == before
+    assert rows(ctx.db, "SELECT workItemId FROM work_item_versions") == [["wi_bare"]]
+
+    assert rows(ctx.db, "SELECT holderKey FROM assignments WHERE id='asg_held'") == [
+             ["successor"]
+           ]
+
+    assert SessionCustodyTransfer.handle(ctx.db, call) == result
+
+    assert rows(ctx.db, "SELECT rowVersion FROM work_item_versions WHERE workItemId='wi_bare'") ==
+             [[version]]
+
+    assert [[encoded]] =
+             rows(
+               ctx.db,
+               "SELECT detail FROM lifecycle_events WHERE kind='session_custody_transferred'"
+             )
+
+    assert JSON.decode!(encoded)["after"]["workItems"] == result["after"]["workItems"]
+  end
+
   test "captured pending wake is delivered and its turn settles for the successor", ctx do
     {:ok, _} =
       DB.query(ctx.db, """
