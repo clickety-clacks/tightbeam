@@ -108,6 +108,7 @@ for module <- Tightbeam.Harness.all(),
 File.mkdir_p!(Path.join(base, "work"))
 Application.put_env(:tightbeam, :autostart, true)
 {:ok, _} = Application.ensure_all_started(:tightbeam)
+assert is_pid(Process.whereis(Tightbeam.HarklightBounces)), "the gateway runs the bounce worker"
 
 rows = fn sql ->
   {:ok, rows} = DB.query(DB, sql)

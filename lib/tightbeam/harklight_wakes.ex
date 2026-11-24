@@ -2547,7 +2547,10 @@ defmodule Tightbeam.HarklightWakes do
 
   def handle_call({:feed_capture, handle, rev, frames, mode}, from, state) do
     if valid_worker?(state, handle, from) do
-      case capture_feed_result(state.db, handle, rev, frames, mode) do
+      result = capture_feed_result(state.db, handle, rev, frames, mode)
+      if match?({:ok, _}, result), do: Tightbeam.HarklightBounces.captured(frames)
+
+      case result do
         {:ok, true} -> {:reply, :ok, confirm_feed_recovery(state, handle)}
         {:ok, false} -> {:reply, :ok, state}
         error -> {:reply, error, state}
@@ -3595,11 +3598,6 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp feed_entry_item(feed, _handle, %{"kind" => "advisory"} = frame, messages),
-    do:
-      {:ok,
-       Tightbeam.HarklightBounces.enrich(frame, messages, &feed_message(feed.executable, &1, &2))}
-
   defp feed_entry_item(_feed, _handle, frame, _messages), do: {:ok, frame}
 
   defp feed_message(executable, messages, id) do
@@ -3809,12 +3807,8 @@ defmodule Tightbeam.HarklightWakes do
   @doc false
   def capture_feed(db, handle, rev, frames, mode) do
     case capture_feed_result(db, handle, rev, frames, mode) do
-      {:ok, _} ->
-        Tightbeam.HarklightBounces.captured(mode, frames)
-        :ok
-
-      error ->
-        error
+      {:ok, _} -> :ok
+      error -> error
     end
   end
 

@@ -75,7 +75,7 @@ defmodule Tightbeam.HarklightBouncesTest do
 
     assert :ok = capture(db, 5, [frame], item)
     assert [[^worker, prompt]] = wake_rows(db, "SELECT sessionKey,prompt FROM wakes")
-    assert prompt =~ "This message had not been opened when it bounced."
+    assert prompt =~ "a version of the message below had not been opened when it bounced."
 
     # The same advisory heard again: by a replayed feed revision, by a later
     # baseline carrying it, and by the read path. Nobody is woken again.
@@ -86,10 +86,7 @@ defmodule Tightbeam.HarklightBouncesTest do
                db,
                @handle,
                9,
-               [
-                 message_frame(8, item),
-                 Map.put(advisory_frame(9, "item-1", "adv-1"), "item", item)
-               ],
+               [message_frame(8, item), advisory_frame(9, "item-1", "adv-1")],
                :baseline
              )
 
@@ -98,7 +95,7 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert [[1]] = wake_rows(db, "SELECT count(*) FROM wakes")
     assert [[1]] = wake_rows(db, "SELECT count(*) FROM harklight_bounces")
     assert [[9]] = wake_rows(db, "SELECT rev FROM harklight_feed_checkpoints")
-    assert [["feed", "woken"]] = wake_rows(db, "SELECT source,outcome FROM harklight_bounces")
+    assert [["woken"]] = wake_rows(db, "SELECT outcome FROM harklight_bounces")
   end
 
   test "the capture, its wake and the checkpoint commit together", ctx do
@@ -154,7 +151,7 @@ defmodule Tightbeam.HarklightBouncesTest do
              read(db, [item("item-1", @handle, advisories: [advisory("adv-1")])])
 
     assert [[1]] = wake_rows(db, "SELECT count(*) FROM wakes")
-    assert [["read"]] = wake_rows(db, "SELECT source FROM harklight_bounces")
+    assert [["woken"]] = wake_rows(db, "SELECT outcome FROM harklight_bounces")
   end
 
   test "an advisory already marked delivered is not woken", ctx do
@@ -179,16 +176,14 @@ defmodule Tightbeam.HarklightBouncesTest do
       DB.query(db, "INSERT INTO harklight_feed_checkpoints(handle,rev) VALUES(?1,3)", [@handle])
 
     frame = JSON.encode!(advisory_frame(5, "item-1", "adv-1"))
-    lookup = JSON.encode!(%{"rev" => 5, "message" => item("item-1", @handle)})
 
+    # Any lookup would exit 2 and stop the feed: a live advisory is captured
+    # from the feed alone, and the listener is never held.
     fake_agent!("""
     case "$*" in
       'listen --follow --session #{@handle} --after 3')
         printf '%s\\n' '#{frame}' '#{frame}' '{"kind":"caught_up","rev":5}'
         exec sleep 30
-        ;;
-      'message-get --item-id item-1')
-        printf '%s\\n' '#{lookup}'
         ;;
       *) exit 2 ;;
     esac
@@ -235,46 +230,10 @@ defmodule Tightbeam.HarklightBouncesTest do
              wake_rows(db, "SELECT advisoryId,outcome FROM harklight_bounces")
   end
 
-  test "a failed message lookup leaves the advisory for the read path", ctx do
-    %{db: db, main: main} = ctx
-    worker = agent(db, "worker", main)
-    conversation(db, @handle, worker)
-    sent(db, @handle, "item-1")
-
-    frame = advisory_frame(5, "item-1", "adv-1")
-    failing = fn _messages, _id -> {:error, "harklight_message_lookup_failed"} end
-
-    log =
-      ExUnit.CaptureLog.capture_log(fn ->
-        assert ^frame = HarklightBounces.enrich(frame, %{}, failing)
-      end)
-
-    assert log =~ "adv-1"
-    assert :ok = HarklightWakes.capture_feed(db, @handle, 5, [frame], :live)
-    assert [[0]] = wake_rows(db, "SELECT count(*) FROM harklight_bounces")
-    assert [[5]] = wake_rows(db, "SELECT rev FROM harklight_feed_checkpoints")
-
-    assert {:ok, %{woken: ["adv-1"]}} =
-             read(db, [item("item-1", @handle, advisories: [advisory("adv-1")])])
-  end
-
-  test "enrichment attaches the message and skips notices that are not bounces" do
-    frame = advisory_frame(5, "item-1", "adv-1")
-    fetch = fn %{}, "item-1" -> {:ok, item("item-1", @handle)} end
-
-    assert %{"item" => %{"item_id" => "item-1"}} = HarklightBounces.enrich(frame, %{}, fetch)
-
-    contradiction =
-      put_in(frame, ["data", "advisory", "advisory_type"], "possible_contradictions")
-
-    refute_called = fn _, _ -> flunk("no lookup for an ignored notice") end
-    assert ^contradiction = HarklightBounces.enrich(contradiction, %{}, refute_called)
-  end
-
   ## Items that are not open, not ours, or not bounces
 
   for state <- ["answered", "cleared", "expired", "superseded", "retracted"] do
-    test "an item #{state} before capture closes without a wake and is acknowledged", ctx do
+    test "an item #{state} before capture closes without a wake and is never acknowledged", ctx do
       %{db: db, main: main} = ctx
       worker = agent(db, "worker", main)
       conversation(db, @handle, worker)
@@ -290,22 +249,21 @@ defmodule Tightbeam.HarklightBouncesTest do
       assert [["closed", nil, nil]] =
                wake_rows(db, "SELECT outcome,recipient,wakeId FROM harklight_bounces")
 
-      # The same closure on the feed path.
+      # The same closure on the feed path, from the message in the same batch.
       assert :ok = capture(db, 9, [advisory_frame(9, "item-1", "adv-2")], closed)
-      assert [[0]] = wake_rows(db, "SELECT count(*) FROM wakes")
 
-      assert [[2]] =
-               wake_rows(db, "SELECT count(*) FROM harklight_bounces WHERE outcome='closed'")
+      assert [[0]] =
+               wake_rows(
+                 db,
+                 "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_harklight_bounce_%'"
+               )
+
+      assert [["closed", "not_owed"], ["closed", "not_owed"]] =
+               wake_rows(db, "SELECT outcome,ackOutcome FROM harklight_bounces")
 
       %{calls: calls, runner: runner} = ack_runner()
       assert {:ok, false} = HarklightBounces.ack_owed(db, runner: runner)
-
-      acked =
-        for ["advisory-ack", "--item-id", "item-1", "--advisory-id", id, "--op-id", _] <-
-              Agent.get(calls, & &1),
-            do: id
-
-      assert Enum.sort(acked) == ["adv-1", "adv-2"]
+      assert [] = Agent.get(calls, & &1)
     end
   end
 
@@ -355,7 +313,7 @@ defmodule Tightbeam.HarklightBouncesTest do
       )
 
     assert {:ok, %{woken: ["adv-1"]}} = read(db, [migrated])
-    assert [["legacy-9"]] = wake_rows(db, "SELECT messageId FROM harklight_bounces")
+    assert [["server-item"]] = wake_rows(db, "SELECT itemId FROM harklight_bounces")
   end
 
   test "possible_contradictions notices are ignored and never acknowledged", ctx do
@@ -591,7 +549,9 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert length(woken) == 30
     assert [[^worker, prompt]] = wake_rows(db, "SELECT sessionKey,prompt FROM wakes")
     assert length(String.split(prompt, "\n- ")) - 1 == 30
-    assert prompt =~ "Each of these 30 messages had not been opened when it bounced."
+
+    assert prompt =~
+             "a version of each of the 30 messages below had not been opened when it bounced."
   end
 
   test "30 overdue bounces for retired targets arrive at their parent as one wake", ctx do
@@ -657,20 +617,14 @@ defmodule Tightbeam.HarklightBouncesTest do
 
   ## What the wake says
 
-  test "the full bounce wake says only what was true when it bounced and resends nothing", ctx do
+  test "the full bounce wake says only what was true of that version when it bounced", ctx do
     %{db: db, main: main} = ctx
     worker = agent(db, "worker", main)
     conversation(db, @handle, worker)
     sent(db, @handle, "item-1")
 
     advisory =
-      advisory("adv-1",
-        extra: %{
-          "evaluated_at_ms" => 1_700_000_000_000,
-          "bounce_after_days" => 3,
-          "level_name" => "Important"
-        }
-      )
+      advisory("adv-1", extra: %{"evaluated_at_ms" => 1_700_000_000_000, "request_revision" => 2})
 
     assert {:ok, _} =
              read(db, [item("item-1", @handle, advisories: [advisory], title: "Deploy approval")])
@@ -678,15 +632,16 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert [[prompt]] = wake_rows(db, "SELECT prompt FROM wakes")
 
     assert prompt ==
-             "Harklight bounce. This message had not been opened when it bounced.\n" <>
+             "Harklight bounce: a version of the message below had not been opened when it bounced.\n" <>
                "- \"Deploy approval\" (message item-1, conversation #{@handle}, started by #{worker}): " <>
-               "it bounced at 2023-11-14T22:13:20.000Z (bounce interval 3 days, level Important).\n" <>
+               "revision 2, bounced at 2023-11-14T22:13:20.000Z.\n" <>
                "Decide whether it is still valid and worth resending, and whether its importance warrants a higher priority. " <>
                "To send it again use `tightbeam harklight-send`; to withdraw it use `tightbeam harklight-retract --message <message id>`. " <>
                "Tightbeam has not resent anything and will not."
 
     refute prompt =~ "never saw"
     refute prompt =~ "inbox"
+    refute prompt =~ "This message had"
 
     assert [["input-needed", "process:tightbeam"]] =
              wake_rows(db, "SELECT class,origin FROM wakes")
@@ -707,14 +662,46 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert [[prompt]] = wake_rows(db, "SELECT prompt FROM wakes")
 
     assert prompt ==
-             "Harklight soft bounce. This message had been opened but not acted on when it bounced.\n" <>
+             "Harklight soft bounce: a version of the message below had been opened but not acted on when it bounced.\n" <>
                "- \"Plan\" (message item-1, conversation #{@handle}, started by #{worker}): " <>
-               "it bounced at 2023-11-14T22:13:20.000Z (bounce interval 2 days, level Normal).\n" <>
+               "revision 1, bounced at 2023-11-14T22:13:20.000Z.\n" <>
                "Decide whether it is still valid and worth resending, and whether its importance warrants a higher priority. " <>
                "To send it again use `tightbeam harklight-send`; to withdraw it use `tightbeam harklight-retract --message <message id>`. " <>
                "Tightbeam has not resent anything and will not."
 
-    assert [["soft"]] = wake_rows(db, "SELECT kind FROM harklight_bounces")
+    assert [["soft_bounce"]] = wake_rows(db, "SELECT advisoryType FROM harklight_bounces")
+  end
+
+  test "a live advisory has no message to name: the wake gives its ID", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+
+    frame = advisory_frame(5, "item-1", "adv-1")
+    assert :ok = HarklightWakes.capture_feed(db, @handle, 5, [frame], :live)
+
+    assert [[prompt]] = wake_rows(db, "SELECT prompt FROM wakes")
+
+    assert prompt =~
+             "- Message item-1 (conversation #{@handle}, started by #{worker}): revision 1, bounced at "
+
+    refute prompt =~ ~s(- ")
+  end
+
+  test "a live advisory marked moot closes without a wake", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+
+    frame = advisory_frame(5, "item-1", "adv-1", extra: %{"moot" => true})
+    assert :ok = HarklightWakes.capture_feed(db, @handle, 5, [frame], :live)
+
+    assert [[0]] = wake_rows(db, "SELECT count(*) FROM wakes")
+
+    assert [["closed", "not_owed"]] =
+             wake_rows(db, "SELECT outcome,ackOutcome FROM harklight_bounces")
   end
 
   test "the later full_bounce type is handled as a full bounce", ctx do
@@ -728,7 +715,7 @@ defmodule Tightbeam.HarklightBouncesTest do
                item("item-1", @handle, advisories: [advisory("adv-1", type: "full_bounce")])
              ])
 
-    assert [["full"]] = wake_rows(db, "SELECT kind FROM harklight_bounces")
+    assert [["full_bounce"]] = wake_rows(db, "SELECT advisoryType FROM harklight_bounces")
   end
 
   test "any other notice type is ignored: no wake, no record, no acknowledgment", ctx do
@@ -774,7 +761,8 @@ defmodule Tightbeam.HarklightBouncesTest do
     refute soft =~ "had not been opened"
   end
 
-  test "a moot advisory closes without a wake and is never acknowledged", ctx do
+  test "a moot advisory read from the list closes without a wake and is never acknowledged",
+       ctx do
     %{db: db, main: main} = ctx
     worker = agent(db, "worker", main)
     conversation(db, @handle, worker)
@@ -786,7 +774,7 @@ defmodule Tightbeam.HarklightBouncesTest do
 
     assert [[0]] = wake_rows(db, "SELECT count(*) FROM wakes")
 
-    assert [["closed", "moot"]] =
+    assert [["closed", "not_owed"]] =
              wake_rows(db, "SELECT outcome,ackOutcome FROM harklight_bounces")
 
     %{calls: calls, runner: runner} = ack_runner()
@@ -838,6 +826,18 @@ defmodule Tightbeam.HarklightBouncesTest do
       assert {:ok, true} = HarklightBounces.ack_owed(db, runner: runner)
       assert [[nil]] = wake_rows(db, "SELECT ackCompletedAt FROM harklight_bounces")
     end
+  end
+
+  test "an acknowledgment for a message that is gone stops retrying", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+    assert {:ok, _} = read(db, [item("item-1", @handle, advisories: [advisory("adv-1")])])
+
+    %{runner: runner} = ack_runner(ack: :moot_reply, lookup: :not_found)
+    assert {:ok, false} = HarklightBounces.ack_owed(db, runner: runner)
+    assert [["gone"]] = wake_rows(db, "SELECT ackOutcome FROM harklight_bounces")
   end
 
   test "an acknowledgment that fails because someone else delivered it is let go", ctx do
@@ -997,7 +997,7 @@ defmodule Tightbeam.HarklightBouncesTest do
     messages = [item("item-1", @handle, advisories: [advisory("adv-1")])]
 
     %{calls: calls, runner: runner} = ack_runner(pages: %{nil => {messages, nil}})
-    opts = [db: db, runner: runner, read_interval_ms: 3_600_000, read_spacing_ms: 1]
+    opts = [db: db, runner: runner, read_interval_ms: 3_600_000]
 
     start_supervised!({HarklightBounces, opts})
 
@@ -1129,7 +1129,7 @@ defmodule Tightbeam.HarklightBouncesTest do
     assert [[0]] = wake_rows(db, "SELECT count(*) FROM harklight_bounces")
   end
 
-  test "the worker reads at start, once for a burst of baselines, and acknowledges", ctx do
+  test "the worker reads at start and again on every timer tick, and acknowledges", ctx do
     %{db: db, main: main} = ctx
     worker = agent(db, "worker", main)
     conversation(db, @handle, worker)
@@ -1140,22 +1140,92 @@ defmodule Tightbeam.HarklightBouncesTest do
         pages: %{nil => {[item("item-1", @handle, advisories: [advisory("adv-1")])], nil}}
       )
 
-    start_supervised!(
-      {HarklightBounces,
-       db: db, runner: runner, read_interval_ms: 3_600_000, read_spacing_ms: 150}
-    )
+    start_supervised!({HarklightBounces, db: db, runner: runner, read_interval_ms: 40})
 
     assert eventually(fn ->
              DB.query(db, "SELECT ackOutcome FROM harklight_bounces") == {:ok, [["acknowledged"]]}
            end)
 
     reads = fn -> Enum.count(Agent.get(calls, & &1), &(&1 == ["messages"])) end
-    assert reads.() == 1
+    assert eventually(fn -> reads.() >= 4 end)
+    assert [[1]] = wake_rows(db, "SELECT count(*) FROM wakes")
+  end
 
-    for _ <- 1..10, do: HarklightBounces.captured(:baseline, [])
-    assert eventually(fn -> reads.() == 2 end)
-    Process.sleep(300)
-    assert reads.() == 2
+  test "a read still running at the next tick is logged once and left alone", ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+    test_pid = self()
+
+    stuck = fn
+      ["messages"] ->
+        send(test_pid, {:read_started, self()})
+
+        receive do
+          :release -> {JSON.encode!(%{"rev" => 1, "messages" => []}), 0}
+        end
+
+      _ ->
+        {"", 1}
+    end
+
+    {reader, log} =
+      ExUnit.CaptureLog.with_log(fn ->
+        start_supervised!({HarklightBounces, db: db, runner: stuck, read_interval_ms: 30})
+        assert_receive {:read_started, reader}, 1_000
+        Process.sleep(250)
+        refute_receive {:read_started, _}, 10
+        reader
+      end)
+
+    send(reader, :release)
+
+    assert length(String.split(log, "still running at its next tick")) == 2
+    # Released, reading goes on.
+    assert_receive {:read_started, _}, 1_000
+  end
+
+  test "a live bounce is acknowledged through the real listener and manager, whatever the list read does",
+       ctx do
+    %{db: db, main: main} = ctx
+    worker = agent(db, "worker", main)
+    conversation(db, @handle, worker)
+    sent(db, @handle, "item-1")
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO harklight_feed_checkpoints(handle,rev) VALUES(?1,3)", [@handle])
+
+    frame = JSON.encode!(advisory_frame(5, "item-1", "adv-1"))
+
+    # The list read always fails here: only the capture can tell the worker.
+    fake_agent!("""
+    case "$1" in
+      listen)
+        printf '%s\\n' '#{frame}' '{"kind":"caught_up","rev":5}'
+        exec sleep 30
+        ;;
+      journal-id)
+        printf '%s\\n' '{"kind":"journal","journal_id":"j1"}'
+        ;;
+      retry)
+        printf '{"kind":"operation_absent","op_id":"%s","journal_id":"j1"}\\n' "$3"
+        exit 1
+        ;;
+      advisory-ack)
+        printf '{"kind":"committed","operation":"advisory-ack","op_id":"%s","response":{"advisory_id":"%s","delivered":true,"already_delivered":false}}\\n' "$7" "$5"
+        ;;
+      *) exit 1 ;;
+    esac
+    """)
+
+    start_supervised!({HarklightBounces, db: db, read_interval_ms: 3_600_000})
+    start_supervised!({HarklightWakes, db: db, retry_delays: [20, 40]})
+
+    assert eventually(fn ->
+             DB.query(db, "SELECT ackOutcome FROM harklight_bounces") == {:ok, [["acknowledged"]]}
+           end)
+
     assert [[1]] = wake_rows(db, "SELECT count(*) FROM wakes")
   end
 
@@ -1211,12 +1281,27 @@ defmodule Tightbeam.HarklightBouncesTest do
       )
   end
 
+  # A message Tightbeam sent: its request record and the bound protocol 2 send
+  # it came from (without which a conversation counts as not yet opened).
   defp sent(db, handle, id) do
     {:ok, _} =
       DB.query(
         db,
         "INSERT INTO harklight_wake_requests(senderId,messageId,handle) VALUES('sender',?1,?2)",
         [id, handle]
+      )
+
+    payload = JSON.encode!(%{"request" => %{"protocol" => 2, "session_handle" => handle}})
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO harklight_send_operations(opId,sessionKey,host,payload,result,handle,senderId,messageId,state,createdAt,updatedAt)
+        SELECT ?1,sessionKey,host,?2,'{}',handle,'sender',?3,'bound',1,1
+        FROM harklight_wake_handles WHERE handle=?4
+        """,
+        ["op-#{id}-#{handle}", payload, id, handle]
       )
   end
 
@@ -1268,16 +1353,9 @@ defmodule Tightbeam.HarklightBouncesTest do
   defp message_frame(rev, item),
     do: %{"kind" => "message", "rev" => rev, "data" => Map.put(item, "rev", rev)}
 
-  # A live feed batch as the listener submits it: advisory frames carry the
-  # message they concern.
+  # A feed batch with the message the advisory concerns in the same batch.
   defp capture(db, rev, frames, item) do
-    frames =
-      Enum.map(frames, fn
-        %{"kind" => "advisory"} = frame -> Map.put(frame, "item", item)
-        frame -> frame
-      end)
-
-    HarklightWakes.capture_feed(db, @handle, rev, frames, :live)
+    HarklightWakes.capture_feed(db, @handle, rev, [message_frame(rev - 1, item) | frames], :live)
   end
 
   defp read(db, messages) do
@@ -1327,6 +1405,11 @@ defmodule Tightbeam.HarklightBouncesTest do
     end
 
     %{calls: calls, runner: runner}
+  end
+
+  defp lookup(:not_found, _item) do
+    {JSON.encode!(%{kind: "refused", operation: "message-get", status: 404, error: "not_found"}) <>
+       "\n", 2}
   end
 
   defp lookup(:fail, _item), do: {"message-get: server returned HTTP 503\n", 1}

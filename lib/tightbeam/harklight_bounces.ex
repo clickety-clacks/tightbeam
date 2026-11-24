@@ -8,16 +8,18 @@ defmodule Tightbeam.HarklightBounces do
 
     * the feed (`capture_frames_in_txn/3`): an `advisory` record is captured in
       the same transaction as its wake and the feed checkpoint;
-    * a read of sent messages (`read_pass/2`): at gateway start, after a feed
-      baseline and at a slow interval, undelivered advisories are taken. This
-      recovers bounces a checkpoint skipped and is how bounces on ended sessions
-      are heard. The read marks nothing Delivered and reopens nothing.
+    * a read of sent messages (`read_pass/2`): at gateway start and at a slow
+      interval, undelivered advisories are taken. This recovers bounces a
+      checkpoint skipped and is how bounces on ended conversations are heard.
+      The read marks nothing Delivered and reopens nothing.
 
-  Delivery is acknowledged to Harklight (`advisory-ack`) only after the wake is
-  committed, from a durable row, and the acknowledgment is retried until it is
-  confirmed. Only messages Tightbeam itself sent (its own request records) are
-  handled; the rest, and `possible_contradictions` notices, are left alone and
-  never acknowledged. Nothing here resends a message.
+  A wake's delivery is acknowledged to Harklight (`advisory-ack`) only after the
+  wake is committed, from a durable row, and retried until Harklight confirms it
+  or the notice turns out to be moot or delivered. A notice that is moot, or on
+  an item that has ended, is recorded and never acknowledged. Only messages
+  Tightbeam itself sent (its own request records) are handled; the rest, and
+  every advisory type other than the bounce types, are left alone. Nothing here
+  resends a message.
   """
 
   use GenServer
@@ -29,10 +31,8 @@ defmodule Tightbeam.HarklightBounces do
   # One wake carries at most this many bounces. A longer list is several wakes
   # due together, which the recipient's batch delivers as one turn.
   @chunk 40
-  @max_pages 2_000
   @ack_delays [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 300_000]
   @read_interval 900_000
-  @read_spacing 60_000
   @max_title 120
 
   @registration_sql """
@@ -47,19 +47,15 @@ defmodule Tightbeam.HarklightBounces do
       advisoryId TEXT PRIMARY KEY,
       itemId TEXT NOT NULL,
       handle TEXT NOT NULL REFERENCES harklight_wake_handles(handle),
-      senderId TEXT NOT NULL,
-      messageId TEXT NOT NULL,
       advisoryType TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK(kind IN ('full','soft')),
       outcome TEXT NOT NULL CHECK(outcome IN ('woken','closed')),
       recipient TEXT REFERENCES sessions(sessionKey),
       wakeId TEXT REFERENCES wakes(wakeId),
-      source TEXT NOT NULL CHECK(source IN ('feed','read')),
       capturedAt INTEGER NOT NULL,
       ackOpId TEXT NOT NULL UNIQUE,
       ackJournalId TEXT,
       ackCompletedAt INTEGER,
-      ackOutcome TEXT CHECK(ackOutcome IN ('acknowledged','gone','moot','delivered')),
+      ackOutcome TEXT CHECK(ackOutcome IN ('acknowledged','gone','moot','delivered','not_owed')),
       CHECK ((outcome='woken' AND recipient IS NOT NULL AND wakeId IS NOT NULL)
           OR (outcome='closed' AND recipient IS NULL AND wakeId IS NULL)),
       CHECK ((ackCompletedAt IS NULL AND ackOutcome IS NULL)
@@ -91,8 +87,10 @@ defmodule Tightbeam.HarklightBounces do
 
   @doc """
   Capture the advisory records of one feed batch inside the batch's own
-  transaction. Frames that are not advisories are untouched. A record that cannot
-  be placed (no message, a message that is not ours) is left for the read path.
+  transaction. Frames that are not advisories are untouched. The message an
+  advisory concerns is the one in the same batch, when there is one; nothing is
+  looked up here, so the listener is never held. A record that cannot be placed
+  is left for the read path.
   """
   def capture_frames_in_txn(%Txn{} = txn, handle, frames) when is_list(frames) do
     messages =
@@ -101,11 +99,11 @@ defmodule Tightbeam.HarklightBounces do
       )
 
     candidates =
-      for %{"kind" => "advisory", "data" => %{"item_id" => id, "advisory" => advisory}} = frame <-
+      for %{"kind" => "advisory", "data" => %{"item_id" => id, "advisory" => advisory}} <-
             frames,
           is_binary(id),
           is_map(advisory) do
-        %{advisory: advisory, item: frame["item"] || messages[id], item_id: id, handle: handle}
+        %{advisory: advisory, item: messages[id], item_id: id, handle: handle}
       end
 
     if candidates != [], do: process_in_txn(txn, candidates, :feed)
@@ -113,49 +111,14 @@ defmodule Tightbeam.HarklightBounces do
   end
 
   @doc """
-  Attach the message an advisory concerns, read once outside the transaction, so
-  the capture can tell whether it is still open. `fetch` is the feed's own
-  message lookup. A failed lookup leaves the frame as it is; the read path hears
-  it later.
+  Tell the worker a feed batch committed, so its acknowledgments go out now and
+  not at the next read.
   """
-  def enrich(
-        %{"kind" => "advisory", "data" => %{"item_id" => id, "advisory" => advisory}} = frame,
-        messages,
-        fetch
-      )
-      when is_binary(id) and is_map(advisory) and is_function(fetch, 2) do
-    cond do
-      kind(advisory) == :ignore ->
-        frame
+  def captured(frames) do
+    pid = Process.whereis(__MODULE__)
 
-      Map.has_key?(frame, "item") ->
-        frame
-
-      true ->
-        case fetch.(messages, id) do
-          {:ok, item} ->
-            Map.put(frame, "item", item)
-
-          {:error, reason} ->
-            Logger.warning(
-              "Harklight bounce #{inspect(advisory["advisory_id"])} not captured from the feed: message lookup failed (#{inspect(reason)}); the read path will hear it"
-            )
-
-            frame
-        end
-    end
-  end
-
-  def enrich(frame, _messages, _fetch), do: frame
-
-  @doc "Tell the worker a feed batch committed. Cheap; sends nothing when nothing is owed."
-  def captured(mode, frames) do
-    advisory? = Enum.any?(frames, &match?(%{"kind" => "advisory"}, &1))
-
-    if pid = Process.whereis(__MODULE__) do
-      if advisory?, do: GenServer.cast(pid, :ack_requested)
-      if mode == :baseline, do: GenServer.cast(pid, :read_requested)
-    end
+    if pid && Enum.any?(frames, &match?(%{"kind" => "advisory"}, &1)),
+      do: GenServer.cast(pid, :ack_requested)
 
     :ok
   end
@@ -164,28 +127,34 @@ defmodule Tightbeam.HarklightBounces do
 
   @doc """
   Handle candidates `%{advisory:, item:, item_id:, handle:}` in one transaction.
-  Returns a summary. An advisory already recorded is skipped, so every route
-  agrees on one wake per advisory ID.
+  `item` is the message when the route has it (a read always does). Returns a
+  summary. An advisory already recorded is skipped, so every route agrees on one
+  wake per advisory ID.
   """
   def process_in_txn(%Txn{} = txn, candidates, source) when source in [:feed, :read] do
     now = System.system_time(:millisecond)
 
-    fresh =
-      candidates
-      |> Enum.filter(&bounce?/1)
-      |> Enum.uniq_by(& &1.advisory["advisory_id"])
-      |> Enum.reject(&recorded?(txn, &1))
-
     checked =
-      for candidate <- fresh, is_map(candidate.item) do
-        {candidate, registration(txn, candidate, candidate.item)}
+      for candidate <- candidates,
+          bounce?(candidate),
+          reduce: {[], MapSet.new()} do
+        {acc, seen} ->
+          id = candidate.advisory["advisory_id"]
+
+          if MapSet.member?(seen, id) or recorded?(txn, id),
+            do: {acc, seen},
+            else: {[{candidate, registration(txn, candidate)} | acc], MapSet.put(seen, id)}
       end
+      |> elem(0)
+      |> Enum.reverse()
 
     decided = for {candidate, {:ok, reg}} <- checked, do: Map.put(candidate, :reg, reg)
 
     # Open bounces on messages Tightbeam did not send: counted, never touched.
     left_alone =
-      for {candidate, :foreign} <- checked, not ended?(candidate.item, candidate.advisory) do
+      for {%{item: item} = candidate, :foreign} <- checked,
+          is_map(item),
+          not ended?(item, candidate.advisory) do
         candidate.advisory["advisory_id"]
       end
 
@@ -193,11 +162,7 @@ defmodule Tightbeam.HarklightBounces do
     # real terminal: nothing to wake. Closing the item in the inbox is not one.
     {closed, open} = Enum.split_with(decided, &ended?(&1.item, &1.advisory))
 
-    routed =
-      for candidate <- open do
-        {candidate, recipient_in_txn(txn, candidate.reg)}
-      end
-
+    routed = for candidate <- open, do: {candidate, recipient_in_txn(txn, candidate.reg)}
     unroutable = for {candidate, :none} <- routed, do: candidate
 
     open =
@@ -209,20 +174,10 @@ defmodule Tightbeam.HarklightBounces do
       )
     end)
 
-    # A notice already seen as moot is never acknowledged: Harklight answers
-    # such an acknowledgment with moot and not delivered, which the Agent
-    # reports as an error.
-    Enum.each(closed, fn candidate ->
-      record(txn, candidate, source, "closed", nil, nil, now)
-
-      if candidate.advisory["moot"] == true do
-        Txn.q(
-          txn,
-          "UPDATE harklight_bounces SET ackCompletedAt=?2,ackOutcome='moot' WHERE advisoryId=?1",
-          [candidate.advisory["advisory_id"], now]
-        )
-      end
-    end)
+    # Closed rows are never acknowledged: Harklight answers an acknowledgment of
+    # a moot notice with moot and not delivered, which the Agent reports as an
+    # error, and the row already keeps a second wake from happening.
+    Enum.each(closed, &record(txn, &1, "closed", nil, nil, now))
 
     woken =
       open
@@ -232,44 +187,37 @@ defmodule Tightbeam.HarklightBounces do
         entries
         |> Enum.sort_by(&{&1.reg.handle, &1.reg.message_id, &1.advisory["advisory_id"]})
         |> Enum.chunk_every(@chunk)
-        |> Enum.flat_map(&wake_chunk(txn, recipient, &1, source, now))
+        |> Enum.flat_map(&wake_chunk(txn, recipient, &1, now))
       end)
 
     %{
       woken: woken,
       closed: Enum.map(closed, & &1.advisory["advisory_id"]),
       unroutable: Enum.map(unroutable, & &1.advisory["advisory_id"]),
-      left_alone_open: left_alone,
-      repaired:
-        for(
-          entry <- open,
-          entry.reg.handle_state == "active",
-          source == :read,
-          do: entry.advisory["advisory_id"]
-        )
+      left_alone_open: left_alone
     }
   end
 
-  defp ended?(item, advisory), do: advisory["moot"] == true or not is_nil(item["terminal"])
+  defp ended?(item, advisory),
+    do: advisory["moot"] == true or (is_map(item) and not is_nil(item["terminal"]))
 
   defp bounce?(%{advisory: %{"advisory_id" => id} = advisory}) when is_binary(id) and id != "",
     do: kind(advisory) != :ignore and advisory["delivered"] != true
 
   defp bounce?(_), do: false
 
-  defp recorded?(txn, candidate) do
-    Txn.q(txn, "SELECT 1 FROM harklight_bounces WHERE advisoryId=?1", [
-      candidate.advisory["advisory_id"]
-    ]) != []
-  end
+  defp recorded?(txn, advisory_id),
+    do: Txn.q(txn, "SELECT 1 FROM harklight_bounces WHERE advisoryId=?1", [advisory_id]) != []
 
   # Only a message Tightbeam sent (its own request record) on a conversation of
-  # this host: `:foreign` is not ours, `:elsewhere` is ours but another host's. A feed capture also requires the conversation to be the feed's.
-  defp registration(txn, candidate, item) do
-    id = candidate.item_id
+  # this host: `:foreign` is not ours, `:elsewhere` is ours but another host's.
+  # Without the message (a live advisory) the message ID must match exactly; a
+  # message migrated from before 0.2 is then left to the read path.
+  defp registration(txn, candidate) do
+    item = candidate.item || %{}
 
     direct =
-      Txn.q(txn, @registration_sql <> " WHERE r.messageId=?1", [id])
+      Txn.q(txn, @registration_sql <> " WHERE r.messageId=?1", [candidate.item_id])
       |> Enum.filter(fn [_, sender | _] -> is_nil(item["sender"]) or sender == item["sender"] end)
 
     rows =
@@ -285,7 +233,7 @@ defmodule Tightbeam.HarklightBounces do
       end
 
     case rows do
-      [[handle, sender, message_id, origin, host, state, receiver]] ->
+      [[handle, _sender, message_id, origin, host, state, receiver]] ->
         cond do
           candidate.handle not in [nil, handle] or item["session"] not in [nil, handle] ->
             :foreign
@@ -297,7 +245,6 @@ defmodule Tightbeam.HarklightBounces do
             {:ok,
              %{
                handle: handle,
-               sender: sender,
                message_id: message_id,
                origin: origin,
                handle_state: state,
@@ -336,7 +283,7 @@ defmodule Tightbeam.HarklightBounces do
     end
   end
 
-  defp wake_chunk(txn, recipient, entries, source, now) do
+  defp wake_chunk(txn, recipient, entries, now) do
     ids = Enum.map(entries, & &1.advisory["advisory_id"])
     digest = :crypto.hash(:sha256, Enum.join([recipient | Enum.sort(ids)], "\n"))
     wake_id = "w_harklight_bounce_" <> binary_part(Base.encode16(digest, case: :lower), 0, 40)
@@ -353,39 +300,39 @@ defmodule Tightbeam.HarklightBounces do
       })
 
     Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
-    Enum.each(entries, &record(txn, &1, source, "woken", recipient, wake.wake_id, now))
+    Enum.each(entries, &record(txn, &1, "woken", recipient, wake.wake_id, now))
     ids
   end
 
-  defp record(txn, candidate, source, outcome, recipient, wake_id, now) do
+  defp record(txn, candidate, outcome, recipient, wake_id, now) do
     advisory = candidate.advisory
+    owed? = outcome == "woken"
 
     Txn.q(
       txn,
       """
-      INSERT INTO harklight_bounces(advisoryId,itemId,handle,senderId,messageId,advisoryType,kind,
-        outcome,recipient,wakeId,source,capturedAt,ackOpId)
-      VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+      INSERT INTO harklight_bounces(advisoryId,itemId,handle,advisoryType,outcome,recipient,
+        wakeId,capturedAt,ackOpId,ackCompletedAt,ackOutcome)
+      VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
       """,
       [
         advisory["advisory_id"],
         candidate.item_id,
         candidate.reg.handle,
-        candidate.reg.sender,
-        candidate.reg.message_id,
         advisory["advisory_type"],
-        Atom.to_string(kind(advisory)),
         outcome,
         recipient,
         wake_id,
-        Atom.to_string(source),
         now,
-        Id.uuid4()
+        Id.uuid4(),
+        if(owed?, do: nil, else: now),
+        if(owed?, do: nil, else: "not_owed")
       ]
     )
   end
 
-  ## What the wake says. Each sentence is true of the kind it is written for.
+  ## What the wake says. Each sentence is true of the kind it is written for,
+  ## and of the version of the message the bounce decided on.
 
   defp prompt(txn, recipient, entries) do
     sections =
@@ -398,25 +345,25 @@ defmodule Tightbeam.HarklightBounces do
     Enum.join(sections, "\n\n")
   end
 
-  # What was true when Harklight bounced it, said as of then. The person may
-  # have opened or acted on the message since; the wake does not say otherwise.
+  # What was true when Harklight bounced it, said as of then and of the version
+  # it decided on. The person may have opened or acted on it since.
   defp section(kind, group, ctx) do
     n = length(group)
     one? = n == 1
 
+    what =
+      if one?,
+        do: "a version of the message below had",
+        else: "a version of each of the #{n} messages below had"
+
     subject =
       case kind do
-        :full ->
-          "Harklight bounce. #{if one?, do: "This message had", else: "Each of these #{n} messages had"} not been opened when it bounced."
-
-        :soft ->
-          "Harklight soft bounce. #{if one?, do: "This message had", else: "Each of these #{n} messages had"} been opened but not acted on when it bounced."
+        :full -> "Harklight bounce: #{what} not been opened when it bounced."
+        :soft -> "Harklight soft bounce: #{what} been opened but not acted on when it bounced."
       end
 
-    lines = Enum.map(group, &line(kind, &1, ctx))
-
     Enum.join(
-      [subject | lines] ++
+      [subject | Enum.map(group, &line(&1, ctx))] ++
         [
           "Decide whether #{if one?, do: "it is", else: "each is"} still valid and worth resending, and whether its importance warrants a higher priority. " <>
             "To send it again use `tightbeam harklight-send`; to withdraw it use `tightbeam harklight-retract --message <message id>`. " <>
@@ -426,28 +373,30 @@ defmodule Tightbeam.HarklightBounces do
     )
   end
 
-  defp line(_kind, %{advisory: advisory, item: item, reg: reg} = entry, ctx) do
-    "- #{quoted(title(item))} (message #{reg.message_id}, conversation #{reg.handle}, started by #{reg.origin}): " <>
-      "#{bounced_clause(advisory)}#{receiver_clause(entry, ctx)}"
-  end
+  defp line(%{advisory: advisory, item: item, reg: reg} = entry, ctx) do
+    ids = "message #{reg.message_id}, conversation #{reg.handle}, started by #{reg.origin}"
 
-  defp bounced_clause(advisory) do
-    days = days(advisory["bounce_after_days"])
+    head =
+      case title(item) do
+        nil ->
+          "- Message #{reg.message_id} (conversation #{reg.handle}, started by #{reg.origin})"
 
-    detail =
-      [
-        days && "bounce interval #{days}",
-        is_binary(advisory["level_name"]) && "level #{clean(advisory["level_name"], 80)}"
-      ]
-      |> Enum.filter(& &1)
-      |> Enum.join(", ")
+        title ->
+          "- #{quoted(title)} (#{ids})"
+      end
 
-    detail = if detail == "", do: "", else: " (#{detail})"
+    revision =
+      if is_integer(advisory["request_revision"]),
+        do: "revision #{advisory["request_revision"]}, ",
+        else: ""
 
-    case advisory["evaluated_at_ms"] do
-      at when is_integer(at) -> "it bounced at #{time(at)}#{detail}."
-      _ -> "it bounced#{detail}."
-    end
+    at =
+      case advisory["evaluated_at_ms"] do
+        at when is_integer(at) -> "bounced at #{time(at)}"
+        _ -> "bounced"
+      end
+
+    "#{head}: #{revision}#{at}.#{receiver_clause(entry, ctx)}"
   end
 
   defp receiver_clause(%{reg: reg}, {txn, recipient}) do
@@ -470,23 +419,13 @@ defmodule Tightbeam.HarklightBounces do
   defp title(%{"message" => %{"title" => title}}) when is_binary(title) and title != "",
     do: clean(title, @max_title)
 
-  defp title(_), do: "untitled"
+  defp title(_), do: nil
 
   defp quoted(text), do: "\"" <> String.replace(text, "\"", "'") <> "\""
 
   defp clean(text, limit) do
     text |> to_string() |> String.replace(~r/[[:cntrl:]]/u, " ") |> String.slice(0, limit)
   end
-
-  defp days(value) when is_integer(value) and value > 0, do: plural_days(value)
-
-  defp days(value) when is_float(value) and value > 0 do
-    if value == Float.round(value), do: plural_days(trunc(value)), else: "#{value} days"
-  end
-
-  defp days(_), do: nil
-  defp plural_days(1), do: "1 day"
-  defp plural_days(n), do: "#{n} days"
 
   defp time(ms) do
     case DateTime.from_unix(ms, :millisecond) do
@@ -504,17 +443,8 @@ defmodule Tightbeam.HarklightBounces do
   def read_pass(db, opts \\ []) do
     with true <- registered_requests?(db) || :idle,
          {:ok, runner} <- HarklightSend.runner(opts),
-         {:ok, candidates} <- collect(runner, nil, MapSet.new(), [], 0),
-         {:ok, summary} <-
-           DB.transaction(db, fn txn -> process_in_txn(txn, candidates, :read) end) do
-      # The safety net repaired these: the feed should have delivered them.
-      # (The gateway's miss counter has a closed set of loops shown by the CLI
-      # doctor, so a repair is logged here by name instead.)
-      Enum.each(summary.repaired, fn id ->
-        Logger.warning("event miss loop=harklight_bounce record=#{id} repaired by read pass")
-      end)
-
-      {:ok, summary}
+         {:ok, candidates} <- collect(runner, nil, MapSet.new(), []) do
+      DB.transaction(db, fn txn -> process_in_txn(txn, candidates, :read) end)
     else
       :idle -> {:ok, :idle}
       {:error, reason} -> {:error, reason}
@@ -525,7 +455,7 @@ defmodule Tightbeam.HarklightBounces do
     match?({:ok, [[1]]}, DB.query(db, "SELECT 1 FROM harklight_wake_requests LIMIT 1"))
   end
 
-  defp collect(runner, token, seen, acc, pages) do
+  defp collect(runner, token, seen, acc) do
     argv = if token, do: ["messages", "--page", token], else: ["messages"]
 
     case read_page(runner, argv) do
@@ -537,9 +467,9 @@ defmodule Tightbeam.HarklightBounces do
             {:ok, acc}
 
           next when is_binary(next) ->
-            if MapSet.member?(seen, next) or pages >= @max_pages,
+            if MapSet.member?(seen, next),
               do: {:error, "harklight_messages_paging_invalid"},
-              else: collect(runner, next, MapSet.put(seen, next), acc, pages + 1)
+              else: collect(runner, next, MapSet.put(seen, next), acc)
 
           _ ->
             {:error, "harklight_messages_paging_invalid"}
@@ -588,9 +518,9 @@ defmodule Tightbeam.HarklightBounces do
   ## Acknowledgment
 
   @doc """
-  Acknowledge every handled advisory whose acknowledgment is still owed.
-  Returns `{:ok, outstanding?}`. An unconfirmed attempt keeps its operation ID
-  and journal and is retried; Harklight treats the acknowledgment as idempotent.
+  Acknowledge every woken advisory whose acknowledgment is still owed. Returns
+  `{:ok, outstanding?}`. An unconfirmed attempt keeps its operation ID and
+  journal and is retried with backoff. Closed rows owe nothing.
   """
   def ack_owed(db, opts \\ []) do
     with {:ok, rows} <-
@@ -601,7 +531,8 @@ defmodule Tightbeam.HarklightBounces do
              WHERE ackCompletedAt IS NULL ORDER BY capturedAt,advisoryId
              """
            ),
-         {:ok, runner} <- ack_runner(rows, opts) do
+         true <- rows != [] || :none,
+         {:ok, runner} <- HarklightSend.runner(opts) do
       outstanding =
         Enum.reduce(rows, false, fn [advisory, item, op, journal], pending ->
           # Every owed row is attempted, whatever happened to the one before.
@@ -611,25 +542,19 @@ defmodule Tightbeam.HarklightBounces do
 
       {:ok, outstanding}
     else
-      {:error, _} -> {:ok, true}
       :none -> {:ok, false}
-    end
-  end
-
-  defp ack_runner([], _opts), do: :none
-
-  defp ack_runner(_rows, opts) do
-    case HarklightSend.runner(opts) do
-      {:ok, runner} -> {:ok, runner}
-      {:error, _} -> {:error, :no_agent}
+      {:error, _} -> {:ok, true}
     end
   end
 
   defp ack_one(db, runner, advisory, item, op, journal) do
     with {:ok, journal} <- journal(db, runner, op, journal) do
-      frames = recover(runner, advisory, item, op, journal)
+      argv = ["advisory-ack", "--item-id", item, "--advisory-id", advisory]
 
-      case settle(frames, advisory, op) do
+      result =
+        Tightbeam.HarklightReceipts.recover_operation(runner, argv, op, journal, ["advisory-ack"])
+
+      case settle(result, advisory, op) do
         :acknowledged ->
           complete(db, advisory, "acknowledged")
 
@@ -659,42 +584,52 @@ defmodule Tightbeam.HarklightBounces do
   # An acknowledgment that did not confirm: read the message's current
   # advisory. If it has become moot (Harklight answers an acknowledgment of a
   # moot notice with moot and not delivered, which the Agent reports as an
-  # error) or is delivered, there is nothing left to acknowledge and the
-  # retries stop. Otherwise, or if it cannot be read, keep retrying.
+  # error) or is delivered, or the message is gone, there is nothing left to
+  # acknowledge and the retries stop. Otherwise, or if it cannot be read, keep
+  # retrying with backoff.
   defp already_settled(db, runner, advisory, item) do
-    with {[%{"message" => %{"advisories" => advisories}}], 0} when is_list(advisories) <-
-           run_message(runner, ["message-get", "--item-id", item]),
-         %{} = current <- Enum.find(advisories, &(&1["advisory_id"] == advisory)) do
-      cond do
-        current["moot"] == true ->
-          Logger.info("Harklight bounce #{advisory} became moot; acknowledgment dropped")
-          complete(db, advisory, "moot")
+    case message_get(runner, item) do
+      {:ok, advisories} ->
+        case Enum.find(advisories, &(&1["advisory_id"] == advisory)) do
+          %{"moot" => true} ->
+            Logger.info("Harklight bounce #{advisory} became moot; acknowledgment dropped")
+            complete(db, advisory, "moot")
 
-        current["delivered"] == true ->
-          complete(db, advisory, "delivered")
+          %{"delivered" => true} ->
+            complete(db, advisory, "delivered")
 
-        true ->
-          :pending
-      end
-    else
-      _ -> :pending
+          _ ->
+            :pending
+        end
+
+      :not_found ->
+        complete(db, advisory, "gone")
+
+      :unreadable ->
+        :pending
     end
   end
 
-  # `message-get` prints the plain response, not a `kind` frame.
-  defp run_message(runner, argv) do
-    {output, status} = runner.(argv)
+  defp message_get(runner, item) do
+    {output, status} = runner.(["message-get", "--item-id", item])
 
     frames =
       for line <- String.split(output, "\n", trim: true),
           {:ok, %{} = frame} <- [JSON.decode(line)],
           do: frame
 
-    {frames, status}
+    case {frames, status} do
+      {[%{"message" => %{"advisories" => advisories}}], 0} when is_list(advisories) ->
+        {:ok, advisories}
+
+      {[%{"kind" => "refused", "error" => "not_found"}], status} when status in [2, 5] ->
+        :not_found
+
+      _ ->
+        :unreadable
+    end
   rescue
-    _ -> {[], :error}
-  catch
-    _, _ -> {[], :error}
+    _ -> :unreadable
   end
 
   defp journal(_db, _runner, _op, journal) when is_binary(journal), do: {:ok, journal}
@@ -710,18 +645,6 @@ defmodule Tightbeam.HarklightBounces do
       {:ok, id}
     else
       _ -> :pending
-    end
-  end
-
-  defp recover(runner, advisory, item, op, journal) do
-    retry = ["retry", "--op-id", op, "--journal-id", journal]
-
-    case run(runner, retry) do
-      {[%{"kind" => "operation_absent", "op_id" => ^op, "journal_id" => ^journal}], 1} ->
-        run(runner, ["advisory-ack", "--item-id", item, "--advisory-id", advisory, "--op-id", op])
-
-      result ->
-        result
     end
   end
 
@@ -759,26 +682,14 @@ defmodule Tightbeam.HarklightBounces do
     end
   end
 
-  defp run(runner, argv) do
-    {output, status} = runner.(argv)
-
-    frames =
-      for line <- String.split(output, "\n", trim: true),
-          {:ok, %{"kind" => _} = frame} <- [JSON.decode(line)],
-          do: frame
-
-    {frames, status}
-  rescue
-    _ -> {[], :error}
-  catch
-    _, _ -> {[], :error}
-  end
-
   ## Worker
 
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
+  # Reads happen at start and on a slow timer; acknowledgments right after a
+  # feed capture, after a read, and by backoff. Neither task has a deadline: a
+  # read still running when the next tick comes is logged once and left alone.
   @impl true
   def init(opts) do
     send(self(), :ack_tick)
@@ -793,24 +704,44 @@ defmodule Tightbeam.HarklightBounces do
        ack_attempts: 0,
        ack_timer: nil,
        read: nil,
-       read_wanted: false,
-       read_timer: nil,
        read_tick: nil,
-       last_read: nil
+       stuck_logged: false
      }}
   end
 
   @impl true
   def handle_cast(:ack_requested, state), do: {:noreply, start_ack(state)}
-  def handle_cast(:read_requested, state), do: {:noreply, request_read(state)}
 
   @impl true
   def handle_info(:ack_tick, state), do: {:noreply, start_ack(%{state | ack_timer: nil})}
 
-  def handle_info(:read_tick, state),
-    do: {:noreply, request_read(%{state | read_tick: nil})}
+  def handle_info(:read_tick, state) do
+    interval = Keyword.get(state.opts, :read_interval_ms, @read_interval)
+    state = %{state | read_tick: Process.send_after(self(), :read_tick, interval)}
 
-  def handle_info(:read_due, state), do: {:noreply, request_read(%{state | read_timer: nil})}
+    cond do
+      is_nil(state.read) ->
+        %{db: db, opts: opts} = state
+
+        task =
+          Task.async(fn ->
+            {:read,
+             guarded(fn -> read_pass(db, opts) end, {:error, "harklight_bounce_read_crashed"})}
+          end)
+
+        {:noreply, %{state | read: task}}
+
+      state.stuck_logged ->
+        {:noreply, state}
+
+      true ->
+        Logger.warning(
+          "Harklight bounce read is still running at its next tick; waiting for it, not starting another"
+        )
+
+        {:noreply, %{state | stuck_logged: true}}
+    end
+  end
 
   def handle_info({ref, {:ack, result}}, %{ack: %Task{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
@@ -850,23 +781,19 @@ defmodule Tightbeam.HarklightBounces do
         Logger.warning("Harklight bounce read failed: #{inspect(reason)}")
     end
 
-    state = %{state | read: nil, last_read: System.monotonic_time(:millisecond)}
-    state = if match?({:ok, %{}}, result), do: start_ack(state), else: state
-    state = arm_read_tick(state)
-    {:noreply, if(state.read_wanted, do: request_read(state), else: state)}
+    state = %{state | read: nil, stuck_logged: false}
+    {:noreply, if(match?({:ok, %{}}, result), do: start_ack(state), else: state)}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     cond do
       match?(%Task{ref: ^ref}, state.ack) ->
         Logger.warning("Harklight bounce acknowledgment worker stopped: #{inspect(reason)}")
-        {:noreply, %{state | ack: nil} |> start_ack_later()}
+        {:noreply, %{state | ack: nil, ack_timer: Process.send_after(self(), :ack_tick, 1_000)}}
 
       match?(%Task{ref: ^ref}, state.read) ->
         Logger.warning("Harklight bounce read worker stopped: #{inspect(reason)}")
-
-        {:noreply,
-         arm_read_tick(%{state | read: nil, last_read: System.monotonic_time(:millisecond)})}
+        {:noreply, %{state | read: nil, stuck_logged: false}}
 
       true ->
         {:noreply, state}
@@ -894,49 +821,5 @@ defmodule Tightbeam.HarklightBounces do
     kind, reason ->
       Logger.warning("Harklight bounce worker failed: #{inspect({kind, reason})}")
       default
-  end
-
-  defp start_ack_later(state) do
-    %{state | ack_timer: Process.send_after(self(), :ack_tick, 1_000)}
-  end
-
-  # Reads are requested by start, by every feed baseline and by a slow timer.
-  # A burst of requests is one read, and reads keep a minimum spacing.
-  defp request_read(%{read: %Task{}} = state), do: %{state | read_wanted: true}
-
-  defp request_read(state) do
-    spacing = Keyword.get(state.opts, :read_spacing_ms, @read_spacing)
-    now = System.monotonic_time(:millisecond)
-
-    wait =
-      case state.last_read do
-        nil -> 0
-        last -> max(0, last + spacing - now)
-      end
-
-    cond do
-      wait == 0 ->
-        %{db: db, opts: opts} = state
-
-        task =
-          Task.async(fn ->
-            {:read,
-             guarded(fn -> read_pass(db, opts) end, {:error, "harklight_bounce_read_crashed"})}
-          end)
-
-        %{state | read: task, read_wanted: false}
-
-      state.read_timer ->
-        %{state | read_wanted: true}
-
-      true ->
-        %{state | read_timer: Process.send_after(self(), :read_due, wait), read_wanted: true}
-    end
-  end
-
-  defp arm_read_tick(state) do
-    if state.read_tick, do: Process.cancel_timer(state.read_tick)
-    interval = Keyword.get(state.opts, :read_interval_ms, @read_interval)
-    %{state | read_tick: Process.send_after(self(), :read_tick, interval)}
   end
 end
