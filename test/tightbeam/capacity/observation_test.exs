@@ -6,10 +6,18 @@ defmodule Tightbeam.Capacity.ObservationTest do
   @now 1_800_000_000_000
 
   test "gateway receipt timestamps the sample and a failure retains its history" do
-    sample = %{observed_at: 999, plan: "plus", windows: [%{id: "primary", used_percent: 70}]}
+    sample = %{
+      observed_at: 999,
+      plan: "plus",
+      windows: [%{id: "primary", used_percent: 70, reset_after_seconds: 60}]
+    }
+
     first = Observation.record(Observation.empty(), {:ok, sample}, @now - 42, @now)
 
     assert first.sample.observed_at == @now
+    assert [%{resets_at: reset_at} = window] = first.sample.windows
+    assert reset_at == @now + 60_000
+    refute Map.has_key?(window, :reset_after_seconds)
     assert first.attempted_at == @now - 42
     assert [%{observed_at: @now}] = first.history
     assert Observation.fresh?(first, @now)

@@ -19,7 +19,8 @@ defmodule Tightbeam.Capacity.Observation do
   end
 
   defp apply_outcome(current, {:ok, sample}, attempted_at, received_at) do
-    sample = %{sample | observed_at: received_at}
+    windows = Enum.map(sample.windows, &resolve_reset(&1, received_at))
+    sample = %{sample | observed_at: received_at, windows: windows}
 
     history =
       History.retain(
@@ -56,6 +57,17 @@ defmodule Tightbeam.Capacity.Observation do
         retry_at: retry_at,
         history: History.retain(current.history, received_at)
     }
+  end
+
+  defp resolve_reset(window, received_at) do
+    case Map.pop(window, :reset_after_seconds) do
+      {nil, window} ->
+        window
+
+      {delay, window} ->
+        reset_at = received_at + delay * 1000
+        Map.put(window, :resets_at, min(reset_at, @max_sqlite_integer))
+    end
   end
 
   def fresh?(%{error: nil, sample: %{observed_at: observed}}, now),

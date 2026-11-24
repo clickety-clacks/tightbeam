@@ -86,6 +86,7 @@ defmodule Tightbeam.Harness.CapacityProbe do
            name: window["name"],
            used_percent: window["usedPercent"],
            resets_at: integer(window["resetsAt"]),
+           reset_after_seconds: integer(window["resetAfterSeconds"]),
            window_seconds: positive(window["windowSeconds"]),
            scope: window["scope"],
            model: string(window["model"])

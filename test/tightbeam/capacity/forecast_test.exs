@@ -72,7 +72,7 @@ defmodule Tightbeam.Capacity.ForecastTest do
     assert reauth.status == "reauth_required"
 
     assert %{status: "incomplete", pools: [pool]} =
-             Pools.aggregate([{stale, "One"}, {reauth, "Two"}], @now)
+             Pools.aggregate([{stale, "One", nil}, {reauth, "Two", nil}], @now)
 
     assert pool.status == "reauth_required"
     assert pool.exhaustion_at == nil
@@ -91,7 +91,7 @@ defmodule Tightbeam.Capacity.ForecastTest do
     busy = Forecast.account("acct_busy", "openai", "ready", busy_history, @now)
 
     assert %{status: "estimated", pools: [pool]} =
-             Pools.aggregate([{idle, "Idle"}, {busy, "Busy"}], @now)
+             Pools.aggregate([{idle, "Idle", nil}, {busy, "Busy", nil}], @now)
 
     assert pool.status == "resets_before_exhaustion"
     assert pool.current_workload_rate_percent_points_per_hour == 10
@@ -134,6 +134,42 @@ defmodule Tightbeam.Capacity.ForecastTest do
 
     assert %{status: "stale", sample: ^sample, error: ^error} =
              ReadPolicy.result("acct_one", sample, error, :retained)
+  end
+
+  test "a known identity contributes capacity once while each login remains visible" do
+    build = fn id, latest, percent ->
+      Forecast.account(
+        id,
+        "openai",
+        "ready",
+        [sample(latest - @hour, percent - 10), sample(latest, percent)],
+        @now
+      )
+    end
+
+    stale = build.("acct_stale", @now - @hour, 20)
+    fresh = build.("acct_fresh", @now, 25)
+    tied = build.("acct_tied", @now, 40)
+    unknown = build.("acct_unknown", @now, 10)
+
+    aggregate =
+      Pools.aggregate(
+        [
+          {stale, "Stale", "identity"},
+          {tied, "Tied", "identity"},
+          {fresh, "Fresh", "identity"},
+          {unknown, "Unknown", nil}
+        ],
+        @now
+      )
+
+    assert Enum.map(aggregate.accounts, & &1.account_id) ==
+             ~w(acct_fresh acct_stale acct_tied acct_unknown)
+
+    assert [pool] = aggregate.pools
+    assert Enum.map(pool.members, & &1.account_id) == ~w(acct_fresh acct_unknown)
+    assert pool.remaining_percent_points == 165
+    refute inspect(aggregate) =~ "identity"
   end
 
   defp sample(at, percent, reset \\ nil) do
