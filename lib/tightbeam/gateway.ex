@@ -1865,8 +1865,11 @@ defmodule Tightbeam.Gateway do
           tune_result(config, db, call)
         end,
       {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
-      {"session-custody-transfer", ["wake.scheduled"]} => fn call ->
-        Tightbeam.SessionCustodyTransfer.handle(db, call)
+      {"session-custody-transfer", ["wake.scheduled", "work_item.updated"]} => fn call ->
+        Tightbeam.SessionCustodyTransfer.handle(
+          db,
+          Map.put(call, :firehose_work_item_summary, true)
+        )
       end,
       {"assignment-opener-accept", ["wake.scheduled"]} => fn call ->
         Tightbeam.AssignmentOpenerAcceptance.handle(db, call)
