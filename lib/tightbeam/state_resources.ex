@@ -261,7 +261,7 @@ defmodule Tightbeam.StateResources do
 
   @item_field_order %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings waiting running rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus fyi rowVersion),
     "attests" =>
@@ -315,7 +315,7 @@ defmodule Tightbeam.StateResources do
       strings:
         ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
       integers: ~w(createdInTurnSeq createdAt priority rowVersion),
-      booleans: ~w(isBug createdContextKnown started),
+      booleans: ~w(isBug createdContextKnown started running),
       nullable:
         ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
     },
@@ -473,6 +473,8 @@ defmodule Tightbeam.StateResources do
   }
 
   @item_complex_types %{
+    {"wakes", "waitOn"} => :json,
+    {"work items", "waiting"} => :json,
     {"work items", "holders"} => {:array, :string, :sort},
     {"work items", "attestCounts"} => :json,
     {"work items", "verdictCounts"} => :json,
@@ -2134,7 +2136,10 @@ defmodule Tightbeam.StateResources do
         do: Map.put_new(row, :delivery_status, nil),
         else: row
 
-    row |> public() |> closed_projection("wakes")
+    row
+    |> public()
+    |> Map.put("waitOn", Map.get(row, "waitOn") || Tightbeam.WaitLinks.wake_targets(row))
+    |> closed_projection("wakes")
   end
 
   def production(row), do: row |> public() |> correlate("eventId", "seq")
@@ -2697,7 +2702,9 @@ defmodule Tightbeam.StateResources do
   end
 
   defp conditional_fields!("wakes", fields, %{"waitReason" => reason}) when is_binary(reason),
-    do: fields ++ ["waitReason"]
+    do: fields ++ ["waitReason", "waitOn"]
+
+  defp conditional_fields!("wakes", fields, _item), do: fields ++ ["waitOn"]
 
   defp conditional_fields!(_resource, fields, _item), do: fields
 

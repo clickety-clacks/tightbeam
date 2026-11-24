@@ -2316,6 +2316,8 @@ defmodule Tightbeam.Escalation do
           %{"decisionRequestId" => after_row.id},
           hub
         )
+
+        Tightbeam.WaitLinks.publish_source_change_in_txn(txn, nil, after_row.assignment_id)
       else
         if before_item != after_item do
           raise DB.Error, message: "invalid decision request public transition"

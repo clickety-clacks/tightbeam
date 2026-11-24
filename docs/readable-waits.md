@@ -1,0 +1,73 @@
+# Wake reasons and direct wait links
+
+A wake's `waitReason` explains why its sender scheduled it. Its prompt tells the
+recipient what to do. The reason uses the existing `WaitReason` contract: a
+nonblank single line of at most 140 characters. `wake --wait-reason` accepts this
+field on timed, recurring, conditional, dependency and after-turn declarations.
+Existing item waits use the same field and validator.
+
+Newly covered wake forms accept an omitted reason. New agent waits return a
+`missing_wait_reason` warning in the command reply; this does not create a turn
+or refuse the wake. Process and user callers, ordinary immediate messages, and
+idempotent replays do not receive that warning. Previously mandatory dependency
+and item-wait paths keep their existing requirements. Invalid supplied values
+are refused; text is never truncated. Cron occurrences inherit their root's
+reason. Historical missing reasons are not filled from prompts.
+
+## Reads
+
+The existing state bearer credential and `asUser` selection apply to these GET
+routes:
+
+- `/api/work-items/:id/wait-links`
+- `/api/assignments/:id/wait-links`
+- `/api/sessions/:key/wait-links`
+- `/api/decision-requests/:id/wait-links`
+
+Each response contains `items`, `source`, `asOf`, `rowVersion`, `nextCursor` and
+`truncated`. `limit` defaults to 20 and is capped at 50. Pass the returned opaque
+`cursor` unchanged for the next page. `nextCursor: null` ends the page sequence.
+Active records are selected by default; `includeEnded=true` includes retained
+ended records. Cursors are scoped to the source and the ended-record selection.
+Pages are ordered by recorded creation time and a stable source identity.
+
+An edge has `id`, nullable `wakeId`, `kind`, nullable `waitReason`, `createdAt`,
+`state`, `recognition`, `from`, `to` and `waitOn`. `to` is the primary target;
+`waitOn` retains all recorded predicate targets and any fallback. A fallback
+has `kind: "time"` and `role: "fallback"`, distinct from a timed wake's
+`role: "due"`. Assignments include their state, holder and work item; decisions
+include their state and addressee; session endpoints include `running` and
+`runningSince`. Unreadable targets remain as `{kind, id: null, visible: false}`.
+A source the caller cannot read returns 404.
+
+Targets come from existing record references, predicates and schedules. A custom
+fact's scope remains an event scope, even when its spelling resembles a record
+ID. Substrate assignment facts can name an assignment. After-turn waits name
+their recorded originating turn. No target is inferred from a prompt. Decision
+and cannot-proceed edges without a wake reason expose null, rather than copying
+a potentially long question or note into the short reason field.
+
+These are direct links, not a recursively expanded graph. Clients follow exact
+record IDs and track visited `(kind, id)` pairs. The server returns cycle edges;
+a client stops traversal at a repeated node, terminal record, exhausted page,
+time/event endpoint, or unreadable target. Clients should display their traversal
+limits; the consuming client uses 12 hops and 40 records. Different hops may be
+read at different moments.
+
+## Changes and compatibility
+
+Wake reads and events add `waitOn` using the same derived references. Work-item
+reads add `waiting: {agent, time, userIds}` and `running`, and linked changes
+publish ordinary work-item updates. Item-wait readback retains `reason` for
+compatibility and adds `waitReason` and `waitOn`.
+
+These are additive response fields. The work-item-ID list filter on change
+subscriptions is a later change; clients can keep their existing scoped
+subscription and re-read only visible records.
+
+A later release may require reasons on newly declared agent waits, after an
+inventory of omitted reasons and affected callers. This change does not enable
+that new refusal. Paged `/api/wakes` reads expose the creator, reason, derived
+targets and timestamps needed for a retained-row inventory. Such a snapshot
+counts rows, not command invocations or warning deliveries; retries and retained
+history must be reported with their window and limitations.

@@ -28,6 +28,8 @@ defmodule Tightbeam.WorkItemWaits do
         %{
           wakeId: wake_id,
           reason: wake.wait_reason,
+          waitReason: wake.wait_reason,
+          waitOn: Tightbeam.WaitLinks.wake_targets(wake),
           predicate: wake.predicate,
           dueAt: if(wake.due_at == Wakes.no_deadline(), do: nil, else: wake.due_at),
           active: is_nil(released_at),

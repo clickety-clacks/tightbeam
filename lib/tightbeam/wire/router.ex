@@ -619,6 +619,22 @@ defmodule Tightbeam.Wire.Router do
     d1_collection(conn, Map.fetch!(@d1_resources, :assignments))
   end
 
+  get "/api/assignments/:assignment_id/wait-links" do
+    wait_links_page(conn, "assignment", assignment_id)
+  end
+
+  get "/api/work-items/:id/wait-links" do
+    wait_links_page(conn, "work-item", id)
+  end
+
+  get "/api/sessions/:session_key/wait-links" do
+    wait_links_page(conn, "session", session_key)
+  end
+
+  get "/api/decision-requests/:id/wait-links" do
+    wait_links_page(conn, "decision", id)
+  end
+
   get "/api/assignments/:assignment_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :assignments), assignment_id)
   end
@@ -1069,6 +1085,19 @@ defmodule Tightbeam.Wire.Router do
 
   match _ do
     error(conn, 404, "not_found")
+  end
+
+  defp wait_links_page(conn, kind, id) do
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- d1_query(conn.query_string),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, request} <- Tightbeam.WaitLinks.request(query, kind, id),
+         {:ok, page} <- Tightbeam.WaitLinks.page(db(conn), kind, id, principal, request) do
+      d1_send(conn, 200, JSON.encode!(page))
+    else
+      {:error, :not_found} -> state_not_found(conn, "wait links")
+      {:error, status, code, message} -> state_error(conn, "wait links", status, code, message)
+    end
   end
 
   defp core_detail(conn, spec, raw_key) do

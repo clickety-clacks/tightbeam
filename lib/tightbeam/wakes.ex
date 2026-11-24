@@ -1825,6 +1825,7 @@ defmodule Tightbeam.Wakes do
     end
 
     schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
+    Tightbeam.WaitLinks.publish_wake_change_in_txn(txn, wake)
     wake
   end
 
@@ -2792,6 +2793,7 @@ defmodule Tightbeam.Wakes do
     if Txn.changes(txn) == 1 do
       schedule_changed_in_txn(txn, :wake_ready)
       Tightbeam.WorkItemWaits.release_in_txn(txn, wake.wake_id)
+      Tightbeam.WaitLinks.publish_wake_change_in_txn(txn, wake)
 
       EventLog.lifecycle_in_txn(
         txn,
@@ -5732,11 +5734,12 @@ defmodule Tightbeam.Wakes do
     ", (SELECT status FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
       ", (SELECT createdAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
       ", (SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-      ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)"
+      ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+      ", (SELECT schedule FROM cron_wake_schedules WHERE wakeId=wakes.wakeId)"
   end
 
   defp wake_with_delivery_projection(row) do
-    {wake_columns, [status, created_at, started_at, ended_at]} = Enum.split(row, -4)
+    {wake_columns, [status, created_at, started_at, ended_at, cron]} = Enum.split(row, -5)
     wake = to_wake(wake_columns)
 
     # Keep the existing maximum-durable-timestamp version convention, now
@@ -5746,7 +5749,10 @@ defmodule Tightbeam.Wakes do
       |> Enum.filter(&is_integer/1)
       |> Enum.max()
 
-    wake |> Map.put(:delivery_status, status) |> Map.put(:row_version, version)
+    wake
+    |> Map.put(:delivery_status, status)
+    |> Map.put(:row_version, version)
+    |> Map.put(:cron, cron)
   end
 
   @doc "Record a failed carrier's outcome in its sender's existing transcript, without a turn."
@@ -8148,6 +8154,8 @@ defmodule Tightbeam.Wakes do
           wake,
           %{"wakeId" => wake_id, "sessionKey" => wake.session_key}
         )
+
+        Tightbeam.WaitLinks.publish_wake_change_in_txn(txn, wake)
     end
   end
 

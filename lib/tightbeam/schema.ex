@@ -3869,7 +3869,9 @@ defmodule Tightbeam.Schema do
     indexes = [
       {"wakes_rest_created_order",
        "CREATE INDEX IF NOT EXISTS wakes_rest_created_order " <>
-         "ON wakes(createdAt, wakeId)"}
+         "ON wakes(createdAt, wakeId)"},
+      {"wakes_wait_links_item",
+       "CREATE INDEX IF NOT EXISTS wakes_wait_links_item ON wakes(work_item_id,createdAt,wakeId)"}
     ]
 
     case DB.migration_transaction(db, :rest_wake_collection_indexes, [], [], fn txn ->

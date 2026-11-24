@@ -326,6 +326,8 @@ defmodule Tightbeam.Firehose.Publisher do
           "workItemId" => turn.job_ref
         })
 
+        Tightbeam.WaitLinks.publish_source_change_in_txn(txn, turn.job_ref, turn.assignment_id)
+
       nil ->
         :ok
     end
