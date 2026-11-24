@@ -599,6 +599,9 @@ defmodule Tightbeam.Harness.RecoveryProbe do
 
   defp port_command(host_config, script, timeout_ms, capture_limit) do
     local? = is_nil(host_config.ssh)
+    # The child gets no stdin. `codex exec` otherwise waits for end of input on the
+    # open pipe. The redirect is inside the script, so ssh's remote shell gets it too.
+    script = "exec </dev/null\n" <> script
 
     {executable, args} =
       if local? do
