@@ -105,6 +105,38 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 7)
   end
 
+  test "remote adapter launch carries its owning-host writer lock", %{tmp_dir: tmp} do
+    db = start_supervised!({DB, path: ":memory:", name: :writer_launch_fixture})
+    :ok = HarnessProcess.ensure_schema(db)
+
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: ["ssh", "fixture-host", "exec", "/bin/true"],
+          process_ssh: "fixture-host",
+          process_helper: "/fixture/bin/tightbeam",
+          process_identity_dir: tmp,
+          account_writer_lock: "/fixture/account home/.tightbeam/account-writer.lock"
+        ],
+        db,
+        {:claude, "acct_fixture", "testhost"}
+      )
+
+    assert [
+             "ssh",
+             "fixture-host",
+             "exec",
+             "/fixture/bin/tightbeam",
+             "harness-exec",
+             _identity_path,
+             _launch_id,
+             "--writer-lock",
+             "'/fixture/account home/.tightbeam/account-writer.lock'",
+             "--",
+             "/bin/true"
+           ] = opts[:cmd]
+  end
+
   test "local Cursor launch switches identity before the session helper records it", %{
     tmp_dir: tmp
   } do

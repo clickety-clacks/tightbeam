@@ -224,7 +224,8 @@ defmodule Tightbeam.HarnessProcess do
         identity_path,
         launch_id,
         root,
-        Keyword.get(opts, :cursor_rails_sha256)
+        Keyword.get(opts, :cursor_rails_sha256),
+        Keyword.get(opts, :account_writer_lock)
       )
     )
     |> Keyword.put(:harness_process_launch_id, launch_id)
@@ -1260,7 +1261,8 @@ defmodule Tightbeam.HarnessProcess do
          _identity_path,
          _launch_id,
          _root,
-         _rails_sha256
+         _rails_sha256,
+         _writer_lock
        )
        when not is_nil(destination) do
     raise ArgumentError, "Cursor execution identity is local-only; SSH hosts are unsupported"
@@ -1274,7 +1276,8 @@ defmodule Tightbeam.HarnessProcess do
          identity_path,
          launch_id,
          _root,
-         rails_sha256
+         rails_sha256,
+         _writer_lock
        ) do
     [
       "/usr/bin/sudo"
@@ -1305,9 +1308,11 @@ defmodule Tightbeam.HarnessProcess do
          identity_path,
          launch_id,
          _root,
-         _rails_sha256
+         _rails_sha256,
+         writer_lock
        ) do
-    [helper_path, "harness-exec", identity_path, launch_id, "--" | cmd]
+    [helper_path, "harness-exec", identity_path, launch_id] ++
+      writer_lock_args(writer_lock) ++ ["--" | cmd]
   end
 
   defp wrap_command(
@@ -1318,7 +1323,8 @@ defmodule Tightbeam.HarnessProcess do
          identity_path,
          launch_id,
          _root,
-         _rails_sha256
+         _rails_sha256,
+         writer_lock
        ) do
     {prefix, remote} = Enum.split_while(rest, &(&1 != destination))
 
@@ -1333,15 +1339,16 @@ defmodule Tightbeam.HarnessProcess do
             helper_path,
             "harness-exec",
             identity_path,
-            launch_id,
-            "--"
-            | remote_cmd
-          ]
+            launch_id
+          ] ++ writer_lock_args(writer_lock && shell_quote(writer_lock)) ++ ["--" | remote_cmd]
 
       _ ->
         raise ArgumentError, "remote harness command does not contain its SSH destination"
     end
   end
+
+  defp writer_lock_args(nil), do: []
+  defp writer_lock_args(path), do: ["--writer-lock", path]
 
   defp cursor_sudo_args, do: ["-n", "-H", "-u", @cursor_account, "--"]
 

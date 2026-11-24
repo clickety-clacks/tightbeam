@@ -1550,6 +1550,14 @@ defmodule Tightbeam.Placement do
         base
       end
 
+    base =
+      if Map.get(config, :provider_accounts_enabled, false) and
+           function_exported?(module, :conversation_directory, 0) do
+        Keyword.put(base, :account_writer_lock, Homes.account_writer_lock(home))
+      else
+        base
+      end
+
     with {:ok, plan} <- Harness.prepare_launch(module, target, home, launch_opts) do
       {:ok, Keyword.merge(base, plan)}
     end
