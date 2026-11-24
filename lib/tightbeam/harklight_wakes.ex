@@ -3445,11 +3445,16 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
+  # Diagnostics share the output. A line with a brace that is not a whole record
+  # may be a damaged row, so it stands as one and nothing is committed.
   defp pending_records(output) do
     for line <- String.split(output, "\n"),
-        String.starts_with?(line, "{"),
-        {:ok, %{"kind" => _} = record} <- [JSON.decode(line)],
-        do: record
+        line =~ ~r/[{}]/ do
+      case JSON.decode(line) do
+        {:ok, %{"kind" => _} = record} -> record
+        _ -> :damaged
+      end
+    end
   end
 
   # The markers must both name the stored position. A row is applied whatever
@@ -3457,9 +3462,7 @@ defmodule Tightbeam.HarklightWakes do
   defp pending_rows([%{"kind" => "baseline", "rev" => rev} | rest], rev) do
     case List.pop_at(rest, -1) do
       {%{"kind" => "baseline_complete", "rev" => ^rev}, rows} ->
-        if Enum.all?(rows, &match?(%{"kind" => kind} when kind in ["entry", "message"], &1)),
-          do: {:ok, rows},
-          else: :error
+        if :damaged in rows, do: :error, else: {:ok, rows}
 
       _ ->
         :error
