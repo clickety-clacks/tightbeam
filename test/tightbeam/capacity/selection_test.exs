@@ -1,7 +1,7 @@
 defmodule Tightbeam.Capacity.SelectionTest do
   use ExUnit.Case, async: true
 
-  alias Tightbeam.Capacity.{Observation, Selection, Store}
+  alias Tightbeam.Capacity.{Collector, Store}
   alias Tightbeam.{DB, ProviderAccounts, Schema}
 
   @now 1_800_000_000_000
@@ -55,8 +55,9 @@ defmodule Tightbeam.Capacity.SelectionTest do
       subscription: %{}
     }
 
-    first = Observation.record(Observation.empty(), {:ok, sample}, @now - 10, @now)
-    assert {:ok, :ok} = DB.transaction(db, &Selection.put_in_txn(&1, account_id, first))
+    account = ProviderAccounts.get(db, account_id)
+    assert {:ok, _, first} = Collector.record(db, account, {:ok, sample}, @now - 10, @now)
+    assert Store.entry(db, account_id) == first
 
     query = """
     SELECT windowId, model, usedPercent, observedAt, readAttemptAt, freshness
@@ -71,8 +72,8 @@ defmodule Tightbeam.Capacity.SelectionTest do
               ["primary", nil, 42.0, @now, ^sent, "current"]
             ]} = DB.query(db, query, [])
 
-    failed = Observation.record(first, {:error, %{code: "UPSTREAM_TIMEOUT"}}, @now + 1, @now + 2)
-    assert {:ok, :ok} = DB.transaction(db, &Selection.put_in_txn(&1, account_id, failed))
+    outcome = {:error, %{code: "UPSTREAM_TIMEOUT"}}
+    assert {:ok, ^first, failed} = Collector.record(db, account, outcome, @now + 1, @now + 2)
 
     assert {:ok,
             [
@@ -80,12 +81,19 @@ defmodule Tightbeam.Capacity.SelectionTest do
               ["primary", nil, 42.0, @now, ^sent, "UPSTREAM_TIMEOUT"]
             ]} = DB.query(db, query, [])
 
-    next =
-      Observation.record(failed, {:ok, %{sample | windows: [hd(windows)]}}, @now + 3, @now + 4)
-
-    assert {:ok, :ok} = DB.transaction(db, &Selection.put_in_txn(&1, account_id, next))
+    next = {:ok, %{sample | windows: [hd(windows)]}}
+    assert {:ok, ^failed, entry} = Collector.record(db, account, next, @now + 3, @now + 4)
     observed = @now + 4
     sent = @now + 3
     assert {:ok, [["primary", nil, 42.0, ^observed, ^sent, "current"]]} = DB.query(db, query, [])
+
+    assert {:ok, []} =
+             DB.query(db, "UPDATE provider_accounts SET signedInAt = ?2 WHERE id = ?1", [
+               account_id,
+               @now + 5
+             ])
+
+    assert :superseded = Collector.record(db, account, {:ok, sample}, @now + 6, @now + 7)
+    assert Store.entry(db, account_id) == entry
   end
 end
