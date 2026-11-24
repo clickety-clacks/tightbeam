@@ -689,7 +689,8 @@ defmodule Tightbeam.RailRemedy do
   # Delegated opener first, then the work item's current accountable recipient,
   # the opener, and the owner's main session; the first active session owned by
   # the assignment's owner receives the notice.
-  defp review_notice_recipient_in_txn(txn, assignment_id) do
+  @doc false
+  def review_notice_recipient_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
            """
