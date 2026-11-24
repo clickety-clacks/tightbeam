@@ -3306,6 +3306,9 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "pending"
 
+    assert {:ok, [[turns_before]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+
     assert {:ok, fact} =
              DB.transaction(ctx.db, fn txn ->
                ConditionFacts.file_in_txn(txn, %{
@@ -3326,6 +3329,17 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "canceled"
 
+    # Scheduling is durable in the release transaction; delivery starts a turn later.
+    assert {:ok, [[^turns_before]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='holder' AND consumer='prompt' AND state='pending'",
+               [blocked.id]
+             )
+
     assert {:ok, [["cannot_proceed_released", 1]]} =
              DB.query(
                ctx.db,
@@ -3333,6 +3347,96 @@ defmodule Tightbeam.AssignmentsTest do
                [filed.decisionWake.wake_id]
              )
   end
+
+  test "release delivers one continuation and replay adds none", ctx do
+    {assignment, _blocked} = release_wake_fixture(ctx)
+    scheduler = terminal_notice_scheduler(ctx.db)
+    fact = ConditionFacts.file(ctx.db, scheduler, release_wake_fact(assignment.id))
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, &Assignments.release_cannot_proceed_in_txn(&1, fact))
+
+    assert :ok = Wakes.fire_matching(scheduler, fact.fact_id)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+  end
+
+  for scope <- [:exact, :any] do
+    @release_wait_scope scope
+    test "release reuses holder's pending #{@release_wait_scope} fact wait", ctx do
+      {assignment, _blocked} = release_wake_fixture(ctx)
+
+      wait = Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        creator_session_key: "holder",
+        origin: "agent:holder",
+        prompt: "continue the blocked assignment",
+        assignment_id: assignment.id,
+        condition_kind: "dependency-ready",
+        condition_scope: if(@release_wait_scope == :exact, do: assignment.id),
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+      scheduler = terminal_notice_scheduler(ctx.db)
+      fact = ConditionFacts.file(ctx.db, scheduler, release_wake_fact(assignment.id))
+      assert :ok = Wakes.fire_due(scheduler)
+      assert Wakes.get(ctx.db, wait.wake_id).fired_by == "condition"
+
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='holder' AND consumer='prompt'",
+                 [assignment.id])
+
+      assert {:ok, :ok} =
+               DB.transaction(ctx.db, &Assignments.release_cannot_proceed_in_txn(&1, fact))
+      assert :ok = Wakes.fire_due(scheduler)
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+    end
+  end
+
+  test "release of a retired holder's block tells the current accountable owner", ctx do
+    owner = session(ctx.db, "delivery-owner", "flynn")
+    item = create_work_item(ctx, "released block with retired holder")
+    assert {:ok, _} = DB.query(ctx.db,
+      "UPDATE work_items SET deliveryOwnerSessionKey=?2 WHERE id=?1", [item.id, owner.sessionKey])
+    {assignment, _blocked} = release_wake_fixture(ctx, item.id)
+    assert {:ok, _} = DB.query(ctx.db,
+      "UPDATE sessions SET state='retired' WHERE sessionKey='holder'")
+    scheduler = terminal_notice_scheduler(ctx.db)
+    ConditionFacts.file(ctx.db, scheduler, release_wake_fact(assignment.id))
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='delivery-owner'")
+  end
+
+  defp release_wake_fixture(ctx, work_item_id \\ nil) do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+    assignment = assign_call({:user, "flynn"}, "blocked continuation", nil, work_item_id)
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+    blocked = attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "waiting for dependency")
+      |> put_in([:params, :release_fact_kind], "dependency-ready")
+      |> put_in([:params, :release_fact_scope], assignment.id)
+      |> put_in([:params, :release_fact_principal_ref], "agent:holder")
+      |> then(&handle(ctx, "attest", &1))
+    {assignment, blocked}
+  end
+
+  defp release_wake_fact(assignment_id),
+    do: %{kind: "dependency-ready", scope: assignment_id, origin: "agent:holder"}
 
   test "cannot-proceed is session-filed, idempotent, pauses one card, releases on its exact custom fact, and leaves a later waiting verdict as a completion FYI",
        ctx do
