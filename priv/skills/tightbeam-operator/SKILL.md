@@ -134,8 +134,16 @@ The example watches new-message notices across sessions visible to the client.
 `principal`, or `archetype` to narrow the feed. Filters do not widen access.
 Message notices identify changes. Raw Firehose has no replay. After a disconnect,
 authenticate and resubscribe first. Once the subscription is ready, buffer live
-notices while you use `tightbeam transcript --after <last-message-id>` with
-the same session to catch up. Reconcile buffered notices by message ID.
+notices and catch up separately for each watched session, using that session’s
+last processed message ID.
+
+```sh
+tightbeam transcript --session '<session key>' --after '<that session’s last message ID>' --as-user '<user ID>'
+```
+
+Continue with the returned `newestId` when there are more pages. If you have no
+saved cursor for a session, read its transcript normally and page back as
+needed. Reconcile buffered notices by message ID.
 
 ## Decision requests
 
