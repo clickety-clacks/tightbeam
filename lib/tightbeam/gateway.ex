@@ -378,6 +378,7 @@ defmodule Tightbeam.Gateway do
           identity_staleness_interval_ms: @identity_staleness_interval_ms,
           name: Tightbeam.WakeScheduler},
          {Tightbeam.HarklightReceipts, db: db},
+         {Tightbeam.HarklightBounces, db: db, runner: Map.get(config, :harklight_bounce_runner)},
          {Tightbeam.HarklightWakes,
           db: db,
           send_runner: Map.get(config, :harklight_send_runner),
