@@ -1695,6 +1695,7 @@ defmodule Tightbeam.HarnessProcess do
       "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt, generation) VALUES (?1, ?2, ?3)",
       [adapter_key, at, Id.ulid()]
     )
+
     :ok
   end
 
