@@ -88,6 +88,15 @@ fn native_failure(reason: RunError) -> Value {
 }
 
 pub(super) fn codex(binary: &Path, home: &Path, refresh: bool) -> Result<(Value, Value), RunError> {
+    codex_until(binary, home, refresh, Instant::now() + DEADLINE)
+}
+
+fn codex_until(
+    binary: &Path,
+    home: &Path,
+    refresh: bool,
+    deadline: Instant,
+) -> Result<(Value, Value), RunError> {
     let mut command = native_command(binary, home);
     command
         .arg("-c")
@@ -99,60 +108,55 @@ pub(super) fn codex(binary: &Path, home: &Path, refresh: bool) -> Result<(Value,
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
 
-    let (output, status) = supervise(
-        command,
-        "Codex account usage probe",
-        Instant::now() + DEADLINE,
-        |child| {
-            let pipes = child.child();
-            let stdin = pipes.stdin.take().ok_or_else(failed)?;
-            let stdout = pipes.stdout.take().ok_or_else(failed)?;
-            let input = stdin.as_raw_fd();
-            nonblocking(input)?;
-            nonblocking(stdout.as_raw_fd())?;
-            let mut output = BufReader::new(stdout);
+    let (output, status) = supervise(command, "Codex account usage probe", deadline, |child| {
+        let pipes = child.child();
+        let stdin = pipes.stdin.take().ok_or_else(failed)?;
+        let stdout = pipes.stdout.take().ok_or_else(failed)?;
+        let input = stdin.as_raw_fd();
+        nonblocking(input)?;
+        nonblocking(stdout.as_raw_fd())?;
+        let mut output = BufReader::new(stdout);
 
-            send(
-                child,
-                input,
-                &json!({
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {"clientInfo": {"name": "tightbeam-capacity", "version": "1"}}
-                }),
-            )?;
-            response(child, &mut output, 1)?;
-            send(
-                child,
-                input,
-                &json!({"method": "initialized", "params": {}}),
-            )?;
-            send(
-                child,
-                input,
-                &json!({"id": 2, "method": "account/read", "params": {"refreshToken": refresh}}),
-            )?;
-            let account = response(child, &mut output, 2)?;
-            send(
-                child,
-                input,
-                &json!({
-                    "id": 3, "method": "account/rateLimits/read",
-                    "params": {"excludeResetCreditDetails": true}
-                }),
-            )?;
-            let limits = response(child, &mut output, 3)?;
+        send(
+            child,
+            input,
+            &json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {"clientInfo": {"name": "tightbeam-capacity", "version": "1"}}
+            }),
+        )?;
+        response(child, &mut output, 1)?;
+        send(
+            child,
+            input,
+            &json!({"method": "initialized", "params": {}}),
+        )?;
+        send(
+            child,
+            input,
+            &json!({"id": 2, "method": "account/read", "params": {"refreshToken": refresh}}),
+        )?;
+        let account = response(child, &mut output, 2)?;
+        send(
+            child,
+            input,
+            &json!({
+                "id": 3, "method": "account/rateLimits/read",
+                "params": {"excludeResetCreditDetails": true}
+            }),
+        )?;
+        let limits = response(child, &mut output, 3)?;
 
-            // Stdin EOF lets app-server cleanly exit. Keep the lease if it needs
-            // time to settle or eventually requires the supervisor to terminate it.
-            drop(stdin);
-            while !child.exited()? {
-                check_deadline(child)?;
-                child.wait(None);
-            }
-            Ok((account, limits))
-        },
-    )?;
+        // Stdin EOF lets app-server cleanly exit. Keep the lease if it needs
+        // time to settle or eventually requires the supervisor to terminate it.
+        drop(stdin);
+        while !child.exited()? {
+            check_deadline(child)?;
+            child.wait(None);
+        }
+        Ok((account, limits))
+    })?;
 
     if status.success() {
         Ok(output)
@@ -265,6 +269,38 @@ fn response(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn deadline_reaps_a_stalled_codex_child_before_returning() {
+        let dir = std::env::temp_dir().join(format!(
+            "tightbeam-capacity-deadline-{}-{}",
+            std::process::id(),
+            super::super::now_ms()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let binary = dir.join("vendor");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nprintf '%s' \"$$\" > vendor-pid\ntrap 'exit 0' TERM\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let result = codex_until(&binary, &dir, true, deadline);
+        assert_eq!(
+            result.map_err(native_failure),
+            Err(error("UPSTREAM_TIMEOUT"))
+        );
+        let pid: i32 = std::fs::read_to_string(dir.join("vendor-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn mock_native_children_finish_before_return_and_never_emit_their_output() {
