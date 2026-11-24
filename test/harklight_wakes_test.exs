@@ -853,7 +853,7 @@ defmodule Tightbeam.HarklightWakesTest do
     }
   end
 
-  test "startup preserves historical wakes and an explicit retry opens a fresh Agent 0.2 baseline",
+  test "startup preserves historical wakes and an explicit retry opens what is still waiting",
        %{db: db} do
     migrated_from_01!(db)
     historical = event(41, "discussion", "Historical wake")
@@ -867,15 +867,23 @@ defmodule Tightbeam.HarklightWakesTest do
       "revision" => 1
     }
 
-    message = JSON.encode!(%{"kind" => "message", "rev" => 1, "data" => migrated_item})
+    message = JSON.encode!(%{"kind" => "message", "message" => migrated_item})
     chat = JSON.encode!(feed_chat(2, "migrated-item", "migrated-entry"))
 
     fake_harklight_agent!("""
     printf '%s\n' "$*" >> "$0.calls"
     case "$*" in
-      'listen --follow --session #{@handle} --snapshot')
+      'read --session #{@handle} --pending --prepare')
+        printf '%s\n' '{"kind":"baseline_prepared","session":"#{@handle}","rev":2,"token":"T"}'
+        ;;
+      'read --session #{@handle} --pending --resume T')
         printf '%s\n' '{"kind":"baseline","rev":2,"reason":"first_contact"}'
-        printf '%s\n' '#{message}' '#{chat}' '{"kind":"baseline_complete","rev":2}'
+        printf '%s\n' '#{chat}' '{"kind":"baseline_complete","rev":2}'
+        ;;
+      'message-get --item-id migrated-item')
+        printf '%s\n' '#{message}'
+        ;;
+      'listen --follow --session #{@handle} --after 2')
         printf '%s\n' '{"kind":"caught_up","rev":2}'
         exec sleep 30
         ;;
@@ -3967,7 +3975,16 @@ defmodule Tightbeam.HarklightWakesTest do
 
       fake_harklight_agent!("""
       printf '%s\n' "$*" >> "$0.calls"
-      printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}'
+      case "$*" in
+        *--prepare)
+          printf '%s\n' '{"kind":"baseline_prepared","session":"#{@handle}","rev":3,"token":"T"}'
+          exit 0 ;;
+        *--resume*)
+          printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}'
+          exit 0 ;;
+        *--snapshot)
+          printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}' ;;
+      esac
       printf '%s\n' '{"kind":"caught_up","rev":3}'
       exec sleep 30
       """)
@@ -4031,7 +4048,11 @@ defmodule Tightbeam.HarklightWakesTest do
         do: assert({:ok, []} = DB.query(db, "SELECT handle FROM #{@held_table}"))
 
       assert :ok = HarklightWakes.first_open_pending(db, @handle)
-      assert File.read!(agent <> ".calls") == "listen --follow --session #{@handle} --snapshot\n"
+
+      assert File.read!(agent <> ".calls") ==
+               "read --session #{@handle} --pending --prepare\n" <>
+                 "read --session #{@handle} --pending --resume T\n" <>
+                 "listen --follow --session #{@handle} --after 3\n"
     end
   end
 
@@ -4051,7 +4072,16 @@ defmodule Tightbeam.HarklightWakesTest do
 
       fake_harklight_agent!("""
       printf '%s\n' "$*" >> "$0.calls"
-      printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}'
+      case "$*" in
+        *--prepare)
+          printf '%s\n' '{"kind":"baseline_prepared","session":"#{@handle}","rev":3,"token":"T"}'
+          exit 0 ;;
+        *--resume*)
+          printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}'
+          exit 0 ;;
+        *--snapshot)
+          printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}' ;;
+      esac
       printf '%s\n' '{"kind":"caught_up","rev":3}'
       exec sleep 30
       """)
@@ -4389,14 +4419,17 @@ defmodule Tightbeam.HarklightWakesTest do
 
     first = [entry.(9, "e9"), entry.(jump + 1, "e#{jump}"), %{kind: "caught_up", rev: jump + 1}]
 
-    # The Server's revisions are lower again: the Agent reports an expired
-    # cursor as a baseline. It shows the known replies, one changed, and one new.
+    # The Server's revisions are lower again, so the position has expired and the
+    # conversation is opened again. It shows the known replies, one changed, and one new.
     second = [
-      %{kind: "baseline", rev: 40, reason: "cursor_expired"},
+      %{kind: "baseline", rev: 40, reason: "first_contact"},
       revised.(20, "e9"),
       entry.(21, "e#{jump}"),
       entry.(22, "new-in-baseline"),
-      %{kind: "baseline_complete", rev: 40},
+      %{kind: "baseline_complete", rev: 40}
+    ]
+
+    third = [
       %{kind: "caught_up", rev: 40},
       entry.(41, "after-baseline"),
       %{kind: "caught_up", rev: 41}
@@ -4408,7 +4441,11 @@ defmodule Tightbeam.HarklightWakesTest do
     printf '%s\n' "$*" >> "$0.calls"
     case "$*" in
       *'--after 8') printf '%s\n' #{lines.(first)}; exit 1 ;;
-      *'--after #{jump + 1}') printf '%s\n' #{lines.(second)}; exit 1 ;;
+      *'--after #{jump + 1}') printf '%s\n' '{"kind":"cursor_expired","rev":0}'; exit 2 ;;
+      *--prepare)
+        printf '%s\n' '{"kind":"baseline_prepared","session":"#{@handle}","rev":40,"token":"T"}' ;;
+      *'--resume T') printf '%s\n' #{lines.(second)} ;;
+      *'--after 40') printf '%s\n' #{lines.(third)}; exit 1 ;;
       *'--after 41') printf '%s\n' '{"kind":"caught_up","rev":41}'; exec sleep 30 ;;
     esac
     """)
@@ -4422,8 +4459,16 @@ defmodule Tightbeam.HarklightWakesTest do
                String.ends_with?(File.read!(agent <> ".calls"), follow <> "41\n")
            end)
 
+    read = "read --session #{@handle} --pending "
+
     assert File.read!(agent <> ".calls") ==
-             follow <> "8\n" <> follow <> "#{jump + 1}\n" <> follow <> "41\n"
+             follow <>
+               "8\n" <>
+               follow <>
+               "#{jump + 1}\n" <>
+               read <>
+               "--prepare\n" <>
+               read <> "--resume T\n" <> follow <> "40\n" <> follow <> "41\n"
 
     {:ok, rows} = DB.query(db, "SELECT rawLine FROM harklight_wake_entries ORDER BY feedCursor")
 
@@ -4431,6 +4476,501 @@ defmodule Tightbeam.HarklightWakesTest do
              ["e9", "e#{jump}", "new-in-baseline", "after-baseline"]
 
     assert {:ok, [[4]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries")
+  end
+
+  describe "pending open" do
+    # A stand-in for the Agent's pending read. It keeps the attempt it served
+    # and lets a test stop it at a named point.
+    defp pending_agent!(opts \\ []) do
+      rows = Keyword.get_lazy(opts, :rows, &pending_rows/0)
+      lines = Enum.map_join(rows, " ", &"'#{JSON.encode!(&1)}'")
+      live = Keyword.get(opts, :live, [])
+      live = Enum.map_join(live ++ [%{kind: "caught_up", rev: 40}], " ", &"'#{JSON.encode!(&1)}'")
+
+      fake_harklight_agent!(
+        """
+        printf '%s\\n' "$*" >> "$0.calls"
+        hold() { if [ -e "$0.hold-$1" ]; then touch "$0.at-$1"; exec sleep 60; fi; }
+        case "$*" in
+          'read --session #{@handle} --pending --prepare')
+            hold prepare
+            if [ -e "$0.usage" ]; then
+              echo "error: unexpected argument '--pending' found" >&2; exit 2
+            fi
+            if [ -e "$0.unsupported" ]; then
+              printf '%s\\n' '{"kind":"unsupported","operation":"pending_baseline"}'; exit 5
+            fi
+            n=$(($(cat "$0.n" 2>/dev/null || echo 0) + 1)); echo $n > "$0.n"
+            printf '{"kind":"baseline_prepared","session":"#{@handle}","rev":30,"token":"T%s"}\\n' $n
+            hold prepared
+            ;;
+          'read --session #{@handle} --pending --resume '*)
+            hold resume
+            if [ -e "$0.reject" ]; then
+              printf '%s\\n' '{"kind":"token_invalid","reason":"invalid_field","field":"page","request_id":"r"}'
+              exit 2
+            fi
+            if [ -e "$0.unsupported" ]; then
+              printf '%s\\n' '{"kind":"unsupported","operation":"pending_baseline"}'; exit 5
+            fi
+            printf '%s\\n' '{"kind":"baseline","rev":30,"reason":"first_contact"}'
+            if [ -e "$0.reject-late" ]; then
+              printf '%s\\n' '{"kind":"token_invalid","reason":"invalid_field","field":"page","request_id":"r"}'
+              exit 2
+            fi
+            printf '%s\\n' #{lines}
+            hold rows
+            if [ -e "$0.cut" ]; then exit 1; fi
+            printf '%s\\n' '{"kind":"baseline_complete","rev":30}'
+            hold complete
+            ;;
+          'listen --follow --session #{@handle} --after '*)
+            if [ -e "$0.expire" ]; then
+              printf '%s\\n' '{"kind":"cursor_expired","rev":8}'; exit 2
+            fi
+            printf '%s\\n' #{live}
+            exec sleep 60
+            ;;
+          *) exit 9 ;;
+        esac
+        """,
+        "0.2.4"
+      )
+
+      System.find_executable("harklight-agent")
+    end
+
+    # Waiting chat and answer on an answered item, chat on an open item, and a
+    # row whose marker says it is an update.
+    defp pending_rows do
+      chat = fn rev, id -> feed_chat(rev, "request", id) end
+
+      answer = %{
+        "kind" => "message",
+        "rev" => 21,
+        "data" => %{
+          "item_id" => "request",
+          "session" => @handle,
+          "revision" => 1,
+          "terminal" => %{"state" => "answered", "at_ms" => 77, "answer" => "yes"}
+        }
+      }
+
+      # The chat was rendered later than the answer that followed it.
+      [chat.(25, "before-answer"), answer, Map.put(chat.(9, "marked"), "pending", false)]
+    end
+
+    defp pending_calls(agent),
+      do:
+        agent
+        |> Kernel.<>(".calls")
+        |> File.read()
+        |> then(fn
+          {:ok, calls} -> String.split(calls, "\n", trim: true)
+          _ -> []
+        end)
+
+    defp pending_call(:prepare), do: "read --session #{@handle} --pending --prepare"
+    defp pending_call({:resume, t}), do: "read --session #{@handle} --pending --resume #{t}"
+
+    defp pending_call({:after, rev}),
+      do: "listen --follow --session #{@handle} --after #{rev} --on-expired exit"
+
+    defp pending_opts(db), do: [db: db, retry_delays: [20], feed_start_spacing_ms: 1]
+
+    defp choose_open(db) do
+      # An explicit retry is answered as in progress while the start is checked.
+      assert eventually(fn ->
+               state = :sys.get_state(HarklightWakes)
+               state.workers == %{} and state.admission_queue == []
+             end)
+
+      Task.start(fn -> HarklightWakes.retry_command(db, %{params: %{handle: @handle}}) end)
+    end
+
+    defp captured_ids(db) do
+      {:ok, rows} = DB.query(db, "SELECT rawLine FROM harklight_wake_entries ORDER BY feedCursor")
+
+      for [line] <- rows do
+        data = JSON.decode!(line)["data"]
+        data["entry_id"] || "answer " <> data["item_id"]
+      end
+    end
+
+    defp pending_row(db),
+      do: DB.query(db, "SELECT rev,token,resumed,stopped FROM harklight_pending_opens")
+
+    defp assert_opened(db, agent, calls) do
+      assert eventually(fn ->
+               List.last(pending_calls(agent)) == pending_call({:after, 30}) and
+                 match?(
+                   {:ok, [["active", nil]]},
+                   DB.query(db, "SELECT state,lastError FROM harklight_wake_handles")
+                 )
+             end)
+
+      assert pending_calls(agent) == Enum.map(calls, &pending_call/1)
+      assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+      assert {:ok, [[3]]} = DB.query(db, "SELECT count(*) FROM harklight_wake_deliveries")
+      assert {:ok, []} = pending_row(db)
+    end
+
+    test "an old conversation opens with everything waiting, then follows from its position", %{
+      db: db
+    } do
+      migrated_from_01!(db)
+      agent = pending_agent!()
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      refute eventually(fn -> File.exists?(agent <> ".calls") end, 20)
+      choose_open(db)
+      assert_opened(db, agent, [:prepare, {:resume, "T1"}, {:after, 30}])
+      assert {:ok, [[40]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+
+      # A later start resumes the position and opens nothing again.
+      :ok = stop_supervised(HarklightWakes)
+      start_supervised!({HarklightWakes, pending_opts(db)})
+
+      assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 40}) end)
+      assert length(captured_ids(db)) == 3
+    end
+
+    test "rows seen again after the open keep their identity", %{db: db} do
+      migrated_from_01!(db)
+      [chat, answer, _] = pending_rows()
+      delivered = put_in(chat, ["data", "delivery"], %{"delivered" => true})
+
+      agent =
+        pending_agent!(
+          live: [
+            %{delivered | "rev" => 35},
+            %{answer | "rev" => 36},
+            feed_chat(37, "request", "new")
+          ]
+        )
+
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      choose_open(db)
+
+      assert eventually(fn ->
+               captured_ids(db) == ["before-answer", "answer request", "marked", "new"]
+             end)
+
+      assert List.last(pending_calls(agent)) == pending_call({:after, 30})
+    end
+
+    for {point, calls} <- [
+          prepare: [:prepare, :prepare, {:resume, "T1"}, {:after, 30}],
+          prepared: [:prepare, :prepare, {:resume, "T2"}, {:after, 30}],
+          resume: [:prepare, {:resume, "T1"}, {:resume, "T1"}, {:after, 30}],
+          rows: [:prepare, {:resume, "T1"}, {:resume, "T1"}, {:after, 30}],
+          complete: [:prepare, {:resume, "T1"}, {:resume, "T1"}, {:after, 30}]
+        ],
+        how <- [:manager, :child] do
+      @point Atom.to_string(point)
+      @expected_calls calls
+
+      test "a #{how} killed at #{point} repeats the open without loss or repeat", %{db: db} do
+        migrated_from_01!(db)
+        agent = pending_agent!()
+        File.touch!(agent <> ".hold-" <> @point)
+        manager = start_supervised!({HarklightWakes, pending_opts(db)})
+        choose_open(db)
+        assert eventually(fn -> File.exists?(agent <> ".at-" <> @point) end)
+        assert captured_ids(db) == []
+        File.rm!(agent <> ".hold-" <> @point)
+
+        # No second choice is made: the open continues by itself.
+        if unquote(how) == :manager do
+          replace_feed_manager(manager)
+        else
+          port = :sys.get_state(manager).ports[@handle]
+          {:os_pid, pid} = Port.info(port, :os_pid)
+          System.cmd("pkill", ["-KILL", "-P", to_string(pid)])
+        end
+
+        assert_opened(db, agent, @expected_calls)
+      end
+    end
+
+    test "a commit that fails leaves the token and repeats it", %{db: db} do
+      migrated_from_01!(db)
+
+      :ok =
+        DB.execute(db, """
+        CREATE TRIGGER reject_position BEFORE INSERT ON harklight_feed_checkpoints
+        BEGIN SELECT RAISE(ABORT, 'refuse position'); END;
+        """)
+
+      agent = pending_agent!()
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      choose_open(db)
+      assert eventually(fn -> length(pending_calls(agent)) > 3 end)
+      assert captured_ids(db) == []
+      assert {:ok, [[30, "T1", 1, 0]]} = pending_row(db)
+
+      assert Enum.uniq(pending_calls(agent)) == [
+               pending_call(:prepare),
+               pending_call({:resume, "T1"})
+             ]
+
+      :ok = DB.execute(db, "DROP TRIGGER reject_position")
+      assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
+      assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+      assert {:ok, []} = pending_row(db)
+    end
+
+    test "a token that could not be stored serves nothing", %{db: db} do
+      migrated_from_01!(db)
+
+      :ok =
+        DB.execute(db, """
+        CREATE TRIGGER reject_token BEFORE UPDATE OF token ON harklight_pending_opens
+        WHEN NEW.token IS NOT NULL BEGIN SELECT RAISE(ABORT, 'refuse token'); END;
+        """)
+
+      agent = pending_agent!()
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      choose_open(db)
+      assert eventually(fn -> length(pending_calls(agent)) > 2 end)
+      assert Enum.uniq(pending_calls(agent)) == [pending_call(:prepare)]
+      :ok = DB.execute(db, "DROP TRIGGER reject_token")
+      assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
+      assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+    end
+
+    test "an incomplete or mismatched page set is never committed", %{db: db} do
+      migrated_from_01!(db)
+      agent = pending_agent!()
+      File.touch!(agent <> ".cut")
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      choose_open(db)
+      assert eventually(fn -> length(pending_calls(agent)) > 3 end)
+      assert captured_ids(db) == []
+      assert {:ok, []} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+      assert {:ok, [[30, "T1", 1, 0]]} = pending_row(db)
+      :ok = DB.execute(db, "UPDATE harklight_pending_opens SET rev=29")
+      File.rm!(agent <> ".cut")
+      before = length(pending_calls(agent))
+      assert eventually(fn -> length(pending_calls(agent)) > before + 2 end)
+      assert captured_ids(db) == []
+      :ok = DB.execute(db, "UPDATE harklight_pending_opens SET rev=30")
+      assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
+      assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+    end
+
+    test "a rejected token that served nothing is prepared again", %{db: db} do
+      migrated_from_01!(db)
+      agent = pending_agent!()
+      File.touch!(agent <> ".reject")
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      choose_open(db)
+      assert eventually(fn -> pending_call({:resume, "T2"}) in pending_calls(agent) end)
+      File.rm!(agent <> ".reject")
+      assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
+      refute Enum.any?(pending_calls(agent), &(&1 =~ "snapshot"))
+      assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+    end
+
+    for served <- [:earlier_run, :same_run] do
+      test "a rejected token that may have served rows stops and tells the owner (#{served})", %{
+        db: db,
+        call: call
+      } do
+        migrated_from_01!(db)
+        agent = pending_agent!()
+        manager = start_supervised!({HarklightWakes, pending_opts(db)})
+
+        if unquote(served) == :earlier_run do
+          File.touch!(agent <> ".cut")
+          choose_open(db)
+
+          assert eventually(fn ->
+                   {:resume, "T1"} |> pending_call() |> Kernel.in(pending_calls(agent))
+                 end)
+
+          File.touch!(agent <> ".reject")
+        else
+          File.touch!(agent <> ".reject-late")
+          choose_open(db)
+        end
+
+        assert eventually(fn -> match?({:ok, [[30, "T1", 1, 1]]}, pending_row(db)) end)
+        assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
+        count = length(pending_calls(agent))
+
+        # Nothing starts it: not activation, a restart, or retrying everything.
+        HarklightWakes.activate(@handle, true)
+        :ok = stop_supervised(HarklightWakes)
+        start_supervised!({HarklightWakes, pending_opts(db)})
+        assert %{results: []} = HarklightWakes.retry_command(db, %{params: %{all: true}})
+        refute eventually(fn -> length(pending_calls(agent)) > count end, 30)
+
+        assert {:ok, [[prompt]]} =
+                 DB.query(
+                   db,
+                   "SELECT prompt FROM wakes WHERE wakeId LIKE 'w_harklight_notice_pending_%'"
+                 )
+
+        assert prompt =~ "the conversation history has them"
+        refute prompt =~ "Automatic recovery continues"
+
+        params = %{
+          harklight_session: @handle,
+          message_type: "request",
+          reply: true,
+          sender_id: "sender",
+          title: "Into a stopped open"
+        }
+
+        assert %{code: "harklight_pending_open_stopped", outcome: "refused"} =
+                 HarklightSend.send_request(db, %{call | params: params},
+                   runner: fn args -> flunk("Agent called: #{inspect(args)}") end
+                 )
+
+        for file <- [".cut", ".reject", ".reject-late"], do: File.rm(agent <> file)
+        choose_open(db)
+        assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
+        assert pending_call({:resume, "T2"}) in pending_calls(agent)
+      end
+    end
+
+    for missing <- [:usage, :unsupported] do
+      test "without the route (#{missing}) it stays unopened, slowly retried and told once", %{
+        db: db
+      } do
+        migrated_from_01!(db)
+        agent = pending_agent!()
+        File.touch!(agent <> ".#{unquote(missing)}")
+
+        start_supervised!(
+          {HarklightWakes,
+           db: db,
+           retry_delays: [1, 250],
+           retry_jitter: false,
+           feed_start_spacing_ms: 1,
+           outage_notice_delay_ms: 50}
+        )
+
+        choose_open(db)
+        assert eventually(fn -> pending_calls(agent) == [pending_call(:prepare)] end)
+        refute eventually(fn -> length(pending_calls(agent)) > 1 end, 12)
+        assert eventually(fn -> length(pending_calls(agent)) > 3 end)
+        assert Enum.uniq(pending_calls(agent)) == [pending_call(:prepare)]
+
+        assert {:ok, [[prompt]]} = DB.query(db, "SELECT prompt FROM wakes")
+        assert prompt =~ "Agent 0.2.4 and Server 0.2.7"
+        File.rm!(agent <> ".#{unquote(missing)}")
+        assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
+        assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+      end
+    end
+
+    test "a route lost after the token was stored keeps the token", %{db: db} do
+      migrated_from_01!(db)
+      agent = pending_agent!()
+      File.touch!(agent <> ".hold-prepared")
+      manager = start_supervised!({HarklightWakes, pending_opts(db)})
+      choose_open(db)
+      assert eventually(fn -> File.exists?(agent <> ".at-prepared") end)
+      File.rm!(agent <> ".hold-prepared")
+      {:ok, _} = DB.query(db, "UPDATE harklight_pending_opens SET rev=30,token='T7'")
+      File.touch!(agent <> ".unsupported")
+      replace_feed_manager(manager)
+      assert eventually(fn -> pending_call({:resume, "T7"}) in pending_calls(agent) end)
+      assert {:ok, [[30, "T7", 1, 0]]} = pending_row(db)
+      File.rm!(agent <> ".unsupported")
+      assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
+      assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+    end
+
+    test "an expired position is opened again and keeps its place until then", %{db: db} do
+      :ok = HarklightWakes.capture_feed(db, @handle, 50, [], :live)
+      agent = pending_agent!()
+      File.touch!(agent <> ".expire")
+      File.touch!(agent <> ".hold-resume")
+      manager = start_supervised!({HarklightWakes, pending_opts(db)})
+      assert eventually(fn -> File.exists?(agent <> ".at-resume") end)
+      assert {:ok, [[50]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+      File.rm!(agent <> ".expire")
+      File.rm!(agent <> ".hold-resume")
+      replace_feed_manager(manager)
+
+      assert_opened(db, agent, [
+        {:after, 50},
+        :prepare,
+        {:resume, "T1"},
+        {:resume, "T1"},
+        {:after, 30}
+      ])
+    end
+
+    test "an older Agent's snapshot of an expired position is not applied", %{db: db} do
+      :ok = HarklightWakes.capture_feed(db, @handle, 50, [], :live)
+      chat = JSON.encode!(feed_chat(20, "request", "from-snapshot"))
+
+      fake_harklight_agent!("""
+      printf '%s\\n' "$*" >> "$0.calls"
+      case "$*" in
+        listen*)
+          printf '%s\\n' '{"kind":"baseline","rev":30,"reason":"cursor_expired"}' '#{chat}'
+          printf '%s\\n' '{"kind":"baseline_complete","rev":30}' '{"kind":"caught_up","rev":30}'
+          exec sleep 60 ;;
+        *) echo "error: unexpected argument '--pending' found" >&2; exit 2 ;;
+      esac
+      """)
+
+      agent = System.find_executable("harklight-agent")
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      assert eventually(fn -> length(pending_calls(agent)) > 2 end)
+
+      assert Enum.uniq(pending_calls(agent)) == [
+               "listen --follow --session #{@handle} --after 50",
+               pending_call(:prepare)
+             ]
+
+      assert captured_ids(db) == []
+      assert {:ok, [[50]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+      assert {:ok, [[nil, nil, 0, 0]]} = pending_row(db)
+    end
+
+    test "a new conversation still starts with a snapshot", %{db: db} do
+      fake_harklight_agent!(
+        """
+        printf '%s\\n' "$*" >> "$0.calls"
+        printf '%s\\n' '{"kind":"baseline","rev":5}' '{"kind":"baseline_complete","rev":5}'
+        printf '%s\\n' '{"kind":"caught_up","rev":5}'
+        exec sleep 60
+        """,
+        "0.2.4"
+      )
+
+      agent = System.find_executable("harklight-agent")
+      start_supervised!({HarklightWakes, pending_opts(db)})
+
+      assert eventually(fn ->
+               DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[5]]}
+             end)
+
+      assert pending_calls(agent) == ["listen --follow --session #{@handle} --snapshot"]
+      assert {:ok, []} = pending_row(db)
+    end
+
+    test "a finished conversation is not opened", %{db: db} do
+      migrated_from_01!(db)
+
+      :ok =
+        DB.execute(
+          db,
+          "INSERT INTO harklight_pending_opens(handle,rev,token) VALUES('#{@handle}',30,'T1')"
+        )
+
+      :ok = DB.execute(db, "UPDATE harklight_wake_handles SET state='complete'")
+      agent = pending_agent!()
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      HarklightWakes.activate(@handle)
+      HarklightWakes.retry_command(db, %{params: %{handle: @handle}})
+      refute eventually(fn -> File.exists?(agent <> ".calls") end, 30)
+    end
   end
 
   defp record_stop!(db, table, last_error) do
@@ -10446,13 +10986,19 @@ defmodule Tightbeam.HarklightWakesTest do
     }
   end
 
-  defp fake_harklight_agent!(body) do
+  defp fake_harklight_agent!(body, version \\ "0.2.3") do
     directory =
       Path.join(System.tmp_dir!(), "harklight-agent-test-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(directory)
     executable = Path.join(directory, "harklight-agent")
-    File.write!(executable, "#!/bin/sh\n" <> body)
+
+    File.write!(
+      executable,
+      "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'harklight-agent #{version}'; exit 0; fi\n" <>
+        body
+    )
+
     File.chmod!(executable, 0o755)
 
     previous_path = System.get_env("PATH")
