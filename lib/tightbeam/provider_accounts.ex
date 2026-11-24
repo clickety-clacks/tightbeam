@@ -95,7 +95,7 @@ defmodule Tightbeam.ProviderAccounts do
     readAttemptAt INTEGER NOT NULL CHECK (readAttemptAt <= observedAt),
     freshness TEXT NOT NULL,
     PRIMARY KEY (accountId, windowId),
-    CHECK ((model IS NULL) = (windowScope = 'account'))
+    CHECK (windowScope = 'model' OR model IS NULL)
   );
 
   ALTER TABLE turns ADD COLUMN accountId TEXT REFERENCES provider_accounts (id);

@@ -72,6 +72,28 @@ defmodule Tightbeam.ProviderAccountsUpgradeTest do
         assert ProviderAccounts.limits(db, id) == []
       end
 
+      window_insert = """
+      INSERT INTO capacity_windows
+        (accountId, windowId, windowScope, model, usedPercent, observedAt, readAttemptAt, freshness)
+      VALUES (?1, ?2, ?3, ?4, 50.5, 20, 10, 'live')
+      """
+
+      assert {:ok, []} =
+               DB.query(db, window_insert, [
+                 codex_account["id"],
+                 "additional:unnamed:1",
+                 "model",
+                 nil
+               ])
+
+      assert {:error, _} =
+               DB.query(db, window_insert, [
+                 codex_account["id"],
+                 "primary",
+                 "account",
+                 "fixture-model"
+               ])
+
       assert credential_files([codex, claude]) == snapshot
       assert :ok = stop_supervised(Credentials)
       assert :ok = Schema.ensure_all(db)
