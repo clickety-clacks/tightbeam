@@ -15,6 +15,7 @@ use std::io;
 use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt as UnixMetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -45,7 +46,13 @@ fn session_exec_with_mode(
             .to_string()
     })?;
 
-    if separator != 2 || args.len() <= separator + 1 {
+    let writer_lock = match separator {
+        2 => None,
+        4 if fixed_path.is_none() && args[2] == "--writer-lock" => Some(Path::new(&args[3])),
+        _ => return Err("invalid harness-exec options".into()),
+    };
+
+    if args.len() <= separator + 1 {
         return Err(
             "usage: tightbeam harness-exec <identity-path> <launch-id> -- <command> [args...]"
                 .into(),
@@ -101,6 +108,13 @@ fn session_exec_with_mode(
         }
     }
 
+    let _writer_lock = match writer_lock.map(acquire_writer_lock).transpose() {
+        Ok(lock) => lock,
+        Err(error) => {
+            let _ = writeln!(child_report, "writer_lock");
+            return Err(error);
+        }
+    };
     if let Err((step, error)) = prepare_session_identity(identity_path, &mut identity, &args[1]) {
         // The parent publishes this only after waitpid. A crash before this write
         // leaves no proof and therefore cannot authorize recovery.
@@ -115,6 +129,34 @@ fn session_exec_with_mode(
     Err(format!("harness command could not be executed: {error}"))
 }
 
+fn acquire_writer_lock(path: &Path) -> Result<fs::File, String> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("account writer lock could not be opened: {error}"))?;
+    let fd = lock.as_raw_fd();
+
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "account writer lock could not be acquired: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    // The owning-host child keeps this descriptor through exec. The SSH
+    // frontend never owns it, so losing that frontend cannot release it.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {
+        return Err(format!(
+            "account writer lock could not be inherited: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(lock)
+}
+
 fn launch_step(_step: &'static str) -> Result<(), (&'static str, String)> {
     #[cfg(test)]
     if std::env::var("TB_TEST_LAUNCH_FAILURE").ok().as_deref() == Some(_step) {
@@ -126,7 +168,7 @@ fn launch_step(_step: &'static str) -> Result<(), (&'static str, String)> {
 fn failure_step(step: &str) -> bool {
     matches!(
         step,
-        "fork" | "session" | "leader" | "boot" | "start_time" | "write"
+        "fork" | "session" | "leader" | "boot" | "start_time" | "write" | "writer_lock"
     )
 }
 

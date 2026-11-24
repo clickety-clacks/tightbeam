@@ -83,3 +83,67 @@ fn truncated_identity_is_never_authority() {
     }
     fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn writer_lock_probe() {
+    let Ok(root) = std::env::var("TB_TEST_WRITER_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    let result = session_exec(&[
+        root.join("lease.identity").to_string_lossy().into_owned(),
+        "writer-lease".into(),
+        "--writer-lock".into(),
+        root.join("lease.lock").to_string_lossy().into_owned(),
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        "echo $$ > \"$1/ready\"; while test ! -e \"$1/release\"; do sleep 0.05; done".into(),
+        "lease-test".into(),
+        root.to_string_lossy().into_owned(),
+    ]);
+    std::process::exit(result.unwrap_or(1));
+}
+
+#[test]
+fn losing_the_launcher_keeps_the_owning_host_writer_excluded() {
+    let dir = std::env::temp_dir().join(format!("account-writer-test-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let root = dir.as_path();
+    let lock = root.join("lease.lock");
+    let mut launcher = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "harness_process::launch_tests::writer_lock_probe",
+        ])
+        .env("TB_TEST_WRITER_ROOT", root)
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !root.join("ready").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ready = root.join("ready").exists();
+    let kill = launcher.kill();
+    let settlement = launcher.wait();
+    let excluded = acquire_writer_lock(&lock).is_err();
+    fs::write(root.join("release"), "").unwrap();
+
+    assert!(ready, "writer never signaled readiness");
+    kill.unwrap();
+    settlement.unwrap();
+    assert!(excluded, "launcher loss released an active writer's lock");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if acquire_writer_lock(&lock).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer lock did not release"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
