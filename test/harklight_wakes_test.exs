@@ -4520,6 +4520,9 @@ defmodule Tightbeam.HarklightWakesTest do
             fi
             printf '%s\\n' #{lines}
             hold rows
+            if [ -e "$0.damage" ]; then
+              printf '%s\\n%s\\n' '{"kind":"entry","rev":26,"da' 'warning text ta":{"entry_id":"split"}}'
+            fi
             if [ -e "$0.cut" ]; then exit 1; fi
             printf '%s\\n' '{"kind":"baseline_complete","rev":30}'
             hold complete
@@ -4754,6 +4757,20 @@ defmodule Tightbeam.HarklightWakesTest do
       assert eventually(fn -> length(pending_calls(agent)) > before + 2 end)
       assert captured_ids(db) == []
       :ok = DB.execute(db, "UPDATE harklight_pending_opens SET rev=30")
+      assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
+      assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+    end
+
+    test "a damaged row stops the commit and the same token is read again", %{db: db} do
+      migrated_from_01!(db)
+      agent = pending_agent!()
+      File.touch!(agent <> ".damage")
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      choose_open(db)
+      assert eventually(fn -> length(pending_calls(agent)) > 3 end)
+      assert captured_ids(db) == []
+      assert {:ok, [[30, "T1", 1, 0]]} = pending_row(db)
+      File.rm!(agent <> ".damage")
       assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
       assert captured_ids(db) == ["before-answer", "answer request", "marked"]
     end
