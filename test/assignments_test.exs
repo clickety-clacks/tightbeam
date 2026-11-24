@@ -4227,7 +4227,17 @@ defmodule Tightbeam.AssignmentsTest do
           assert %{state: "retired"} = Org.retire(ctx.db, "holder", "user:flynn")
 
         :missing ->
-          assert {:ok, []} = DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey='holder'")
+          # Stage an orphaned historical holder while keeping normal writes constrained.
+          assert {:ok, []} =
+                   DB.migration_transaction(
+                     ctx.db,
+                     :late_review_missing_holder,
+                     ["PRAGMA foreign_keys=OFF"],
+                     ["PRAGMA foreign_keys=ON"],
+                     fn txn ->
+                       Tightbeam.DB.Txn.q(txn, "DELETE FROM sessions WHERE sessionKey='holder'")
+                     end
+                   )
 
         :missing_recipient ->
           assert %{state: "retired"} = Org.retire(ctx.db, "holder", "user:flynn")
@@ -4265,6 +4275,15 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert {:ok, [["changes-requested"]]} =
                DB.query(ctx.db, "SELECT verdictKind FROM attests WHERE id=?1", [verdict_id])
+
+      expected_owner = item.ownerUserId
+
+      assert {:ok, [[^expected_owner]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT ownerUserId FROM condition_facts WHERE kind='assignment-reviewed' AND scope=?1",
+                 [producer.id]
+               )
 
       if scenario == :active do
         assert {:ok, [["open", nil, nil]]} =
