@@ -885,11 +885,56 @@ defmodule Tightbeam.Assignments do
               "[cannot-proceed released: #{assignment_id} by #{fact.kind}/#{fact.scope}]"
             )
 
+            schedule_release_continuation_in_txn(txn, assignment_id, holder, fact)
+
           nil ->
             :ok
         end
       end
     end)
+
+    :ok
+  end
+
+  defp schedule_release_continuation_in_txn(txn, assignment_id, holder, fact) do
+    recipient =
+      case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1 AND state='active'", [
+             holder
+           ]) do
+        [[owner]] ->
+          {:ok,
+           %{
+             session_key: holder,
+             owner_user_id: owner,
+             work_item_id: fetch_assignment(txn, assignment_id).workItemId
+           }}
+
+        _ ->
+          Tightbeam.RailRemedy.review_notice_recipient_in_txn(txn, assignment_id)
+      end
+
+    case recipient do
+      {:ok, recipient} ->
+        if not Wakes.pending_fact_wait_in_txn?(txn, recipient.session_key, fact) do
+          Wakes.schedule_in_txn(txn, %{
+            session_key: recipient.session_key,
+            owner_user_id: recipient.owner_user_id,
+            work_item_id: recipient.work_item_id,
+            assignment_id: assignment_id,
+            origin: "process:tightbeam",
+            prompt:
+              "Cannot-proceed released for #{assignment_id} by #{fact.kind}/#{fact.scope}. " <>
+                "Re-read the assignment and continue its work or arrange an active holder.",
+            due_at: fact.ts,
+            summon: true
+          })
+        end
+
+      {:error, reason} ->
+        Logger.warning(
+          "cannot-proceed release notice for assignment #{assignment_id} undelivered: #{inspect(reason)}"
+        )
+    end
 
     :ok
   end
@@ -3777,7 +3822,9 @@ defmodule Tightbeam.Assignments do
          review_attest
        ) do
     producer =
-      if producer.state == "closed" and producer.outcome == "completed" do
+      if producer.state == "closed" and producer.outcome == "completed" and
+           reopen_holder_active(txn, producer) == :ok and
+           reopen_work_item_open(txn, producer) == :ok do
         reopen_call =
           Map.put(
             call,
@@ -3800,18 +3847,40 @@ defmodule Tightbeam.Assignments do
   end
 
   defp schedule_author_review_changes_in_txn(txn, assignment, review_attest) do
-    Wakes.schedule_in_txn(txn, %{
-      session_key: assignment.holderKey,
-      origin: "remedy:completion-requires-review",
-      creator_session_key: review_attest.bySession,
-      prompt:
-        "Independent review #{review_attest.id} requested changes to assignment #{assignment.id}; " <>
-          "address the review and record the next result.",
-      due_at: now(),
-      assignment_id: assignment.id,
-      work_item_id: assignment.workItemId,
-      class: "input-needed"
-    })
+    recipient =
+      if assignment.state == "open" do
+        {:ok, %{session_key: assignment.holderKey}}
+      else
+        Tightbeam.RailRemedy.review_notice_recipient_in_txn(txn, assignment.id)
+      end
+
+    case recipient do
+      {:ok, %{session_key: session_key}} ->
+        next_step =
+          if assignment.state == "open",
+            do: "address the review and record the next result.",
+            else:
+              "the assignment was not reopened; reassign the requested changes " <>
+                "and reopen the work item first if needed."
+
+        Wakes.schedule_in_txn(txn, %{
+          session_key: session_key,
+          origin: "remedy:completion-requires-review",
+          creator_session_key: review_attest.bySession,
+          prompt:
+            "Independent review #{review_attest.id} requested changes to assignment #{assignment.id}; " <>
+              next_step,
+          due_at: now(),
+          assignment_id: assignment.id,
+          work_item_id: assignment.workItemId,
+          class: "input-needed"
+        })
+
+      {:error, reason} ->
+        Logger.warning(
+          "review changes notice for assignment #{assignment.id} undelivered: #{inspect(reason)}"
+        )
+    end
 
     :ok
   end

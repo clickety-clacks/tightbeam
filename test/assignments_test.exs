@@ -1670,6 +1670,93 @@ defmodule Tightbeam.AssignmentsTest do
       end
     end
 
+    for effect_kind <- ["coordination", "code"] do
+      @producer_effect effect_kind
+      test "a clean review preserves an automatically reopened #{@producer_effect} assignment after notice delivery",
+           ctx do
+        session(ctx.db, "notice-parent", "flynn")
+
+        producer =
+          assign_call({:session, "notice-parent"}, "reviewed producer")
+          |> put_in([:params, :effect_kind], @producer_effect)
+          |> then(&handle(ctx, "assign", &1))
+
+        review =
+          assign_call({:session, "notice-parent"}, "producer review")
+          |> put_in([:params, :reviews_assignment_id], producer.id)
+          |> Map.put(:session_key, "other-session")
+          |> then(&handle(ctx, "assign", &1))
+
+        verdict = fn principal, assignment, kind ->
+          attest_call(principal, assignment.id, "verdict")
+          |> put_in([:params, :verdict_kind], kind)
+          |> then(&handle(ctx, "attest", &1))
+        end
+
+        complete = fn ->
+          handle(ctx, "attest", attest_call({:session, "holder"}, producer.id, "completion"))
+        end
+
+        review_verdict = fn kind -> verdict.({:session, "other-session"}, review, kind) end
+
+        if @producer_effect == "code" do
+          assert %{attest: %{verdictKind: "verified"}} =
+                   verdict.({:session, "holder"}, producer, "verified")
+
+          assert %{attest: %{verdictKind: "reviewed-clean"}} = review_verdict.("reviewed-clean")
+        end
+
+        notices = fn ->
+          Enum.filter(
+            terminal_notices(ctx.db),
+            &(&1.obligation_ref == "terminal-child-owner-notification:" <> producer.id)
+          )
+        end
+
+        assert %{assignment: %{state: "closed"}, attest: %{id: first_id}} = complete.()
+        assert [first_notice] = notices.()
+        assert first_notice.prompt =~ ~s(source_token="#{first_id}")
+        force_wake_due(ctx.db, first_notice.wake_id)
+        scheduler = terminal_notice_scheduler(ctx.db)
+        assert :ok = Wakes.fire_due(scheduler)
+        assert %{state: "fired"} = Wakes.get(ctx.db, first_notice.wake_id)
+
+        assert [[_seq, "notice-parent", "queued", _carrier_id]] =
+                 source_delivery_turns(ctx.db, first_notice.wake_id)
+
+        assert %{attest: %{verdictKind: "changes-requested"}} =
+                 review_verdict.("changes-requested")
+
+        readback = fn ->
+          handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, producer.id))
+        end
+
+        assert %{state: "open", reopenings: [%{priorClosingAttestId: ^first_id}]} = readback.()
+
+        assert %{attest: %{id: clean_id, verdictKind: "reviewed-clean"}} =
+                 review_verdict.("reviewed-clean")
+
+        assert %{state: "open", outcome: nil, closingAttestId: nil} = readback.()
+
+        assert {:ok, [["reviewed-clean"]]} =
+                 DB.query(ctx.db, "SELECT verdictKind FROM attests WHERE id=?1", [clean_id])
+
+        first_wake_id = first_notice.wake_id
+        assert [%{wake_id: ^first_wake_id, state: "fired"}] = notices.()
+
+        assert %{assignment: %{state: "closed", outcome: "completed"}, attest: %{id: second_id}} =
+                 complete.()
+
+        assert second_id != first_id
+        assert %{closingAttestId: ^second_id} = readback.()
+
+        assert {[%{state: "fired"}], [second_notice]} =
+                 Enum.split_with(notices.(), &(&1.wake_id == first_wake_id))
+
+        assert second_notice.prompt =~ ~s(source_token="#{second_id}")
+      end
+    end
+
     test "retiring a notice recipient readdresses its pending terminal notice", ctx do
       {_assignment, wake, personal} = terminal_delivery_fixture(ctx, "completion")
 
@@ -3306,6 +3393,9 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "pending"
 
+    assert {:ok, [[turns_before]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+
     assert {:ok, fact} =
              DB.transaction(ctx.db, fn txn ->
                ConditionFacts.file_in_txn(txn, %{
@@ -3326,6 +3416,17 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "canceled"
 
+    # Scheduling is durable in the release transaction; delivery starts a turn later.
+    assert {:ok, [[^turns_before]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='holder' AND consumer='prompt' AND state='pending'",
+               [blocked.id]
+             )
+
     assert {:ok, [["cannot_proceed_released", 1]]} =
              DB.query(
                ctx.db,
@@ -3333,6 +3434,208 @@ defmodule Tightbeam.AssignmentsTest do
                [filed.decisionWake.wake_id]
              )
   end
+
+  for scope <- [:exact, :any, :nonmatching] do
+    @dependency_scope scope
+    test "release deduplicates only a satisfied #{@dependency_scope} dependency wait", ctx do
+      {assignment, _blocked} = release_wake_fixture(ctx)
+
+      resolver =
+        assign_call({:user, "flynn"}, "dependency resolver", nil, nil)
+        |> put_in([:params, :effect_kind], "coordination")
+        |> then(&handle(ctx, "assign", &1))
+
+      assert {:ok, wait} =
+               DB.transaction(ctx.db, fn txn ->
+                 Wakes.register_wait_in_txn(txn, %{
+                   session_key: "holder",
+                   origin: "agent:holder",
+                   prompt: "continue after dependency",
+                   due_at: System.system_time(:millisecond) + 60_000,
+                   assignment_id: assignment.id,
+                   registrant_session_key: "holder",
+                   owner_user_id: "flynn",
+                   wait_reason: "Waiting for the exact release fact",
+                   predicate: %{
+                     "conditions" =>
+                       [%{"fact" => "condition_fact.matches", "op" => "eq", "value" => true}] ++
+                         if(@dependency_scope == :nonmatching,
+                           do: [
+                             %{"fact" => "assignment.state", "op" => "eq", "value" => "closed"}
+                           ],
+                           else: []
+                         ),
+                     "bindings" => %{
+                       "conditionKind" => "dependency-ready",
+                       "conditionScope" =>
+                         if(@dependency_scope == :any, do: nil, else: assignment.id),
+                       "assignmentId" => resolver.id
+                     },
+                     "resolverRef" => %{"kind" => "assignment", "id" => resolver.id},
+                     "necessity" => "The release fact permits continuation."
+                   }
+                 })
+               end)
+
+      assert wait.wait_mode == "dependency"
+      scheduler = terminal_notice_scheduler(ctx.db)
+      ConditionFacts.file(ctx.db, scheduler, release_wake_fact(assignment.id))
+      assert :ok = Wakes.fire_due(scheduler)
+
+      if @dependency_scope == :nonmatching do
+        assert Wakes.get(ctx.db, wait.wake_id).recognition_path == nil
+      else
+        assert Wakes.get(ctx.db, wait.wake_id).recognition_path == "success"
+      end
+
+      expected = if @dependency_scope == :nonmatching, do: 1, else: 0
+
+      assert {:ok, [[^expected]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND origin='process:tightbeam' AND prompt LIKE 'Cannot-proceed released for %'",
+                 [assignment.id]
+               )
+
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+    end
+  end
+
+  test "release delivers one continuation and replay adds none", ctx do
+    {assignment, _blocked} = release_wake_fixture(ctx)
+    scheduler = terminal_notice_scheduler(ctx.db)
+    fact = ConditionFacts.file(ctx.db, scheduler, release_wake_fact(assignment.id))
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, &Assignments.release_cannot_proceed_in_txn(&1, fact))
+
+    assert :ok = Wakes.fire_matching(scheduler, fact.fact_id)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+  end
+
+  for scope <- [:exact, :any] do
+    @release_wait_scope scope
+    test "release reuses holder's pending #{@release_wait_scope} fact wait", ctx do
+      {assignment, _blocked} = release_wake_fixture(ctx)
+
+      wait =
+        Wakes.schedule(ctx.db, %{
+          session_key: "holder",
+          creator_session_key: "holder",
+          origin: "agent:holder",
+          prompt: "continue the blocked assignment",
+          assignment_id: assignment.id,
+          condition_kind: "dependency-ready",
+          condition_scope: if(@release_wait_scope == :exact, do: assignment.id),
+          due_at: System.system_time(:millisecond) + 60_000
+        })
+
+      scheduler = terminal_notice_scheduler(ctx.db)
+      fact = ConditionFacts.file(ctx.db, scheduler, release_wake_fact(assignment.id))
+      assert :ok = Wakes.fire_due(scheduler)
+      assert Wakes.get(ctx.db, wait.wake_id).fired_by == "condition"
+
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='holder' AND origin='process:tightbeam' AND prompt LIKE 'Cannot-proceed released for %'",
+                 [assignment.id]
+               )
+
+      assert {:ok, :ok} =
+               DB.transaction(ctx.db, &Assignments.release_cannot_proceed_in_txn(&1, fact))
+
+      assert :ok = Wakes.fire_due(scheduler)
+
+      assert {:ok, [[1]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+    end
+  end
+
+  test "release of a retired holder's block tells the current accountable owner", ctx do
+    owner = session(ctx.db, "delivery-owner", "flynn")
+    item = create_work_item(ctx, "released block with retired holder")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE work_items SET deliveryOwnerSessionKey=?2 WHERE id=?1", [
+               item.id,
+               owner.session_key
+             ])
+
+    {assignment, _blocked} = release_wake_fixture(ctx, item.id)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET state='retired' WHERE sessionKey='holder'"
+             )
+
+    scheduler = terminal_notice_scheduler(ctx.db)
+    ConditionFacts.file(ctx.db, scheduler, release_wake_fact(assignment.id))
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='holder'")
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='delivery-owner'")
+  end
+
+  test "release remains settled when no accountable recipient is active", ctx do
+    {assignment, _blocked} = release_wake_fixture(ctx)
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='retired'")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, _} =
+                 DB.transaction(ctx.db, fn txn ->
+                   ConditionFacts.file_in_txn(txn, release_wake_fact(assignment.id))
+                 end)
+      end)
+
+    assert log =~ "missing_accountable_owner"
+
+    assert {:ok, [["settled", "release-fact"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind FROM assignment_cannot_proceed WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
+  defp release_wake_fixture(ctx, work_item_id \\ nil) do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, "blocked continuation", nil, work_item_id)
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "waiting for dependency")
+      |> put_in([:params, :release_fact_kind], "dependency-ready")
+      |> put_in([:params, :release_fact_scope], assignment.id)
+      |> put_in([:params, :release_fact_principal_ref], "agent:holder")
+      |> then(&handle(ctx, "attest", &1))
+
+    {assignment, blocked}
+  end
+
+  defp release_wake_fact(assignment_id),
+    do: %{kind: "dependency-ready", scope: assignment_id, origin: "agent:holder"}
 
   test "cannot-proceed is session-filed, idempotent, pauses one card, releases on its exact custom fact, and leaves a later waiting verdict as a completion FYI",
        ctx do
@@ -3952,6 +4255,13 @@ defmodule Tightbeam.AssignmentsTest do
                "attest",
                attest_call({:session, "holder"}, assignment.id, "completion")
              )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Cannot-proceed released for %'",
+               [assignment.id]
+             )
   end
 
   test "a session answers a standing cannot-proceed with its own attribution", ctx do
@@ -4194,6 +4504,124 @@ defmodule Tightbeam.AssignmentsTest do
                """,
                [blocked.cannotProceed.id]
              )
+  end
+
+  for scenario <- [:active, :retired, :closed_work_item, :missing_recipient] do
+    @late_review_scenario scenario
+    test "late changes request respects reopening eligibility: #{scenario}", ctx do
+      scenario = @late_review_scenario
+      session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+      session(ctx.db, "current-owner", "flynn")
+      item = create_work_item(ctx, "late review")
+
+      producer =
+        assign_call({:user, "flynn"}, "completed evidence", nil, item.id)
+        |> put_in([:params, :effect_kind], "coordination")
+        |> then(&handle(ctx, "assign", &1))
+
+      review =
+        assign_call({:user, "flynn"}, "late review", nil, item.id)
+        |> put_in([:params, :reviews_assignment_id], producer.id)
+        |> Map.put(:session_key, "other-session")
+        |> then(&handle(ctx, "assign", &1))
+
+      first = handle(ctx, "attest", attest_call({:session, "holder"}, producer.id, "completion"))
+      assert first.assignment.state == "closed"
+      set_delivery_owner(ctx, item.id, "current-owner")
+
+      case scenario do
+        :active ->
+          :ok
+
+        :retired ->
+          assert %{state: "retired"} = Org.retire(ctx.db, "holder", "user:flynn")
+
+        :missing_recipient ->
+          assert %{state: "retired"} = Org.retire(ctx.db, "holder", "user:flynn")
+          assert %{state: "retired"} = Org.retire(ctx.db, "current-owner", "user:flynn")
+
+          assert %{state: "retired"} =
+                   Org.retire(ctx.db, Org.personal_session_key("flynn"), "user:flynn")
+
+        :closed_work_item ->
+          assert {:ok, []} =
+                   DB.query(ctx.db, "UPDATE work_items SET state='closed' WHERE id=?1", [item.id])
+      end
+
+      verdict_call =
+        attest_call({:session, "other-session"}, review.id, "verdict")
+        |> put_in([:params, :verdict_kind], "changes-requested")
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %{attest: %{verdictKind: "changes-requested"}} =
+                   handle(ctx, "attest", verdict_call)
+        end)
+
+      if scenario == :missing_recipient do
+        assert log =~ "undelivered"
+        assert log =~ "missing_accountable_owner"
+      end
+
+      assert {:ok, [[verdict_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT id FROM attests WHERE assignmentId=?1 AND verdictKind='changes-requested'",
+                 [review.id]
+               )
+
+      assert {:ok, [["changes-requested"]]} =
+               DB.query(ctx.db, "SELECT verdictKind FROM attests WHERE id=?1", [verdict_id])
+
+      if scenario == :active do
+        assert {:ok, [["open", nil, nil]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
+                   [producer.id]
+                 )
+
+        assert {:ok, [[1]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM assignment_reopenings WHERE assignmentId=?1",
+                   [producer.id]
+                 )
+      else
+        assert {:ok, [["closed", "completed", closing_id]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
+                   [producer.id]
+                 )
+
+        assert closing_id == first.attest.id
+
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM assignment_reopenings WHERE assignmentId=?1",
+                   [producer.id]
+                 )
+      end
+
+      assert {:ok, notices} =
+               DB.query(
+                 ctx.db,
+                 "SELECT sessionKey,prompt FROM wakes WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'",
+                 [producer.id]
+               )
+
+      if scenario == :missing_recipient do
+        assert notices == []
+      else
+        expected_recipient = if scenario == :active, do: "holder", else: "current-owner"
+        assert [[^expected_recipient, prompt]] = notices
+        assert prompt =~ verdict_id
+        assert prompt =~ producer.id
+        if scenario != :active, do: assert(prompt =~ "reassign")
+      end
+    end
   end
 
   test "a clean review does not reclose a reopened assignment with its earlier completion",

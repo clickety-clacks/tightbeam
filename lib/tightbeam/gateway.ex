@@ -382,14 +382,6 @@ defmodule Tightbeam.Gateway do
           db: db,
           send_runner: Map.get(config, :harklight_send_runner),
           child_opts: [base_dir: config.base_dir, cli_path: Path.join(cli_bin, "tightbeam")]},
-         if(
-           Map.get(
-             config,
-             :coordinator_hold_alerts_enabled,
-             Application.get_env(:tightbeam, :coordinator_hold_alerts_enabled, true)
-           ),
-           do: {Tightbeam.CoordinatorHoldAlerts, db: db, runner: config[:harklight_send_runner]}
-         ),
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
@@ -1879,8 +1871,11 @@ defmodule Tightbeam.Gateway do
           tune_result(config, db, call)
         end,
       {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
-      {"session-custody-transfer", ["wake.scheduled"]} => fn call ->
-        Tightbeam.SessionCustodyTransfer.handle(db, call)
+      {"session-custody-transfer", ["wake.scheduled", "work_item.updated"]} => fn call ->
+        Tightbeam.SessionCustodyTransfer.handle(
+          db,
+          Map.put(call, :firehose_work_item_summary, true)
+        )
       end,
       {"assignment-opener-accept", ["wake.scheduled"]} => fn call ->
         Tightbeam.AssignmentOpenerAcceptance.handle(db, call)
@@ -6630,7 +6625,6 @@ defmodule Tightbeam.Gateway do
       end)
 
     Tightbeam.RowReactions.recover(Map.get(config, :db, Tightbeam.DB))
-    Tightbeam.CoordinatorHoldAlerts.changed()
     rules
   end
 

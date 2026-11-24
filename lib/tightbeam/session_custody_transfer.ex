@@ -1,14 +1,14 @@
 defmodule Tightbeam.SessionCustodyTransfer do
   @moduledoc "Operator transfer of current session custody without changing origin records."
 
-  alias Tightbeam.{DB, EventLog, Idempotency, Org, SessionReparent, Wakes}
+  alias Tightbeam.{DB, EventLog, Idempotency, Org, SessionReparent, Wakes, WorkItemSummary}
   alias Tightbeam.DB.Txn
 
   defmodule Refusal do
     defexception [:code]
   end
 
-  def handle(db, %{principal: {:user, owner}, params: params}) do
+  def handle(db, %{principal: {:user, owner}, params: params} = call) do
     source = params[:from_session_key]
     target = params[:to_session_key]
     parent = params[:parent_session_key]
@@ -16,7 +16,7 @@ defmodule Tightbeam.SessionCustodyTransfer do
 
     if valid_key?(key) and valid_session?(source) and valid_session?(target) and
          (is_nil(parent) or valid_session?(parent)) do
-      case DB.transaction(db, &transfer_in_txn(&1, owner, source, target, parent, key)) do
+      case DB.transaction(db, &transfer_in_txn(&1, owner, source, target, parent, key, call)) do
         {:ok, result} -> result
         {:error, %Refusal{code: code}} -> refusal(code)
         {:error, error} -> raise error
@@ -28,7 +28,7 @@ defmodule Tightbeam.SessionCustodyTransfer do
 
   def handle(_db, _call), do: refusal("user_principal_required")
 
-  defp transfer_in_txn(txn, owner, source, target, parent, key) do
+  defp transfer_in_txn(txn, owner, source, target, parent, key, call) do
     fingerprint =
       :crypto.hash(:sha256, JSON.encode!([owner, source, target, parent]))
       |> Base.encode16(case: :lower)
@@ -38,20 +38,26 @@ defmodule Tightbeam.SessionCustodyTransfer do
         response
 
       nil ->
-        transfer_new_in_txn(txn, owner, source, target, parent, key, fingerprint)
+        transfer_new_in_txn(txn, owner, source, target, parent, key, fingerprint, call)
 
       _ ->
         refusal("idempotency_conflict")
     end
   end
 
-  defp transfer_new_in_txn(txn, owner, source, target, parent, key, fingerprint) do
+  defp transfer_new_in_txn(txn, owner, source, target, parent, key, fingerprint, call) do
     if source == target, do: raise(Refusal, code: "no_change")
 
     active_owner_host!(txn, source, owner)
     target_host = active_owner_host!(txn, target, owner)
 
     selected = %{
+      work_items:
+        ids(
+          txn,
+          "SELECT id FROM work_items WHERE deliveryOwnerSessionKey=?1 AND state='open' ORDER BY createdAt,id",
+          [source]
+        ),
       holders:
         ids(
           txn,
@@ -186,6 +192,13 @@ defmodule Tightbeam.SessionCustodyTransfer do
 
     update_ids!(
       txn,
+      selected.work_items,
+      "UPDATE work_items SET deliveryOwnerSessionKey=?2 WHERE id=?1 AND deliveryOwnerSessionKey=?3 AND state='open'",
+      [target, source]
+    )
+
+    update_ids!(
+      txn,
       selected.openers,
       "UPDATE assignments SET currentOpenerSessionKey=?2 WHERE id=?1 AND COALESCE(currentOpenerSessionKey,openedBySession)=?3 AND state='open'",
       [target, source]
@@ -244,6 +257,11 @@ defmodule Tightbeam.SessionCustodyTransfer do
       [target, source, at]
     )
 
+    Enum.each(selected.work_items, fn item_id ->
+      Wakes.readdress_accountability_notices_in_txn(txn, item_id)
+      WorkItemSummary.publish_change_in_txn(txn, item_id, call)
+    end)
+
     after_state = snapshot(txn, source, selected, captured)
 
     if before == after_state, do: raise(Refusal, code: "no_change")
@@ -293,6 +311,24 @@ defmodule Tightbeam.SessionCustodyTransfer do
   defp snapshot(txn, source, selected, captured) do
     %{
       "currentParent" => Org.current_parent(txn, source),
+      "workItems" =>
+        rows_for(
+          txn,
+          "work_items",
+          "id,deliveryOwnerSessionKey,createdByUser,createdBySession,state",
+          "id",
+          selected.work_items
+        )
+        |> Enum.map(fn row ->
+          [[version]] =
+            Txn.q(
+              txn,
+              "SELECT COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId=work_items.id),createdAt) FROM work_items WHERE id=?1",
+              [row["id"]]
+            )
+
+          Map.put(row, "rowVersion", version)
+        end),
       "coordinationParents" =>
         Map.new(selected.holders, fn id ->
           {id, SessionReparent.current_coordination_parent(txn, id)}

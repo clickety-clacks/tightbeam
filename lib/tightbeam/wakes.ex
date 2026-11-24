@@ -2664,6 +2664,54 @@ defmodule Tightbeam.Wakes do
   defp transition_new(%{fields: fields}, name), do: get_in(fields, [String.to_atom(name), :new])
   defp transition_new(_transition, _name), do: nil
 
+  @doc false
+  def pending_fact_wait_in_txn?(txn, session_key, fact) do
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId FROM wakes
+      WHERE state='pending' AND consumer='prompt'
+        AND (conditionKind=?2 OR waitMode='dependency')
+        AND ((targetRole IS NULL AND sessionKey=?1)
+          OR targetRole IN (SELECT name FROM roles WHERE boundSessionKey=?1))
+      """,
+      [session_key, fact.kind]
+    )
+    |> Enum.any?(fn [wake_id] ->
+      wake = get_in_txn(txn, wake_id)
+
+      predicate =
+        if wake.wait_mode == "dependency" do
+          stored_dependency_contracts!(wake)
+          wake.predicate
+        else
+          %{
+            "conditions" => [%{"fact" => "condition_fact.matches", "op" => "eq", "value" => true}],
+            "bindings" => %{
+              "conditionKind" => wake.condition_kind,
+              "conditionScope" => wake.condition_scope,
+              "conditionAfterId" => wake.condition_after_id
+            }
+          }
+        end
+
+      case RuleRuntime.evaluate_predicate_in_txn(txn, %{
+             owner_user_id: wake.owner_user_id,
+             conditions: predicate["conditions"],
+             bindings: Map.put_new(predicate["bindings"], "conditionFactId", fact.fact_id)
+           }) do
+        {:ok, %{matched: true, condition_match: %{id: id}}} ->
+          id == fact.fact_id
+
+        {:ok, _} ->
+          false
+
+        {:error, error} ->
+          raise DB.Error, message: "stored wait predicate refused: #{error.message}"
+      end
+    end)
+  end
+
   defp evaluate_wait_predicate_in_txn(txn, wake) do
     # The deadline sweep must refuse corrupt stored vocabulary too, before it
     # can stamp a later success as a registration snapshot.

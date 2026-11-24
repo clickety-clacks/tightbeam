@@ -102,6 +102,116 @@ defmodule Tightbeam.WorkItemBracketsTest do
     }
   end
 
+  test "custody transfer keeps assigned and bare item ownership after source retirement", ctx do
+    alias Tightbeam.Firehose.Hub
+    owner = ctx.holder.owner_user_id
+    source = ctx.holder.session_key
+    session(ctx.db, "successor", owner)
+    hub = start_supervised!({Hub, name: nil})
+    item = create(ctx, {:user, owner}, %{title: "Transferred assignment"})
+    bare = create(ctx, {:user, owner}, %{title: "Transferred bare item"})
+    for id <- [item.id, bare.id], do: update(ctx, id, %{delivery_owner_session_key: source})
+    {:ok, assignment} = disp_assign(ctx, {:user, owner}, source, "continuing work", item.id)
+    before = Map.new([item.id, bare.id], &{&1, get(ctx, &1).workItem})
+    routing = routing_wake_id(ctx.db, bare.id)
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: owner, is_admin: false})
+
+    call = %{
+      principal: {:user, owner},
+      firehose_hub: hub,
+      params: %{
+        from_session_key: source,
+        to_session_key: "successor",
+        idempotency_key: "transfer-items"
+      }
+    }
+
+    result = ctx.handlers["session-custody-transfer"].(call)
+    assert is_binary(result["eventId"])
+
+    assert Enum.sort(Enum.map(result["after"]["workItems"], & &1["id"])) ==
+             Enum.sort([item.id, bare.id])
+
+    for _ <- [item.id, bare.id] do
+      assert_receive {:firehose_notice, %{"class" => "work_item.updated", "payload" => payload}}
+      Hub.delivered(hub, self())
+      id = payload["id"]
+      current = get(ctx, id).workItem
+      assert current.deliveryOwnerSessionKey == "successor"
+      assert current.rowVersion > before[id].rowVersion
+      assert current.createdByUser == before[id].createdByUser
+      assert current.createdBySession == before[id].createdBySession
+      assert payload["rowVersion"] == current.rowVersion
+      assert payload["holders"] == current.holders
+    end
+
+    assert routing_wake_id(ctx.db, bare.id) == routing
+    assert Wakes.get(ctx.db, routing).session_key == Org.personal_session_key(owner)
+    assert ctx.handlers["session-custody-transfer"].(call) == result
+    refute_receive {:firehose_notice, %{"class" => "work_item.updated"}}
+
+    retired =
+      ctx.handlers["retire"].(%{
+        verb: "retire",
+        origin: "user:" <> owner,
+        principal: {:user, owner},
+        session_key: source,
+        params: %{}
+      })
+
+    assert source in retired.retired_session_keys
+
+    assert {:ok, [["open", "successor"]]} =
+             DB.query(ctx.db, "SELECT state,holderKey FROM assignments WHERE id=?1", [
+               assignment.id
+             ])
+
+    for id <- [item.id, bare.id],
+        do: assert(get(ctx, id).workItem.deliveryOwnerSessionKey == "successor")
+  end
+
+  test "item-only custody transfer preserves routing and readdresses and rearms saved slate",
+       ctx do
+    owner = ctx.holder.owner_user_id
+    source = Org.personal_session_key(owner)
+    session(ctx.db, "successor", owner)
+    bare = create(ctx, {:user, owner}, %{title: "Routing remains personal"})
+    drained = create(ctx, {:user, owner}, %{title: "Slate follows delivery owner"})
+    for id <- [bare.id, drained.id], do: update(ctx, id, %{delivery_owner_session_key: source})
+
+    {:ok, assignment} =
+      disp_assign(ctx, {:user, owner}, ctx.holder.session_key, "finish", drained.id)
+
+    complete(ctx, ctx.holder.session_key, assignment.id)
+    routing = routing_wake_id(ctx.db, bare.id)
+    slate = slate_wake_id(ctx.db, drained.id)
+    assert Wakes.get(ctx.db, slate).session_key == source
+
+    call = %{
+      principal: {:user, owner},
+      params: %{
+        from_session_key: source,
+        to_session_key: "successor",
+        idempotency_key: "item-only"
+      }
+    }
+
+    result = ctx.handlers["session-custody-transfer"].(call)
+    assert is_binary(result["eventId"])
+    assert result["after"]["assignments"] == []
+    assert routing_wake_id(ctx.db, bare.id) == routing
+    assert Wakes.get(ctx.db, routing).session_key == source
+    assert slate_wake_id(ctx.db, drained.id) == slate
+    assert Wakes.get(ctx.db, slate).session_key == "successor"
+    assert item_wake_count(ctx.db, bare.id) == 1
+    assert item_wake_count(ctx.db, drained.id) == 1
+    assert ctx.handlers["session-custody-transfer"].(call) == result
+    deliver_bracket_wake(ctx.db, Wakes.get(ctx.db, slate))
+    rearmed = Wakes.get(ctx.db, slate_wake_id(ctx.db, drained.id))
+    assert rearmed.wake_id != slate
+    assert rearmed.session_key == "successor"
+  end
+
   test "absent work-item rails preserve create, assignment and close results without reminders",
        ctx do
     Rules.load!(Path.join(ctx.law_base, "absent"), Map.keys(ctx.handlers))
