@@ -1,7 +1,7 @@
 defmodule Tightbeam.ProviderAccountsUpgradeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Credentials, DB, ProviderAccounts, Schema, StateResources}
+  alias Tightbeam.{Credentials, DB, Placement, ProviderAccounts, Schema, StateResources}
 
   @host "test-host"
   # The second fixture is the same synthetic 0.1.16 DB opened by Schema.ensure_all/1
@@ -137,10 +137,84 @@ defmodule Tightbeam.ProviderAccountsUpgradeTest do
     try do
       assert {:error, _} = GenServer.call(worker, {:kind, :openai}, 1_000)
       assert ProviderAccounts.list(db) == []
+
+      first_ref = Process.monitor(first)
+      second_ref = Process.monitor(second)
+      assert :ok = stop_supervised(Credentials)
+      assert_receive {:DOWN, ^first_ref, :process, ^first, :shutdown}, 5_000
+      assert_receive {:DOWN, ^second_ref, :process, ^second, :shutdown}, 5_000
     after
       send(first, :offline)
       send(second, :offline)
     end
+  end
+
+  test "an in-flight backfill cannot publish after its host registration is replaced" do
+    db = start_supervised!({DB, path: ":memory:", name: :moving_provider_accounts_upgrade})
+    assert :ok = Schema.ensure_all(db)
+    test = self()
+    old = %{base_dir: "/fixture/old", ssh: "old.example.invalid"}
+    new = %{base_dir: "/fixture/new", ssh: "new.example.invalid"}
+    assert {:ok, _} = Placement.register_host(db, @host, old)
+
+    runner = fn args ->
+      case Enum.take(args, -3) do
+        ["sh", "-c", script] ->
+          if String.contains?(script, "codex/auth.json"), do: {"", 0}, else: {"", 1}
+
+        ["test", "-d", _path] ->
+          {"", 0}
+
+        _ ->
+          case Enum.take(args, -2) do
+            ["cat", path] ->
+              if String.starts_with?(path, old.base_dir) do
+                send(test, {:old_metadata_read, self()})
+
+                receive do
+                  :finish_read -> :ok
+                end
+              end
+
+              {JSON.encode!(%{"kind" => "subscription"}), 0}
+
+            _ ->
+              {"", 1}
+          end
+      end
+    end
+
+    start_one = fn config ->
+      start_supervised!(
+        {Credentials,
+         name: :moving_provider_account_fixture,
+         machine: @host,
+         base_dir: config.base_dir,
+         ssh: config.ssh,
+         provider_accounts_db: db,
+         provider_accounts_registration: {config.base_dir, config.ssh},
+         sh: runner}
+      )
+    end
+
+    _worker = start_one.(old)
+    assert_receive {:old_metadata_read, reader}, 5_000
+    old_ref = Process.monitor(reader)
+    assert {:ok, _} = Placement.register_host(db, @host, new)
+    send(reader, :finish_read)
+    assert_receive {:DOWN, ^old_ref, :process, ^reader, :normal}, 5_000
+    assert ProviderAccounts.list(db) == []
+
+    assert :ok = stop_supervised(Credentials)
+    worker = start_one.(new)
+
+    for {_provider, pid} <- :sys.get_state(worker).shared_backfills do
+      ref = Process.monitor(pid)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+    end
+
+    assert [%{"harness" => "codex", "kind" => "subscription", "slot" => "shared"}] =
+             ProviderAccounts.list(db)
   end
 
   test "a failed account insert is logged without stopping the credential owner" do

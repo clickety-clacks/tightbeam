@@ -569,6 +569,7 @@ defmodule Tightbeam.Credentials do
        status_reads: %{},
        last_status: %{},
        provider_accounts_db: Keyword.get(opts, :provider_accounts_db),
+       provider_accounts_registration: Keyword.get(opts, :provider_accounts_registration),
        shared_backfills: %{}
      }, {:continue, :backfill_shared_accounts}}
   end
@@ -1327,7 +1328,7 @@ defmodule Tightbeam.Credentials do
       owner = self()
 
       {:ok, pid} =
-        Task.start(fn ->
+        Task.start_link(fn ->
           try do
             backfill_shared_account(state.provider_accounts_db, state, provider)
           rescue
@@ -1363,7 +1364,8 @@ defmodule Tightbeam.Credentials do
           decode_kind(metadata["kind"]),
           login_state,
           reason,
-          metadata["onboarded_at_ms"]
+          metadata["onboarded_at_ms"],
+          state.provider_accounts_registration
         )
       end
       |> case do

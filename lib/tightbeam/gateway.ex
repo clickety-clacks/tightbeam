@@ -457,6 +457,8 @@ defmodule Tightbeam.Gateway do
       [
         name: Tightbeam.Credentials.server(machine),
         provider_accounts_db: db,
+        provider_accounts_registration:
+          if(machine != Placement.local_host_name(), do: {host.base_dir, host.ssh}),
         base_dir: host.base_dir,
         credentials_directory: Map.get(config, :credentials_directory),
         staging_base_dir: config.base_dir,

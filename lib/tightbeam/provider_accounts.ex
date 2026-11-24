@@ -194,19 +194,35 @@ defmodule Tightbeam.ProviderAccounts do
   end
 
   @doc false
-  def record_existing_shared(db, host, provider, harness, kind, state, reason, signed_in_at) do
+  def record_existing_shared(
+        db,
+        host,
+        provider,
+        harness,
+        kind,
+        state,
+        reason,
+        signed_in_at,
+        registration \\ nil
+      ) do
     account_id = "acct_" <> Id.uuid4()
     now = System.system_time(:millisecond)
+    {base_dir, ssh} = registration || {nil, nil}
 
     DB.transaction(db, fn txn ->
+      # A replaced remote worker can finish a read from the old directory after
+      # registration changes. Check the source and publish the slot atomically.
       Txn.q(
         txn,
         """
         INSERT INTO provider_accounts
           (id, host, provider, harness, label, kind, slot, loginState, loginReason,
            identityReason, enabled, signedInAt, updatedAt, rowVersion)
-        VALUES (?1, ?2, ?3, ?4, 'default', ?5, 'shared', ?6, ?7,
-                'not_checked', 1, ?8, ?9, ?9)
+        SELECT ?1, ?2, ?3, ?4, 'default', ?5, 'shared', ?6, ?7,
+               'not_checked', 1, ?8, ?9, ?9
+        WHERE ?10 IS NULL OR EXISTS (
+          SELECT 1 FROM hosts WHERE name=?2 AND baseDir=?10 AND ssh IS ?11
+        )
         ON CONFLICT (host, harness, slot) DO NOTHING
         """,
         [
@@ -218,7 +234,9 @@ defmodule Tightbeam.ProviderAccounts do
           state,
           reason,
           signed_in_at,
-          now
+          now,
+          base_dir,
+          ssh
         ]
       )
 
