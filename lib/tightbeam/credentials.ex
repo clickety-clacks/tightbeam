@@ -527,6 +527,7 @@ defmodule Tightbeam.Credentials do
     Tightbeam.DB.owed_work()
 
     machine = Keyword.fetch!(opts, :machine)
+    backfill = {:continue, {:backfill_shared_accounts, Keyword.get(opts, :provider_accounts_db)}}
 
     {:ok,
      %{
@@ -568,7 +569,15 @@ defmodule Tightbeam.Credentials do
        pending: %{},
        status_reads: %{},
        last_status: %{}
-     }}
+     }, backfill}
+  end
+
+  @impl true
+  def handle_continue({:backfill_shared_accounts, nil}, state), do: {:noreply, state}
+
+  def handle_continue({:backfill_shared_accounts, db}, state) do
+    Enum.each([:openai, :anthropic], &backfill_shared_account(db, state, &1))
+    {:noreply, state}
   end
 
   @impl true
@@ -1293,6 +1302,46 @@ defmodule Tightbeam.Credentials do
 
       {:error, reason} ->
         {:needs_onboarding, reason}
+    end
+  end
+
+  defp backfill_shared_account(db, state, provider) do
+    harness = harness_id(provider)
+
+    if is_nil(Tightbeam.ProviderAccounts.shared_id(db, harness, state.machine)) and
+         credential_present?(state, provider) do
+      case read_metadata(state, provider) do
+        {:ok, metadata} ->
+          {login_state, reason} = backfill_login_state(metadata)
+
+          {:ok, :ok} =
+            Tightbeam.ProviderAccounts.record_existing_shared(
+              db,
+              state.machine,
+              provider,
+              harness,
+              decode_kind(metadata["kind"]),
+              login_state,
+              reason,
+              metadata["onboarded_at_ms"]
+            )
+
+        {:error, reason} ->
+          state.log_event.(
+            "provider_account_backfill_refused",
+            "#{provider}@#{state.machine}",
+            inspect(reason)
+          )
+      end
+    end
+  end
+
+  defp backfill_login_state(metadata) do
+    cond do
+      metadata["present_but_unverified"] -> {"needs_sign_in", "present_but_unverified"}
+      metadata["subscription_status"] == "unsupported" -> {"needs_sign_in", "unsupported"}
+      metadata["terminal"] == true -> {"needs_sign_in", "revoked"}
+      true -> {"signed_in", nil}
     end
   end
 

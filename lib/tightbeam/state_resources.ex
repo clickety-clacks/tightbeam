@@ -260,6 +260,11 @@ defmodule Tightbeam.StateResources do
   }
 
   @item_field_order %{
+    "provider accounts" =>
+      ~w(id host provider harness label kind slot loginState loginReason identityKey identityReason enabled signedInAt updatedAt rowVersion),
+    "account serving" => ~w(harness host accountId revision reason sinceAt previousAccountId),
+    "account limits" =>
+      ~w(id accountId identityKey scope observedAt resetAt evidenceKind evidenceTurnSeq clearedAt clearCause),
     "work items" =>
       ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority holders started attestCounts verdictCounts effectiveCommitRefs landings rowVersion),
     "assignments" =>
@@ -311,6 +316,25 @@ defmodule Tightbeam.StateResources do
   # The normative R7/R7a value schema. Field order remains owned by
   # @item_field_order; these categories own JSON type and nullability.
   @item_wire_categories %{
+    "provider accounts" => %{
+      strings:
+        ~w(id host provider harness label kind slot loginState loginReason identityKey identityReason),
+      integers: ~w(signedInAt updatedAt rowVersion),
+      booleans: ~w(enabled),
+      nullable: ~w(loginReason identityKey identityReason signedInAt)
+    },
+    "account serving" => %{
+      strings: ~w(harness host accountId reason previousAccountId),
+      integers: ~w(revision sinceAt),
+      booleans: [],
+      nullable: ~w(previousAccountId)
+    },
+    "account limits" => %{
+      strings: ~w(id accountId identityKey scope evidenceKind clearCause),
+      integers: ~w(observedAt resetAt evidenceTurnSeq clearedAt),
+      booleans: [],
+      nullable: ~w(identityKey resetAt evidenceTurnSeq clearedAt clearCause)
+    },
     "work items" => %{
       strings:
         ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
@@ -2138,6 +2162,10 @@ defmodule Tightbeam.StateResources do
   end
 
   def production(row), do: row |> public() |> correlate("eventId", "seq")
+
+  def provider_account(row), do: row |> public() |> closed_projection("provider accounts")
+  def account_serving(row), do: row |> public() |> closed_projection("account serving")
+  def account_limit(row), do: row |> public() |> closed_projection("account limits")
 
   def turn(row) do
     case value(row, :prompt) do

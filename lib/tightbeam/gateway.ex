@@ -456,6 +456,7 @@ defmodule Tightbeam.Gateway do
     opts =
       [
         name: Tightbeam.Credentials.server(machine),
+        provider_accounts_db: db,
         base_dir: host.base_dir,
         credentials_directory: Map.get(config, :credentials_directory),
         staging_base_dir: config.base_dir,
