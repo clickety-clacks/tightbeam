@@ -45,6 +45,15 @@ defmodule Tightbeam.AccountWriter do
     Txn.q(txn, "SELECT 1 FROM account_writer_leases WHERE adapterKey = ?1", [adapter_key]) != []
   end
 
+  def settle_from_receipt(db, adapter_key, lease, receipt) do
+    with ["tightbeam-account-writer-v1", ^lease, status] <- String.split(receipt, "\t"),
+         {code, "\n"} when code >= 0 and code <= 255 <- Integer.parse(status) do
+      settle(db, adapter_key, lease)
+    else
+      _ -> {:error, :unconfirmed_writer_settlement}
+    end
+  end
+
   # Call only after the owning host proves that the writer is finished or never started.
   def settle(db, adapter_key, lease) do
     DB.transaction(db, fn txn ->

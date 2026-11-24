@@ -134,7 +134,18 @@ defmodule Tightbeam.HarnessProcessTest do
     end
 
     assert_raise RuntimeError, ~r/credential writer active/, prepare
-    assert {:ok, true} = Tightbeam.AccountWriter.settle(db, key_name, lease)
+
+    assert {:error, :unconfirmed_writer_settlement} =
+             Tightbeam.AccountWriter.settle_from_receipt(db, key_name, lease, "partial receipt")
+
+    assert {:ok, true} =
+             Tightbeam.AccountWriter.settle_from_receipt(
+               db,
+               key_name,
+               lease,
+               "tightbeam-account-writer-v1\t#{lease}\t0\n"
+             )
+
     opts = prepare.()
     assert {:ok, {:error, :adapter_unresolved}} = Tightbeam.AccountWriter.reserve(db, key_name)
 

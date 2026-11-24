@@ -95,6 +95,8 @@ fn writer_lock_probe() {
         "writer-lease".into(),
         "--writer-lock".into(),
         root.join("lease.lock").to_string_lossy().into_owned(),
+        "--writer-receipt".into(),
+        root.join("writer.done").to_string_lossy().into_owned(),
         "--".into(),
         "/bin/sh".into(),
         "-c".into(),
@@ -146,4 +148,9 @@ fn losing_the_launcher_keeps_the_owning_host_writer_excluded() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(
+        fs::read_to_string(root.join("writer.done")).unwrap(),
+        "tightbeam-account-writer-v1\twriter-lease\t0\n"
+    );
+    fs::remove_dir_all(root).unwrap();
 }

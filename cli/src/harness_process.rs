@@ -46,9 +46,17 @@ fn session_exec_with_mode(
             .to_string()
     })?;
 
-    let writer_lock = match separator {
-        2 => None,
-        4 if fixed_path.is_none() && args[2] == "--writer-lock" => Some(Path::new(&args[3])),
+    let (writer_lock, writer_receipt) = match separator {
+        2 => (None, None),
+        4 if fixed_path.is_none() && args[2] == "--writer-lock" => {
+            (Some(Path::new(&args[3])), None)
+        }
+        6 if fixed_path.is_none()
+            && args[2] == "--writer-lock"
+            && args[4] == "--writer-receipt" =>
+        {
+            (Some(Path::new(&args[3])), Some(Path::new(&args[5])))
+        }
         _ => return Err("invalid harness-exec options".into()),
     };
 
@@ -124,9 +132,37 @@ fn session_exec_with_mode(
     drop(child_report);
 
     let mut command = child_command(&args[separator + 1], &args[separator + 2..], fixed_path);
+    if let Some(receipt) = writer_receipt {
+        use std::os::unix::process::ExitStatusExt;
+        let status = command
+            .status()
+            .map_err(|error| format!("account writer could not be launched: {error}"))?;
+        let code = status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+        publish_writer_receipt(receipt, &args[1], code)?;
+        return Ok(code);
+    }
+
     let error = command.exec();
 
     Err(format!("harness command could not be executed: {error}"))
+}
+
+fn publish_writer_receipt(path: &Path, lease: &str, code: i32) -> Result<(), String> {
+    let temporary = path.with_extension("pending");
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        writeln!(file, "tightbeam-account-writer-v1\t{lease}\t{code}")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+
+    result.map_err(|error| format!("account writer receipt could not be published: {error}"))
 }
 
 fn acquire_writer_lock(path: &Path) -> Result<fs::File, String> {
