@@ -2,7 +2,7 @@ defmodule Tightbeam.Harness.RecoveryProbe do
   @moduledoc false
 
   alias Tightbeam.{DB, ErrorDiagnostic, Homes, Placement}
-  alias Tightbeam.Harness.Support
+  alias Tightbeam.Harness.{Claude, ClaudeCli, Support}
 
   @supported_harnesses ~w(claude codex)
   @error_limit 512
@@ -125,10 +125,10 @@ defmodule Tightbeam.Harness.RecoveryProbe do
       pin_name = if harness == "codex", do: "CODEX_PATH", else: "CLAUDE_CODE_EXECUTABLE"
 
       pin =
-        case Enum.find(Placement.env_overlays(db, host, harness), &(&1.name == pin_name)) do
-          %{value: value} when is_binary(value) and value != "" -> value
+        Enum.find_value(Placement.env_overlays(db, host, harness), fn
+          %{name: ^pin_name, value: value} -> value
           _ -> nil
-        end
+        end)
 
       {:ok, host_config, path, home, pin, harness, credential_kind}
     else
@@ -143,18 +143,12 @@ defmodule Tightbeam.Harness.RecoveryProbe do
       {:inconclusive, "recovery check timed out during binary selection"}
     else
       root = Path.join(host_config.base_dir, "adapters")
-      script = binary_selection_program(harness)
-      pin = pin || ""
-      vendor = if harness == "codex", do: "codex", else: "claude"
-
-      command =
-        "env -i PATH=#{shell_path_assignment(path)} HOME=#{Support.shell_quote(home)} " <>
-          "node -e #{Support.shell_quote(script)} #{Support.shell_quote(root)} " <>
-          "#{Support.shell_quote(vendor)} #{Support.shell_quote(pin)}"
+      env = "env -i PATH=#{shell_path_assignment(path)} HOME=#{Support.shell_quote(home)} "
+      command = env <> selection_command(harness, root, pin, host_config)
 
       case port_command(host_config, command, timeout_ms, @selection_output_limit) do
-        {:exit, 0, output} -> decode_selected_binary(output)
-        {:ok, output} -> decode_selected_binary(output)
+        {:exit, 0, output} -> decode_selected_binary(harness, output)
+        {:ok, output} -> decode_selected_binary(harness, output)
         {:exit, _status, _output} -> {:uncheckable, "the selected harness CLI is unavailable"}
         {:timeout, output} -> {:inconclusive, diagnostic(output)}
         {:transport_error, output} -> {:inconclusive, diagnostic(output)}
@@ -163,7 +157,33 @@ defmodule Tightbeam.Harness.RecoveryProbe do
     end
   end
 
-  defp decode_selected_binary(output) do
+  defp selection_command("claude", root, pin, host_config) do
+    override =
+      if is_nil(pin) do
+        ~S(${CLAUDE_CODE_EXECUTABLE+CLAUDE_CODE_EXECUTABLE="$CLAUDE_CODE_EXECUTABLE"} )
+      else
+        "CLAUDE_CODE_EXECUTABLE=#{Support.shell_quote(pin)} "
+      end
+
+    cwd = if host_config.ssh, do: "", else: Application.get_env(:tightbeam, :cwd, File.cwd!())
+    args = ClaudeCli.selection_args(Claude.installed_adapter(root), cwd)
+    override <> Enum.map_join(args, " ", &Support.shell_quote/1)
+  end
+
+  defp selection_command("codex", root, pin, _host_config) do
+    script = binary_selection_program("codex")
+
+    "node -e #{Support.shell_quote(script)} #{Support.shell_quote(root)} codex #{Support.shell_quote(pin || "")}"
+  end
+
+  defp decode_selected_binary("claude", output) do
+    case ClaudeCli.selection_result(output, "the recovery route host") do
+      {:ok, %{"command" => command}} -> {:ok, command}
+      {:error, %{message: message}} -> {:uncheckable, message}
+    end
+  end
+
+  defp decode_selected_binary("codex", output) do
     case JSON.decode(String.trim(output)) do
       {:ok, %{"command" => command, "source" => source}}
       when is_list(command) and source in ["pin", "path", "bundle"] ->
@@ -179,45 +199,20 @@ defmodule Tightbeam.Harness.RecoveryProbe do
   end
 
   @doc false
-  def binary_selection_program(harness) when harness in ["claude", "codex"] do
-    bundle =
-      if harness == "codex" do
-        """
-        function bundle() {
-          const adapter = createRequire(path.join(root, 'package.json'));
-          const entry = adapter.resolve('@agentclientprotocol/codex-acp');
-          return createRequire(entry).resolve('@openai/codex/bin/codex.js');
-        }
-        """
-      else
-        """
-        function bundle() {
-          const adapter = createRequire(path.join(root, 'package.json'));
-          const entry = adapter.resolve('@agentclientprotocol/claude-agent-acp');
-          const sdk = createRequire(entry).resolve('@anthropic-ai/claude-agent-sdk');
-          const resolve = createRequire(sdk);
-          const extension = process.platform === 'win32' ? '.exe' : '';
-          const isMusl = !process.report?.getReport()?.header?.glibcVersionRuntime;
-          const names = process.platform === 'linux'
-            ? (isMusl
-              ? [`@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl`, `@anthropic-ai/claude-agent-sdk-linux-${process.arch}`]
-              : [`@anthropic-ai/claude-agent-sdk-linux-${process.arch}`, `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl`])
-            : [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}`];
-          for (const name of names) {
-            try { return resolve.resolve(`${name}/claude${extension}`); } catch {}
-          }
-          throw new Error('bundled CLI package is missing');
-        }
-        """
-      end
+  def binary_selection_program("claude"), do: ClaudeCli.selection_program()
 
+  def binary_selection_program("codex") do
     """
     const fs = require('node:fs');
     const path = require('node:path');
     const {createRequire} = require('node:module');
     const {spawnSync} = require('node:child_process');
     const [root, vendor, pin] = process.argv.slice(1);
-    #{bundle}
+    function bundle() {
+      const adapter = createRequire(path.join(root, 'package.json'));
+      const entry = adapter.resolve('@agentclientprotocol/codex-acp');
+      return createRequire(entry).resolve('@openai/codex/bin/codex.js');
+    }
     function lookup(name) {
       if (name.includes(path.sep)) return path.resolve(name);
       for (const directory of (process.env.PATH || '').split(path.delimiter)) {

@@ -9,7 +9,7 @@ defmodule Tightbeam.Harness.ClaudeCliReadinessTest do
     modules = Path.join(root, "node_modules")
     package = Path.join(modules, "@agentclientprotocol/claude-agent-acp")
     entry = Path.join(package, "dist/adapter.js")
-    adapter = Path.join(modules, ".bin/claude-agent-acp")
+    adapter = Claude.installed_adapter(root)
     manifest = Path.join(package, "package.json")
     File.mkdir_p!(Path.dirname(adapter))
     File.mkdir_p!(Path.dirname(entry))
@@ -25,19 +25,27 @@ defmodule Tightbeam.Harness.ClaudeCliReadinessTest do
     """)
 
     path_cli = Path.join(root, "bin/claude")
-    write_cli(path_cli, "2.1.322")
-    path = Path.dirname(path_cli) <> ":" <> System.fetch_env!("PATH")
-    %{root: root, adapter: adapter, manifest: manifest, bundled: bundled, path: path}
+    node_dir = Path.dirname(System.find_executable("node"))
+    path = Path.dirname(path_cli) <> ":" <> node_dir <> ":/usr/bin:/bin"
+
+    %{
+      root: root,
+      adapter: adapter,
+      manifest: manifest,
+      bundled: bundled,
+      path: path,
+      path_cli: path_cli
+    }
   end
 
-  test "a stale satellite refuses before launch even with a newer CLI on PATH", ctx do
+  test "a stale satellite reports the bundled CLI version and the required ACP pin", ctx do
     write_package(ctx.manifest, "0.59.0")
     write_cli(ctx.bundled, "2.1.207")
 
     opts = satellite_opts(ctx)
 
     assert {:error, %{code: "claude_cli_unready", message: message}} =
-             ClaudeCli.check_launch(opts, "satellite", &satellite/1)
+             ClaudeCli.prepare_launch(opts, "satellite", &satellite/1)
 
     assert message =~ "satellite"
     assert message =~ "bundled Claude Code executable reports 2.1.207"
@@ -47,30 +55,49 @@ defmodule Tightbeam.Harness.ClaudeCliReadinessTest do
 
   test "a stale ACP package needs reconciliation before a cold launch", ctx do
     write_package(ctx.manifest, "0.59.0")
-    write_cli(ctx.bundled, "2.1.322")
+    write_cli(ctx.bundled, "2.1.207")
+    write_cli(ctx.path_cli, "2.1.322")
 
     assert {:error, %{message: message}} =
-             ClaudeCli.check_launch(satellite_opts(ctx), "satellite", &satellite/1)
+             ClaudeCli.prepare_launch(satellite_opts(ctx), "satellite", &satellite/1)
 
     assert message =~ "ACP package must be reconciled to #{Claude.adapter_version()}"
   end
 
-  test "a fresh install runs the bundled CLI at the supported floor", ctx do
+  test "a supported bundle is used when PATH has no supported CLI", ctx do
     write_cli(ctx.bundled, "2.1.280")
-    assert :ok = ClaudeCli.check_launch(local_opts(ctx), "local", &run/1)
-    assert :ok = ClaudeCli.check_launch(satellite_opts(ctx), "satellite", &satellite/1)
+    write_cli(ctx.path_cli, "2.1.280-dev")
+    assert {:ok, opts} = ClaudeCli.prepare_launch(local_opts(ctx), "local", &run/1)
+    assert launch_pin(opts) == ctx.bundled
+
+    assert {:ok, opts} = ClaudeCli.prepare_launch(satellite_opts(ctx), "satellite", &satellite/1)
+    assert launch_pin(opts) == ctx.bundled
   end
 
-  test "a valid override takes precedence over an old bundle", ctx do
+  test "a supported PATH CLI is passed to ACP for local and satellite launches", ctx do
+    write_cli(ctx.path_cli, "2.1.322")
     write_cli(ctx.bundled, "2.1.207")
+
+    assert {:ok, opts} = ClaudeCli.prepare_launch(local_opts(ctx), "local", &run/1)
+    assert launch_pin(opts) == ctx.path_cli
+
+    assert {:ok, opts} = ClaudeCli.prepare_launch(satellite_opts(ctx), "satellite", &satellite/1)
+    assert launch_pin(opts) == ctx.path_cli
+  end
+
+  test "a valid override takes precedence over a supported PATH CLI", ctx do
+    write_cli(ctx.bundled, "2.1.207")
+    write_cli(ctx.path_cli, "2.1.322")
     override = Path.join(ctx.root, "custom cli")
     write_cli(override, "2.1.322")
 
     opts = local_opts(ctx, [{"CLAUDE_CODE_EXECUTABLE", override}])
-    assert :ok = ClaudeCli.check_launch(opts, "local", &run/1)
+    assert {:ok, opts} = ClaudeCli.prepare_launch(opts, "local", &run/1)
+    assert launch_pin(opts) == override
 
     opts = satellite_opts(ctx, ["CLAUDE_CODE_EXECUTABLE=" <> Support.shell_quote(override)])
-    assert :ok = ClaudeCli.check_launch(opts, "satellite", &satellite/1)
+    assert {:ok, opts} = ClaudeCli.prepare_launch(opts, "satellite", &satellite/1)
+    assert launch_pin(opts) == override
   end
 
   test "an old explicit override is refused even when the bundle is supported", ctx do
@@ -79,7 +106,7 @@ defmodule Tightbeam.Harness.ClaudeCliReadinessTest do
     write_cli(override, "2.1.207")
 
     opts = local_opts(ctx, [{"CLAUDE_CODE_EXECUTABLE", override}])
-    assert {:error, %{message: message}} = ClaudeCli.check_launch(opts, "local", &run/1)
+    assert {:error, %{message: message}} = ClaudeCli.prepare_launch(opts, "local", &run/1)
     assert message =~ "CLAUDE_CODE_EXECUTABLE override reports 2.1.207"
   end
 
@@ -88,7 +115,24 @@ defmodule Tightbeam.Harness.ClaudeCliReadinessTest do
     File.write!(override, "console.log('2.1.322 (Claude Code)');\n")
 
     opts = local_opts(ctx, [{"CLAUDE_CODE_EXECUTABLE", override}])
-    assert :ok = ClaudeCli.check_launch(opts, "local", &run/1)
+    assert {:ok, opts} = ClaudeCli.prepare_launch(opts, "local", &run/1)
+    assert launch_pin(opts) == override
+  end
+
+  defp launch_pin(opts) do
+    if opts[:process_ssh], do: remote_launch_pin(opts), else: local_launch_pin(opts)
+  end
+
+  defp local_launch_pin(opts) do
+    {_, path} = List.keyfind(opts[:env], "CLAUDE_CODE_EXECUTABLE", 0)
+    path
+  end
+
+  defp remote_launch_pin(opts) do
+    assert List.last(opts[:cmd]) =~ "/.bin/claude-agent-acp"
+    "CLAUDE_CODE_EXECUTABLE=" <> quoted = Enum.at(opts[:cmd], -2)
+    {path, 0} = run(["/bin/sh", "-c", "printf %s " <> quoted])
+    path
   end
 
   defp local_opts(ctx, extra_env \\ []) do

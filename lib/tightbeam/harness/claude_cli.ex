@@ -12,7 +12,37 @@ defmodule Tightbeam.Harness.ClaudeCli do
   const path = require('node:path');
   const { spawnSync } = require('node:child_process');
   const { pathToFileURL } = require('node:url');
-  const [adapter, cwd, expected] = process.argv.slice(1);
+  const [adapter, cwd] = process.argv.slice(1);
+
+  function lookup(name) {
+    for (const directory of (process.env.PATH || '').split(path.delimiter)) {
+      const candidate = path.resolve(directory, name);
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {}
+    }
+  }
+
+  function checkCli(file, source) {
+    if (!file) return { problem: source };
+    // The SDK invokes script overrides through Node and native CLIs directly.
+    const script = /\.(?:js|mjs|tsx|ts|jsx)$/.test(file);
+    const executable = script || file.includes(path.sep) ? path.resolve(file) : lookup(file);
+    if (!executable) return { problem: source };
+
+    const command = script ? [process.execPath, executable] : [executable];
+    const result = spawnSync(command[0], [...command.slice(1), '--version'],
+      { encoding: 'utf8', timeout: 3000 });
+    const version = /^((\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)(?:\s|$)/
+      .exec((result.stdout || '').trim());
+    if (result.status !== 0 || !version) return { problem: source };
+
+    const [major, minor, patch] = floor.split('.').map(Number);
+    const order = Number(version[2]) - major || Number(version[3]) - minor || Number(version[4]) - patch;
+    return { source, version: version[1], executable, command,
+      supported: order > 0 || (order === 0 && !version[5]) };
+  }
 
   async function inspectLaunch() {
     if (cwd) process.chdir(cwd);
@@ -31,30 +61,21 @@ defmodule Tightbeam.Harness.ClaudeCli do
     }
 
     const override = process.env.CLAUDE_CODE_EXECUTABLE;
-    const source = override === undefined ? 'bundle' : 'override';
-    let cli = override;
-    if (source === 'bundle') {
-      // Both the pinned and the known stale ACP package export the very
-      // resolver used by their sessions. Import it without starting ACP.
-      try {
-        const agent = pathToFileURL(path.join(dir, 'dist/acp-agent.js'));
-        cli = await (await import(agent.href)).claudeCliPath();
-      } catch {
-        return { problem: source };
-      }
-    }
+    const pinned = pkg.version === expected;
+    if (override !== undefined) return { ...checkCli(override, 'override'), pinned };
 
-    if (!cli) return { problem: source };
-    // The SDK invokes script overrides through Node and native CLIs directly.
-    const script = /\.(?:js|mjs|tsx|ts|jsx)$/.test(cli);
-    const command = script ? process.execPath : cli;
-    const args = script ? [cli, '--version'] : ['--version'];
-    const result = spawnSync(command, args, { encoding: 'utf8', timeout: 3000 });
-    const match = /^([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)(?:\s|$)/
-      .exec((result.stdout || '').trim());
-    return result.status === 0 && match
-      ? { source, version: match[1], pinned: pkg.version === expected }
-      : { problem: source };
+    const cliOnPath = checkCli(lookup('claude'), 'path');
+    if (cliOnPath.supported) return { ...cliOnPath, pinned };
+
+    // Both the pinned and the known stale ACP package export the resolver
+    // used by their sessions. Import it without starting ACP.
+    try {
+      const agent = pathToFileURL(path.join(dir, 'dist/acp-agent.js'));
+      const bundle = await (await import(agent.href)).claudeCliPath();
+      return { ...checkCli(bundle, 'bundle'), pinned };
+    } catch {
+      return { problem: 'bundle' };
+    }
   }
 
   inspectLaunch()
@@ -62,14 +83,44 @@ defmodule Tightbeam.Harness.ClaudeCli do
     .then(result => process.stdout.write(JSON.stringify(result)));
   """
 
-  @doc "Check the Claude executable on the launch host before the adapter is started."
-  def check_launch(opts, host, run) do
+  @doc "Check and pin the executable on the launch host before the adapter is started."
+  def prepare_launch(opts, host, run) do
     case Support.bounded_run(run, command(opts), @timeout_ms) do
       {:ok, {output, 0}} when is_binary(output) ->
-        check_result(JSON.decode(String.trim(output)), host)
+        with {:ok, selection} <- selection_result(output, host) do
+          {:ok, put_executable(opts, selection["executable"])}
+        end
 
       _ ->
         refusal(host, "could not check the Claude Code executable on the launch host")
+    end
+  end
+
+  @doc false
+  def selection_args(adapter, cwd),
+    do: ["node", "-e", selection_program(), adapter, cwd]
+
+  @doc false
+  def selection_program do
+    "const expected = #{JSON.encode!(Claude.adapter_version())};\n" <>
+      "const floor = #{JSON.encode!(@floor)};\n" <> @probe
+  end
+
+  @doc false
+  def selection_result(output, host), do: check_result(JSON.decode(String.trim(output)), host)
+
+  defp put_executable(opts, executable) do
+    if Keyword.get(opts, :process_ssh) do
+      {adapter, command} = List.pop_at(Keyword.fetch!(opts, :cmd), -1)
+      pin = "CLAUDE_CODE_EXECUTABLE=" <> Support.shell_quote(executable)
+      Keyword.put(opts, :cmd, command ++ [pin, adapter])
+    else
+      env =
+        Enum.reject(Keyword.get(opts, :env, []), fn {name, _} ->
+          name == "CLAUDE_CODE_EXECUTABLE"
+        end)
+
+      Keyword.put(opts, :env, env ++ [{"CLAUDE_CODE_EXECUTABLE", executable}])
     end
   end
 
@@ -87,7 +138,7 @@ defmodule Tightbeam.Harness.ClaudeCli do
         |> Enum.drop(-1)
         |> Enum.filter(&String.starts_with?(&1, ["PATH=", "CLAUDE_CODE_EXECUTABLE="]))
 
-      probe = Enum.map(probe_args(adapter, ""), &Support.shell_quote/1)
+      probe = Enum.map(selection_args(adapter, ""), &Support.shell_quote/1)
       ssh ++ ["exec", "env" | env ++ probe]
     else
       env =
@@ -96,36 +147,23 @@ defmodule Tightbeam.Harness.ClaudeCli do
         |> Enum.filter(fn {name, _} -> name in ["PATH", "CLAUDE_CODE_EXECUTABLE"] end)
         |> Enum.map(fn {name, value} -> name <> "=" <> value end)
 
-      ["/usr/bin/env" | env ++ probe_args(adapter, Keyword.fetch!(opts, :cwd))]
+      ["/usr/bin/env" | env ++ selection_args(adapter, Keyword.fetch!(opts, :cwd))]
     end
   end
 
-  defp probe_args(adapter, cwd),
-    do: ["node", "-e", @probe, adapter, cwd, Claude.adapter_version()]
-
-  defp check_result({:ok, %{"source" => source, "version" => version, "pinned" => pinned}}, host)
-       when source in ["override", "bundle"] and is_binary(version) do
-    case Version.parse(version) do
-      {:ok, parsed} ->
-        cond do
-          Version.compare(parsed, @floor) == :lt ->
-            reason =
-              "#{label(source)} reports #{version}. Claude Code #{@floor} or newer is required"
-
-            refusal(host, if(pinned, do: reason, else: reason <> ". " <> package_remedy()))
-
-          pinned == true ->
-            :ok
-
-          true ->
-            refusal(host, package_remedy())
-        end
-
-      :error ->
-        refusal(host, "could not read the version of #{label(source)}")
-    end
+  defp check_result(
+         {:ok, %{"source" => source, "version" => version, "supported" => false} = result},
+         host
+       )
+       when source in ["override", "bundle"] do
+    reason = "#{label(source)} reports #{version}. Claude Code #{@floor} or newer is required"
+    refusal(host, if(result["pinned"], do: reason, else: reason <> ". " <> package_remedy()))
   end
 
+  defp check_result({:ok, %{"supported" => true, "pinned" => true} = selection}, _host),
+    do: {:ok, selection}
+
+  defp check_result({:ok, %{"pinned" => false}}, host), do: refusal(host, package_remedy())
   defp check_result({:ok, %{"problem" => "package"}}, host), do: refusal(host, package_remedy())
 
   defp check_result({:ok, %{"problem" => source}}, host) when source in ["override", "bundle"],
