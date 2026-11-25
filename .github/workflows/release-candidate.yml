@@ -103,10 +103,13 @@ jobs:
           - os: macos-latest
             platform: darwin-aarch64
     name: test ${{ matrix.platform }}
-    # Candidate jobs run on the self-hosted pools, which carry only release
-    # work, so a candidate never waits behind pull request suites on the
-    # shared hosted macOS runners.
-    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || fromJSON('["self-hosted", "tb-macos"]') }}
+    # Linux candidate tests run on the self-hosted pool, which carries only
+    # release work. The macOS candidate tests run on a hosted arm64 runner, the
+    # same macos-latest image pull request CI uses for its macOS suite: the
+    # shared self-hosted Macs can be loaded heavily enough by other work that
+    # the suite times out. The package and proof jobs below still build and
+    # check the shipped archives on the self-hosted pools.
+    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
