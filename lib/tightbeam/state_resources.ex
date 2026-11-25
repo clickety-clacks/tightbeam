@@ -2888,6 +2888,21 @@ defmodule Tightbeam.StateResources do
     validate_closed_wire_object!(value, %{"repo" => :string, "commit" => :string}, label)
   end
 
+  defp validate_wire_value!(value, :landing, label) do
+    validate_closed_wire_object!(
+      value,
+      %{
+        "repository" => :string,
+        "branch" => :string,
+        "commit" => :string,
+        "headCommit" => :string,
+        "pullRequest" => :positive_integer,
+        "observedAt" => :integer
+      },
+      label
+    )
+  end
+
   defp validate_wire_value!(value, :submitter, label) do
     validate_closed_wire_object!(
       value,
