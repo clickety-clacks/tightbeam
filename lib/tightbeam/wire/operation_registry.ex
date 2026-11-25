@@ -72,6 +72,7 @@ defmodule Tightbeam.Wire.OperationRegistry do
     {{"GET", "/api/work"}, "http.api_work.list"},
     {{"GET", "/api/work/:id"}, "http.api_work.get"},
     {{"GET", "/api/work-items"}, "http.api_work_items.list"},
+    {{"GET", "/api/work-item-indicators"}, "http.api_work_item_indicators.get"},
     {{"GET", "/api/work-items/:id"}, "http.api_work_items.get"},
     {{"POST", "/api/session-control"}, "http.api_session_control"},
     {{"POST", "/upload"}, "http.upload"},

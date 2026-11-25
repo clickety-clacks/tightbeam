@@ -742,6 +742,65 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  @doc "Basic state of the named work items a REST principal can read; no counts."
+  def query_work_item_states(txn, ids, principal) do
+    {kind, id, is_admin} = detail_principal(%{rest_principal: principal})
+
+    observed_query(
+      txn,
+      principal,
+      """
+      SELECT wi.id, wi.title, wi.state, COALESCE(v.rowVersion, wi.createdAt),
+        EXISTS(SELECT 1 FROM assignments a WHERE a.workItemId = wi.id),
+        (SELECT json_group_array(holderKey) FROM (
+          SELECT DISTINCT a.holderKey FROM assignments a
+          WHERE a.workItemId = wi.id AND a.state = 'open' ORDER BY a.holderKey
+        ))
+      FROM json_each(?1) AS named
+      CROSS JOIN work_items AS wi ON wi.id = named.value
+      LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
+      WHERE ?2 = 1 OR (?3 = 'user' AND wi.ownerUserId = ?4) OR ?3 = 'session'
+      """,
+      [JSON.encode!(ids), bool_int(is_admin), kind, id]
+    )
+    |> Map.new(fn [id, title, state, version, started, holders] ->
+      holders = JSON.decode!(holders)
+
+      {id,
+       %{
+         id: id,
+         title: title,
+         state: state,
+         rowVersion: version,
+         started: started == 1,
+         held: holders != [],
+         holders: holders
+       }}
+    end)
+  end
+
+  @doc "The named assignments a REST principal can read, with the item each belongs to."
+  def query_assignment_items(_txn, [], _principal), do: %{}
+
+  def query_assignment_items(txn, ids, principal) do
+    {kind, id, is_admin} = detail_principal(%{rest_principal: principal})
+
+    {visibility, params} =
+      assignment_collection_scope(%{kind: kind, id: id, is_admin: is_admin})
+
+    observed_query(
+      txn,
+      principal,
+      "SELECT a.id, a.workItemId, a.state FROM json_each(?) AS named " <>
+        "CROSS JOIN assignments a ON a.id = named.value " <>
+        "LEFT JOIN work_items wi ON wi.id = a.workItemId WHERE " <> visibility,
+      [JSON.encode!(ids) | params]
+    )
+    |> Map.new(fn [id, work_item_id, state] ->
+      {id, %{id: id, workItemId: work_item_id, state: state}}
+    end)
+  end
+
   @doc "Return one bounded page of assignments visible to a REST principal."
   def query_assignments_page(db, principal, boundary, limit) do
     trace_core_detail(principal, {:au4_visibility, "assignments"})

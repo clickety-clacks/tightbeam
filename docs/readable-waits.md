@@ -55,6 +55,9 @@ their recorded originating turn. No target is inferred from a prompt. Decision
 addressees and raisers follow current custody. Decision and cannot-proceed edges without a wake reason expose null, rather than copying
 a potentially long question or note into the short reason field.
 
+For a page of items, [work-item indicators](work-item-indicators.md) returns the
+same waiting facts for up to 50 items and 50 cards in one read.
+
 These are direct links, not a recursively expanded graph. Clients follow exact
 record IDs and track visited `(kind, id)` pairs. The server returns cycle edges;
 a client stops traversal at a repeated node, terminal record, exhausted page,

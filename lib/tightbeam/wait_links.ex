@@ -112,6 +112,8 @@ defmodule Tightbeam.WaitLinks do
 
   def work_item_reminder_reference?(_), do: false
 
+  # The unary plus drops wakeId's text affinity, which the expression index lacks;
+  # with it SQLite walks the whole index for every wake.
   defp declared_wait_sql do
     """
     w.wakeId NOT GLOB 'wr_*'
@@ -139,13 +141,26 @@ defmodule Tightbeam.WaitLinks do
       declared_wait_sql()
   end
 
+  # A trigger that defers the wake; an undelivered immediate message is not a wait.
+  defp waiting_wake_sql,
+    do:
+      "(w.waitMode IS NOT NULL OR w.conditionKind IS NOT NULL OR w.consumer='cron' OR w.dueAt>w.createdAt)"
+
+  @reserved_facts "('assignment-landed','assignment-reviewed','assignment-blocked')"
+
   @doc "Small work-item indicators; reads only records explicitly linked to each item."
   def summaries(db, ids) do
-    if enabled?(), do: summaries_enabled(db, ids), else: Map.new(ids, &{&1, %{}})
+    if enabled?(),
+      do: Map.new(linked(db, ids), fn {id, row} -> {id, Map.take(row, [:waiting, :running])} end),
+      else: Map.new(ids, &{&1, %{}})
   end
 
-  defp summaries_enabled(db, ids) do
-    sql = """
+  # Every record that makes an item waiting or running, for the items named in ?1
+  # (a JSON id array). Each named item or card drives its own indexed seeks:
+  # CROSS JOIN fixes that order, because INDEXED BY alone still lets SQLite walk a
+  # whole index and there are no statistics to tell it otherwise.
+  defp linked_sql do
+    """
     WITH items AS MATERIALIZED (SELECT value id FROM json_each(?1)),
     item_assignments AS MATERIALIZED (
       SELECT a.id,a.workItemId FROM items i CROSS JOIN assignments a ON a.workItemId=i.id
@@ -172,63 +187,139 @@ defmodule Tightbeam.WaitLinks do
         CROSS JOIN assignment_cannot_proceed cp INDEXED BY cannot_proceed_wait_assignment ON cp.assignmentId=a.id
         WHERE cp.state='standing'
     ),
+    item_asks AS MATERIALIZED (
+      SELECT d.itemId,'decision' type,d.id,d.id decisionId,d.assignmentId,d.raisedAt at,
+        COALESCE(d.currentExpecterSessionKey,d.expecterSessionKey) session,COALESCE(d.expecterUserId,d.ownerUserId) user
+      FROM item_decisions d WHERE NOT EXISTS(
+        SELECT 1 FROM item_blocks cp WHERE cp.decisionRequestId=d.id)
+      UNION ALL
+      SELECT cp.itemId,'cannot-proceed',cp.id,cp.decisionRequestId,cp.assignmentId,cp.createdAt,
+        CASE WHEN cp.disposerRef LIKE 'session:%' THEN substr(cp.disposerRef,9) END,
+        CASE WHEN cp.disposerRef LIKE 'user:%' THEN substr(cp.disposerRef,6) END
+      FROM item_blocks cp WHERE cp.releaseFactKind IS NULL
+    ),
     item_running AS MATERIALIZED (
       SELECT i.id itemId FROM items i CROSS JOIN turns t INDEXED BY turns_wait_item ON t.jobRef=i.id WHERE t.status='running'
       UNION
       SELECT a.workItemId itemId FROM item_assignments a CROSS JOIN turns t INDEXED BY turns_wait_assignment ON t.assignmentId=a.id WHERE t.status='running'
     )
-    SELECT i.id,
-      EXISTS(SELECT 1 FROM item_wakes w WHERE w.itemId=i.id AND
-        (w.resolverKind='assignment' OR w.waitMode='after-turn' OR w.waitFactKind IN ('assignment-landed','assignment-reviewed','assignment-blocked'))) OR EXISTS(SELECT 1 FROM item_blocks cp WHERE cp.itemId=i.id AND cp.releaseFactKind IN ('assignment-landed','assignment-reviewed','assignment-blocked')),
-      EXISTS(SELECT 1 FROM item_wakes w WHERE w.itemId=i.id AND
-        (w.consumer='cron' OR (w.waitMode IS NULL AND w.conditionKind IS NULL AND w.dueAt>w.createdAt))),
-      EXISTS(SELECT 1 FROM item_wakes w WHERE w.itemId=i.id AND w.waitFactKind IS NOT NULL AND w.waitFactKind NOT IN ('assignment-landed','assignment-reviewed','assignment-blocked')) OR EXISTS(SELECT 1 FROM item_blocks cp WHERE cp.itemId=i.id AND cp.releaseFactKind IS NOT NULL AND cp.releaseFactKind NOT IN ('assignment-landed','assignment-reviewed','assignment-blocked')),
-      COALESCE((SELECT json_group_array(json_object('kind',r.kind,'session',r.session,'user',r.user)) FROM (
-        SELECT d.kind,COALESCE(d.currentExpecterSessionKey,d.expecterSessionKey) session,COALESCE(d.expecterUserId,d.ownerUserId) user
-        FROM item_decisions d WHERE d.itemId=i.id AND NOT EXISTS(
-          SELECT 1 FROM item_blocks cp WHERE cp.decisionRequestId=d.id)
-        UNION ALL
-        SELECT 'cannot-proceed',
-          CASE WHEN cp.disposerRef LIKE 'session:%' THEN substr(cp.disposerRef,9) END,
-          CASE WHEN cp.disposerRef LIKE 'user:%' THEN substr(cp.disposerRef,6) END
-        FROM item_blocks cp WHERE cp.itemId=i.id AND cp.releaseFactKind IS NULL
-      ) r), '[]'),
-      EXISTS(SELECT 1 FROM item_running t WHERE t.itemId=i.id)
-    FROM items i
+    SELECT w.itemId,'wake' type,w.wakeId id,NULL decisionId,w.assignmentId,w.createdAt at,
+      (w.resolverKind='assignment' OR w.waitMode='after-turn' OR w.waitFactKind IN #{@reserved_facts}) IS TRUE agent,
+      (w.consumer='cron' OR (w.waitMode IS NULL AND w.conditionKind IS NULL AND w.dueAt>w.createdAt)) IS TRUE time,
+      (w.waitFactKind NOT IN #{@reserved_facts}) IS TRUE event,
+      NULL user
+    FROM item_wakes w WHERE #{waiting_wake_sql()}
+    UNION ALL
+    SELECT cp.itemId,'cannot-proceed',cp.id,cp.decisionRequestId,cp.assignmentId,cp.createdAt,
+      cp.releaseFactKind IN #{@reserved_facts},0,cp.releaseFactKind NOT IN #{@reserved_facts},NULL
+    FROM item_blocks cp WHERE cp.releaseFactKind IS NOT NULL
+    UNION ALL
+    SELECT r.itemId,r.type,r.id,r.decisionId,r.assignmentId,r.at,
+      r.session IS NOT NULL,0,0,CASE WHEN r.session IS NULL THEN r.user END
+    FROM item_asks r WHERE r.session IS NOT NULL OR r.user IS NOT NULL
+    UNION ALL
+    SELECT itemId,'running',NULL,NULL,NULL,0,0,0,0,NULL FROM item_running
+    ORDER BY at,2,3
     """
+  end
 
+  @doc """
+  What each named item waits on, oldest first. `waits` and `questions` (open to a
+  user) are rows; readers turn the ones they return into links with `wait/3` and
+  `question/3`. `waiting` and `running` are the indicators those rows add up to.
+  """
+  def linked(db, ids) do
     rows =
       case db do
         %Txn{} ->
-          Txn.q(db, sql, [JSON.encode!(ids)])
+          Txn.q(db, linked_sql(), [JSON.encode!(ids)])
 
         _ ->
-          {:ok, rows} = DB.query(db, sql, [JSON.encode!(ids)])
+          {:ok, rows} = DB.query(db, linked_sql(), [JSON.encode!(ids)])
           rows
       end
+      |> Enum.map(fn [item, type, id, decision_id, assignment, at, agent, time, event, user] ->
+        %{
+          item: item,
+          type: type,
+          id: id,
+          decision_id: decision_id,
+          assignment_id: assignment,
+          at: at,
+          agent: agent == 1,
+          time: time == 1,
+          event: event == 1,
+          user: user
+        }
+      end)
+      |> Enum.group_by(& &1.item)
 
-    Map.new(rows, fn [id, agent, time, event, decisions, running] ->
-      decisions = JSON.decode!(decisions)
-
-      users =
-        decisions
-        |> Enum.reject(&is_binary(&1["session"]))
-        |> Enum.map(& &1["user"])
-        |> Enum.filter(&is_binary/1)
-        |> Enum.uniq()
-        |> Enum.sort()
+    Map.new(ids, fn id ->
+      {running, rows} = rows |> Map.get(id, []) |> Enum.split_with(&(&1.type == "running"))
+      {questions, waits} = Enum.split_with(rows, &(&1.user && &1.decision_id))
 
       {id,
        %{
          waiting: %{
-           agent: agent == 1 or Enum.any?(decisions, &is_binary(&1["session"])),
-           time: time == 1,
-           event: event == 1,
-           userIds: users
+           agent: Enum.any?(rows, & &1.agent),
+           time: Enum.any?(rows, & &1.time),
+           event: Enum.any?(rows, & &1.event),
+           userIds: rows |> Enum.map(& &1.user) |> Enum.filter(& &1) |> Enum.uniq() |> Enum.sort()
          },
-         running: running == 1
+         running: running != [],
+         waits: waits,
+         questions: Enum.uniq_by(questions, & &1.decision_id)
        }}
     end)
+  end
+
+  @doc "One small wait from a `linked/2` row, with the same link rules as a wait-links page."
+  def wait(%Txn{} = txn, row, principal) do
+    link = edge(txn, "work-item", row.item, [row.at, nil, row.type, row.id], principal)
+    due = fn role -> Enum.find_value(link.waitOn, &(&1["role"] == role && &1["dueAt"])) end
+
+    %{
+      id: link.id,
+      wakeId: link.wakeId,
+      kind: link.kind,
+      by: if(link.id, do: wait_by(row, link.waitOn)),
+      assignmentId: if(link.id, do: row.assignment_id),
+      waitReason: link.waitReason,
+      createdAt: link[:createdAt],
+      dueAt: due.("due"),
+      fallbackAt: due.("fallback"),
+      waitOn: link.waitOn
+    }
+  end
+
+  @doc "One open question's reference from a `linked/2` row; never its text."
+  def question(%Txn{} = txn, row, principal) do
+    case target(txn, ref("decision", row.decision_id), principal) do
+      %{"visible" => true} = decision ->
+        %{
+          id: row.decision_id,
+          kind: decision["decisionKind"],
+          userId: row.user,
+          assignmentId: row.assignment_id,
+          raisedAt: row.at
+        }
+
+      _ ->
+        %{id: nil, visible: false}
+    end
+  end
+
+  defp wait_by(%{agent: true}, _targets), do: "agent"
+  defp wait_by(%{time: true}, _targets), do: "time"
+  defp wait_by(%{event: true}, _targets), do: "event"
+  defp wait_by(%{user: user}, _targets) when is_binary(user), do: "user"
+
+  # A wait on a recorded decision is on whoever that decision is addressed to.
+  defp wait_by(_row, targets) do
+    case Enum.find(targets, &(&1["kind"] == "decision"))["addressee"]["kind"] do
+      "session" -> "agent"
+      kind -> kind
+    end
   end
 
   @doc false
@@ -375,9 +466,6 @@ defmodule Tightbeam.WaitLinks do
     active_decision = if ended, do: "1=1", else: "d.status='open'"
     active_block = if ended, do: "1=1", else: "cp.state='standing'"
 
-    waiting =
-      "(w.waitMode IS NOT NULL OR w.conditionKind IS NOT NULL OR w.consumer='cron' OR w.dueAt>w.createdAt)"
-
     wake = fn scope, index ->
       index =
         if ended do
@@ -391,7 +479,7 @@ defmodule Tightbeam.WaitLinks do
           |> Map.fetch!(index)
         end
 
-      "SELECT w.createdAt at,'wake:'||printf('%020d',w.rowid) key,'wake' type,w.wakeId id FROM wakes w INDEXED BY #{index} WHERE (#{scope}) AND #{active_wake} AND #{waiting} AND #{declared_wait_sql()}"
+      "SELECT w.createdAt at,'wake:'||printf('%020d',w.rowid) key,'wake' type,w.wakeId id FROM wakes w INDEXED BY #{index} WHERE (#{scope}) AND #{active_wake} AND #{waiting_wake_sql()} AND #{declared_wait_sql()}"
     end
 
     decision = fn scope ->
@@ -588,6 +676,8 @@ defmodule Tightbeam.WaitLinks do
         hidden(ref)
 
       row ->
+        # The status list is the pending-turn index's own predicate; without it an
+        # idle session's whole turn history is walked.
         running =
           Txn.q(
             txn,

@@ -984,6 +984,25 @@ defmodule Tightbeam.Wire.Router do
     d1_collection(conn, Map.fetch!(@d1_resources, :work_items))
   end
 
+  get "/api/work-item-indicators" do
+    with {:ok, auth} <- state_bearer_auth(conn),
+         {:ok, query} <- d1_query(conn.query_string),
+         {:ok, principal} <- state_principal(auth, query, conn),
+         {:ok, request} <- Tightbeam.WorkItemIndicators.request(query) do
+      page =
+        Tightbeam.WorkItemIndicators.read(
+          db(conn),
+          request,
+          core_detail_trace_principal(conn, principal)
+        )
+
+      d1_send(conn, 200, JSON.encode!(page))
+    else
+      {:error, status, code, message} ->
+        d1_error(conn, "work item indicators", status, code, message)
+    end
+  end
+
   get "/api/work-items/:id/trace" do
     d2c_work_item_trace(conn, id)
   end
