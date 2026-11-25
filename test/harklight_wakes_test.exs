@@ -870,26 +870,29 @@ defmodule Tightbeam.HarklightWakesTest do
     message = JSON.encode!(%{"kind" => "message", "message" => migrated_item})
     chat = JSON.encode!(feed_chat(2, "migrated-item", "migrated-entry"))
 
-    fake_harklight_agent!("""
-    printf '%s\n' "$*" >> "$0.calls"
-    case "$*" in
-      'read --session #{@handle} --pending --prepare')
-        printf '%s\n' '{"kind":"baseline_prepared","session":"#{@handle}","rev":2,"token":"T"}'
-        ;;
-      'read --session #{@handle} --pending --resume T')
-        printf '%s\n' '{"kind":"baseline","rev":2,"reason":"first_contact"}'
-        printf '%s\n' '#{chat}' '{"kind":"baseline_complete","rev":2}'
-        ;;
-      'message-get --item-id migrated-item')
-        printf '%s\n' '#{message}'
-        ;;
-      'listen --follow --session #{@handle} --after 2')
-        printf '%s\n' '{"kind":"caught_up","rev":2}'
-        exec sleep 30
-        ;;
-      *) exit 2 ;;
-    esac
-    """)
+    fake_harklight_agent!(
+      """
+      printf '%s\n' "$*" >> "$0.calls"
+      case "$*" in
+        'read --session #{@handle} --pending --prepare')
+          printf '%s\n' '{"answers":"all","kind":"baseline_prepared","rev":2,"session":"#{@handle}","token":"T"}'
+          ;;
+        'read --session #{@handle} --pending --resume T')
+          printf '%s\n' '{"kind":"baseline","rev":2,"reason":"first_contact"}'
+          printf '%s\n' '#{chat}' '{"kind":"baseline_complete","rev":2}'
+          ;;
+        'message-get --item-id migrated-item')
+          printf '%s\n' '#{message}'
+          ;;
+        'listen --follow --session #{@handle} --after 2 --on-expired exit')
+          printf '%s\n' '{"kind":"caught_up","rev":2}'
+          exec sleep 30
+          ;;
+        *) exit 2 ;;
+      esac
+      """,
+      "0.2.5"
+    )
 
     agent = System.find_executable("harklight-agent")
     start_supervised!({HarklightWakes, db: db})
@@ -3395,6 +3398,7 @@ defmodule Tightbeam.HarklightWakesTest do
     File.write!(script, """
     #!/bin/sh
     if [ "$1" = --version ]; then echo 'harklight-agent 0.2.3'; exit 0; fi
+    case "$*" in *--pending*) echo "error: unexpected argument '--pending' found" >&2; exit 2;; esac
     printf '%s\n' "$*" >> "$0.calls"
     printf '%s\n' "$$" > "$0.pid"
     exec sleep 300
@@ -3982,21 +3986,24 @@ defmodule Tightbeam.HarklightWakesTest do
           )
       end
 
-      fake_harklight_agent!("""
-      printf '%s\n' "$*" >> "$0.calls"
-      case "$*" in
-        *--prepare)
-          printf '%s\n' '{"kind":"baseline_prepared","session":"#{@handle}","rev":3,"token":"T"}'
-          exit 0 ;;
-        *--resume*)
-          printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}'
-          exit 0 ;;
-        *--snapshot)
-          printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}' ;;
-      esac
-      printf '%s\n' '{"kind":"caught_up","rev":3}'
-      exec sleep 30
-      """)
+      fake_harklight_agent!(
+        """
+        printf '%s\n' "$*" >> "$0.calls"
+        case "$*" in
+          *--prepare)
+            printf '%s\n' '{"answers":"all","kind":"baseline_prepared","rev":3,"session":"#{@handle}","token":"T"}'
+            exit 0 ;;
+          *--resume*)
+            printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}'
+            exit 0 ;;
+          *--snapshot)
+            printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}' ;;
+        esac
+        printf '%s\n' '{"kind":"caught_up","rev":3}'
+        exec sleep 30
+        """,
+        "0.2.5"
+      )
 
       agent = System.find_executable("harklight-agent")
       manager = start_supervised!({HarklightWakes, db: db, feed_start_spacing_ms: 1})
@@ -4061,7 +4068,7 @@ defmodule Tightbeam.HarklightWakesTest do
       assert File.read!(agent <> ".calls") ==
                "read --session #{@handle} --pending --prepare\n" <>
                  "read --session #{@handle} --pending --resume T\n" <>
-                 "listen --follow --session #{@handle} --after 3\n"
+                 "listen --follow --session #{@handle} --after 3 --on-expired exit\n"
     end
   end
 
@@ -4079,21 +4086,24 @@ defmodule Tightbeam.HarklightWakesTest do
           [@handle]
         )
 
-      fake_harklight_agent!("""
-      printf '%s\n' "$*" >> "$0.calls"
-      case "$*" in
-        *--prepare)
-          printf '%s\n' '{"kind":"baseline_prepared","session":"#{@handle}","rev":3,"token":"T"}'
-          exit 0 ;;
-        *--resume*)
-          printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}'
-          exit 0 ;;
-        *--snapshot)
-          printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}' ;;
-      esac
-      printf '%s\n' '{"kind":"caught_up","rev":3}'
-      exec sleep 30
-      """)
+      fake_harklight_agent!(
+        """
+        printf '%s\n' "$*" >> "$0.calls"
+        case "$*" in
+          *--prepare)
+            printf '%s\n' '{"answers":"all","kind":"baseline_prepared","rev":3,"session":"#{@handle}","token":"T"}'
+            exit 0 ;;
+          *--resume*)
+            printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}'
+            exit 0 ;;
+          *--snapshot)
+            printf '%s\n' '{"kind":"baseline","rev":3}' '{"kind":"baseline_complete","rev":3}' ;;
+        esac
+        printf '%s\n' '{"kind":"caught_up","rev":3}'
+        exec sleep 30
+        """,
+        "0.2.5"
+      )
 
       agent = System.find_executable("harklight-agent")
       start_supervised!({HarklightWakes, db: db, feed_start_spacing_ms: 1})
@@ -4453,7 +4463,7 @@ defmodule Tightbeam.HarklightWakesTest do
         *'--after 8 --on-expired exit') printf '%s\n' #{lines.(first)}; exit 1 ;;
         *'--after #{jump + 1} --on-expired exit') printf '%s\n' '{"kind":"cursor_expired","rev":0}'; exit 2 ;;
         *--prepare)
-          printf '%s\n' '{"kind":"baseline_prepared","session":"#{@handle}","rev":40,"token":"T"}' ;;
+          printf '%s\n' '{"answers":"all","kind":"baseline_prepared","rev":40,"session":"#{@handle}","token":"T"}' ;;
         *'--resume T') printf '%s\n' #{lines.(second)} ;;
         *'--after 40 --on-expired exit') printf '%s\n' #{lines.(third)}; exit 1 ;;
         *'--after 41 --on-expired exit') printf '%s\n' '{"kind":"caught_up","rev":41}'; exec sleep 30 ;;
@@ -4518,7 +4528,8 @@ defmodule Tightbeam.HarklightWakesTest do
               printf '%s\\n' '{"kind":"unsupported","operation":"pending_baseline"}'; exit 5
             fi
             n=$(($(cat "$0.n" 2>/dev/null || echo 0) + 1)); echo $n > "$0.n"
-            printf '{"kind":"baseline_prepared","session":"#{@handle}","rev":30,"token":"T%s"}\\n' $n
+            mark='"answers":"all",'; if [ -e "$0.nomark" ]; then mark=; fi
+            printf '{%s"kind":"baseline_prepared","rev":30,"session":"#{@handle}","token":"T%s"}\\n' "$mark" $n
             hold prepared
             ;;
           'read --session #{@handle} --pending --resume '*)
@@ -4847,7 +4858,7 @@ defmodule Tightbeam.HarklightWakesTest do
           choose_open(db)
         end
 
-        assert eventually(fn -> match?({:ok, [[30, "T1", 1, 1]]}, pending_row(db)) end)
+        assert eventually(fn -> match?({:ok, [[30, "T1", 1, 1]]}, pending_row(db)) end, 1_000)
         assert eventually(fn -> :sys.get_state(manager).workers == %{} end)
         count = length(pending_calls(agent))
 
@@ -4887,7 +4898,7 @@ defmodule Tightbeam.HarklightWakesTest do
       end
     end
 
-    for missing <- [:usage, :unsupported] do
+    for missing <- [:usage, :unsupported, :nomark] do
       test "without the route (#{missing}) it stays unopened, slowly retried and told once", %{
         db: db
       } do
@@ -4911,7 +4922,8 @@ defmodule Tightbeam.HarklightWakesTest do
         assert Enum.uniq(pending_calls(agent)) == [pending_call(:prepare)]
 
         assert {:ok, [[prompt]]} = DB.query(db, "SELECT prompt FROM wakes")
-        assert prompt =~ "Agent 0.2.4 and Server 0.2.7"
+        assert prompt =~ "serves every answer"
+        assert {:ok, [[nil, nil, 0, 0]]} = pending_row(db)
         File.rm!(agent <> ".#{unquote(missing)}")
         assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
         assert captured_ids(db) == ["before-answer", "answer request", "marked"]
@@ -5065,24 +5077,27 @@ defmodule Tightbeam.HarklightWakesTest do
       assert {:ok, []} = pending_row(db)
     end
 
-    test "an expired position on a Server without the route is recovered by the Agent", %{db: db} do
-      :ok = HarklightWakes.capture_feed(db, @handle, 50, [], :live)
-      agent = pending_agent!()
-      File.touch!(agent <> ".expire")
-      File.touch!(agent <> ".unsupported")
-      start_supervised!({HarklightWakes, pending_opts(db)})
+    for missing <- [:unsupported, :nomark] do
+      test "an expired position on a Server without the route (#{missing}) is recovered by the Agent",
+           %{db: db} do
+        :ok = HarklightWakes.capture_feed(db, @handle, 50, [], :live)
+        agent = pending_agent!()
+        File.touch!(agent <> ".expire")
+        File.touch!(agent <> ".#{unquote(missing)}")
+        start_supervised!({HarklightWakes, pending_opts(db)})
 
-      assert eventually(fn ->
-               DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[12]]}
-             end)
+        assert eventually(fn ->
+                 DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[12]]}
+               end)
 
-      assert pending_calls(agent) == [
-               pending_call({:after, 50}),
-               pending_call(:prepare),
-               "listen --follow --session #{@handle} --after 50"
-             ]
+        assert pending_calls(agent) == [
+                 pending_call({:after, 50}),
+                 pending_call(:prepare),
+                 "listen --follow --session #{@handle} --after 50"
+               ]
 
-      assert {:ok, []} = pending_row(db)
+        assert {:ok, []} = pending_row(db)
+      end
     end
 
     for point <- [nil, "prepared", "resume", "rows", "complete"] do
@@ -5109,21 +5124,23 @@ defmodule Tightbeam.HarklightWakesTest do
       end
     end
 
-    test "a new conversation on an older Server starts with a snapshot", %{db: db} do
-      agent = pending_agent!()
-      File.touch!(agent <> ".unsupported")
-      start_supervised!({HarklightWakes, pending_opts(db)})
+    for missing <- [:unsupported, :nomark] do
+      test "a new conversation on an older Server (#{missing}) starts with a snapshot", %{db: db} do
+        agent = pending_agent!()
+        File.touch!(agent <> ".#{unquote(missing)}")
+        start_supervised!({HarklightWakes, pending_opts(db)})
 
-      assert eventually(fn ->
-               DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[5]]}
-             end)
+        assert eventually(fn ->
+                 DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[5]]}
+               end)
 
-      assert pending_calls(agent) == [
-               pending_call(:prepare),
-               "listen --follow --session #{@handle} --snapshot"
-             ]
+        assert pending_calls(agent) == [
+                 pending_call(:prepare),
+                 "listen --follow --session #{@handle} --snapshot"
+               ]
 
-      assert {:ok, []} = pending_row(db)
+        assert {:ok, []} = pending_row(db)
+      end
     end
 
     test "a new conversation whose token is stored never falls back to a snapshot", %{db: db} do
@@ -5165,6 +5182,7 @@ defmodule Tightbeam.HarklightWakesTest do
     } do
       second = "7d737f62-bbd7-4c51-978d-f6ff5b4d8147"
       seed_completion_handle(db, session.session_key, second, "other")
+      for h <- [@handle, second], do: :ok = HarklightWakes.capture_feed(db, h, 8, [], :live)
 
       fake_harklight_agent!("exit 9")
       agent = System.find_executable("harklight-agent")
@@ -5175,10 +5193,9 @@ defmodule Tightbeam.HarklightWakesTest do
       if mkdir "$0.hung" 2>/dev/null; then exec sleep 60; fi
       if [ "$1" = --version ]; then
         if [ -e "$0.fail" ]; then exit 1; fi
-        echo 'harklight-agent 0.2.3'; exit 0
+        echo 'harklight-agent 0.2.4'; exit 0
       fi
-      printf '%s\\n' '{"kind":"baseline","rev":5}' '{"kind":"baseline_complete","rev":5}'
-      printf '%s\\n' '{"kind":"caught_up","rev":5}'
+      printf '%s\\n' '{"kind":"caught_up","rev":8}'
       exec sleep 60
       """)
 
@@ -5193,12 +5210,9 @@ defmodule Tightbeam.HarklightWakesTest do
       assert Enum.uniq(pending_calls(agent)) == ["--version"]
       File.rm!(agent <> ".fail")
 
+      # Either conversation may be the one whose question hangs.
       assert eventually(
-               fn ->
-                 # Either conversation may be the one whose question hangs.
-                 DB.query(db, "SELECT count(*) FROM harklight_feed_checkpoints") ==
-                   {:ok, [[1]]}
-               end,
+               fn -> Enum.any?(pending_calls(agent), &(&1 =~ "--after 8 --on-expired exit")) end,
                2_000
              )
     end
@@ -5218,6 +5232,7 @@ defmodule Tightbeam.HarklightWakesTest do
                DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[5]]}
              end)
 
+      # The refused prepare is not logged by the stand-in, as a real one prints usage only.
       assert pending_calls(agent) == ["listen --follow --session #{@handle} --snapshot"]
       assert {:ok, []} = pending_row(db)
     end
@@ -11263,7 +11278,7 @@ defmodule Tightbeam.HarklightWakesTest do
     File.write!(
       executable,
       "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'harklight-agent #{version}'; exit 0; fi\n" <>
-        body
+        older_agent_refusals(version) <> body
     )
 
     File.chmod!(executable, 0o755)
@@ -11278,6 +11293,19 @@ defmodule Tightbeam.HarklightWakesTest do
 
       File.rm_rf!(directory)
     end)
+  end
+
+  # What Agent 0.2.3 and older print for flags they do not know.
+  defp older_agent_refusals(version) do
+    if Version.compare(version, "0.2.4") == :lt do
+      """
+      for a in "$@"; do case "$a" in --pending|--on-expired)
+        echo "error: unexpected argument '$a' found" >&2; exit 2;;
+      esac; done
+      """
+    else
+      ""
+    end
   end
 
   defp fake_harklight_session_end_agent!(exit_status \\ 0, opts \\ []) do
@@ -11302,7 +11330,9 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.write!(
       executable,
-      "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"#{calls}\"\n" <>
+      "#!/bin/sh\n" <>
+        older_agent_refusals("0.2.3") <>
+        "printf '%s\\n' \"$*\" >> \"#{calls}\"\n" <>
         wait_for_session_end <>
         "if [ \"$1\" = \"session\" ]; then printf '%s\\n' '#{exit_status}' > \"#{calls}.exit-status\"; fi\n" <>
         "exit #{exit_status}\n"
