@@ -5132,7 +5132,10 @@ defmodule Tightbeam.HarklightWakesTest do
         retry_now = fn calls ->
           assert eventually(fn -> Map.has_key?(:sys.get_state(manager).retry_timers, @handle) end)
           {timer, token} = :sys.get_state(manager).retry_timers[@handle]
-          assert Process.read_timer(timer) > 300_000
+          # read_timer returns false for a timer that has fired, and atoms sort
+          # above numbers.
+          remaining = Process.read_timer(timer)
+          assert is_integer(remaining) and remaining > 300_000
           assert length(pending_calls(agent)) == calls
           send(manager, {:retry_listener, @handle, token, :existing})
         end
