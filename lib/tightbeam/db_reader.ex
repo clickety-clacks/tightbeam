@@ -7,12 +7,14 @@ defmodule Tightbeam.DB.Reader do
   def start_link(path), do: GenServer.start_link(__MODULE__, path)
 
   def query(reader, sql, params, envelope) do
-    budget = max(0, envelope.deadline - System.monotonic_time(:millisecond))
-    GenServer.call(reader, {:query, sql, params, envelope}, budget)
+    GenServer.call(reader, {:query, sql, params, envelope}, remaining(envelope.deadline))
   end
 
   def read_transaction(reader, fun, timeout) when is_function(fun, 1) do
-    deadline = System.monotonic_time(:millisecond) + timeout
+    deadline =
+      if timeout == :infinity,
+        do: :infinity,
+        else: System.monotonic_time(:millisecond) + timeout
 
     try do
       GenServer.call(reader, {:read_transaction, fun, deadline}, timeout)
@@ -34,7 +36,7 @@ defmodule Tightbeam.DB.Reader do
 
   @impl true
   def handle_call({:query, sql, params, envelope}, _from, conn) do
-    remaining = envelope.deadline - System.monotonic_time(:millisecond)
+    remaining = remaining(envelope.deadline)
 
     # The timer covers the race where the caller times out just before this
     # request starts. Join it before admitting the next statement.
@@ -43,12 +45,12 @@ defmodule Tightbeam.DB.Reader do
         receive do
           :done -> :ok
         after
-          max(0, remaining) -> Sqlite3.interrupt(conn)
+          remaining -> Sqlite3.interrupt(conn)
         end
       end)
 
     reply =
-      DBObservation.server(envelope, max(0, remaining), fn ->
+      DBObservation.server(envelope, if(remaining != :infinity, do: remaining), fn ->
         result =
           if remaining > 0,
             do: DB.read_query(conn, sql, params),
@@ -69,14 +71,14 @@ defmodule Tightbeam.DB.Reader do
   end
 
   def handle_call({:read_transaction, fun, deadline}, _from, conn) do
-    remaining = deadline - System.monotonic_time(:millisecond)
+    remaining = remaining(deadline)
 
     {timer, timer_ref} =
       spawn_monitor(fn ->
         receive do
           :done -> :ok
         after
-          max(0, remaining) -> Sqlite3.interrupt(conn)
+          remaining -> Sqlite3.interrupt(conn)
         end
       end)
 
@@ -89,6 +91,10 @@ defmodule Tightbeam.DB.Reader do
     receive do: ({:DOWN, ^timer_ref, :process, ^timer, _} -> :ok)
     {:reply, result, conn}
   end
+
+  # `:infinity` sorts above every integer, so the deadline comparisons hold.
+  defp remaining(:infinity), do: :infinity
+  defp remaining(deadline), do: max(0, deadline - System.monotonic_time(:millisecond))
 
   defp run_read_transaction(conn, fun, deadline) do
     txn = %DB.Txn{conn: conn, deadline: deadline}

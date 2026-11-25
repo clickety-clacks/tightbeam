@@ -68,6 +68,22 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     owner
   end
 
+  # Accept every new call and answer none, past the ordinary client timeout.
+  defp stall!(db) do
+    previous = Application.fetch_env(:tightbeam, :db_call_timeout_ms)
+    Application.put_env(:tightbeam, :db_call_timeout_ms, 100)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, value} -> Application.put_env(:tightbeam, :db_call_timeout_ms, value)
+        :error -> Application.delete_env(:tightbeam, :db_call_timeout_ms)
+      end
+    end)
+
+    :sys.suspend(Process.whereis(db))
+    refute DB.overloaded?(db)
+  end
+
   defp relieve!(db), do: :sys.resume(Process.whereis(db))
 
   defp enqueue!(db, session_key, prompt) do
@@ -318,6 +334,200 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     end
   end
 
+  describe "a stalled owner, past the ordinary client timeout" do
+    test "still times out every caller that owes nothing", %{db: db} do
+      stall!(db)
+      assert_raise DB.Timeout, fn -> DB.query(db, "SELECT 1") end
+      assert_raise DB.Timeout, fn -> DB.transaction(db, fn _ -> :ok end) end
+      deadline = System.monotonic_time(:millisecond) + 100
+
+      assert {:error, %DB.DeadlineExceeded{}} =
+               DB.owed_work(fn -> DB.query_until(db, "SELECT 1", [], deadline) end)
+    end
+
+    test "keeps the lane, and the claim and finish of its turn", %{db: db} do
+      parts = start_lane_parts()
+      test = self()
+
+      runner = fn turn ->
+        send(test, {:running, self()})
+
+        receive do
+          :write -> :ok
+        end
+
+        {:ok, _} = DB.transaction(db, fn _txn -> :ok end)
+        send(test, :wrote)
+
+        receive do
+          :finish -> {:ok, %{text: turn.prompt}}
+        end
+      end
+
+      capture_log(fn ->
+        seq = enqueue!(db, "k1", "hello")
+        stall!(db)
+        lane = start_lane(db, parts, "k1", runner)
+        ref = Process.monitor(lane)
+        refute_receive {:DOWN, ^ref, :process, _, _}, 400
+
+        relieve!(db)
+        assert_receive {:running, task}, 2_000
+
+        :sys.suspend(Process.whereis(db))
+        send(task, :write)
+        Process.sleep(400)
+        assert Process.alive?(task)
+        relieve!(db)
+        assert_receive :wrote, 2_000
+
+        :sys.suspend(Process.whereis(db))
+        send(task, :finish)
+        refute_receive {:DOWN, ^ref, :process, _, _}, 400
+        relieve!(db)
+
+        assert eventually(fn -> status(db, seq) == "delivered" end)
+      end)
+    end
+
+    test "keeps the lane that serves a cancel, and answers the caller", %{db: db} do
+      parts = start_lane_parts()
+      seq = enqueue!(db, "k1", "hello")
+      test = self()
+
+      runner = fn _turn ->
+        send(test, :running)
+        Process.sleep(:infinity)
+      end
+
+      capture_log(fn ->
+        lane = start_lane(db, parts, "k1", runner)
+        ref = Process.monitor(lane)
+        assert_receive :running, 2_000
+
+        stall!(db)
+        cancel = Task.async(fn -> SessionLane.cancel_current("k1") end)
+        refute_receive {:DOWN, ^ref, :process, _, _}, 400
+        assert Task.yield(cancel, 0) == nil
+
+        relieve!(db)
+        assert {:ok, _} = Task.await(cancel, 5_000)
+        assert status(db, seq) == "canceled"
+      end)
+    end
+
+    test "keeps the lane supervisor with more waiting lanes than its restart limit", %{db: db} do
+      parts = start_lane_parts()
+      ref = Process.monitor(parts.lane_sup)
+
+      keys =
+        for index <- 1..60 do
+          key = "stalled#{index}"
+
+          :ok =
+            DB.execute(db, """
+            INSERT INTO sessions
+              (sessionKey,displayName,ownerUserId,origin,spawnedBy,archetype,
+               harness,provider,model,thinkingLevel,host,createdAt,updatedAt)
+            VALUES
+              ('#{key}','K','t','user:t','k1','default','claude','anthropic',
+               'claude-sonnet-5','medium','testhost',1,1);
+            """)
+
+          key
+        end
+
+      seqs = for key <- keys, do: enqueue!(db, key, "burst")
+
+      capture_log(fn ->
+        stall!(db)
+
+        for key <- keys,
+            do: start_lane(db, parts, key, fn turn -> {:ok, %{text: turn.prompt}} end)
+
+        refute_receive {:DOWN, ^ref, :process, _, _}, 500
+        assert %{active: 60} = DynamicSupervisor.count_children(parts.lane_sup)
+
+        relieve!(db)
+        assert eventually(fn -> Enum.all?(seqs, &(status(db, &1) == "delivered")) end)
+      end)
+    end
+
+    test "does not raise in the shared adapter", %{db: db} do
+      seq = enqueue!(db, "k1", "hello")
+
+      state = %Tightbeam.Acp.Adapter{
+        db: db,
+        harness: :claude,
+        chunks: %{"sid" => []},
+        tool_turns: %{"sid" => %{session_key: "k1", turn_seq: seq}}
+      }
+
+      notification =
+        {:acp_notification, "session/update",
+         %{
+           "sessionId" => "sid",
+           "update" => %{
+             "sessionUpdate" => "agent_message_chunk",
+             "messageId" => "message-1",
+             "content" => %{"type" => "text", "text" => "kept"}
+           }
+         }}
+
+      stall!(db)
+      waiter = Task.async(fn -> Tightbeam.Acp.Adapter.handle_info(notification, state) end)
+      assert Task.yield(waiter, 400) == nil
+      relieve!(db)
+      assert {:noreply, _} = Task.await(waiter, 5_000)
+    end
+  end
+
+  describe "slow reads on every read connection" do
+    @tag :tmp_dir
+    test "make owed reads wait and still time out every other read", %{tmp_dir: tmp} do
+      prepared = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "schema_shape_runtime.exs")
+      db = :"overload_file_db_#{System.unique_integer([:positive])}"
+
+      owner =
+        start_supervised!(
+          {DB,
+           path: Path.join(prepared.base, "state.db"),
+           name: db,
+           guard_inputs: [],
+           payload_root: prepared.payload},
+          id: db
+        )
+
+      previous = Application.fetch_env(:tightbeam, :db_call_timeout_ms)
+      Application.put_env(:tightbeam, :db_call_timeout_ms, 100)
+
+      on_exit(fn ->
+        case previous do
+          {:ok, value} -> Application.put_env(:tightbeam, :db_call_timeout_ms, value)
+          :error -> Application.delete_env(:tightbeam, :db_call_timeout_ms)
+        end
+      end)
+
+      readers = :persistent_term.get({DB, owner})
+      assert length(readers) == 4
+      for reader <- readers, do: :sys.suspend(reader)
+
+      assert_raise DB.Timeout, fn -> DB.query(db, "SELECT 1") end
+
+      waiting =
+        Task.async(fn ->
+          DB.owed_work(fn ->
+            {DB.query(db, "SELECT 1"),
+             DB.read_transaction(db, fn txn -> DB.Txn.q(txn, "SELECT 2") end)}
+          end)
+        end)
+
+      assert Task.yield(waiting, 400) == nil
+      for reader <- readers, do: :sys.resume(reader)
+      assert {{:ok, [[1]]}, {:ok, [[2]]}} = Task.await(waiting, 5_000)
+    end
+  end
+
   describe "a request the lane serves for a caller" do
     test "still gets the refusal: a cancel during the overload answers at once", %{db: db} do
       parts = start_lane_parts()
@@ -394,6 +604,17 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
                  EventLog.lifecycle_events(db)
 
         refute_received {:DOWN, ^ref, :process, _, _}
+
+        # The same death with the owner stalled past the client timeout.
+        assert {:ok, adapter, 2} = AdapterCoordinator.adapter_for(coordinator, key)
+        stall!(db)
+        Process.exit(adapter, :kill)
+        refute_receive {:DOWN, ^ref, :process, _, _}, 400
+        relieve!(db)
+
+        assert eventually(fn ->
+                 coordinator |> :sys.get_state() |> get_in([:adapters, key, :generation]) == 3
+               end)
       end)
     end
   end

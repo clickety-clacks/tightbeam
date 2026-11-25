@@ -128,7 +128,7 @@ defmodule Tightbeam.DBObservation do
       principal_ref: context.principal_ref,
       timeout_source: "otp_db_call",
       budget_ms: budget,
-      deadline: System.monotonic_time(:millisecond) + budget,
+      deadline: deadline(mode, budget),
       enqueued_monotonic: started
     }
 
@@ -206,6 +206,17 @@ defmodule Tightbeam.DBObservation do
 
   defp send_request(server, request, envelope, budget),
     do: owner_request(server, request, envelope, budget)
+
+  # Owed work waits for its answer; `budget_ms` still reports a late one.
+  defp deadline(:ordinary, budget) do
+    if Tightbeam.DB.waits_for_answer?(),
+      do: :infinity,
+      else: System.monotonic_time(:millisecond) + budget
+  end
+
+  defp deadline(_mode, budget), do: System.monotonic_time(:millisecond) + budget
+
+  defp remaining(%{deadline: :infinity}), do: :infinity
 
   defp remaining(envelope),
     do: max(0, envelope.deadline - System.monotonic_time(:millisecond))

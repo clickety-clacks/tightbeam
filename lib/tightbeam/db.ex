@@ -128,15 +128,20 @@ defmodule Tightbeam.DB do
   again cannot repeat an effect.
 
   Inside this scope a refused call therefore waits outside the owner's queue
-  until the queue is back under its limit and is then sent again as an ordinary
-  call with its ordinary timeout. The queue limit is unchanged and binds every
-  other caller. Each wait is logged. Calls that carry their own deadline
-  (`transaction_until/3`, `query_until/4`) keep returning the refusal.
+  until the queue is back under its limit and is then sent again. The queue
+  limit is unchanged and binds every other caller. Each wait is logged.
+
+  Once sent, an owed call waits for its answer without a client timeout, for
+  the same reason: a timeout raised in a lane, a coordinator or an adapter drops
+  the work. It is also the only safe wait for a write, whose effect a timeout
+  would leave unknown. Calls that carry their own deadline
+  (`transaction_until/3`, `query_until/4`) keep their deadline and the refusal.
 
   `owed_work/0` marks the calling process for its lifetime; `owed_work/1` marks
   it while `fun` runs. `refusable/1` is the way back: inside a marked process it
   runs `fun` with the ordinary refusal, for the calls that process makes on
-  behalf of a caller who can be told to retry.
+  behalf of a caller who can be told to retry. A call it does send is still
+  waited for: a timeout would end the process that owes the other work.
   """
   @spec owed_work() :: :ok
   def owed_work do
@@ -160,7 +165,8 @@ defmodule Tightbeam.DB do
 
   @spec refusable((-> result)) :: result when result: term()
   def refusable(fun) when is_function(fun, 0) do
-    previous = Process.delete(@owed_work_key)
+    previous = Process.get(@owed_work_key)
+    if previous != nil, do: Process.put(@owed_work_key, :refusable)
 
     try do
       fun.()
@@ -171,6 +177,9 @@ defmodule Tightbeam.DB do
 
   @doc false
   def owed_work?, do: Process.get(@owed_work_key) == true
+
+  @doc false
+  def waits_for_answer?, do: Process.get(@owed_work_key) != nil
 
   @doc false
   # Block until the owner's queue is back under its limit. Returns the wait in ms.
@@ -455,7 +464,8 @@ defmodule Tightbeam.DB do
     else
       case reader(server, "SELECT 1") do
         reader when is_pid(reader) ->
-          Tightbeam.DB.Reader.read_transaction(reader, fun, call_timeout())
+          timeout = if waits_for_answer?(), do: :infinity, else: call_timeout()
+          Tightbeam.DB.Reader.read_transaction(reader, fun, timeout)
 
         _ ->
           # Private in-memory databases have no separate connection pool.
