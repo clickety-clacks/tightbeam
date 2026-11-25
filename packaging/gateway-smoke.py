@@ -4,6 +4,7 @@ from pathlib import Path
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -59,7 +60,8 @@ def lsof_errors(stderr):
     lsof reports file systems it cannot stat (for example a mount under
     another user's home) as "lsof: WARNING: ..." plus indented continuation
     lines. Those concern other files, not the sockets selected with -p and
-    -i, so they are logged once and accepted. Any other output is an error.
+    -i, so they are accepted. Only their number is logged, so a public log
+    shows no host paths. Any other output is an error.
     """
     errors, in_warning = [], False
     for line in stderr.splitlines():
@@ -67,13 +69,18 @@ def lsof_errors(stderr):
             in_warning = True
             if line not in _lsof_warnings_seen:
                 _lsof_warnings_seen.add(line)
-                print(f"gateway-smoke: accepted {line}", file=sys.stderr)
+                print(f"gateway-smoke: accepted {len(_lsof_warnings_seen)} distinct lsof warning(s)",
+                      file=sys.stderr)
         elif in_warning and line[:1].isspace():
             continue
         elif line.strip():
             in_warning = False
             errors.append(line)
     return errors
+
+
+def redact_homes(text):
+    return re.sub(r"/(Users|home)/[^/\s:;]+", r"/\1/<user>", text)
 
 
 def listeners(pid, port, lsof):
@@ -83,7 +90,7 @@ def listeners(pid, port, lsof):
         result = observe([lsof, "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN", "-Fn"])
         errors = lsof_errors(result.stderr)
         if result.returncode not in (0, 1) or errors:
-            detail = "; ".join(errors)[:500] or "no error output"
+            detail = redact_homes("; ".join(errors))[:500] or "no error output"
             raise SmokeError(
                 f"cannot inspect test process listeners (lsof exit {result.returncode}: {detail})")
         ports = {int(line.rsplit(":", 1)[-1]) for line in result.stdout.splitlines()
