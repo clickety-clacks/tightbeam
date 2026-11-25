@@ -189,7 +189,8 @@ defmodule Tightbeam.HarklightWakes do
          :ok <- HarklightFailures.ensure_schema(db),
          :ok <- HarklightLifecycle.ensure_schema(db),
          :ok <- Tightbeam.HarklightReceipts.ensure_schema(db),
-         :ok <- Tightbeam.HarklightBriefings.ensure_schema(db) do
+         :ok <- Tightbeam.HarklightBriefings.ensure_schema(db),
+         :ok <- Tightbeam.HarklightBounces.ensure_schema(db) do
       backfill_pending_supersedes(db)
     end
   end
@@ -2546,7 +2547,10 @@ defmodule Tightbeam.HarklightWakes do
 
   def handle_call({:feed_capture, handle, rev, frames, mode}, from, state) do
     if valid_worker?(state, handle, from) do
-      case capture_feed_result(state.db, handle, rev, frames, mode) do
+      result = capture_feed_result(state.db, handle, rev, frames, mode)
+      if match?({:ok, _}, result), do: Tightbeam.HarklightBounces.captured(frames)
+
+      case result do
         {:ok, true} -> {:reply, :ok, confirm_feed_recovery(state, handle)}
         {:ok, false} -> {:reply, :ok, state}
         error -> {:reply, error, state}
@@ -3841,6 +3845,8 @@ defmodule Tightbeam.HarklightWakes do
 
            if mode == :baseline or rev > previous do
              ordered = if mode == :baseline, do: Enum.sort_by(frames, & &1["rev"]), else: frames
+
+             :ok = Tightbeam.HarklightBounces.capture_frames_in_txn(txn, handle, ordered)
 
              Enum.each(ordered, fn frame ->
                case capture_change_in_txn(txn, handle, frame) do
