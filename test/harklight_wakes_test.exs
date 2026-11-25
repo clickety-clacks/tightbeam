@@ -5047,25 +5047,38 @@ defmodule Tightbeam.HarklightWakesTest do
         agent = pending_agent!()
         File.touch!(agent <> ".#{unquote(missing)}")
 
-        start_supervised!(
-          {HarklightWakes,
-           db: db,
-           retry_delays: [1, 250],
-           retry_jitter: false,
-           feed_start_spacing_ms: 1,
-           outage_notice_delay_ms: 50}
-        )
+        manager =
+          start_supervised!(
+            {HarklightWakes,
+             db: db,
+             retry_delays: [1, 1, 1, 600_000],
+             retry_jitter: false,
+             feed_start_spacing_ms: 1,
+             outage_notice_delay_ms: 50}
+          )
+
+        # The slow pace is read from the timer, so a loaded machine cannot use it up.
+        # The ordinary ladder would try three more times first.
+        retry_now = fn calls ->
+          assert eventually(fn -> Map.has_key?(:sys.get_state(manager).retry_timers, @handle) end)
+          {timer, token} = :sys.get_state(manager).retry_timers[@handle]
+          assert Process.read_timer(timer) > 300_000
+          assert length(pending_calls(agent)) == calls
+          send(manager, {:retry_listener, @handle, token, :existing})
+        end
 
         choose_open(db)
         assert eventually(fn -> pending_calls(agent) == [pending_call(:prepare)] end)
-        refute eventually(fn -> length(pending_calls(agent)) > 1 end, 12)
-        assert eventually(fn -> length(pending_calls(agent)) > 3 end)
+        retry_now.(1)
+        assert eventually(fn -> length(pending_calls(agent)) == 2 end)
         assert Enum.uniq(pending_calls(agent)) == [pending_call(:prepare)]
+        assert eventually(fn -> match?({:ok, [_]}, DB.query(db, "SELECT prompt FROM wakes")) end)
 
         assert {:ok, [[prompt]]} = DB.query(db, "SELECT prompt FROM wakes")
         assert prompt =~ "serves every answer"
         assert {:ok, [[nil, nil, 0, 0]]} = pending_row(db)
         File.rm!(agent <> ".#{unquote(missing)}")
+        retry_now.(2)
         assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
         assert captured_ids(db) == ["before-answer", "answer request", "marked"]
       end
