@@ -3394,6 +3394,7 @@ defmodule Tightbeam.HarklightWakesTest do
 
     File.write!(script, """
     #!/bin/sh
+    if [ "$1" = --version ]; then echo 'harklight-agent 0.2.3'; exit 0; fi
     printf '%s\n' "$*" >> "$0.calls"
     printf '%s\n' "$$" > "$0.pid"
     exec sleep 300
@@ -4437,18 +4438,21 @@ defmodule Tightbeam.HarklightWakesTest do
 
     :ok = HarklightWakes.capture_feed(db, @handle, 8, [], :live)
 
-    fake_harklight_agent!("""
-    printf '%s\n' "$*" >> "$0.calls"
-    case "$*" in
-      *'--after 8') printf '%s\n' #{lines.(first)}; exit 1 ;;
-      *'--after #{jump + 1}') printf '%s\n' '{"kind":"cursor_expired","rev":0}'; exit 2 ;;
-      *--prepare)
-        printf '%s\n' '{"kind":"baseline_prepared","session":"#{@handle}","rev":40,"token":"T"}' ;;
-      *'--resume T') printf '%s\n' #{lines.(second)} ;;
-      *'--after 40') printf '%s\n' #{lines.(third)}; exit 1 ;;
-      *'--after 41') printf '%s\n' '{"kind":"caught_up","rev":41}'; exec sleep 30 ;;
-    esac
-    """)
+    fake_harklight_agent!(
+      """
+      printf '%s\n' "$*" >> "$0.calls"
+      case "$*" in
+        *'--after 8 --on-expired exit') printf '%s\n' #{lines.(first)}; exit 1 ;;
+        *'--after #{jump + 1} --on-expired exit') printf '%s\n' '{"kind":"cursor_expired","rev":0}'; exit 2 ;;
+        *--prepare)
+          printf '%s\n' '{"kind":"baseline_prepared","session":"#{@handle}","rev":40,"token":"T"}' ;;
+        *'--resume T') printf '%s\n' #{lines.(second)} ;;
+        *'--after 40 --on-expired exit') printf '%s\n' #{lines.(third)}; exit 1 ;;
+        *'--after 41 --on-expired exit') printf '%s\n' '{"kind":"caught_up","rev":41}'; exec sleep 30 ;;
+      esac
+      """,
+      "0.2.4"
+    )
 
     agent = System.find_executable("harklight-agent")
     start_supervised!({HarklightWakes, db: db, retry_delays: [5], feed_start_spacing_ms: 1})
@@ -4456,19 +4460,24 @@ defmodule Tightbeam.HarklightWakesTest do
 
     assert eventually(fn ->
              DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[41]]} and
-               String.ends_with?(File.read!(agent <> ".calls"), follow <> "41\n")
+               String.ends_with?(
+                 File.read!(agent <> ".calls"),
+                 follow <> "41 --on-expired exit\n"
+               )
            end)
 
     read = "read --session #{@handle} --pending "
 
     assert File.read!(agent <> ".calls") ==
              follow <>
-               "8\n" <>
+               "8 --on-expired exit\n" <>
                follow <>
-               "#{jump + 1}\n" <>
+               "#{jump + 1} --on-expired exit\n" <>
                read <>
                "--prepare\n" <>
-               read <> "--resume T\n" <> follow <> "40\n" <> follow <> "41\n"
+               read <>
+               "--resume T\n" <>
+               follow <> "40 --on-expired exit\n" <> follow <> "41 --on-expired exit\n"
 
     {:ok, rows} = DB.query(db, "SELECT rawLine FROM harklight_wake_entries ORDER BY feedCursor")
 
@@ -4526,6 +4535,16 @@ defmodule Tightbeam.HarklightWakesTest do
             if [ -e "$0.cut" ]; then exit 1; fi
             printf '%s\\n' '{"kind":"baseline_complete","rev":30}'
             hold complete
+            ;;
+          'listen --follow --session #{@handle} --snapshot')
+            printf '%s\\n' '{"kind":"baseline","rev":5}' '{"kind":"baseline_complete","rev":5}'
+            printf '%s\\n' '{"kind":"caught_up","rev":5}'
+            exec sleep 60
+            ;;
+          'listen --follow --session #{@handle} --after '[0-9]*[0-9])
+            printf '%s\\n' '{"kind":"baseline","rev":12,"reason":"cursor_expired"}'
+            printf '%s\\n' '{"kind":"baseline_complete","rev":12}' '{"kind":"caught_up","rev":12}'
+            exec sleep 60
             ;;
           'listen --follow --session #{@handle} --after '*)
             if [ -e "$0.expire" ]; then
@@ -4921,45 +4940,207 @@ defmodule Tightbeam.HarklightWakesTest do
       ])
     end
 
-    test "an older Agent's snapshot of an expired position is not applied", %{db: db} do
+    test "a feed told to exit on expiry does not apply a snapshot", %{db: db} do
       :ok = HarklightWakes.capture_feed(db, @handle, 50, [], :live)
       chat = JSON.encode!(feed_chat(20, "request", "from-snapshot"))
 
-      fake_harklight_agent!("""
-      printf '%s\\n' "$*" >> "$0.calls"
-      case "$*" in
-        listen*)
-          printf '%s\\n' '{"kind":"baseline","rev":30,"reason":"cursor_expired"}' '#{chat}'
-          printf '%s\\n' '{"kind":"baseline_complete","rev":30}' '{"kind":"caught_up","rev":30}'
-          exec sleep 60 ;;
-        *) echo "error: unexpected argument '--pending' found" >&2; exit 2 ;;
-      esac
-      """)
+      fake_harklight_agent!(
+        """
+        printf '%s\\n' "$*" >> "$0.calls"
+        case "$*" in
+          listen*)
+            printf '%s\\n' '{"kind":"baseline","rev":30,"reason":"cursor_expired"}' '#{chat}'
+            printf '%s\\n' '{"kind":"baseline_complete","rev":30}' '{"kind":"caught_up","rev":30}'
+            exec sleep 60 ;;
+          *) exit 1 ;;
+        esac
+        """,
+        "0.2.4"
+      )
 
       agent = System.find_executable("harklight-agent")
       start_supervised!({HarklightWakes, pending_opts(db)})
       assert eventually(fn -> length(pending_calls(agent)) > 2 end)
 
       assert Enum.uniq(pending_calls(agent)) == [
-               "listen --follow --session #{@handle} --after 50",
+               pending_call({:after, 50}),
                pending_call(:prepare)
              ]
 
       assert captured_ids(db) == []
       assert {:ok, [[50]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
-      assert {:ok, [[nil, nil, 0, 0]]} = pending_row(db)
     end
 
-    test "a new conversation still starts with a snapshot", %{db: db} do
+    for wanted <- [false, true] do
+      test "an older Agent recovers an expired position itself (open wanted: #{wanted})", %{
+        db: db
+      } do
+        :ok = HarklightWakes.capture_feed(db, @handle, 50, [], :live)
+
+        if unquote(wanted),
+          do:
+            {:ok, _} =
+              DB.query(db, "INSERT INTO harklight_pending_opens(handle) VALUES(?1)", [@handle])
+
+        chat = JSON.encode!(feed_chat(20, "request", "from-snapshot"))
+
+        fake_harklight_agent!("""
+        printf '%s\\n' "$*" >> "$0.calls"
+        printf '%s\\n' '{"kind":"baseline","rev":30,"reason":"cursor_expired"}' '#{chat}'
+        printf '%s\\n' '{"kind":"baseline_complete","rev":30}' '{"kind":"caught_up","rev":30}'
+        exec sleep 60
+        """)
+
+        agent = System.find_executable("harklight-agent")
+        start_supervised!({HarklightWakes, pending_opts(db)})
+        assert eventually(fn -> captured_ids(db) == ["from-snapshot"] end)
+
+        assert eventually(fn ->
+                 DB.query(db, "SELECT state FROM harklight_wake_handles") == {:ok, [["active"]]}
+               end)
+
+        assert pending_calls(agent) == ["listen --follow --session #{@handle} --after 50"]
+        assert {:ok, [[30]]} = DB.query(db, "SELECT rev FROM harklight_feed_checkpoints")
+        assert {:ok, []} = pending_row(db)
+      end
+    end
+
+    test "an expired position on a Server without the route is recovered by the Agent", %{db: db} do
+      :ok = HarklightWakes.capture_feed(db, @handle, 50, [], :live)
+      agent = pending_agent!()
+      File.touch!(agent <> ".expire")
+      File.touch!(agent <> ".unsupported")
+      start_supervised!({HarklightWakes, pending_opts(db)})
+
+      assert eventually(fn ->
+               DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[12]]}
+             end)
+
+      assert pending_calls(agent) == [
+               pending_call({:after, 50}),
+               pending_call(:prepare),
+               "listen --follow --session #{@handle} --after 50"
+             ]
+
+      assert {:ok, []} = pending_row(db)
+    end
+
+    for point <- [nil, "prepared", "resume", "rows", "complete"] do
+      @point point
+      test "a new conversation opens the same way, killed at #{inspect(point)}", %{db: db} do
+        agent = pending_agent!()
+        if @point, do: File.touch!(agent <> ".hold-" <> @point)
+        manager = start_supervised!({HarklightWakes, pending_opts(db)})
+
+        if @point do
+          assert eventually(fn -> File.exists?(agent <> ".at-" <> @point) end)
+          File.rm!(agent <> ".hold-" <> @point)
+          replace_feed_manager(manager)
+        end
+
+        calls =
+          case @point do
+            nil -> [:prepare, {:resume, "T1"}]
+            "prepared" -> [:prepare, :prepare, {:resume, "T2"}]
+            _ -> [:prepare, {:resume, "T1"}, {:resume, "T1"}]
+          end
+
+        assert_opened(db, agent, calls ++ [{:after, 30}])
+      end
+    end
+
+    test "a new conversation on an older Server starts with a snapshot", %{db: db} do
+      agent = pending_agent!()
+      File.touch!(agent <> ".unsupported")
+      start_supervised!({HarklightWakes, pending_opts(db)})
+
+      assert eventually(fn ->
+               DB.query(db, "SELECT rev FROM harklight_feed_checkpoints") == {:ok, [[5]]}
+             end)
+
+      assert pending_calls(agent) == [
+               pending_call(:prepare),
+               "listen --follow --session #{@handle} --snapshot"
+             ]
+
+      assert {:ok, []} = pending_row(db)
+    end
+
+    test "a new conversation whose token is stored never falls back to a snapshot", %{db: db} do
+      agent = pending_agent!()
+      File.touch!(agent <> ".hold-resume")
+      manager = start_supervised!({HarklightWakes, pending_opts(db)})
+      assert eventually(fn -> File.exists?(agent <> ".at-resume") end)
+      File.rm!(agent <> ".hold-resume")
+      File.touch!(agent <> ".unsupported")
+      replace_feed_manager(manager)
+      assert eventually(fn -> length(pending_calls(agent)) > 3 end)
+      File.rm!(agent <> ".unsupported")
+      assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
+      refute Enum.any?(pending_calls(agent), &(&1 =~ "snapshot"))
+      assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+    end
+
+    test "a failed prepare of a new conversation is retried, not replaced by a snapshot", %{
+      db: db
+    } do
       fake_harklight_agent!(
         """
         printf '%s\\n' "$*" >> "$0.calls"
-        printf '%s\\n' '{"kind":"baseline","rev":5}' '{"kind":"baseline_complete","rev":5}'
-        printf '%s\\n' '{"kind":"caught_up","rev":5}'
-        exec sleep 60
+        echo 'server returned HTTP 500: Some("internal_error") (request ID None)' >&2
+        exit 1
         """,
         "0.2.4"
       )
+
+      agent = System.find_executable("harklight-agent")
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      assert eventually(fn -> length(pending_calls(agent)) > 2 end)
+      assert Enum.uniq(pending_calls(agent)) == [pending_call(:prepare)]
+    end
+
+    test "an Agent that does not say its version holds back nothing and is asked again", %{
+      db: db,
+      session: session
+    } do
+      second = "7d737f62-bbd7-4c51-978d-f6ff5b4d8147"
+      seed_completion_handle(db, session.session_key, second, "other")
+
+      fake_harklight_agent!("exit 9")
+      agent = System.find_executable("harklight-agent")
+
+      File.write!(agent, """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "$0.calls"
+      if [ ! -e "$0.hung" ]; then touch "$0.hung"; exec sleep 60; fi
+      if [ "$1" = --version ]; then
+        if [ -e "$0.fail" ]; then exit 1; fi
+        echo 'harklight-agent 0.2.3'; exit 0
+      fi
+      printf '%s\\n' '{"kind":"baseline","rev":5}' '{"kind":"baseline_complete","rev":5}'
+      printf '%s\\n' '{"kind":"caught_up","rev":5}'
+      exec sleep 60
+      """)
+
+      File.touch!(agent <> ".fail")
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      assert eventually(fn -> Enum.count(pending_calls(agent), &(&1 == "--version")) > 3 end)
+      assert Enum.uniq(pending_calls(agent)) == ["--version"]
+      File.rm!(agent <> ".fail")
+
+      assert eventually(fn ->
+               DB.query(db, "SELECT handle FROM harklight_feed_checkpoints") ==
+                 {:ok, [[second]]}
+             end)
+    end
+
+    test "an older Agent starts a new conversation with a snapshot", %{db: db} do
+      fake_harklight_agent!("""
+      printf '%s\\n' "$*" >> "$0.calls"
+      printf '%s\\n' '{"kind":"baseline","rev":5}' '{"kind":"baseline_complete","rev":5}'
+      printf '%s\\n' '{"kind":"caught_up","rev":5}'
+      exec sleep 60
+      """)
 
       agent = System.find_executable("harklight-agent")
       start_supervised!({HarklightWakes, pending_opts(db)})

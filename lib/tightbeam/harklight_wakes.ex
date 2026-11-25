@@ -162,7 +162,7 @@ defmodule Tightbeam.HarklightWakes do
   """
 
   # A conversation with messages from before protocol 2 that has never been
-  # opened under it. Its first read is a pending open, never a snapshot.
+  # opened under it. Its first read is never a snapshot.
   @earlier_unopened_sql """
   (NOT EXISTS(SELECT 1 FROM harklight_feed_checkpoints c WHERE c.handle=h.handle)
    AND (h.lastCursor>0
@@ -2763,10 +2763,20 @@ defmodule Tightbeam.HarklightWakes do
 
     if earlier_unopened == 1, do: want_pending_open_in_txn(txn, handle)
 
+    # What an Agent and Server without the pending read do instead, as long as
+    # nothing was prepared: an expired position keeps the Agent's own recovery, a
+    # new conversation starts from a snapshot, and an old one stays unopened.
+    older =
+      cond do
+        is_integer(rev) -> {:after, rev, :agent_recovers}
+        earlier_unopened == 1 -> nil
+        true -> :snapshot
+      end
+
     case Txn.q(txn, "SELECT rev,token FROM harklight_pending_opens WHERE handle=?1", [handle]) do
-      [[open_rev, token]] -> {:pending, open_rev, token}
+      [[open_rev, token]] when is_binary(token) -> {:pending, {open_rev, token}, nil}
       [] when is_integer(rev) -> {:after, rev}
-      [] -> :snapshot
+      _ -> {:pending, {nil, nil}, older}
     end
   end
 
@@ -2774,7 +2784,11 @@ defmodule Tightbeam.HarklightWakes do
   defp pending_open_in_txn(txn, handle, {:prepared, rev, token}) do
     Txn.q(
       txn,
-      "UPDATE harklight_pending_opens SET rev=?2,token=?3,resumed=0 WHERE handle=?1 AND token IS NULL",
+      """
+      INSERT INTO harklight_pending_opens(handle,rev,token) VALUES(?1,?2,?3)
+      ON CONFLICT(handle) DO UPDATE SET rev=excluded.rev,token=excluded.token,resumed=0
+      WHERE token IS NULL
+      """,
       [handle, rev, token]
     )
 
@@ -3306,8 +3320,18 @@ defmodule Tightbeam.HarklightWakes do
     with executable when is_binary(executable) <- System.find_executable("harklight-agent"),
          {:ok, db, start} <- GenServer.call(manager, {:feed_start, handle}, :infinity) do
       case start do
-        {:pending, rev, token} ->
-          open_pending(manager, db, executable, handle, {rev, token}, state_delays)
+        {:pending, open, older} ->
+          # An old conversation asks anyway: only the refusal tells its receiver.
+          case older && pending_agent?(manager, handle, executable) do
+            {:ok, false} ->
+              follow(manager, db, executable, handle, older, state_delays)
+
+            supported when supported in [nil, {:ok, true}] ->
+              open_pending(manager, db, executable, handle, open, older, state_delays)
+
+            other ->
+              finish_pending(other, manager, handle)
+          end
 
         start ->
           follow(manager, db, executable, handle, start, state_delays)
@@ -3363,30 +3387,36 @@ defmodule Tightbeam.HarklightWakes do
   defp exit_status_detail(status) when is_integer(status), do: "exit status: #{status}"
   defp exit_status_detail(_), do: "exit status: unknown (not observed)"
 
-  # A caller-owned open: nothing listens until everything waiting at its fixed
+  # Every first open, and an expired position, is a caller-owned open: nothing listens until everything waiting at its fixed
   # position is applied and that position is committed with it. Killed anywhere,
   # the same token serves the same rows again and events keep their identity.
   # One reader per conversation: another reader of this identity can take rows
   # that this open would then not be served.
-  defp open_pending(manager, db, executable, handle, {_, nil}, state_delays) do
-    with {:ok, output, status} <- run_agent(manager, handle, executable, ["--prepare"]) do
+  defp open_pending(manager, db, executable, handle, {_, nil}, older, state_delays) do
+    with {:ok, output, status} <-
+           run_agent(manager, handle, executable, pending_args(handle, ["--prepare"])) do
       case {status, pending_records(output)} do
         {0,
          [%{"kind" => "baseline_prepared", "session" => ^handle, "rev" => rev, "token" => token}]}
         when is_integer(rev) and rev >= 0 and is_binary(token) and token != "" ->
           with {:ok, rev, token} <- pending_step(manager, handle, {:prepared, rev, token}),
-               do: open_pending(manager, db, executable, handle, {rev, token}, state_delays)
+               do: open_pending(manager, db, executable, handle, {rev, token}, nil, state_delays)
 
         {_, records} ->
-          {:error, pending_failure(records, output, status)}
+          failure = pending_failure(records, output, status)
+
+          if older && no_pending_route?(failure),
+            do: follow(manager, db, executable, handle, older, state_delays),
+            else: {:error, failure}
       end
     end
     |> finish_pending(manager, handle)
   end
 
-  defp open_pending(manager, db, executable, handle, {rev, token}, state_delays) do
+  defp open_pending(manager, db, executable, handle, {rev, token}, _older, state_delays) do
     with {:ok, resumed?} <- pending_step(manager, handle, {:resuming, token}),
-         {:ok, output, status} <- run_agent(manager, handle, executable, ["--resume", token]) do
+         args = pending_args(handle, ["--resume", token]),
+         {:ok, output, status} <- run_agent(manager, handle, executable, args) do
       records = pending_records(output)
 
       case {status, pending_rows(records, rev)} do
@@ -3421,10 +3451,11 @@ defmodule Tightbeam.HarklightWakes do
   defp pending_step(manager, handle, step),
     do: GenServer.call(manager, {:pending_open, handle, step}, :infinity)
 
-  # Both steps name exactly one conversation and run as that feed's only child.
-  defp run_agent(manager, handle, executable, step) do
-    args = ["read", "--session", handle, "--pending" | step]
+  # Both steps name exactly one conversation.
+  defp pending_args(handle, step), do: ["read", "--session", handle, "--pending" | step]
 
+  # Runs to its end as that feed's only child.
+  defp run_agent(manager, handle, executable, args) do
     case GenServer.call(manager, {:launch_child, handle, executable, args}, :infinity) do
       {:ok, port, initial, _token} ->
         {output, status} = Tightbeam.HarklightChild.collect(port, initial)
@@ -3468,7 +3499,7 @@ defmodule Tightbeam.HarklightWakes do
   defp pending_rows(_records, _rev), do: :error
 
   # An Agent without the flags refuses its command line; a Server without the
-  # route is reported as unsupported. Neither may fall back to a snapshot.
+  # route is reported as unsupported.
   defp pending_failure(records, output, status) do
     lines =
       output
@@ -3493,38 +3524,56 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  # Read once per installed Agent. An Agent that cannot say is treated as older.
-  defp stops_on_expiry?(executable) do
-    key = {__MODULE__, :agent_version, executable}
+  # Asked once per installed Agent, as that feed's child, so one that does not
+  # answer holds back nothing else. Only an answer makes it an older Agent.
+  defp pending_agent?(manager, handle, executable) do
+    key = {__MODULE__, :pending_agent, executable}
     identity = with {:ok, stat} <- File.stat(executable), do: {stat.inode, stat.mtime, stat.size}
 
     case :persistent_term.get(key, nil) do
       {^identity, answer} ->
-        answer
+        {:ok, answer}
 
       _ ->
-        answer =
-          with {output, 0} <- System.cmd(executable, ["--version"], stderr_to_stdout: true),
-               [_, version] <- Regex.run(~r/(\d+\.\d+\.\d+)/, output) do
-            Version.compare(version, "0.2.4") != :lt
-          else
-            _ -> false
-          end
+        case run_agent(manager, handle, executable, ["--version"]) do
+          {:ok, output, 0} ->
+            answer =
+              case Regex.run(~r/(\d+\.\d+\.\d+)/, output) do
+                [_, version] -> Version.compare(version, "0.2.4") != :lt
+                nil -> false
+              end
 
-        :persistent_term.put(key, {identity, answer})
-        answer
+            :persistent_term.put(key, {identity, answer})
+            {:ok, answer}
+
+          {:ok, output, status} ->
+            {:error, pending_failure([], output, status)}
+
+          other ->
+            other
+        end
     end
   end
 
-  defp feed_args({:after, rev}, executable) do
-    expiry = if stops_on_expiry?(executable), do: ["--on-expired", "exit"], else: []
-    ["--after", to_string(rev) | expiry]
+  defp feed_args({:after, rev}, true),
+    do: ["--after", to_string(rev), "--on-expired", "exit"]
+
+  defp feed_args({:after, rev}, false), do: ["--after", to_string(rev)]
+  defp feed_args({:after, rev, :agent_recovers}, _), do: ["--after", to_string(rev)]
+  defp feed_args(:snapshot, _), do: ["--snapshot"]
+
+  defp follow(manager, db, executable, handle, {:after, _} = start, state_delays) do
+    case pending_agent?(manager, handle, executable) do
+      {:ok, stops?} -> follow(manager, db, executable, handle, start, stops?, state_delays)
+      other -> finish_pending(other, manager, handle)
+    end
   end
 
-  defp feed_args(:snapshot, _executable), do: ["--snapshot"]
+  defp follow(manager, db, executable, handle, start, state_delays),
+    do: follow(manager, db, executable, handle, start, false, state_delays)
 
-  defp follow(manager, db, executable, handle, start, state_delays) do
-    args = ["listen", "--follow", "--session", handle | feed_args(start, executable)]
+  defp follow(manager, db, executable, handle, start, stops_on_expiry?, state_delays) do
+    args = ["listen", "--follow", "--session", handle | feed_args(start, stops_on_expiry?)]
 
     case GenServer.call(manager, {:launch_child, handle, executable, args}, :infinity) do
       {:ok, port, initial, token} ->
@@ -3534,7 +3583,7 @@ defmodule Tightbeam.HarklightWakes do
             executable: executable,
             token: token,
             baseline: nil,
-            resumed: start != :snapshot,
+            stops_on_expiry: stops_on_expiry?,
             diagnostic_evidence: :quiet,
             ready: false,
             state_delays: state_delays
@@ -3813,13 +3862,15 @@ defmodule Tightbeam.HarklightWakes do
 
   defp apply_listener_frame(_manager, _handle, %{"kind" => "focus"}, feed), do: {:ok, feed}
 
-  # The position expired. An Agent that does not exit on expiry prints a
-  # snapshot, which skips chat on closed items, so it is not applied.
+  # The position expired. A feed told to exit then must not print a snapshot,
+  # which skips chat on closed items, so one is not applied.
   defp apply_listener_frame(_manager, _handle, %{"kind" => "cursor_expired"}, _feed),
     do: {:error, "cursor_expired"}
 
-  defp apply_listener_frame(_manager, _handle, %{"kind" => "baseline"}, %{resumed: true}),
-    do: {:error, "cursor_expired"}
+  defp apply_listener_frame(_manager, _handle, %{"kind" => "baseline"}, %{
+         stops_on_expiry: true
+       }),
+       do: {:error, "cursor_expired"}
 
   defp apply_listener_frame(
          _manager,
@@ -4199,6 +4250,15 @@ defmodule Tightbeam.HarklightWakes do
                """,
                [handle, rev]
              )
+
+             # The Agent's own recovery ends an open that was only wanted.
+             if mode == :baseline,
+               do:
+                 Txn.q(
+                   txn,
+                   "DELETE FROM harklight_pending_opens WHERE handle=?1 AND token IS NULL",
+                   [handle]
+                 )
 
              with {:pending, token} <- mode,
                   [] <-
