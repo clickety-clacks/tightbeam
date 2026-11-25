@@ -4422,11 +4422,21 @@ defmodule Tightbeam.HarklightWakesTest do
     assert {:ok, :notified} = Outage.notify(db, separate, separate_episode, 6_000, 1_000)
     assert List.last(wakes.("w_harklight_notice_recovery_%")) =~ "handle #{separate} stopped"
 
-    # Back and out again before it is told: nothing is announced.
+    # Back and out again before it is told: nothing is announced yet.
     {:ok, :ok} = Outage.finish(db, separate, true, 7_000)
     start.(separate, 7_001)
     assert {:ok, _} = Outage.announce_recoveries(db, 7_002)
     assert [_] = wakes.("w_harklight_listening_%")
+
+    # That second outage ends before it is due to be told. The first one's
+    # all-clear is still owed, and is sent once.
+    {:ok, :ok} = Outage.finish(db, separate, true, 8_000)
+    assert {:ok, _} = Outage.announce_recoveries(db, 8_001)
+    assert [_, back_again] = wakes.("w_harklight_listening_%")
+    assert back_again =~ "conversation #{separate}"
+    assert {:ok, _} = Outage.announce_recoveries(db, 8_002)
+    assert length(wakes.("w_harklight_listening_%")) == 2
+    assert {:ok, []} = DB.query(db, "SELECT handle FROM harklight_outage_recoveries")
   end
 
   test "a gathered recovery is told after a restart", %{db: db} do

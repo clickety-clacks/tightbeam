@@ -172,8 +172,8 @@ defmodule Tightbeam.HarklightListenerOutage do
           ])
   end
 
-  # Tells each receiver once about its reported conversations that are back, and
-  # says nothing about one that has gone out again.
+  # Tells each receiver once about its reported conversations that are back. One
+  # that has gone out again is told when that outage ends, reported or not.
   def announce_recoveries(db, now) do
     DB.transaction(db, fn txn ->
       rows =
@@ -186,7 +186,10 @@ defmodule Tightbeam.HarklightListenerOutage do
           """
         )
 
-      Txn.q(txn, "DELETE FROM harklight_outage_recoveries")
+      # One that is out again keeps its row: its all-clear follows its recovery.
+      Enum.each(rows, fn [handle, _] ->
+        Txn.q(txn, "DELETE FROM harklight_outage_recoveries WHERE handle=?1", [handle])
+      end)
 
       rows
       |> Enum.group_by(fn [handle, _] -> recipient(txn, handle) end)
