@@ -387,6 +387,7 @@ defmodule Tightbeam.Gateway do
          ),
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
+         {Tightbeam.RunningModel, db: db, name: Tightbeam.RunningModel},
          {Tightbeam.AdapterCoordinator,
           adapter_sup: Tightbeam.AdapterSupervisor,
           adapter_context: adapter_context,
@@ -5097,7 +5098,8 @@ defmodule Tightbeam.Gateway do
   defp placement_adapter_key(session),
     do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
-  defp adapter_key(%{harness: harness} = session) do
+  @doc false
+  def adapter_key(%{harness: harness} = session) do
     case Harness.parse!(harness).id() do
       :pi -> Placement.pi_session_adapter_key(session.session_key, session.host)
       id -> {id, "shared", session.host}

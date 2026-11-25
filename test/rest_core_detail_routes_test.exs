@@ -42,7 +42,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
-      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities fyi rowVersion),
+      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus runningModel capabilities fyi rowVersion),
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
@@ -62,7 +62,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "decision requests" =>
       ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context),
     "sessions" =>
-      ~w(ownerUserId spawnedBy topologyParent handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides),
+      ~w(ownerUserId spawnedBy topologyParent handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides runningModel),
     "devices" => ~w(claimedName platform model),
     "artifacts" =>
       ~w(description createdBySession createdByProcess parentSession contentSha256 recordedMessageId home),
@@ -2305,6 +2305,50 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert collection.status == 200, collection.resp_body
 
     assert item in JSON.decode!(collection.resp_body)["items"]
+  end
+
+  test "REST serves the stored running model and reading it loads no agent", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "running-model-session",
+        display_name: "Running model",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("sonnet")
+      })
+
+    path = "/api/sessions/#{session.session_key}"
+    assert JSON.decode!(get(ctx, path).resp_body)["item"]["runningModel"] == nil
+
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: true})
+
+    assert :changed =
+             Org.set_running_model(ctx.db, session.session_key, %{id: "opus", label: "Opus"})
+
+    expected = %{"id" => "opus", "label" => "Opus", "harness" => "claude"}
+    detail = get(ctx, path)
+    assert detail.status == 200, detail.resp_body
+    assert JSON.decode!(detail.resp_body)["item"]["runningModel"] == expected
+
+    # The Firehose row is the REST row.
+    assert_receive {:firehose_notice,
+                    %{"class" => "session.updated", "payload" => %{"sessionKey" => key} = row}}
+                   when key == "running-model-session"
+
+    assert row == JSON.decode!(detail.resp_body)["item"]
+
+    collection = JSON.decode!(get(ctx, "/api/sessions").resp_body)["items"]
+
+    assert Enum.find(collection, &(&1["sessionKey"] == session.session_key))["runningModel"] ==
+             expected
+
+    # The value is stored. No adapter coordinator runs in this fixture, so a read
+    # that tried to load an agent to learn the model could not have succeeded.
+    assert Process.whereis(Tightbeam.AdapterCoordinator) == nil
   end
 
   test "artifact archive and release notices equal the current ordered REST detail", ctx do

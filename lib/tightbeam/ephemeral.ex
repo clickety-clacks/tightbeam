@@ -147,7 +147,8 @@ defmodule Tightbeam.Ephemeral do
       Txn.q(
         txn,
         """
-        UPDATE sessions SET state='retired', mechanicalStatus='idle', updatedAt=MAX(updatedAt+1,?2)
+        UPDATE sessions SET state='retired', mechanicalStatus='idle', updatedAt=MAX(updatedAt+1,?2),
+          runningModelId=NULL, runningModelLabel=NULL, runningModelHarness=NULL
         WHERE sessionKey=?1 AND state='active'
         """,
         [key, System.system_time(:millisecond)]
