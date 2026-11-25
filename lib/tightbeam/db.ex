@@ -95,6 +95,7 @@ defmodule Tightbeam.DB do
   @admission_poll_ms 10
   @admission_poll_max_ms 250
   @admission_report_ms 10_000
+  @owed_wait_ms 1_000
   @startup_progress_ms 5_000
   @deadline_key {__MODULE__, :deadline}
   @statement_cache_key {__MODULE__, :statement_cache}
@@ -134,8 +135,11 @@ defmodule Tightbeam.DB do
   Once sent, an owed call waits for its answer without a client timeout, for
   the same reason: a timeout raised in a lane, a coordinator or an adapter drops
   the work. It is also the only safe wait for a write, whose effect a timeout
-  would leave unknown. Calls that carry their own deadline
-  (`transaction_until/3`, `query_until/4`) keep their deadline and the refusal.
+  would leave unknown. The wait ends with the database process, and once the
+  waiting process has been told to stop it is bounded by the ordinary timeout.
+  A wait past that timeout is logged each time it passes again, naming its
+  caller. Calls that carry their own deadline (`transaction_until/3`,
+  `query_until/4`) keep their deadline and the refusal.
 
   `owed_work/0` marks the calling process for its lifetime; `owed_work/1` marks
   it while `fun` runs. `refusable/1` is the way back: inside a marked process it
@@ -182,16 +186,88 @@ defmodule Tightbeam.DB do
   def waits_for_answer?, do: Process.get(@owed_work_key) != nil
 
   @doc false
-  # Block until the owner's queue is back under its limit. Returns the wait in ms.
+  # `GenServer.call/3` for owed work: it ends with an answer or the server.
+  def owed_call(server, request, operation) do
+    now = System.monotonic_time(:millisecond)
+    owed_wait(:gen_server.send_request(server, request), operation, now, call_timeout())
+  end
+
+  defp owed_wait(id, operation, started, report_at) do
+    case :gen_server.wait_response(id, min(@owed_wait_ms, call_timeout())) do
+      {:reply, reply} ->
+        reply
+
+      {:error, {reason, _server}} ->
+        exit({reason, {GenServer, :call, [:redacted]}})
+
+      :timeout ->
+        waited = System.monotonic_time(:millisecond) - started
+
+        cond do
+          waited < report_at ->
+            owed_wait(id, operation, started, report_at)
+
+          stopping?() ->
+            case :gen_server.receive_response(id, 0) do
+              {:reply, reply} -> reply
+              _ -> exit({:timeout, {GenServer, :call, [:redacted]}})
+            end
+
+          true ->
+            Logger.warning(
+              "database has not answered owed #{operation} after #{waited}ms; " <>
+                "caller=#{owed_caller()} pid=#{inspect(self())}"
+            )
+
+            owed_wait(id, operation, started, waited + call_timeout())
+        end
+    end
+  end
+
+  # A process that traps exits finds its supervisor's stop in its mailbox, where
+  # a blocked call would never read it. Leave it there for the process to handle.
+  defp stopping? do
+    parent =
+      case Process.get(:"$ancestors") do
+        [parent | _] when is_atom(parent) -> Process.whereis(parent)
+        [parent | _] -> parent
+        _ -> nil
+      end
+
+    receive do
+      {:EXIT, ^parent, _reason} = stop ->
+        send(self(), stop)
+        true
+    after
+      0 -> false
+    end
+  end
+
+  defp owed_caller do
+    {:current_stacktrace, frames} = Process.info(self(), :current_stacktrace)
+
+    Enum.find_value(frames, "unknown", fn {module, function, arity, _location} ->
+      name = Atom.to_string(module)
+
+      if String.starts_with?(name, "Elixir.Tightbeam.") and
+           module not in [__MODULE__, DBObservation, __MODULE__.Reader],
+         do: Exception.format_mfa(module, function, arity)
+    end)
+  end
+
+  @doc false
+  # Block until the owner's queue is back under its limit, or the process is
+  # told to stop. Returns whether the call may be sent.
   def await_admission(server, operation) do
     started = System.monotonic_time(:millisecond)
     Logger.warning("database overloaded; owed work is waiting to send #{operation}")
-    waited = admission_wait(server, operation, started, started, @admission_poll_ms)
+    admitted? = admission_wait(server, operation, started, started, @admission_poll_ms)
+    waited = System.monotonic_time(:millisecond) - started
 
-    if waited >= @admission_report_ms,
+    if admitted? and waited >= @admission_report_ms,
       do: Logger.warning("database overload passed; owed #{operation} sent after #{waited}ms")
 
-    waited
+    admitted?
   end
 
   defp admission_wait(server, operation, started, reported, pause) do
@@ -201,7 +277,10 @@ defmodule Tightbeam.DB do
 
     cond do
       not overloaded?(server) ->
-        now - started
+        true
+
+      now - started >= call_timeout() and stopping?() ->
+        false
 
       now - reported >= @admission_report_ms ->
         Logger.warning(
@@ -778,12 +857,10 @@ defmodule Tightbeam.DB do
 
       # A refused call was never sent. Owed work asks again once the queue has
       # room; every other caller is handed the refusal.
-      if unsent? and owed_work?() and match?({:error, %Overloaded{}}, reply) do
-        await_admission(server, operation)
-        observed_call(server, request, operation, budget)
-      else
-        reply
-      end
+      if unsent? and owed_work?() and match?({:error, %Overloaded{}}, reply) and
+           await_admission(server, operation),
+         do: observed_call(server, request, operation, budget),
+         else: reply
     end
   end
 

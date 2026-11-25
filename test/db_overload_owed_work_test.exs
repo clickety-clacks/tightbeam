@@ -14,6 +14,26 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     SessionLane
   }
 
+  defmodule Owing do
+    use GenServer
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+    @impl true
+    def init(opts) do
+      Process.flag(:trap_exit, true)
+      DB.owed_work()
+      {:ok, opts}
+    end
+
+    @impl true
+    def handle_info(:work, state) do
+      send(state.parent, :working)
+      result = DB.transaction(state.db, fn _ -> :ok end)
+      {:noreply, Map.put(state, :result, result)}
+    end
+  end
+
   defmodule HealthPlug do
     def init(opts), do: opts
     def call(conn, _opts), do: Plug.Conn.send_resp(conn, 200, "ok")
@@ -343,6 +363,79 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
 
       assert {:error, %DB.DeadlineExceeded{}} =
                DB.owed_work(fn -> DB.query_until(db, "SELECT 1", [], deadline) end)
+    end
+
+    test "logs the caller of a late owed call, each time the timeout passes again", %{db: db} do
+      stall!(db)
+
+      log =
+        capture_log(fn ->
+          waiting =
+            Task.async(fn -> DB.owed_work(fn -> EventLog.lifecycle(db, "late", "x", nil) end) end)
+
+          assert Task.yield(waiting, 500) == nil
+          relieve!(db)
+          assert :ok = Task.await(waiting, 5_000)
+        end)
+
+      lines =
+        Regex.scan(
+          ~r/database has not answered owed db\.transaction .*caller=Tightbeam\.EventLog\.lifecycle/,
+          log
+        )
+
+      assert length(lines) >= 2
+    end
+
+    test "ends an owed call when the owner dies", %{db: db} do
+      stall!(db)
+      owner = Process.whereis(db)
+
+      {waiting, ref} =
+        spawn_monitor(fn -> DB.owed_work(fn -> DB.transaction(db, fn _ -> :ok end) end) end)
+
+      refute_receive {:DOWN, ^ref, :process, ^waiting, _}, 300
+      capture_log(fn -> Process.exit(owner, :kill) end)
+      assert_receive {:DOWN, ^ref, :process, ^waiting, {:killed, _}}, 2_000
+    end
+
+    for shape <- [:stalled, :overloaded] do
+      test "lets a process that traps exits stop while its owed call waits (#{shape})",
+           %{db: db} do
+        {:ok, sup} = Supervisor.start_link([], strategy: :one_for_one)
+        test = self()
+
+        child = %{
+          id: :owing,
+          # Without a limit of its own, the call alone decides when this stops.
+          shutdown: :infinity,
+          start: {Tightbeam.DBOverloadOwedWorkTest.Owing, :start_link, [%{db: db, parent: test}]}
+        }
+
+        {:ok, owing} = Supervisor.start_child(sup, child)
+        ref = Process.monitor(owing)
+        stall!(db)
+
+        if unquote(shape) == :overloaded,
+          do:
+            for(
+              _ <- 1..128,
+              do:
+                send(
+                  Process.whereis(db),
+                  {:"$gen_call", {self(), make_ref()}, {:query, "SELECT 1", []}}
+                )
+            )
+
+        capture_log(fn ->
+          send(owing, :work)
+          assert_receive :working
+          refute_receive {:DOWN, ^ref, :process, _, _}, 400
+          stopping = Task.async(fn -> Supervisor.terminate_child(sup, :owing) end)
+          assert_receive {:DOWN, ^ref, :process, ^owing, _}, 3_000
+          assert :ok = Task.await(stopping)
+        end)
+      end
     end
 
     test "keeps the lane, and the claim and finish of its turn", %{db: db} do

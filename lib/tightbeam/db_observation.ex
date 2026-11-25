@@ -234,7 +234,9 @@ defmodule Tightbeam.DBObservation do
 
       response
     else
-      GenServer.call(server, request, budget)
+      if budget == :infinity,
+        do: Tightbeam.DB.owed_call(server, request, envelope.operation),
+        else: GenServer.call(server, request, budget)
     end
   end
 

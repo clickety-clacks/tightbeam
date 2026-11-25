@@ -7,7 +7,7 @@ defmodule Tightbeam.DB.Reader do
   def start_link(path), do: GenServer.start_link(__MODULE__, path)
 
   def query(reader, sql, params, envelope) do
-    GenServer.call(reader, {:query, sql, params, envelope}, remaining(envelope.deadline))
+    call(reader, {:query, sql, params, envelope}, remaining(envelope.deadline), "db.query")
   end
 
   def read_transaction(reader, fun, timeout) when is_function(fun, 1) do
@@ -17,12 +17,15 @@ defmodule Tightbeam.DB.Reader do
         else: System.monotonic_time(:millisecond) + timeout
 
     try do
-      GenServer.call(reader, {:read_transaction, fun, deadline}, timeout)
+      call(reader, {:read_transaction, fun, deadline}, timeout, "db.read_transaction")
     catch
       :exit, {:timeout, _} -> {:error, %DB.DeadlineExceeded{}}
       :exit, reason -> {:error, reason}
     end
   end
+
+  defp call(reader, request, :infinity, operation), do: DB.owed_call(reader, request, operation)
+  defp call(reader, request, timeout, _operation), do: GenServer.call(reader, request, timeout)
 
   @impl true
   def init(path) do
