@@ -4703,7 +4703,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp prepare_adapter_cli({:claude, _, host}, opts, config) do
-    run = Map.get(config, :sh, &Tightbeam.Harness.Support.system_cmd/1)
+    run = config[:sh_out] || &Tightbeam.Harness.Support.system_cmd_out/1
     Tightbeam.Harness.ClaudeCli.prepare_launch(opts, host, run)
   end
 

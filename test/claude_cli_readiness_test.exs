@@ -119,6 +119,17 @@ defmodule Tightbeam.Harness.ClaudeCliReadinessTest do
     assert launch_pin(opts) == override
   end
 
+  @tag timeout: 180_000
+  test "Gateway refuses an obsolete CLI then starts ACP with the checked executable", ctx do
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_claude_cli.exs",
+      "guarded-gateway-claude-cli: ok"
+    )
+
+    assert File.read!(Path.join(ctx.tmp_dir, "runtime.log")) =~ "fixture version probe warning"
+  end
+
   defp launch_pin(opts) do
     if opts[:process_ssh], do: remote_launch_pin(opts), else: local_launch_pin(opts)
   end

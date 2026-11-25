@@ -2,7 +2,7 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, Placement}
-  alias Tightbeam.Harness.{Claude, RecoveryProbe}
+  alias Tightbeam.Harness.{Claude, RecoveryProbe, Support}
 
   @codex_help ~w(--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -C -m -s -c
                  --disable --output-schema --json)
@@ -22,7 +22,7 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
 
   # Every CLI call reads standard input to end of file before answering, as
   # `codex exec` does. The check call also fails unless that input is empty.
-  defp fake_cli!(dir, name, help, features) do
+  defp fake_cli!(dir, name, help, features, version \\ "2.1.322") do
     path = Path.join(dir, name)
 
     File.write!(path, """
@@ -30,10 +30,10 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
     input=$(cat)
     [ -z "$input" ] || { echo "unexpected stdin" >&2; exit 9; }
     case "$1 $2" in
-      "--version ") echo "2.1.322 (Claude Code)" ;;
+      "--version ") echo "#{version} (Claude Code)" ;;
       "exec --help"|"--help ") echo "#{Enum.join(help, " ")}" ;;
       "features list") echo "#{Enum.join(features, " ")}" ;;
-      *) : ;;
+      *) touch "$0.called" ;;
     esac
     """)
 
@@ -41,12 +41,14 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
     path
   end
 
-  defp fake_ssh!(dir) do
+  defp fake_ssh!(dir, warning \\ "") do
     # Like ssh: skip the options and host, give the rest to a shell, keep stdin open.
     path = Path.join(dir, "ssh")
+    warning = if warning == "", do: "", else: warning <> "\n"
 
     File.write!(path, """
     #!/bin/sh
+    printf %s #{Support.shell_quote(warning)} >&2
     while [ "$1" = "-o" ]; do shift 2; done
     shift
     exec sh -c "$*"
@@ -93,21 +95,23 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
   end
 
   @tag :tmp_dir
-  test "Claude recovery prefers a supported CLI on the configured toolchain PATH", ctx do
-    fake_claude_adapter!(ctx.tmp_dir)
-    fake_cli!(ctx.tmp_dir, "claude", @claude_help, [])
-
-    assert {:ok, _} =
-             Placement.register_host(ctx.db, "stdinhost", %{ssh: nil, base_dir: ctx.tmp_dir})
-
-    {node, 0} = System.cmd("node", ["-p", "process.execPath"])
-    node_dir = node |> String.trim() |> Path.dirname()
-
-    assert {:ok, _} =
-             Placement.set_toolchain_dirs(ctx.db, "stdinhost", [ctx.tmp_dir, node_dir], "test")
-
-    with_claude_override(nil)
+  test "Claude recovery uses a supported PATH CLI when the bundle is obsolete", ctx do
+    bundle = fake_claude_adapter!(ctx.tmp_dir, "2.1.207")
+    path_cli = fake_cli!(ctx.tmp_dir, "claude", @claude_help, [])
+    configure_claude_toolchain!(ctx)
     assert {{:succeeded, nil}, _} = run(ctx, "claude", nil, nil, 20_000)
+    assert File.exists?(path_cli <> ".called")
+    refute File.exists?(bundle <> ".called")
+  end
+
+  @tag :tmp_dir
+  test "Claude recovery uses a supported bundle when the PATH CLI is obsolete", ctx do
+    bundle = fake_claude_adapter!(ctx.tmp_dir)
+    path_cli = fake_cli!(ctx.tmp_dir, "claude", @claude_help, [], "2.1.207")
+    configure_claude_toolchain!(ctx)
+    assert {{:succeeded, nil}, _} = run(ctx, "claude", nil, nil, 20_000)
+    assert File.exists?(bundle <> ".called")
+    refute File.exists?(path_cli <> ".called")
   end
 
   @tag :tmp_dir
@@ -119,30 +123,71 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
   end
 
   @tag :tmp_dir
+  test "Claude recovery reads JSON separately from SSH warnings", ctx do
+    fake_ssh!(ctx.tmp_dir, "fixture SSH warning")
+    with_fixture_path(ctx.tmp_dir)
+    fake_claude_adapter!(ctx.tmp_dir)
+    binary = fake_cli!(ctx.tmp_dir, "custom claude", @claude_help, [])
+    assert {{:succeeded, nil}, _} = run(ctx, "claude", binary, "fixture@remote", 20_000)
+    assert File.exists?(binary <> ".called")
+  end
+
+  @tag :tmp_dir
   test "a remote Codex check gets no stdin through ssh", ctx do
     fake_ssh!(ctx.tmp_dir)
     binary = fake_cli!(ctx.tmp_dir, "codex", @codex_help, @codex_features)
-    path = System.get_env("PATH")
-    System.put_env("PATH", ctx.tmp_dir <> ":" <> path)
-    on_exit(fn -> System.put_env("PATH", path) end)
+    with_fixture_path(ctx.tmp_dir)
 
     assert {{:succeeded, nil}, elapsed} = run(ctx, "codex", binary, "fixture@remote", 20_000)
     assert elapsed < 15_000
   end
 
-  defp fake_claude_adapter!(dir) do
+  defp fake_claude_adapter!(dir, version \\ "2.1.280") do
     root = Path.join(dir, "adapters")
     package = Path.join(root, "node_modules/@agentclientprotocol/claude-agent-acp")
     adapter = Claude.installed_adapter(root)
-    File.mkdir_p!(package)
+    File.mkdir_p!(Path.join(package, "dist"))
     File.mkdir_p!(Path.dirname(adapter))
     entry = fake_cli!(package, "cli", [], [])
     File.ln_s!(entry, adapter)
 
     File.write!(
       Path.join(package, "package.json"),
-      JSON.encode!(%{name: Claude.install_package(), version: Claude.adapter_version()})
+      JSON.encode!(%{
+        name: Claude.install_package(),
+        version: Claude.adapter_version(),
+        type: "module"
+      })
     )
+
+    bundle = fake_cli!(package, "bundled-claude", @claude_help, [], version)
+
+    File.write!(Path.join(package, "dist/acp-agent.js"), """
+    export function claudeCliPath() {
+      return #{JSON.encode!(bundle)};
+    }
+    """)
+
+    bundle
+  end
+
+  defp configure_claude_toolchain!(ctx) do
+    assert {:ok, _} =
+             Placement.register_host(ctx.db, "stdinhost", %{ssh: nil, base_dir: ctx.tmp_dir})
+
+    {node, 0} = System.cmd("node", ["-p", "process.execPath"])
+    node_dir = node |> String.trim() |> Path.dirname()
+
+    assert {:ok, _} =
+             Placement.set_toolchain_dirs(ctx.db, "stdinhost", [ctx.tmp_dir, node_dir], "test")
+
+    with_claude_override(nil)
+  end
+
+  defp with_fixture_path(dir) do
+    path = System.fetch_env!("PATH")
+    System.put_env("PATH", dir <> ":" <> path)
+    on_exit(fn -> System.put_env("PATH", path) end)
   end
 
   defp with_claude_override(value) do

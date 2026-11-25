@@ -146,7 +146,9 @@ defmodule Tightbeam.Harness.RecoveryProbe do
       env = "env -i PATH=#{shell_path_assignment(path)} HOME=#{Support.shell_quote(home)} "
       command = env <> selection_command(harness, root, pin, host_config)
 
-      case port_command(host_config, command, timeout_ms, @selection_output_limit) do
+      case port_command(host_config, command, timeout_ms, @selection_output_limit,
+             stderr_to_stdout: harness != "claude"
+           ) do
         {:exit, 0, output} -> decode_selected_binary(harness, output)
         {:ok, output} -> decode_selected_binary(harness, output)
         {:exit, _status, _output} -> {:uncheckable, "the selected harness CLI is unavailable"}
@@ -592,7 +594,7 @@ defmodule Tightbeam.Harness.RecoveryProbe do
     end
   end
 
-  defp port_command(host_config, script, timeout_ms, capture_limit) do
+  defp port_command(host_config, script, timeout_ms, capture_limit, opts \\ []) do
     local? = is_nil(host_config.ssh)
     # The child gets no stdin. `codex exec` otherwise waits for end of input on the
     # open pipe. The redirect is inside the script, so ssh's remote shell gets it too.
@@ -606,14 +608,13 @@ defmodule Tightbeam.Harness.RecoveryProbe do
         {ssh, Support.ssh_opts() ++ [host_config.ssh, "sh", "-c", Support.shell_quote(script)]}
       end
 
-    port =
-      Port.open({:spawn_executable, executable}, [
-        :binary,
-        :exit_status,
-        :stderr_to_stdout,
-        :hide,
-        {:args, args}
-      ])
+    # A Claude selection result is JSON. Leave transport diagnostics on stderr.
+    port_opts = [:binary, :exit_status, :hide, {:args, args}]
+
+    port_opts =
+      if opts[:stderr_to_stdout] == false, do: port_opts, else: [:stderr_to_stdout | port_opts]
+
+    port = Port.open({:spawn_executable, executable}, port_opts)
 
     result =
       collect_port(port, System.monotonic_time(:millisecond) + timeout_ms, capture_limit, "")
