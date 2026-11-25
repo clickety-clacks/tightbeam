@@ -19,15 +19,24 @@ defmodule Tightbeam.HarklightSend do
     result =
       with :ok <- origin!(db, call),
            {:ok, input} <- inputs(call.params),
+           :ok <- HarklightWakes.first_open_pending(db, input.session),
            {:ok, input, unresolved} <- split_unresolved(db, input),
            {:ok, runner} <- runner(opts) do
         send_with_association(db, call, Map.put(input, :unresolved, unresolved), runner, opts)
         |> Map.put(:message_type, input.message_type)
         |> Map.put(:message_type_label, type_label(input.message_type))
       else
-        {:unresolved, id} -> unresolved_result("send", id)
-        {:error, code, reason} -> failure("send", code, reason, "failed")
-        {:error, reason} -> failure("send", reason, early_reason(reason), "failed")
+        {:unresolved, id} ->
+          unresolved_result("send", id)
+
+        {:error, "harklight_first_open_pending" = code, reason} ->
+          failure("send", code, reason, "refused")
+
+        {:error, code, reason} ->
+          failure("send", code, reason, "failed")
+
+        {:error, reason} ->
+          failure("send", reason, early_reason(reason), "failed")
       end
 
     result =
