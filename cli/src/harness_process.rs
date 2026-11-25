@@ -116,7 +116,7 @@ fn session_exec_with_mode(
         }
     }
 
-    let _writer_lock = match writer_lock.map(acquire_writer_lock).transpose() {
+    let writer_guard = match writer_lock.map(acquire_writer_lock).transpose() {
         Ok(lock) => lock,
         Err(error) => {
             let _ = writeln!(child_report, "writer_lock");
@@ -142,8 +142,12 @@ fn session_exec_with_mode(
     drop(child_report);
 
     let mut command = child_command(&args[separator + 1], &args[separator + 2..], fixed_path);
+    command.env_remove("TIGHTBEAM_ACCOUNT_WRITER_FD");
     if let Some(receipt) = writer_receipt {
         use std::os::unix::process::ExitStatusExt;
+        if let Some(lock) = &writer_guard {
+            command.env("TIGHTBEAM_ACCOUNT_WRITER_FD", lock.as_raw_fd().to_string());
+        }
         let status = command
             .status()
             .map_err(|error| format!("account writer could not be launched: {error}"))?;
