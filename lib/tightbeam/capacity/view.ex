@@ -63,6 +63,37 @@ defmodule Tightbeam.Capacity.View do
     |> Pools.aggregate(now)
   end
 
+  def health(accounts_with_entries, cli_by_provider) do
+    providers =
+      Map.new(cli_by_provider, fn {provider, available?} ->
+        counts = %{
+          "total" => 0,
+          "ready" => 0,
+          "degraded" => 0,
+          "reauthRequired" => 0,
+          "unknown" => 0
+        }
+
+        counts =
+          accounts_with_entries
+          |> Enum.filter(fn {account, _} -> account["provider"] == provider end)
+          |> Enum.reduce(counts, fn {account, entry}, acc ->
+            state = account_state(account, entry.sample, entry.error).status
+            key = if state == "reauth_required", do: "reauthRequired", else: state
+            acc |> Map.update!("total", &(&1 + 1)) |> Map.update!(key, &(&1 + 1))
+          end)
+
+        {provider, %{cli_available: available?, accounts: counts}}
+      end)
+
+    status =
+      if Enum.any?(providers, fn {_, view} -> view.accounts["total"] != view.accounts["ready"] end),
+         do: "degraded",
+         else: "ready"
+
+    %{status: status, providers: providers}
+  end
+
   defp sample(account, sample, serving?, now) do
     %{
       account_id: account["id"],

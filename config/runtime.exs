@@ -8,6 +8,10 @@ if config_env() != :test do
     _ -> raise ArgumentError, "TIGHTBEAM_EXECUTION_MAP_TURN_BACKFILL must be true or false"
   end
 
+  if System.get_env("TIGHTBEAM_PROVIDER_ACCOUNTS_ENABLED") in ["1", "true"] do
+    config :tightbeam, :provider_accounts_enabled, true
+  end
+
   case System.get_env("TIGHTBEAM_COORDINATOR_HOLD_DECISIONS") do
     nil -> :ok
     "true" -> config :tightbeam, :coordinator_hold_decisions_enabled, true

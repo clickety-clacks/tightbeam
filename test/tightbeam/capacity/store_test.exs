@@ -5,7 +5,6 @@ defmodule Tightbeam.Capacity.StoreTest do
   alias Tightbeam.DB
 
   @now 1_800_000_000_000
-  @id "acct_fixture"
 
   test "latest usage and provider hold survive SQLite reopen", %{test: test} do
     base = Path.join(System.tmp_dir!(), "#{test}-#{System.unique_integer([:positive])}")
@@ -24,10 +23,22 @@ defmodule Tightbeam.Capacity.StoreTest do
 
     db = start_supervised!({DB, path: path, name: nil, guard_inputs: [], payload_root: payload})
     :ok = Tightbeam.Schema.ensure_all(db)
-    :ok = DB.execute(db, "CREATE TABLE provider_accounts (id TEXT PRIMARY KEY NOT NULL)")
-    :ok = DB.execute(db, "INSERT INTO provider_accounts VALUES ('acct_fixture')")
+
+    assert {:ok, :ok} =
+             Tightbeam.ProviderAccounts.record_existing_shared(
+               db,
+               "test-host",
+               "openai",
+               "codex",
+               "subscription",
+               "signed_in",
+               "ok",
+               @now
+             )
+
+    id = Tightbeam.ProviderAccounts.shared_id(db, "codex", "test-host")
     :ok = Store.ensure_schema(db)
-    assert Store.entry(db, @id) == Observation.empty()
+    assert Store.entry(db, id) == Observation.empty()
 
     sample = %{
       observed_at: @now - 30,
@@ -48,28 +59,28 @@ defmodule Tightbeam.Capacity.StoreTest do
     }
 
     assert {:ok, {:ok, _, %{sample: %{observed_at: @now}}}} =
-             DB.transaction(db, &Store.record_in_txn(&1, @id, {:ok, sample}, @now - 40, @now))
+             DB.transaction(db, &Store.record_in_txn(&1, id, {:ok, sample}, @now - 40, @now))
 
     rate_limit = {:error, %{code: "UPSTREAM_RATE_LIMITED", retry_after_seconds: 120}}
 
     assert {:ok, {:ok, _, %{retry_at: retry_at}}} =
-             DB.transaction(db, &Store.record_in_txn(&1, @id, rate_limit, @now + 1, @now + 2))
+             DB.transaction(db, &Store.record_in_txn(&1, id, rate_limit, @now + 1, @now + 2))
 
     stop_supervised!(DB)
     db = start_supervised!({DB, path: path, name: nil, guard_inputs: [], payload_root: payload})
     :ok = Store.ensure_schema(db)
-    assert entry = Store.entry(db, @id)
+    assert entry = Store.entry(db, id)
     assert entry.retry_at == retry_at
     assert entry.sample == %{sample | observed_at: @now}
-    assert [%{observed_at: @now}] = Store.history(db, @id, @now + 3)
-    assert Store.history(db, @id, @now + :timer.hours(169)) == []
+    assert [%{observed_at: @now}] = Store.history(db, id, @now + 3)
+    assert Store.history(db, id, @now + :timer.hours(169)) == []
 
     assert {:error, _} =
              DB.transaction(db, fn txn ->
-               :ok = Store.delete_in_txn(txn, @id)
+               :ok = Store.delete_in_txn(txn, id)
                raise "rollback"
              end)
 
-    assert Store.entry(db, @id) == entry
+    assert Store.entry(db, id) == entry
   end
 end

@@ -3,8 +3,11 @@ defmodule Tightbeam.Capacity.Collector do
 
   alias Tightbeam.{DB, ProviderAccounts}
   alias Tightbeam.Capacity.{Selection, Store}
+  alias Tightbeam.Firehose.Publisher
 
   @login_generation ~w(id host provider harness kind slot identityKey signedInAt)
+
+  def firehose_sources, do: [{:record, "capacity.changed"}]
 
   @doc """
   Commit normalized usage only while it still belongs to the login that was read.
@@ -13,7 +16,7 @@ defmodule Tightbeam.Capacity.Collector do
   selection projection and retained sample commit together. A read-only probe
   can run beside an adapter, but a result from a superseded login is discarded.
   """
-  def record(db, account, outcome, attempted_at, received_at) do
+  def record(db, account, outcome, attempted_at, received_at, opts \\ []) do
     account_id = Map.fetch!(account, "id")
 
     case DB.transaction(db, fn txn ->
@@ -23,6 +26,7 @@ defmodule Tightbeam.Capacity.Collector do
              case Store.record_in_txn(txn, account_id, outcome, attempted_at, received_at) do
                {:ok, previous, next} ->
                  :ok = Selection.put_in_txn(txn, account_id, next)
+                 publish_change(txn, opts[:hub], account_id, previous, next)
                  {:ok, previous, next}
 
                :superseded ->
@@ -35,6 +39,23 @@ defmodule Tightbeam.Capacity.Collector do
       {:ok, result} -> result
       {:error, _} -> {:error, %{code: "HISTORY_PERSISTENCE_ERROR"}}
     end
+  end
+
+  defp publish_change(txn, hub, id, previous, next) do
+    if hub &&
+         {previous.sample, previous.error, previous.retry_at} !=
+           {next.sample, next.error, next.retry_at} do
+      Publisher.source_invalidation_in_txn(
+        txn,
+        hub,
+        "capacity.changed",
+        next.completed_at,
+        next.completed_at,
+        %{"accountId" => id}
+      )
+    end
+
+    :ok
   end
 
   defp same_login?(account, %{"loginState" => state} = current) when state != "removed",

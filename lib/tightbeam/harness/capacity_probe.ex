@@ -9,6 +9,16 @@ defmodule Tightbeam.Harness.CapacityProbe do
     UPSTREAM_CONTRACT_CHANGED UPSTREAM_RATE_LIMITED UPSTREAM_TIMEOUT UPSTREAM_UNAVAILABLE
   )
 
+  def provider_atom("openai"), do: :openai
+  def provider_atom("anthropic"), do: :anthropic
+
+  def local_cli_availability do
+    Map.new([Tightbeam.Harness.Codex, Tightbeam.Harness.Claude], fn harness ->
+      {to_string(harness.credential_provider()),
+       System.find_executable(harness.cli_binary()) != nil}
+    end)
+  end
+
   @doc false
   def idle_argv(executable, vendor_binary, provider, home) do
     [executable, "capacity-probe", "--idle-native", to_string(provider), home, vendor_binary]

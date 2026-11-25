@@ -295,6 +295,16 @@ defmodule Tightbeam.Gateway do
       defaults: defaults
     }
 
+    capacity_enabled = Map.get(config, :provider_accounts_enabled, false)
+
+    capacity_children =
+      if capacity_enabled do
+        :ok = Tightbeam.Capacity.Store.ensure_schema(db)
+        [{Tightbeam.Capacity.Service, adapter_config}]
+      else
+        []
+      end
+
     router_deps =
       Map.merge(socket_deps, %{
         base_dir: config.base_dir,
@@ -302,6 +312,7 @@ defmodule Tightbeam.Gateway do
         cli_token: cli_token,
         diagnostic_scope: config[:diagnostic_scope] || %{},
         session_status: fn session_key -> session_status(session_key, db, config) end,
+        provider_accounts_enabled: capacity_enabled,
         adapter_coordinator: Tightbeam.AdapterCoordinator
       })
 
@@ -349,7 +360,10 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.ArtifactBlobStore, blob_options},
          {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
          {Task, fn -> DB.owed_work(fn -> HarnessHealth.resume_other_routes(db) end) end},
-         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub, db: db},
+         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub, db: db}
+       ] ++
+       capacity_children ++
+       [
          # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
          # statute, and the episode writer must already own the ordering before the first
          # evaluation runs. Explicitly a child rather than lazily started — a lazy start

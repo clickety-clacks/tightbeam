@@ -763,6 +763,30 @@ defmodule Tightbeam.Wire.Router do
     d1_collection(conn, Map.fetch!(@d1_resources, :artifacts))
   end
 
+  get "/api/capacity" do
+    capacity_read(conn, :usage)
+  end
+
+  get "/api/capacity/forecast" do
+    capacity_read(conn, :forecast)
+  end
+
+  get "/api/capacity/health" do
+    capacity_read(conn, :health)
+  end
+
+  get "/api/capacity/:account_id/history" do
+    capacity_read(conn, :history, account_id)
+  end
+
+  get "/api/capacity/:account_id/forecast" do
+    capacity_read(conn, :forecast, account_id)
+  end
+
+  get "/api/capacity/:account_id" do
+    capacity_read(conn, :usage, account_id)
+  end
+
   get "/api/harness-processes" do
     d1_collection(conn, Map.fetch!(@d1_resources, :harness_processes))
   end
@@ -3244,6 +3268,107 @@ defmodule Tightbeam.Wire.Router do
     error in [ArgumentError, KeyError, MatchError] ->
       reraise_overload(error, __STACKTRACE__)
       d1_error(conn, "work-item trace", 500, "projection_invalid", nil)
+  end
+
+  defp capacity_read(conn, operation, id \\ nil) do
+    with {:ok, auth} <- d1_bearer_auth(conn),
+         {:ok, query} <- d1_query(conn.query_string),
+         {:ok, principal} <- d1_principal(auth, query, conn),
+         true <-
+           Map.get(deps(conn), :provider_accounts_enabled, false) and
+             principal.is_admin and not match?({:session, _}, auth),
+         {:ok, mode} <- capacity_mode(operation, Map.delete(query, "asUser")),
+         {:ok, body} <- capacity_body(conn, operation, id, mode) do
+      d1_send(conn, 200, JSON.encode!(StateResources.observation(body)))
+    else
+      false -> d1_error(conn, "capacity", 404, "not_found", nil)
+      {:error, status, code, message} -> d1_error(conn, "capacity", status, code, message)
+      {:error, error} -> capacity_error(conn, error)
+    end
+  end
+
+  defp capacity_mode(:usage, %{"refresh" => [value]} = query) when map_size(query) == 1 do
+    case value do
+      "background" -> {:ok, :background}
+      "wait" -> {:ok, :wait}
+      "cache" -> {:ok, :snapshot}
+      _ -> {:error, 400, "INVALID_REQUEST", "Unknown refresh mode."}
+    end
+  end
+
+  defp capacity_mode(_, query) when map_size(query) == 0, do: {:ok, :background}
+  defp capacity_mode(_, _), do: {:error, 400, "INVALID_REQUEST", "Unknown capacity query."}
+
+  defp capacity_body(conn, :usage, nil, mode),
+    do: Tightbeam.Capacity.Service.usage(db(conn), capacity_server(conn), mode)
+
+  defp capacity_body(conn, :forecast, nil, _mode),
+    do: {:ok, Tightbeam.Capacity.Service.forecast(db(conn))}
+
+  defp capacity_body(conn, :health, nil, _mode),
+    do: {:ok, Tightbeam.Capacity.Service.health(db(conn))}
+
+  defp capacity_body(conn, operation, id, mode) do
+    service = Tightbeam.Capacity.Service
+
+    case Tightbeam.ProviderAccounts.get(db(conn), id) do
+      %{"kind" => "subscription", "loginState" => state} = account when state != "removed" ->
+        case operation do
+          :usage ->
+            result = service.usage(db(conn), capacity_server(conn), account, mode)
+
+            if mode != :snapshot and result.status == "error",
+              do: {:error, result.error},
+              else: {:ok, result}
+
+          :history ->
+            {:ok, service.history(db(conn), account)}
+
+          :forecast ->
+            {:ok, service.forecast(db(conn), account)}
+        end
+
+      _ ->
+        {:error, 404, "ACCOUNT_NOT_FOUND", "Capacity account not found."}
+    end
+  end
+
+  defp capacity_server(conn),
+    do: Map.get(deps(conn), :capacity_server, Tightbeam.Capacity.Service)
+
+  defp capacity_error(conn, nil), do: capacity_error(conn, %{code: "UPSTREAM_UNAVAILABLE"})
+
+  defp capacity_error(conn, %{code: code} = detail) do
+    status =
+      case code do
+        "UPSTREAM_RATE_LIMITED" -> 429
+        "UPSTREAM_CONTRACT_CHANGED" -> 502
+        "HISTORY_PERSISTENCE_ERROR" -> 500
+        "NO_ACCOUNTS_ONBOARDED" -> 409
+        "TOKEN_SCOPE_INSUFFICIENT" -> 409
+        "REFRESH_REJECTED" -> 409
+        "CREDENTIAL_" <> _ -> 409
+        _ -> 503
+      end
+
+    error = Map.put(detail, :message, Tightbeam.Capacity.Service.error_message(code))
+
+    conn =
+      if delay = detail[:retry_after_seconds] do
+        Plug.Conn.put_resp_header(conn, "retry-after", Integer.to_string(delay))
+      else
+        conn
+      end
+
+    d1_send(
+      conn,
+      status,
+      JSON.encode!(%{
+        schemaVersion: 1,
+        resource: "capacity",
+        error: StateResources.observation(error)
+      })
+    )
   end
 
   defp d1_bearer_auth(conn) do

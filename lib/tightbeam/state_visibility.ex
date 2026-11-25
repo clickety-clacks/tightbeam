@@ -80,6 +80,9 @@ defmodule Tightbeam.StateVisibility do
     subagent_marker_visible?(db, notice, user_id, is_admin)
   end
 
+  def visible?(db, %{"class" => "capacity.changed"} = notice, user_id, is_admin),
+    do: capacity_visible?(db, notice, user_id, is_admin)
+
   def visible?(_db, _notice, _user_id, true), do: true
 
   def visible?(_db, %{"class" => class}, _user_id, false) when class in @admin_classes do
@@ -386,6 +389,9 @@ defmodule Tightbeam.StateVisibility do
 
   defp lower_first(<<first::utf8, rest::binary>>), do: String.downcase(<<first::utf8>>) <> rest
   defp lower_first(""), do: ""
+
+  @doc false
+  def capacity_visible?(_db, _notice, _user_id, is_admin), do: is_admin
 
   @doc "A Topline invalidation uses the committed Topline owner-or-admin grant."
   def topline_visible?(db, notice, user_id, is_admin) do

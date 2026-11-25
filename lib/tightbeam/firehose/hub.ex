@@ -13,6 +13,7 @@ defmodule Tightbeam.Firehose.Hub do
     defstruct monitor: nil,
               mode: :pending,
               user_id: nil,
+              is_admin: false,
               device_id: nil,
               principal_kind: nil,
               principal_id: nil,
@@ -128,6 +129,7 @@ defmodule Tightbeam.Firehose.Hub do
           Map.take(opts, [
             :mode,
             :user_id,
+            :is_admin,
             :device_id,
             :principal_kind,
             :principal_id,
@@ -346,6 +348,14 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp track_archetype(state, _session_key, _archetype), do: state
 
+  defp deliver_notice(
+         %{mode: :filtered, is_admin: false} = socket,
+         _pid,
+         %{"class" => "capacity.changed"},
+         _archetypes
+       ),
+       do: socket
+
   defp deliver_notice(%{mode: :pending} = socket, _, _, _), do: socket
   defp deliver_notice(%{overflowed: true} = socket, _, _, _), do: socket
 
@@ -524,7 +534,7 @@ defmodule Tightbeam.Firehose.Hub do
             &(is_binary(&1) and String.starts_with?(notice["class"] || "", &1))
           ))) and
       Enum.all?(
-        ~w(sessionKey workItemId origin principal),
+        ~w(sessionKey workItemId origin principal accountId),
         &(is_nil(filters[&1]) or filters[&1] == refs[&1])
       ) and archetype_matches?(archetypes, notice, filters)
   end

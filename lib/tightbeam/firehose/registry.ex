@@ -154,6 +154,15 @@ defmodule Tightbeam.Firehose.Registry do
 
   @invalidation_rows [
     %{
+      class: "capacity.changed",
+      op: "observe",
+      ref_sets: [["accountId"]],
+      source: {Tightbeam.Capacity.Collector, :record},
+      version_source: "capacity_observations.completedAt",
+      occurred_at_source: "capacity_observations.completedAt",
+      visibility: :capacity_visible?
+    },
+    %{
       class: "topline.created",
       op: "observe",
       ref_sets: [["toplineId"]],

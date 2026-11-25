@@ -42,6 +42,15 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   ]
 
   @r8b_inventory %{
+    "capacity.changed" => %{
+      class: "capacity.changed",
+      op: "observe",
+      ref_sets: [["accountId"]],
+      source: {Tightbeam.Capacity.Collector, :record},
+      version_source: "capacity_observations.completedAt",
+      occurred_at_source: "capacity_observations.completedAt",
+      visibility: :capacity_visible?
+    },
     "topline.created" => %{
       class: "topline.created",
       op: "observe",
@@ -178,6 +187,9 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
         end),
         Enum.map(SubagentMarkers.firehose_sources(), fn {source, class} ->
           {{SubagentMarkers, source}, class}
+        end),
+        Enum.map(Tightbeam.Capacity.Collector.firehose_sources(), fn {source, class} ->
+          {{Tightbeam.Capacity.Collector, source}, class}
         end)
       ])
       |> Map.new()
@@ -451,18 +463,14 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     end
   end
 
-  test "increment independently closes exactly four real R8b source mappings" do
+  test "registered invalidations match the exact production source mappings" do
     assert Registry.invalidation_rows() == @r8b_inventory
 
     production =
-      Enum.concat(
-        Enum.map(Toplines.firehose_sources(), fn {source, class} ->
-          {{Toplines, source}, class}
-        end),
-        Enum.map(SubagentMarkers.firehose_sources(), fn {source, class} ->
-          {{SubagentMarkers, source}, class}
-        end)
-      )
+      [Toplines, SubagentMarkers, Tightbeam.Capacity.Collector]
+      |> Enum.flat_map(fn module ->
+        Enum.map(module.firehose_sources(), fn {source, class} -> {{module, source}, class} end)
+      end)
       |> Map.new()
 
     assert production == Map.new(@r8b_inventory, fn {class, row} -> {row.source, class} end)
