@@ -82,6 +82,7 @@ defmodule Tightbeam.HarklightWakes do
     token TEXT,
     resumed INTEGER NOT NULL DEFAULT 0,
     stopped INTEGER NOT NULL DEFAULT 0,
+    expired INTEGER,
     CHECK ((rev IS NULL) = (token IS NULL))
   );
   CREATE TABLE IF NOT EXISTS harklight_feed_launches (
@@ -1021,9 +1022,10 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  # Opening a conversation held for its first opening is a separate choice, made
-  # with a handle or message. Besides failed handles, select active ones that have no listener: a listener
+  # Besides failed handles, select active ones that have no listener: a listener
   # that ended before its state was recorded leaves its row looking healthy.
+  # Conversations that wait for a choice are left out; that choice is made with a
+  # handle or message.
   defp retry_targets(db, :all) do
     case DB.query(
            db,
@@ -1948,8 +1950,18 @@ defmodule Tightbeam.HarklightWakes do
   defp cursor_expired?({:harklight_failure, "cursor_expired", _, _}), do: true
   defp cursor_expired?(_), do: false
 
+  # An expired position is recorded with the wish, so that a position which has
+  # moved since is followed instead.
   defp want_pending_open_in_txn(txn, handle),
-    do: Txn.q(txn, "INSERT OR IGNORE INTO harklight_pending_opens(handle) VALUES(?1)", [handle])
+    do:
+      Txn.q(
+        txn,
+        """
+        INSERT OR IGNORE INTO harklight_pending_opens(handle,expired)
+        VALUES(?1,(SELECT rev FROM harklight_feed_checkpoints WHERE handle=?1))
+        """,
+        [handle]
+      )
 
   # A failure the Agent or the capture path identified, as opposed to a lost
   # connection or an unexplained exit. These outrank a closing child's silence.
@@ -2765,6 +2777,14 @@ defmodule Tightbeam.HarklightWakes do
         [handle]
       )
 
+    # The position that expired is no longer the position, as after a rollback to
+    # a version whose Agent recovered by itself.
+    Txn.q(
+      txn,
+      "DELETE FROM harklight_pending_opens WHERE handle=?1 AND token IS NULL AND expired IS NOT NULL AND expired IS NOT ?2",
+      [handle, rev]
+    )
+
     if earlier_unopened == 1, do: want_pending_open_in_txn(txn, handle)
 
     # What an Agent and Server without the pending read do instead, as long as
@@ -2834,7 +2854,7 @@ defmodule Tightbeam.HarklightWakes do
 
     Txn.q(
       txn,
-      "UPDATE harklight_wake_handles SET state='unavailable',lastError='pending_token_invalid',updatedAt=?2 WHERE handle=?1",
+      "UPDATE harklight_wake_handles SET state='unavailable',lastError='pending_token_invalid',updatedAt=?2 WHERE handle=?1 AND state<>'complete'",
       [handle, now]
     )
 
@@ -3391,11 +3411,12 @@ defmodule Tightbeam.HarklightWakes do
   defp exit_status_detail(status) when is_integer(status), do: "exit status: #{status}"
   defp exit_status_detail(_), do: "exit status: unknown (not observed)"
 
-  # Every first open, and an expired position, is a caller-owned open: nothing listens until everything waiting at its fixed
-  # position is applied and that position is committed with it. Killed anywhere,
-  # the same token serves the same rows again and events keep their identity.
-  # One reader per conversation: another reader of this identity can take rows
-  # that this open would then not be served.
+  # Every first open, and an expired position, is a caller-owned open: nothing
+  # listens until everything waiting at its fixed position is applied and that
+  # position is committed with it. Killed anywhere, the same token serves the
+  # same rows again and events keep their identity. One reader per conversation:
+  # another reader of this identity can take rows that this open would then not
+  # be served.
   defp open_pending(manager, db, executable, handle, {_, nil}, older, state_delays) do
     with {:ok, output, status} <-
            run_agent(manager, handle, executable, pending_args(handle, ["--prepare"])) do
@@ -4235,6 +4256,16 @@ defmodule Tightbeam.HarklightWakes do
                [] -> -1
              end
 
+           # A feed that answers ends an open that was only wanted: its position
+           # is good, or the Agent recovered it.
+           if mode in [:baseline, :live],
+             do:
+               Txn.q(
+                 txn,
+                 "DELETE FROM harklight_pending_opens WHERE handle=?1 AND token IS NULL",
+                 [handle]
+               )
+
            if mode != :live or rev > previous do
              # A pending open keeps the Server's order: chat before its answer.
              ordered = if mode == :baseline, do: Enum.sort_by(frames, & &1["rev"]), else: frames
@@ -4256,15 +4287,6 @@ defmodule Tightbeam.HarklightWakes do
                """,
                [handle, rev]
              )
-
-             # The Agent's own recovery ends an open that was only wanted.
-             if mode == :baseline,
-               do:
-                 Txn.q(
-                   txn,
-                   "DELETE FROM harklight_pending_opens WHERE handle=?1 AND token IS NULL",
-                   [handle]
-                 )
 
              with {:pending, token} <- mode,
                   [] <-
