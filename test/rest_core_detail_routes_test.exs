@@ -3907,6 +3907,102 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert JSON.decode!(empty.resp_body)["items"] == []
   end
 
+  test "work item reads with a recorded landing succeed on detail, list page and change notice",
+       ctx do
+    commit = String.duplicate("a", 40)
+    head = String.duplicate("b", 40)
+
+    neighbour =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{title: "Landing neighbour"}
+      })
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id, assignmentId, kind, bySession, commitRefs, ts) VALUES (?1, ?2, 'completion', ?3, ?4, ?5)",
+               [
+                 "att_landing_projection",
+                 ctx.assignment.id,
+                 ctx.assignment.holderKey,
+                 JSON.encode!([%{"repo" => "Example/Repo", "commit" => commit}]),
+                 1
+               ]
+             )
+
+    hub = start_supervised!({Hub, name: nil})
+
+    :ok =
+      Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    input = %{
+      kind: "landing.observed-merge",
+      scope: "Example/Repo#12",
+      origin: "process:landing-watch",
+      payload: %{"branch" => "main", "commit" => commit, "headCommit" => head},
+      idempotency_key: "landing-record:Example/Repo#12:merged:#{commit}"
+    }
+
+    call = %{
+      verb: "condition",
+      principal: {:user, "flynn"},
+      rest_principal: %{kind: "user", id: "flynn", is_admin: false},
+      params: %{kind: input.kind, scope: input.scope},
+      firehose_in_txn: true,
+      firehose_hub: hub
+    }
+
+    assert {%{kind: "landing.observed-merge"}, true} =
+             Tightbeam.ConditionFacts.file_idempotent_with_effect(
+               ctx.db,
+               :landing_projection_scheduler,
+               input,
+               call
+             )
+
+    detail = get(ctx, "/api/work-items/" <> ctx.work_item.id)
+    assert detail.status == 200
+    item = JSON.decode!(detail.resp_body)["item"]
+
+    assert [
+             %{
+               "repository" => "Example/Repo",
+               "branch" => "main",
+               "commit" => ^commit,
+               "headCommit" => ^head,
+               "pullRequest" => 12,
+               "observedAt" => observed_at
+             }
+           ] = item["landings"]
+
+    assert is_integer(observed_at)
+
+    list = get(ctx, "/api/work-items?state=open")
+    assert list.status == 200
+    items = JSON.decode!(list.resp_body)["items"]
+    assert item in items
+    assert %{"landings" => []} = Enum.find(items, &(&1["id"] == neighbour.id))
+
+    notices =
+      for _ <- 1..20, reduce: [] do
+        acc ->
+          receive do
+            {:firehose, notice} -> [notice | acc]
+            other -> [other | acc]
+          after
+            50 -> acc
+          end
+      end
+
+    assert Enum.any?(notices, fn notice ->
+             inspect(notice) =~ "work_item.updated" and inspect(notice) =~ "Example/Repo"
+           end)
+  end
+
   test "B2 missing priority sidecar preserves configured and fallback defaults across reads and notices",
        ctx do
     for {configured_default, expected_priority} <- [{"7", 7}, {"0", 0}, {nil, 4}] do
