@@ -148,7 +148,16 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
   end
 
   test "retention skips overload and preserves its cursor", %{db: db} do
-    state = %{db: db, days: 60, cursor: 42, cutoff: nil}
+    state = %{
+      db: db,
+      cursor: 42,
+      complete: false,
+      batch: 200,
+      pace_factor: 4,
+      min_yield_ms: 100,
+      last_pause_ms: nil
+    }
+
     assert {:noreply, ^state} = Tightbeam.Retention.handle_info(:trim, state)
   end
 end

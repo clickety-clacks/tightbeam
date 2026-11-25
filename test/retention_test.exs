@@ -61,17 +61,50 @@ defmodule Tightbeam.RetentionTest do
   end
 
   test "large history is processed in bounded batches without blocking other reads", %{db: db} do
-    for _ <- 1..2_001, do: insert_row(db, @first, "rail_sweep")
-    {:ok, pid} = Retention.start_link(db: db, name: nil)
-    assert count(db) == 2_001
+    for _ <- 1..201, do: insert_row(db, @first, "rail_sweep")
+    {:ok, pid} = Retention.start_link(db: db, name: nil, min_yield_ms: 1)
+    assert count(db) == 201
 
     send(pid, :trim)
-    assert %{cursor: 2_000, complete: false} = :sys.get_state(pid)
+    assert %{cursor: 200, complete: false} = :sys.get_state(pid)
     assert count(db) == 1
     assert {:ok, [[42]]} = DB.query(db, "SELECT 42")
     drain(pid)
     assert count(db) == 0
     GenServer.stop(pid)
+  end
+
+  test "a long history still finishes in small batches and writes the marker", %{db: db} do
+    for _ <- 1..1_050, do: insert_row(db, @first, "rail_sweep")
+    for _ <- 1..30, do: insert_row(db, @first, "rail_remedy")
+    {:ok, pid} = Retention.start_link(db: db, name: nil, min_yield_ms: 1)
+
+    drain(pid)
+
+    assert {:ok, [["rail_remedy", 30]]} =
+             DB.query(db, "SELECT kind, COUNT(*) FROM lifecycle_events GROUP BY kind")
+
+    assert {:ok, [[0]]} = DB.query(db, "SELECT id FROM rail_sweep_cleanup")
+    GenServer.stop(pid)
+  end
+
+  test "the walk waits between batches before taking the writer again", %{db: db} do
+    for _ <- 1..450, do: insert_row(db, @first, "rail_sweep")
+    {:ok, pid} = Retention.start_link(db: db, name: nil, min_yield_ms: 2_000)
+
+    send(pid, :trim)
+    assert %{cursor: 200, last_pause_ms: pause} = :sys.get_state(pid)
+    assert pause >= 2_000
+    Process.sleep(100)
+    assert %{cursor: 200} = :sys.get_state(pid)
+    eventually(fn -> :sys.get_state(pid).cursor == 400 end, 250)
+    GenServer.stop(pid)
+  end
+
+  test "the pause grows with the batch time and stays within its bounds" do
+    assert Retention.pause_ms(1_000, 4, 100) == 4_000
+    assert Retention.pause_ms(5, 4, 100) == 100
+    assert Retention.pause_ms(31_000, 4, 100) == 60_000
   end
 
   test "a failed pass leaves the process alive and does not mark cleanup complete", %{db: db} do
