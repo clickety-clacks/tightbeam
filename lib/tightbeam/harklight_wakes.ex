@@ -26,6 +26,9 @@ defmodule Tightbeam.HarklightWakes do
   @feed_read_retry_delay 250
   @retry_delays [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 300_000]
 
+  # Recoveries of reported outages are gathered this long and told together.
+  @recovery_gather_delay 60_000
+
   # A feed that stays up this long after catching up has recovered. Focus
   # records need a separate grant, so a quiet feed may never confirm itself.
   @feed_steady_delay 60_000
@@ -1465,6 +1468,8 @@ defmodule Tightbeam.HarklightWakes do
        admission_next: nil,
        admission_spacing: Keyword.get(opts, :feed_start_spacing_ms, 250),
        launching: MapSet.new(),
+       recovery_timer: nil,
+       recovery_gather_delay: Keyword.get(opts, :recovery_gather_ms, @recovery_gather_delay),
        feed_steady_delay: Keyword.get(opts, :feed_steady_delay_ms, @feed_steady_delay),
        transport_failures: %{},
        cooldown_until: nil,
@@ -1494,6 +1499,9 @@ defmodule Tightbeam.HarklightWakes do
              """
            ),
          {:ok, outages} <- Outage.pending(state.db) do
+      # A recovery gathered before a restart is still told.
+      state = arm_recoveries(state)
+
       # Nothing recovers a held conversation, so its outage is not announced.
       held = for [handle, hold, _] when is_binary(hold) <- rows, into: MapSet.new(), do: handle
 
@@ -1548,6 +1556,15 @@ defmodule Tightbeam.HarklightWakes do
     do: {:noreply, admit_feed(%{state | admission_timer: nil})}
 
   def handle_info({:admit_feed, _stale}, state), do: {:noreply, state}
+
+  def handle_info(:announce_recoveries, state) do
+    state = %{state | recovery_timer: nil}
+
+    case DB.refusable(fn -> Outage.announce_recoveries(state.db, state.wall_now.()) end) do
+      {:ok, _} -> {:noreply, state}
+      {:error, _} -> {:noreply, arm_recoveries(state)}
+    end
+  end
 
   def handle_info({:feed_steady, handle, pid}, state) do
     if state.workers[handle] == pid and not Map.has_key?(state.failures, handle) and
@@ -2935,8 +2952,15 @@ defmodule Tightbeam.HarklightWakes do
     observe_feed_failure(state, handle, status, ended?)
   end
 
+  defp arm_recoveries(%{recovery_timer: nil} = state) do
+    timer = Process.send_after(self(), :announce_recoveries, state.recovery_gather_delay)
+    %{state | recovery_timer: timer}
+  end
+
+  defp arm_recoveries(state), do: state
+
   defp confirm_feed_recovery(state, handle) do
-    state = cancel_outage_timer(state, handle)
+    state = state |> cancel_outage_timer(handle) |> arm_recoveries()
     if state.admission_timer, do: Process.cancel_timer(elem(state.admission_timer, 0))
 
     admit_feed(%{
@@ -3165,6 +3189,15 @@ defmodule Tightbeam.HarklightWakes do
         deferred = MapSet.put(state.deferred, handle)
         deferred = if mode != :existing, do: MapSet.put(deferred, {handle, mode}), else: deferred
         %{state | deferred: deferred}
+
+      # The receiver became eligible again before the closing worker ended.
+      Map.has_key?(state.workers, handle) and MapSet.member?(state.stopping, handle) ->
+        restart = MapSet.put(state.restart, handle)
+
+        restart =
+          if mode == :new_request, do: MapSet.put(restart, {handle, :new_request}), else: restart
+
+        %{state | restart: restart, stopping: MapSet.delete(state.stopping, handle)}
 
       Map.has_key?(state.workers, handle) ->
         state
