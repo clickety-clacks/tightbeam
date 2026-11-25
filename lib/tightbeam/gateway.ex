@@ -382,6 +382,9 @@ defmodule Tightbeam.Gateway do
           db: db,
           send_runner: Map.get(config, :harklight_send_runner),
           child_opts: [base_dir: config.base_dir, cli_path: Path.join(cli_bin, "tightbeam")]},
+         if(Application.get_env(:tightbeam, :coordinator_hold_decisions_enabled, true),
+           do: {Tightbeam.CoordinatorHoldDecisions, db: db}
+         ),
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
@@ -6625,6 +6628,7 @@ defmodule Tightbeam.Gateway do
       end)
 
     Tightbeam.RowReactions.recover(Map.get(config, :db, Tightbeam.DB))
+    Tightbeam.CoordinatorHoldDecisions.changed()
     rules
   end
 

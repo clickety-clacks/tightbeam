@@ -429,12 +429,12 @@ defmodule Tightbeam.Wire.ChangeSocket do
     do: {:push, {:text, Publisher.encode_wire_notice(payload, model_catalog(state))}, state}
 
   defp push(%{"class" => _class} = payload, state) do
-    payload =
-      Tightbeam.WaitLinks.project_notice(db(state), payload, %{
-        kind: "user",
-        id: state.user_id,
-        is_admin: state.is_admin
-      })
+    principal =
+      if state.principal_kind == :session,
+        do: %{kind: "session", id: state.principal_id, is_admin: true},
+        else: %{kind: "user", id: state.user_id, is_admin: state.is_admin}
+
+    payload = Tightbeam.WaitLinks.project_notice(db(state), payload, principal)
 
     {:push, {:text, Publisher.encode_wire_notice(payload, model_catalog(state))}, state}
   end

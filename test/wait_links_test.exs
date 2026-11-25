@@ -586,6 +586,20 @@ defmodule Tightbeam.WaitLinksTest do
              Tightbeam.Wire.ChangeSocket.handle_info({:firehose_notice, notice}, state)
 
     assert JSON.decode!(wire)["payload"]["waitOn"] == targets
+
+    # Session credentials retain the same existing grant as their REST reads;
+    # changing that projection does not widen the user's socket above.
+    session_read = get(ctx, "/api/wakes/#{w.wake_id}", Org.get(ctx.db, other).cli_token)
+    assert session_read.status == 200
+
+    session_state = %{state | principal_kind: :session, principal_id: other}
+
+    assert {:push, {:text, session_wire}, _} =
+             Tightbeam.Wire.ChangeSocket.handle_info({:firehose_notice, notice}, session_state)
+
+    session_targets = JSON.decode!(session_read.resp_body)["item"]["waitOn"]
+    assert hd(session_targets)["id"] == ctx.assignment.id
+    assert JSON.decode!(session_wire)["payload"]["waitOn"] == session_targets
   end
 
   test "operator requests linked directly to an item publish on ruling and replay stays unchanged",
@@ -740,6 +754,65 @@ defmodule Tightbeam.WaitLinksTest do
     IO.puts(
       "WAIT_LINK_TIMING summary in transaction: 300 items before=#{before_us}us after_3000_unrelated=#{after_us}us one_item_after=#{single_us}us; minimum of five, same result"
     )
+  end
+
+  test "delivery retry due time does not declare a wait", ctx do
+    before = item(ctx)
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        wake_id: "wr_transport_attempt",
+        session_key: ctx.admin_session.session_key,
+        origin: "process:tightbeam",
+        prompt: "Retry delivery",
+        work_item_id: ctx.work_item.id,
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert item(ctx)["waiting"] == before["waiting"]
+    assert item(ctx)["rowVersion"] == before["rowVersion"]
+    assert StateResources.wake(StateResources.query_wake(ctx.db, wake.wake_id))["waitOn"] == []
+
+    for ended <- ["true", "false"] do
+      {:ok, request} =
+        WaitLinks.request(%{"includeEnded" => ended}, "work-item", ctx.work_item.id)
+
+      {:ok, page} =
+        WaitLinks.page(
+          ctx.db,
+          "work-item",
+          ctx.work_item.id,
+          %{kind: "user", id: "flynn", is_admin: true},
+          request
+        )
+
+      refute Enum.any?(page.items, &(&1[:wakeId] == wake.wake_id))
+    end
+  end
+
+  test "malformed stored decision context keeps its existing per-row refusal and does not block boot",
+       ctx do
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO decision_requests(id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,question,context,status) VALUES('dr_bad_context','statute','user:flynn','flynn',1,2,'test','bad','Question','{bad','open')"
+             )
+
+    # Rebuild the new index from retained malformed state, as on an upgrade.
+    assert :ok = DB.execute(ctx.db, "DROP INDEX decision_requests_wait_item")
+    assert :ok = Schema.ensure_all(ctx.db)
+
+    assert {:ok, [["{bad"]]} =
+             DB.query(ctx.db, "SELECT context FROM decision_requests WHERE id='dr_bad_context'")
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               request = Escalation.raw_by_id_in_txn(txn, "dr_bad_context")
+               Escalation.publish_wait_source_in_txn(txn, request)
+             end)
+
+    assert is_map(WaitLinks.summaries(ctx.db, [ctx.work_item.id]))
+    assert is_map(links(ctx, "work-items", ctx.work_item.id))
   end
 
   defp get(ctx, path, bearer \\ nil, headers \\ []) do

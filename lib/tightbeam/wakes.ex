@@ -1825,7 +1825,10 @@ defmodule Tightbeam.Wakes do
     end
 
     schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
-    Tightbeam.WaitLinks.publish_wake_change_in_txn(txn, wake)
+
+    unless input[:wait_link_excluded],
+      do: Tightbeam.WaitLinks.publish_wake_change_in_txn(txn, wake)
+
     wake
   end
 
@@ -5726,7 +5729,7 @@ defmodule Tightbeam.Wakes do
         nil
 
       [row] ->
-        wake_with_delivery_projection(row) |> Tightbeam.WaitLinks.with_schedule(txn)
+        wake_with_delivery_projection(row) |> Tightbeam.WaitLinks.with_wait_metadata(txn)
     end
   end
 
@@ -5734,11 +5737,12 @@ defmodule Tightbeam.Wakes do
     ", (SELECT status FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
       ", (SELECT createdAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
       ", (SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-      ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)"
+      ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+      ", " <> Tightbeam.WaitLinks.excluded_sql("wakes")
   end
 
   defp wake_with_delivery_projection(row) do
-    {wake_columns, [status, created_at, started_at, ended_at]} = Enum.split(row, -4)
+    {wake_columns, [status, created_at, started_at, ended_at, excluded]} = Enum.split(row, -5)
     wake = to_wake(wake_columns)
 
     # Keep the existing maximum-durable-timestamp version convention, now
@@ -5751,6 +5755,7 @@ defmodule Tightbeam.Wakes do
     wake
     |> Map.put(:delivery_status, status)
     |> Map.put(:row_version, version)
+    |> Map.put(:wait_link_excluded, excluded == 1)
   end
 
   @doc "Record a failed carrier's outcome in its sender's existing transcript, without a turn."
@@ -6143,7 +6148,8 @@ defmodule Tightbeam.Wakes do
              rows:
                Enum.map(
                  page.rows,
-                 &(wake_with_delivery_projection(&1) |> Tightbeam.WaitLinks.with_schedule(txn))
+                 &(wake_with_delivery_projection(&1)
+                   |> Tightbeam.WaitLinks.with_wait_metadata(txn))
                ),
              flags: page
            }

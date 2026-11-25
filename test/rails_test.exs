@@ -553,7 +553,7 @@ defmodule Tightbeam.RailsTest do
 
   defp assert_unavailable(expected \\ nil, load) do
     log =
-      ExUnit.CaptureLog.capture_log(fn ->
+      ExUnit.CaptureLog.capture_log([colors: [enabled: false]], fn ->
         result = load.()
         assert is_list(result)
         assert Enum.all?(result, &(&1.pattern == ".*" and &1.action == nil))

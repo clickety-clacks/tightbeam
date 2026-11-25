@@ -16,6 +16,7 @@ defmodule Tightbeam.Archetypes do
 
   @typedoc "A validated archetype."
   @type t :: %{
+          optional(:manifest_name) => String.t(),
           name: String.t(),
           skills: [String.t()],
           where: [String.t()],
@@ -327,6 +328,7 @@ defmodule Tightbeam.Archetypes do
 
     archetype =
       archetype
+      |> Map.put(:manifest_name, archetype.name)
       |> Map.put(:name, name)
       |> Map.put(:source, %{
         file: relative,

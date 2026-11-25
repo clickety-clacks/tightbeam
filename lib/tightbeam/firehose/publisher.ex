@@ -111,7 +111,8 @@ defmodule Tightbeam.Firehose.Publisher do
 
   defp source_work_item_ref(db, payload) when is_map(payload) do
     payload = payload["item"] || payload
-    context = payload[:context] || payload["context"] || %{}
+    context = payload[:context] || payload["context"]
+    context = if is_map(context), do: context, else: %{}
     item = payload[:work_item_id] || payload["workItemId"] || context["workItemId"]
     assignment = payload[:assignment_id] || payload["assignmentId"]
 

@@ -1425,6 +1425,28 @@ defmodule Tightbeam.WorkItemBracketsTest do
     new = slate_wake_id(ctx.db, item.id)
     assert new != slate
     assert Wakes.get(ctx.db, new).state == "pending"
+
+    assert Tightbeam.WaitLinks.summaries(ctx.db, [item.id])[item.id].waiting == %{
+             agent: false,
+             time: false,
+             event: false,
+             userIds: []
+           }
+
+    principal = %{kind: "user", id: "flynn", is_admin: true}
+
+    for kind <- ["work-item", "session"], ended <- ["true", "false"] do
+      id = if kind == "work-item", do: item.id, else: Wakes.get(ctx.db, new).session_key
+      {:ok, request} = Tightbeam.WaitLinks.request(%{"includeEnded" => ended}, kind, id)
+      {:ok, page} = Tightbeam.WaitLinks.page(ctx.db, kind, id, principal, request)
+      refute Enum.any?(page.items, &(&1[:id] in ["wake:" <> slate, "wake:" <> new]))
+    end
+
+    for wake_id <- [slate, new] do
+      assert Tightbeam.StateResources.wake(Tightbeam.StateResources.query_wake(ctx.db, wake_id))[
+               "waitOn"
+             ] == []
+    end
   end
 
   test "slate notices use the recorded delivery owner when scheduled and re-armed", ctx do

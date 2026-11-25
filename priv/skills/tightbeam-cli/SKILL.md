@@ -83,6 +83,65 @@ Recover the card in this order:
 After context loss, repeat this recovery from rows. Do not reconstruct state from chat
 memory.
 
+### Read conversation history
+
+Use `tightbeam transcript --session '<exact session key>' --limit 20` from the
+assignment worktree. If you only have a display name, use
+`tightbeam transcript --name '<display name>'` to find candidate session keys.
+Page back with `--before <oldestId>` or catch up with `--after <newestId>`, using
+the returned cursor. Never open or query `state.db`. The gateway applies your
+transcript access through the CLI.
+
+### Watch one session live
+
+Use `tightbeam session-connect` for a snapshot followed by live updates to one
+selected session. It uses Firehose and writes one JSON object per line. Expect
+`snapshot.begin`, `snapshot.item` records, `snapshot.end`, then `ready` and live
+`event` frames as updates arrive. Reconnects can produce a fresh snapshot.
+
+For a read-only watch, keep stdin open without writing any bytes. The command
+can send messages when given input, and stdin EOF ends the connection. This
+example holds stdin open for 20 seconds and sends nothing.
+
+```sh
+sleep 20 | tightbeam session-connect --session '<exact session key>'
+```
+
+### Watch across sessions with Firehose
+
+For broader subscriptions, use an already provisioned Firehose client. Connect
+to the configured gateway's WebSocket endpoint `/ws/changes?protocolVersion=2`.
+Use `wss://` when the gateway is served over HTTPS. Have the client send the auth
+frame using its provisioned credential. Never extract or copy credentials from
+Tightbeam files. Ask the gateway operator for client access if needed.
+
+For a bounded example, set a 20-second deadline before connecting. Send the
+following JSON text frames in order. Keep the credential inside the client
+process and out of command arguments, logs, and output.
+
+1. Send `{"type":"auth","token":"<client credential>"}`. Wait for
+   `auth_result` with `success: true`. When using an organization credential,
+   include the authorized user's ID in `asUser`.
+2. Send
+   `{"type":"subscribe","subscriptionId":"messages","filters":{"classes":["message.created"]}}`.
+   Wait for `subscription_ready` and close when the deadline expires.
+
+The example watches new-message notices across sessions visible to the client.
+`classes` matches class prefixes. Add `sessionKey`, `workItemId`, `origin`,
+`principal`, or `archetype` to narrow the feed. Filters do not widen access.
+Message notices identify changes. Raw Firehose has no replay. After a disconnect,
+authenticate and resubscribe first. Once the subscription is ready, buffer live
+notices and catch up separately for each watched session, using that session’s
+last processed message ID.
+
+```sh
+tightbeam transcript --session '<session key>' --after '<that session’s last message ID>'
+```
+
+Continue with the returned `newestId` when there are more pages. If you have no
+saved cursor for a session, read its transcript normally and page back as
+needed. Reconcile buffered notices by message ID.
+
 ## Perform only the obligation
 
 Read the assignment subject, its attests, the work item, and the named artifacts before

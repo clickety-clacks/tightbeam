@@ -4,6 +4,10 @@ defmodule Tightbeam.WaitLinks do
   alias Tightbeam.DB.Txn
 
   @doc "The same recorded target references used by wake reads and events."
+  def wake_targets(%{wait_link_excluded: true}), do: []
+  # Retry wake IDs name transport attempts, not new wait declarations.
+  def wake_targets(%{wake_id: "wr_" <> _}), do: []
+
   def wake_targets(wake) do
     bindings = (wake[:predicate] || %{})["bindings"] || %{}
 
@@ -96,8 +100,37 @@ defmodule Tightbeam.WaitLinks do
   defp time(at, role, cron),
     do: %{"kind" => "time", "id" => nil, "dueAt" => at, "role" => role, "cron" => cron}
 
+  @doc false
+  def work_item_reminder_reference?(%{"resource" => "work_item", "field" => field})
+      when field in ["routingWakeId", "slateWakeId"], do: true
+
+  def work_item_reminder_reference?(_), do: false
+
+  defp declared_wait_sql do
+    """
+    w.wakeId NOT GLOB 'wr_*'
+    AND NOT EXISTS(SELECT 1 FROM work_items wi WHERE wi.id=w.work_item_id
+      AND (wi.routingWakeId=w.wakeId OR wi.slateWakeId=w.wakeId))
+    AND NOT EXISTS(SELECT 1 FROM row_reaction_actions r INDEXED BY row_reaction_output
+      WHERE json_extract(r.result,'$.wake_id')=w.wakeId
+      AND json_extract(r.plan,'$.value.reference.resource')='work_item'
+      AND json_extract(r.plan,'$.value.reference.field') IN ('routingWakeId','slateWakeId'))
+    """
+  end
+
+  @doc false
+  def excluded_sql(alias_name),
+    do: "NOT (" <> String.replace(declared_wait_sql(), "w.", alias_name <> ".") <> ")"
+
+  defp declared_wait?(txn, wake) do
+    Txn.q(txn, "SELECT 1 FROM wakes w WHERE w.wakeId=?1 AND " <> declared_wait_sql(), [
+      wake.wake_id
+    ]) != []
+  end
+
   defp active_wake_sql do
-    "w.state='pending' AND (w.recognitionAt IS NULL OR w.waitMode='after-turn') AND (w.firedAt IS NULL OR w.consumer='cron')"
+    "w.state='pending' AND (w.recognitionAt IS NULL OR w.waitMode='after-turn') AND (w.firedAt IS NULL OR w.consumer='cron') AND " <>
+      declared_wait_sql()
   end
 
   @doc "Small work-item indicators; reads only records explicitly linked to each item."
@@ -122,7 +155,7 @@ defmodule Tightbeam.WaitLinks do
         WHERE w.resolverKind='decision_request' AND d.status='open'
       UNION
       SELECT i.id itemId,d.* FROM items i JOIN decision_requests d INDEXED BY decision_requests_wait_item
-        ON json_extract(d.context,'$.workItemId')=i.id WHERE d.status='open'
+        ON (CASE WHEN json_valid(d.context) THEN json_extract(d.context,'$.workItemId') END)=i.id WHERE d.status='open'
     ),
     item_blocks AS MATERIALIZED (
       SELECT a.workItemId itemId,cp.* FROM item_assignments a
@@ -190,7 +223,7 @@ defmodule Tightbeam.WaitLinks do
 
   @doc false
   def publish_wake_change_in_txn(txn, wake) do
-    if wake_targets(wake) != [],
+    if wake_targets(wake) != [] and declared_wait?(txn, wake),
       do: publish_source_change_in_txn(txn, wake.work_item_id, wake.assignment_id),
       else: :ok
   end
@@ -221,14 +254,23 @@ defmodule Tightbeam.WaitLinks do
   end
 
   @doc false
-  def with_schedule(%{consumer: "cron"} = wake, txn) do
+  def with_wait_metadata(wake, txn) do
+    wake = with_schedule(wake, txn)
+
+    if Map.has_key?(wake, :wait_link_excluded) or wake_targets(wake) == [] or
+         declared_wait?(txn, wake),
+       do: wake,
+       else: Map.put(wake, :wait_link_excluded, true)
+  end
+
+  defp with_schedule(%{consumer: "cron"} = wake, txn) do
     case Txn.q(txn, "SELECT schedule FROM cron_wake_schedules WHERE wakeId=?1", [wake.wake_id]) do
       [[schedule]] -> Map.put(wake, :cron, schedule)
       [] -> wake
     end
   end
 
-  def with_schedule(wake, _txn), do: wake
+  defp with_schedule(wake, _txn), do: wake
 
   def request(query, kind, id) do
     query =
@@ -300,7 +342,7 @@ defmodule Tightbeam.WaitLinks do
       "(w.waitMode IS NOT NULL OR w.conditionKind IS NOT NULL OR w.consumer='cron' OR w.dueAt>w.createdAt)"
 
     wake = fn scope, index ->
-      "SELECT w.createdAt at,'wake:'||printf('%020d',w.rowid) key,'wake' type,w.wakeId id FROM wakes w INDEXED BY #{index} WHERE (#{scope}) AND #{active_wake} AND #{waiting}"
+      "SELECT w.createdAt at,'wake:'||printf('%020d',w.rowid) key,'wake' type,w.wakeId id FROM wakes w INDEXED BY #{index} WHERE (#{scope}) AND #{active_wake} AND #{waiting} AND #{declared_wait_sql()}"
     end
 
     decision = fn scope ->
@@ -317,8 +359,9 @@ defmodule Tightbeam.WaitLinks do
            ) <>
            " UNION ALL SELECT a.openedAt,'assignment:'||printf('%020d',a.rowid),'assignment',a.id FROM assignments a WHERE a.workItemId=? AND #{active_assignment}" <>
            " UNION ALL " <>
-           decision.("json_extract(d.context,'$.workItemId')=? AND d.assignmentId IS NULL"),
-         [id, id, id, id, id]}
+           decision.(
+             "(CASE WHEN json_valid(d.context) THEN json_extract(d.context,'$.workItemId') END)=? AND d.assignmentId IS NULL"
+           ), [id, id, id, id, id]}
 
       "assignment" ->
         {wake.("w.assignmentId=?", "wakes_assignment") <>
@@ -338,7 +381,7 @@ defmodule Tightbeam.WaitLinks do
   end
 
   defp edge(txn, kind, source_id, [at, _key, "wake", id], principal) do
-    wake = with_schedule(Wakes.get_in_txn(txn, id), txn)
+    wake = with_wait_metadata(Wakes.get_in_txn(txn, id), txn)
     notice = %{"class" => "wake.scheduled", "payload" => StateResources.wake(wake), "refs" => %{}}
 
     visible =

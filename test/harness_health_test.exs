@@ -4161,6 +4161,90 @@ defmodule Tightbeam.HarnessHealthTest do
     assert second_resumed_turn.prompt == second_failure_prompt
   end
 
+  @tag :tmp_dir
+  test "a retry runs the real Codex check against a CLI that waits for end of input and releases the hold",
+       ctx do
+    base_dir = ctx.tmp_dir
+    register_hosts(ctx.db, [{"testhost", %{ssh: nil, base_dir: base_dir}}])
+
+    help =
+      "--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -C -m -s -c " <>
+        "--disable --output-schema --json"
+
+    features =
+      ~w(shell_tool unified_exec code_mode_host multi_agent apps plugins hooks browser_use
+         browser_use_external computer_use in_app_browser image_generation view_image sleep_tool
+         goals tool_suggest skill_search memories workspace_dependencies
+         skill_mcp_dependency_install)
+      |> Enum.join(" ")
+
+    fake = Path.join(base_dir, "codex")
+
+    File.write!(fake, """
+    #!/bin/sh
+    # Like codex exec: read standard input to end of file before answering.
+    cat >/dev/null
+    case "$1 $2" in
+      "exec --help") echo "#{help}" ;;
+      "features list") echo "#{features}" ;;
+      *) : ;;
+    esac
+    """)
+
+    File.chmod!(fake, 0o755)
+
+    assert {:ok, _} =
+             Tightbeam.Placement.set_env_overlay(
+               ctx.db,
+               "testhost",
+               "codex",
+               "CODEX_PATH",
+               fake,
+               "test"
+             )
+
+    failure_turn =
+      fail_health_turn!(
+        ctx.db,
+        ctx.main_session,
+        "codex-real-check",
+        "Codex usage limit",
+        @captured_codex_rate_limit
+      )
+
+    assert {:ok, [[incident_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT incidentId FROM harness_health_observations WHERE correlationId=?1",
+               ["harness-turn:#{failure_turn.seq}:rate-limit-dead"]
+             )
+
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+
+    assert {:ok, cycle_id} =
+             Tightbeam.HarnessHealth.RecoverySchedule.retry_now(ctx.db, incident_id)
+
+    assert [%{"cycle_id" => ^cycle_id}] =
+             Tightbeam.HarnessHealth.RecoverySchedule.fire_due(
+               ctx.db,
+               System.system_time(:millisecond)
+             )
+
+    task_sup = start_supervised!(Task.Supervisor)
+    assert :ok = RecoveryCheck.start_cycle(ctx.db, base_dir, task_sup, incident_id, cycle_id)
+
+    assert eventually(fn -> HarnessHealth.get(ctx.db, incident_id).state == "resolved" end, 1500)
+
+    assert {:ok, [["succeeded"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT outcome FROM harness_health_recovery_checks WHERE holdId=?1",
+               [incident_id]
+             )
+
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+  end
+
   test "operator retry reports provider limit and credential refusal without releasing the fence",
        ctx do
     failure_turn =

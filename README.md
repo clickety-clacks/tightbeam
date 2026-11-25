@@ -792,6 +792,11 @@ cannot run a single turn.
 
 ## Operating
 
+When a usage limit or a harness hold stops every active coordinator, Tightbeam
+files a decision request for the gateway owner. View it with
+`tightbeam decision-requests`. To disable coordinator hold decision requests,
+set `TIGHTBEAM_COORDINATOR_HOLD_DECISIONS=false` in the gateway environment.
+
 - `docs/SMOKE.md` — the manual acceptance runbook; it follows this README's
   authoritative fresh-org install path.
 - `docs/ARCHITECTURE.md` — the substrate's shape.

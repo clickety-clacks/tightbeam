@@ -29,7 +29,7 @@ Each response contains `items`, `source`, `asOf`, `rowVersion`, `nextCursor` and
 `cursor` unchanged for the next page. `nextCursor: null` ends the page sequence.
 Active records are selected by default; `includeEnded=true` includes retained
 ended records. Cursors are scoped to the source and the ended-record selection.
-Pages are ordered by recorded creation time and a stable record ordinal; cursor keys do not expose hidden target IDs. Pending after-turn waits remain active until the originating turn ends. A trigger already released for delivery is no longer a wait; recurring roots remain active for their next occurrence.
+Pages are ordered by recorded creation time and a stable record ordinal; cursor keys do not expose hidden target IDs. Pending after-turn waits remain active until the originating turn ends. A trigger already released for delivery is no longer a wait; recurring roots remain active for their next occurrence. Native work-item routing and slate reminders, and failed-delivery retry attempts, are not declared waits. They do not supply wait links or waiting indicators, including in ended history. Their ordinary delivery notices remain unchanged.
 
 An edge has `id`, nullable `wakeId`, `kind`, nullable `waitReason`, `createdAt`,
 `state`, `recognition`, `from`, `to` and `waitOn`. `to` is the primary target;

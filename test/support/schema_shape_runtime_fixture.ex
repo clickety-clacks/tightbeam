@@ -763,6 +763,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                "SELECT COUNT(*) FROM wire_idempotency WHERE operation='session-custody-transfer'"
              )
 
+    assert :ok = DB.execute(db, "DROP INDEX IF EXISTS decision_requests_wait_raiser")
+
     for {table, column} <- [
           {"assignments", "currentOpenerSessionKey"},
           {"decision_requests", "currentRaiserSessionKey"},

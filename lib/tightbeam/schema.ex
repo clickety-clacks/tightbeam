@@ -2159,6 +2159,8 @@ defmodule Tightbeam.Schema do
     # This table rebuild follows all predecessor migrations so a refusal above
     # leaves the older database and its indexes untouched.
     :ok = upgrade_compactor_model_rate_limit_source(db)
+    :ok = Tightbeam.Escalation.ensure_coordinator_operator_schema(db)
+    :ok = Tightbeam.CoordinatorHoldDecisions.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
@@ -3894,7 +3896,7 @@ defmodule Tightbeam.Schema do
       {"cannot_proceed_wait_assignment",
        "CREATE INDEX IF NOT EXISTS cannot_proceed_wait_assignment ON assignment_cannot_proceed(assignmentId,createdAt,id)"},
       {"decision_requests_wait_item",
-       "CREATE INDEX IF NOT EXISTS decision_requests_wait_item ON decision_requests(json_extract(context,'$.workItemId'))"},
+       "CREATE INDEX IF NOT EXISTS decision_requests_wait_item ON decision_requests(CASE WHEN json_valid(context) THEN json_extract(context,'$.workItemId') END)"},
       {"decision_requests_wait_raiser",
        "CREATE INDEX IF NOT EXISTS decision_requests_wait_raiser ON decision_requests(COALESCE(currentRaiserSessionKey,raiserSessionKey),raisedAt,id)"},
       {"turns_wait_item", "CREATE INDEX IF NOT EXISTS turns_wait_item ON turns(jobRef,status)"},
