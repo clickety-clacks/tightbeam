@@ -135,7 +135,7 @@ defmodule Tightbeam.TranscriptTest do
         {:ok, _} =
           DB.query(
             ctx.db,
-            "INSERT INTO wakes(wakeId,sessionKey,origin,dueAt,createdAt) VALUES (?1,'owned','process:tightbeam',0,0)",
+            "INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt) VALUES (?1,'owned','process:tightbeam','test',0,0)",
             [wake]
           )
 
@@ -152,7 +152,7 @@ defmodule Tightbeam.TranscriptTest do
           {:ok, _} =
             DB.query(
               ctx.db,
-              "INSERT INTO wakes(wakeId,sessionKey,origin,dueAt,createdAt) VALUES (?1,'owned','process:tightbeam',0,0)",
+              "INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt) VALUES (?1,'owned','process:tightbeam','test',0,0)",
               [member_wake]
             )
 
