@@ -50,13 +50,42 @@ def linux_listener_ports(pid):
     return ports
 
 
+_lsof_warnings_seen = set()
+
+
+def lsof_errors(stderr):
+    """Split lsof stderr into its own warnings and anything else.
+
+    lsof reports file systems it cannot stat (for example a mount under
+    another user's home) as "lsof: WARNING: ..." plus indented continuation
+    lines. Those concern other files, not the sockets selected with -p and
+    -i, so they are logged once and accepted. Any other output is an error.
+    """
+    errors, in_warning = [], False
+    for line in stderr.splitlines():
+        if line.startswith("lsof: WARNING:"):
+            in_warning = True
+            if line not in _lsof_warnings_seen:
+                _lsof_warnings_seen.add(line)
+                print(f"gateway-smoke: accepted {line}", file=sys.stderr)
+        elif in_warning and line[:1].isspace():
+            continue
+        elif line.strip():
+            in_warning = False
+            errors.append(line)
+    return errors
+
+
 def listeners(pid, port, lsof):
     if sys.platform == "linux":
         ports = linux_listener_ports(pid)
     else:
         result = observe([lsof, "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN", "-Fn"])
-        if result.returncode not in (0, 1) or result.stderr:
-            raise SmokeError("cannot inspect test process listeners")
+        errors = lsof_errors(result.stderr)
+        if result.returncode not in (0, 1) or errors:
+            detail = "; ".join(errors)[:500] or "no error output"
+            raise SmokeError(
+                f"cannot inspect test process listeners (lsof exit {result.returncode}: {detail})")
         ports = {int(line.rsplit(":", 1)[-1]) for line in result.stdout.splitlines()
                  if line.startswith("n")}
     if ports - {port}:
