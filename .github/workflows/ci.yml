@@ -313,8 +313,16 @@ jobs:
       - name: mix deps.get
         run: mix deps.get
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Assemble the npm package
-        run: sh packaging/assemble.sh
+        run: |
+          sh packaging/assemble.sh
+          for package in _build/npm/tightbeam-*.tgz; do
+            python3 packaging/gateway-smoke.py "$package" || exit
+          done
 
       - name: Stamp provenance
         run: |

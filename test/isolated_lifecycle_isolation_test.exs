@@ -311,75 +311,29 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
              )
   end
 
-  # ── R1/R4 — rpc/remote resolve the node from the descriptor (Phase 1) ───────
-
-  test "rpc resolves the node from the descriptor, and the descriptor node wins over ambient" do
+  test "distributed debug verbs refuse even with a named descriptor and conflicting ambient node" do
     shim = faked_release_shim!()
-
-    base = Path.join(System.tmp_dir!(), "tb-rpc-#{System.unique_integer([:positive])}")
+    base = Path.join(System.tmp_dir!(), "tb-debug-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(base) end)
+    write_descriptor(base, %{port: 11_484, cliToken: "tbc_iso", node: "custom_iso_node"})
 
-    # A CUSTOM-node instance (booted with its own TIGHTBEAM_NODE), recorded in the
-    # descriptor at boot.
-    write_descriptor(base, %{
-      port: 11_484,
-      cliToken: "tbc_iso",
-      node: "custom_iso_node",
-      ownedPid: "1",
-      ownedCommand: "x"
-    })
+    for verb <- ~w(rpc remote) do
+      {out, status} =
+        System.cmd(shim, [verb, "Foo.bar()"],
+          env: [
+            {"TIGHTBEAM_BASE_DIR", base},
+            {"RELEASE_NODE", "ambient_node"},
+            {"RELEASE_COOKIE", "synthetic-unused"}
+          ],
+          stderr_to_stdout: true
+        )
 
-    {out, status} =
-      System.cmd(shim, ["rpc", "Foo.bar()"],
-        env: [
-          {"TIGHTBEAM_BASE_DIR", base},
-          # the exact incident vector, now aimed at a debug verb:
-          {"RELEASE_NODE", "tightbeam_gateway_11373"},
-          {"TIGHTBEAM_NODE", "tightbeam_gateway_11373"},
-          {"RELEASE_COOKIE", "prod-shared-cookie"}
-        ],
-        stderr_to_stdout: true
-      )
-
-    assert status == 0, out
-    # (a) custom-node support restored: rpc used the descriptor's node.
-    assert out =~ ~r/^REL_NODE=custom_iso_node$/m
-    # (b) incident-safety for the debug verbs: the inherited node did NOT redirect.
-    refute out =~ ~r/^REL_NODE=tightbeam_gateway_11373$/m
-    # (c) R4 (shim half, T2): the shim STRIPS the inherited RELEASE_COOKIE from
-    # the rpc/remote environment, so the release falls back to its baked cookie.
-    # The real launcher's baked resolution is proven against the built artifact
-    # in release_cookie_resolution_test.exs (T1).
-    assert out =~ ~r/^REL_COOKIE=<unset>$/m
-    refute out =~ ~r/prod-shared-cookie/
-    # the debug argv is forwarded intact.
-    assert out =~ ~r/^ARG=rpc$/m
-    assert out =~ ~r/^ARG=Foo\.bar\(\)$/m
+      assert status == 64, out
+      assert out =~ "this release runs without Erlang distribution"
+      refute out =~ "ARG="
+      refute out =~ "synthetic-unused"
+    end
   end
-
-  test "rpc refuses when the descriptor has no node" do
-    shim = faked_release_shim!()
-
-    base = Path.join(System.tmp_dir!(), "tb-rpc-nonode-#{System.unique_integer([:positive])}")
-    on_exit(fn -> File.rm_rf!(base) end)
-
-    write_descriptor(base, %{port: 11_484, cliToken: "tbc_iso", ownedPid: "1", ownedCommand: "x"})
-
-    {out, status} =
-      System.cmd(shim, ["rpc", "Foo.bar()"],
-        env: [{"TIGHTBEAM_BASE_DIR", base}, {"RELEASE_NODE", "tightbeam_gateway_11373"}],
-        stderr_to_stdout: true
-      )
-
-    assert status != 0, "rpc must refuse a descriptor with no node"
-    assert out =~ "no node"
-    refute out =~ "REL_NODE="
-  end
-
-  # Case 2 (design §5, N5) — the direct mix-script per-instance-cookie backstop —
-  # exercises fix C, which ships in Phase 2. It is omitted here rather than left
-  # as a permanent skip/stub (AGENTS.md "Tests"): a real Case-2 proof lands with
-  # Phase 2.
 
   # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -400,10 +354,6 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
 
     fake = Path.join(rel_bin, "tightbeam_gateway")
 
-    # A raw probe: echoes the node it was handed and the RAW inherited
-    # RELEASE_COOKIE — so the tests can prove the shim STRIPS the cookie on the
-    # rpc/remote path (T2). The REAL launcher's baked-cookie resolution is proven
-    # separately, against the built artifact, in release_cookie_resolution_test.
     File.write!(
       fake,
       "#!/bin/sh\n" <>

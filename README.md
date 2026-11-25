@@ -363,21 +363,16 @@ identity, or an incompatible schema is refused.
 Supported. Give each instance its own `TIGHTBEAM_BASE_DIR` and its own
 `TIGHTBEAM_PORT` and you are done.
 
-A release build also runs a named Erlang node, and two nodes on one machine
-cannot share a name. `tightbeam-gateway` derives the name from the port, so
-distinct ports already give distinct names and there is nothing extra to set.
-`TIGHTBEAM_NODE` names it yourself if you want to; the only way to collide is to
-give two instances the same port, or to pin them to the same name by hand.
+Packaged gateways start without Erlang distribution. The ordinary CLI and Chat
+use HTTP. Remote BEAM debugging verbs (`rpc` and `remote`) require a distributed
+node and are unavailable on these packaged gateways. A foreground local console
+is available with `tightbeam-gateway start_iex`.
 
-The lifecycle verbs `tightbeam-gateway stop`, `remote` and `pid` FIND a running
-gateway through its descriptor at `<base_dir>/gateway.json` — resolved from
-`TIGHTBEAM_BASE_DIR` ONLY, never from an ambient port or inherited node. `stop`
-SIGTERMs the owned OS pid the descriptor records — no Erlang node or cookie is
-consulted; `remote` and `pid` read the same descriptor. So **point them at the
-same `TIGHTBEAM_BASE_DIR` you started the instance with**. With no
-`TIGHTBEAM_BASE_DIR` set, `stop` REFUSES rather than guess a target — set
-`TIGHTBEAM_BASE_DIR=<dir>` for the instance you mean, or use
-`systemctl stop tightbeam` for the managed gateway.
+The lifecycle verbs `tightbeam-gateway stop` and `pid` find a running gateway
+through the descriptor at `<base_dir>/gateway.json`. Set `TIGHTBEAM_BASE_DIR`
+to the directory used to start that instance, or use `systemctl stop tightbeam`
+for the managed gateway. The stop command sends SIGTERM to the owned OS pid
+after checking the process identity.
 
 What `stop`'s identity check does and does not guarantee: the descriptor records
 the owned pid together with that process's command line **and its start time**,
@@ -589,7 +584,6 @@ The service must **start with no interactive login**, **survive logout**,
 | `TIGHTBEAM_LIVE_BASE_TRANSITION` | Optional exact JSON transition for an approved non-automatic transition; supported 0.1.8 and earlier 0.1.9 upgrades derive it automatically. Malformed, mismatched, or schema-incompatible values are refused. |
 | `TIGHTBEAM_PORT` | Rewritten into `gateway.json` at every boot. |
 | `TIGHTBEAM_SUPERVISION_INTERVAL_MS` | Assignment inactivity reminder interval in milliseconds. Defaults to `1800000` (30 minutes); set to `off` to disable these reminders. Other notices are unaffected. |
-| `TIGHTBEAM_NODE` | The release's Erlang node name. Defaults to `tightbeam_gateway_<port>`, which is already unique per instance — set it only if you want to choose the name. |
 | `TIGHTBEAM_ADVERTISED_URL` | The URL clients are told to connect back on. `mix tightbeam.doctor` fails without it. |
 | `TIGHTBEAM_DEFAULT_MODEL` | The default model itself, undecorated (`claude-sonnet-5`). Must be live for the default harness. It is a single global, so on a two-harness host one harness will report its default as unselectable — that is expected, not a fault. |
 | `TIGHTBEAM_DEFAULT_EFFORT` | The default reasoning level (`low`…`max`). Required when the default model offers effort tiers — a model is selected by FIELDS, never one packed string. |

@@ -3521,7 +3521,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag cold_gateway: true, tmp_dir: true
-  test "the node the REAL writer persists is what rpc resolves; ambient node+cookie cannot override (writer→consumer seam)",
+  test "the persisted developer node does not enable distribution on the packaged gateway",
        %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
       tmp,

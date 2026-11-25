@@ -226,9 +226,7 @@ defmodule Tightbeam.Gateway do
     # LATER process can carry the same command line (a second gateway started the
     # same way), and only the start time tells this process apart from such a
     # successor.
-    # R1/R4: also record `node` — the instance's ACTUAL booted RELEASE_NODE — so
-    # the debug verbs `rpc`/`remote` resolve the node FROM the descriptor (custom
-    # `TIGHTBEAM_NODE` instances included), never from an ambient/inherited node.
+    # Keep the node field for descriptor readers, including developer nodes.
     # `cliToken` is preserved (read above); `port`/`node`/`ownedPid`/
     # `ownedCommand`/`ownedStart` are overwritten every boot.
     owned_pid = System.pid()

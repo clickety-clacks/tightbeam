@@ -41,8 +41,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{config: config, base: base} ->
     assert second["node"] == "custom_operator_node"
     assert second["cliToken"] == first["cliToken"]
 
-    # The committed shim must resolve the node persisted by the real writer,
-    # never the ambient node or cookie supplied by the caller.
+    # A descriptor from a named developer node does not enable packaged RPC.
     System.put_env("RELEASE_NODE", "seam_custom_node")
     Gateway.children(config)
 
@@ -56,11 +55,10 @@ Tightbeam.GuardGatewayFixture.run!(fn %{config: config, base: base} ->
         stderr_to_stdout: true
       )
 
-    assert status == 0, out
-    assert out =~ ~r/^REL_NODE=seam_custom_node$/m
-    refute out =~ ~r/^REL_NODE=tightbeam_gateway_11373$/m
-    assert out =~ ~r/^REL_COOKIE=<unset>$/m
-    refute out =~ ~r/prod-shared-cookie/
+    assert status == 64, out
+    assert out =~ "this release runs without Erlang distribution"
+    refute out =~ "ARG="
+    refute out =~ "prod-shared-cookie"
   after
     if original,
       do: System.put_env("RELEASE_NODE", original),
