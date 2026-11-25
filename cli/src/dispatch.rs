@@ -4256,7 +4256,17 @@ where
                         Some("harklight-retry: one or more selected handles remain unavailable");
                 }
                 if matches!(command, Command::Transcript { text: true, .. }) {
-                    print!("{}", crate::transcript::render_text(&result)?);
+                    print!(
+                        "{}",
+                        crate::transcript::render_text_with_cursor(
+                            &result,
+                            match &command {
+                                Command::Transcript { before, after, .. } =>
+                                    before.as_deref().or(after.as_deref()),
+                                _ => None,
+                            }
+                        )?
+                    );
                 } else {
                     println!(
                         "{}",

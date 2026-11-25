@@ -5995,7 +5995,7 @@ defmodule Tightbeam.Gateway do
 
   defp append_transcript_self_inspection(guidance, session_key) do
     transcript_command =
-      "tightbeam transcript --session #{inspect(session_key)} --limit 50 --role assistant --format text"
+      "tightbeam transcript --session #{inspect(session_key)} --limit 50 --no-notices --format text"
 
     guidance <>
       "\n\n## Inspect recent Tightbeam transcript\n\n" <>

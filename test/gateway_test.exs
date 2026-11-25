@@ -6236,7 +6236,7 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:candidate_guidance, "candidate-1", guidance}
 
     assert guidance =~
-             "tightbeam transcript --session \"swapme\" --limit 50 --role assistant --format text"
+             "tightbeam transcript --session \"swapme\" --limit 50 --no-notices --format text"
 
     assert guidance =~ "Do not replay or inject earlier messages"
     assert guidance =~ "Cross-harness handoff from durable session records"
@@ -11878,7 +11878,7 @@ defmodule Tightbeam.GatewayTest do
     assert guidance =~ "Codex developer message"
 
     assert guidance =~
-             "tightbeam transcript --session \"k1\" --limit 50 --role assistant --format text"
+             "tightbeam transcript --session \"k1\" --limit 50 --no-notices --format text"
 
     refute File.exists?(Path.join(home, "AGENTS.md"))
 

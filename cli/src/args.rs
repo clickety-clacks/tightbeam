@@ -1205,9 +1205,10 @@ COMMANDS:
       No cursor reads the tail (newest first page, shown oldest-first); page
       back with --before <oldestId> and catch up with --after <newestId>, both
       ids the previous response handed you. --limit defaults to 50, caps at 500.
-      Recover compactly with --role assistant --format text. --role repeats or
-      accepts commas (user, assistant, system, tool). --no-notices skips user
-      messages sent by process:tightbeam. Filters apply before limit and paging.
+      Recover with --no-notices --format text; --role assistant reads just replies. --role repeats or
+      accepts commas (user, assistant, system, tool). --no-notices hides process
+      user notices and batches with only process-authored included members;
+      mixed agent batches stay. Filters apply before limit and paging.
       --since accepts ISO 8601 with timezone or durations (30m, 2h, 1d).
       JSON is the default. Text includes UTC headers and paging cursors.
       Filters require gateway capability transcript-filters-v1; older gateways

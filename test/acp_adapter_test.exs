@@ -2817,7 +2817,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "bounded continuity guidance uses the supported harness channel on new and load" do
     guidance =
       "served guidance\n\n" <>
-        "Run `tightbeam transcript --session \"same-key\" --limit 50 --role assistant --format text`. " <>
+        "Run `tightbeam transcript --session \"same-key\" --limit 50 --no-notices --format text`. " <>
         "Do not replay or inject earlier messages."
 
     for {harness, expected} <- [

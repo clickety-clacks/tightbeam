@@ -184,7 +184,11 @@ defmodule Tightbeam.Transcript do
           String.to_integer(count) *
             Map.fetch!(%{"s" => 1, "m" => 60, "h" => 3600, "d" => 86400}, unit)
 
-        {:ok, System.system_time(:millisecond) - seconds * 1000}
+        since = System.system_time(:millisecond) - seconds * 1000
+
+        if since >= -9_223_372_036_854_775_808 and since <= 9_223_372_036_854_775_807,
+          do: {:ok, since},
+          else: {:error, invalid("--since duration exceeds the supported timestamp range")}
 
       _ ->
         case DateTime.from_iso8601(value) do
@@ -211,7 +215,14 @@ defmodule Tightbeam.Transcript do
 
     notice_sql =
       if filters.no_notices,
-        do: " AND NOT (m.role = 'user' AND COALESCE(m.sender, '') = 'process:tightbeam')",
+        do: " AND NOT (m.role = 'user' AND COALESCE(m.sender, '') = 'process:tightbeam'
+          AND NOT EXISTS (
+            SELECT 1 FROM turns nt
+            JOIN notice_batches nb ON nb.deliveryWakeId = nt.wakeId
+            JOIN notice_batch_members nm ON nm.batchId = nb.batchId
+            WHERE nt.messageId = m.id AND nm.state = 'included'
+              AND nm.senderPrincipal NOT LIKE 'process:%'
+          ))",
         else: ""
 
     since_sql = if filters.since == nil, do: "", else: " AND m.timestamp >= ?"
@@ -329,7 +340,7 @@ defmodule Tightbeam.Transcript do
     {:ok, [[count]]} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM messages AS m WHERE m.sessionKey = ?1" <> sql,
+        "SELECT EXISTS(SELECT 1 FROM messages AS m WHERE m.sessionKey = ?1" <> sql <> " LIMIT 1)",
         [session_key] ++ values
       )
 
@@ -342,9 +353,9 @@ defmodule Tightbeam.Transcript do
     {:ok, [[count]]} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM messages AS m WHERE m.sessionKey = ?1" <>
+        "SELECT EXISTS(SELECT 1 FROM messages AS m WHERE m.sessionKey = ?1" <>
           sql <>
-          " AND m.seq #{comparison} (SELECT seq FROM messages WHERE id = ?)",
+          " AND m.seq #{comparison} (SELECT seq FROM messages WHERE id = ?) LIMIT 1)",
         [session_key] ++ values ++ [id]
       )
 

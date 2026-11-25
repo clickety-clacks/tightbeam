@@ -3,6 +3,10 @@ use std::fmt::Write;
 
 /// Indent content so even a message containing a header/trailer cannot impersonate one.
 pub fn render_text(page: &Value) -> Result<String, String> {
+    render_text_with_cursor(page, None)
+}
+
+pub fn render_text_with_cursor(page: &Value, cursor: Option<&str>) -> Result<String, String> {
     let messages = page
         .get("messages")
         .and_then(Value::as_array)
@@ -57,8 +61,14 @@ pub fn render_text(page: &Value) -> Result<String, String> {
         page.get("hasMoreAfter")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        page.get("oldestId").and_then(Value::as_str).unwrap_or("-"),
-        page.get("newestId").and_then(Value::as_str).unwrap_or("-")
+        page.get("oldestId")
+            .and_then(Value::as_str)
+            .or(cursor)
+            .unwrap_or("-"),
+        page.get("newestId")
+            .and_then(Value::as_str)
+            .or(cursor)
+            .unwrap_or("-")
     )
     .unwrap();
     Ok(out)
@@ -80,5 +90,14 @@ mod tests {
     #[test]
     fn empty_text_page_keeps_paging_hints() {
         assert_eq!(render_text(&json!({"messages": [], "hasMoreBefore": false, "hasMoreAfter": true, "oldestId": null, "newestId": null})).unwrap(), "--- page hasMoreBefore=false hasMoreAfter=true before=- after=-\n");
+    }
+    #[test]
+    fn empty_page_echoes_request_cursor() {
+        let text = render_text_with_cursor(
+            &json!({"messages": [], "hasMoreAfter": true}),
+            Some("anchor"),
+        )
+        .unwrap();
+        assert!(text.contains("before=anchor after=anchor"));
     }
 }

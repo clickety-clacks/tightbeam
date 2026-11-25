@@ -124,6 +124,58 @@ defmodule Tightbeam.TranscriptTest do
              JSON.decode!(response.resp_body)
   end
 
+  test "notice filter keeps mixed carriers and hides all-process carriers", ctx do
+    ids =
+      for {batch, senders} <- [
+            {"mixed", ["process:tightbeam", "agent:coordinator"]},
+            {"process", ["process:tightbeam"]}
+          ] do
+        wake = "wake-" <> batch
+
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "INSERT INTO wakes(wakeId,sessionKey,origin,dueAt,createdAt) VALUES (?1,'owned','process:tightbeam',0,0)",
+            [wake]
+          )
+
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,visibilityScope,policyRevision,state,dueAt,openedAt,deliveryWakeId) VALUES (?1,?1,'owned',?1,'test','open',0,0,?2)",
+            [batch, wake]
+          )
+
+        for {sender, n} <- Enum.with_index(senders, 1) do
+          member_wake = wake <> Integer.to_string(n)
+
+          {:ok, _} =
+            DB.query(
+              ctx.db,
+              "INSERT INTO wakes(wakeId,sessionKey,origin,dueAt,createdAt) VALUES (?1,'owned','process:tightbeam',0,0)",
+              [member_wake]
+            )
+
+          {:ok, _} =
+            DB.query(
+              ctx.db,
+              "INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,recipientAddress,visibilityScope,publicationSeq,policyRevision,senderPrincipal,cause,class,payload,renderedBytes,state,addedAt) VALUES (?1,?2,?3,'test',?2,?2,?4,'test',?5,'test','fyi','test',1,'included',0)",
+              [batch <> Integer.to_string(n), batch, member_wake, n, sender]
+            )
+        end
+
+        id = message!(ctx.db, "owned", "user", "carrier", sender: "process:tightbeam")
+        seq = turn!(ctx.db, "owned", id, [])
+        :ok = DB.query(ctx.db, "UPDATE turns SET wakeId=?1 WHERE seq=?2", [wake, seq])
+        id
+      end
+
+    page = read(ctx, %{session_key: "owned", no_notices: true, limit: 1})
+    assert Enum.map(page.messages, & &1.id) == [hd(ids)]
+    refute page.has_more_before
+    refute page.has_more_after
+  end
+
   test "since accepts ISO offsets and relative durations and refuses bad input", ctx do
     _ = message!(ctx.db, "owned", "assistant", "old", timestamp: 1000)
     fresh = message!(ctx.db, "owned", "assistant", "fresh")
@@ -134,7 +186,7 @@ defmodule Tightbeam.TranscriptTest do
       refute page.has_more_before
     end
 
-    for since <- ["yesterday", "2026-11-25", "-2h", "2x", 42] do
+    for since <- ["yesterday", "2026-11-25", "-2h", "2x", "99999999999999999d", 42] do
       assert %{code: "invalid", message: message} =
                read(ctx, %{session_key: "owned", since: since})
 

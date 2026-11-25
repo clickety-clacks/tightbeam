@@ -84,7 +84,7 @@ needs their decision. Keep identifiers as supporting detail and say what each on
 
 ### Read conversation history
 
-Use `tightbeam transcript --session '<exact session key>' --limit 20 --role assistant --format text --as-user '<user ID>'`.
+Use `tightbeam transcript --session '<exact session key>' --limit 20 --no-notices --format text --as-user '<user ID>'`.
 If you only have a display name, use
 `tightbeam transcript --name '<display name>' --as-user '<user ID>'` to find
 candidate session keys. Page back with `--before <oldestId>` or catch up with
@@ -92,16 +92,13 @@ candidate session keys. Page back with `--before <oldestId>` or catch up with
 The gateway applies your transcript access through the CLI.
 
 
-For recovery, this selects assistant replies with compact UTC headers and a
-paging trailer (`before`/`after` are the continuation IDs). Omit `--role` to read
-all roles, or repeat it / use `--role user,assistant`. Add `--no-notices` to skip
-user messages attributed to `process:tightbeam`, and `--since 30m` (also `2h`,
-`1d`, or an ISO 8601 time with timezone) to bound time. Filters apply before
-`--limit`; keep the same filters when paging. Use an absolute `--since` value
-for a stable time boundary across pages. JSON remains the default and preserves
-metadata. Filters require gateway capability `transcript-filters-v1`; the CLI
-fails clearly on older gateways. Text without filters works on older gateways.
-Name lookup remains JSON and never returns conversation content.
+Recovery keeps all roles; `--no-notices` hides process-authored user notices and
+batches whose included members are all process-authored. Mixed agent batches stay.
+Use `--role assistant` for just your replies (roles repeat or accept commas).
+Text has UTC headers and paging cursors; JSON is the default. Filters precede
+`--limit` and require a gateway advertising `transcript-filters-v1` (older gateways
+fail clearly). `--since` accepts ISO 8601 with timezone or `30m`, `2h`, `1d`;
+keep filters unchanged and use an absolute time for a stable paging boundary.
 
 ### Watch one session live
 
