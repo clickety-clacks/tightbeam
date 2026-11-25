@@ -124,9 +124,13 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
     seq
   end
 
+  # The test process owes nothing, so its own reads are refused while a burst
+  # it made drains; that reads as "not yet".
   defp status(db, seq) do
-    {:ok, [[status]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [seq])
-    status
+    case DB.query(db, "SELECT status FROM turns WHERE seq=?1", [seq]) do
+      {:ok, [[status]]} -> status
+      {:error, %DB.Overloaded{}} -> :refused
+    end
   end
 
   defp eventually(fun, tries \\ 400) do
