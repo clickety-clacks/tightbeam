@@ -152,6 +152,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Put the in-repo harness CLI on PATH
         run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
 
@@ -325,6 +329,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install Mix dependencies
         run: mix deps.get
 
@@ -336,10 +344,15 @@ jobs:
           package=$(find _build/npm -maxdepth 1 -type f -name 'tightbeam-*.tgz')
           [ "$(printf '%s\n' "$package" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ]
           mkdir -p "stage/packages/$PLATFORM" stage/toolchains
+          python3 packaging/gateway-smoke.py "$package" > package-smoke.txt
+          cat package-smoke.txt
           cp "$package" "stage/packages/$PLATFORM/"
+          digest=$(shasum -a 256 "stage/packages/$PLATFORM/$(basename "$package")" | awk '{print $1}')
+          grep -F "package smoke: OK sha256=$digest " package-smoke.txt > /dev/null
           {
             elixir --version
             rustc --version
+            cat package-smoke.txt
           } > "stage/toolchains/$PLATFORM.txt"
 
       # Staging is short-lived job transport. Only the proof job publishes candidate proof.

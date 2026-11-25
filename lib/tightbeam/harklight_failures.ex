@@ -149,6 +149,13 @@ defmodule Tightbeam.HarklightFailures do
     end
   end
 
+  # Agent 0.2.3 reports a cut-off and its recovery without exiting. Neither says
+  # anything about how the feed later ends.
+  def listen_progress?(line) do
+    line = line |> String.replace_invalid() |> String.trim()
+    Regex.match?(~r/\Alisten: (?:.+; reconnecting|live updates resumed)\z/, line)
+  end
+
   def listen_refusal(line) do
     line = String.trim(line)
 
@@ -158,6 +165,10 @@ defmodule Tightbeam.HarklightFailures do
       _ -> non_http_listen_refusal(line)
     end
   end
+
+  # The Server sends this reason only when the enrolled device itself is
+  # removed. Other closings, and any refused request, can pass.
+  defp non_http_listen_refusal("agent feed closed: revoked"), do: :identity_revoked
 
   defp non_http_listen_refusal("agent feed closed: " <> reason) when reason != "",
     do: :feed_refused

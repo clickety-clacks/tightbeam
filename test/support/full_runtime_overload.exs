@@ -131,6 +131,9 @@ for name <- [
     ],
     do: :sys.get_state(name)
 
+# The production scheduler starts with quiet-assignment holder nudges off.
+false = :sys.get_state(Tightbeam.WakeScheduler).holder_prod
+
 runtime = Process.whereis(Tightbeam.RuntimeSupervisor)
 
 children = fn ->

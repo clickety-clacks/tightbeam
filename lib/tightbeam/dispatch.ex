@@ -16,7 +16,8 @@ defmodule Tightbeam.Dispatch do
 
   Rules evaluate each call before its handler runs. Handler database writes
   record an identity audit in their transaction. Dispatch records remaining
-  audits and publication asynchronously for successful reads.
+  audits and publication asynchronously for successful reads, outside the
+  database owner's queue (`Tightbeam.DispatchAudit`).
   Read audits contain identity and verb rather than the returned content.
   """
 
@@ -25,6 +26,7 @@ defmodule Tightbeam.Dispatch do
   alias Tightbeam.{
     Assignments,
     DB,
+    DispatchAudit,
     ErrorDiagnostic,
     Escalation,
     EventLog,
@@ -442,6 +444,16 @@ defmodule Tightbeam.Dispatch do
                   principal
                 )
             else
+              read? = verb in @read_verbs
+
+              # A read changes no state, so its notice is the observation alone
+              # and its result is never sent to the database owner.
+              handoff =
+                if read?,
+                  do: &Publisher.observed_accepted_in_txn(&1, publisher_call),
+                  else:
+                    &Publisher.accepted_in_txn(&1, publisher_call, caller_only_stripped(result))
+
               :ok =
                 append_event_with_handoff(
                   db,
@@ -451,8 +463,8 @@ defmodule Tightbeam.Dispatch do
                   session_key,
                   payload,
                   principal,
-                  &Publisher.accepted_in_txn(&1, publisher_call, caller_only_stripped(result)),
-                  verb in @read_verbs
+                  handoff,
+                  read?
                 )
             end
 
@@ -570,22 +582,27 @@ defmodule Tightbeam.Dispatch do
           handoff.(txn)
         end)
     else
-      if DB.overloaded?(db) do
-        Logger.warning("dispatch audit for #{verb} skipped: database overloaded")
-      else
-        side_task = fn txn ->
-          record.(txn)
-          if handoff, do: handoff.(txn), else: :ok
-        end
-
-        GenServer.cast(
-          db,
-          {:dispatch_audit, side_task, System.monotonic_time(:millisecond) + 2_000}
-        )
+      side_task = fn txn ->
+        record.(txn)
+        if handoff, do: handoff.(txn), else: :ok
       end
+
+      if not async or DispatchAudit.record(db, verb, side_task) == :no_process,
+        do: queue_audit(db, verb, side_task)
     end
 
     :ok
+  end
+
+  defp queue_audit(db, verb, side_task) do
+    if DB.overloaded?(db) do
+      Logger.warning("dispatch audit for #{verb} skipped: database overloaded")
+    else
+      GenServer.cast(
+        db,
+        {:dispatch_audit, side_task, System.monotonic_time(:millisecond) + 2_000}
+      )
+    end
   end
 
   defp identity_invocation_id(call, verb, origin) do
