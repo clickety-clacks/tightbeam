@@ -268,7 +268,12 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert notice["schemaVersion"] == 2
     assert notice["resource"] == "decision requests"
     assert notice["op"] == "upsert"
-    assert notice["refs"] == %{"decisionRequestId" => request.id}
+
+    assert notice["refs"] == %{
+             "decisionRequestId" => request.id,
+             "workItemId" => assignment.work_item_id
+           }
+
     assert notice["payload"] == Tightbeam.StateResources.decision_request(request)
 
     Hub.delivered(hub, self())

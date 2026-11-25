@@ -884,7 +884,13 @@ defmodule Tightbeam.Escalation do
           |> encode_optional()
 
         context =
-          JSON.encode!(%{verb: Map.fetch!(call, :verb), params: Map.fetch!(call, :params)})
+          %{verb: Map.fetch!(call, :verb), params: Map.fetch!(call, :params)}
+          |> then(fn context ->
+            if Map.get(ctx, :source_unavailable),
+              do: Map.put(context, :sourceUnavailable, true),
+              else: context
+          end)
+          |> JSON.encode!()
 
         deadline_at = now + decision_deadline_ms()
 
@@ -2440,6 +2446,9 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc false
+  # A failed rail source lookup must remain reportable without repeating it.
+  def publish_wait_source_in_txn(_txn, %{context: %{"sourceUnavailable" => true}}), do: :ok
+
   def publish_wait_source_in_txn(txn, request) do
     Tightbeam.WaitLinks.publish_source_change_in_txn(
       txn,

@@ -117,7 +117,7 @@ defmodule Tightbeam.Firehose.Publisher do
     assignment = payload[:assignment_id] || payload["assignmentId"]
 
     item =
-      if is_nil(item) and is_binary(assignment) do
+      if is_nil(item) and is_binary(assignment) and context["sourceUnavailable"] != true do
         sql = "SELECT workItemId FROM assignments WHERE id=?1"
 
         rows =

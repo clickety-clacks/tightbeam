@@ -112,7 +112,7 @@ defmodule Tightbeam.WaitLinks do
     AND NOT EXISTS(SELECT 1 FROM work_items wi WHERE wi.id=w.work_item_id
       AND (wi.routingWakeId=w.wakeId OR wi.slateWakeId=w.wakeId))
     AND NOT EXISTS(SELECT 1 FROM row_reaction_actions r INDEXED BY row_reaction_output
-      WHERE json_extract(r.result,'$.wake_id')=w.wakeId
+      WHERE json_extract(r.result,'$.wake_id')=+w.wakeId
       AND json_extract(r.plan,'$.value.reference.resource')='work_item'
       AND json_extract(r.plan,'$.value.reference.field') IN ('routingWakeId','slateWakeId'))
     """
@@ -138,34 +138,34 @@ defmodule Tightbeam.WaitLinks do
     sql = """
     WITH items AS MATERIALIZED (SELECT value id FROM json_each(?1)),
     item_assignments AS MATERIALIZED (
-      SELECT a.id,a.workItemId FROM items i JOIN assignments a ON a.workItemId=i.id
+      SELECT a.id,a.workItemId FROM items i CROSS JOIN assignments a ON a.workItemId=i.id
     ),
     item_wakes AS MATERIALIZED (
-      SELECT i.id itemId,COALESCE(w.conditionKind,json_extract(w.predicate,'$.bindings.conditionKind')) waitFactKind,w.* FROM items i JOIN wakes w INDEXED BY wakes_wait_links_item ON w.work_item_id=i.id
+      SELECT i.id itemId,COALESCE(w.conditionKind,json_extract(w.predicate,'$.bindings.conditionKind')) waitFactKind,w.* FROM items i CROSS JOIN wakes w INDEXED BY wakes_wait_links_item ON w.work_item_id=i.id
       WHERE #{active_wake_sql()}
       UNION ALL
-      SELECT a.workItemId itemId,COALESCE(w.conditionKind,json_extract(w.predicate,'$.bindings.conditionKind')) waitFactKind,w.* FROM item_assignments a JOIN wakes w INDEXED BY wakes_assignment ON w.assignmentId=a.id
+      SELECT a.workItemId itemId,COALESCE(w.conditionKind,json_extract(w.predicate,'$.bindings.conditionKind')) waitFactKind,w.* FROM item_assignments a CROSS JOIN wakes w INDEXED BY wakes_assignment ON w.assignmentId=a.id
       WHERE w.work_item_id IS NOT a.workItemId AND #{active_wake_sql()}
     ),
     item_decisions AS MATERIALIZED (
       SELECT a.workItemId itemId,d.* FROM item_assignments a
-        JOIN decision_requests d INDEXED BY decision_requests_rest_assignment_order ON d.assignmentId=a.id WHERE d.status='open'
+        CROSS JOIN decision_requests d INDEXED BY decision_requests_rest_assignment_order ON d.assignmentId=a.id WHERE d.status='open'
       UNION
-      SELECT w.itemId,d.* FROM item_wakes w JOIN decision_requests d ON d.id=w.resolverId
+      SELECT w.itemId,d.* FROM item_wakes w CROSS JOIN decision_requests d ON d.id=w.resolverId
         WHERE w.resolverKind='decision_request' AND d.status='open'
       UNION
-      SELECT i.id itemId,d.* FROM items i JOIN decision_requests d INDEXED BY decision_requests_wait_item
+      SELECT i.id itemId,d.* FROM items i CROSS JOIN decision_requests d INDEXED BY decision_requests_wait_item
         ON (CASE WHEN json_valid(d.context) THEN json_extract(d.context,'$.workItemId') END)=i.id WHERE d.status='open'
     ),
     item_blocks AS MATERIALIZED (
       SELECT a.workItemId itemId,cp.* FROM item_assignments a
-        JOIN assignment_cannot_proceed cp INDEXED BY cannot_proceed_wait_assignment ON cp.assignmentId=a.id
+        CROSS JOIN assignment_cannot_proceed cp INDEXED BY cannot_proceed_wait_assignment ON cp.assignmentId=a.id
         WHERE cp.state='standing'
     ),
     item_running AS MATERIALIZED (
-      SELECT i.id itemId FROM items i JOIN turns t INDEXED BY turns_wait_item ON t.jobRef=i.id WHERE t.status='running'
+      SELECT i.id itemId FROM items i CROSS JOIN turns t INDEXED BY turns_wait_item ON t.jobRef=i.id WHERE t.status='running'
       UNION
-      SELECT a.workItemId itemId FROM item_assignments a JOIN turns t INDEXED BY turns_wait_assignment ON t.assignmentId=a.id WHERE t.status='running'
+      SELECT a.workItemId itemId FROM item_assignments a CROSS JOIN turns t INDEXED BY turns_wait_assignment ON t.assignmentId=a.id WHERE t.status='running'
     )
     SELECT i.id,
       EXISTS(SELECT 1 FROM item_wakes w WHERE w.itemId=i.id AND
@@ -240,15 +240,18 @@ defmodule Tightbeam.WaitLinks do
         []
       end
 
-    [work_item_id | ids]
-    |> Enum.filter(&is_binary/1)
-    |> Enum.uniq()
-    |> Enum.each(
-      &Tightbeam.WorkItemSummary.publish_change_in_txn(txn, &1, %{
+    ids = [work_item_id | ids] |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+    # A turn's jobRef is an attribution key and may not name a work item.
+    Txn.q(txn, "SELECT id FROM work_items WHERE id IN (SELECT value FROM json_each(?1))", [
+      JSON.encode!(ids)
+    ])
+    |> Enum.each(fn [id] ->
+      Tightbeam.WorkItemSummary.publish_change_in_txn(txn, id, %{
         principal: {:process, "tightbeam"},
         firehose_work_item_summary: true
       })
-    )
+    end)
 
     :ok
   end
@@ -542,7 +545,7 @@ defmodule Tightbeam.WaitLinks do
         running =
           Txn.q(
             txn,
-            "SELECT seq,startedAt FROM turns WHERE sessionKey=? AND status='running' ORDER BY seq DESC LIMIT 1",
+            "SELECT seq,startedAt FROM turns INDEXED BY turns_pending WHERE sessionKey=? AND status IN ('queued','running') AND status='running' ORDER BY seq DESC LIMIT 1",
             [id]
           )
 

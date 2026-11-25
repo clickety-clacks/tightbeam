@@ -989,6 +989,12 @@ defmodule Tightbeam.RailScriptTest do
 
     assert question =~ "denied script_error"
     assert question =~ "script_exit_class unreported"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT json_extract(context,'$.sourceUnavailable') FROM decision_requests"
+             )
   end
 
   # BLOCKING review finding. Recovery used to be ordered by the ACTOR's delayed mutation

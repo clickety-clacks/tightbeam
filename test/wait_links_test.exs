@@ -503,9 +503,21 @@ defmodule Tightbeam.WaitLinksTest do
       DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, [JSON.encode!([ctx.work_item.id])])
 
     details = Enum.map_join(plan, "\n", &List.last/1)
-    assert details =~ "wakes_wait_links_item"
-    assert details =~ "wakes_assignment"
-    assert details =~ "decision_requests_rest_assignment_order"
+    assert details =~ "SEARCH w USING INDEX wakes_wait_links_item"
+    assert details =~ "SEARCH w USING INDEX wakes_assignment"
+    assert details =~ "SEARCH r USING INDEX row_reaction_output"
+    assert details =~ "SEARCH d USING INDEX decision_requests_rest_assignment_order"
+    assert details =~ "SEARCH d USING INDEX decision_requests_wait_item"
+    assert details =~ ~r/SEARCH cp USING (?:COVERING )?INDEX cannot_proceed_wait_assignment/
+    assert details =~ ~r/SEARCH a USING (?:COVERING )?INDEX \w+ \(workItemId=\?\)/
+    assert details =~ ~r/SEARCH t USING (?:COVERING )?INDEX turns_wait_item/
+    assert details =~ ~r/SEARCH t USING (?:COVERING )?INDEX turns_wait_assignment/
+    # CTE scans are bounded by requested items. Base-table loops must seek.
+    refute details =~ ~r/SCAN (a|w|d|cp|t|r) USING (?:COVERING )?INDEX/
+
+    refute details =~
+             ~r/SCAN (assignments|wakes|decision_requests|assignment_cannot_proceed|turns)\b/
+
     refute details =~ "wakes_wait_recognition"
     refute details =~ "decision_requests_rest_status_order"
 
@@ -531,8 +543,8 @@ defmodule Tightbeam.WaitLinksTest do
       )
 
     page_details = Enum.map_join(page_plan, "\n", &List.last/1)
-    assert page_details =~ "wakes_wait_links_item"
-    assert page_details =~ "wakes_assignment"
+    assert page_details =~ "SEARCH w USING INDEX wakes_wait_links_item"
+    assert page_details =~ "SEARCH w USING INDEX wakes_assignment"
     refute page_details =~ "wakes_wait_recognition"
     refute page_details =~ "decision_requests_rest_status_order"
   end

@@ -242,9 +242,13 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
                :attest_counts,
                :verdict_counts,
                :effective_commit_refs,
-               :landings
+               :landings,
+               :waiting,
+               :running
              ]) == row
 
+      assert detail.waiting == %{agent: false, time: false, event: false, userIds: []}
+      assert detail.running == false
       assert detail.started == false
       assert detail.holders == []
       assert detail.attest_counts == %{}

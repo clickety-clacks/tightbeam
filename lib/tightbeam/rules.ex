@@ -3138,7 +3138,7 @@ defmodule Tightbeam.Rules do
           # where the rest of it was cleaned out. The class no observation carried is
           # exactly what `unreported` exists to say.
           :error ->
-            malfunction(rule, call, "script_error", "unreported", to_close, to_consume)
+            malfunction(rule, call, "script_error", "unreported", to_close, to_consume, true)
         end
     end
   end
@@ -3256,11 +3256,20 @@ defmodule Tightbeam.Rules do
 
   # The one shape every malfunction takes, so the two sites that reach one cannot drift:
   # the deny is byte-identical to what it always was, and the summons rides beside it.
-  defp malfunction(rule, call, reason, exit_class, to_close, to_consume) do
+  defp malfunction(
+         rule,
+         call,
+         reason,
+         exit_class,
+         to_close,
+         to_consume,
+         source_unavailable \\ false
+       ) do
     ctx = %{
       question: malfunction_question(rule, reason, exit_class),
       error: denial_error(rule, call, reason, exit_class),
-      episode_key: exit_class
+      episode_key: exit_class,
+      source_unavailable: source_unavailable
     }
 
     {{:deny_escalate, rule, ctx}, Enum.reverse(to_close), Enum.reverse(to_consume)}
