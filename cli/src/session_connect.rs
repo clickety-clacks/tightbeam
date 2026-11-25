@@ -194,7 +194,7 @@ impl ReadSelection {
         Self { as_user }
     }
 
-    fn auth_frame(&self, token: &str) -> Value {
+    pub(crate) fn auth_frame(&self, token: &str) -> Value {
         let mut frame = json!({"type": "auth", "token": token});
         if let Some(user) = &self.as_user {
             frame["asUser"] = json!(user);
@@ -945,7 +945,7 @@ fn read_handshake_frame(
     }
 }
 
-fn set_read_timeout(
+pub(crate) fn set_read_timeout(
     stream: &mut MaybeTlsStream<TcpStream>,
     timeout: Option<Duration>,
 ) -> io::Result<()> {
@@ -967,7 +967,7 @@ fn normal_close_frame() -> tungstenite::protocol::CloseFrame<'static> {
     }
 }
 
-fn websocket_url(base: &str, protocol_version: u64) -> String {
+pub(crate) fn websocket_url(base: &str, protocol_version: u64) -> String {
     let base = base
         .trim_end_matches('/')
         .replacen("https://", "wss://", 1)
@@ -2054,7 +2054,7 @@ fn snapshot_signal(signal: &AtomicI32) -> Option<i32> {
     }
 }
 
-fn encode_path(value: &str) -> String {
+pub(crate) fn encode_path(value: &str) -> String {
     value
         .bytes()
         .flat_map(|byte| match byte {

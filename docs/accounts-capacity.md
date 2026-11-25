@@ -23,10 +23,11 @@ account from Tightbeam's list and keeps the login on its host. Sign in to a
 second account using the existing onboarding command with `--account new`.
 Use `--account acct_example` when signing in again to the same account.
 
-The gateway applies its account visibility and action permissions. From a
-Tightbeam session, the CLI uses the session's credential. With an organization
-credential, use `--as-user <userId>` to select a user's read visibility, or
-`--as-process <name>` to use the credential's default read principal.
+Capacity reads require an administrator's device credential or an organization
+credential with an administrator as the read principal. With an organization
+credential, use `--as-user <userId>` to select the read principal, or
+`--as-process <name>` to use the default read principal. Run capacity commands
+outside a session worktree so discovery selects your administrator credential.
 
 ## Read capacity
 

@@ -1176,6 +1176,7 @@ COMMANDS:
 
   capacity [show] [--account <accountId>] [--refresh] [--json]
       Show usage, reset times, reading freshness and subscription status.
+      Capacity reads require an administrator credential.
       --refresh waits for a fresh reading subject to provider availability.
       capacity history --account <accountId> [--json]
       capacity forecast [--account <accountId>] [--json]

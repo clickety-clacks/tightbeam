@@ -1,0 +1,337 @@
+{
+    "accountForecast": {
+        "status": 200,
+        "body": {
+            "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+            "accountStatus": "ready",
+            "coverageHours": 0.0,
+            "currentSampleAgeSeconds": 0,
+            "diagnostics": [],
+            "exhaustionAt": null,
+            "generatedAt": 1795570013403,
+            "historyError": null,
+            "historySampleCount": 1,
+            "latestObservedAt": 1795570013389,
+            "limitingWindowId": null,
+            "limitingWindowName": null,
+            "lookbackHours": 0,
+            "plan": "pro",
+            "provider": "openai",
+            "qualification": null,
+            "status": "insufficient_history",
+            "windows": [
+                {
+                    "coverage24hHours": 0.0,
+                    "coverage48hHours": 0.0,
+                    "diagnostics": [],
+                    "estimateLookbackHours": null,
+                    "exhaustionAt": null,
+                    "generation": "reset:1795570073",
+                    "id": "primary",
+                    "lookback24hHours": 0,
+                    "lookback48hHours": 0,
+                    "name": "Primary",
+                    "rate24hPercentPerHour": null,
+                    "rate48hPercentPerHour": null,
+                    "ratePercentPerHour": null,
+                    "remainingPercent": 58,
+                    "resetsAt": 1795570073389,
+                    "sampleCount24h": 1,
+                    "sampleCount48h": 1,
+                    "status": "insufficient_history",
+                    "usedPercent": 42,
+                    "windowSeconds": 18000
+                }
+            ]
+        }
+    },
+    "accountUsageCache": {
+        "status": 200,
+        "body": {
+            "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+            "error": null,
+            "sample": {
+                "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+                "ageSeconds": 0,
+                "diagnostics": [],
+                "label": "default",
+                "observedAt": 1795570013389,
+                "plan": "pro",
+                "provider": "openai",
+                "serving": true,
+                "windows": [
+                    {
+                        "id": "primary",
+                        "model": null,
+                        "name": "Primary",
+                        "resetsAt": 1795570073389,
+                        "scope": "account",
+                        "usedPercent": 42,
+                        "windowSeconds": 18000
+                    }
+                ]
+            },
+            "status": "cache",
+            "summary": {
+                "accountState": "ready",
+                "accountStateReason": null,
+                "label": "default",
+                "plan": "pro",
+                "planUnknownReason": null,
+                "provider": "openai",
+                "subscriptionObservedAt": 1795570013389,
+                "subscriptionPeriodEndAt": null,
+                "subscriptionPeriodEndKind": null,
+                "subscriptionPeriodEndUnknownReason": "not_exposed_by_provider",
+                "subscriptionStatus": "unknown",
+                "subscriptionStatusReason": "not_exposed_by_provider",
+                "usageAgeSeconds": 0,
+                "usageFreshness": "current",
+                "usageFreshnessReason": null,
+                "usageObservedAt": 1795570013389
+            }
+        }
+    },
+    "capacityChanged": {
+        "class": "capacity.changed",
+        "occurredAt": 1795570013389,
+        "op": "observe",
+        "payload": {
+            "sourceVersion": 1795570013389
+        },
+        "refs": {
+            "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59"
+        }
+    },
+    "forecast": {
+        "status": 200,
+        "body": {
+            "accounts": [
+                {
+                    "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+                    "accountStatus": "ready",
+                    "coverageHours": 0.0,
+                    "currentSampleAgeSeconds": 0,
+                    "diagnostics": [],
+                    "exhaustionAt": null,
+                    "generatedAt": 1795570013404,
+                    "historyError": null,
+                    "historySampleCount": 1,
+                    "latestObservedAt": 1795570013389,
+                    "limitingWindowId": null,
+                    "limitingWindowName": null,
+                    "lookbackHours": 0,
+                    "plan": "pro",
+                    "provider": "openai",
+                    "qualification": null,
+                    "status": "insufficient_history",
+                    "windows": [
+                        {
+                            "coverage24hHours": 0.0,
+                            "coverage48hHours": 0.0,
+                            "diagnostics": [],
+                            "estimateLookbackHours": null,
+                            "exhaustionAt": null,
+                            "generation": "reset:1795570073",
+                            "id": "primary",
+                            "lookback24hHours": 0,
+                            "lookback48hHours": 0,
+                            "name": "Primary",
+                            "rate24hPercentPerHour": null,
+                            "rate48hPercentPerHour": null,
+                            "ratePercentPerHour": null,
+                            "remainingPercent": 58,
+                            "resetsAt": 1795570073389,
+                            "sampleCount24h": 1,
+                            "sampleCount48h": 1,
+                            "status": "insufficient_history",
+                            "usedPercent": 42,
+                            "windowSeconds": 18000
+                        }
+                    ]
+                }
+            ],
+            "assumptions": [
+                "Pool rates assume recent demand continues at the measured current-workload rate.",
+                "Pool estimates assume work can be redistributed among accounts in the same comparable pool.",
+                "Multiple windows can overlap or constrain the same account, so pooled ETA is optimistic redistribution arithmetic, not a routing guarantee.",
+                "Providers, plans, window IDs, and window durations remain separate quotas."
+            ],
+            "diagnostics": [],
+            "generatedAt": 1795570013404,
+            "pools": [
+                {
+                    "capacityMemberCount": 1,
+                    "comparable": true,
+                    "compatibility": "same_capacity",
+                    "coverageHours": 0.0,
+                    "currentWorkloadRatePercentPointsPerHour": null,
+                    "diagnostics": [
+                        {
+                            "code": "POOL_MISSING_BURN",
+                            "message": "At least one member has no finite recent burn estimate, so the pool ETA is qualified."
+                        }
+                    ],
+                    "effectiveRemainingPercentPoints": 0,
+                    "exhaustionAt": null,
+                    "key": "openai:pro:primary:18000",
+                    "lookbackHours": 0,
+                    "measuredMemberCount": 0,
+                    "members": [
+                        {
+                            "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+                            "coverageHours": 0.0,
+                            "exhaustionAt": null,
+                            "label": "default",
+                            "observedAt": 1795570013389,
+                            "rate24hPercentPerHour": null,
+                            "rate48hPercentPerHour": null,
+                            "ratePercentPerHour": null,
+                            "remainingPercent": 58,
+                            "resetsAt": 1795570073389,
+                            "sampleCount": 1,
+                            "status": "insufficient_history"
+                        }
+                    ],
+                    "missingRateMemberCount": 1,
+                    "plan": "pro",
+                    "planKnown": true,
+                    "provider": "openai",
+                    "rate24hPercentPointsPerHour": null,
+                    "rate48hPercentPointsPerHour": null,
+                    "remainingPercentPoints": 58,
+                    "status": "incomplete",
+                    "windowId": "primary",
+                    "windowName": "Primary",
+                    "windowSeconds": 18000
+                }
+            ],
+            "status": "incomplete"
+        }
+    },
+    "health": {
+        "status": 200,
+        "body": {
+            "providers": {
+                "anthropic": {
+                    "accounts": {
+                        "degraded": 0,
+                        "ready": 0,
+                        "reauthRequired": 0,
+                        "total": 0,
+                        "unknown": 0
+                    },
+                    "cliAvailable": true
+                },
+                "openai": {
+                    "accounts": {
+                        "degraded": 0,
+                        "ready": 1,
+                        "reauthRequired": 0,
+                        "total": 1,
+                        "unknown": 0
+                    },
+                    "cliAvailable": true
+                }
+            },
+            "status": "ready"
+        }
+    },
+    "history": {
+        "status": 200,
+        "body": {
+            "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+            "earliestObservedAt": 1795570013389,
+            "latestObservedAt": 1795570013389,
+            "provider": "openai",
+            "samples": [
+                {
+                    "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+                    "observedAt": 1795570013389,
+                    "plan": "pro",
+                    "provider": "openai",
+                    "windows": [
+                        {
+                            "id": "primary",
+                            "model": null,
+                            "name": "Primary",
+                            "resetsAt": 1795570073389,
+                            "scope": "account",
+                            "usedPercent": 42,
+                            "windowSeconds": 18000
+                        }
+                    ]
+                }
+            ]
+        }
+    },
+    "notFound": {
+        "status": 404,
+        "body": {
+            "error": {
+                "code": "ACCOUNT_NOT_FOUND",
+                "message": "Capacity account not found."
+            },
+            "resource": "capacity",
+            "schemaVersion": 1
+        }
+    },
+    "usageCache": {
+        "status": 200,
+        "body": {
+            "counts": {
+                "cache": 1,
+                "error": 0,
+                "live": 0,
+                "stale": 0
+            },
+            "generatedAt": 1795570013405,
+            "results": [
+                {
+                    "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+                    "error": null,
+                    "sample": {
+                        "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+                        "ageSeconds": 0,
+                        "diagnostics": [],
+                        "label": "default",
+                        "observedAt": 1795570013389,
+                        "plan": "pro",
+                        "provider": "openai",
+                        "serving": true,
+                        "windows": [
+                            {
+                                "id": "primary",
+                                "model": null,
+                                "name": "Primary",
+                                "resetsAt": 1795570073389,
+                                "scope": "account",
+                                "usedPercent": 42,
+                                "windowSeconds": 18000
+                            }
+                        ]
+                    },
+                    "status": "cache",
+                    "summary": {
+                        "accountState": "ready",
+                        "accountStateReason": null,
+                        "label": "default",
+                        "plan": "pro",
+                        "planUnknownReason": null,
+                        "provider": "openai",
+                        "subscriptionObservedAt": 1795570013389,
+                        "subscriptionPeriodEndAt": null,
+                        "subscriptionPeriodEndKind": null,
+                        "subscriptionPeriodEndUnknownReason": "not_exposed_by_provider",
+                        "subscriptionStatus": "unknown",
+                        "subscriptionStatusReason": "not_exposed_by_provider",
+                        "usageAgeSeconds": 0,
+                        "usageFreshness": "current",
+                        "usageFreshnessReason": null,
+                        "usageObservedAt": 1795570013389
+                    }
+                }
+            ]
+        }
+    }
+}

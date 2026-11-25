@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::attempt_diagnostic::command_context::CommandContext;
 
-use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
+use crate::args::{AccountAction, Command, Identity, Target, ToplineSelection, TuneControl};
 use crate::attempt_diagnostic::{
     Action, AttemptCause, AttemptRender, DiagnosticCode, DiagnosticOperation, EffectKind,
     EffectState, FailureDiagnostic, FailurePresentation, GatewayAccepted, ReceiptAvailability,
@@ -186,9 +186,31 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         | Command::UpdateClients { .. }
         | Command::Assimilate(_)
         | Command::SessionConnect { .. }
-        | Command::Accounts { .. }
         | Command::Capacity { .. } => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
+        }
+        Command::Accounts {
+            identity, action, ..
+        } => {
+            let (action, account, label) = match action {
+                AccountAction::Use(account) => ("use", account, None),
+                AccountAction::Rename { account, label } => ("rename", account, Some(label)),
+                AccountAction::Enable(account) => ("enable", account, None),
+                AccountAction::Disable(account) => ("disable", account, None),
+                AccountAction::Remove(account) => ("remove", account, None),
+                AccountAction::Verify(account) => ("verify", account, None),
+                AccountAction::List | AccountAction::Show(_) => {
+                    return Err("account reads use REST".into());
+                }
+            };
+            let mut params = vec![
+                string_field("action", action),
+                string_field("accountId", account),
+            ];
+            if let Some(label) = label {
+                params.push(string_field("label", label));
+            }
+            Ok(request(identity, "accounts", vec![], params))
         }
         Command::Wake {
             identity,
@@ -4036,9 +4058,16 @@ where
         Command::Help | Command::CommandHelp(_) => {
             unreachable!("help is handled before dispatch")
         }
-        Command::Accounts { .. } | Command::Capacity { .. } => {
-            Err("account and capacity API integration is pending".into())
-        }
+        Command::Accounts {
+            action: action @ (AccountAction::List | AccountAction::Show(_)),
+            identity,
+            json,
+        } => crate::capacity_cli::run_accounts(&discover_endpoint()?, &identity, &action, json),
+        Command::Capacity {
+            identity,
+            action,
+            json,
+        } => crate::capacity_cli::run_capacity(&discover_endpoint()?, &identity, &action, json),
         Command::IdentityCurrent => print_current_session_identity(),
         Command::Doctor {
             identity,
@@ -4233,6 +4262,16 @@ fn add_user_target_is_local(endpoint: &Endpoint) -> bool {
 }
 
 fn requires_session_discovery(command: &Command) -> bool {
+    if matches!(
+        command,
+        Command::Capacity { .. }
+            | Command::Accounts {
+                action: AccountAction::List | AccountAction::Show(_),
+                ..
+            }
+    ) {
+        return false;
+    }
     if matches!(command, Command::ToolCallObserved) {
         return true;
     }
