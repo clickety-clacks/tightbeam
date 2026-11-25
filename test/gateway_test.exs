@@ -11982,13 +11982,9 @@ defmodule Tightbeam.GatewayTest do
     assert rest_post(ctx, "tbc_test", put_in(body, [:params, :clientMessageId], "bad")).status ==
              400
 
-    oversized =
-      rest_post(ctx, "tbc_test", put_in(body, [:params, :content], String.duplicate("x", 65_537)))
-
-    assert oversized.status == 400
-
-    assert %{"error" => %{"code" => "payload_too_large"}} =
-             JSON.decode!(oversized.resp_body)
+    invalid = rest_post(ctx, "tbc_test", put_in(body, [:params, :content], 123))
+    assert invalid.status == 400
+    assert %{"error" => %{"code" => "invalid_message"}} = JSON.decode!(invalid.resp_body)
 
     :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='k1'")
     retired = rest_post(ctx, "tbc_test", body)
@@ -11996,6 +11992,40 @@ defmodule Tightbeam.GatewayTest do
     assert %{"error" => %{"code" => "not_deliverable"}} = JSON.decode!(retired.resp_body)
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+  end
+
+  test "REST human post preserves large decoded prompts and stable retry receipts", ctx do
+    for {content, index} <-
+          Enum.with_index([
+            String.duplicate("x", 65_535),
+            String.duplicate("x", 65_536),
+            String.duplicate("x", 65_537),
+            String.duplicate("é", 40_000),
+            String.duplicate("\"\n\u0001", 30_000),
+            String.duplicate("x", 3_000_000)
+          ]) do
+      body = %{
+        verb: "post",
+        asUser: "flynn",
+        sessionKey: "k1",
+        params: %{clientMessageId: "c_large_#{index}", deviceId: "chat_test", content: content}
+      }
+
+      response = rest_post(ctx, "tbc_test", body)
+      assert response.status == 200
+      receipt = JSON.decode!(response.resp_body)["result"]
+      assert receipt["outcome"] == "recorded"
+      assert Projection.get(ctx.db, receipt["messageId"]).content == content
+      duplicate = rest_post(ctx, "tbc_test", body)
+      assert duplicate.status == 200
+
+      assert JSON.decode!(duplicate.resp_body)["result"] ==
+               receipt
+               |> Map.delete("ack")
+               |> Map.merge(%{"outcome" => "duplicate", "dedupe" => "duplicate"})
+    end
+
+    assert {:ok, [[6]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
   end
 
   test "REST human post refuses session tokens and requires org user attribution", ctx do
@@ -16066,6 +16096,7 @@ defmodule Tightbeam.GatewayTest do
   test "REST post carries submitter through the parser into history and the model prompt", ctx do
     ensure_global_registry()
     owner = ctx.device.user_id
+    content = String.duplicate("hello é\n", 10_000)
     submitter = %{"identity" => nil, "displayName" => "Avery"}
 
     response =
@@ -16076,7 +16107,7 @@ defmodule Tightbeam.GatewayTest do
         params: %{
           clientMessageId: "c_rest_submitter",
           deviceId: "chat_submitter",
-          content: "hello",
+          content: content,
           attachments: [],
           submitter: submitter
         }
@@ -16089,13 +16120,15 @@ defmodule Tightbeam.GatewayTest do
 
     message_id = rest_post_message_id!(ctx.db, "k1", "chat_submitter", "c_rest_submitter")
 
-    assert %{content: "hello", submitter: ^submitter, sender: "user:" <> ^owner} =
+    assert %{content: ^content, submitter: ^submitter, sender: "user:" <> ^owner} =
              Projection.get(ctx.db, message_id)
 
     assert %{"submitter" => ^submitter} =
              ctx.db |> StateResources.query_message(message_id) |> StateResources.message()
 
-    assert {:ok, [["[from Avery]\n\nhello"]]} =
+    prompt = "[from Avery]\n\n" <> content
+
+    assert {:ok, [[^prompt]]} =
              DB.query(ctx.db, "SELECT prompt FROM turns WHERE messageId=?1", [message_id])
   end
 
@@ -16122,7 +16155,7 @@ defmodule Tightbeam.GatewayTest do
       params: %{
         clientMessageId: "c_rest_attachment",
         deviceId: "chat_test",
-        content: "open sample.zip",
+        content: String.duplicate("open sample.zip\n", 8_000),
         attachments: [attachment]
       }
     }
@@ -16148,7 +16181,7 @@ defmodule Tightbeam.GatewayTest do
     message_id = rest_post_message_id!(ctx.db, "k1", "chat_test", "c_rest_attachment")
     assert receipt_message_id == message_id
     raw = Projection.get(ctx.db, message_id)
-    assert raw.content == "open sample.zip"
+    assert raw.content == String.duplicate("open sample.zip\n", 8_000)
     assert raw.sender == "user:#{owner}"
     assert raw.attachments == [attachment]
 

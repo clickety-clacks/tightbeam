@@ -47,6 +47,7 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
     opts =
       Router.init(
         db: db,
+        base_dir: base,
         handlers: handlers,
         cli_token: "operator-fixture",
         firehose_hub: hub,
@@ -516,6 +517,122 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey='selected'")
+  end
+
+  test "REST accepts escaped unicode and control text above the former content cap", ctx do
+    content = String.duplicate("é\"\n\u0001", 20_000)
+
+    body =
+      JSON.encode!(%{
+        verb: "post",
+        asUser: "reader",
+        sessionKey: "selected",
+        params: %{
+          clientMessageId: "c_escaped_unicode",
+          deviceId: "browser-escaped",
+          content: content
+        }
+      })
+      |> String.replace("é", "\\u00e9")
+
+    assert byte_size(content) > 65_536
+    assert byte_size(body) > byte_size(content)
+    {200, accepted} = http_post(ctx.port, body)
+    assert accepted["result"]["outcome"] == "recorded"
+    assert {:ok, [[stored]]} = DB.query(ctx.db, "SELECT content FROM messages")
+    assert stored == content
+    {200, duplicate} = http_post(ctx.port, body)
+
+    assert duplicate["result"] ==
+             accepted["result"]
+             |> Map.delete("ack")
+             |> Map.merge(%{"outcome" => "duplicate", "dedupe" => "duplicate"})
+  end
+
+  test "REST body boundary refuses before recording and keeps the send identity reusable", ctx do
+    body = %{
+      verb: "post",
+      asUser: "reader",
+      sessionKey: "selected",
+      params: %{clientMessageId: "c_body_boundary", deviceId: "browser-body", content: ""}
+    }
+
+    overhead = byte_size(JSON.encode!(body))
+    oversized = put_in(body, [:params, :content], String.duplicate("x", 8_000_001 - overhead))
+    {status, refused} = http_post(ctx.port, JSON.encode!(oversized))
+    assert status == 413
+    assert refused["error"]["code"] == "invalid_message"
+    assert refused["error"]["message"] == "request body too large"
+
+    for table <- ["messages", "turns", "wakes"] do
+      assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM #{table}")
+    end
+
+    # Same identity after a refusal, with the body shortened to the transport boundary.
+    permitted = put_in(body, [:params, :content], String.duplicate("x", 8_000_000 - overhead))
+    {status, accepted} = http_post(ctx.port, JSON.encode!(permitted))
+    assert status == 200
+    assert accepted["result"]["outcome"] == "recorded"
+    assert {:ok, [[stored]]} = DB.query(ctx.db, "SELECT content FROM messages")
+    assert stored == permitted.params.content
+    assert_receive {:ensure_lane, "selected"}
+    {200, duplicate} = http_post(ctx.port, JSON.encode!(permitted))
+
+    assert duplicate["result"] ==
+             accepted["result"]
+             |> Map.delete("ack")
+             |> Map.merge(%{"outcome" => "duplicate", "dedupe" => "duplicate"})
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    under = put_in(body, [:params, :clientMessageId], "c_body_under___")
+    overhead = byte_size(JSON.encode!(under))
+
+    under =
+      put_in(under, [:params, :content], String.duplicate("é", div(7_999_999 - overhead, 2)))
+
+    {200, accepted_under} = http_post(ctx.port, JSON.encode!(under))
+    assert accepted_under["result"]["outcome"] == "recorded"
+
+    assert {:ok, [[stored_under]]} =
+             DB.query(ctx.db, "SELECT content FROM messages WHERE clientMessageId=?1", [
+               under.params.clientMessageId
+             ])
+
+    assert stored_under == under.params.content
+  end
+
+  defp http_post(port, body) do
+    {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
+
+    request = [
+      "POST /agent/dispatch HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n",
+      "Authorization: Bearer operator-fixture\r\n",
+      "x-tightbeam-cli-version: ",
+      Tightbeam.CliCompatibility.required_version(),
+      "\r\n",
+      "Content-Type: application/json\r\nContent-Length: ",
+      Integer.to_string(byte_size(body)),
+      "\r\n\r\n",
+      body
+    ]
+
+    :ok = :gen_tcp.send(socket, request)
+    response = read_http(socket, [])
+    :gen_tcp.close(socket)
+    [headers, payload] = String.split(response, "\r\n\r\n", parts: 2)
+    [_, status | _] = String.split(headers, " ", parts: 3)
+    assert payload != "", "HTTP response has no JSON: #{headers}"
+    {String.to_integer(status), JSON.decode!(payload)}
+  end
+
+  defp read_http(socket, chunks) do
+    case :gen_tcp.recv(socket, 0, 30_000) do
+      {:ok, chunk} -> read_http(socket, [chunks, chunk])
+      {:error, :closed} -> IO.iodata_to_binary(chunks)
+      other -> flunk("HTTP response read failed: #{inspect(other)}")
+    end
   end
 
   defp auth,
