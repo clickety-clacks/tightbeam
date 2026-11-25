@@ -3345,17 +3345,7 @@ defmodule Tightbeam.HarklightWakes do
          {:ok, db, start} <- GenServer.call(manager, {:feed_start, handle}, :infinity) do
       case start do
         {:pending, open, older} ->
-          # An old conversation asks anyway: only the refusal tells its receiver.
-          case older && pending_agent?(manager, handle, executable) do
-            {:ok, false} ->
-              follow(manager, db, executable, handle, older, state_delays)
-
-            supported when supported in [nil, {:ok, true}] ->
-              open_pending(manager, db, executable, handle, open, older, state_delays)
-
-            other ->
-              finish_pending(other, manager, handle)
-          end
+          open_pending(manager, db, executable, handle, open, older, state_delays)
 
         start ->
           follow(manager, db, executable, handle, start, state_delays)
@@ -3420,9 +3410,19 @@ defmodule Tightbeam.HarklightWakes do
   defp open_pending(manager, db, executable, handle, {_, nil}, older, state_delays) do
     with {:ok, output, status} <-
            run_agent(manager, handle, executable, pending_args(handle, ["--prepare"])) do
+      # Only an attempt that says it serves every answer is used; without that
+      # mark nothing is stored, and the Server counts as having no route.
       case {status, pending_records(output)} do
         {0,
-         [%{"kind" => "baseline_prepared", "session" => ^handle, "rev" => rev, "token" => token}]}
+         [
+           %{
+             "kind" => "baseline_prepared",
+             "session" => ^handle,
+             "rev" => rev,
+             "token" => token,
+             "answers" => "all"
+           }
+         ]}
         when is_integer(rev) and rev >= 0 and is_binary(token) and token != "" ->
           with {:ok, rev, token} <- pending_step(manager, handle, {:prepared, rev, token}),
                do: open_pending(manager, db, executable, handle, {rev, token}, nil, state_delays)
@@ -3533,12 +3533,15 @@ defmodule Tightbeam.HarklightWakes do
       |> Enum.reduce([], &append_diagnostic(&2, &1))
 
     cond do
-      Enum.any?(records, &match?(%{"kind" => "unsupported"}, &1)) or
+      Enum.any?(
+        records,
+        &match?(%{"kind" => kind} when kind in ["unsupported", "baseline_prepared"], &1)
+      ) or
           (status == 2 and output =~ ~r/unexpected argument '--(?:pending|prepare|resume)'/) ->
         failure_status(
           {"pending_unavailable", "no_pending_route"},
           "listen",
-          "Opening this conversation needs Harklight Agent 0.2.4 and Server 0.2.7 or newer"
+          "Opening this conversation needs a Harklight Agent and Server whose pending read serves every answer (Agent 0.2.5 or newer)"
         )
 
       true ->
@@ -3549,8 +3552,9 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  # Asked once per installed Agent, as that feed's child, so one that does not
-  # answer holds back nothing else. Only an answer makes it an older Agent.
+  # Only listening with --on-expired needs to know the Agent: older ones refuse
+  # the flag. Asked once per installed Agent, as that feed's child, so one that
+  # does not answer holds back nothing else. Only an answer makes it older.
   defp pending_agent?(manager, handle, executable) do
     key = {__MODULE__, :pending_agent, executable}
     identity = with {:ok, stat} <- File.stat(executable), do: {stat.inode, stat.mtime, stat.size}

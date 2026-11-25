@@ -79,6 +79,7 @@ if phase == "prepare" do
   File.write!(agent, """
   #!/bin/sh
   if [ "$1" = --version ]; then echo 'harklight-agent 0.2.3'; exit 0; fi
+  case "$*" in *--pending*) echo "error: unexpected argument '--pending' found" >&2; exit 2;; esac
   printf '%s\n' "$*" >> '#{calls_path}'
   if [ -f '#{root}/resume' ]; then
     printf '%s\n' '{"kind":"caught_up","rev":9}'
