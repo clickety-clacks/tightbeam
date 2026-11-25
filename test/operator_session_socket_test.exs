@@ -629,9 +629,22 @@ defmodule Tightbeam.Wire.OperatorSessionSocketTest do
 
   defp read_http(socket, chunks) do
     case :gen_tcp.recv(socket, 0, 30_000) do
-      {:ok, chunk} -> read_http(socket, [chunks, chunk])
-      {:error, :closed} -> IO.iodata_to_binary(chunks)
-      other -> flunk("HTTP response read failed: #{inspect(other)}")
+      {:ok, chunk} ->
+        read_http(socket, [chunks, chunk])
+
+      {:error, :closed} ->
+        IO.iodata_to_binary(chunks)
+
+      {:error, :econnreset} ->
+        response = IO.iodata_to_binary(chunks)
+
+        assert String.starts_with?(response, "HTTP/1.1 413 "),
+               "HTTP connection reset before a 413 response was received"
+
+        response
+
+      other ->
+        flunk("HTTP response read failed: #{inspect(other)}")
     end
   end
 
