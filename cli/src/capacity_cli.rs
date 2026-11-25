@@ -652,7 +652,7 @@ mod tests {
         );
     }
 
-    // Gateway fixture captured from the capacity route implementation.
+    // Subset of the gateway fixture captured from the capacity route implementation.
     // Source: test/support/fixtures/capacity/wire.json at 007629cd.
     const WIRE: &str = include_str!("../tests/fixtures/capacity_wire_931.json");
 

@@ -4954,6 +4954,41 @@ mod tests {
     }
 
     #[test]
+    fn account_mutations_pass_the_account_id_and_keep_removal_non_destructive() {
+        let parse = |args: &[&str]| {
+            args::parse(args.iter().map(|value| (*value).to_owned()).collect()).unwrap()
+        };
+        let decode = |command| {
+            let request = build_request(&command).unwrap();
+            assert_eq!(request.path, "/agent/dispatch");
+            serde_json::from_str::<Value>(&request.body_json).unwrap()
+        };
+        let removal = decode(parse(&[
+            "accounts",
+            "remove",
+            "acct_example",
+            "--as-user",
+            "operator",
+        ]));
+        assert_eq!(removal["verb"], "accounts");
+        assert_eq!(
+            removal["params"],
+            serde_json::json!({"action":"remove","accountId":"acct_example"})
+        );
+        let rename = decode(parse(&[
+            "accounts",
+            "rename",
+            "acct_example",
+            "Backup login",
+        ]));
+        assert_eq!(
+            rename["params"],
+            serde_json::json!({"action":"rename","accountId":"acct_example","label":"Backup login"})
+        );
+        assert!(build_request(&parse(&["accounts", "show", "acct_example"])).is_err());
+    }
+
+    #[test]
     fn send_command_builds_one_request_without_caller_origin() {
         let request: Value = serde_json::from_str(&body(&[
             "harklight-send",
