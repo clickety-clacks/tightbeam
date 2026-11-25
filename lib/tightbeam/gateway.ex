@@ -505,32 +505,58 @@ defmodule Tightbeam.Gateway do
     fn provider ->
       scope = "#{machine}:#{provider}"
 
-      case DB.transaction_then(
-             db,
-             fn txn ->
-               ConditionFacts.file_in_txn(txn, %{
-                 kind: "credential-present",
-                 scope: scope,
-                 origin: "process:tightbeam"
-               })
-             end,
-             fn txn, fact ->
-               Tightbeam.Wakes.row_commit_in_txn(txn, [])
-               {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
-             end,
-             fallback: fn fact -> {fact, []} end,
-             retry_deliveries: true
-           ) do
-        {:ok, {%{fact_id: fact_id}, deliveries}} ->
-          Enum.each(deliveries, &complete_delivery(db, &1))
-          Tightbeam.Productions.CatalogRederive.recognize(db, catalog, fact_id)
+      contained(scope, fn ->
+        case DB.transaction_then(
+               db,
+               fn txn ->
+                 ConditionFacts.file_in_txn(txn, %{
+                   kind: "credential-present",
+                   scope: scope,
+                   origin: "process:tightbeam"
+                 })
+               end,
+               fn txn, fact ->
+                 Tightbeam.Wakes.row_commit_in_txn(txn, [])
+                 {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
+               end,
+               fallback: fn fact -> {fact, []} end,
+               retry_deliveries: true
+             ) do
+          {:ok, {%{fact_id: fact_id}, deliveries}} ->
+            # A matching wait yields {:condition_batch_ready, _}; only
+            # complete_deliveries/2 leaves those to the scheduler, which the
+            # nudge then wakes.
+            contained(scope, fn ->
+              ConditionFacts.complete_deliveries(db, deliveries)
+              Tightbeam.Wakes.nudge_matching(Tightbeam.WakeScheduler, fact_id)
+            end)
 
-        other ->
-          Logger.error("credential-present fact for #{scope} not filed: #{inspect(other)}")
-      end
+            Tightbeam.Productions.CatalogRederive.recognize(db, catalog, fact_id)
+
+          other ->
+            Logger.error("credential-present fact for #{scope} not filed: #{inspect(other)}")
+        end
+      end)
 
       :ok
     end
+  end
+
+  # The fact is best-effort and must never raise into the sign-in commit.
+  defp contained(scope, fun) do
+    fun.()
+  rescue
+    error ->
+      Logger.error(
+        "credential-present fact for #{scope} crashed and was contained: " <>
+          Exception.format(:error, error, __STACKTRACE__)
+      )
+  catch
+    kind, reason ->
+      Logger.error(
+        "credential-present fact for #{scope} failed and was contained: " <>
+          inspect({kind, reason})
+      )
   end
 
   defp start_credential_child(config, db, machine, previous_host, host) do
