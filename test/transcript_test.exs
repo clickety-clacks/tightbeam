@@ -166,7 +166,7 @@ defmodule Tightbeam.TranscriptTest do
 
         id = message!(ctx.db, "owned", "user", "carrier", sender: "process:tightbeam")
         seq = turn!(ctx.db, "owned", id, [])
-        :ok = DB.query(ctx.db, "UPDATE turns SET wakeId=?1 WHERE seq=?2", [wake, seq])
+        {:ok, _} = DB.query(ctx.db, "UPDATE turns SET wakeId=?1 WHERE seq=?2", [wake, seq])
         id
       end
 
