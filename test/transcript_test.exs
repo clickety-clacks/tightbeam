@@ -61,6 +61,89 @@ defmodule Tightbeam.TranscriptTest do
     %{db: db, owned: owned, foreign: foreign}
   end
 
+  test "filters precede limit, preserve seq paging, and use notice attribution", ctx do
+    a = message!(ctx.db, "owned", "assistant", "a", timestamp: 1000)
+
+    _ =
+      message!(ctx.db, "owned", "user", "[from process:tightbeam] literal user text",
+        timestamp: 2000
+      )
+
+    b = message!(ctx.db, "owned", "assistant", "b", timestamp: 3000)
+
+    notice =
+      message!(ctx.db, "owned", "user", "arbitrary notice content",
+        sender: "process:tightbeam",
+        timestamp: 4000
+      )
+
+    c = message!(ctx.db, "owned", "assistant", "c", timestamp: 5000)
+    opts = %{session_key: "owned", roles: ["assistant"], limit: 2}
+    page = read(ctx, opts)
+    assert Enum.map(page.messages, & &1.id) == [b, c]
+    assert page.has_more_before
+    refute page.has_more_after
+    older = read(ctx, Map.put(opts, :before, b))
+    assert Enum.map(older.messages, & &1.id) == [a]
+    refute older.has_more_before
+    assert older.has_more_after
+    forward = read(ctx, Map.put(opts, :after, a))
+    assert Enum.map(forward.messages, & &1.id) == [b, c]
+    assert read(ctx, Map.put(opts, :before, a)).messages == []
+    # A filtered-out cursor can still anchor the matching history.
+    assert Enum.map(read(ctx, Map.put(opts, :after, notice)).messages, & &1.id) == [c]
+    users = read(ctx, %{session_key: "owned", roles: ["user"], no_notices: true, limit: 1})
+    assert length(users.messages) == 1
+    assert hd(users.messages).content == "[from process:tightbeam] literal user text"
+    refute users.has_more_before
+    refute users.has_more_after
+    assert length(read(ctx, %{session_key: "owned", roles: ["user", "assistant"]}).messages) == 5
+    assert length(read(ctx, %{session_key: "owned", no_notices: true}).messages) == 4
+  end
+
+  test "wire accepts transcript filters without changing the default response", ctx do
+    _ = message!(ctx.db, "owned", "user", "notice", sender: "process:tightbeam")
+    id = message!(ctx.db, "owned", "assistant", "reply")
+
+    response =
+      dispatch(router_opts(ctx), %{
+        verb: "transcript",
+        asUser: "flynn",
+        params: %{
+          sessionKey: "owned",
+          roles: ["assistant"],
+          noNotices: true,
+          since: "1d",
+          limit: 1
+        }
+      })
+
+    assert response.status == 200
+
+    assert %{"result" => %{"messages" => [%{"id" => ^id}], "hasMoreBefore" => false}} =
+             JSON.decode!(response.resp_body)
+  end
+
+  test "since accepts ISO offsets and relative durations and refuses bad input", ctx do
+    _ = message!(ctx.db, "owned", "assistant", "old", timestamp: 1000)
+    fresh = message!(ctx.db, "owned", "assistant", "fresh")
+
+    for since <- ["1970-01-01T01:00:02+01:00", "30m", "2h", "1d"] do
+      page = read(ctx, %{session_key: "owned", since: since, limit: 1})
+      assert Enum.map(page.messages, & &1.id) == [fresh]
+      refute page.has_more_before
+    end
+
+    for since <- ["yesterday", "2026-11-25", "-2h", "2x", 42] do
+      assert %{code: "invalid", message: message} =
+               read(ctx, %{session_key: "owned", since: since})
+
+      assert message =~ "since"
+    end
+
+    assert %{code: "invalid"} = read(ctx, %{session_key: "owned", roles: ["bogus"]})
+  end
+
   ## Proof 1 — tail default
 
   test "proof 1: no cursor returns the newest limit rows, oldest-first", ctx do

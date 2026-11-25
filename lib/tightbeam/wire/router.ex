@@ -299,7 +299,7 @@ defmodule Tightbeam.Wire.Router do
       "version" => Tightbeam.CliCompatibility.required_version(),
       "build" => Tightbeam.BuildStamp.build(),
       "sha" => Tightbeam.BuildStamp.sha(),
-      "features" => ["stale-turn-settlement-v1"],
+      "features" => ["stale-turn-settlement-v1", "transcript-filters-v1"],
       "adapters" => snapshot.adapters,
       "adaptersAsOf" => snapshot.as_of,
       "diagnostics" => diagnostic_health(),
@@ -4935,7 +4935,7 @@ defmodule Tightbeam.Wire.Router do
     "subtree-guidance-withdraw" => ~w(name)a,
     "topline" => ~w(history origin owner quiet_over session spec spec_sha state topline_id)a,
     "toplines" => ~w(origin owner quiet_over session spec spec_sha state)a,
-    "transcript" => ~w(after before limit name session_key)a,
+    "transcript" => ~w(after before limit name session_key roles no_notices since)a,
     "tune" =>
       ~w(adopted context display_name effort fast_mode harness host idempotency_key mode model reasoning_level session_key setting skill guidance thinking_level verbosity)a,
     "unlearn" => ~w(idempotency_key name)a,

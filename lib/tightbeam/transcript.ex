@@ -101,8 +101,14 @@ defmodule Tightbeam.Transcript do
 
     if session && readable?(caller, session) do
       case cursor(params) do
-        {:error, error} -> error
-        selection -> page(db, session, selection, limit(params))
+        {:error, error} ->
+          error
+
+        selection ->
+          case filters(params) do
+            {:ok, filters} -> page(db, session, selection, limit(params), filters)
+            {:error, error} -> error
+          end
       end
     else
       # An unknown key and a session this caller may not read are the same answer.
@@ -110,14 +116,14 @@ defmodule Tightbeam.Transcript do
     end
   end
 
-  defp page(db, session, selection, limit) do
+  defp page(db, session, selection, limit, filters) do
     case resolve_cursor(db, session.session_key, selection) do
       {:error, error} ->
         error
 
       {:ok, bound} ->
-        entries = select(db, session.session_key, bound, limit)
-        flags = flags(db, session.session_key, bound, entries)
+        entries = select(db, session.session_key, bound, limit, filters)
+        flags = flags(db, session.session_key, bound, entries, filters)
 
         %{
           session_key: session.session_key,
@@ -154,20 +160,84 @@ defmodule Tightbeam.Transcript do
 
   ## Range selection — every mode selects from the full session history
 
-  defp select(db, session_key, :tail, limit) do
-    db
-    |> rows("ORDER BY m.seq DESC LIMIT ?2", [session_key, limit])
-    |> Enum.reverse()
+  defp filters(params) do
+    roles = Map.get(params, :roles, [])
+    no_notices = Map.get(params, :no_notices, false)
+
+    with true <-
+           is_list(roles) and Enum.all?(roles, &(&1 in ["user", "assistant", "system", "tool"])),
+         true <- is_boolean(no_notices),
+         {:ok, since} <- parse_since(Map.get(params, :since)) do
+      {:ok, %{roles: roles, no_notices: no_notices, since: since}}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, invalid("invalid transcript roles or noNotices filter")}
+    end
   end
 
-  defp select(db, session_key, {:before, cursor_seq}, limit) do
-    db
-    |> rows("AND m.seq < ?2 ORDER BY m.seq DESC LIMIT ?3", [session_key, cursor_seq, limit])
-    |> Enum.reverse()
+  defp parse_since(nil), do: {:ok, nil}
+
+  defp parse_since(value) when is_binary(value) do
+    case Regex.run(~r/^(\d+)([smhd])$/, value) do
+      [_, count, unit] ->
+        seconds =
+          String.to_integer(count) *
+            Map.fetch!(%{"s" => 1, "m" => 60, "h" => 3600, "d" => 86400}, unit)
+
+        {:ok, System.system_time(:millisecond) - seconds * 1000}
+
+      _ ->
+        case DateTime.from_iso8601(value) do
+          {:ok, time, _offset} ->
+            {:ok, DateTime.to_unix(time, :millisecond)}
+
+          _ ->
+            {:error,
+             invalid(
+               "--since requires an ISO 8601 time with timezone or a duration such as 30m, 2h, 1d"
+             )}
+        end
+    end
   end
 
-  defp select(db, session_key, {:after, cursor_seq}, limit) do
-    rows(db, "AND m.seq > ?2 ORDER BY m.seq ASC LIMIT ?3", [session_key, cursor_seq, limit])
+  defp parse_since(_), do: {:error, invalid("invalid --since time")}
+
+  # All value-bearing predicates are bound parameters. Reuse them for page flags.
+  defp filter_sql(filters) do
+    role_sql =
+      if filters.roles == [],
+        do: "",
+        else: " AND m.role IN (" <> Enum.map_join(filters.roles, ",", fn _ -> "?" end) <> ")"
+
+    notice_sql =
+      if filters.no_notices,
+        do: " AND NOT (m.role = 'user' AND COALESCE(m.sender, '') = 'process:tightbeam')",
+        else: ""
+
+    since_sql = if filters.since == nil, do: "", else: " AND m.timestamp >= ?"
+
+    {role_sql <> notice_sql <> since_sql,
+     filters.roles ++ if(filters.since == nil, do: [], else: [filters.since])}
+  end
+
+  defp select(db, session_key, bound, limit, filters) do
+    {sql, values} = filter_sql(filters)
+
+    {range, cursor_values, order} =
+      case bound do
+        :tail -> {"", [], "DESC"}
+        {:before, seq} -> {" AND m.seq < ?", [seq], "DESC"}
+        {:after, seq} -> {" AND m.seq > ?", [seq], "ASC"}
+      end
+
+    entries =
+      rows(
+        db,
+        sql <> range <> " ORDER BY m.seq " <> order <> " LIMIT ?",
+        [session_key] ++ values ++ cursor_values ++ [limit]
+      )
+
+    if order == "DESC", do: Enum.reverse(entries), else: entries
   end
 
   # The pinned turn join: a `user` entry joins on `turns.messageId = entry.id`, an
@@ -231,10 +301,10 @@ defmodule Tightbeam.Transcript do
 
   ## Page flags — computed over the full session history
 
-  defp flags(db, session_key, bound, []) do
+  defp flags(db, session_key, bound, [], filters) do
     # An empty page reports the direction it could still travel, so a caller is
     # never told history exists that it can never page to.
-    visible? = visible_any?(db, session_key)
+    visible? = visible_any?(db, session_key, filters)
 
     case bound do
       :tail -> %{before: false, after: false}
@@ -243,38 +313,39 @@ defmodule Tightbeam.Transcript do
     end
   end
 
-  defp flags(db, session_key, _bound, entries) do
+  defp flags(db, session_key, _bound, entries, filters) do
     oldest = List.first(entries).id
     newest = List.last(entries).id
 
     %{
-      before: neighbor?(db, session_key, "<", oldest),
-      after: neighbor?(db, session_key, ">", newest)
+      before: neighbor?(db, session_key, "<", oldest, filters),
+      after: neighbor?(db, session_key, ">", newest, filters)
     }
   end
 
-  defp visible_any?(db, session_key) do
+  defp visible_any?(db, session_key, filters) do
+    {sql, values} = filter_sql(filters)
+
     {:ok, [[count]]} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1 LIMIT 1",
-        [session_key]
+        "SELECT COUNT(*) FROM messages AS m WHERE m.sessionKey = ?1" <> sql,
+        [session_key] ++ values
       )
 
     count > 0
   end
 
-  defp neighbor?(db, session_key, comparison, id) do
+  defp neighbor?(db, session_key, comparison, id, filters) do
+    {sql, values} = filter_sql(filters)
+
     {:ok, [[count]]} =
       DB.query(
         db,
-        """
-        SELECT COUNT(*) FROM messages
-        WHERE sessionKey = ?1
-          AND seq #{comparison} (SELECT seq FROM messages WHERE id = ?2)
-        LIMIT 1
-        """,
-        [session_key, id]
+        "SELECT COUNT(*) FROM messages AS m WHERE m.sessionKey = ?1" <>
+          sql <>
+          " AND m.seq #{comparison} (SELECT seq FROM messages WHERE id = ?)",
+        [session_key] ++ values ++ [id]
       )
 
     count > 0

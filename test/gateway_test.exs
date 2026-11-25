@@ -6234,7 +6234,7 @@ defmodule Tightbeam.GatewayTest do
     assert JSON.decode!(rest.resp_body)["item"] == harness_changed
 
     assert_receive {:candidate_guidance, "candidate-1", guidance}
-    assert guidance =~ "tightbeam transcript --session \"swapme\" --limit 50"
+    assert guidance =~ "tightbeam transcript --session \"swapme\" --limit 50 --role assistant --format text"
     assert guidance =~ "Do not replay or inject earlier messages"
     assert guidance =~ "Cross-harness handoff from durable session records"
     assert guidance =~ "REPLAY_SENTINEL_ONE"
@@ -11873,7 +11873,7 @@ defmodule Tightbeam.GatewayTest do
     home = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     assert_receive {:candidate_guidance, "candidate-1", guidance}
     assert guidance =~ "Codex developer message"
-    assert guidance =~ "tightbeam transcript --session \"k1\" --limit 50"
+    assert guidance =~ "tightbeam transcript --session \"k1\" --limit 50 --role assistant --format text"
     refute File.exists?(Path.join(home, "AGENTS.md"))
 
     assert JSON.decode!(File.read!(Path.join([home, ".tightbeam", "manifest"])))["harness"] ==
