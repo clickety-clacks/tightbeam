@@ -74,14 +74,14 @@ defmodule Tightbeam.CredentialPresentWaitTest do
     %{db: db, session: session, base: base}
   end
 
-  defp wait_on_credential(ctx) do
+  defp wait_on_credential(ctx, provider \\ "openai") do
     Wakes.schedule(ctx.db, %{
       session_key: ctx.session.session_key,
       origin: "agent:owner",
       prompt: "signed in",
       due_at: System.system_time(:millisecond) + 60_000,
       condition_kind: "credential-present",
-      condition_scope: "#{@host}:openai",
+      condition_scope: "#{@host}:#{provider}",
       creator_session_key: "agent:owner:app"
     })
   end
@@ -175,5 +175,57 @@ defmodule Tightbeam.CredentialPresentWaitTest do
 
     assert {:ok, _staging, _lease} = Credentials.begin_onboard(:anthropic, server)
     assert Process.alive?(server)
+  end
+
+  test "an API-key finish_onboard succeeds with a pending wait", ctx do
+    wake = wait_on_credential(ctx, "anthropic")
+
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: @host,
+        sh: fn _argv -> {"", 0} end,
+        start: fn :anthropic, _kind -> :ok end,
+        on_credential_present: Gateway.credential_present_hook(ctx.db, @host, catalog_spy()),
+        capture_sessions: fn :anthropic -> [] end,
+        resume: fn :anthropic -> :ok end,
+        publish_sessions: fn _, _ -> :ok end
+      )
+
+    assert {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
+    File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-staged")
+
+    assert :ok = Credentials.finish_onboard(:anthropic, :api_key, lease_id, server)
+    assert_receive {:rederived, @host, :anthropic, _fact_id}
+    assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
+    assert delivery_turn_count(ctx.db, wake.wake_id) == 1
+  end
+
+  test "the direct onboard path succeeds with a pending wait", ctx do
+    wake = wait_on_credential(ctx)
+
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: @host,
+        sh: fn _argv -> {"", 0} end,
+        onboarders: %{
+          openai: fn _state -> {:ok, %{bytes: ~S({"token":"new"}), expires_at: nil}} end
+        },
+        gate: fn _ -> :ok end,
+        stop: fn _ -> :ok end,
+        start: fn _, _ -> :ok end,
+        on_credential_present: Gateway.credential_present_hook(ctx.db, @host, catalog_spy()),
+        capture_sessions: fn _ -> [] end,
+        resume: fn _ -> :ok end,
+        publish_sessions: fn _, _ -> :ok end
+      )
+
+    assert :ok = Credentials.onboard(:openai, server)
+    assert_receive {:rederived, @host, :openai, _fact_id}
+    assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
+    assert delivery_turn_count(ctx.db, wake.wake_id) == 1
   end
 end
