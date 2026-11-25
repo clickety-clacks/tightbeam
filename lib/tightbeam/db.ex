@@ -949,16 +949,31 @@ defmodule Tightbeam.DB do
       :ok = load_topline_unicode(conn)
       if path == ":memory:", do: :ok = Tightbeam.Recognition.ensure_sqlite_schema(conn)
       {:ok, retry} = Tightbeam.Recognition.start_link(self(), path == ":memory:")
+      audits = start_audits(path)
       readers = open_readers(path)
       :persistent_term.put({__MODULE__, self()}, readers)
 
       {:ok,
-       %{conn: conn, readers: readers, retry: retry, admission: admission, reference_fences: %{}}}
+       %{
+         conn: conn,
+         readers: readers,
+         retry: retry,
+         audits: audits,
+         admission: admission,
+         reference_fences: %{}
+       }}
     rescue
       error ->
         :ok = Sqlite3.close(conn)
         reraise error, __STACKTRACE__
     end
+  end
+
+  defp start_audits(":memory:"), do: nil
+
+  defp start_audits(_path) do
+    {:ok, audits} = Tightbeam.DispatchAudit.start_link(self())
+    audits
   end
 
   defp open_readers(":memory:"), do: []
@@ -995,9 +1010,13 @@ defmodule Tightbeam.DB do
   end
 
   @impl true
-  def terminate(_reason, %{conn: conn, readers: readers, retry: retry}) do
-    Process.unlink(retry)
-    Process.exit(retry, :shutdown)
+  def terminate(_reason, %{conn: conn, readers: readers, retry: retry, audits: audits}) do
+    for child <- [retry, audits], is_pid(child) do
+      Process.unlink(child)
+      Process.exit(child, :shutdown)
+    end
+
+    :persistent_term.erase({Tightbeam.DispatchAudit, self()})
     :persistent_term.erase({Tightbeam.Recognition, self()})
     :persistent_term.erase({Tightbeam.FilingRemedy, self()})
     :persistent_term.erase({__MODULE__, self()})
