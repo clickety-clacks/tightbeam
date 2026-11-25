@@ -7,8 +7,13 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const UNVERIFIED_EXIT: i32 = 125;
+// Another child still holds the lifetime lock.
+const LOCK_HELD_EXIT: i32 = 75;
+// Enough for a child that was just told to stop to be reaped.
+const LOCK_GRACE: Duration = Duration::from_secs(2);
 
 pub fn run(args: &[String]) -> Result<i32, String> {
     if args.len() < 3 || args[0] != "--lock" {
@@ -55,7 +60,15 @@ pub fn run(args: &[String]) -> Result<i32, String> {
         }
     });
 
-    lock_exclusive(lock.as_raw_fd())?;
+    // Do not wait for a child that outlived its own wrapper: the caller is
+    // blocked meanwhile, and would leave this wrapper waiting when it gives up.
+    if !lock_within_grace(lock.as_raw_fd(), &stopped)? {
+        return Ok(if stopped.load(Ordering::SeqCst) {
+            0
+        } else {
+            LOCK_HELD_EXIT
+        });
+    }
     // A wrapper that was still waiting for the lock when its port closed
     // must never launch later, after a restart barrier has passed.
     let mut input = libc::pollfd {
@@ -125,6 +138,25 @@ pub fn run(args: &[String]) -> Result<i32, String> {
         Ok(0)
     } else {
         Ok(status.code().unwrap_or(1))
+    }
+}
+
+fn lock_within_grace(fd: i32, stopped: &AtomicBool) -> Result<bool, String> {
+    let started = Instant::now();
+    loop {
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => {}
+            _ => return Err(error.to_string()),
+        }
+        if stopped.load(Ordering::SeqCst) || started.elapsed() >= LOCK_GRACE {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

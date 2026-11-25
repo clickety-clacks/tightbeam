@@ -16,6 +16,10 @@ defmodule Tightbeam.HarklightListenerOutage do
              diagnostic TEXT,
              checkpoint INTEGER NOT NULL DEFAULT -1
            );
+           CREATE TABLE IF NOT EXISTS harklight_outage_recoveries (
+             handle TEXT PRIMARY KEY REFERENCES harklight_wake_handles(handle),
+             episode TEXT NOT NULL
+           );
            """),
          {:ok, columns} <- DB.query(db, "PRAGMA table_info(harklight_listener_outages)") do
       if Enum.any?(columns, fn [_, name | _] -> name == "checkpoint" end),
@@ -87,39 +91,9 @@ defmodule Tightbeam.HarklightListenerOutage do
         [[_, state, _, _, _, nil, started]] when state != "complete" and now < started + delay ->
           {:early, [handle, episode, started, nil]}
 
-        [[session, state, error, operation, diagnostic, nil, _started]]
-        when state != "complete" ->
+        [[_session, state, _, _, _, nil, _started]] when state != "complete" ->
           if recipient = recipient(txn, handle) do
-            base = "w_harklight_notice_recovery_" <> handle
-
-            id =
-              if Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [base]) == [],
-                do: base,
-                else: base <> "_" <> episode
-
-            detail =
-              if operation == "listen" and is_binary(diagnostic),
-                do: " #{String.upcase(operation)} failure: #{diagnostic}.",
-                else: ""
-
-            wake =
-              Wakes.schedule_in_txn(txn, %{
-                wake_id: id,
-                session_key: recipient,
-                creator_session_key: session,
-                origin: "process:tightbeam",
-                class: "blocker",
-                due_at: now,
-                prompt:
-                  "Harklight listening for session #{session} and handle #{handle} stopped (#{error}).#{detail} Replies on this thread will not reach the current receiver while it is unavailable. Automatic recovery continues."
-              })
-
-            Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
-
-            Txn.q(txn, "UPDATE harklight_listener_outages SET noticeWakeId=?2 WHERE handle=?1", [
-              handle,
-              id
-            ])
+            notify_receiver(txn, recipient, due_together(txn, handle, recipient, now, delay), now)
           end
 
           :notified
@@ -128,6 +102,128 @@ defmodule Tightbeam.HarklightListenerOutage do
           :unchanged
       end
     end)
+  end
+
+  # One cause usually stops many conversations at nearly the same time. Those
+  # that fall due within a tenth of the delay are told together. A later outage
+  # always has its own notice.
+  defp due_together(txn, handle, recipient, now, delay) do
+    others =
+      Txn.q(
+        txn,
+        """
+        SELECT o.handle FROM harklight_listener_outages o
+        JOIN harklight_wake_handles h ON h.handle=o.handle
+        WHERE o.noticeWakeId IS NULL AND h.state<>'complete' AND o.handle<>?1 AND o.startedAt<=?2
+        ORDER BY o.startedAt,o.handle
+        """,
+        [handle, now - delay + div(delay, 10)]
+      )
+
+    [handle | for([other] <- others, recipient(txn, other) == recipient, do: other)]
+  end
+
+  defp notify_receiver(txn, recipient, [handle | others] = handles, now) do
+    [[session, episode, error, operation, diagnostic]] =
+      Txn.q(
+        txn,
+        """
+        SELECT h.sessionKey,o.episode,o.error,o.operation,o.diagnostic
+        FROM harklight_listener_outages o JOIN harklight_wake_handles h ON h.handle=o.handle
+        WHERE o.handle=?1
+        """,
+        [handle]
+      )
+
+    base = "w_harklight_notice_recovery_" <> handle
+
+    id =
+      if Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [base]) == [],
+        do: base,
+        else: base <> "_" <> episode
+
+    detail =
+      if operation == "listen" and is_binary(diagnostic),
+        do: " #{String.upcase(operation)} failure: #{diagnostic}.",
+        else: ""
+
+    prompt =
+      if others == [],
+        do:
+          "Harklight listening for session #{session} and handle #{handle} stopped (#{error}).#{detail} Replies on this thread will not reach the current receiver while it is unavailable. Automatic recovery continues.",
+        else:
+          "Harklight listening stopped for #{length(handles)} of your conversations: #{listed(handles)}. The first (#{handle}, session #{session}) stopped with #{error}.#{detail} Replies on these threads will not reach their current receiver while they are unavailable. Automatic recovery continues."
+
+    schedule(txn, %{
+      wake_id: id,
+      session_key: recipient,
+      creator_session_key: session,
+      origin: "process:tightbeam",
+      class: "blocker",
+      due_at: now,
+      prompt: prompt
+    })
+
+    for member <- handles,
+        do:
+          Txn.q(txn, "UPDATE harklight_listener_outages SET noticeWakeId=?2 WHERE handle=?1", [
+            member,
+            id
+          ])
+  end
+
+  # Tells each receiver once about its reported conversations that are back, and
+  # says nothing about one that has gone out again.
+  def announce_recoveries(db, now) do
+    DB.transaction(db, fn txn ->
+      rows =
+        Txn.q(
+          txn,
+          """
+          SELECT r.handle,r.episode FROM harklight_outage_recoveries r
+          WHERE NOT EXISTS(SELECT 1 FROM harklight_listener_outages o WHERE o.handle=r.handle)
+          ORDER BY r.handle
+          """
+        )
+
+      Txn.q(txn, "DELETE FROM harklight_outage_recoveries")
+
+      rows
+      |> Enum.group_by(fn [handle, _] -> recipient(txn, handle) end)
+      |> Enum.each(fn
+        {nil, _} ->
+          :ok
+
+        {recipient, [[first, episode] | _] = back} ->
+          handles = Enum.map(back, &hd/1)
+
+          prompt =
+            if length(handles) == 1,
+              do: "Tightbeam is receiving Harklight updates again for conversation #{first}.",
+              else:
+                "Tightbeam is receiving Harklight updates again for #{length(handles)} of your conversations: #{listed(handles)}."
+
+          schedule(txn, %{
+            wake_id: "w_harklight_listening_" <> episode,
+            session_key: recipient,
+            origin: "process:tightbeam",
+            class: "fyi",
+            due_at: now,
+            prompt: prompt
+          })
+      end)
+    end)
+  end
+
+  defp listed(handles) do
+    {shown, rest} = Enum.split(handles, 10)
+    more = if rest == [], do: "", else: " and #{length(rest)} more"
+    Enum.join(shown, ", ") <> more
+  end
+
+  defp schedule(txn, attrs) do
+    wake = Wakes.schedule_in_txn(txn, attrs)
+    Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
   end
 
   def finish(db, handle, resumed?, now) do
@@ -155,19 +251,11 @@ defmodule Tightbeam.HarklightListenerOutage do
            [handle]
          ) do
       [[episode, notice]] when resumed? and is_binary(notice) ->
-        if recipient = recipient(txn, handle) do
-          wake =
-            Wakes.schedule_in_txn(txn, %{
-              wake_id: "w_harklight_listening_" <> episode,
-              session_key: recipient,
-              origin: "process:tightbeam",
-              class: "fyi",
-              due_at: now,
-              prompt: "Tightbeam is receiving Harklight updates again for conversation #{handle}."
-            })
-
-          Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
-        end
+        Txn.q(
+          txn,
+          "INSERT OR REPLACE INTO harklight_outage_recoveries(handle,episode) VALUES(?1,?2)",
+          [handle, episode]
+        )
 
       _ ->
         :ok
