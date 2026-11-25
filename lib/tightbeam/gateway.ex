@@ -279,9 +279,12 @@ defmodule Tightbeam.Gateway do
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
 
     adapter_opts = fn key, context ->
-      adapter_config
-      |> Map.merge(Map.new(context))
-      |> Placement.adapter_opts(key)
+      config = Map.merge(adapter_config, Map.new(context))
+
+      with {:ok, opts} <- Placement.adapter_opts(config, key),
+           :ok <- check_adapter_cli(key, opts, config) do
+        {:ok, opts}
+      end
     end
 
     socket_deps = %{
@@ -4699,6 +4702,13 @@ defmodule Tightbeam.Gateway do
       {:error, error} -> raise error
     end
   end
+
+  defp check_adapter_cli({:claude, _, host}, opts, config) do
+    run = Map.get(config, :sh, &Tightbeam.Harness.Support.system_cmd/1)
+    Tightbeam.Harness.ClaudeCli.check_launch(opts, host, run)
+  end
+
+  defp check_adapter_cli(_key, _opts, _config), do: :ok
 
   defp turn_runner(config) do
     db = Map.get(config, :db, Tightbeam.DB)
