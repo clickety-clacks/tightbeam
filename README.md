@@ -802,6 +802,7 @@ set `TIGHTBEAM_COORDINATOR_HOLD_DECISIONS=false` in the gateway environment.
 - `docs/ARCHITECTURE.md` — the substrate's shape.
 - `docs/SATELLITE.md` — adding a machine to an existing org.
 - `docs/firehose.md` — live change delivery, recovery limits, and snapshot costs.
+- `docs/accounts-capacity.md` — provider accounts, quota readings, forecasts, and live updates.
 
 ## Developing Tightbeam
 

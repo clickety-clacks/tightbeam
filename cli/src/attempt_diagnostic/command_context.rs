@@ -4,7 +4,7 @@
 
 use super::TransportOperation;
 use super::observation::EffectContract;
-use crate::args::Command;
+use crate::args::{AccountAction, Command};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Requests {
@@ -50,10 +50,16 @@ impl CommandContext {
             // dedicated transport callers are explicitly integrated.
             IdentityCurrent
             | GithubAuthCheck { .. }
+            | Accounts {
+                action: AccountAction::List | AccountAction::Show(_),
+                ..
+            }
+            | Capacity { .. }
             | SessionConnect { .. }
             | SessionDiagnose { .. } => {
                 return None;
             }
+            Accounts { .. } => ("cli.accounts", DispatchPath),
             Help => ("cli.help", Catalog),
             CommandHelp(_) => ("cli.command_help", Catalog),
             Doctor { .. } => ("cli.doctor", CatalogAndDispatch),
@@ -340,7 +346,15 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         };
     }
     match command {
-        IdentityCurrent | GithubAuthCheck { .. } | SessionConnect { .. } => Unknown,
+        IdentityCurrent
+        | GithubAuthCheck { .. }
+        | SessionConnect { .. }
+        | Capacity { .. }
+        | Accounts {
+            action: AccountAction::List | AccountAction::Show(_),
+            ..
+        } => Unknown,
+        Accounts { .. } => WriteWithoutIdempotency,
         Help
         | CommandHelp(_)
         | Doctor { .. }

@@ -1,0 +1,71 @@
+{
+  "usageCache": {
+    "status": 200,
+    "body": {
+      "counts": {
+        "cache": 1,
+        "error": 0,
+        "live": 0,
+        "stale": 0
+      },
+      "generatedAt": 1795570013405,
+      "results": [
+        {
+          "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+          "error": null,
+          "sample": {
+            "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59",
+            "ageSeconds": 0,
+            "diagnostics": [],
+            "label": "default",
+            "observedAt": 1795570013389,
+            "plan": "pro",
+            "provider": "openai",
+            "serving": true,
+            "windows": [
+              {
+                "id": "primary",
+                "model": null,
+                "name": "Primary",
+                "resetsAt": 1795570073389,
+                "scope": "account",
+                "usedPercent": 42,
+                "windowSeconds": 18000
+              }
+            ]
+          },
+          "status": "cache",
+          "summary": {
+            "accountState": "ready",
+            "accountStateReason": null,
+            "label": "default",
+            "plan": "pro",
+            "planUnknownReason": null,
+            "provider": "openai",
+            "subscriptionObservedAt": 1795570013389,
+            "subscriptionPeriodEndAt": null,
+            "subscriptionPeriodEndKind": null,
+            "subscriptionPeriodEndUnknownReason": "not_exposed_by_provider",
+            "subscriptionStatus": "unknown",
+            "subscriptionStatusReason": "not_exposed_by_provider",
+            "usageAgeSeconds": 0,
+            "usageFreshness": "current",
+            "usageFreshnessReason": null,
+            "usageObservedAt": 1795570013389
+          }
+        }
+      ]
+    }
+  },
+  "capacityChanged": {
+    "class": "capacity.changed",
+    "occurredAt": 1795570013389,
+    "op": "observe",
+    "payload": {
+      "sourceVersion": 1795570013389
+    },
+    "refs": {
+      "accountId": "acct_fd4aea40-24ea-42b3-8068-f817f4672f59"
+    }
+  }
+}

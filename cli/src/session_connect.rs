@@ -181,12 +181,12 @@ enum SnapshotEmissionError {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ReadSelection {
+pub(crate) struct ReadSelection {
     as_user: Option<String>,
 }
 
 impl ReadSelection {
-    fn for_invocation(endpoint: &Endpoint, identity: &Identity) -> Self {
+    pub(crate) fn for_invocation(endpoint: &Endpoint, identity: &Identity) -> Self {
         let as_user = match identity {
             Identity::User(user) if is_org_credential(endpoint) => Some(user.clone()),
             _ => None,
@@ -194,7 +194,7 @@ impl ReadSelection {
         Self { as_user }
     }
 
-    fn auth_frame(&self, token: &str) -> Value {
+    pub(crate) fn auth_frame(&self, token: &str) -> Value {
         let mut frame = json!({"type": "auth", "token": token});
         if let Some(user) = &self.as_user {
             frame["asUser"] = json!(user);
@@ -202,7 +202,7 @@ impl ReadSelection {
         frame
     }
 
-    fn request_path(&self, path: &str) -> String {
+    pub(crate) fn request_path(&self, path: &str) -> String {
         match &self.as_user {
             Some(user) => format!(
                 "{path}{}asUser={}",
@@ -214,7 +214,7 @@ impl ReadSelection {
     }
 }
 
-fn is_org_credential(endpoint: &Endpoint) -> bool {
+pub(crate) fn is_org_credential(endpoint: &Endpoint) -> bool {
     endpoint.token.starts_with("tbc_")
 }
 
@@ -945,7 +945,7 @@ fn read_handshake_frame(
     }
 }
 
-fn set_read_timeout(
+pub(crate) fn set_read_timeout(
     stream: &mut MaybeTlsStream<TcpStream>,
     timeout: Option<Duration>,
 ) -> io::Result<()> {
@@ -967,7 +967,7 @@ fn normal_close_frame() -> tungstenite::protocol::CloseFrame<'static> {
     }
 }
 
-fn websocket_url(base: &str, protocol_version: u64) -> String {
+pub(crate) fn websocket_url(base: &str, protocol_version: u64) -> String {
     let base = base
         .trim_end_matches('/')
         .replacen("https://", "wss://", 1)
@@ -2054,7 +2054,7 @@ fn snapshot_signal(signal: &AtomicI32) -> Option<i32> {
     }
 }
 
-fn encode_path(value: &str) -> String {
+pub(crate) fn encode_path(value: &str) -> String {
     value
         .bytes()
         .flat_map(|byte| match byte {

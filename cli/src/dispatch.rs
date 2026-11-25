@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::attempt_diagnostic::command_context::CommandContext;
 
-use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
+use crate::args::{AccountAction, Command, Identity, Target, ToplineSelection, TuneControl};
 use crate::attempt_diagnostic::{
     Action, AttemptCause, AttemptRender, DiagnosticCode, DiagnosticOperation, EffectKind,
     EffectState, FailureDiagnostic, FailurePresentation, GatewayAccepted, ReceiptAvailability,
@@ -185,8 +185,32 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         | Command::GithubAuthCheck { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_)
-        | Command::SessionConnect { .. } => {
+        | Command::SessionConnect { .. }
+        | Command::Capacity { .. } => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
+        }
+        Command::Accounts {
+            identity, action, ..
+        } => {
+            let (action, account, label) = match action {
+                AccountAction::Use(account) => ("use", account, None),
+                AccountAction::Rename { account, label } => ("rename", account, Some(label)),
+                AccountAction::Enable(account) => ("enable", account, None),
+                AccountAction::Disable(account) => ("disable", account, None),
+                AccountAction::Remove(account) => ("remove", account, None),
+                AccountAction::Verify(account) => ("verify", account, None),
+                AccountAction::List | AccountAction::Show(_) => {
+                    return Err("account reads use REST".into());
+                }
+            };
+            let mut params = vec![
+                string_field("action", action),
+                string_field("accountId", account),
+            ];
+            if let Some(label) = label {
+                params.push(string_field("label", label));
+            }
+            Ok(request(identity, "accounts", vec![], params))
         }
         Command::Wake {
             identity,
@@ -4034,6 +4058,16 @@ where
         Command::Help | Command::CommandHelp(_) => {
             unreachable!("help is handled before dispatch")
         }
+        Command::Accounts {
+            action: action @ (AccountAction::List | AccountAction::Show(_)),
+            identity,
+            json,
+        } => crate::capacity_cli::run_accounts(&discover_endpoint()?, &identity, &action, json),
+        Command::Capacity {
+            identity,
+            action,
+            json,
+        } => crate::capacity_cli::run_capacity(&discover_endpoint()?, &identity, &action, json),
         Command::IdentityCurrent => print_current_session_identity(),
         Command::Doctor {
             identity,
@@ -4228,6 +4262,16 @@ fn add_user_target_is_local(endpoint: &Endpoint) -> bool {
 }
 
 fn requires_session_discovery(command: &Command) -> bool {
+    if matches!(
+        command,
+        Command::Capacity { .. }
+            | Command::Accounts {
+                action: AccountAction::List | AccountAction::Show(_),
+                ..
+            }
+    ) {
+        return false;
+    }
     if matches!(command, Command::ToolCallObserved) {
         return true;
     }
@@ -4330,7 +4374,9 @@ fn local_harklight_identity_refusal(
 
 fn command_identity(command: &Command) -> Option<&Identity> {
     match command {
-        Command::Wake { identity, .. }
+        Command::Accounts { identity, .. }
+        | Command::Capacity { identity, .. }
+        | Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
         | Command::FactDemand { identity, .. }
         | Command::FactProducerClaim { identity, .. }
@@ -4905,6 +4951,41 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn account_mutations_pass_the_account_id_and_keep_removal_non_destructive() {
+        let parse = |args: &[&str]| {
+            args::parse(args.iter().map(|value| (*value).to_owned()).collect()).unwrap()
+        };
+        let decode = |command| {
+            let request = build_request(&command).unwrap();
+            assert_eq!(request.path, "/agent/dispatch");
+            serde_json::from_str::<Value>(&request.body_json).unwrap()
+        };
+        let removal = decode(parse(&[
+            "accounts",
+            "remove",
+            "acct_example",
+            "--as-user",
+            "operator",
+        ]));
+        assert_eq!(removal["verb"], "accounts");
+        assert_eq!(
+            removal["params"],
+            serde_json::json!({"action":"remove","accountId":"acct_example"})
+        );
+        let rename = decode(parse(&[
+            "accounts",
+            "rename",
+            "acct_example",
+            "Backup login",
+        ]));
+        assert_eq!(
+            rename["params"],
+            serde_json::json!({"action":"rename","accountId":"acct_example","label":"Backup login"})
+        );
+        assert!(build_request(&parse(&["accounts", "show", "acct_example"])).is_err());
     }
 
     #[test]
