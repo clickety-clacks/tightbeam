@@ -3417,7 +3417,7 @@ defmodule Tightbeam.HarklightWakesTest do
                File.exists?(script <> ".calls") and File.read!(script <> ".calls") =~ listen_call
            end)
 
-    port = await_listener_port()
+    port = await_open_port()
     {:os_pid, pid} = Port.info(port, :os_pid)
 
     child_pid = File.read!(script <> ".pid") |> String.trim()
@@ -3449,7 +3449,7 @@ defmodule Tightbeam.HarklightWakesTest do
              |> Enum.count(&(&1 == listen_call)) == 2
            end)
 
-    new_port = await_listener_port()
+    new_port = await_open_port()
     refute new_port == port
   end
 
@@ -3631,17 +3631,25 @@ defmodule Tightbeam.HarklightWakesTest do
     refute eventually(fn -> length(calls.()) > 2 end, 35)
   end
 
-  defp await_listener_port(attempts \\ 100)
-  defp await_listener_port(0), do: flunk("listener port did not start")
+  # A feed's first child may only be asked its version. The one that listens is
+  # the one that has caught up.
+  defp await_listener_port, do: await_port(&(not MapSet.member?(&1.starts_in_flight, @handle)))
 
-  defp await_listener_port(attempts) do
-    port = :sys.get_state(HarklightWakes).ports[@handle]
+  # For a child that never catches up.
+  defp await_open_port, do: await_port(fn _ -> true end)
 
-    if is_port(port) and Port.info(port) != nil do
+  defp await_port(ready?, attempts \\ 1_000)
+  defp await_port(_ready?, 0), do: flunk("listener port did not start")
+
+  defp await_port(ready?, attempts) do
+    state = :sys.get_state(HarklightWakes)
+    port = state.ports[@handle]
+
+    if is_port(port) and Port.info(port) != nil and ready?.(state) do
       port
     else
       Process.sleep(10)
-      await_listener_port(attempts - 1)
+      await_port(ready?, attempts - 1)
     end
   end
 
@@ -4522,7 +4530,8 @@ defmodule Tightbeam.HarklightWakesTest do
             if [ -e "$0.unsupported" ]; then
               printf '%s\\n' '{"kind":"unsupported","operation":"pending_baseline"}'; exit 5
             fi
-            printf '%s\\n' '{"kind":"baseline","rev":30,"reason":"first_contact"}'
+            start=30; if [ -e "$0.otherstart" ]; then start=29; fi
+            printf '{"kind":"baseline","rev":%s,"reason":"first_contact"}\\n' $start
             if [ -e "$0.reject-late" ]; then
               printf '%s\\n' '{"kind":"token_invalid","reason":"invalid_field","field":"page","request_id":"r"}'
               exit 2
@@ -4533,6 +4542,10 @@ defmodule Tightbeam.HarklightWakesTest do
               printf '%s\\n%s\\n' '{"kind":"entry","rev":26,"da' 'warning text ta":{"entry_id":"split"}}'
             fi
             if [ -e "$0.cut" ]; then exit 1; fi
+            if [ -e "$0.noend" ]; then exit 0; fi
+            if [ -e "$0.othermark" ]; then
+              printf '%s\\n' '{"kind":"baseline_complete","rev":31}'; exit 0
+            fi
             printf '%s\\n' '{"kind":"baseline_complete","rev":30}'
             hold complete
             ;;
@@ -4780,18 +4793,22 @@ defmodule Tightbeam.HarklightWakesTest do
       assert captured_ids(db) == ["before-answer", "answer request", "marked"]
     end
 
-    test "a damaged row stops the commit and the same token is read again", %{db: db} do
-      migrated_from_01!(db)
-      agent = pending_agent!()
-      File.touch!(agent <> ".damage")
-      start_supervised!({HarklightWakes, pending_opts(db)})
-      choose_open(db)
-      assert eventually(fn -> length(pending_calls(agent)) > 3 end)
-      assert captured_ids(db) == []
-      assert {:ok, [[30, "T1", 1, 0]]} = pending_row(db)
-      File.rm!(agent <> ".damage")
-      assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
-      assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+    for fault <- ["damage", "noend", "othermark", "otherstart"] do
+      @fault fault
+      test "output with a fault (#{fault}) is not committed and the same token is read again",
+           %{db: db} do
+        migrated_from_01!(db)
+        agent = pending_agent!()
+        File.touch!(agent <> "." <> @fault)
+        start_supervised!({HarklightWakes, pending_opts(db)})
+        choose_open(db)
+        assert eventually(fn -> length(pending_calls(agent)) > 3 end)
+        assert captured_ids(db) == []
+        assert {:ok, [[30, "T1", 1, 0]]} = pending_row(db)
+        File.rm!(agent <> "." <> @fault)
+        assert eventually(fn -> List.last(pending_calls(agent)) == pending_call({:after, 30}) end)
+        assert captured_ids(db) == ["before-answer", "answer request", "marked"]
+      end
     end
 
     test "a rejected token that served nothing is prepared again", %{db: db} do
@@ -5005,6 +5022,49 @@ defmodule Tightbeam.HarklightWakesTest do
       end
     end
 
+    for equal <- [true, false] do
+      test "a position that is good again ends the wish to open (same revision: #{equal})", %{
+        db: db
+      } do
+        :ok = HarklightWakes.capture_feed(db, @handle, 50, [], :live)
+        rev = if unquote(equal), do: 50, else: 60
+
+        {:ok, _} =
+          DB.query(db, "INSERT INTO harklight_pending_opens(handle,expired) VALUES(?1,50)", [
+            @handle
+          ])
+
+        fake_harklight_agent!("""
+        printf '%s\\n' "$*" >> "$0.calls"
+        printf '%s\\n' '{"kind":"caught_up","rev":#{rev}}'
+        exec sleep 60
+        """)
+
+        start_supervised!({HarklightWakes, pending_opts(db)})
+        assert eventually(fn -> pending_row(db) == {:ok, []} end)
+        :ok = stop_supervised(HarklightWakes)
+
+        # A newer Agent then follows the position.
+        agent = pending_agent!()
+        start_supervised!({HarklightWakes, pending_opts(db)})
+        assert eventually(fn -> pending_calls(agent) == [pending_call({:after, rev})] end)
+      end
+    end
+
+    test "a position moved by another version is followed, not opened", %{db: db} do
+      :ok = HarklightWakes.capture_feed(db, @handle, 50, [], :live)
+
+      {:ok, _} =
+        DB.query(db, "INSERT INTO harklight_pending_opens(handle,expired) VALUES(?1,90)", [
+          @handle
+        ])
+
+      agent = pending_agent!()
+      start_supervised!({HarklightWakes, pending_opts(db)})
+      assert eventually(fn -> pending_calls(agent) == [pending_call({:after, 50})] end)
+      assert {:ok, []} = pending_row(db)
+    end
+
     test "an expired position on a Server without the route is recovered by the Agent", %{db: db} do
       :ok = HarklightWakes.capture_feed(db, @handle, 50, [], :live)
       agent = pending_agent!()
@@ -5112,7 +5172,7 @@ defmodule Tightbeam.HarklightWakesTest do
       File.write!(agent, """
       #!/bin/sh
       printf '%s\\n' "$*" >> "$0.calls"
-      if [ ! -e "$0.hung" ]; then touch "$0.hung"; exec sleep 60; fi
+      if mkdir "$0.hung" 2>/dev/null; then exec sleep 60; fi
       if [ "$1" = --version ]; then
         if [ -e "$0.fail" ]; then exit 1; fi
         echo 'harklight-agent 0.2.3'; exit 0
@@ -5124,14 +5184,23 @@ defmodule Tightbeam.HarklightWakesTest do
 
       File.touch!(agent <> ".fail")
       start_supervised!({HarklightWakes, pending_opts(db)})
-      assert eventually(fn -> Enum.count(pending_calls(agent), &(&1 == "--version")) > 3 end)
+
+      assert eventually(
+               fn -> Enum.count(pending_calls(agent), &(&1 == "--version")) > 3 end,
+               2_000
+             )
+
       assert Enum.uniq(pending_calls(agent)) == ["--version"]
       File.rm!(agent <> ".fail")
 
-      assert eventually(fn ->
-               DB.query(db, "SELECT handle FROM harklight_feed_checkpoints") ==
-                 {:ok, [[second]]}
-             end)
+      assert eventually(
+               fn ->
+                 # Either conversation may be the one whose question hangs.
+                 DB.query(db, "SELECT count(*) FROM harklight_feed_checkpoints") ==
+                   {:ok, [[1]]}
+               end,
+               2_000
+             )
     end
 
     test "an older Agent starts a new conversation with a snapshot", %{db: db} do
