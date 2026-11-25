@@ -2,7 +2,7 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, Placement}
-  alias Tightbeam.Harness.{Claude, RecoveryProbe, Support}
+  alias Tightbeam.Harness.{Claude, ClaudeCli, RecoveryProbe, Support}
 
   @codex_help ~w(--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -C -m -s -c
                  --disable --output-schema --json)
@@ -95,22 +95,28 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
   end
 
   @tag :tmp_dir
-  test "Claude recovery uses a supported PATH CLI when the bundle is obsolete", ctx do
+  test "Claude launch and recovery select the same PATH CLI when the bundle is obsolete", ctx do
     bundle = fake_claude_adapter!(ctx.tmp_dir, "2.1.207")
     path_cli = fake_cli!(ctx.tmp_dir, "claude", @claude_help, [])
     configure_claude_toolchain!(ctx)
+
+    selected = launch_executable!(ctx)
+    assert selected == path_cli
     assert {{:succeeded, nil}, _} = run(ctx, "claude", nil, nil, 20_000)
-    assert File.exists?(path_cli <> ".called")
+    assert File.exists?(selected <> ".called")
     refute File.exists?(bundle <> ".called")
   end
 
   @tag :tmp_dir
-  test "Claude recovery uses a supported bundle when the PATH CLI is obsolete", ctx do
+  test "Claude launch and recovery select the same bundle when the PATH CLI is obsolete", ctx do
     bundle = fake_claude_adapter!(ctx.tmp_dir)
     path_cli = fake_cli!(ctx.tmp_dir, "claude", @claude_help, [], "2.1.207")
     configure_claude_toolchain!(ctx)
+
+    selected = launch_executable!(ctx)
+    assert selected == bundle
     assert {{:succeeded, nil}, _} = run(ctx, "claude", nil, nil, 20_000)
-    assert File.exists?(bundle <> ".called")
+    assert File.exists?(selected <> ".called")
     refute File.exists?(path_cli <> ".called")
   end
 
@@ -182,6 +188,20 @@ defmodule Tightbeam.RecoveryProbeStdinTest do
              Placement.set_toolchain_dirs(ctx.db, "stdinhost", [ctx.tmp_dir, node_dir], "test")
 
     with_claude_override(nil)
+  end
+
+  defp launch_executable!(ctx) do
+    path = Placement.toolchain_path_preview(%{base_dir: ctx.tmp_dir, db: ctx.db}, "stdinhost")
+    adapter = Claude.installed_adapter(Path.join(ctx.tmp_dir, "adapters"))
+    opts = [cmd: [adapter], cwd: ctx.tmp_dir, env: [{"PATH", path}]]
+
+    assert {:ok, launch_opts} =
+             ClaudeCli.prepare_launch(opts, "stdinhost", &Support.system_cmd_out/1)
+
+    {"CLAUDE_CODE_EXECUTABLE", executable} =
+      List.keyfind(launch_opts[:env], "CLAUDE_CODE_EXECUTABLE", 0)
+
+    executable
   end
 
   defp with_fixture_path(dir) do

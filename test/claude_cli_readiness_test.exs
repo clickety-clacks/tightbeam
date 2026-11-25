@@ -165,7 +165,7 @@ defmodule Tightbeam.Harness.ClaudeCliReadinessTest do
   end
 
   defp run([executable | args]) do
-    System.cmd(executable, args, stderr_to_stdout: true, env: [{"CLAUDE_CODE_EXECUTABLE", nil}])
+    System.cmd(executable, args, env: [{"CLAUDE_CODE_EXECUTABLE", nil}])
   end
 
   defp write_package(manifest, version) do
