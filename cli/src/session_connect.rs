@@ -214,7 +214,7 @@ impl ReadSelection {
     }
 }
 
-fn is_org_credential(endpoint: &Endpoint) -> bool {
+pub(crate) fn is_org_credential(endpoint: &Endpoint) -> bool {
     endpoint.token.starts_with("tbc_")
 }
 

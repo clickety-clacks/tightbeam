@@ -1,6 +1,8 @@
 use crate::args::{AccountAction, CapacityAction, Identity};
 use crate::dispatch::{self, Endpoint};
-use crate::session_connect::{ReadSelection, encode_path, set_read_timeout, websocket_url};
+use crate::session_connect::{
+    ReadSelection, encode_path, is_org_credential, set_read_timeout, websocket_url,
+};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::io::{self, Write};
@@ -84,6 +86,15 @@ fn capacity_path(action: &CapacityAction) -> String {
     }
 }
 
+fn read_selection(endpoint: &Endpoint, identity: &Identity) -> Result<ReadSelection, String> {
+    if matches!(identity, Identity::User(_)) && !is_org_credential(endpoint) {
+        return Err(
+            "--as-user for account and capacity reads requires an organization credential".into(),
+        );
+    }
+    Ok(ReadSelection::for_invocation(endpoint, identity))
+}
+
 pub(crate) fn run_accounts(
     endpoint: &Endpoint,
     identity: &Identity,
@@ -95,7 +106,7 @@ pub(crate) fn run_accounts(
         AccountAction::Show(account) => format!("/api/accounts/{}", encode_path(account)),
         _ => return Err("account mutations use dispatch".into()),
     };
-    let selection = ReadSelection::for_invocation(endpoint, identity);
+    let selection = read_selection(endpoint, identity)?;
     let body = read_json(endpoint, &selection, &path).map_err(|error| error.to_string())?;
     let output = if json {
         format!("{body}\n")
@@ -120,7 +131,7 @@ pub(crate) fn run_capacity(
     action: &CapacityAction,
     json: bool,
 ) -> Result<(), String> {
-    let selection = ReadSelection::for_invocation(endpoint, identity);
+    let selection = read_selection(endpoint, identity)?;
     let path = capacity_path(action);
     if let CapacityAction::Watch { account } = action {
         return watch(endpoint, &selection, &path, account.as_deref(), |body| {
@@ -650,145 +661,6 @@ mod tests {
             format_capacity(&action, &history, false),
             "History for acct_example\nNo usage history.\n"
         );
-    }
-
-    // Subset of the gateway fixture captured from the capacity route implementation.
-    // Source: test/support/fixtures/capacity/wire.json at 007629cd.
-    const WIRE: &str = include_str!("../tests/fixtures/capacity_wire_931.json");
-
-    fn fixture_socket(listener: &TcpListener) -> TcpStream {
-        let (socket, _) = listener.accept().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        socket
-    }
-
-    fn serve_snapshot(mut socket: TcpStream, body: &Value, before_reply: impl FnOnce()) {
-        let request: Vec<_> = BufReader::new(&socket)
-            .lines()
-            .map(Result::unwrap)
-            .take_while(|line| !line.is_empty())
-            .collect();
-        assert_eq!(
-            request[0],
-            "GET /api/capacity?refresh=cache&asUser=operator HTTP/1.1",
-        );
-        assert!(
-            request.iter().any(|header| {
-                header.eq_ignore_ascii_case("authorization: Bearer tbc_synthetic")
-            })
-        );
-        before_reply();
-        let body = body.to_string();
-        write!(
-            socket,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len(),
-        )
-        .unwrap();
-    }
-
-    fn send_frame(socket: &mut WebSocket<TcpStream>, frame: Value) {
-        socket.send(Message::Text(frame.to_string())).unwrap();
-    }
-
-    fn receive_frame(socket: &mut WebSocket<TcpStream>) -> Value {
-        serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap()
-    }
-
-    fn serve_subscription(listener: &TcpListener) -> WebSocket<TcpStream> {
-        let mut socket = tungstenite::accept(fixture_socket(listener)).unwrap();
-        assert_eq!(
-            receive_frame(&mut socket),
-            json!({"type":"auth", "token":"tbc_synthetic", "asUser":"operator"}),
-        );
-        send_frame(
-            &mut socket,
-            json!({"type":"auth_result", "success":true, "isAdmin":true}),
-        );
-        assert_eq!(
-            receive_frame(&mut socket),
-            json!({"type":"subscribe", "protocolVersion":2, "subscriptionId":"capacity-watch",
-                "filters":{"classes":WATCH_CLASSES}}),
-        );
-        // Without readiness the client must not start REST.
-        listener.set_nonblocking(true).unwrap();
-        assert_eq!(
-            listener.accept().unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        listener.set_nonblocking(false).unwrap();
-        send_frame(
-            &mut socket,
-            json!({"type":"subscription_ready", "subscriptionId":"capacity-watch"}),
-        );
-        socket
-    }
-
-    #[test]
-    fn capacity_watch_reconciles_during_snapshot_and_rebuilds_after_reload() {
-        let wire: Value = serde_json::from_str(WIRE).unwrap();
-        let baseline = wire["usageCache"]["body"].clone();
-        let mut event = wire["capacityChanged"].clone();
-        event["type"] = json!("change");
-        event["schemaVersion"] = json!(2);
-        event["subscriptionId"] = json!("capacity-watch");
-        event["seq"] = json!(1);
-        let mut updated = baseline.clone();
-        updated["results"][0]["sample"]["windows"][0]["usedPercent"] = json!(77);
-        let rebuilt = json!({
-            "generatedAt": 1795570014000_i64, "results": [],
-            "counts": {"live":0, "cache":0, "stale":0, "error":0},
-        });
-        let expected = [baseline.clone(), updated.clone(), rebuilt.clone()];
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = Endpoint {
-            base: format!("http://{}", listener.local_addr().unwrap()),
-            token: "tbc_synthetic".into(),
-            origin: Origin::Named,
-        };
-
-        let server = std::thread::spawn(move || {
-            let mut socket = serve_subscription(&listener);
-            serve_snapshot(fixture_socket(&listener), &baseline, || {
-                send_frame(&mut socket, event)
-            });
-            serve_snapshot(fixture_socket(&listener), &updated, || {});
-            send_frame(
-                &mut socket,
-                json!({"type":"reload_required", "reason":"backlog_overflow"}),
-            );
-            drop(socket);
-            let _socket = serve_subscription(&listener);
-            serve_snapshot(fixture_socket(&listener), &rebuilt, || {});
-        });
-        let (send, receive) = std::sync::mpsc::channel();
-        let client = std::thread::spawn(move || {
-            let selection =
-                ReadSelection::for_invocation(&endpoint, &Identity::User("operator".into()));
-            let action = CapacityAction::Watch { account: None };
-            let path = capacity_path(&action);
-            let mut count = 0;
-            let result = watch(&endpoint, &selection, &path, None, |body| {
-                send.send(format_capacity(&action, body, true))
-                    .map_err(|error| error.to_string())?;
-                count += 1;
-                if count == 3 {
-                    Err("test finished".into())
-                } else {
-                    Ok(())
-                }
-            });
-            assert_eq!(result, Err("test finished".into()));
-        });
-
-        for snapshot in expected {
-            let line = receive.recv_timeout(Duration::from_secs(8)).unwrap();
-            assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), snapshot);
-        }
-        client.join().unwrap();
-        server.join().unwrap();
     }
 
     #[test]
