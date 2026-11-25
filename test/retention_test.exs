@@ -90,14 +90,14 @@ defmodule Tightbeam.RetentionTest do
 
   test "the walk waits between batches before taking the writer again", %{db: db} do
     for _ <- 1..450, do: insert_row(db, @first, "rail_sweep")
-    {:ok, pid} = Retention.start_link(db: db, name: nil, min_yield_ms: 300)
+    {:ok, pid} = Retention.start_link(db: db, name: nil, min_yield_ms: 2_000)
 
     send(pid, :trim)
     assert %{cursor: 200, last_pause_ms: pause} = :sys.get_state(pid)
-    assert pause >= 300
+    assert pause >= 2_000
     Process.sleep(100)
     assert %{cursor: 200} = :sys.get_state(pid)
-    eventually(fn -> :sys.get_state(pid).cursor == 400 end)
+    eventually(fn -> :sys.get_state(pid).cursor == 400 end, 250)
     GenServer.stop(pid)
   end
 
