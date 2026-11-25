@@ -318,8 +318,10 @@ jobs:
           node-version: "22"
 
       - name: Assemble the npm package
+        run: sh packaging/assemble.sh
+
+      - name: Smoke the assembled gateway package
         run: |
-          sh packaging/assemble.sh
           for package in _build/npm/tightbeam-*.tgz; do
             python3 packaging/gateway-smoke.py "$package" || exit
           done
