@@ -45,8 +45,8 @@ Work the gateway itself owes (`DB.owed_work`: session lanes, turn tasks, the ada
 coordinator, schedulers) has no caller to answer. It waits for its answer without a
 client or statement deadline, because a timeout there ends the process and drops the
 turn or harness connection. The wait ends if the database process dies, and takes the
-ordinary client wait once the waiting process has been told to stop. Each further
-30,000 ms is logged with the caller. Calls that carry their own deadline keep it.
+ordinary client wait once the waiting process has been told to stop. Each 30,000 ms of
+waiting is logged with the caller. Calls that carry their own deadline keep it.
 
 SQLite's existing [busy_timeout](https://sqlite.org/pragma.html#pragma_busy_timeout)
 remains 5,000 ms: it controls lock-contention waiting, not total migration or

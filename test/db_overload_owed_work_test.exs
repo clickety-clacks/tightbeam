@@ -106,6 +106,12 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
 
   defp relieve!(db), do: :sys.resume(Process.whereis(db))
 
+  defp waiting_lines(log, operation, pid) do
+    log
+    |> String.split("\n")
+    |> Enum.filter(&(&1 =~ "database has not answered owed #{operation} " and &1 =~ "pid=#{pid}"))
+  end
+
   defp enqueue!(db, session_key, prompt) do
     {:ok, seq} =
       Ledger.enqueue(db, %{
@@ -365,26 +371,43 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
                DB.owed_work(fn -> DB.query_until(db, "SELECT 1", [], deadline) end)
     end
 
-    test "logs the caller of a late owed call, each time the timeout passes again", %{db: db} do
+    test "logs a waiting owed call before its answer, and runs it once", %{db: db} do
       stall!(db)
+      ran = :counters.new(1, [])
 
-      log =
-        capture_log(fn ->
-          waiting =
-            Task.async(fn -> DB.owed_work(fn -> EventLog.lifecycle(db, "late", "x", nil) end) end)
-
-          assert Task.yield(waiting, 500) == nil
-          relieve!(db)
-          assert :ok = Task.await(waiting, 5_000)
+      waiting =
+        Task.async(fn ->
+          DB.owed_work(fn ->
+            {DB.transaction(db, fn _txn -> :counters.add(ran, 1, 1) end)}
+          end)
         end)
 
-      lines =
-        Regex.scan(
-          ~r/database has not answered owed db\.transaction .*caller=Tightbeam\.EventLog\.lifecycle/,
-          log
-        )
+      log = capture_log(fn -> assert Task.yield(waiting, 500) == nil end)
+      pid = inspect(waiting.pid)
 
+      lines = waiting_lines(log, "db.transaction", pid)
       assert length(lines) >= 2
+      assert Enum.all?(lines, &(&1 =~ ~r/caller=.*Tightbeam\.DBOverloadOwedWorkTest/))
+      assert :counters.get(ran, 1) == 0
+
+      relieve!(db)
+      assert {{:ok, :ok}} = Task.await(waiting, 5_000)
+      :sys.get_state(db)
+      assert :counters.get(ran, 1) == 1
+    end
+
+    test "logs a waiting call every 30 s however long the client timeout is" do
+      previous = Application.fetch_env(:tightbeam, :db_call_timeout_ms)
+
+      on_exit(fn ->
+        case previous do
+          {:ok, value} -> Application.put_env(:tightbeam, :db_call_timeout_ms, value)
+          :error -> Application.delete_env(:tightbeam, :db_call_timeout_ms)
+        end
+      end)
+
+      Application.put_env(:tightbeam, :db_call_timeout_ms, 300_000)
+      assert DB.owed_report_ms() == 30_000
     end
 
     test "ends an owed call when the owner dies", %{db: db} do
@@ -607,17 +630,33 @@ defmodule Tightbeam.DBOverloadOwedWorkTest do
 
       assert_raise DB.Timeout, fn -> DB.query(db, "SELECT 1") end
 
-      waiting =
+      ran = :counters.new(1, [])
+
+      query = Task.async(fn -> DB.owed_work(fn -> DB.query(db, "SELECT 1") end) end)
+
+      snapshot =
         Task.async(fn ->
           DB.owed_work(fn ->
-            {DB.query(db, "SELECT 1"),
-             DB.read_transaction(db, fn txn -> DB.Txn.q(txn, "SELECT 2") end)}
+            DB.read_transaction(db, fn txn ->
+              :counters.add(ran, 1, 1)
+              DB.Txn.q(txn, "SELECT 2")
+            end)
           end)
         end)
 
-      assert Task.yield(waiting, 400) == nil
+      log =
+        capture_log(fn ->
+          assert Task.yield(query, 500) == nil
+          assert Task.yield(snapshot, 0) == nil
+        end)
+
+      assert waiting_lines(log, "db.query", inspect(query.pid)) != []
+      assert waiting_lines(log, "db.read_transaction", inspect(snapshot.pid)) != []
+
       for reader <- readers, do: :sys.resume(reader)
-      assert {{:ok, [[1]]}, {:ok, [[2]]}} = Task.await(waiting, 5_000)
+      assert {:ok, [[1]]} = Task.await(query, 5_000)
+      assert {:ok, [[2]]} = Task.await(snapshot, 5_000)
+      assert :counters.get(ran, 1) == 1
     end
   end
 

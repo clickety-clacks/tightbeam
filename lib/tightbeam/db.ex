@@ -96,6 +96,7 @@ defmodule Tightbeam.DB do
   @admission_poll_max_ms 250
   @admission_report_ms 10_000
   @owed_wait_ms 1_000
+  @owed_report_ms 30_000
   @startup_progress_ms 5_000
   @deadline_key {__MODULE__, :deadline}
   @statement_cache_key {__MODULE__, :statement_cache}
@@ -137,8 +138,7 @@ defmodule Tightbeam.DB do
   the work. It is also the only safe wait for a write, whose effect a timeout
   would leave unknown. The wait ends with the database process, and once the
   waiting process has been told to stop it is bounded by the ordinary timeout.
-  A wait past that timeout is logged each time it passes again, naming its
-  caller. Calls that carry their own deadline (`transaction_until/3`,
+  A wait is logged every 30 s, naming its caller. Calls that carry their own deadline (`transaction_until/3`,
   `query_until/4`) keep their deadline and the refusal.
 
   `owed_work/0` marks the calling process for its lifetime; `owed_work/1` marks
@@ -186,14 +186,19 @@ defmodule Tightbeam.DB do
   def waits_for_answer?, do: Process.get(@owed_work_key) != nil
 
   @doc false
-  # `GenServer.call/3` for owed work: it ends with an answer or the server.
+  # `GenServer.call/3` for owed work, sent once: it ends with an answer or the
+  # server.
   def owed_call(server, request, operation) do
     now = System.monotonic_time(:millisecond)
-    owed_wait(:gen_server.send_request(server, request), operation, now, call_timeout())
+    owed_wait(:gen_server.send_request(server, request), operation, now, owed_report_ms())
   end
 
+  @doc false
+  # Not the client timeout, which an installation may set to minutes.
+  def owed_report_ms, do: min(@owed_report_ms, call_timeout())
+
   defp owed_wait(id, operation, started, report_at) do
-    case :gen_server.wait_response(id, min(@owed_wait_ms, call_timeout())) do
+    case :gen_server.wait_response(id, min(@owed_wait_ms, owed_report_ms())) do
       {:reply, reply} ->
         reply
 
@@ -204,14 +209,14 @@ defmodule Tightbeam.DB do
         waited = System.monotonic_time(:millisecond) - started
 
         cond do
-          waited < report_at ->
-            owed_wait(id, operation, started, report_at)
-
-          stopping?() ->
+          waited >= call_timeout() and stopping?() ->
             case :gen_server.receive_response(id, 0) do
               {:reply, reply} -> reply
               _ -> exit({:timeout, {GenServer, :call, [:redacted]}})
             end
+
+          waited < report_at ->
+            owed_wait(id, operation, started, report_at)
 
           true ->
             Logger.warning(
@@ -219,7 +224,7 @@ defmodule Tightbeam.DB do
                 "caller=#{owed_caller()} pid=#{inspect(self())}"
             )
 
-            owed_wait(id, operation, started, waited + call_timeout())
+            owed_wait(id, operation, started, waited + owed_report_ms())
         end
     end
   end
@@ -243,10 +248,18 @@ defmodule Tightbeam.DB do
     end
   end
 
+  # A tail call leaves no frame; the process then names itself.
   defp owed_caller do
     {:current_stacktrace, frames} = Process.info(self(), :current_stacktrace)
 
-    Enum.find_value(frames, "unknown", fn {module, function, arity, _location} ->
+    process =
+      case {Process.info(self(), :registered_name), Process.get(:"$initial_call")} do
+        {{:registered_name, name}, _} when is_atom(name) -> inspect(name)
+        {_, {module, function, arity}} -> Exception.format_mfa(module, function, arity)
+        _ -> "unknown"
+      end
+
+    Enum.find_value(frames, process, fn {module, function, arity, _location} ->
       name = Atom.to_string(module)
 
       if String.starts_with?(name, "Elixir.Tightbeam.") and
