@@ -271,7 +271,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
 
     assert notice["refs"] == %{
              "decisionRequestId" => request.id,
-             "workItemId" => assignment.work_item_id
+             "workItemId" => assignment.workItemId
            }
 
     assert notice["payload"] == Tightbeam.StateResources.decision_request(request)
