@@ -345,6 +345,18 @@ defmodule Tightbeam.WaitLinks do
       "(w.waitMode IS NOT NULL OR w.conditionKind IS NOT NULL OR w.consumer='cron' OR w.dueAt>w.createdAt)"
 
     wake = fn scope, index ->
+      index =
+        if ended do
+          index
+        else
+          %{
+            "wakes_wait_links_item" => "wakes_wait_pending_item",
+            "wakes_assignment" => "wakes_wait_pending_assignment",
+            "wakes_rest_session_created_order" => "wakes_wait_pending_session"
+          }
+          |> Map.fetch!(index)
+        end
+
       "SELECT w.createdAt at,'wake:'||printf('%020d',w.rowid) key,'wake' type,w.wakeId id FROM wakes w INDEXED BY #{index} WHERE (#{scope}) AND #{active_wake} AND #{waiting} AND #{declared_wait_sql()}"
     end
 
@@ -363,7 +375,7 @@ defmodule Tightbeam.WaitLinks do
            " UNION ALL SELECT a.openedAt,'assignment:'||printf('%020d',a.rowid),'assignment',a.id FROM assignments a WHERE a.workItemId=? AND #{active_assignment}" <>
            " UNION ALL " <>
            decision.(
-             "(CASE WHEN json_valid(d.context) THEN json_extract(d.context,'$.workItemId') END)=? AND d.assignmentId IS NULL"
+             "(CASE WHEN json_valid(d.context) THEN json_extract(d.context,'$.workItemId') END)=? AND +d.assignmentId IS NULL"
            ), [id, id, id, id, id]}
 
       "assignment" ->

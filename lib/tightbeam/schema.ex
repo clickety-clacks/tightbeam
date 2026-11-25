@@ -3893,6 +3893,12 @@ defmodule Tightbeam.Schema do
 
   defp ensure_wait_links_indexes(db) do
     indexes = [
+      {"wakes_wait_pending_item",
+       "CREATE INDEX IF NOT EXISTS wakes_wait_pending_item ON wakes(work_item_id,createdAt,wakeId) WHERE state='pending'"},
+      {"wakes_wait_pending_assignment",
+       "CREATE INDEX IF NOT EXISTS wakes_wait_pending_assignment ON wakes(assignmentId,createdAt,wakeId) WHERE state='pending'"},
+      {"wakes_wait_pending_session",
+       "CREATE INDEX IF NOT EXISTS wakes_wait_pending_session ON wakes(sessionKey,createdAt,wakeId) WHERE state='pending'"},
       {"cannot_proceed_wait_assignment",
        "CREATE INDEX IF NOT EXISTS cannot_proceed_wait_assignment ON assignment_cannot_proceed(assignmentId,createdAt,id)"},
       {"decision_requests_wait_item",

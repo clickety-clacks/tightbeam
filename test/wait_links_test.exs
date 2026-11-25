@@ -543,8 +543,9 @@ defmodule Tightbeam.WaitLinksTest do
       )
 
     page_details = Enum.map_join(page_plan, "\n", &List.last/1)
-    assert page_details =~ "SEARCH w USING INDEX wakes_wait_links_item"
-    assert page_details =~ "SEARCH w USING INDEX wakes_assignment"
+    assert page_details =~ "SEARCH w USING INDEX wakes_wait_pending_item"
+    assert page_details =~ "SEARCH w USING INDEX wakes_wait_pending_assignment"
+    assert page_details =~ "SEARCH d USING INDEX decision_requests_wait_item"
     refute page_details =~ "wakes_wait_recognition"
     refute page_details =~ "decision_requests_rest_status_order"
   end

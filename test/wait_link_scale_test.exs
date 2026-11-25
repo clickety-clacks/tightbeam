@@ -52,8 +52,24 @@ defmodule Tightbeam.WaitLinkScaleTest do
 
     principal = %{kind: "user", id: "bench", is_admin: true}
 
+    {:ok, [[busy_session, history_count]]} =
+      DB.query(
+        db,
+        "SELECT sessionKey,count(*) n FROM wakes GROUP BY sessionKey ORDER BY n DESC LIMIT 1"
+      )
+
+    assert history_count > 20_000
+    repro_item = "wi_00000947-0000-4000-8000-000000000947"
+
+    page = fn kind, id ->
+      {:ok, request} = WaitLinks.request(%{}, kind, id)
+      assert {:ok, _} = WaitLinks.page(db, kind, id, principal, request)
+    end
+
     scenarios =
       [
+        {"review-item-page", fn -> page.("work-item", repro_item) end},
+        {"review-busy-session", fn -> page.("session", busy_session) end},
         {"summary", fn -> WaitLinks.summaries(db, [item]) end},
         {"waitOn", fn -> StateResources.query_wake(db, %{key: wake, principal: principal}) end},
         {"publish",

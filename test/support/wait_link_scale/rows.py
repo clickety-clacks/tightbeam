@@ -31,13 +31,20 @@ for line in open(sys.argv[3]):
         if status==100: n+=1
         elif status==101: break
         else: raise RuntimeError(L.sqlite3_errmsg(db))
-    tot=0; loops=[]; i=0; base_seeks=0
+    tot=0; loops=[]; i=0; base_seeks=0; decision_visits=0; wake_visits=0
     while True:
         v=C.c_int64(-1); 
         if L.sqlite3_stmt_scanstatus_v2(st,i,1,0,C.byref(v)): break
         e=C.c_char_p(); L.sqlite3_stmt_scanstatus_v2(st,i,4,0,C.byref(e))
         name=C.c_char_p(); L.sqlite3_stmt_scanstatus_v2(st,i,3,0,C.byref(name))
         detail=(e.value or b"").decode()
+        index_name=(name.value or b"").decode()
+        if d["scenario"] == "review-item-page" and "'decision' type" in d["sql"] and index_name.startswith("decision_requests"):
+            assert index_name == "decision_requests_wait_item", (index_name,detail)
+            decision_visits += max(0,v.value)
+        if d["scenario"] in ("review-item-page","review-busy-session") and "'wake' type" in d["sql"] and index_name.startswith("wakes"):
+            assert index_name.startswith("wakes_wait_pending_"), (index_name,detail)
+            wake_visits += max(0,v.value)
         if (name.value or b"").decode() in base_names and detail.startswith("SEARCH "): base_seeks+=1
         if (name.value or b"").decode() in base_names and detail.startswith("SCAN "):
             failures.append((d["scenario"],detail))
@@ -46,6 +53,10 @@ for line in open(sys.argv[3]):
     if "SELECT seq,startedAt FROM turns" in d["sql"]:
         assert "INDEXED BY turns_pending" in d["sql"], d["sql"]
         assert tot <= 10, ("running-turn lookup visits history",tot,loops)
+    if d["scenario"] == "review-item-page":
+        assert decision_visits <= 10, (decision_visits,loops)
+    if d["scenario"] == "review-busy-session":
+        assert wake_visits <= 123, (wake_visits,loops)
     vm=L.sqlite3_stmt_status(st,4,0)
     s=out.setdefault(d["scenario"],dict(statements=0,rows_visited=0,rows_returned=0,vm_steps=0,base_seeks=0))
     s["base_seeks"]+=base_seeks; s["statements"]+=1; s["rows_visited"]+=tot; s["rows_returned"]+=n; s["vm_steps"]+=vm
